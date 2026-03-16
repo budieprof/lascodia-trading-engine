@@ -1,0 +1,17 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\LascodiaTradingEngine.Domain\LascodiaTradingEngine.Domain.csproj" />
+    <ProjectReference Include="..\submodules\shared\Library\SharedApplication\SharedApplication.csproj" />
+    <ProjectReference Include="..\submodules\shared\Library\SharedLibrary\SharedLibrary.csproj" />
+    <ProjectReference Include="..\submodules\shared\EventBus\EventBus\EventBus.csproj" />
+    <ProjectReference Include="..\submodules\shared\EventBus\IntegrationEventLogEF\IntegrationEventLogEF.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>

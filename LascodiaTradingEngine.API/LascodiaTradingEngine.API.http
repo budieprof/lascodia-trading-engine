@@ -1,0 +1,6 @@
+@LascodiaTradingEngine.API_HostAddress = http://localhost:5081
+
+GET {{LascodiaTradingEngine.API_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

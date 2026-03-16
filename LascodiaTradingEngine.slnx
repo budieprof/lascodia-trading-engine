@@ -1,0 +1,7 @@
+<Solution>
+  <Project Path="LascodiaTradingEngine.API/LascodiaTradingEngine.API.csproj" />
+  <Project Path="LascodiaTradingEngine.Application/LascodiaTradingEngine.Application.csproj" />
+  <Project Path="LascodiaTradingEngine.Domain/LascodiaTradingEngine.Domain.csproj" />
+  <Project Path="LascodiaTradingEngine.Infrastructure/LascodiaTradingEngine.Infrastructure.csproj" />
+  <Project Path="LascodiaTradingEngine.UnitTest/LascodiaTradingEngine.UnitTest.csproj" />
+</Solution>

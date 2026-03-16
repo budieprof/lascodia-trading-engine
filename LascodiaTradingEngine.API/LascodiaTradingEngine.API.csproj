@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <ItemGroup>
+    <ProjectReference Include="..\LascodiaTradingEngine.Application\LascodiaTradingEngine.Application.csproj" />
+    <ProjectReference Include="..\LascodiaTradingEngine.Infrastructure\LascodiaTradingEngine.Infrastructure.csproj" />
+    <ProjectReference Include="..\submodules\shared\Library\SharedAPI\SharedAPI.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+</Project>

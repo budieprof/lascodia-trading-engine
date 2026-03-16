@@ -1,0 +1,15 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\LascodiaTradingEngine.Application\LascodiaTradingEngine.Application.csproj" />
+    <ProjectReference Include="..\submodules\shared\Library\SharedInfrastructure\SharedInfrastructure.csproj" />
+    <ProjectReference Include="..\submodules\shared\EventBus\EventBusRabbitMQ\EventBusRabbitMQ.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>
