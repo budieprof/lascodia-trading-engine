@@ -12,7 +12,6 @@ namespace LascodiaTradingEngine.Application.Orders.Queries.GetOrder;
 
 public class GetOrderQuery : IRequest<ResponseData<OrderDto>>
 {
-    [JsonIgnore] public int BusinessId { get; set; }
     public required long Id { get; set; }
 }
 
@@ -26,14 +25,14 @@ public class GetOrderQueryHandler : IRequestHandler<GetOrderQuery, ResponseData<
     public GetOrderQueryHandler(IReadApplicationDbContext context, IMapper mapper)
     {
         _context = context;
-        _mapper = mapper;
+        _mapper  = mapper;
     }
 
     public async Task<ResponseData<OrderDto>> Handle(GetOrderQuery request, CancellationToken cancellationToken)
     {
         var entity = await _context.GetDbContext()
             .Set<Domain.Entities.Order>()
-            .FirstOrDefaultAsync(x => x.Id == request.Id && x.BusinessId == request.BusinessId, cancellationToken);
+            .FirstOrDefaultAsync(x => x.Id == request.Id && !x.IsDeleted, cancellationToken);
 
         if (entity == null)
             return ResponseData<OrderDto>.Init(null, false, "Order not found", "-14");

@@ -1,10 +1,8 @@
 using FluentValidation;
 using MediatR;
-using Microsoft.EntityFrameworkCore;
-using System.Text.Json.Serialization;
-using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.Orders.Commands.CreateOrder;
 
@@ -12,14 +10,18 @@ namespace LascodiaTradingEngine.Application.Orders.Commands.CreateOrder;
 
 public class CreateOrderCommand : IRequest<ResponseData<long>>
 {
-    [JsonIgnore]
-    public int BusinessId { get; set; }
-
+    public long?   TradeSignalId  { get; set; }
+    public long    StrategyId     { get; set; }
+    public long    TradingAccountId { get; set; }
     public required string Symbol { get; set; }
-    public required string OrderType { get; set; }   // Buy / Sell
-    public decimal Quantity { get; set; }
-    public decimal Price { get; set; }
-    public string? Notes { get; set; }
+    public required string OrderType { get; set; }    // "Buy" | "Sell"
+    public string  ExecutionType  { get; set; } = "Market";  // "Market" | "Limit" | "Stop" | "StopLimit"
+    public decimal Quantity       { get; set; }
+    public decimal Price          { get; set; }  // 0 for Market orders
+    public decimal? StopLoss      { get; set; }
+    public decimal? TakeProfit    { get; set; }
+    public bool    IsPaper        { get; set; }
+    public string? Notes          { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
@@ -30,17 +32,27 @@ public class CreateOrderCommandValidator : AbstractValidator<CreateOrderCommand>
     {
         RuleFor(x => x.Symbol)
             .NotEmpty().WithMessage("Symbol cannot be empty")
-            .MaximumLength(20).WithMessage("Symbol cannot exceed 20 characters");
+            .MaximumLength(10).WithMessage("Symbol cannot exceed 10 characters");
 
         RuleFor(x => x.OrderType)
             .NotEmpty().WithMessage("OrderType cannot be empty")
             .Must(t => t == "Buy" || t == "Sell").WithMessage("OrderType must be 'Buy' or 'Sell'");
 
+        RuleFor(x => x.ExecutionType)
+            .Must(t => t is "Market" or "Limit" or "Stop" or "StopLimit")
+            .WithMessage("ExecutionType must be Market, Limit, Stop, or StopLimit");
+
         RuleFor(x => x.Quantity)
             .GreaterThan(0).WithMessage("Quantity must be greater than zero");
 
+        // Price = 0 is valid for Market orders
         RuleFor(x => x.Price)
-            .GreaterThan(0).WithMessage("Price must be greater than zero");
+            .GreaterThanOrEqualTo(0).WithMessage("Price cannot be negative");
+
+        // Limit/Stop orders require a price
+        RuleFor(x => x.Price)
+            .GreaterThan(0).WithMessage("Price must be set for non-Market orders")
+            .When(x => x.ExecutionType != "Market");
     }
 }
 
@@ -49,28 +61,30 @@ public class CreateOrderCommandValidator : AbstractValidator<CreateOrderCommand>
 public class CreateOrderCommandHandler : IRequestHandler<CreateOrderCommand, ResponseData<long>>
 {
     private readonly IWriteApplicationDbContext _context;
-    private readonly IIntegrationEventService _eventService;
 
-    public CreateOrderCommandHandler(
-        IWriteApplicationDbContext context,
-        IIntegrationEventService eventService)
+    public CreateOrderCommandHandler(IWriteApplicationDbContext context)
     {
         _context = context;
-        _eventService = eventService;
     }
 
     public async Task<ResponseData<long>> Handle(CreateOrderCommand request, CancellationToken cancellationToken)
     {
         var entity = new Domain.Entities.Order
         {
-            BusinessId = request.BusinessId,
-            Symbol = request.Symbol,
-            OrderType = request.OrderType,
-            Quantity = request.Quantity,
-            Price = request.Price,
-            Notes = request.Notes,
-            Status = "Pending",
-            CreatedAt = DateTime.UtcNow
+            TradeSignalId    = request.TradeSignalId,
+            StrategyId       = request.StrategyId,
+            TradingAccountId = request.TradingAccountId,
+            Symbol           = request.Symbol.ToUpperInvariant(),
+            OrderType        = Enum.Parse<OrderType>(request.OrderType, ignoreCase: true),
+            ExecutionType    = Enum.Parse<ExecutionType>(request.ExecutionType, ignoreCase: true),
+            Quantity         = request.Quantity,
+            Price            = request.Price,
+            StopLoss         = request.StopLoss,
+            TakeProfit       = request.TakeProfit,
+            IsPaper          = request.IsPaper,
+            Notes            = request.Notes,
+            Status           = OrderStatus.Pending,
+            CreatedAt        = DateTime.UtcNow
         };
 
         await _context.GetDbContext()

@@ -1,0 +1,43 @@
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+using LascodiaTradingEngine.Domain.Entities;
+
+namespace LascodiaTradingEngine.Infrastructure.Persistence.Configurations;
+
+public class RiskProfileConfiguration : IEntityTypeConfiguration<RiskProfile>
+{
+    public void Configure(EntityTypeBuilder<RiskProfile> builder)
+    {
+        builder.HasKey(x => x.Id);
+        builder.Property(x => x.Id).ValueGeneratedOnAdd();
+
+        builder.Property(x => x.Name)
+            .HasMaxLength(100);
+
+        builder.Property(x => x.MaxLotSizePerTrade)
+            .HasPrecision(18, 8);
+
+        builder.Property(x => x.MaxDailyDrawdownPct)
+            .HasPrecision(18, 8);
+
+        builder.Property(x => x.MaxTotalDrawdownPct)
+            .HasPrecision(18, 8);
+
+        builder.Property(x => x.MaxRiskPerTradePct)
+            .HasPrecision(18, 8);
+
+        builder.Property(x => x.MaxSymbolExposurePct)
+            .HasPrecision(18, 8);
+
+        builder.Property(x => x.DrawdownRecoveryThresholdPct)
+            .HasPrecision(18, 8);
+
+        builder.Property(x => x.RecoveryLotSizeMultiplier)
+            .HasPrecision(18, 8);
+
+        builder.Property(x => x.RecoveryExitThresholdPct)
+            .HasPrecision(18, 8);
+
+        builder.HasIndex(x => x.IsDefault);
+    }
+}

@@ -6,6 +6,9 @@ using Lascodia.Trading.Engine.SharedLibrary;
 using LascodiaTradingEngine.Application.Orders.Commands.CreateOrder;
 using LascodiaTradingEngine.Application.Orders.Commands.DeleteOrder;
 using LascodiaTradingEngine.Application.Orders.Commands.UpdateOrder;
+using LascodiaTradingEngine.Application.Orders.Commands.CancelOrder;
+using LascodiaTradingEngine.Application.Orders.Commands.ModifyOrder;
+using LascodiaTradingEngine.Application.Orders.Commands.SubmitOrder;
 using LascodiaTradingEngine.Application.Orders.Queries.DTOs;
 using LascodiaTradingEngine.Application.Orders.Queries.GetOrder;
 using LascodiaTradingEngine.Application.Orders.Queries.GetPagedOrders;
@@ -22,18 +25,17 @@ public class OrderController : AuthControllerBase<OrderController>
         ICurrentUserService userService)
         : base(logger, config, userService) { }
 
-    /// <summary>Create a new order</summary>
+    /// <summary>Create a new manual order</summary>
     [HttpPost]
     public async Task<ResponseData<long>> Create(CreateOrderCommand command)
     {
         if (!ModelState.IsValid)
             return ResponseData<long>.Init(0, false, "Model state failed", "-11");
 
-        command.BusinessId = (int)(UserService?.User?.BusinessId ?? 0);
         return await Mediator.Send(command);
     }
 
-    /// <summary>Update an order</summary>
+    /// <summary>Update an order (metadata only)</summary>
     [HttpPut("{id}")]
     public async Task<ResponseData<string>> Update(long id, UpdateOrderCommand command)
     {
@@ -41,27 +43,36 @@ public class OrderController : AuthControllerBase<OrderController>
             return ResponseData<string>.Init(null, false, "Model state failed", "-11");
 
         command.Id = id;
-        command.BusinessId = (int)(UserService?.User?.BusinessId ?? 0);
         return await Mediator.Send(command);
     }
 
-    /// <summary>Delete an order</summary>
+    /// <summary>Submit a Pending order to the broker</summary>
+    [HttpPost("{id}/submit")]
+    public async Task<ResponseData<string>> Submit(long id)
+        => await Mediator.Send(new SubmitOrderCommand { Id = id });
+
+    /// <summary>Cancel an order</summary>
+    [HttpPost("{id}/cancel")]
+    public async Task<ResponseData<string>> Cancel(long id)
+        => await Mediator.Send(new CancelOrderCommand { Id = id });
+
+    /// <summary>Modify stop loss / take profit of an existing order</summary>
+    [HttpPut("{id}/modify")]
+    public async Task<ResponseData<string>> Modify(long id, ModifyOrderCommand command)
+    {
+        command.Id = id;
+        return await Mediator.Send(command);
+    }
+
+    /// <summary>Soft-delete an order</summary>
     [HttpDelete("{id}")]
     public async Task<ResponseData<string>> Delete(long id)
-        => await Mediator.Send(new DeleteOrderCommand
-        {
-            Id = id,
-            BusinessId = (int)(UserService?.User?.BusinessId ?? 0)
-        });
+        => await Mediator.Send(new DeleteOrderCommand { Id = id });
 
     /// <summary>Get order by Id</summary>
     [HttpGet("{id}")]
     public async Task<ResponseData<OrderDto>> GetById(long id)
-        => await Mediator.Send(new GetOrderQuery
-        {
-            Id = id,
-            BusinessId = (int)(UserService?.User?.BusinessId ?? 0)
-        });
+        => await Mediator.Send(new GetOrderQuery { Id = id });
 
     /// <summary>Get paged list of orders</summary>
     [HttpPost("list")]
@@ -71,7 +82,6 @@ public class OrderController : AuthControllerBase<OrderController>
             return ResponseData<PagedData<OrderDto>>.Init(null, false, "Model state failed", "-11");
 
         Logger.LogInformation(query.GetJson());
-        query.BusinessId = (int)(UserService?.User?.BusinessId ?? 0);
         return await Mediator.Send(query);
     }
 }

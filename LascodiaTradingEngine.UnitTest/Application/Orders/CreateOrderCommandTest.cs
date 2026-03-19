@@ -2,7 +2,6 @@ using FluentValidation.TestHelper;
 using Microsoft.EntityFrameworkCore;
 using Moq;
 using MockQueryable.Moq;
-using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Orders.Commands.CreateOrder;
 using LascodiaTradingEngine.Domain.Entities;
@@ -12,25 +11,19 @@ namespace LascodiaTradingEngine.UnitTest.Application.Orders;
 public class CreateOrderCommandTest
 {
     private readonly Mock<IWriteApplicationDbContext> _mockWriteContext;
-    private readonly Mock<IIntegrationEventService> _mockEventService;
     private readonly CreateOrderCommandHandler _handler;
     private readonly CreateOrderCommandValidator _validator;
 
     public CreateOrderCommandTest()
     {
         _mockWriteContext = new Mock<IWriteApplicationDbContext>();
-        _mockEventService = new Mock<IIntegrationEventService>();
 
         var mockDbContext = new Mock<DbContext>();
         var orders = new List<Order>().AsQueryable().BuildMockDbSet();
         mockDbContext.Setup(c => c.Set<Order>()).Returns(orders.Object);
         _mockWriteContext.Setup(c => c.GetDbContext()).Returns(mockDbContext.Object);
 
-        _handler = new CreateOrderCommandHandler(
-            _mockWriteContext.Object,
-            _mockEventService.Object
-        );
-
+        _handler   = new CreateOrderCommandHandler(_mockWriteContext.Object);
         _validator = new CreateOrderCommandValidator();
     }
 
@@ -39,10 +32,10 @@ public class CreateOrderCommandTest
     {
         var command = new CreateOrderCommand
         {
-            Symbol = string.Empty,
+            Symbol    = string.Empty,
             OrderType = "Buy",
-            Quantity = 1,
-            Price = 100
+            Quantity  = 1,
+            Price     = 0
         };
 
         var result = await _validator.TestValidateAsync(command);
@@ -55,10 +48,10 @@ public class CreateOrderCommandTest
     {
         var command = new CreateOrderCommand
         {
-            Symbol = "BTC/USDT",
+            Symbol    = "EURUSD",
             OrderType = "Hold",
-            Quantity = 1,
-            Price = 100
+            Quantity  = 1,
+            Price     = 0
         };
 
         var result = await _validator.TestValidateAsync(command);
@@ -71,10 +64,10 @@ public class CreateOrderCommandTest
     {
         var command = new CreateOrderCommand
         {
-            Symbol = "BTC/USDT",
+            Symbol    = "EURUSD",
             OrderType = "Buy",
-            Quantity = 0,
-            Price = 100
+            Quantity  = 0,
+            Price     = 0
         };
 
         var result = await _validator.TestValidateAsync(command);
@@ -83,14 +76,15 @@ public class CreateOrderCommandTest
     }
 
     [Fact]
-    public async Task Validator_Should_Pass_With_Valid_Command()
+    public async Task Validator_Should_Pass_With_Valid_Market_Order()
     {
         var command = new CreateOrderCommand
         {
-            Symbol = "BTC/USDT",
-            OrderType = "Buy",
-            Quantity = 1.5m,
-            Price = 50000m
+            Symbol        = "EURUSD",
+            OrderType     = "Buy",
+            ExecutionType = "Market",
+            Quantity      = 0.01m,
+            Price         = 0  // Market order — price = 0 is valid
         };
 
         var result = await _validator.TestValidateAsync(command);
@@ -102,11 +96,10 @@ public class CreateOrderCommandTest
     {
         var command = new CreateOrderCommand
         {
-            BusinessId = 1,
-            Symbol = "BTC/USDT",
+            Symbol    = "EURUSD",
             OrderType = "Buy",
-            Quantity = 1.5m,
-            Price = 50000m
+            Quantity  = 0.01m,
+            Price     = 0
         };
 
         _mockWriteContext.Setup(c => c.SaveChangesAsync(It.IsAny<CancellationToken>()))

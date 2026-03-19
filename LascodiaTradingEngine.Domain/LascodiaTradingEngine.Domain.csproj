@@ -10,4 +10,8 @@
     <ProjectReference Include="..\submodules\shared\Library\SharedDomain\SharedDomain.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Folder Include="Enums/" />
+  </ItemGroup>
+
 </Project>

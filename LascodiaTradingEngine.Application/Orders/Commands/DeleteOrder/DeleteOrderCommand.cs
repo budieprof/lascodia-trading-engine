@@ -12,7 +12,6 @@ namespace LascodiaTradingEngine.Application.Orders.Commands.DeleteOrder;
 public class DeleteOrderCommand : IRequest<ResponseData<string>>
 {
     [JsonIgnore] public long Id { get; set; }
-    [JsonIgnore] public int BusinessId { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
@@ -34,13 +33,12 @@ public class DeleteOrderCommandHandler : IRequestHandler<DeleteOrderCommand, Res
     {
         var entity = await _context.GetDbContext()
             .Set<Domain.Entities.Order>()
-            .FirstOrDefaultAsync(x => x.Id == request.Id && x.BusinessId == request.BusinessId, cancellationToken);
+            .FirstOrDefaultAsync(x => x.Id == request.Id && !x.IsDeleted, cancellationToken);
 
         if (entity == null)
             return ResponseData<string>.Init(null, false, "Order not found", "-14");
 
         entity.IsDeleted = true;
-
         await _context.SaveChangesAsync(cancellationToken);
 
         return ResponseData<string>.Init("Deleted", true, "Successful", "00");

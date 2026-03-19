@@ -1,0 +1,28 @@
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+using LascodiaTradingEngine.Domain.Entities;
+
+namespace LascodiaTradingEngine.Infrastructure.Persistence.Configurations;
+
+public class MLFeatureInteractionAuditConfiguration : IEntityTypeConfiguration<MLFeatureInteractionAudit>
+{
+    public void Configure(EntityTypeBuilder<MLFeatureInteractionAudit> builder)
+    {
+        builder.HasKey(x => x.Id);
+        builder.Property(x => x.Id).ValueGeneratedOnAdd();
+
+        builder.Property(x => x.Symbol).IsRequired().HasMaxLength(10);
+        builder.Property(x => x.Timeframe).HasConversion<string>().IsRequired().HasMaxLength(10);
+        builder.Property(x => x.FeatureNameA).IsRequired().HasMaxLength(50);
+        builder.Property(x => x.FeatureNameB).IsRequired().HasMaxLength(50);
+        builder.Property(x => x.InteractionScore).HasPrecision(18, 8);
+
+        builder.HasIndex(x => new { x.MLModelId, x.Rank });
+        builder.HasIndex(x => new { x.MLModelId, x.IsIncludedAsFeature });
+
+        builder.HasOne(x => x.MLModel)
+               .WithMany(x => x.FeatureInteractionAudits)
+               .HasForeignKey(x => x.MLModelId)
+               .OnDelete(DeleteBehavior.Cascade);
+    }
+}

@@ -8,6 +8,13 @@
     <ProjectReference Include="..\submodules\shared\EventBus\IntegrationEventLogEF\IntegrationEventLogEF.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- TorchSharp-cpu bundles LibTorch CPU binaries for all platforms.
+         For GPU support swap this for TorchSharp + libtorch-cuda-<version>. -->
+    <PackageReference Include="Microsoft.ML.OnnxRuntime.Gpu" Version="1.24.3" />
+    <PackageReference Include="TorchSharp-cpu" Version="0.103.0" />
+  </ItemGroup>
+
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
