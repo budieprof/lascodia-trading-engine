@@ -184,13 +184,15 @@ public class MLModelPredictionLog : Entity<long>
     /// </summary>
     public double?  ConformalNonConformityScore { get; set; }
 
-    // ── Rec #19: SHAP feature attribution ─────────────────────────────────────
+    // ── Rec #19: Approximate SHAP feature attribution ─────────────────────────
 
     /// <summary>
-    /// Full JSON array of permutation-based SHAP values for all features.
+    /// JSON array of approximate SHAP values for all features, computed as
+    /// <c>featureImportance[j] × standardisedFeature[j]</c>. This is a fast linear
+    /// approximation — not true permutation or kernel SHAP — so values may
+    /// understate non-linear interaction effects.
     /// Format: [0.042, -0.031, 0.007, ...] — one value per feature, matching FeatureNames order.
-    /// More expensive than the top-3 linear SHAP in <see cref="ContributionsJson"/>
-    /// but captures non-linear interactions.
+    /// For top-feature attribution, see <see cref="ContributionsJson"/>.
     /// </summary>
     public string?  ShapValuesJson       { get; set; }
 

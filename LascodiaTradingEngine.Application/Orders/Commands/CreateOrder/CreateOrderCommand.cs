@@ -1,6 +1,8 @@
 using FluentValidation;
 using MediatR;
+using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
+using LascodiaTradingEngine.Application.Common.Events;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -61,10 +63,12 @@ public class CreateOrderCommandValidator : AbstractValidator<CreateOrderCommand>
 public class CreateOrderCommandHandler : IRequestHandler<CreateOrderCommand, ResponseData<long>>
 {
     private readonly IWriteApplicationDbContext _context;
+    private readonly IIntegrationEventService _eventBus;
 
-    public CreateOrderCommandHandler(IWriteApplicationDbContext context)
+    public CreateOrderCommandHandler(IWriteApplicationDbContext context, IIntegrationEventService eventBus)
     {
-        _context = context;
+        _context  = context;
+        _eventBus = eventBus;
     }
 
     public async Task<ResponseData<long>> Handle(CreateOrderCommand request, CancellationToken cancellationToken)
@@ -91,7 +95,20 @@ public class CreateOrderCommandHandler : IRequestHandler<CreateOrderCommand, Res
             .Set<Domain.Entities.Order>()
             .AddAsync(entity, cancellationToken);
 
-        await _context.SaveChangesAsync(cancellationToken);
+        await _eventBus.SaveAndPublish(_context, new OrderCreatedIntegrationEvent
+        {
+            OrderId          = entity.Id,
+            TradeSignalId    = entity.TradeSignalId,
+            StrategyId       = entity.StrategyId,
+            TradingAccountId = entity.TradingAccountId,
+            Symbol           = entity.Symbol,
+            OrderType        = entity.OrderType,
+            ExecutionType    = entity.ExecutionType,
+            Quantity         = entity.Quantity,
+            Price            = entity.Price,
+            IsPaper          = entity.IsPaper,
+            CreatedAt        = entity.CreatedAt,
+        });
 
         return ResponseData<long>.Init(entity.Id, true, "Successful", "00");
     }

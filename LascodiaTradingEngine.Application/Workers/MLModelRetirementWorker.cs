@@ -52,6 +52,11 @@ public sealed class MLModelRetirementWorker : BackgroundService
     private readonly IServiceScopeFactory                _scopeFactory;
     private readonly ILogger<MLModelRetirementWorker>    _logger;
 
+    /// <summary>
+    /// Initializes the worker.
+    /// </summary>
+    /// <param name="scopeFactory">Per-iteration DI scope factory.</param>
+    /// <param name="logger">Structured logger.</param>
     public MLModelRetirementWorker(
         IServiceScopeFactory                 scopeFactory,
         ILogger<MLModelRetirementWorker>     logger)
@@ -60,6 +65,12 @@ public sealed class MLModelRetirementWorker : BackgroundService
         _logger       = logger;
     }
 
+    /// <summary>
+    /// Background service main loop. Polls every 30 minutes by default. The 30-minute
+    /// cadence balances responsiveness (detecting multi-signal degradation promptly)
+    /// against the cost of reading EWMA accuracy rows and cooldown config keys for
+    /// all active models each iteration.
+    /// </summary>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation("MLModelRetirementWorker started.");
@@ -97,6 +108,11 @@ public sealed class MLModelRetirementWorker : BackgroundService
 
     // ── Retirement evaluation core ────────────────────────────────────────────
 
+    /// <summary>
+    /// Loads retirement thresholds and evaluates all active, non-suppressed models.
+    /// Only models where <c>IsActive = true</c> and <c>IsSuppressed = false</c> are
+    /// candidates — already-suppressed models are skipped to avoid redundant writes.
+    /// </summary>
     private async Task EvaluateAllModelsAsync(
         Microsoft.EntityFrameworkCore.DbContext readCtx,
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
@@ -107,7 +123,8 @@ public sealed class MLModelRetirementWorker : BackgroundService
         int    sigsRequired = await GetConfigAsync<int>   (readCtx, CK_SigRequired,  2,       ct);
         string alertDest    = await GetConfigAsync<string>(readCtx, CK_AlertDest,    "ml-ops", ct);
 
-        // Load active, non-suppressed models
+        // Only evaluate active, non-suppressed models — models already suppressed
+        // by a previous retirement cycle are excluded to prevent redundant DB updates.
         var activeModels = await readCtx.Set<MLModel>()
             .Where(m => m.IsActive && !m.IsSuppressed && !m.IsDeleted)
             .AsNoTracking()
@@ -135,6 +152,44 @@ public sealed class MLModelRetirementWorker : BackgroundService
         }
     }
 
+    /// <summary>
+    /// Evaluates all three retirement signals for a single model and, if enough signals
+    /// are simultaneously active, suppresses the model and fires a critical alert.
+    /// </summary>
+    /// <remarks>
+    /// <b>Three-signal retirement criteria:</b>
+    /// <list type="number">
+    ///   <item>
+    ///     <b>Cooldown active (Signal 1):</b> Reads the config key
+    ///     <c>MLCooldown:{Symbol}:{Timeframe}:ExpiresAt</c>, which is written by the
+    ///     consecutive-miss detector when a model issues several wrong predictions in a row.
+    ///     A future expiry time means the model is currently in a forced cooldown period.
+    ///   </item>
+    ///   <item>
+    ///     <b>EWMA accuracy critical (Signal 2):</b> The exponentially-weighted moving
+    ///     average accuracy tracked in <c>MLModelEwmaAccuracy</c> has fallen below
+    ///     <paramref name="ewmaThreshold"/>. The EWMA is more sensitive to recent
+    ///     performance than a simple rolling average because it down-weights older observations.
+    ///   </item>
+    ///   <item>
+    ///     <b>Live accuracy degraded (Signal 3):</b> The model's
+    ///     <see cref="MLModel.LiveDirectionAccuracy"/> field (updated by
+    ///     <c>MLPredictionOutcomeWorker</c>) is below <paramref name="liveAccuracyFloor"/>.
+    ///     This is a simple rolling fraction, complementary to the EWMA.
+    ///   </item>
+    /// </list>
+    ///
+    /// <b>Retirement action:</b> When <paramref name="signalsRequired"/> or more signals
+    /// are simultaneously active, <c>IsSuppressed = true</c> is written via
+    /// <c>ExecuteUpdateAsync</c> (bulk update, no entity tracking overhead).
+    /// The model remains suppressed until a new champion model is promoted by the
+    /// shadow-arbiter workflow.
+    ///
+    /// <b>Post-retirement recovery:</b> Suppression is not permanent. When
+    /// <see cref="MLShadowArbiterWorker"/> promotes a challenger model as the new
+    /// active champion, it sets <c>IsSuppressed = false</c> on the new model and
+    /// deactivates the old suppressed one.
+    /// </remarks>
     private async Task EvaluateModelAsync(
         long                                    modelId,
         string                                  symbol,
@@ -148,10 +203,14 @@ public sealed class MLModelRetirementWorker : BackgroundService
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
         CancellationToken                       ct)
     {
-        var now             = DateTime.UtcNow;
-        var activeSignals   = new List<string>();
+        var now           = DateTime.UtcNow;
+        var activeSignals = new List<string>();
 
         // ── Signal 1: Consecutive-miss cooldown active ────────────────────────
+        // The cooldown key is written by the consecutive-miss detector (e.g.
+        // MLSuppressionRollbackWorker or a dedicated cooldown worker) when the model
+        // issues N consecutive wrong predictions. The key holds an ISO-8601 expiry
+        // timestamp; if it is in the future, the cooldown is still active.
         var cdKey   = $"MLCooldown:{symbol}:{timeframe}:ExpiresAt";
         var cdEntry = await readCtx.Set<EngineConfig>()
             .AsNoTracking()
@@ -164,10 +223,15 @@ public sealed class MLModelRetirementWorker : BackgroundService
                 out var cdExpiry) &&
             now < cdExpiry)
         {
+            // Cooldown is actively suppressing the model — record the signal
             activeSignals.Add($"cooldown_active (expires {cdExpiry:HH:mm} UTC)");
         }
 
         // ── Signal 2: EWMA accuracy below critical threshold ─────────────────
+        // MLModelEwmaAccuracy is updated by the EWMA tracking worker after each
+        // resolved prediction. The EWMA is weighted toward recent predictions,
+        // making it more sensitive to sudden performance deterioration than
+        // a simple rolling average over a fixed window.
         var ewmaRow = await readCtx.Set<MLModelEwmaAccuracy>()
             .AsNoTracking()
             .FirstOrDefaultAsync(r => r.MLModelId == modelId, ct);
@@ -176,6 +240,9 @@ public sealed class MLModelRetirementWorker : BackgroundService
             activeSignals.Add($"ewma_critical ({ewmaRow.EwmaAccuracy:P2} < {ewmaThreshold:P2})");
 
         // ── Signal 3: Live direction accuracy below floor ─────────────────────
+        // MLModel.LiveDirectionAccuracy is a simple rolling fraction updated by
+        // MLPredictionOutcomeWorker. Unlike EWMA it treats all predictions in the
+        // window equally — it serves as a complementary, less reactive signal.
         if (liveDirectionAccuracy.HasValue &&
             (double)liveDirectionAccuracy.Value < liveAccuracyFloor)
         {
@@ -190,9 +257,12 @@ public sealed class MLModelRetirementWorker : BackgroundService
             modelId, symbol, timeframe, signalCount, signalsRequired,
             string.Join("; ", activeSignals));
 
+        // Not enough simultaneous signals to justify retirement — the model continues operating.
         if (signalCount < signalsRequired) return;
 
-        // ── Retire the model ──────────────────────────────────────────────────
+        // ── Retire the model (suppress) ───────────────────────────────────────
+        // ExecuteUpdateAsync performs a single targeted SQL UPDATE without loading
+        // the entity, minimizing overhead for a critical path operation.
         _logger.LogWarning(
             "Retirement: model {Id} ({Symbol}/{Tf}) — {N} simultaneous degradation signals. " +
             "Suppressing model. Signals: {Sigs}",
@@ -202,7 +272,8 @@ public sealed class MLModelRetirementWorker : BackgroundService
             .Where(m => m.Id == modelId)
             .ExecuteUpdateAsync(s => s.SetProperty(m => m.IsSuppressed, true), ct);
 
-        // Alert
+        // ── Critical alert ────────────────────────────────────────────────────
+        // Deduplicate before inserting — one active MLModelDegraded alert per symbol.
         bool alertExists = await readCtx.Set<Alert>()
             .AnyAsync(a => a.Symbol    == symbol                  &&
                            a.AlertType == AlertType.MLModelDegraded &&
@@ -218,15 +289,16 @@ public sealed class MLModelRetirementWorker : BackgroundService
                 Destination   = alertDest,
                 ConditionJson = System.Text.Json.JsonSerializer.Serialize(new
                 {
-                    reason             = "model_decommissioned",
-                    severity           = "critical",
+                    reason           = "model_decommissioned",
+                    severity         = "critical",
                     symbol,
-                    timeframe          = timeframe.ToString(),
+                    timeframe        = timeframe.ToString(),
                     modelId,
                     activeSignals,
                     signalCount,
                     signalsRequired,
-                    action             = "IsSuppressed set to true — model will no longer score signals",
+                    // Describe the effect so operators immediately understand the consequence
+                    action           = "IsSuppressed set to true — model will no longer score signals",
                 }),
                 IsActive = true,
             });
@@ -237,6 +309,10 @@ public sealed class MLModelRetirementWorker : BackgroundService
 
     // ── Config helper ─────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Reads a typed value from <see cref="EngineConfig"/>. Returns
+    /// <paramref name="defaultValue"/> if the key is absent or unparseable.
+    /// </summary>
     private static async Task<T> GetConfigAsync<T>(
         Microsoft.EntityFrameworkCore.DbContext ctx,
         string                                  key,

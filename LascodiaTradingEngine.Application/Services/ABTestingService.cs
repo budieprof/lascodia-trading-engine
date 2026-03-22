@@ -1,5 +1,7 @@
 using System.Collections.Concurrent;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using LascodiaTradingEngine.Application.Common.Attributes;
 
 namespace LascodiaTradingEngine.Application.Services;
 
@@ -55,6 +57,7 @@ public sealed record ABTestResult(
     bool   ChallengerWins,
     bool   StatisticallySignificant);
 
+[RegisterService(ServiceLifetime.Singleton)]
 public sealed class ABTestingService : IABTestingService
 {
     private const int    MinTradesPerVariant = 30;

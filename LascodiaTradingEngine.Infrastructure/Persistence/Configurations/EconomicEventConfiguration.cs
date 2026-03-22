@@ -19,6 +19,8 @@ public class EconomicEventConfiguration : IEntityTypeConfiguration<EconomicEvent
         builder.Property(x => x.Previous).HasMaxLength(50);
         builder.Property(x => x.Actual).HasMaxLength(50);
 
+        builder.HasQueryFilter(x => !x.IsDeleted);
+
         builder.HasIndex(x => new { x.Currency, x.ScheduledAt });
     }
 }

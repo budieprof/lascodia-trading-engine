@@ -1,6 +1,8 @@
 using System.Text.Json;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.MLModels.Shared;
+using LascodiaTradingEngine.Domain.Enums;
 using Microsoft.Extensions.Logging;
 
 namespace LascodiaTradingEngine.Application.Services.ML;
@@ -44,6 +46,7 @@ namespace LascodiaTradingEngine.Application.Services.ML;
 /// </para>
 /// Registered as a keyed IMLModelTrainer with key "gbm".
 /// </summary>
+[RegisterKeyedService(typeof(IMLModelTrainer), LearnerArchitecture.Gbm)]
 public sealed class GbmModelTrainer : IMLModelTrainer
 {
     // ── Constants ────────────────────────────────────────────────────────────
@@ -453,6 +456,8 @@ public sealed class GbmModelTrainer : IMLModelTrainer
             AdaptiveLabelSmoothing     = effectiveLabelSmoothing,
             ConformalCoverage          = hp.ConformalCoverage,
             GbmTreesJson              = JsonSerializer.Serialize(trees, JsonOptions),
+            GbmBaseLogOdds            = baseLogOdds,
+            GbmLearningRate           = lr,
         };
 
         var modelBytes = JsonSerializer.SerializeToUtf8Bytes(snapshot, JsonOptions);

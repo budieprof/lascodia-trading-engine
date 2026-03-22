@@ -1,5 +1,5 @@
 using MediatR;
-using Lascodia.Trading.Engine.EventBus.Abstractions;
+using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Events;
@@ -25,19 +25,21 @@ public class UpdateLiveCandleCommand : IRequest<ResponseData<string>>
 public class UpdateLiveCandleCommandHandler : IRequestHandler<UpdateLiveCandleCommand, ResponseData<string>>
 {
     private readonly ILivePriceCache _cache;
-    private readonly IEventBus _eventBus;
+    private readonly IWriteApplicationDbContext _context;
+    private readonly IIntegrationEventService _eventBus;
 
-    public UpdateLiveCandleCommandHandler(ILivePriceCache cache, IEventBus eventBus)
+    public UpdateLiveCandleCommandHandler(ILivePriceCache cache, IWriteApplicationDbContext context, IIntegrationEventService eventBus)
     {
         _cache    = cache;
+        _context  = context;
         _eventBus = eventBus;
     }
 
-    public Task<ResponseData<string>> Handle(UpdateLiveCandleCommand request, CancellationToken cancellationToken)
+    public async Task<ResponseData<string>> Handle(UpdateLiveCandleCommand request, CancellationToken cancellationToken)
     {
         _cache.Update(request.Symbol, request.Bid, request.Ask, request.Timestamp);
 
-        _eventBus.Publish(new PriceUpdatedIntegrationEvent
+        await _eventBus.SaveAndPublish(_context, new PriceUpdatedIntegrationEvent
         {
             Symbol    = request.Symbol,
             Bid       = request.Bid,
@@ -45,6 +47,6 @@ public class UpdateLiveCandleCommandHandler : IRequestHandler<UpdateLiveCandleCo
             Timestamp = request.Timestamp
         });
 
-        return Task.FromResult(ResponseData<string>.Init(null, true, "Successful", "00"));
+        return ResponseData<string>.Init(null, true, "Successful", "00");
     }
 }

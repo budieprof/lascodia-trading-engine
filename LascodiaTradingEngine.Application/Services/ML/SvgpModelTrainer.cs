@@ -1,6 +1,8 @@
 using System.Text.Json;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.MLModels.Shared;
+using LascodiaTradingEngine.Domain.Enums;
 using Microsoft.Extensions.Logging;
 using TorchSharp;
 using TorchSharp.Modules;
@@ -27,6 +29,7 @@ namespace LascodiaTradingEngine.Application.Services.ML;
 ///         pipeline (conformal, meta-label, abstention gate).</item>
 /// </list>
 /// </summary>
+[RegisterKeyedService(typeof(IMLModelTrainer), LearnerArchitecture.Svgp)]
 public sealed class SvgpModelTrainer : IMLModelTrainer
 {
     // ── Constants ────────────────────────────────────────────────────────────

@@ -1,6 +1,8 @@
 using FluentValidation;
 using MediatR;
+using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
+using LascodiaTradingEngine.Application.Common.Events;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -17,6 +19,7 @@ public class OpenPositionCommand : IRequest<ResponseData<long>>
     public decimal?        StopLoss          { get; set; }
     public decimal?        TakeProfit        { get; set; }
     public bool            IsPaper           { get; set; }
+    public long?           OpenOrderId       { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
@@ -46,10 +49,12 @@ public class OpenPositionCommandValidator : AbstractValidator<OpenPositionComman
 public class OpenPositionCommandHandler : IRequestHandler<OpenPositionCommand, ResponseData<long>>
 {
     private readonly IWriteApplicationDbContext _context;
+    private readonly IIntegrationEventService _eventBus;
 
-    public OpenPositionCommandHandler(IWriteApplicationDbContext context)
+    public OpenPositionCommandHandler(IWriteApplicationDbContext context, IIntegrationEventService eventBus)
     {
-        _context = context;
+        _context  = context;
+        _eventBus = eventBus;
     }
 
     public async Task<ResponseData<long>> Handle(OpenPositionCommand request, CancellationToken cancellationToken)
@@ -63,6 +68,7 @@ public class OpenPositionCommandHandler : IRequestHandler<OpenPositionCommand, R
             StopLoss          = request.StopLoss,
             TakeProfit        = request.TakeProfit,
             IsPaper           = request.IsPaper,
+            OpenOrderId       = request.OpenOrderId,
             Status            = PositionStatus.Open,
             OpenedAt          = DateTime.UtcNow
         };
@@ -71,7 +77,19 @@ public class OpenPositionCommandHandler : IRequestHandler<OpenPositionCommand, R
             .Set<Domain.Entities.Position>()
             .AddAsync(entity, cancellationToken);
 
-        await _context.SaveChangesAsync(cancellationToken);
+        await _eventBus.SaveAndPublish(_context, new PositionOpenedIntegrationEvent
+        {
+            PositionId        = entity.Id,
+            OpenOrderId       = entity.OpenOrderId,
+            Symbol            = entity.Symbol,
+            Direction         = entity.Direction,
+            OpenLots          = entity.OpenLots,
+            AverageEntryPrice = entity.AverageEntryPrice,
+            StopLoss          = entity.StopLoss,
+            TakeProfit        = entity.TakeProfit,
+            IsPaper           = entity.IsPaper,
+            OpenedAt          = entity.OpenedAt,
+        });
 
         return ResponseData<long>.Init(entity.Id, true, "Successful", "00");
     }

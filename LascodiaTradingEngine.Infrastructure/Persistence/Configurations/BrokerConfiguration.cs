@@ -37,6 +37,8 @@ public class BrokerConfiguration : IEntityTypeConfiguration<Broker>
             .HasConversion<string>()
             .HasMaxLength(20);
 
+        builder.HasQueryFilter(x => !x.IsDeleted);
+
         builder.HasIndex(x => x.BrokerType);
         builder.HasIndex(x => x.IsActive);
 

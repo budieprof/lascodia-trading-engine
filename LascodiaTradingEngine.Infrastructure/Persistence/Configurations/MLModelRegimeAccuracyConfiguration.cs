@@ -15,6 +15,8 @@ public class MLModelRegimeAccuracyConfiguration : IEntityTypeConfiguration<MLMod
         builder.Property(x => x.Timeframe).HasConversion<string>().IsRequired().HasMaxLength(10);
         builder.Property(x => x.Regime).HasConversion<string>().IsRequired().HasMaxLength(20);
 
+        builder.HasQueryFilter(x => !x.IsDeleted);
+
         // One row per (model, regime) — upserted, never duplicated.
         builder.HasIndex(x => new { x.MLModelId, x.Regime }).IsUnique();
         builder.HasIndex(x => new { x.Symbol, x.Timeframe, x.Regime });

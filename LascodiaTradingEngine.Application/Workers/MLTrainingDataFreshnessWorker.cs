@@ -51,6 +51,14 @@ public sealed class MLTrainingDataFreshnessWorker : BackgroundService
     private readonly IServiceScopeFactory                    _scopeFactory;
     private readonly ILogger<MLTrainingDataFreshnessWorker>  _logger;
 
+    /// <summary>
+    /// Initialises the worker with its DI scope factory and logger.
+    /// </summary>
+    /// <param name="scopeFactory">
+    /// Used to create a new async DI scope per poll cycle so scoped EF Core
+    /// contexts are correctly disposed after each freshness check pass.
+    /// </param>
+    /// <param name="logger">Structured logger scoped to this worker type.</param>
     public MLTrainingDataFreshnessWorker(
         IServiceScopeFactory                     scopeFactory,
         ILogger<MLTrainingDataFreshnessWorker>   logger)
@@ -59,12 +67,19 @@ public sealed class MLTrainingDataFreshnessWorker : BackgroundService
         _logger       = logger;
     }
 
+    /// <summary>
+    /// Hosted-service entry point. Polls every <c>MLFreshness:PollIntervalSeconds</c>
+    /// seconds (default 3600 = 1 hour), reading the interval from <see cref="EngineConfig"/>
+    /// on each cycle so it can be hot-reloaded without a restart.
+    /// </summary>
+    /// <param name="stoppingToken">Signalled when the host is shutting down.</param>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation("MLTrainingDataFreshnessWorker started.");
 
         while (!stoppingToken.IsCancellationRequested)
         {
+            // Default 1-hour poll interval; refreshed from DB on every cycle.
             int pollSecs = 3600;
 
             try
@@ -75,6 +90,7 @@ public sealed class MLTrainingDataFreshnessWorker : BackgroundService
                 var ctx     = readDb.GetDbContext();
                 var wCtx    = writeDb.GetDbContext();
 
+                // Refresh poll interval from DB each cycle to support hot-reload.
                 pollSecs = await GetConfigAsync<int>(ctx, CK_PollSecs, 3600, stoppingToken);
 
                 await CheckFreshnessAsync(ctx, wCtx, stoppingToken);
@@ -96,14 +112,24 @@ public sealed class MLTrainingDataFreshnessWorker : BackgroundService
 
     // ── Freshness check core ──────────────────────────────────────────────────
 
+    /// <summary>
+    /// Iterates over all active models and delegates per-model freshness checks to
+    /// <see cref="CheckModelFreshnessAsync"/>. Reads staleness thresholds once per
+    /// cycle to avoid redundant per-model DB round trips.
+    /// </summary>
+    /// <param name="readCtx">Read-only EF context for models and training run history.</param>
+    /// <param name="writeCtx">Write EF context for inserting training runs and updating EngineConfig.</param>
+    /// <param name="ct">Cancellation token forwarded from the host.</param>
     private async Task CheckFreshnessAsync(
         Microsoft.EntityFrameworkCore.DbContext readCtx,
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
         CancellationToken                       ct)
     {
+        // Read staleness policy values once per cycle.
         int stalenessDays   = await GetConfigAsync<int>(readCtx, CK_Staleness,   60,  ct);
         int trainWindowDays = await GetConfigAsync<int>(readCtx, CK_TrainWindow, 180, ct);
 
+        // Load all active models — project to minimal fields to reduce bandwidth.
         var activeModels = await readCtx.Set<MLModel>()
             .Where(m => m.IsActive && !m.IsDeleted)
             .AsNoTracking()
@@ -123,6 +149,7 @@ public sealed class MLTrainingDataFreshnessWorker : BackgroundService
             }
             catch (Exception ex)
             {
+                // Per-model exceptions are non-fatal — log and continue with remaining models.
                 _logger.LogWarning(ex,
                     "Freshness: check failed for model {Id} ({Symbol}/{Tf}) — skipping.",
                     model.Id, model.Symbol, model.Timeframe);
@@ -130,6 +157,39 @@ public sealed class MLTrainingDataFreshnessWorker : BackgroundService
         }
     }
 
+    /// <summary>
+    /// Checks whether the training data for a single active model has exceeded the
+    /// staleness threshold and, if so, enqueues an <c>AutoDegrading</c> retraining run
+    /// while also publishing an observability metric to <see cref="EngineConfig"/>.
+    /// </summary>
+    /// <remarks>
+    /// Training data freshness monitoring:
+    ///
+    /// A model trained on data ending 60+ days ago has never observed recent market
+    /// microstructure, volatility regimes, spread changes, or central bank policy shifts.
+    /// Even if the model's accuracy workers report acceptable performance today, its
+    /// predictions are structurally anchored to a stale distribution. Over time this
+    /// produces "slow-rot" degradation that is harder to detect than sudden distributional
+    /// shift because the model's confidence scores may remain stable while its predictions
+    /// become quietly misaligned with current price dynamics.
+    ///
+    /// <b>Observability:</b> The worker writes
+    /// <c>MLTraining:{Symbol}:{Tf}:DaysSinceTrainingDataEnd</c> to <see cref="EngineConfig"/>
+    /// on every cycle regardless of whether a retrain is triggered. This provides a live
+    /// dashboard metric visible to operators without querying the raw training run table.
+    ///
+    /// <b>Trigger condition:</b> daysSince &gt; stalenessDays AND no queued run exists.
+    /// The new run uses <c>TriggerType.AutoDegrading</c> to distinguish it from manually
+    /// requested retrains, enabling downstream analysis of how often staleness triggers fire.
+    /// </remarks>
+    /// <param name="modelId">ID of the model being checked (for log context).</param>
+    /// <param name="symbol">Trading symbol (e.g. "EUR_USD").</param>
+    /// <param name="timeframe">Candle timeframe for this model.</param>
+    /// <param name="stalenessDays">Number of days after which training data is considered stale.</param>
+    /// <param name="trainWindowDays">Size of the data window for the auto-triggered retraining run.</param>
+    /// <param name="readCtx">Read-only EF context for training run history.</param>
+    /// <param name="writeCtx">Write EF context for inserting runs and upserting EngineConfig.</param>
+    /// <param name="ct">Cancellation token forwarded from the host.</param>
     private async Task CheckModelFreshnessAsync(
         long                                    modelId,
         string                                  symbol,
@@ -140,7 +200,8 @@ public sealed class MLTrainingDataFreshnessWorker : BackgroundService
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
         CancellationToken                       ct)
     {
-        // Find the most recent completed training run for this model
+        // Find the most recent completed training run for this symbol/timeframe.
+        // ToDate is the end of the training data window — this is what determines staleness.
         var latestRun = await readCtx.Set<MLTrainingRun>()
             .Where(r => r.Symbol    == symbol        &&
                         r.Timeframe == timeframe      &&
@@ -160,9 +221,13 @@ public sealed class MLTrainingDataFreshnessWorker : BackgroundService
         }
 
         var now = DateTime.UtcNow;
+
+        // Compute days since the training data window ended.
+        // This is the primary freshness metric: how far behind the model's "knowledge" is.
         int daysSince = (int)(now - latestRun.ToDate).TotalDays;
 
-        // Write observability key to EngineConfig
+        // Write the freshness metric to EngineConfig for live operator visibility.
+        // The key format is "MLTraining:{Symbol}:{Tf}:DaysSinceTrainingDataEnd".
         string configKey = $"{KeyPrefix}{symbol}:{timeframe}{KeySuffix}";
         await UpsertConfigAsync(writeCtx, configKey, daysSince.ToString(), ct);
 
@@ -170,9 +235,11 @@ public sealed class MLTrainingDataFreshnessWorker : BackgroundService
             "Freshness: {Symbol}/{Tf} — {Days} day(s) since training data end ({ToDate:yyyy-MM-dd}).",
             symbol, timeframe, daysSince, latestRun.ToDate);
 
+        // Model is still fresh — no action required.
         if (daysSince <= stalenessDays) return;
 
-        // Check whether a queued run already exists to avoid duplicate scheduling
+        // Check whether a queued run already exists to avoid scheduling duplicates.
+        // Another trigger (PSI, diversity, explicit API call) may have already scheduled a retrain.
         bool alreadyQueued = await readCtx.Set<MLTrainingRun>()
             .AnyAsync(r => r.Symbol    == symbol        &&
                            r.Timeframe == timeframe      &&
@@ -187,14 +254,16 @@ public sealed class MLTrainingDataFreshnessWorker : BackgroundService
             return;
         }
 
-        // Enqueue a new training run
+        // Enqueue an AutoDegrading training run with a fresh data window.
+        // The window starts trainWindowDays in the past and ends now, ensuring the new
+        // model is trained on the most recent available market data.
         var fromDate = now.AddDays(-trainWindowDays);
 
         writeCtx.Set<MLTrainingRun>().Add(new MLTrainingRun
         {
             Symbol      = symbol,
             Timeframe   = timeframe,
-            TriggerType = TriggerType.AutoDegrading,
+            TriggerType = TriggerType.AutoDegrading, // distinct from manual/PSI/diversity triggers
             Status      = RunStatus.Queued,
             FromDate    = fromDate,
             ToDate      = now,
@@ -209,12 +278,22 @@ public sealed class MLTrainingDataFreshnessWorker : BackgroundService
 
     // ── EngineConfig upsert ───────────────────────────────────────────────────
 
+    /// <summary>
+    /// Upserts a key-value pair in the <see cref="EngineConfig"/> table.
+    /// Attempts an in-place update first (one DB round trip for existing keys);
+    /// inserts a new row only when no existing row is found (cold-start or new symbol).
+    /// </summary>
+    /// <param name="writeCtx">Write EF context for the update/insert operations.</param>
+    /// <param name="key">The EngineConfig key to upsert.</param>
+    /// <param name="value">The string value to write.</param>
+    /// <param name="ct">Cancellation token.</param>
     private static async Task UpsertConfigAsync(
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
         string                                  key,
         string                                  value,
         CancellationToken                       ct)
     {
+        // Attempt bulk update — returns 0 rows if key does not yet exist.
         int rows = await writeCtx.Set<EngineConfig>()
             .Where(c => c.Key == key)
             .ExecuteUpdateAsync(s => s
@@ -222,6 +301,7 @@ public sealed class MLTrainingDataFreshnessWorker : BackgroundService
                 .SetProperty(c => c.LastUpdatedAt, DateTime.UtcNow),
                 ct);
 
+        // Key did not exist — insert it for the first time.
         if (rows == 0)
         {
             writeCtx.Set<EngineConfig>().Add(new EngineConfig
@@ -239,6 +319,17 @@ public sealed class MLTrainingDataFreshnessWorker : BackgroundService
 
     // ── Config helper ─────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Reads a typed configuration value from the <see cref="EngineConfig"/> table,
+    /// falling back to <paramref name="defaultValue"/> if the key is absent or
+    /// the stored value cannot be converted to <typeparamref name="T"/>.
+    /// </summary>
+    /// <typeparam name="T">Target value type (int, double, string, etc.).</typeparam>
+    /// <param name="ctx">EF Core context to query against.</param>
+    /// <param name="key">The EngineConfig key to look up.</param>
+    /// <param name="defaultValue">Value to return when the key is missing or invalid.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>The parsed config value or <paramref name="defaultValue"/>.</returns>
     private static async Task<T> GetConfigAsync<T>(
         Microsoft.EntityFrameworkCore.DbContext ctx,
         string                                  key,

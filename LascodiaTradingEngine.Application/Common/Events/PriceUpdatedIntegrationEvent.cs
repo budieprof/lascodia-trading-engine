@@ -4,6 +4,9 @@ namespace LascodiaTradingEngine.Application.Common.Events;
 
 public record PriceUpdatedIntegrationEvent : IntegrationEvent
 {
+    /// <summary>Monotonic sequence number for ordering detection.</summary>
+    public long    SequenceNumber { get; init; } = EventSequence.Next();
+
     public string  Symbol    { get; init; } = string.Empty;
     public decimal Bid       { get; init; }
     public decimal Ask       { get; init; }

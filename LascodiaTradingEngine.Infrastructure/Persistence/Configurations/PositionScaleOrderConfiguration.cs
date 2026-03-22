@@ -17,6 +17,8 @@ public class PositionScaleOrderConfiguration : IEntityTypeConfiguration<Position
         builder.Property(x => x.LotSize).HasPrecision(18, 8);
         builder.Property(x => x.TakeProfitPrice).HasPrecision(18, 8);
 
+        builder.HasQueryFilter(x => !x.IsDeleted);
+
         builder.HasIndex(x => x.PositionId);
         builder.HasIndex(x => x.OrderId);
 

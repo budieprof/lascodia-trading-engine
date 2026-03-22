@@ -16,6 +16,8 @@ public class DrawdownSnapshotConfiguration : IEntityTypeConfiguration<DrawdownSn
         builder.Property(x => x.DrawdownPct).HasPrecision(18, 4);
         builder.Property(x => x.RecoveryMode).HasConversion<string>().IsRequired().HasMaxLength(20);
 
+        builder.HasQueryFilter(x => !x.IsDeleted);
+
         builder.HasIndex(x => x.RecordedAt);
     }
 }

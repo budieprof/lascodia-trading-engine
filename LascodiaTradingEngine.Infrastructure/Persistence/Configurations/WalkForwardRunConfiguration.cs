@@ -18,6 +18,8 @@ public class WalkForwardRunConfiguration : IEntityTypeConfiguration<WalkForwardR
         builder.Property(x => x.AverageOutOfSampleScore).HasPrecision(18, 6);
         builder.Property(x => x.ScoreConsistency).HasPrecision(18, 6);
 
+        builder.HasQueryFilter(x => !x.IsDeleted);
+
         builder.HasIndex(x => x.StrategyId);
         builder.HasIndex(x => new { x.StrategyId, x.Status });
 

@@ -1,5 +1,7 @@
 using System.Net.Http.Json;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Services.Alerts.Options;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
@@ -16,6 +18,7 @@ namespace LascodiaTradingEngine.Application.Services.Alerts.Channels;
 /// (numeric for users/groups, or @channelname for public channels).
 /// The bot must be invited to any group/channel before it can post.
 /// </remarks>
+[RegisterService(ServiceLifetime.Scoped, typeof(IAlertChannelSender))]
 public class TelegramAlertSender : IAlertChannelSender
 {
     public AlertChannel Channel => AlertChannel.Telegram;

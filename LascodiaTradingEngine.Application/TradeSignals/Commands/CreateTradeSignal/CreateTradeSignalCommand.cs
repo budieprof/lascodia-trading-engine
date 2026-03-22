@@ -1,10 +1,13 @@
 using FluentValidation;
 using MediatR;
-using Microsoft.EntityFrameworkCore;
+using Lascodia.Trading.Engine.EventBus.Abstractions;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
+using LascodiaTradingEngine.Application.Common.Events;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
+using Lascodia.Trading.Engine.IntegrationEventLogEF.Services;
+using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 
 namespace LascodiaTradingEngine.Application.TradeSignals.Commands.CreateTradeSignal;
 
@@ -77,10 +80,12 @@ public class CreateTradeSignalCommandValidator : AbstractValidator<CreateTradeSi
 public class CreateTradeSignalCommandHandler : IRequestHandler<CreateTradeSignalCommand, ResponseData<long>>
 {
     private readonly IWriteApplicationDbContext _context;
+    private readonly IIntegrationEventService _eventBus;
 
-    public CreateTradeSignalCommandHandler(IWriteApplicationDbContext context)
+    public CreateTradeSignalCommandHandler(IWriteApplicationDbContext context, IIntegrationEventService eventBus)
     {
-        _context = context;
+        _context  = context;
+        _eventBus = eventBus;
     }
 
     public async Task<ResponseData<long>> Handle(CreateTradeSignalCommand request, CancellationToken cancellationToken)
@@ -110,10 +115,10 @@ public class CreateTradeSignalCommandHandler : IRequestHandler<CreateTradeSignal
         await db.Set<Domain.Entities.TradeSignal>()
             .AddAsync(entity, cancellationToken);
 
-        await _context.SaveChangesAsync(cancellationToken);
-
         // Create the MLModelPredictionLog record immediately so that
         // MLPredictionOutcomeWorker / drift monitors can resolve the outcome later.
+        // Added in the same SaveChangesAsync call — EF Core resolves the temporary
+        // TradeSignalId FK automatically, ensuring both writes are atomic.
         if (request.MLModelId.HasValue)
         {
             var predLog = new MLModelPredictionLog
@@ -132,8 +137,18 @@ public class CreateTradeSignalCommandHandler : IRequestHandler<CreateTradeSignal
             };
 
             db.Set<MLModelPredictionLog>().Add(predLog);
-            await _context.SaveChangesAsync(cancellationToken);
         }
+
+        //await _context.SaveChangesAsync(cancellationToken);
+
+        await _eventBus.SaveAndPublish(_context,new TradeSignalCreatedIntegrationEvent
+        {
+            TradeSignalId = entity.Id,
+            StrategyId    = entity.StrategyId,
+            Symbol        = entity.Symbol,
+            Direction     = entity.Direction.ToString(),
+            EntryPrice    = entity.EntryPrice,
+        });
 
         return ResponseData<long>.Init(entity.Id, true, "Successful", "00");
     }

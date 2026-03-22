@@ -1,4 +1,5 @@
 using System.Text.Json;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Domain.Enums;
@@ -23,6 +24,7 @@ namespace LascodiaTradingEngine.Application.Services.ML;
 /// 5. Terminate when P(flip | x) ≥ 0.5 or max iterations reached.
 /// 6. Return Δ = x_final − x₀ for features where |Δ/σ| > 0.01.
 /// </remarks>
+[RegisterService]
 public class CounterfactualExplainer : ICounterfactualExplainer
 {
     private readonly ILogger<CounterfactualExplainer> _logger;

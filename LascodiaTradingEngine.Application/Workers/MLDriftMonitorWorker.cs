@@ -57,6 +57,15 @@ public sealed class MLDriftMonitorWorker : BackgroundService
     private readonly IServiceScopeFactory       _scopeFactory;
     private readonly ILogger<MLDriftMonitorWorker> _logger;
 
+    /// <summary>
+    /// Initialises the worker with its required dependencies.
+    /// </summary>
+    /// <param name="scopeFactory">
+    /// Used to create a new DI scope per poll cycle, which gives each iteration a fresh
+    /// pair of <see cref="IReadApplicationDbContext"/> / <see cref="IWriteApplicationDbContext"/>
+    /// instances and prevents long-lived DbContext connection leaks.
+    /// </param>
+    /// <param name="logger">Structured logger for drift events and diagnostic output.</param>
     public MLDriftMonitorWorker(
         IServiceScopeFactory            scopeFactory,
         ILogger<MLDriftMonitorWorker>   logger)
@@ -65,6 +74,20 @@ public sealed class MLDriftMonitorWorker : BackgroundService
         _logger       = logger;
     }
 
+    /// <summary>
+    /// Main background loop. Runs indefinitely at <c>MLDrift:PollIntervalSeconds</c> intervals
+    /// (default 300 s / 5 min) until the host requests shutdown.
+    ///
+    /// Each cycle:
+    /// <list type="number">
+    ///   <item>Creates a fresh DI scope and resolves read + write DB contexts.</item>
+    ///   <item>Reads all configurable thresholds from <see cref="EngineConfig"/>.</item>
+    ///   <item>Loads all active (non-deleted) <see cref="MLModel"/> records.</item>
+    ///   <item>Prunes the in-memory <see cref="_consecutiveFailures"/> tracker for models
+    ///         that are no longer active (prevents unbounded memory growth).</item>
+    ///   <item>Calls <see cref="CheckModelDriftAsync"/> for each active model.</item>
+    /// </list>
+    /// </summary>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation("MLDriftMonitorWorker started.");
@@ -139,6 +162,56 @@ public sealed class MLDriftMonitorWorker : BackgroundService
 
     // ── Per-model drift check ─────────────────────────────────────────────────
 
+    /// <summary>
+    /// Evaluates a single active <see cref="MLModel"/> for multiple forms of performance
+    /// degradation using its resolved <see cref="MLModelPredictionLog"/> records from the
+    /// rolling drift window. Queues a <see cref="MLTrainingRun"/> if any drift criterion
+    /// is triggered for <paramref name="requiredConsecutiveFailures"/> consecutive windows.
+    ///
+    /// <para><b>Drift criteria evaluated (any one can trigger retraining):</b></para>
+    /// <list type="bullet">
+    ///   <item><b>Accuracy drift</b> — rolling direction accuracy &lt; <paramref name="threshold"/>
+    ///         (absolute floor, e.g. 50%).</item>
+    ///   <item><b>Relative degradation</b> — rolling accuracy &lt; training accuracy ×
+    ///         <paramref name="relativeDegradationRatio"/> (e.g. 85% of training accuracy),
+    ///         allowing models trained on different base rates to share a common relative standard.</item>
+    ///   <item><b>Calibration drift (Brier score)</b> — rolling Brier score &gt;
+    ///         <paramref name="maxBrierScore"/>. Detects models that are systematically
+    ///         over- or under-confident even when raw accuracy is still acceptable.
+    ///         See <see cref="ComputeRollingBrierScore"/>.</item>
+    ///   <item><b>Ensemble disagreement</b> — mean inter-learner std &gt;
+    ///         <paramref name="maxEnsembleDisagreement"/>. High disagreement among bag members
+    ///         indicates the model is operating in a region of the input space not well
+    ///         covered by training data — an early-warning signal before accuracy drops.</item>
+    ///   <item><b>Sharpe degradation</b> — rolling live Sharpe &lt; training Sharpe ×
+    ///         <paramref name="sharpeDegradationRatio"/>. Requires at least
+    ///         <paramref name="minClosedTradesForSharpe"/> resolved trades. Uses
+    ///         magnitude × direction-sign as a P&amp;L proxy (annualised with √252 factor).</item>
+    /// </list>
+    ///
+    /// <para><b>Consecutive-window guard:</b> a single bad window (e.g. a flash event) is
+    /// not enough to trigger retraining. The model must fail on
+    /// <paramref name="requiredConsecutiveFailures"/> consecutive poll cycles before a new
+    /// <see cref="MLTrainingRun"/> is queued. The counter is stored in
+    /// <see cref="_consecutiveFailures"/> and reset to 0 on any healthy cycle.</para>
+    ///
+    /// <para><b>Deduplication:</b> if a run for the same symbol/timeframe is already
+    /// queued or running, this method skips queueing to avoid pile-up.</para>
+    /// </summary>
+    /// <param name="model">The active model to evaluate.</param>
+    /// <param name="writeCtx">EF write context — used only to persist a new <see cref="MLTrainingRun"/>.</param>
+    /// <param name="readCtx">EF read context — used for all SELECT queries.</param>
+    /// <param name="windowStart">Start of the rolling evaluation window (UTC).</param>
+    /// <param name="minPredictions">Minimum resolved predictions required to run drift checks.</param>
+    /// <param name="threshold">Absolute direction accuracy floor.</param>
+    /// <param name="trainingDays">Training window size for the queued retraining run (days back from now).</param>
+    /// <param name="maxBrierScore">Maximum acceptable Brier score (calibration gate).</param>
+    /// <param name="maxEnsembleDisagreement">Maximum acceptable mean ensemble std deviation.</param>
+    /// <param name="relativeDegradationRatio">Fraction of training accuracy below which relative drift fires.</param>
+    /// <param name="requiredConsecutiveFailures">Number of consecutive bad windows before retraining is queued.</param>
+    /// <param name="sharpeDegradationRatio">Fraction of training Sharpe below which Sharpe drift fires.</param>
+    /// <param name="minClosedTradesForSharpe">Minimum resolved trades before Sharpe comparison is active.</param>
+    /// <param name="ct">Cancellation token.</param>
     private async Task CheckModelDriftAsync(
         MLModel                                 model,
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
@@ -334,6 +407,11 @@ public sealed class MLDriftMonitorWorker : BackgroundService
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Reads a typed value from <see cref="EngineConfig"/> or returns <paramref name="defaultValue"/>
+    /// when the key is absent or its string value cannot be converted to <typeparamref name="T"/>.
+    /// All reads are <c>AsNoTracking</c> to avoid stale-cache issues in long-lived loops.
+    /// </summary>
     private static async Task<T> GetConfigAsync<T>(
         Microsoft.EntityFrameworkCore.DbContext ctx,
         string                                  key,

@@ -17,6 +17,8 @@ public class AlertConfiguration : IEntityTypeConfiguration<Alert>
         builder.Property(x => x.Destination).IsRequired().HasMaxLength(500);
         builder.Property(x => x.ConditionJson).IsRequired().HasMaxLength(1000);
 
+        builder.HasQueryFilter(x => !x.IsDeleted);
+
         builder.HasIndex(x => new { x.Symbol, x.AlertType, x.IsActive });
     }
 }

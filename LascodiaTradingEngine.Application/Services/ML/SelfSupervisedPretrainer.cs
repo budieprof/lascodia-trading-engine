@@ -1,3 +1,4 @@
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.MLModels.Shared;
 using Microsoft.Extensions.Logging;
@@ -18,6 +19,7 @@ namespace LascodiaTradingEngine.Application.Services.ML;
 /// Training: Adam-style gradient descent with weight decay.
 /// On completion, the encoder weight matrix and reconstruction loss are returned.
 /// </remarks>
+[RegisterService]
 public class SelfSupervisedPretrainer : ISelfSupervisedPretrainer
 {
     private readonly ILogger<SelfSupervisedPretrainer> _logger;

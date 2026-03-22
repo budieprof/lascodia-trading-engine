@@ -5,6 +5,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Lascodia.Trading.Engine.EventBus.Abstractions;
 using LascodiaTradingEngine.Application.AuditTrail.Commands.LogDecision;
+using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Events;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Orders.Commands.CreateOrder;
@@ -25,15 +26,18 @@ public class SignalOrderBridgeWorker : BackgroundService, IIntegrationEventHandl
     private readonly ILogger<SignalOrderBridgeWorker> _logger;
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IEventBus _eventBus;
+    private readonly TradingMetrics _metrics;
 
     public SignalOrderBridgeWorker(
         ILogger<SignalOrderBridgeWorker> logger,
         IServiceScopeFactory scopeFactory,
-        IEventBus eventBus)
+        IEventBus eventBus,
+        TradingMetrics metrics)
     {
         _logger       = logger;
         _scopeFactory = scopeFactory;
         _eventBus     = eventBus;
+        _metrics      = metrics;
     }
 
     protected override Task ExecuteAsync(CancellationToken stoppingToken)
@@ -110,6 +114,7 @@ public class SignalOrderBridgeWorker : BackgroundService, IIntegrationEventHandl
                     "SignalOrderBridgeWorker: signal {Id} blocked by risk check — {Reason}",
                     signal.Id, riskResult.BlockReason);
 
+                _metrics.SignalsRejected.Add(1, new KeyValuePair<string, object?>("reason", "risk_check"));
                 await RejectSignalAsync(mediator, signal.Id, riskResult.BlockReason!);
 
                 await mediator.Send(new LogDecisionCommand
@@ -126,6 +131,7 @@ public class SignalOrderBridgeWorker : BackgroundService, IIntegrationEventHandl
             }
 
             // Approve signal
+            _metrics.SignalsAccepted.Add(1);
             await mediator.Send(new ApproveTradeSignalCommand { Id = signal.Id });
 
             // ── Sub-bar execution timing optimizer ─────────────────────────
@@ -138,7 +144,7 @@ public class SignalOrderBridgeWorker : BackgroundService, IIntegrationEventHandl
                 _logger.LogInformation(
                     "SignalOrderBridgeWorker: delaying execution of signal {Id} by {Delay}ms (entry timing optimizer)",
                     signal.Id, executionDelay.TotalMilliseconds);
-                await Task.Delay(executionDelay);
+                await Task.Delay(executionDelay, CancellationToken.None);
             }
 
             // Create the Pending order

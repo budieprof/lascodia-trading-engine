@@ -58,6 +58,15 @@ public sealed class MLIsotonicRecalibrationWorker : BackgroundService
     private readonly IMemoryCache                             _cache;
     private readonly ILogger<MLIsotonicRecalibrationWorker>   _logger;
 
+    /// <summary>
+    /// Initialises the worker with its required dependencies.
+    /// </summary>
+    /// <param name="scopeFactory">Creates scoped DI scopes per polling cycle.</param>
+    /// <param name="cache">
+    /// Shared in-memory cache. The <c>MLSnapshot:{modelId}</c> entry is evicted after
+    /// a successful update so the scorer reloads the patched breakpoints immediately.
+    /// </param>
+    /// <param name="logger">Structured logger.</param>
     public MLIsotonicRecalibrationWorker(
         IServiceScopeFactory                    scopeFactory,
         IMemoryCache                            cache,
@@ -68,12 +77,19 @@ public sealed class MLIsotonicRecalibrationWorker : BackgroundService
         _logger       = logger;
     }
 
+    /// <summary>
+    /// Main hosted-service loop. Polls every <c>MLIsotonicRecal:PollIntervalSeconds</c>
+    /// (default 28800 s / 8 h). Creates a fresh DI scope per cycle and delegates to
+    /// <see cref="RecalibrateModelsAsync"/>.
+    /// </summary>
+    /// <param name="stoppingToken">Signals graceful shutdown requested by the host.</param>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation("MLIsotonicRecalibrationWorker started.");
 
         while (!stoppingToken.IsCancellationRequested)
         {
+            // Default poll interval — refreshed from live EngineConfig each cycle.
             int pollSecs = 28800;
 
             try
@@ -103,6 +119,12 @@ public sealed class MLIsotonicRecalibrationWorker : BackgroundService
         _logger.LogInformation("MLIsotonicRecalibrationWorker stopping.");
     }
 
+    /// <summary>
+    /// Loads window/sample configuration from <see cref="EngineConfig"/> and iterates
+    /// over every active model with serialised model bytes, delegating per-model work to
+    /// <see cref="RecalibrateModelAsync"/>. Errors for individual models are swallowed so
+    /// one bad model cannot block the remaining models.
+    /// </summary>
     private async Task RecalibrateModelsAsync(
         Microsoft.EntityFrameworkCore.DbContext readCtx,
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
@@ -133,6 +155,31 @@ public sealed class MLIsotonicRecalibrationWorker : BackgroundService
         }
     }
 
+    /// <summary>
+    /// Refits the isotonic calibration breakpoints for a single model using the PAVA
+    /// algorithm applied to recent resolved prediction logs.
+    ///
+    /// <b>Probability reconstruction:</b> Because raw logits are not stored in prediction logs,
+    /// the calibrated probability is approximated from <c>ConfidenceScore</c>,
+    /// <c>PredictedDirection</c>, and the model's current decision threshold T:
+    /// <list type="bullet">
+    ///   <item>Buy:  calibP = T + conf × (1 − T)  → maps conf ∈ [0,1] to calibP ∈ [T, 1]</item>
+    ///   <item>Sell: calibP = T − conf × T          → maps conf ∈ [0,1] to calibP ∈ [0, T]</item>
+    /// </list>
+    ///
+    /// This ensures the reconstructed probability is consistent with the model's threshold and
+    /// maps confidence scores to the correct side of the probability space.
+    ///
+    /// The resulting (calibP, label) pairs are sorted and fed into <see cref="FitPAVA"/>.
+    /// The new breakpoints replace the existing ones in <c>ModelSnapshot.IsotonicBreakpoints</c>
+    /// and are written back to <c>MLModel.ModelBytes</c>.
+    /// </summary>
+    /// <param name="model">Active model entity to refine isotonic breakpoints for.</param>
+    /// <param name="readCtx">Read-only EF context.</param>
+    /// <param name="writeCtx">Write EF context for persisting the patched snapshot.</param>
+    /// <param name="windowDays">Look-back window in days for resolved logs.</param>
+    /// <param name="minResolved">Minimum resolved-log count required to proceed (skip if fewer).</param>
+    /// <param name="ct">Cooperative cancellation token.</param>
     private async Task RecalibrateModelAsync(
         MLModel                                 model,
         Microsoft.EntityFrameworkCore.DbContext readCtx,
@@ -141,18 +188,21 @@ public sealed class MLIsotonicRecalibrationWorker : BackgroundService
         int                                     minResolved,
         CancellationToken                       ct)
     {
+        // Deserialise the current snapshot to extract the model's active decision threshold.
         ModelSnapshot? snap;
         try { snap = JsonSerializer.Deserialize<ModelSnapshot>(model.ModelBytes!); }
         catch { return; }
 
         if (snap is null) return;
 
+        // Resolve the current threshold in priority order: OptimalThreshold → AdaptiveThreshold → 0.5.
         double threshold = snap.OptimalThreshold > 0.0 ? snap.OptimalThreshold
                          : snap.AdaptiveThreshold > 0.0 ? snap.AdaptiveThreshold
                          : 0.5;
 
         var since = DateTime.UtcNow.AddDays(-windowDays);
 
+        // Load only the fields needed for PAVA fitting to minimise data transfer.
         var resolved = await readCtx.Set<MLModelPredictionLog>()
             .Where(l => l.MLModelId        == model.Id &&
                         l.PredictedAt      >= since    &&
@@ -177,21 +227,23 @@ public sealed class MLIsotonicRecalibrationWorker : BackgroundService
         // Reconstruct approximate calibP from ConfidenceScore + PredictedDirection + threshold.
         // Buy:  calibP ≈ T + ConfidenceScore × (1 − T)  → maps [0,1] confidence to [T, 1]
         // Sell: calibP ≈ T − ConfidenceScore × T         → maps [0,1] confidence to [T, 0]
+        // Sorting by calibP ascending is required for PAVA's monotone-increasing constraint.
         var pairs = resolved
             .Select(r =>
             {
                 double conf    = Math.Clamp((double)r.ConfidenceScore, 0.0, 1.0);
                 double calibP  = r.PredictedDirection == TradeDirection.Buy
-                    ? threshold + conf * (1.0 - threshold)
-                    : threshold - conf * threshold;
+                    ? threshold + conf * (1.0 - threshold)  // Buy: probability above threshold
+                    : threshold - conf * threshold;          // Sell: probability below threshold
                 double label   = r.DirectionCorrect ? 1.0 : 0.0;
                 return (P: calibP, Y: label);
             })
-            .OrderBy(p => p.P)
+            .OrderBy(p => p.P)  // PAVA requires sorted input
             .ToList();
 
         double[] newBreakpoints = FitPAVA(pairs);
 
+        // Require at least 2 breakpoint segments (4 values) to be useful.
         if (newBreakpoints.Length < 4)
         {
             _logger.LogDebug(
@@ -204,6 +256,7 @@ public sealed class MLIsotonicRecalibrationWorker : BackgroundService
             "IsotonicRecal: {Symbol}/{Tf} model {Id}: fitted {N} PAVA breakpoints from {Count} samples.",
             model.Symbol, model.Timeframe, model.Id, newBreakpoints.Length / 2, resolved.Count);
 
+        // Overwrite the existing isotonic breakpoints with the freshly fitted ones.
         snap.IsotonicBreakpoints = newBreakpoints;
         byte[] updatedBytes = JsonSerializer.SerializeToUtf8Bytes(snap);
 
@@ -211,6 +264,7 @@ public sealed class MLIsotonicRecalibrationWorker : BackgroundService
             .Where(m => m.Id == model.Id)
             .ExecuteUpdateAsync(s => s.SetProperty(m => m.ModelBytes, updatedBytes), ct);
 
+        // Evict the scorer cache so the updated breakpoints are used immediately.
         _cache.Remove($"{SnapshotCacheKeyPrefix}{model.Id}");
     }
 
@@ -220,43 +274,77 @@ public sealed class MLIsotonicRecalibrationWorker : BackgroundService
     /// Fits a monotone non-decreasing calibration curve via PAVA.
     /// Returns interleaved [x₀,y₀,x₁,y₁,…] breakpoints compatible with
     /// <see cref="BaggedLogisticTrainer.ApplyIsotonicCalibration"/>.
+    ///
+    /// <b>PAVA algorithm:</b> processes the sorted (P, Y) pairs left to right.
+    /// Each pair is added as a new block. Whenever the new block's mean Y (accuracy)
+    /// is less than the previous block's mean Y, the two blocks are merged into one
+    /// combined block with pooled statistics. This merging is repeated until the
+    /// non-decreasing invariant is restored. The result is a staircase function from
+    /// probability to accuracy that is guaranteed monotone non-decreasing.
+    ///
+    /// <b>Output format:</b> the interleaved array [x₀,y₀, x₁,y₁, …] matches the
+    /// format expected by <c>BaggedLogisticTrainer.ApplyIsotonicCalibration</c>, where
+    /// x_i is the mean calibrated probability for block i and y_i is the mean accuracy
+    /// (empirical label rate) for that block.
     /// </summary>
+    /// <param name="pairs">
+    /// (calibP, label) pairs sorted ascending by calibP.
+    /// Returns empty array when fewer than 10 pairs are provided.
+    /// </param>
+    /// <returns>
+    /// Interleaved [x, y] breakpoints where x = mean calibP, y = mean empirical accuracy.
+    /// </returns>
     private static double[] FitPAVA(List<(double P, double Y)> pairs)
     {
         if (pairs.Count < 10) return [];
 
-        // Stack-based PAVA: each entry = (sumY, sumP, count)
+        // Stack-based PAVA: each entry = (sumY, sumP, count).
+        // The mean accuracy of a block is sumY / count.
+        // The mean probability of a block is sumP / count.
         var stack = new List<(double SumY, double SumP, int Count)>(pairs.Count);
         foreach (var (P, Y) in pairs)
         {
+            // Push each new point as a singleton block.
             stack.Add((Y, P, 1));
+            // Merge back while the monotone non-decreasing invariant is violated.
             while (stack.Count >= 2)
             {
                 var last = stack[^1];
                 var prev = stack[^2];
+                // Violation: previous block has higher mean accuracy than the current block.
                 if (prev.SumY / prev.Count > last.SumY / last.Count)
                 {
+                    // Pool the two blocks: combine their sums and counts.
                     stack.RemoveAt(stack.Count - 1);
                     stack[^1] = (prev.SumY + last.SumY,
                                  prev.SumP + last.SumP,
                                  prev.Count + last.Count);
                 }
-                else break;
+                else break; // Non-decreasing invariant satisfied — stop merging.
             }
         }
 
-        // Build interleaved [x,y] breakpoints: x = mean calibP, y = mean label
+        // Build interleaved [x,y] breakpoints: x = mean calibP, y = mean label.
         var bp = new double[stack.Count * 2];
         for (int i = 0; i < stack.Count; i++)
         {
-            bp[i * 2]     = stack[i].SumP / stack[i].Count;
-            bp[i * 2 + 1] = stack[i].SumY / stack[i].Count;
+            bp[i * 2]     = stack[i].SumP / stack[i].Count; // x: mean probability for block i
+            bp[i * 2 + 1] = stack[i].SumY / stack[i].Count; // y: mean accuracy for block i
         }
         return bp;
     }
 
     // ── Config helper ─────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Reads a typed value from the <see cref="EngineConfig"/> table by key.
+    /// Falls back to <paramref name="defaultValue"/> when the key is missing or unparseable.
+    /// </summary>
+    /// <typeparam name="T">Target CLR type.</typeparam>
+    /// <param name="ctx">EF Core context to query.</param>
+    /// <param name="key">Configuration key stored in <c>EngineConfig.Key</c>.</param>
+    /// <param name="defaultValue">Fallback value.</param>
+    /// <param name="ct">Cooperative cancellation token.</param>
     private static async Task<T> GetConfigAsync<T>(
         Microsoft.EntityFrameworkCore.DbContext ctx,
         string                                  key,

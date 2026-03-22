@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -8,6 +9,7 @@ namespace LascodiaTradingEngine.Application.SignalFilters;
 /// Confirms a signal direction by checking SMA20 trend on higher timeframes.
 /// Returns true when the majority of applicable higher timeframes agree with the signal direction.
 /// </summary>
+[RegisterService]
 public class MultiTimeframeFilter : IMultiTimeframeFilter
 {
     private static readonly Timeframe[] TimeframeHierarchy =

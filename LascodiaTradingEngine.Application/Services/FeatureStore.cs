@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Domain.Entities;
@@ -59,6 +60,7 @@ public sealed record StoredFeature(
     float[]   Features,
     float[][]? SequenceFeatures);
 
+[RegisterService(ServiceLifetime.Singleton)]
 public sealed class FeatureStore : IFeatureStore
 {
     // In-memory cache of recent features (last 100 per symbol/tf) for fast inference

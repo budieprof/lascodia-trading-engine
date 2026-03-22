@@ -1,6 +1,8 @@
 using System.Text.Json;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.MLModels.Shared;
+using LascodiaTradingEngine.Domain.Enums;
 using Microsoft.Extensions.Logging;
 using TorchSharp;
 using TorchSharp.Modules;
@@ -40,6 +42,7 @@ namespace LascodiaTradingEngine.Application.Services.ML;
 /// Alphas stored in <c>ModelSnapshot.Weights[0]</c>; stump trees in <c>ModelSnapshot.GbmTreesJson</c>.
 /// Registered as a keyed <see cref="IMLModelTrainer"/> with key <c>"adaboost"</c>.
 /// </summary>
+[RegisterKeyedService(typeof(IMLModelTrainer), LearnerArchitecture.AdaBoost)]
 public sealed class AdaBoostModelTrainer : IMLModelTrainer
 {
     // ── Constants ────────────────────────────────────────────────────────────

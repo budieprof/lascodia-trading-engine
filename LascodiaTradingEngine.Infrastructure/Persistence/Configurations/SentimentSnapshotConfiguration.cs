@@ -16,6 +16,8 @@ public class SentimentSnapshotConfiguration : IEntityTypeConfiguration<Sentiment
         builder.Property(x => x.SentimentScore).HasPrecision(18, 6);
         builder.Property(x => x.Confidence).HasPrecision(18, 6);
 
+        builder.HasQueryFilter(x => !x.IsDeleted);
+
         builder.HasIndex(x => new { x.Currency, x.CapturedAt });
     }
 }

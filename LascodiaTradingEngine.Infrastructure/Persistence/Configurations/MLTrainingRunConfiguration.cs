@@ -24,6 +24,8 @@ public class MLTrainingRunConfiguration : IEntityTypeConfiguration<MLTrainingRun
         builder.Property(x => x.SharpeRatio).HasPrecision(10, 4);
         builder.Property(x => x.HyperparamConfigJson).HasMaxLength(2048);
 
+        builder.HasQueryFilter(x => !x.IsDeleted);
+
         builder.HasIndex(x => new { x.Symbol, x.Timeframe, x.Status });
         builder.HasIndex(x => x.MLModelId);
 

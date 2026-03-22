@@ -1,8 +1,11 @@
 using System.Collections.Concurrent;
+using Microsoft.Extensions.DependencyInjection;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 
 namespace LascodiaTradingEngine.Application.Services.RateLimiting;
 
+[RegisterService(ServiceLifetime.Singleton)]
 public class TokenBucketRateLimiter : IRateLimiter
 {
     private readonly ConcurrentDictionary<string, (int Count, DateTime WindowStart)> _buckets = new();

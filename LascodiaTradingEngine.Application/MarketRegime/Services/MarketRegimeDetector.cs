@@ -35,7 +35,35 @@ public class MarketRegimeDetector : IMarketRegimeDetector
         MarketRegimeEnum regime;
         double confidence;
 
-        if (atr > atrAvg * 1.5)
+        // ── Crisis: extreme ATR spike with directional sell-off ─────────────
+        bool isCrisis = atrAvg > 0 && atr > atrAvg * 2.5 && HasTrailingSellOff(candles, 3);
+
+        // ── Breakout: BB compression (pre-expansion) + current candle expansion ──
+        bool isBreakout = false;
+        if (!isCrisis && candles.Count > BbPeriod)
+        {
+            var preExpansion = candles.Take(candles.Count - 1).ToList();
+            double bbwPre = CalculateBollingerBandWidth(preExpansion, BbPeriod);
+            double bbwAvg = CalculateBbwRollingAverage(preExpansion, BbPeriod, 20);
+            if (bbwAvg > 0 && bbwPre < bbwAvg * 0.4)
+            {
+                double latestTr = (double)(candles[^1].High - candles[^1].Low);
+                if (atr > 0 && latestTr > atr * 1.8)
+                    isBreakout = true;
+            }
+        }
+
+        if (isCrisis)
+        {
+            regime     = MarketRegimeEnum.Crisis;
+            confidence = Math.Min(1.0, atr / (atrAvg * 3.0));
+        }
+        else if (isBreakout)
+        {
+            regime     = MarketRegimeEnum.Breakout;
+            confidence = Math.Min(1.0, (double)(candles[^1].High - candles[^1].Low) / atr);
+        }
+        else if (atr > atrAvg * 1.5)
         {
             regime     = MarketRegimeEnum.HighVolatility;
             confidence = Math.Min(1.0, atr / (atrAvg * 2.0));
@@ -163,6 +191,41 @@ public class MarketRegimeDetector : IMarketRegimeDetector
         }
 
         return atrValues.Count > 0 ? atrValues.Average() : CalculateAtr(candles, atrPeriod);
+    }
+
+    // ── Crisis helper ─────────────────────────────────────────────────────────
+
+    private static bool HasTrailingSellOff(IReadOnlyList<Candle> candles, int minBearish)
+    {
+        int count = 0;
+        for (int i = candles.Count - 1; i >= 0; i--)
+        {
+            if (candles[i].Close < candles[i].Open)
+                count++;
+            else
+                break;
+        }
+        return count >= minBearish;
+    }
+
+    // ── BBW rolling average ──────────────────────────────────────────────────
+
+    private static double CalculateBbwRollingAverage(IReadOnlyList<Candle> candles, int bbPeriod, int lookback)
+    {
+        int n = candles.Count;
+        if (n < bbPeriod + lookback) return CalculateBollingerBandWidth(candles, bbPeriod);
+
+        double sum = 0.0;
+        int count = 0;
+        for (int end = n - lookback; end <= n; end++)
+        {
+            if (end < bbPeriod) continue;
+            var slice = candles.Skip(end - bbPeriod).Take(bbPeriod).ToList();
+            sum += CalculateBollingerBandWidth(slice, bbPeriod);
+            count++;
+        }
+
+        return count > 0 ? sum / count : CalculateBollingerBandWidth(candles, bbPeriod);
     }
 
     // ── Bollinger Band Width ───────────────────────────────────────────────────

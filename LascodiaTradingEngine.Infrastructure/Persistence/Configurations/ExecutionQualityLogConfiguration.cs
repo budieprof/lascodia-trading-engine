@@ -18,6 +18,8 @@ public class ExecutionQualityLogConfiguration : IEntityTypeConfiguration<Executi
         builder.Property(x => x.SlippagePips).HasPrecision(18, 8);
         builder.Property(x => x.FillRate).HasPrecision(18, 8);
 
+        builder.HasQueryFilter(x => !x.IsDeleted);
+
         builder.HasIndex(x => new { x.Symbol, x.Session });
         builder.HasIndex(x => x.OrderId).IsUnique();
 

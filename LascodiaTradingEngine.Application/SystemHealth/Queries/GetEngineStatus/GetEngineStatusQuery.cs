@@ -41,28 +41,24 @@ public class GetEngineStatusQueryHandler
     {
         var db = _context.GetDbContext();
 
-        var activeStrategiesTask = db.Set<Domain.Entities.Strategy>()
+        var activeStrategies = await db.Set<Domain.Entities.Strategy>()
             .CountAsync(x => x.Status == StrategyStatus.Active && !x.IsDeleted, cancellationToken);
 
-        var openPositionsTask = db.Set<Domain.Entities.Position>()
+        var openPositions = await db.Set<Domain.Entities.Position>()
             .CountAsync(x => x.Status == PositionStatus.Open && !x.IsDeleted, cancellationToken);
 
-        var pendingOrdersTask = db.Set<Domain.Entities.Order>()
+        var pendingOrders = await db.Set<Domain.Entities.Order>()
             .CountAsync(x => x.Status == OrderStatus.Pending && !x.IsDeleted, cancellationToken);
 
-        var paperModeConfigTask = db.Set<Domain.Entities.EngineConfig>()
+        var paperModeConfig = await db.Set<Domain.Entities.EngineConfig>()
             .FirstOrDefaultAsync(x => x.Key == "PaperMode" && !x.IsDeleted, cancellationToken);
-
-        await Task.WhenAll(activeStrategiesTask, openPositionsTask, pendingOrdersTask, paperModeConfigTask);
-
-        var paperModeConfig = await paperModeConfigTask;
 
         var dto = new EngineStatusDto
         {
             IsRunning        = true,
-            ActiveStrategies = await activeStrategiesTask,
-            OpenPositions    = await openPositionsTask,
-            PendingOrders    = await pendingOrdersTask,
+            ActiveStrategies = activeStrategies,
+            OpenPositions    = openPositions,
+            PendingOrders    = pendingOrders,
             PaperMode        = paperModeConfig?.Value ?? "false",
             CheckedAt        = DateTime.UtcNow
         };

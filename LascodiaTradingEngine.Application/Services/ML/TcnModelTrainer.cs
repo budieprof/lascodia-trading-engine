@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Text.Json;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Domain.Enums;
@@ -49,6 +50,7 @@ namespace LascodiaTradingEngine.Application.Services.ML;
 /// </list>
 /// </para>
 /// </summary>
+[RegisterKeyedService(typeof(IMLModelTrainer), LearnerArchitecture.TemporalConvNet)]
 public sealed class TcnModelTrainer : IMLModelTrainer
 {
     // ── Constants ────────────────────────────────────────────────────────────

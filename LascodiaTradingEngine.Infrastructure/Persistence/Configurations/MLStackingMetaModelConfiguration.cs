@@ -19,6 +19,8 @@ public class MLStackingMetaModelConfiguration : IEntityTypeConfiguration<MLStack
         builder.Property(x => x.DirectionAccuracy).HasPrecision(5, 4);
         builder.Property(x => x.BrierScore).HasPrecision(5, 4);
 
+        builder.HasQueryFilter(x => !x.IsDeleted);
+
         builder.HasIndex(x => new { x.Symbol, x.Timeframe, x.IsActive });
     }
 }

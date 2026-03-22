@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Logging;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
@@ -10,6 +11,7 @@ namespace LascodiaTradingEngine.Application.Services.Alerts;
 /// based on <see cref="Alert.Channel"/>. Each channel has its own dedicated sender
 /// (Webhook, Email, Telegram) registered in DI.
 /// </summary>
+[RegisterService]
 public class AlertDispatcher : IAlertDispatcher
 {
     private readonly IReadOnlyDictionary<AlertChannel, IAlertChannelSender> _senders;

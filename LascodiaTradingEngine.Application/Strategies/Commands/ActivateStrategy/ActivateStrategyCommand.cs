@@ -1,6 +1,6 @@
 using MediatR;
 using Microsoft.EntityFrameworkCore;
-using Lascodia.Trading.Engine.EventBus.Abstractions;
+using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.Common.Events;
 using LascodiaTradingEngine.Application.Common.Interfaces;
@@ -21,9 +21,9 @@ public class ActivateStrategyCommand : IRequest<ResponseData<string>>
 public class ActivateStrategyCommandHandler : IRequestHandler<ActivateStrategyCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;
-    private readonly IEventBus _eventBus;
+    private readonly IIntegrationEventService _eventBus;
 
-    public ActivateStrategyCommandHandler(IWriteApplicationDbContext context, IEventBus eventBus)
+    public ActivateStrategyCommandHandler(IWriteApplicationDbContext context, IIntegrationEventService eventBus)
     {
         _context  = context;
         _eventBus = eventBus;
@@ -57,10 +57,9 @@ public class ActivateStrategyCommandHandler : IRequestHandler<ActivateStrategyCo
         };
 
         await _context.GetDbContext().Set<BacktestRun>().AddAsync(backtestRun, cancellationToken);
-        await _context.SaveChangesAsync(cancellationToken);
 
         // ── Publish StrategyActivatedIntegrationEvent ─────────────────────────
-        _eventBus.Publish(new StrategyActivatedIntegrationEvent
+        await _eventBus.SaveAndPublish(_context, new StrategyActivatedIntegrationEvent
         {
             StrategyId  = entity.Id,
             Name        = entity.Name,

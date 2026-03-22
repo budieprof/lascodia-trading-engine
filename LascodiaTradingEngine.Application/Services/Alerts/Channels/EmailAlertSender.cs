@@ -1,6 +1,8 @@
 using System.Net;
 using System.Net.Mail;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Services.Alerts.Options;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
@@ -12,6 +14,7 @@ namespace LascodiaTradingEngine.Application.Services.Alerts.Channels;
 /// SMTP credentials are read from <see cref="EmailAlertOptions"/> (appsettings EmailAlertOptions section).
 /// If the options are not configured (Host is empty) the sender logs a warning and skips delivery.
 /// </summary>
+[RegisterService(ServiceLifetime.Scoped, typeof(IAlertChannelSender))]
 public class EmailAlertSender : IAlertChannelSender
 {
     public AlertChannel Channel => AlertChannel.Email;

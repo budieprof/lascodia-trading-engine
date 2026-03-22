@@ -12,21 +12,41 @@ namespace LascodiaTradingEngine.Application.Workers;
 /// Monitors the realized P&amp;L quality of each active ML model by simulating
 /// trade returns from resolved <see cref="MLModelPredictionLog"/> records.
 ///
-/// Directional accuracy is a proxy metric — a model can maintain 55% accuracy while
-/// systematically losing money if it bets large on wrong predictions and small on
-/// correct ones (magnitude miscalibration), or if the wrong predictions happen to
-/// coincide with large adverse moves. This worker tracks the actual economic outcome
-/// using:
+/// <para>
+/// <b>Purpose:</b> Directional accuracy is a proxy metric — a model can maintain 55%
+/// accuracy while systematically losing money if it bets large on wrong predictions and
+/// small on correct ones (magnitude miscalibration), or if the wrong predictions coincide
+/// with large adverse moves. This worker tracks the actual economic outcome by computing
+/// a confidence-weighted, signed return series from resolved prediction logs, then
+/// deriving a rolling annualized Sharpe ratio. A Sharpe ratio below the floor triggers
+/// an alert and queues a retrain.
+/// </para>
 ///
-///   return_i = DirectionCorrect_i ? +|ActualMagnitudePips| : −|ActualMagnitudePips|
-///   scaled by ConfidenceScore_i as a position-sizing proxy
+/// <para>
+/// <b>PnL Attribution method:</b>
+/// <code>
+///   return_i = sign_i × |ActualMagnitudePips_i| × ConfidenceScore_i
+///   sign_i   = +1 if DirectionCorrect, −1 otherwise
+/// </code>
+/// ConfidenceScore acts as a fractional position-size proxy: a high-confidence correct
+/// prediction earns more than a low-confidence one; a high-confidence wrong prediction
+/// loses proportionally more. This penalizes models that are overconfident on losing trades.
+/// </para>
 ///
-/// From the return series it computes a rolling Sharpe ratio. When Sharpe drops below
-/// <c>MLPnlMonitor:MinRollingSharpeCeiling</c>, an <see cref="AlertType.MLModelDegraded"/>
-/// alert is created and a retrain is queued.
+/// <para>
+/// <b>Polling interval:</b> Configurable via <c>MLPnlMonitor:PollIntervalSeconds</c>;
+/// defaults to 10800 seconds (3 hours). The 3-hour cadence reflects that enough new
+/// resolved outcomes need to accumulate between checks for the Sharpe estimate to move.
+/// </para>
 ///
-/// This catches magnitude-calibration drift and P&amp;L degradation that accuracy
-/// metrics alone miss.
+/// <para>
+/// <b>ML lifecycle contribution:</b> Catches magnitude-calibration drift and P&amp;L
+/// degradation that accuracy metrics alone miss. When the Sharpe floor is breached,
+/// an <see cref="AlertType.MLModelDegraded"/> alert is raised (deduplicated) and a
+/// retrain is queued with diagnostic metadata so the training pipeline can focus on
+/// magnitude calibration (e.g. by re-weighting examples or switching to a regression
+/// head).
+/// </para>
 ///
 /// Configuration keys (read from <see cref="EngineConfig"/>):
 /// <list type="bullet">
@@ -46,6 +66,11 @@ public sealed class MLPredictionPnlWorker : BackgroundService
     private readonly IServiceScopeFactory            _scopeFactory;
     private readonly ILogger<MLPredictionPnlWorker>  _logger;
 
+    /// <summary>
+    /// Initializes the worker.
+    /// </summary>
+    /// <param name="scopeFactory">Per-iteration DI scope factory.</param>
+    /// <param name="logger">Structured logger.</param>
     public MLPredictionPnlWorker(
         IServiceScopeFactory           scopeFactory,
         ILogger<MLPredictionPnlWorker> logger)
@@ -54,6 +79,12 @@ public sealed class MLPredictionPnlWorker : BackgroundService
         _logger       = logger;
     }
 
+    /// <summary>
+    /// Background service main loop. On each iteration, creates a fresh DI scope,
+    /// reads the poll interval, and delegates P&amp;L monitoring to
+    /// <see cref="MonitorPnlAsync"/>. Errors are caught and logged to maintain
+    /// loop continuity across transient failures.
+    /// </summary>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation("MLPredictionPnlWorker started.");
@@ -89,6 +120,11 @@ public sealed class MLPredictionPnlWorker : BackgroundService
         _logger.LogInformation("MLPredictionPnlWorker stopping.");
     }
 
+    /// <summary>
+    /// Loads config and iterates all active models, delegating per-model P&amp;L
+    /// analysis to <see cref="CheckModelPnlAsync"/>. Per-model failures are isolated
+    /// so one bad model does not block the rest.
+    /// </summary>
     private async Task MonitorPnlAsync(
         Microsoft.EntityFrameworkCore.DbContext readCtx,
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
@@ -121,6 +157,23 @@ public sealed class MLPredictionPnlWorker : BackgroundService
         }
     }
 
+    /// <summary>
+    /// Computes the confidence-weighted, rolling Sharpe ratio for a single model from
+    /// resolved prediction logs within the look-back window, and triggers alerts/retrains
+    /// when Sharpe falls below the configured floor.
+    /// </summary>
+    /// <param name="model">The ML model to evaluate.</param>
+    /// <param name="readCtx">Read-only EF DbContext.</param>
+    /// <param name="writeCtx">Write EF DbContext.</param>
+    /// <param name="windowDays">Number of calendar days to look back for resolved predictions.</param>
+    /// <param name="minResolved">
+    /// Minimum number of resolved logs (with both DirectionCorrect and ActualMagnitudePips
+    /// populated) required to compute a meaningful Sharpe ratio.
+    /// </param>
+    /// <param name="minSharpe">
+    /// Sharpe ratio floor. Values below this trigger a degradation alert and retrain.
+    /// </param>
+    /// <param name="ct">Cancellation token.</param>
     private async Task CheckModelPnlAsync(
         MLModel                                 model,
         Microsoft.EntityFrameworkCore.DbContext readCtx,
@@ -132,6 +185,8 @@ public sealed class MLPredictionPnlWorker : BackgroundService
     {
         var since = DateTime.UtcNow.AddDays(-windowDays);
 
+        // Only fetch logs that have been resolved with both directional outcome
+        // and actual magnitude — unresolved logs lack the data needed for P&L simulation.
         var resolved = await readCtx.Set<MLModelPredictionLog>()
             .Where(l => l.MLModelId          == model.Id &&
                         l.PredictedAt        >= since    &&
@@ -141,9 +196,9 @@ public sealed class MLPredictionPnlWorker : BackgroundService
             .OrderBy(l => l.PredictedAt)
             .Select(l => new
             {
-                DirectionCorrect   = l.DirectionCorrect!.Value,
+                DirectionCorrect    = l.DirectionCorrect!.Value,
                 ActualMagnitudePips = (double)l.ActualMagnitudePips!.Value,
-                ConfidenceScore    = (double)l.ConfidenceScore,
+                ConfidenceScore     = (double)l.ConfidenceScore,
             })
             .ToListAsync(ct);
 
@@ -155,17 +210,29 @@ public sealed class MLPredictionPnlWorker : BackgroundService
             return;
         }
 
-        // Simulate returns: confidence-scaled signed magnitude
-        // return_i = sign × |actualPips| × confidence
+        // ── PnL attribution: confidence-weighted signed return series ─────────
+        // Each prediction generates a simulated return:
+        //   return_i = sign_i × |actualMagnitudePips_i| × clamp(confidence_i, 0.01, 1.0)
+        //
+        // The confidence weight acts as a fractional bet size:
+        //   - A confident correct prediction earns proportionally more.
+        //   - A confident wrong prediction loses proportionally more.
+        // This penalises magnitude miscalibration: high confidence on losses is more
+        // damaging than low confidence on losses.
         var returns = resolved
             .Select(r =>
             {
                 double sign   = r.DirectionCorrect ? 1.0 : -1.0;
+                // Floor confidence at 0.01 to avoid near-zero position sizing
                 double sizing = Math.Clamp(r.ConfidenceScore, 0.01, 1.0);
                 return sign * Math.Abs(r.ActualMagnitudePips) * sizing;
             })
             .ToList();
 
+        // ── Annualized Sharpe ratio ───────────────────────────────────────────
+        // Sharpe = mean(returns) / std(returns) × sqrt(252)
+        // The √252 annualization assumes daily bars; the metric degrades gracefully
+        // for intraday models but remains comparable across timeframes.
         double meanReturn = returns.Average();
         double stdReturn  = returns.Count > 1
             ? Math.Sqrt(returns.Select(r => (r - meanReturn) * (r - meanReturn)).Average())
@@ -181,14 +248,16 @@ public sealed class MLPredictionPnlWorker : BackgroundService
             model.Symbol, model.Timeframe, model.Id,
             annualisedSharpe, meanReturn, stdReturn, resolved.Count);
 
+        // If Sharpe is at or above the floor, the model's P&L quality is acceptable.
         if (annualisedSharpe >= minSharpe) return;
 
+        // Sharpe below floor — the model is destroying value on a magnitude-adjusted basis.
         _logger.LogWarning(
             "P&L degradation: {Symbol}/{Tf} model {Id}: rolling Sharpe={Sharpe:F2} " +
             "< floor={Floor:F2} — model may be profitable on direction but losing on magnitude.",
             model.Symbol, model.Timeframe, model.Id, annualisedSharpe, minSharpe);
 
-        // Deduplicate alert
+        // ── Deduplicated alert ────────────────────────────────────────────────
         bool alertExists = await readCtx.Set<Alert>()
             .AnyAsync(a => a.Symbol    == model.Symbol              &&
                            a.AlertType == AlertType.MLModelDegraded &&
@@ -219,7 +288,9 @@ public sealed class MLPredictionPnlWorker : BackgroundService
             });
         }
 
-        // Queue retrain if none already pending
+        // ── Idempotent retrain queue ──────────────────────────────────────────
+        // Queue a retrain with the Sharpe context so the MLTrainingWorker can
+        // apply magnitude-aware training adjustments if supported.
         bool alreadyQueued = await readCtx.Set<MLTrainingRun>()
             .AnyAsync(r => r.Symbol    == model.Symbol    &&
                            r.Timeframe == model.Timeframe &&
@@ -245,6 +316,11 @@ public sealed class MLPredictionPnlWorker : BackgroundService
         await writeCtx.SaveChangesAsync(ct);
     }
 
+    /// <summary>
+    /// Reads a typed value from <see cref="EngineConfig"/>. Returns
+    /// <paramref name="defaultValue"/> if the key is missing or the stored value
+    /// cannot be converted to <typeparamref name="T"/>.
+    /// </summary>
     private static async Task<T> GetConfigAsync<T>(
         Microsoft.EntityFrameworkCore.DbContext ctx,
         string                                  key,

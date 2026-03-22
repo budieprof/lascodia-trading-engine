@@ -4,6 +4,7 @@ namespace LascodiaTradingEngine.Application.Common.Events;
 
 public record TradeSignalCreatedIntegrationEvent : IntegrationEvent
 {
+    public long    SequenceNumber { get; init; } = EventSequence.Next();
     public long    TradeSignalId { get; init; }
     public long    StrategyId    { get; init; }
     public string  Symbol        { get; init; } = string.Empty;

@@ -99,11 +99,13 @@ public record MLScoreResult(
     /// </summary>
     string?         CounterfactualJson = null,
 
-    // ── Rec #19: Permutation SHAP ─────────────────────────────────────────────
+    // ── Rec #19: Approximate SHAP ─────────────────────────────────────────────
     /// <summary>
-    /// Full JSON array of permutation-based SHAP values for all features.
-    /// Format: [0.042, -0.031, ...] — one value per feature. More accurate than
-    /// the linear SHAP in <see cref="ContributionsJson"/> for non-linear models.
+    /// JSON array of approximate SHAP values for all features, computed as
+    /// <c>featureImportance[j] × standardisedFeature[j]</c>. This is a fast linear
+    /// approximation — not true permutation or kernel SHAP — so values may
+    /// understate non-linear interaction effects. Format: [0.042, -0.031, ...].
+    /// For top-feature attribution with non-linear weighting, see <see cref="ContributionsJson"/>.
     /// </summary>
     string?         ShapValuesJson = null,
 

@@ -1,0 +1,15 @@
+**/bin/
+**/obj/
+**/.vs/
+**/.vscode/
+**/.idea/
+**/node_modules/
+**/*.user
+**/*.suo
+**/test-results/
+**/.git/
+**/.DS_Store
+*.md
+!CLAUDE.md
+LICENSE
+.github/

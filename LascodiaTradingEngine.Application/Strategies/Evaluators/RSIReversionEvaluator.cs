@@ -1,5 +1,6 @@
 using System.Text.Json;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Options;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -7,7 +8,29 @@ namespace LascodiaTradingEngine.Application.Strategies.Evaluators;
 
 public class RSIReversionEvaluator : IStrategyEvaluator
 {
+    private readonly StrategyEvaluatorOptions _options;
+
+    public RSIReversionEvaluator(StrategyEvaluatorOptions options)
+    {
+        _options = options;
+    }
+
     public StrategyType StrategyType => StrategyType.RSIReversion;
+
+    public int MinRequiredCandles(Strategy strategy)
+    {
+        int period = 14;
+        try
+        {
+            using var doc = JsonDocument.Parse(strategy.ParametersJson ?? "{}");
+            if (doc.RootElement.TryGetProperty("Period", out var p) && p.TryGetInt32(out var pVal))
+                period = pVal;
+        }
+        catch { /* use default */ }
+
+        // Need period+1 for RSI calculation (to get previous RSI too) plus ATR for SL/TP
+        return Math.Max(period + 1, _options.AtrPeriodForSlTp) + 1;
+    }
 
     public Task<TradeSignal?> EvaluateAsync(
         Strategy strategy,
@@ -29,7 +52,11 @@ public class RSIReversionEvaluator : IStrategyEvaluator
         }
         catch { /* use defaults */ }
 
-        int requiredCandles = period + 1;
+        period     = Math.Clamp(period, 2, 500);
+        oversold   = Math.Clamp(oversold, 1m, 49m);
+        overbought = Math.Clamp(overbought, 51m, 99m);
+
+        int requiredCandles = Math.Max(period + 1, _options.AtrPeriodForSlTp) + 1;
         if (candles.Count < requiredCandles)
             return Task.FromResult<TradeSignal?>(null);
 
@@ -59,6 +86,25 @@ public class RSIReversionEvaluator : IStrategyEvaluator
             return Task.FromResult<TradeSignal?>(null);
         }
 
+        // ATR-based stop-loss and take-profit
+        decimal atr = CalculateAtr(candles, candles.Count - 1, _options.AtrPeriodForSlTp);
+        if (atr <= 0) return Task.FromResult<TradeSignal?>(null);
+        decimal stopDistance   = atr * _options.StopLossAtrMultiplier;
+        decimal profitDistance = atr * _options.TakeProfitAtrMultiplier;
+
+        decimal? stopLoss;
+        decimal? takeProfit;
+        if (direction == TradeDirection.Buy)
+        {
+            stopLoss   = entryPrice - stopDistance;
+            takeProfit = entryPrice + profitDistance;
+        }
+        else
+        {
+            stopLoss   = entryPrice + stopDistance;
+            takeProfit = entryPrice - profitDistance;
+        }
+
         var now = DateTime.UtcNow;
         var signal = new TradeSignal
         {
@@ -66,30 +112,25 @@ public class RSIReversionEvaluator : IStrategyEvaluator
             Symbol           = strategy.Symbol,
             Direction        = direction.Value,
             EntryPrice       = entryPrice,
-            StopLoss         = null,
-            TakeProfit       = null,
-            SuggestedLotSize = 0.01m,
+            StopLoss         = stopLoss,
+            TakeProfit       = takeProfit,
+            SuggestedLotSize = _options.DefaultLotSize,
             Confidence       = confidence,
             Status           = TradeSignalStatus.Pending,
             GeneratedAt      = now,
-            ExpiresAt        = now.AddMinutes(30)
+            ExpiresAt        = now.AddMinutes(_options.RsiReversionExpiryMinutes)
         };
 
         return Task.FromResult<TradeSignal?>(signal);
     }
 
-    /// <summary>
-    /// Calculates RSI using Wilder's smoothing method at the given end index.
-    /// </summary>
     private static decimal CalculateRsi(IReadOnlyList<Candle> candles, int endIndex, int period)
     {
-        // We need `period` price changes, so `period + 1` closing prices ending at endIndex
         int startIndex = endIndex - period;
 
         decimal avgGain = 0m;
         decimal avgLoss = 0m;
 
-        // Initial average (simple average of first `period` changes)
         for (int i = startIndex + 1; i <= startIndex + period; i++)
         {
             decimal change = candles[i].Close - candles[i - 1].Close;
@@ -104,5 +145,22 @@ public class RSIReversionEvaluator : IStrategyEvaluator
         decimal rs  = avgGain / avgLoss;
         decimal rsi = 100m - (100m / (1m + rs));
         return rsi;
+    }
+
+    private static decimal CalculateAtr(IReadOnlyList<Candle> candles, int endIndex, int period)
+    {
+        decimal sumTr = 0m;
+        int start = endIndex - period + 1;
+        for (int i = start; i <= endIndex; i++)
+        {
+            decimal high = candles[i].High;
+            decimal low  = candles[i].Low;
+            decimal prevClose = candles[i - 1].Close;
+            decimal tr = Math.Max(high - low,
+                         Math.Max(Math.Abs(high - prevClose),
+                                  Math.Abs(low  - prevClose)));
+            sumTr += tr;
+        }
+        return sumTr / period;
     }
 }

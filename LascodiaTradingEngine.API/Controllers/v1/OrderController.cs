@@ -48,7 +48,7 @@ public class OrderController : AuthControllerBase<OrderController>
 
     /// <summary>Submit a Pending order to the broker</summary>
     [HttpPost("{id}/submit")]
-    public async Task<ResponseData<string>> Submit(long id)
+    public async Task<ResponseData<SubmitOrderResult>> Submit(long id)
         => await Mediator.Send(new SubmitOrderCommand { Id = id });
 
     /// <summary>Cancel an order</summary>

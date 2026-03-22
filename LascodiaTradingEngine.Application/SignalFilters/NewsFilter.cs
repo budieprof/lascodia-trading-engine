@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -9,6 +10,7 @@ namespace LascodiaTradingEngine.Application.SignalFilters;
 /// falls within the blackout window around the intended trade time.
 /// Returns false (not safe) if a blocking event is found.
 /// </summary>
+[RegisterService]
 public class NewsFilter : INewsFilter
 {
     private readonly IReadApplicationDbContext _context;

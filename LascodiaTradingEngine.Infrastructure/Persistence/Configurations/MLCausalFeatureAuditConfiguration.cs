@@ -18,6 +18,8 @@ public class MLCausalFeatureAuditConfiguration : IEntityTypeConfiguration<MLCaus
         builder.Property(x => x.GrangerFStat).HasPrecision(10, 4);
         builder.Property(x => x.GrangerPValue).HasPrecision(10, 8);
 
+        builder.HasQueryFilter(x => !x.IsDeleted);
+
         builder.HasIndex(x => new { x.MLModelId, x.FeatureIndex });
         builder.HasIndex(x => new { x.MLModelId, x.IsCausal });
 

@@ -1,6 +1,7 @@
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
@@ -51,6 +52,7 @@ public sealed record ReconciliationResult
     public DateTime ReconciledAt         { get; init; }
 }
 
+[RegisterService]
 public sealed class StateReconciliationService : IStateReconciliationService
 {
     private const int PendingOrderTimeoutMinutes = 30;

@@ -109,6 +109,12 @@ public class Position : Entity<long>
     /// </summary>
     public string? BrokerPositionId     { get; set; }
 
+    /// <summary>
+    /// The order that initially opened this position. Used for idempotency:
+    /// if the event bus retries delivery, this prevents duplicate positions.
+    /// </summary>
+    public long? OpenOrderId           { get; set; }
+
     /// <summary>UTC timestamp when this position was opened (first fill).</summary>
     public DateTime OpenedAt           { get; set; } = DateTime.UtcNow;
 
@@ -117,6 +123,9 @@ public class Position : Entity<long>
 
     /// <summary>Soft-delete flag. Filtered out by the global EF Core query filter.</summary>
     public bool    IsDeleted           { get; set; }
+
+    /// <summary>Optimistic concurrency token — auto-incremented by PostgreSQL on every update.</summary>
+    public uint    RowVersion          { get; set; }
 
     // ── Navigation properties ────────────────────────────────────────────────
 

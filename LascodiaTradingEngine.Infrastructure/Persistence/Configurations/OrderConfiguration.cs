@@ -26,6 +26,10 @@ public class OrderConfiguration : IEntityTypeConfiguration<Order>
         builder.Property(x => x.TrailingStopValue).HasPrecision(18, 8);
         builder.Property(x => x.HighestFavourablePrice).HasPrecision(18, 8);
 
+        builder.HasQueryFilter(x => !x.IsDeleted);
+
+        builder.Property(x => x.RowVersion).IsRowVersion();
+
         builder.HasIndex(x => new { x.Symbol, x.Status });
         builder.HasIndex(x => x.TradeSignalId);
         builder.HasIndex(x => x.StrategyId);

@@ -51,6 +51,12 @@ public sealed class MLFeatureImportanceTrendWorker : BackgroundService
     private readonly IServiceScopeFactory                      _scopeFactory;
     private readonly ILogger<MLFeatureImportanceTrendWorker>   _logger;
 
+    /// <summary>
+    /// Initialises the worker with a DI scope factory and a logger.
+    /// </summary>
+    /// <param name="scopeFactory">Factory used to create a fresh DI scope each polling cycle,
+    /// ensuring EF Core DbContexts are properly scoped and disposed.</param>
+    /// <param name="logger">Structured logger for trend diagnostics and alerts.</param>
     public MLFeatureImportanceTrendWorker(
         IServiceScopeFactory                     scopeFactory,
         ILogger<MLFeatureImportanceTrendWorker>  logger)
@@ -59,12 +65,24 @@ public sealed class MLFeatureImportanceTrendWorker : BackgroundService
         _logger       = logger;
     }
 
+    /// <summary>
+    /// Entry point for the hosted service. Runs a continuous polling loop that:
+    /// <list type="number">
+    ///   <item>Creates a fresh DI scope and resolves the read/write DbContexts.</item>
+    ///   <item>Reads the poll interval from <see cref="EngineConfig"/> (key
+    ///         <c>MLFeatureImpTrend:PollIntervalSeconds</c>, default 86400 s = 24 h).</item>
+    ///   <item>Delegates trend analysis to <see cref="CheckImportanceTrendsAsync"/>.</item>
+    ///   <item>Waits for the configured interval before the next cycle.</item>
+    /// </list>
+    /// </summary>
+    /// <param name="stoppingToken">Cancellation token signalled when the host is shutting down.</param>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation("MLFeatureImportanceTrendWorker started.");
 
         while (!stoppingToken.IsCancellationRequested)
         {
+            // Default poll interval (24 hours). Overridden from EngineConfig each cycle.
             int pollSecs = 86400;
 
             try
@@ -94,16 +112,26 @@ public sealed class MLFeatureImportanceTrendWorker : BackgroundService
         _logger.LogInformation("MLFeatureImportanceTrendWorker stopping.");
     }
 
+    /// <summary>
+    /// Reads configuration values and orchestrates per-symbol/timeframe trend checks.
+    /// Discovers distinct (symbol, timeframe) pairs from currently active models and
+    /// calls <see cref="CheckSymbolTfTrendAsync"/> for each, isolating failures per pair.
+    /// </summary>
+    /// <param name="readCtx">Read DbContext for querying models and their snapshots.</param>
+    /// <param name="writeCtx">Write DbContext for persisting alerts.</param>
+    /// <param name="ct">Cancellation token.</param>
     private async Task CheckImportanceTrendsAsync(
         Microsoft.EntityFrameworkCore.DbContext readCtx,
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
         CancellationToken                       ct)
     {
+        // Load configuration values once per cycle.
         int    generationsToCheck = await GetConfigAsync<int>   (readCtx, CK_Generations,    4,     ct);
         int    minGenerations     = await GetConfigAsync<int>   (readCtx, CK_MinGenerations, 3,     ct);
         double decayThreshold     = await GetConfigAsync<double>(readCtx, CK_DecayThreshold, 0.005, ct);
 
-        // Get distinct symbol/timeframe pairs from active models
+        // Only examine non-regime-specific models (RegimeScope == null) to avoid
+        // cross-contaminating trend signals between regime-partitioned model variants.
         var symbolTfPairs = await readCtx.Set<MLModel>()
             .Where(m => m.IsActive && !m.IsDeleted && m.RegimeScope == null)
             .Select(m => new { m.Symbol, m.Timeframe })
@@ -123,6 +151,7 @@ public sealed class MLFeatureImportanceTrendWorker : BackgroundService
             }
             catch (Exception ex)
             {
+                // Isolate failures — a corrupt snapshot for one pair must not block others.
                 _logger.LogWarning(ex,
                     "Feature importance trend check failed for {Symbol}/{Tf} — skipping.",
                     pair.Symbol, pair.Timeframe);
@@ -130,6 +159,42 @@ public sealed class MLFeatureImportanceTrendWorker : BackgroundService
         }
     }
 
+    /// <summary>
+    /// Performs the monotone-decay importance trend check for a single (symbol, timeframe) pair.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The algorithm loads up to <paramref name="generationsToCheck"/> model versions for this
+    /// pair (ordered oldest to newest), then for each feature checks whether its importance
+    /// score is strictly monotonically decreasing across all loaded generations. A feature
+    /// is deemed "dying" if:
+    /// <list type="bullet">
+    ///   <item>It is strictly decreasing across all consecutive generation pairs, AND</item>
+    ///   <item>Its importance in the most recent generation is below <paramref name="decayThreshold"/>.</item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// Strict monotone decrease is a conservative criterion — any non-decreasing step
+    /// (even slight plateaus) disqualifies the feature, reducing false positives.
+    /// The additional absolute threshold (<paramref name="decayThreshold"/> = 0.005 by default)
+    /// ensures that only features that have truly become negligible are flagged, not those
+    /// still carrying modest but declining weight.
+    /// </para>
+    /// <para>
+    /// A single deduplicated <see cref="AlertType.MLModelDegraded"/> alert is raised per
+    /// symbol if any dying features are found. Deduplication prevents alert flooding when
+    /// the worker runs daily and the operator has not yet acted on the previous alert.
+    /// </para>
+    /// </remarks>
+    /// <param name="symbol">Trading symbol (e.g. "EURUSD").</param>
+    /// <param name="timeframe">Candle timeframe (e.g. H1).</param>
+    /// <param name="readCtx">Read DbContext.</param>
+    /// <param name="writeCtx">Write DbContext.</param>
+    /// <param name="generationsToCheck">Maximum number of past model versions to include in the trend window.</param>
+    /// <param name="minGenerations">Minimum number of generations required to perform the check; fewer → skip.</param>
+    /// <param name="decayThreshold">Absolute importance floor below which a monotonically-declining
+    /// feature is classified as "dying".</param>
+    /// <param name="ct">Cancellation token.</param>
     private async Task CheckSymbolTfTrendAsync(
         string                                  symbol,
         Timeframe                               timeframe,
@@ -140,7 +205,9 @@ public sealed class MLFeatureImportanceTrendWorker : BackgroundService
         double                                  decayThreshold,
         CancellationToken                       ct)
     {
-        // Load the last N model generations (including superseded) ordered oldest → newest
+        // Load the last N model generations (including superseded) ordered oldest → newest.
+        // Including superseded models gives us the historical importance trajectory even
+        // after the model has been retrained and a new champion has been promoted.
         var models = await readCtx.Set<MLModel>()
             .Where(m => m.Symbol      == symbol    &&
                         m.Timeframe   == timeframe  &&
@@ -152,7 +219,8 @@ public sealed class MLFeatureImportanceTrendWorker : BackgroundService
             .AsNoTracking()
             .ToListAsync(ct);
 
-        // Re-order oldest → newest for trend computation
+        // Re-order oldest → newest so importanceMatrix[0] is the earliest generation.
+        // This is important for correct monotone-decrease direction checking (g > g-1).
         models = models.OrderBy(m => m.TrainedAt).ToList();
 
         if (models.Count < minGenerations)
@@ -163,7 +231,8 @@ public sealed class MLFeatureImportanceTrendWorker : BackgroundService
             return;
         }
 
-        // Deserialise each snapshot and extract per-feature importances
+        // Deserialise each snapshot and extract per-feature importance score arrays.
+        // Rows are indexed by generation (oldest first); columns by feature index.
         var importanceMatrix = new List<double[]>(models.Count);
         string[]? featureNames = null;
 
@@ -175,6 +244,7 @@ public sealed class MLFeatureImportanceTrendWorker : BackgroundService
                 if (snap?.FeatureImportanceScores is { Length: > 0 })
                 {
                     importanceMatrix.Add(snap.FeatureImportanceScores);
+                    // Capture feature names from the first valid snapshot encountered.
                     featureNames ??= snap.Features.Length > 0 ? snap.Features : null;
                 }
             }
@@ -183,6 +253,8 @@ public sealed class MLFeatureImportanceTrendWorker : BackgroundService
 
         if (importanceMatrix.Count < minGenerations) return;
 
+        // Use the minimum feature count across all generations to avoid index-out-of-range
+        // when a retrain added or removed features between generations.
         int featureCount = importanceMatrix.Min(x => x.Length);
         if (featureCount == 0) return;
 
@@ -190,7 +262,10 @@ public sealed class MLFeatureImportanceTrendWorker : BackgroundService
 
         for (int j = 0; j < featureCount; j++)
         {
-            // Check strict monotone decrease across generations
+            // Check strict monotone decrease across generations.
+            // importanceMatrix[g][j] must be strictly less than importanceMatrix[g-1][j]
+            // for every consecutive pair of generations. Any plateau or increase resets
+            // the flag, preventing noisy features from triggering false positives.
             bool isDecreasing = true;
             for (int g = 1; g < importanceMatrix.Count; g++)
             {
@@ -201,6 +276,8 @@ public sealed class MLFeatureImportanceTrendWorker : BackgroundService
                 }
             }
 
+            // The absolute value guard (< decayThreshold) ensures we only report features
+            // that have decayed to near-zero importance, not merely slightly declining ones.
             double latestImportance = importanceMatrix[^1][j];
             if (isDecreasing && latestImportance < decayThreshold)
             {
@@ -223,7 +300,9 @@ public sealed class MLFeatureImportanceTrendWorker : BackgroundService
             symbol, timeframe, dyingFeatures.Count,
             string.Join(", ", dyingFeatures.Select(f => $"{f.Name}({f.LatestImportance:F4})")));
 
-        // Deduplicate alert
+        // Deduplicate alert: only raise a new alert if no active MLModelDegraded alert
+        // already exists for this symbol. This avoids spamming the alert channel on
+        // each daily cycle when the operator has not yet acted.
         bool alertExists = await readCtx.Set<Alert>()
             .AnyAsync(a => a.Symbol    == symbol                       &&
                            a.AlertType == AlertType.MLModelDegraded    &&
@@ -240,6 +319,8 @@ public sealed class MLFeatureImportanceTrendWorker : BackgroundService
                 ConditionJson = System.Text.Json.JsonSerializer.Serialize(new
                 {
                     reason           = "feature_importance_monotone_decay",
+                    // Full list of dying features with their latest importance value
+                    // so the ML-ops team can decide which to prune in the next retrain.
                     dyingFeatures    = dyingFeatures.Select(f => new
                     {
                         index            = f.Index,
@@ -257,6 +338,15 @@ public sealed class MLFeatureImportanceTrendWorker : BackgroundService
         }
     }
 
+    /// <summary>
+    /// Reads a typed configuration value from the <see cref="EngineConfig"/> table.
+    /// Returns <paramref name="defaultValue"/> when the key is absent or cannot be converted.
+    /// </summary>
+    /// <typeparam name="T">Target type (e.g. <see cref="int"/>, <see cref="double"/>).</typeparam>
+    /// <param name="ctx">EF Core DbContext to query.</param>
+    /// <param name="key">Configuration key.</param>
+    /// <param name="defaultValue">Fallback value.</param>
+    /// <param name="ct">Cancellation token.</param>
     private static async Task<T> GetConfigAsync<T>(
         Microsoft.EntityFrameworkCore.DbContext ctx,
         string                                  key,

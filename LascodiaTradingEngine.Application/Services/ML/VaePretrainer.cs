@@ -1,3 +1,4 @@
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
@@ -10,6 +11,7 @@ namespace LascodiaTradingEngine.Application.Services.ML;
 /// Architecture: x (F) → Dense(H, ReLU) → [μ (L), log_σ² (L)]
 /// Training minimises ELBO = reconstruction_BCE + KL_divergence.
 /// </summary>
+[RegisterService]
 public sealed class VaePretrainer : IVaePretrainer
 {
     private const int    HiddenDim = 32;

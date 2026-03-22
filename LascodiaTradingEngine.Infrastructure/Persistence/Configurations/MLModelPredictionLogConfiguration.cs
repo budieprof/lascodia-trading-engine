@@ -24,6 +24,8 @@ public class MLModelPredictionLogConfiguration : IEntityTypeConfiguration<MLMode
         builder.Property(x => x.EnsembleDisagreement).HasPrecision(5, 4);
         builder.Property(x => x.ContributionsJson).HasMaxLength(500);
 
+        builder.HasQueryFilter(x => !x.IsDeleted);
+
         builder.HasIndex(x => x.TradeSignalId);
         builder.HasIndex(x => new { x.MLModelId, x.ModelRole });
         // Deduplication guard: one prediction log per (signal, model) pair.

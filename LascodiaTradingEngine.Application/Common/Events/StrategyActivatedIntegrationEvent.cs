@@ -11,6 +11,9 @@ namespace LascodiaTradingEngine.Application.Common.Events;
 /// </summary>
 public record StrategyActivatedIntegrationEvent : IntegrationEvent
 {
+    /// <summary>Monotonic sequence number for ordering detection.</summary>
+    public long       SequenceNumber { get; init; } = EventSequence.Next();
+
     /// <summary>The activated strategy's database Id.</summary>
     public long       StrategyId   { get; init; }
 

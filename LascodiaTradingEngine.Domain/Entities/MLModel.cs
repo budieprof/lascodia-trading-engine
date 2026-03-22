@@ -254,6 +254,9 @@ public class MLModel : Entity<long>
     /// <summary>Soft-delete flag. Filtered out by the global EF Core query filter.</summary>
     public bool    IsDeleted               { get; set; }
 
+    /// <summary>Optimistic concurrency token — auto-incremented by PostgreSQL on every update.</summary>
+    public uint    RowVersion              { get; set; }
+
     // ── Navigation properties ────────────────────────────────────────────────
 
     /// <summary>Training runs that produced or are associated with this model.</summary>

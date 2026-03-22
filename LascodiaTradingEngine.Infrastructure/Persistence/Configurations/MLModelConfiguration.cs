@@ -31,6 +31,10 @@ public class MLModelConfiguration : IEntityTypeConfiguration<MLModel>
         builder.Property(x => x.PlattB).HasPrecision(10, 6);
         builder.Property(x => x.RegimeScope).HasMaxLength(20);
 
+        builder.HasQueryFilter(x => !x.IsDeleted);
+
+        builder.Property(x => x.RowVersion).IsRowVersion();
+
         builder.HasIndex(x => new { x.Symbol, x.Timeframe, x.IsActive });
         builder.HasIndex(x => new { x.Symbol, x.Timeframe, x.RegimeScope, x.IsActive });
 

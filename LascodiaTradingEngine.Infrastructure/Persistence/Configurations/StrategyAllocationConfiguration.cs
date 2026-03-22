@@ -14,6 +14,8 @@ public class StrategyAllocationConfiguration : IEntityTypeConfiguration<Strategy
         builder.Property(x => x.Weight).HasPrecision(18, 8);
         builder.Property(x => x.RollingSharpRatio).HasPrecision(18, 8);
 
+        builder.HasQueryFilter(x => !x.IsDeleted);
+
         builder.HasIndex(x => x.StrategyId).IsUnique();
 
         builder.HasOne(x => x.Strategy)

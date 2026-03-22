@@ -1,4 +1,6 @@
+using Microsoft.Extensions.DependencyInjection;
 using LascodiaTradingEngine.Application.Backtesting.Models;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
@@ -18,6 +20,7 @@ public interface IBacktestEngine
 
 // ── Implementation ────────────────────────────────────────────────────────────
 
+[RegisterService(ServiceLifetime.Singleton)]
 public class BacktestEngine : IBacktestEngine
 {
     private readonly IEnumerable<IStrategyEvaluator> _evaluators;

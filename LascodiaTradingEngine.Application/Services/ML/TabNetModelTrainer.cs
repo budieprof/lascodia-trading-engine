@@ -1,7 +1,9 @@
 using System.Buffers;
 using System.Text.Json;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.MLModels.Shared;
+using LascodiaTradingEngine.Domain.Enums;
 using Microsoft.Extensions.Logging;
 
 namespace LascodiaTradingEngine.Application.Services.ML;
@@ -45,6 +47,7 @@ namespace LascodiaTradingEngine.Application.Services.ML;
 /// </list>
 /// </para>
 /// </summary>
+[RegisterKeyedService(typeof(IMLModelTrainer), LearnerArchitecture.TabNet)]
 public sealed class TabNetModelTrainer : IMLModelTrainer
 {
     // ── Constants ─────────────────────────────────────────────────────────────

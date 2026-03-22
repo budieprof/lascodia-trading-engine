@@ -1,3 +1,4 @@
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
@@ -10,6 +11,7 @@ namespace LascodiaTradingEngine.Application.Services.ML;
 /// bilinear prediction network (Rec #49). Minimises InfoNCE loss: the positive future
 /// embedding should score higher than K=9 random negatives when predicted from context.
 /// </summary>
+[RegisterService]
 public sealed class CpcPretrainer : ICpcPretrainer
 {
     private const int    Epochs = 30;

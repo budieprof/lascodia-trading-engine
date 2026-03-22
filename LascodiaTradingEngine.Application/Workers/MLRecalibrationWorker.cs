@@ -46,6 +46,15 @@ public sealed class MLRecalibrationWorker : BackgroundService
     private readonly IMemoryCache                      _cache;
     private readonly ILogger<MLRecalibrationWorker>    _logger;
 
+    /// <summary>
+    /// Initialises the worker with its required dependencies.
+    /// </summary>
+    /// <param name="scopeFactory">Creates scoped DI scopes per polling cycle.</param>
+    /// <param name="cache">
+    /// Shared in-memory cache. Used to evict the <c>MLSnapshot:{modelId}</c> entry so the
+    /// <c>MLSignalScorer</c> reloads the patched snapshot on its next scoring call.
+    /// </param>
+    /// <param name="logger">Structured logger.</param>
     public MLRecalibrationWorker(
         IServiceScopeFactory             scopeFactory,
         IMemoryCache                     cache,
@@ -56,16 +65,24 @@ public sealed class MLRecalibrationWorker : BackgroundService
         _logger       = logger;
     }
 
+    /// <summary>
+    /// Main hosted-service loop. Polls at the interval configured under
+    /// <c>MLRecalibration:PollIntervalSeconds</c> (default 3600 s / 1 h).
+    /// Each cycle creates a fresh DI scope and delegates to <see cref="RecalibrateActiveModelsAsync"/>.
+    /// </summary>
+    /// <param name="stoppingToken">Signals graceful shutdown requested by the host.</param>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation("MLRecalibrationWorker started.");
 
         while (!stoppingToken.IsCancellationRequested)
         {
+            // Default poll interval — refreshed from EngineConfig each cycle.
             int pollSecs = 3600;
 
             try
             {
+                // Fresh scope per cycle prevents stale EF change-tracker state.
                 await using var scope = _scopeFactory.CreateAsyncScope();
                 var readDb  = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
                 var writeDb = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
@@ -93,11 +110,18 @@ public sealed class MLRecalibrationWorker : BackgroundService
 
     // ── Per-poll recalibration loop ───────────────────────────────────────────
 
+    /// <summary>
+    /// Loads global recalibration configuration then iterates over every active model,
+    /// delegating to <see cref="RecalibrateModelAsync"/> for the actual calibration update.
+    /// Errors for individual models are caught and logged so a single bad model cannot
+    /// stall calibration of the remaining models.
+    /// </summary>
     private async Task RecalibrateActiveModelsAsync(
         Microsoft.EntityFrameworkCore.DbContext readCtx,
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
         CancellationToken                       ct)
     {
+        // Pull all recalibration hyperparameters from live EngineConfig.
         int windowDays  = await GetConfigAsync<int>(readCtx,    CK_WindowDays,  30,    ct);
         int minSamples  = await GetConfigAsync<int>(readCtx,    CK_MinSamples,  50,    ct);
         double maxEce   = await GetConfigAsync<double>(readCtx, CK_MaxEce,      0.07,  ct);
@@ -130,6 +154,36 @@ public sealed class MLRecalibrationWorker : BackgroundService
         }
     }
 
+    /// <summary>
+    /// Recalibrates a single model's Platt (A, B) parameters and isotonic breakpoints
+    /// by fitting them on recent resolved prediction logs and patching <c>ModelBytes</c>
+    /// only when the new calibration demonstrably reduces ECE.
+    ///
+    /// <b>Algorithm:</b>
+    /// <list type="number">
+    ///   <item>Skip if a full retrain is already queued — the retrain will produce fresh calibration.</item>
+    ///   <item>Load resolved logs from the last <paramref name="windowDays"/> days.</item>
+    ///   <item>Compute the current ECE from stored confidence scores; skip if already ≤ <paramref name="maxEce"/>.</item>
+    ///   <item>Build temporal decay weights: w_i = exp(−λ × days_ago), so more-recent outcomes
+    ///         influence the gradient more strongly (λ = 0 gives uniform weights).</item>
+    ///   <item>Run weighted SGD to find new Platt (A, B) parameters.</item>
+    ///   <item>Run PAVA to fit new isotonic breakpoints using the post-Platt probabilities.</item>
+    ///   <item>Accept the update only if the new ECE (computed under the new Platt parameters)
+    ///         is strictly lower than the current ECE — prevents degradation from a bad fit.</item>
+    ///   <item>Fit class-conditional Platt scalers (Buy subset / Sell subset) to correct
+    ///         direction-specific probability bias.</item>
+    ///   <item>Persist patched <c>ModelBytes</c> and evict the scorer cache entry.</item>
+    /// </list>
+    /// </summary>
+    /// <param name="model">Active model entity to recalibrate.</param>
+    /// <param name="readCtx">Read-only EF context.</param>
+    /// <param name="writeCtx">Write EF context for persisting the patched snapshot.</param>
+    /// <param name="windowDays">How many days of resolved logs to include in the fit.</param>
+    /// <param name="minSamples">Minimum resolved-log count required to proceed.</param>
+    /// <param name="maxEce">ECE ceiling; skip if current ECE is already below this value.</param>
+    /// <param name="plattLr">SGD learning rate for Platt parameter fitting.</param>
+    /// <param name="plattEpochs">Number of SGD epochs for Platt fitting.</param>
+    /// <param name="ct">Cooperative cancellation token.</param>
     private async Task RecalibrateModelAsync(
         MLModel                                 model,
         Microsoft.EntityFrameworkCore.DbContext readCtx,
@@ -141,7 +195,9 @@ public sealed class MLRecalibrationWorker : BackgroundService
         int                                     plattEpochs,
         CancellationToken                       ct)
     {
-        // Skip if a full retrain is already queued for this symbol/timeframe
+        // Skip if a full retrain is already queued for this symbol/timeframe.
+        // The retrain will produce a fresh calibration from scratch, making this lightweight
+        // recalibration redundant and potentially wasteful.
         bool retrainQueued = await readCtx.Set<MLTrainingRun>()
             .AnyAsync(r => r.Symbol == model.Symbol && r.Timeframe == model.Timeframe
                            && r.Status == RunStatus.Queued, ct);
@@ -153,7 +209,8 @@ public sealed class MLRecalibrationWorker : BackgroundService
             return;
         }
 
-        // Load resolved prediction logs within the recalibration window
+        // Load resolved prediction logs within the recalibration window.
+        // Logs must have DirectionCorrect set (the trade outcome is known).
         var since = DateTime.UtcNow.AddDays(-windowDays);
         var logs  = await readCtx.Set<MLModelPredictionLog>()
             .Where(l => l.MLModelId           == model.Id &&
@@ -172,7 +229,7 @@ public sealed class MLRecalibrationWorker : BackgroundService
             return;
         }
 
-        // Deserialise snapshot
+        // Deserialise snapshot to access existing Platt parameters and isotonic breakpoints.
         ModelSnapshot? snap;
         try
         {
@@ -187,7 +244,8 @@ public sealed class MLRecalibrationWorker : BackgroundService
 
         if (snap is null) return;
 
-        // Compute current ECE from prediction logs (using stored predicted probability)
+        // Compute current ECE from prediction logs (using stored predicted probability).
+        // This is the baseline to beat; if already acceptable, skip the recalibration work.
         double currentEce = ComputeEceFromLogs(logs);
         _logger.LogDebug(
             "Model {Symbol}/{Tf} id={Id}: ECE={Ece:F4} (max={Max:F4}, samples={N})",
@@ -201,16 +259,24 @@ public sealed class MLRecalibrationWorker : BackgroundService
             return;
         }
 
-        // Build per-log temporal decay weights (more recent = higher weight)
+        // Build per-log temporal decay weights: w_i = exp(−λ × days_since_prediction).
+        // λ=0 → uniform weights; λ>0 → exponential decay giving more weight to recent logs.
+        // This means the Platt parameters will be pulled more strongly by recent market conditions.
         double recalDecayLambda = await GetConfigAsync<double>(readCtx, "MLRecalibration:DecayLambda", 0.0, ct);
         double[] logWeights = BuildTemporalWeights(logs, recalDecayLambda);
 
-        // Refit Platt scaling (A, B) using temporally-weighted SGD on the resolved prediction logs
+        // Refit Platt scaling (A, B) using temporally-weighted SGD on the resolved prediction logs.
+        // Platt scaling maps a raw logit f to a calibrated probability: σ(A·f + B)
+        // where σ is the sigmoid function. A=1, B=0 is the identity (no change).
         var (newPlattA, newPlattB) = RefitPlattFromLogs(logs, logWeights, plattLr, plattEpochs);
 
-        // Refit isotonic calibration breakpoints
+        // Refit isotonic calibration breakpoints using PAVA on Platt-transformed scores.
+        // Isotonic regression produces a non-decreasing monotone mapping from calibrated
+        // probability to empirical accuracy, correcting systematic over/under-confidence.
         var newIsotonicBp = RefitIsotonicFromLogs(logs, newPlattA, newPlattB);
 
+        // Verify that the new Platt parameters actually improve ECE before committing.
+        // If the new fit is worse than the current calibration, discard it.
         double newEce = ComputeEceFromLogsWithPlatt(logs, newPlattA, newPlattB);
         if (newEce >= currentEce)
         {
@@ -220,13 +286,17 @@ public sealed class MLRecalibrationWorker : BackgroundService
             return;
         }
 
-        // Refit class-conditional Platt (separate scalers for Buy and Sell)
+        // Refit class-conditional Platt (separate scalers for Buy and Sell).
+        // Buy-predicted logs (confidence ≥ 0.5) and Sell-predicted logs (< 0.5) may have
+        // systematically different calibration errors; fitting separate (A, B) pairs corrects this.
         var (newABuy, newBBuy, newASell, newBSell) = RefitClassConditionalPlatt(logs, plattLr, plattEpochs);
 
-        // Patch snapshot with new calibration parameters
+        // Patch snapshot with new calibration parameters.
         snap.PlattA              = newPlattA;
         snap.PlattB              = newPlattB;
         snap.IsotonicBreakpoints = newIsotonicBp;
+        // Only update class-conditional Platt if the fitting produced non-zero parameters
+        // (FitSgd returns (0, 0) when a class has fewer than 5 samples).
         if (newABuy  != 0.0) { snap.PlattABuy  = newABuy;  snap.PlattBBuy  = newBBuy;  }
         if (newASell != 0.0) { snap.PlattASell = newASell; snap.PlattBSell = newBSell; }
 
@@ -241,11 +311,14 @@ public sealed class MLRecalibrationWorker : BackgroundService
             return;
         }
 
+        // Persist the patched snapshot bytes directly into ModelBytes using a targeted update
+        // (avoids loading the full entity into EF change tracker).
         await writeCtx.Set<MLModel>()
             .Where(m => m.Id == model.Id)
             .ExecuteUpdateAsync(s => s.SetProperty(m => m.ModelBytes, updatedBytes), ct);
 
-        // Invalidate scorer cache
+        // Evict the scorer's 30-min cache entry so MLSignalScorer picks up the new parameters
+        // on its very next scoring call, rather than continuing to use the stale snapshot.
         _cache.Remove($"{SnapshotCacheKeyPrefix}{model.Id}");
 
         _logger.LogInformation(
@@ -257,6 +330,17 @@ public sealed class MLRecalibrationWorker : BackgroundService
 
     // ── Calibration helpers ───────────────────────────────────────────────────
 
+    /// <summary>
+    /// Computes Expected Calibration Error (ECE) directly from stored
+    /// <see cref="MLModelPredictionLog.ConfidenceScore"/> values using 10 equal-width bins.
+    ///
+    /// A prediction is considered "correct" when the relationship between confidence and
+    /// direction matches: confidence ≥ 0.5 ⟺ DirectionCorrect is true.
+    ///
+    /// ECE = Σ_m (|B_m| / n) × |acc(B_m) − conf(B_m)|
+    /// </summary>
+    /// <param name="logs">Resolved prediction logs with non-null <c>DirectionCorrect</c>.</param>
+    /// <returns>ECE in [0, 1]. Lower is better calibrated.</returns>
     private static double ComputeEceFromLogs(IReadOnlyList<MLModelPredictionLog> logs)
     {
         if (logs.Count == 0) return 0.0;
@@ -270,6 +354,8 @@ public sealed class MLRecalibrationWorker : BackgroundService
             double p   = (double)log.ConfidenceScore;
             int    bin = Math.Clamp((int)(p * NumBins), 0, NumBins - 1);
             binConfSum[bin] += p;
+            // A prediction is deemed correct when the confidence side (≥0.5 = Buy intent)
+            // matches whether the trade direction was correct.
             bool correct = (p >= 0.5) == (log.DirectionCorrect == true);
             if (correct) binCorrect[bin]++;
             binCount[bin]++;
@@ -287,6 +373,18 @@ public sealed class MLRecalibrationWorker : BackgroundService
         return ece;
     }
 
+    /// <summary>
+    /// Computes ECE after applying Platt scaling to the stored confidence scores.
+    /// Used to evaluate whether the newly fitted Platt (A, B) parameters produce a
+    /// lower ECE than the currently stored parameters before committing the update.
+    ///
+    /// Platt transform: calibP = σ(A × logit(rawP) + B)
+    /// where logit(p) = log(p / (1 − p)) and σ is the sigmoid function.
+    /// </summary>
+    /// <param name="logs">Resolved prediction logs.</param>
+    /// <param name="plattA">Scale parameter A for the Platt sigmoid.</param>
+    /// <param name="plattB">Bias parameter B for the Platt sigmoid.</param>
+    /// <returns>ECE in [0, 1] after applying the Platt transform.</returns>
     private static double ComputeEceFromLogsWithPlatt(
         IReadOnlyList<MLModelPredictionLog> logs,
         double                              plattA,
@@ -301,6 +399,7 @@ public sealed class MLRecalibrationWorker : BackgroundService
         foreach (var log in logs)
         {
             double rawP    = (double)log.ConfidenceScore;
+            // Apply Platt scaling: logit(rawP) → A·logit + B → sigmoid → calibP
             double logit   = MLFeatureHelper.Logit(rawP);
             double calibP  = MLFeatureHelper.Sigmoid(plattA * logit + plattB);
             int    bin     = Math.Clamp((int)(calibP * NumBins), 0, NumBins - 1);
@@ -325,7 +424,17 @@ public sealed class MLRecalibrationWorker : BackgroundService
     /// <summary>
     /// Builds per-log temporal decay weights: w_i = exp(−λ × days_since_prediction).
     /// Normalised to sum to logs.Count. When λ = 0, returns uniform weights (all = 1.0).
+    ///
+    /// The normalisation ensures the effective gradient magnitude in SGD is the same
+    /// regardless of λ, so the learning rate does not need to be adjusted when enabling decay.
     /// </summary>
+    /// <param name="logs">Prediction logs ordered by time (oldest to newest).</param>
+    /// <param name="lambda">
+    /// Exponential decay rate in units of 1/days.
+    /// λ = 0   → uniform weights (no temporal preference).
+    /// λ = 0.1 → weight halves every ≈ 7 days.
+    /// </param>
+    /// <returns>Array of non-negative weights, one per log, normalised to sum to <c>logs.Count</c>.</returns>
     private static double[] BuildTemporalWeights(
         IReadOnlyList<MLModelPredictionLog> logs,
         double                              lambda)
@@ -336,6 +445,7 @@ public sealed class MLRecalibrationWorker : BackgroundService
 
         if (lambda <= 0.0)
         {
+            // Uniform weights — all samples equally influential.
             for (int i = 0; i < n; i++) weights[i] = 1.0;
             return weights;
         }
@@ -344,21 +454,42 @@ public sealed class MLRecalibrationWorker : BackgroundService
         for (int i = 0; i < n; i++)
         {
             double days = (now - logs[i].PredictedAt).TotalDays;
+            // Exponential decay: older samples receive geometrically smaller weights.
             weights[i]  = Math.Exp(-lambda * days);
             sum        += weights[i];
         }
-        // Normalise so that the effective gradient scale equals the unweighted scale
+        // Normalise so that the effective gradient scale equals the unweighted scale.
+        // Without this, a high-λ config would produce tiny gradients and slow convergence.
         if (sum > 1e-15)
             for (int i = 0; i < n; i++) weights[i] = weights[i] / sum * n;
         return weights;
     }
 
+    /// <summary>
+    /// Fits Platt scaling parameters (A, B) via weighted mini-batch SGD (full-batch gradient
+    /// descent over the provided logs, repeated for <paramref name="epochs"/> iterations).
+    ///
+    /// Platt scaling model:  calibP = σ(A × logit(rawP) + B)
+    /// Loss:                 binary cross-entropy L = −[y log(calibP) + (1−y) log(1−calibP)]
+    /// Gradients:            ∂L/∂A = (calibP − y) × logit(rawP)
+    ///                       ∂L/∂B = (calibP − y)
+    /// Update rule:          A ← A − lr × Σ(w_i × ∂L_i/∂A) / Σ(w_i)
+    ///                       B ← B − lr × Σ(w_i × ∂L_i/∂B) / Σ(w_i)
+    ///
+    /// Initialised at A=1, B=0 (identity — no calibration change from the start).
+    /// </summary>
+    /// <param name="logs">Resolved prediction logs to fit on.</param>
+    /// <param name="sampleWeights">Per-sample weights (from <see cref="BuildTemporalWeights"/>).</param>
+    /// <param name="lr">SGD learning rate.</param>
+    /// <param name="epochs">Number of full-pass gradient descent iterations.</param>
+    /// <returns>Fitted (A, B) Platt parameters.</returns>
     private static (double A, double B) RefitPlattFromLogs(
         IReadOnlyList<MLModelPredictionLog> logs,
         double[]                            sampleWeights,
         double                              lr,
         int                                 epochs)
     {
+        // Initialise at identity: A=1, B=0 means calibP = σ(logit(rawP)) = rawP (no change).
         double plattA = 1.0, plattB = 0.0;
 
         for (int epoch = 0; epoch < epochs; epoch++)
@@ -372,12 +503,14 @@ public sealed class MLRecalibrationWorker : BackgroundService
                 double logit  = MLFeatureHelper.Logit(rawP);
                 double calibP = MLFeatureHelper.Sigmoid(plattA * logit + plattB);
                 double y      = log.DirectionCorrect == true ? 1.0 : 0.0;
+                // Gradient of cross-entropy loss with respect to A and B.
                 double err    = (calibP - y) * w;
                 dA   += err * logit;
                 dB   += err;
                 wSum += w;
             }
             if (wSum < 1e-15) break;
+            // Weighted average gradient update step.
             plattA -= lr * dA / wSum;
             plattB -= lr * dB / wSum;
         }
@@ -385,6 +518,27 @@ public sealed class MLRecalibrationWorker : BackgroundService
         return (plattA, plattB);
     }
 
+    /// <summary>
+    /// Refits isotonic regression calibration breakpoints using the Pool Adjacent Violators
+    /// Algorithm (PAVA) applied to Platt-transformed confidence scores.
+    ///
+    /// Isotonic regression finds the closest non-decreasing step function to the empirical
+    /// accuracy curve. The result is a monotone mapping from predicted probability → true
+    /// empirical accuracy that can be stored as interleaved [x₀,y₀, x₁,y₁, …] breakpoints.
+    ///
+    /// PAVA algorithm:
+    /// For each new point (P_i, y_i), push it onto the stack.
+    /// While the new block's mean y is less than the previous block's mean y, merge them
+    /// (pool the violating pair into a single block whose y = pooled mean).
+    /// This enforces non-decreasingness across all blocks.
+    /// </summary>
+    /// <param name="logs">Resolved prediction logs.</param>
+    /// <param name="plattA">Platt A parameter for pre-transforming confidence scores.</param>
+    /// <param name="plattB">Platt B parameter for pre-transforming confidence scores.</param>
+    /// <returns>
+    /// Interleaved [x, y] breakpoints: x = mean calibP in the PAVA block, y = mean label.
+    /// Returns an empty array when fewer than 10 samples are available.
+    /// </returns>
     private static double[] RefitIsotonicFromLogs(
         IReadOnlyList<MLModelPredictionLog> logs,
         double                              plattA,
@@ -392,6 +546,7 @@ public sealed class MLRecalibrationWorker : BackgroundService
     {
         if (logs.Count < 10) return [];
 
+        // Apply Platt transform and pair with binary labels, sorted by ascending calibP.
         var pairs = logs
             .Select(l =>
             {
@@ -402,17 +557,22 @@ public sealed class MLRecalibrationWorker : BackgroundService
             .OrderBy(x => x.P)
             .ToList();
 
-        // Pool Adjacent Violators Algorithm (PAVA)
+        // Pool Adjacent Violators Algorithm (PAVA).
+        // Each stack entry is a "block" of merged samples: (sumY, sumP, count).
+        // Block mean y = sumY / count; block mean P = sumP / count.
         var stack = new List<(double SumY, double SumP, int Count)>(pairs.Count);
         foreach (var (P, Y) in pairs)
         {
             stack.Add((Y, P, 1));
+            // Merge while the previous block's average accuracy > current block's average accuracy.
+            // This enforces the non-decreasing constraint of isotonic regression.
             while (stack.Count >= 2)
             {
                 var last = stack[^1];
                 var prev = stack[^2];
                 if (prev.SumY / prev.Count > last.SumY / last.Count)
                 {
+                    // Violation: pool the two blocks into one with combined statistics.
                     stack.RemoveAt(stack.Count - 1);
                     stack[^1] = (prev.SumY + last.SumY,
                                  prev.SumP + last.SumP,
@@ -422,11 +582,12 @@ public sealed class MLRecalibrationWorker : BackgroundService
             }
         }
 
+        // Emit interleaved [x, y] breakpoint pairs: x = mean calibP, y = mean empirical accuracy.
         var bp = new double[stack.Count * 2];
         for (int i = 0; i < stack.Count; i++)
         {
-            bp[i * 2]     = stack[i].SumP / stack[i].Count;
-            bp[i * 2 + 1] = stack[i].SumY / stack[i].Count;
+            bp[i * 2]     = stack[i].SumP / stack[i].Count; // x: mean probability in block
+            bp[i * 2 + 1] = stack[i].SumY / stack[i].Count; // y: mean accuracy in block
         }
         return bp;
     }
@@ -437,7 +598,20 @@ public sealed class MLRecalibrationWorker : BackgroundService
     /// Refits separate Platt scalers for the Buy-predicted subset (ConfidenceScore ≥ 0.5)
     /// and the Sell-predicted subset (ConfidenceScore &lt; 0.5) of the resolved prediction logs.
     /// Returns (0,0,0,0) when either class subset has fewer than 5 samples.
+    ///
+    /// Motivation: a model that is well-calibrated overall may still be systematically
+    /// over-confident on Buy signals or under-confident on Sell signals. Class-conditional
+    /// Platt scalers correct this asymmetric bias by fitting independent (A, B) pairs for
+    /// each predicted class, ensuring that P(correct | Buy prediction) and
+    /// P(correct | Sell prediction) are both accurately reflected in the output probability.
     /// </summary>
+    /// <param name="logs">Resolved prediction logs to split and fit on.</param>
+    /// <param name="lr">SGD learning rate for the per-class SGD fits.</param>
+    /// <param name="epochs">Number of SGD epochs per class.</param>
+    /// <returns>
+    /// (ABuy, BBuy, ASell, BSell) — Platt (A, B) pairs for each class.
+    /// Returns (0, 0, 0, 0) if either class has fewer than 5 samples.
+    /// </returns>
     private static (double ABuy, double BBuy, double ASell, double BSell)
         RefitClassConditionalPlatt(
             IReadOnlyList<MLModelPredictionLog> logs,
@@ -447,6 +621,7 @@ public sealed class MLRecalibrationWorker : BackgroundService
         var buyPairs  = new List<(double Logit, double Y)>();
         var sellPairs = new List<(double Logit, double Y)>();
 
+        // Partition logs into Buy-predicted (confidence ≥ 0.5) and Sell-predicted (< 0.5).
         foreach (var log in logs)
         {
             double rawP  = (double)log.ConfidenceScore;
@@ -456,8 +631,10 @@ public sealed class MLRecalibrationWorker : BackgroundService
             else             sellPairs.Add((logit, y));
         }
 
+        // Local SGD fitter: standard Platt mini-batch SGD for a single (logit, label) dataset.
         static (double A, double B) FitSgd(List<(double Logit, double Y)> pairs, double lr, int epochs)
         {
+            // Return (0, 0) sentinel when not enough samples for a reliable fit.
             if (pairs.Count < 5) return (0.0, 0.0);
             double a = 1.0, b = 0.0;
             for (int ep = 0; ep < epochs; ep++)
@@ -484,6 +661,15 @@ public sealed class MLRecalibrationWorker : BackgroundService
 
     // ── Config helper ─────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Reads a typed value from the <see cref="EngineConfig"/> table by key.
+    /// Falls back to <paramref name="defaultValue"/> when the key is missing or unparseable.
+    /// </summary>
+    /// <typeparam name="T">Target CLR type.</typeparam>
+    /// <param name="ctx">EF Core context to query.</param>
+    /// <param name="key">Configuration key stored in <c>EngineConfig.Key</c>.</param>
+    /// <param name="defaultValue">Fallback value.</param>
+    /// <param name="ct">Cooperative cancellation token.</param>
     private static async Task<T> GetConfigAsync<T>(
         Microsoft.EntityFrameworkCore.DbContext ctx,
         string                                  key,

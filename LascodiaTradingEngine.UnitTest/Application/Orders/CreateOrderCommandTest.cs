@@ -2,6 +2,7 @@ using FluentValidation.TestHelper;
 using Microsoft.EntityFrameworkCore;
 using Moq;
 using MockQueryable.Moq;
+using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Orders.Commands.CreateOrder;
 using LascodiaTradingEngine.Domain.Entities;
@@ -11,19 +12,21 @@ namespace LascodiaTradingEngine.UnitTest.Application.Orders;
 public class CreateOrderCommandTest
 {
     private readonly Mock<IWriteApplicationDbContext> _mockWriteContext;
+    private readonly Mock<IIntegrationEventService> _mockEventService;
     private readonly CreateOrderCommandHandler _handler;
     private readonly CreateOrderCommandValidator _validator;
 
     public CreateOrderCommandTest()
     {
-        _mockWriteContext = new Mock<IWriteApplicationDbContext>();
+        _mockWriteContext  = new Mock<IWriteApplicationDbContext>();
+        _mockEventService  = new Mock<IIntegrationEventService>();
 
         var mockDbContext = new Mock<DbContext>();
         var orders = new List<Order>().AsQueryable().BuildMockDbSet();
         mockDbContext.Setup(c => c.Set<Order>()).Returns(orders.Object);
         _mockWriteContext.Setup(c => c.GetDbContext()).Returns(mockDbContext.Object);
 
-        _handler   = new CreateOrderCommandHandler(_mockWriteContext.Object);
+        _handler   = new CreateOrderCommandHandler(_mockWriteContext.Object, _mockEventService.Object);
         _validator = new CreateOrderCommandValidator();
     }
 

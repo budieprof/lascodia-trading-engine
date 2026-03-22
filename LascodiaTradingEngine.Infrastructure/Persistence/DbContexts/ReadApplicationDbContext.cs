@@ -14,4 +14,12 @@ public class ReadApplicationDbContext
         IHttpContextAccessor httpContextAccessor)
         : base(options, httpContextAccessor, Assembly.GetExecutingAssembly()) { }
 
+    protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
+    {
+        base.OnConfiguring(optionsBuilder);
+
+        // Read context should never track entities — all queries are read-only.
+        // Individual handlers can still opt in to tracking with .AsTracking() if needed.
+        optionsBuilder.UseQueryTrackingBehavior(QueryTrackingBehavior.NoTracking);
+    }
 }

@@ -60,6 +60,11 @@ public sealed class MLRewardToRiskWorker : BackgroundService
     private readonly IServiceScopeFactory            _scopeFactory;
     private readonly ILogger<MLRewardToRiskWorker>   _logger;
 
+    /// <summary>
+    /// Initializes the worker.
+    /// </summary>
+    /// <param name="scopeFactory">Per-iteration DI scope factory.</param>
+    /// <param name="logger">Structured logger.</param>
     public MLRewardToRiskWorker(
         IServiceScopeFactory             scopeFactory,
         ILogger<MLRewardToRiskWorker>    logger)
@@ -68,6 +73,10 @@ public sealed class MLRewardToRiskWorker : BackgroundService
         _logger       = logger;
     }
 
+    /// <summary>
+    /// Background service main loop. Runs hourly by default, creating a fresh scope
+    /// per iteration and delegating to <see cref="CheckAllModelsAsync"/>.
+    /// </summary>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation("MLRewardToRiskWorker started.");
@@ -105,6 +114,11 @@ public sealed class MLRewardToRiskWorker : BackgroundService
 
     // ── Detection core ────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Loads configuration and iterates all active models, delegating the per-model
+    /// RR calculation to <see cref="CheckModelAsync"/>. Per-model errors are isolated
+    /// so a single DB error does not abort the entire iteration.
+    /// </summary>
     private async Task CheckAllModelsAsync(
         Microsoft.EntityFrameworkCore.DbContext readCtx,
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
@@ -145,6 +159,29 @@ public sealed class MLRewardToRiskWorker : BackgroundService
         }
     }
 
+    /// <summary>
+    /// Computes the realized reward-to-risk ratio for a single model by performing a
+    /// temporal join between prediction log timestamps and closed positions, then
+    /// separating matched positions into wins and losses to compute mean values.
+    /// </summary>
+    /// <remarks>
+    /// <b>Temporal join rationale:</b> Prediction logs record when a signal was scored
+    /// (<c>PredictedAt</c>); positions record when a trade was opened (<c>OpenedAt</c>).
+    /// A signal scored at T should correspond to a position opened within approximately
+    /// <paramref name="matchWindowMinutes"/> minutes of T, accounting for broker latency
+    /// and order queue delay. The closest-match approach (sort by absolute time difference,
+    /// take first) avoids double-counting while tolerating variable execution delays.
+    ///
+    /// <b>RR calculation:</b>
+    /// <code>
+    ///   RR = mean(winning position PnL) / |mean(losing position PnL)|
+    /// </code>
+    /// Values above 1.0 mean winners are larger than losers on average.
+    /// Values below the warning threshold (default 0.8) indicate the model's losses
+    /// are disproportionately large relative to wins. Values below the critical threshold
+    /// (default 0.5) indicate a materially loss-making size asymmetry.
+    /// When there are no matched losses in the window, RR is reported as +∞ and no alert fires.
+    /// </remarks>
     private async Task CheckModelAsync(
         long                                    modelId,
         string                                  symbol,
@@ -159,7 +196,8 @@ public sealed class MLRewardToRiskWorker : BackgroundService
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
         CancellationToken                       ct)
     {
-        // Load resolved prediction log timestamps
+        // Load only the prediction timestamps for the temporal join — the full log
+        // row is not needed since position P&L comes from the Position table directly.
         var logs = await readCtx.Set<MLModelPredictionLog>()
             .Where(l => l.MLModelId        == modelId  &&
                         l.DirectionCorrect != null      &&
@@ -171,7 +209,8 @@ public sealed class MLRewardToRiskWorker : BackgroundService
 
         if (logs.Count < minSamples) return;
 
-        // Load closed positions for the symbol in the window
+        // Load all closed positions for the symbol in the window.
+        // Closed positions have a known RealizedPnL which is used to determine win/loss.
         var positions = await readCtx.Set<Position>()
             .Where(p => p.Symbol    == symbol                &&
                         p.Status    == PositionStatus.Closed &&
@@ -183,7 +222,9 @@ public sealed class MLRewardToRiskWorker : BackgroundService
 
         if (positions.Count == 0) return;
 
-        // Temporal join: match each log to the closest position within the window
+        // ── Temporal join ─────────────────────────────────────────────────────
+        // For each resolved prediction timestamp, find the closest position opened
+        // within the match window. Positions not matched to any prediction are excluded.
         var matchTol = TimeSpan.FromMinutes(matchWindowMinutes);
         var winPnls  = new List<decimal>();
         var lossPnls = new List<decimal>();
@@ -197,6 +238,8 @@ public sealed class MLRewardToRiskWorker : BackgroundService
 
             if (match is null) continue;
 
+            // Separate into wins (positive P&L) and losses (zero or negative P&L).
+            // Note: breakeven trades (PnL == 0) are categorised as losses to be conservative.
             if (match.RealizedPnL > 0m)
                 winPnls.Add(match.RealizedPnL);
             else
@@ -207,9 +250,12 @@ public sealed class MLRewardToRiskWorker : BackgroundService
         if (matchedCount < minSamples) return;
 
         double meanWin  = winPnls.Count  > 0 ? (double)winPnls.Average()  :  0.0;
-        double meanLoss = lossPnls.Count > 0 ? (double)lossPnls.Average() :  0.0; // negative
+        double meanLoss = lossPnls.Count > 0 ? (double)lossPnls.Average() :  0.0; // negative value
 
-        // RR = mean_win / |mean_loss| — undefined (infinity) when no losses
+        // ── Reward-to-Risk ratio ──────────────────────────────────────────────
+        // RR = mean_win / |mean_loss|
+        // Special case: if there are no losses, RR is +Infinity — this is a healthy
+        // condition (all trades profitable) and should not trigger an alert.
         double rr = lossPnls.Count > 0 && Math.Abs(meanLoss) > 1e-9
             ? meanWin / Math.Abs(meanLoss)
             : double.PositiveInfinity;
@@ -220,8 +266,12 @@ public sealed class MLRewardToRiskWorker : BackgroundService
             modelId, symbol, timeframe, matchedCount,
             winPnls.Count, lossPnls.Count, meanWin, meanLoss, rr);
 
-        if (double.IsPositiveInfinity(rr)) return; // no losses — no alert
+        // No losses in the window — no adverse RR condition to report
+        if (double.IsPositiveInfinity(rr)) return;
 
+        // ── Alert severity determination ──────────────────────────────────────
+        // Two levels: warning (RR < warnRRThreshold) and critical (RR < critRRThreshold).
+        // Critical takes precedence and uses a distinct alert reason for triage.
         bool critAlert = rr < critRRThreshold;
         bool warnAlert = rr < warnRRThreshold;
 
@@ -235,6 +285,7 @@ public sealed class MLRewardToRiskWorker : BackgroundService
             "avgWin={AW:F2} avgLoss={AL:F2} matched={M}",
             modelId, symbol, timeframe, rr, severity, meanWin, meanLoss, matchedCount);
 
+        // Deduplicate: only one active MLModelDegraded alert per symbol at a time
         bool alertExists = await readCtx.Set<Alert>()
             .AnyAsync(a => a.Symbol    == symbol                  &&
                            a.AlertType == AlertType.MLModelDegraded &&
@@ -272,6 +323,10 @@ public sealed class MLRewardToRiskWorker : BackgroundService
 
     // ── Config helper ─────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Reads a typed value from <see cref="EngineConfig"/>. Returns
+    /// <paramref name="defaultValue"/> if the key is absent or unparseable.
+    /// </summary>
     private static async Task<T> GetConfigAsync<T>(
         Microsoft.EntityFrameworkCore.DbContext ctx,
         string                                  key,

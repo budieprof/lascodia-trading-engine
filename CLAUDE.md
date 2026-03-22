@@ -62,7 +62,7 @@ Entities inherit `Entity<long>` from `SharedDomain`. All entities use a soft-del
 | Backtesting | `BacktestRun`, `OptimizationRun`, `WalkForwardRun` |
 | Other | `EconomicEvent`, `COTReport`, `EngineConfig`, `DecisionLog` |
 
-**Enums (33):** `OrderType`, `OrderStatus`, `TradeDirection`, `TradeSignalStatus`, `StrategyType`, `StrategyStatus`, `PositionDirection`, `PositionStatus`, `BrokerType`, `BrokerEnvironment`, `BrokerStatus`, `ExecutionType`, `TimeFrame`, `TradingSession`, `TrailingStopType`, `AlertType`, `AlertChannel`, `MLModelStatus`, `ModelRole`, `ShadowEvaluationStatus`, `PromotionDecision`, `OptimizationRunStatus`, `RunStatus`, `MarketRegime`, `EconomicImpact`, `EconomicEventSource`, `SentimentSource`, `ScaleType`, `ScaleOrderStatus`, `ConfigDataType`, `RecoveryMode`, `StrategyHealthStatus`, `TriggerType`
+**Enums (33):** `OrderType`, `OrderStatus`, `TradeDirection`, `TradeSignalStatus`, `StrategyType`, `StrategyStatus`, `PositionDirection`, `PositionStatus`, `BrokerType`, `BrokerEnvironment`, `BrokerStatus`, `ExecutionType`, `Timeframe`, `TradingSession`, `TrailingStopType`, `AlertType`, `AlertChannel`, `MLModelStatus`, `ModelRole`, `ShadowEvaluationStatus`, `PromotionDecision`, `OptimizationRunStatus`, `RunStatus`, `MarketRegime`, `EconomicImpact`, `EconomicEventSource`, `SentimentSource`, `ScaleType`, `ScaleOrderStatus`, `ConfigDataType`, `RecoveryMode`, `StrategyHealthStatus`, `TriggerType`
 
 ---
 
@@ -95,7 +95,6 @@ Orders/
 - **Commands** inject `IWriteApplicationDbContext`; **Queries** inject `IReadApplicationDbContext` — never both in the same handler.
 - Commands return `ResponseData<long>` (new ID) or `ResponseData<bool>`.
 - List queries accept `PagerRequest` and return `ResponseData<Pager<TDto>>`.
-- Set `BusinessId` from `ICurrentUserService` in every command handler — never trust it from the request body.
 - Publish integration events via `IEventBus` after successful writes.
 
 #### Features (33)
@@ -369,7 +368,6 @@ These types are discovered and registered **automatically by reflection** — yo
 ## Key Patterns & Rules
 
 - **Soft delete**: All entities have `IsDeleted`; EF global query filters exclude deleted rows automatically.
-- **Multi-tenancy**: Always set `BusinessId` from `ICurrentUserService` in command handlers — never from the request body.
 - **Pagination**: List queries take `PagerRequest`, return `Pager<TDto>`.
 - **Event bus**: After a successful command write, publish the relevant `IntegrationEvent` via `IEventBus`.
 - **CQRS separation**: Commands use `IWriteApplicationDbContext`; queries use `IReadApplicationDbContext`. Never inject both into a single handler.
@@ -377,3 +375,23 @@ These types are discovered and registered **automatically by reflection** — yo
 - **Strategy evaluators**: Implement `IStrategyEvaluator`; registered and resolved by strategy type enum.
 - **ML workflow**: Train → Shadow evaluation → Promotion decision → Activate (event triggers downstream workers).
 - **Broker adapters**: Implement `IBrokerOrderExecutor` + `IBrokerDataFeed`; `BrokerFailoverService` switches between brokers automatically.
+
+---
+
+## Git Submodule Rules
+
+The shared library lives in a **separate repository** at `submodules/shared/` (git submodule).
+
+- **NEVER edit files directly inside `submodules/shared/`**. Changes will be overwritten on `git submodule update`.
+- To modify the shared library, edit the **source repo** at its own path (e.g. `lascodia-trading-engine-shared-library/`), commit and push there, then update the submodule in the main repo:
+  ```bash
+  cd submodules/shared
+  git pull origin master
+  cd ../..
+  git add submodules/shared
+  git commit -m "bump shared library submodule"
+  ```
+- When cloning or pulling the main repo, always initialise submodules:
+  ```bash
+  git submodule update --init --recursive
+  ```

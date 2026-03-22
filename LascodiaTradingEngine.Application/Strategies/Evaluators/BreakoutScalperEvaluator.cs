@@ -1,5 +1,6 @@
 using System.Text.Json;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Options;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -7,7 +8,28 @@ namespace LascodiaTradingEngine.Application.Strategies.Evaluators;
 
 public class BreakoutScalperEvaluator : IStrategyEvaluator
 {
+    private readonly StrategyEvaluatorOptions _options;
+
+    public BreakoutScalperEvaluator(StrategyEvaluatorOptions options)
+    {
+        _options = options;
+    }
+
     public StrategyType StrategyType => StrategyType.BreakoutScalper;
+
+    public int MinRequiredCandles(Strategy strategy)
+    {
+        int lookbackBars = 20;
+        try
+        {
+            using var doc = JsonDocument.Parse(strategy.ParametersJson ?? "{}");
+            if (doc.RootElement.TryGetProperty("LookbackBars", out var lb) && lb.TryGetInt32(out var lbVal))
+                lookbackBars = lbVal;
+        }
+        catch { /* use default */ }
+
+        return Math.Max(lookbackBars, _options.AtrPeriodForSlTp) + 1;
+    }
 
     public Task<TradeSignal?> EvaluateAsync(
         Strategy strategy,
@@ -25,10 +47,13 @@ public class BreakoutScalperEvaluator : IStrategyEvaluator
             if (root.TryGetProperty("LookbackBars",        out var lb) && lb.TryGetInt32(out var lbVal))         lookbackBars       = lbVal;
             if (root.TryGetProperty("BreakoutMultiplier",  out var bm) && bm.TryGetDecimal(out var bmVal))       breakoutMultiplier = bmVal;
         }
-        catch { /* use defaults */ }
+        catch (JsonException) { }
 
-        // Need lookbackBars candles for ATR + 1 extra for first TR calculation
-        if (candles.Count < lookbackBars + 1)
+        lookbackBars       = Math.Clamp(lookbackBars, 2, 500);
+        breakoutMultiplier = Math.Clamp(breakoutMultiplier, 0.1m, 10m);
+
+        int requiredCandles = Math.Max(lookbackBars, _options.AtrPeriodForSlTp) + 1;
+        if (candles.Count < requiredCandles)
             return Task.FromResult<TradeSignal?>(null);
 
         int lastIndex = candles.Count - 1;
@@ -65,6 +90,25 @@ public class BreakoutScalperEvaluator : IStrategyEvaluator
             return Task.FromResult<TradeSignal?>(null);
         }
 
+        // ATR-based stop-loss and take-profit
+        decimal slAtr = CalculateAtr(candles, lastIndex, _options.AtrPeriodForSlTp);
+        if (slAtr <= 0) return Task.FromResult<TradeSignal?>(null); // degenerate data
+        decimal stopDistance   = slAtr * _options.StopLossAtrMultiplier;
+        decimal profitDistance = slAtr * _options.TakeProfitAtrMultiplier;
+
+        decimal? stopLoss;
+        decimal? takeProfit;
+        if (direction == TradeDirection.Buy)
+        {
+            stopLoss   = entryPrice - stopDistance;
+            takeProfit = entryPrice + profitDistance;
+        }
+        else
+        {
+            stopLoss   = entryPrice + stopDistance;
+            takeProfit = entryPrice - profitDistance;
+        }
+
         var now = DateTime.UtcNow;
         var signal = new TradeSignal
         {
@@ -72,13 +116,13 @@ public class BreakoutScalperEvaluator : IStrategyEvaluator
             Symbol           = strategy.Symbol,
             Direction        = direction.Value,
             EntryPrice       = entryPrice,
-            StopLoss         = null,
-            TakeProfit       = null,
-            SuggestedLotSize = 0.01m,
-            Confidence       = 0.65m,
+            StopLoss         = stopLoss,
+            TakeProfit       = takeProfit,
+            SuggestedLotSize = _options.DefaultLotSize,
+            Confidence       = _options.BreakoutConfidence,
             Status           = TradeSignalStatus.Pending,
             GeneratedAt      = now,
-            ExpiresAt        = now.AddMinutes(15)
+            ExpiresAt        = now.AddMinutes(_options.BreakoutExpiryMinutes)
         };
 
         return Task.FromResult<TradeSignal?>(signal);

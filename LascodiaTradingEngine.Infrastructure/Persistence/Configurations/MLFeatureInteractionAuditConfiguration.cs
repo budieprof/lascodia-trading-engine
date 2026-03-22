@@ -17,6 +17,8 @@ public class MLFeatureInteractionAuditConfiguration : IEntityTypeConfiguration<M
         builder.Property(x => x.FeatureNameB).IsRequired().HasMaxLength(50);
         builder.Property(x => x.InteractionScore).HasPrecision(18, 8);
 
+        builder.HasQueryFilter(x => !x.IsDeleted);
+
         builder.HasIndex(x => new { x.MLModelId, x.Rank });
         builder.HasIndex(x => new { x.MLModelId, x.IsIncludedAsFeature });
 

@@ -1,6 +1,8 @@
 using System.Text.Json;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.MLModels.Shared;
+using LascodiaTradingEngine.Domain.Enums;
 using Microsoft.Extensions.Logging;
 using TorchSharp;
 using TorchSharp.Modules;
@@ -65,6 +67,7 @@ namespace LascodiaTradingEngine.Application.Services.ML;
 /// </para>
 /// Registered as keyed <see cref="IMLModelTrainer"/> with key "dann".
 /// </summary>
+[RegisterKeyedService(typeof(IMLModelTrainer), LearnerArchitecture.Dann)]
 public sealed class DannModelTrainer : IMLModelTrainer
 {
     // ── Architecture constants ─────────────────────────────────────────────────

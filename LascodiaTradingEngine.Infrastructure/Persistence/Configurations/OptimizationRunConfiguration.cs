@@ -17,6 +17,8 @@ public class OptimizationRunConfiguration : IEntityTypeConfiguration<Optimizatio
         builder.Property(x => x.BestHealthScore).HasPrecision(5, 4);
         builder.Property(x => x.BaselineHealthScore).HasPrecision(5, 4);
 
+        builder.HasQueryFilter(x => !x.IsDeleted);
+
         builder.HasIndex(x => x.StrategyId);
         builder.HasIndex(x => new { x.StrategyId, x.Status });
 

@@ -1,6 +1,7 @@
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -11,6 +12,7 @@ namespace LascodiaTradingEngine.Application.Services.BrokerAdapters;
 /// Replace the method bodies with real HTTP calls using the OANDA SDK or HttpClient.
 /// Credentials are loaded from the active Broker/TradingAccount DB records.
 /// </summary>
+[RegisterService(ServiceLifetime.Singleton)]
 public class OandaBrokerAdapter : IBrokerDataFeed
 {
     private readonly IServiceScopeFactory _scopeFactory;

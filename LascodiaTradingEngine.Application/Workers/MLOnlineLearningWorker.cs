@@ -38,12 +38,26 @@ public sealed class MLOnlineLearningWorker : BackgroundService
     private const int    BatchSize       = 32;
     private const int    PollIntervalSec = 60;
 
+    /// <summary>
+    /// Initialises the worker with its DI scope factory and logger.
+    /// </summary>
+    /// <param name="scopeFactory">
+    /// Used to create a new DI scope per poll cycle so EF Core scoped contexts
+    /// are correctly disposed after each batch.
+    /// </param>
+    /// <param name="logger">Structured logger scoped to this worker type.</param>
     public MLOnlineLearningWorker(IServiceScopeFactory scopeFactory, ILogger<MLOnlineLearningWorker> logger)
     {
         _scopeFactory = scopeFactory;
         _logger       = logger;
     }
 
+    /// <summary>
+    /// Hosted-service entry point. Polls every <see cref="PollIntervalSec"/> seconds (60 s)
+    /// and invokes <see cref="RunBatchAsync"/> to apply incremental SGD updates from
+    /// recently resolved trade outcomes.
+    /// </summary>
+    /// <param name="stoppingToken">Signalled when the host is shutting down.</param>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation("MLOnlineLearningWorker started.");
@@ -56,6 +70,50 @@ public sealed class MLOnlineLearningWorker : BackgroundService
         }
     }
 
+    /// <summary>
+    /// Processes a mini-batch of recently resolved prediction outcomes and applies
+    /// a single online SGD gradient step to each affected model's ensemble biases.
+    /// </summary>
+    /// <remarks>
+    /// Online / incremental learning update methodology:
+    /// <list type="number">
+    ///   <item>
+    ///     <b>Outcome discovery:</b> Query <see cref="MLModelPredictionLog"/> records
+    ///     from the last 2 hours where <c>DirectionCorrect</c> is now set (the outcome
+    ///     worker has resolved the trade) and <c>ShapValuesJson</c> is still null (used
+    ///     as a lightweight "not yet online-updated" flag to avoid reprocessing). Take
+    ///     at most <see cref="BatchSize"/> records ordered oldest-first to process in
+    ///     chronological sequence.
+    ///   </item>
+    ///   <item>
+    ///     <b>Model grouping:</b> Group logs by <c>MLModelId</c> so each model's
+    ///     weights are updated exactly once per batch call (one SaveChanges per model),
+    ///     preventing partial writes if an exception interrupts the loop mid-batch.
+    ///   </item>
+    ///   <item>
+    ///     <b>Gradient computation:</b> The raw feature vector is not stored in the
+    ///     prediction log (storing it would double DB size per prediction). Instead, a
+    ///     scalar pseudo-gradient is derived solely from the probability prediction error:
+    ///     <c>err = pHat − targetLabel</c>. This is applied as a bias correction:
+    ///     <c>bias[k] -= OnlineLr × err</c>. While less precise than a full gradient
+    ///     step, it nudges the model's calibration in the correct direction without
+    ///     requiring feature replay.
+    ///   </item>
+    ///   <item>
+    ///     <b>Catastrophic forgetting prevention:</b> The learning rate <see cref="OnlineLr"/>
+    ///     (1e-4) is intentionally tiny relative to the batch training rate (typically
+    ///     0.01–0.1). This ensures that thousands of online updates are needed to
+    ///     meaningfully shift the decision boundary, preventing any single noisy trade
+    ///     outcome from destabilising the model.
+    ///   </item>
+    ///   <item>
+    ///     <b>Bookkeeping:</b> After saving, <c>MLModel.OnlineLearningUpdateCount</c>
+    ///     and <c>LastOnlineLearningAt</c> are updated so monitoring workers can track
+    ///     how aggressively a model has drifted from its batch-trained state.
+    ///   </item>
+    /// </list>
+    /// </remarks>
+    /// <param name="ct">Cancellation token forwarded from the host.</param>
     private async Task RunBatchAsync(CancellationToken ct)
     {
         using var scope   = _scopeFactory.CreateScope();
@@ -64,7 +122,9 @@ public sealed class MLOnlineLearningWorker : BackgroundService
         var readDb   = readCtx.GetDbContext();
         var writeDb  = writeCtx.GetDbContext();
 
-        // Find recently resolved prediction logs not yet used for online learning
+        // Fetch recently resolved logs whose outcomes have not yet been applied as
+        // online learning updates. ShapValuesJson == null acts as a "pending" flag;
+        // the outcome worker sets this field after the online update is confirmed.
         var cutoff = DateTime.UtcNow.AddHours(-2);
         var logs = await readDb.Set<MLModelPredictionLog>()
             .Where(l => !l.IsDeleted
@@ -77,10 +137,13 @@ public sealed class MLOnlineLearningWorker : BackgroundService
 
         if (logs.Count == 0) return;
 
-        // Group by model
+        // Group logs by model so we perform one SaveChanges per model rather than one
+        // per log record. This keeps write amplification low for busy symbols.
         var byModel = logs.GroupBy(l => l.MLModelId);
         foreach (var group in byModel)
         {
+            // Load the live model from the write context to ensure we hold a tracked
+            // instance so EF Core detects the ModelBytes change on SaveChanges.
             var model = await writeDb.Set<MLModel>()
                 .FirstOrDefaultAsync(m => m.Id == group.Key && m.IsActive && !m.IsDeleted, ct);
             if (model?.ModelBytes == null) continue;
@@ -95,25 +158,38 @@ public sealed class MLOnlineLearningWorker : BackgroundService
 
                 foreach (var log in group)
                 {
-                    // Reconstruct feature vector from stored SHAP contributions (proxy)
+                    // Reconstruct feature vector from stored SHAP contributions (proxy).
                     // In a full implementation the raw feature vector would be stored;
-                    // here we use the stored ContributionsJson or skip
+                    // here we use the stored ContributionsJson as a presence gate — if
+                    // ContributionsJson is absent the log cannot contribute a gradient.
                     if (string.IsNullOrEmpty(log.ContributionsJson)) continue;
 
-                    // Parse top-3 feature indices from ContributionsJson
+                    // Parse top-3 feature indices from ContributionsJson.
                     // Format: [{"Feature":"Rsi","Value":0.042},...]
-                    // We do a scalar pseudo-gradient from probability error alone
+                    // We do a scalar pseudo-gradient from probability error alone because
+                    // the raw feature vector is not stored in the prediction log.
                     double targetLabel = (log.ActualDirection == log.PredictedDirection) ? 1.0 : 0.0;
                     double pHat        = (double)(log.ConfidenceScore);
-                    double err         = pHat - targetLabel;
 
-                    // Apply error-scaled weight decay to all learners' biases
-                    // (lightweight gradient signal without stored feature vector)
+                    // Cross-entropy gradient w.r.t. the logit: σ(z) − y.
+                    // This is the standard logistic regression gradient; subtracting it
+                    // (multiplied by lr) from the bias moves the model's output toward
+                    // the correct label.
+                    double err = pHat - targetLabel;
+
+                    // Apply error-scaled bias correction to all K learners in the ensemble.
+                    // Without the stored feature vector we cannot update feature weights w,
+                    // only the intercept (bias) term. This still corrects for systematic
+                    // over- or under-confidence without distorting the decision hyperplane.
                     for (int k = 0; k < K && k < snap.Biases.Length; k++)
                         snap.Biases[k] -= OnlineLr * err;
                 }
 
+                // Re-serialise the updated snapshot back into the model blob.
                 model.ModelBytes = JsonSerializer.SerializeToUtf8Bytes(snap);
+
+                // Track cumulative online updates so monitoring workers can flag models
+                // that have diverged significantly from their batch-trained baseline.
                 model.OnlineLearningUpdateCount += group.Count();
                 model.LastOnlineLearningAt       = DateTime.UtcNow;
 

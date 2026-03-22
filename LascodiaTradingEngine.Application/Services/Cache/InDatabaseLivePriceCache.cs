@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
 
@@ -14,6 +15,7 @@ namespace LascodiaTradingEngine.Application.Services.Cache;
 /// latest prices survive a process restart.
 /// Call InitializeAsync() at startup to pre-warm the dictionary from the DB.
 /// </summary>
+[RegisterService(ServiceLifetime.Singleton)]
 public class InDatabaseLivePriceCache : ILivePriceCache
 {
     private readonly ConcurrentDictionary<string, (decimal Bid, decimal Ask, DateTime Timestamp)> _store = new();

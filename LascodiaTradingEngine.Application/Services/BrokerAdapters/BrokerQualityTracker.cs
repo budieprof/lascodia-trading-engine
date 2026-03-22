@@ -2,7 +2,9 @@ using System.Collections.Concurrent;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Options;
 using LascodiaTradingEngine.Domain.Entities;
 
 namespace LascodiaTradingEngine.Application.Services.BrokerAdapters;
@@ -31,21 +33,23 @@ public interface IBrokerQualityTracker
     Task LoadHistoryAsync(CancellationToken ct);
 }
 
+[RegisterService(ServiceLifetime.Singleton)]
 public sealed class BrokerQualityTracker : IBrokerQualityTracker
 {
-    // Key: "brokerName|SYMBOL|hour" → rolling slippage values (last 100)
     private readonly ConcurrentDictionary<string, RollingWindow> _fillData = new();
-    private const int WindowSize = 100;
+    private readonly int _windowSize;
 
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<BrokerQualityTracker> _logger;
 
     public BrokerQualityTracker(
         IServiceScopeFactory scopeFactory,
-        ILogger<BrokerQualityTracker> logger)
+        ILogger<BrokerQualityTracker> logger,
+        BrokerQualityOptions options)
     {
         _scopeFactory = scopeFactory;
         _logger       = logger;
+        _windowSize   = options.WindowSize;
     }
 
     public string? GetBestBroker(string symbol)
@@ -82,7 +86,7 @@ public sealed class BrokerQualityTracker : IBrokerQualityTracker
         int hour = DateTime.UtcNow.Hour;
         string key = $"{brokerName}|{symbol.ToUpperInvariant()}|{hour}";
 
-        var window = _fillData.GetOrAdd(key, _ => new RollingWindow(WindowSize));
+        var window = _fillData.GetOrAdd(key, _ => new RollingWindow(_windowSize));
         window.Add((double)slippagePips);
 
         _logger.LogDebug(
@@ -109,7 +113,7 @@ public sealed class BrokerQualityTracker : IBrokerQualityTracker
         {
             int hour   = log.RecordedAt.Hour;
             string key = $"default|{log.Symbol.ToUpperInvariant()}|{hour}";
-            var window = _fillData.GetOrAdd(key, _ => new RollingWindow(WindowSize));
+            var window = _fillData.GetOrAdd(key, _ => new RollingWindow(_windowSize));
             window.Add((double)log.SlippagePips);
         }
 

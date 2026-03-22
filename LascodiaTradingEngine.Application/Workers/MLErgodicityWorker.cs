@@ -43,6 +43,14 @@ public sealed class MLErgodicityWorker : BackgroundService
     private readonly IServiceScopeFactory        _scopeFactory;
     private readonly ILogger<MLErgodicityWorker> _logger;
 
+    /// <summary>
+    /// Initialises the worker with its DI scope factory and logger.
+    /// </summary>
+    /// <param name="scopeFactory">
+    /// Used to create a new async DI scope per poll cycle so scoped EF Core
+    /// contexts are correctly disposed after each ergodicity computation pass.
+    /// </param>
+    /// <param name="logger">Structured logger scoped to this worker type.</param>
     public MLErgodicityWorker(
         IServiceScopeFactory         scopeFactory,
         ILogger<MLErgodicityWorker>  logger)
@@ -51,12 +59,19 @@ public sealed class MLErgodicityWorker : BackgroundService
         _logger       = logger;
     }
 
+    /// <summary>
+    /// Hosted-service entry point. Polls every <c>MLErgodicity:PollIntervalHours</c>
+    /// hours (default 24), reading the interval from <see cref="EngineConfig"/> on each
+    /// cycle so it can be hot-reloaded without a restart.
+    /// </summary>
+    /// <param name="stoppingToken">Signalled when the host is shutting down.</param>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation("MLErgodicityWorker started.");
 
         while (!stoppingToken.IsCancellationRequested)
         {
+            // Default 24-hour poll interval; refreshed from DB on every cycle.
             int pollHours = 24;
 
             try
@@ -67,6 +82,7 @@ public sealed class MLErgodicityWorker : BackgroundService
                 var ctx     = readDb.GetDbContext();
                 var wCtx    = writeDb.GetDbContext();
 
+                // Refresh all config values each cycle to support operator hot-reload.
                 pollHours      = await GetConfigAsync<int>(ctx, CK_PollHours,  24, stoppingToken);
                 int windowDays = await GetConfigAsync<int>(ctx, CK_WindowDays, 30, stoppingToken);
                 int minSamples = await GetConfigAsync<int>(ctx, CK_MinSamples, 20, stoppingToken);
@@ -90,6 +106,44 @@ public sealed class MLErgodicityWorker : BackgroundService
 
     // ── Ergodicity core ───────────────────────────────────────────────────────
 
+    /// <summary>
+    /// For each active model, computes ergodicity economics metrics from the last
+    /// <paramref name="windowDays"/> days of resolved prediction logs and persists the
+    /// results to <c>MLErgodicityLog</c>.
+    /// </summary>
+    /// <remarks>
+    /// Ergodicity economics methodology (Ole Peters, 2019):
+    ///
+    /// Classical expected-value theory maximises the ensemble average (arithmetic mean)
+    /// of outcomes across many parallel trials. However, a single trader experiences a
+    /// time sequence of outcomes, not an ensemble. For multiplicative processes (which
+    /// compounding wealth is), the long-run time average (geometric mean growth rate)
+    /// differs from the ensemble average:
+    ///   time_average = mean(log(1 + r))
+    ///   ensemble_average = mean(r)
+    ///   ergodicity_gap = ensemble_average − time_average
+    ///
+    /// A positive gap means the ensemble average overstates the long-run per-trade
+    /// growth rate. Kelly and naive position-sizing formulas derived from the ensemble
+    /// average oversize positions, leading to ruin in finite time even when expected
+    /// value is positive.
+    ///
+    /// The ergodicity-adjusted Kelly fraction corrects for this by scaling down the
+    /// naive Kelly: f_adj = f_naive × (1 − gap / variance). This produces a position
+    /// size that maximises the geometric growth rate (Peters optimal fraction) rather
+    /// than the arithmetic expectation (naive Kelly).
+    ///
+    /// Return proxy: each prediction log contributes a return of:
+    ///   r = (confidence − 0.5) if correct, −(confidence − 0.5) if incorrect.
+    /// This uses the model's stated confidence as a proxy for the magnitude of the
+    /// position's P&amp;L contribution. Positive confidence above 0.5 maps to a positive
+    /// return on a correct prediction.
+    /// </remarks>
+    /// <param name="readCtx">Read-only EF context for models and prediction logs.</param>
+    /// <param name="writeCtx">Write EF context for persisting <c>MLErgodicityLog</c> records.</param>
+    /// <param name="windowDays">Rolling history window for prediction logs.</param>
+    /// <param name="minSamples">Minimum resolved logs required before computing metrics.</param>
+    /// <param name="ct">Cancellation token forwarded from the host.</param>
     private async Task RunErgodicityAsync(
         Microsoft.EntityFrameworkCore.DbContext readCtx,
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
@@ -107,6 +161,8 @@ public sealed class MLErgodicityWorker : BackgroundService
 
         foreach (var model in models)
         {
+            // Load resolved prediction logs within the rolling window.
+            // Cap at 200 records to bound memory usage per model.
             var logs = await readCtx.Set<MLModelPredictionLog>()
                 .AsNoTracking()
                 .Where(l => l.MLModelId == model.Id && !l.IsDeleted && l.PredictedAt >= cutoff
@@ -115,6 +171,7 @@ public sealed class MLErgodicityWorker : BackgroundService
                 .Take(200)
                 .ToListAsync(ct);
 
+            // Skip models without enough resolved history for reliable metric estimates.
             if (logs.Count < minSamples)
             {
                 _logger.LogDebug("MLErgodicityWorker: model {Id} ({Sym}) skipped — only {N} logs",
@@ -122,35 +179,51 @@ public sealed class MLErgodicityWorker : BackgroundService
                 continue;
             }
 
-            // Convert to returns
+            // Convert prediction logs to return proxies.
+            // ret > 0 for correct predictions, ret < 0 for incorrect predictions.
+            // The magnitude is proportional to the model's stated confidence above 0.5.
             double[] r = new double[logs.Count];
             for (int i = 0; i < logs.Count; i++)
             {
                 double conf = (double)logs[i].ConfidenceScore;
                 r[i] = logs[i].DirectionCorrect == true
-                    ? conf - 0.5
-                    : -(conf - 0.5);
+                    ? conf - 0.5          // correct: positive return proportional to confidence
+                    : -(conf - 0.5);      // incorrect: negative return proportional to confidence
             }
 
-            // Ensemble growth rate (arithmetic mean)
+            // Ensemble growth rate: arithmetic mean of returns across all predictions.
+            // This is what naive expected-value optimisation maximises.
             double mu = r.Average();
 
-            // Peters time-average growth: mean(log(1 + max(r, -0.9999)))
+            // Peters time-average growth rate: mean of log(1 + r).
+            // This is the long-run geometric growth rate per trade for a compounding
+            // account. Clamp r to −0.9999 to prevent log(0) or log(negative).
             double timeAvg = r.Average(v => Math.Log(1.0 + Math.Max(v, -0.9999)));
 
-            // Ergodicity gap
+            // Ergodicity gap: difference between ensemble and time averages.
+            // A large positive gap indicates that naive sizing would systematically
+            // oversize positions, degrading long-run compounded wealth.
             double gap = mu - timeAvg;
 
-            // Variance of returns
+            // Variance of returns: used as the denominator in both Kelly formulas.
+            // Bessel-corrected (divide by N-1) for an unbiased sample variance.
             double sigma2 = r.Sum(v => (v - mu) * (v - mu)) / Math.Max(r.Length - 1, 1);
 
-            // Naive Kelly = mu / sigma2
+            // Naive Kelly fraction: f* = μ / σ² (continuous Kelly for log-normal returns).
+            // This maximises E[log(wealth)] ignoring the ergodicity correction.
             double naiveKelly = mu / Math.Max(sigma2, 1e-10);
 
-            // Ergodicity-adjusted Kelly: clamp to [-2, 2]
+            // Ergodicity-adjusted Kelly: scale naive Kelly by (1 − gap / σ²).
+            // This applies the Peters correction: it reduces the fraction when the
+            // ergodicity gap is positive (process is non-ergodic and multiplicative).
+            // Clamp to [−2, 2] to prevent pathological extreme values from unstable
+            // variance estimates with few samples.
             double adjKelly = naiveKelly * (1.0 - gap / Math.Max(sigma2, 1e-10));
             adjKelly = Math.Max(-2.0, Math.Min(2.0, adjKelly));
 
+            // Persist all computed metrics as a new MLErgodicityLog record.
+            // Downstream position-sizing workers read ErgodicityAdjustedKelly to
+            // determine the optimal fraction of account equity to risk per signal.
             var log = new MLErgodicityLog
             {
                 MLModelId                = model.Id,
@@ -175,6 +248,17 @@ public sealed class MLErgodicityWorker : BackgroundService
 
     // ── Config helper ─────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Reads a typed configuration value from the <see cref="EngineConfig"/> table,
+    /// falling back to <paramref name="defaultValue"/> if the key is absent or
+    /// the stored value cannot be converted to <typeparamref name="T"/>.
+    /// </summary>
+    /// <typeparam name="T">Target value type (int, double, string, etc.).</typeparam>
+    /// <param name="ctx">EF Core context to query against.</param>
+    /// <param name="key">The EngineConfig key to look up.</param>
+    /// <param name="defaultValue">Value to return when the key is missing or invalid.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>The parsed config value or <paramref name="defaultValue"/>.</returns>
     private static async Task<T> GetConfigAsync<T>(
         Microsoft.EntityFrameworkCore.DbContext ctx,
         string                                  key,

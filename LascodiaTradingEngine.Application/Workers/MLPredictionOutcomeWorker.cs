@@ -102,6 +102,35 @@ public sealed class MLPredictionOutcomeWorker : BackgroundService
 
     // ── Resolution core ───────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Resolves up to <paramref name="batchSize"/> unresolved <see cref="MLModelPredictionLog"/>
+    /// records by comparing the predicted direction against the next closed candle after each
+    /// prediction timestamp.
+    ///
+    /// <para><b>Algorithm:</b></para>
+    /// <list type="number">
+    ///   <item>Load unresolved logs older than a 5-minute safety buffer (ensures the outcome
+    ///         candle has had time to write) ordered by <c>PredictedAt</c> ascending (oldest first).</item>
+    ///   <item>Group by (symbol, timeframe) and further filter by the timeframe-specific minimum
+    ///         duration cutoff from <see cref="TimeframeMinDuration"/> — e.g. an H1 prediction
+    ///         is not resolved until at least 70 minutes have elapsed.</item>
+    ///   <item>Batch-load candles covering the group's time window (with a 2-hour lead and
+    ///         4-hour lag buffer) in a single query per group.</item>
+    ///   <item>For each log, find <c>prevCandle</c> (last closed candle at or before <c>PredictedAt</c>)
+    ///         and <c>outcomeCandle</c> (first closed candle strictly after <c>PredictedAt</c>).</item>
+    ///   <item>Apply the gap-detection guard: if the gap between <c>prevCandle</c> and
+    ///         <c>outcomeCandle</c> exceeds <paramref name="maxGapFactor"/> × the nominal candle
+    ///         interval (from <see cref="TimeframeExpectedGap"/>), mark the log as
+    ///         <c>ResolutionSource = "GapSkipped"</c> and leave <c>DirectionCorrect</c> null.
+    ///         This prevents weekend or holiday gaps from producing spurious outcomes.</item>
+    ///   <item>Compute actual direction as <c>Buy</c> when <c>outcomeCandle.Close > prevCandle.Close</c>,
+    ///         otherwise <c>Sell</c>. Record <c>ActualMagnitudePips</c> as the raw price difference
+    ///         (used by <see cref="MLDriftMonitorWorker"/> for Sharpe estimation).</item>
+    ///   <item>Persist results via <c>ExecuteUpdateAsync</c> — one UPDATE per log avoids
+    ///         loading the full entity into the change tracker.</item>
+    /// </list>
+    /// </summary>
+    /// <returns>Total number of logs that were either resolved or gap-skipped.</returns>
     private async Task<int> ResolveOutcomesAsync(
         Microsoft.EntityFrameworkCore.DbContext readCtx,
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
@@ -308,6 +337,10 @@ public sealed class MLPredictionOutcomeWorker : BackgroundService
 
     // ── Config helper ─────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Reads a typed value from <see cref="EngineConfig"/> or returns <paramref name="defaultValue"/>
+    /// when the key is absent or its stored string cannot be converted to <typeparamref name="T"/>.
+    /// </summary>
     private static async Task<T> GetConfigAsync<T>(
         Microsoft.EntityFrameworkCore.DbContext ctx,
         string                                  key,

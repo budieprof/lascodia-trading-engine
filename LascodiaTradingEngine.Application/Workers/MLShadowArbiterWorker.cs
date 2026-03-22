@@ -33,13 +33,16 @@ public sealed class MLShadowArbiterWorker : BackgroundService
 
     private readonly IServiceScopeFactory           _scopeFactory;
     private readonly ILogger<MLShadowArbiterWorker> _logger;
+    private readonly IDistributedLock                _distributedLock;
 
     public MLShadowArbiterWorker(
         IServiceScopeFactory             scopeFactory,
-        ILogger<MLShadowArbiterWorker>   logger)
+        ILogger<MLShadowArbiterWorker>   logger,
+        IDistributedLock                 distributedLock)
     {
-        _scopeFactory = scopeFactory;
-        _logger       = logger;
+        _scopeFactory    = scopeFactory;
+        _logger          = logger;
+        _distributedLock = distributedLock;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -79,6 +82,17 @@ public sealed class MLShadowArbiterWorker : BackgroundService
 
     // ── Main evaluation loop ──────────────────────────────────────────────────
 
+    /// <summary>
+    /// Loads all <see cref="MLShadowEvaluation"/> records currently in the
+    /// <see cref="ShadowEvaluationStatus.Running"/> state and processes each one.
+    ///
+    /// <para><b>Concurrency safety:</b> each evaluation is atomically claimed by flipping
+    /// its status to <see cref="ShadowEvaluationStatus.Processing"/> via a targeted
+    /// <c>ExecuteUpdateAsync</c>. If another worker instance already claimed the row
+    /// (i.e. <c>ExecuteUpdateAsync</c> returns 0 rows affected), this instance skips it.
+    /// On unexpected failure the status is reverted to <see cref="ShadowEvaluationStatus.Running"/>
+    /// so the next poll cycle can retry.</para>
+    /// </summary>
     private async Task ProcessRunningShadowEvalsAsync(
         Microsoft.EntityFrameworkCore.DbContext readCtx,
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
@@ -86,20 +100,109 @@ public sealed class MLShadowArbiterWorker : BackgroundService
     {
         double shadowMinZScore = await GetConfigAsync<double>(readCtx, CK_ShadowMinZScore, 1.645, ct);
 
-        var running = await readCtx.Set<MLShadowEvaluation>()
+        // Atomic claim: mark evaluations as "Processing" so concurrent instances
+        // don't evaluate the same shadow run. Only rows still in Running state are
+        // claimed — if another worker already flipped the status, this returns 0.
+        var claimedIds = await writeCtx.Set<MLShadowEvaluation>()
             .Where(s => s.Status == ShadowEvaluationStatus.Running && !s.IsDeleted)
-            .AsNoTracking()
+            .Select(s => s.Id)
             .ToListAsync(ct);
 
-        _logger.LogDebug("Shadow arbiter found {Count} running evaluation(s).", running.Count);
+        if (claimedIds.Count == 0)
+        {
+            _logger.LogDebug("Shadow arbiter: no running evaluations to process.");
+            return;
+        }
 
-        foreach (var shadow in running)
+        _logger.LogDebug("Shadow arbiter found {Count} running evaluation(s).", claimedIds.Count);
+
+        foreach (var shadowId in claimedIds)
         {
             ct.ThrowIfCancellationRequested();
-            await EvaluateShadowAsync(shadow, readCtx, writeCtx, shadowMinZScore, ct);
+
+            // Atomic claim: only proceed if we successfully flip status from Running.
+            // This prevents two workers from evaluating the same shadow simultaneously.
+            int claimed = await writeCtx.Set<MLShadowEvaluation>()
+                .Where(s => s.Id == shadowId && s.Status == ShadowEvaluationStatus.Running)
+                .ExecuteUpdateAsync(s => s
+                    .SetProperty(x => x.Status, ShadowEvaluationStatus.Processing), ct);
+
+            if (claimed == 0)
+            {
+                _logger.LogDebug("Shadow eval {Id}: already claimed by another worker — skipping.", shadowId);
+                continue;
+            }
+
+            try
+            {
+                var shadow = await readCtx.Set<MLShadowEvaluation>()
+                    .AsNoTracking()
+                    .FirstOrDefaultAsync(s => s.Id == shadowId, ct);
+
+                if (shadow is null) continue;
+
+                await EvaluateShadowAsync(shadow, readCtx, writeCtx, shadowMinZScore, ct);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Shadow eval {Id}: evaluation failed — reverting to Running.", shadowId);
+
+                // Revert status so the evaluation can be retried on the next cycle.
+                await writeCtx.Set<MLShadowEvaluation>()
+                    .Where(s => s.Id == shadowId)
+                    .ExecuteUpdateAsync(s => s
+                        .SetProperty(x => x.Status, ShadowEvaluationStatus.Running), ct);
+            }
         }
     }
 
+    /// <summary>
+    /// Core evaluation logic for a single <see cref="MLShadowEvaluation"/>. Loads resolved
+    /// prediction logs for both models, computes statistics, applies the decision tree, persists
+    /// the outcome, and acts on it (promote or retire the challenger).
+    ///
+    /// <para><b>Decision priority order (first matching rule wins):</b></para>
+    /// <list type="number">
+    ///   <item><b>Expiry with insufficient data</b> — if the evaluation has exceeded its
+    ///         <c>ExpiresAt</c> deadline and neither <c>hasEnoughData</c> nor <c>partialSufficient</c>
+    ///         is true, flag for human review (champion retained).</item>
+    ///   <item><b>Regime failure</b> — if the challenger underperforms the champion by ≥ threshold
+    ///         in any market regime with ≥ 10 resolved predictions, flag for review regardless of
+    ///         overall margin (prevents a model that wins on average but fails in one key regime
+    ///         from being promoted).</item>
+    ///   <item><b>SPRT early promotion</b> — if the Wald SPRT log-likelihood ratio (LLR) ≥ upper
+    ///         bound (ln((1−β)/α) ≈ 2.773 for α=0.05, β=0.20), promote immediately without
+    ///         waiting for <c>RequiredTrades</c>.</item>
+    ///   <item><b>SPRT early rejection</b> — if LLR ≤ lower bound (ln(β/(1−α)) ≈ −1.558),
+    ///         reject the challenger immediately.</item>
+    ///   <item><b>Two-proportion z-test promotion</b> — if overall accuracy margin ≥ threshold
+    ///         AND p &lt; 0.05 AND z ≥ <paramref name="shadowMinZScore"/>, promote.</item>
+    ///   <item><b>z-test inconclusive margin</b> — accuracy margin ≥ threshold but statistical
+    ///         significance not met — flag for human review to collect more data.</item>
+    ///   <item><b>Champion superiority</b> — margin ≤ −threshold → reject challenger.</item>
+    ///   <item><b>Inconclusive margin</b> — margin within ±threshold and SPRT inconclusive →
+    ///         flag for review.</item>
+    /// </list>
+    ///
+    /// <para><b>Partial sufficiency fast-path:</b> when ≥ 50% of <c>RequiredTrades</c> are
+    /// collected and the challenger leads by ≥ 2× the promotion threshold, the challenger
+    /// can be promoted early. This prevents low-volume symbols from being permanently
+    /// blocked waiting for a sample count they may never reach.</para>
+    ///
+    /// <para><b>Regime-conditioned accuracy:</b> after computing overall statistics, the
+    /// worker also computes per-regime accuracy breakdowns (Trending, Ranging, Volatile, etc.)
+    /// by tagging each prediction with the most recent <see cref="MarketRegimeSnapshot"/>
+    /// at the time of the prediction. These are stored in <c>MLShadowRegimeBreakdown</c> rows
+    /// for post-hoc analysis regardless of the promotion decision.</para>
+    /// </summary>
+    /// <param name="shadow">The shadow evaluation to decide on (loaded with <c>AsNoTracking</c>).</param>
+    /// <param name="readCtx">EF read context for loading prediction logs and regime snapshots.</param>
+    /// <param name="writeCtx">EF write context for persisting the decision and acting on it.</param>
+    /// <param name="shadowMinZScore">
+    ///   Minimum z-score required for the two-proportion test to accept a promotion
+    ///   (configured via <c>MLTraining:ShadowMinZScore</c>, default 1.645 = one-tailed 95th percentile).
+    /// </param>
+    /// <param name="ct">Cancellation token.</param>
     private async Task EvaluateShadowAsync(
         MLShadowEvaluation                      shadow,
         Microsoft.EntityFrameworkCore.DbContext readCtx,
@@ -131,6 +234,10 @@ public sealed class MLShadowArbiterWorker : BackgroundService
         // Auto-promote early when ≥ 50% of required trades are collected and
         // the challenger leads by ≥ 2× the promotion threshold. Prevents
         // challengers from being permanently blocked on low-volume symbols.
+        //
+        // The 2× stricter threshold compensates for the reduced statistical power
+        // when operating on only half the target sample size — a larger observed
+        // margin is required to achieve the same confidence with fewer observations.
         double threshold        = (double)shadow.PromotionThreshold;
         bool   partialSufficient = completedTrades >= shadow.RequiredTrades / 2 &&
                                    completedTrades > 0;
@@ -315,6 +422,18 @@ public sealed class MLShadowArbiterWorker : BackgroundService
         // ── Act on the decision ───────────────────────────────────────────────
         if (decision == PromotionDecision.AutoPromoted)
         {
+            // Advisory lock scoped to symbol+timeframe prevents concurrent promotion
+            // from both MLShadowArbiterWorker and MLTrainingWorker.
+            var lockKey = $"ml:promote:{shadow.Symbol}:{shadow.Timeframe}";
+            await using var promotionLock = await _distributedLock.TryAcquireAsync(lockKey, ct);
+            if (promotionLock is null)
+            {
+                _logger.LogWarning(
+                    "Shadow eval {Id}: could not acquire promotion lock — another promotion in progress. Skipping.",
+                    shadow.Id);
+                return;
+            }
+
             await PromoteChallengerAsync(shadow, writeCtx, ct);
         }
         else
@@ -332,6 +451,22 @@ public sealed class MLShadowArbiterWorker : BackgroundService
         }
     }
 
+    /// <summary>
+    /// Executes the promotion of the challenger model to champion status:
+    /// <list type="number">
+    ///   <item>Snapshots the outgoing champion's live performance stats (accuracy, trade count,
+    ///         active days) from its <see cref="MLModelPredictionLog"/> records before retiring it.
+    ///         This preserves a permanent record of how the champion performed in production,
+    ///         separate from its original training metrics. Mirrors the same snapshot logic in
+    ///         <see cref="MLTrainingWorker"/> for consistency between both promotion paths.</item>
+    ///   <item>Marks the champion as <see cref="MLModelStatus.Superseded"/> with <c>IsActive = false</c>.</item>
+    ///   <item>Marks the challenger as <see cref="MLModelStatus.Active"/> with <c>IsActive = true</c>
+    ///         and stamps <c>ActivatedAt = now</c>.</item>
+    /// </list>
+    ///
+    /// The live-performance snapshot is best-effort — a failure is logged at Warning level
+    /// but does not abort the promotion.
+    /// </summary>
     private async Task PromoteChallengerAsync(
         MLShadowEvaluation                      shadow,
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
@@ -412,11 +547,27 @@ public sealed class MLShadowArbiterWorker : BackgroundService
 
     // ── Regime-segmented accuracy ─────────────────────────────────────────────
 
+    /// <summary>
+    /// Immutable tuple holding challenger accuracy, champion accuracy, and the sample count
+    /// for a single market regime bucket. Used to detect regime-specific underperformance
+    /// and to populate <c>MLShadowRegimeBreakdown</c> persistence rows.
+    /// </summary>
     private record RegimeBucket(double ChallengerAcc, double ChampionAcc, int Count);
 
     /// <summary>
     /// Tags each prediction log with the market regime that was active at its prediction time,
     /// then computes per-regime accuracy for challenger and champion.
+    ///
+    /// <para><b>Regime assignment:</b> for each log, the most recent <see cref="MarketRegimeSnapshot"/>
+    /// with <c>DetectedAt ≤ PredictedAt</c> is selected via a linear scan of the
+    /// pre-sorted snapshot list. This is equivalent to a "last-observation-carried-forward"
+    /// (LOCF) imputation — if no snapshot precedes the prediction, the log is assigned
+    /// <see cref="MarketRegimeEnum.Ranging"/> as a safe default.</para>
+    ///
+    /// <para><b>Usage in promotion logic:</b> <see cref="EvaluateShadowAsync"/> checks whether
+    /// the challenger underperforms the champion by ≥ threshold in any regime bucket with
+    /// ≥ 10 observations (the 10-sample floor prevents noise from tiny regime windows from
+    /// blocking an otherwise good promotion).</para>
     /// </summary>
     private static Dictionary<MarketRegimeEnum, RegimeBucket> ComputeRegimeSegmentedAccuracy(
         List<MLModelPredictionLog> challengerLogs,
@@ -463,12 +614,31 @@ public sealed class MLShadowArbiterWorker : BackgroundService
 
     // ── Metric helpers ────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Computes the fraction of resolved logs where the predicted direction matched the
+    /// actual market direction. Returns 0 when <paramref name="logs"/> is empty.
+    /// </summary>
     private static double DirectionAccuracy(List<MLModelPredictionLog> logs)
     {
         if (logs.Count == 0) return 0;
         return logs.Count(l => l.DirectionCorrect == true) / (double)logs.Count;
     }
 
+    /// <summary>
+    /// Computes the Brier score for a model's resolved prediction logs, measuring
+    /// probabilistic calibration quality.
+    ///
+    /// <para>
+    /// The confidence score (0–1) is remapped into a calibrated probability:
+    /// <c>pBuy = 0.5 + confidence/2</c> when the model predicted Buy, or
+    /// <c>pBuy = 0.5 − confidence/2</c> when it predicted Sell.
+    /// This maps confidence 0 → p=0.5 (maximum uncertainty) and confidence 1 → p=1.0 or p=0.0.
+    /// </para>
+    ///
+    /// Brier score = mean((p_buy − y)²) where y=1 for actual Buy, y=0 for actual Sell.
+    /// Lower is better; a score of 0.25 corresponds to random guessing.
+    /// Returns 0 when no resolved logs are available.
+    /// </summary>
     private static double BrierScore(List<MLModelPredictionLog> logs)
     {
         if (logs.Count == 0) return 0;
@@ -488,6 +658,16 @@ public sealed class MLShadowArbiterWorker : BackgroundService
         return n > 0 ? sum / n : 0;
     }
 
+    /// <summary>
+    /// Computes the Pearson correlation coefficient between the model's predicted move
+    /// magnitude (in pips) and the actual move magnitude for all logs that have a resolved
+    /// <c>ActualMagnitudePips</c> value.
+    ///
+    /// A correlation close to +1.0 indicates the model accurately sizes predicted moves
+    /// relative to actual moves — useful beyond binary direction accuracy for evaluating
+    /// whether the model's confidence scores are proportional to realised volatility.
+    /// Returns 0 when fewer than 2 valid logs are available.
+    /// </summary>
     private static double MagnitudeCorrelation(List<MLModelPredictionLog> logs)
     {
         var valid = logs.Where(l => l.ActualMagnitudePips.HasValue).ToList();
@@ -591,6 +771,10 @@ public sealed class MLShadowArbiterWorker : BackgroundService
         return Math.Clamp(llr, -10.0, 10.0);
     }
 
+    /// <summary>
+    /// Standard normal CDF Φ(x) = P(Z ≤ x) computed via the complementary error function.
+    /// Used to convert z-scores to one-tailed p-values in the two-proportion test.
+    /// </summary>
     private static double NormalCdf(double x)
         => 0.5 * (1.0 + Erf(x / Math.Sqrt(2.0)));
 
@@ -616,6 +800,10 @@ public sealed class MLShadowArbiterWorker : BackgroundService
 
     // ── Config helper ─────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Reads a typed value from <see cref="EngineConfig"/> or returns <paramref name="defaultValue"/>
+    /// when the key is absent or the stored string cannot be converted to <typeparamref name="T"/>.
+    /// </summary>
     private static async Task<T> GetConfigAsync<T>(
         Microsoft.EntityFrameworkCore.DbContext ctx,
         string                                  key,

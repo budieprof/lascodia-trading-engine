@@ -49,6 +49,11 @@ public sealed class MLRegimeTransitionGuardWorker : BackgroundService
     private readonly IServiceScopeFactory                       _scopeFactory;
     private readonly ILogger<MLRegimeTransitionGuardWorker>     _logger;
 
+    /// <summary>
+    /// Initializes the worker.
+    /// </summary>
+    /// <param name="scopeFactory">Per-iteration DI scope factory.</param>
+    /// <param name="logger">Structured logger.</param>
     public MLRegimeTransitionGuardWorker(
         IServiceScopeFactory                    scopeFactory,
         ILogger<MLRegimeTransitionGuardWorker>  logger)
@@ -57,6 +62,12 @@ public sealed class MLRegimeTransitionGuardWorker : BackgroundService
         _logger       = logger;
     }
 
+    /// <summary>
+    /// Background service main loop. Polls every 300 seconds (5 minutes) by default,
+    /// making it one of the most frequent ML workers because regime transitions can
+    /// occur rapidly and the confidence dampening must be applied before the next
+    /// prediction log is scored.
+    /// </summary>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation("MLRegimeTransitionGuardWorker started.");
@@ -94,6 +105,12 @@ public sealed class MLRegimeTransitionGuardWorker : BackgroundService
 
     // ── Guard core ────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Resolves the distinct set of (Symbol, Timeframe) pairs covered by active
+    /// models and applies the regime-transition guard to each pair. Multiple models
+    /// on the same symbol/timeframe share a single penalty key — the guard is applied
+    /// at the pair level, not the model level.
+    /// </summary>
     private async Task GuardTransitionsAsync(
         Microsoft.EntityFrameworkCore.DbContext readCtx,
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
@@ -102,6 +119,8 @@ public sealed class MLRegimeTransitionGuardWorker : BackgroundService
         int    windowBars = await GetConfigAsync<int>   (readCtx, CK_WindowBars, 20,   ct);
         double penalty    = await GetConfigAsync<double>(readCtx, CK_Penalty,    0.80, ct);
 
+        // Use Distinct so that multiple models on the same symbol/timeframe are
+        // processed once — they all share the same regime snapshot and penalty key.
         var activeModels = await readCtx.Set<MLModel>()
             .Where(m => m.IsActive && !m.IsDeleted)
             .AsNoTracking()
@@ -131,6 +150,31 @@ public sealed class MLRegimeTransitionGuardWorker : BackgroundService
         }
     }
 
+    /// <summary>
+    /// Applies or lifts the regime-transition confidence penalty for a single
+    /// (symbol, timeframe) pair by comparing the two most recent
+    /// <see cref="MarketRegimeSnapshot"/> records.
+    /// </summary>
+    /// <remarks>
+    /// <b>Regime transition handling logic:</b>
+    /// <list type="number">
+    ///   <item>Load the two most recent snapshots for the pair.</item>
+    ///   <item>If regimes differ (a transition occurred):
+    ///     <list type="bullet">
+    ///       <item>Compute elapsed bars = (now − latestSnapshot.DetectedAt) / barDuration.</item>
+    ///       <item>If elapsed &lt; windowBars: set penalty factor (e.g. 0.80) — the model is
+    ///             operating in the "danger zone" immediately after a structural market change
+    ///             where its historical feature-to-outcome mapping may no longer hold.</item>
+    ///       <item>If elapsed ≥ windowBars: reset factor to 1.0 — the model has had time
+    ///             to accumulate new observations in the new regime.</item>
+    ///     </list>
+    ///   </item>
+    ///   <item>If regimes match (no recent transition): reset factor to 1.0.</item>
+    /// </list>
+    /// The penalty key written to <see cref="EngineConfig"/> follows the pattern
+    /// <c>MLRegimeTransition:{Symbol}:{Timeframe}:PenaltyFactor</c> and is read by
+    /// <c>MLSignalScorer</c> to multiplicatively dampen the computed confidence.
+    /// </remarks>
     private async Task ProcessPairAsync(
         string                                  symbol,
         Timeframe                               timeframe,
@@ -140,7 +184,9 @@ public sealed class MLRegimeTransitionGuardWorker : BackgroundService
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
         CancellationToken                       ct)
     {
-        // Load the two most recent regime snapshots
+        // Load the two most recent regime snapshots to detect a change in regime.
+        // We need exactly 2 to compare consecutive snapshots; fewer means we cannot
+        // determine whether a transition has occurred.
         var recent = await readCtx.Set<MarketRegimeSnapshot>()
             .Where(r => r.Symbol    == symbol    &&
                         r.Timeframe == timeframe  &&
@@ -158,14 +204,19 @@ public sealed class MLRegimeTransitionGuardWorker : BackgroundService
             return;
         }
 
-        var latest    = recent[0]; // newest
-        var previous  = recent[1]; // one before newest
+        var latest    = recent[0]; // newest snapshot
+        var previous  = recent[1]; // immediately preceding snapshot
 
+        // The EngineConfig key is unique per (symbol, timeframe) pair.
+        // MLSignalScorer reads this key and multiplies the confidence by its value.
         string configKey = $"{KeyPrefix}{symbol}:{timeframe}{KeySuffix}";
 
         if (latest.Regime != previous.Regime)
         {
-            // A transition occurred — compute bars elapsed since the latest snapshot
+            // ── Regime transition detected ────────────────────────────────────
+            // Compute how many timeframe bars have elapsed since the regime changed.
+            // Dividing wallclock seconds by bar duration converts time to "bar units",
+            // making the window threshold timeframe-agnostic.
             var barDuration  = TimeframeExpectedGap(timeframe);
             double barsElapsed = barDuration.TotalSeconds > 0
                 ? (DateTime.UtcNow - latest.DetectedAt).TotalSeconds / barDuration.TotalSeconds
@@ -173,7 +224,9 @@ public sealed class MLRegimeTransitionGuardWorker : BackgroundService
 
             if (barsElapsed < windowBars)
             {
-                // Within transition window: apply penalty
+                // Still within the post-transition dampening window — apply penalty.
+                // The penalty reduces confidence by a fixed factor to prevent the model
+                // from over-committing when market structure has just changed.
                 string penaltyStr = penalty.ToString("F4", System.Globalization.CultureInfo.InvariantCulture);
                 await UpsertConfigAsync(writeCtx, configKey, penaltyStr, ct);
 
@@ -184,7 +237,8 @@ public sealed class MLRegimeTransitionGuardWorker : BackgroundService
             }
             else
             {
-                // Transition window expired: lift penalty
+                // Transition window has expired — the model has operated in the new regime
+                // long enough for its accuracy metrics to be representative again.
                 await UpsertConfigAsync(writeCtx, configKey, "1.0", ct);
 
                 _logger.LogDebug(
@@ -195,7 +249,8 @@ public sealed class MLRegimeTransitionGuardWorker : BackgroundService
         }
         else
         {
-            // No transition — ensure penalty is lifted
+            // No transition between the two most recent snapshots — regime is stable.
+            // Ensure any previously written penalty is cleared (idempotent).
             await UpsertConfigAsync(writeCtx, configKey, "1.0", ct);
 
             _logger.LogDebug(
@@ -206,12 +261,23 @@ public sealed class MLRegimeTransitionGuardWorker : BackgroundService
 
     // ── EngineConfig upsert ───────────────────────────────────────────────────
 
+    /// <summary>
+    /// Inserts or updates a single <see cref="EngineConfig"/> row identified by
+    /// <paramref name="key"/>. Uses <c>ExecuteUpdateAsync</c> for efficiency; falls
+    /// back to an insert when the key does not yet exist (first time the guard runs
+    /// for a new symbol/timeframe pair).
+    /// </summary>
+    /// <param name="writeCtx">Write DbContext.</param>
+    /// <param name="key">The unique config key (e.g. <c>MLRegimeTransition:EURUSD:H1:PenaltyFactor</c>).</param>
+    /// <param name="value">String representation of the penalty factor (e.g. "0.8000" or "1.0").</param>
+    /// <param name="ct">Cancellation token.</param>
     private static async Task UpsertConfigAsync(
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
         string                                  key,
         string                                  value,
         CancellationToken                       ct)
     {
+        // Attempt an in-place update first — avoids a round-trip insert if the row exists.
         int rows = await writeCtx.Set<EngineConfig>()
             .Where(c => c.Key == key)
             .ExecuteUpdateAsync(s => s
@@ -221,6 +287,8 @@ public sealed class MLRegimeTransitionGuardWorker : BackgroundService
 
         if (rows == 0)
         {
+            // Row does not exist yet — create it with descriptive metadata so operators
+            // understand where this config key originated.
             writeCtx.Set<EngineConfig>().Add(new EngineConfig
             {
                 Key             = key,
@@ -228,6 +296,7 @@ public sealed class MLRegimeTransitionGuardWorker : BackgroundService
                 DataType        = Domain.Enums.ConfigDataType.Decimal,
                 Description     = "Regime-transition confidence penalty factor for MLSignalScorer. " +
                                   "Written by MLRegimeTransitionGuardWorker.",
+                // Mark as hot-reloadable so the scorer picks up changes without restart.
                 IsHotReloadable = true,
                 LastUpdatedAt   = DateTime.UtcNow,
             });
@@ -237,6 +306,12 @@ public sealed class MLRegimeTransitionGuardWorker : BackgroundService
 
     // ── Timeframe helper ──────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Maps a <see cref="Timeframe"/> enum value to the expected wall-clock duration
+    /// of one bar. Used to convert elapsed time since a regime transition into bar units,
+    /// making the <c>TransitionWindowBars</c> threshold timeframe-agnostic.
+    /// Unlisted timeframes default to H1 (1 hour).
+    /// </summary>
     private static TimeSpan TimeframeExpectedGap(Timeframe tf) => tf switch
     {
         Timeframe.M1  => TimeSpan.FromMinutes(1),
@@ -250,6 +325,11 @@ public sealed class MLRegimeTransitionGuardWorker : BackgroundService
 
     // ── Config helper ─────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Reads a typed value from <see cref="EngineConfig"/>. Returns
+    /// <paramref name="defaultValue"/> if the key is absent or the stored value
+    /// cannot be converted to <typeparamref name="T"/>.
+    /// </summary>
     private static async Task<T> GetConfigAsync<T>(
         Microsoft.EntityFrameworkCore.DbContext ctx,
         string                                  key,

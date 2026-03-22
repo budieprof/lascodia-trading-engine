@@ -33,6 +33,8 @@ public class TradingAccountConfiguration : IEntityTypeConfiguration<TradingAccou
         builder.Property(x => x.MarginAvailable)
             .HasPrecision(18, 8);
 
+        builder.HasQueryFilter(x => !x.IsDeleted);
+
         builder.HasIndex(x => x.BrokerId);
         builder.HasIndex(x => x.IsActive);
 

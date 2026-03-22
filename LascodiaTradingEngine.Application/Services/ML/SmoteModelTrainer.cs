@@ -1,7 +1,9 @@
 using System.Buffers;
 using System.Text.Json;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.MLModels.Shared;
+using LascodiaTradingEngine.Domain.Enums;
 using Microsoft.Extensions.Logging;
 
 namespace LascodiaTradingEngine.Application.Services.ML;
@@ -65,6 +67,7 @@ namespace LascodiaTradingEngine.Application.Services.ML;
 ///   <item>Full ModelSnapshot serialised with complete lineage for reproducibility.</item>
 /// </list>
 /// </summary>
+[RegisterKeyedService(typeof(IMLModelTrainer), LearnerArchitecture.Smote)]
 public sealed class SmoteModelTrainer : IMLModelTrainer
 {
     private const string ModelType    = "SMOTE";
@@ -77,6 +80,22 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
     private const int PolyTopN = 5;
     private const int PolyPairCount = PolyTopN * (PolyTopN - 1) / 2; // = 10
 
+    private const double TrainSplitRatio          = 0.70;
+    private const double CalSplitRatio            = 0.80;
+    private const int    MinCalSamples            = 20;
+    private const int    MinEvalSamples           = 10;
+    private const int    DefaultCalibrationEpochs = 200;
+    private const int    ClassCondPlattEpochs     = 150;
+    private const int    GesRounds                = 50;
+    private const int    MinFoldSize              = 50;
+    private const double PruneAccuracyTolerance   = 0.005;
+    private const double BiasedSamplingTemp       = 5.0;
+    private const double ThresholdSearchStep      = 0.02;
+    private const int    EceBinCount              = 10;
+    private const int    MIBinCount               = 10;
+    private const int    DensityRatioEpochs       = 50;
+    private const int    MaxJackknifeResiduals     = 5_000;
+
     private static readonly JsonSerializerOptions JsonOpts =
         new() { WriteIndented = false, MaxDepth = 64 };
 
@@ -86,6 +105,88 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         public static readonly MetaLearner None = new([], 0.0);
         public bool IsActive => Weights is { Length: > 0 };
     }
+
+    /// <summary>Bundles the ensemble state passed to most evaluation/calibration helpers.</summary>
+    internal readonly record struct EnsembleState(
+        double[][]  Weights,
+        double[]    Biases,
+        int         F,
+        int[][]?    FeatureSubsets,
+        MetaLearner Meta,
+        double[][]? MlpHW,
+        double[][]? MlpHB,
+        int         HidDim);
+
+    // ── EnsembleState forwarding helpers ────────────────────────────────────
+    private static double EnsembleProb(float[] x, in EnsembleState es)
+        => EnsembleProb(x, es.Weights, es.Biases, es.F, es.FeatureSubsets, es.Meta, es.MlpHW, es.MlpHB, es.HidDim);
+
+    private static double EvalAccuracy(List<TrainingSample> s, in EnsembleState es, double pA, double pB)
+        => EvalAccuracy(s, es.Weights, es.Biases, pA, pB, es.F, es.FeatureSubsets, es.Meta, es.MlpHW, es.MlpHB, es.HidDim);
+
+    private static double ComputeEce(List<TrainingSample> s, in EnsembleState es, double pA, double pB)
+        => ComputeEce(s, es.Weights, es.Biases, pA, pB, es.F, es.FeatureSubsets, es.Meta, es.MlpHW, es.MlpHB, es.HidDim);
+
+    private static double ComputeBrierSkillScore(List<TrainingSample> s, in EnsembleState es, double pA, double pB)
+        => ComputeBrierSkillScore(s, es.Weights, es.Biases, pA, pB, es.F, es.FeatureSubsets, es.Meta, es.MlpHW, es.MlpHB, es.HidDim);
+
+    private static double ComputeOptimalThreshold(List<TrainingSample> s, in EnsembleState es, double pA, double pB, double lo, double hi)
+        => ComputeOptimalThreshold(s, es.Weights, es.Biases, pA, pB, es.F, es.FeatureSubsets, es.Meta, es.MlpHW, es.MlpHB, es.HidDim, lo, hi);
+
+    private static EvalMetrics EvaluateEnsemble(List<TrainingSample> s, in EnsembleState es, double[] mw, double mb, double pA, double pB, double oobAcc)
+        => EvaluateEnsemble(s, es.Weights, es.Biases, mw, mb, pA, pB, es.F, es.FeatureSubsets, es.Meta, oobAcc, es.MlpHW, es.MlpHB, es.HidDim);
+
+    private static MetaLearner FitMetaLearner(List<TrainingSample> s, in EnsembleState es)
+        => FitMetaLearner(s, es.Weights, es.Biases, es.F, es.FeatureSubsets, es.MlpHW, es.MlpHB, es.HidDim);
+
+    private static (double A, double B) FitPlattScaling(List<TrainingSample> s, in EnsembleState es)
+        => FitPlattScaling(s, es.Weights, es.Biases, es.F, es.FeatureSubsets, es.Meta, es.MlpHW, es.MlpHB, es.HidDim);
+
+    private static double[] FitIsotonicCalibration(List<TrainingSample> s, in EnsembleState es, double pA, double pB)
+        => FitIsotonicCalibration(s, es.Weights, es.Biases, pA, pB, es.F, es.FeatureSubsets, es.Meta, es.MlpHW, es.MlpHB, es.HidDim);
+
+    private static (double AvgP, double StdP) EnsembleProbAndStd(float[] x, in EnsembleState es)
+        => EnsembleProbAndStd(x, es.Weights, es.Biases, es.F, es.FeatureSubsets, es.MlpHW, es.MlpHB, es.HidDim);
+
+    private static double ComputeConformalQHat(List<TrainingSample> s, in EnsembleState es, double pA, double pB, double[] isoBp, double alpha)
+        => ComputeConformalQHat(s, es.Weights, es.Biases, pA, pB, isoBp, es.F, es.FeatureSubsets, es.Meta, es.MlpHW, es.MlpHB, es.HidDim, alpha);
+
+    private static double[] ComputeJackknifeResiduals(List<TrainingSample> s, in EnsembleState es)
+        => ComputeJackknifeResiduals(s, es.Weights, es.Biases, es.F, es.FeatureSubsets, es.MlpHW, es.MlpHB, es.HidDim);
+
+    private static (double[] Weights, double Bias) FitMetaLabelModel(List<TrainingSample> s, in EnsembleState es, double[]? importanceScores = null)
+        => FitMetaLabelModel(s, es.Weights, es.Biases, es.F, es.FeatureSubsets, es.MlpHW, es.MlpHB, es.HidDim, importanceScores);
+
+    private static (double[] Weights, double Bias, double Threshold) FitAbstentionModel(
+        List<TrainingSample> s, in EnsembleState es, double pA, double pB, double[] metaLabelW, double metaLabelB)
+        => FitAbstentionModel(s, es.Weights, es.Biases, pA, pB, metaLabelW, metaLabelB, es.F, es.FeatureSubsets, es.MlpHW, es.MlpHB, es.HidDim);
+
+    private static double FitTemperatureScaling(List<TrainingSample> s, in EnsembleState es)
+        => FitTemperatureScaling(s, es.Weights, es.Biases, es.F, es.FeatureSubsets, es.Meta, es.MlpHW, es.MlpHB, es.HidDim);
+
+    private static double ComputeEnsembleDiversity(in EnsembleState es)
+        => ComputeEnsembleDiversity(es.Weights, es.F);
+
+    private static (double Mean, double Std) ComputeDecisionBoundaryStats(List<TrainingSample> s, in EnsembleState es)
+        => ComputeDecisionBoundaryStats(s, es.Weights, es.Biases, es.F, es.FeatureSubsets, es.MlpHW, es.MlpHB, es.HidDim);
+
+    private static double[] RunGreedyEnsembleSelection(List<TrainingSample> s, in EnsembleState es)
+        => RunGreedyEnsembleSelection(s, es.Weights, es.Biases, es.F, es.FeatureSubsets, es.MlpHW, es.MlpHB, es.HidDim);
+
+    private static float[] ComputePermutationImportance(List<TrainingSample> s, in EnsembleState es, double pA, double pB, Random rng, CancellationToken ct)
+        => ComputePermutationImportance(s, es.Weights, es.Biases, pA, pB, es.F, es.FeatureSubsets, es.Meta, es.MlpHW, es.MlpHB, es.HidDim, rng, ct);
+
+    private static double[] ComputeCalPermutationImportance(List<TrainingSample> s, in EnsembleState es, double pA, double pB, CancellationToken ct)
+        => ComputeCalPermutationImportance(s, es.Weights, es.Biases, pA, pB, es.F, es.FeatureSubsets, es.Meta, es.MlpHW, es.MlpHB, es.HidDim, ct);
+
+    private static (double ABuy, double BBuy, double ASell, double BSell) FitClassConditionalPlatt(List<TrainingSample> s, in EnsembleState es)
+        => FitClassConditionalPlatt(s, es.Weights, es.Biases, es.F, es.FeatureSubsets, es.Meta, es.MlpHW, es.MlpHB, es.HidDim);
+
+    private static double ComputeAvgKellyFraction(List<TrainingSample> s, in EnsembleState es, double pA, double pB)
+        => ComputeAvgKellyFraction(s, es.Weights, es.Biases, pA, pB, es.F, es.FeatureSubsets, es.Meta, es.MlpHW, es.MlpHB, es.HidDim);
+
+    private static double ComputeOobAccuracy(List<TrainingSample> s, in EnsembleState es, bool[][] oobMasks)
+        => ComputeOobAccuracy(s, es.Weights, es.Biases, oobMasks, es.F, es.FeatureSubsets, es.MlpHW, es.MlpHB, es.HidDim);
 
     private readonly ILogger<SmoteModelTrainer> _logger;
 
@@ -120,7 +221,7 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
             // Floor: after 70/10/20 split + two embargo gaps the train fold must still have
             // at least MinSamples rows. Solving 0.70×w - 2×embargo ≥ MinSamples:
             // w ≥ (MinSamples + 2×embargo) / 0.70
-            int minWindowForSplit = (int)Math.Ceiling((hp.MinSamples + 2 * hp.EmbargoBarCount) / 0.70);
+            int minWindowForSplit = (int)Math.Ceiling((hp.MinSamples + 2 * hp.EmbargoBarCount) / TrainSplitRatio);
             if (recentCount >= minWindowForSplit)
             {
                 if (_logger.IsEnabled(LogLevel.Information))
@@ -223,8 +324,8 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         // ── 3. 3-way split: 70% train | 10% cal | ~20% test ──────────────────
         int embargo  = hp.EmbargoBarCount;
         int n        = allStd.Count;
-        int trainEnd = (int)(n * 0.70);
-        int calEnd   = (int)(n * 0.80);
+        int trainEnd = (int)(n * TrainSplitRatio);
+        int calEnd   = (int)(n * CalSplitRatio);
 
         var trainSet = allStd[..Math.Max(0, trainEnd - embargo)];
         var calSet   = allStd[(calEnd > trainEnd ? trainEnd + embargo : trainEnd)
@@ -242,7 +343,7 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
             var sortedMags = new double[trainSet.Count];
             for (int i = 0; i < trainSet.Count; i++) sortedMags[i] = Math.Abs(trainSet[i].Magnitude);
             Array.Sort(sortedMags);
-            double p20 = sortedMags[(int)(sortedMags.Length * 0.20)];
+            double p20 = sortedMags[Math.Min((int)(sortedMags.Length * 0.20), sortedMags.Length - 1)];
             int ambigCount = 0;
             foreach (var s in trainSet)
                 if (Math.Abs(s.Magnitude) <= p20) ambigCount++;
@@ -291,12 +392,8 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
 
         // ── 6. Fit ensemble ───────────────────────────────────────────────────
         var (weights, biases, featureSubsets, polyStart, oobMasks, ensMlpHW, ensMlpHB, swaCount) =
-            FitEnsemble(balancedTrain, effectiveHp, F, K, labelSmoothing, warmStart, densityWeights, ct);
-
-        // ── GES (greedy ensemble selection) ──────────────────────────────────
-        double[] gesWeights = hp.EnableGreedyEnsembleSelection && calSet.Count >= 20
-            ? RunGreedyEnsembleSelection(calSet, weights, biases, F, featureSubsets, ensMlpHW, ensMlpHB, hp.MlpHiddenDim)
-            : [];
+            FitEnsemble(balancedTrain, effectiveHp, F, K, labelSmoothing, warmStart, densityWeights, ct,
+                originalCount: trainSet.Count);
 
         // ── 7. Post-training NaN/Inf sanitization ─────────────────────────────
         int sanitizedCount = 0;
@@ -324,11 +421,15 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         if (sanitizedCount > 0)
             _logger.LogWarning("Post-training sanitization: {N}/{K} learners cleared.", sanitizedCount, K);
 
+        // Ensemble state (meta-learner not yet fitted); will be rebuilt after meta-learner
+        var ens = new EnsembleState(weights, biases, F, featureSubsets, MetaLearner.None, ensMlpHW, ensMlpHB, hp.MlpHiddenDim);
+
+        // ── GES (greedy ensemble selection) ──────────────────────────────────
+        double[] gesWeights = hp.EnableGreedyEnsembleSelection && calSet.Count >= MinCalSamples
+            ? RunGreedyEnsembleSelection(calSet, ens) : [];
+
         // ── 8. OOB accuracy ───────────────────────────────────────────────────
-        var oobTemporalWeights = ComputeTemporalWeights(balancedTrain.Count, effectiveHp.TemporalDecayLambda);
-        double oobAccuracy = ComputeOobAccuracy(
-            balancedTrain, weights, biases, oobTemporalWeights, F, featureSubsets,
-            ensMlpHW, ensMlpHB, hp.MlpHiddenDim);
+        double oobAccuracy = ComputeOobAccuracy(balancedTrain, ens, oobMasks);
         if (_logger.IsEnabled(LogLevel.Information))
             _logger.LogInformation("OOB accuracy={Oob:P1}", oobAccuracy);
 
@@ -362,41 +463,37 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         }
 
         // ── H5: Stacking meta-learner ─────────────────────────────────────────
-        var meta = calSet.Count >= 20
+        var meta = calSet.Count >= MinCalSamples
             ? FitMetaLearner(calSet, weights, biases, F, featureSubsets, ensMlpHW, ensMlpHB, hp.MlpHiddenDim)
             : MetaLearner.None;
         _logger.LogDebug("Stacking meta-learner: bias={B:F4} active={Active}", meta.Bias, meta.IsActive);
 
+        // Rebuild ensemble state now that meta-learner is fitted
+        ens = new EnsembleState(weights, biases, F, featureSubsets, meta, ensMlpHW, ensMlpHB, hp.MlpHiddenDim);
+
         // ── 11. Platt calibration ─────────────────────────────────────────────
-        var (plattA, plattB) = calSet.Count >= 20
-            ? FitPlattScaling(calSet, weights, biases, F, featureSubsets, meta, ensMlpHW, ensMlpHB, hp.MlpHiddenDim)
-            : (1.0, 0.0);
+        var (plattA, plattB) = calSet.Count >= MinCalSamples
+            ? FitPlattScaling(calSet, ens) : (1.0, 0.0);
         _logger.LogDebug("Platt: A={A:F4} B={B:F4}", plattA, plattB);
 
         // ── M3: Class-conditional Platt ───────────────────────────────────────
-        var (plattABuy, plattBBuy, plattASell, plattBSell) = calSet.Count >= 20
-            ? FitClassConditionalPlatt(calSet, weights, biases, F, featureSubsets, meta, ensMlpHW, ensMlpHB, hp.MlpHiddenDim)
-            : (0.0, 0.0, 0.0, 0.0);
+        var (plattABuy, plattBBuy, plattASell, plattBSell) = calSet.Count >= MinCalSamples
+            ? FitClassConditionalPlatt(calSet, ens) : (0.0, 0.0, 0.0, 0.0);
 
         // ── M9: Average Kelly fraction ────────────────────────────────────────
-        double avgKellyFraction = calSet.Count >= 10
-            ? ComputeAvgKellyFraction(calSet, weights, biases, plattA, plattB, F, featureSubsets, meta, ensMlpHW, ensMlpHB, hp.MlpHiddenDim)
-            : 0.0;
+        double avgKellyFraction = calSet.Count >= MinEvalSamples
+            ? ComputeAvgKellyFraction(calSet, ens, plattA, plattB) : 0.0;
 
         // ── 12. EV-optimal threshold ──────────────────────────────────────────
         double lo = hp.ThresholdSearchMin > 0 ? hp.ThresholdSearchMin / 100.0 : 0.30;
         double hi = hp.ThresholdSearchMax > 0 ? hp.ThresholdSearchMax / 100.0 : 0.70;
-        double optimalThreshold = calSet.Count >= 20
-            ? ComputeOptimalThreshold(calSet, weights, biases, plattA, plattB, F, featureSubsets, meta,
-                ensMlpHW, ensMlpHB, hp.MlpHiddenDim, lo, hi)
-            : 0.5;
+        double optimalThreshold = calSet.Count >= MinCalSamples
+            ? ComputeOptimalThreshold(calSet, ens, plattA, plattB, lo, hi) : 0.5;
         if (_logger.IsEnabled(LogLevel.Information))
             _logger.LogInformation("EV-optimal threshold={Thr:F2}", optimalThreshold);
 
         // ── 13. Final evaluation ──────────────────────────────────────────────
-        var finalMetrics = EvaluateEnsemble(
-            testSet, weights, biases, magWeights, magBias, plattA, plattB,
-            F, featureSubsets, meta, oobAccuracy, ensMlpHW, ensMlpHB, hp.MlpHiddenDim);
+        var finalMetrics = EvaluateEnsemble(testSet, ens, magWeights, magBias, plattA, plattB, oobAccuracy);
         if (_logger.IsEnabled(LogLevel.Information))
             _logger.LogInformation(
                 "SmoteModelTrainer: K={K} balancedN={BN} acc={Acc:P1} f1={F1:F3} brier={B:F4} sharpe={Sh:F2}",
@@ -404,21 +501,18 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
                 finalMetrics.BrierScore, finalMetrics.SharpeRatio);
 
         // ── H6: ECE ───────────────────────────────────────────────────────────
-        double ece = testSet.Count >= 10
-            ? ComputeEce(testSet, weights, biases, plattA, plattB, F, featureSubsets, meta, ensMlpHW, ensMlpHB, hp.MlpHiddenDim)
-            : 0.0;
+        double ece = testSet.Count >= MinEvalSamples
+            ? ComputeEce(testSet, ens, plattA, plattB) : 0.0;
         _logger.LogDebug("ECE={Ece:F4}", ece);
 
         // ── H7: Brier Skill Score ─────────────────────────────────────────────
-        double bss = testSet.Count >= 10
-            ? ComputeBrierSkillScore(testSet, weights, biases, plattA, plattB, F, featureSubsets, meta, ensMlpHW, ensMlpHB, hp.MlpHiddenDim)
-            : 0.0;
+        double bss = testSet.Count >= MinEvalSamples
+            ? ComputeBrierSkillScore(testSet, ens, plattA, plattB) : 0.0;
         _logger.LogDebug("BSS={BSS:F4}", bss);
 
         // ── 14. Permutation feature importance (test set) ─────────────────────
-        float[] featureImportance = testSet.Count >= 10
-            ? ComputePermutationImportance(testSet, weights, biases, plattA, plattB, F, featureSubsets, meta,
-                ensMlpHW, ensMlpHB, hp.MlpHiddenDim, new Random(77), ct)
+        float[] featureImportance = testSet.Count >= MinEvalSamples
+            ? ComputePermutationImportance(testSet, ens, plattA, plattB, new Random(77), ct)
             : new float[F];
 
         if (_logger.IsEnabled(LogLevel.Information))
@@ -434,9 +528,8 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         }
 
         // ── M7: Cal-set permutation importance (for warm-start biased sampling) ─
-        double[] calImportanceScores = calSet.Count >= 10
-            ? ComputeCalPermutationImportance(calSet, weights, biases, plattA, plattB, F, featureSubsets, meta,
-                ensMlpHW, ensMlpHB, hp.MlpHiddenDim, ct)
+        double[] calImportanceScores = calSet.Count >= MinEvalSamples
+            ? ComputeCalPermutationImportance(calSet, ens, plattA, plattB, ct)
             : new double[F];
 
         // ── H13: Feature pruning retrain pass ─────────────────────────────────
@@ -452,6 +545,7 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
             var maskedTrain = ApplyMask(balancedTrain, activeMask);
             var maskedCal   = ApplyMask(calSet,        activeMask);
             var maskedTest  = ApplyMask(testSet,        activeMask);
+            int reducedF    = activeMask.Count(m => m);
 
             var prunedHp = effectiveHp with
             {
@@ -460,18 +554,17 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
             };
 
             var (pw, pb, _, _, _, pMlpHW, pMlpHB, _) = FitEnsemble(
-                maskedTrain, prunedHp, F, K, labelSmoothing, null, densityWeights, ct);
-            var pMeta       = maskedCal.Count >= 20
-                ? FitMetaLearner(maskedCal, pw, pb, F, null, pMlpHW, pMlpHB, prunedHp.MlpHiddenDim)
+                maskedTrain, prunedHp, reducedF, K, labelSmoothing, null, densityWeights, ct);
+            var pMeta       = maskedCal.Count >= MinCalSamples
+                ? FitMetaLearner(maskedCal, pw, pb, reducedF, null, pMlpHW, pMlpHB, prunedHp.MlpHiddenDim)
                 : MetaLearner.None;
-            var (pA, pB)    = maskedCal.Count >= 20
-                ? FitPlattScaling(maskedCal, pw, pb, F, null, pMeta, pMlpHW, pMlpHB, prunedHp.MlpHiddenDim)
-                : (1.0, 0.0);
-            var (pmw, pmb)  = FitLinearRegressor(maskedTrain, F, prunedHp);
-            var prunedMetrics = EvaluateEnsemble(maskedTest, pw, pb, pmw, pmb, pA, pB, F, null, pMeta, 0.0,
-                pMlpHW, pMlpHB, prunedHp.MlpHiddenDim);
+            var pEns = new EnsembleState(pw, pb, reducedF, null, pMeta, pMlpHW, pMlpHB, prunedHp.MlpHiddenDim);
+            var (pA, pB)    = maskedCal.Count >= MinCalSamples
+                ? FitPlattScaling(maskedCal, pEns) : (1.0, 0.0);
+            var (pmw, pmb)  = FitLinearRegressor(maskedTrain, reducedF, prunedHp);
+            var prunedMetrics = EvaluateEnsemble(maskedTest, pEns, pmw, pmb, pA, pB, 0.0);
 
-            if (prunedMetrics.Accuracy >= finalMetrics.Accuracy - 0.005)
+            if (prunedMetrics.Accuracy >= finalMetrics.Accuracy - PruneAccuracyTolerance)
             {
                 if (_logger.IsEnabled(LogLevel.Information))
                     _logger.LogInformation("Pruned model accepted: acc={Acc:P1} (was {Old:P1})",
@@ -479,17 +572,19 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
                 weights = pw; biases = pb; ensMlpHW = pMlpHW; ensMlpHB = pMlpHB;
                 magWeights = pmw; magBias = pmb;
                 plattA = pA; plattB = pB; meta = pMeta;
-                finalMetrics = prunedMetrics; featureSubsets = null;
-                ece = ComputeEce(maskedTest, pw, pb, pA, pB, F, null, pMeta, pMlpHW, pMlpHB, prunedHp.MlpHiddenDim);
-                optimalThreshold = ComputeOptimalThreshold(maskedCal, pw, pb, pA, pB, F, null, pMeta,
-                    pMlpHW, pMlpHB, prunedHp.MlpHiddenDim, lo, hi);
-                gesWeights = hp.EnableGreedyEnsembleSelection && maskedCal.Count >= 20
-                    ? RunGreedyEnsembleSelection(maskedCal, pw, pb, F, null, pMlpHW, pMlpHB, prunedHp.MlpHiddenDim)
-                    : [];
-                calImportanceScores = maskedCal.Count >= 10
-                    ? ComputeCalPermutationImportance(maskedCal, pw, pb, pA, pB, F, null, pMeta,
-                        pMlpHW, pMlpHB, prunedHp.MlpHiddenDim, ct)
-                    : new double[F];
+                finalMetrics = prunedMetrics;
+                // Use reduced-F EnsembleState for evaluating on masked data
+                ece = ComputeEce(maskedTest, pEns, pA, pB);
+                optimalThreshold = ComputeOptimalThreshold(maskedCal, pEns, pA, pB, lo, hi);
+                gesWeights = hp.EnableGreedyEnsembleSelection && maskedCal.Count >= MinCalSamples
+                    ? RunGreedyEnsembleSelection(maskedCal, pEns) : [];
+                calImportanceScores = maskedCal.Count >= MinEvalSamples
+                    ? ComputeCalPermutationImportance(maskedCal, pEns, pA, pB, ct)
+                    : new double[reducedF];
+                // Set featureSubsets to keptIndices for inference (maps reduced weights → original features)
+                int[] keptIndices = Enumerable.Range(0, F).Where(j => activeMask[j]).ToArray();
+                featureSubsets = new int[K][];
+                for (int ki = 0; ki < K; ki++) featureSubsets[ki] = keptIndices;
             }
             else
             {
@@ -508,8 +603,9 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         var postPruneCalSet = prunedCount > 0 ? ApplyMask(calSet, activeMask) : calSet;
 
         // ── H8: Isotonic calibration ──────────────────────────────────────────
-        double[] isotonicBp = FitIsotonicCalibration(
-            postPruneCalSet, weights, biases, plattA, plattB, F, featureSubsets, meta, ensMlpHW, ensMlpHB, hp.MlpHiddenDim);
+        // Rebuild EnsembleState in case pruning changed weights/biases/featureSubsets
+        ens = new EnsembleState(weights, biases, F, featureSubsets, meta, ensMlpHW, ensMlpHB, hp.MlpHiddenDim);
+        double[] isotonicBp = FitIsotonicCalibration(postPruneCalSet, ens, plattA, plattB);
         if (_logger.IsEnabled(LogLevel.Information))
             _logger.LogInformation("Isotonic calibration: {N} PAVA breakpoints", isotonicBp.Length / 2);
 
@@ -517,40 +613,33 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
 
         // ── H9: Conformal qHat ────────────────────────────────────────────────
         double conformalAlpha = Math.Clamp(1.0 - hp.ConformalCoverage, 0.01, 0.50);
-        double conformalQHat = ComputeConformalQHat(
-            postPruneCalSet, weights, biases, plattA, plattB, isotonicBp, F, featureSubsets, meta,
-            ensMlpHW, ensMlpHB, hp.MlpHiddenDim, conformalAlpha);
+        double conformalQHat = ComputeConformalQHat(postPruneCalSet, ens, plattA, plattB, isotonicBp, conformalAlpha);
         _logger.LogDebug("Conformal qHat={QHat:F4} ({Cov:P0} coverage)", conformalQHat, hp.ConformalCoverage);
 
         // ── H10: Jackknife+ residuals ─────────────────────────────────────────
-        double[] jackknifeResiduals = ComputeJackknifeResiduals(
-            balancedTrain, weights, biases, oobTemporalWeights, F, featureSubsets,
-            ensMlpHW, ensMlpHB, hp.MlpHiddenDim);
+        double[] jackknifeResiduals = ComputeJackknifeResiduals(balancedTrain, ens);
         _logger.LogDebug("Jackknife+ residuals: {N} samples", jackknifeResiduals.Length);
 
         // ── H11: Meta-label secondary classifier ─────────────────────────────
         var (metaLabelWeights, metaLabelBias) = FitMetaLabelModel(
-            postPruneCalSet, weights, biases, F, featureSubsets, ensMlpHW, ensMlpHB, hp.MlpHiddenDim,
-            importanceScores: calImportanceScores);
+            postPruneCalSet, ens, importanceScores: calImportanceScores);
         _logger.LogDebug("Meta-label model: bias={B:F4}", metaLabelBias);
 
         // ── H12: Abstention gate ──────────────────────────────────────────────
         var (abstentionWeights, abstentionBias, abstentionThreshold) = FitAbstentionModel(
-            postPruneCalSet, weights, biases, plattA, plattB, metaLabelWeights, metaLabelBias,
-            F, featureSubsets, ensMlpHW, ensMlpHB, hp.MlpHiddenDim);
+            postPruneCalSet, ens, plattA, plattB, metaLabelWeights, metaLabelBias);
         _logger.LogDebug("Abstention gate: bias={B:F4} threshold={T:F2}", abstentionBias, abstentionThreshold);
 
         // ── M11: Temperature scaling ──────────────────────────────────────────
         double temperatureScale = 0.0;
-        if (hp.FitTemperatureScale && postPruneCalSet.Count >= 10)
+        if (hp.FitTemperatureScale && postPruneCalSet.Count >= MinEvalSamples)
         {
-            temperatureScale = FitTemperatureScaling(
-                postPruneCalSet, weights, biases, F, featureSubsets, meta, ensMlpHW, ensMlpHB, hp.MlpHiddenDim);
+            temperatureScale = FitTemperatureScaling(postPruneCalSet, ens);
             _logger.LogDebug("Temperature scaling: T={T:F4}", temperatureScale);
         }
 
         // ── M10: Ensemble diversity ───────────────────────────────────────────
-        double ensembleDiversity = ComputeEnsembleDiversity(weights, F);
+        double ensembleDiversity = ComputeEnsembleDiversity(ens);
         _logger.LogDebug("Ensemble diversity (avg ρ)={Div:F4}", ensembleDiversity);
         if (hp.MaxEnsembleDiversity < 1.0 && ensembleDiversity > hp.MaxEnsembleDiversity)
             _logger.LogWarning(
@@ -562,16 +651,15 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         if (hp.OobPruningEnabled && K >= 2)
         {
             oobPrunedCount = PruneByOobContribution(
-                balancedTrain, weights, biases, oobTemporalWeights, F, featureSubsets,
+                balancedTrain, weights, biases, F, featureSubsets,
                 ensMlpHW, ensMlpHB, hp.MlpHiddenDim, K);
             if (oobPrunedCount > 0)
                 _logger.LogInformation("OOB pruning: removed {N}/{K} learners.", oobPrunedCount, K);
         }
 
         // ── M18: Decision boundary stats ─────────────────────────────────────
-        var (dbMean, dbStd) = postPruneCalSet.Count >= 10
-            ? ComputeDecisionBoundaryStats(postPruneCalSet, weights, biases, F, featureSubsets)
-            : (0.0, 0.0);
+        var (dbMean, dbStd) = postPruneCalSet.Count >= MinEvalSamples
+            ? ComputeDecisionBoundaryStats(postPruneCalSet, ens) : (0.0, 0.0);
 
         // ── M12: Durbin-Watson ────────────────────────────────────────────────
         double durbinWatson = ComputeDurbinWatson(balancedTrain, magWeights, magBias, F);
@@ -622,7 +710,6 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
             TestSamples                = testSet.Count,
             CalSamples                 = calSet.Count,
             EmbargoSamples             = embargo,
-            TrainedOn                  = DateTime.UtcNow,
             TrainedAtUtc               = DateTime.UtcNow,
             FeatureImportance          = featureImportance,
             FeatureImportanceScores    = calImportanceScores,
@@ -688,7 +775,7 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         int embargo  = hp.EmbargoBarCount;
         int foldSize = samples.Count / (folds + 1);
 
-        if (foldSize < 50)
+        if (foldSize < MinFoldSize)
         {
             _logger.LogWarning("SmoteModelTrainer CV: fold size too small ({Size}), skipping.", foldSize);
             return (new WalkForwardResult(0, 0, 0, 0, 0, 0), false);
@@ -697,7 +784,9 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         // ── H3/H14/M15: Parallel fold results ────────────────────────────────
         var foldResults = new (double Acc, double F1, double EV, double Sharpe, double[] Imp, bool IsBad)?[folds];
 
-        Parallel.For(0, folds, new ParallelOptions { CancellationToken = ct }, fold =>
+        // Limit CV parallelism to avoid thread pool starvation from nested Parallel.For
+        int cvMaxDop = Math.Max(1, Environment.ProcessorCount / 2);
+        Parallel.For(0, folds, new ParallelOptions { CancellationToken = ct, MaxDegreeOfParallelism = cvMaxDop }, fold =>
         {
             int testEnd   = (fold + 2) * foldSize;
             int testStart = testEnd - foldSize;
@@ -729,10 +818,11 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
                 DiversityLambda       = 0.0,
             };
 
+            int foldOrigCount = foldTrain.Count;
             var (balancedFold, _) = ApplySmote(foldTrain, hp, F, ct);
             var (w, b, subs, _, _, cvMlpHW, cvMlpHB, _) = FitEnsemble(
                 balancedFold, cvHp, F, cvHp.K, hp.LabelSmoothing, null, null, ct,
-                forceSequential: false);
+                forceSequential: false, originalCount: foldOrigCount);
             var (mw, mb) = FitLinearRegressor(balancedFold, F, cvHp);
             var m = EvaluateEnsemble(foldTest, w, b, mw, mb, 1.0, 0.0, F, subs, MetaLearner.None, 0.0,
                 cvMlpHW, cvMlpHB, cvHp.MlpHiddenDim);
@@ -987,7 +1077,8 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         ModelSnapshot?       warmStart,
         double[]?            densityWeights,
         CancellationToken    ct,
-        bool                 forceSequential = false)
+        bool                 forceSequential = false,
+        int                  originalCount   = 0)
     {
         int    n       = trainSet.Count;
         double lr0     = hp.LearningRate > 0  ? hp.LearningRate  : 0.01;
@@ -1024,8 +1115,10 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
             temporalWeights = blended;
         }
 
-        var posIdx = Enumerable.Range(0, n).Where(i => trainSet[i].Direction > 0).ToArray();
-        var negIdx = Enumerable.Range(0, n).Where(i => trainSet[i].Direction <= 0).ToArray();
+        // Bootstrap/OOB only over original samples (not SMOTE synthetics)
+        int origN = originalCount > 0 ? Math.Min(originalCount, n) : n;
+        var posIdx = Enumerable.Range(0, origN).Where(i => trainSet[i].Direction > 0).ToArray();
+        var negIdx = Enumerable.Range(0, origN).Where(i => trainSet[i].Direction <= 0).ToArray();
 
         // Result arrays
         var weights      = new double[K][];
@@ -1044,9 +1137,11 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         bool runParallel = !forceSequential && learnersIndependent;
 
         // Split off a small validation set for adaptive LR decay (M1)
-        int valSize = Math.Max(20, n / 10);
-        var valSet  = trainSet[^valSize..];
-        var fitSet  = trainSet[..^valSize];
+        // valSet indices are excluded from OOB to avoid feedback between LR decay and early stopping
+        int valSize  = Math.Max(20, n / 10);
+        int valStart = n - valSize;
+        var valSet   = trainSet[valStart..];
+        var fitSet   = trainSet[..valStart];
 
         // ── Per-learner training closure ──────────────────────────────────────
         void TrainLearner(int k)
@@ -1121,10 +1216,12 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
                 b = warmStart is not null && k < warmStart.Biases?.Length ? warmStart.Biases[k] : 0.0;
             }
 
-            // Bootstrap
-            int[] bootstrap = StratifiedBootstrap(posIdx, negIdx, n, temporalWeights, rng);
+            // Bootstrap over original samples; synthetics always included in training
+            int[] bootstrap = StratifiedBootstrap(posIdx, negIdx, origN, temporalWeights, rng);
             var   inBag     = new HashSet<int>(bootstrap);
-            oobMasks[k] = [.. Enumerable.Range(0, n).Select(i => !inBag.Contains(i))];
+            // OOB mask: original samples not in bag and not in valSet are OOB;
+            // synthetics (index >= origN) and valSet samples (index >= valStart) are never OOB
+            oobMasks[k] = [.. Enumerable.Range(0, n).Select(i => i < origN && i < valStart && !inBag.Contains(i))];
 
             // Adam state — M19: ArrayPool for Adam moment arrays
             int hWSize = useMlp ? hW!.Length : 0;
@@ -1167,6 +1264,19 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
             // Cosine-annealing LR
             double GetLr(int ep) => adaptedLr0 * 0.5 * (1.0 + Math.Cos(Math.PI * ep / epochs));
 
+            // Preallocate gradient arrays (reused per batch)
+            double[] gw   = new double[outDim];
+            double[]? ghW = useMlp ? new double[hWSize] : null;
+            double[]? ghB = useMlp ? new double[hBSize] : null;
+
+            // Preallocate MLP activation arrays (reused per sample)
+            double[]? hL1PreBuf = useMlp ? new double[hiddenDim] : null;
+            double[]? hL1ActBuf = useMlp ? new double[hiddenDim] : null;
+            double[]? hL2PreBuf = isDeep2 ? new double[hiddenDim] : null;
+            double[]? hL2ActBuf = isDeep2 ? new double[hiddenDim] : null;
+            double[]? dL1Buf    = isDeep2 ? new double[hiddenDim] : null;
+            double[] hFinalRef  = isDeep2 ? hL2ActBuf! : (useMlp ? hL1ActBuf! : []);
+
             try
             {
                 for (int ep = 0; ep < epochs && !ct.IsCancellationRequested; ep++)
@@ -1187,11 +1297,10 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
                     {
                         int actual = Math.Min(batchSize, bootstrap.Length - bStart);
 
-                        // Accumulate gradients over batch
-                        double[] gw   = new double[outDim];
-                        double   gb   = 0;
-                        double[]? ghW = useMlp ? new double[hWSize] : null;
-                        double[]? ghB = useMlp ? new double[hBSize] : null;
+                        // Clear gradient accumulators
+                        Array.Clear(gw, 0, outDim);
+                        double gb = 0;
+                        if (useMlp) { Array.Clear(ghW!, 0, hWSize); Array.Clear(ghB!, 0, hBSize); }
 
                         for (int bi = 0; bi < actual; bi++)
                         {
@@ -1230,47 +1339,35 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
                                 ? yRaw * (1.0 - labelSmoothing) + 0.5 * labelSmoothing
                                 : yRaw;
 
-                            // Forward pass
+                            // Forward pass (reuse preallocated activation buffers)
                             double logit;
-                            double[]? h      = null;  // final hidden activation (fed to output layer)
-                            double[]? hL1    = null;  // layer-1 activation (needed for L2 weight gradients)
-                            double[]? preL1  = null;  // layer-1 pre-activations (ReLU gate in backprop)
-                            double[]? preL2  = null;  // layer-2 pre-activations (ReLU gate in backprop)
 
                             if (useMlp)
                             {
                                 // Layer 1: input → hiddenDim
-                                hL1  = new double[hiddenDim];
-                                preL1 = new double[hiddenDim];
                                 for (int hj = 0; hj < hiddenDim; hj++)
                                 {
                                     double act = hB![hj];
                                     for (int ji = 0; ji < fk; ji++)
                                         act += hW![hj * fk + ji] * xFull[subset[ji]];
-                                    preL1[hj] = act;
-                                    hL1[hj]   = Math.Max(0, act); // ReLU
+                                    hL1PreBuf![hj] = act;
+                                    hL1ActBuf![hj] = Math.Max(0, act); // ReLU
                                 }
                                 if (isDeep2)
                                 {
                                     // Layer 2: hiddenDim → hiddenDim
                                     int l2WOff = hiddenDim * fk;
-                                    h     = new double[hiddenDim];
-                                    preL2 = new double[hiddenDim];
                                     for (int hj = 0; hj < hiddenDim; hj++)
                                     {
                                         double act = hB![hiddenDim + hj];
                                         for (int ji = 0; ji < hiddenDim; ji++)
-                                            act += hW![l2WOff + hj * hiddenDim + ji] * hL1[ji];
-                                        preL2[hj] = act;
-                                        h[hj]     = Math.Max(0, act); // ReLU
+                                            act += hW![l2WOff + hj * hiddenDim + ji] * hL1ActBuf![ji];
+                                        hL2PreBuf![hj] = act;
+                                        hL2ActBuf![hj] = Math.Max(0, act); // ReLU
                                     }
                                 }
-                                else
-                                {
-                                    h = hL1; // single-layer: output of only hidden layer
-                                }
                                 logit = b;
-                                for (int hj = 0; hj < hiddenDim; hj++) logit += w[hj] * h[hj];
+                                for (int hj = 0; hj < hiddenDim; hj++) logit += w[hj] * hFinalRef[hj];
                             }
                             else
                             {
@@ -1338,27 +1435,24 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
                                 if (isDeep2)
                                 {
                                     int l2WOff = hiddenDim * fk;
-                                    // Output-layer gradient: dL/dw uses h (layer-2 activation)
-                                    // Layer-2 backprop: accumulate dL/dhL1 to propagate to layer 1
-                                    var dL1 = new double[hiddenDim];
+                                    Array.Clear(dL1Buf!, 0, hiddenDim);
                                     for (int hj = 0; hj < hiddenDim; hj++)
                                     {
-                                        gw[hj] += err * h![hj] + l2 * w[hj];
-                                        double reluGate2 = preL2![hj] > 0 ? 1.0 : 0.0;
+                                        gw[hj] += err * hL2ActBuf![hj] + l2 * w[hj];
+                                        double reluGate2 = hL2PreBuf![hj] > 0 ? 1.0 : 0.0;
                                         double dOut = err * w[hj] * reluGate2;
                                         ghB![hiddenDim + hj] += dOut;
                                         for (int ji = 0; ji < hiddenDim; ji++)
                                         {
                                             int wIdx = l2WOff + hj * hiddenDim + ji;
-                                            ghW![wIdx] += dOut * hL1![ji] + l2 * hW![wIdx];
-                                            dL1[ji]    += dOut * hW![wIdx];
+                                            ghW![wIdx] += dOut * hL1ActBuf![ji] + l2 * hW![wIdx];
+                                            dL1Buf![ji] += dOut * hW![wIdx];
                                         }
                                     }
-                                    // Layer-1 backprop using stored pre-activations (no recomputation)
                                     for (int hj = 0; hj < hiddenDim; hj++)
                                     {
-                                        double reluGate1 = preL1![hj] > 0 ? 1.0 : 0.0;
-                                        double dAct1     = dL1[hj] * reluGate1;
+                                        double reluGate1 = hL1PreBuf![hj] > 0 ? 1.0 : 0.0;
+                                        double dAct1     = dL1Buf![hj] * reluGate1;
                                         ghB![hj] += dAct1;
                                         for (int ji2 = 0; ji2 < fk; ji2++)
                                             ghW![hj * fk + ji2] += dAct1 * xFull[subset[ji2]] + l2 * hW![hj * fk + ji2];
@@ -1366,11 +1460,10 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
                                 }
                                 else
                                 {
-                                    // Single-layer backprop: use stored preL1 — no recomputation
                                     for (int hj = 0; hj < hiddenDim; hj++)
                                     {
-                                        gw[hj] += err * h![hj] + l2 * w[hj];
-                                        double reluGate = preL1![hj] > 0 ? 1.0 : 0.0;
+                                        gw[hj] += err * hL1ActBuf![hj] + l2 * w[hj];
+                                        double reluGate = hL1PreBuf![hj] > 0 ? 1.0 : 0.0;
                                         double dH = err * w[hj] * reluGate;
                                         ghB![hj] += dH;
                                         for (int ji2 = 0; ji2 < fk; ji2++)
@@ -1380,13 +1473,8 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
                             }
                             else
                             {
-                                double gradNormSq = 0;
                                 for (int ji = 0; ji < fk; ji++)
-                                {
-                                    double gj = err * xFull[subset[ji]] + l2 * w[ji];
-                                    gw[ji] += gj;
-                                    gradNormSq += gj * gj;
-                                }
+                                    gw[ji] += err * xFull[subset[ji]] + l2 * w[ji];
                             }
                         } // end per-sample accumulation
 
@@ -1495,8 +1583,8 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
                         swaB += (b - swaB) / swaCount;
                         if (useMlp && swaHW is not null)
                         {
-                            for (int i = 0; i < hiddenDim * fk; i++) swaHW![i] += (hW![i] - swaHW![i]) / swaCount;
-                            for (int hj = 0; hj < hiddenDim; hj++) swaHB![hj] += (hB![hj] - swaHB![hj]) / swaCount;
+                            for (int i = 0; i < hWSize; i++) swaHW![i] += (hW![i] - swaHW![i]) / swaCount;
+                            for (int hj = 0; hj < hBSize; hj++) swaHB![hj] += (hB![hj] - swaHB![hj]) / swaCount;
                         }
                     }
 
@@ -1529,12 +1617,25 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
                     }
                 } // end epoch loop
 
-                // Apply SWA weights if accumulated
+                // Apply SWA weights if accumulated, but validate against early-stopped best
                 if (swaCount > 0)
                 {
                     Array.Copy(swaW, w, outDim);
                     b = swaB;
                     if (useMlp && swaHW is not null) { Array.Copy(swaHW, hW!, hW!.Length); Array.Copy(swaHB!, hB!, hB!.Length); }
+
+                    // If early stopping tracked a best loss, verify SWA didn't degrade
+                    if (patience > 0 && bestLoss < double.MaxValue && oobMasks[k].Any(x => x))
+                    {
+                        double swaLoss = ComputeOobLoss(fitSet, oobMasks[k], w, b, subset, fk,
+                            labelSmoothing, hW, hB, hiddenDim);
+                        if (swaLoss > bestLoss * 1.1) // SWA is >10% worse — fall back
+                        {
+                            w = bestW; b = bestB;
+                            if (useMlp && bestHW is not null) { Array.Copy(bestHW, hW!, hW!.Length); Array.Copy(bestHB!, hB!, hB!.Length); }
+                            swaCount = 0; // mark as not used
+                        }
+                    }
                 }
                 else if (patience > 0)
                 {
@@ -1599,14 +1700,12 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
                 double rho = PearsonCorrelation(weights[i], weights[j], F);
                 if (rho > hp.MaxLearnerCorrelation)
                 {
-                    // Re-init the weaker learner (lower OOB contribution)
-                    int weak = i; // simplified: always re-init j
-                    var rng2 = new Random(weak * 31 + 7);
-                    weights[weak] = new double[weights[weak].Length];
-                    double scale = Math.Sqrt(6.0 / (weights[weak].Length + 1));
-                    for (int ji = 0; ji < weights[weak].Length; ji++)
-                        weights[weak][ji] = (rng2.NextDouble() * 2.0 - 1.0) * scale;
-                    biases[weak] = 0.0;
+                    // Zero out the later learner — effectively prunes it from the ensemble
+                    // rather than injecting untrained random noise
+                    Array.Clear(weights[j], 0, weights[j].Length);
+                    biases[j] = 0.0;
+                    if (mlpHW?[j] is not null) Array.Clear(mlpHW[j], 0, mlpHW[j].Length);
+                    if (mlpHB?[j] is not null) Array.Clear(mlpHB[j], 0, mlpHB[j].Length);
                 }
             }
         }
@@ -1628,6 +1727,8 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
 
         var    w = new double[F];
         double b = 0;
+        var    bestW = new double[F];
+        double bestB = 0;
 
         for (int ep = 0; ep < epochs; ep++)
         {
@@ -1635,11 +1736,17 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
             {
                 double pred = b;
                 for (int j = 0; j < F; j++) pred += w[j] * s.Features[j];
-                double err = pred - s.Magnitude;
+                double err = Math.Clamp(pred - s.Magnitude, -10.0, 10.0);
                 b -= lr * err;
                 for (int j = 0; j < F; j++)
                     w[j] -= lr * (err * s.Features[j] + l2 * w[j]);
             }
+
+            // NaN/Inf guard — rollback to last good state
+            bool bad = !double.IsFinite(b);
+            if (!bad) for (int j = 0; j < F; j++) if (!double.IsFinite(w[j])) { bad = true; break; }
+            if (bad) { Array.Copy(bestW, w, F); b = bestB; break; }
+            Array.Copy(w, bestW, F); bestB = b;
         }
 
         return (w, b);
@@ -1657,6 +1764,8 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
 
         var    w = new double[F];
         double b = 0;
+        var    bestW = new double[F];
+        double bestB = 0;
 
         for (int ep = 0; ep < epochs; ep++)
         {
@@ -1665,12 +1774,16 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
                 double pred = b;
                 for (int j = 0; j < F; j++) pred += w[j] * s.Features[j];
                 double residual = s.Magnitude - pred;
-                // Pinball loss gradient: tau if residual >= 0 else (tau - 1)
-                double g = residual >= 0 ? tau - 1.0 : tau; // dL/dpred
-                b -= lr * (-g);
+                double dLdpred = residual >= 0 ? -tau : (1.0 - tau);
+                b -= lr * dLdpred;
                 for (int j = 0; j < F; j++)
-                    w[j] -= lr * (-g * s.Features[j] + l2 * w[j]);
+                    w[j] -= lr * (dLdpred * s.Features[j] + l2 * w[j]);
             }
+
+            bool bad = !double.IsFinite(b);
+            if (!bad) for (int j = 0; j < F; j++) if (!double.IsFinite(w[j])) { bad = true; break; }
+            if (bad) { Array.Copy(bestW, w, F); b = bestB; break; }
+            Array.Copy(w, bestW, F); bestB = b;
         }
 
         return (w, b);
@@ -1689,12 +1802,12 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         int                  hidDim  = 0)
     {
         int K = weights.Length;
-        if (calSet.Count < 20 || K < 2) return MetaLearner.None;
+        if (calSet.Count < MinCalSamples || K < 2) return MetaLearner.None;
 
         var mw = new double[K];
         double mb = 0;
         const double lr = 0.01;
-        const int    ep = 200;
+        const int    ep = DefaultCalibrationEpochs;
 
         for (int e = 0; e < ep; e++)
         {
@@ -1737,10 +1850,9 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         int                  hidDim  = 0)
     {
         double A = 1.0, B = 0.0;
-        const double lr     = 0.01;
-        const int    epochs = 200;
+        const double lr = 0.01;
 
-        for (int ep = 0; ep < epochs; ep++)
+        for (int ep = 0; ep < DefaultCalibrationEpochs; ep++)
         {
             double dA = 0, dB = 0;
             foreach (var s in calSet)
@@ -1773,10 +1885,20 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         double[][]?          mlpHB = null,
         int                  hidDim = 0)
     {
-        var buySet  = calSet.Where(s => s.Direction > 0).ToList();
-        var sellSet = calSet.Where(s => s.Direction <= 0).ToList();
+        // Split by predicted direction (not true label) so each subset contains
+        // both correct and incorrect predictions — making calibration well-posed
+        var buyPredSet  = new List<TrainingSample>();
+        var sellPredSet = new List<TrainingSample>();
+        foreach (var s in calSet)
+        {
+            double rawP = EnsembleProb(s.Features, weights, biases, F, featureSubsets, meta, mlpHW, mlpHB, hidDim);
+            if (rawP >= 0.5)
+                buyPredSet.Add(s);
+            else
+                sellPredSet.Add(s);
+        }
 
-        if (buySet.Count < 5 || sellSet.Count < 5)
+        if (buyPredSet.Count < 5 || sellPredSet.Count < 5)
             return (0.0, 0.0, 0.0, 0.0);
 
         static (double A, double B) FitOnSubset(
@@ -1785,7 +1907,7 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         {
             double A = 1.0, B = 0.0;
             const double lr = 0.01;
-            for (int ep = 0; ep < 150; ep++)
+            for (int ep = 0; ep < ClassCondPlattEpochs; ep++)
             {
                 double dA = 0, dB = 0;
                 foreach (var s in sub)
@@ -1803,8 +1925,8 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
             return (A, B);
         }
 
-        var (AB, BB) = FitOnSubset(buySet,  weights, biases, F, featureSubsets, meta, mlpHW, mlpHB, hidDim);
-        var (AS, BS) = FitOnSubset(sellSet, weights, biases, F, featureSubsets, meta, mlpHW, mlpHB, hidDim);
+        var (AB, BB) = FitOnSubset(buyPredSet,  weights, biases, F, featureSubsets, meta, mlpHW, mlpHB, hidDim);
+        var (AS, BS) = FitOnSubset(sellPredSet, weights, biases, F, featureSubsets, meta, mlpHW, mlpHB, hidDim);
         return (AB, BB, AS, BS);
     }
 
@@ -1823,7 +1945,7 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         double[][]?          mlpHB  = null,
         int                  hidDim = 0)
     {
-        if (calSet.Count < 10) return [];
+        if (calSet.Count < MinEvalSamples) return [];
 
         // Collect (platt-calibrated probability, label) pairs, sorted by probability
         var pairs = new List<(double P, double Y)>(calSet.Count);
@@ -1865,8 +1987,14 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         }
 
         // Encode as interleaved [x0, y0, x1, y1, ...] breakpoints
-        var bps = new List<double>(n * 2);
-        for (int i = 0; i < n; i++) { bps.Add(pairs[i].P); bps.Add(isotonic[i]); }
+        // Stride-sample to cap size (preserves quantile distribution like jackknife residuals)
+        const int MaxIsotonicBreakpoints = 1_000;
+        int stride = n > MaxIsotonicBreakpoints ? n / MaxIsotonicBreakpoints : 1;
+        int capacity = (n / stride + 1) * 2;
+        var bps = new List<double>(capacity);
+        for (int i = 0; i < n; i += stride) { bps.Add(pairs[i].P); bps.Add(isotonic[i]); }
+        // Always include the last point for boundary coverage
+        if (stride > 1 && n > 0) { bps.Add(pairs[n - 1].P); bps.Add(isotonic[n - 1]); }
         return [.. bps];
     }
 
@@ -1886,7 +2014,7 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         double T = 1.0;
         const double lr = 0.01;
 
-        for (int ep = 0; ep < 200; ep++)
+        for (int ep = 0; ep < DefaultCalibrationEpochs; ep++)
         {
             double dT = 0;
             foreach (var s in calSet)
@@ -1918,7 +2046,7 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         int                  hidDim           = 0,
         double[]?            importanceScores = null)
     {
-        if (calSet.Count < 20) return ([], 0.0);
+        if (calSet.Count < MinCalSamples) return ([], 0.0);
 
         // Determine top-3 feature indices by cal-set importance; fall back to [0,1,2]
         int[] top3 = importanceScores is { Length: > 0 }
@@ -1933,7 +2061,7 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         double mb = 0;
         const double lr = 0.01;
 
-        for (int ep = 0; ep < 200; ep++)
+        for (int ep = 0; ep < DefaultCalibrationEpochs; ep++)
         {
             double[] dw = new double[MetaInputDim];
             double   db = 0;
@@ -1982,14 +2110,14 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         double[][]?          mlpHB  = null,
         int                  hidDim = 0)
     {
-        if (calSet.Count < 20 || metaLabelWeights.Length == 0) return ([], 0.0, 0.5);
+        if (calSet.Count < MinCalSamples || metaLabelWeights.Length == 0) return ([], 0.0, 0.5);
 
         // Input features for abstention gate: [calibP, ensStd, metaLabelScore]
         var aw = new double[3];
         double ab = 0;
         const double lr = 0.01;
 
-        for (int ep = 0; ep < 200; ep++)
+        for (int ep = 0; ep < DefaultCalibrationEpochs; ep++)
         {
             double[] dw = new double[3];
             double   db = 0;
@@ -2063,7 +2191,7 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         int                  hidDim = 0,
         double               alpha  = 0.10)
     {
-        if (calSet.Count < 10) return 0.5;
+        if (calSet.Count < MinEvalSamples) return 0.5;
 
         var scores = new double[calSet.Count];
         for (int i = 0; i < calSet.Count; i++)
@@ -2092,7 +2220,6 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         List<TrainingSample> trainSet,
         double[][]           weights,
         double[]             biases,
-        double[]             temporalWeights,
         int                  F,
         int[][]?             featureSubsets,
         double[][]?          mlpHW  = null,
@@ -2116,7 +2243,7 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         // Cap serialised residuals to avoid outsized snapshot payloads.
         // Stride-sample the sorted list so the empirical quantile distribution
         // is preserved — quantile lookups in MLSignalScorer remain accurate.
-        const int MaxJackknifeResiduals = 5_000;
+        // MaxJackknifeResiduals is defined as a class-level constant
         if (res.Count > MaxJackknifeResiduals)
         {
             int stride  = res.Count / MaxJackknifeResiduals;
@@ -2149,7 +2276,7 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         double best   = 0.50;
         double bestEV = double.MinValue;
 
-        for (double t = lo; t <= hi + 1e-9; t += 0.02)
+        for (double t = lo; t <= hi + 1e-9; t += ThresholdSearchStep)
         {
             int correct = 0;
             foreach (var s in calSet)
@@ -2189,6 +2316,7 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
 
         int correct = 0, tp = 0, fp = 0, fn = 0, tn = 0;
         double brierSum = 0, magSqSum = 0;
+        double sumR = 0, sumR2 = 0;
 
         foreach (var s in evalSet)
         {
@@ -2206,6 +2334,11 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
 
             brierSum += (calibP - yVal) * (calibP - yVal);
 
+            // Per-sample return: +1 correct, -1 incorrect
+            double ret = yHat == yVal ? 1.0 : -1.0;
+            sumR  += ret;
+            sumR2 += ret * ret;
+
             double magPred = magBias;
             for (int j = 0; j < Math.Min(magWeights.Length, F); j++)
                 magPred += magWeights[j] * s.Features[j];
@@ -2220,7 +2353,10 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         double recall    = (tp + fn) > 0 ? (double)tp / (tp + fn) : 0;
         double f1        = (precision + recall) > 0 ? 2 * precision * recall / (precision + recall) : 0;
         double ev        = accuracy > 0.5 ? accuracy - 0.5 : 0;
-        double sharpe    = ev / (brier + 0.01);
+        // Sharpe = mean(returns) / std(returns) where return is +1/-1 per prediction
+        double meanR = sumR / evalN;
+        double varR  = evalN > 1 ? (sumR2 / evalN - meanR * meanR) : 0;
+        double sharpe = varR > 0 ? meanR / Math.Sqrt(varR) : 0;
 
         return new EvalMetrics(
             Accuracy: accuracy, Precision: precision, Recall: recall, F1: f1,
@@ -2235,25 +2371,33 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         List<TrainingSample> trainSet,
         double[][]           weights,
         double[]             biases,
-        double[]             temporalWeights,
+        bool[][]             oobMasks,
         int                  F,
         int[][]?             featureSubsets,
         double[][]?          mlpHW  = null,
         double[][]?          mlpHB  = null,
         int                  hidDim = 0)
     {
-        // OOB accuracy is currently tracked via oobMasks in FitEnsemble.
-        // Here we compute an ensemble-averaged OOB estimate.
         int K = weights.Length;
         int correct = 0, total = 0;
 
         for (int i = 0; i < trainSet.Count; i++)
         {
-            // Without oobMasks reference here, approximate with full ensemble
-            // (stored per-learner in FitEnsemble; this is a post-hoc estimate)
-            double rawP = EnsembleProb(trainSet[i].Features, weights, biases, F, featureSubsets,
-                MetaLearner.None, mlpHW, mlpHB, hidDim);
-            if ((rawP >= 0.5 ? 1 : 0) == (trainSet[i].Direction > 0 ? 1 : 0)) correct++;
+            // Average predictions only from learners where sample i is out-of-bag
+            double sumP = 0;
+            int oobCount = 0;
+            for (int k = 0; k < K; k++)
+            {
+                if (i < oobMasks[k].Length && oobMasks[k][i])
+                {
+                    sumP += SingleLearnerProb(trainSet[i].Features, weights[k], biases[k],
+                        featureSubsets?[k], F, mlpHW?[k], mlpHB?[k], hidDim);
+                    oobCount++;
+                }
+            }
+            if (oobCount == 0) continue;
+            double avgP = sumP / oobCount;
+            if ((avgP >= 0.5 ? 1 : 0) == (trainSet[i].Direction > 0 ? 1 : 0)) correct++;
             total++;
         }
 
@@ -2266,7 +2410,6 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         List<TrainingSample> trainSet,
         double[][]           weights,
         double[]             biases,
-        double[]             temporalWeights,
         int                  F,
         int[][]?             featureSubsets,
         double[][]?          mlpHW  = null,
@@ -2339,24 +2482,23 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
     {
         if (evalSet.Count == 0) return 0.0;
 
-        const int bins = 10;
-        var binAcc  = new double[bins];
-        var binConf = new double[bins];
-        var binCnt  = new int[bins];
+        var binAcc  = new double[EceBinCount];
+        var binConf = new double[EceBinCount];
+        var binCnt  = new int[EceBinCount];
 
         foreach (var s in evalSet)
         {
             double rawP   = EnsembleProb(s.Features, weights, biases, F, featureSubsets, meta, mlpHW, mlpHB, hidDim);
             double logit  = Math.Log(Math.Max(rawP, 1e-9) / Math.Max(1 - rawP, 1e-9));
             double calibP = Sigmoid(plattA * logit + plattB);
-            int    b      = Math.Min((int)(calibP * bins), bins - 1);
+            int    b      = Math.Min((int)(calibP * EceBinCount), EceBinCount - 1);
             binCnt[b]++;
             binConf[b] += calibP;
             binAcc[b]  += (s.Direction > 0 ? 1 : 0);
         }
 
         double ece = 0.0;
-        for (int b = 0; b < bins; b++)
+        for (int b = 0; b < EceBinCount; b++)
         {
             if (binCnt[b] == 0) continue;
             double conf = binConf[b] / binCnt[b];
@@ -2455,30 +2597,35 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         double[][]           weights,
         double[]             biases,
         int                  F,
-        int[][]?             featureSubsets)
+        int[][]?             featureSubsets,
+        double[][]?          mlpHW  = null,
+        double[][]?          mlpHB  = null,
+        int                  hidDim = 0)
     {
-        // ‖∇_x P‖ = P(1-P) × ‖w_ensemble‖ for linear logistic
+        // Numerical gradient norm via finite differences — correct for both linear and MLP
         if (calSet.Count == 0 || weights.Length == 0) return (0.0, 0.0);
 
-        // Compute mean ensemble weight vector
-        var wMean = new double[F];
-        int K     = weights.Length;
-        for (int k = 0; k < K; k++)
-            for (int j = 0; j < Math.Min(weights[k].Length, F); j++)
-                wMean[j] += weights[k][j];
-        double wNorm = 0;
-        for (int j = 0; j < F; j++) { wMean[j] /= K; wNorm += wMean[j] * wMean[j]; }
-        wNorm = Math.Sqrt(wNorm);
-
+        const double eps = 1e-4;
         var gradNorms = new double[calSet.Count];
         for (int i = 0; i < calSet.Count; i++)
         {
-            double rawP = EnsembleProb(calSet[i].Features, weights, biases, F, featureSubsets, MetaLearner.None);
-            gradNorms[i] = rawP * (1 - rawP) * wNorm;
+            var x = calSet[i].Features;
+            double p0 = EnsembleProb(x, weights, biases, F, featureSubsets, MetaLearner.None, mlpHW, mlpHB, hidDim);
+            double gradSq = 0;
+            for (int j = 0; j < Math.Min(F, x.Length); j++)
+            {
+                float orig = x[j];
+                x[j] = (float)(orig + eps);
+                double pPlus = EnsembleProb(x, weights, biases, F, featureSubsets, MetaLearner.None, mlpHW, mlpHB, hidDim);
+                x[j] = orig;
+                double dP = (pPlus - p0) / eps;
+                gradSq += dP * dP;
+            }
+            gradNorms[i] = Math.Sqrt(gradSq);
         }
 
         double mean = gradNorms.Average();
-        double std  = StdDev(gradNorms.ToList(), mean);
+        double std  = StdDev(gradNorms, mean);
         return (mean, std);
     }
 
@@ -2519,62 +2666,73 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         int                  F,
         double               threshold)
     {
-        if (trainSet.Count < 20 || F < 2) return [];
+        if (trainSet.Count < MinCalSamples || F < 2) return [];
 
         // Approximate MI via binned joint entropy: MI(i,j) = H(i) + H(j) - H(i,j)
-        const int bins = 10;
-        var redundant = new List<string>();
+        // Precompute per-feature min/max/marginal entropy to avoid redundant scans
         var featureNames = MLFeatureHelper.FeatureNames;
+        double maxMI = Math.Log(2);
+        double n = trainSet.Count;
 
-        for (int i = 0; i < F - 1; i++)
-        for (int j = i + 1; j < F; j++)
+        // Precompute per-feature min, max, and binned marginal counts
+        var fMin = new double[F];
+        var fMax = new double[F];
+        Array.Fill(fMin, double.MaxValue);
+        Array.Fill(fMax, double.MinValue);
+        foreach (var s in trainSet)
+            for (int fi = 0; fi < Math.Min(F, s.Features.Length); fi++)
+            {
+                if (s.Features[fi] < fMin[fi]) fMin[fi] = s.Features[fi];
+                if (s.Features[fi] > fMax[fi]) fMax[fi] = s.Features[fi];
+            }
+
+        // Build total pair count for parallel array sizing
+        int totalPairs = F * (F - 1) / 2;
+        var pairResults = new string?[totalPairs];
+
+        Parallel.For(0, F - 1, i =>
         {
-            // Compute joint histogram
-            var jointCounts = new double[bins, bins];
-            double[] piCounts = new double[bins];
-            double[] pjCounts = new double[bins];
+            double iRange = Math.Max(fMax[i] - fMin[i], 1e-9);
 
-            // Get min/max for binning
-            double iMin = double.MaxValue, iMax = double.MinValue;
-            double jMin = double.MaxValue, jMax = double.MinValue;
-            foreach (var s in trainSet)
+            for (int j = i + 1; j < F; j++)
             {
-                if (i < s.Features.Length) { iMin = Math.Min(iMin, s.Features[i]); iMax = Math.Max(iMax, s.Features[i]); }
-                if (j < s.Features.Length) { jMin = Math.Min(jMin, s.Features[j]); jMax = Math.Max(jMax, s.Features[j]); }
-            }
-            double iRange = Math.Max(iMax - iMin, 1e-9);
-            double jRange = Math.Max(jMax - jMin, 1e-9);
+                double jRange = Math.Max(fMax[j] - fMin[j], 1e-9);
 
-            foreach (var s in trainSet)
-            {
-                int bi = Math.Min((int)((s.Features[i] - iMin) / iRange * bins), bins - 1);
-                int bj = Math.Min((int)((s.Features[j] - jMin) / jRange * bins), bins - 1);
-                jointCounts[bi, bj]++;
-                piCounts[bi]++;
-                pjCounts[bj]++;
-            }
+                var jointCounts = new double[MIBinCount, MIBinCount];
+                double[] piCounts = new double[MIBinCount];
+                double[] pjCounts = new double[MIBinCount];
 
-            double n  = trainSet.Count;
-            double Hi = 0, Hj = 0, Hij = 0;
-            for (int bi = 0; bi < bins; bi++)
-            {
-                if (piCounts[bi] > 0) { double p = piCounts[bi] / n; Hi -= p * Math.Log(p); }
-                if (pjCounts[bi] > 0) { double p = pjCounts[bi] / n; Hj -= p * Math.Log(p); }
-                for (int bj = 0; bj < bins; bj++)
-                    if (jointCounts[bi, bj] > 0) { double p = jointCounts[bi, bj] / n; Hij -= p * Math.Log(p); }
-            }
+                foreach (var s in trainSet)
+                {
+                    int bi = Math.Min((int)((s.Features[i] - fMin[i]) / iRange * MIBinCount), MIBinCount - 1);
+                    int bj = Math.Min((int)((s.Features[j] - fMin[j]) / jRange * MIBinCount), MIBinCount - 1);
+                    jointCounts[bi, bj]++;
+                    piCounts[bi]++;
+                    pjCounts[bj]++;
+                }
 
-            double mi     = Hi + Hj - Hij;
-            double maxMI  = Math.Log(2); // max binary MI
-            if (mi > threshold * maxMI)
-            {
-                string iName = i < featureNames.Length ? featureNames[i] : $"f{i}";
-                string jName = j < featureNames.Length ? featureNames[j] : $"f{j}";
-                redundant.Add($"{iName}:{jName}");
-            }
-        }
+                double Hi = 0, Hj = 0, Hij = 0;
+                for (int bi = 0; bi < MIBinCount; bi++)
+                {
+                    if (piCounts[bi] > 0) { double p = piCounts[bi] / n; Hi -= p * Math.Log(p); }
+                    if (pjCounts[bi] > 0) { double p = pjCounts[bi] / n; Hj -= p * Math.Log(p); }
+                    for (int bj = 0; bj < MIBinCount; bj++)
+                        if (jointCounts[bi, bj] > 0) { double p = jointCounts[bi, bj] / n; Hij -= p * Math.Log(p); }
+                }
 
-        return [.. redundant];
+                double mi = Hi + Hj - Hij;
+                if (mi > threshold * maxMI)
+                {
+                    string iName = i < featureNames.Length ? featureNames[i] : $"f{i}";
+                    string jName = j < featureNames.Length ? featureNames[j] : $"f{j}";
+                    // Compute flat pair index for lock-free storage
+                    int pairIdx = i * (2 * F - i - 1) / 2 + (j - i - 1);
+                    pairResults[pairIdx] = $"{iName}:{jName}";
+                }
+            }
+        });
+
+        return [.. pairResults.Where(r => r is not null).Cast<string>()];
     }
 
     // ── Permutation feature importance (test set) ─────────────────────────────
@@ -2591,7 +2749,7 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         double[][]?          mlpHW,
         double[][]?          mlpHB,
         int                  hidDim,
-        Random               rng,
+        Random               _,
         CancellationToken    ct)
     {
         double baseline = EvalAccuracy(testSet, weights, biases, plattA, plattB, F, featureSubsets, meta, mlpHW, mlpHB, hidDim);
@@ -2601,6 +2759,8 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         {
             if (ct.IsCancellationRequested) break;
 
+            // Per-feature deterministic seed — avoids ordering dependency between features
+            var rng = new Random(77 * (j + 1));
             var origVals = testSet.Select(s => s.Features[j]).ToArray();
             for (int i = origVals.Length - 1; i > 0; i--)
             {
@@ -2641,12 +2801,12 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
     {
         double baseline = EvalAccuracy(calSet, weights, biases, plattA, plattB, F, featureSubsets, meta, mlpHW, mlpHB, hidDim);
         var imp = new double[F];
-        var rng = new Random(13);
 
         for (int j = 0; j < F; j++)
         {
             if (ct.IsCancellationRequested) break;
 
+            var rng = new Random(13 * (j + 1));
             var origVals = calSet.Select(s => s.Features[j]).ToArray();
             for (int i = origVals.Length - 1; i > 0; i--)
             {
@@ -2686,7 +2846,7 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         double db = 0;
         const double lr = 0.01;
 
-        for (int ep = 0; ep < 50; ep++)
+        for (int ep = 0; ep < DensityRatioEpochs; ep++)
         {
             double[] gdw = new double[F]; double gdb = 0;
             for (int i = 0; i < n; i++)
@@ -2793,27 +2953,47 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         int                  hidDim = 0)
     {
         int K = weights.Length;
+        int N = calSet.Count;
         var useCounts = new int[K];
 
-        // Forward selection: repeatedly add the learner that most improves ensemble
-        const int rounds = 50;
-        var selected = new List<int>();
+        // Cache per-learner predictions to avoid redundant computation
+        var cache = new double[K][];
+        var labels = new int[N];
+        for (int k = 0; k < K; k++)
+        {
+            cache[k] = new double[N];
+            for (int i = 0; i < N; i++)
+                cache[k][i] = SingleLearnerProb(calSet[i].Features, weights[k], biases[k],
+                    featureSubsets?[k], F, mlpHW?[k], mlpHB?[k], hidDim);
+        }
+        for (int i = 0; i < N; i++)
+            labels[i] = calSet[i].Direction > 0 ? 1 : 0;
 
-        for (int r = 0; r < rounds; r++)
+        var selected = new List<int>();
+        var runningSum = new double[N];
+
+        for (int r = 0; r < GesRounds; r++)
         {
             double bestAcc = -1;
             int    bestK   = 0;
+            int    count   = selected.Count + 1;
 
             for (int k = 0; k < K; k++)
             {
-                var candidate = new List<int>(selected) { k };
-                double acc = EvalAccuracySubset(calSet, weights, biases, F, featureSubsets,
-                    mlpHW, mlpHB, hidDim, candidate);
+                int correct = 0;
+                for (int i = 0; i < N; i++)
+                {
+                    double avgP = (runningSum[i] + cache[k][i]) / count;
+                    if ((avgP >= 0.5 ? 1 : 0) == labels[i]) correct++;
+                }
+                double acc = (double)correct / N;
                 if (acc > bestAcc) { bestAcc = acc; bestK = k; }
             }
 
             selected.Add(bestK);
             useCounts[bestK]++;
+            for (int i = 0; i < N; i++)
+                runningSum[i] += cache[bestK][i];
         }
 
         double total = useCounts.Sum();
@@ -2971,30 +3151,7 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         return (double)correct / samples.Count;
     }
 
-    private static double EvalAccuracySubset(
-        List<TrainingSample> samples,
-        double[][]           weights,
-        double[]             biases,
-        int                  F,
-        int[][]?             featureSubsets,
-        double[][]?          mlpHW,
-        double[][]?          mlpHB,
-        int                  hidDim,
-        List<int>            selectedK)
-    {
-        if (samples.Count == 0 || selectedK.Count == 0) return 0.0;
-        int correct = 0;
-        foreach (var s in samples)
-        {
-            double sumP = 0;
-            foreach (int k in selectedK)
-                sumP += SingleLearnerProb(s.Features, weights[k], biases[k],
-                    featureSubsets?[k], F, mlpHW?[k], mlpHB?[k], hidDim);
-            double p = sumP / selectedK.Count;
-            if ((p >= 0.5 ? 1 : 0) == (s.Direction > 0 ? 1 : 0)) correct++;
-        }
-        return (double)correct / samples.Count;
-    }
+
 
     // ── OOB cross-entropy loss (for per-learner early stopping) ───────────────
 
@@ -3182,11 +3339,14 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
 
     private static List<TrainingSample> ApplyMask(List<TrainingSample> samples, bool[] mask)
     {
+        // Reduce dimensionality: only keep features where mask[j] is true
+        int[] kept = Enumerable.Range(0, mask.Length).Where(j => mask[j]).ToArray();
+        int newF = kept.Length;
         return samples.Select(s =>
         {
-            var mf = new float[s.Features.Length];
-            for (int j = 0; j < s.Features.Length; j++)
-                mf[j] = j < mask.Length && mask[j] ? s.Features[j] : 0f;
+            var mf = new float[newF];
+            for (int i = 0; i < newF; i++)
+                mf[i] = kept[i] < s.Features.Length ? s.Features[kept[i]] : 0f;
             return s with { Features = mf };
         }).ToList();
     }
@@ -3215,7 +3375,7 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         for (int j = 0; j < F; j++)
         {
             double imp = j < importanceScores.Length ? Math.Max(0, importanceScores[j]) : 0;
-            weights[j] = Math.Exp(imp * 5.0); // temperature = 5
+            weights[j] = Math.Exp(imp * BiasedSamplingTemp);
             sum += weights[j];
         }
         for (int j = 0; j < F; j++) weights[j] /= sum;
@@ -3305,13 +3465,40 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         return Math.Sqrt(-2.0 * Math.Log(u1)) * Math.Sin(2.0 * Math.PI * u2);
     }
 
-    // L7: Beta distribution sample (approximated via rejection for small α)
+    // L7: Beta(α, α) sample via Gamma distribution (Marsaglia-Tsang method)
     private static double SampleBeta(double alpha, Random rng)
     {
         if (alpha <= 0) return 0.5;
-        // Use normal approximation for moderate α
-        double u = rng.NextDouble();
-        return Math.Clamp(0.5 + (u - 0.5) * (1.0 - 1.0 / (1.0 + alpha)), 0.0, 1.0);
+        double x = SampleGamma(alpha, rng);
+        double y = SampleGamma(alpha, rng);
+        double sum = x + y;
+        return sum > 0 ? x / sum : 0.5;
+    }
+
+    private static double SampleGamma(double shape, Random rng)
+    {
+        // For shape < 1, use Ahrens-Dieter correction: Gamma(a) = Gamma(a+1) * U^(1/a)
+        if (shape < 1.0)
+        {
+            double u = rng.NextDouble();
+            return SampleGamma(shape + 1.0, rng) * Math.Pow(Math.Max(u, 1e-15), 1.0 / shape);
+        }
+        // Marsaglia-Tsang method for shape >= 1
+        double d = shape - 1.0 / 3.0;
+        double c = 1.0 / Math.Sqrt(9.0 * d);
+        while (true)
+        {
+            double x, v;
+            do
+            {
+                x = SampleNormal(rng);
+                v = 1.0 + c * x;
+            } while (v <= 0);
+            v = v * v * v;
+            double u2 = rng.NextDouble();
+            if (u2 < 1.0 - 0.0331 * (x * x) * (x * x)) return d * v;
+            if (Math.Log(u2) < 0.5 * x * x + d * (1 - v + Math.Log(v))) return d * v;
+        }
     }
 
     private static double StdDev(List<double> values, double mean)
@@ -3321,8 +3508,13 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         return Math.Sqrt(variance);
     }
 
-    private static double StdDev(IEnumerable<double> values, double mean)
-        => StdDev(values.ToList(), mean);
+    private static double StdDev(double[] values, double mean)
+    {
+        if (values.Length < 2) return 0.0;
+        double sum = 0;
+        for (int i = 0; i < values.Length; i++) { double d = values[i] - mean; sum += d * d; }
+        return Math.Sqrt(sum / (values.Length - 1));
+    }
 
     private static double ComputeSharpeTrend(List<double> sharpeList)
     {

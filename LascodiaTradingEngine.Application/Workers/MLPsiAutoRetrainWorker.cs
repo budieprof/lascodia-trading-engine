@@ -35,6 +35,14 @@ public sealed class MLPsiAutoRetrainWorker : BackgroundService
     private readonly IServiceScopeFactory           _scopeFactory;
     private readonly ILogger<MLPsiAutoRetrainWorker> _logger;
 
+    /// <summary>
+    /// Initialises the worker with its DI scope factory and logger.
+    /// </summary>
+    /// <param name="scopeFactory">
+    /// Used to create a new async DI scope per poll cycle so scoped EF Core
+    /// contexts are correctly disposed after each PSI check pass.
+    /// </param>
+    /// <param name="logger">Structured logger scoped to this worker type.</param>
     public MLPsiAutoRetrainWorker(
         IServiceScopeFactory             scopeFactory,
         ILogger<MLPsiAutoRetrainWorker>  logger)
@@ -43,12 +51,19 @@ public sealed class MLPsiAutoRetrainWorker : BackgroundService
         _logger       = logger;
     }
 
+    /// <summary>
+    /// Hosted-service entry point. Polls every <c>MLPsiAutoRetrain:PollIntervalSeconds</c>
+    /// seconds (default 14400 = 4 hours), reading the interval from <see cref="EngineConfig"/>
+    /// on each cycle so it can be hot-reloaded without a restart.
+    /// </summary>
+    /// <param name="stoppingToken">Signalled when the host is shutting down.</param>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation("MLPsiAutoRetrainWorker started.");
 
         while (!stoppingToken.IsCancellationRequested)
         {
+            // Default 4-hour poll interval; refreshed from DB on every cycle.
             int pollSecs = 14400;
 
             try
@@ -59,6 +74,7 @@ public sealed class MLPsiAutoRetrainWorker : BackgroundService
                 var ctx     = readDb.GetDbContext();
                 var wCtx    = writeDb.GetDbContext();
 
+                // Refresh poll interval from DB each cycle to support hot-reload.
                 pollSecs = await GetConfigAsync<int>(ctx, CK_PollSecs, 14400, stoppingToken);
 
                 await CheckPsiAndEnqueueAsync(ctx, wCtx, stoppingToken);
@@ -80,15 +96,26 @@ public sealed class MLPsiAutoRetrainWorker : BackgroundService
 
     // ── Per-poll PSI check ────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Iterates over all active models that have a valid serialised snapshot and
+    /// delegates per-model PSI checks to <see cref="CheckModelPsiAsync"/>.
+    /// Reads the current PSI configuration from <see cref="EngineConfig"/> once per
+    /// poll cycle and passes it to each model check to avoid redundant DB queries.
+    /// </summary>
+    /// <param name="readCtx">Read-only EF context for models, prediction logs, and config.</param>
+    /// <param name="writeCtx">Write EF context for inserting training run records.</param>
+    /// <param name="ct">Cancellation token forwarded from the host.</param>
     private async Task CheckPsiAndEnqueueAsync(
         Microsoft.EntityFrameworkCore.DbContext readCtx,
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
         CancellationToken                       ct)
     {
+        // Read PSI policy parameters once per cycle to avoid per-model DB round trips.
         int    windowDays     = await GetConfigAsync<int>   (readCtx, CK_WindowDays,     30,   ct);
         int    minPredictions = await GetConfigAsync<int>   (readCtx, CK_MinPredictions, 50,   ct);
         double psiThreshold   = await GetConfigAsync<double>(readCtx, CK_PsiThreshold,   0.20, ct);
 
+        // Load models with valid snapshots — FeatureQuantileBreakpoints are needed for PSI.
         var activeModels = await readCtx.Set<MLModel>()
             .Where(m => m.IsActive && !m.IsDeleted && m.ModelBytes != null)
             .AsNoTracking()
@@ -106,6 +133,7 @@ public sealed class MLPsiAutoRetrainWorker : BackgroundService
             }
             catch (Exception ex)
             {
+                // Per-model exceptions are non-fatal — log and continue with remaining models.
                 _logger.LogWarning(ex,
                     "PSI auto-retrain check failed for {Symbol}/{Tf} model {Id} — skipping.",
                     model.Symbol, model.Timeframe, model.Id);
@@ -113,6 +141,43 @@ public sealed class MLPsiAutoRetrainWorker : BackgroundService
         }
     }
 
+    /// <summary>
+    /// Checks whether the confidence-score distribution of a single model's recent
+    /// predictions has shifted significantly (PSI breach) from the training-time
+    /// distribution and, if so, enqueues a new <see cref="MLTrainingRun"/>.
+    /// </summary>
+    /// <remarks>
+    /// PSI auto-retrain methodology:
+    ///
+    /// The Population Stability Index (PSI) quantifies distributional shift between
+    /// two samples:
+    ///   PSI = Σ_b (pObs_b − pExp_b) × log(pObs_b / pExp_b)
+    /// Standard interpretation:
+    /// <list type="bullet">
+    ///   <item>PSI &lt; 0.10: no significant shift — model remains representative.</item>
+    ///   <item>0.10 ≤ PSI &lt; 0.25: moderate shift — monitor closely.</item>
+    ///   <item>PSI ≥ 0.25: major shift — retrain required.</item>
+    /// </list>
+    ///
+    /// <b>Confidence-score proxy:</b> Full feature-level PSI requires raw feature values
+    /// at inference time, which the prediction log does not store (storing them would
+    /// double the log table size). Instead, the model's output confidence score is used
+    /// as a 1-D distributional proxy. A shift in the confidence distribution is a strong
+    /// signal that the model's feature inputs have drifted — the model has become
+    /// under- or over-confident relative to its training-time calibration.
+    ///
+    /// <b>Expected distribution:</b> A well-calibrated model produces confidence scores
+    /// that are approximately uniform over [0, 1] when averaged across many signals.
+    /// The PSI baseline is therefore a 10-bin uniform distribution (each bin expects
+    /// 10% of scores). Departures from uniformity indicate calibration drift.
+    /// </remarks>
+    /// <param name="model">The model being checked.</param>
+    /// <param name="readCtx">Read-only EF context for training runs and prediction logs.</param>
+    /// <param name="writeCtx">Write EF context for inserting the retraining run record.</param>
+    /// <param name="windowDays">Rolling window in days for prediction log collection.</param>
+    /// <param name="minPredictions">Minimum recent predictions required before PSI is computed.</param>
+    /// <param name="psiThreshold">PSI value above which a retraining run is enqueued.</param>
+    /// <param name="ct">Cancellation token forwarded from the host.</param>
     private async Task CheckModelPsiAsync(
         MLModel                                 model,
         Microsoft.EntityFrameworkCore.DbContext readCtx,
@@ -122,7 +187,8 @@ public sealed class MLPsiAutoRetrainWorker : BackgroundService
         double                                  psiThreshold,
         CancellationToken                       ct)
     {
-        // Skip if a training run is already queued or running
+        // Skip if a training run is already queued or running for this symbol/timeframe.
+        // An in-flight retrain will refresh the model regardless of the PSI trigger.
         bool alreadyQueued = await readCtx.Set<MLTrainingRun>()
             .AnyAsync(r => r.Symbol    == model.Symbol    &&
                            r.Timeframe == model.Timeframe &&
@@ -135,16 +201,19 @@ public sealed class MLPsiAutoRetrainWorker : BackgroundService
             return;
         }
 
-        // Deserialise snapshot to get FeatureQuantileBreakpoints
+        // Deserialise snapshot to access FeatureQuantileBreakpoints.
+        // These were stored at training time and represent the expected feature distribution.
         ModelSnapshot? snap;
         try { snap = System.Text.Json.JsonSerializer.Deserialize<ModelSnapshot>(model.ModelBytes!); }
         catch { return; }
 
+        // Skip models whose snapshots were created before the FeatureQuantileBreakpoints field
+        // was introduced (pre-Round-7 snapshots). An empty array is a sentinel for "not computed".
         if (snap is null || snap.FeatureQuantileBreakpoints.Length == 0) return;
 
-        // Load recent prediction-log confidence scores for PSI proxy
-        // (We use the confidence score as a 1-D proxy; full feature-level PSI
-        //  requires feature values at inference time, which are not stored.)
+        // Load recent prediction-log confidence scores for the PSI confidence-score proxy.
+        // We use the confidence score as a 1-D proxy; full feature-level PSI requires
+        // feature values at inference time, which are not stored in the prediction log.
         var since  = DateTime.UtcNow.AddDays(-windowDays);
         var scores = await readCtx.Set<MLModelPredictionLog>()
             .Where(l => l.MLModelId   == model.Id &&
@@ -153,6 +222,7 @@ public sealed class MLPsiAutoRetrainWorker : BackgroundService
             .Select(l => (double)l.ConfidenceScore)
             .ToListAsync(ct);
 
+        // Require a minimum number of recent predictions for a stable PSI estimate.
         if (scores.Count < minPredictions)
         {
             _logger.LogDebug(
@@ -161,15 +231,13 @@ public sealed class MLPsiAutoRetrainWorker : BackgroundService
             return;
         }
 
-        // Compute PSI on confidence-score distribution vs training-time breakpoints of
-        // the first stored feature (index 0) as a fast proxy.
-        // Full feature-level PSI requires storing raw feature values in prediction logs,
-        // which is outside the scope of this worker.
+        // Compute PSI on the confidence-score distribution.
         double psi = ComputeConfidenceScorePsi(scores, snap);
         _logger.LogDebug(
             "PSI auto-retrain: {Symbol}/{Tf} model {Id}: PSI(conf)={PSI:F4} (threshold={Thr:F2})",
             model.Symbol, model.Timeframe, model.Id, psi, psiThreshold);
 
+        // No significant distributional shift — model remains representative.
         if (psi < psiThreshold) return;
 
         _logger.LogWarning(
@@ -177,6 +245,8 @@ public sealed class MLPsiAutoRetrainWorker : BackgroundService
             "auto-enqueuing training run.",
             model.Symbol, model.Timeframe, model.Id, psi, psiThreshold);
 
+        // Enqueue a new training run. The HyperparamConfigJson carries audit fields
+        // so the ML health worker can trace why this run was scheduled.
         var run = new MLTrainingRun
         {
             Symbol    = model.Symbol,
@@ -202,10 +272,32 @@ public sealed class MLPsiAutoRetrainWorker : BackgroundService
     // ── PSI computation (confidence-score distribution vs uniform baseline) ───
 
     /// <summary>
-    /// Computes the Population Stability Index between the observed confidence-score
+    /// Computes the Population Stability Index (PSI) between the observed confidence-score
     /// distribution (10 equal-width bins over [0, 1]) and a uniform expected distribution.
-    /// PSI &lt; 0.10 = no significant shift; 0.10–0.25 = moderate; &gt; 0.25 = major shift.
     /// </summary>
+    /// <remarks>
+    /// PSI formula:
+    ///   PSI = Σ_b (p_obs_b − p_exp_b) × ln(p_obs_b / p_exp_b)
+    ///
+    /// Binning: 10 equal-width bins of width 0.1 over [0, 1].
+    /// Expected distribution: uniform (each bin expects 10% of scores) — this is the
+    /// baseline for a well-calibrated model producing diverse confidence outputs.
+    ///
+    /// Numerical guard: both p_obs and p_exp are clamped to ≥ 1e-10 to avoid log(0).
+    ///
+    /// Interpretation:
+    /// <list type="bullet">
+    ///   <item>PSI &lt; 0.10 — negligible shift; no action needed.</item>
+    ///   <item>0.10 ≤ PSI &lt; 0.25 — moderate shift; monitor.</item>
+    ///   <item>PSI ≥ 0.25 — major shift; retrain recommended.</item>
+    /// </list>
+    /// </remarks>
+    /// <param name="scores">Recent model confidence scores in [0, 1].</param>
+    /// <param name="snap">
+    /// Model snapshot (not currently used in this 1-D confidence proxy; included for
+    /// future extension to full feature-level PSI using FeatureQuantileBreakpoints).
+    /// </param>
+    /// <returns>The computed PSI value (≥ 0).</returns>
     private static double ComputeConfidenceScorePsi(
         IReadOnlyList<double> scores,
         ModelSnapshot         snap)
@@ -213,20 +305,24 @@ public sealed class MLPsiAutoRetrainWorker : BackgroundService
         const int NumBin  = 10;
         double    binSize = 1.0 / NumBin;
 
-        var observed  = new double[NumBin];
-        var expected  = new double[NumBin]; // uniform = 1/NumBin each
+        var observed  = new double[NumBin]; // count of scores in each bin
 
+        // Distribute scores into equal-width bins.
+        // Clamp to [0, NumBin-1] so that a score of exactly 1.0 does not overflow.
         foreach (double s in scores)
         {
             int b = Math.Clamp((int)(s / binSize), 0, NumBin - 1);
             observed[b]++;
         }
 
+        // Compute PSI as the sum of (pObs − pExp) × ln(pObs / pExp) across all bins.
         double n = scores.Count;
         double psi = 0.0;
         for (int b = 0; b < NumBin; b++)
         {
+            // Normalise observed counts to proportions; guard against log(0).
             double pObs = Math.Max(observed[b] / n, 1e-10);
+            // Uniform expected proportion (1/NumBin); guard against log(0).
             double pExp = Math.Max(1.0 / NumBin, 1e-10);
             psi += (pObs - pExp) * Math.Log(pObs / pExp);
         }
@@ -236,6 +332,17 @@ public sealed class MLPsiAutoRetrainWorker : BackgroundService
 
     // ── Config helper ─────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Reads a typed configuration value from the <see cref="EngineConfig"/> table,
+    /// falling back to <paramref name="defaultValue"/> if the key is absent or
+    /// the stored value cannot be converted to <typeparamref name="T"/>.
+    /// </summary>
+    /// <typeparam name="T">Target value type (int, double, string, etc.).</typeparam>
+    /// <param name="ctx">EF Core context to query against.</param>
+    /// <param name="key">The EngineConfig key to look up.</param>
+    /// <param name="defaultValue">Value to return when the key is missing or invalid.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>The parsed config value or <paramref name="defaultValue"/>.</returns>
     private static async Task<T> GetConfigAsync<T>(
         Microsoft.EntityFrameworkCore.DbContext ctx,
         string                                  key,

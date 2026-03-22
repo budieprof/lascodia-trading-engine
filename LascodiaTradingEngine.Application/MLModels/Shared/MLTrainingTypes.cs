@@ -1434,6 +1434,14 @@ public class ModelSnapshot
     /// </summary>
     public double[] FeatureVariances { get; set; } = [];
 
+    /// <summary>
+    /// Mahalanobis distance threshold for out-of-distribution detection.
+    /// Features with normalised distance above this are flagged as OOD.
+    /// Default 3.0 (≈ 3σ). Set to 0 to disable OOD gating.
+    /// Populated from <see cref="HyperparamConfig.OodThresholdSigma"/> at training time.
+    /// </summary>
+    public double OodThreshold { get; set; } = 3.0;
+
     // ── Stacking meta-learner (set by BaggedLogisticTrainer after base learner training) ──
 
     /// <summary>
@@ -2018,6 +2026,19 @@ public class ModelSnapshot
     /// Null for models trained by other architectures.
     /// </summary>
     public string? GbmTreesJson { get; set; }
+
+    /// <summary>
+    /// Base log-odds intercept for GBM inference: logit(basePositiveRate).
+    /// The GBM score is computed as <c>GbmBaseLogOdds + GbmLearningRate × Σ tree predictions</c>.
+    /// Defaults to 0.0 (logit of 0.5) for snapshots serialised before this field was added.
+    /// </summary>
+    public double GbmBaseLogOdds { get; set; }
+
+    /// <summary>
+    /// Learning rate (shrinkage) applied to each GBM tree prediction during inference.
+    /// Defaults to 0.1 for snapshots serialised before this field was added.
+    /// </summary>
+    public double GbmLearningRate { get; set; }
 
     // ── Rec #86: Mean Teacher EMA weights ────────────────────────────────────
 

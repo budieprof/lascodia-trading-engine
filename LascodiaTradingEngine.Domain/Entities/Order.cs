@@ -145,6 +145,9 @@ public class Order : Entity<long>
     /// <summary>Soft-delete flag. Filtered out by the global EF Core query filter.</summary>
     public bool      IsDeleted { get; set; }
 
+    /// <summary>Optimistic concurrency token — auto-incremented by PostgreSQL on every update.</summary>
+    public uint      RowVersion { get; set; }
+
     // ── Navigation properties ────────────────────────────────────────────────
 
     /// <summary>The trade signal this order was generated from (nullable for manual orders).</summary>

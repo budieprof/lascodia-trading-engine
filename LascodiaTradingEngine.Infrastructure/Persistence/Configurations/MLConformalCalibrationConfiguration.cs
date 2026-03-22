@@ -19,6 +19,8 @@ public class MLConformalCalibrationConfiguration : IEntityTypeConfiguration<MLCo
         builder.Property(x => x.EmpiricalCoverage).HasPrecision(5, 4);
         builder.Property(x => x.AmbiguousRate).HasPrecision(5, 4);
 
+        builder.HasQueryFilter(x => !x.IsDeleted);
+
         builder.HasIndex(x => new { x.MLModelId, x.IsDeleted });
         builder.HasIndex(x => new { x.Symbol, x.Timeframe });
 

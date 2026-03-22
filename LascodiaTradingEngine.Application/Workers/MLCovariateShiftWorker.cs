@@ -121,6 +121,14 @@ public sealed class MLCovariateShiftWorker : BackgroundService
 
     // ── Per-model covariate check ─────────────────────────────────────────────
 
+    /// <summary>
+    /// Iterates over all active <see cref="MLModel"/> records that have serialised
+    /// <c>ModelBytes</c> (i.e. a <see cref="MLModels.Shared.ModelSnapshot"/> with training
+    /// means/stds), and dispatches each to <see cref="CheckModelCovariateShiftAsync"/>.
+    ///
+    /// Models without <c>ModelBytes</c> are skipped — they cannot be evaluated because
+    /// the training-time feature distribution statistics are stored inside the snapshot.
+    /// </summary>
     private async Task CheckAllModelsAsync(
         Microsoft.EntityFrameworkCore.DbContext readCtx,
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
@@ -149,6 +157,39 @@ public sealed class MLCovariateShiftWorker : BackgroundService
         }
     }
 
+    /// <summary>
+    /// Checks a single <see cref="MLModel"/> for covariate shift by comparing the input feature
+    /// distribution of recent market data against the distribution observed during training.
+    ///
+    /// <para><b>Two complementary shift detectors run in parallel:</b></para>
+    /// <list type="bullet">
+    ///   <item><b>Univariate PSI</b> — PSI is computed for each feature independently using
+    ///         importance-weighted aggregation (see <see cref="ComputePsi"/>). Any feature
+    ///         exceeding <paramref name="psiThreshold"/> (default 0.20 = "significant shift")
+    ///         triggers the detector. Importance weighting ensures high-signal features
+    ///         (large <c>FeatureImportance</c> values) carry more weight in the aggregate PSI.</item>
+    ///   <item><b>Multivariate mean-sq-z-score</b> — computes the mean of all squared
+    ///         z-scores across every feature and every recent sample. Under the training
+    ///         distribution (N(0,1) after standardisation) the expected value is 1.0.
+    ///         A value significantly above 1.0 signals joint distributional shift even when
+    ///         no single feature PSI exceeds the threshold — for example, when several features
+    ///         shift modestly but in a correlated direction that PSI alone misses.</item>
+    /// </list>
+    ///
+    /// <para>When either detector fires and no retraining run is already queued, a new
+    /// <see cref="MLTrainingRun"/> with <see cref="TriggerType.AutoDegrading"/> is created.
+    /// This is the same trigger used by <see cref="MLDriftMonitorWorker"/> so the two workers
+    /// produce identical run records and share the same deduplication logic.</para>
+    /// </summary>
+    /// <param name="model">The active model to evaluate for covariate shift.</param>
+    /// <param name="readCtx">EF read context — used for all SELECT queries.</param>
+    /// <param name="writeCtx">EF write context — used only to persist a new training run.</param>
+    /// <param name="windowDays">How many days of recent closed candles to load for comparison.</param>
+    /// <param name="psiThreshold">PSI value above which a feature is considered shifted (0.10 = moderate, 0.20 = significant).</param>
+    /// <param name="minCandles">Minimum closed candles required to compute reliable feature statistics.</param>
+    /// <param name="trainingDays">Window size (days) for the queued retraining run.</param>
+    /// <param name="multivariateThreshold">Mean squared z-score threshold above which multivariate shift fires.</param>
+    /// <param name="ct">Cancellation token.</param>
     private async Task CheckModelCovariateShiftAsync(
         MLModel                                 model,
         Microsoft.EntityFrameworkCore.DbContext readCtx,
@@ -433,6 +474,10 @@ public sealed class MLCovariateShiftWorker : BackgroundService
 
     // ── Config helper ─────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Reads a typed value from <see cref="EngineConfig"/> or returns <paramref name="defaultValue"/>
+    /// when the key is absent or its stored string cannot be parsed into <typeparamref name="T"/>.
+    /// </summary>
     private static async Task<T> GetConfigAsync<T>(
         Microsoft.EntityFrameworkCore.DbContext ctx,
         string                                  key,

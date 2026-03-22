@@ -27,6 +27,8 @@ public class EngineConfigConfiguration : IEntityTypeConfiguration<EngineConfig>
             .IsRequired()
             .HasMaxLength(20);
 
+        builder.HasQueryFilter(x => !x.IsDeleted);
+
         builder.HasIndex(x => x.Key).IsUnique();
     }
 }

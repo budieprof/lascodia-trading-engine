@@ -53,6 +53,11 @@ public class PositionConfiguration : IEntityTypeConfiguration<Position>
         builder.Property(x => x.TrailingStopValue)
             .HasPrecision(18, 8);
 
+        builder.HasQueryFilter(x => !x.IsDeleted);
+
+        builder.Property(x => x.RowVersion).IsRowVersion();
+
+        builder.HasIndex(x => x.OpenOrderId).IsUnique().HasFilter("\"OpenOrderId\" IS NOT NULL");
         builder.HasIndex(x => new { x.Symbol, x.Status });
     }
 }

@@ -10,6 +10,9 @@ namespace LascodiaTradingEngine.Application.Common.Events;
 /// </summary>
 public record OrderFilledIntegrationEvent : IntegrationEvent
 {
+    /// <summary>Monotonic sequence number for ordering detection. Consumers can discard events with lower sequence than previously seen.</summary>
+    public long          SequenceNumber  { get; init; } = EventSequence.Next();
+
     /// <summary>The filled order's database Id.</summary>
     public long          OrderId         { get; init; }
 

@@ -1,4 +1,6 @@
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Options;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -7,8 +9,16 @@ namespace LascodiaTradingEngine.Application.RiskProfiles.Services;
 /// <summary>
 /// Validates trade signals and account drawdown against a given risk profile.
 /// </summary>
+[RegisterService]
 public class RiskChecker : IRiskChecker
 {
+    private readonly RiskCheckerOptions _options;
+
+    public RiskChecker(RiskCheckerOptions options)
+    {
+        _options = options;
+    }
+
     public Task<RiskCheckResult> CheckAsync(
         TradeSignal signal,
         RiskProfile profile,
@@ -51,7 +61,7 @@ public class RiskChecker : IRiskChecker
             signal.MLConfidenceScore.HasValue &&
             signal.MLPredictedDirection != signal.Direction)
         {
-            const decimal mlDisagreementMinConfidence = 0.70m;
+            decimal mlDisagreementMinConfidence = _options.MLDisagreementMinConfidence;
             if (signal.Confidence < mlDisagreementMinConfidence)
                 return Fail(
                     $"ML model predicts {signal.MLPredictedDirection} but signal direction is {signal.Direction}; " +

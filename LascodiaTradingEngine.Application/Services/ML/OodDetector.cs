@@ -1,3 +1,5 @@
+using Microsoft.Extensions.DependencyInjection;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.MLModels.Shared;
 
@@ -15,6 +17,7 @@ namespace LascodiaTradingEngine.Application.Services.ML;
 /// The Euclidean z-score sum follows a χ²(F) distribution, so the expected value
 /// is F and the threshold at 3σ beyond the mean is F + 3√(2F).
 /// </remarks>
+[RegisterService(ServiceLifetime.Singleton)]
 public sealed class OodDetector : IOodDetector
 {
     /// <inheritdoc/>

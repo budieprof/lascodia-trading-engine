@@ -1,6 +1,7 @@
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
@@ -57,6 +58,7 @@ public sealed record EngineHealthSnapshot
     public DateTime SnapshotAt           { get; init; }
 }
 
+[RegisterService]
 public sealed class EngineMonitoringService : IEngineMonitoringService
 {
     private readonly IServiceScopeFactory _scopeFactory;

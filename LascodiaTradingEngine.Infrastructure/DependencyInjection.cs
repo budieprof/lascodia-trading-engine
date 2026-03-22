@@ -6,6 +6,8 @@ using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Infrastructure.Persistence.DbContexts;
 using Lascodia.Trading.Engine.IntegrationEventLogEF.Services;
 using Lascodia.Trading.Engine.IntegrationEventLogEF;
+using LascodiaTradingEngine.Infrastructure.Services;
+using LascodiaTradingEngine.Infrastructure.HealthChecks;
 
 namespace LascodiaTradingEngine.Infrastructure;
 
@@ -34,6 +36,16 @@ public static class DependencyInjection
                 options.SetPostgresDB<ReadApplicationDbContext>(configuration, "ReadDbConnection"));
 
             services.AddScoped<IReadApplicationDbContext>(provider => provider.GetService<ReadApplicationDbContext>()!);
+
+            // Distributed lock via PostgreSQL advisory locks — no extra infrastructure needed.
+            services.AddSingleton<IDistributedLock, PostgresAdvisoryLock>();
+
+            // Deep health checks — registered as named checks for /health endpoint.
+            services.AddHealthChecks()
+                .AddCheck<DatabaseHealthCheck>("database", tags: ["ready"])
+                .AddCheck<BrokerHealthCheck>("broker", tags: ["ready"])
+                .AddCheck<PriceCacheFreshnessCheck>("price_cache", tags: ["live"]);
+
             return services;
         }
 

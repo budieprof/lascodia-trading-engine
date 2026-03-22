@@ -15,6 +15,8 @@ public class COTReportConfiguration : IEntityTypeConfiguration<COTReport>
         builder.Property(x => x.NetNonCommercialPositioning).HasPrecision(18, 2);
         builder.Property(x => x.NetPositioningChangeWeekly).HasPrecision(18, 2);
 
+        builder.HasQueryFilter(x => !x.IsDeleted);
+
         builder.HasIndex(x => new { x.Currency, x.ReportDate });
     }
 }

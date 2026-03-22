@@ -1,5 +1,8 @@
 using System.Collections.Concurrent;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using LascodiaTradingEngine.Application.Common.Attributes;
+using LascodiaTradingEngine.Application.Common.Options;
 
 namespace LascodiaTradingEngine.Application.Services.BrokerAdapters;
 
@@ -14,11 +17,11 @@ namespace LascodiaTradingEngine.Application.Services.BrokerAdapters;
 ///   <item><b>Primary/secondary model:</b> the first registered feed is the primary.
 ///         Others are secondaries that receive ticks in parallel for cross-validation.</item>
 ///   <item><b>Staleness detection:</b> if the primary feed produces no ticks for a symbol
-///         for <see cref="StalenessThreshold"/>, the manager promotes the next healthy
+///         for <see cref="_stalenessThreshold"/>, the manager promotes the next healthy
 ///         secondary to primary and emits a warning.</item>
 ///   <item><b>Cross-validation:</b> when multiple feeds produce ticks for the same symbol
-///         within <see cref="CrossValidationWindowMs"/>, the manager compares mid prices.
-///         If they diverge by more than <see cref="MaxMidPriceDivergencePips"/>, the tick
+///         within <see cref="_crossValidationWindowMs"/>, the manager compares mid prices.
+///         If they diverge by more than <see cref="_maxMidPriceDivergencePips"/>, the tick
 ///         is flagged as suspicious and logged.</item>
 ///   <item><b>Automatic recovery:</b> when the original primary recovers (produces fresh ticks),
 ///         it is re-promoted if its cross-validation score is better than the current primary.</item>
@@ -51,11 +54,12 @@ public sealed record FeedHealth(
     int     CrossValidationFailures,
     DateTime LastTickAt);
 
+[RegisterService(ServiceLifetime.Singleton)]
 public sealed class MultiFeedManager : IMultiFeedManager
 {
-    private static readonly TimeSpan StalenessThreshold       = TimeSpan.FromSeconds(30);
-    private const int                CrossValidationWindowMs   = 500;
-    private const double             MaxMidPriceDivergencePips = 3.0;
+    private readonly TimeSpan _stalenessThreshold;
+    private readonly int      _crossValidationWindowMs;
+    private readonly double   _maxMidPriceDivergencePips;
 
     private readonly List<(string Name, IBrokerDataFeed Feed)> _feeds = [];
     private readonly ConcurrentDictionary<string, FeedState>   _feedStates = new();
@@ -64,9 +68,12 @@ public sealed class MultiFeedManager : IMultiFeedManager
 
     private string _primaryName = "";
 
-    public MultiFeedManager(ILogger<MultiFeedManager> logger)
+    public MultiFeedManager(ILogger<MultiFeedManager> logger, MultiFeedOptions options)
     {
         _logger = logger;
+        _stalenessThreshold        = TimeSpan.FromSeconds(options.StalenessThresholdSeconds);
+        _crossValidationWindowMs   = options.CrossValidationWindowMs;
+        _maxMidPriceDivergencePips = options.MaxMidPriceDivergencePips;
     }
 
     public string PrimaryFeedName => _primaryName;
@@ -105,7 +112,7 @@ public sealed class MultiFeedManager : IMultiFeedManager
             if (!_feedStates.TryGetValue(name, out var state)) continue;
             result[name] = new FeedHealth(
                 name,
-                IsHealthy: state.LastTickUtc > DateTime.UtcNow - StalenessThreshold,
+                IsHealthy: state.LastTickUtc > DateTime.UtcNow - _stalenessThreshold,
                 TicksLastMinute: state.TicksLastMinute,
                 StaleSymbols: state.StaleSymbolCount,
                 CrossValidationFailures: state.CrossValidationFailures,
@@ -133,8 +140,8 @@ public sealed class MultiFeedManager : IMultiFeedManager
         // Cross-validate if we have ticks from multiple feeds within the window
         if (snapshot.HasMultipleFeeds)
         {
-            double divergence = snapshot.MidPriceDivergencePips(tick.Symbol);
-            if (divergence > MaxMidPriceDivergencePips)
+            double divergence = snapshot.MidPriceDivergencePips(tick.Symbol, _crossValidationWindowMs);
+            if (divergence > _maxMidPriceDivergencePips)
             {
                 _logger.LogWarning(
                     "MultiFeedManager: mid-price divergence {Div:F1} pips for {Symbol} across feeds — tick from '{Feed}' may be erroneous",
@@ -166,7 +173,7 @@ public sealed class MultiFeedManager : IMultiFeedManager
                 continue;
 
             // Check if primary is stale
-            if (DateTime.UtcNow - primaryState.LastTickUtc > StalenessThreshold)
+            if (DateTime.UtcNow - primaryState.LastTickUtc > _stalenessThreshold)
             {
                 // Find a healthy secondary
                 foreach (var (name, _) in _feeds)
@@ -174,7 +181,7 @@ public sealed class MultiFeedManager : IMultiFeedManager
                     if (name == _primaryName) continue;
                     if (!_feedStates.TryGetValue(name, out var secState)) continue;
 
-                    if (DateTime.UtcNow - secState.LastTickUtc < StalenessThreshold)
+                    if (DateTime.UtcNow - secState.LastTickUtc < _stalenessThreshold)
                     {
                         string oldPrimary = _primaryName;
                         _primaryName = name;
@@ -182,7 +189,7 @@ public sealed class MultiFeedManager : IMultiFeedManager
                         _logger.LogWarning(
                             "MultiFeedManager: primary feed '{Old}' stale (no ticks for {Sec}s) — " +
                             "failing over to '{New}'",
-                            oldPrimary, StalenessThreshold.TotalSeconds, name);
+                            oldPrimary, _stalenessThreshold.TotalSeconds, name);
                         break;
                     }
                 }
@@ -220,10 +227,10 @@ public sealed class MultiFeedManager : IMultiFeedManager
 
         public bool HasMultipleFeeds => _feedTicks.Count > 1;
 
-        public double MidPriceDivergencePips(string symbol)
+        public double MidPriceDivergencePips(string symbol, int crossValidationWindowMs)
         {
             var recent = _feedTicks.Values
-                .Where(v => DateTime.UtcNow - v.ReceivedAt < TimeSpan.FromMilliseconds(CrossValidationWindowMs))
+                .Where(v => DateTime.UtcNow - v.ReceivedAt < TimeSpan.FromMilliseconds(crossValidationWindowMs))
                 .Select(v => ((double)v.Tick.Bid + (double)v.Tick.Ask) / 2.0)
                 .ToList();
 

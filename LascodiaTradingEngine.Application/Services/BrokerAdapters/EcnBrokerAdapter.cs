@@ -1,4 +1,6 @@
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
 
@@ -91,6 +93,7 @@ public sealed record EcnRoutingDecision
     public bool CanFill { get; init; }
 }
 
+[RegisterService(ServiceLifetime.Singleton)]
 public sealed class EcnBrokerAdapter : IEcnBrokerAdapter
 {
     private const double MinFillRate = 0.80; // exclude venues below 80% fill rate

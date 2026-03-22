@@ -83,6 +83,36 @@ public sealed class MLPredictionLogPruningWorker : BackgroundService
 
     // ── Pruning ───────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Performs one pruning cycle: soft-deletes both resolved and orphaned
+    /// <see cref="MLModelPredictionLog"/> records that have aged past their respective
+    /// retention thresholds.
+    ///
+    /// <para><b>Resolved log pruning</b> (<c>DirectionCorrect != null</c>):</para>
+    /// <list type="bullet">
+    ///   <item>Selects up to <c>BatchSize</c> resolved logs with <c>PredictedAt ≤ cutoff</c>
+    ///         where <c>cutoff = now − RetentionDays</c>.</item>
+    ///   <item>Applies a single bulk <c>ExecuteUpdateAsync</c> to set <c>IsDeleted = true</c>
+    ///         without loading entities into the change tracker — efficient for large batches.</item>
+    ///   <item>Soft-delete (not hard-delete) preserves audit history while suppressing the rows
+    ///         from all global query filters used by drift, suppression, and accuracy workers.</item>
+    /// </list>
+    ///
+    /// <para><b>Orphaned log pruning</b> (<c>DirectionCorrect == null</c>):</para>
+    /// <list type="bullet">
+    ///   <item>Uses a 2× retention multiplier as the orphan cutoff to distinguish genuinely
+    ///         old unresolved logs from recently created ones still awaiting outcome candles.</item>
+    ///   <item><see cref="MLPredictionOutcomeWorker.ResolveOrphanedLogsAsync"/> handles the
+    ///         short-term case (signals rejected/expired). This method handles the long-term
+    ///         residue — logs that somehow survived without a resolution source for double the
+    ///         retention period, likely due to data gaps or system downtime.</item>
+    /// </list>
+    ///
+    /// <para><b>Batch size cap</b>: pruning in bounded batches rather than a single unbounded
+    /// DELETE prevents long-running transactions and table lock contention on the prediction log
+    /// table, which is also written by <see cref="MLPredictionOutcomeWorker"/> concurrently.
+    /// Remaining logs are pruned on the next daily cycle.</para>
+    /// </summary>
     private async Task PruneAsync(
         Microsoft.EntityFrameworkCore.DbContext readCtx,
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
@@ -116,12 +146,34 @@ public sealed class MLPredictionLogPruningWorker : BackgroundService
             .ExecuteUpdateAsync(s => s.SetProperty(l => l.IsDeleted, true), ct);
 
         _logger.LogInformation(
-            "MLPredictionLogPruningWorker: soft-deleted {N} prediction log(s) older than {Days}d.",
+            "MLPredictionLogPruningWorker: soft-deleted {N} resolved prediction log(s) older than {Days}d.",
             deleted, retentionDays);
+
+        // Also prune orphaned (unresolved) logs that are much older — these will never be resolved.
+        // Use 2× retention period as a safe threshold for orphan detection.
+        var orphanCutoff = DateTime.UtcNow.AddDays(-retentionDays * 2);
+
+        int orphanedIds = await writeCtx.Set<MLModelPredictionLog>()
+            .Where(l => !l.IsDeleted &&
+                        l.DirectionCorrect == null &&
+                        l.PredictedAt <= orphanCutoff)
+            .Take(batchSize)
+            .ExecuteUpdateAsync(s => s.SetProperty(l => l.IsDeleted, true), ct);
+
+        if (orphanedIds > 0)
+        {
+            _logger.LogInformation(
+                "MLPredictionLogPruningWorker: soft-deleted {N} orphaned (unresolved) prediction log(s) older than {Days}d.",
+                orphanedIds, retentionDays * 2);
+        }
     }
 
     // ── Config helper ─────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Reads a typed value from <see cref="EngineConfig"/> or returns <paramref name="defaultValue"/>
+    /// when the key is absent or its stored string cannot be converted to <typeparamref name="T"/>.
+    /// </summary>
     private static async Task<T> GetConfigAsync<T>(
         Microsoft.EntityFrameworkCore.DbContext ctx,
         string                                  key,

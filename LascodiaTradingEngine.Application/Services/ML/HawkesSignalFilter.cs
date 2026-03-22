@@ -1,3 +1,4 @@
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
@@ -10,6 +11,7 @@ namespace LascodiaTradingEngine.Application.Services.ML;
 /// Evaluates the current Hawkes process intensity λ(t) to detect burst episodes
 /// and suppress new signals during cluster periods (Rec #32).
 /// </summary>
+[RegisterService]
 public sealed class HawkesSignalFilter : IHawkesSignalFilter
 {
     private readonly IReadApplicationDbContext _read;

@@ -11,6 +11,9 @@ namespace LascodiaTradingEngine.Application.Common.Events;
 /// </summary>
 public record BacktestCompletedIntegrationEvent : IntegrationEvent
 {
+    /// <summary>Monotonic sequence number for ordering detection.</summary>
+    public long      SequenceNumber { get; init; } = EventSequence.Next();
+
     /// <summary>The completed BacktestRun's database Id.</summary>
     public long      BacktestRunId { get; init; }
 

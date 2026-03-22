@@ -6,17 +6,38 @@ using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.Orders.Commands.SubmitOrder;
 
+// ── Result ────────────────────────────────────────────────────────────────────
+
+/// <summary>
+/// Returned by <see cref="SubmitOrderCommand"/> so callers can inspect the
+/// post-submission state without re-querying the database.
+/// </summary>
+public record SubmitOrderResult
+{
+    public long            OrderId        { get; init; }
+    public long            StrategyId     { get; init; }
+    public string          Symbol         { get; init; } = string.Empty;
+    public TradingSession  Session        { get; init; }
+    public OrderStatus     Status         { get; init; }
+    public decimal         RequestedPrice { get; init; }
+    public decimal?        FilledPrice    { get; init; }
+    public decimal?        FilledQuantity { get; init; }
+    public decimal         Quantity       { get; init; }
+    public DateTime?       FilledAt       { get; init; }
+    public OrderType       OrderType      { get; init; }
+}
+
 // ── Command ───────────────────────────────────────────────────────────────────
 
 /// <summary>Submits a Pending order to the broker and updates its status.</summary>
-public class SubmitOrderCommand : IRequest<ResponseData<string>>
+public class SubmitOrderCommand : IRequest<ResponseData<SubmitOrderResult>>
 {
     public long Id { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
-public class SubmitOrderCommandHandler : IRequestHandler<SubmitOrderCommand, ResponseData<string>>
+public class SubmitOrderCommandHandler : IRequestHandler<SubmitOrderCommand, ResponseData<SubmitOrderResult>>
 {
     private readonly IWriteApplicationDbContext _context;
     private readonly IBrokerOrderExecutor _broker;
@@ -27,17 +48,17 @@ public class SubmitOrderCommandHandler : IRequestHandler<SubmitOrderCommand, Res
         _broker  = broker;
     }
 
-    public async Task<ResponseData<string>> Handle(SubmitOrderCommand request, CancellationToken cancellationToken)
+    public async Task<ResponseData<SubmitOrderResult>> Handle(SubmitOrderCommand request, CancellationToken cancellationToken)
     {
         var order = await _context.GetDbContext()
             .Set<Domain.Entities.Order>()
             .FirstOrDefaultAsync(x => x.Id == request.Id && !x.IsDeleted, cancellationToken);
 
         if (order is null)
-            return ResponseData<string>.Init(null, false, "Order not found", "-14");
+            return ResponseData<SubmitOrderResult>.Init(null, false, "Order not found", "-14");
 
         if (order.Status != OrderStatus.Pending)
-            return ResponseData<string>.Init(null, false, "Order is not in Pending status", "-11");
+            return ResponseData<SubmitOrderResult>.Init(null, false, "Order is not in Pending status", "-11");
 
         var result = await _broker.SubmitOrderAsync(order, cancellationToken);
 
@@ -56,6 +77,26 @@ public class SubmitOrderCommandHandler : IRequestHandler<SubmitOrderCommand, Res
         }
 
         await _context.SaveChangesAsync(cancellationToken);
-        return ResponseData<string>.Init(null, result.Success, result.Success ? "Successful" : result.ErrorMessage ?? "Rejected", result.Success ? "00" : "-11");
+
+        var submitResult = new SubmitOrderResult
+        {
+            OrderId        = order.Id,
+            StrategyId     = order.StrategyId,
+            Symbol         = order.Symbol,
+            Session        = order.Session,
+            Status         = order.Status,
+            RequestedPrice = order.Price,
+            FilledPrice    = order.FilledPrice,
+            FilledQuantity = order.FilledQuantity,
+            Quantity       = order.Quantity,
+            FilledAt       = order.FilledAt,
+            OrderType      = order.OrderType,
+        };
+
+        return ResponseData<SubmitOrderResult>.Init(
+            submitResult,
+            result.Success,
+            result.Success ? "Successful" : result.ErrorMessage ?? "Rejected",
+            result.Success ? "00" : "-11");
     }
 }

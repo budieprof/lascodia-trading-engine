@@ -1,7 +1,9 @@
 using System.Collections.Concurrent;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
+using LascodiaTradingEngine.Application.Common.Attributes;
 
 namespace LascodiaTradingEngine.Application.Services.ML;
 
@@ -58,6 +60,7 @@ public sealed record OnnxModelStats(
     double P95LatencyMs,
     double P99LatencyMs);
 
+[RegisterService(ServiceLifetime.Singleton)]
 public sealed class OnnxInferenceEngine : IOnnxInferenceEngine, IDisposable
 {
     private readonly ConcurrentDictionary<long, CachedModel> _models = new();

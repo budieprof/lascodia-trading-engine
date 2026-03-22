@@ -1,2 +1,2 @@
 namespace LascodiaTradingEngine.Domain.Enums;
-public enum EconomicEventSource { ForexFactory = 0, Investing = 1, Manual = 2 }
+public enum EconomicEventSource { ForexFactory = 0, Investing = 1, Manual = 2, Oanda = 3 }

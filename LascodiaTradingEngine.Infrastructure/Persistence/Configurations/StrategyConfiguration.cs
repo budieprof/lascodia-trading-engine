@@ -30,6 +30,8 @@ public class StrategyConfiguration : IEntityTypeConfiguration<Strategy>
             .HasConversion<string>()
             .HasMaxLength(50);
 
+        builder.HasQueryFilter(x => !x.IsDeleted);
+
         builder.HasIndex(x => x.Symbol);
         builder.HasIndex(x => x.RiskProfileId);
 

@@ -47,6 +47,8 @@ public class TradeSignalConfiguration : IEntityTypeConfiguration<TradeSignal>
         builder.Property(x => x.MLPredictedMagnitude)
             .HasPrecision(18, 6);
 
+        builder.HasQueryFilter(x => !x.IsDeleted);
+
         builder.HasIndex(x => new { x.Symbol, x.Status });
         builder.HasIndex(x => new { x.StrategyId, x.Status });
 

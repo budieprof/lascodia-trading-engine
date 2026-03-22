@@ -8,7 +8,7 @@ using LascodiaTradingEngine.Application.Common.Interfaces;
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
-[Route("api/v1/lascodia-trading-engine/broker")]
+[Route("api/v1/lascodia-trading-engine/broker-management")]
 [ApiController]
 public class BrokerManagementController : AuthControllerBase<BrokerManagementController>
 {

@@ -1,6 +1,8 @@
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Options;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -14,7 +16,7 @@ namespace LascodiaTradingEngine.Application.Services;
 /// Called by <c>SignalOrderBridgeWorker</c> before order creation to adjust lot sizes.
 /// <list type="bullet">
 ///   <item>Computes per-symbol Kelly fraction from the model's confidence and historical win rate.</item>
-///   <item>Applies portfolio-level Kelly cap: sum of all position allocations ≤ MaxPortfolioKelly.</item>
+///   <item>Applies portfolio-level Kelly cap: sum of all position allocations ≤ _opts.MaxPortfolioKelly.</item>
 ///   <item>Applies correlation penalty: correlated pairs share a group budget.</item>
 ///   <item>Returns an adjusted lot size (may be zero = skip trade).</item>
 /// </list>
@@ -34,30 +36,24 @@ public interface IPortfolioOptimizer
         CancellationToken ct);
 }
 
+[RegisterService]
 public sealed class PortfolioOptimizer : IPortfolioOptimizer
 {
-    private const double MaxPortfolioKelly     = 0.25; // max 25% of equity across all positions
-    private const double MaxPerTradeKelly      = 0.05; // max 5% per individual trade
-    private const double CorrelationGroupCap   = 0.10; // max 10% per correlation group
-    private const double MinLotSize            = 0.01;
-
-    private static readonly string[][] CorrelationGroups =
-    [
-        ["EURUSD", "GBPUSD", "AUDUSD", "NZDUSD"],
-        ["USDCHF", "USDJPY", "USDCAD"],
-        ["EURJPY", "GBPJPY", "AUDJPY", "NZDJPY"],
-        ["EURGBP", "EURCHF", "GBPCHF"],
-    ];
-
+    private readonly PortfolioOptimizerOptions _opts;
+    private readonly CorrelationGroupOptions _corrOpts;
     private readonly IReadApplicationDbContext _readDb;
     private readonly ILogger<PortfolioOptimizer> _logger;
 
     public PortfolioOptimizer(
         IReadApplicationDbContext readDb,
-        ILogger<PortfolioOptimizer> logger)
+        ILogger<PortfolioOptimizer> logger,
+        PortfolioOptimizerOptions opts,
+        CorrelationGroupOptions corrOpts)
     {
-        _readDb = readDb;
-        _logger = logger;
+        _readDb   = readDb;
+        _logger   = logger;
+        _opts     = opts;
+        _corrOpts = corrOpts;
     }
 
     public async Task<decimal> OptimizeLotSizeAsync(
@@ -84,17 +80,17 @@ public sealed class PortfolioOptimizer : IPortfolioOptimizer
         // f = (2p − 1) × 0.5 where p = confidence (calibrated probability)
         double p = Math.Clamp((double)confidence, 0.0, 1.0);
         double kellyFraction = Math.Max(0, (2 * p - 1) * 0.5);
-        kellyFraction = Math.Min(kellyFraction, MaxPerTradeKelly);
+        kellyFraction = Math.Min(kellyFraction, _opts.MaxPerTradeKelly);
 
         // ── 3. Current portfolio exposure ──────────────────────────────────
         double totalExposure = openPositions.Sum(pos => (double)pos.OpenLots);
-        double portfolioBudgetRemaining = MaxPortfolioKelly - (totalExposure / (double)accountEquity);
+        double portfolioBudgetRemaining = _opts.MaxPortfolioKelly - (totalExposure / (double)accountEquity);
 
         if (portfolioBudgetRemaining <= 0)
         {
             _logger.LogInformation(
                 "PortfolioOptimizer: portfolio Kelly budget exhausted ({Total:P1} >= {Max:P1}) — skipping {Symbol}",
-                totalExposure / (double)accountEquity, MaxPortfolioKelly, symbol);
+                totalExposure / (double)accountEquity, _opts.MaxPortfolioKelly, symbol);
             return 0;
         }
 
@@ -106,7 +102,7 @@ public sealed class PortfolioOptimizer : IPortfolioOptimizer
                 .Where(pos => group.Contains(pos.Symbol.ToUpperInvariant()))
                 .Sum(pos => (double)pos.OpenLots);
 
-            double groupBudgetRemaining = CorrelationGroupCap - (groupExposure / (double)accountEquity);
+            double groupBudgetRemaining = _opts.CorrelationGroupCap - (groupExposure / (double)accountEquity);
 
             if (groupBudgetRemaining <= 0)
             {
@@ -128,7 +124,7 @@ public sealed class PortfolioOptimizer : IPortfolioOptimizer
         adjustedLots = Math.Min(adjustedLots, suggestedLotSize); // never exceed the strategy's suggestion
         adjustedLots = Math.Round(adjustedLots, 2);
 
-        if (adjustedLots < (decimal)MinLotSize)
+        if (adjustedLots < (decimal)_opts.MinLotSize)
         {
             _logger.LogDebug(
                 "PortfolioOptimizer: adjusted lot size {Lots} below minimum — skipping {Symbol}",
@@ -143,9 +139,9 @@ public sealed class PortfolioOptimizer : IPortfolioOptimizer
         return adjustedLots;
     }
 
-    private static string[]? FindCorrelationGroup(string symbol)
+    private string[]? FindCorrelationGroup(string symbol)
     {
-        foreach (var group in CorrelationGroups)
+        foreach (var group in _corrOpts.Groups)
             if (group.Contains(symbol))
                 return group;
         return null;

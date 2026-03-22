@@ -19,6 +19,8 @@ public class MLHawkesKernelParamsConfiguration : IEntityTypeConfiguration<MLHawk
         builder.Property(x => x.LogLikelihood).HasPrecision(18, 4);
         builder.Property(x => x.SuppressMultiplier).HasPrecision(5, 2);
 
+        builder.HasQueryFilter(x => !x.IsDeleted);
+
         builder.HasIndex(x => new { x.Symbol, x.Timeframe, x.FittedAt });
     }
 }

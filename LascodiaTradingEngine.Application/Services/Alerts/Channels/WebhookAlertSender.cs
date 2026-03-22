@@ -1,5 +1,7 @@
 using System.Net.Http.Json;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Services.Alerts.Options;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
@@ -11,6 +13,7 @@ namespace LascodiaTradingEngine.Application.Services.Alerts.Channels;
 /// The request body is a JSON object with Symbol, AlertType, Message, and Timestamp.
 /// An optional <c>X-Lascodia-Secret</c> header is included when <see cref="WebhookAlertOptions.SharedSecret"/> is set.
 /// </summary>
+[RegisterService(ServiceLifetime.Scoped, typeof(IAlertChannelSender))]
 public class WebhookAlertSender : IAlertChannelSender
 {
     public AlertChannel Channel => AlertChannel.Webhook;

@@ -14,22 +14,49 @@ namespace LascodiaTradingEngine.Application.Workers;
 /// proportionally scale down bet sizing when a model is underperforming its training
 /// accuracy — without triggering full suppression.
 ///
+/// <para>
+/// <b>Position sizing algorithm (Kelly-inspired adaptive multiplier):</b>
+/// The classical Kelly criterion sizes bets as f = (bp − q) / b, where p is win probability,
+/// q = 1 − p, and b is the payout ratio. This worker applies a simplified, monotone
+/// approximation: if the model's live accuracy has drifted below training accuracy, the
+/// position size is proportionally reduced. The formula is:
+/// <code>
+///   multiplier = clamp(liveAccuracy / trainingAccuracy, MinMultiplier, 1.0)
+/// </code>
+/// A model scoring 90% of its training accuracy gets a 0.90 multiplier applied to all
+/// downstream bet sizes. At or above training accuracy the multiplier is 1.0 (no reduction).
+/// The <c>MinMultiplier</c> floor (default 0.50) prevents near-zero sizing that would
+/// make signals economically meaningless.
+/// </para>
+///
+/// <para>
 /// <b>Distinction from existing mechanisms:</b>
 /// <list type="bullet">
 ///   <item>The BSS-based Kelly multiplier in <c>MLSignalScorer</c> step 13b uses the
 ///         <em>training-time</em> Brier Skill Score — a static quality measure frozen
-///         at training time.</item>
-///   <item>This worker computes a <em>live</em> multiplier based on the gap between the
-///         model's declared <see cref="MLModel.DirectionAccuracy"/> (training accuracy)
-///         and its current rolling live accuracy from resolved prediction logs.</item>
+///         at training time that does not adapt to live performance.</item>
+///   <item>This worker computes a <em>live</em> multiplier from resolved prediction logs
+///         in the rolling window, so it responds dynamically to in-market model drift.</item>
+///   <item>When insufficient data is available (fewer than <c>MinSamples</c> resolved logs),
+///         the multiplier defaults to 1.0 (benefit of the doubt) rather than 0 — the model
+///         is not penalized for having been recently deployed.</item>
 /// </list>
+/// </para>
 ///
-/// <b>Multiplier formula:</b>
-/// <c>multiplier = clamp(liveAccuracy / trainingAccuracy, MinMultiplier, 1.0)</c>
+/// <para>
+/// <b>Polling interval:</b> 3600 seconds (1 hour) by default. The hourly update ensures
+/// position sizing reflects recent performance while avoiding excessive write pressure on
+/// the EngineConfig table.
+/// </para>
 ///
-/// A model at 90% of its training accuracy gets a 0.90 multiplier; at or above training
-/// accuracy the multiplier is 1.0 (no reduction). The floor is <c>MinMultiplier</c>
-/// (default 0.50) to prevent near-zero bet sizing.
+/// <para>
+/// <b>ML lifecycle contribution:</b> Writes <c>MLKelly:{Symbol}:{Timeframe}:LiveMultiplier</c>
+/// to <see cref="EngineConfig"/> for each active model. The scorer reads this key to
+/// proportionally reduce the computed lot size before submitting the signal to the
+/// order bridge. This creates a smooth, continuous degradation path between a fully
+/// performing model (multiplier 1.0) and the suppression threshold handled by
+/// <see cref="MLModelRetirementWorker"/>.
+/// </para>
 ///
 /// Configuration keys (read from <see cref="EngineConfig"/>):
 /// <list type="bullet">
@@ -51,6 +78,11 @@ public sealed class MLPositionSizeAdvisorWorker : BackgroundService
     private readonly IServiceScopeFactory                 _scopeFactory;
     private readonly ILogger<MLPositionSizeAdvisorWorker> _logger;
 
+    /// <summary>
+    /// Initializes the worker.
+    /// </summary>
+    /// <param name="scopeFactory">Per-iteration DI scope factory.</param>
+    /// <param name="logger">Structured logger.</param>
     public MLPositionSizeAdvisorWorker(
         IServiceScopeFactory                  scopeFactory,
         ILogger<MLPositionSizeAdvisorWorker>  logger)
@@ -59,6 +91,11 @@ public sealed class MLPositionSizeAdvisorWorker : BackgroundService
         _logger       = logger;
     }
 
+    /// <summary>
+    /// Background service main loop. Each iteration creates a fresh scope, reads the
+    /// poll interval, and calls <see cref="UpdateMultipliersAsync"/> to refresh the
+    /// Kelly multipliers for all active models.
+    /// </summary>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation("MLPositionSizeAdvisorWorker started.");
@@ -96,6 +133,11 @@ public sealed class MLPositionSizeAdvisorWorker : BackgroundService
 
     // ── Multiplier computation core ───────────────────────────────────────────
 
+    /// <summary>
+    /// Iterates all active models and writes an updated live Kelly multiplier to
+    /// <see cref="EngineConfig"/> for each one. Models with no stored training
+    /// accuracy or insufficient live data default to multiplier = 1.0.
+    /// </summary>
     private async Task UpdateMultipliersAsync(
         Microsoft.EntityFrameworkCore.DbContext readCtx,
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
@@ -107,6 +149,8 @@ public sealed class MLPositionSizeAdvisorWorker : BackgroundService
 
         var cutoff = DateTime.UtcNow.AddDays(-windowDays);
 
+        // Fetch only the fields needed for the Kelly calculation — avoids loading
+        // heavy JSON columns (e.g. HyperparamConfigJson) unnecessarily.
         var activeModels = await readCtx.Set<MLModel>()
             .Where(m => m.IsActive && !m.IsDeleted)
             .AsNoTracking()
@@ -119,9 +163,13 @@ public sealed class MLPositionSizeAdvisorWorker : BackgroundService
 
             try
             {
+                // The config key is unique per (symbol, timeframe) — multiple models sharing
+                // the same pair write to the same key; the last writer wins (acceptable since
+                // all models on the same pair should produce similar multipliers).
                 string configKey = $"{KeyPrefix}{model.Symbol}:{model.Timeframe}{KeySuffix}";
 
-                // If no training accuracy stored, use multiplier = 1.0 (no adjustment)
+                // If the model has no stored training accuracy (e.g. imported externally),
+                // we cannot compute a meaningful ratio — fall back to no-op multiplier.
                 if (!model.DirectionAccuracy.HasValue || model.DirectionAccuracy.Value <= 0m)
                 {
                     await UpsertConfigAsync(writeCtx, configKey, "1.0", ct);
@@ -130,7 +178,9 @@ public sealed class MLPositionSizeAdvisorWorker : BackgroundService
 
                 double trainingAccuracy = (double)model.DirectionAccuracy.Value;
 
-                // Compute live accuracy from resolved prediction logs in the window
+                // ── Live accuracy from resolved prediction logs ────────────────
+                // Only include logs with DirectionCorrect populated (i.e., the outcome
+                // has been recorded by MLPredictionOutcomeWorker).
                 var liveOutcomes = await readCtx.Set<MLModelPredictionLog>()
                     .Where(l => l.MLModelId        == model.Id   &&
                                 l.DirectionCorrect != null        &&
@@ -142,11 +192,20 @@ public sealed class MLPositionSizeAdvisorWorker : BackgroundService
 
                 if (liveOutcomes.Count < minSamples)
                 {
-                    // Not enough data — keep multiplier at 1.0 (benefit of doubt)
+                    // Insufficient resolved outcomes — give the model benefit of the doubt
+                    // rather than applying an arbitrary penalty on small samples.
                     await UpsertConfigAsync(writeCtx, configKey, "1.0", ct);
                     continue;
                 }
 
+                // ── Kelly multiplier computation ──────────────────────────────
+                // liveAccuracy = fraction of resolved predictions that were correct
+                // multiplier   = liveAccuracy / trainingAccuracy, clamped to [minMult, 1.0]
+                //
+                // The upper clamp at 1.0 ensures the model never receives a bonus above
+                // its training-time capability estimate — only reductions are applied.
+                // The lower clamp at minMult ensures the signal is not reduced to near-zero
+                // (which would make it economically useless even if technically correct).
                 double liveAccuracy = liveOutcomes.Count(x => x) / (double)liveOutcomes.Count;
                 double multiplier   = Math.Clamp(liveAccuracy / trainingAccuracy, minMult, 1.0);
 
@@ -170,6 +229,15 @@ public sealed class MLPositionSizeAdvisorWorker : BackgroundService
 
     // ── EngineConfig upsert ───────────────────────────────────────────────────
 
+    /// <summary>
+    /// Inserts or updates a <see cref="EngineConfig"/> row for the Kelly multiplier key.
+    /// Uses <c>ExecuteUpdateAsync</c> to avoid a full entity load; falls back to an
+    /// insert if the key does not yet exist (first run for a new model).
+    /// </summary>
+    /// <param name="writeCtx">Write DbContext.</param>
+    /// <param name="key">Config key (e.g. <c>MLKelly:EURUSD:H1:LiveMultiplier</c>).</param>
+    /// <param name="value">Four-decimal string representation of the multiplier.</param>
+    /// <param name="ct">Cancellation token.</param>
     private static async Task UpsertConfigAsync(
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
         string                                  key,
@@ -200,6 +268,10 @@ public sealed class MLPositionSizeAdvisorWorker : BackgroundService
 
     // ── Config helper ─────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Reads a typed value from <see cref="EngineConfig"/>. Returns
+    /// <paramref name="defaultValue"/> if the key is absent or unparseable.
+    /// </summary>
     private static async Task<T> GetConfigAsync<T>(
         Microsoft.EntityFrameworkCore.DbContext ctx,
         string                                  key,

@@ -16,6 +16,8 @@ public class BacktestRunConfiguration : IEntityTypeConfiguration<BacktestRun>
         builder.Property(x => x.Status).HasConversion<string>().IsRequired().HasMaxLength(20);
         builder.Property(x => x.InitialBalance).HasPrecision(18, 2);
 
+        builder.HasQueryFilter(x => !x.IsDeleted);
+
         builder.HasIndex(x => x.StrategyId);
         builder.HasIndex(x => new { x.StrategyId, x.Status });
 

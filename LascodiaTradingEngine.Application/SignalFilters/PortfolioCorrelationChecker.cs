@@ -1,5 +1,7 @@
 using Microsoft.EntityFrameworkCore;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Options;
 using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.SignalFilters;
@@ -8,23 +10,18 @@ namespace LascodiaTradingEngine.Application.SignalFilters;
 /// Checks whether opening a new position for the given symbol+direction would
 /// breach the maximum number of correlated open positions.
 /// </summary>
+[RegisterService]
 public class PortfolioCorrelationChecker : IPortfolioCorrelationChecker
 {
-    // USD-base pairs: positively correlated
-    // USD-quote pairs: negatively correlated with above (same group for simplicity)
-    // JPY crosses: positively correlated among themselves
-    private static readonly string[][] CorrelationGroups =
-    [
-        ["EURUSD", "GBPUSD", "AUDUSD", "NZDUSD"],
-        ["USDCHF", "USDJPY", "USDCAD"],
-        ["EURJPY", "GBPJPY", "AUDJPY"],
-    ];
-
+    private readonly string[][] _correlationGroups;
     private readonly IReadApplicationDbContext _context;
 
-    public PortfolioCorrelationChecker(IReadApplicationDbContext context)
+    public PortfolioCorrelationChecker(
+        IReadApplicationDbContext context,
+        CorrelationGroupOptions options)
     {
         _context = context;
+        _correlationGroups = options.Groups;
     }
 
     public async Task<bool> IsCorrelationBreachedAsync(
@@ -48,9 +45,9 @@ public class PortfolioCorrelationChecker : IPortfolioCorrelationChecker
         return openCount >= maxCorrelatedPositions;
     }
 
-    private static string[]? FindCorrelationGroup(string symbol)
+    private string[]? FindCorrelationGroup(string symbol)
     {
-        foreach (var group in CorrelationGroups)
+        foreach (var group in _correlationGroups)
         {
             if (group.Contains(symbol))
                 return group;

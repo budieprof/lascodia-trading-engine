@@ -19,6 +19,8 @@ public class CurrencyPairConfiguration : IEntityTypeConfiguration<CurrencyPair>
         builder.Property(x => x.MaxLotSize).HasPrecision(18, 5);
         builder.Property(x => x.LotStep).HasPrecision(18, 5);
 
+        builder.HasQueryFilter(x => !x.IsDeleted);
+
         builder.HasIndex(x => x.Symbol).IsUnique();
     }
 }

@@ -8,6 +8,12 @@ public interface IStrategyEvaluator
     StrategyType StrategyType { get; }
 
     /// <summary>
+    /// Minimum number of closed candles required for this evaluator to produce a valid signal.
+    /// The caller must fetch at least this many candles before invoking <see cref="EvaluateAsync"/>.
+    /// </summary>
+    int MinRequiredCandles(Strategy strategy);
+
+    /// <summary>
     /// Evaluates the strategy against the provided candles and live price.
     /// Returns a TradeSignal if conditions are met, or null if no setup exists.
     /// </summary>

@@ -1,3 +1,5 @@
+using Microsoft.Extensions.DependencyInjection;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -21,6 +23,7 @@ namespace LascodiaTradingEngine.Application.Services.ML;
 /// Full MinT (covariance-based) requires historical reconciliation residuals and is
 /// implemented as an iterative reweighting scheme here.
 /// </remarks>
+[RegisterService(ServiceLifetime.Singleton)]
 public sealed class MinTReconciler : IMinTReconciler
 {
     /// <inheritdoc/>

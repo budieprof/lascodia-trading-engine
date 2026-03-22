@@ -1,6 +1,8 @@
 using System.Text.Json;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.MLModels.Shared;
+using LascodiaTradingEngine.Domain.Enums;
 using Microsoft.Extensions.Logging;
 
 namespace LascodiaTradingEngine.Application.Services.ML;
@@ -61,6 +63,7 @@ namespace LascodiaTradingEngine.Application.Services.ML;
 /// Feature importance stored in <c>ModelSnapshot.Weights[0]</c> and <c>ModelSnapshot.QrfWeights[0]</c>.
 /// Registered as a keyed <see cref="IMLModelTrainer"/> with key <c>"quantilerf"</c>.
 /// </summary>
+[RegisterKeyedService(typeof(IMLModelTrainer), LearnerArchitecture.QuantileRf)]
 public sealed class QuantileRfModelTrainer : IMLModelTrainer
 {
     // ── Constants ────────────────────────────────────────────────────────────

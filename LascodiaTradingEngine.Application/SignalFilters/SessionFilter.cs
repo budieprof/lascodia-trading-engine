@@ -1,3 +1,5 @@
+using Microsoft.Extensions.DependencyInjection;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 
 namespace LascodiaTradingEngine.Application.SignalFilters;
@@ -12,6 +14,7 @@ namespace LascodiaTradingEngine.Application.SignalFilters;
 ///   LondonNYOverlap  13:00 – 17:00  (highest priority)
 ///   NewYork          13:00 – 22:00
 /// </summary>
+[RegisterService(ServiceLifetime.Singleton)]
 public class SessionFilter : ISessionFilter
 {
     public string GetCurrentSession(DateTime utcTime)

@@ -20,6 +20,8 @@ public class StrategyPerformanceSnapshotConfiguration : IEntityTypeConfiguration
         builder.Property(x => x.TotalPnL).HasPrecision(18, 8);
         builder.Property(x => x.HealthScore).HasPrecision(5, 4);
 
+        builder.HasQueryFilter(x => !x.IsDeleted);
+
         builder.HasIndex(x => x.StrategyId);
         builder.HasIndex(x => x.EvaluatedAt);
 

@@ -42,6 +42,14 @@ public class MLModelDistillationWorker : BackgroundService
     // Track consecutive breaches per model (in-process state; resets on restart)
     private readonly Dictionary<long, int> _breachCounts = new();
 
+    /// <summary>
+    /// Initialises the worker with its logger and DI scope factory.
+    /// </summary>
+    /// <param name="logger">Structured logger scoped to this worker type.</param>
+    /// <param name="scopeFactory">
+    /// Used to create a new DI scope on every poll cycle so that scoped EF Core
+    /// contexts are correctly disposed between polls.
+    /// </param>
     public MLModelDistillationWorker(
         ILogger<MLModelDistillationWorker> logger,
         IServiceScopeFactory scopeFactory)
@@ -50,9 +58,17 @@ public class MLModelDistillationWorker : BackgroundService
         _scopeFactory = scopeFactory;
     }
 
+    /// <summary>
+    /// Hosted-service entry point. Waits <see cref="_initialDelay"/> after startup
+    /// then polls every <see cref="_interval"/> (30 min), calling
+    /// <see cref="RunCycleAsync"/> to check for sustained latency breaches.
+    /// </summary>
+    /// <param name="stoppingToken">Signalled when the host is shutting down.</param>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation("MLModelDistillationWorker starting");
+
+        // Stagger startup to avoid contention with heavier workers during boot.
         await Task.Delay(_initialDelay, stoppingToken);
 
         while (!stoppingToken.IsCancellationRequested)
@@ -65,6 +81,48 @@ public class MLModelDistillationWorker : BackgroundService
         }
     }
 
+    /// <summary>
+    /// Core distillation detection cycle. Computes the rolling P99 inference latency
+    /// for each active model from recent <see cref="MLModelPredictionLog"/> records,
+    /// increments an in-process breach counter per model, and queues a distillation
+    /// training run once <see cref="ConsecutiveCyclesThreshold"/> consecutive breaches
+    /// are observed.
+    /// </summary>
+    /// <remarks>
+    /// Knowledge distillation methodology:
+    /// <list type="number">
+    ///   <item>
+    ///     Query all prediction logs written in the last 2 hours that carry a
+    ///     <c>LatencyMs</c> measurement. Group by <c>MLModelId</c> and compute the
+    ///     approximate P99 (skip the top 1% of sorted latencies). Models whose P99
+    ///     exceeds <see cref="LatencyThresholdMs"/> are candidates for distillation.
+    ///   </item>
+    ///   <item>
+    ///     Use the in-memory <see cref="_breachCounts"/> dictionary as a hysteresis
+    ///     filter. A single high-latency sample could be a transient spike; only after
+    ///     <see cref="ConsecutiveCyclesThreshold"/> consecutive 30-minute cycles all
+    ///     breaching the threshold do we treat the latency regression as persistent.
+    ///   </item>
+    ///   <item>
+    ///     Before queuing, check whether a distillation run is already in flight
+    ///     (any run with <c>IsDistillationRun = true</c> that has not yet completed
+    ///     or failed). This prevents duplicate student training runs stacking up.
+    ///   </item>
+    ///   <item>
+    ///     Queue the distillation <see cref="MLTrainingRun"/> with
+    ///     <c>IsDistillationRun = true</c> and <c>K = 1</c>. The <c>MLTrainingWorker</c>
+    ///     detects this flag and routes the run to a single-learner trainer that uses
+    ///     temperature-scaled soft labels from the teacher ensemble rather than hard
+    ///     0/1 direction labels. The resulting student model is dramatically smaller
+    ///     and faster while retaining most of the teacher's predictive signal.
+    ///   </item>
+    ///   <item>
+    ///     Reset the breach counter to zero after queuing, so a new independent
+    ///     threshold-crossing period must elapse before another distillation is triggered.
+    ///   </item>
+    /// </list>
+    /// </remarks>
+    /// <param name="ct">Cancellation token forwarded from the host.</param>
     private async Task RunCycleAsync(CancellationToken ct)
     {
         using var scope  = _scopeFactory.CreateScope();
@@ -73,7 +131,10 @@ public class MLModelDistillationWorker : BackgroundService
         var readDb       = readCtx.GetDbContext();
         var writeDb      = writeCtx.GetDbContext();
 
-        // Find active models with recent high-latency prediction logs
+        // Query prediction logs from the last 2 hours that include latency measurements.
+        // Group by model and compute an approximate P99 by ordering descending and
+        // skipping the top 1% of rows. This is an in-database approximation; for exact
+        // P99 a window function (EF OVER/PERCENTILE_CONT) would be required.
         var latencyBreaches = await readDb.Set<MLModelPredictionLog>()
             .Where(p => !p.IsDeleted
                      && p.LatencyMs != null
@@ -82,6 +143,7 @@ public class MLModelDistillationWorker : BackgroundService
             .Select(g => new
             {
                 ModelId  = g.Key,
+                // Approximate P99: sort descending, skip top 1%, take next row's latency.
                 P99Ms    = g.OrderByDescending(p => p.LatencyMs).Skip((int)(g.Count() * 0.01)).FirstOrDefault()!.LatencyMs ?? 0
             })
             .Where(x => x.P99Ms > LatencyThresholdMs)
@@ -89,12 +151,19 @@ public class MLModelDistillationWorker : BackgroundService
 
         foreach (var breach in latencyBreaches)
         {
+            // Increment in-process hysteresis counter for this model.
+            // State is intentionally in-process (not persisted) so it resets on restart,
+            // which is acceptable — a restart represents a recovery event that clears
+            // transient state anyway.
             _breachCounts.TryGetValue(breach.ModelId, out int count);
             _breachCounts[breach.ModelId] = count + 1;
 
+            // Only act after ConsecutiveCyclesThreshold sustained breaches.
+            // This prevents distillation being triggered by a single noisy measurement.
             if (_breachCounts[breach.ModelId] < ConsecutiveCyclesThreshold) continue;
 
-            // Check if distillation run already queued or distilled model already active
+            // Check if distillation run already queued or distilled model already active.
+            // A queued, pending, or running distillation run indicates work is in progress.
             bool alreadyQueued = await writeDb.Set<MLTrainingRun>()
                 .AnyAsync(r => r.IsDistillationRun
                             && r.Status != RunStatus.Completed
@@ -103,18 +172,25 @@ public class MLModelDistillationWorker : BackgroundService
 
             if (alreadyQueued) continue;
 
+            // Fetch the teacher model — must still be active at queue time.
             var teacher = await writeDb.Set<MLModel>()
                 .FirstOrDefaultAsync(m => m.Id == breach.ModelId && m.IsActive && !m.IsDeleted, ct);
 
             if (teacher == null) continue;
 
-            // Queue a distillation training run
+            // Queue a distillation training run.
+            // K=1 produces a single lightweight logistic student that mimics the full
+            // ensemble's soft probability outputs (temperature-scaled cross-entropy loss).
+            // MaxEpochs=30 is sufficient for the student to converge on soft labels;
+            // fewer epochs reduce the risk of the student overfitting to teacher noise.
             var distillRun = new MLTrainingRun
             {
                 Symbol              = teacher.Symbol,
                 Timeframe           = teacher.Timeframe,
                 TriggerType         = TriggerType.Scheduled,
                 Status              = RunStatus.Queued,
+                // 180-day window provides sufficient recency without reaching back to
+                // market regimes that may differ from the teacher's training distribution.
                 FromDate            = DateTime.UtcNow.AddDays(-180),
                 ToDate              = DateTime.UtcNow,
                 IsDistillationRun   = true,
@@ -130,7 +206,9 @@ public class MLModelDistillationWorker : BackgroundService
             writeDb.Set<MLTrainingRun>().Add(distillRun);
             await writeDb.SaveChangesAsync(ct);
 
-            _breachCounts[breach.ModelId] = 0; // reset counter
+            // Reset breach counter so a new independent latency episode must be
+            // observed before another distillation run is queued.
+            _breachCounts[breach.ModelId] = 0;
 
             _logger.LogInformation(
                 "Distillation run queued for {Symbol}/{Timeframe} — P99 latency breached {Threshold}ms",

@@ -25,6 +25,8 @@ public class MLShadowEvaluationConfiguration : IEntityTypeConfiguration<MLShadow
         builder.Property(x => x.ChallengerBrierScore).HasPrecision(5, 4);
         builder.Property(x => x.PromotionThreshold).HasPrecision(5, 4);
 
+        builder.HasQueryFilter(x => !x.IsDeleted);
+
         builder.HasIndex(x => new { x.Symbol, x.Timeframe, x.Status });
 
         builder.HasOne(x => x.ChampionModel)

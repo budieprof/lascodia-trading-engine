@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Text.Json;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.MLModels.Shared;
 using Microsoft.Extensions.Logging;
@@ -28,6 +29,7 @@ namespace LascodiaTradingEngine.Application.Services;
 /// </list>
 /// </para>
 /// </summary>
+[RegisterService]
 public sealed class BaggedLogisticTrainer : IMLModelTrainer
 {
     // ── Constants ────────────────────────────────────────────────────────────

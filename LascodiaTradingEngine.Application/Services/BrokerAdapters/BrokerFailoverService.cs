@@ -3,6 +3,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.AuditTrail.Commands.LogDecision;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -12,6 +13,7 @@ namespace LascodiaTradingEngine.Application.Services.BrokerAdapters;
 /// Manages broker failover, allowing runtime switching between configured broker adapters.
 /// Credentials and the active broker are loaded from the database.
 /// </summary>
+[RegisterService(ServiceLifetime.Singleton)]
 public class BrokerFailoverService : IBrokerFailover
 {
     private readonly IServiceScopeFactory _scopeFactory;

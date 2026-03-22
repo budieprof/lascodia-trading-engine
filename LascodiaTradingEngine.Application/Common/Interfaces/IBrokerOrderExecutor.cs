@@ -7,7 +7,9 @@ public record BrokerOrderResult(
     string? BrokerOrderId,
     decimal? FilledPrice,
     decimal? FilledQuantity,
-    string? ErrorMessage);
+    string? ErrorMessage,
+    string? RequoteId = null,
+    decimal? RequotedPrice = null);
 
 /// <summary>Live account balance and margin snapshot returned by the broker.</summary>
 public record BrokerAccountSummary(

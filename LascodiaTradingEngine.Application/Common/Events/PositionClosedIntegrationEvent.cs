@@ -11,6 +11,9 @@ namespace LascodiaTradingEngine.Application.Common.Events;
 /// </summary>
 public record PositionClosedIntegrationEvent : IntegrationEvent
 {
+    /// <summary>Monotonic sequence number for ordering detection.</summary>
+    public long            SequenceNumber  { get; init; } = EventSequence.Next();
+
     /// <summary>The closed position's database Id.</summary>
     public long            PositionId      { get; init; }
 

@@ -19,6 +19,8 @@ public class CandleConfiguration : IEntityTypeConfiguration<Candle>
         builder.Property(x => x.Close).HasPrecision(18, 8);
         builder.Property(x => x.Volume).HasPrecision(18, 8);
 
+        builder.HasQueryFilter(x => !x.IsDeleted);
+
         // Composite index for efficient candle lookups
         builder.HasIndex(x => new { x.Symbol, x.Timeframe, x.Timestamp }).IsUnique();
         builder.HasIndex(x => new { x.Symbol, x.Timeframe, x.IsClosed });

@@ -38,6 +38,8 @@ public class RiskProfileConfiguration : IEntityTypeConfiguration<RiskProfile>
         builder.Property(x => x.RecoveryExitThresholdPct)
             .HasPrecision(18, 8);
 
+        builder.HasQueryFilter(x => !x.IsDeleted);
+
         builder.HasIndex(x => x.IsDefault);
     }
 }

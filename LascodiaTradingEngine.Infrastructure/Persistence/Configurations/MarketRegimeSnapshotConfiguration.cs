@@ -19,6 +19,8 @@ public class MarketRegimeSnapshotConfiguration : IEntityTypeConfiguration<Market
         builder.Property(x => x.ATR).HasPrecision(18, 6);
         builder.Property(x => x.BollingerBandWidth).HasPrecision(18, 6);
 
+        builder.HasQueryFilter(x => !x.IsDeleted);
+
         builder.HasIndex(x => new { x.Symbol, x.Timeframe, x.DetectedAt });
     }
 }
