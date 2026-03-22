@@ -18,6 +18,14 @@ public record BrokerAccountSummary(
     decimal MarginUsed,
     decimal MarginAvailable);
 
+/// <summary>Current status of an order at the broker.</summary>
+public record BrokerOrderStatus(
+    string BrokerOrderId,
+    string Status,
+    decimal? FilledPrice,
+    decimal? FilledQuantity,
+    DateTime? LastUpdatedUtc);
+
 public interface IBrokerOrderExecutor
 {
     Task<BrokerOrderResult>    SubmitOrderAsync(Order order, CancellationToken cancellationToken);
@@ -30,4 +38,10 @@ public interface IBrokerOrderExecutor
     /// Returns <c>null</c> if the broker connection is unavailable.
     /// </summary>
     Task<BrokerAccountSummary?> GetAccountSummaryAsync(CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Queries the broker for the current status of an order (pending, filled, cancelled, etc.).
+    /// Returns <c>null</c> if the order cannot be found or the broker connection is unavailable.
+    /// </summary>
+    Task<BrokerOrderStatus?> GetOrderStatusAsync(string brokerOrderId, CancellationToken cancellationToken);
 }

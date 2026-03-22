@@ -99,6 +99,19 @@ public class OandaOrderExecutor : IBrokerOrderExecutor
             MarginAvailable: 10_000m);
     }
 
+    public async Task<BrokerOrderStatus?> GetOrderStatusAsync(
+        string brokerOrderId, CancellationToken cancellationToken)
+    {
+        var accountId = await GetAccountIdAsync(cancellationToken);
+
+        // TODO: GET /v3/accounts/{accountId}/orders/{brokerOrderId}
+        _logger.LogWarning(
+            "OandaOrderExecutor.GetOrderStatusAsync is not yet implemented (account={AccountId})",
+            accountId);
+
+        return null;
+    }
+
     private async Task<string> GetAccountIdAsync(CancellationToken ct)
     {
         using var scope   = _scopeFactory.CreateScope();

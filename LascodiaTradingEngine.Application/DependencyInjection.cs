@@ -11,6 +11,7 @@ using LascodiaTradingEngine.Application.Workers;
 using LascodiaTradingEngine.Application.Common.Events;
 using LascodiaTradingEngine.Application.Services.Alerts.Options;
 using LascodiaTradingEngine.Application.Services.EconomicCalendar;
+using LascodiaTradingEngine.Application.Services.MarketData;
 using Microsoft.Extensions.Logging;
 
 namespace LascodiaTradingEngine.Application;
@@ -89,6 +90,10 @@ public static class DependencyInjection
         {
             c.Timeout = TimeSpan.FromSeconds(10);
         });
+
+        // ── Candle Aggregator ──────────────────────────────────────────────────────
+        // Singleton: must hold state across ticks for the lifetime of the application.
+        services.AddSingleton<ICandleAggregator, CandleAggregator>();
 
         // ── Time abstraction ─────────────────────────────────────────────────────
         services.AddSingleton(TimeProvider.System);

@@ -7,6 +7,7 @@ using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.MarketData.Commands.IngestCandle;
 using LascodiaTradingEngine.Application.MarketData.Commands.UpdateLiveCandle;
 using LascodiaTradingEngine.Application.Services.BrokerAdapters;
+using LascodiaTradingEngine.Application.Services.MarketData;
 
 namespace LascodiaTradingEngine.Application.Workers;
 
@@ -60,6 +61,13 @@ public class MarketDataWorker : BackgroundService
     private readonly IBrokerDataFeed _feed;
 
     /// <summary>
+    /// Aggregates incoming ticks into OHLCV candle bars across all timeframes.
+    /// When a tick crosses into a new time period, the previous candle is closed
+    /// and persisted via <see cref="IngestCandleCommand"/>.
+    /// </summary>
+    private readonly ICandleAggregator _candleAggregator;
+
+    /// <summary>
     /// Initialises the worker with its required dependencies.
     /// </summary>
     /// <param name="logger">Structured logger for diagnostic and operational messages.</param>
@@ -71,14 +79,20 @@ public class MarketDataWorker : BackgroundService
     /// The broker data feed adapter. Must implement <see cref="IBrokerDataFeed.SubscribeAsync"/>
     /// as a long-running push subscription (e.g. WebSocket or streaming REST).
     /// </param>
+    /// <param name="candleAggregator">
+    /// Tick-to-candle aggregator. Accumulates ticks and emits closed candles when a time
+    /// period boundary is crossed.
+    /// </param>
     public MarketDataWorker(
         ILogger<MarketDataWorker> logger,
         IServiceScopeFactory scopeFactory,
-        IBrokerDataFeed feed)
+        IBrokerDataFeed feed,
+        ICandleAggregator candleAggregator)
     {
-        _logger       = logger;
-        _scopeFactory = scopeFactory;
-        _feed         = feed;
+        _logger           = logger;
+        _scopeFactory     = scopeFactory;
+        _feed             = feed;
+        _candleAggregator = candleAggregator;
     }
 
     /// <summary>
@@ -112,6 +126,9 @@ public class MarketDataWorker : BackgroundService
         // SubscribeAsync is a long-running call — it holds the connection open and
         // fires OnTickAsync for every price update until stoppingToken is cancelled.
         await _feed.SubscribeAsync(symbols, OnTickAsync, stoppingToken);
+
+        // Flush any in-progress candles so the currently building bars are not lost.
+        await FlushOpenCandlesAsync();
 
         _logger.LogInformation("MarketDataWorker stopped");
     }
@@ -149,6 +166,27 @@ public class MarketDataWorker : BackgroundService
             Ask       = tick.Ask,
             Timestamp = tick.Timestamp
         });
+
+        // Aggregate the tick into OHLCV candle bars across all timeframes.
+        // When the tick crosses a period boundary, the aggregator returns the
+        // closed candle(s) which are then persisted via IngestCandleCommand.
+        var closedCandles = _candleAggregator.ProcessTick(tick);
+
+        foreach (var candle in closedCandles)
+        {
+            await mediator.Send(new IngestCandleCommand
+            {
+                Symbol    = candle.Symbol,
+                Timeframe = candle.Timeframe.ToString(),
+                Open      = candle.Open,
+                High      = candle.High,
+                Low       = candle.Low,
+                Close     = candle.Close,
+                Volume    = candle.TickVolume,
+                Timestamp = candle.Timestamp,
+                IsClosed  = true
+            });
+        }
     }
 
     /// <summary>
@@ -161,6 +199,38 @@ public class MarketDataWorker : BackgroundService
     /// Returns an empty list if no active pairs are configured, which causes the worker
     /// to enter its idle state without attempting a broker subscription.
     /// </returns>
+    /// <summary>
+    /// Flushes all in-progress candles from the aggregator and persists them via
+    /// <see cref="IngestCandleCommand"/>. Called on graceful shutdown so the currently
+    /// building bars are not lost.
+    /// </summary>
+    private async Task FlushOpenCandlesAsync()
+    {
+        var flushedCandles = _candleAggregator.FlushAll();
+
+        if (flushedCandles.Count == 0)
+            return;
+
+        using var scope = _scopeFactory.CreateScope();
+        var mediator = scope.ServiceProvider.GetRequiredService<IMediator>();
+
+        foreach (var candle in flushedCandles)
+        {
+            await mediator.Send(new IngestCandleCommand
+            {
+                Symbol    = candle.Symbol,
+                Timeframe = candle.Timeframe.ToString(),
+                Open      = candle.Open,
+                High      = candle.High,
+                Low       = candle.Low,
+                Close     = candle.Close,
+                Volume    = candle.TickVolume,
+                Timestamp = candle.Timestamp,
+                IsClosed  = false
+            });
+        }
+    }
+
     private async Task<List<string>> GetActiveSymbolsAsync(CancellationToken cancellationToken)
     {
         // Use a dedicated scope because GetActiveSymbolsAsync is called before the main

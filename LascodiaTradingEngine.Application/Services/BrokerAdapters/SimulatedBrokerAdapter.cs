@@ -647,6 +647,34 @@ public sealed class SimulatedBrokerAdapter : ISimulatedBroker, IDisposable
         }
     }
 
+    public Task<BrokerOrderStatus?> GetOrderStatusAsync(
+        string brokerOrderId, CancellationToken cancellationToken)
+    {
+        SimulateConnectionFailure();
+
+        if (_openPositions.TryGetValue(brokerOrderId, out var position))
+        {
+            return Task.FromResult<BrokerOrderStatus?>(new BrokerOrderStatus(
+                BrokerOrderId: brokerOrderId,
+                Status: "Filled",
+                FilledPrice: position.EntryPrice,
+                FilledQuantity: position.Lots,
+                LastUpdatedUtc: DateTime.UtcNow));
+        }
+
+        if (_pendingOrders.TryGetValue(brokerOrderId, out var pending))
+        {
+            return Task.FromResult<BrokerOrderStatus?>(new BrokerOrderStatus(
+                BrokerOrderId: brokerOrderId,
+                Status: "Pending",
+                FilledPrice: null,
+                FilledQuantity: null,
+                LastUpdatedUtc: pending.CreatedAtUtc));
+        }
+
+        return Task.FromResult<BrokerOrderStatus?>(null);
+    }
+
     // ── IBrokerDataFeed ─────────────────────────────────────────────────────
 
     public async Task SubscribeAsync(

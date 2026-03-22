@@ -46,6 +46,13 @@ public sealed class TradingMetrics
     public Histogram<double> WorkerCycleDurationMs  { get; }
     public Counter<long>     WorkerErrors           { get; }
 
+    // ── Candle Aggregator ──────────────────────────────────────────────
+    public Counter<long>     CandlesClosed          { get; }
+    public Counter<long>     CandlesSynthetic       { get; }
+    public Counter<long>     CandleTicksDropped     { get; }
+    public Counter<long>     CandleSlotsPurged      { get; }
+    public Counter<long>     CandleTicksSpreadRejected { get; }
+
     // ── Cache ───────────────────────────────────────────────────────────────
     public Counter<long>     PriceCacheMisses       { get; }
 
@@ -96,6 +103,13 @@ public sealed class TradingMetrics
         // Workers
         WorkerCycleDurationMs = _meter.CreateHistogram<double>("trading.workers.cycle_duration", "ms", "Worker poll cycle duration");
         WorkerErrors          = _meter.CreateCounter<long>("trading.workers.errors", "errors", "Unhandled worker errors");
+
+        // Candle Aggregator
+        CandlesClosed      = _meter.CreateCounter<long>("trading.candles.closed", "candles", "Candle bars closed by aggregator");
+        CandlesSynthetic   = _meter.CreateCounter<long>("trading.candles.synthetic", "candles", "Synthetic gap-fill candles emitted");
+        CandleTicksDropped = _meter.CreateCounter<long>("trading.candles.ticks_dropped", "ticks", "Out-of-order ticks dropped by aggregator");
+        CandleSlotsPurged  = _meter.CreateCounter<long>("trading.candles.slots_purged", "slots", "Stale candle slots purged");
+        CandleTicksSpreadRejected = _meter.CreateCounter<long>("trading.candles.ticks_spread_rejected", "ticks", "Ticks rejected due to excessive spread");
 
         // Cache
         PriceCacheMisses = _meter.CreateCounter<long>("trading.cache.price_misses", "misses", "Live price cache misses");
