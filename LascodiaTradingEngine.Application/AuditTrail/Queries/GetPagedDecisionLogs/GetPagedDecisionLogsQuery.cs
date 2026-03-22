@@ -10,7 +10,13 @@ namespace LascodiaTradingEngine.Application.AuditTrail.Queries.GetPagedDecisionL
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
-public class GetPagedDecisionLogsQuery : PagerRequest<ResponseData<PagedData<DecisionLogDto>>>
+public class GetPagedDecisionLogsQuery : PagerRequestWithFilterType<DecisionLogQueryFilter, ResponseData<PagedData<DecisionLogDto>>>
+{
+}
+
+// ── Filter ────────────────────────────────────────────────────────────────────
+
+public class DecisionLogQueryFilter
 {
     public string?   EntityType   { get; set; }
     public long?     EntityId     { get; set; }
@@ -38,6 +44,7 @@ public class GetPagedDecisionLogsQueryHandler
         GetPagedDecisionLogsQuery request, CancellationToken cancellationToken)
     {
         Pager pager = _mapper.Map<Pager>(request);
+        var filter = request.GetFilter<DecisionLogQueryFilter>();
 
         // No IsDeleted filter — DecisionLog is immutable
         var query = _context.GetDbContext()
@@ -45,23 +52,23 @@ public class GetPagedDecisionLogsQueryHandler
             .OrderByDescending(x => x.CreatedAt)
             .AsQueryable();
 
-        if (!string.IsNullOrWhiteSpace(request.EntityType))
-            query = query.Where(x => x.EntityType == request.EntityType);
+        if (!string.IsNullOrWhiteSpace(filter?.EntityType))
+            query = query.Where(x => x.EntityType == filter.EntityType);
 
-        if (request.EntityId.HasValue)
-            query = query.Where(x => x.EntityId == request.EntityId.Value);
+        if (filter?.EntityId.HasValue == true)
+            query = query.Where(x => x.EntityId == filter.EntityId!.Value);
 
-        if (!string.IsNullOrWhiteSpace(request.DecisionType))
-            query = query.Where(x => x.DecisionType == request.DecisionType);
+        if (!string.IsNullOrWhiteSpace(filter?.DecisionType))
+            query = query.Where(x => x.DecisionType == filter.DecisionType);
 
-        if (!string.IsNullOrWhiteSpace(request.Outcome))
-            query = query.Where(x => x.Outcome == request.Outcome);
+        if (!string.IsNullOrWhiteSpace(filter?.Outcome))
+            query = query.Where(x => x.Outcome == filter.Outcome);
 
-        if (request.From.HasValue)
-            query = query.Where(x => x.CreatedAt >= request.From.Value);
+        if (filter?.From.HasValue == true)
+            query = query.Where(x => x.CreatedAt >= filter.From!.Value);
 
-        if (request.To.HasValue)
-            query = query.Where(x => x.CreatedAt <= request.To.Value);
+        if (filter?.To.HasValue == true)
+            query = query.Where(x => x.CreatedAt <= filter.To!.Value);
 
         var data = await pager.ExecuteQuery(query).ToListAsync(cancellationToken);
         var dtos = _mapper.Map<List<DecisionLogDto>>(data);

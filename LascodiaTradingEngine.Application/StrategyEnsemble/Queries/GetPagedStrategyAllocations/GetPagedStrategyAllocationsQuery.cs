@@ -10,8 +10,15 @@ namespace LascodiaTradingEngine.Application.StrategyEnsemble.Queries.GetPagedStr
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
-public class GetPagedStrategyAllocationsQuery : PagerRequest<ResponseData<PagedData<StrategyAllocationDto>>>
+public class GetPagedStrategyAllocationsQuery : PagerRequestWithFilterType<StrategyAllocationQueryFilter, ResponseData<PagedData<StrategyAllocationDto>>>
 {
+}
+
+// ── Filter ────────────────────────────────────────────────────────────────────
+
+public class StrategyAllocationQueryFilter
+{
+    public long? StrategyId { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
@@ -32,6 +39,7 @@ public class GetPagedStrategyAllocationsQueryHandler
         GetPagedStrategyAllocationsQuery request, CancellationToken cancellationToken)
     {
         Pager pager = _mapper.Map<Pager>(request);
+        var filter = request.GetFilter<StrategyAllocationQueryFilter>();
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.StrategyAllocation>()

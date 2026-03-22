@@ -11,7 +11,11 @@ namespace LascodiaTradingEngine.Application.Brokers.Queries.GetPagedBrokers;
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
-public class GetPagedBrokersQuery : PagerRequest<ResponseData<PagedData<BrokerDto>>>
+public class GetPagedBrokersQuery : PagerRequestWithFilterType<BrokerQueryFilter, ResponseData<PagedData<BrokerDto>>>
+{
+}
+
+public class BrokerQueryFilter
 {
     public string? BrokerType { get; set; }
 }
@@ -34,6 +38,7 @@ public class GetPagedBrokersQueryHandler
         GetPagedBrokersQuery request, CancellationToken cancellationToken)
     {
         Pager pager = _mapper.Map<Pager>(request);
+        var filter = request.GetFilter<BrokerQueryFilter>();
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.Broker>()
@@ -41,7 +46,7 @@ public class GetPagedBrokersQueryHandler
             .OrderByDescending(x => x.IsActive)
             .AsQueryable();
 
-        if (!string.IsNullOrWhiteSpace(request.BrokerType) && Enum.TryParse<BrokerType>(request.BrokerType, ignoreCase: true, out var brokerType))
+        if (!string.IsNullOrWhiteSpace(filter?.BrokerType) && Enum.TryParse<BrokerType>(filter?.BrokerType, ignoreCase: true, out var brokerType))
             query = query.Where(x => x.BrokerType == brokerType);
 
         var data = await pager.ExecuteQuery(query).ToListAsync(cancellationToken);

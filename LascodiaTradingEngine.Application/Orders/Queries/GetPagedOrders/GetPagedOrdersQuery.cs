@@ -11,7 +11,11 @@ namespace LascodiaTradingEngine.Application.Orders.Queries.GetPagedOrders;
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
-public class GetPagedOrdersQuery : PagerRequest<ResponseData<PagedData<OrderDto>>>
+public class GetPagedOrdersQuery : PagerRequestWithFilterType<OrderQueryFilter, ResponseData<PagedData<OrderDto>>>
+{
+}
+
+public class OrderQueryFilter
 {
     public string? Search    { get; set; }
     public string? Status    { get; set; }
@@ -36,6 +40,7 @@ public class GetPagedOrdersQueryHandler
         GetPagedOrdersQuery request, CancellationToken cancellationToken)
     {
         Pager pager = _mapper.Map<Pager>(request);
+        var filter = request.GetFilter<OrderQueryFilter>();
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.Order>()
@@ -43,13 +48,13 @@ public class GetPagedOrdersQueryHandler
             .OrderByDescending(x => x.CreatedAt)
             .AsQueryable();
 
-        if (!string.IsNullOrWhiteSpace(request.Search))
-            query = query.Where(x => x.Symbol.Contains(request.Search));
+        if (!string.IsNullOrWhiteSpace(filter?.Search))
+            query = query.Where(x => x.Symbol.Contains(filter.Search));
 
-        if (!string.IsNullOrWhiteSpace(request.Status) && Enum.TryParse<OrderStatus>(request.Status, ignoreCase: true, out var statusFilter))
+        if (!string.IsNullOrWhiteSpace(filter?.Status) && Enum.TryParse<OrderStatus>(filter.Status, ignoreCase: true, out var statusFilter))
             query = query.Where(x => x.Status == statusFilter);
 
-        if (!string.IsNullOrWhiteSpace(request.OrderType) && Enum.TryParse<OrderType>(request.OrderType, ignoreCase: true, out var orderTypeFilter))
+        if (!string.IsNullOrWhiteSpace(filter?.OrderType) && Enum.TryParse<OrderType>(filter.OrderType, ignoreCase: true, out var orderTypeFilter))
             query = query.Where(x => x.OrderType == orderTypeFilter);
 
         var data = await pager.ExecuteQuery(query).ToListAsync(cancellationToken);

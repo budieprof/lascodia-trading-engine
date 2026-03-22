@@ -11,7 +11,11 @@ namespace LascodiaTradingEngine.Application.Positions.Queries.GetPagedPositions;
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
-public class GetPagedPositionsQuery : PagerRequest<ResponseData<PagedData<PositionDto>>>
+public class GetPagedPositionsQuery : PagerRequestWithFilterType<PositionQueryFilter, ResponseData<PagedData<PositionDto>>>
+{
+}
+
+public class PositionQueryFilter
 {
     public string? Symbol  { get; set; }
     public string? Status  { get; set; }
@@ -36,6 +40,7 @@ public class GetPagedPositionsQueryHandler
         GetPagedPositionsQuery request, CancellationToken cancellationToken)
     {
         Pager pager = _mapper.Map<Pager>(request);
+        var filter = request.GetFilter<PositionQueryFilter>();
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.Position>()
@@ -43,14 +48,14 @@ public class GetPagedPositionsQueryHandler
             .OrderByDescending(x => x.OpenedAt)
             .AsQueryable();
 
-        if (!string.IsNullOrWhiteSpace(request.Symbol))
-            query = query.Where(x => x.Symbol == request.Symbol);
+        if (!string.IsNullOrWhiteSpace(filter?.Symbol))
+            query = query.Where(x => x.Symbol == filter.Symbol);
 
-        if (!string.IsNullOrWhiteSpace(request.Status) && Enum.TryParse<PositionStatus>(request.Status, ignoreCase: true, out var positionStatus))
+        if (!string.IsNullOrWhiteSpace(filter?.Status) && Enum.TryParse<PositionStatus>(filter.Status, ignoreCase: true, out var positionStatus))
             query = query.Where(x => x.Status == positionStatus);
 
-        if (request.IsPaper.HasValue)
-            query = query.Where(x => x.IsPaper == request.IsPaper.Value);
+        if (filter?.IsPaper.HasValue == true)
+            query = query.Where(x => x.IsPaper == filter.IsPaper.Value);
 
         var data = await pager.ExecuteQuery(query).ToListAsync(cancellationToken);
         var dtos = _mapper.Map<List<PositionDto>>(data);

@@ -11,7 +11,13 @@ namespace LascodiaTradingEngine.Application.MLModels.Queries.GetPagedMLTrainingR
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
-public class GetPagedMLTrainingRunsQuery : PagerRequest<ResponseData<PagedData<MLTrainingRunDto>>>
+public class GetPagedMLTrainingRunsQuery : PagerRequestWithFilterType<MLTrainingRunQueryFilter, ResponseData<PagedData<MLTrainingRunDto>>>
+{
+}
+
+// ── Filter ────────────────────────────────────────────────────────────────────
+
+public class MLTrainingRunQueryFilter
 {
     public string? Symbol    { get; set; }
     public string? Timeframe { get; set; }
@@ -36,6 +42,7 @@ public class GetPagedMLTrainingRunsQueryHandler
         GetPagedMLTrainingRunsQuery request, CancellationToken cancellationToken)
     {
         Pager pager = _mapper.Map<Pager>(request);
+        var filter = request.GetFilter<MLTrainingRunQueryFilter>();
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.MLTrainingRun>()
@@ -43,13 +50,13 @@ public class GetPagedMLTrainingRunsQueryHandler
             .OrderByDescending(x => x.StartedAt)
             .AsQueryable();
 
-        if (!string.IsNullOrWhiteSpace(request.Symbol))
-            query = query.Where(x => x.Symbol == request.Symbol.ToUpperInvariant());
+        if (!string.IsNullOrWhiteSpace(filter?.Symbol))
+            query = query.Where(x => x.Symbol == filter.Symbol.ToUpperInvariant());
 
-        if (!string.IsNullOrWhiteSpace(request.Timeframe) && Enum.TryParse<Timeframe>(request.Timeframe, ignoreCase: true, out var timeframe))
+        if (!string.IsNullOrWhiteSpace(filter?.Timeframe) && Enum.TryParse<Timeframe>(filter.Timeframe, ignoreCase: true, out var timeframe))
             query = query.Where(x => x.Timeframe == timeframe);
 
-        if (!string.IsNullOrWhiteSpace(request.Status) && Enum.TryParse<RunStatus>(request.Status, ignoreCase: true, out var status))
+        if (!string.IsNullOrWhiteSpace(filter?.Status) && Enum.TryParse<RunStatus>(filter.Status, ignoreCase: true, out var status))
             query = query.Where(x => x.Status == status);
 
         var data = await pager.ExecuteQuery(query).ToListAsync(cancellationToken);

@@ -10,7 +10,11 @@ namespace LascodiaTradingEngine.Application.TradingAccounts.Queries.GetPagedTrad
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
-public class GetPagedTradingAccountsQuery : PagerRequest<ResponseData<PagedData<TradingAccountDto>>>
+public class GetPagedTradingAccountsQuery : PagerRequestWithFilterType<TradingAccountQueryFilter, ResponseData<PagedData<TradingAccountDto>>>
+{
+}
+
+public class TradingAccountQueryFilter
 {
     public long? BrokerId { get; set; }
     public bool? IsPaper  { get; set; }
@@ -34,6 +38,7 @@ public class GetPagedTradingAccountsQueryHandler
         GetPagedTradingAccountsQuery request, CancellationToken cancellationToken)
     {
         Pager pager = _mapper.Map<Pager>(request);
+        var filter = request.GetFilter<TradingAccountQueryFilter>();
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.TradingAccount>()
@@ -41,11 +46,11 @@ public class GetPagedTradingAccountsQueryHandler
             .OrderByDescending(x => x.IsActive)
             .AsQueryable();
 
-        if (request.BrokerId.HasValue)
-            query = query.Where(x => x.BrokerId == request.BrokerId.Value);
+        if (filter?.BrokerId.HasValue == true)
+            query = query.Where(x => x.BrokerId == filter.BrokerId.Value);
 
-        if (request.IsPaper.HasValue)
-            query = query.Where(x => x.IsPaper == request.IsPaper.Value);
+        if (filter?.IsPaper.HasValue == true)
+            query = query.Where(x => x.IsPaper == filter.IsPaper.Value);
 
         var data = await pager.ExecuteQuery(query).ToListAsync(cancellationToken);
         var dtos = _mapper.Map<List<TradingAccountDto>>(data);

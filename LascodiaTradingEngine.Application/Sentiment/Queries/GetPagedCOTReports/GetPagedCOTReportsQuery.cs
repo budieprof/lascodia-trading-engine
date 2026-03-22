@@ -10,7 +10,13 @@ namespace LascodiaTradingEngine.Application.Sentiment.Queries.GetPagedCOTReports
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
-public class GetPagedCOTReportsQuery : PagerRequest<ResponseData<PagedData<COTReportDto>>>
+public class GetPagedCOTReportsQuery : PagerRequestWithFilterType<COTReportQueryFilter, ResponseData<PagedData<COTReportDto>>>
+{
+}
+
+// ── Filter ────────────────────────────────────────────────────────────────────
+
+public class COTReportQueryFilter
 {
     public string? Symbol { get; set; }
 }
@@ -33,6 +39,7 @@ public class GetPagedCOTReportsQueryHandler
         GetPagedCOTReportsQuery request, CancellationToken cancellationToken)
     {
         Pager pager = _mapper.Map<Pager>(request);
+        var filter = request.GetFilter<COTReportQueryFilter>();
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.COTReport>()
@@ -40,11 +47,11 @@ public class GetPagedCOTReportsQueryHandler
             .OrderByDescending(x => x.ReportDate)
             .AsQueryable();
 
-        if (!string.IsNullOrWhiteSpace(request.Symbol))
+        if (!string.IsNullOrWhiteSpace(filter?.Symbol))
         {
-            string currency = request.Symbol.Length >= 3
-                ? request.Symbol[..3].ToUpperInvariant()
-                : request.Symbol.ToUpperInvariant();
+            string currency = filter.Symbol.Length >= 3
+                ? filter.Symbol[..3].ToUpperInvariant()
+                : filter.Symbol.ToUpperInvariant();
 
             query = query.Where(x => x.Currency == currency);
         }

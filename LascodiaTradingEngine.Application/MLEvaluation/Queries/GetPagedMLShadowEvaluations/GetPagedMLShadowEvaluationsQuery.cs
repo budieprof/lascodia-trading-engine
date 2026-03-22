@@ -11,7 +11,13 @@ namespace LascodiaTradingEngine.Application.MLEvaluation.Queries.GetPagedMLShado
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
-public class GetPagedMLShadowEvaluationsQuery : PagerRequest<ResponseData<PagedData<MLShadowEvaluationDto>>>
+public class GetPagedMLShadowEvaluationsQuery : PagerRequestWithFilterType<MLShadowEvaluationQueryFilter, ResponseData<PagedData<MLShadowEvaluationDto>>>
+{
+}
+
+// ── Filter ────────────────────────────────────────────────────────────────────
+
+public class MLShadowEvaluationQueryFilter
 {
     public string? Symbol { get; set; }
     public string? Status { get; set; }
@@ -35,6 +41,7 @@ public class GetPagedMLShadowEvaluationsQueryHandler
         GetPagedMLShadowEvaluationsQuery request, CancellationToken cancellationToken)
     {
         Pager pager = _mapper.Map<Pager>(request);
+        var filter = request.GetFilter<MLShadowEvaluationQueryFilter>();
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.MLShadowEvaluation>()
@@ -42,10 +49,10 @@ public class GetPagedMLShadowEvaluationsQueryHandler
             .OrderByDescending(x => x.StartedAt)
             .AsQueryable();
 
-        if (!string.IsNullOrWhiteSpace(request.Symbol))
-            query = query.Where(x => x.Symbol == request.Symbol.ToUpperInvariant());
+        if (!string.IsNullOrWhiteSpace(filter?.Symbol))
+            query = query.Where(x => x.Symbol == filter.Symbol.ToUpperInvariant());
 
-        if (!string.IsNullOrWhiteSpace(request.Status) && Enum.TryParse<ShadowEvaluationStatus>(request.Status, ignoreCase: true, out var status))
+        if (!string.IsNullOrWhiteSpace(filter?.Status) && Enum.TryParse<ShadowEvaluationStatus>(filter.Status, ignoreCase: true, out var status))
             query = query.Where(x => x.Status == status);
 
         var data = await pager.ExecuteQuery(query).ToListAsync(cancellationToken);

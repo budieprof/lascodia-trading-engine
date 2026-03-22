@@ -10,7 +10,11 @@ namespace LascodiaTradingEngine.Application.RiskProfiles.Queries.GetPagedRiskPro
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
-public class GetPagedRiskProfilesQuery : PagerRequest<ResponseData<PagedData<RiskProfileDto>>>
+public class GetPagedRiskProfilesQuery : PagerRequestWithFilterType<RiskProfileQueryFilter, ResponseData<PagedData<RiskProfileDto>>>
+{
+}
+
+public class RiskProfileQueryFilter
 {
     public string? Search { get; set; }
 }
@@ -33,6 +37,7 @@ public class GetPagedRiskProfilesQueryHandler
         GetPagedRiskProfilesQuery request, CancellationToken cancellationToken)
     {
         Pager pager = _mapper.Map<Pager>(request);
+        var filter = request.GetFilter<RiskProfileQueryFilter>();
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.RiskProfile>()
@@ -40,8 +45,8 @@ public class GetPagedRiskProfilesQueryHandler
             .OrderByDescending(x => x.IsDefault)
             .AsQueryable();
 
-        if (!string.IsNullOrWhiteSpace(request.Search))
-            query = query.Where(x => x.Name.Contains(request.Search));
+        if (!string.IsNullOrWhiteSpace(filter?.Search))
+            query = query.Where(x => x.Name.Contains(filter.Search));
 
         var data = await pager.ExecuteQuery(query).ToListAsync(cancellationToken);
         var dtos = _mapper.Map<List<RiskProfileDto>>(data);

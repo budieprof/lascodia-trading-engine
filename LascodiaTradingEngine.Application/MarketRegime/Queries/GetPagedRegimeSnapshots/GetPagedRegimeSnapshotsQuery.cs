@@ -12,7 +12,13 @@ namespace LascodiaTradingEngine.Application.MarketRegime.Queries.GetPagedRegimeS
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
-public class GetPagedRegimeSnapshotsQuery : PagerRequest<ResponseData<PagedData<MarketRegimeSnapshotDto>>>
+public class GetPagedRegimeSnapshotsQuery : PagerRequestWithFilterType<RegimeSnapshotQueryFilter, ResponseData<PagedData<MarketRegimeSnapshotDto>>>
+{
+}
+
+// ── Filter ────────────────────────────────────────────────────────────────────
+
+public class RegimeSnapshotQueryFilter
 {
     public string? Symbol    { get; set; }
     public string? Timeframe { get; set; }
@@ -37,6 +43,7 @@ public class GetPagedRegimeSnapshotsQueryHandler
         GetPagedRegimeSnapshotsQuery request, CancellationToken cancellationToken)
     {
         Pager pager = _mapper.Map<Pager>(request);
+        var filter = request.GetFilter<RegimeSnapshotQueryFilter>();
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.MarketRegimeSnapshot>()
@@ -44,13 +51,13 @@ public class GetPagedRegimeSnapshotsQueryHandler
             .OrderByDescending(x => x.DetectedAt)
             .AsQueryable();
 
-        if (!string.IsNullOrWhiteSpace(request.Symbol))
-            query = query.Where(x => x.Symbol == request.Symbol);
+        if (!string.IsNullOrWhiteSpace(filter?.Symbol))
+            query = query.Where(x => x.Symbol == filter.Symbol);
 
-        if (!string.IsNullOrWhiteSpace(request.Timeframe) && Enum.TryParse<Timeframe>(request.Timeframe, ignoreCase: true, out var timeframe))
+        if (!string.IsNullOrWhiteSpace(filter?.Timeframe) && Enum.TryParse<Timeframe>(filter.Timeframe, ignoreCase: true, out var timeframe))
             query = query.Where(x => x.Timeframe == timeframe);
 
-        if (!string.IsNullOrWhiteSpace(request.Regime) && Enum.TryParse<MarketRegimeEnum>(request.Regime, ignoreCase: true, out var regime))
+        if (!string.IsNullOrWhiteSpace(filter?.Regime) && Enum.TryParse<MarketRegimeEnum>(filter.Regime, ignoreCase: true, out var regime))
             query = query.Where(x => x.Regime == regime);
 
         var data = await pager.ExecuteQuery(query).ToListAsync(cancellationToken);

@@ -11,7 +11,13 @@ namespace LascodiaTradingEngine.Application.MLModels.Queries.GetPagedMLModels;
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
-public class GetPagedMLModelsQuery : PagerRequest<ResponseData<PagedData<MLModelDto>>>
+public class GetPagedMLModelsQuery : PagerRequestWithFilterType<MLModelQueryFilter, ResponseData<PagedData<MLModelDto>>>
+{
+}
+
+// ── Filter ────────────────────────────────────────────────────────────────────
+
+public class MLModelQueryFilter
 {
     public string? Symbol    { get; set; }
     public string? Timeframe { get; set; }
@@ -37,6 +43,7 @@ public class GetPagedMLModelsQueryHandler
         GetPagedMLModelsQuery request, CancellationToken cancellationToken)
     {
         Pager pager = _mapper.Map<Pager>(request);
+        var filter = request.GetFilter<MLModelQueryFilter>();
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.MLModel>()
@@ -44,16 +51,16 @@ public class GetPagedMLModelsQueryHandler
             .OrderByDescending(x => x.TrainedAt)
             .AsQueryable();
 
-        if (!string.IsNullOrWhiteSpace(request.Symbol))
-            query = query.Where(x => x.Symbol == request.Symbol.ToUpperInvariant());
+        if (!string.IsNullOrWhiteSpace(filter?.Symbol))
+            query = query.Where(x => x.Symbol == filter.Symbol.ToUpperInvariant());
 
-        if (!string.IsNullOrWhiteSpace(request.Timeframe) && Enum.TryParse<Timeframe>(request.Timeframe, ignoreCase: true, out var timeframe))
+        if (!string.IsNullOrWhiteSpace(filter?.Timeframe) && Enum.TryParse<Timeframe>(filter.Timeframe, ignoreCase: true, out var timeframe))
             query = query.Where(x => x.Timeframe == timeframe);
 
-        if (request.IsActive.HasValue)
-            query = query.Where(x => x.IsActive == request.IsActive.Value);
+        if (filter?.IsActive.HasValue == true)
+            query = query.Where(x => x.IsActive == filter.IsActive!.Value);
 
-        if (!string.IsNullOrWhiteSpace(request.Status) && Enum.TryParse<MLModelStatus>(request.Status, ignoreCase: true, out var status))
+        if (!string.IsNullOrWhiteSpace(filter?.Status) && Enum.TryParse<MLModelStatus>(filter.Status, ignoreCase: true, out var status))
             query = query.Where(x => x.Status == status);
 
         var data = await pager.ExecuteQuery(query).ToListAsync(cancellationToken);

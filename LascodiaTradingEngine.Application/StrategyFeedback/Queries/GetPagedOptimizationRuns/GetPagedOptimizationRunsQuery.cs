@@ -11,7 +11,13 @@ namespace LascodiaTradingEngine.Application.StrategyFeedback.Queries.GetPagedOpt
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
-public class GetPagedOptimizationRunsQuery : PagerRequest<ResponseData<PagedData<OptimizationRunDto>>>
+public class GetPagedOptimizationRunsQuery : PagerRequestWithFilterType<OptimizationRunQueryFilter, ResponseData<PagedData<OptimizationRunDto>>>
+{
+}
+
+// ── Filter ────────────────────────────────────────────────────────────────────
+
+public class OptimizationRunQueryFilter
 {
     public long?   StrategyId { get; set; }
     public string? Status     { get; set; }
@@ -35,6 +41,7 @@ public class GetPagedOptimizationRunsQueryHandler
         GetPagedOptimizationRunsQuery request, CancellationToken cancellationToken)
     {
         Pager pager = _mapper.Map<Pager>(request);
+        var filter = request.GetFilter<OptimizationRunQueryFilter>();
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.OptimizationRun>()
@@ -42,10 +49,10 @@ public class GetPagedOptimizationRunsQueryHandler
             .OrderByDescending(x => x.StartedAt)
             .AsQueryable();
 
-        if (request.StrategyId.HasValue)
-            query = query.Where(x => x.StrategyId == request.StrategyId.Value);
+        if (filter?.StrategyId.HasValue == true)
+            query = query.Where(x => x.StrategyId == filter.StrategyId.Value);
 
-        if (!string.IsNullOrWhiteSpace(request.Status) && Enum.TryParse<OptimizationRunStatus>(request.Status, ignoreCase: true, out var status))
+        if (!string.IsNullOrWhiteSpace(filter?.Status) && Enum.TryParse<OptimizationRunStatus>(filter.Status, ignoreCase: true, out var status))
             query = query.Where(x => x.Status == status);
 
         var data = await pager.ExecuteQuery(query).ToListAsync(cancellationToken);

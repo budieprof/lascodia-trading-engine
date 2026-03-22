@@ -11,7 +11,13 @@ namespace LascodiaTradingEngine.Application.WalkForward.Queries.GetPagedWalkForw
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
-public class GetPagedWalkForwardRunsQuery : PagerRequest<ResponseData<PagedData<WalkForwardRunDto>>>
+public class GetPagedWalkForwardRunsQuery : PagerRequestWithFilterType<WalkForwardRunQueryFilter, ResponseData<PagedData<WalkForwardRunDto>>>
+{
+}
+
+// ── Filter ────────────────────────────────────────────────────────────────────
+
+public class WalkForwardRunQueryFilter
 {
     public long?   StrategyId { get; set; }
     public string? Status     { get; set; }
@@ -35,6 +41,7 @@ public class GetPagedWalkForwardRunsQueryHandler
         GetPagedWalkForwardRunsQuery request, CancellationToken cancellationToken)
     {
         Pager pager = _mapper.Map<Pager>(request);
+        var filter = request.GetFilter<WalkForwardRunQueryFilter>();
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.WalkForwardRun>()
@@ -42,10 +49,10 @@ public class GetPagedWalkForwardRunsQueryHandler
             .OrderByDescending(x => x.StartedAt)
             .AsQueryable();
 
-        if (request.StrategyId.HasValue)
-            query = query.Where(x => x.StrategyId == request.StrategyId.Value);
+        if (filter?.StrategyId.HasValue == true)
+            query = query.Where(x => x.StrategyId == filter.StrategyId.Value);
 
-        if (!string.IsNullOrWhiteSpace(request.Status) && Enum.TryParse<RunStatus>(request.Status, ignoreCase: true, out var status))
+        if (!string.IsNullOrWhiteSpace(filter?.Status) && Enum.TryParse<RunStatus>(filter.Status, ignoreCase: true, out var status))
             query = query.Where(x => x.Status == status);
 
         var data = await pager.ExecuteQuery(query).ToListAsync(cancellationToken);

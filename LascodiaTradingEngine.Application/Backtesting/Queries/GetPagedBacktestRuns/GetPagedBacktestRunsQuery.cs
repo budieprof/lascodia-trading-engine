@@ -11,7 +11,13 @@ namespace LascodiaTradingEngine.Application.Backtesting.Queries.GetPagedBacktest
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
-public class GetPagedBacktestRunsQuery : PagerRequest<ResponseData<PagedData<BacktestRunDto>>>
+public class GetPagedBacktestRunsQuery : PagerRequestWithFilterType<BacktestRunQueryFilter, ResponseData<PagedData<BacktestRunDto>>>
+{
+}
+
+// ── Filter ────────────────────────────────────────────────────────────────────
+
+public class BacktestRunQueryFilter
 {
     public long?   StrategyId { get; set; }
     public string? Status     { get; set; }
@@ -35,6 +41,7 @@ public class GetPagedBacktestRunsQueryHandler
         GetPagedBacktestRunsQuery request, CancellationToken cancellationToken)
     {
         Pager pager = _mapper.Map<Pager>(request);
+        var filter = request.GetFilter<BacktestRunQueryFilter>();
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.BacktestRun>()
@@ -42,10 +49,10 @@ public class GetPagedBacktestRunsQueryHandler
             .OrderByDescending(x => x.StartedAt)
             .AsQueryable();
 
-        if (request.StrategyId.HasValue)
-            query = query.Where(x => x.StrategyId == request.StrategyId.Value);
+        if (filter?.StrategyId.HasValue == true)
+            query = query.Where(x => x.StrategyId == filter.StrategyId.Value);
 
-        if (!string.IsNullOrWhiteSpace(request.Status) && Enum.TryParse<RunStatus>(request.Status, ignoreCase: true, out var status))
+        if (!string.IsNullOrWhiteSpace(filter?.Status) && Enum.TryParse<RunStatus>(filter.Status, ignoreCase: true, out var status))
             query = query.Where(x => x.Status == status);
 
         var data = await pager.ExecuteQuery(query).ToListAsync(cancellationToken);

@@ -11,7 +11,11 @@ namespace LascodiaTradingEngine.Application.TradeSignals.Queries.GetPagedTradeSi
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
-public class GetPagedTradeSignalsQuery : PagerRequest<ResponseData<PagedData<TradeSignalDto>>>
+public class GetPagedTradeSignalsQuery : PagerRequestWithFilterType<TradeSignalQueryFilter, ResponseData<PagedData<TradeSignalDto>>>
+{
+}
+
+public class TradeSignalQueryFilter
 {
     public string?   Search     { get; set; }   // filters on Symbol
     public string?   Status     { get; set; }
@@ -39,6 +43,7 @@ public class GetPagedTradeSignalsQueryHandler
         GetPagedTradeSignalsQuery request, CancellationToken cancellationToken)
     {
         Pager pager = _mapper.Map<Pager>(request);
+        var filter = request.GetFilter<TradeSignalQueryFilter>();
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.TradeSignal>()
@@ -46,23 +51,23 @@ public class GetPagedTradeSignalsQueryHandler
             .OrderByDescending(x => x.GeneratedAt)
             .AsQueryable();
 
-        if (!string.IsNullOrWhiteSpace(request.Search))
-            query = query.Where(x => x.Symbol.Contains(request.Search));
+        if (!string.IsNullOrWhiteSpace(filter?.Search))
+            query = query.Where(x => x.Symbol.Contains(filter.Search));
 
-        if (!string.IsNullOrWhiteSpace(request.Status) && Enum.TryParse<TradeSignalStatus>(request.Status, ignoreCase: true, out var status))
+        if (!string.IsNullOrWhiteSpace(filter?.Status) && Enum.TryParse<TradeSignalStatus>(filter.Status, ignoreCase: true, out var status))
             query = query.Where(x => x.Status == status);
 
-        if (!string.IsNullOrWhiteSpace(request.Direction) && Enum.TryParse<TradeDirection>(request.Direction, ignoreCase: true, out var direction))
+        if (!string.IsNullOrWhiteSpace(filter?.Direction) && Enum.TryParse<TradeDirection>(filter.Direction, ignoreCase: true, out var direction))
             query = query.Where(x => x.Direction == direction);
 
-        if (request.StrategyId.HasValue)
-            query = query.Where(x => x.StrategyId == request.StrategyId.Value);
+        if (filter?.StrategyId.HasValue == true)
+            query = query.Where(x => x.StrategyId == filter.StrategyId.Value);
 
-        if (request.From.HasValue)
-            query = query.Where(x => x.GeneratedAt >= request.From.Value);
+        if (filter?.From.HasValue == true)
+            query = query.Where(x => x.GeneratedAt >= filter.From.Value);
 
-        if (request.To.HasValue)
-            query = query.Where(x => x.GeneratedAt <= request.To.Value);
+        if (filter?.To.HasValue == true)
+            query = query.Where(x => x.GeneratedAt <= filter.To.Value);
 
         var data = await pager.ExecuteQuery(query).ToListAsync(cancellationToken);
         var dtos = _mapper.Map<List<TradeSignalDto>>(data);

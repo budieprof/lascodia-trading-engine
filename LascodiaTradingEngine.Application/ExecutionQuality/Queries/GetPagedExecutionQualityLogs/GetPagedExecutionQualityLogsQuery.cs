@@ -11,7 +11,13 @@ namespace LascodiaTradingEngine.Application.ExecutionQuality.Queries.GetPagedExe
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
-public class GetPagedExecutionQualityLogsQuery : PagerRequest<ResponseData<PagedData<ExecutionQualityLogDto>>>
+public class GetPagedExecutionQualityLogsQuery : PagerRequestWithFilterType<ExecutionQualityLogQueryFilter, ResponseData<PagedData<ExecutionQualityLogDto>>>
+{
+}
+
+// ── Filter ────────────────────────────────────────────────────────────────────
+
+public class ExecutionQualityLogQueryFilter
 {
     public string?   Symbol     { get; set; }
     public string?   Session    { get; set; }
@@ -38,6 +44,7 @@ public class GetPagedExecutionQualityLogsQueryHandler
         GetPagedExecutionQualityLogsQuery request, CancellationToken cancellationToken)
     {
         Pager pager = _mapper.Map<Pager>(request);
+        var filter = request.GetFilter<ExecutionQualityLogQueryFilter>();
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.ExecutionQualityLog>()
@@ -45,20 +52,20 @@ public class GetPagedExecutionQualityLogsQueryHandler
             .OrderByDescending(x => x.RecordedAt)
             .AsQueryable();
 
-        if (!string.IsNullOrWhiteSpace(request.Symbol))
-            query = query.Where(x => x.Symbol == request.Symbol);
+        if (!string.IsNullOrWhiteSpace(filter?.Symbol))
+            query = query.Where(x => x.Symbol == filter.Symbol);
 
-        if (!string.IsNullOrWhiteSpace(request.Session) && Enum.TryParse<TradingSession>(request.Session, ignoreCase: true, out var session))
+        if (!string.IsNullOrWhiteSpace(filter?.Session) && Enum.TryParse<TradingSession>(filter.Session, ignoreCase: true, out var session))
             query = query.Where(x => x.Session == session);
 
-        if (request.StrategyId.HasValue)
-            query = query.Where(x => x.StrategyId == request.StrategyId.Value);
+        if (filter?.StrategyId.HasValue == true)
+            query = query.Where(x => x.StrategyId == filter.StrategyId!.Value);
 
-        if (request.From.HasValue)
-            query = query.Where(x => x.RecordedAt >= request.From.Value);
+        if (filter?.From.HasValue == true)
+            query = query.Where(x => x.RecordedAt >= filter.From!.Value);
 
-        if (request.To.HasValue)
-            query = query.Where(x => x.RecordedAt <= request.To.Value);
+        if (filter?.To.HasValue == true)
+            query = query.Where(x => x.RecordedAt <= filter.To!.Value);
 
         var data = await pager.ExecuteQuery(query).ToListAsync(cancellationToken);
         var dtos = _mapper.Map<List<ExecutionQualityLogDto>>(data);

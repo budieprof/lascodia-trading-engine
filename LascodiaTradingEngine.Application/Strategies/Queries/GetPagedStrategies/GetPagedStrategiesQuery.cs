@@ -11,7 +11,11 @@ namespace LascodiaTradingEngine.Application.Strategies.Queries.GetPagedStrategie
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
-public class GetPagedStrategiesQuery : PagerRequest<ResponseData<PagedData<StrategyDto>>>
+public class GetPagedStrategiesQuery : PagerRequestWithFilterType<StrategyQueryFilter, ResponseData<PagedData<StrategyDto>>>
+{
+}
+
+public class StrategyQueryFilter
 {
     public string? Search { get; set; }
     public string? Status { get; set; }
@@ -36,6 +40,7 @@ public class GetPagedStrategiesQueryHandler
         GetPagedStrategiesQuery request, CancellationToken cancellationToken)
     {
         Pager pager = _mapper.Map<Pager>(request);
+        var filter = request.GetFilter<StrategyQueryFilter>();
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.Strategy>()
@@ -43,14 +48,14 @@ public class GetPagedStrategiesQueryHandler
             .OrderBy(x => x.Name)
             .AsQueryable();
 
-        if (!string.IsNullOrWhiteSpace(request.Search))
-            query = query.Where(x => x.Name.Contains(request.Search) || x.Symbol.Contains(request.Search));
+        if (!string.IsNullOrWhiteSpace(filter?.Search))
+            query = query.Where(x => x.Name.Contains(filter.Search) || x.Symbol.Contains(filter.Search));
 
-        if (!string.IsNullOrWhiteSpace(request.Status) && Enum.TryParse<StrategyStatus>(request.Status, ignoreCase: true, out var status))
+        if (!string.IsNullOrWhiteSpace(filter?.Status) && Enum.TryParse<StrategyStatus>(filter.Status, ignoreCase: true, out var status))
             query = query.Where(x => x.Status == status);
 
-        if (!string.IsNullOrWhiteSpace(request.Symbol))
-            query = query.Where(x => x.Symbol == request.Symbol);
+        if (!string.IsNullOrWhiteSpace(filter?.Symbol))
+            query = query.Where(x => x.Symbol == filter.Symbol);
 
         var data = await pager.ExecuteQuery(query).ToListAsync(cancellationToken);
         var dtos = _mapper.Map<List<StrategyDto>>(data);

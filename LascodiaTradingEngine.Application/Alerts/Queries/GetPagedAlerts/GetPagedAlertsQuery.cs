@@ -11,7 +11,11 @@ namespace LascodiaTradingEngine.Application.Alerts.Queries.GetPagedAlerts;
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
-public class GetPagedAlertsQuery : PagerRequest<ResponseData<PagedData<AlertDto>>>
+public class GetPagedAlertsQuery : PagerRequestWithFilterType<AlertQueryFilter, ResponseData<PagedData<AlertDto>>>
+{
+}
+
+public class AlertQueryFilter
 {
     public string? Symbol    { get; set; }
     public string? AlertType { get; set; }
@@ -36,6 +40,7 @@ public class GetPagedAlertsQueryHandler
         GetPagedAlertsQuery request, CancellationToken cancellationToken)
     {
         Pager pager = _mapper.Map<Pager>(request);
+        var filter = request.GetFilter<AlertQueryFilter>();
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.Alert>()
@@ -43,14 +48,14 @@ public class GetPagedAlertsQueryHandler
             .OrderByDescending(x => x.Id)
             .AsQueryable();
 
-        if (!string.IsNullOrWhiteSpace(request.Symbol))
-            query = query.Where(x => x.Symbol == request.Symbol);
+        if (!string.IsNullOrWhiteSpace(filter?.Symbol))
+            query = query.Where(x => x.Symbol == filter.Symbol);
 
-        if (!string.IsNullOrWhiteSpace(request.AlertType) && Enum.TryParse<AlertType>(request.AlertType, ignoreCase: true, out var alertType))
+        if (!string.IsNullOrWhiteSpace(filter?.AlertType) && Enum.TryParse<AlertType>(filter.AlertType, ignoreCase: true, out var alertType))
             query = query.Where(x => x.AlertType == alertType);
 
-        if (request.IsActive.HasValue)
-            query = query.Where(x => x.IsActive == request.IsActive.Value);
+        if (filter?.IsActive.HasValue == true)
+            query = query.Where(x => x.IsActive == filter.IsActive.Value);
 
         var data = await pager.ExecuteQuery(query).ToListAsync(cancellationToken);
         var dtos = _mapper.Map<List<AlertDto>>(data);

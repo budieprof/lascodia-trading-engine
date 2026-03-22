@@ -11,7 +11,11 @@ namespace LascodiaTradingEngine.Application.EconomicEvents.Queries.GetPagedEcono
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
-public class GetPagedEconomicEventsQuery : PagerRequest<ResponseData<PagedData<EconomicEventDto>>>
+public class GetPagedEconomicEventsQuery : PagerRequestWithFilterType<EconomicEventQueryFilter, ResponseData<PagedData<EconomicEventDto>>>
+{
+}
+
+public class EconomicEventQueryFilter
 {
     public string?   Currency { get; set; }
     public string?   Impact   { get; set; }
@@ -37,6 +41,7 @@ public class GetPagedEconomicEventsQueryHandler
         GetPagedEconomicEventsQuery request, CancellationToken cancellationToken)
     {
         Pager pager = _mapper.Map<Pager>(request);
+        var filter = request.GetFilter<EconomicEventQueryFilter>();
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.EconomicEvent>()
@@ -44,17 +49,17 @@ public class GetPagedEconomicEventsQueryHandler
             .OrderBy(x => x.ScheduledAt)
             .AsQueryable();
 
-        if (!string.IsNullOrWhiteSpace(request.Currency))
-            query = query.Where(x => x.Currency == request.Currency.ToUpperInvariant());
+        if (!string.IsNullOrWhiteSpace(filter?.Currency))
+            query = query.Where(x => x.Currency == filter.Currency.ToUpperInvariant());
 
-        if (!string.IsNullOrWhiteSpace(request.Impact) && Enum.TryParse<EconomicImpact>(request.Impact, ignoreCase: true, out var impact))
+        if (!string.IsNullOrWhiteSpace(filter?.Impact) && Enum.TryParse<EconomicImpact>(filter?.Impact, ignoreCase: true, out var impact))
             query = query.Where(x => x.Impact == impact);
 
-        if (request.From.HasValue)
-            query = query.Where(x => x.ScheduledAt >= request.From.Value);
+        if (filter?.From.HasValue == true)
+            query = query.Where(x => x.ScheduledAt >= filter.From.Value);
 
-        if (request.To.HasValue)
-            query = query.Where(x => x.ScheduledAt <= request.To.Value);
+        if (filter?.To.HasValue == true)
+            query = query.Where(x => x.ScheduledAt <= filter.To.Value);
 
         var data = await pager.ExecuteQuery(query).ToListAsync(cancellationToken);
         var dtos = _mapper.Map<List<EconomicEventDto>>(data);

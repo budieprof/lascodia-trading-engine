@@ -11,10 +11,16 @@ namespace LascodiaTradingEngine.Application.MarketData.Queries.GetCandles;
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
-public class GetCandlesQuery : PagerRequest<ResponseData<PagedData<CandleDto>>>
+public class GetCandlesQuery : PagerRequestWithFilterType<CandleQueryFilter,ResponseData<PagedData<CandleDto>>>
 {
-    public required string Symbol    { get; set; }
-    public required string Timeframe { get; set; }
+    
+}
+
+
+public class CandleQueryFilter
+{
+    public string? Symbol    { get; set; }
+    public string? Timeframe { get; set; }
     public DateTime? From { get; set; }
     public DateTime? To   { get; set; }
 }
@@ -36,23 +42,28 @@ public class GetCandlesQueryHandler
     public async Task<ResponseData<PagedData<CandleDto>>> Handle(
         GetCandlesQuery request, CancellationToken cancellationToken)
     {
+        var filter = request.GetFilter<CandleQueryFilter>();
         Pager pager = _mapper.Map<Pager>(request);
 
-        var timeframe = Enum.Parse<Timeframe>(request.Timeframe, ignoreCase: true);
+        if (string.IsNullOrWhiteSpace(filter?.Timeframe))
+            return ResponseData<PagedData<CandleDto>>.Init(
+                null!, false, "Timeframe filter is required.", "-11");
+
+        var timeframe = Enum.Parse<Timeframe>(filter.Timeframe, ignoreCase: true);
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.Candle>()
-            .Where(x => x.Symbol == request.Symbol
+            .Where(x => x.Symbol == filter.Symbol
                      && x.Timeframe == timeframe
                      && !x.IsDeleted)
             .OrderByDescending(x => x.Timestamp)
             .AsQueryable();
 
-        if (request.From.HasValue)
-            query = query.Where(x => x.Timestamp >= request.From.Value);
+        if (filter.From.HasValue)
+            query = query.Where(x => x.Timestamp >= filter.From.Value);
 
-        if (request.To.HasValue)
-            query = query.Where(x => x.Timestamp <= request.To.Value);
+        if (filter.To.HasValue)
+            query = query.Where(x => x.Timestamp <= filter.To.Value);
 
         var data = await pager.ExecuteQuery(query).ToListAsync(cancellationToken);
         var dtos = _mapper.Map<List<CandleDto>>(data);

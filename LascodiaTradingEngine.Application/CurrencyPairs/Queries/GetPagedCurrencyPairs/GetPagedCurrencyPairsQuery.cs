@@ -10,7 +10,11 @@ namespace LascodiaTradingEngine.Application.CurrencyPairs.Queries.GetPagedCurren
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
-public class GetPagedCurrencyPairsQuery : PagerRequest<ResponseData<PagedData<CurrencyPairDto>>>
+public class GetPagedCurrencyPairsQuery : PagerRequestWithFilterType<CurrencyPairQueryFilter, ResponseData<PagedData<CurrencyPairDto>>>
+{
+}
+
+public class CurrencyPairQueryFilter
 {
     public string? Search   { get; set; }
     public bool?   IsActive { get; set; }
@@ -34,6 +38,7 @@ public class GetPagedCurrencyPairsQueryHandler
         GetPagedCurrencyPairsQuery request, CancellationToken cancellationToken)
     {
         Pager pager = _mapper.Map<Pager>(request);
+        var filter = request.GetFilter<CurrencyPairQueryFilter>();
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.CurrencyPair>()
@@ -41,13 +46,13 @@ public class GetPagedCurrencyPairsQueryHandler
             .OrderBy(x => x.Symbol)
             .AsQueryable();
 
-        if (!string.IsNullOrWhiteSpace(request.Search))
-            query = query.Where(x => x.Symbol.Contains(request.Search)
-                                  || x.BaseCurrency.Contains(request.Search)
-                                  || x.QuoteCurrency.Contains(request.Search));
+        if (!string.IsNullOrWhiteSpace(filter?.Search))
+            query = query.Where(x => x.Symbol.Contains(filter.Search)
+                                  || x.BaseCurrency.Contains(filter.Search)
+                                  || x.QuoteCurrency.Contains(filter.Search));
 
-        if (request.IsActive.HasValue)
-            query = query.Where(x => x.IsActive == request.IsActive.Value);
+        if (filter?.IsActive.HasValue == true)
+            query = query.Where(x => x.IsActive == filter.IsActive.Value);
 
         var data = await pager.ExecuteQuery(query).ToListAsync(cancellationToken);
         var dtos = _mapper.Map<List<CurrencyPairDto>>(data);
