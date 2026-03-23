@@ -9,6 +9,7 @@ using LascodiaTradingEngine.Application.MarketData.Queries.GetLatestCandle;
 using LascodiaTradingEngine.Application.MarketData.Queries.GetLivePrice;
 using LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ReceiveTickBatch;
 using LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ReceiveCandle;
+using LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ReceiveCandleBatch;
 using LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ReceiveCandleBackfill;
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
@@ -64,6 +65,16 @@ public class MarketDataController : AuthControllerBase<MarketDataController>
     {
         if (!ModelState.IsValid)
             return ResponseData<long>.Init(0, false, "Model state failed", "-11");
+
+        return await Mediator.Send(command);
+    }
+
+    /// <summary>Receive a batch of live candles from the EA</summary>
+    [HttpPost("candle/batch")]
+    public async Task<ResponseData<int>> ReceiveCandleBatch(ReceiveCandleBatchCommand command)
+    {
+        if (!ModelState.IsValid)
+            return ResponseData<int>.Init(0, false, "Model state failed", "-11");
 
         return await Mediator.Send(command);
     }

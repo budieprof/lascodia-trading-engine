@@ -67,6 +67,7 @@ public class SubmitExecutionReportCommandHandler : IRequestHandler<SubmitExecuti
             return ResponseData<string>.Init(null, false, "Order not found", "-14");
 
         var newStatus = Enum.Parse<OrderStatus>(request.Status, ignoreCase: true);
+        var previousStatus = entity.Status;
         entity.Status          = newStatus;
         entity.BrokerOrderId   = request.BrokerOrderId ?? entity.BrokerOrderId;
         entity.FilledPrice     = request.FilledPrice ?? entity.FilledPrice;
@@ -74,7 +75,9 @@ public class SubmitExecutionReportCommandHandler : IRequestHandler<SubmitExecuti
         entity.RejectionReason = request.RejectionReason ?? entity.RejectionReason;
         entity.FilledAt        = request.FilledAt ?? entity.FilledAt;
 
-        if (newStatus == OrderStatus.Filled)
+        // Only publish OrderFilledIntegrationEvent if status actually transitioned to Filled
+        // (prevents duplicate events on retry/resubmission)
+        if (newStatus == OrderStatus.Filled && previousStatus != OrderStatus.Filled)
         {
             var filledPrice = entity.FilledPrice ?? 0;
             var filledQty   = entity.FilledQuantity ?? 0;

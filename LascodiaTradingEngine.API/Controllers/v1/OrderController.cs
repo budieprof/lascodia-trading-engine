@@ -10,6 +10,7 @@ using LascodiaTradingEngine.Application.Orders.Commands.CancelOrder;
 using LascodiaTradingEngine.Application.Orders.Commands.ModifyOrder;
 using LascodiaTradingEngine.Application.Orders.Commands.SubmitOrder;
 using LascodiaTradingEngine.Application.Orders.Commands.SubmitExecutionReport;
+using LascodiaTradingEngine.Application.Orders.Commands.SubmitExecutionReportBatch;
 using LascodiaTradingEngine.Application.Orders.Queries.DTOs;
 using LascodiaTradingEngine.Application.Orders.Queries.GetOrder;
 using LascodiaTradingEngine.Application.Orders.Queries.GetPagedOrders;
@@ -70,6 +71,16 @@ public class OrderController : AuthControllerBase<OrderController>
     public async Task<ResponseData<string>> ExecutionReport(long id, SubmitExecutionReportCommand command)
     {
         command.Id = id;
+        return await Mediator.Send(command);
+    }
+
+    /// <summary>Submit a batch of execution reports from the EA</summary>
+    [HttpPost("execution-report/batch")]
+    public async Task<ResponseData<int>> ExecutionReportBatch(SubmitExecutionReportBatchCommand command)
+    {
+        if (!ModelState.IsValid)
+            return ResponseData<int>.Init(0, false, "Model state failed", "-11");
+
         return await Mediator.Send(command);
     }
 
