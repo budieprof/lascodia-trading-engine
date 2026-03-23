@@ -50,7 +50,7 @@ API → SharedAPI (submodule)
 
 Entities inherit `Entity<long>` from `SharedDomain`. All entities use a soft-delete `IsDeleted` flag.
 
-**Entities (24):**
+**Entities (26):**
 | Group | Entities |
 |---|---|
 | Core Trading | `Order`, `Position`, `PositionScaleOrder`, `TradeSignal` |
@@ -60,9 +60,10 @@ Entities inherit `Entity<long>` from `SharedDomain`. All entities use a soft-del
 | Risk & Alerts | `Alert`, `RiskProfile`, `DrawdownSnapshot`, `ExecutionQualityLog` |
 | ML Models | `MLModel`, `MLTrainingRun`, `MLModelPredictionLog`, `MLShadowEvaluation` |
 | Backtesting | `BacktestRun`, `OptimizationRun`, `WalkForwardRun` |
+| Expert Advisor | `EAInstance`, `EACommand` |
 | Other | `EconomicEvent`, `COTReport`, `EngineConfig`, `DecisionLog` |
 
-**Enums (33):** `OrderType`, `OrderStatus`, `TradeDirection`, `TradeSignalStatus`, `StrategyType`, `StrategyStatus`, `PositionDirection`, `PositionStatus`, `BrokerType`, `BrokerEnvironment`, `BrokerStatus`, `ExecutionType`, `Timeframe`, `TradingSession`, `TrailingStopType`, `AlertType`, `AlertChannel`, `MLModelStatus`, `ModelRole`, `ShadowEvaluationStatus`, `PromotionDecision`, `OptimizationRunStatus`, `RunStatus`, `MarketRegime`, `EconomicImpact`, `EconomicEventSource`, `SentimentSource`, `ScaleType`, `ScaleOrderStatus`, `ConfigDataType`, `RecoveryMode`, `StrategyHealthStatus`, `TriggerType`
+**Enums (35):** `OrderType`, `OrderStatus`, `TradeDirection`, `TradeSignalStatus`, `StrategyType`, `StrategyStatus`, `PositionDirection`, `PositionStatus`, `BrokerType`, `BrokerEnvironment`, `BrokerStatus`, `ExecutionType`, `Timeframe`, `TradingSession`, `TrailingStopType`, `AlertType`, `AlertChannel`, `MLModelStatus`, `ModelRole`, `ShadowEvaluationStatus`, `PromotionDecision`, `OptimizationRunStatus`, `RunStatus`, `MarketRegime`, `EconomicImpact`, `EconomicEventSource`, `SentimentSource`, `ScaleType`, `ScaleOrderStatus`, `ConfigDataType`, `RecoveryMode`, `StrategyHealthStatus`, `TriggerType`, `EACommandType`, `EAInstanceStatus`
 
 ---
 
@@ -97,7 +98,7 @@ Orders/
 - List queries accept `PagerRequest` and return `ResponseData<Pager<TDto>>`.
 - Publish integration events via `IEventBus` after successful writes.
 
-#### Features (33)
+#### Features (34)
 
 | Feature | Commands | Queries |
 |---|---|---|
@@ -130,6 +131,7 @@ Orders/
 | TradingAccounts | Create, Update, Delete, Activate, SyncAccountBalance | GetTradingAccount, GetActiveTradingAccount, GetPagedTradingAccounts |
 | TrailingStop | UpdateTrailingStop | GetTrailingStop |
 | WalkForward | RunWalkForward | GetWalkForwardRun, GetPagedRuns |
+| ExpertAdvisor | RegisterEA, DeregisterEA, ProcessHeartbeat, ReceiveSymbolSpecs, RefreshSymbolSpecs, ReceiveTradingSessions, ReceiveTickBatch, ReceiveCandle, ReceiveCandleBackfill, ReceivePositionSnapshot, ReceiveOrderSnapshot, ReceiveDealSnapshot, ProcessReconciliation, AcknowledgeCommand | GetPendingCommands, GetActiveInstances |
 
 #### Common Interfaces (`Common/Interfaces/`)
 
@@ -161,6 +163,7 @@ Orders/
 - `TradeSignalCreatedIntegrationEvent`
 - `MLModelActivatedIntegrationEvent`
 - `BacktestCompletedIntegrationEvent`
+- `EAInstanceRegisteredIntegrationEvent`
 
 #### Services (`Services/`)
 
@@ -229,9 +232,9 @@ All controllers inherit `AuthControllerBase<T>` from the shared library. All end
 | `"-11"` | Validation error |
 | `"-14"` | Not found |
 
-#### Controllers (`Controllers/v1/`) — 31 controllers
+#### Controllers (`Controllers/v1/`) — 32 controllers
 
-`OrderController`, `PositionController`, `StrategyController`, `StrategyEnsembleController`, `StrategyFeedbackController`, `TradeSignalController`, `TradingAccountController`, `BrokerController`, `BrokerManagementController`, `CurrencyPairController`, `RiskProfileController`, `AlertController`, `AuditTrailController`, `MarketDataController`, `MarketRegimeController`, `SentimentController`, `EconomicEventController`, `MLModelController`, `MLEvaluationController`, `BacktestController`, `WalkForwardController`, `DrawdownRecoveryController`, `TrailingStopController`, `ExecutionQualityController`, `PaperTradingController`, `PerformanceAttributionController`, `RateLimitingController`, `SystemHealthController`, `EngineConfigurationController`
+`OrderController`, `PositionController`, `StrategyController`, `StrategyEnsembleController`, `StrategyFeedbackController`, `TradeSignalController`, `TradingAccountController`, `BrokerController`, `BrokerManagementController`, `CurrencyPairController`, `RiskProfileController`, `AlertController`, `AuditTrailController`, `MarketDataController`, `MarketRegimeController`, `SentimentController`, `EconomicEventController`, `MLModelController`, `MLEvaluationController`, `BacktestController`, `WalkForwardController`, `DrawdownRecoveryController`, `TrailingStopController`, `ExecutionQualityController`, `PaperTradingController`, `PerformanceAttributionController`, `RateLimitingController`, `SystemHealthController`, `EngineConfigurationController`, **`ExpertAdvisorController`**
 
 #### Infrastructure Configuration (`appsettings.json`)
 
@@ -365,6 +368,116 @@ These types are discovered and registered **automatically by reflection** — yo
 
 ---
 
+## Expert Advisor Integration (EA as Exclusive Broker Adapter)
+
+The engine's built-in broker adapters (OANDA, IB, FXCM) are **disabled**. All market data and order execution flows through MQL5 Expert Advisor instances running on MetaTrader 5. The EA project lives at `../lascodia-trading-engine-ea/`.
+
+### Architecture Change
+
+```
+Previously:  Engine → OANDA/IB/FXCM APIs → Broker (direct connection)
+Now:         Engine ← EA instances → MT5 → Broker (EA is the sole adapter)
+```
+
+- The EA streams ALL ticks, candles, symbol specs, sessions, and account state to the engine
+- The engine generates trade signals; the EA polls and executes them on MT5
+- If all EA instances disconnect, the engine enters `DATA_UNAVAILABLE` state
+- Multiple EA instances run concurrently on different charts (one symbol per instance recommended)
+
+### To disable built-in adapters: set `WorkerGroups.BrokerAdapters = false` in appsettings.json
+
+### New Domain Entities
+
+| Entity | File | Purpose |
+|--------|------|---------|
+| `EAInstance` | `Domain/Entities/EAInstance.cs` | Tracks registered EA instances (instanceId, ownedSymbols, isCoordinator, status, lastHeartbeat) |
+| `EACommand` | `Domain/Entities/EACommand.cs` | Commands queued for EA execution (ModifySLTP, ClosePosition, CancelOrder, RequestBackfill) |
+
+### New Domain Enums
+
+| Enum | Values |
+|------|--------|
+| `EACommandType` | ModifySLTP, ClosePosition, CancelOrder, UpdateTrailing, RequestBackfill |
+| `EAInstanceStatus` | Active, Disconnected, ShuttingDown |
+
+### New Feature: ExpertAdvisor (`Application/ExpertAdvisor/`)
+
+**Commands (14):**
+
+| Command | Endpoint | Purpose |
+|---------|----------|---------|
+| `RegisterEACommand` | `POST /ea/register` | Register instance + validate symbol ownership (409 on conflict) |
+| `DeregisterEACommand` | `POST /ea/deregister` | Mark instance as ShuttingDown |
+| `ProcessHeartbeatCommand` | `POST /ea/heartbeat` | Update lastHeartbeat, return server time |
+| `ReceiveSymbolSpecsCommand` | `POST /ea/symbol-specs` | Upsert CurrencyPair records from EA spec data |
+| `RefreshSymbolSpecsCommand` | `PUT /ea/symbol-specs/refresh` | Daily swap/margin refresh |
+| `ReceiveTradingSessionsCommand` | `POST /ea/trading-sessions` | Receive session schedules |
+| `ReceiveTickBatchCommand` | `POST /market-data/tick/batch` | Update ILivePriceCache + publish PriceUpdatedIntegrationEvent |
+| `ReceiveCandleCommand` | `POST /market-data/candle` | Upsert individual candles |
+| `ReceiveCandleBackfillCommand` | `POST /market-data/candle/backfill` | Bulk-insert historical candles |
+| `ReceivePositionSnapshotCommand` | `POST /ea/positions/snapshot` | Sync broker positions into engine |
+| `ReceiveOrderSnapshotCommand` | `POST /ea/orders/snapshot` | Sync broker orders into engine |
+| `ReceiveDealSnapshotCommand` | `POST /ea/deals/snapshot` | Update fill status from broker deals |
+| `ProcessReconciliationCommand` | `POST /ea/reconciliation` | Compare engine vs broker state |
+| `AcknowledgeCommandCommand` | `PUT /ea/commands/{id}/ack` | Mark EA command as processed |
+
+**Queries (2):**
+
+| Query | Endpoint | Purpose |
+|-------|----------|---------|
+| `GetPendingCommandsQuery` | `GET /ea/commands` | Unacknowledged commands for an instance |
+| `GetActiveInstancesQuery` | `GET /ea/instances` | All active EA instances |
+
+**DTOs:** `EAInstanceDto`, `EACommandDto`
+
+### New Supporting Features
+
+| File | Purpose |
+|------|---------|
+| `TradeSignals/Queries/GetPendingExecutionTradeSignals/` | `GET /trade-signal/pending-execution` -- approved signals for EA |
+| `Orders/Commands/SubmitExecutionReport/` | `POST /order/{id}/execution-report` -- EA reports fill/rejection |
+| `Common/Events/EAInstanceRegisteredIntegrationEvent.cs` | Published on EA registration |
+
+### New Controller: ExpertAdvisorController
+
+Route: `api/v1/lascodia-trading-engine/ea` with 13 endpoints (see commands/queries above).
+
+### Modified Controllers
+
+| Controller | Added Endpoints |
+|-----------|----------------|
+| `MarketDataController` | `POST tick/batch`, `POST candle`, `POST candle/backfill` |
+| `TradeSignalController` | `GET pending-execution` |
+| `OrderController` | `POST {id}/execution-report` |
+
+### EA Data Flow (engine perspective)
+
+```
+STARTUP:
+  EA registers → engine creates/reactivates EAInstance
+  EA sends symbol specs → engine upserts CurrencyPair records
+  EA sends sessions → engine stores session schedules
+  EA sends position/order snapshots → engine reconciles state
+  EA sends candle backfill → engine initializes indicators
+
+RUNTIME:
+  EA sends tick batches → engine updates ILivePriceCache, publishes PriceUpdatedIntegrationEvent
+  EA sends closed candles → engine stores candles, triggers strategy evaluation
+  Engine generates signals → EA polls GET /trade-signal/pending-execution
+  EA executes signal → EA reports via POST /order/{id}/execution-report
+  Engine queues commands (modify SL/TP, close) → EA polls GET /ea/commands
+  EA heartbeats → engine tracks instance health
+
+SHUTDOWN:
+  EA deregisters → engine marks instance symbols as DATA_UNAVAILABLE
+```
+
+### Important: EA health monitoring
+
+The engine should track EA heartbeats. If no heartbeat from an instance for 60 seconds, mark that instance's symbols as `DATA_UNAVAILABLE`. This prevents the engine from evaluating strategies on stale data.
+
+---
+
 ## Key Patterns & Rules
 
 - **Soft delete**: All entities have `IsDeleted`; EF global query filters exclude deleted rows automatically.
@@ -374,7 +487,8 @@ These types are discovered and registered **automatically by reflection** — yo
 - **Worker pattern**: All background workers implement `BackgroundService` and are registered as hosted services in Application DI.
 - **Strategy evaluators**: Implement `IStrategyEvaluator`; registered and resolved by strategy type enum.
 - **ML workflow**: Train → Shadow evaluation → Promotion decision → Activate (event triggers downstream workers).
-- **Broker adapters**: Implement `IBrokerOrderExecutor` + `IBrokerDataFeed`; `BrokerFailoverService` switches between brokers automatically.
+- **Broker adapters**: Built-in adapters (`IBrokerOrderExecutor` + `IBrokerDataFeed`) are **disabled** when EA is active. The EA replaces them entirely. Set `WorkerGroups.BrokerAdapters = false`.
+- **EA as broker adapter**: All market data comes from EA instances via REST API. The engine has zero direct broker connectivity when EA mode is enabled.
 
 ---
 

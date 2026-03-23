@@ -9,6 +9,7 @@ using LascodiaTradingEngine.Application.Orders.Commands.UpdateOrder;
 using LascodiaTradingEngine.Application.Orders.Commands.CancelOrder;
 using LascodiaTradingEngine.Application.Orders.Commands.ModifyOrder;
 using LascodiaTradingEngine.Application.Orders.Commands.SubmitOrder;
+using LascodiaTradingEngine.Application.Orders.Commands.SubmitExecutionReport;
 using LascodiaTradingEngine.Application.Orders.Queries.DTOs;
 using LascodiaTradingEngine.Application.Orders.Queries.GetOrder;
 using LascodiaTradingEngine.Application.Orders.Queries.GetPagedOrders;
@@ -59,6 +60,14 @@ public class OrderController : AuthControllerBase<OrderController>
     /// <summary>Modify stop loss / take profit of an existing order</summary>
     [HttpPut("{id}/modify")]
     public async Task<ResponseData<string>> Modify(long id, ModifyOrderCommand command)
+    {
+        command.Id = id;
+        return await Mediator.Send(command);
+    }
+
+    /// <summary>Submit an execution report from the EA after broker-side execution</summary>
+    [HttpPost("{id}/execution-report")]
+    public async Task<ResponseData<string>> ExecutionReport(long id, SubmitExecutionReportCommand command)
     {
         command.Id = id;
         return await Mediator.Send(command);

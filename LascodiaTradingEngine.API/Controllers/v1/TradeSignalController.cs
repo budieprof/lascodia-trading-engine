@@ -9,6 +9,7 @@ using LascodiaTradingEngine.Application.TradeSignals.Commands.ExpireTradeSignal;
 using LascodiaTradingEngine.Application.TradeSignals.Queries.DTOs;
 using LascodiaTradingEngine.Application.TradeSignals.Queries.GetTradeSignal;
 using LascodiaTradingEngine.Application.TradeSignals.Queries.GetPagedTradeSignals;
+using LascodiaTradingEngine.Application.TradeSignals.Queries.GetPendingExecutionTradeSignals;
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
@@ -42,6 +43,11 @@ public class TradeSignalController : AuthControllerBase<TradeSignalController>
     [HttpPut("{id}/expire")]
     public async Task<ResponseData<string>> Expire(long id)
         => await Mediator.Send(new ExpireTradeSignalCommand { Id = id });
+
+    /// <summary>Get approved trade signals pending broker execution</summary>
+    [HttpGet("pending-execution")]
+    public async Task<ResponseData<List<TradeSignalDto>>> GetPendingExecution()
+        => await Mediator.Send(new GetPendingExecutionTradeSignalsQuery());
 
     /// <summary>Get trade signal by Id</summary>
     [HttpGet("{id}")]

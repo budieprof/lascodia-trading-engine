@@ -7,6 +7,9 @@ using LascodiaTradingEngine.Application.MarketData.Queries.DTOs;
 using LascodiaTradingEngine.Application.MarketData.Queries.GetCandles;
 using LascodiaTradingEngine.Application.MarketData.Queries.GetLatestCandle;
 using LascodiaTradingEngine.Application.MarketData.Queries.GetLivePrice;
+using LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ReceiveTickBatch;
+using LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ReceiveCandle;
+using LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ReceiveCandleBackfill;
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
@@ -43,5 +46,35 @@ public class MarketDataController : AuthControllerBase<MarketDataController>
 
         Logger.LogInformation(query.GetJson());
         return await Mediator.Send(query);
+    }
+
+    /// <summary>Receive a batch of tick data from the EA</summary>
+    [HttpPost("tick/batch")]
+    public async Task<ResponseData<string>> ReceiveTickBatch(ReceiveTickBatchCommand command)
+    {
+        if (!ModelState.IsValid)
+            return ResponseData<string>.Init(null, false, "Model state failed", "-11");
+
+        return await Mediator.Send(command);
+    }
+
+    /// <summary>Receive a single candle from the EA</summary>
+    [HttpPost("candle")]
+    public async Task<ResponseData<long>> ReceiveCandle(ReceiveCandleCommand command)
+    {
+        if (!ModelState.IsValid)
+            return ResponseData<long>.Init(0, false, "Model state failed", "-11");
+
+        return await Mediator.Send(command);
+    }
+
+    /// <summary>Receive a backfill batch of historical candles from the EA</summary>
+    [HttpPost("candle/backfill")]
+    public async Task<ResponseData<int>> ReceiveCandleBackfill(ReceiveCandleBackfillCommand command)
+    {
+        if (!ModelState.IsValid)
+            return ResponseData<int>.Init(0, false, "Model state failed", "-11");
+
+        return await Mediator.Send(command);
     }
 }
