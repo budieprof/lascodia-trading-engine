@@ -15,7 +15,47 @@ public interface IBacktestEngine
         Strategy strategy,
         IReadOnlyList<Candle> candles,
         decimal initialBalance,
-        CancellationToken ct);
+        CancellationToken ct,
+        BacktestOptions? options = null);
+}
+
+/// <summary>
+/// Optional parameters for backtest simulation realism.
+/// </summary>
+public class BacktestOptions
+{
+    /// <summary>Simulated slippage in price units applied to entries and exits. Defaults to 0.</summary>
+    public decimal SlippagePriceUnits { get; set; }
+
+    /// <summary>Commission per lot per round-trip (entry + exit) in account currency. Defaults to 0.</summary>
+    public decimal CommissionPerLot { get; set; }
+
+    /// <summary>Swap (rollover) cost per lot per day held in account currency. Defaults to 0.</summary>
+    public decimal SwapPerLotPerDay { get; set; }
+
+    /// <summary>Contract size for PnL calculation. Defaults to 100,000 (standard FX lot).</summary>
+    public decimal ContractSize { get; set; } = 100_000m;
+
+    /// <summary>
+    /// Simulated bid-ask spread in price units. Applied to entry (buy at ask = mid + half spread)
+    /// and exit prices. Defaults to 0.
+    /// </summary>
+    public decimal SpreadPriceUnits { get; set; }
+
+    /// <summary>
+    /// Percentage of the gap to apply as additional slippage when a bar opens beyond
+    /// SL/TP levels (gap scenario). For example, 0.5 means 50% of the gap is applied.
+    /// Defaults to 0 (SL/TP fill at exact level even through gaps).
+    /// </summary>
+    public decimal GapSlippagePct { get; set; }
+
+    /// <summary>
+    /// Fraction of the requested lot size that actually gets filled (0.0–1.0).
+    /// Simulates partial fills where only a portion of the order executes.
+    /// For example, 0.8 means 80% of each order is filled; the remaining 20% is cancelled.
+    /// Defaults to 1.0 (full fill). Set to 0 to reject all orders (no fills).
+    /// </summary>
+    public decimal FillRatio { get; set; } = 1.0m;
 }
 
 // ── Implementation ────────────────────────────────────────────────────────────
@@ -34,8 +74,11 @@ public class BacktestEngine : IBacktestEngine
         Strategy strategy,
         IReadOnlyList<Candle> candles,
         decimal initialBalance,
-        CancellationToken ct)
+        CancellationToken ct,
+        BacktestOptions? options = null)
     {
+        options ??= new BacktestOptions();
+
         var evaluator = _evaluators.FirstOrDefault(e => e.StrategyType == strategy.StrategyType);
 
         if (evaluator == null)
@@ -73,11 +116,25 @@ public class BacktestEngine : IBacktestEngine
                     {
                         exitPrice  = stopLoss.Value;
                         exitReason = "StopLoss";
+
+                        // Gap simulation: if bar opens beyond SL (gap down), fill at gap-adjusted price
+                        if (options.GapSlippagePct > 0 && bar.Open < stopLoss.Value)
+                        {
+                            decimal gapSize = stopLoss.Value - bar.Open;
+                            exitPrice = stopLoss.Value - gapSize * options.GapSlippagePct;
+                        }
                     }
                     else if (takeProfit.HasValue && bar.High >= takeProfit.Value)
                     {
                         exitPrice  = takeProfit.Value;
                         exitReason = "TakeProfit";
+
+                        // Gap simulation: if bar opens beyond TP (gap up), fill at gap-adjusted price (favorable)
+                        if (options.GapSlippagePct > 0 && bar.Open > takeProfit.Value)
+                        {
+                            decimal gapSize = bar.Open - takeProfit.Value;
+                            exitPrice = takeProfit.Value + gapSize * options.GapSlippagePct;
+                        }
                     }
                 }
                 else // Sell
@@ -86,17 +143,45 @@ public class BacktestEngine : IBacktestEngine
                     {
                         exitPrice  = stopLoss.Value;
                         exitReason = "StopLoss";
+
+                        // Gap simulation: if bar opens beyond SL (gap up), fill at gap-adjusted price (unfavorable)
+                        if (options.GapSlippagePct > 0 && bar.Open > stopLoss.Value)
+                        {
+                            decimal gapSize = bar.Open - stopLoss.Value;
+                            exitPrice = stopLoss.Value + gapSize * options.GapSlippagePct;
+                        }
                     }
                     else if (takeProfit.HasValue && bar.Low <= takeProfit.Value)
                     {
                         exitPrice  = takeProfit.Value;
                         exitReason = "TakeProfit";
+
+                        // Gap simulation: if bar opens beyond TP (gap down), fill at gap-adjusted price (favorable)
+                        if (options.GapSlippagePct > 0 && bar.Open < takeProfit.Value)
+                        {
+                            decimal gapSize = takeProfit.Value - bar.Open;
+                            exitPrice = takeProfit.Value - gapSize * options.GapSlippagePct;
+                        }
                     }
                 }
 
                 if (!string.IsNullOrEmpty(exitReason))
                 {
-                    decimal pnl = CalculatePnL(direction, entryPrice, exitPrice, lotSize);
+                    // Apply slippage against the trader on exit
+                    decimal slippedExit = direction == TradeDirection.Buy
+                        ? exitPrice - options.SlippagePriceUnits  // Long exit slips down
+                        : exitPrice + options.SlippagePriceUnits; // Short exit slips up
+
+                    decimal tradePnl = CalculatePnL(direction, entryPrice, slippedExit, lotSize, options.ContractSize);
+
+                    // Apply commission (round-trip per lot)
+                    decimal commission = lotSize * options.CommissionPerLot;
+
+                    // Apply swap for days held (pro-rate for same-day trades)
+                    decimal daysHeldExact = (decimal)(bar.Timestamp - entryTime).TotalDays;
+                    decimal swap = lotSize * options.SwapPerLotPerDay * Math.Max(daysHeldExact, 0m);
+
+                    decimal pnl = tradePnl - commission - swap;
                     balance += pnl;
                     equityCurve.Add(balance);
 
@@ -104,7 +189,7 @@ public class BacktestEngine : IBacktestEngine
                     {
                         Direction  = direction,
                         EntryPrice = entryPrice,
-                        ExitPrice  = exitPrice,
+                        ExitPrice  = slippedExit,
                         LotSize    = lotSize,
                         PnL        = pnl,
                         EntryTime  = entryTime,
@@ -120,18 +205,24 @@ public class BacktestEngine : IBacktestEngine
             if (!inTrade && i < candles.Count - 1)
             {
                 var window = candles.Take(i + 1).ToList().AsReadOnly();
-                var currentPrice = (Bid: bar.Close, Ask: bar.Close);
+                decimal halfSpread = options.SpreadPriceUnits / 2m;
+                var currentPrice = (Bid: bar.Close - halfSpread, Ask: bar.Close + halfSpread);
 
                 var signal = await evaluator.EvaluateAsync(strategy, window, currentPrice, ct);
 
                 if (signal != null)
                 {
-                    // Execute on next bar's open price
+                    // Execute on next bar's open price with slippage against the trader
                     var nextBar = candles[i + 1];
                     inTrade    = true;
                     direction  = signal.Direction;
-                    entryPrice = nextBar.Open;
-                    lotSize    = signal.SuggestedLotSize > 0 ? signal.SuggestedLotSize : 0.01m;
+                    decimal rawEntry = nextBar.Open;
+                    entryPrice = direction == TradeDirection.Buy
+                        ? rawEntry + options.SlippagePriceUnits  // Long entry slips up
+                        : rawEntry - options.SlippagePriceUnits; // Short entry slips down
+                    decimal requestedLots = signal.SuggestedLotSize > 0 ? signal.SuggestedLotSize : 0.01m;
+                    lotSize = requestedLots * Math.Clamp(options.FillRatio, 0m, 1m);
+                    if (lotSize <= 0) { inTrade = false; continue; } // Zero fill — order rejected
                     stopLoss   = signal.StopLoss;
                     takeProfit = signal.TakeProfit;
                     entryTime  = nextBar.Timestamp;
@@ -143,9 +234,15 @@ public class BacktestEngine : IBacktestEngine
         if (inTrade && candles.Count > 0)
         {
             var lastBar   = candles[candles.Count - 1];
-            decimal exitPrice = lastBar.Close;
-            decimal pnl   = CalculatePnL(direction, entryPrice, exitPrice, lotSize);
-            balance      += pnl;
+            decimal exitPrice = direction == TradeDirection.Buy
+                ? lastBar.Close - options.SlippagePriceUnits
+                : lastBar.Close + options.SlippagePriceUnits;
+            decimal tradePnl = CalculatePnL(direction, entryPrice, exitPrice, lotSize, options.ContractSize);
+            decimal commission = lotSize * options.CommissionPerLot;
+            decimal daysHeldExact = (decimal)(lastBar.Timestamp - entryTime).TotalDays;
+            decimal swap = lotSize * options.SwapPerLotPerDay * Math.Max(daysHeldExact, 0m);
+            decimal pnl  = tradePnl - commission - swap;
+            balance     += pnl;
             equityCurve.Add(balance);
 
             trades.Add(new BacktestTrade
@@ -196,11 +293,10 @@ public class BacktestEngine : IBacktestEngine
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    private static decimal CalculatePnL(TradeDirection direction, decimal entry, decimal exit, decimal lots)
+    private static decimal CalculatePnL(TradeDirection direction, decimal entry, decimal exit, decimal lots, decimal contractSize = 100_000m)
     {
-        // Simplified PnL: pip-based approximation using price difference × lots × 100000
         decimal priceDiff = direction == TradeDirection.Buy ? exit - entry : entry - exit;
-        return priceDiff * lots * 100_000m;
+        return priceDiff * lots * contractSize;
     }
 
     private static decimal CalculateMaxDrawdownPct(List<decimal> equityCurve)

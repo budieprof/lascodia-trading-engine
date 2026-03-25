@@ -1,45 +1,15 @@
 using FluentValidation.TestHelper;
-using Microsoft.EntityFrameworkCore;
-using Moq;
-using MockQueryable.Moq;
-using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.TradingAccounts.Commands.CreateTradingAccount;
-using LascodiaTradingEngine.Domain.Entities;
 
 namespace LascodiaTradingEngine.UnitTest.Application.TradingAccounts;
 
 public class CreateTradingAccountCommandTest
 {
-    private readonly Mock<IWriteApplicationDbContext> _mockWriteContext;
-    private readonly CreateTradingAccountCommandHandler _handler;
     private readonly CreateTradingAccountCommandValidator _validator;
 
     public CreateTradingAccountCommandTest()
     {
-        _mockWriteContext = new Mock<IWriteApplicationDbContext>();
-
-        var mockDbContext = new Mock<DbContext>();
-        var accounts = new List<TradingAccount>().AsQueryable().BuildMockDbSet();
-        mockDbContext.Setup(c => c.Set<TradingAccount>()).Returns(accounts.Object);
-        _mockWriteContext.Setup(c => c.GetDbContext()).Returns(mockDbContext.Object);
-
-        _handler   = new CreateTradingAccountCommandHandler(_mockWriteContext.Object);
         _validator = new CreateTradingAccountCommandValidator();
-    }
-
-    [Fact]
-    public async Task Validator_Should_Fail_When_BrokerId_Is_Zero()
-    {
-        var command = new CreateTradingAccountCommand
-        {
-            BrokerId    = 0,
-            AccountId   = "001-001-12345-001",
-            AccountName = "Practice Account"
-        };
-
-        var result = await _validator.TestValidateAsync(command);
-        result.ShouldHaveValidationErrorFor(c => c.BrokerId)
-              .WithErrorMessage("BrokerId must be greater than zero");
     }
 
     [Fact]
@@ -47,9 +17,9 @@ public class CreateTradingAccountCommandTest
     {
         var command = new CreateTradingAccountCommand
         {
-            BrokerId    = 1,
             AccountId   = string.Empty,
-            AccountName = "Practice Account"
+            BrokerServer = "MetaQuotes-Demo",
+            BrokerName   = "MetaQuotes"
         };
 
         var result = await _validator.TestValidateAsync(command);
@@ -62,9 +32,9 @@ public class CreateTradingAccountCommandTest
     {
         var command = new CreateTradingAccountCommand
         {
-            BrokerId    = 1,
-            AccountId   = new string('X', 101),
-            AccountName = "Practice Account"
+            AccountId    = new string('X', 101),
+            BrokerServer = "MetaQuotes-Demo",
+            BrokerName   = "MetaQuotes"
         };
 
         var result = await _validator.TestValidateAsync(command);
@@ -73,33 +43,33 @@ public class CreateTradingAccountCommandTest
     }
 
     [Fact]
-    public async Task Validator_Should_Fail_When_AccountName_Is_Empty()
+    public async Task Validator_Should_Fail_When_BrokerServer_Is_Empty()
     {
         var command = new CreateTradingAccountCommand
         {
-            BrokerId    = 1,
-            AccountId   = "001-001-12345-001",
-            AccountName = string.Empty
+            AccountId    = "12345678",
+            BrokerServer = string.Empty,
+            BrokerName   = "MetaQuotes"
         };
 
         var result = await _validator.TestValidateAsync(command);
-        result.ShouldHaveValidationErrorFor(c => c.AccountName)
-              .WithErrorMessage("AccountName cannot be empty");
+        result.ShouldHaveValidationErrorFor(c => c.BrokerServer)
+              .WithErrorMessage("BrokerServer cannot be empty");
     }
 
     [Fact]
-    public async Task Validator_Should_Fail_When_AccountName_Exceeds_Max_Length()
+    public async Task Validator_Should_Fail_When_BrokerName_Is_Empty()
     {
         var command = new CreateTradingAccountCommand
         {
-            BrokerId    = 1,
-            AccountId   = "001-001-12345-001",
-            AccountName = new string('A', 201)
+            AccountId    = "12345678",
+            BrokerServer = "MetaQuotes-Demo",
+            BrokerName   = string.Empty
         };
 
         var result = await _validator.TestValidateAsync(command);
-        result.ShouldHaveValidationErrorFor(c => c.AccountName)
-              .WithErrorMessage("AccountName cannot exceed 200 characters");
+        result.ShouldHaveValidationErrorFor(c => c.BrokerName)
+              .WithErrorMessage("BrokerName cannot be empty");
     }
 
     [Fact]
@@ -107,10 +77,10 @@ public class CreateTradingAccountCommandTest
     {
         var command = new CreateTradingAccountCommand
         {
-            BrokerId    = 1,
-            AccountId   = "001-001-12345-001",
-            AccountName = "Practice Account",
-            Currency    = "USDT"
+            AccountId    = "12345678",
+            BrokerServer = "MetaQuotes-Demo",
+            BrokerName   = "MetaQuotes",
+            Currency     = "USDT"
         };
 
         var result = await _validator.TestValidateAsync(command);
@@ -123,11 +93,12 @@ public class CreateTradingAccountCommandTest
     {
         var command = new CreateTradingAccountCommand
         {
-            BrokerId    = 1,
-            AccountId   = "001-001-12345-001",
-            AccountName = "Practice Account",
-            Currency    = "USD",
-            IsPaper     = true
+            AccountId    = "12345678",
+            BrokerServer = "MetaQuotes-Demo",
+            BrokerName   = "MetaQuotes",
+            Currency     = "USD",
+            Leverage     = 100,
+            IsPaper      = true
         };
 
         var result = await _validator.TestValidateAsync(command);
@@ -135,24 +106,49 @@ public class CreateTradingAccountCommandTest
     }
 
     [Fact]
-    public async Task Handler_Should_Return_Success()
+    public async Task Validator_Should_Fail_When_Leverage_Is_Zero()
     {
         var command = new CreateTradingAccountCommand
         {
-            BrokerId    = 1,
-            AccountId   = "001-001-12345-001",
-            AccountName = "Practice Account",
-            Currency    = "USD",
-            IsPaper     = true
+            AccountId    = "12345678",
+            BrokerServer = "MetaQuotes-Demo",
+            BrokerName   = "MetaQuotes",
+            Leverage     = 0
         };
 
-        _mockWriteContext.Setup(c => c.SaveChangesAsync(It.IsAny<CancellationToken>()))
-            .ReturnsAsync(1);
+        var result = await _validator.TestValidateAsync(command);
+        result.ShouldHaveValidationErrorFor(c => c.Leverage)
+              .WithErrorMessage("Leverage must be greater than 0");
+    }
 
-        var result = await _handler.Handle(command, CancellationToken.None);
+    [Fact]
+    public async Task Validator_Should_Fail_When_Leverage_Exceeds_Regulatory_Ceiling()
+    {
+        var command = new CreateTradingAccountCommand
+        {
+            AccountId    = "12345678",
+            BrokerServer = "MetaQuotes-Demo",
+            BrokerName   = "MetaQuotes",
+            Leverage     = 1000
+        };
 
-        Assert.True(result.status);
-        Assert.Equal("00", result.responseCode);
-        Assert.Equal("Successful", result.message);
+        var result = await _validator.TestValidateAsync(command);
+        result.ShouldHaveValidationErrorFor(c => c.Leverage)
+              .WithErrorMessage("Leverage cannot exceed 500:1 (regulatory ceiling)");
+    }
+
+    [Fact]
+    public async Task Validator_Should_Pass_When_Leverage_Is_At_Ceiling()
+    {
+        var command = new CreateTradingAccountCommand
+        {
+            AccountId    = "12345678",
+            BrokerServer = "MetaQuotes-Demo",
+            BrokerName   = "MetaQuotes",
+            Leverage     = 500
+        };
+
+        var result = await _validator.TestValidateAsync(command);
+        result.ShouldNotHaveValidationErrorFor(c => c.Leverage);
     }
 }

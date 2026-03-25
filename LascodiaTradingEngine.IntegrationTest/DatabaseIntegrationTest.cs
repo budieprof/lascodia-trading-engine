@@ -41,31 +41,20 @@ public class DatabaseIntegrationTest : IClassFixture<PostgresFixture>
     }
 
     /// <summary>
-    /// Seeds the prerequisite entities (Broker, TradingAccount, Strategy) that Orders depend on
+    /// Seeds the prerequisite entities (TradingAccount, Strategy) that Orders depend on
     /// via foreign keys, and returns their IDs.
     /// </summary>
-    private async Task<(long BrokerId, long TradingAccountId, long StrategyId)> SeedPrerequisitesAsync()
+    private async Task<(long TradingAccountId, long StrategyId)> SeedPrerequisitesAsync()
     {
         await using var context = CreateWriteContext();
 
-        var broker = new Broker
-        {
-            Name = "Test Broker",
-            BrokerType = BrokerType.Oanda,
-            Environment = BrokerEnvironment.Practice,
-            BaseUrl = "https://api-fxpractice.oanda.com",
-            IsActive = true,
-            IsPaper = true,
-            Status = BrokerStatus.Connected
-        };
-        context.Set<Broker>().Add(broker);
-        await context.SaveChangesAsync();
-
         var tradingAccount = new TradingAccount
         {
-            BrokerId = broker.Id,
             AccountId = "101-001-TEST-001",
             AccountName = "Integration Test Account",
+            BrokerServer = "api-fxpractice.oanda.com",
+            BrokerName = "Oanda",
+            AccountType = AccountType.Demo,
             Currency = "USD",
             Balance = 10000m,
             Equity = 10000m,
@@ -89,7 +78,7 @@ public class DatabaseIntegrationTest : IClassFixture<PostgresFixture>
         context.Set<Strategy>().Add(strategy);
         await context.SaveChangesAsync();
 
-        return (broker.Id, tradingAccount.Id, strategy.Id);
+        return (tradingAccount.Id, strategy.Id);
     }
 
     [Fact]
@@ -109,7 +98,7 @@ public class DatabaseIntegrationTest : IClassFixture<PostgresFixture>
     {
         // Arrange
         await EnsureMigrated();
-        var (_, tradingAccountId, strategyId) = await SeedPrerequisitesAsync();
+        var (tradingAccountId, strategyId) = await SeedPrerequisitesAsync();
 
         // Act — create an order
         long orderId;
@@ -155,7 +144,7 @@ public class DatabaseIntegrationTest : IClassFixture<PostgresFixture>
     {
         // Arrange
         await EnsureMigrated();
-        var (_, tradingAccountId, strategyId) = await SeedPrerequisitesAsync();
+        var (tradingAccountId, strategyId) = await SeedPrerequisitesAsync();
 
         long orderId;
         await using (var writeCtx = CreateWriteContext())
@@ -257,7 +246,7 @@ public class DatabaseIntegrationTest : IClassFixture<PostgresFixture>
     {
         // Arrange
         await EnsureMigrated();
-        var (_, tradingAccountId, strategyId) = await SeedPrerequisitesAsync();
+        var (tradingAccountId, strategyId) = await SeedPrerequisitesAsync();
 
         long orderId;
         await using (var writeCtx = CreateWriteContext())

@@ -31,6 +31,7 @@ public class GetWalkForwardRunQueryHandler : IRequestHandler<GetWalkForwardRunQu
     {
         var entity = await _context.GetDbContext()
             .Set<Domain.Entities.WalkForwardRun>()
+            .AsNoTracking()
             .FirstOrDefaultAsync(x => x.Id == request.Id && !x.IsDeleted, cancellationToken);
 
         if (entity == null)

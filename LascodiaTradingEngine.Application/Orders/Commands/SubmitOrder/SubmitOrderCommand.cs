@@ -1,7 +1,9 @@
+using FluentValidation;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.Orders.Commands.SubmitOrder;
@@ -29,10 +31,24 @@ public record SubmitOrderResult
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
-/// <summary>Submits a Pending order to the broker and updates its status.</summary>
+/// <summary>
+/// Marks a Pending order as Submitted so the EA can discover and execute it on MT5.
+/// The EA polls for approved trade signals, executes them, and reports back via
+/// <c>SubmitExecutionReportCommand</c>.
+/// </summary>
 public class SubmitOrderCommand : IRequest<ResponseData<SubmitOrderResult>>
 {
     public long Id { get; set; }
+}
+
+// ── Validator ─────────────────────────────────────────────────────────────────
+
+public class SubmitOrderCommandValidator : AbstractValidator<SubmitOrderCommand>
+{
+    public SubmitOrderCommandValidator()
+    {
+        RuleFor(x => x.Id).GreaterThan(0).WithMessage("Id must be greater than zero");
+    }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
@@ -40,12 +56,12 @@ public class SubmitOrderCommand : IRequest<ResponseData<SubmitOrderResult>>
 public class SubmitOrderCommandHandler : IRequestHandler<SubmitOrderCommand, ResponseData<SubmitOrderResult>>
 {
     private readonly IWriteApplicationDbContext _context;
-    private readonly IBrokerOrderExecutor _broker;
+    private readonly IEAOwnershipGuard _ownershipGuard;
 
-    public SubmitOrderCommandHandler(IWriteApplicationDbContext context, IBrokerOrderExecutor broker)
+    public SubmitOrderCommandHandler(IWriteApplicationDbContext context, IEAOwnershipGuard ownershipGuard)
     {
         _context = context;
-        _broker  = broker;
+        _ownershipGuard = ownershipGuard;
     }
 
     public async Task<ResponseData<SubmitOrderResult>> Handle(SubmitOrderCommand request, CancellationToken cancellationToken)
@@ -57,26 +73,25 @@ public class SubmitOrderCommandHandler : IRequestHandler<SubmitOrderCommand, Res
         if (order is null)
             return ResponseData<SubmitOrderResult>.Init(null, false, "Order not found", "-14");
 
+        var callerAccountId = _ownershipGuard.GetCallerAccountId();
+        if (callerAccountId is not null && order.TradingAccountId != callerAccountId)
+            return ResponseData<SubmitOrderResult>.Init(null, false, "Unauthorized: order belongs to another account", "-11");
+
         if (order.Status != OrderStatus.Pending)
             return ResponseData<SubmitOrderResult>.Init(null, false, "Order is not in Pending status", "-11");
 
-        var result = await _broker.SubmitOrderAsync(order, cancellationToken);
+        // Atomic status transition using a WHERE guard to prevent check-then-act race conditions.
+        // If another thread changed the status between our read and this update, zero rows are affected.
+        int affected = await _context.GetDbContext()
+            .Set<Domain.Entities.Order>()
+            .Where(x => x.Id == request.Id && x.Status == OrderStatus.Pending && !x.IsDeleted)
+            .ExecuteUpdateAsync(s => s.SetProperty(o => o.Status, OrderStatus.Submitted), cancellationToken);
 
-        if (result.Success)
-        {
-            order.Status         = result.FilledPrice.HasValue ? OrderStatus.Filled : OrderStatus.Submitted;
-            order.BrokerOrderId  = result.BrokerOrderId;
-            order.FilledPrice    = result.FilledPrice;
-            order.FilledQuantity = result.FilledQuantity;
-            order.FilledAt       = result.FilledPrice.HasValue ? DateTime.UtcNow : null;
-        }
-        else
-        {
-            order.Status          = OrderStatus.Rejected;
-            order.RejectionReason = result.ErrorMessage;
-        }
+        if (affected == 0)
+            return ResponseData<SubmitOrderResult>.Init(null, false, "Order status changed concurrently — not Pending anymore", "-11");
 
-        await _context.SaveChangesAsync(cancellationToken);
+        // Refresh the in-memory entity to reflect the DB state
+        order.Status = OrderStatus.Submitted;
 
         var submitResult = new SubmitOrderResult
         {
@@ -93,10 +108,6 @@ public class SubmitOrderCommandHandler : IRequestHandler<SubmitOrderCommand, Res
             OrderType      = order.OrderType,
         };
 
-        return ResponseData<SubmitOrderResult>.Init(
-            submitResult,
-            result.Success,
-            result.Success ? "Successful" : result.ErrorMessage ?? "Rejected",
-            result.Success ? "00" : "-11");
+        return ResponseData<SubmitOrderResult>.Init(submitResult, true, "Successful", "00");
     }
 }

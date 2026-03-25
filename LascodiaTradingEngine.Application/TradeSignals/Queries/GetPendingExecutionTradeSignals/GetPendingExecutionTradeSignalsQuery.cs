@@ -36,6 +36,7 @@ public class GetPendingExecutionTradeSignalsQueryHandler : IRequestHandler<GetPe
     {
         var signals = await _context.GetDbContext()
             .Set<Domain.Entities.TradeSignal>()
+            .AsNoTracking()
             .Where(x => x.Status == TradeSignalStatus.Approved
                       && x.OrderId == null
                       && x.ExpiresAt > DateTime.UtcNow

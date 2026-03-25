@@ -36,6 +36,7 @@ public class GetLatestRegimeQueryHandler : IRequestHandler<GetLatestRegimeQuery,
 
         var entity = await _context.GetDbContext()
             .Set<Domain.Entities.MarketRegimeSnapshot>()
+            .AsNoTracking()
             .Where(x => x.Symbol == request.Symbol && x.Timeframe == timeframe && !x.IsDeleted)
             .OrderByDescending(x => x.DetectedAt)
             .FirstOrDefaultAsync(cancellationToken);

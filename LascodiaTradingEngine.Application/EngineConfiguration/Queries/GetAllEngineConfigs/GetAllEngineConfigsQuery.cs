@@ -31,6 +31,7 @@ public class GetAllEngineConfigsQueryHandler : IRequestHandler<GetAllEngineConfi
     {
         var entities = await _context.GetDbContext()
             .Set<Domain.Entities.EngineConfig>()
+            .AsNoTracking()
             .Where(x => !x.IsDeleted)
             .OrderBy(x => x.Key)
             .ToListAsync(cancellationToken);

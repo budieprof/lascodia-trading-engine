@@ -1,3 +1,4 @@
+using FluentValidation;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 using System.Text.Json.Serialization;
@@ -12,6 +13,16 @@ namespace LascodiaTradingEngine.Application.Orders.Commands.DeleteOrder;
 public class DeleteOrderCommand : IRequest<ResponseData<string>>
 {
     [JsonIgnore] public long Id { get; set; }
+}
+
+// ── Validator ─────────────────────────────────────────────────────────────────
+
+public class DeleteOrderCommandValidator : AbstractValidator<DeleteOrderCommand>
+{
+    public DeleteOrderCommandValidator()
+    {
+        RuleFor(x => x.Id).GreaterThan(0).WithMessage("Id must be greater than zero");
+    }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────

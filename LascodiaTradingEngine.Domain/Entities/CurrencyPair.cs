@@ -42,6 +42,14 @@ public class CurrencyPair : Entity<long>
     public decimal ContractSize { get; set; } = 100_000m;
 
     /// <summary>
+    /// The monetary value of one pip movement per standard lot.
+    /// For most FX pairs quoted in USD (e.g. EURUSD): 0.0001 × 100 000 = 10.
+    /// For JPY pairs: 0.01 × 100 000 = 1000 (in JPY).
+    /// When zero, the risk engine derives pip size from <see cref="DecimalPlaces"/>.
+    /// </summary>
+    public decimal PipSize { get; set; }
+
+    /// <summary>
     /// Minimum tradeable lot size (e.g. 0.01 = 1 micro lot).
     /// Orders below this size are rejected by the risk checker before submission.
     /// </summary>

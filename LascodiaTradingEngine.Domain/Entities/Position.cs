@@ -61,6 +61,19 @@ public class Position : Entity<long>
     public decimal RealizedPnL         { get; set; }
 
     /// <summary>
+    /// Cumulative swap (rollover) charges in account currency, as reported by the broker.
+    /// Updated from EA position snapshots/deltas. Negative = cost, positive = credit.
+    /// Included in total P&amp;L on position close.
+    /// </summary>
+    public decimal Swap                { get; set; }
+
+    /// <summary>
+    /// Cumulative commission charges in account currency, as reported by the broker.
+    /// Updated from EA position snapshots/deltas.
+    /// </summary>
+    public decimal Commission          { get; set; }
+
+    /// <summary>
     /// Stop-loss price level. The <c>PositionWorker</c> compares <see cref="CurrentPrice"/>
     /// against this value on every cycle and closes the position when the level is breached.
     /// Null if no stop loss is configured.

@@ -44,6 +44,7 @@ public class GetPagedPositionsQueryHandler
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.Position>()
+            .AsNoTracking()
             .Where(x => !x.IsDeleted)
             .OrderByDescending(x => x.OpenedAt)
             .AsQueryable();

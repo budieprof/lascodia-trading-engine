@@ -95,6 +95,10 @@ public class AlertWorker : BackgroundService
     /// </summary>
     private static readonly TimeSpan LevelCooldown   = TimeSpan.FromMinutes(60);
 
+    /// <summary>Max backoff delay on consecutive failures (5 minutes).</summary>
+    private static readonly TimeSpan MaxBackoff = TimeSpan.FromMinutes(5);
+    private int _consecutiveFailures;
+
     private readonly ILogger<AlertWorker>  _logger;
     private readonly IServiceScopeFactory  _scopeFactory;
 
@@ -136,6 +140,7 @@ public class AlertWorker : BackgroundService
             try
             {
                 await EvaluateAlertsAsync(stoppingToken);
+                _consecutiveFailures = 0;
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -143,10 +148,19 @@ public class AlertWorker : BackgroundService
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Unexpected error in AlertWorker polling loop");
+                _consecutiveFailures++;
+                _logger.LogError(ex,
+                    "Unexpected error in AlertWorker polling loop (consecutive={Count})",
+                    _consecutiveFailures);
             }
 
-            await Task.Delay(PollingInterval, stoppingToken);
+            var delay = _consecutiveFailures > 0
+                ? TimeSpan.FromSeconds(Math.Min(
+                    PollingInterval.TotalSeconds * Math.Pow(2, _consecutiveFailures - 1),
+                    MaxBackoff.TotalSeconds))
+                : PollingInterval;
+
+            await Task.Delay(delay, stoppingToken);
         }
 
         _logger.LogInformation("AlertWorker stopped");
@@ -272,7 +286,13 @@ public class AlertWorker : BackgroundService
 
         JsonElement condition;
         try { condition = JsonDocument.Parse(alert.ConditionJson).RootElement; }
-        catch { return (false, string.Empty); } // Malformed JSON — skip; operator must fix the alert definition
+        catch (JsonException ex)
+        {
+            _logger.LogWarning(ex,
+                "AlertWorker: malformed ConditionJson for PriceLevel alert {AlertId} ({Symbol}) — skipping until operator fixes the definition",
+                alert.Id, alert.Symbol);
+            return (false, string.Empty);
+        }
 
         if (!condition.TryGetProperty("Price",     out var priceEl))     return (false, string.Empty);
         if (!condition.TryGetProperty("Direction", out var directionEl)) return (false, string.Empty);
@@ -315,7 +335,13 @@ public class AlertWorker : BackgroundService
 
         JsonElement condition;
         try { condition = JsonDocument.Parse(alert.ConditionJson).RootElement; }
-        catch { return (false, string.Empty); }
+        catch (JsonException ex)
+        {
+            _logger.LogWarning(ex,
+                "AlertWorker: malformed ConditionJson for DrawdownBreached alert {AlertId} — skipping until operator fixes the definition",
+                alert.Id);
+            return (false, string.Empty);
+        }
 
         if (!condition.TryGetProperty("ThresholdPct", out var thresholdEl)) return (false, string.Empty);
 

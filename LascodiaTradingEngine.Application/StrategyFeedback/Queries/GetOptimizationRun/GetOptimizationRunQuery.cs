@@ -31,6 +31,7 @@ public class GetOptimizationRunQueryHandler : IRequestHandler<GetOptimizationRun
     {
         var entity = await _context.GetDbContext()
             .Set<Domain.Entities.OptimizationRun>()
+            .AsNoTracking()
             .FirstOrDefaultAsync(x => x.Id == request.Id && !x.IsDeleted, cancellationToken);
 
         if (entity is null)

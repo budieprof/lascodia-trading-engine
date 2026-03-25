@@ -1,6 +1,7 @@
 using System.Text.Json;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Options;
+using LascodiaTradingEngine.Application.Common.Utilities;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -111,7 +112,7 @@ public class SessionBreakoutEvaluator : IStrategyEvaluator
             return Task.FromResult<TradeSignal?>(null);
 
         // ATR for threshold and SL/TP
-        decimal atr       = CalculateAtr(candles, last, _options.AtrPeriodForSlTp);
+        decimal atr       = IndicatorCalculator.Atr(candles, last, _options.AtrPeriodForSlTp);
         if (atr <= 0) return Task.FromResult<TradeSignal?>(null);
         decimal threshold = atr * thresholdMultiplier;
 
@@ -173,19 +174,5 @@ public class SessionBreakoutEvaluator : IStrategyEvaluator
             GeneratedAt      = now,
             ExpiresAt        = now.AddMinutes(_options.SessionBreakoutExpiryMinutes)
         });
-    }
-
-    private static decimal CalculateAtr(IReadOnlyList<Candle> candles, int endIndex, int period)
-    {
-        decimal sumTr = 0m;
-        for (int i = endIndex - period + 1; i <= endIndex; i++)
-        {
-            decimal prevClose = candles[i - 1].Close;
-            decimal tr = Math.Max(candles[i].High - candles[i].Low,
-                         Math.Max(Math.Abs(candles[i].High - prevClose),
-                                  Math.Abs(candles[i].Low  - prevClose)));
-            sumTr += tr;
-        }
-        return sumTr / period;
     }
 }

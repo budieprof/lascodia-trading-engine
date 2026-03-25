@@ -1,7 +1,10 @@
 using FluentValidation.TestHelper;
+using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Moq;
 using MockQueryable.Moq;
+using Lascodia.Trading.Engine.SharedApplication.Common.Models;
+using LascodiaTradingEngine.Application.AuditTrail.Commands.LogDecision;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.EngineConfiguration.Commands.UpsertEngineConfig;
 using LascodiaTradingEngine.Domain.Entities;
@@ -11,11 +14,16 @@ namespace LascodiaTradingEngine.UnitTest.Application.EngineConfiguration;
 public class UpdateEngineConfigCommandTest
 {
     private readonly Mock<IWriteApplicationDbContext> _mockWriteContext;
+    private readonly Mock<IMediator> _mockMediator;
     private readonly UpsertEngineConfigCommandValidator _validator;
 
     public UpdateEngineConfigCommandTest()
     {
         _mockWriteContext = new Mock<IWriteApplicationDbContext>();
+        _mockMediator = new Mock<IMediator>();
+        _mockMediator
+            .Setup(m => m.Send(It.IsAny<LogDecisionCommand>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(ResponseData<long>.Init(1, true, "Successful", "00"));
         _validator = new UpsertEngineConfigCommandValidator();
     }
 
@@ -89,7 +97,7 @@ public class UpdateEngineConfigCommandTest
         _mockWriteContext.Setup(c => c.SaveChangesAsync(It.IsAny<CancellationToken>()))
             .ReturnsAsync(1);
 
-        var handler = new UpsertEngineConfigCommandHandler(_mockWriteContext.Object);
+        var handler = new UpsertEngineConfigCommandHandler(_mockWriteContext.Object, _mockMediator.Object);
         var command = new UpsertEngineConfigCommand
         {
             Key = "NewSetting",
@@ -126,7 +134,7 @@ public class UpdateEngineConfigCommandTest
         _mockWriteContext.Setup(c => c.SaveChangesAsync(It.IsAny<CancellationToken>()))
             .ReturnsAsync(1);
 
-        var handler = new UpsertEngineConfigCommandHandler(_mockWriteContext.Object);
+        var handler = new UpsertEngineConfigCommandHandler(_mockWriteContext.Object, _mockMediator.Object);
         var command = new UpsertEngineConfigCommand
         {
             Key = "MaxOrderSize",

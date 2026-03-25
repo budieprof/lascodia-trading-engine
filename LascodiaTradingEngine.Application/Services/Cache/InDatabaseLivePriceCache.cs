@@ -14,13 +14,17 @@ namespace LascodiaTradingEngine.Application.Services.Cache;
 /// Every Update() also fire-and-forgets an upsert to the database so the
 /// latest prices survive a process restart.
 /// Call InitializeAsync() at startup to pre-warm the dictionary from the DB.
+/// Prices older than <see cref="StalePriceTtl"/> are evicted and not returned by Get().
 /// </summary>
 [RegisterService(ServiceLifetime.Singleton)]
 public class InDatabaseLivePriceCache : ILivePriceCache
 {
+    private static readonly TimeSpan StalePriceTtl = TimeSpan.FromMinutes(5);
+
     private readonly ConcurrentDictionary<string, (decimal Bid, decimal Ask, DateTime Timestamp)> _store = new();
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<InDatabaseLivePriceCache> _logger;
+    private Timer? _evictionTimer;
 
     public InDatabaseLivePriceCache(
         IServiceScopeFactory scopeFactory,
@@ -28,6 +32,9 @@ public class InDatabaseLivePriceCache : ILivePriceCache
     {
         _scopeFactory = scopeFactory;
         _logger       = logger;
+
+        // Evict stale prices every 60 seconds
+        _evictionTimer = new Timer(EvictStalePrices, null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
     }
 
     // ── ILivePriceCache ──────────────────────────────────────────────────────
@@ -39,10 +46,32 @@ public class InDatabaseLivePriceCache : ILivePriceCache
     }
 
     public (decimal Bid, decimal Ask, DateTime Timestamp)? Get(string symbol)
-        => _store.TryGetValue(symbol, out var price) ? price : null;
+    {
+        if (!_store.TryGetValue(symbol, out var price))
+            return null;
+
+        // Do not serve stale prices — treat as unavailable
+        if (DateTime.UtcNow - price.Timestamp > StalePriceTtl)
+            return null;
+
+        return price;
+    }
 
     public IReadOnlyDictionary<string, (decimal Bid, decimal Ask, DateTime Timestamp)> GetAll()
         => _store;
+
+    private void EvictStalePrices(object? state)
+    {
+        var cutoff = DateTime.UtcNow - StalePriceTtl;
+        int evicted = 0;
+        foreach (var kvp in _store)
+        {
+            if (kvp.Value.Timestamp < cutoff && _store.TryRemove(kvp.Key, out _))
+                evicted++;
+        }
+        if (evicted > 0)
+            _logger.LogWarning("Evicted {Count} stale prices from live price cache (TTL={Ttl})", evicted, StalePriceTtl);
+    }
 
     // ── Startup warm-up ──────────────────────────────────────────────────────
 

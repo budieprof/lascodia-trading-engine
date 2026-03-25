@@ -32,12 +32,14 @@ public class GetStrategyAllocationsQueryHandler
     {
         var allocations = await _context.GetDbContext()
             .Set<Domain.Entities.StrategyAllocation>()
+            .AsNoTracking()
             .Where(x => !x.IsDeleted)
             .OrderByDescending(x => x.Weight)
             .ToListAsync(cancellationToken);
 
         var strategies = await _context.GetDbContext()
             .Set<Domain.Entities.Strategy>()
+            .AsNoTracking()
             .Where(s => !s.IsDeleted)
             .ToListAsync(cancellationToken);
 

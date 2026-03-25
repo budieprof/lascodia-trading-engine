@@ -44,6 +44,19 @@ public class TradeSignal : Entity<long>
     public decimal? TakeProfit        { get; set; }
 
     /// <summary>
+    /// Optional partial take-profit price level (closer to entry than <see cref="TakeProfit"/>).
+    /// When hit, a portion of the position (see <see cref="PartialClosePercent"/>) is closed
+    /// and the remainder trails toward the full <see cref="TakeProfit"/>.
+    /// </summary>
+    public decimal? PartialTakeProfit { get; set; }
+
+    /// <summary>
+    /// Percentage of the position to close at <see cref="PartialTakeProfit"/> (0..1).
+    /// Only meaningful when <see cref="PartialTakeProfit"/> is set. Defaults to null.
+    /// </summary>
+    public decimal? PartialClosePercent { get; set; }
+
+    /// <summary>
     /// Lot size recommended by the strategy's position-sizing logic,
     /// constrained later by the active <see cref="RiskProfile"/>.
     /// </summary>
@@ -120,4 +133,7 @@ public class TradeSignal : Entity<long>
 
     /// <summary>ML prediction logs recording what each model predicted for this signal and the actual outcome.</summary>
     public virtual ICollection<MLModelPredictionLog> PredictionLogs { get; set; } = new List<MLModelPredictionLog>();
+
+    /// <summary>Records of account-level (Tier 2) risk check attempts against this signal.</summary>
+    public virtual ICollection<SignalAccountAttempt> AccountAttempts { get; set; } = new List<SignalAccountAttempt>();
 }

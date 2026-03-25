@@ -10,7 +10,7 @@ namespace LascodiaTradingEngine.Application.Services;
 
 /// <summary>
 /// Real-time engine health and performance metrics, consumable by dashboards and alerting systems.
-/// Aggregates across all subsystems: ML models, positions, broker health, training queue, and drift.
+/// Aggregates across all subsystems: ML models, positions, EA instance health, training queue, and drift.
 /// </summary>
 public interface IEngineMonitoringService
 {
@@ -40,11 +40,12 @@ public sealed record EngineHealthSnapshot
     public decimal AccountEquity         { get; init; }
     public double DrawdownPct            { get; init; }
 
-    // ── Broker ──────────────────────────────────────────────────────────────
-    public string  ActiveBroker          { get; init; } = "";
-    public bool    BrokerHealthy         { get; init; }
-    public double  AvgSlippagePips       { get; init; }
-    public double  P95InferenceLatencyMs { get; init; }
+    // ── EA Instances ──────────────────────────────────────────────────────
+    public int    ActiveEAInstances      { get; init; }
+    public int    DisconnectedEAInstances { get; init; }
+    public bool   EAHealthy              { get; init; }
+    public double AvgSlippagePips        { get; init; }
+    public double P95InferenceLatencyMs  { get; init; }
 
     // ── Signals ─────────────────────────────────────────────────────────────
     public int    SignalsLast24h         { get; init; }
@@ -61,17 +62,16 @@ public sealed record EngineHealthSnapshot
 [RegisterService]
 public sealed class EngineMonitoringService : IEngineMonitoringService
 {
+    private static readonly TimeSpan HeartbeatThreshold = TimeSpan.FromSeconds(60);
+
     private readonly IServiceScopeFactory _scopeFactory;
-    private readonly IBrokerFailover _brokerFailover;
     private readonly ILogger<EngineMonitoringService> _logger;
 
     public EngineMonitoringService(
         IServiceScopeFactory scopeFactory,
-        IBrokerFailover brokerFailover,
         ILogger<EngineMonitoringService> logger)
     {
         _scopeFactory   = scopeFactory;
-        _brokerFailover = brokerFailover;
         _logger         = logger;
     }
 
@@ -98,7 +98,6 @@ public sealed class EngineMonitoringService : IEngineMonitoringService
                 accSum += (double)m.LiveDirectionAccuracy.Value;
             if (m.SharpeRatio.HasValue)
                 sharpeSum += (double)m.SharpeRatio.Value;
-            // Model is "in drift" if live accuracy < 85% of training accuracy
             if (m.DirectionAccuracy.HasValue && m.LiveDirectionAccuracy.HasValue &&
                 (double)m.LiveDirectionAccuracy.Value < (double)m.DirectionAccuracy.Value * 0.85)
                 modelsInDrift++;
@@ -129,8 +128,15 @@ public sealed class EngineMonitoringService : IEngineMonitoringService
         if (account is not null && account.Balance > 0)
             drawdownPct = (double)(1m - equity / account.Balance) * 100;
 
-        // ── Broker ──────────────────────────────────────────────────────────
-        bool brokerHealthy = await _brokerFailover.IsHealthyAsync(ct);
+        // ── EA Health ─────────────────────────────────────────────────────
+        var heartbeatCutoff = now - HeartbeatThreshold;
+        var activeInstances = await ctx.Set<EAInstance>()
+            .Where(e => e.Status == EAInstanceStatus.Active && !e.IsDeleted)
+            .AsNoTracking()
+            .ToListAsync(ct);
+        bool eaHealthy = activeInstances.Count > 0 && activeInstances.All(e => e.LastHeartbeat >= heartbeatCutoff);
+        int disconnectedCount = await ctx.Set<EAInstance>()
+            .CountAsync(e => e.Status == EAInstanceStatus.Disconnected && !e.IsDeleted, ct);
 
         var recentFills = await ctx.Set<ExecutionQualityLog>()
             .Where(e => e.RecordedAt >= day && !e.IsDeleted)
@@ -175,8 +181,9 @@ public sealed class EngineMonitoringService : IEngineMonitoringService
             UnrealizedPnl          = unrealizedPnl,
             AccountEquity          = equity,
             DrawdownPct            = drawdownPct,
-            ActiveBroker           = _brokerFailover.ActiveBroker,
-            BrokerHealthy          = brokerHealthy,
+            ActiveEAInstances      = activeInstances.Count,
+            DisconnectedEAInstances = disconnectedCount,
+            EAHealthy              = eaHealthy,
             AvgSlippagePips        = avgSlippage,
             P95InferenceLatencyMs  = p95Latency,
             SignalsLast24h         = signalsTotal,
@@ -186,9 +193,9 @@ public sealed class EngineMonitoringService : IEngineMonitoringService
         };
 
         _logger.LogDebug(
-            "EngineMonitoring: models={Models} drift={Drift} positions={Pos} equity={Eq:F0} drawdown={DD:F1}%",
+            "EngineMonitoring: models={Models} drift={Drift} positions={Pos} equity={Eq:F0} drawdown={DD:F1}% ea={EA}",
             snapshot.ActiveModels, snapshot.ModelsInDrift, snapshot.OpenPositions,
-            snapshot.AccountEquity, snapshot.DrawdownPct);
+            snapshot.AccountEquity, snapshot.DrawdownPct, snapshot.ActiveEAInstances);
 
         return snapshot;
     }

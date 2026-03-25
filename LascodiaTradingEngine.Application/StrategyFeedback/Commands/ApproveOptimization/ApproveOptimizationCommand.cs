@@ -1,3 +1,4 @@
+using FluentValidation;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
@@ -11,6 +12,16 @@ namespace LascodiaTradingEngine.Application.StrategyFeedback.Commands.ApproveOpt
 public class ApproveOptimizationCommand : IRequest<ResponseData<string>>
 {
     public long Id { get; set; }
+}
+
+// ── Validator ─────────────────────────────────────────────────────────────────
+
+public class ApproveOptimizationCommandValidator : AbstractValidator<ApproveOptimizationCommand>
+{
+    public ApproveOptimizationCommandValidator()
+    {
+        RuleFor(x => x.Id).GreaterThan(0).WithMessage("Id must be greater than zero");
+    }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────

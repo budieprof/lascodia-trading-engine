@@ -45,6 +45,7 @@ public class GetPagedEconomicEventsQueryHandler
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.EconomicEvent>()
+            .AsNoTracking()
             .Where(x => !x.IsDeleted)
             .OrderBy(x => x.ScheduledAt)
             .AsQueryable();

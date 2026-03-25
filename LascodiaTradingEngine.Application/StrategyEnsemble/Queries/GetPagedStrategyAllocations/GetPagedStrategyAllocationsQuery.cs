@@ -43,6 +43,7 @@ public class GetPagedStrategyAllocationsQueryHandler
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.StrategyAllocation>()
+            .AsNoTracking()
             .Where(x => !x.IsDeleted)
             .OrderByDescending(x => x.Weight)
             .AsQueryable();

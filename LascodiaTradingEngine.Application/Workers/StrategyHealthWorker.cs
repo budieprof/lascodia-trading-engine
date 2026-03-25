@@ -76,15 +76,10 @@ public class StrategyHealthWorker : BackgroundService
     private readonly ILogger<StrategyHealthWorker> _logger;
     private readonly IServiceScopeFactory _scopeFactory;
 
-    /// <summary>How often the worker evaluates all active strategies (60 seconds).</summary>
-    private static readonly TimeSpan PollingInterval    = TimeSpan.FromSeconds(60);
-
-    /// <summary>
-    /// Minimum time between ensemble rebalance operations (7 days). The rebalance is
-    /// relatively expensive — it recomputes Sharpe-based weights for all active strategies —
-    /// so it is deferred to a weekly cadence.
-    /// </summary>
-    private static readonly TimeSpan RebalanceInterval  = TimeSpan.FromDays(7);
+    private const string CK_PollSecs = "StrategyHealth:PollIntervalSeconds";
+    private const string CK_RebalanceDays = "StrategyHealth:RebalanceIntervalDays";
+    private const int DefaultPollSeconds = 60;
+    private const int DefaultRebalanceDays = 7;
 
     /// <summary>
     /// In-process timestamp of the last successful ensemble rebalance. Reset to
@@ -92,6 +87,10 @@ public class StrategyHealthWorker : BackgroundService
     /// on the first post-restart cycle.
     /// </summary>
     private DateTime _lastRebalancedAt = DateTime.MinValue;
+
+    /// <summary>Max backoff delay on consecutive failures (5 minutes).</summary>
+    private static readonly TimeSpan MaxBackoff = TimeSpan.FromMinutes(5);
+    private int _consecutiveFailures;
 
     /// <summary>
     /// Initialises the worker.
@@ -118,10 +117,17 @@ public class StrategyHealthWorker : BackgroundService
 
         while (!stoppingToken.IsCancellationRequested)
         {
+            int pollSecs = DefaultPollSeconds;
             try
             {
                 await EvaluateAllActiveStrategiesAsync(stoppingToken);
-                await TriggerWeeklyRebalanceIfDueAsync(stoppingToken);
+                await TriggerRebalanceIfDueAsync(stoppingToken);
+                _consecutiveFailures = 0;
+
+                // Read configurable poll interval from EngineConfig
+                using var configScope = _scopeFactory.CreateScope();
+                var configCtx = configScope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+                pollSecs = await GetConfigAsync<int>(configCtx, CK_PollSecs, DefaultPollSeconds, stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -129,10 +135,22 @@ public class StrategyHealthWorker : BackgroundService
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Unexpected error in StrategyHealthWorker polling loop");
+                _consecutiveFailures++;
+                _logger.LogError(ex,
+                    "StrategyHealthWorker: polling error (consecutive failures: {Failures})",
+                    _consecutiveFailures);
             }
 
-            await Task.Delay(PollingInterval, stoppingToken);
+            var pollingInterval = TimeSpan.FromSeconds(pollSecs);
+
+            // Exponential backoff on consecutive failures: 60s, 120s, 240s, capped at 5min
+            var delay = _consecutiveFailures > 0
+                ? TimeSpan.FromSeconds(Math.Min(
+                    pollingInterval.TotalSeconds * Math.Pow(2, _consecutiveFailures - 1),
+                    MaxBackoff.TotalSeconds))
+                : pollingInterval;
+
+            await Task.Delay(delay, stoppingToken);
         }
 
         _logger.LogInformation("StrategyHealthWorker stopped");
@@ -149,10 +167,19 @@ public class StrategyHealthWorker : BackgroundService
     /// trigger an immediate rebalance, which is acceptable because rebalancing is idempotent.
     /// </para>
     /// </summary>
-    private async Task TriggerWeeklyRebalanceIfDueAsync(CancellationToken ct)
+    private async Task TriggerRebalanceIfDueAsync(CancellationToken ct)
     {
-        // Check if enough time has elapsed since the last rebalance.
-        if (DateTime.UtcNow - _lastRebalancedAt < RebalanceInterval)
+        // Read configurable rebalance interval from EngineConfig
+        int rebalanceDays = DefaultRebalanceDays;
+        try
+        {
+            using var configScope = _scopeFactory.CreateScope();
+            var configCtx = configScope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+            rebalanceDays = await GetConfigAsync<int>(configCtx, CK_RebalanceDays, DefaultRebalanceDays, ct);
+        }
+        catch { /* use default */ }
+
+        if (DateTime.UtcNow - _lastRebalancedAt < TimeSpan.FromDays(rebalanceDays))
             return;
 
         try
@@ -193,16 +220,27 @@ public class StrategyHealthWorker : BackgroundService
             .Where(x => x.Status == StrategyStatus.Active && !x.IsDeleted)
             .ToListAsync(ct);
 
+        int evaluated = 0, failed = 0;
+
         foreach (var strategy in strategies)
         {
             try
             {
                 await EvaluateStrategyAsync(strategy, writeContext, readContext, mediator, ct);
+                evaluated++;
             }
             catch (Exception ex)
             {
+                failed++;
                 _logger.LogError(ex, "StrategyHealthWorker: evaluation failed for strategy {StrategyId}", strategy.Id);
             }
+        }
+
+        if (strategies.Count > 0)
+        {
+            _logger.LogDebug(
+                "StrategyHealthWorker cycle: {Total} strategies, {Evaluated} evaluated, {Failed} failed",
+                strategies.Count, evaluated, failed);
         }
     }
 
@@ -278,6 +316,13 @@ public class StrategyHealthWorker : BackgroundService
             .Where(x => orderIds.Contains(x.Id) && x.Status == OrderStatus.Filled && !x.IsDeleted)
             .ToDictionaryAsync(x => x.Id, ct);
 
+        // Pre-load contract sizes for all symbols involved
+        var symbolsInvolved = signals.Select(s => s.Symbol).Distinct().ToList();
+        var contractSizes = await readContext.GetDbContext()
+            .Set<Domain.Entities.CurrencyPair>()
+            .Where(x => symbolsInvolved.Contains(x.Symbol) && !x.IsDeleted)
+            .ToDictionaryAsync(x => x.Symbol, x => x.ContractSize, StringComparer.OrdinalIgnoreCase, ct);
+
         var pnlList = new List<decimal>();
 
         foreach (var signal in signals)
@@ -285,17 +330,14 @@ public class StrategyHealthWorker : BackgroundService
             if (!signal.OrderId.HasValue || !orders.TryGetValue(signal.OrderId.Value, out var order))
                 continue;
 
-            // Skip orders where FilledPrice was not recorded (partial fills, cancellations).
             if (order.FilledPrice is null) continue;
 
-            // Simplified PnL: pips × lots × pip value (100,000 units per standard lot).
-            // For a 4-decimal pair (e.g. EUR/USD), 1 pip = 0.0001 price units.
-            // A Buy profits when FilledPrice > EntryPrice; a Sell profits when EntryPrice > FilledPrice.
+            decimal contractSize = contractSizes.GetValueOrDefault(signal.Symbol, 100_000m);
             decimal pnl;
             if (signal.Direction == TradeDirection.Buy)
-                pnl = (order.FilledPrice.Value - signal.EntryPrice) * signal.SuggestedLotSize * 100_000m;
+                pnl = (order.FilledPrice.Value - signal.EntryPrice) * signal.SuggestedLotSize * contractSize;
             else
-                pnl = (signal.EntryPrice - order.FilledPrice.Value) * signal.SuggestedLotSize * 100_000m;
+                pnl = (signal.EntryPrice - order.FilledPrice.Value) * signal.SuggestedLotSize * contractSize;
 
             pnlList.Add(pnl);
         }
@@ -463,5 +505,19 @@ public class StrategyHealthWorker : BackgroundService
                 }, ct);
             }
         }
+    }
+
+    private static async Task<T> GetConfigAsync<T>(
+        IReadApplicationDbContext readContext, string key, T defaultValue, CancellationToken ct)
+    {
+        var entry = await readContext.GetDbContext()
+            .Set<EngineConfig>()
+            .AsNoTracking()
+            .FirstOrDefaultAsync(c => c.Key == key, ct);
+
+        if (entry?.Value is null) return defaultValue;
+
+        try   { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
+        catch { return defaultValue; }
     }
 }

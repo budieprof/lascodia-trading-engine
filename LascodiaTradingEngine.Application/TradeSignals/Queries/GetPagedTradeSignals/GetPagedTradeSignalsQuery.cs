@@ -47,6 +47,7 @@ public class GetPagedTradeSignalsQueryHandler
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.TradeSignal>()
+            .AsNoTracking()
             .Where(x => !x.IsDeleted)
             .OrderByDescending(x => x.GeneratedAt)
             .AsQueryable();

@@ -34,6 +34,9 @@ public record EconomicCalendarEvent(
     DateTime ScheduledAt,
     string? Forecast,
     string? Previous,
+    string? Actual,
     /// <summary>Stable identifier from the data provider used to fetch the post-release actual.</summary>
     string ExternalKey,
-    EconomicEventSource Source);
+    EconomicEventSource Source,
+    bool IsAllDay = false,
+    bool IsTentative = false);

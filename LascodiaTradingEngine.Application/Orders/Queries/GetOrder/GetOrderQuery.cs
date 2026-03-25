@@ -32,6 +32,7 @@ public class GetOrderQueryHandler : IRequestHandler<GetOrderQuery, ResponseData<
     {
         var entity = await _context.GetDbContext()
             .Set<Domain.Entities.Order>()
+            .AsNoTracking()
             .FirstOrDefaultAsync(x => x.Id == request.Id && !x.IsDeleted, cancellationToken);
 
         if (entity == null)

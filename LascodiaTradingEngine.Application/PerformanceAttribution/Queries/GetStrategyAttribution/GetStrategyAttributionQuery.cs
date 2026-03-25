@@ -30,6 +30,7 @@ public class GetStrategyAttributionQueryHandler
     {
         var strategy = await _context.GetDbContext()
             .Set<Domain.Entities.Strategy>()
+            .AsNoTracking()
             .FirstOrDefaultAsync(x => x.Id == request.StrategyId && !x.IsDeleted, cancellationToken);
 
         if (strategy is null)
@@ -37,6 +38,7 @@ public class GetStrategyAttributionQueryHandler
 
         var snapshot = await _context.GetDbContext()
             .Set<Domain.Entities.StrategyPerformanceSnapshot>()
+            .AsNoTracking()
             .Where(x => x.StrategyId == request.StrategyId && !x.IsDeleted)
             .OrderByDescending(x => x.EvaluatedAt)
             .FirstOrDefaultAsync(cancellationToken);

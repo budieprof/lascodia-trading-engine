@@ -1,9 +1,13 @@
+using System.Diagnostics;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using LascodiaTradingEngine.Application.AuditTrail.Commands.LogDecision;
+using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Options;
 using LascodiaTradingEngine.Application.EconomicEvents.Commands.CreateEconomicEvent;
 using LascodiaTradingEngine.Application.EconomicEvents.Commands.UpdateEconomicEventActual;
 using LascodiaTradingEngine.Domain.Entities;
@@ -13,123 +17,90 @@ namespace LascodiaTradingEngine.Application.Workers;
 
 /// <summary>
 /// Background service that keeps the <see cref="EconomicEvent"/> table in sync with an
-/// external economic calendar (ForexFactory, Investing.com, or a configured stub).
+/// external economic calendar feed. Runs two passes per cycle — ingestion of upcoming
+/// events and patching of released actuals — with adaptive polling, weekend skipping,
+/// and a circuit breaker for sustained feed failures.
 /// </summary>
-/// <remarks>
-/// <b>Role in the trading engine:</b>
-/// High-impact economic releases (NFP, CPI, central bank rate decisions) can trigger
-/// extreme volatility and cause strategy signals to behave unpredictably. The engine uses
-/// the event database to apply a news blackout window: the <c>NewsFilter</c> and
-/// <c>EconomicCalendarWorker</c> together ensure that no new positions are opened within
-/// a configurable window before and after a high-impact event. Post-release, the actual
-/// figure is used to contextualise ML feature sets for backtesting and training.
-///
-/// <b>Two-phase operation — Ingestion + Actuals patch:</b>
-/// Each polling cycle performs two sequential passes:
-/// <list type="number">
-///   <item>
-///     <b>Ingestion pass</b> (<see cref="IngestUpcomingEventsAsync"/>) — fetches events
-///     scheduled in the next <see cref="LookaheadDays"/> days for all currencies derived
-///     from active <see cref="CurrencyPair"/> records, then inserts any that are not
-///     already present. Deduplication uses a composite key of Title + Currency + ScheduledAt
-///     (truncated to minute precision) to tolerate minor timestamp variations between feed
-///     updates without creating duplicate rows.
-///   </item>
-///   <item>
-///     <b>Actuals patch pass</b> (<see cref="PatchReleasedActualsAsync"/>) — finds events
-///     whose <c>ScheduledAt</c> is in the past and whose <c>Actual</c> field is still null,
-///     then queries the feed for the released figure and patches the record via
-///     <see cref="UpdateEconomicEventActualCommand"/>. This two-phase design allows the
-///     engine to track whether a release has occurred and what the actual number was,
-///     which is important for post-trade analysis and ML feature enrichment.
-///   </item>
-/// </list>
-///
-/// <b>Polling cadence:</b>
-/// Runs every 6 hours (<see cref="PollingInterval"/>). Economic calendars are typically
-/// stable a week out and only require intraday updates on the day of release. Six-hour
-/// polling gives timely ingestion without hammering the data provider.
-///
-/// <b>Data source:</b>
-/// Resolved from DI as <see cref="IEconomicCalendarFeed"/>. The default registration
-/// points to <c>StubEconomicCalendarFeed</c>. Replace with a real implementation
-/// (e.g. <c>ForexFactoryCalendarFeed</c>, <c>InvestingComCalendarFeed</c>) by updating
-/// the DI registration in <c>Application/DependencyInjection.cs</c>.
-///
-/// <b>Currency extraction:</b>
-/// Economic events are keyed by individual currency codes (e.g. "USD", "EUR") not pair
-/// symbols. The worker splits each 6-character pair symbol into its base and quote
-/// currency to build the currency filter list passed to the feed.
-/// </remarks>
+/// <seealso cref="EconomicCalendarOptions"/>
+/// <seealso cref="IEconomicCalendarFeed"/>
+/// <seealso cref="EconomicEvent"/>
 public class EconomicCalendarWorker : BackgroundService
 {
     private readonly ILogger<EconomicCalendarWorker> _logger;
     private readonly IServiceScopeFactory _scopeFactory;
+    private readonly EconomicCalendarOptions _options;
+    private readonly TradingMetrics _metrics;
 
-    /// <summary>
-    /// How often the worker wakes up to sync calendar data with the external feed.
-    /// 6 hours balances timeliness against rate limits on the calendar data provider.
-    /// </summary>
-    private static readonly TimeSpan PollingInterval = TimeSpan.FromHours(6);
+    private long _consecutiveEmptyFetches;
+    private long _consecutiveFeedFailures;
 
-    /// <summary>
-    /// How far ahead (in days) to fetch upcoming events on each ingestion pass.
-    /// 7 days ensures the engine has visibility of the full trading week ahead,
-    /// allowing the <c>NewsFilter</c> to pre-screen events at signal evaluation time.
-    /// </summary>
-    private const int LookaheadDays = 7;
-
-    /// <summary>
-    /// Initialises the worker with its required dependencies.
-    /// </summary>
-    /// <param name="logger">Structured logger for operational and diagnostic messages.</param>
-    /// <param name="scopeFactory">
-    /// Factory used to create short-lived DI scopes for each polling cycle pass.
-    /// Separate scopes are created for the ingestion and actuals-patch passes to ensure
-    /// clean DbContext lifetimes and avoid stale tracked entities between the two operations.
-    /// </param>
     public EconomicCalendarWorker(
         ILogger<EconomicCalendarWorker> logger,
-        IServiceScopeFactory scopeFactory)
+        IServiceScopeFactory scopeFactory,
+        EconomicCalendarOptions options,
+        TradingMetrics metrics)
     {
         _logger       = logger;
         _scopeFactory = scopeFactory;
+        _options      = options;
+        _metrics      = metrics;
+
+        _metrics.RegisterEconEmptyFetchGauge(() => Interlocked.Read(ref _consecutiveEmptyFetches));
     }
 
     /// <summary>
     /// Entry point invoked by the .NET hosted-service infrastructure.
     /// Runs a continuous polling loop, executing both the ingestion and actuals-patch
-    /// passes on each cycle before sleeping for <see cref="PollingInterval"/>.
+    /// passes on each cycle before sleeping for the configured (or adaptive) interval.
     /// </summary>
-    /// <param name="stoppingToken">Signalled when the host is shutting down.</param>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("EconomicCalendarWorker starting");
+        _logger.LogInformation(
+            "EconomicCalendarWorker starting (interval={Interval}h, lookahead={Lookahead}d, stale cutoff={Cutoff}d, batch={Batch}, feedTimeout={Timeout}s, retries={Retries}, patchConcurrency={Concurrency}, patchRetries={PatchRetries}, skipWeekends={SkipWeekends}, circuitBreaker={CircuitBreaker})",
+            _options.PollingIntervalHours, _options.LookaheadDays, _options.StaleEventCutoffDays,
+            _options.ActualsPatchBatchSize, _options.FeedCallTimeoutSeconds, _options.FeedRetryCount,
+            _options.ActualsPatchMaxConcurrency, _options.ActualsPatchRetryCount, _options.SkipWeekends,
+            _options.FeedCircuitBreakerThreshold);
 
         while (!stoppingToken.IsCancellationRequested)
         {
+            // ── Weekend skip ─────────────────────────────────────────────────
+            if (_options.SkipWeekends && IsWeekend())
+            {
+                _logger.LogDebug("EconomicCalendarWorker: skipping cycle (weekend)");
+                await Task.Delay(TimeSpan.FromHours(_options.PollingIntervalHours), stoppingToken);
+                continue;
+            }
+
+            var cycleSw = Stopwatch.StartNew();
+            var hadPendingActuals = false;
+
             try
             {
-                // Run the ingestion pass first to ensure new upcoming events are stored
-                // before attempting to patch actuals (which only patches existing rows).
                 await IngestUpcomingEventsAsync(stoppingToken);
-                await PatchReleasedActualsAsync(stoppingToken);
+                hadPendingActuals = await PatchReleasedActualsAsync(stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
-                // Expected during graceful shutdown — exit the loop cleanly.
                 break;
             }
             catch (Exception ex)
             {
-                // Catch-all so a transient error in either pass does not kill the worker.
-                // Both passes will be retried on the next cycle.
                 _logger.LogError(ex, "Unexpected error in EconomicCalendarWorker polling loop");
+                _metrics.WorkerErrors.Add(1,
+                    new KeyValuePair<string, object?>("worker", "EconomicCalendar"),
+                    new KeyValuePair<string, object?>("reason", "unhandled"));
             }
 
-            // Wait before the next full sync cycle. Task.Delay respects cancellation
-            // so the worker shuts down promptly even when mid-sleep.
-            await Task.Delay(PollingInterval, stoppingToken);
+            cycleSw.Stop();
+            _metrics.EconCycleDurationMs.Record(cycleSw.Elapsed.TotalMilliseconds);
+
+            // ── Adaptive interval (skip DB query when no pending actuals) ────
+            var nextInterval = hadPendingActuals
+                ? await ComputeNextIntervalAsync(stoppingToken)
+                : TimeSpan.FromHours(_options.PollingIntervalHours);
+
+            await Task.Delay(nextInterval, stoppingToken);
         }
 
         _logger.LogInformation("EconomicCalendarWorker stopped");
@@ -139,31 +110,37 @@ public class EconomicCalendarWorker : BackgroundService
 
     /// <summary>
     /// Fetches upcoming economic events from the configured calendar feed for the next
-    /// <see cref="LookaheadDays"/> days and inserts any new events that are not already
-    /// present in the database.
+    /// N days and inserts any new events that are not already present in the database.
+    /// Retries transient feed errors with exponential backoff.
+    /// Deduplicates on <c>ExternalKey</c> first, falling back to composite key.
+    /// Skips when the feed circuit breaker is open.
     /// </summary>
-    /// <param name="ct">Propagated cancellation token.</param>
-    /// <remarks>
-    /// <b>Deduplication strategy:</b>
-    /// Rather than issuing a DB query per incoming event, the method loads all existing
-    /// event identity keys within the lookahead window into a <see cref="HashSet{T}"/> in
-    /// a single query. Membership checks against this set are O(1), making the ingestion
-    /// pass efficient even for feeds returning hundreds of events.
-    ///
-    /// After each successful insert the key is added to <c>existingSet</c> in memory so
-    /// that duplicate entries within the same feed response are also suppressed without
-    /// requiring additional DB round-trips.
-    /// </remarks>
     private async Task IngestUpcomingEventsAsync(CancellationToken ct)
     {
-        // Use a dedicated scope for the ingestion pass so the read and write contexts
-        // are freshly allocated and do not carry stale entity tracking state from prior cycles.
+        // ── Circuit breaker ──────────────────────────────────────────────────
+        var failures = Interlocked.Read(ref _consecutiveFeedFailures);
+        if (failures >= _options.FeedCircuitBreakerThreshold)
+        {
+            _logger.LogWarning(
+                "EconomicCalendarWorker: feed circuit breaker open ({Failures} consecutive failures, threshold={Threshold}) — skipping ingestion",
+                failures, _options.FeedCircuitBreakerThreshold);
+
+            // Probe fires when failure count is an exact multiple of the threshold
+            // (e.g. threshold=3: skip at 4,5 → probe at 6 → skip at 7,8 → probe at 9 …)
+            if (failures % _options.FeedCircuitBreakerThreshold != 0)
+            {
+                Interlocked.Increment(ref _consecutiveFeedFailures);
+                return;
+            }
+
+            _logger.LogInformation("EconomicCalendarWorker: circuit breaker probe — attempting ingestion");
+        }
+
         using var scope   = _scopeFactory.CreateScope();
         var readContext   = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
         var mediator      = scope.ServiceProvider.GetRequiredService<IMediator>();
         var calendarFeed  = scope.ServiceProvider.GetRequiredService<IEconomicCalendarFeed>();
 
-        // Derive the currency filter list from currently active pairs.
         var currencies = await GetActiveCurrenciesAsync(readContext, ct);
         if (currencies.Count == 0)
         {
@@ -171,57 +148,75 @@ public class EconomicCalendarWorker : BackgroundService
             return;
         }
 
-        // Define the lookahead window: now → now + 7 days.
         var fromUtc = DateTime.UtcNow;
-        var toUtc   = fromUtc.AddDays(LookaheadDays);
+        var toUtc   = fromUtc.AddDays(_options.LookaheadDays);
 
-        IReadOnlyList<Common.Interfaces.EconomicCalendarEvent> incoming;
-        try
-        {
-            // Fetch the full event list for all relevant currencies within the time window.
-            // The feed is responsible for filtering by impact level if configured to do so.
-            incoming = await calendarFeed.GetUpcomingEventsAsync(currencies, fromUtc, toUtc, ct);
-        }
-        catch (Exception ex)
-        {
-            // Feed errors are logged but do not propagate — the current DB state is preserved
-            // and the next cycle will attempt a fresh fetch.
-            _logger.LogError(ex, "EconomicCalendarWorker: failed to fetch upcoming events from feed");
-            return;
-        }
+        var incoming = await TryFetchUpcomingEventsAsync(calendarFeed, currencies, fromUtc, toUtc, ct);
+        if (incoming is null)
+            return; // All retries exhausted — circuit breaker already incremented
 
         if (incoming.Count == 0)
         {
-            _logger.LogDebug("EconomicCalendarWorker: no upcoming events returned by feed");
+            Interlocked.Increment(ref _consecutiveEmptyFetches);
+            if (_consecutiveEmptyFetches >= _options.SustainedEmptyFetchThreshold)
+            {
+                _logger.LogCritical(
+                    "EconomicCalendarWorker: feed returned 0 events for {Count} consecutive cycles — possible feed structural change or blocking. Check EconFeedParseFailures metric and ForexFactory page structure",
+                    _consecutiveEmptyFetches);
+                _metrics.EconFeedErrors.Add(1,
+                    new KeyValuePair<string, object?>("phase", "ingestion"),
+                    new KeyValuePair<string, object?>("reason", "sustained_empty"));
+            }
+            else
+            {
+                _logger.LogDebug("EconomicCalendarWorker: no upcoming events returned by feed");
+            }
             return;
         }
 
-        // Pre-load the deduplication set from the DB in a single query.
-        // Scoped to the same time window to avoid loading the entire event history.
-        // Load existing keys to avoid duplicates (Title + Currency + ScheduledAt, minute precision)
-        var existingKeys = await readContext.GetDbContext()
+        // Reset empty-fetch counter on a successful non-empty response
+        Interlocked.Exchange(ref _consecutiveEmptyFetches, 0);
+
+        // ── Build deduplication sets (single query, two indices) ──────────────
+        var existingEvents = await readContext.GetDbContext()
             .Set<EconomicEvent>()
             .Where(e => !e.IsDeleted && e.ScheduledAt >= fromUtc && e.ScheduledAt <= toUtc)
-            .Select(e => new { e.Title, e.Currency, e.ScheduledAt })
+            .Select(e => new { e.Title, e.Currency, e.ScheduledAt, e.ExternalKey })
             .ToListAsync(ct);
 
-        // Build the hash set for O(1) deduplication. OrdinalIgnoreCase handles any
-        // minor casing differences between the DB and the incoming feed data.
-        var existingSet = existingKeys
+        var externalKeySet = existingEvents
+            .Where(e => e.ExternalKey != null)
+            .Select(e => e.ExternalKey!)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var compositeKeySet = existingEvents
             .Select(e => DedupeKey(e.Title, e.Currency, e.ScheduledAt))
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
         int created = 0;
+        int missingExternalKey = 0;
+
         foreach (var ev in incoming)
         {
-            // Skip events already present in the DB (or already created in this batch).
-            if (existingSet.Contains(DedupeKey(ev.Title, ev.Currency, ev.ScheduledAt)))
+            // Primary dedup: ExternalKey (more reliable across feed title variations)
+            if (!string.IsNullOrWhiteSpace(ev.ExternalKey) && externalKeySet.Contains(ev.ExternalKey))
                 continue;
+
+            // Fallback dedup: composite key (Title + Currency + ScheduledAt at minute precision)
+            if (compositeKeySet.Contains(DedupeKey(ev.Title, ev.Currency, ev.ScheduledAt)))
+                continue;
+
+            // Warn if no ExternalKey — actuals patching will be unavailable for this event
+            if (string.IsNullOrWhiteSpace(ev.ExternalKey))
+            {
+                missingExternalKey++;
+                _logger.LogWarning(
+                    "EconomicCalendarWorker: event '{Title}' ({Currency} at {ScheduledAt:u}) has no ExternalKey — actuals patching will be unavailable",
+                    ev.Title, ev.Currency, ev.ScheduledAt);
+            }
 
             try
             {
-                // Route through MediatR so the full pipeline (validation, soft-delete check,
-                // event publishing) is applied — same as a manual API call.
                 await mediator.Send(new CreateEconomicEventCommand
                 {
                     Title       = ev.Title,
@@ -229,170 +224,369 @@ public class EconomicCalendarWorker : BackgroundService
                     Impact      = ev.Impact.ToString(),
                     ScheduledAt = ev.ScheduledAt,
                     Source      = ev.Source.ToString(),
-                    Forecast    = ev.Forecast,   // analyst consensus estimate at time of ingestion
-                    Previous    = ev.Previous    // prior period's released figure
+                    Forecast    = ev.Forecast,
+                    Previous    = ev.Previous,
+                    Actual      = ev.Actual,
+                    ExternalKey = ev.ExternalKey
                 }, ct);
 
-                // Add to the in-memory set so subsequent duplicates in the same feed response
-                // are also suppressed without needing another DB query.
-                existingSet.Add(DedupeKey(ev.Title, ev.Currency, ev.ScheduledAt));
+                // Update both dedup sets
+                if (!string.IsNullOrWhiteSpace(ev.ExternalKey))
+                    externalKeySet.Add(ev.ExternalKey);
+                compositeKeySet.Add(DedupeKey(ev.Title, ev.Currency, ev.ScheduledAt));
                 created++;
             }
             catch (Exception ex)
             {
-                // Per-event isolation: one failed insert does not abort the rest of the batch.
+                _metrics.EconFeedErrors.Add(1, new KeyValuePair<string, object?>("phase", "ingestion_persist"), new KeyValuePair<string, object?>("reason", "db_error"));
                 _logger.LogError(ex,
                     "EconomicCalendarWorker: failed to create event '{Title}' ({Currency})", ev.Title, ev.Currency);
             }
         }
 
+        _metrics.EconEventsIngested.Add(created);
         _logger.LogInformation(
-            "EconomicCalendarWorker: ingestion pass complete — {Created} new events created out of {Total} fetched",
-            created, incoming.Count);
+            "EconomicCalendarWorker: ingestion pass complete — {Created} new events created out of {Total} fetched ({MissingKey} without ExternalKey)",
+            created, incoming.Count, missingExternalKey);
+
+        // ── Audit trail for ingestion pass ────────────────────────────────────
+        if (created > 0)
+        {
+            await TryLogDecisionAsync(mediator,
+                entityType:   "EconomicCalendar",
+                entityId:     0,
+                decisionType: "Ingestion",
+                outcome:      "Completed",
+                reason:       $"Ingested {created} of {incoming.Count} events for {currencies.Count} currencies ({fromUtc:u} to {toUtc:u}), {missingExternalKey} without ExternalKey",
+                ct);
+        }
     }
 
     // ── Actual patch pass ─────────────────────────────────────────────────────
 
     /// <summary>
     /// Finds past economic events that are still missing their released actual value and
-    /// attempts to patch them by querying the calendar feed for the released figure.
+    /// attempts to patch them by querying the calendar feed using the event's stored
+    /// <see cref="EconomicEvent.ExternalKey"/>. Events older than
+    /// <see cref="EconomicCalendarOptions.StaleEventCutoffDays"/> are skipped.
+    /// High-impact events are prioritised. Fetches run concurrently up to
+    /// <see cref="EconomicCalendarOptions.ActualsPatchMaxConcurrency"/> and each attempt
+    /// retries up to <see cref="EconomicCalendarOptions.ActualsPatchRetryCount"/> times.
+    /// Returns true if there were pending events, so the main loop can decide whether
+    /// the adaptive interval DB query is worth running.
     /// </summary>
-    /// <param name="ct">Propagated cancellation token.</param>
-    /// <remarks>
-    /// <b>Why actuals matter:</b>
-    /// The actual released figure, compared against the forecast and previous period,
-    /// determines whether the event was a positive or negative surprise. This surprise
-    /// magnitude is used as a feature in ML models and in post-trade attribution to
-    /// explain unusual price behaviour around high-impact releases.
-    ///
-    /// <b>Batch cap:</b>
-    /// The query is capped at 50 events per cycle (<c>Take(50)</c>) to limit the number
-    /// of individual API calls made to the calendar feed in a single pass. Events are
-    /// processed oldest-first so older releases are resolved before newer ones in backlogs.
-    ///
-    /// <b>Null handling:</b>
-    /// If the feed returns null for a given event (actual not yet published by the source),
-    /// the record is left untouched and will be retried on the next polling cycle.
-    /// </remarks>
-    private async Task PatchReleasedActualsAsync(CancellationToken ct)
+    private async Task<bool> PatchReleasedActualsAsync(CancellationToken ct)
     {
-        // Use a separate scope from the ingestion pass to avoid carrying over tracked
-        // entities from CreateEconomicEventCommand writes.
         using var scope   = _scopeFactory.CreateScope();
         var readContext   = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
-        var mediator      = scope.ServiceProvider.GetRequiredService<IMediator>();
-        var calendarFeed  = scope.ServiceProvider.GetRequiredService<IEconomicCalendarFeed>();
 
-        // Query for events that have passed their scheduled time but still have no actual value.
-        // Events past their scheduled time but still missing an actual value
+        var staleCutoff = DateTime.UtcNow.AddDays(-_options.StaleEventCutoffDays);
+
+        // Impact-based prioritisation: High-impact events are patched first
         var pending = await readContext.GetDbContext()
             .Set<EconomicEvent>()
-            .Where(e => !e.IsDeleted && e.Actual == null && e.ScheduledAt < DateTime.UtcNow)
-            .OrderBy(e => e.ScheduledAt)   // oldest first — resolve backlog in chronological order
-            .Take(50)                       // cap per cycle to limit API calls to the calendar feed
-            .Select(e => new { e.Id, e.Title, e.Currency, e.ScheduledAt })
+            .Where(e => !e.IsDeleted
+                     && e.Actual == null
+                     && e.ExternalKey != null
+                     && e.ScheduledAt < DateTime.UtcNow
+                     && e.ScheduledAt >= staleCutoff)
+            .OrderByDescending(e => e.Impact)
+            .ThenBy(e => e.ScheduledAt)
+            .Take(_options.ActualsPatchBatchSize)
+            .Select(e => new { e.Id, e.ExternalKey, e.Impact })
             .ToListAsync(ct);
 
         if (pending.Count == 0)
-            return;
+            return false;
 
         _logger.LogInformation(
-            "EconomicCalendarWorker: patching actuals for {Count} past events", pending.Count);
+            "EconomicCalendarWorker: patching actuals for {Count} past events (high-impact first)", pending.Count);
 
+        // Parallel execution with per-event scopes (DbContext is not thread-safe)
         int patched = 0;
-        foreach (var ev in pending)
+        await Parallel.ForEachAsync(
+            pending,
+            new ParallelOptions
+            {
+                MaxDegreeOfParallelism = _options.ActualsPatchMaxConcurrency,
+                CancellationToken = ct
+            },
+            async (ev, token) =>
+            {
+                try
+                {
+                    using var innerScope = _scopeFactory.CreateScope();
+                    var innerMediator    = innerScope.ServiceProvider.GetRequiredService<IMediator>();
+                    var innerFeed        = innerScope.ServiceProvider.GetRequiredService<IEconomicCalendarFeed>();
+
+                    if (await TryFetchAndPatchActualAsync(ev.Id, ev.ExternalKey!, innerFeed, innerMediator, token))
+                        Interlocked.Increment(ref patched);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _logger.LogWarning(ex,
+                        "EconomicCalendarWorker: failed to patch actual for event {EventId} — isolated, continuing batch",
+                        ev.Id);
+                    _metrics.EconFeedErrors.Add(1,
+                        new KeyValuePair<string, object?>("reason", "actual_patch_failed"),
+                        new KeyValuePair<string, object?>("event_id", ev.Id.ToString()));
+                }
+            });
+
+        _metrics.EconActualsPatched.Add(patched);
+        _logger.LogInformation(
+            "EconomicCalendarWorker: patched actuals for {Patched}/{Total} events", patched, pending.Count);
+
+        // ── Audit trail for actuals patch pass ────────────────────────────────
+        if (patched > 0)
+        {
+            using var auditScope = _scopeFactory.CreateScope();
+            var auditMediator    = auditScope.ServiceProvider.GetRequiredService<IMediator>();
+
+            await TryLogDecisionAsync(auditMediator,
+                entityType:   "EconomicCalendar",
+                entityId:     0,
+                decisionType: "ActualsPatch",
+                outcome:      "Completed",
+                reason:       $"Patched actuals for {patched} of {pending.Count} events (stale cutoff={staleCutoff:u})",
+                ct);
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Fetches upcoming events from the calendar feed with retry and exponential backoff.
+    /// Returns null (and increments the circuit breaker) if all retries are exhausted.
+    /// Resets the circuit breaker on a successful fetch.
+    /// </summary>
+    private async Task<IReadOnlyList<EconomicCalendarEvent>?> TryFetchUpcomingEventsAsync(
+        IEconomicCalendarFeed calendarFeed, List<string> currencies,
+        DateTime fromUtc, DateTime toUtc, CancellationToken ct)
+    {
+        int maxAttempts = 1 + _options.FeedRetryCount;
+
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
         {
             try
             {
-                // Reconstruct the same stable key used during ingestion so the feed can
-                // look up the correct event record in its own storage.
-                var externalKey = DedupeKey(ev.Title, ev.Currency, ev.ScheduledAt);
-                var actual = await calendarFeed.GetActualAsync(externalKey, ct);
+                using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                timeoutCts.CancelAfter(TimeSpan.FromSeconds(_options.FeedCallTimeoutSeconds));
 
-                // null means the feed does not yet have the actual figure (e.g. the release
-                // is delayed or the feed has not yet processed it). Skip without error —
-                // the next polling cycle will retry.
-                if (actual is null)
-                    continue;
+                var result = await calendarFeed.GetUpcomingEventsAsync(currencies, fromUtc, toUtc, timeoutCts.Token);
 
-                // Patch the actual value through MediatR to ensure the update goes through
-                // the full pipeline (optimistic concurrency check, audit trail, etc.).
-                await mediator.Send(new UpdateEconomicEventActualCommand
+                // Successful fetch — reset circuit breaker
+                Interlocked.Exchange(ref _consecutiveFeedFailures, 0);
+                return result;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw; // Host shutdown — propagate
+            }
+            catch (OperationCanceledException)
+            {
+                _metrics.EconFeedErrors.Add(1, new KeyValuePair<string, object?>("phase", "ingestion"), new KeyValuePair<string, object?>("reason", "timeout"));
+                _logger.LogWarning(
+                    "EconomicCalendarWorker: feed timeout on ingestion attempt {Attempt}/{Max} ({Timeout}s)",
+                    attempt, maxAttempts, _options.FeedCallTimeoutSeconds);
+
+                if (attempt >= maxAttempts)
                 {
-                    Id     = ev.Id,
-                    Actual = actual
-                }, ct);
+                    Interlocked.Increment(ref _consecutiveFeedFailures);
+                    return null;
+                }
+                await Task.Delay(TimeSpan.FromMilliseconds(200 * Math.Pow(2, attempt - 1)), ct);
+            }
+            catch (Exception ex) when (attempt < maxAttempts)
+            {
+                _metrics.EconFeedErrors.Add(1, new KeyValuePair<string, object?>("phase", "ingestion"), new KeyValuePair<string, object?>("reason", "transient"));
+                _logger.LogWarning(ex,
+                    "EconomicCalendarWorker: transient feed error on ingestion attempt {Attempt}/{Max} — retrying",
+                    attempt, maxAttempts);
 
-                patched++;
+                await Task.Delay(TimeSpan.FromMilliseconds(200 * Math.Pow(2, attempt - 1)), ct);
             }
             catch (Exception ex)
             {
-                // Per-event isolation: one failed patch does not abort the rest of the batch.
+                _metrics.EconFeedErrors.Add(1, new KeyValuePair<string, object?>("phase", "ingestion"), new KeyValuePair<string, object?>("reason", "exhausted"));
                 _logger.LogError(ex,
-                    "EconomicCalendarWorker: failed to patch actual for event id={Id}", ev.Id);
+                    "EconomicCalendarWorker: feed error on final ingestion attempt {Attempt}/{Max} — skipping cycle",
+                    attempt, maxAttempts);
+
+                Interlocked.Increment(ref _consecutiveFeedFailures);
+                return null;
             }
         }
 
-        _logger.LogInformation(
-            "EconomicCalendarWorker: patched actuals for {Patched}/{Total} events", patched, pending.Count);
+        return null;
+    }
+
+    /// <summary>
+    /// Attempts to fetch and patch the actual value for a single economic event,
+    /// with retry and exponential backoff on transient errors.
+    /// </summary>
+    private async Task<bool> TryFetchAndPatchActualAsync(
+        long eventId, string externalKey,
+        IEconomicCalendarFeed calendarFeed, IMediator mediator,
+        CancellationToken ct)
+    {
+        int maxAttempts = 1 + _options.ActualsPatchRetryCount;
+
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            try
+            {
+                using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                timeoutCts.CancelAfter(TimeSpan.FromSeconds(_options.FeedCallTimeoutSeconds));
+
+                var actual = await calendarFeed.GetActualAsync(externalKey, timeoutCts.Token);
+
+                if (actual is null)
+                    return false;
+
+                await mediator.Send(new UpdateEconomicEventActualCommand
+                {
+                    Id     = eventId,
+                    Actual = actual
+                }, ct);
+
+                return true;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw; // Host shutdown — propagate
+            }
+            catch (OperationCanceledException)
+            {
+                _metrics.EconFeedErrors.Add(1,
+                    new KeyValuePair<string, object?>("phase", "actuals_patch"),
+                    new KeyValuePair<string, object?>("reason", "timeout"));
+                _logger.LogWarning(
+                    "EconomicCalendarWorker: timeout fetching actual for event id={Id}, attempt {Attempt}/{Max} ({Timeout}s)",
+                    eventId, attempt, maxAttempts, _options.FeedCallTimeoutSeconds);
+
+                if (attempt >= maxAttempts) return false;
+                await Task.Delay(TimeSpan.FromMilliseconds(200 * Math.Pow(2, attempt - 1)), ct);
+            }
+            catch (Exception ex)
+            {
+                _metrics.EconFeedErrors.Add(1,
+                    new KeyValuePair<string, object?>("phase", "actuals_patch"),
+                    new KeyValuePair<string, object?>("reason", "error"));
+                _logger.LogWarning(ex,
+                    "EconomicCalendarWorker: error fetching actual for event id={Id}, attempt {Attempt}/{Max}",
+                    eventId, attempt, maxAttempts);
+
+                if (attempt >= maxAttempts) return false;
+                await Task.Delay(TimeSpan.FromMilliseconds(200 * Math.Pow(2, attempt - 1)), ct);
+            }
+        }
+
+        return false;
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Queries the read database for all active currency pair symbols and expands each
-    /// 6-character symbol into its constituent base and quote currency codes.
+    /// Queries the read database for all active currency pairs and extracts their
+    /// <c>BaseCurrency</c> and <c>QuoteCurrency</c> fields into a deduplicated list
+    /// of ISO currency codes.
     /// </summary>
-    /// <param name="readContext">Read DbContext for querying active pairs.</param>
-    /// <param name="ct">Propagated cancellation token.</param>
-    /// <returns>
-    /// A deduplicated list of 3-character ISO currency codes (e.g. <c>["USD", "EUR", "GBP"]</c>)
-    /// derived from all active pairs. Used as the currency filter when calling
-    /// <see cref="IEconomicCalendarFeed.GetUpcomingEventsAsync"/>.
-    /// </returns>
-    /// <remarks>
-    /// A standard forex pair symbol (e.g. "EURUSD") encodes both the base currency
-    /// (first 3 chars: "EUR") and the quote currency (next 3 chars: "USD"). Splitting
-    /// each symbol and deduplicating ensures the engine fetches events for all currencies
-    /// it trades in, regardless of whether they appear as base or quote in a given pair.
-    /// </remarks>
     private static async Task<List<string>> GetActiveCurrenciesAsync(
         IReadApplicationDbContext readContext, CancellationToken ct)
     {
-        var symbols = await readContext.GetDbContext()
+        var currencies = await readContext.GetDbContext()
             .Set<CurrencyPair>()
             .Where(x => x.IsActive && !x.IsDeleted)
-            .Select(x => x.Symbol)
+            .SelectMany(x => new[] { x.BaseCurrency, x.QuoteCurrency })
+            .Distinct()
             .ToListAsync(ct);
 
-        // Split each 6-char symbol (e.g. "EURUSD") into ["EUR", "USD"].
-        // Symbols shorter than 6 chars are treated as a single currency code.
-        // Distinct() deduplicates when multiple pairs share a currency (e.g. EUR appears
-        // in both EURUSD and EURGBP — we only need EUR events once).
-        return symbols
-            .SelectMany(s => s.Length >= 6
-                ? new[] { s[..3].ToUpperInvariant(), s[3..6].ToUpperInvariant() }
-                : new[] { s.ToUpperInvariant() })
-            .Distinct()
-            .ToList();
+        return currencies;
+    }
+
+    /// <summary>
+    /// Computes the next polling interval. Returns a shorter interval when recently-released
+    /// high-impact events still lack their actual values, allowing faster post-release patching.
+    /// Only called when the previous cycle found pending actuals to avoid unnecessary DB queries.
+    /// </summary>
+    private async Task<TimeSpan> ComputeNextIntervalAsync(CancellationToken ct)
+    {
+        var baseInterval = TimeSpan.FromHours(_options.PollingIntervalHours);
+
+        try
+        {
+            using var scope    = _scopeFactory.CreateScope();
+            var readContext    = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+            var now            = DateTime.UtcNow;
+
+            var hasPendingHighImpactActuals = await readContext.GetDbContext()
+                .Set<EconomicEvent>()
+                .AnyAsync(e => !e.IsDeleted
+                    && e.Impact == EconomicImpact.High
+                    && e.Actual == null
+                    && e.ExternalKey != null
+                    && e.ScheduledAt < now
+                    && e.ScheduledAt >= now.AddHours(-2), ct);
+
+            if (hasPendingHighImpactActuals)
+            {
+                var accelerated = TimeSpan.FromHours(Math.Max(1, _options.PollingIntervalHours / 4.0));
+                _logger.LogInformation(
+                    "EconomicCalendarWorker: high-impact events pending actuals — using accelerated interval {Interval}h",
+                    accelerated.TotalHours);
+                return accelerated;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "EconomicCalendarWorker: failed to compute adaptive interval — using default");
+        }
+
+        return baseInterval;
+    }
+
+    /// <summary>
+    /// Returns true if the current UTC day is Saturday or Sunday. Economic releases are
+    /// almost never scheduled on weekends, so polling can be skipped to reduce unnecessary
+    /// feed API calls.
+    /// </summary>
+    private static bool IsWeekend()
+    {
+        return DateTime.UtcNow.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday;
+    }
+
+    /// <summary>
+    /// Best-effort audit trail log. Failures are logged but do not propagate — the worker
+    /// must not fail because an audit record could not be written.
+    /// </summary>
+    private async Task TryLogDecisionAsync(
+        IMediator mediator, string entityType, long entityId,
+        string decisionType, string outcome, string reason, CancellationToken ct)
+    {
+        try
+        {
+            await mediator.Send(new LogDecisionCommand
+            {
+                EntityType   = entityType,
+                EntityId     = entityId,
+                DecisionType = decisionType,
+                Outcome      = outcome,
+                Reason       = reason,
+                Source       = nameof(EconomicCalendarWorker)
+            }, ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "EconomicCalendarWorker: failed to write audit trail ({DecisionType}/{Outcome})",
+                decisionType, outcome);
+        }
     }
 
     /// <summary>
     /// Produces a stable deduplication key from the event identity fields,
     /// truncating the timestamp to minute precision to tolerate minor feed discrepancies.
     /// </summary>
-    /// <param name="title">The event title (e.g. "Non-Farm Payrolls").</param>
-    /// <param name="currency">The ISO currency code the event belongs to (e.g. "USD").</param>
-    /// <param name="scheduledAt">The UTC time the event is scheduled to release.</param>
-    /// <returns>
-    /// A pipe-delimited key string in the form <c>TITLE|CURRENCY|yyyyMMddHHmm</c>.
-    /// </returns>
-    /// <remarks>
-    /// The timestamp is truncated to minute precision (format <c>yyyyMMddHHmm</c>) because
-    /// different feed providers sometimes differ by a few seconds on the exact release time.
-    /// Minute-level truncation absorbs these discrepancies while still distinguishing events
-    /// that are genuinely scheduled at different times on the same day for the same currency.
-    /// </remarks>
     private static string DedupeKey(string title, string currency, DateTime scheduledAt)
         => $"{title.Trim().ToUpperInvariant()}|{currency.ToUpperInvariant()}|{scheduledAt:yyyyMMddHHmm}";
 }

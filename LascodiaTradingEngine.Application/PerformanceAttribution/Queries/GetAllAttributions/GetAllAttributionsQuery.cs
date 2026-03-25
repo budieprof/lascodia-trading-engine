@@ -30,12 +30,14 @@ public class GetAllAttributionsQueryHandler
         var db = _context.GetDbContext();
 
         var strategies = await db.Set<Domain.Entities.Strategy>()
+            .AsNoTracking()
             .Where(x => !x.IsDeleted)
             .ToListAsync(cancellationToken);
 
         var strategyIds = strategies.Select(s => s.Id).ToList();
 
         var allSnapshots = await db.Set<Domain.Entities.StrategyPerformanceSnapshot>()
+            .AsNoTracking()
             .Where(x => strategyIds.Contains(x.StrategyId) && !x.IsDeleted)
             .ToListAsync(cancellationToken);
 

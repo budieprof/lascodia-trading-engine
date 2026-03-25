@@ -44,6 +44,7 @@ public class GetPagedAlertsQueryHandler
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.Alert>()
+            .AsNoTracking()
             .Where(x => !x.IsDeleted)
             .OrderByDescending(x => x.Id)
             .AsQueryable();

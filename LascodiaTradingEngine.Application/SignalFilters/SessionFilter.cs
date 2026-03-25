@@ -1,6 +1,7 @@
 using Microsoft.Extensions.DependencyInjection;
 using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.SignalFilters;
 
@@ -17,7 +18,7 @@ namespace LascodiaTradingEngine.Application.SignalFilters;
 [RegisterService(ServiceLifetime.Singleton)]
 public class SessionFilter : ISessionFilter
 {
-    public string GetCurrentSession(DateTime utcTime)
+    public TradingSession GetCurrentSession(DateTime utcTime)
     {
         var time = utcTime.TimeOfDay;
 
@@ -32,23 +33,32 @@ public class SessionFilter : ISessionFilter
 
         // LondonNYOverlap has highest priority
         if (time >= londonNYStart && time < londonNYEnd)
-            return "LondonNYOverlap";
+            return TradingSession.LondonNYOverlap;
 
         if (time >= londonStart && time < londonEnd)
-            return "London";
+            return TradingSession.London;
 
         if (time >= newYorkStart && time < newYorkEnd)
-            return "NewYork";
+            return TradingSession.NewYork;
 
         if (time >= asianStart && time < asianEnd)
-            return "Asian";
+            return TradingSession.Asian;
 
         // Late evening (22:00–24:00) — treat as Asian pre-open
-        return "Asian";
+        return TradingSession.Asian;
     }
 
-    public bool IsSessionAllowed(string session, IReadOnlyList<string> allowedSessions)
+    public bool IsSessionAllowed(TradingSession session, IReadOnlyList<TradingSession> allowedSessions)
     {
         return allowedSessions.Contains(session);
     }
+
+    public decimal GetSessionQuality(TradingSession session) => session switch
+    {
+        TradingSession.LondonNYOverlap => 1.0m,
+        TradingSession.London          => 0.85m,
+        TradingSession.NewYork         => 0.80m,
+        TradingSession.Asian           => 0.50m,
+        _                              => 0.60m,
+    };
 }

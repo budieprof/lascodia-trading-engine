@@ -3,6 +3,7 @@ using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ReceivePositionSnapshot;
@@ -26,6 +27,8 @@ public class PositionSnapshotItem
     public decimal? StopLoss        { get; set; }
     public decimal? TakeProfit      { get; set; }
     public decimal  Profit          { get; set; }
+    public decimal  Swap            { get; set; }
+    public decimal  Commission      { get; set; }
     public DateTime OpenTime        { get; set; }
 }
 
@@ -39,7 +42,8 @@ public class ReceivePositionSnapshotCommandValidator : AbstractValidator<Receive
             .NotEmpty().WithMessage("InstanceId cannot be empty");
 
         RuleFor(x => x.Positions)
-            .NotNull().WithMessage("Positions cannot be null");
+            .NotNull().WithMessage("Positions cannot be null")
+            .Must(p => p.Count <= 500).WithMessage("Position snapshot cannot exceed 500 items");
     }
 }
 
@@ -48,14 +52,19 @@ public class ReceivePositionSnapshotCommandValidator : AbstractValidator<Receive
 public class ReceivePositionSnapshotCommandHandler : IRequestHandler<ReceivePositionSnapshotCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;
+    private readonly IEAOwnershipGuard _ownershipGuard;
 
-    public ReceivePositionSnapshotCommandHandler(IWriteApplicationDbContext context)
+    public ReceivePositionSnapshotCommandHandler(IWriteApplicationDbContext context, IEAOwnershipGuard ownershipGuard)
     {
-        _context = context;
+        _context        = context;
+        _ownershipGuard = ownershipGuard;
     }
 
     public async Task<ResponseData<string>> Handle(ReceivePositionSnapshotCommand request, CancellationToken cancellationToken)
     {
+        if (!await _ownershipGuard.IsOwnerAsync(request.InstanceId, cancellationToken))
+            return ResponseData<string>.Init(null, false, "Unauthorized: caller does not own this EA instance", "-403");
+
         var dbContext = _context.GetDbContext();
 
         foreach (var snap in request.Positions)
@@ -75,6 +84,8 @@ public class ReceivePositionSnapshotCommandHandler : IRequestHandler<ReceivePosi
             {
                 existing.CurrentPrice  = snap.CurrentPrice;
                 existing.UnrealizedPnL = snap.Profit;
+                existing.Swap          = snap.Swap;
+                existing.Commission    = snap.Commission;
                 existing.StopLoss      = snap.StopLoss;
                 existing.TakeProfit    = snap.TakeProfit;
                 existing.OpenLots      = snap.Volume;
@@ -91,6 +102,8 @@ public class ReceivePositionSnapshotCommandHandler : IRequestHandler<ReceivePosi
                     AverageEntryPrice = snap.OpenPrice,
                     CurrentPrice      = snap.CurrentPrice,
                     UnrealizedPnL     = snap.Profit,
+                    Swap              = snap.Swap,
+                    Commission        = snap.Commission,
                     StopLoss          = snap.StopLoss,
                     TakeProfit        = snap.TakeProfit,
                     Status            = PositionStatus.Open,

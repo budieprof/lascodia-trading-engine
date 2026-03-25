@@ -15,6 +15,7 @@ public class CurrencyPairConfiguration : IEntityTypeConfiguration<CurrencyPair>
         builder.Property(x => x.BaseCurrency).IsRequired().HasMaxLength(3);
         builder.Property(x => x.QuoteCurrency).IsRequired().HasMaxLength(3);
         builder.Property(x => x.ContractSize).HasPrecision(18, 5);
+        builder.Property(x => x.PipSize).HasPrecision(18, 8);
         builder.Property(x => x.MinLotSize).HasPrecision(18, 5);
         builder.Property(x => x.MaxLotSize).HasPrecision(18, 5);
         builder.Property(x => x.LotStep).HasPrecision(18, 5);

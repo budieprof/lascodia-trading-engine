@@ -59,4 +59,6 @@ public sealed class WorkerGroupConfiguration
     /// Alert dispatch: AlertWorker.
     /// </summary>
     public bool Alerts          { get; set; }
+
+
 }

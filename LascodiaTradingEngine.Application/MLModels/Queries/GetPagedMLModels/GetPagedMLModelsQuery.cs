@@ -47,6 +47,7 @@ public class GetPagedMLModelsQueryHandler
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.MLModel>()
+            .AsNoTracking()
             .Where(x => !x.IsDeleted)
             .OrderByDescending(x => x.TrainedAt)
             .AsQueryable();

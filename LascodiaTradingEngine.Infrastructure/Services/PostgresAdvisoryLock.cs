@@ -34,6 +34,16 @@ public sealed class PostgresAdvisoryLock : IDistributedLock
 
     public async Task<IAsyncDisposable?> TryAcquireAsync(string lockKey, CancellationToken ct = default)
     {
+        return await TryAcquireCoreAsync(lockKey, timeout: null, ct);
+    }
+
+    public async Task<IAsyncDisposable?> TryAcquireAsync(string lockKey, TimeSpan timeout, CancellationToken ct = default)
+    {
+        return await TryAcquireCoreAsync(lockKey, timeout, ct);
+    }
+
+    private async Task<IAsyncDisposable?> TryAcquireCoreAsync(string lockKey, TimeSpan? timeout, CancellationToken ct)
+    {
         long lockId = HashToLong(lockKey);
 
         var scope   = _scopeFactory.CreateAsyncScope();
@@ -45,11 +55,26 @@ public sealed class PostgresAdvisoryLock : IDistributedLock
 
         // pg_try_advisory_lock returns true if acquired, false if already held.
         // Session-level lock: held until explicitly released or connection closes.
-        await using var cmd = conn.CreateCommand();
-        cmd.CommandText = $"SELECT pg_try_advisory_lock({lockId})";
+        bool acquired = await TryLockOnceAsync(conn, lockId, ct);
 
-        var result = await cmd.ExecuteScalarAsync(ct);
-        bool acquired = result is true;
+        // If not acquired and timeout is specified, poll with exponential backoff
+        if (!acquired && timeout.HasValue && timeout.Value > TimeSpan.Zero)
+        {
+            var deadline = DateTime.UtcNow + timeout.Value;
+            int pollMs = 50;
+            const int maxPollMs = 1000;
+
+            while (!acquired && DateTime.UtcNow < deadline)
+            {
+                ct.ThrowIfCancellationRequested();
+                var remaining = deadline - DateTime.UtcNow;
+                if (remaining <= TimeSpan.Zero) break;
+
+                await Task.Delay(Math.Min(pollMs, (int)remaining.TotalMilliseconds), ct);
+                acquired = await TryLockOnceAsync(conn, lockId, ct);
+                pollMs = Math.Min(pollMs * 2, maxPollMs);
+            }
+        }
 
         if (!acquired)
         {
@@ -63,6 +88,14 @@ public sealed class PostgresAdvisoryLock : IDistributedLock
         _logger.LogDebug("Advisory lock acquired for '{Key}' (id={LockId})", lockKey, lockId);
 
         return new LockHandle((DbConnection)conn, lockId, lockKey, scope, _logger);
+    }
+
+    private static async Task<bool> TryLockOnceAsync(DbConnection conn, long lockId, CancellationToken ct)
+    {
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = $"SELECT pg_try_advisory_lock({lockId})";
+        var result = await cmd.ExecuteScalarAsync(ct);
+        return result is true;
     }
 
     /// <summary>

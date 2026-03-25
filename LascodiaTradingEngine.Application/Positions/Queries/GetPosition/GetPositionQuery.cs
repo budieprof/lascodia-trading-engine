@@ -31,6 +31,7 @@ public class GetPositionQueryHandler : IRequestHandler<GetPositionQuery, Respons
     {
         var entity = await _context.GetDbContext()
             .Set<Domain.Entities.Position>()
+            .AsNoTracking()
             .FirstOrDefaultAsync(x => x.Id == request.Id && !x.IsDeleted, cancellationToken);
 
         if (entity == null)

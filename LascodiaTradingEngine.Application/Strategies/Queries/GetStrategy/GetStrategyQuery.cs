@@ -31,6 +31,7 @@ public class GetStrategyQueryHandler : IRequestHandler<GetStrategyQuery, Respons
     {
         var entity = await _context.GetDbContext()
             .Set<Domain.Entities.Strategy>()
+            .AsNoTracking()
             .FirstOrDefaultAsync(x => x.Id == request.Id && !x.IsDeleted, cancellationToken);
 
         if (entity == null)

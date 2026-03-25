@@ -46,6 +46,7 @@ public class GetPagedMLTrainingRunsQueryHandler
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.MLTrainingRun>()
+            .AsNoTracking()
             .Where(x => !x.IsDeleted)
             .OrderByDescending(x => x.StartedAt)
             .AsQueryable();

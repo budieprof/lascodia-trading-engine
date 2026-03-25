@@ -31,6 +31,7 @@ public class GetTradingAccountQueryHandler : IRequestHandler<GetTradingAccountQu
     {
         var entity = await _context.GetDbContext()
             .Set<Domain.Entities.TradingAccount>()
+            .AsNoTracking()
             .FirstOrDefaultAsync(x => x.Id == request.Id && !x.IsDeleted, cancellationToken);
 
         if (entity == null)

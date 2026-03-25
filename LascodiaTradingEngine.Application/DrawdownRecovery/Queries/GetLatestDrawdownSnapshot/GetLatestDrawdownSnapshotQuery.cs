@@ -32,6 +32,7 @@ public class GetLatestDrawdownSnapshotQueryHandler
     {
         var snapshot = await _context.GetDbContext()
             .Set<Domain.Entities.DrawdownSnapshot>()
+            .AsNoTracking()
             .Where(x => !x.IsDeleted)
             .OrderByDescending(x => x.RecordedAt)
             .FirstOrDefaultAsync(cancellationToken);

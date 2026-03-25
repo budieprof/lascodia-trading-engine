@@ -42,6 +42,7 @@ public class GetPagedCurrencyPairsQueryHandler
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.CurrencyPair>()
+            .AsNoTracking()
             .Where(x => !x.IsDeleted)
             .OrderBy(x => x.Symbol)
             .AsQueryable();

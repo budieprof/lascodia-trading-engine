@@ -13,6 +13,12 @@ public record OrderFilledIntegrationEvent : IntegrationEvent
     /// <summary>Monotonic sequence number for ordering detection. Consumers can discard events with lower sequence than previously seen.</summary>
     public long          SequenceNumber  { get; init; } = EventSequence.Next();
 
+    /// <summary>
+    /// Correlation ID propagated from the originating <see cref="TradeSignalCreatedIntegrationEvent"/>.
+    /// Allows tracing the full signal → order → fill → position chain in logs.
+    /// </summary>
+    public string?       CorrelationId   { get; init; }
+
     /// <summary>The filled order's database Id.</summary>
     public long          OrderId         { get; init; }
 

@@ -1,3 +1,4 @@
+using FluentValidation;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
@@ -10,6 +11,13 @@ namespace LascodiaTradingEngine.Application.StrategyEnsemble.Commands.RebalanceE
 
 public class RebalanceEnsembleCommand : IRequest<ResponseData<string>>
 {
+}
+
+// ── Validator ─────────────────────────────────────────────────────────────────
+
+public class RebalanceEnsembleCommandValidator : AbstractValidator<RebalanceEnsembleCommand>
+{
+    public RebalanceEnsembleCommandValidator() { }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────

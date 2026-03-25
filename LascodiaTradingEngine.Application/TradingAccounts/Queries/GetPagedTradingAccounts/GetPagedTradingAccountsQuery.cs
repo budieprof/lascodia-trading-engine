@@ -16,8 +16,9 @@ public class GetPagedTradingAccountsQuery : PagerRequestWithFilterType<TradingAc
 
 public class TradingAccountQueryFilter
 {
-    public long? BrokerId { get; set; }
-    public bool? IsPaper  { get; set; }
+    public string? BrokerServer { get; set; }
+    public string? BrokerName   { get; set; }
+    public bool?   IsPaper      { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
@@ -42,12 +43,16 @@ public class GetPagedTradingAccountsQueryHandler
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.TradingAccount>()
+            .AsNoTracking()
             .Where(x => !x.IsDeleted)
             .OrderByDescending(x => x.IsActive)
             .AsQueryable();
 
-        if (filter?.BrokerId.HasValue == true)
-            query = query.Where(x => x.BrokerId == filter.BrokerId.Value);
+        if (!string.IsNullOrEmpty(filter?.BrokerServer))
+            query = query.Where(x => x.BrokerServer == filter.BrokerServer);
+
+        if (!string.IsNullOrEmpty(filter?.BrokerName))
+            query = query.Where(x => x.BrokerName == filter.BrokerName);
 
         if (filter?.IsPaper.HasValue == true)
             query = query.Where(x => x.IsPaper == filter.IsPaper.Value);

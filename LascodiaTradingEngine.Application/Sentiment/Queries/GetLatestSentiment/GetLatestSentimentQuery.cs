@@ -38,6 +38,7 @@ public class GetLatestSentimentQueryHandler
 
         var snapshot = await _context.GetDbContext()
             .Set<Domain.Entities.SentimentSnapshot>()
+            .AsNoTracking()
             .Where(x => !x.IsDeleted && x.Currency == currency)
             .OrderByDescending(x => x.CapturedAt)
             .FirstOrDefaultAsync(cancellationToken);

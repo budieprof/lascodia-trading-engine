@@ -16,12 +16,17 @@ using LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ProcessReconcilia
 using LascodiaTradingEngine.Application.ExpertAdvisor.Commands.AcknowledgeCommand;
 using LascodiaTradingEngine.Application.ExpertAdvisor.Queries.GetPendingCommands;
 using LascodiaTradingEngine.Application.ExpertAdvisor.Queries.GetActiveInstances;
+using LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ProcessSignalFeedback;
+using LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ReceivePositionDelta;
+using LascodiaTradingEngine.Application.ExpertAdvisor.Commands.UpdateEAConfig;
 using LascodiaTradingEngine.Application.ExpertAdvisor.Queries.DTOs;
+using Microsoft.AspNetCore.RateLimiting;
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
 [Route("api/v1/lascodia-trading-engine/ea")]
 [ApiController]
+[EnableRateLimiting("ea")]
 public class ExpertAdvisorController : AuthControllerBase<ExpertAdvisorController>
 {
     public ExpertAdvisorController(
@@ -149,8 +154,37 @@ public class ExpertAdvisorController : AuthControllerBase<ExpertAdvisorControlle
         return await Mediator.Send(command);
     }
 
+    /// <summary>
+    /// Hot-reload EA safety configuration parameters without requiring an EA restart.
+    /// Queues an UpdateConfig command for targeted EA instance(s).
+    /// Zero values are ignored by the EA (keeps current value).
+    /// </summary>
+    [HttpPost("commands/update-config")]
+    public async Task<ResponseData<string>> UpdateEAConfig(UpdateEAConfigCommand command)
+        => await Mediator.Send(command);
+
     /// <summary>Get all active EA instances</summary>
     [HttpGet("instances")]
     public async Task<ResponseData<List<EAInstanceDto>>> GetActiveInstances()
         => await Mediator.Send(new GetActiveInstancesQuery());
+
+    /// <summary>Receive signal feedback from EA (deferred, dropped, expired signals)</summary>
+    [HttpPost("signal-feedback")]
+    public async Task<ResponseData<int>> ProcessSignalFeedback(ProcessSignalFeedbackCommand command)
+    {
+        if (!ModelState.IsValid)
+            return ResponseData<int>.Init(0, false, "Model state failed", "-11");
+
+        return await Mediator.Send(command);
+    }
+
+    /// <summary>Receive incremental position changes (opened/closed/modified)</summary>
+    [HttpPost("positions/delta")]
+    public async Task<ResponseData<int>> ReceivePositionDelta(ReceivePositionDeltaCommand command)
+    {
+        if (!ModelState.IsValid)
+            return ResponseData<int>.Init(0, false, "Model state failed", "-11");
+
+        return await Mediator.Send(command);
+    }
 }

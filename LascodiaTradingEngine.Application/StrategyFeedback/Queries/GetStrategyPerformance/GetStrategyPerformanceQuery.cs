@@ -33,6 +33,7 @@ public class GetStrategyPerformanceQueryHandler
     {
         var entity = await _context.GetDbContext()
             .Set<Domain.Entities.StrategyPerformanceSnapshot>()
+            .AsNoTracking()
             .Where(x => x.StrategyId == request.StrategyId && !x.IsDeleted)
             .OrderByDescending(x => x.EvaluatedAt)
             .FirstOrDefaultAsync(cancellationToken);

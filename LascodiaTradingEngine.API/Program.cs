@@ -22,9 +22,12 @@ using LascodiaTradingEngine.Infrastructure.Persistence;
 var builder = WebApplication.CreateBuilder(args);
 
 // Allow background services to fail without stopping the host.
+// ShutdownTimeout gives in-flight event handlers (e.g. SignalOrderBridgeWorker,
+// OrderFilledEventHandler) up to 30 seconds to complete before force-kill.
 builder.Services.Configure<HostOptions>(options =>
 {
     options.BackgroundServiceExceptionBehavior = BackgroundServiceExceptionBehavior.Ignore;
+    options.ShutdownTimeout = TimeSpan.FromSeconds(30);
 });
 
 // ── Thread Pool Tuning ──────────────────────────────────────────────────────
@@ -124,12 +127,18 @@ builder.Services.AddCors(options =>
                   .AllowAnyHeader()
                   .AllowCredentials();
         }
-        else
+        else if (builder.Environment.IsDevelopment())
         {
             // Development fallback: allow all origins
             policy.AllowAnyOrigin()
                   .AllowAnyMethod()
                   .AllowAnyHeader();
+        }
+        else
+        {
+            throw new InvalidOperationException(
+                "CorsSettings:AllowedOrigins must be configured in production. " +
+                "Set at least one allowed origin.");
         }
     });
 });
@@ -146,15 +155,58 @@ builder.Services.AddOpenTelemetry()
         metrics.AddPrometheusExporter();
     });
 
-// ── Rate Limiting (auth endpoint protection) ────────────────────────────────
+// ── Rate Limiting ────────────────────────────────────────────────────────
 builder.Services.AddRateLimiter(options =>
 {
     options.RejectionStatusCode = 429;
-    options.AddPolicy("auth", _ => RateLimitPartition.GetFixedWindowLimiter(
-        partitionKey: "auth",
+
+    // Auth endpoints: 10 req/min per IP to resist brute-force
+    options.AddPolicy("auth", httpContext => RateLimitPartition.GetFixedWindowLimiter(
+        partitionKey: httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown",
         factory: _ => new FixedWindowRateLimiterOptions
         {
             PermitLimit = 10,
+            Window = TimeSpan.FromMinutes(1),
+            QueueLimit = 0,
+        }));
+
+    // EA high-frequency endpoints: 10,000 req/min per EA instance.
+    // Partition key requires X-EA-Instance-ID header; falls back to IP with a
+    // stricter limit (1,000 req/min) to throttle misconfigured EA instances.
+    options.AddPolicy("ea", httpContext =>
+    {
+        var instanceId = httpContext.Request.Headers["X-EA-Instance-ID"].FirstOrDefault();
+        if (!string.IsNullOrEmpty(instanceId))
+        {
+            return RateLimitPartition.GetSlidingWindowLimiter(
+                partitionKey: instanceId,
+                factory: _ => new SlidingWindowRateLimiterOptions
+                {
+                    PermitLimit = 10_000,
+                    Window = TimeSpan.FromMinutes(1),
+                    SegmentsPerWindow = 6,
+                    QueueLimit = 0,
+                });
+        }
+
+        // Fallback: no instance header — apply a stricter per-IP limit
+        return RateLimitPartition.GetSlidingWindowLimiter(
+            partitionKey: $"ea-ip:{httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown"}",
+            factory: _ => new SlidingWindowRateLimiterOptions
+            {
+                PermitLimit = 1_000,
+                Window = TimeSpan.FromMinutes(1),
+                SegmentsPerWindow = 6,
+                QueueLimit = 0,
+            });
+    });
+
+    // Metrics scrape endpoint: 60 req/min per IP (prevents abuse while allowing normal scraping)
+    options.AddPolicy("metrics", httpContext => RateLimitPartition.GetFixedWindowLimiter(
+        partitionKey: httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+        factory: _ => new FixedWindowRateLimiterOptions
+        {
+            PermitLimit = 60,
             Window = TimeSpan.FromMinutes(1),
             QueueLimit = 0,
         }));
@@ -190,8 +242,8 @@ app.UseRateLimiter();
 
 app.UseCors("LascodiaPolicy");
 
-// Prometheus scrape endpoint — no auth required
-app.MapPrometheusScrapingEndpoint();
+// Prometheus scrape endpoint — rate-limited, no auth required
+app.MapPrometheusScrapingEndpoint().RequireRateLimiting("metrics");
 
 if (app.Environment.IsDevelopment())
 {

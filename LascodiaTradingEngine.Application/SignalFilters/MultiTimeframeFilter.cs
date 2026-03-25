@@ -38,9 +38,31 @@ public class MultiTimeframeFilter : IMultiTimeframeFilter
         string primaryTimeframe,
         CancellationToken ct)
     {
+        var (confirmations, total) = await CountConfirmationsAsync(symbol, signalDirection, primaryTimeframe, ct);
+        if (total == 0) return true;
+        return confirmations > total / 2;
+    }
+
+    public async Task<decimal> GetConfirmationStrengthAsync(
+        string symbol,
+        string signalDirection,
+        string primaryTimeframe,
+        CancellationToken ct)
+    {
+        var (confirmations, total) = await CountConfirmationsAsync(symbol, signalDirection, primaryTimeframe, ct);
+        if (total == 0) return 1.0m;
+        return (decimal)confirmations / total;
+    }
+
+    private async Task<(int Confirmations, int Total)> CountConfirmationsAsync(
+        string symbol,
+        string signalDirection,
+        string primaryTimeframe,
+        CancellationToken ct)
+    {
         if (!Enum.TryParse<Timeframe>(primaryTimeframe, ignoreCase: true, out var primaryTf)
             || !HigherTimeframes.TryGetValue(primaryTf, out var higherTfs) || higherTfs.Length == 0)
-            return true;  // D1 or unknown — no higher TFs to check
+            return (0, 0);
 
         int confirmations = 0;
 
@@ -53,22 +75,20 @@ public class MultiTimeframeFilter : IMultiTimeframeFilter
                 .Take(20)
                 .ToListAsync(ct);
 
-
             if (candles.Count < 20)
-                continue;  // Not enough data to confirm
+                continue;
 
             decimal sma20      = candles.Average(x => x.Close);
-            decimal latestClose = candles[0].Close;  // Most recent close (descending order)
+            decimal latestClose = candles[0].Close;
 
             bool confirms = signalDirection == "Buy"
-                ? latestClose > sma20    // Uptrend confirms Buy
-                : latestClose < sma20;   // Downtrend confirms Sell
+                ? latestClose > sma20
+                : latestClose < sma20;
 
             if (confirms)
                 confirmations++;
         }
 
-        // Majority of higher TFs must confirm
-        return confirmations > higherTfs.Length / 2;
+        return (confirmations, higherTfs.Length);
     }
 }

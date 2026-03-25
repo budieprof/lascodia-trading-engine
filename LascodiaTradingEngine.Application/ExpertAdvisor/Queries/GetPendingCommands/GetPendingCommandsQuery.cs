@@ -33,6 +33,7 @@ public class GetPendingCommandsQueryHandler : IRequestHandler<GetPendingCommands
     {
         var query = _context.GetDbContext()
             .Set<Domain.Entities.EACommand>()
+            .AsNoTracking()
             .Where(x => x.TargetInstanceId == request.EAInstanceId
                       && !x.Acknowledged
                       && !x.IsDeleted);

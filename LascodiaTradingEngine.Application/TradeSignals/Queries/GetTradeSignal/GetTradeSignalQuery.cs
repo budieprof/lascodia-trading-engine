@@ -31,6 +31,7 @@ public class GetTradeSignalQueryHandler : IRequestHandler<GetTradeSignalQuery, R
     {
         var entity = await _context.GetDbContext()
             .Set<Domain.Entities.TradeSignal>()
+            .AsNoTracking()
             .FirstOrDefaultAsync(x => x.Id == request.Id && !x.IsDeleted, cancellationToken);
 
         if (entity == null)

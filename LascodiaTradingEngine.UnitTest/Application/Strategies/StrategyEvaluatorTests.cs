@@ -1,13 +1,72 @@
+using System.Diagnostics.Metrics;
+using LascodiaTradingEngine.Application.Common.Diagnostics;
+using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Options;
 using LascodiaTradingEngine.Application.Strategies.Evaluators;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
+using Microsoft.Extensions.Logging.Abstractions;
+using Moq;
 
 namespace LascodiaTradingEngine.UnitTest.Application.Strategies;
 
-public class StrategyEvaluatorTests
+public class StrategyEvaluatorTests : IDisposable
 {
     private readonly StrategyEvaluatorOptions _defaultOptions = new();
+    private readonly TestMeterFactory _meterFactory = new();
+    private readonly TradingMetrics _metrics;
+    private readonly IMarketRegimeDetector _regimeDetector = Mock.Of<IMarketRegimeDetector>();
+    private readonly IMultiTimeframeFilter _mtfFilter = Mock.Of<IMultiTimeframeFilter>();
+
+    public StrategyEvaluatorTests()
+    {
+        _metrics = new TradingMetrics(_meterFactory);
+    }
+
+    public void Dispose()
+    {
+        _meterFactory.Dispose();
+        GC.SuppressFinalize(this);
+    }
+
+    private sealed class TestMeterFactory : IMeterFactory
+    {
+        private readonly List<Meter> _meters = [];
+        public Meter Create(MeterOptions options)
+        {
+            var meter = new Meter(options);
+            _meters.Add(meter);
+            return meter;
+        }
+        public void Dispose()
+        {
+            foreach (var meter in _meters) meter.Dispose();
+            _meters.Clear();
+        }
+    }
+
+    /// <summary>
+    /// Options with all MA crossover hardening filters disabled so core crossover
+    /// logic can be tested with minimal candle data.
+    /// </summary>
+    private static StrategyEvaluatorOptions MaCrossoverCoreOptions() => new()
+    {
+        MaCrossoverMinAdx = 0,
+        MaCrossoverMaxRecentCrossovers = 0,
+        MaCrossoverMinMagnitudeAtrFraction = 0,
+        MaCrossoverMaxSpreadAtrFraction = 0,
+        MaCrossoverMinVolume = 0,
+        MaCrossoverMaxGapAtrFraction = 0,        // disable gap rejection
+        MaCrossoverDeadbandAtrFraction = 0,       // disable deadband so small crosses register
+        MaCrossoverMinRiskRewardRatio = 0,        // disable R:R gate
+        MaCrossoverMaxRsiForBuy = 0,              // disable RSI filter
+        MaCrossoverMinRsiForSell = 0,             // disable RSI filter
+        MaCrossoverSwingSlEnabled = false,         // no swing SL override
+        MaCrossoverSwingTpEnabled = false,         // no swing TP override
+        MaCrossoverConfirmationBars = 0,           // no multi-bar confirmation
+        MaCrossoverDynamicSlTp = false,            // no ADX-based SL/TP scaling
+        MaCrossoverSlippageAtrFraction = 0         // no slippage buffer
+    };
 
     // ────────────────────────────────────────────────────────────────────────
     //  Helpers
@@ -95,7 +154,7 @@ public class StrategyEvaluatorTests
     [Fact]
     public async Task Breakout_Buy_Signal_When_Price_Breaks_Above_NBarHigh()
     {
-        var evaluator = new BreakoutScalperEvaluator(_defaultOptions);
+        var evaluator = new BreakoutScalperEvaluator(_defaultOptions, NullLogger<BreakoutScalperEvaluator>.Instance, _metrics);
         var strategy = CreateStrategy(StrategyType.BreakoutScalper);
 
         // 22 candles ranging around 1.1000
@@ -112,7 +171,8 @@ public class StrategyEvaluatorTests
         Assert.NotNull(signal);
         Assert.Equal(TradeDirection.Buy, signal!.Direction);
         Assert.Equal(ask, signal.EntryPrice);
-        Assert.Equal(_defaultOptions.BreakoutConfidence, signal.Confidence);
+        Assert.True(signal.Confidence >= _defaultOptions.BreakoutConfidence, "Confidence should be at least base confidence");
+        Assert.InRange(signal.Confidence, 0m, 1m);
         Assert.Equal(_defaultOptions.DefaultLotSize, signal.SuggestedLotSize);
         Assert.Equal(TradeSignalStatus.Pending, signal.Status);
         Assert.Equal(strategy.Id, signal.StrategyId);
@@ -127,7 +187,7 @@ public class StrategyEvaluatorTests
     [Fact]
     public async Task Breakout_Sell_Signal_When_Price_Breaks_Below_NBarLow()
     {
-        var evaluator = new BreakoutScalperEvaluator(_defaultOptions);
+        var evaluator = new BreakoutScalperEvaluator(_defaultOptions, NullLogger<BreakoutScalperEvaluator>.Instance, _metrics);
         var strategy = CreateStrategy(StrategyType.BreakoutScalper);
 
         var candles = GenerateCandles(Enumerable.Range(0, 22)
@@ -143,14 +203,15 @@ public class StrategyEvaluatorTests
         Assert.NotNull(signal);
         Assert.Equal(TradeDirection.Sell, signal!.Direction);
         Assert.Equal(bid, signal.EntryPrice);
-        Assert.Equal(_defaultOptions.BreakoutConfidence, signal.Confidence);
+        Assert.True(signal.Confidence >= _defaultOptions.BreakoutConfidence, "Confidence should be at least base confidence");
+        Assert.InRange(signal.Confidence, 0m, 1m);
         Assert.Equal(_defaultOptions.DefaultLotSize, signal.SuggestedLotSize);
     }
 
     [Fact]
     public async Task Breakout_No_Signal_When_Insufficient_Candles()
     {
-        var evaluator = new BreakoutScalperEvaluator(_defaultOptions);
+        var evaluator = new BreakoutScalperEvaluator(_defaultOptions, NullLogger<BreakoutScalperEvaluator>.Instance, _metrics);
         var strategy = CreateStrategy(StrategyType.BreakoutScalper);
 
         // Only 10 candles -- needs 21 (lookbackBars + 1)
@@ -165,7 +226,7 @@ public class StrategyEvaluatorTests
     [Fact]
     public async Task Breakout_No_Signal_When_Price_Inside_Range()
     {
-        var evaluator = new BreakoutScalperEvaluator(_defaultOptions);
+        var evaluator = new BreakoutScalperEvaluator(_defaultOptions, NullLogger<BreakoutScalperEvaluator>.Instance, _metrics);
         var strategy = CreateStrategy(StrategyType.BreakoutScalper);
 
         var candles = GenerateCandles(Enumerable.Range(0, 22)
@@ -189,7 +250,7 @@ public class StrategyEvaluatorTests
             BreakoutConfidence = 0.80m,
             BreakoutExpiryMinutes = 30
         };
-        var evaluator = new BreakoutScalperEvaluator(customOptions);
+        var evaluator = new BreakoutScalperEvaluator(customOptions, NullLogger<BreakoutScalperEvaluator>.Instance, _metrics);
         var strategy = CreateStrategy(StrategyType.BreakoutScalper);
 
         var candles = GenerateCandles(Enumerable.Range(0, 22)
@@ -202,7 +263,8 @@ public class StrategyEvaluatorTests
 
         Assert.NotNull(signal);
         Assert.Equal(0.05m, signal!.SuggestedLotSize);
-        Assert.Equal(0.80m, signal.Confidence);
+        Assert.True(signal.Confidence >= 0.80m, "Confidence should be at least the configured base confidence");
+        Assert.InRange(signal.Confidence, 0m, 1m);
         Assert.InRange(
             (signal.ExpiresAt - signal.GeneratedAt).TotalMinutes, 29, 31);
     }
@@ -214,30 +276,12 @@ public class StrategyEvaluatorTests
     [Fact]
     public async Task MaCrossover_Buy_Signal_When_Fast_Crosses_Above_Slow()
     {
-        var evaluator = new MovingAverageCrossoverEvaluator(_defaultOptions);
+        var options = MaCrossoverCoreOptions();
+        var evaluator = new MovingAverageCrossoverEvaluator(options, NullLogger<MovingAverageCrossoverEvaluator>.Instance, _metrics);
         var strategy = CreateStrategy(StrategyType.MovingAverageCrossover,
-            parametersJson: "{\"FastPeriod\":3,\"SlowPeriod\":7,\"MaPeriod\":0}");
+            parametersJson: "{\"FastPeriod\":3,\"SlowPeriod\":7,\"MaPeriod\":0,\"UseEma\":false}");
 
-        // We need: at bar N-1 (second-to-last), fast3 <= slow7;
-        //          at bar N   (last),           fast3 >  slow7.
-        // Strategy: long decline keeping fast below slow, then a single large jump
-        // at the last bar that pulls the 3-bar SMA above the 7-bar SMA.
-        //
-        // Indices:  0      1      2      3      4      5      6      7
-        // Prices:   1.10   1.09   1.08   1.07   1.06   1.05   1.04   1.12
-        //
-        // Bar 6 (prev): fast3 = avg(1.06,1.05,1.04) = 1.05
-        //               slow7 = avg(1.10,1.09,..,1.04) = 1.07
-        //               fast < slow => OK
-        // Bar 7 (curr): fast3 = avg(1.05,1.04,1.12) = 1.07
-        //               slow7 = avg(1.09,1.08,..,1.12) = 1.0757..
-        //               fast < slow => still no cross — need bigger jump.
-        //
-        // Let's use a bigger jump: last bar = 1.20
-        // Bar 7: fast3 = avg(1.05,1.04,1.20) = 1.0967
-        //         slow7 = avg(1.09,1.08,1.07,1.06,1.05,1.04,1.20) = 1.0843
-        //         fast > slow => cross!
-        // Enough candles for ATR period: 8 flat + 8 crossover pattern = 16
+        // 8 flat + decline + large jump at bar 15 to force bullish crossover
         var prices = new decimal[]
         {
             1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m,
@@ -252,8 +296,7 @@ public class StrategyEvaluatorTests
         Assert.NotNull(signal);
         Assert.Equal(TradeDirection.Buy, signal!.Direction);
         Assert.Equal(ask, signal.EntryPrice);
-        Assert.Equal(_defaultOptions.MaCrossoverConfidence, signal.Confidence);
-        Assert.Equal(_defaultOptions.DefaultLotSize, signal.SuggestedLotSize);
+        Assert.Equal(options.DefaultLotSize, signal.SuggestedLotSize);
         Assert.Equal(TradeSignalStatus.Pending, signal.Status);
         Assert.Equal(strategy.Id, signal.StrategyId);
         Assert.Equal(strategy.Symbol, signal.Symbol);
@@ -261,33 +304,22 @@ public class StrategyEvaluatorTests
         Assert.NotNull(signal.TakeProfit);
         Assert.True(signal.StopLoss < signal.EntryPrice, "Buy signal SL should be below entry");
         Assert.True(signal.TakeProfit > signal.EntryPrice, "Buy signal TP should be above entry");
+        Assert.InRange(signal.Confidence, 0.1m, 1.0m);
         Assert.InRange(
             (signal.ExpiresAt - signal.GeneratedAt).TotalMinutes,
-            _defaultOptions.MaCrossoverExpiryMinutes - 1,
-            _defaultOptions.MaCrossoverExpiryMinutes + 1);
+            options.MaCrossoverExpiryMinutes - 1,
+            options.MaCrossoverExpiryMinutes + 1);
     }
 
     [Fact]
     public async Task MaCrossover_Sell_Signal_When_Fast_Crosses_Below_Slow()
     {
-        var evaluator = new MovingAverageCrossoverEvaluator(_defaultOptions);
+        var options = MaCrossoverCoreOptions();
+        var evaluator = new MovingAverageCrossoverEvaluator(options, NullLogger<MovingAverageCrossoverEvaluator>.Instance, _metrics);
         var strategy = CreateStrategy(StrategyType.MovingAverageCrossover,
-            parametersJson: "{\"FastPeriod\":3,\"SlowPeriod\":7,\"MaPeriod\":0}");
+            parametersJson: "{\"FastPeriod\":3,\"SlowPeriod\":7,\"MaPeriod\":0,\"UseEma\":false}");
 
-        // Mirror of the buy test: long rally then a single large drop at the last bar.
-        //
-        // Indices:  0      1      2      3      4      5      6      7
-        // Prices:   1.04   1.05   1.06   1.07   1.08   1.09   1.10   0.94
-        //
-        // Bar 6 (prev): fast3 = avg(1.08,1.09,1.10) = 1.09
-        //               slow7 = avg(1.04..1.10)      = 1.07
-        //               fast > slow => OK (no bearish cross yet)
-        // Bar 7 (curr): fast3 = avg(1.09,1.10,0.94) = 1.0433
-        //               slow7 = avg(1.05,1.06,1.07,1.08,1.09,1.10,0.94) = 1.0557
-        //               fast < slow => bearish cross!
-        //
-        // longMaBearish: MaPeriod=0 so longMa=null, condition is true.
-        // Enough candles for ATR period: 8 flat + 8 crossover pattern = 16
+        // Rally then a single large drop at the last bar to force bearish crossover
         var prices = new decimal[]
         {
             1.0700m, 1.0700m, 1.0700m, 1.0700m, 1.0700m, 1.0700m, 1.0700m, 1.0700m,
@@ -302,7 +334,7 @@ public class StrategyEvaluatorTests
         Assert.NotNull(signal);
         Assert.Equal(TradeDirection.Sell, signal!.Direction);
         Assert.Equal(bid, signal.EntryPrice);
-        Assert.Equal(_defaultOptions.MaCrossoverConfidence, signal.Confidence);
+        Assert.InRange(signal.Confidence, 0.1m, 1.0m);
         Assert.NotNull(signal.StopLoss);
         Assert.NotNull(signal.TakeProfit);
         Assert.True(signal.StopLoss > signal.EntryPrice, "Sell signal SL should be above entry");
@@ -312,8 +344,8 @@ public class StrategyEvaluatorTests
     [Fact]
     public async Task MaCrossover_No_Signal_When_Insufficient_Candles()
     {
-        var evaluator = new MovingAverageCrossoverEvaluator(_defaultOptions);
-        // Default slow period is 21, need 22 candles
+        var options = MaCrossoverCoreOptions();
+        var evaluator = new MovingAverageCrossoverEvaluator(options, NullLogger<MovingAverageCrossoverEvaluator>.Instance, _metrics);
         var strategy = CreateStrategy(StrategyType.MovingAverageCrossover);
 
         var candles = GenerateTrendCandles(5, 1.1000m, 0.0001m);
@@ -327,12 +359,13 @@ public class StrategyEvaluatorTests
     [Fact]
     public async Task MaCrossover_No_Signal_When_No_Crossover()
     {
-        var evaluator = new MovingAverageCrossoverEvaluator(_defaultOptions);
+        var options = MaCrossoverCoreOptions();
+        var evaluator = new MovingAverageCrossoverEvaluator(options, NullLogger<MovingAverageCrossoverEvaluator>.Instance, _metrics);
         var strategy = CreateStrategy(StrategyType.MovingAverageCrossover,
-            parametersJson: "{\"FastPeriod\":3,\"SlowPeriod\":7,\"MaPeriod\":0}");
+            parametersJson: "{\"FastPeriod\":3,\"SlowPeriod\":7,\"MaPeriod\":0,\"UseEma\":false}");
 
-        // Steady uptrend -- fast SMA stays above slow SMA the whole time, no crossover event
-        var candles = GenerateTrendCandles(12, 1.1000m, 0.0010m);
+        // Steady uptrend -- fast SMA stays above slow SMA the whole time
+        var candles = GenerateTrendCandles(16, 1.1000m, 0.0010m);
         decimal lastClose = candles[^1].Close;
 
         var signal = await evaluator.EvaluateAsync(
@@ -348,13 +381,27 @@ public class StrategyEvaluatorTests
         {
             DefaultLotSize = 0.10m,
             MaCrossoverConfidence = 0.85m,
-            MaCrossoverExpiryMinutes = 120
+            MaCrossoverExpiryMinutes = 120,
+            MaCrossoverMinAdx = 0,
+            MaCrossoverMaxRecentCrossovers = 0,
+            MaCrossoverMinMagnitudeAtrFraction = 0,
+            MaCrossoverMaxSpreadAtrFraction = 0,
+            MaCrossoverMinVolume = 0,
+            MaCrossoverMaxGapAtrFraction = 0,
+            MaCrossoverDeadbandAtrFraction = 0,
+            MaCrossoverMinRiskRewardRatio = 0,
+            MaCrossoverMaxRsiForBuy = 0,
+            MaCrossoverMinRsiForSell = 0,
+            MaCrossoverSwingSlEnabled = false,
+            MaCrossoverSwingTpEnabled = false,
+            MaCrossoverConfirmationBars = 0,
+            MaCrossoverDynamicSlTp = false,
+            MaCrossoverSlippageAtrFraction = 0
         };
-        var evaluator = new MovingAverageCrossoverEvaluator(customOptions);
+        var evaluator = new MovingAverageCrossoverEvaluator(customOptions, NullLogger<MovingAverageCrossoverEvaluator>.Instance, _metrics);
         var strategy = CreateStrategy(StrategyType.MovingAverageCrossover,
-            parametersJson: "{\"FastPeriod\":3,\"SlowPeriod\":7,\"MaPeriod\":0}");
+            parametersJson: "{\"FastPeriod\":3,\"SlowPeriod\":7,\"MaPeriod\":0,\"UseEma\":false}");
 
-        // Enough candles for ATR period: 8 flat + 8 crossover pattern = 16
         var prices = new decimal[]
         {
             1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m,
@@ -367,9 +414,289 @@ public class StrategyEvaluatorTests
 
         Assert.NotNull(signal);
         Assert.Equal(0.10m, signal!.SuggestedLotSize);
-        Assert.Equal(0.85m, signal.Confidence);
+        Assert.InRange(signal.Confidence, 0.1m, 1.0m);
         Assert.InRange(
             (signal.ExpiresAt - signal.GeneratedAt).TotalMinutes, 119, 121);
+    }
+
+    // ========================================================================
+    //  MovingAverageCrossoverEvaluator — Hardening filters
+    // ========================================================================
+
+    [Fact]
+    public async Task MaCrossover_EMA_Produces_Signal()
+    {
+        var options = MaCrossoverCoreOptions();
+        var evaluator = new MovingAverageCrossoverEvaluator(options, NullLogger<MovingAverageCrossoverEvaluator>.Instance, _metrics);
+        var strategy = CreateStrategy(StrategyType.MovingAverageCrossover,
+            parametersJson: "{\"FastPeriod\":3,\"SlowPeriod\":7,\"MaPeriod\":0,\"UseEma\":true}");
+
+        var prices = new decimal[]
+        {
+            1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m,
+            1.1000m, 1.0900m, 1.0800m, 1.0700m, 1.0600m, 1.0500m, 1.0400m, 1.2000m
+        };
+        var candles = GenerateCandles(prices);
+
+        var signal = await evaluator.EvaluateAsync(
+            strategy, candles, (1.2000m, 1.2002m), CancellationToken.None);
+
+        Assert.NotNull(signal);
+        Assert.Equal(TradeDirection.Buy, signal!.Direction);
+    }
+
+    [Fact]
+    public async Task MaCrossover_Rejected_By_Spread_Filter()
+    {
+        var options = MaCrossoverCoreOptions();
+        options.MaCrossoverMaxSpreadAtrFraction = 0.01m; // very tight — will reject
+        var evaluator = new MovingAverageCrossoverEvaluator(options, NullLogger<MovingAverageCrossoverEvaluator>.Instance, _metrics);
+        var strategy = CreateStrategy(StrategyType.MovingAverageCrossover,
+            parametersJson: "{\"FastPeriod\":3,\"SlowPeriod\":7,\"MaPeriod\":0,\"UseEma\":false}");
+
+        var prices = new decimal[]
+        {
+            1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m,
+            1.1000m, 1.0900m, 1.0800m, 1.0700m, 1.0600m, 1.0500m, 1.0400m, 1.2000m
+        };
+        var candles = GenerateCandles(prices);
+
+        // Wide spread: 50 pips
+        var signal = await evaluator.EvaluateAsync(
+            strategy, candles, (1.1950m, 1.2000m), CancellationToken.None);
+
+        Assert.Null(signal);
+    }
+
+    [Fact]
+    public async Task MaCrossover_Rejected_By_Volume_Filter()
+    {
+        var options = MaCrossoverCoreOptions();
+        options.MaCrossoverMinVolume = 5000m; // test candles have Volume = 1000
+        var evaluator = new MovingAverageCrossoverEvaluator(options, NullLogger<MovingAverageCrossoverEvaluator>.Instance, _metrics);
+        var strategy = CreateStrategy(StrategyType.MovingAverageCrossover,
+            parametersJson: "{\"FastPeriod\":3,\"SlowPeriod\":7,\"MaPeriod\":0,\"UseEma\":false}");
+
+        var prices = new decimal[]
+        {
+            1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m,
+            1.1000m, 1.0900m, 1.0800m, 1.0700m, 1.0600m, 1.0500m, 1.0400m, 1.2000m
+        };
+        var candles = GenerateCandles(prices);
+
+        var signal = await evaluator.EvaluateAsync(
+            strategy, candles, (1.2000m, 1.2002m), CancellationToken.None);
+
+        Assert.Null(signal);
+    }
+
+    [Fact]
+    public async Task MaCrossover_Rejected_By_Magnitude_Filter()
+    {
+        var options = MaCrossoverCoreOptions();
+        options.MaCrossoverMinMagnitudeAtrFraction = 10.0m; // impossibly high
+        var evaluator = new MovingAverageCrossoverEvaluator(options, NullLogger<MovingAverageCrossoverEvaluator>.Instance, _metrics);
+        var strategy = CreateStrategy(StrategyType.MovingAverageCrossover,
+            parametersJson: "{\"FastPeriod\":3,\"SlowPeriod\":7,\"MaPeriod\":0,\"UseEma\":false}");
+
+        var prices = new decimal[]
+        {
+            1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m,
+            1.1000m, 1.0900m, 1.0800m, 1.0700m, 1.0600m, 1.0500m, 1.0400m, 1.2000m
+        };
+        var candles = GenerateCandles(prices);
+
+        var signal = await evaluator.EvaluateAsync(
+            strategy, candles, (1.2000m, 1.2002m), CancellationToken.None);
+
+        Assert.Null(signal);
+    }
+
+    [Fact]
+    public async Task MaCrossover_Rejected_By_Whipsaw_Filter()
+    {
+        var options = MaCrossoverCoreOptions();
+        options.MaCrossoverMaxRecentCrossovers = 1; // allow only 1 recent crossover
+        options.MaCrossoverWhipsawLookbackBars = 15;
+        var evaluator = new MovingAverageCrossoverEvaluator(options, NullLogger<MovingAverageCrossoverEvaluator>.Instance, _metrics);
+        var strategy = CreateStrategy(StrategyType.MovingAverageCrossover,
+            parametersJson: "{\"FastPeriod\":3,\"SlowPeriod\":5,\"MaPeriod\":0,\"UseEma\":false}");
+
+        // Choppy price action: alternating up/down to create multiple crossovers
+        var prices = new decimal[]
+        {
+            1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m,
+            1.1200m, 1.0800m, 1.1200m, 1.0800m, 1.1200m, 1.0800m, 1.1200m, 1.0800m
+        };
+        var candles = GenerateCandles(prices);
+        decimal lastClose = candles[^1].Close;
+
+        var signal = await evaluator.EvaluateAsync(
+            strategy, candles, (lastClose, lastClose + 0.0002m), CancellationToken.None);
+
+        Assert.Null(signal);
+    }
+
+    [Fact]
+    public async Task MaCrossover_Dynamic_Confidence_Is_Not_Static()
+    {
+        // Verify that dynamic confidence varies based on signal conditions
+        // (not a fixed value from options)
+        var options = MaCrossoverCoreOptions();
+        options.MaCrossoverConfidence = 0.70m;
+        var evaluator = new MovingAverageCrossoverEvaluator(options, NullLogger<MovingAverageCrossoverEvaluator>.Instance, _metrics);
+        var strategy = CreateStrategy(StrategyType.MovingAverageCrossover,
+            parametersJson: "{\"FastPeriod\":3,\"SlowPeriod\":7,\"MaPeriod\":0,\"UseEma\":false}");
+
+        var prices = new decimal[]
+        {
+            1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m,
+            1.1000m, 1.0900m, 1.0800m, 1.0700m, 1.0600m, 1.0500m, 1.0400m, 1.2000m
+        };
+        var candles = GenerateCandles(prices);
+
+        var signal = await evaluator.EvaluateAsync(
+            strategy, candles, (1.2000m, 1.2002m), CancellationToken.None);
+
+        Assert.NotNull(signal);
+        // Confidence should be dynamic (not exactly the base value)
+        Assert.InRange(signal!.Confidence, 0.1m, 1.0m);
+        // It should differ from the static base — the multi-factor scoring adjusts it
+        Assert.NotEqual(0.70m, signal.Confidence);
+    }
+
+    [Fact]
+    public async Task MaCrossover_Rejected_By_ADX_Filter()
+    {
+        var options = MaCrossoverCoreOptions();
+        options.MaCrossoverMinAdx = 99m; // impossibly high — guaranteed rejection
+        options.MaCrossoverAdxPeriod = 7;
+        var evaluator = new MovingAverageCrossoverEvaluator(options, NullLogger<MovingAverageCrossoverEvaluator>.Instance, _metrics);
+        var strategy = CreateStrategy(StrategyType.MovingAverageCrossover,
+            parametersJson: "{\"FastPeriod\":3,\"SlowPeriod\":7,\"MaPeriod\":0,\"UseEma\":false}");
+
+        var prices = new decimal[]
+        {
+            1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m,
+            1.1000m, 1.0900m, 1.0800m, 1.0700m, 1.0600m, 1.0500m, 1.0400m, 1.2000m
+        };
+        var candles = GenerateCandles(prices);
+
+        var signal = await evaluator.EvaluateAsync(
+            strategy, candles, (1.2000m, 1.2002m), CancellationToken.None);
+
+        Assert.Null(signal);
+    }
+
+    [Fact]
+    public async Task MaCrossover_No_Signal_When_Zero_Volume_Candles()
+    {
+        var options = MaCrossoverCoreOptions();
+        options.MaCrossoverMinVolume = 1m; // require at least 1 volume
+        var evaluator = new MovingAverageCrossoverEvaluator(options, NullLogger<MovingAverageCrossoverEvaluator>.Instance, _metrics);
+        var strategy = CreateStrategy(StrategyType.MovingAverageCrossover,
+            parametersJson: "{\"FastPeriod\":3,\"SlowPeriod\":7,\"MaPeriod\":0,\"UseEma\":false}");
+
+        var prices = new decimal[]
+        {
+            1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m,
+            1.1000m, 1.0900m, 1.0800m, 1.0700m, 1.0600m, 1.0500m, 1.0400m, 1.2000m
+        };
+        // Generate candles with zero volume
+        var candles = GenerateCandles(prices);
+        foreach (var c in candles) c.Volume = 0m;
+
+        var signal = await evaluator.EvaluateAsync(
+            strategy, candles, (1.2000m, 1.2002m), CancellationToken.None);
+
+        Assert.Null(signal);
+    }
+
+    [Fact]
+    public async Task MaCrossover_Passes_When_Equal_Fast_Slow_Clamped()
+    {
+        // FastPeriod == SlowPeriod should be clamped so fast = slow - 1
+        var options = MaCrossoverCoreOptions();
+        var evaluator = new MovingAverageCrossoverEvaluator(options, NullLogger<MovingAverageCrossoverEvaluator>.Instance, _metrics);
+        var strategy = CreateStrategy(StrategyType.MovingAverageCrossover,
+            parametersJson: "{\"FastPeriod\":7,\"SlowPeriod\":7,\"MaPeriod\":0,\"UseEma\":false}");
+
+        // After clamping, fast=6, slow=7 — should not crash
+        var candles = GenerateTrendCandles(16, 1.1000m, 0.0010m);
+        decimal lastClose = candles[^1].Close;
+
+        var signal = await evaluator.EvaluateAsync(
+            strategy, candles, (lastClose, lastClose + 0.0002m), CancellationToken.None);
+
+        // No assertion on signal value — just verify it doesn't throw
+    }
+
+    [Fact]
+    public async Task MaCrossover_VWMA_Produces_Signal()
+    {
+        var options = MaCrossoverCoreOptions();
+        var evaluator = new MovingAverageCrossoverEvaluator(options, NullLogger<MovingAverageCrossoverEvaluator>.Instance, _metrics);
+        var strategy = CreateStrategy(StrategyType.MovingAverageCrossover,
+            parametersJson: "{\"FastPeriod\":3,\"SlowPeriod\":7,\"MaPeriod\":0,\"MaType\":\"Vwma\"}");
+
+        var prices = new decimal[]
+        {
+            1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m,
+            1.1000m, 1.0900m, 1.0800m, 1.0700m, 1.0600m, 1.0500m, 1.0400m, 1.2000m
+        };
+        var candles = GenerateCandles(prices);
+
+        var signal = await evaluator.EvaluateAsync(
+            strategy, candles, (1.2000m, 1.2002m), CancellationToken.None);
+
+        Assert.NotNull(signal);
+        Assert.Equal(TradeDirection.Buy, signal!.Direction);
+    }
+
+    [Fact]
+    public async Task MaCrossover_VWMA_Falls_Back_To_SMA_On_Zero_Volume()
+    {
+        var options = MaCrossoverCoreOptions();
+        var evaluator = new MovingAverageCrossoverEvaluator(options, NullLogger<MovingAverageCrossoverEvaluator>.Instance, _metrics);
+        var strategy = CreateStrategy(StrategyType.MovingAverageCrossover,
+            parametersJson: "{\"FastPeriod\":3,\"SlowPeriod\":7,\"MaPeriod\":0,\"MaType\":\"Vwma\"}");
+
+        var prices = new decimal[]
+        {
+            1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m,
+            1.1000m, 1.0900m, 1.0800m, 1.0700m, 1.0600m, 1.0500m, 1.0400m, 1.2000m
+        };
+        var candles = GenerateCandles(prices);
+        foreach (var c in candles) c.Volume = 0m;
+
+        // Should not crash — VWMA falls back to SMA when volume is zero
+        var signal = await evaluator.EvaluateAsync(
+            strategy, candles, (1.2000m, 1.2002m), CancellationToken.None);
+
+        Assert.NotNull(signal);
+    }
+
+    [Fact]
+    public async Task MaCrossover_MaType_String_Backwards_Compatible_With_UseEma()
+    {
+        var options = MaCrossoverCoreOptions();
+        var evaluator = new MovingAverageCrossoverEvaluator(options, NullLogger<MovingAverageCrossoverEvaluator>.Instance, _metrics);
+
+        // Old-style "UseEma": false should still work
+        var strategy = CreateStrategy(StrategyType.MovingAverageCrossover,
+            parametersJson: "{\"FastPeriod\":3,\"SlowPeriod\":7,\"MaPeriod\":0,\"UseEma\":false}");
+
+        var prices = new decimal[]
+        {
+            1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m,
+            1.1000m, 1.0900m, 1.0800m, 1.0700m, 1.0600m, 1.0500m, 1.0400m, 1.2000m
+        };
+        var candles = GenerateCandles(prices);
+
+        var signal = await evaluator.EvaluateAsync(
+            strategy, candles, (1.2000m, 1.2002m), CancellationToken.None);
+
+        Assert.NotNull(signal);
     }
 
     // ========================================================================
@@ -530,11 +857,11 @@ public class StrategyEvaluatorTests
     [Fact]
     public void Evaluators_Report_Correct_StrategyType()
     {
-        var breakout   = new BreakoutScalperEvaluator(_defaultOptions);
-        var maCross    = new MovingAverageCrossoverEvaluator(_defaultOptions);
+        var breakout   = new BreakoutScalperEvaluator(_defaultOptions, NullLogger<BreakoutScalperEvaluator>.Instance, _metrics);
+        var maCross    = new MovingAverageCrossoverEvaluator(_defaultOptions, NullLogger<MovingAverageCrossoverEvaluator>.Instance, _metrics);
         var rsi        = new RSIReversionEvaluator(_defaultOptions);
         var bollinger  = new BollingerBandReversionEvaluator(_defaultOptions);
-        var macd       = new MACDDivergenceEvaluator(_defaultOptions);
+        var macd       = new MACDDivergenceEvaluator(_defaultOptions, NullLogger<MACDDivergenceEvaluator>.Instance, _metrics, _regimeDetector, _mtfFilter);
         var session    = new SessionBreakoutEvaluator(_defaultOptions);
         var momentum   = new MomentumTrendEvaluator(_defaultOptions);
 
@@ -562,13 +889,16 @@ public class StrategyEvaluatorTests
         var strategy = CreateStrategy(StrategyType.BollingerBandReversion,
             parametersJson: "{\"Period\":10,\"StdDevMultiple\":2.0,\"SqueezeThreshold\":0.0}");
 
-        // 10 candles oscillating around 1.1000, then a sharp dip and recovery
+        // 14 flat warmup bars (RSI warmup) + 10 oscillating bars + sharp dip + recovery
         var prices = new decimal[]
         {
+            1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m,
+            1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m,
+            1.1000m, 1.1000m, 1.1000m, 1.1000m, // 14 warmup bars
             1.1000m, 1.1010m, 1.0990m, 1.1005m, 1.0995m,
             1.1002m, 1.0998m, 1.1003m, 1.0997m, 1.1001m,
             1.1000m, 1.1005m, 1.0995m, 1.1000m,
-            1.0900m, // sharp dip — below lower band
+            1.0940m, // dip — below lower band but gap within 2× ATR threshold
             1.0980m  // recovery — back inside band
         };
         var candles = GenerateCandles(prices);
@@ -593,10 +923,13 @@ public class StrategyEvaluatorTests
 
         var prices = new decimal[]
         {
+            1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m,
+            1.1000m, 1.1000m, 1.1000m, 1.1000m, 1.1000m,
+            1.1000m, 1.1000m, 1.1000m, 1.1000m, // 14 warmup bars
             1.1000m, 1.1010m, 1.0990m, 1.1005m, 1.0995m,
             1.1002m, 1.0998m, 1.1003m, 1.0997m, 1.1001m,
             1.1000m, 1.1005m, 1.0995m, 1.1000m,
-            1.1100m, // spike above upper band
+            1.1060m, // spike above upper band but gap within 2× ATR threshold
             1.1020m  // reversal — back inside band
         };
         var candles = GenerateCandles(prices);
@@ -656,7 +989,7 @@ public class StrategyEvaluatorTests
     [Fact]
     public async Task Macd_Buy_Signal_On_Zero_Line_Crossover()
     {
-        var evaluator = new MACDDivergenceEvaluator(_defaultOptions);
+        var evaluator = new MACDDivergenceEvaluator(_defaultOptions, NullLogger<MACDDivergenceEvaluator>.Instance, _metrics, _regimeDetector, _mtfFilter);
         var strategy = CreateStrategy(StrategyType.MACDDivergence,
             parametersJson: "{\"FastPeriod\":5,\"SlowPeriod\":10,\"SignalPeriod\":3,\"DivergenceLookback\":5}");
 
@@ -689,7 +1022,7 @@ public class StrategyEvaluatorTests
     [Fact]
     public async Task Macd_Sell_Signal_On_Zero_Line_Crossover()
     {
-        var evaluator = new MACDDivergenceEvaluator(_defaultOptions);
+        var evaluator = new MACDDivergenceEvaluator(_defaultOptions, NullLogger<MACDDivergenceEvaluator>.Instance, _metrics, _regimeDetector, _mtfFilter);
         var strategy = CreateStrategy(StrategyType.MACDDivergence,
             parametersJson: "{\"FastPeriod\":5,\"SlowPeriod\":10,\"SignalPeriod\":3,\"DivergenceLookback\":5}");
 
@@ -720,7 +1053,7 @@ public class StrategyEvaluatorTests
     [Fact]
     public async Task Macd_No_Signal_When_Insufficient_Candles()
     {
-        var evaluator = new MACDDivergenceEvaluator(_defaultOptions);
+        var evaluator = new MACDDivergenceEvaluator(_defaultOptions, NullLogger<MACDDivergenceEvaluator>.Instance, _metrics, _regimeDetector, _mtfFilter);
         var strategy = CreateStrategy(StrategyType.MACDDivergence);
 
         var candles = GenerateTrendCandles(5, 1.1000m, 0.0001m);

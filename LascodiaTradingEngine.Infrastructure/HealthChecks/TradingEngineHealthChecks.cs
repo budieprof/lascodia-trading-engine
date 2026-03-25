@@ -1,7 +1,6 @@
 using Lascodia.Trading.Engine.EventBus.Abstractions;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
-using LascodiaTradingEngine.Domain.Enums;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Logging;
@@ -50,19 +49,23 @@ public class DatabaseHealthCheck : IHealthCheck
 }
 
 /// <summary>
-/// Verifies that the RabbitMQ event bus service is registered and resolvable in DI.
-/// This is a lightweight check — it does not attempt to open a connection or publish a message.
+/// Verifies that the event bus is registered and, for RabbitMQ, that the persistent
+/// connection is alive. This catches silent connection drops that the lightweight
+/// DI-resolution-only check would miss.
 /// </summary>
 public class RabbitMQHealthCheck : IHealthCheck
 {
     private readonly IEventBus? _eventBus;
+    private readonly IServiceProvider _serviceProvider;
     private readonly ILogger<RabbitMQHealthCheck> _logger;
 
     public RabbitMQHealthCheck(
         IEventBus? eventBus,
+        IServiceProvider serviceProvider,
         ILogger<RabbitMQHealthCheck> logger)
     {
         _eventBus = eventBus;
+        _serviceProvider = serviceProvider;
         _logger = logger;
     }
 
@@ -79,12 +82,40 @@ public class RabbitMQHealthCheck : IHealthCheck
                     HealthCheckResult.Unhealthy("Event bus (RabbitMQ) is not registered in the service container."));
             }
 
+            // Attempt to resolve the RabbitMQ persistent connection and verify connectivity.
+            // This uses dynamic resolution because the connection type lives in the shared
+            // library and may not be registered when using Kafka instead of RabbitMQ.
+            var connectionType = AppDomain.CurrentDomain.GetAssemblies()
+                .SelectMany(a => { try { return a.GetTypes(); } catch { return []; } })
+                .FirstOrDefault(t => t.Name == "IRabbitMQPersistentConnection" && t.IsInterface);
+
+            if (connectionType is not null)
+            {
+                var connection = _serviceProvider.GetService(connectionType);
+                if (connection is not null)
+                {
+                    var isConnectedProp = connectionType.GetProperty("IsConnected");
+                    if (isConnectedProp is not null)
+                    {
+                        var isConnected = (bool)(isConnectedProp.GetValue(connection) ?? false);
+                        if (!isConnected)
+                        {
+                            _logger.LogWarning("RabbitMQ health check: connection is not active.");
+                            return Task.FromResult(
+                                HealthCheckResult.Degraded(
+                                    "Event bus registered but RabbitMQ connection is not active — " +
+                                    "events may not be delivered until the connection recovers."));
+                        }
+                    }
+                }
+            }
+
             _logger.LogDebug("RabbitMQ health check passed: IEventBus instance resolved ({Type}).",
                 _eventBus.GetType().Name);
 
             return Task.FromResult(
                 HealthCheckResult.Healthy(
-                    $"Event bus is available (implementation: {_eventBus.GetType().Name})."));
+                    $"Event bus is available and connected (implementation: {_eventBus.GetType().Name})."));
         }
         catch (Exception ex)
         {
@@ -96,8 +127,8 @@ public class RabbitMQHealthCheck : IHealthCheck
 }
 
 /// <summary>
-/// Verifies that at least one broker with <see cref="BrokerStatus.Connected"/> status
-/// exists in the database, indicating the engine can route orders.
+/// Verifies that at least one active trading account exists in the database,
+/// indicating the engine can route orders.
 /// </summary>
 public class BrokerHealthCheck : IHealthCheck
 {
@@ -118,26 +149,101 @@ public class BrokerHealthCheck : IHealthCheck
     {
         try
         {
-            var activeBroker = await _readContext.GetDbContext()
-                .Set<Broker>()
+            var activeAccount = await _readContext.GetDbContext()
+                .Set<TradingAccount>()
                 .AsNoTracking()
                 .FirstOrDefaultAsync(
-                    b => b.Status == BrokerStatus.Connected && !b.IsDeleted,
+                    a => a.IsActive && !a.IsDeleted,
                     cancellationToken);
 
-            if (activeBroker is not null)
+            if (activeAccount is not null)
             {
                 return HealthCheckResult.Healthy(
-                    $"Active broker found: {activeBroker.Name} (Id: {activeBroker.Id}).");
+                    $"Active trading account found: {activeAccount.AccountName} (Id: {activeAccount.Id}).");
             }
 
-            _logger.LogWarning("Broker health check: no connected broker found in the database.");
-            return HealthCheckResult.Unhealthy("No broker with Connected status found in the database.");
+            _logger.LogWarning("Broker health check: no active trading account found in the database.");
+            return HealthCheckResult.Unhealthy("No active trading account found in the database.");
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Broker health check threw an exception.");
-            return HealthCheckResult.Unhealthy("Broker connectivity check failed.", ex);
+            return HealthCheckResult.Unhealthy("Trading account connectivity check failed.", ex);
+        }
+    }
+}
+
+/// <summary>
+/// Verifies that at least one EA instance has sent a heartbeat within the last 60 seconds.
+/// If all instances are stale or no instances exist, the engine has no market data source.
+/// </summary>
+public class EAHeartbeatHealthCheck : IHealthCheck
+{
+    private static readonly TimeSpan HeartbeatTimeout = TimeSpan.FromSeconds(60);
+
+    private readonly IReadApplicationDbContext _readContext;
+    private readonly ILogger<EAHeartbeatHealthCheck> _logger;
+
+    public EAHeartbeatHealthCheck(
+        IReadApplicationDbContext readContext,
+        ILogger<EAHeartbeatHealthCheck> logger)
+    {
+        _readContext = readContext;
+        _logger = logger;
+    }
+
+    public async Task<HealthCheckResult> CheckHealthAsync(
+        HealthCheckContext context,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var cutoff = DateTime.UtcNow - HeartbeatTimeout;
+
+            var activeInstances = await _readContext.GetDbContext()
+                .Set<EAInstance>()
+                .AsNoTracking()
+                .Where(x => x.Status == Domain.Enums.EAInstanceStatus.Active && !x.IsDeleted)
+                .Select(x => new { x.InstanceId, x.LastHeartbeat, x.Symbols })
+                .ToListAsync(cancellationToken);
+
+            if (activeInstances.Count == 0)
+            {
+                _logger.LogWarning("EA heartbeat health check: no active EA instances registered.");
+                return HealthCheckResult.Unhealthy("No active EA instances registered — engine has no market data source.");
+            }
+
+            var staleInstances = activeInstances.Where(x => x.LastHeartbeat < cutoff).ToList();
+            var healthyInstances = activeInstances.Count - staleInstances.Count;
+
+            if (healthyInstances == 0)
+            {
+                _logger.LogError(
+                    "EA heartbeat health check: all {Total} EA instances are stale (last heartbeat > {Timeout}s ago).",
+                    activeInstances.Count, HeartbeatTimeout.TotalSeconds);
+                return HealthCheckResult.Unhealthy(
+                    $"All {activeInstances.Count} EA instance(s) are stale — DATA_UNAVAILABLE. " +
+                    $"Stale instances: {string.Join(", ", staleInstances.Select(x => x.InstanceId))}");
+            }
+
+            if (staleInstances.Count > 0)
+            {
+                _logger.LogWarning(
+                    "EA heartbeat health check: {Stale}/{Total} EA instances are stale.",
+                    staleInstances.Count, activeInstances.Count);
+                return HealthCheckResult.Degraded(
+                    $"{healthyInstances}/{activeInstances.Count} EA instance(s) healthy. " +
+                    $"Stale: {string.Join(", ", staleInstances.Select(x => x.InstanceId))}");
+            }
+
+            return HealthCheckResult.Healthy(
+                $"All {activeInstances.Count} EA instance(s) healthy. " +
+                $"Freshest heartbeat: {(DateTime.UtcNow - activeInstances.Max(x => x.LastHeartbeat)).TotalSeconds:F0}s ago.");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "EA heartbeat health check threw an exception.");
+            return HealthCheckResult.Unhealthy("EA heartbeat health check failed.", ex);
         }
     }
 }

@@ -1,3 +1,4 @@
+using FluentValidation;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 using System.Text.Json.Serialization;
@@ -11,6 +12,16 @@ namespace LascodiaTradingEngine.Application.Alerts.Commands.DeleteAlert;
 public class DeleteAlertCommand : IRequest<ResponseData<string>>
 {
     [JsonIgnore] public long Id { get; set; }
+}
+
+// ── Validator ─────────────────────────────────────────────────────────────────
+
+public class DeleteAlertCommandValidator : AbstractValidator<DeleteAlertCommand>
+{
+    public DeleteAlertCommandValidator()
+    {
+        RuleFor(x => x.Id).GreaterThan(0).WithMessage("Id must be greater than zero");
+    }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────

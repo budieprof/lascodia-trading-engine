@@ -3,6 +3,7 @@ using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ProcessHeartbeat;
@@ -35,14 +36,19 @@ public class ProcessHeartbeatCommandValidator : AbstractValidator<ProcessHeartbe
 public class ProcessHeartbeatCommandHandler : IRequestHandler<ProcessHeartbeatCommand, ResponseData<HeartbeatResponse>>
 {
     private readonly IWriteApplicationDbContext _context;
+    private readonly IEAOwnershipGuard _ownershipGuard;
 
-    public ProcessHeartbeatCommandHandler(IWriteApplicationDbContext context)
+    public ProcessHeartbeatCommandHandler(IWriteApplicationDbContext context, IEAOwnershipGuard ownershipGuard)
     {
-        _context = context;
+        _context        = context;
+        _ownershipGuard = ownershipGuard;
     }
 
     public async Task<ResponseData<HeartbeatResponse>> Handle(ProcessHeartbeatCommand request, CancellationToken cancellationToken)
     {
+        if (!await _ownershipGuard.IsOwnerAsync(request.InstanceId, cancellationToken))
+            return ResponseData<HeartbeatResponse>.Init(null, false, "Unauthorized: caller does not own this EA instance", "-403");
+
         var entity = await _context.GetDbContext()
             .Set<Domain.Entities.EAInstance>()
             .FirstOrDefaultAsync(

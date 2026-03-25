@@ -1,3 +1,4 @@
+using FluentValidation;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
@@ -12,6 +13,16 @@ public class RejectTradeSignalCommand : IRequest<ResponseData<string>>
 {
     public long   Id     { get; set; }
     public string Reason { get; set; } = string.Empty;
+}
+
+// ── Validator ─────────────────────────────────────────────────────────────────
+
+public class RejectTradeSignalCommandValidator : AbstractValidator<RejectTradeSignalCommand>
+{
+    public RejectTradeSignalCommandValidator()
+    {
+        RuleFor(x => x.Id).GreaterThan(0).WithMessage("Id must be greater than zero");
+    }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────

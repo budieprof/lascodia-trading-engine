@@ -13,4 +13,11 @@ public interface IDistributedLock
     /// The lock is automatically released when the handle is disposed.
     /// </summary>
     Task<IAsyncDisposable?> TryAcquireAsync(string lockKey, CancellationToken ct = default);
+
+    /// <summary>
+    /// Attempts to acquire a lock for the given key, waiting up to <paramref name="timeout"/>.
+    /// Returns a disposable handle if successful, or <c>null</c> if the timeout elapsed.
+    /// </summary>
+    Task<IAsyncDisposable?> TryAcquireAsync(string lockKey, TimeSpan timeout, CancellationToken ct = default)
+        => TryAcquireAsync(lockKey, ct);
 }

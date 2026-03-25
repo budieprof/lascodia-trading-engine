@@ -2,7 +2,9 @@ using FluentValidation;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
+using LascodiaTradingEngine.Application.AuditTrail.Commands.LogDecision;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Utilities;
 using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.EngineConfiguration.Commands.UpsertEngineConfig;
@@ -42,10 +44,12 @@ public class UpsertEngineConfigCommandValidator : AbstractValidator<UpsertEngine
 public class UpsertEngineConfigCommandHandler : IRequestHandler<UpsertEngineConfigCommand, ResponseData<long>>
 {
     private readonly IWriteApplicationDbContext _context;
+    private readonly IMediator _mediator;
 
-    public UpsertEngineConfigCommandHandler(IWriteApplicationDbContext context)
+    public UpsertEngineConfigCommandHandler(IWriteApplicationDbContext context, IMediator mediator)
     {
         _context = context;
+        _mediator = mediator;
     }
 
     public async Task<ResponseData<long>> Handle(UpsertEngineConfigCommand request, CancellationToken cancellationToken)
@@ -58,6 +62,9 @@ public class UpsertEngineConfigCommandHandler : IRequestHandler<UpsertEngineConf
 
         if (existing is not null)
         {
+            // Capture before-state for audit trail
+            var previousValue = existing.Value;
+
             existing.Value           = request.Value;
             existing.Description     = request.Description;
             existing.DataType        = dataType;
@@ -65,6 +72,20 @@ public class UpsertEngineConfigCommandHandler : IRequestHandler<UpsertEngineConf
             existing.LastUpdatedAt   = DateTime.UtcNow;
 
             await _context.SaveChangesAsync(cancellationToken);
+
+            await _mediator.Send(new LogDecisionCommand
+            {
+                EntityType   = "EngineConfig",
+                EntityId     = existing.Id,
+                DecisionType = "ConfigUpdated",
+                Outcome      = "Updated",
+                Reason       = $"Configuration '{request.Key}' updated",
+                ContextJson  = AuditSnapshot.Capture(
+                    before: new { Key = request.Key, Value = previousValue },
+                    after:  new { Key = request.Key, Value = request.Value }),
+                Source       = "UpsertEngineConfigCommand"
+            }, cancellationToken);
+
             return ResponseData<long>.Init(existing.Id, true, "Updated", "00");
         }
 
@@ -83,6 +104,18 @@ public class UpsertEngineConfigCommandHandler : IRequestHandler<UpsertEngineConf
             .AddAsync(entity, cancellationToken);
 
         await _context.SaveChangesAsync(cancellationToken);
+
+        await _mediator.Send(new LogDecisionCommand
+        {
+            EntityType   = "EngineConfig",
+            EntityId     = entity.Id,
+            DecisionType = "ConfigCreated",
+            Outcome      = "Created",
+            Reason       = $"Configuration '{request.Key}' created with value '{request.Value}'",
+            ContextJson  = AuditSnapshot.CaptureCreated(
+                new { request.Key, request.Value, request.DataType, request.IsHotReloadable }),
+            Source       = "UpsertEngineConfigCommand"
+        }, cancellationToken);
 
         return ResponseData<long>.Init(entity.Id, true, "Created", "00");
     }

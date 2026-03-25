@@ -33,6 +33,7 @@ public class GetExecutionQualityLogQueryHandler
     {
         var entity = await _context.GetDbContext()
             .Set<Domain.Entities.ExecutionQualityLog>()
+            .AsNoTracking()
             .FirstOrDefaultAsync(x => x.Id == request.Id && !x.IsDeleted, cancellationToken);
 
         if (entity == null)

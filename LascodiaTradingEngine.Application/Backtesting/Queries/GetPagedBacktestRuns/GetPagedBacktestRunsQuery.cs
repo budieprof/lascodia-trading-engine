@@ -45,6 +45,7 @@ public class GetPagedBacktestRunsQueryHandler
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.BacktestRun>()
+            .AsNoTracking()
             .Where(x => !x.IsDeleted)
             .OrderByDescending(x => x.StartedAt)
             .AsQueryable();

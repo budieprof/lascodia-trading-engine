@@ -42,15 +42,19 @@ public class GetEngineStatusQueryHandler
         var db = _context.GetDbContext();
 
         var activeStrategies = await db.Set<Domain.Entities.Strategy>()
+            .AsNoTracking()
             .CountAsync(x => x.Status == StrategyStatus.Active && !x.IsDeleted, cancellationToken);
 
         var openPositions = await db.Set<Domain.Entities.Position>()
+            .AsNoTracking()
             .CountAsync(x => x.Status == PositionStatus.Open && !x.IsDeleted, cancellationToken);
 
         var pendingOrders = await db.Set<Domain.Entities.Order>()
+            .AsNoTracking()
             .CountAsync(x => x.Status == OrderStatus.Pending && !x.IsDeleted, cancellationToken);
 
         var paperModeConfig = await db.Set<Domain.Entities.EngineConfig>()
+            .AsNoTracking()
             .FirstOrDefaultAsync(x => x.Key == "PaperMode" && !x.IsDeleted, cancellationToken);
 
         var dto = new EngineStatusDto

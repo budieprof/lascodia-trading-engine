@@ -72,6 +72,9 @@ public class RiskMonitorWorker : BackgroundService
 {
     private readonly ILogger<RiskMonitorWorker> _logger;
     private readonly IServiceScopeFactory _scopeFactory;
+    private const int DefaultPollSeconds = 30;
+    private const int MaxBackoffSeconds = 300;
+    private int _consecutiveFailures;
 
     /// <summary>
     /// Initialises the worker with the logger and a scope factory.
@@ -105,12 +108,34 @@ public class RiskMonitorWorker : BackgroundService
     {
         _logger.LogInformation("RiskMonitorWorker starting");
 
+        // Wait first — gives the rest of the engine time to fully start
+        await Task.Delay(TimeSpan.FromSeconds(DefaultPollSeconds), stoppingToken);
+
         while (!stoppingToken.IsCancellationRequested)
         {
-            // Wait first — gives the rest of the engine time to fully start
-            // before the first DB query executes.
-            await Task.Delay(TimeSpan.FromSeconds(30), stoppingToken);
-            await MonitorRiskAsync(stoppingToken);
+            try
+            {
+                await MonitorRiskAsync(stoppingToken);
+                _consecutiveFailures = 0;
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                _consecutiveFailures++;
+                int backoffSecs = Math.Min(
+                    DefaultPollSeconds * (int)Math.Pow(2, _consecutiveFailures - 1),
+                    MaxBackoffSeconds);
+                _logger.LogError(ex,
+                    "RiskMonitorWorker: error in monitoring cycle (consecutive={Count}), backing off {Backoff}s",
+                    _consecutiveFailures, backoffSecs);
+                await Task.Delay(TimeSpan.FromSeconds(backoffSecs), stoppingToken);
+                continue;
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(DefaultPollSeconds), stoppingToken);
         }
 
         _logger.LogInformation("RiskMonitorWorker stopped");
@@ -181,10 +206,9 @@ public class RiskMonitorWorker : BackgroundService
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            // Swallow non-cancellation exceptions so the polling loop survives
-            // transient DB outages or EF mapping issues. The next 30-second cycle
-            // will attempt the check again.
+            // Re-throw to the outer loop which handles exponential backoff.
             _logger.LogError(ex, "RiskMonitorWorker error during risk monitoring cycle");
+            throw;
         }
     }
 }

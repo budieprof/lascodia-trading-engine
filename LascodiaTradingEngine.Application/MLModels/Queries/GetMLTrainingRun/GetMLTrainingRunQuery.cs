@@ -31,6 +31,7 @@ public class GetMLTrainingRunQueryHandler : IRequestHandler<GetMLTrainingRunQuer
     {
         var entity = await _context.GetDbContext()
             .Set<Domain.Entities.MLTrainingRun>()
+            .AsNoTracking()
             .FirstOrDefaultAsync(x => x.Id == request.Id && !x.IsDeleted, cancellationToken);
 
         if (entity is null)

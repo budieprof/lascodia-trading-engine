@@ -14,6 +14,12 @@ public record PositionClosedIntegrationEvent : IntegrationEvent
     /// <summary>Monotonic sequence number for ordering detection.</summary>
     public long            SequenceNumber  { get; init; } = EventSequence.Next();
 
+    /// <summary>
+    /// Correlation ID propagated from the originating trade signal chain.
+    /// Allows tracing the full signal → order → fill → position → close chain in logs.
+    /// </summary>
+    public string?         CorrelationId   { get; init; }
+
     /// <summary>The closed position's database Id.</summary>
     public long            PositionId      { get; init; }
 

@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -22,11 +23,14 @@ namespace LascodiaTradingEngine.Application.Workers;
 /// </summary>
 public class PositionWorker : BackgroundService
 {
+    private const int InvertedQuoteEscalationThreshold = 5;
+
     private readonly ILogger<PositionWorker> _logger;
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILivePriceCache _priceCache;
     private readonly TradingMetrics _metrics;
     private readonly IDistributedLock _distributedLock;
+    private readonly ConcurrentDictionary<string, int> _consecutiveInvertedQuotes = new();
 
     public PositionWorker(
         ILogger<PositionWorker> logger,
@@ -42,11 +46,15 @@ public class PositionWorker : BackgroundService
         _distributedLock = distributedLock;
     }
 
+    private const string CK_PollSecs = "Position:PollIntervalSeconds";
+    private const int DefaultPollSeconds = 10;
+    private const int MaxBackoffSeconds = 300; // 5 minutes
+    private int _consecutiveErrors;
+
     /// <summary>
-    /// Main polling loop that runs every 10 seconds, updating open position prices
-    /// and checking SL/TP levels. The 10-second interval balances responsiveness
-    /// against database load — SL/TP accuracy depends on the live price cache
-    /// being updated more frequently by <c>MarketDataWorker</c>.
+    /// Main polling loop, updating open position prices and checking SL/TP levels.
+    /// The poll interval is configurable via EngineConfig key <c>Position:PollIntervalSeconds</c>
+    /// (defaults to 10).
     /// </summary>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -54,8 +62,37 @@ public class PositionWorker : BackgroundService
 
         while (!stoppingToken.IsCancellationRequested)
         {
-            await Task.Delay(TimeSpan.FromSeconds(10), stoppingToken);
-            await UpdatePositionsAsync(stoppingToken);
+            int pollSecs = DefaultPollSeconds;
+            try
+            {
+                using var configScope = _scopeFactory.CreateScope();
+                var configCtx = configScope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+                var entry = await configCtx.GetDbContext()
+                    .Set<Domain.Entities.EngineConfig>()
+                    .AsNoTracking()
+                    .FirstOrDefaultAsync(c => c.Key == CK_PollSecs, stoppingToken);
+                if (entry?.Value is not null && int.TryParse(entry.Value, out var parsed) && parsed > 0)
+                    pollSecs = parsed;
+            }
+            catch { /* use default */ }
+
+            try
+            {
+                await UpdatePositionsAsync(stoppingToken);
+                _consecutiveErrors = 0;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _consecutiveErrors++;
+                int backoffSecs = Math.Min(pollSecs * (int)Math.Pow(2, _consecutiveErrors - 1), MaxBackoffSeconds);
+                _logger.LogError(ex,
+                    "PositionWorker: error in update cycle (consecutive={Count}), backing off {Backoff}s",
+                    _consecutiveErrors, backoffSecs);
+                await Task.Delay(TimeSpan.FromSeconds(backoffSecs), stoppingToken);
+                continue;
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(pollSecs), stoppingToken);
         }
 
         _logger.LogInformation("PositionWorker stopped");
@@ -83,103 +120,162 @@ public class PositionWorker : BackgroundService
                 .Where(x => x.Status == PositionStatus.Open && !x.IsDeleted)
                 .ToListAsync(cancellationToken);
 
+            int priceUpdated = 0, slClosed = 0, tpClosed = 0, cacheMisses = 0, errors = 0;
+
             foreach (var position in openPositions)
             {
-                // Look up the latest bid/ask for this symbol from the in-memory cache
-                var priceData = _priceCache.Get(position.Symbol);
-                if (priceData == null)
+                try
                 {
-                    _metrics.PriceCacheMisses.Add(1, new KeyValuePair<string, object?>("symbol", position.Symbol));
-                    _logger.LogWarning(
-                        "PositionWorker: no live price for {Symbol} — position {Id} skipped (SL/TP not monitored this cycle)",
-                        position.Symbol, position.Id);
-                    continue;
-                }
-
-                // Use mid price for P&L updates
-                decimal currentPrice = (priceData.Value.Bid + priceData.Value.Ask) / 2m;
-
-                await mediator.Send(new UpdatePositionPriceCommand
-                {
-                    Id           = position.Id,
-                    CurrentPrice = currentPrice
-                }, cancellationToken);
-
-                // Lock per position to prevent concurrent close from PositionWorker
-                // and OrderExecutionWorker operating on the same position simultaneously.
-                var lockKey = $"position:close:{position.Id}";
-                await using var posLock = await _distributedLock.TryAcquireAsync(lockKey, cancellationToken);
-                if (posLock is null) continue; // another worker is handling this position
-
-                // Check Stop Loss
-                if (position.StopLoss.HasValue)
-                {
-                    bool slHit = position.Direction == PositionDirection.Long
-                        ? currentPrice <= position.StopLoss.Value
-                        : currentPrice >= position.StopLoss.Value;
-
-                    if (slHit)
+                    // Look up the latest bid/ask for this symbol from the in-memory cache
+                    var priceData = _priceCache.Get(position.Symbol);
+                    if (priceData == null)
                     {
-                        _logger.LogWarning("Stop loss hit for Position {Id} ({Symbol} {Direction}) at {Price}",
-                            position.Id, position.Symbol, position.Direction, currentPrice);
-
-                        await mediator.Send(new ClosePositionCommand
-                        {
-                            Id         = position.Id,
-                            ClosePrice = currentPrice
-                        }, cancellationToken);
-
-                        await mediator.Send(new LogDecisionCommand
-                        {
-                            EntityType   = "Position",
-                            EntityId     = position.Id,
-                            DecisionType = "StopLossClosure",
-                            Outcome      = "Closed",
-                            Reason       = $"Stop loss hit at {currentPrice} (SL level: {position.StopLoss}), {position.Symbol} {position.Direction}",
-                            Source       = "PositionWorker"
-                        }, cancellationToken);
-
-                        await PublishPositionClosedEventAsync(writeContext, eventService, position, currentPrice, "StopLoss");
+                        cacheMisses++;
+                        _metrics.PriceCacheMisses.Add(1, new KeyValuePair<string, object?>("symbol", position.Symbol));
+                        _logger.LogWarning(
+                            "PositionWorker: no live price for {Symbol} — position {Id} skipped (SL/TP not monitored this cycle)",
+                            position.Symbol, position.Id);
                         continue;
                     }
-                }
 
-                // Check Take Profit
-                if (position.TakeProfit.HasValue)
-                {
-                    bool tpHit = position.Direction == PositionDirection.Long
-                        ? currentPrice >= position.TakeProfit.Value
-                        : currentPrice <= position.TakeProfit.Value;
-
-                    if (tpHit)
+                    // Price sanity: reject inverted quotes (Ask < Bid)
+                    if (priceData.Value.Ask < priceData.Value.Bid)
                     {
-                        _logger.LogInformation("Take profit hit for Position {Id} ({Symbol} {Direction}) at {Price}",
-                            position.Id, position.Symbol, position.Direction, currentPrice);
+                        int count = _consecutiveInvertedQuotes.AddOrUpdate(position.Symbol, 1, (_, c) => c + 1);
+                        var logLevel = count >= InvertedQuoteEscalationThreshold
+                            ? LogLevel.Error
+                            : LogLevel.Warning;
+                        _logger.Log(logLevel,
+                            "PositionWorker: inverted quote for {Symbol} (Bid={Bid}, Ask={Ask}) — skipping position {Id} (consecutive: {Count})",
+                            position.Symbol, priceData.Value.Bid, priceData.Value.Ask, position.Id, count);
+                        _metrics.WorkerErrors.Add(1,
+                            new KeyValuePair<string, object?>("worker", "PositionWorker"),
+                            new KeyValuePair<string, object?>("reason", "inverted_quote"));
+                        continue;
+                    }
+                    _consecutiveInvertedQuotes.TryRemove(position.Symbol, out _);
 
-                        await mediator.Send(new ClosePositionCommand
+                    // Use mid price for P&L updates
+                    decimal currentPrice = (priceData.Value.Bid + priceData.Value.Ask) / 2m;
+
+                    // Wrap mediator calls with a timeout to prevent hung handlers from
+                    // blocking the entire position update cycle
+                    using var priceCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                    priceCts.CancelAfter(TimeSpan.FromSeconds(30));
+
+                    await mediator.Send(new UpdatePositionPriceCommand
+                    {
+                        Id           = position.Id,
+                        CurrentPrice = currentPrice
+                    }, priceCts.Token);
+                    priceUpdated++;
+
+                    // Lock per position to prevent concurrent close from PositionWorker
+                    // and OrderExecutionWorker operating on the same position simultaneously.
+                    var lockKey = $"position:close:{position.Id}";
+                    await using var posLock = await _distributedLock.TryAcquireAsync(lockKey, cancellationToken);
+                    if (posLock is null) continue; // another worker is handling this position
+
+                    // Check Stop Loss
+                    if (position.StopLoss.HasValue)
+                    {
+                        bool slHit = position.Direction == PositionDirection.Long
+                            ? currentPrice <= position.StopLoss.Value
+                            : currentPrice >= position.StopLoss.Value;
+
+                        if (slHit)
                         {
-                            Id         = position.Id,
-                            ClosePrice = currentPrice
-                        }, cancellationToken);
+                            _logger.LogWarning("Stop loss hit for Position {Id} ({Symbol} {Direction}) at {Price}",
+                                position.Id, position.Symbol, position.Direction, currentPrice);
 
-                        await mediator.Send(new LogDecisionCommand
+                            using var closeCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                            closeCts.CancelAfter(TimeSpan.FromSeconds(30));
+
+                            await mediator.Send(new ClosePositionCommand
+                            {
+                                Id         = position.Id,
+                                ClosePrice = currentPrice
+                            }, closeCts.Token);
+
+                            await mediator.Send(new LogDecisionCommand
+                            {
+                                EntityType   = "Position",
+                                EntityId     = position.Id,
+                                DecisionType = "StopLossClosure",
+                                Outcome      = "Closed",
+                                Reason       = $"Stop loss hit at {currentPrice} (SL level: {position.StopLoss}), {position.Symbol} {position.Direction}",
+                                Source       = "PositionWorker"
+                            }, closeCts.Token);
+
+                            await PublishPositionClosedEventAsync(writeContext, context, eventService, position, currentPrice, "StopLoss");
+                            slClosed++;
+                            continue;
+                        }
+                    }
+
+                    // Check Take Profit
+                    if (position.TakeProfit.HasValue)
+                    {
+                        bool tpHit = position.Direction == PositionDirection.Long
+                            ? currentPrice >= position.TakeProfit.Value
+                            : currentPrice <= position.TakeProfit.Value;
+
+                        if (tpHit)
                         {
-                            EntityType   = "Position",
-                            EntityId     = position.Id,
-                            DecisionType = "TakeProfitClosure",
-                            Outcome      = "Closed",
-                            Reason       = $"Take profit hit at {currentPrice} (TP level: {position.TakeProfit}), {position.Symbol} {position.Direction}",
-                            Source       = "PositionWorker"
-                        }, cancellationToken);
+                            _logger.LogInformation("Take profit hit for Position {Id} ({Symbol} {Direction}) at {Price}",
+                                position.Id, position.Symbol, position.Direction, currentPrice);
 
-                        await PublishPositionClosedEventAsync(writeContext, eventService, position, currentPrice, "TakeProfit");
+                            using var closeCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                            closeCts.CancelAfter(TimeSpan.FromSeconds(30));
+
+                            await mediator.Send(new ClosePositionCommand
+                            {
+                                Id         = position.Id,
+                                ClosePrice = currentPrice
+                            }, closeCts.Token);
+
+                            await mediator.Send(new LogDecisionCommand
+                            {
+                                EntityType   = "Position",
+                                EntityId     = position.Id,
+                                DecisionType = "TakeProfitClosure",
+                                Outcome      = "Closed",
+                                Reason       = $"Take profit hit at {currentPrice} (TP level: {position.TakeProfit}), {position.Symbol} {position.Direction}",
+                                Source       = "PositionWorker"
+                            }, closeCts.Token);
+
+                            await PublishPositionClosedEventAsync(writeContext, context, eventService, position, currentPrice, "TakeProfit");
+                            tpClosed++;
+                        }
                     }
                 }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw; // Host shutdown — propagate
+                }
+                catch (Exception ex)
+                {
+                    errors++;
+                    _logger.LogError(ex,
+                        "PositionWorker: error processing position {PositionId} ({Symbol}) — skipping to next position",
+                        position.Id, position.Symbol);
+                    _metrics.WorkerErrors.Add(1,
+                        new KeyValuePair<string, object?>("worker", "PositionWorker"),
+                        new KeyValuePair<string, object?>("position_id", position.Id));
+                }
+            }
+
+            if (openPositions.Count > 0)
+            {
+                _logger.LogDebug(
+                    "PositionWorker cycle: {Total} positions, {Updated} priced, {SL} SL closed, {TP} TP closed, {Miss} cache misses, {Errors} errors",
+                    openPositions.Count, priceUpdated, slClosed, tpClosed, cacheMisses, errors);
             }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger.LogError(ex, "PositionWorker error during price update cycle");
+            throw; // Let the outer loop handle backoff
         }
     }
 
@@ -196,6 +292,7 @@ public class PositionWorker : BackgroundService
     /// <param name="reason">Closure reason label (e.g., "StopLoss", "TakeProfit").</param>
     private async Task PublishPositionClosedEventAsync(
         IWriteApplicationDbContext writeContext,
+        IReadApplicationDbContext readContext,
         IIntegrationEventService eventService,
         Domain.Entities.Position position,
         decimal closePrice,
@@ -207,11 +304,19 @@ public class PositionWorker : BackgroundService
         decimal directionSign    = position.Direction == PositionDirection.Long ? 1m : -1m;
         decimal magnitudePips    = (closePrice - position.AverageEntryPrice) * pipFactor * directionSign;
 
-        // Estimate realised PnL (close may not be persisted yet; use approximation for the event payload)
-        const decimal standardLot = 100_000m;
-        decimal estimatedPnl = position.Direction == PositionDirection.Long
-            ? (closePrice - position.AverageEntryPrice) * position.OpenLots * standardLot
-            : (position.AverageEntryPrice - closePrice) * position.OpenLots * standardLot;
+        // Load actual contract size from currency pair spec instead of assuming 100k
+        var currencyPair = await readContext.GetDbContext()
+            .Set<Domain.Entities.CurrencyPair>()
+            .AsNoTracking()
+            .FirstOrDefaultAsync(x => x.Symbol == position.Symbol && !x.IsDeleted);
+
+        decimal contractSize = currencyPair?.ContractSize ?? 100_000m;
+
+        // Estimate realised PnL including swap and commission
+        decimal tradePnl = position.Direction == PositionDirection.Long
+            ? (closePrice - position.AverageEntryPrice) * position.OpenLots * contractSize
+            : (position.AverageEntryPrice - closePrice) * position.OpenLots * contractSize;
+        decimal estimatedPnl = tradePnl + position.Swap + position.Commission;
 
         _metrics.PositionsClosed.Add(1, new KeyValuePair<string, object?>("reason", reason));
         _metrics.PositionPnL.Record((double)estimatedPnl);

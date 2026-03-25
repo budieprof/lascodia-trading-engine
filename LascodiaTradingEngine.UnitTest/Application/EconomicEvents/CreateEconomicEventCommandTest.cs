@@ -88,7 +88,7 @@ public class CreateEconomicEventCommandTest
 
         var result = await _validator.TestValidateAsync(command);
         result.ShouldHaveValidationErrorFor(c => c.Impact)
-              .WithErrorMessage("Impact must be 'High', 'Medium', or 'Low'");
+              .WithErrorMessage("Impact must be 'High', 'Medium', 'Low', or 'Holiday'");
     }
 
     [Fact]

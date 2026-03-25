@@ -1,3 +1,4 @@
+using FluentValidation;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
@@ -12,6 +13,17 @@ public class UpdatePositionPriceCommand : IRequest<ResponseData<string>>
 {
     public long    Id           { get; set; }
     public decimal CurrentPrice { get; set; }
+}
+
+// ── Validator ─────────────────────────────────────────────────────────────────
+
+public class UpdatePositionPriceCommandValidator : AbstractValidator<UpdatePositionPriceCommand>
+{
+    public UpdatePositionPriceCommandValidator()
+    {
+        RuleFor(x => x.Id).GreaterThan(0);
+        RuleFor(x => x.CurrentPrice).GreaterThan(0);
+    }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
@@ -36,11 +48,17 @@ public class UpdatePositionPriceCommandHandler : IRequestHandler<UpdatePositionP
 
         entity.CurrentPrice = request.CurrentPrice;
 
-        const decimal standardLot = 100_000m;
+        // Load actual contract size from currency pair spec instead of assuming 100k
+        var currencyPair = await _context.GetDbContext()
+            .Set<Domain.Entities.CurrencyPair>()
+            .AsNoTracking()
+            .FirstOrDefaultAsync(x => x.Symbol == entity.Symbol && !x.IsDeleted, cancellationToken);
+
+        decimal contractSize = currencyPair?.ContractSize ?? 100_000m;
 
         entity.UnrealizedPnL = entity.Direction == PositionDirection.Long
-            ? (request.CurrentPrice - entity.AverageEntryPrice) * entity.OpenLots * standardLot
-            : (entity.AverageEntryPrice - request.CurrentPrice) * entity.OpenLots * standardLot;
+            ? (request.CurrentPrice - entity.AverageEntryPrice) * entity.OpenLots * contractSize
+            : (entity.AverageEntryPrice - request.CurrentPrice) * entity.OpenLots * contractSize;
 
         await _context.SaveChangesAsync(cancellationToken);
 

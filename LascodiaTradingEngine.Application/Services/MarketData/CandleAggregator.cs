@@ -1,10 +1,12 @@
 using System.Collections.Concurrent;
 using LascodiaTradingEngine.Application.Common.Diagnostics;
-using LascodiaTradingEngine.Application.Services.BrokerAdapters;
 using LascodiaTradingEngine.Domain.Enums;
 using Microsoft.Extensions.Logging;
 
 namespace LascodiaTradingEngine.Application.Services.MarketData;
+
+/// <summary>A single price tick with bid/ask spread and timestamp.</summary>
+public record Tick(string Symbol, decimal Bid, decimal Ask, DateTime Timestamp);
 
 /// <summary>
 /// Controls which price component of a tick is used to build OHLCV candles.

@@ -11,6 +11,7 @@ using LascodiaTradingEngine.Application.Orders.Commands.ModifyOrder;
 using LascodiaTradingEngine.Application.Orders.Commands.SubmitOrder;
 using LascodiaTradingEngine.Application.Orders.Commands.SubmitExecutionReport;
 using LascodiaTradingEngine.Application.Orders.Commands.SubmitExecutionReportBatch;
+using LascodiaTradingEngine.Application.Orders.Commands.CreateOrderFromSignal;
 using LascodiaTradingEngine.Application.Orders.Queries.DTOs;
 using LascodiaTradingEngine.Application.Orders.Queries.GetOrder;
 using LascodiaTradingEngine.Application.Orders.Queries.GetPagedOrders;
@@ -26,6 +27,19 @@ public class OrderController : AuthControllerBase<OrderController>
         IConfiguration config,
         ICurrentUserService userService)
         : base(logger, config, userService) { }
+
+    /// <summary>
+    /// Creates an order from an approved trade signal for a specific trading account.
+    /// Runs Tier 2 (account-level) risk checks. The signal stays Approved if the check fails.
+    /// </summary>
+    [HttpPost("from-signal")]
+    public async Task<ResponseData<long>> CreateFromSignal(CreateOrderFromSignalCommand command)
+    {
+        if (!ModelState.IsValid)
+            return ResponseData<long>.Init(0, false, "Model state failed", "-11");
+
+        return await Mediator.Send(command);
+    }
 
     /// <summary>Create a new manual order</summary>
     [HttpPost]

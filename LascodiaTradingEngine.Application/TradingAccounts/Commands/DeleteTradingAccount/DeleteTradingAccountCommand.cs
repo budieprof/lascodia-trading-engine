@@ -1,3 +1,4 @@
+using FluentValidation;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
@@ -10,6 +11,16 @@ namespace LascodiaTradingEngine.Application.TradingAccounts.Commands.DeleteTradi
 public class DeleteTradingAccountCommand : IRequest<ResponseData<string>>
 {
     public long Id { get; set; }
+}
+
+// ── Validator ─────────────────────────────────────────────────────────────────
+
+public class DeleteTradingAccountCommandValidator : AbstractValidator<DeleteTradingAccountCommand>
+{
+    public DeleteTradingAccountCommandValidator()
+    {
+        RuleFor(x => x.Id).GreaterThan(0).WithMessage("Id must be greater than zero");
+    }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────

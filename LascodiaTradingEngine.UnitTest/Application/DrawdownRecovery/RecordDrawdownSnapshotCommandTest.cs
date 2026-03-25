@@ -3,6 +3,7 @@ using Microsoft.EntityFrameworkCore;
 using Moq;
 using MockQueryable.Moq;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Options;
 using LascodiaTradingEngine.Application.DrawdownRecovery.Commands.RecordDrawdownSnapshot;
 using LascodiaTradingEngine.Domain.Entities;
 
@@ -23,7 +24,7 @@ public class RecordDrawdownSnapshotCommandTest
         mockDbContext.Setup(c => c.Set<DrawdownSnapshot>()).Returns(snapshots.Object);
         _mockWriteContext.Setup(c => c.GetDbContext()).Returns(mockDbContext.Object);
 
-        _handler = new RecordDrawdownSnapshotCommandHandler(_mockWriteContext.Object);
+        _handler = new RecordDrawdownSnapshotCommandHandler(_mockWriteContext.Object, new RiskCheckerOptions());
         _validator = new RecordDrawdownSnapshotCommandValidator();
     }
 

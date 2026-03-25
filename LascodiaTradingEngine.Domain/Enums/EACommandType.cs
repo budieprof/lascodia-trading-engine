@@ -18,5 +18,19 @@ public enum EACommandType
     UpdateTrailing,
 
     /// <summary>Request the EA to backfill historical candle data for a symbol/timeframe.</summary>
-    RequestBackfill
+    RequestBackfill,
+
+    /// <summary>
+    /// Request the EA to report the current status of an order by broker ticket or engine order ID.
+    /// Queued by <c>StaleOrderRecoveryWorker</c> when an order is stuck in Submitted status
+    /// without an execution report from the EA.
+    /// </summary>
+    RequestExecutionStatus,
+
+    /// <summary>
+    /// Hot-reload EA safety configuration parameters without requiring an EA restart.
+    /// Parameters JSON contains the safety limits to update (zero values are ignored/keep current).
+    /// Queued via POST /ea/commands/update-config endpoint.
+    /// </summary>
+    UpdateConfig
 }

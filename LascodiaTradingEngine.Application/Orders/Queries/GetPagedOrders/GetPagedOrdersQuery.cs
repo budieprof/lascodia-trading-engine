@@ -44,6 +44,7 @@ public class GetPagedOrdersQueryHandler
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.Order>()
+            .AsNoTracking()
             .Where(x => !x.IsDeleted)
             .OrderByDescending(x => x.CreatedAt)
             .AsQueryable();

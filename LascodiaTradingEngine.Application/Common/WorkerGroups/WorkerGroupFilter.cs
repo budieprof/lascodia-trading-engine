@@ -22,17 +22,17 @@ public static class WorkerGroupFilter
     [
         typeof(StrategyWorker),
         typeof(SignalOrderBridgeWorker),
-        typeof(OrderExecutionWorker),
         typeof(PositionWorker),
         typeof(TrailingStopWorker),
-        typeof(AccountSyncWorker),
         typeof(OrderFilledEventHandler),
         typeof(PositionClosedEventHandler),
+        typeof(PartialFillResubmissionWorker),
+        typeof(EAHealthMonitorWorker),
+        typeof(ReconciliationWorker),
     ];
 
     private static readonly Type[] MarketDataWorkers =
     [
-        typeof(MarketDataWorker),
         typeof(RegimeDetectionWorker),
         typeof(SentimentWorker),
         typeof(COTDataWorker),
@@ -47,6 +47,7 @@ public static class WorkerGroupFilter
         typeof(ExecutionQualityCircuitBreakerWorker),
         typeof(StrategyHealthWorker),
         typeof(StrategyFeedbackWorker),
+        typeof(CorrelationMatrixWorker),
     ];
 
     private static readonly Type[] MLTrainingWorkers =
@@ -161,8 +162,6 @@ public static class WorkerGroupFilter
         if (disabledTypes.Count == 0)
             return services;
 
-        // Walk the service collection and remove IHostedService registrations
-        // for workers in disabled groups.
         int removed = 0;
         for (int i = services.Count - 1; i >= 0; i--)
         {
@@ -181,7 +180,6 @@ public static class WorkerGroupFilter
             }
         }
 
-        // Build a logger to report what was filtered
         using var tempProvider = services.BuildServiceProvider();
         var logger = tempProvider.GetRequiredService<ILoggerFactory>()
             .CreateLogger("WorkerGroupFilter");

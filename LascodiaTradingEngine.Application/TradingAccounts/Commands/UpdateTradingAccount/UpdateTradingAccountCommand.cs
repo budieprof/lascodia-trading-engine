@@ -1,3 +1,4 @@
+using FluentValidation;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 using System.Text.Json.Serialization;
@@ -14,6 +15,18 @@ public class UpdateTradingAccountCommand : IRequest<ResponseData<string>>
     public string?  AccountName { get; set; }
     public string?  Currency    { get; set; }
     public bool?    IsPaper     { get; set; }
+}
+
+// ── Validator ─────────────────────────────────────────────────────────────────
+
+public class UpdateTradingAccountCommandValidator : AbstractValidator<UpdateTradingAccountCommand>
+{
+    public UpdateTradingAccountCommandValidator()
+    {
+        RuleFor(x => x.Id).GreaterThan(0);
+        RuleFor(x => x.AccountName).MaximumLength(100).When(x => x.AccountName is not null);
+        RuleFor(x => x.Currency).MaximumLength(10).When(x => x.Currency is not null);
+    }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────

@@ -1,3 +1,4 @@
+using FluentValidation;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
@@ -10,6 +11,16 @@ namespace LascodiaTradingEngine.Application.TradingAccounts.Commands.ActivateTra
 public class ActivateTradingAccountCommand : IRequest<ResponseData<string>>
 {
     public long Id { get; set; }
+}
+
+// ── Validator ─────────────────────────────────────────────────────────────────
+
+public class ActivateTradingAccountCommandValidator : AbstractValidator<ActivateTradingAccountCommand>
+{
+    public ActivateTradingAccountCommandValidator()
+    {
+        RuleFor(x => x.Id).GreaterThan(0).WithMessage("Id must be greater than zero");
+    }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
@@ -32,10 +43,10 @@ public class ActivateTradingAccountCommandHandler : IRequestHandler<ActivateTrad
         if (target == null)
             return ResponseData<string>.Init(null, false, "Trading account not found", "-14");
 
-        // Deactivate all accounts for the same broker
+        // Deactivate all other active accounts
         var siblings = await _context.GetDbContext()
             .Set<Domain.Entities.TradingAccount>()
-            .Where(x => x.BrokerId == target.BrokerId && x.IsActive && !x.IsDeleted)
+            .Where(x => x.Id != target.Id && x.IsActive && !x.IsDeleted)
             .ToListAsync(cancellationToken);
 
         foreach (var account in siblings)

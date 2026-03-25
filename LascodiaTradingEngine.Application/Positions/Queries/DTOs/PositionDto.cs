@@ -16,6 +16,8 @@ public class PositionDto : IMapFrom<Position>
     public decimal?          CurrentPrice      { get; set; }
     public decimal           UnrealizedPnL     { get; set; }
     public decimal           RealizedPnL       { get; set; }
+    public decimal           Swap              { get; set; }
+    public decimal           Commission        { get; set; }
     public decimal?          StopLoss          { get; set; }
     public decimal?          TakeProfit        { get; set; }
     public PositionStatus    Status            { get; set; }

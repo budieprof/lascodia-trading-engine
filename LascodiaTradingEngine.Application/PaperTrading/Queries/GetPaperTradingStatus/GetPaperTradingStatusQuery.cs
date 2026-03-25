@@ -30,6 +30,7 @@ public class GetPaperTradingStatusQueryHandler
     {
         var config = await _context.GetDbContext()
             .Set<Domain.Entities.EngineConfig>()
+            .AsNoTracking()
             .FirstOrDefaultAsync(x => x.Key == ConfigKey && !x.IsDeleted, cancellationToken);
 
         if (config == null)

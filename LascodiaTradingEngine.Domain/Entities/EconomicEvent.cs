@@ -32,9 +32,10 @@ public class EconomicEvent : Entity<long>
     public string  Currency     { get; set; } = string.Empty;
 
     /// <summary>
-    /// Expected market impact level: <c>Low</c>, <c>Medium</c>, or <c>High</c>.
+    /// Expected market impact level: <c>Low</c>, <c>Medium</c>, <c>High</c>, or <c>Holiday</c>.
     /// Only <c>High</c>-impact events trigger trading halts by default, though this
-    /// is configurable via <see cref="EngineConfig"/>.
+    /// is configurable via <see cref="EngineConfig"/>. <c>Holiday</c> denotes bank holidays
+    /// or non-economic events (e.g. ForexFactory gray icons) that are not data releases.
     /// </summary>
     public EconomicImpact  Impact       { get; set; } = EconomicImpact.Low;
 
@@ -58,6 +59,13 @@ public class EconomicEvent : Entity<long>
     /// Populated post-release by the data sync worker. Null before the event fires.
     /// </summary>
     public string? Actual       { get; set; }
+
+    /// <summary>
+    /// Stable identifier assigned by the external calendar data provider (e.g. ForexFactory event ID).
+    /// Used to look up the post-release actual figure via <c>IEconomicCalendarFeed.GetActualAsync</c>.
+    /// Null for manually created events.
+    /// </summary>
+    public string? ExternalKey  { get; set; }
 
     /// <summary>
     /// How this event record was created: via an automated API feed or entered manually.

@@ -31,6 +31,7 @@ public class GetMLShadowEvaluationQueryHandler : IRequestHandler<GetMLShadowEval
     {
         var entity = await _context.GetDbContext()
             .Set<Domain.Entities.MLShadowEvaluation>()
+            .AsNoTracking()
             .FirstOrDefaultAsync(x => x.Id == request.Id && !x.IsDeleted, cancellationToken);
 
         if (entity == null)

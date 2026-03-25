@@ -43,6 +43,7 @@ public class GetPagedCOTReportsQueryHandler
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.COTReport>()
+            .AsNoTracking()
             .Where(x => !x.IsDeleted)
             .OrderByDescending(x => x.ReportDate)
             .AsQueryable();

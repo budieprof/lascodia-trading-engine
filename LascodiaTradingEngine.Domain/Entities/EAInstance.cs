@@ -68,6 +68,12 @@ public class EAInstance : Entity<long>
     /// <summary>UTC timestamp when this instance was deregistered. Null while active.</summary>
     public DateTime? DeregisteredAt { get; set; }
 
+    /// <summary>
+    /// Highest position-delta sequence number successfully processed from this instance.
+    /// Used for idempotency — duplicate or out-of-order deltas are rejected.
+    /// </summary>
+    public long? LastProcessedDeltaSequence { get; set; }
+
     /// <summary>Soft-delete flag. Filtered out by the global EF Core query filter.</summary>
     public bool IsDeleted { get; set; }
 

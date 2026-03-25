@@ -1,3 +1,4 @@
+using FluentValidation;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
@@ -11,6 +12,16 @@ namespace LascodiaTradingEngine.Application.Strategies.Commands.PauseStrategy;
 public class PauseStrategyCommand : IRequest<ResponseData<string>>
 {
     public long Id { get; set; }
+}
+
+// ── Validator ─────────────────────────────────────────────────────────────────
+
+public class PauseStrategyCommandValidator : AbstractValidator<PauseStrategyCommand>
+{
+    public PauseStrategyCommandValidator()
+    {
+        RuleFor(x => x.Id).GreaterThan(0).WithMessage("Id must be greater than zero");
+    }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────

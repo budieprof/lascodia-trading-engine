@@ -1,3 +1,4 @@
+using FluentValidation;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
@@ -12,6 +13,16 @@ public class SetPaperTradingModeCommand : IRequest<ResponseData<string>>
 {
     public bool    IsPaperMode { get; set; }
     public string? Reason      { get; set; }
+}
+
+// ── Validator ─────────────────────────────────────────────────────────────────
+
+public class SetPaperTradingModeCommandValidator : AbstractValidator<SetPaperTradingModeCommand>
+{
+    public SetPaperTradingModeCommandValidator()
+    {
+        RuleFor(x => x.Reason).MaximumLength(500).When(x => x.Reason is not null);
+    }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────

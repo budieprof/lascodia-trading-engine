@@ -149,6 +149,7 @@ public class InvestingComCalendarFeed : IEconomicCalendarFeed
                     ScheduledAt: scheduledAt,
                     Forecast: forecast,
                     Previous: previous,
+                    Actual: actual,
                     ExternalKey: externalKey,
                     Source: EconomicEventSource.Investing));
             }

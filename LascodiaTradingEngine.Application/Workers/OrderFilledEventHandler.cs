@@ -9,6 +9,7 @@ using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Positions.Commands.OpenPosition;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
+using System.Text.Json;
 
 namespace LascodiaTradingEngine.Application.Workers;
 
@@ -117,29 +118,43 @@ public sealed class OrderFilledEventHandler : IIntegrationEventHandler<OrderFill
                 await HandleCoreAsync(@event);
                 return; // Success — exit the retry loop immediately.
             }
-            catch (Exception ex) when (attempt < maxRetries)
+            catch (Exception ex) when (attempt < maxRetries && IsTransient(ex))
             {
-                // Exponential back-off: 500ms, 1s, 2s before the next attempt.
-                // The exception filter (attempt < maxRetries) ensures the final
-                // attempt falls through to the unconditional catch below.
-                int delayMs = 500 * (int)Math.Pow(2, attempt - 1); // 500ms, 1s, 2s
+                // Exponential back-off with jitter: 500ms, 1s, 2s ± random jitter
+                int baseDelayMs = 500 * (int)Math.Pow(2, attempt - 1);
+                int jitter = Random.Shared.Next(0, baseDelayMs / 2);
+                int delayMs = baseDelayMs + jitter;
                 _logger.LogWarning(ex,
-                    "OrderFilledEventHandler: attempt {Attempt}/{Max} failed for order {OrderId} — retrying in {Delay}ms",
+                    "OrderFilledEventHandler: transient error on attempt {Attempt}/{Max} for order {OrderId} — retrying in {Delay}ms",
                     attempt, maxRetries, @event.OrderId, delayMs);
                 await Task.Delay(delayMs);
             }
             catch (Exception ex)
             {
-                // All retry attempts exhausted. Log at Error and drop the event.
-                // The filled order will exist in the Orders table without a corresponding
-                // Position row — this will need manual reconciliation.
+                // Permanent error or all retry attempts exhausted — dead-letter immediately.
+                // Permanent errors (validation, argument, null-ref) are not retried because
+                // they will fail identically on every attempt.
                 _logger.LogError(ex,
-                    "OrderFilledEventHandler: all {Max} attempts exhausted for order {OrderId} — event dropped. " +
-                    "Manual intervention required.",
-                    maxRetries, @event.OrderId);
+                    "OrderFilledEventHandler: {ErrorType} error for order {OrderId} on attempt {Attempt}/{Max} — dead-lettering event.",
+                    IsTransient(ex) ? "final retry" : "permanent",
+                    @event.OrderId, attempt, maxRetries);
+
+                await TryDeadLetterAsync(@event, ex, attempt);
+                return;
             }
         }
     }
+
+    /// <summary>
+    /// Determines whether an exception is transient and worth retrying.
+    /// Validation, argument, and null-reference errors are permanent — they will
+    /// fail identically on every retry and should be dead-lettered immediately.
+    /// </summary>
+    private static bool IsTransient(Exception ex) => ex is not (
+        ArgumentException or
+        InvalidOperationException or
+        NullReferenceException or
+        FormatException);
 
     /// <summary>
     /// Core logic executed on each retry attempt. Creates a DI scope, loads the filled
@@ -149,6 +164,11 @@ public sealed class OrderFilledEventHandler : IIntegrationEventHandler<OrderFill
     /// <param name="event">The <see cref="OrderFilledIntegrationEvent"/> to process.</param>
     private async Task HandleCoreAsync(OrderFilledIntegrationEvent @event)
     {
+        // Structured logging scope — CorrelationId appears in every log line within this scope
+        using var correlationScope = @event.CorrelationId is not null
+            ? _logger.BeginScope(new Dictionary<string, object> { ["CorrelationId"] = @event.CorrelationId })
+            : null;
+
         // Create a new DI scope so that EF Core DbContext instances are short-lived and
         // isolated to this single event invocation. The scope is disposed at the end of
         // the using block, releasing all scoped services and their database connections.
@@ -192,6 +212,12 @@ public sealed class OrderFilledEventHandler : IIntegrationEventHandler<OrderFill
                 @event.OrderId);
             return;
         }
+
+        // Wrap position creation + audit log in an explicit transaction so both
+        // succeed or fail atomically.
+        var writeContext = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+        var wdb = writeContext.GetDbContext();
+        await using var transaction = await wdb.Database.BeginTransactionAsync();
 
         // Derive position direction from the order type. OrderType.Buy → Long position
         // (profit when price rises); all other order types (Sell, SellLimit, etc.) → Short
@@ -241,11 +267,8 @@ public sealed class OrderFilledEventHandler : IIntegrationEventHandler<OrderFill
             "({Symbol} @ {Price:F5}, lots={Lots:F2})",
             direction, positionId, @event.OrderId, order.Symbol, @event.FilledPrice, lots);
 
-        // Write a DecisionLog entry so that the full Order → Position chain is queryable
-        // from the audit trail. This is consumed by the PerformanceAttribution feature and
-        // displayed in the back-office UI. EntityType="Order" (not "Position") because the
-        // decision being recorded is "this order fill produced a position", anchored on the
-        // order that triggered it.
+        // Write a DecisionLog entry inside the transaction so that position creation
+        // and audit are atomic — if the transaction rolls back, neither persists.
         await mediator.Send(new LogDecisionCommand
         {
             EntityType   = "Order",
@@ -256,5 +279,39 @@ public sealed class OrderFilledEventHandler : IIntegrationEventHandler<OrderFill
                            $"{direction} position opened (lots={lots:F2})",
             Source       = "OrderFilledEventHandler"
         });
+
+        await transaction.CommitAsync();
+    }
+
+    /// <summary>
+    /// Persists a failed event to the dead-letter table for manual inspection and replay.
+    /// Best-effort — if this also fails, the event is truly lost (logged at Critical).
+    /// </summary>
+    private async Task TryDeadLetterAsync(OrderFilledIntegrationEvent @event, Exception ex, int attempts)
+    {
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var deadLetterSink = scope.ServiceProvider.GetRequiredService<IDeadLetterSink>();
+
+            await deadLetterSink.WriteAsync(
+                handlerName:      nameof(OrderFilledEventHandler),
+                eventType:        nameof(OrderFilledIntegrationEvent),
+                eventPayloadJson: JsonSerializer.Serialize(@event),
+                errorMessage:     ex.Message,
+                stackTrace:       ex.StackTrace,
+                attempts:         attempts);
+
+            _logger.LogWarning(
+                "OrderFilledEventHandler: dead-lettered event for order {OrderId} — stored for manual replay",
+                @event.OrderId);
+        }
+        catch (Exception dlEx)
+        {
+            _logger.LogCritical(dlEx,
+                "OrderFilledEventHandler: FAILED to dead-letter event for order {OrderId} — event may be lost. " +
+                "Original error: {OriginalError}",
+                @event.OrderId, ex.Message);
+        }
     }
 }

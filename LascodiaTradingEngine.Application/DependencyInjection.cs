@@ -11,8 +11,11 @@ using LascodiaTradingEngine.Application.Workers;
 using LascodiaTradingEngine.Application.Common.Events;
 using LascodiaTradingEngine.Application.Services.Alerts.Options;
 using LascodiaTradingEngine.Application.Services.EconomicCalendar;
+using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Application.Services.MarketData;
 using Microsoft.Extensions.Logging;
+using Polly;
+using Polly.Extensions.Http;
 
 namespace LascodiaTradingEngine.Application;
 
@@ -90,6 +93,35 @@ public static class DependencyInjection
         {
             c.Timeout = TimeSpan.FromSeconds(10);
         });
+        services.AddHttpClient("ForexFactoryCalendar", c =>
+        {
+            c.Timeout = TimeSpan.FromSeconds(15);
+        })
+        .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler
+        {
+            UseCookies = true,
+            CookieContainer = new System.Net.CookieContainer(),
+            AutomaticDecompression = System.Net.DecompressionMethods.GZip
+                                   | System.Net.DecompressionMethods.Deflate
+        })
+        .AddPolicyHandler(HttpPolicyExtensions
+            .HandleTransientHttpError()
+            .OrResult(r => r.StatusCode == System.Net.HttpStatusCode.TooManyRequests)
+            .WaitAndRetryAsync(3, (attempt, response, _) =>
+            {
+                // Respect Retry-After header from 429 responses when available
+                var retryAfter = response?.Result?.Headers?.RetryAfter?.Delta;
+                return retryAfter ?? TimeSpan.FromSeconds(Math.Pow(2, attempt))
+                    + TimeSpan.FromMilliseconds(Random.Shared.Next(0, 500));
+            }, (_, _, _, _) => Task.CompletedTask));
+
+        // ── Correlation Matrix (singleton: both hosted service and provider) ─────
+        services.AddSingleton<CorrelationMatrixWorker>();
+        services.AddSingleton<ICorrelationMatrixProvider>(sp => sp.GetRequiredService<CorrelationMatrixWorker>());
+        services.AddHostedService(sp => sp.GetRequiredService<CorrelationMatrixWorker>());
+
+        // ── EA Ownership Guard ────────────────────────────────────────────────────
+        services.AddScoped<IEAOwnershipGuard, EAOwnershipGuard>();
 
         // ── Candle Aggregator ──────────────────────────────────────────────────────
         // Singleton: must hold state across ticks for the lifetime of the application.
@@ -99,14 +131,15 @@ public static class DependencyInjection
         services.AddSingleton(TimeProvider.System);
 
         // ── Economic Calendar Feeds (composite factory) ──────────────────────────
+        services.AddSingleton<ForexFactoryFetchThrottle>();
+        services.AddScoped<ForexFactoryCalendarFeed>();
         services.AddScoped<InvestingComCalendarFeed>();
-        services.AddScoped<OandaCalendarFeed>();
         services.AddScoped<IEconomicCalendarFeed>(sp =>
             new CompositeCalendarFeed(
                 new IEconomicCalendarFeed[]
                 {
-                    sp.GetRequiredService<InvestingComCalendarFeed>(),
-                    sp.GetRequiredService<OandaCalendarFeed>()
+                    sp.GetRequiredService<ForexFactoryCalendarFeed>(),
+                    sp.GetRequiredService<InvestingComCalendarFeed>()
                 },
                 sp.GetRequiredService<ILogger<CompositeCalendarFeed>>()));
 

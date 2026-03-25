@@ -134,6 +134,14 @@ public class Order : Entity<long>
     /// </summary>
     public decimal? HighestFavourablePrice { get; set; }
 
+    // ── Partial fill resubmission ─────────────────────────────────────────
+
+    /// <summary>
+    /// If this order is a residual order created to fill the remainder of a partial fill,
+    /// this references the original order. Null for primary orders.
+    /// </summary>
+    public long? ParentOrderId { get; set; }
+
     // ── Timestamps ───────────────────────────────────────────────────────────
 
     /// <summary>UTC timestamp when this order record was created in the system.</summary>

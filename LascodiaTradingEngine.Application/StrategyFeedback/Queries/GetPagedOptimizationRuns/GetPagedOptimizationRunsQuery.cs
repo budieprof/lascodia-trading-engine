@@ -45,6 +45,7 @@ public class GetPagedOptimizationRunsQueryHandler
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.OptimizationRun>()
+            .AsNoTracking()
             .Where(x => !x.IsDeleted)
             .OrderByDescending(x => x.StartedAt)
             .AsQueryable();

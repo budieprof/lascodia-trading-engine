@@ -5,6 +5,7 @@ using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.Common.Events;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.ExpertAdvisor.Commands.RegisterEA;
@@ -53,15 +54,25 @@ public class RegisterEACommandHandler : IRequestHandler<RegisterEACommand, Respo
 {
     private readonly IWriteApplicationDbContext _context;
     private readonly IIntegrationEventService _eventBus;
+    private readonly IEAOwnershipGuard _ownershipGuard;
 
-    public RegisterEACommandHandler(IWriteApplicationDbContext context, IIntegrationEventService eventBus)
+    public RegisterEACommandHandler(
+        IWriteApplicationDbContext context,
+        IIntegrationEventService eventBus,
+        IEAOwnershipGuard ownershipGuard)
     {
-        _context  = context;
-        _eventBus = eventBus;
+        _context        = context;
+        _eventBus       = eventBus;
+        _ownershipGuard = ownershipGuard;
     }
 
     public async Task<ResponseData<long>> Handle(RegisterEACommand request, CancellationToken cancellationToken)
     {
+        // Verify the caller owns the trading account they're registering the EA for
+        var callerAccountId = _ownershipGuard.GetCallerAccountId();
+        if (callerAccountId is null || callerAccountId != request.TradingAccountId)
+            return ResponseData<long>.Init(0, false, "Unauthorized: caller does not own this trading account", "-403");
+
         var dbContext = _context.GetDbContext();
         var requestedSymbols = request.Symbols
             .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)

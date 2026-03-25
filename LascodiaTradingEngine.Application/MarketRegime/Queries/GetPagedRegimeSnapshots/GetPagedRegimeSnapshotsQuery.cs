@@ -47,6 +47,7 @@ public class GetPagedRegimeSnapshotsQueryHandler
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.MarketRegimeSnapshot>()
+            .AsNoTracking()
             .Where(x => !x.IsDeleted)
             .OrderByDescending(x => x.DetectedAt)
             .AsQueryable();

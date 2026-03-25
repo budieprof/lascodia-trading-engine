@@ -1,3 +1,4 @@
+using FluentValidation;
 using MediatR;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
@@ -18,6 +19,18 @@ public class UpdateLiveCandleCommand : IRequest<ResponseData<string>>
     public decimal         Bid       { get; set; }
     public decimal         Ask       { get; set; }
     public DateTime        Timestamp { get; set; }
+}
+
+// ── Validator ─────────────────────────────────────────────────────────────────
+
+public class UpdateLiveCandleCommandValidator : AbstractValidator<UpdateLiveCandleCommand>
+{
+    public UpdateLiveCandleCommandValidator()
+    {
+        RuleFor(x => x.Symbol).NotEmpty().MaximumLength(20);
+        RuleFor(x => x.Bid).GreaterThan(0);
+        RuleFor(x => x.Ask).GreaterThan(0);
+    }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────

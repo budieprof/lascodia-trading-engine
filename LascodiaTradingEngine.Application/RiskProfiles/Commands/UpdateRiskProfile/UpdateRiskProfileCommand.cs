@@ -3,7 +3,9 @@ using MediatR;
 using Microsoft.EntityFrameworkCore;
 using System.Text.Json.Serialization;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
+using LascodiaTradingEngine.Application.AuditTrail.Commands.LogDecision;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Utilities;
 
 namespace LascodiaTradingEngine.Application.RiskProfiles.Commands.UpdateRiskProfile;
 
@@ -76,10 +78,12 @@ public class UpdateRiskProfileCommandValidator : AbstractValidator<UpdateRiskPro
 public class UpdateRiskProfileCommandHandler : IRequestHandler<UpdateRiskProfileCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;
+    private readonly IMediator _mediator;
 
-    public UpdateRiskProfileCommandHandler(IWriteApplicationDbContext context)
+    public UpdateRiskProfileCommandHandler(IWriteApplicationDbContext context, IMediator mediator)
     {
         _context = context;
+        _mediator = mediator;
     }
 
     public async Task<ResponseData<string>> Handle(UpdateRiskProfileCommand request, CancellationToken cancellationToken)
@@ -90,6 +94,23 @@ public class UpdateRiskProfileCommandHandler : IRequestHandler<UpdateRiskProfile
 
         if (entity == null)
             return ResponseData<string>.Init(null, false, "Risk profile not found", "-14");
+
+        // Capture before-state for audit trail
+        var beforeState = new
+        {
+            entity.Name,
+            entity.MaxLotSizePerTrade,
+            entity.MaxDailyDrawdownPct,
+            entity.MaxTotalDrawdownPct,
+            entity.MaxOpenPositions,
+            entity.MaxDailyTrades,
+            entity.MaxRiskPerTradePct,
+            entity.MaxSymbolExposurePct,
+            entity.IsDefault,
+            entity.DrawdownRecoveryThresholdPct,
+            entity.RecoveryLotSizeMultiplier,
+            entity.RecoveryExitThresholdPct,
+        };
 
         if (request.IsDefault && !entity.IsDefault)
         {
@@ -115,6 +136,34 @@ public class UpdateRiskProfileCommandHandler : IRequestHandler<UpdateRiskProfile
         entity.RecoveryExitThresholdPct     = request.RecoveryExitThresholdPct;
 
         await _context.SaveChangesAsync(cancellationToken);
+
+        // Log before/after snapshot for compliance audit
+        var afterState = new
+        {
+            request.Name,
+            request.MaxLotSizePerTrade,
+            request.MaxDailyDrawdownPct,
+            request.MaxTotalDrawdownPct,
+            request.MaxOpenPositions,
+            request.MaxDailyTrades,
+            request.MaxRiskPerTradePct,
+            request.MaxSymbolExposurePct,
+            request.IsDefault,
+            request.DrawdownRecoveryThresholdPct,
+            request.RecoveryLotSizeMultiplier,
+            request.RecoveryExitThresholdPct,
+        };
+
+        await _mediator.Send(new LogDecisionCommand
+        {
+            EntityType   = "RiskProfile",
+            EntityId     = entity.Id,
+            DecisionType = "RiskProfileUpdated",
+            Outcome      = "Updated",
+            Reason       = $"Risk profile '{entity.Name}' updated",
+            ContextJson  = AuditSnapshot.Capture(beforeState, afterState),
+            Source       = "UpdateRiskProfileCommand"
+        }, cancellationToken);
 
         return ResponseData<string>.Init("Updated", true, "Successful", "00");
     }

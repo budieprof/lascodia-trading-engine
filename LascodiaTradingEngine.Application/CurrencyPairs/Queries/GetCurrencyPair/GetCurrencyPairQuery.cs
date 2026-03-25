@@ -31,6 +31,7 @@ public class GetCurrencyPairQueryHandler : IRequestHandler<GetCurrencyPairQuery,
     {
         var entity = await _context.GetDbContext()
             .Set<Domain.Entities.CurrencyPair>()
+            .AsNoTracking()
             .FirstOrDefaultAsync(x => x.Id == request.Id && !x.IsDeleted, cancellationToken);
 
         if (entity is null)

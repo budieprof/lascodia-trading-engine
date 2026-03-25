@@ -11,7 +11,6 @@ namespace LascodiaTradingEngine.Application.TradingAccounts.Queries.GetActiveTra
 
 public class GetActiveTradingAccountQuery : IRequest<ResponseData<TradingAccountDto>>
 {
-    public required long BrokerId { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
@@ -31,10 +30,11 @@ public class GetActiveTradingAccountQueryHandler : IRequestHandler<GetActiveTrad
     {
         var entity = await _context.GetDbContext()
             .Set<Domain.Entities.TradingAccount>()
-            .FirstOrDefaultAsync(x => x.BrokerId == request.BrokerId && x.IsActive && !x.IsDeleted, cancellationToken);
+            .AsNoTracking()
+            .FirstOrDefaultAsync(x => x.IsActive && !x.IsDeleted, cancellationToken);
 
         if (entity == null)
-            return ResponseData<TradingAccountDto>.Init(null, false, "No active trading account found for broker", "-14");
+            return ResponseData<TradingAccountDto>.Init(null, false, "No active trading account found", "-14");
 
         return ResponseData<TradingAccountDto>.Init(_mapper.Map<TradingAccountDto>(entity), true, "Successful", "00");
     }

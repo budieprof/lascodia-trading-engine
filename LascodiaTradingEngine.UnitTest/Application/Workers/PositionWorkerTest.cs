@@ -99,6 +99,16 @@ public class PositionWorkerTest : IDisposable
         var mockDbContext = new Mock<DbContext>();
         var positionDbSet = positions.AsQueryable().BuildMockDbSet();
         mockDbContext.Setup(c => c.Set<Position>()).Returns(positionDbSet.Object);
+
+        // CurrencyPair lookup used by PublishPositionClosedEventAsync for contract size
+        var currencyPairs = new List<CurrencyPair>
+        {
+            new() { Symbol = "EURUSD", ContractSize = 100_000m },
+            new() { Symbol = "GBPUSD", ContractSize = 100_000m },
+        };
+        var currencyPairDbSet = currencyPairs.AsQueryable().BuildMockDbSet();
+        mockDbContext.Setup(c => c.Set<CurrencyPair>()).Returns(currencyPairDbSet.Object);
+
         _mockReadContext.Setup(c => c.GetDbContext()).Returns(mockDbContext.Object);
     }
 
@@ -324,6 +334,31 @@ public class PositionWorkerTest : IDisposable
             e => e.SaveAndPublish(It.IsAny<IWriteApplicationDbContext>(), It.Is<PositionClosedIntegrationEvent>(
                 ev => ev.PositionId == 11 && ev.CloseReason == "StopLoss")),
             Times.Once);
+    }
+
+    [Fact]
+    public async Task UpdatePositions_InvertedQuote_SkipsPositionEntirely()
+    {
+        // Arrange — inverted quote: Ask < Bid
+        var position = new Position
+        {
+            Id = 20, Symbol = "EURUSD", Status = PositionStatus.Open,
+            Direction = PositionDirection.Long, OpenLots = 1.0m,
+            AverageEntryPrice = 1.1000m, StopLoss = 1.0900m
+        };
+        SetupOpenPositions(new List<Position> { position });
+        SetupLivePrice("EURUSD", 1.1012m, 1.1008m); // Ask < Bid = inverted
+
+        // Act
+        await InvokeUpdatePositionsAsync();
+
+        // Assert — no price update, no close command sent
+        _mockMediator.Verify(
+            m => m.Send(It.IsAny<UpdatePositionPriceCommand>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+        _mockMediator.Verify(
+            m => m.Send(It.IsAny<ClosePositionCommand>(), It.IsAny<CancellationToken>()),
+            Times.Never);
     }
 
     // ── Test helper ──────────────────────────────────────────────────────────

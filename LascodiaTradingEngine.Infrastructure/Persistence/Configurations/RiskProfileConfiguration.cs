@@ -38,6 +38,24 @@ public class RiskProfileConfiguration : IEntityTypeConfiguration<RiskProfile>
         builder.Property(x => x.RecoveryExitThresholdPct)
             .HasPrecision(18, 8);
 
+        builder.Property(x => x.MaxTotalExposurePct)
+            .HasPrecision(18, 8);
+
+        builder.Property(x => x.MaxAbsoluteRiskPerTrade)
+            .HasPrecision(18, 4);
+
+        builder.Property(x => x.MinStopLossDistancePips)
+            .HasPrecision(18, 8);
+
+        builder.Property(x => x.MinRiskRewardRatio)
+            .HasPrecision(18, 8);
+
+        builder.Property(x => x.WeekendGapRiskMultiplier)
+            .HasPrecision(18, 8);
+
+        builder.Property(x => x.MinEquityFloor)
+            .HasPrecision(18, 4);
+
         builder.HasQueryFilter(x => !x.IsDeleted);
 
         builder.HasIndex(x => x.IsDefault);

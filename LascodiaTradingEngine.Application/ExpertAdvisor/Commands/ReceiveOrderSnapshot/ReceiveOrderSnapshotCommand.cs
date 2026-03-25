@@ -38,7 +38,8 @@ public class ReceiveOrderSnapshotCommandValidator : AbstractValidator<ReceiveOrd
             .NotEmpty().WithMessage("InstanceId cannot be empty");
 
         RuleFor(x => x.Orders)
-            .NotNull().WithMessage("Orders cannot be null");
+            .NotNull().WithMessage("Orders cannot be null")
+            .Must(o => o.Count <= 500).WithMessage("Order snapshot cannot exceed 500 items");
     }
 }
 

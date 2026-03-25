@@ -55,7 +55,7 @@ Entities inherit `Entity<long>` from `SharedDomain`. All entities use a soft-del
 |---|---|
 | Core Trading | `Order`, `Position`, `PositionScaleOrder`, `TradeSignal` |
 | Strategies | `Strategy`, `StrategyAllocation`, `StrategyPerformanceSnapshot` |
-| Accounts & Brokers | `TradingAccount`, `Broker`, `CurrencyPair` |
+| Accounts | `TradingAccount`, `CurrencyPair` |
 | Market Data | `Candle`, `LivePrice`, `MarketRegimeSnapshot`, `SentimentSnapshot` |
 | Risk & Alerts | `Alert`, `RiskProfile`, `DrawdownSnapshot`, `ExecutionQualityLog` |
 | ML Models | `MLModel`, `MLTrainingRun`, `MLModelPredictionLog`, `MLShadowEvaluation` |
@@ -63,7 +63,7 @@ Entities inherit `Entity<long>` from `SharedDomain`. All entities use a soft-del
 | Expert Advisor | `EAInstance`, `EACommand` |
 | Other | `EconomicEvent`, `COTReport`, `EngineConfig`, `DecisionLog` |
 
-**Enums (35):** `OrderType`, `OrderStatus`, `TradeDirection`, `TradeSignalStatus`, `StrategyType`, `StrategyStatus`, `PositionDirection`, `PositionStatus`, `BrokerType`, `BrokerEnvironment`, `BrokerStatus`, `ExecutionType`, `Timeframe`, `TradingSession`, `TrailingStopType`, `AlertType`, `AlertChannel`, `MLModelStatus`, `ModelRole`, `ShadowEvaluationStatus`, `PromotionDecision`, `OptimizationRunStatus`, `RunStatus`, `MarketRegime`, `EconomicImpact`, `EconomicEventSource`, `SentimentSource`, `ScaleType`, `ScaleOrderStatus`, `ConfigDataType`, `RecoveryMode`, `StrategyHealthStatus`, `TriggerType`, `EACommandType`, `EAInstanceStatus`
+**Enums (32):** `OrderType`, `OrderStatus`, `TradeDirection`, `TradeSignalStatus`, `StrategyType`, `StrategyStatus`, `PositionDirection`, `PositionStatus`, `ExecutionType`, `Timeframe`, `TradingSession`, `TrailingStopType`, `AlertType`, `AlertChannel`, `MLModelStatus`, `ModelRole`, `ShadowEvaluationStatus`, `PromotionDecision`, `OptimizationRunStatus`, `RunStatus`, `MarketRegime`, `EconomicImpact`, `EconomicEventSource`, `SentimentSource`, `ScaleType`, `ScaleOrderStatus`, `ConfigDataType`, `RecoveryMode`, `StrategyHealthStatus`, `TriggerType`, `EACommandType`, `EAInstanceStatus`
 
 ---
 
@@ -105,8 +105,6 @@ Orders/
 | Alerts | Create, Update, Delete | Get, GetPaged |
 | AuditTrail | Create | Get, GetPaged |
 | Backtesting | RunBacktest | GetBacktestRun, GetPagedBacktestRuns |
-| BrokerManagement | (operational commands) | (status queries) |
-| Brokers | Create, Update, Delete, Activate, UpdateStatus | GetBroker, GetActiveBroker, GetPagedBrokers |
 | CurrencyPairs | Create, Update | GetPaged |
 | DrawdownRecovery | RecordDrawdownSnapshot | GetLatestDrawdownSnapshot |
 | EconomicEvents | Create, Update | Get, GetPaged |
@@ -128,7 +126,7 @@ Orders/
 | StrategyFeedback | TriggerOptimization, ApproveOptimization, RejectOptimization | GetOptimizationRun, GetPagedRuns, GetStrategyPerformance |
 | SystemHealth | — | (health queries) |
 | TradeSignals | Create, Approve, Reject, Expire | GetTradeSignal, GetPagedTradeSignals |
-| TradingAccounts | Create, Update, Delete, Activate, SyncAccountBalance | GetTradingAccount, GetActiveTradingAccount, GetPagedTradingAccounts |
+| TradingAccounts | Create, Update, Delete, Activate, SyncAccountBalance, ChangePassword, RegisterTrader, LoginTradingAccount | GetTradingAccount, GetActiveTradingAccount, GetPagedTradingAccounts |
 | TrailingStop | UpdateTrailingStop | GetTrailingStop |
 | WalkForward | RunWalkForward | GetWalkForwardRun, GetPagedRuns |
 | ExpertAdvisor | RegisterEA, DeregisterEA, ProcessHeartbeat, ReceiveSymbolSpecs, RefreshSymbolSpecs, ReceiveTradingSessions, ReceiveTickBatch, ReceiveCandle, ReceiveCandleBackfill, ReceivePositionSnapshot, ReceiveOrderSnapshot, ReceiveDealSnapshot, ProcessReconciliation, AcknowledgeCommand | GetPendingCommands, GetActiveInstances |
@@ -170,7 +168,8 @@ Orders/
 | Service Group | Implementations |
 |---|---|
 | Alert Channels | `AlertDispatcher`, `WebhookAlertSender`, `EmailAlertSender`, `TelegramAlertSender` |
-| Broker Adapters | `OandaBrokerAdapter`, `OandaOrderExecutor`, `BrokerFailoverService` |
+| Broker Adapters | `OandaBrokerAdapter`, `OandaOrderExecutor`, `BrokerFailoverService` (disabled — EA is sole adapter) |
+| Security | `FieldEncryption` (AES-256-GCM), `TradingAccountTokenGenerator` (JWT) |
 | Cache | `InMemoryLivePriceCache`, `InDatabaseLivePriceCache` |
 | Economic Calendar | `StubEconomicCalendarFeed` |
 | Filters | `NewsFilter`, `MultiTimeframeFilter`, `SessionFilter`, `PortfolioCorrelationChecker` |
@@ -222,7 +221,7 @@ EF Core with **separate read/write contexts** and a dedicated **event log contex
 
 ### API (`LascodiaTradingEngine.API`)
 
-All controllers inherit `AuthControllerBase<T>` from the shared library. All endpoints require JWT authentication.
+Most controllers inherit `AuthControllerBase<T>` from the shared library. All endpoints require JWT authentication except the auth endpoints.
 
 #### Response Codes
 
@@ -232,9 +231,22 @@ All controllers inherit `AuthControllerBase<T>` from the shared library. All end
 | `"-11"` | Validation error |
 | `"-14"` | Not found |
 
-#### Controllers (`Controllers/v1/`) — 32 controllers
+#### Controllers (`Controllers/v1/`) — 31 controllers
 
-`OrderController`, `PositionController`, `StrategyController`, `StrategyEnsembleController`, `StrategyFeedbackController`, `TradeSignalController`, `TradingAccountController`, `BrokerController`, `BrokerManagementController`, `CurrencyPairController`, `RiskProfileController`, `AlertController`, `AuditTrailController`, `MarketDataController`, `MarketRegimeController`, `SentimentController`, `EconomicEventController`, `MLModelController`, `MLEvaluationController`, `BacktestController`, `WalkForwardController`, `DrawdownRecoveryController`, `TrailingStopController`, `ExecutionQualityController`, `PaperTradingController`, `PerformanceAttributionController`, `RateLimitingController`, `SystemHealthController`, `EngineConfigurationController`, **`ExpertAdvisorController`**
+`OrderController`, `PositionController`, `StrategyController`, `StrategyEnsembleController`, `StrategyFeedbackController`, `TradeSignalController`, `TradingAccountController`, **`TradingAccountAuthController`** (`[AllowAnonymous]`), `CurrencyPairController`, `RiskProfileController`, `AlertController`, `AuditTrailController`, `MarketDataController`, `MarketRegimeController`, `SentimentController`, `EconomicEventController`, `MLModelController`, `MLEvaluationController`, `BacktestController`, `WalkForwardController`, `DrawdownRecoveryController`, `TrailingStopController`, `ExecutionQualityController`, `PaperTradingController`, `PerformanceAttributionController`, `RateLimitingController`, `SystemHealthController`, `EngineConfigurationController`, **`ExpertAdvisorController`**
+
+#### Authentication Endpoints (TradingAccountAuthController)
+
+| Endpoint | Method | Auth | Purpose |
+|----------|--------|------|---------|
+| `POST /api/v1/lascodia-trading-engine/auth/register` | RegisterTraderCommand | `[AllowAnonymous]` | Self-registration + auto-login (returns JWT) |
+| `POST /api/v1/lascodia-trading-engine/auth/login` | LoginTradingAccountCommand | `[AllowAnonymous]` | Login (EA: passwordless, Web: password required) |
+
+#### TradingAccount Password Management
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `PUT /api/v1/lascodia-trading-engine/trading-account/{id}/password` | ChangePasswordCommand | Change account password |
 
 #### Infrastructure Configuration (`appsettings.json`)
 
@@ -370,7 +382,7 @@ These types are discovered and registered **automatically by reflection** — yo
 
 ## Expert Advisor Integration (EA as Exclusive Broker Adapter)
 
-The engine's built-in broker adapters (OANDA, IB, FXCM) are **disabled**. All market data and order execution flows through MQL5 Expert Advisor instances running on MetaTrader 5. The EA project lives at `../lascodia-trading-engine-ea/`.
+The engine's built-in broker adapters (OANDA, IB, FXCM) are **disabled**. All market data and order execution flows through MQL5 Expert Advisor instances running on MetaTrader 5. The EA project lives at `/Users/olabodeolaleye/Developments/Software Projects/personal/Lascodia Trading Engine/lascodia-trading-engine-ea`.
 
 ### Architecture Change
 
@@ -489,6 +501,14 @@ The engine should track EA heartbeats. If no heartbeat from an instance for 60 s
 - **ML workflow**: Train → Shadow evaluation → Promotion decision → Activate (event triggers downstream workers).
 - **Broker adapters**: Built-in adapters (`IBrokerOrderExecutor` + `IBrokerDataFeed`) are **disabled** when EA is active. The EA replaces them entirely. Set `WorkerGroups.BrokerAdapters = false`.
 - **EA as broker adapter**: All market data comes from EA instances via REST API. The engine has zero direct broker connectivity when EA mode is enabled.
+- **Trading account-centric**: The `Broker` entity has been removed. All broker info (name, server) lives on `TradingAccount`. Login is via AccountId + BrokerServer.
+- **Trader authentication**: `POST /auth/register` (self-registration + auto-login) and `POST /auth/login` (EA: passwordless, Web: password required). JWT tokens are scoped to a single TradingAccount.
+- **Password encryption**: Passwords are AES-256-GCM encrypted via `FieldEncryption` (stored in `TradingAccount.EncryptedPassword`). Default passwords are auto-generated on registration. Traders must set their own via `PUT /trading-account/{id}/password` for web dashboard access.
+- **Two-tier risk checking**: Trade signals are validated in two stages:
+  - **Tier 1 (`ISignalValidator`)**: Account-agnostic signal validation (expiry, lot size positivity, SL/TP direction, min SL distance, R:R ratio, mandatory SL, ML agreement). Runs in `SignalOrderBridgeWorker` — rejects or approves the signal.
+  - **Tier 2 (`IRiskChecker`)**: Account-specific risk checks (margin, exposure, position limits, drawdown, lot constraints, spread). Runs when creating an order from an approved signal via `POST /order/from-signal` (`CreateOrderFromSignalCommand`).
+  - Approved signals remain consumable until they expire. Tier 2 failure does NOT reject the signal — it records a `SignalAccountAttempt` and returns failure, so other accounts can still try.
+- **Signal-to-order flow**: `StrategyWorker` generates signal → `SignalOrderBridgeWorker` runs Tier 1 → approves/rejects → EA/dashboard calls `POST /order/from-signal` with signalId + accountId → Tier 2 runs → order created if passed.
 
 ---
 

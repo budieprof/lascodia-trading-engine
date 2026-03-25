@@ -57,12 +57,13 @@ public class DrawdownMonitorWorker : BackgroundService
     private readonly ILogger<DrawdownMonitorWorker> _logger;
     private readonly IServiceScopeFactory _scopeFactory;
 
-    /// <summary>
-    /// How often the worker samples account equity and writes a new snapshot.
-    /// Set to 60 seconds to give the equity-curve adequate resolution while
-    /// keeping DB write volume manageable (≈ 1 440 rows per account per day).
-    /// </summary>
-    private static readonly TimeSpan PollingInterval = TimeSpan.FromSeconds(60);
+    private const string CK_PollSecs = "Drawdown:PollIntervalSeconds";
+    private const int DefaultPollSeconds = 60;
+
+    /// <summary>Max backoff delay on consecutive failures (5 minutes).</summary>
+    private static readonly TimeSpan MaxBackoff = TimeSpan.FromMinutes(5);
+
+    private int _consecutiveFailures;
 
     /// <summary>
     /// Initialises the worker.
@@ -92,21 +93,44 @@ public class DrawdownMonitorWorker : BackgroundService
 
         while (!stoppingToken.IsCancellationRequested)
         {
+            int pollSecs = DefaultPollSeconds;
             try
             {
                 await RecordSnapshotAsync(stoppingToken);
+                _consecutiveFailures = 0;
+
+                // Read configurable poll interval from EngineConfig
+                using var configScope = _scopeFactory.CreateScope();
+                var configCtx = configScope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+                var entry = await configCtx.GetDbContext()
+                    .Set<Domain.Entities.EngineConfig>()
+                    .AsNoTracking()
+                    .FirstOrDefaultAsync(c => c.Key == CK_PollSecs, stoppingToken);
+                if (entry?.Value is not null && int.TryParse(entry.Value, out var parsed) && parsed > 0)
+                    pollSecs = parsed;
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
-                // Host is shutting down — exit the loop cleanly without logging an error.
                 break;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Unexpected error in DrawdownMonitorWorker polling loop");
+                _consecutiveFailures++;
+                _logger.LogError(ex,
+                    "DrawdownMonitorWorker: polling error (consecutive failures: {Failures})",
+                    _consecutiveFailures);
             }
 
-            await Task.Delay(PollingInterval, stoppingToken);
+            var pollingInterval = TimeSpan.FromSeconds(pollSecs);
+
+            // Exponential backoff on consecutive failures: 60s, 120s, 240s, capped at 5min
+            var delay = _consecutiveFailures > 0
+                ? TimeSpan.FromSeconds(Math.Min(
+                    pollingInterval.TotalSeconds * Math.Pow(2, _consecutiveFailures - 1),
+                    MaxBackoff.TotalSeconds))
+                : pollingInterval;
+
+            await Task.Delay(delay, stoppingToken);
         }
 
         _logger.LogInformation("DrawdownMonitorWorker stopped");
@@ -183,6 +207,24 @@ public class DrawdownMonitorWorker : BackgroundService
         // Calculate drawdown % here solely for the log message — the canonical value
         // is computed and stored by the command handler.
         decimal drawdownPct = (peakEquity - currentEquity) / peakEquity * 100m;
+
+        // ── Margin level monitoring ─────────────────────────────────────────
+        // Margin level = Equity / MarginUsed × 100%.
+        // Broker margin call is typically at 100%; we warn at 200% and alert at 150%.
+        if (account.MarginUsed > 0)
+        {
+            decimal marginLevel = account.Equity / account.MarginUsed * 100m;
+
+            if (marginLevel < 150m)
+                _logger.LogError(
+                    "DrawdownMonitorWorker: CRITICAL — margin level {Level:F0}% is below 150% (equity={Equity:F2}, margin={Margin:F2}). " +
+                    "Broker margin call imminent.",
+                    marginLevel, account.Equity, account.MarginUsed);
+            else if (marginLevel < 200m)
+                _logger.LogWarning(
+                    "DrawdownMonitorWorker: margin level {Level:F0}% is below 200% safety threshold (equity={Equity:F2}, margin={Margin:F2})",
+                    marginLevel, account.Equity, account.MarginUsed);
+        }
 
         _logger.LogInformation(
             "DrawdownMonitorWorker: snapshot recorded — Equity={Equity:F2}, Peak={Peak:F2}, Drawdown={DD:F2}%",

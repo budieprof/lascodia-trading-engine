@@ -1,8 +1,10 @@
+using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Utilities;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -35,9 +37,12 @@ public sealed class TrailingStopWorker : BackgroundService
 {
     private const string CK_PollSecs = "TrailingStop:PollIntervalSeconds";
 
+    private static readonly TimeSpan MaxBackoff = TimeSpan.FromMinutes(5);
+
     private readonly IServiceScopeFactory        _scopeFactory;
     private readonly ILivePriceCache             _priceCache;
     private readonly ILogger<TrailingStopWorker> _logger;
+    private int _consecutiveFailures;
 
     public TrailingStopWorker(
         IServiceScopeFactory        scopeFactory,
@@ -68,6 +73,7 @@ public sealed class TrailingStopWorker : BackgroundService
                 pollSecs = await GetConfigAsync<int>(ctx, CK_PollSecs, 10, stoppingToken);
 
                 await UpdateTrailingStopsAsync(ctx, writeCtx, stoppingToken);
+                _consecutiveFailures = 0;
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -75,10 +81,20 @@ public sealed class TrailingStopWorker : BackgroundService
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "TrailingStopWorker loop error");
+                _consecutiveFailures++;
+                _logger.LogError(ex,
+                    "TrailingStopWorker: loop error (consecutive failures: {Failures})",
+                    _consecutiveFailures);
             }
 
-            await Task.Delay(TimeSpan.FromSeconds(pollSecs), stoppingToken);
+            // Exponential backoff on consecutive failures, capped at 5min
+            var delay = _consecutiveFailures > 0
+                ? TimeSpan.FromSeconds(Math.Min(
+                    pollSecs * Math.Pow(2, _consecutiveFailures - 1),
+                    MaxBackoff.TotalSeconds))
+                : TimeSpan.FromSeconds(pollSecs);
+
+            await Task.Delay(delay, stoppingToken);
         }
 
         _logger.LogInformation("TrailingStopWorker stopping.");
@@ -166,6 +182,31 @@ public sealed class TrailingStopWorker : BackgroundService
                     continue;
             }
 
+            // ── Bounds validation: SL must be positive and on the correct side of entry ──
+            if (newSl <= 0)
+            {
+                _logger.LogWarning(
+                    "TrailingStop: position {Id} ({Symbol}) computed invalid SL {NewSl:F5} — skipping",
+                    pos.Id, pos.Symbol, newSl);
+                continue;
+            }
+
+            if (pos.Direction == PositionDirection.Long && newSl >= current)
+            {
+                _logger.LogWarning(
+                    "TrailingStop: position {Id} ({Symbol} Long) SL {NewSl:F5} >= current price {Price:F5} — skipping",
+                    pos.Id, pos.Symbol, newSl, current);
+                continue;
+            }
+
+            if (pos.Direction == PositionDirection.Short && newSl <= current)
+            {
+                _logger.LogWarning(
+                    "TrailingStop: position {Id} ({Symbol} Short) SL {NewSl:F5} <= current price {Price:F5} — skipping",
+                    pos.Id, pos.Symbol, newSl, current);
+                continue;
+            }
+
             // ── Persist the updated SL and trail reference price ──────────────
             await writeCtx.Set<Position>()
                 .Where(p => p.Id == pos.Id)
@@ -173,6 +214,58 @@ public sealed class TrailingStopWorker : BackgroundService
                     .SetProperty(p => p.StopLoss,          newSl)
                     .SetProperty(p => p.TrailingStopLevel, current),
                     ct);
+
+            // ── Queue EACommand so the EA updates the SL on MT5 ─────────────
+            if (!string.IsNullOrEmpty(pos.BrokerPositionId))
+            {
+                try
+                {
+                    var eaInstance = await writeCtx.Set<EAInstance>()
+                        .ActiveForSymbol(pos.Symbol)
+                        .FirstOrDefaultAsync(ct);
+
+                    if (eaInstance is not null)
+                    {
+                        await writeCtx.Set<EACommand>().AddAsync(new EACommand
+                        {
+                            TargetInstanceId = eaInstance.InstanceId,
+                            CommandType      = EACommandType.UpdateTrailing,
+                            TargetTicket     = long.TryParse(pos.BrokerPositionId, out var ticket) ? ticket : null,
+                            Symbol           = pos.Symbol,
+                            Parameters       = JsonSerializer.Serialize(new { stopLoss = newSl }),
+                        }, ct);
+                        await writeCtx.SaveChangesAsync(ct);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Dead-letter the failed EA command to prevent silent loss of SL modifications
+                    _logger.LogError(ex,
+                        "TrailingStop: FAILED to queue EA command for position {Id} ({Symbol}) SL→{NewSl:F5} — dead-lettering",
+                        pos.Id, pos.Symbol, newSl);
+
+                    try
+                    {
+                        using var dlScope = _scopeFactory.CreateScope();
+                        var deadLetterSink = dlScope.ServiceProvider.GetRequiredService<IDeadLetterSink>();
+
+                        await deadLetterSink.WriteAsync(
+                            handlerName:      nameof(TrailingStopWorker),
+                            eventType:        "EACommand:UpdateTrailing",
+                            eventPayloadJson: JsonSerializer.Serialize(new { positionId = pos.Id, symbol = pos.Symbol, newStopLoss = newSl, brokerPositionId = pos.BrokerPositionId }),
+                            errorMessage:     ex.Message,
+                            stackTrace:       ex.StackTrace,
+                            attempts:         1,
+                            ct);
+                    }
+                    catch (Exception dlEx)
+                    {
+                        _logger.LogCritical(dlEx,
+                            "TrailingStop: FAILED to dead-letter EA command for position {Id} — command may be lost",
+                            pos.Id);
+                    }
+                }
+            }
 
             updated++;
 

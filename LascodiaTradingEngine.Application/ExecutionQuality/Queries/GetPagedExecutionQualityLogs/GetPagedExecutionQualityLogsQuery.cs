@@ -48,6 +48,7 @@ public class GetPagedExecutionQualityLogsQueryHandler
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.ExecutionQualityLog>()
+            .AsNoTracking()
             .Where(x => !x.IsDeleted)
             .OrderByDescending(x => x.RecordedAt)
             .AsQueryable();

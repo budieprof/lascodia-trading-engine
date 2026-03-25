@@ -35,6 +35,7 @@ public class GetLatestCandleQueryHandler : IRequestHandler<GetLatestCandleQuery,
 
         var candle = await _context.GetDbContext()
             .Set<Domain.Entities.Candle>()
+            .AsNoTracking()
             .Where(x => x.Symbol == request.Symbol
                      && x.Timeframe == timeframe
                      && !x.IsDeleted)

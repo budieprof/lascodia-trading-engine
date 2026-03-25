@@ -1,3 +1,4 @@
+using FluentValidation;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
@@ -14,6 +15,16 @@ namespace LascodiaTradingEngine.Application.Strategies.Commands.ActivateStrategy
 public class ActivateStrategyCommand : IRequest<ResponseData<string>>
 {
     public long Id { get; set; }
+}
+
+// ── Validator ─────────────────────────────────────────────────────────────────
+
+public class ActivateStrategyCommandValidator : AbstractValidator<ActivateStrategyCommand>
+{
+    public ActivateStrategyCommandValidator()
+    {
+        RuleFor(x => x.Id).GreaterThan(0).WithMessage("Id must be greater than zero");
+    }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────

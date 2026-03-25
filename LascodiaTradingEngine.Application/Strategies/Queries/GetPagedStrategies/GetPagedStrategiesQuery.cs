@@ -44,6 +44,7 @@ public class GetPagedStrategiesQueryHandler
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.Strategy>()
+            .AsNoTracking()
             .Where(x => !x.IsDeleted)
             .OrderBy(x => x.Name)
             .AsQueryable();

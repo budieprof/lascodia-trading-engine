@@ -32,6 +32,7 @@ public class GetActiveInstancesQueryHandler : IRequestHandler<GetActiveInstances
     {
         var instances = await _context.GetDbContext()
             .Set<Domain.Entities.EAInstance>()
+            .AsNoTracking()
             .Where(x => x.Status == EAInstanceStatus.Active && !x.IsDeleted)
             .OrderByDescending(x => x.LastHeartbeat)
             .ProjectTo<EAInstanceDto>(_mapper.ConfigurationProvider)

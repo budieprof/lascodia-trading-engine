@@ -13,11 +13,12 @@ public class EconomicEventConfiguration : IEntityTypeConfiguration<EconomicEvent
 
         builder.Property(x => x.Title).IsRequired().HasMaxLength(200);
         builder.Property(x => x.Currency).IsRequired().HasMaxLength(3);
-        builder.Property(x => x.Impact).HasConversion<string>().IsRequired().HasMaxLength(10);
+        builder.Property(x => x.Impact).HasConversion<string>().IsRequired().HasMaxLength(20);
         builder.Property(x => x.Source).HasConversion<string>().IsRequired().HasMaxLength(50);
         builder.Property(x => x.Forecast).HasMaxLength(50);
         builder.Property(x => x.Previous).HasMaxLength(50);
         builder.Property(x => x.Actual).HasMaxLength(50);
+        builder.Property(x => x.ExternalKey).HasMaxLength(200);
 
         builder.HasQueryFilter(x => !x.IsDeleted);
 

@@ -1,6 +1,7 @@
 using System.Text.Json;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Options;
+using LascodiaTradingEngine.Application.Common.Utilities;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -74,8 +75,8 @@ public class MomentumTrendEvaluator : IStrategyEvaluator
         int last = candles.Count - 1;
 
         // Compute +DI, -DI, ADX for current and previous bars
-        var (adxCurr, pdiCurr, mdiCurr) = ComputeAdx(candles, last, adxPeriod);
-        var (adxPrev, pdiPrev, mdiPrev) = ComputeAdx(candles, last - 1, adxPeriod);
+        var (adxCurr, pdiCurr, mdiCurr) = IndicatorCalculator.AdxWithDI(candles, last, adxPeriod);
+        var (adxPrev, pdiPrev, mdiPrev) = IndicatorCalculator.AdxWithDI(candles, last - 1, adxPeriod);
 
         // ADX must be above threshold and rising
         if (adxCurr < adxThreshold || adxCurr <= adxPrev)
@@ -102,7 +103,7 @@ public class MomentumTrendEvaluator : IStrategyEvaluator
         }
 
         // ATR-based SL/TP
-        decimal atr           = CalculateAtr(candles, last, _options.AtrPeriodForSlTp);
+        decimal atr           = IndicatorCalculator.Atr(candles, last, _options.AtrPeriodForSlTp);
         if (atr <= 0) return Task.FromResult<TradeSignal?>(null);
         decimal stopDistance   = atr * _options.StopLossAtrMultiplier;
         decimal profitDistance = atr * _options.TakeProfitAtrMultiplier;
@@ -138,129 +139,5 @@ public class MomentumTrendEvaluator : IStrategyEvaluator
             GeneratedAt      = now,
             ExpiresAt        = now.AddMinutes(_options.MomentumTrendExpiryMinutes)
         });
-    }
-
-    // ── ADX calculation ─────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Computes ADX, +DI, and -DI at the given bar index using Wilder's smoothing.
-    /// </summary>
-    private static (decimal Adx, decimal PlusDI, decimal MinusDI) ComputeAdx(
-        IReadOnlyList<Candle> candles, int endIndex, int period)
-    {
-        int start = endIndex - period * 2;
-        if (start < 1) start = 1;
-
-        decimal smoothedPlusDM  = 0;
-        decimal smoothedMinusDM = 0;
-        decimal smoothedTR      = 0;
-
-        // Initial sums over first `period` bars
-        int initEnd = Math.Min(start + period, endIndex + 1);
-        for (int i = start; i < initEnd; i++)
-        {
-            var (tr, pdm, mdm) = TrueRangeAndDM(candles, i);
-            smoothedTR      += tr;
-            smoothedPlusDM  += pdm;
-            smoothedMinusDM += mdm;
-        }
-
-        // Wilder's smoothing for remaining bars
-        for (int i = initEnd; i <= endIndex; i++)
-        {
-            var (tr, pdm, mdm) = TrueRangeAndDM(candles, i);
-            smoothedTR      = smoothedTR      - smoothedTR      / period + tr;
-            smoothedPlusDM  = smoothedPlusDM  - smoothedPlusDM  / period + pdm;
-            smoothedMinusDM = smoothedMinusDM - smoothedMinusDM / period + mdm;
-        }
-
-        decimal plusDI  = smoothedTR > 0 ? (smoothedPlusDM  / smoothedTR) * 100 : 0;
-        decimal minusDI = smoothedTR > 0 ? (smoothedMinusDM / smoothedTR) * 100 : 0;
-
-        decimal diSum  = plusDI + minusDI;
-        decimal dx     = diSum > 0 ? Math.Abs(plusDI - minusDI) / diSum * 100 : 0;
-
-        // Simple ADX approximation (average DX over last period)
-        // For a more accurate ADX we'd need to track running DX values,
-        // but this single-point approximation is sufficient for crossover detection.
-        decimal adx = dx; // Approximation — actual Wilder ADX would smooth DX
-
-        // Improve approximation: compute DX at a few recent points and average
-        if (endIndex - start >= period)
-        {
-            decimal dxSum = dx;
-            int dxCount = 1;
-            for (int offset = 1; offset <= Math.Min(period - 1, 4); offset++)
-            {
-                int idx = endIndex - offset;
-                if (idx <= start) break;
-                var (adxI, _, _) = ComputeAdxSingle(candles, idx, period, start);
-                dxSum += adxI;
-                dxCount++;
-            }
-            adx = dxSum / dxCount;
-        }
-
-        return (adx, plusDI, minusDI);
-    }
-
-    private static (decimal Dx, decimal PlusDI, decimal MinusDI) ComputeAdxSingle(
-        IReadOnlyList<Candle> candles, int endIndex, int period, int start)
-    {
-        decimal sTR = 0, sPDM = 0, sMDM = 0;
-        int initEnd = Math.Min(start + period, endIndex + 1);
-        for (int i = start; i < initEnd; i++)
-        {
-            var (tr, pdm, mdm) = TrueRangeAndDM(candles, i);
-            sTR += tr; sPDM += pdm; sMDM += mdm;
-        }
-        for (int i = initEnd; i <= endIndex; i++)
-        {
-            var (tr, pdm, mdm) = TrueRangeAndDM(candles, i);
-            sTR  = sTR  - sTR  / period + tr;
-            sPDM = sPDM - sPDM / period + pdm;
-            sMDM = sMDM - sMDM / period + mdm;
-        }
-        decimal pdi = sTR > 0 ? sPDM / sTR * 100 : 0;
-        decimal mdi = sTR > 0 ? sMDM / sTR * 100 : 0;
-        decimal sum = pdi + mdi;
-        decimal dx  = sum > 0 ? Math.Abs(pdi - mdi) / sum * 100 : 0;
-        return (dx, pdi, mdi);
-    }
-
-    private static (decimal TR, decimal PlusDM, decimal MinusDM) TrueRangeAndDM(
-        IReadOnlyList<Candle> candles, int i)
-    {
-        decimal high      = candles[i].High;
-        decimal low       = candles[i].Low;
-        decimal prevHigh  = candles[i - 1].High;
-        decimal prevLow   = candles[i - 1].Low;
-        decimal prevClose = candles[i - 1].Close;
-
-        decimal tr = Math.Max(high - low,
-                     Math.Max(Math.Abs(high - prevClose),
-                              Math.Abs(low  - prevClose)));
-
-        decimal upMove   = high - prevHigh;
-        decimal downMove = prevLow - low;
-
-        decimal plusDM  = upMove > downMove && upMove > 0 ? upMove : 0;
-        decimal minusDM = downMove > upMove && downMove > 0 ? downMove : 0;
-
-        return (tr, plusDM, minusDM);
-    }
-
-    private static decimal CalculateAtr(IReadOnlyList<Candle> candles, int endIndex, int period)
-    {
-        decimal sumTr = 0m;
-        for (int i = endIndex - period + 1; i <= endIndex; i++)
-        {
-            decimal prevClose = candles[i - 1].Close;
-            decimal tr = Math.Max(candles[i].High - candles[i].Low,
-                         Math.Max(Math.Abs(candles[i].High - prevClose),
-                                  Math.Abs(candles[i].Low  - prevClose)));
-            sumTr += tr;
-        }
-        return sumTr / period;
     }
 }

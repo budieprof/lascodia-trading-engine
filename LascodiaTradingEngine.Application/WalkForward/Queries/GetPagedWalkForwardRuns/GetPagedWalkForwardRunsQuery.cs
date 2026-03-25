@@ -45,6 +45,7 @@ public class GetPagedWalkForwardRunsQueryHandler
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.WalkForwardRun>()
+            .AsNoTracking()
             .Where(x => !x.IsDeleted)
             .OrderByDescending(x => x.StartedAt)
             .AsQueryable();

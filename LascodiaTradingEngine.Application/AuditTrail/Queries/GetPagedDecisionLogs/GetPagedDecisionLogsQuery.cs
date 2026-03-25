@@ -49,6 +49,7 @@ public class GetPagedDecisionLogsQueryHandler
         // No IsDeleted filter — DecisionLog is immutable
         var query = _context.GetDbContext()
             .Set<Domain.Entities.DecisionLog>()
+            .AsNoTracking()
             .OrderByDescending(x => x.CreatedAt)
             .AsQueryable();
 

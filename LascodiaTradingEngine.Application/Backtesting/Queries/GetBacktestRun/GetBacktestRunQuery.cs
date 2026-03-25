@@ -32,6 +32,7 @@ public class GetBacktestRunQueryHandler : IRequestHandler<GetBacktestRunQuery, R
     {
         var entity = await _context.GetDbContext()
             .Set<Domain.Entities.BacktestRun>()
+            .AsNoTracking()
             .FirstOrDefaultAsync(x => x.Id == request.Id && !x.IsDeleted, cancellationToken);
 
         if (entity == null)

@@ -1,3 +1,4 @@
+using FluentValidation;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 using System.Text.Json.Serialization;
@@ -11,6 +12,16 @@ namespace LascodiaTradingEngine.Application.Strategies.Commands.DeleteStrategy;
 public class DeleteStrategyCommand : IRequest<ResponseData<string>>
 {
     [JsonIgnore] public long Id { get; set; }
+}
+
+// ── Validator ─────────────────────────────────────────────────────────────────
+
+public class DeleteStrategyCommandValidator : AbstractValidator<DeleteStrategyCommand>
+{
+    public DeleteStrategyCommandValidator()
+    {
+        RuleFor(x => x.Id).GreaterThan(0).WithMessage("Id must be greater than zero");
+    }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────

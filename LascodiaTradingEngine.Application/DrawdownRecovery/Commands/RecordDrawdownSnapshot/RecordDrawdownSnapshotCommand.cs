@@ -2,6 +2,7 @@ using FluentValidation;
 using MediatR;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Options;
 using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.DrawdownRecovery.Commands.RecordDrawdownSnapshot;
@@ -34,10 +35,12 @@ public class RecordDrawdownSnapshotCommandHandler
     : IRequestHandler<RecordDrawdownSnapshotCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;
+    private readonly RiskCheckerOptions _options;
 
-    public RecordDrawdownSnapshotCommandHandler(IWriteApplicationDbContext context)
+    public RecordDrawdownSnapshotCommandHandler(IWriteApplicationDbContext context, RiskCheckerOptions options)
     {
         _context = context;
+        _options = options;
     }
 
     public async Task<ResponseData<string>> Handle(
@@ -45,8 +48,8 @@ public class RecordDrawdownSnapshotCommandHandler
     {
         decimal drawdownPct = (request.PeakEquity - request.CurrentEquity) / request.PeakEquity * 100m;
 
-        RecoveryMode recoveryMode = drawdownPct >= 20m ? RecoveryMode.Halted
-            : drawdownPct >= 10m ? RecoveryMode.Reduced
+        RecoveryMode recoveryMode = drawdownPct >= _options.HaltedDrawdownPct ? RecoveryMode.Halted
+            : drawdownPct >= _options.ReducedDrawdownPct ? RecoveryMode.Reduced
             : RecoveryMode.Normal;
 
         var snapshot = new Domain.Entities.DrawdownSnapshot

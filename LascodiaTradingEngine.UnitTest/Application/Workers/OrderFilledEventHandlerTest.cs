@@ -1,5 +1,7 @@
 using MediatR;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Moq;
@@ -18,6 +20,7 @@ namespace LascodiaTradingEngine.UnitTest.Application.Workers;
 public class OrderFilledEventHandlerTest
 {
     private readonly Mock<IReadApplicationDbContext> _mockReadContext;
+    private readonly Mock<IWriteApplicationDbContext> _mockWriteContext;
     private readonly Mock<IMediator>                _mockMediator;
     private readonly Mock<ILogger<OrderFilledEventHandler>> _mockLogger;
     private readonly Mock<IServiceScopeFactory>     _mockScopeFactory;
@@ -28,12 +31,22 @@ public class OrderFilledEventHandlerTest
     public OrderFilledEventHandlerTest()
     {
         _mockReadContext  = new Mock<IReadApplicationDbContext>();
+        _mockWriteContext = new Mock<IWriteApplicationDbContext>();
         _mockMediator    = new Mock<IMediator>();
         _mockLogger      = new Mock<ILogger<OrderFilledEventHandler>>();
         _mockScopeFactory = new Mock<IServiceScopeFactory>();
         _mockDbContext    = new Mock<DbContext>();
 
         _mockReadContext.Setup(c => c.GetDbContext()).Returns(_mockDbContext.Object);
+        _mockWriteContext.Setup(c => c.GetDbContext()).Returns(_mockDbContext.Object);
+
+        // Mock Database.BeginTransactionAsync for the explicit transaction in HandleCoreAsync
+        var mockDatabaseFacade = new Mock<DatabaseFacade>(_mockDbContext.Object);
+        var mockTransaction = new Mock<IDbContextTransaction>();
+        mockDatabaseFacade
+            .Setup(d => d.BeginTransactionAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(mockTransaction.Object);
+        _mockDbContext.Setup(c => c.Database).Returns(mockDatabaseFacade.Object);
 
         // Wire up IServiceScopeFactory → IServiceScope → IServiceProvider
         var mockScope           = new Mock<IServiceScope>();
@@ -42,6 +55,10 @@ public class OrderFilledEventHandlerTest
         mockServiceProvider
             .Setup(sp => sp.GetService(typeof(IReadApplicationDbContext)))
             .Returns(_mockReadContext.Object);
+
+        mockServiceProvider
+            .Setup(sp => sp.GetService(typeof(IWriteApplicationDbContext)))
+            .Returns(_mockWriteContext.Object);
 
         mockServiceProvider
             .Setup(sp => sp.GetService(typeof(IMediator)))

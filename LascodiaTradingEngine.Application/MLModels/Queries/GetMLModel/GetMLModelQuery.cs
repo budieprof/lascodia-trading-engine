@@ -31,6 +31,7 @@ public class GetMLModelQueryHandler : IRequestHandler<GetMLModelQuery, ResponseD
     {
         var entity = await _context.GetDbContext()
             .Set<Domain.Entities.MLModel>()
+            .AsNoTracking()
             .FirstOrDefaultAsync(x => x.Id == request.Id && !x.IsDeleted, cancellationToken);
 
         if (entity is null)

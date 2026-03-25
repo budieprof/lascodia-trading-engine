@@ -7,8 +7,8 @@ using LascodiaTradingEngine.Domain.Enums;
 namespace LascodiaTradingEngine.Infrastructure.Persistence;
 
 /// <summary>
-/// Seeds the database with the minimum data required to run the engine locally in
-/// paper-trading mode via <c>SimulatedBrokerAdapter</c>.
+/// Seeds the database with the minimum data required to run the engine locally.
+/// Trading accounts are created at runtime when the EA registers via POST /auth/register.
 /// Idempotent — checks for existing rows before inserting.
 /// </summary>
 public sealed class DatabaseSeeder
@@ -27,7 +27,6 @@ public sealed class DatabaseSeeder
         var db = _context.GetDbContext();
 
         await SeedCurrencyPairsAsync(db, ct);
-        await SeedBrokerAsync(db, ct);
         await SeedTradingAccountAsync(db, ct);
         await SeedRiskProfileAsync(db, ct);
         await SeedStrategiesAsync(db, ct);
@@ -59,52 +58,11 @@ public sealed class DatabaseSeeder
         _logger.LogInformation("Seeded {Count} currency pairs", 10);
     }
 
-    private async Task SeedBrokerAsync(DbContext db, CancellationToken ct)
+    private Task SeedTradingAccountAsync(DbContext db, CancellationToken ct)
     {
-        var brokers = db.Set<Broker>();
-        if (await brokers.AnyAsync(b => b.BrokerType == BrokerType.Paper, ct)) return;
-
-        brokers.Add(new Broker
-        {
-            Name = "Paper Trading Broker",
-            BrokerType = BrokerType.Paper,
-            Environment = BrokerEnvironment.Practice,
-            BaseUrl = "http://localhost",
-            IsActive = true,
-            IsPaper = true,
-            Status = BrokerStatus.Connected,
-            StatusMessage = "Simulated broker — always connected",
-            CreatedAt = DateTime.UtcNow,
-        });
-
-        await db.SaveChangesAsync(ct);
-        _logger.LogInformation("Seeded paper trading broker");
-    }
-
-    private async Task SeedTradingAccountAsync(DbContext db, CancellationToken ct)
-    {
-        var accounts = db.Set<TradingAccount>();
-        if (await accounts.AnyAsync(ct)) return;
-
-        var broker = await db.Set<Broker>().FirstAsync(b => b.BrokerType == BrokerType.Paper, ct);
-
-        accounts.Add(new TradingAccount
-        {
-            BrokerId = broker.Id,
-            AccountId = "PAPER-001",
-            AccountName = "Paper Trading Account",
-            Currency = "USD",
-            Balance = 100_000m,
-            Equity = 100_000m,
-            MarginUsed = 0m,
-            MarginAvailable = 100_000m,
-            IsActive = true,
-            IsPaper = true,
-            LastSyncedAt = DateTime.UtcNow,
-        });
-
-        await db.SaveChangesAsync(ct);
-        _logger.LogInformation("Seeded paper trading account with $100,000 balance");
+        // Trading accounts are created at runtime when the EA registers
+        // via POST /auth/register. No seed data needed.
+        return Task.CompletedTask;
     }
 
     private async Task SeedRiskProfileAsync(DbContext db, CancellationToken ct)
@@ -260,8 +218,8 @@ public sealed class DatabaseSeeder
             new EngineConfig
             {
                 Key = "Engine:ActiveBrokerType",
-                Value = "Paper",
-                Description = "The broker type to use for order execution",
+                Value = "EA",
+                Description = "The broker adapter type — EA is the sole adapter",
                 DataType = ConfigDataType.String,
                 IsHotReloadable = false,
             },
@@ -307,27 +265,11 @@ public sealed class DatabaseSeeder
             },
             new EngineConfig
             {
-                Key = "SimulatedBroker:InitialBalance",
-                Value = "100000",
-                Description = "Starting balance for the simulated paper broker",
-                DataType = ConfigDataType.Decimal,
-                IsHotReloadable = false,
-            },
-            new EngineConfig
-            {
-                Key = "SimulatedBroker:SlippagePips",
-                Value = "0.5",
-                Description = "Simulated slippage in pips per fill",
-                DataType = ConfigDataType.Decimal,
-                IsHotReloadable = true,
-            },
-            new EngineConfig
-            {
-                Key = "SimulatedBroker:Leverage",
-                Value = "50",
-                Description = "Leverage ratio for the simulated broker",
+                Key = "EA:HeartbeatTimeoutSeconds",
+                Value = "60",
+                Description = "Seconds before an EA instance is considered disconnected",
                 DataType = ConfigDataType.Int,
-                IsHotReloadable = false,
+                IsHotReloadable = true,
             },
             new EngineConfig
             {
@@ -348,6 +290,6 @@ public sealed class DatabaseSeeder
         );
 
         await db.SaveChangesAsync(ct);
-        _logger.LogInformation("Seeded {Count} engine configuration entries", 12);
+        _logger.LogInformation("Seeded {Count} engine configuration entries", 10);
     }
 }

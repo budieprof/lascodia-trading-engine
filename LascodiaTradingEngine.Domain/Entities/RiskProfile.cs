@@ -61,6 +61,24 @@ public class RiskProfile : Entity<long>
     public decimal MaxSymbolExposurePct        { get; set; } = 5m;
 
     /// <summary>
+    /// Maximum percentage of account equity that may be exposed across all open positions combined.
+    /// Prevents over-leveraging the entire account even when individual symbol limits are respected.
+    /// </summary>
+    public decimal MaxTotalExposurePct         { get; set; } = 50m;
+
+    /// <summary>
+    /// When <c>true</c>, every trade signal must have a stop-loss defined.
+    /// Signals without a stop-loss are rejected by the risk checker.
+    /// </summary>
+    public bool    RequireStopLoss             { get; set; }
+
+    /// <summary>
+    /// Maximum absolute monetary amount that can be risked on a single trade (in account currency).
+    /// Zero means no absolute cap is applied (only percentage-based limits).
+    /// </summary>
+    public decimal MaxAbsoluteRiskPerTrade     { get; set; }
+
+    /// <summary>
     /// When <c>true</c>, this profile is used as the system-wide fallback for strategies
     /// that do not have an explicit <see cref="Strategy.RiskProfileId"/> assigned.
     /// Only one profile should have this flag set.
@@ -87,6 +105,51 @@ public class RiskProfile : Entity<long>
     /// and resume trading at full lot sizes.
     /// </summary>
     public decimal RecoveryExitThresholdPct     { get; set; } = 0.5m;
+
+    /// <summary>
+    /// Minimum distance in pips between entry price and stop-loss.
+    /// Prevents signals with impractically tight stops that would be stopped out by spread/slippage.
+    /// Zero means no minimum distance is enforced.
+    /// </summary>
+    public decimal MinStopLossDistancePips { get; set; }
+
+    /// <summary>
+    /// Minimum required risk-to-reward ratio when both SL and TP are defined.
+    /// Calculated as |TP - Entry| / |SL - Entry|. Zero means no minimum RR is enforced.
+    /// </summary>
+    public decimal MinRiskRewardRatio { get; set; }
+
+    /// <summary>
+    /// Maximum number of open positions allowed on a single symbol.
+    /// Zero means no per-symbol limit is enforced (only the global <see cref="MaxOpenPositions"/> applies).
+    /// </summary>
+    public int MaxPositionsPerSymbol { get; set; }
+
+    /// <summary>
+    /// Number of consecutive losing trades that triggers a temporary trading pause.
+    /// Zero means no consecutive loss gate is applied.
+    /// </summary>
+    public int MaxConsecutiveLosses { get; set; }
+
+    /// <summary>
+    /// Multiplier applied to risk per trade for positions held over a weekend or holiday gap.
+    /// Gap risk is unhedgeable, so the effective risk is scaled up before comparing to limits.
+    /// 1.0 means no adjustment. Typical values: 1.5–2.0.
+    /// </summary>
+    public decimal WeekendGapRiskMultiplier { get; set; } = 1.0m;
+
+    /// <summary>
+    /// Maximum number of correlated open positions allowed before new signals in the same
+    /// correlation group are rejected. Zero means the correlated exposure check is disabled.
+    /// </summary>
+    public int MaxCorrelatedPositions { get; set; }
+
+    /// <summary>
+    /// Minimum account equity (in account currency) below which all trading is halted.
+    /// Provides an absolute floor regardless of percentage-based drawdown limits.
+    /// Zero means no minimum equity floor is enforced.
+    /// </summary>
+    public decimal MinEquityFloor { get; set; }
 
     /// <summary>Soft-delete flag. Filtered out by the global EF Core query filter.</summary>
     public bool    IsDeleted { get; set; }

@@ -46,7 +46,19 @@ public class ReceiveCandleBackfillCommandValidator : AbstractValidator<ReceiveCa
             .WithMessage("Timeframe must be one of: M1, M5, M15, H1, H4, D1");
 
         RuleFor(x => x.Candles)
-            .NotEmpty().WithMessage("Candles list cannot be empty");
+            .NotEmpty().WithMessage("Candles list cannot be empty")
+            .Must(c => c.Count <= 10000).WithMessage("Candle backfill batch cannot exceed 10000 items");
+
+        RuleForEach(x => x.Candles).ChildRules(c =>
+        {
+            c.RuleFor(i => i.Open).GreaterThan(0).WithMessage("Open must be greater than zero");
+            c.RuleFor(i => i.High).GreaterThan(0).WithMessage("High must be greater than zero");
+            c.RuleFor(i => i.Low).GreaterThan(0).WithMessage("Low must be greater than zero");
+            c.RuleFor(i => i.Close).GreaterThan(0).WithMessage("Close must be greater than zero");
+            c.RuleFor(i => i.High).GreaterThanOrEqualTo(i => i.Low).WithMessage("High must be >= Low");
+            c.RuleFor(i => i.Volume).GreaterThanOrEqualTo(0).WithMessage("Volume cannot be negative");
+            c.RuleFor(i => i.Timestamp).NotEmpty().WithMessage("Candle timestamp cannot be empty");
+        });
     }
 }
 

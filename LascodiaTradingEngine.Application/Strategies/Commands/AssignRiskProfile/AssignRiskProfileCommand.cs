@@ -1,3 +1,4 @@
+using FluentValidation;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
@@ -11,6 +12,17 @@ public class AssignRiskProfileCommand : IRequest<ResponseData<string>>
 {
     public long  StrategyId    { get; set; }
     public long? RiskProfileId { get; set; }
+}
+
+// ── Validator ─────────────────────────────────────────────────────────────────
+
+public class AssignRiskProfileCommandValidator : AbstractValidator<AssignRiskProfileCommand>
+{
+    public AssignRiskProfileCommandValidator()
+    {
+        RuleFor(x => x.StrategyId).GreaterThan(0);
+        RuleFor(x => x.RiskProfileId).GreaterThan(0).When(x => x.RiskProfileId.HasValue);
+    }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────

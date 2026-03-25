@@ -43,7 +43,9 @@ public static class DependencyInjection
             // Deep health checks — registered as named checks for /health endpoint.
             services.AddHealthChecks()
                 .AddCheck<DatabaseHealthCheck>("database", tags: ["ready"])
+                .AddCheck<RabbitMQHealthCheck>("event_bus", tags: ["ready"])
                 .AddCheck<BrokerHealthCheck>("broker", tags: ["ready"])
+                .AddCheck<EAHeartbeatHealthCheck>("ea_heartbeat", tags: ["ready", "live"])
                 .AddCheck<PriceCacheFreshnessCheck>("price_cache", tags: ["live"]);
 
             return services;

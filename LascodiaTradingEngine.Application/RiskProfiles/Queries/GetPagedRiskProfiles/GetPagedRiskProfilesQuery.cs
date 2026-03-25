@@ -41,6 +41,7 @@ public class GetPagedRiskProfilesQueryHandler
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.RiskProfile>()
+            .AsNoTracking()
             .Where(x => !x.IsDeleted)
             .OrderByDescending(x => x.IsDefault)
             .AsQueryable();

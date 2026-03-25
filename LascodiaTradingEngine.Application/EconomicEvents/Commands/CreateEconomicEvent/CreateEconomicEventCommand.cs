@@ -17,6 +17,8 @@ public class CreateEconomicEventCommand : IRequest<ResponseData<long>>
     public string          Source      { get; set; } = "Manual";
     public string?         Forecast    { get; set; }
     public string?         Previous    { get; set; }
+    public string?         ExternalKey { get; set; }
+    public string?         Actual      { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
@@ -35,7 +37,7 @@ public class CreateEconomicEventCommandValidator : AbstractValidator<CreateEcono
         RuleFor(x => x.Impact)
             .NotEmpty().WithMessage("Impact is required")
             .Must(i => Enum.TryParse<EconomicImpact>(i, ignoreCase: true, out _))
-            .WithMessage("Impact must be 'High', 'Medium', or 'Low'");
+            .WithMessage("Impact must be 'High', 'Medium', 'Low', or 'Holiday'");
     }
 }
 
@@ -60,7 +62,9 @@ public class CreateEconomicEventCommandHandler : IRequestHandler<CreateEconomicE
             ScheduledAt = request.ScheduledAt,
             Source      = Enum.Parse<EconomicEventSource>(request.Source, ignoreCase: true),
             Forecast    = request.Forecast,
-            Previous    = request.Previous
+            Previous    = request.Previous,
+            Actual      = request.Actual,
+            ExternalKey = request.ExternalKey
         };
 
         await _context.GetDbContext()

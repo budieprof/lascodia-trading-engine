@@ -1,6 +1,7 @@
 using System.Text.Json;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Options;
+using LascodiaTradingEngine.Application.Common.Utilities;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -60,8 +61,8 @@ public class RSIReversionEvaluator : IStrategyEvaluator
         if (candles.Count < requiredCandles)
             return Task.FromResult<TradeSignal?>(null);
 
-        decimal currentRsi = CalculateRsi(candles, candles.Count - 1, period);
-        decimal prevRsi    = CalculateRsi(candles, candles.Count - 2, period);
+        decimal currentRsi = IndicatorCalculator.SimpleRsi(candles, candles.Count - 1, period);
+        decimal prevRsi    = IndicatorCalculator.SimpleRsi(candles, candles.Count - 2, period);
 
         TradeDirection? direction = null;
         decimal entryPrice;
@@ -87,7 +88,7 @@ public class RSIReversionEvaluator : IStrategyEvaluator
         }
 
         // ATR-based stop-loss and take-profit
-        decimal atr = CalculateAtr(candles, candles.Count - 1, _options.AtrPeriodForSlTp);
+        decimal atr = IndicatorCalculator.Atr(candles, candles.Count - 1, _options.AtrPeriodForSlTp);
         if (atr <= 0) return Task.FromResult<TradeSignal?>(null);
         decimal stopDistance   = atr * _options.StopLossAtrMultiplier;
         decimal profitDistance = atr * _options.TakeProfitAtrMultiplier;
@@ -122,45 +123,5 @@ public class RSIReversionEvaluator : IStrategyEvaluator
         };
 
         return Task.FromResult<TradeSignal?>(signal);
-    }
-
-    private static decimal CalculateRsi(IReadOnlyList<Candle> candles, int endIndex, int period)
-    {
-        int startIndex = endIndex - period;
-
-        decimal avgGain = 0m;
-        decimal avgLoss = 0m;
-
-        for (int i = startIndex + 1; i <= startIndex + period; i++)
-        {
-            decimal change = candles[i].Close - candles[i - 1].Close;
-            if (change > 0) avgGain += change;
-            else            avgLoss -= change;
-        }
-        avgGain /= period;
-        avgLoss /= period;
-
-        if (avgLoss == 0m) return 100m;
-
-        decimal rs  = avgGain / avgLoss;
-        decimal rsi = 100m - (100m / (1m + rs));
-        return rsi;
-    }
-
-    private static decimal CalculateAtr(IReadOnlyList<Candle> candles, int endIndex, int period)
-    {
-        decimal sumTr = 0m;
-        int start = endIndex - period + 1;
-        for (int i = start; i <= endIndex; i++)
-        {
-            decimal high = candles[i].High;
-            decimal low  = candles[i].Low;
-            decimal prevClose = candles[i - 1].Close;
-            decimal tr = Math.Max(high - low,
-                         Math.Max(Math.Abs(high - prevClose),
-                                  Math.Abs(low  - prevClose)));
-            sumTr += tr;
-        }
-        return sumTr / period;
     }
 }

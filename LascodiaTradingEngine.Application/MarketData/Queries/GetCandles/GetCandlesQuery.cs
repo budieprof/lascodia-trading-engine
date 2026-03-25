@@ -53,6 +53,7 @@ public class GetCandlesQueryHandler
 
         var query = _context.GetDbContext()
             .Set<Domain.Entities.Candle>()
+            .AsNoTracking()
             .Where(x => x.Symbol == filter.Symbol
                      && x.Timeframe == timeframe
                      && !x.IsDeleted)
