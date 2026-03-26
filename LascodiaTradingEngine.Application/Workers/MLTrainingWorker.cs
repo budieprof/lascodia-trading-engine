@@ -142,6 +142,8 @@ public sealed class MLTrainingWorker : BackgroundService
     private const string CK_MinSharpeTrendSlope        = "MLTraining:MinSharpeTrendSlope";
     private const string CK_MinF1                      = "MLTraining:MinF1Score";
     private const string CK_UseClassWeights            = "MLTraining:UseClassWeights";
+    private const string CK_TrendingMinAccuracy        = "MLTraining:TrendingMinAccuracy";
+    private const string CK_TrendingMinEV              = "MLTraining:TrendingMinEV";
     private const string CK_FitTemperatureScale        = "MLTraining:FitTemperatureScale";
     private const string CK_MinBrierSkillScore         = "MLTraining:MinBrierSkillScore";
     private const string CK_RecalibrationDecayLambda   = "MLTraining:RecalibrationDecayLambda";
@@ -687,12 +689,33 @@ public sealed class MLTrainingWorker : BackgroundService
                 parentOobAccuracy > 0.0           &&
                 result.FinalMetrics.OobAccuracy < parentOobAccuracy * hp.MinQualityRetentionRatio;
 
+            // ── Regime-conditional F1 gate ──────────────────────────────────
+            // In Trending regime, allow directional (single-class) models if they
+            // have high accuracy and positive EV — a sell-only model during a
+            // sustained downtrend is a valid directional strategy.
+            // In all other regimes, enforce the standard MinF1Score threshold.
+            var currentRegime = await ctx.Set<MarketRegimeSnapshot>()
+                .Where(r => r.Symbol == run.Symbol && r.Timeframe == run.Timeframe && !r.IsDeleted)
+                .OrderByDescending(r => r.DetectedAt)
+                .Select(r => (Domain.Enums.MarketRegime?)r.Regime)
+                .FirstOrDefaultAsync(stoppingToken);
+
+            bool isTrending = currentRegime == Domain.Enums.MarketRegime.Trending
+                           || currentRegime == Domain.Enums.MarketRegime.Breakout;
+
+            double trendingMinAccuracy = await GetConfigAsync<double>(ctx, CK_TrendingMinAccuracy, 0.65, stoppingToken);
+            double trendingMinEV       = await GetConfigAsync<double>(ctx, CK_TrendingMinEV, 0.02, stoppingToken);
+
+            bool f1Passed = isTrending
+                ? (m.F1 >= hp.MinF1Score || (m.Accuracy >= trendingMinAccuracy && m.ExpectedValue >= trendingMinEV))
+                : (hp.MinF1Score <= 0 || m.F1 >= hp.MinF1Score);
+
             bool passed =
                 m.Accuracy           >= hp.MinAccuracyToPromote                                    &&
                 m.ExpectedValue      >= hp.MinExpectedValue                                        &&
                 m.BrierScore         <= hp.MaxBrierScore                                           &&
                 m.SharpeRatio        >= hp.MinSharpeRatio                                          &&
-                (hp.MinF1Score <= 0 || m.F1 >= hp.MinF1Score)                                      &&
+                f1Passed                                                                           &&
                 cvCheck.StdAccuracy  <= hp.MaxWalkForwardStdDev                                    &&
                 (hp.MaxEce <= 0 || snapEce <= hp.MaxEce)                                           &&
                 (hp.MinBrierSkillScore <= -1.0 || snapBss >= hp.MinBrierSkillScore)                &&
@@ -701,13 +724,15 @@ public sealed class MLTrainingWorker : BackgroundService
             _logger.LogInformation(
                 "Quality gates — acc={Acc:P1}/{MinAcc:P1} ev={EV:F4}/{MinEV:F4} " +
                 "brier={Brier:F4}/{MaxBrier:F4} sharpe={Sharpe:F2}/{MinSharpe:F2} " +
-                "f1={F1:F3}/{MinF1:F3} wfStd={WfStd:P1}/{MaxWfStd:P1} ece={Ece:F4}/{MaxEce:F4} " +
+                "f1={F1:F3}/{MinF1:F3} regime={Regime} f1Passed={F1Passed} " +
+                "wfStd={WfStd:P1}/{MaxWfStd:P1} ece={Ece:F4}/{MaxEce:F4} " +
                 "bss={Bss:F4}/{MinBss:F4} oobReg={OobNew:P1}/{OobParent:P1} passed={Passed}",
                 m.Accuracy,              hp.MinAccuracyToPromote,
                 m.ExpectedValue,         hp.MinExpectedValue,
                 m.BrierScore,            hp.MaxBrierScore,
                 m.SharpeRatio,           hp.MinSharpeRatio,
                 m.F1,                    hp.MinF1Score,
+                currentRegime?.ToString() ?? "unknown", f1Passed,
                 cvCheck.StdAccuracy,     hp.MaxWalkForwardStdDev,
                 snapEce,                 hp.MaxEce,
                 snapBss,                 hp.MinBrierSkillScore,
@@ -725,7 +750,8 @@ public sealed class MLTrainingWorker : BackgroundService
             run.BrierScore         = (decimal)m.BrierScore;
             run.SharpeRatio        = (decimal)m.SharpeRatio;
             run.ErrorMessage       = passed ? null : BuildGateFailureMessage(
-                m, cvCheck, hp, snapEce, snapBss, result.FinalMetrics.OobAccuracy, parentOobAccuracy);
+                m, cvCheck, hp, snapEce, snapBss, result.FinalMetrics.OobAccuracy, parentOobAccuracy,
+                isTrending, trendingMinAccuracy, trendingMinEV);
 
             if (!passed)
             {
@@ -1675,7 +1701,10 @@ public sealed class MLTrainingWorker : BackgroundService
         double              snapEce            = 0.0,
         double              snapBss            = double.NegativeInfinity,
         double              newOobAccuracy     = 0.0,
-        double              parentOobAccuracy  = 0.0)
+        double              parentOobAccuracy  = 0.0,
+        bool                isTrending         = false,
+        double              trendingMinAccuracy = 0.65,
+        double              trendingMinEV       = 0.02)
     {
         var failed = new List<string>(8);
 
@@ -1687,8 +1716,19 @@ public sealed class MLTrainingWorker : BackgroundService
             failed.Add($"brier {m.BrierScore:F4} > {hp.MaxBrierScore:F4}");
         if (m.SharpeRatio     < hp.MinSharpeRatio)
             failed.Add($"sharpe {m.SharpeRatio:F2} < {hp.MinSharpeRatio:F2}");
-        if (hp.MinF1Score > 0 && m.F1 < hp.MinF1Score)
+
+        // Regime-conditional F1 gate
+        if (isTrending)
+        {
+            bool f1Ok = m.F1 >= hp.MinF1Score
+                     || (m.Accuracy >= trendingMinAccuracy && m.ExpectedValue >= trendingMinEV);
+            if (!f1Ok)
+                failed.Add($"f1 {m.F1:F3} < {hp.MinF1Score:F3} (trending bypass requires acc≥{trendingMinAccuracy:P0} + ev≥{trendingMinEV:F3})");
+        }
+        else if (hp.MinF1Score > 0 && m.F1 < hp.MinF1Score)
+        {
             failed.Add($"f1 {m.F1:F3} < {hp.MinF1Score:F3}");
+        }
         if (cv.StdAccuracy    > hp.MaxWalkForwardStdDev)
             failed.Add($"wf_std {cv.StdAccuracy:P1} > {hp.MaxWalkForwardStdDev:P1}");
         if (hp.MaxEce > 0 && snapEce > hp.MaxEce)
