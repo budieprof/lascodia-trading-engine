@@ -75,21 +75,21 @@ public class GetPendingSignalsByAccountQueryHandler
             from strategy in strategyJoin.DefaultIfEmpty()
             orderby signal.GeneratedAt
             select new AccountSignalItem(
-                AccountId:      order.TradingAccountId,
-                SignalId:       signal.Id,
-                EngineOrderId:  order.Id,
-                Symbol:         signal.Symbol,
-                Direction:      (int)signal.Direction,
-                ExecutionType:  0, // Market execution (bridge always sends market orders)
-                EntryPrice:     (double)signal.EntryPrice,
-                StopLoss:       signal.StopLoss.HasValue ? (double)signal.StopLoss.Value : 0.0,
-                TakeProfit:     signal.TakeProfit.HasValue ? (double)signal.TakeProfit.Value : 0.0,
-                LotSize:        (double)signal.SuggestedLotSize,
-                Confidence:     (double)signal.Confidence,
-                StrategyId:     signal.StrategyId,
-                StrategyName:   strategy != null ? strategy.Name : string.Empty,
-                ExpiresAtUnix:  new DateTimeOffset(signal.ExpiresAt, TimeSpan.Zero).ToUnixTimeSeconds(),
-                CreatedAtUnix:  new DateTimeOffset(signal.GeneratedAt, TimeSpan.Zero).ToUnixTimeSeconds())
+                order.TradingAccountId,
+                signal.Id,
+                order.Id,
+                signal.Symbol,
+                (int)signal.Direction,
+                0, // Market execution (bridge always sends market orders)
+                (double)signal.EntryPrice,
+                signal.StopLoss.HasValue ? (double)signal.StopLoss.Value : 0.0,
+                signal.TakeProfit.HasValue ? (double)signal.TakeProfit.Value : 0.0,
+                (double)signal.SuggestedLotSize,
+                (double)signal.Confidence,
+                signal.StrategyId,
+                strategy != null ? strategy.Name : string.Empty,
+                new DateTimeOffset(signal.ExpiresAt, TimeSpan.Zero).ToUnixTimeSeconds(),
+                new DateTimeOffset(signal.GeneratedAt, TimeSpan.Zero).ToUnixTimeSeconds())
             ).ToListAsync(cancellationToken);
 
         return ResponseData<List<AccountSignalItem>>.Init(items, true, "Successful", "00");
