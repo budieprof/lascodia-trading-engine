@@ -224,7 +224,7 @@ public sealed class DatabaseSeeder
                 Timeframe   = s.Timeframe,
                 TriggerType = TriggerType.Manual,
                 Status      = RunStatus.Queued,
-                FromDate    = now.AddDays(-180),
+                FromDate    = now.AddDays(-365),
                 ToDate      = now,
                 StartedAt   = now,
             });

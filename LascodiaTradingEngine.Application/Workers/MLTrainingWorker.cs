@@ -880,15 +880,22 @@ public sealed class MLTrainingWorker : BackgroundService
 
                         if (!recentlyHandled)
                         {
+                            // Use a fresh training window rather than copying the parent run's
+                            // dates, which may be stale. Default to 365 days matching the drift
+                            // workers' MLTraining:TrainingDataWindowDays default.
+                            var shadowNow = DateTime.UtcNow;
+                            int windowDays = await GetConfigAsync<int>(
+                                ctx, "MLTraining:TrainingDataWindowDays", 365, stoppingToken);
+
                             ctx.Set<MLTrainingRun>().Add(new MLTrainingRun
                             {
                                 Symbol              = run.Symbol,
                                 Timeframe           = run.Timeframe,
                                 TriggerType         = TriggerType.AutoDegrading,
                                 Status              = RunStatus.Queued,
-                                FromDate            = run.FromDate,
-                                ToDate              = run.ToDate,
-                                StartedAt           = DateTime.UtcNow,
+                                FromDate            = shadowNow.AddDays(-windowDays),
+                                ToDate              = shadowNow,
+                                StartedAt           = shadowNow,
                                 LearnerArchitecture = arch,
                             });
 
