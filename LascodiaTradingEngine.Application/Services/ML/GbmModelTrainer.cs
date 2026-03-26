@@ -665,7 +665,7 @@ public sealed class GbmModelTrainer : IMLModelTrainer
                 double cw = trainSet[i].Direction > 0 ? classWeightBuy : classWeightSell;
                 residuals[i]     = (y - p) * cw;       // first-order gradient (negative), class-weighted
                 hessians[i]      = p * (1 - p) * cw;   // second-order (Hessian diagonal), class-weighted
-                sampleWeights[i] = temporalWeights[i];
+                sampleWeights[i] = temporalWeights[i] * cw; // split criterion also class-weighted
             }
 
             // Fit a weighted regression tree using Newton-Raphson leaf values

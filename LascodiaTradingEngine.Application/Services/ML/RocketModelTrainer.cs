@@ -785,6 +785,14 @@ public sealed class RocketModelTrainer : IMLModelTrainer
         for (int i = 0; i < trainN; i++)
             softLabels[i] = labels[i].Direction > 0 ? posLabel : negLabel;
 
+        // Class weights for balanced training
+        double rocketCwBuy = 1.0, rocketCwSell = 1.0;
+        if (hp.UseClassWeights)
+        {
+            int bc = labels.Count(s => s.Direction > 0), sc = trainN - bc;
+            if (bc > 0 && sc > 0) { rocketCwBuy = (double)trainN / (2.0 * bc); rocketCwSell = (double)trainN / (2.0 * sc); }
+        }
+
         // Mixup augmentation (post-ROCKET feature space)
         bool useMixup = hp.MixupAlpha > 0.0;
         double[][]? mixupFeatures = null;
@@ -850,7 +858,8 @@ public sealed class RocketModelTrainer : IMLModelTrainer
                     double logit = bias;
                     for (int j = 0; j < dim; j++) logit += w[j] * feat[j];
                     double p   = MLFeatureHelper.Sigmoid(logit);
-                    double err = (p - yVal) * temporalWeights[si] * trainN;
+                    double rcw = labels[si].Direction > 0 ? rocketCwBuy : rocketCwSell;
+                    double err = (p - yVal) * temporalWeights[si] * rcw * trainN;
 
                     for (int j = 0; j < dim; j++)
                         gW[j] += err * feat[j] + l2 * w[j];
