@@ -4,6 +4,8 @@ using LascodiaTradingEngine.Application.Common.Options;
 using LascodiaTradingEngine.Application.Common.Utilities;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
+using Microsoft.Extensions.DependencyInjection;
+using LascodiaTradingEngine.Application.Common.Attributes;
 
 namespace LascodiaTradingEngine.Application.Strategies.Evaluators;
 
@@ -27,6 +29,7 @@ namespace LascodiaTradingEngine.Application.Strategies.Evaluators;
 ///   • Multi-factor confidence — weighted score from RSI depth, candle pattern, volume, recovery speed.
 ///   • Confidence-based lot sizing — optional scaling between min/max lot by confidence score.
 /// </summary>
+[RegisterService(ServiceLifetime.Singleton, typeof(IStrategyEvaluator))]
 public class RSIReversionEvaluator : IStrategyEvaluator
 {
     private readonly StrategyEvaluatorOptions _options;

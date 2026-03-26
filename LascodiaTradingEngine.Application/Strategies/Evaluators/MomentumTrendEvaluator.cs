@@ -5,7 +5,9 @@ using LascodiaTradingEngine.Application.Common.Options;
 using LascodiaTradingEngine.Application.Common.Utilities;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using LascodiaTradingEngine.Application.Common.Attributes;
 
 namespace LascodiaTradingEngine.Application.Strategies.Evaluators;
 
@@ -37,6 +39,7 @@ namespace LascodiaTradingEngine.Application.Strategies.Evaluators;
 /// This evaluator intentionally avoids ranging markets (ADX &lt; 25) where directional
 /// movement signals produce whipsaws.
 /// </summary>
+[RegisterService(ServiceLifetime.Singleton, typeof(IStrategyEvaluator))]
 public class MomentumTrendEvaluator : IStrategyEvaluator
 {
     private readonly StrategyEvaluatorOptions _options;

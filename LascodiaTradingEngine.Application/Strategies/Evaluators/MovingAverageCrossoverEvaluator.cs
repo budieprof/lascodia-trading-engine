@@ -5,10 +5,13 @@ using LascodiaTradingEngine.Application.Common.Options;
 using LascodiaTradingEngine.Application.Common.Utilities;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using LascodiaTradingEngine.Application.Common.Attributes;
 
 namespace LascodiaTradingEngine.Application.Strategies.Evaluators;
 
+[RegisterService(ServiceLifetime.Singleton, typeof(IStrategyEvaluator))]
 public class MovingAverageCrossoverEvaluator : IStrategyEvaluator
 {
     private readonly StrategyEvaluatorOptions _options;

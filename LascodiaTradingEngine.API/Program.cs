@@ -251,6 +251,30 @@ if (app.Environment.IsDevelopment())
     app.UseSwaggerUI();
 }
 
+// Detailed health check breakdown endpoint
+app.MapHealthChecks("/health/detail", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions
+{
+    ResponseWriter = async (context, report) =>
+    {
+        context.Response.ContentType = "application/json";
+        var result = new
+        {
+            status = report.Status.ToString(),
+            totalDuration = report.TotalDuration.TotalMilliseconds,
+            checks = report.Entries.Select(e => new
+            {
+                name = e.Key,
+                status = e.Value.Status.ToString(),
+                description = e.Value.Description,
+                duration = e.Value.Duration.TotalMilliseconds,
+                exception = e.Value.Exception?.Message,
+                tags = e.Value.Tags
+            })
+        };
+        await context.Response.WriteAsJsonAsync(result);
+    }
+});
+
 app.RunAppPipeline<Program, WriteApplicationDbContext, IWriteApplicationDbContext>(services =>
 {
     services.DbMigrate<Program, WriteApplicationDbContext, IWriteApplicationDbContext>();

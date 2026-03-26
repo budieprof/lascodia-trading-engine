@@ -10,6 +10,7 @@ using MarketRegimeEnum = LascodiaTradingEngine.Domain.Enums.MarketRegime;
 using Microsoft.Extensions.Logging;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using LascodiaTradingEngine.Application.Common.Attributes;
 
 namespace LascodiaTradingEngine.Application.Strategies.Evaluators;
 
@@ -66,6 +67,7 @@ namespace LascodiaTradingEngine.Application.Strategies.Evaluators;
 ///  35.  Partial take-profit with scale-out at swing target
 ///  36.  Persistent cooldown via DB seeding on cache miss
 /// </summary>
+[RegisterService(ServiceLifetime.Singleton, typeof(IStrategyEvaluator))]
 public class MACDDivergenceEvaluator : IStrategyEvaluator
 {
     private readonly StrategyEvaluatorOptions _options;
