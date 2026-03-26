@@ -221,8 +221,8 @@ public sealed class MLRegimeAccuracyWorker : BackgroundService
                         l.DirectionCorrect != null      &&
                         !l.IsDeleted)
             .AsNoTracking()
-            .Select(l => new PredLog(l.Id, l.PredictedAt, l.DirectionCorrect!.Value))
             .OrderBy(l => l.PredictedAt)   // chronological order for binary-search validity
+            .Select(l => new PredLog(l.Id, l.PredictedAt, l.DirectionCorrect!.Value))
             .ToListAsync(ct);
 
         if (logs.Count < minPredictions)
