@@ -206,7 +206,7 @@ public sealed class GbmModelTrainer : IMLModelTrainer
         // ── 4. Fit GBM ensemble ─────────────────────────────────────────────
         var (trees, baseLogOdds, treeBagMasks) = FitGbmEnsemble(trainSet, featureCount, numRounds, maxDepth, lr,
             effectiveLabelSmoothing, warmStart, densityWeights, hp.TemporalDecayLambda,
-            hp.FeatureSampleRatio, hp.L2Lambda, ct);
+            hp.FeatureSampleRatio, hp.L2Lambda, ct, hp.UseClassWeights);
 
         _logger.LogInformation("GBM fitted: {R} trees, baseLogOdds={BLO:F4}", trees.Count, baseLogOdds);
 
@@ -280,7 +280,7 @@ public sealed class GbmModelTrainer : IMLModelTrainer
             int prunedRounds = Math.Max(10, numRounds / 2);
             var (pTrees, pBLO, _) = FitGbmEnsemble(maskedTrain, featureCount, prunedRounds, maxDepth, lr,
                 effectiveLabelSmoothing, null, densityWeights, hp.TemporalDecayLambda,
-                hp.FeatureSampleRatio, hp.L2Lambda, ct);
+                hp.FeatureSampleRatio, hp.L2Lambda, ct, hp.UseClassWeights);
             var (pA, pB)       = FitPlattScaling(maskedCal, pTrees, pBLO, lr, featureCount);
             var (pmw, pmb)     = FitLinearRegressor(maskedTrain, featureCount, hp);
             var prunedMetrics  = EvaluateGbm(maskedTest, pTrees, pBLO, lr, pmw, pmb, pA, pB, featureCount);
@@ -485,7 +485,8 @@ public sealed class GbmModelTrainer : IMLModelTrainer
         double               temporalDecayLambda,
         double               colSampleRatio,
         double               l2Lambda,
-        CancellationToken    ct)
+        CancellationToken    ct,
+        bool                 useClassWeights = false)
     {
         int valSize  = Math.Max(20, train.Count / 10);
         var valSet   = train[^valSize..];
@@ -506,6 +507,20 @@ public sealed class GbmModelTrainer : IMLModelTrainer
         }
 
         int n = trainSet.Count;
+
+        // Class weights: inverse-frequency balancing to prevent majority-class collapse.
+        double classWeightBuy  = 1.0;
+        double classWeightSell = 1.0;
+        if (useClassWeights)
+        {
+            int buyCount  = trainSet.Count(s => s.Direction > 0);
+            int sellCount = n - buyCount;
+            if (buyCount > 0 && sellCount > 0)
+            {
+                classWeightBuy  = (double)n / (2.0 * buyCount);
+                classWeightSell = (double)n / (2.0 * sellCount);
+            }
+        }
 
         // Stochastic GBM: row subsampling fraction (default 0.8 when not configured)
         double rowSubsampleFrac = 0.8;
@@ -647,8 +662,9 @@ public sealed class GbmModelTrainer : IMLModelTrainer
                 double y = labelSmoothing > 0
                     ? rawY * (1 - labelSmoothing) + 0.5 * labelSmoothing
                     : rawY;
-                residuals[i]     = y - p;              // first-order gradient (negative)
-                hessians[i]      = p * (1 - p);        // second-order (Hessian diagonal)
+                double cw = trainSet[i].Direction > 0 ? classWeightBuy : classWeightSell;
+                residuals[i]     = (y - p) * cw;       // first-order gradient (negative), class-weighted
+                hessians[i]      = p * (1 - p) * cw;   // second-order (Hessian diagonal), class-weighted
                 sampleWeights[i] = temporalWeights[i];
             }
 

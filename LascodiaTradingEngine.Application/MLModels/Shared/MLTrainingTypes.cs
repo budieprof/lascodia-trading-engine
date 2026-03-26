@@ -898,6 +898,17 @@ public record TrainingHyperparams(
     double SelfDistillTemp,
     /// <summary>Rec #182: FGSM adversarial perturbation magnitude ε. Default 0.01.</summary>
     double FgsmEpsilon,
+    /// <summary>
+    /// Minimum F1 score required for model promotion. Prevents single-class predictors
+    /// (F1=0.000) from being promoted. 0.0 = disabled. Default 0.10.
+    /// </summary>
+    double MinF1Score,
+    /// <summary>
+    /// When true, applies inverse-frequency class weighting during training so the
+    /// minority class receives higher loss penalty. Prevents majority-class collapse
+    /// in imbalanced datasets. Default true.
+    /// </summary>
+    bool UseClassWeights,
     /// <summary>Rec #398: Label smoothing epsilon for LabelSmoothModelTrainer. Null = 0.1.</summary>
     double? LabelSmoothEpsilon = null,
     /// <summary>Rec #399: Focal loss gamma for FocalLossModelTrainer. Null = 2.0.</summary>

@@ -140,6 +140,8 @@ public sealed class MLTrainingWorker : BackgroundService
     private const string CK_OobPruningEnabled          = "MLTraining:OobPruningEnabled";
     private const string CK_MutualInfoRedundancyThr    = "MLTraining:MutualInfoRedundancyThreshold";
     private const string CK_MinSharpeTrendSlope        = "MLTraining:MinSharpeTrendSlope";
+    private const string CK_MinF1                      = "MLTraining:MinF1Score";
+    private const string CK_UseClassWeights            = "MLTraining:UseClassWeights";
     private const string CK_FitTemperatureScale        = "MLTraining:FitTemperatureScale";
     private const string CK_MinBrierSkillScore         = "MLTraining:MinBrierSkillScore";
     private const string CK_RecalibrationDecayLambda   = "MLTraining:RecalibrationDecayLambda";
@@ -690,6 +692,7 @@ public sealed class MLTrainingWorker : BackgroundService
                 m.ExpectedValue      >= hp.MinExpectedValue                                        &&
                 m.BrierScore         <= hp.MaxBrierScore                                           &&
                 m.SharpeRatio        >= hp.MinSharpeRatio                                          &&
+                (hp.MinF1Score <= 0 || m.F1 >= hp.MinF1Score)                                      &&
                 cvCheck.StdAccuracy  <= hp.MaxWalkForwardStdDev                                    &&
                 (hp.MaxEce <= 0 || snapEce <= hp.MaxEce)                                           &&
                 (hp.MinBrierSkillScore <= -1.0 || snapBss >= hp.MinBrierSkillScore)                &&
@@ -698,12 +701,13 @@ public sealed class MLTrainingWorker : BackgroundService
             _logger.LogInformation(
                 "Quality gates — acc={Acc:P1}/{MinAcc:P1} ev={EV:F4}/{MinEV:F4} " +
                 "brier={Brier:F4}/{MaxBrier:F4} sharpe={Sharpe:F2}/{MinSharpe:F2} " +
-                "wfStd={WfStd:P1}/{MaxWfStd:P1} ece={Ece:F4}/{MaxEce:F4} " +
+                "f1={F1:F3}/{MinF1:F3} wfStd={WfStd:P1}/{MaxWfStd:P1} ece={Ece:F4}/{MaxEce:F4} " +
                 "bss={Bss:F4}/{MinBss:F4} oobReg={OobNew:P1}/{OobParent:P1} passed={Passed}",
                 m.Accuracy,              hp.MinAccuracyToPromote,
                 m.ExpectedValue,         hp.MinExpectedValue,
                 m.BrierScore,            hp.MaxBrierScore,
                 m.SharpeRatio,           hp.MinSharpeRatio,
+                m.F1,                    hp.MinF1Score,
                 cvCheck.StdAccuracy,     hp.MaxWalkForwardStdDev,
                 snapEce,                 hp.MaxEce,
                 snapBss,                 hp.MinBrierSkillScore,
@@ -1619,7 +1623,9 @@ public sealed class MLTrainingWorker : BackgroundService
             MultiTaskMagnitudeWeight:    Cfg<double>("MLTraining:MultiTaskMagnitudeWeight", 0.3),
             CurriculumEasyFraction:      Cfg<double>("MLTraining:CurriculumEasyFraction",   0.3),
             SelfDistillTemp:             Cfg<double>("MLTraining:SelfDistillTemp",          3.0),
-            FgsmEpsilon:                 Cfg<double>("MLTraining:FgsmEpsilon",              0.01));
+            FgsmEpsilon:                 Cfg<double>("MLTraining:FgsmEpsilon",              0.01),
+            MinF1Score:                  Cfg<double>(CK_MinF1,                             0.10),
+            UseClassWeights:             Cfg<bool>  (CK_UseClassWeights,                   true));
     }
 
     /// <summary>
@@ -1681,6 +1687,8 @@ public sealed class MLTrainingWorker : BackgroundService
             failed.Add($"brier {m.BrierScore:F4} > {hp.MaxBrierScore:F4}");
         if (m.SharpeRatio     < hp.MinSharpeRatio)
             failed.Add($"sharpe {m.SharpeRatio:F2} < {hp.MinSharpeRatio:F2}");
+        if (hp.MinF1Score > 0 && m.F1 < hp.MinF1Score)
+            failed.Add($"f1 {m.F1:F3} < {hp.MinF1Score:F3}");
         if (cv.StdAccuracy    > hp.MaxWalkForwardStdDev)
             failed.Add($"wf_std {cv.StdAccuracy:P1} > {hp.MaxWalkForwardStdDev:P1}");
         if (hp.MaxEce > 0 && snapEce > hp.MaxEce)

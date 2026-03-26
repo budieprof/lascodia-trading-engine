@@ -870,6 +870,22 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         var temporalWeights = ComputeTemporalWeights(trainSet.Count, hp.TemporalDecayLambda);
         bool useNoise       = hp.NoiseSigma > 0.0;
 
+        // Class weights: inverse-frequency balancing to prevent majority-class collapse.
+        // classWeightBuy/Sell are multiplied into the per-sample gradient so the minority
+        // class receives proportionally higher loss penalty.
+        double classWeightBuy  = 1.0;
+        double classWeightSell = 1.0;
+        if (hp.UseClassWeights)
+        {
+            int buyCount  = trainSet.Count(s => s.Direction > 0);
+            int sellCount = trainSet.Count - buyCount;
+            if (buyCount > 0 && sellCount > 0)
+            {
+                classWeightBuy  = (double)trainSet.Count / (2.0 * buyCount);
+                classWeightSell = (double)trainSet.Count / (2.0 * sellCount);
+            }
+        }
+
         // Blend density-ratio importance weights with temporal decay weights
         if (densityWeights is { Length: > 0 } && densityWeights.Length == temporalWeights.Length)
         {
@@ -1190,7 +1206,9 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
                     double errWeight = Math.Abs(hp.FpCostWeight - 0.5) > 1e-6
                         ? (sample.Direction == 0 ? 2.0 * hp.FpCostWeight : 2.0 * (1.0 - hp.FpCostWeight))
                         : 1.0;
-                    double err = (p - y) * errWeight;
+                    // Class weight: minority class gets higher gradient contribution
+                    double cw = sample.Direction > 0 ? classWeightBuy : classWeightSell;
+                    double err = (p - y) * errWeight * cw;
 
                     // Label noise correction via confident learning (from epoch 1 onward).
                     // Uses current ensemble average probability to estimate P(correct label).

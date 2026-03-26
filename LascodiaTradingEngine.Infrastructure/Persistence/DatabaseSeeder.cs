@@ -218,20 +218,34 @@ public sealed class DatabaseSeeder
         var now = DateTime.UtcNow;
         foreach (var s in activeStrategies)
         {
+            // Default architecture run (TrainerSelector will auto-select)
             runs.Add(new MLTrainingRun
             {
                 Symbol      = s.Symbol,
                 Timeframe   = s.Timeframe,
                 TriggerType = TriggerType.Manual,
                 Status      = RunStatus.Queued,
-                FromDate    = now.AddDays(-365),
+                FromDate    = now.AddDays(-730),
                 ToDate      = now,
                 StartedAt   = now,
+            });
+
+            // SMOTE run for class-imbalanced data
+            runs.Add(new MLTrainingRun
+            {
+                Symbol              = s.Symbol,
+                Timeframe           = s.Timeframe,
+                TriggerType         = TriggerType.Manual,
+                Status              = RunStatus.Queued,
+                FromDate            = now.AddDays(-730),
+                ToDate              = now,
+                StartedAt           = now,
+                LearnerArchitecture = LearnerArchitecture.Smote,
             });
         }
 
         await db.SaveChangesAsync(ct);
-        _logger.LogInformation("Seeded {Count} initial ML training runs", activeStrategies.Count);
+        _logger.LogInformation("Seeded {Count} initial ML training runs", activeStrategies.Count * 2);
     }
 
     private async Task SeedEngineConfigAsync(DbContext db, CancellationToken ct)
@@ -319,10 +333,43 @@ public sealed class DatabaseSeeder
                 Description = "Interval in seconds between drawdown monitoring checks",
                 DataType = ConfigDataType.Int,
                 IsHotReloadable = true,
+            },
+            // ── ML model quality improvements ─────────────────────────────────
+            new EngineConfig
+            {
+                Key = "MLTraining:MinF1Score",
+                Value = "0.10",
+                Description = "Minimum F1 score to promote — rejects single-class predictors",
+                DataType = ConfigDataType.Decimal,
+                IsHotReloadable = true,
+            },
+            new EngineConfig
+            {
+                Key = "MLTraining:UseClassWeights",
+                Value = "true",
+                Description = "Apply inverse-frequency class weighting during training",
+                DataType = ConfigDataType.Bool,
+                IsHotReloadable = true,
+            },
+            new EngineConfig
+            {
+                Key = "MLTraining:UseTripleBarrier",
+                Value = "true",
+                Description = "Use triple-barrier labeling (profit/stop/time) instead of next-bar direction",
+                DataType = ConfigDataType.Bool,
+                IsHotReloadable = true,
+            },
+            new EngineConfig
+            {
+                Key = "MLTraining:TrainingDataWindowDays",
+                Value = "730",
+                Description = "Default training data window in days for ML retraining runs",
+                DataType = ConfigDataType.Int,
+                IsHotReloadable = true,
             }
         );
 
         await db.SaveChangesAsync(ct);
-        _logger.LogInformation("Seeded {Count} engine configuration entries", 10);
+        _logger.LogInformation("Seeded engine configuration entries");
     }
 }
