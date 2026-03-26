@@ -82,13 +82,16 @@ public class ReceiveCandleBackfillCommandHandler : IRequestHandler<ReceiveCandle
 
         foreach (var candle in request.Candles)
         {
+            // IgnoreQueryFilters so soft-deleted rows are also checked — without this,
+            // a soft-deleted candle passes the AnyAsync guard but then triggers a unique
+            // constraint violation on SaveChangesAsync (unique index ignores IsDeleted).
             var exists = await dbContext
                 .Set<Domain.Entities.Candle>()
+                .IgnoreQueryFilters()
                 .AnyAsync(
                     x => x.Symbol == symbol
                       && x.Timeframe == timeframe
-                      && x.Timestamp == candle.Timestamp
-                      && !x.IsDeleted,
+                      && x.Timestamp == candle.Timestamp,
                     cancellationToken);
 
             if (exists)
@@ -110,7 +113,24 @@ public class ReceiveCandleBackfillCommandHandler : IRequestHandler<ReceiveCandle
             inserted++;
         }
 
-        await _context.SaveChangesAsync(cancellationToken);
+        try
+        {
+            await _context.SaveChangesAsync(cancellationToken);
+        }
+        catch (DbUpdateException ex)
+        {
+            // Unique constraint violation: a race-condition duplicate slipped through the
+            // AnyAsync guard (e.g. two concurrent chunks with overlapping timestamps).
+            // Treat as a successful no-op — the candles are already persisted.
+            var inner = ex.InnerException?.Message ?? ex.Message;
+            if (inner.Contains("unique", StringComparison.OrdinalIgnoreCase) ||
+                inner.Contains("duplicate", StringComparison.OrdinalIgnoreCase) ||
+                inner.Contains("23505"))   // PostgreSQL unique_violation SQLSTATE
+            {
+                return ResponseData<int>.Init(0, true, $"Candles already exist for {symbol}/{timeframe} (constraint conflict, skipped)", "00");
+            }
+            throw; // Re-throw unexpected DB errors
+        }
 
         return ResponseData<int>.Init(inserted, true, $"Inserted {inserted} candles", "00");
     }
