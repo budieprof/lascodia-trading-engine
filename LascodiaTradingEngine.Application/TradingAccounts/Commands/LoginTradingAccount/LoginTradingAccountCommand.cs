@@ -2,7 +2,9 @@ using FluentValidation;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Options;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
+using LascodiaTradingEngine.Application.Bridge.Options;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Security;
 
@@ -49,11 +51,16 @@ public class LoginTradingAccountCommandHandler : IRequestHandler<LoginTradingAcc
 {
     private readonly IReadApplicationDbContext _context;
     private readonly IConfiguration _configuration;
+    private readonly BridgeOptions _bridgeOptions;
 
-    public LoginTradingAccountCommandHandler(IReadApplicationDbContext context, IConfiguration configuration)
+    public LoginTradingAccountCommandHandler(
+        IReadApplicationDbContext context,
+        IConfiguration configuration,
+        IOptions<BridgeOptions> bridgeOptions)
     {
-        _context = context;
+        _context       = context;
         _configuration = configuration;
+        _bridgeOptions = bridgeOptions.Value;
     }
 
     public async Task<ResponseData<AuthTokenResult>> Handle(LoginTradingAccountCommand request, CancellationToken cancellationToken)
@@ -120,6 +127,13 @@ public class LoginTradingAccountCommandHandler : IRequestHandler<LoginTradingAcc
         }
 
         var tokenResult = TradingAccountTokenGenerator.GenerateToken(entity, _configuration);
+
+        // Advertise bridge endpoint when the bridge is enabled
+        if (_bridgeOptions.Enabled)
+        {
+            tokenResult.BridgeHost = _bridgeOptions.EffectiveAdvertisedHost;
+            tokenResult.BridgePort = _bridgeOptions.Port;
+        }
 
         return ResponseData<AuthTokenResult>.Init(tokenResult, true, "Successful", "00");
     }

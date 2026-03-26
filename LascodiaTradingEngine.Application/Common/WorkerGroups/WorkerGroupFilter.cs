@@ -29,6 +29,7 @@ public static class WorkerGroupFilter
         typeof(PartialFillResubmissionWorker),
         typeof(EAHealthMonitorWorker),
         typeof(ReconciliationWorker),
+        typeof(TcpBridgeWorker),
     ];
 
     private static readonly Type[] MarketDataWorkers =

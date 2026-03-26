@@ -84,6 +84,19 @@ public class AuthTokenResult
     /// on the EA's filesystem. Only populated on registration or key rotation.
     /// </summary>
     public string? EncryptedApiKeyBlob { get; set; }
+
+    /// <summary>
+    /// Engine-advertised TCP bridge hostname or IP for DLL transport.
+    /// Populated only when the bridge is enabled (BridgeOptions.Enabled=true).
+    /// The EA should prefer this over any locally-configured InpDllBridgeHost.
+    /// </summary>
+    public string? BridgeHost { get; set; }
+
+    /// <summary>
+    /// Engine-advertised TCP bridge port for DLL transport.
+    /// Populated only when the bridge is enabled (BridgeOptions.Enabled=true).
+    /// </summary>
+    public int? BridgePort { get; set; }
 }
 
 public class AuthAccountSummary

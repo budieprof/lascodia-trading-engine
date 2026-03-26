@@ -2,7 +2,9 @@ using FluentValidation;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Options;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
+using LascodiaTradingEngine.Application.Bridge.Options;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Domain.Enums;
@@ -63,11 +65,16 @@ public class RegisterTraderCommandHandler : IRequestHandler<RegisterTraderComman
 {
     private readonly IWriteApplicationDbContext _context;
     private readonly IConfiguration _configuration;
+    private readonly BridgeOptions _bridgeOptions;
 
-    public RegisterTraderCommandHandler(IWriteApplicationDbContext context, IConfiguration configuration)
+    public RegisterTraderCommandHandler(
+        IWriteApplicationDbContext context,
+        IConfiguration configuration,
+        IOptions<BridgeOptions> bridgeOptions)
     {
-        _context = context;
+        _context       = context;
         _configuration = configuration;
+        _bridgeOptions = bridgeOptions.Value;
     }
 
     public async Task<ResponseData<AuthTokenResult>> Handle(RegisterTraderCommand request, CancellationToken cancellationToken)
@@ -99,6 +106,11 @@ public class RegisterTraderCommandHandler : IRequestHandler<RegisterTraderComman
 
             var existingToken = TradingAccountTokenGenerator.GenerateToken(existing, _configuration);
             existingToken.ApiKey = existingApiKey;
+            if (_bridgeOptions.Enabled)
+            {
+                existingToken.BridgeHost = _bridgeOptions.EffectiveAdvertisedHost;
+                existingToken.BridgePort = _bridgeOptions.Port;
+            }
             return ResponseData<AuthTokenResult>.Init(existingToken, true, "Successful", "00");
         }
 
@@ -131,6 +143,11 @@ public class RegisterTraderCommandHandler : IRequestHandler<RegisterTraderComman
         var tokenResult = TradingAccountTokenGenerator.GenerateToken(entity, _configuration);
         tokenResult.ApiKey = plainApiKey;
         tokenResult.EncryptedApiKeyBlob = encryptedApiKey; // EA can store this opaque blob instead of plaintext
+        if (_bridgeOptions.Enabled)
+        {
+            tokenResult.BridgeHost = _bridgeOptions.EffectiveAdvertisedHost;
+            tokenResult.BridgePort = _bridgeOptions.Port;
+        }
 
         return ResponseData<AuthTokenResult>.Init(tokenResult, true, "Successful", "00");
     }

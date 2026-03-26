@@ -13,6 +13,8 @@ using LascodiaTradingEngine.Application.Services.Alerts.Options;
 using LascodiaTradingEngine.Application.Services.EconomicCalendar;
 using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Application.Services.MarketData;
+using LascodiaTradingEngine.Application.Bridge.Services;
+using LascodiaTradingEngine.Application.Common.Interfaces;
 using Microsoft.Extensions.Logging;
 using Polly;
 using Polly.Extensions.Http;
@@ -126,6 +128,13 @@ public static class DependencyInjection
         // ── Candle Aggregator ──────────────────────────────────────────────────────
         // Singleton: must hold state across ticks for the lifetime of the application.
         services.AddSingleton<ICandleAggregator, CandleAggregator>();
+
+        // ── TCP Bridge Worker ─────────────────────────────────────────────────────
+        // Singleton so the registry and worker share state. WorkerGroupFilter respects
+        // the BridgeOptions.Enabled flag by keeping TcpBridgeWorker in CoreTradingWorkers;
+        // the worker itself exits immediately when Enabled=false.
+        services.AddSingleton<ITcpBridgeSessionRegistry, TcpBridgeSessionRegistry>();
+        services.AddHostedService<TcpBridgeWorker>();
 
         // ── Time abstraction ─────────────────────────────────────────────────────
         services.AddSingleton(TimeProvider.System);
