@@ -5,6 +5,9 @@ using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.Common.Events;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Security;
+using LascodiaTradingEngine.Domain.Entities;
+using LascodiaTradingEngine.Domain.Enums;
+using Microsoft.EntityFrameworkCore;
 
 namespace LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ReceiveTickBatch;
 
@@ -73,6 +76,21 @@ public class ReceiveTickBatchCommandHandler : IRequestHandler<ReceiveTickBatchCo
     {
         if (!await _ownershipGuard.IsOwnerAsync(request.InstanceId, cancellationToken))
             return ResponseData<string>.Init(null, false, "Unauthorized: caller does not own this EA instance", "-403");
+
+        // Refresh EA heartbeat — receiving ticks is proof the EA is alive.
+        // Also reactivate Disconnected instances since sending ticks proves connectivity.
+        var eaInstance = await _context.GetDbContext()
+            .Set<EAInstance>()
+            .FirstOrDefaultAsync(ea => ea.InstanceId == request.InstanceId
+                                    && !ea.IsDeleted, cancellationToken);
+
+        if (eaInstance is not null)
+        {
+            eaInstance.LastHeartbeat = DateTime.UtcNow;
+            if (eaInstance.Status == EAInstanceStatus.Disconnected)
+                eaInstance.Status = EAInstanceStatus.Active;
+            await _context.GetDbContext().SaveChangesAsync(cancellationToken);
+        }
 
         // Track unique symbols to publish one event per symbol (latest tick wins)
         var latestBySymbol = new Dictionary<string, TickItem>(StringComparer.OrdinalIgnoreCase);
