@@ -163,7 +163,7 @@ public class BrokerHealthCheck : IHealthCheck
             }
 
             _logger.LogWarning("Broker health check: no active trading account found in the database.");
-            return HealthCheckResult.Unhealthy("No active trading account found in the database.");
+            return HealthCheckResult.Degraded("No active trading account found in the database.");
         }
         catch (Exception ex)
         {
@@ -210,7 +210,7 @@ public class EAHeartbeatHealthCheck : IHealthCheck
             if (activeInstances.Count == 0)
             {
                 _logger.LogWarning("EA heartbeat health check: no active EA instances registered.");
-                return HealthCheckResult.Unhealthy("No active EA instances registered — engine has no market data source.");
+                return HealthCheckResult.Degraded("No active EA instances registered — engine has no market data source.");
             }
 
             var staleInstances = activeInstances.Where(x => x.LastHeartbeat < cutoff).ToList();
@@ -280,7 +280,7 @@ public class PriceCacheFreshnessCheck : IHealthCheck
             {
                 _logger.LogWarning("Price cache freshness check: cache is empty.");
                 return Task.FromResult(
-                    HealthCheckResult.Unhealthy("Live price cache is empty — no prices available."));
+                    HealthCheckResult.Degraded("Live price cache is empty — no prices available."));
             }
 
             var freshestTimestamp = allPrices.Values.Max(p => p.Timestamp);

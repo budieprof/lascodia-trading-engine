@@ -36,8 +36,9 @@ RUN dotnet publish LascodiaTradingEngine.API/LascodiaTradingEngine.API.csproj \
 FROM mcr.microsoft.com/dotnet/aspnet:10.0-preview AS runtime
 WORKDIR /app
 
-# Non-root user for security
-RUN if ! getent group 1000 >/dev/null; then groupadd --gid 1000 appuser; fi && \
+# Install curl for health checks and create non-root user
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/* && \
+    if ! getent group 1000 >/dev/null; then groupadd --gid 1000 appuser; fi && \
     if ! getent passwd 1000 >/dev/null; then useradd --uid 1000 --gid 1000 --shell /bin/false --create-home appuser; fi
 
 COPY --from=build /app/publish .
