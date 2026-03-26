@@ -334,10 +334,10 @@ public class TcpBridgeWorker : BackgroundService
                 var mediator      = scope.ServiceProvider.GetRequiredService<IMediator>();
                 var result        = await mediator.Send(new GetPendingSignalsByAccountQuery(), ct);
 
-                if (!result.Status || result.Data is null || result.Data.Count == 0)
+                if (!result.status || result.data is null || result.data.Count == 0)
                     continue;
 
-                foreach (var item in result.Data)
+                foreach (var item in result.data)
                 {
                     if (_registry.SessionCountForAccount(item.AccountId) == 0)
                         continue;
