@@ -708,7 +708,7 @@ public class AdditionalStrategyEvaluatorTests : IDisposable
     [Fact]
     public async Task Momentum_Returns_Null_When_Insufficient_Candles()
     {
-        var evaluator = new MomentumTrendEvaluator(_defaultOptions);
+        var evaluator = new MomentumTrendEvaluator(_defaultOptions, NullLogger<MomentumTrendEvaluator>.Instance, _metrics);
         var strategy = CreateStrategy(StrategyType.MomentumTrend);
 
         var candles = GenerateCandles([1.1000m, 1.1001m, 1.1002m]);
@@ -720,7 +720,7 @@ public class AdditionalStrategyEvaluatorTests : IDisposable
     [Fact]
     public async Task Momentum_Returns_Null_In_Ranging_Market()
     {
-        var evaluator = new MomentumTrendEvaluator(_defaultOptions);
+        var evaluator = new MomentumTrendEvaluator(_defaultOptions, NullLogger<MomentumTrendEvaluator>.Instance, _metrics);
         var strategy = CreateStrategy(StrategyType.MomentumTrend,
             parametersJson: """{"AdxPeriod":14,"AdxThreshold":25}""");
 
@@ -734,7 +734,7 @@ public class AdditionalStrategyEvaluatorTests : IDisposable
     [Fact]
     public async Task Momentum_Generates_Signal_In_Strong_Trend()
     {
-        var evaluator = new MomentumTrendEvaluator(_defaultOptions);
+        var evaluator = new MomentumTrendEvaluator(_defaultOptions, NullLogger<MomentumTrendEvaluator>.Instance, _metrics);
         var strategy = CreateStrategy(StrategyType.MomentumTrend,
             parametersJson: """{"AdxPeriod":7,"AdxThreshold":15}""");
 
@@ -763,7 +763,7 @@ public class AdditionalStrategyEvaluatorTests : IDisposable
     [Fact]
     public async Task Momentum_Signal_Has_ADX_Confidence_Bonus()
     {
-        var evaluator = new MomentumTrendEvaluator(_defaultOptions);
+        var evaluator = new MomentumTrendEvaluator(_defaultOptions, NullLogger<MomentumTrendEvaluator>.Instance, _metrics);
         var strategy = CreateStrategy(StrategyType.MomentumTrend,
             parametersJson: """{"AdxPeriod":7,"AdxThreshold":10}""");
 
@@ -790,7 +790,7 @@ public class AdditionalStrategyEvaluatorTests : IDisposable
     [Fact]
     public async Task Session_Returns_Null_When_Insufficient_Candles()
     {
-        var evaluator = new SessionBreakoutEvaluator(_defaultOptions);
+        var evaluator = new SessionBreakoutEvaluator(_defaultOptions, NullLogger<SessionBreakoutEvaluator>.Instance, _metrics);
         var strategy = CreateStrategy(StrategyType.SessionBreakout);
 
         var candles = GenerateCandles([1.1000m, 1.1001m]);
@@ -802,7 +802,7 @@ public class AdditionalStrategyEvaluatorTests : IDisposable
     [Fact]
     public async Task Session_Returns_Null_Outside_Breakout_Window()
     {
-        var evaluator = new SessionBreakoutEvaluator(_defaultOptions);
+        var evaluator = new SessionBreakoutEvaluator(_defaultOptions, NullLogger<SessionBreakoutEvaluator>.Instance, _metrics);
         var strategy = CreateStrategy(StrategyType.SessionBreakout,
             parametersJson: """{"RangeStartHourUtc":0,"RangeEndHourUtc":8,"BreakoutStartHour":8,"BreakoutEndHour":12}""");
 
@@ -826,7 +826,7 @@ public class AdditionalStrategyEvaluatorTests : IDisposable
     [Fact]
     public async Task Session_Buy_Signal_On_Breakout_Above_Range_High()
     {
-        var evaluator = new SessionBreakoutEvaluator(_defaultOptions);
+        var evaluator = new SessionBreakoutEvaluator(_defaultOptions, NullLogger<SessionBreakoutEvaluator>.Instance, _metrics);
         var strategy = CreateStrategy(StrategyType.SessionBreakout,
             parametersJson: """{"RangeStartHourUtc":0,"RangeEndHourUtc":8,"BreakoutStartHour":8,"BreakoutEndHour":12,"ThresholdMultiplier":0}""");
 
@@ -879,7 +879,7 @@ public class AdditionalStrategyEvaluatorTests : IDisposable
     [Fact]
     public async Task Session_Sell_Signal_On_Breakout_Below_Range_Low()
     {
-        var evaluator = new SessionBreakoutEvaluator(_defaultOptions);
+        var evaluator = new SessionBreakoutEvaluator(_defaultOptions, NullLogger<SessionBreakoutEvaluator>.Instance, _metrics);
         var strategy = CreateStrategy(StrategyType.SessionBreakout,
             parametersJson: """{"RangeStartHourUtc":0,"RangeEndHourUtc":8,"BreakoutStartHour":8,"BreakoutEndHour":12,"ThresholdMultiplier":0}""");
 
@@ -1165,8 +1165,8 @@ public class AdditionalStrategyEvaluatorTests : IDisposable
         // Verify each evaluator reports its correct StrategyType
         Assert.Equal(StrategyType.BollingerBandReversion, new BollingerBandReversionEvaluator(_defaultOptions).StrategyType);
         Assert.Equal(StrategyType.RSIReversion, new RSIReversionEvaluator(_defaultOptions).StrategyType);
-        Assert.Equal(StrategyType.MomentumTrend, new MomentumTrendEvaluator(_defaultOptions).StrategyType);
-        Assert.Equal(StrategyType.SessionBreakout, new SessionBreakoutEvaluator(_defaultOptions).StrategyType);
+        Assert.Equal(StrategyType.MomentumTrend, new MomentumTrendEvaluator(_defaultOptions, NullLogger<MomentumTrendEvaluator>.Instance, _metrics).StrategyType);
+        Assert.Equal(StrategyType.SessionBreakout, new SessionBreakoutEvaluator(_defaultOptions, NullLogger<SessionBreakoutEvaluator>.Instance, _metrics).StrategyType);
         Assert.Equal(StrategyType.MACDDivergence,
             new MACDDivergenceEvaluator(_defaultOptions, NullLogger<MACDDivergenceEvaluator>.Instance, _metrics, _regimeDetector, _mtfFilter).StrategyType);
     }
@@ -1179,9 +1179,9 @@ public class AdditionalStrategyEvaluatorTests : IDisposable
         Assert.True(new BollingerBandReversionEvaluator(_defaultOptions).MinRequiredCandles(strategy) > 0);
         Assert.True(new RSIReversionEvaluator(_defaultOptions).MinRequiredCandles(
             CreateStrategy(StrategyType.RSIReversion)) > 0);
-        Assert.True(new MomentumTrendEvaluator(_defaultOptions).MinRequiredCandles(
+        Assert.True(new MomentumTrendEvaluator(_defaultOptions, NullLogger<MomentumTrendEvaluator>.Instance, _metrics).MinRequiredCandles(
             CreateStrategy(StrategyType.MomentumTrend)) > 0);
-        Assert.True(new SessionBreakoutEvaluator(_defaultOptions).MinRequiredCandles(
+        Assert.True(new SessionBreakoutEvaluator(_defaultOptions, NullLogger<SessionBreakoutEvaluator>.Instance, _metrics).MinRequiredCandles(
             CreateStrategy(StrategyType.SessionBreakout)) > 0);
         Assert.True(new MACDDivergenceEvaluator(_defaultOptions, NullLogger<MACDDivergenceEvaluator>.Instance, _metrics, _regimeDetector, _mtfFilter)
             .MinRequiredCandles(CreateStrategy(StrategyType.MACDDivergence)) > 0);

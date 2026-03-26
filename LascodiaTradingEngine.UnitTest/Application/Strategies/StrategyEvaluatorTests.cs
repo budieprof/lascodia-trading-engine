@@ -862,8 +862,8 @@ public class StrategyEvaluatorTests : IDisposable
         var rsi        = new RSIReversionEvaluator(_defaultOptions);
         var bollinger  = new BollingerBandReversionEvaluator(_defaultOptions);
         var macd       = new MACDDivergenceEvaluator(_defaultOptions, NullLogger<MACDDivergenceEvaluator>.Instance, _metrics, _regimeDetector, _mtfFilter);
-        var session    = new SessionBreakoutEvaluator(_defaultOptions);
-        var momentum   = new MomentumTrendEvaluator(_defaultOptions);
+        var session    = new SessionBreakoutEvaluator(_defaultOptions, NullLogger<SessionBreakoutEvaluator>.Instance, _metrics);
+        var momentum   = new MomentumTrendEvaluator(_defaultOptions, NullLogger<MomentumTrendEvaluator>.Instance, _metrics);
 
         Assert.Equal(StrategyType.BreakoutScalper, breakout.StrategyType);
         Assert.Equal(StrategyType.MovingAverageCrossover, maCross.StrategyType);
@@ -1099,7 +1099,7 @@ public class StrategyEvaluatorTests : IDisposable
     [Fact]
     public async Task Session_Buy_Signal_When_Price_Breaks_Above_Asian_Range()
     {
-        var evaluator = new SessionBreakoutEvaluator(_defaultOptions);
+        var evaluator = new SessionBreakoutEvaluator(_defaultOptions, NullLogger<SessionBreakoutEvaluator>.Instance, _metrics);
         var strategy = CreateStrategy(StrategyType.SessionBreakout,
             parametersJson: "{\"RangeStartHourUtc\":0,\"RangeEndHourUtc\":8,\"BreakoutStartHour\":8,\"BreakoutEndHour\":12,\"ThresholdMultiplier\":0.1}");
 
@@ -1131,7 +1131,7 @@ public class StrategyEvaluatorTests : IDisposable
     [Fact]
     public async Task Session_No_Signal_Outside_Breakout_Window()
     {
-        var evaluator = new SessionBreakoutEvaluator(_defaultOptions);
+        var evaluator = new SessionBreakoutEvaluator(_defaultOptions, NullLogger<SessionBreakoutEvaluator>.Instance, _metrics);
         var strategy = CreateStrategy(StrategyType.SessionBreakout,
             parametersJson: "{\"BreakoutStartHour\":8,\"BreakoutEndHour\":12}");
 
@@ -1154,7 +1154,7 @@ public class StrategyEvaluatorTests : IDisposable
     [Fact]
     public async Task Session_No_Signal_When_Insufficient_Candles()
     {
-        var evaluator = new SessionBreakoutEvaluator(_defaultOptions);
+        var evaluator = new SessionBreakoutEvaluator(_defaultOptions, NullLogger<SessionBreakoutEvaluator>.Instance, _metrics);
         var strategy = CreateStrategy(StrategyType.SessionBreakout);
 
         var candles = GenerateTrendCandles(5, 1.1000m, 0.0001m);
@@ -1171,7 +1171,7 @@ public class StrategyEvaluatorTests : IDisposable
     [Fact]
     public async Task Momentum_Buy_Signal_In_Strong_Uptrend()
     {
-        var evaluator = new MomentumTrendEvaluator(_defaultOptions);
+        var evaluator = new MomentumTrendEvaluator(_defaultOptions, NullLogger<MomentumTrendEvaluator>.Instance, _metrics);
         var strategy = CreateStrategy(StrategyType.MomentumTrend,
             parametersJson: "{\"AdxPeriod\":7,\"AdxThreshold\":20}");
 
@@ -1206,7 +1206,7 @@ public class StrategyEvaluatorTests : IDisposable
     [Fact]
     public async Task Momentum_Sell_Signal_In_Strong_Downtrend()
     {
-        var evaluator = new MomentumTrendEvaluator(_defaultOptions);
+        var evaluator = new MomentumTrendEvaluator(_defaultOptions, NullLogger<MomentumTrendEvaluator>.Instance, _metrics);
         var strategy = CreateStrategy(StrategyType.MomentumTrend,
             parametersJson: "{\"AdxPeriod\":7,\"AdxThreshold\":20}");
 
@@ -1236,7 +1236,7 @@ public class StrategyEvaluatorTests : IDisposable
     [Fact]
     public async Task Momentum_No_Signal_In_Ranging_Market()
     {
-        var evaluator = new MomentumTrendEvaluator(_defaultOptions);
+        var evaluator = new MomentumTrendEvaluator(_defaultOptions, NullLogger<MomentumTrendEvaluator>.Instance, _metrics);
         var strategy = CreateStrategy(StrategyType.MomentumTrend,
             parametersJson: "{\"AdxPeriod\":7,\"AdxThreshold\":25}");
 
@@ -1257,7 +1257,7 @@ public class StrategyEvaluatorTests : IDisposable
     [Fact]
     public async Task Momentum_No_Signal_When_Insufficient_Candles()
     {
-        var evaluator = new MomentumTrendEvaluator(_defaultOptions);
+        var evaluator = new MomentumTrendEvaluator(_defaultOptions, NullLogger<MomentumTrendEvaluator>.Instance, _metrics);
         var strategy = CreateStrategy(StrategyType.MomentumTrend);
 
         var candles = GenerateTrendCandles(5, 1.1000m, 0.0001m);

@@ -391,6 +391,143 @@ public class StrategyEvaluatorOptions : ConfigurationOption<StrategyEvaluatorOpt
     /// <summary>Signal expiry in minutes for RSI reversion. Defaults to 30.</summary>
     public int RsiReversionExpiryMinutes { get; set; } = 30;
 
+    /// <summary>Default confidence for RSI reversion signals. Defaults to 0.65.</summary>
+    public decimal RsiReversionConfidence { get; set; } = 0.65m;
+
+    // ── RSI Reversion filters ─────────────────────────────────────────────
+
+    /// <summary>
+    /// Maximum spread (Ask − Bid) as a fraction of ATR allowed for an RSI reversion signal.
+    /// Prevents entries when spread is abnormally wide (news, low liquidity).
+    /// Defaults to 0.5 (50% of ATR). Set to 0 to disable.
+    /// </summary>
+    public decimal RsiReversionMaxSpreadAtrFraction { get; set; } = 0.5m;
+
+    /// <summary>
+    /// Maximum gap (|Open − PreviousClose|) as a fraction of ATR on the signal bar.
+    /// Large gaps distort RSI and ATR calculations. Defaults to 2.0. Set to 0 to disable.
+    /// </summary>
+    public decimal RsiReversionMaxGapAtrFraction { get; set; } = 2.0m;
+
+    /// <summary>
+    /// Minimum tick volume on the signal bar required for the signal to fire.
+    /// Filters out signals in thin/illiquid markets. Defaults to 0 (disabled).
+    /// </summary>
+    public decimal RsiReversionMinVolume { get; set; } = 0m;
+
+    /// <summary>
+    /// When true, requires a pin bar or engulfing candle on the signal bar to confirm reversal.
+    /// Increases signal precision at the cost of fewer entries. Defaults to false.
+    /// </summary>
+    public bool RsiReversionRequireCandleConfirmation { get; set; } = false;
+
+    /// <summary>
+    /// Slippage buffer as a fraction of ATR added to the entry price.
+    /// Buy entries are shifted up, sell entries are shifted down. Defaults to 0 (disabled).
+    /// </summary>
+    public decimal RsiReversionSlippageAtrFraction { get; set; } = 0m;
+
+    // ── RSI Reversion RSI divergence filter ────────────────────────────────
+
+    /// <summary>
+    /// When enabled, requires RSI to form a divergence with price at the oversold/overbought zone.
+    /// Bullish: price makes a lower low but RSI makes a higher low (stronger reversal setup).
+    /// Defaults to false.
+    /// </summary>
+    public bool RsiReversionRequireDivergence { get; set; } = false;
+
+    /// <summary>
+    /// Number of bars to look back for a prior RSI swing to compare for divergence.
+    /// Defaults to 20.
+    /// </summary>
+    public int RsiReversionDivergenceLookbackBars { get; set; } = 20;
+
+    // ── RSI Reversion stop-loss ────────────────────────────────────────────
+
+    /// <summary>
+    /// When true, stop-loss is placed at the nearest swing low (buy) or swing high (sell)
+    /// within the lookback window, with an ATR buffer, clamped by min/max multipliers.
+    /// Defaults to false (uses ATR multiplier directly).
+    /// </summary>
+    public bool RsiReversionSwingSlEnabled { get; set; } = false;
+
+    /// <summary>Number of bars to search for the swing point for SL placement. Defaults to 10.</summary>
+    public int RsiReversionSwingSlLookbackBars { get; set; } = 10;
+
+    /// <summary>ATR fraction buffer beyond the swing point for SL placement. Defaults to 0.1.</summary>
+    public decimal RsiReversionSwingSlBufferAtrFraction { get; set; } = 0.1m;
+
+    /// <summary>Minimum SL distance as ATR multiplier when using swing SL. Defaults to 0.5.</summary>
+    public decimal RsiReversionSwingSlMinAtrMultiplier { get; set; } = 0.5m;
+
+    /// <summary>Maximum SL distance as ATR multiplier when using swing SL. Defaults to 2.0.</summary>
+    public decimal RsiReversionSwingSlMaxAtrMultiplier { get; set; } = 2.0m;
+
+    // ── RSI Reversion take-profit ──────────────────────────────────────────
+
+    /// <summary>
+    /// When true, take-profit targets the RSI midline (50) equivalent price level —
+    /// estimated as the SMA of the RSI period. Natural mean-reversion destination.
+    /// Minimum TP is floored at half the default ATR TP. Defaults to false.
+    /// </summary>
+    public bool RsiReversionMidlineTpEnabled { get; set; } = false;
+
+    /// <summary>
+    /// Minimum acceptable risk-reward ratio (TP distance / SL distance).
+    /// Defaults to 1.0. Set to 0 to disable.
+    /// </summary>
+    public decimal RsiReversionMinRiskRewardRatio { get; set; } = 1.0m;
+
+    // ── RSI Reversion confidence weights ───────────────────────────────────
+
+    /// <summary>
+    /// Confidence weight for RSI depth (how far RSI penetrated oversold/overbought zone).
+    /// Deeper penetration = stronger exhaustion signal. Defaults to 0.40.
+    /// </summary>
+    public decimal RsiReversionWeightDepth { get; set; } = 0.40m;
+
+    /// <summary>
+    /// Confidence weight for reversal candle pattern (engulfing, pin bar) on the signal bar.
+    /// Defaults to 0 (disabled). Set when your data source reliably produces meaningful OHLC patterns.
+    /// </summary>
+    public decimal RsiReversionWeightCandle { get; set; } = 0m;
+
+    /// <summary>
+    /// Confidence weight for volume relative to the recent average.
+    /// Defaults to 0.15. Set to 0 to exclude volume from the confidence calculation.
+    /// </summary>
+    public decimal RsiReversionWeightVolume { get; set; } = 0.15m;
+
+    /// <summary>Number of bars for average volume calculation in the RSI reversion confidence factor. Defaults to 20.</summary>
+    public int RsiReversionVolumeLookbackBars { get; set; } = 20;
+
+    /// <summary>
+    /// Confidence weight for RSI recovery speed (how quickly RSI crossed back through the threshold).
+    /// A sharp bounce signals stronger conviction. Defaults to 0.20.
+    /// </summary>
+    public decimal RsiReversionWeightRecoverySpeed { get; set; } = 0.20m;
+
+    /// <summary>
+    /// Controls how much the multi-factor score shifts the final confidence above or below the
+    /// base <see cref="RsiReversionConfidence"/>. Final confidence = base + (score − 0.5) × sensitivity.
+    /// Maximum swing = ±(sensitivity / 2). Defaults to 0.30 (±0.15 around base).
+    /// </summary>
+    public decimal RsiReversionConfidenceSensitivity { get; set; } = 0.30m;
+
+    // ── RSI Reversion lot sizing ───────────────────────────────────────────
+
+    /// <summary>
+    /// When true, lot size is scaled between min and max based on confidence.
+    /// Defaults to false (uses DefaultLotSize).
+    /// </summary>
+    public bool RsiReversionConfidenceLotSizing { get; set; } = false;
+
+    /// <summary>Minimum lot size for confidence-based lot sizing. Defaults to 0.01.</summary>
+    public decimal RsiReversionMinLotSize { get; set; } = 0.01m;
+
+    /// <summary>Maximum lot size for confidence-based lot sizing. Defaults to 0.10.</summary>
+    public decimal RsiReversionMaxLotSize { get; set; } = 0.10m;
+
     // ── Bollinger Band Reversion ─────────────────────────────────────────
 
     /// <summary>Default confidence for Bollinger Band reversion signals. Defaults to 0.65.</summary>
@@ -1039,6 +1176,67 @@ public class StrategyEvaluatorOptions : ConfigurationOption<StrategyEvaluatorOpt
     /// <summary>Signal expiry in minutes for session breakout. Defaults to 30.</summary>
     public int SessionBreakoutExpiryMinutes { get; set; } = 30;
 
+    /// <summary>
+    /// Maximum spread as a fraction of ATR allowed for a session breakout signal.
+    /// Prevents entries when spread is abnormally wide (news, low liquidity).
+    /// Defaults to 0.5 (50% of ATR). Set to 0 to disable.
+    /// </summary>
+    public decimal SessionBreakoutMaxSpreadAtrFraction { get; set; } = 0.5m;
+
+    /// <summary>
+    /// Minimum tick volume on the signal bar required for the session breakout to fire.
+    /// Breakouts without volume participation are often false. Defaults to 0 (disabled).
+    /// </summary>
+    public decimal SessionBreakoutMinVolume { get; set; } = 0m;
+
+    /// <summary>
+    /// Minimum acceptable risk-reward ratio (TP distance / SL distance).
+    /// Signals that cannot achieve this R:R are rejected. Defaults to 1.0. Set to 0 to disable.
+    /// </summary>
+    public decimal SessionBreakoutMinRiskRewardRatio { get; set; } = 1.0m;
+
+    /// <summary>
+    /// Maximum gap (|Open - PreviousClose|) as a fraction of ATR allowed on the signal bar.
+    /// Overnight gaps distort the session range. Defaults to 2.0 (200% of ATR). Set to 0 to disable.
+    /// </summary>
+    public decimal SessionBreakoutMaxGapAtrFraction { get; set; } = 2.0m;
+
+    /// <summary>
+    /// Number of consecutive closed bars where price must remain on the breakout side of
+    /// the session level before the signal fires. Eliminates snap-back false breakouts.
+    /// Defaults to 1. Set to 0 to fire on the breakout bar itself.
+    /// </summary>
+    public int SessionBreakoutConfirmationBars { get; set; } = 1;
+
+    /// <summary>
+    /// Minimum ADX value required for a session breakout signal to fire.
+    /// Low ADX indicates a ranging market where breakouts are prone to failing.
+    /// Defaults to 0 (disabled). Typical production value: 20–25.
+    /// </summary>
+    public decimal SessionBreakoutMinAdx { get; set; } = 0m;
+
+    /// <summary>ADX period for the session breakout trend-strength filter. Defaults to 14.</summary>
+    public int SessionBreakoutAdxPeriod { get; set; } = 14;
+
+    /// <summary>
+    /// Slippage buffer as a fraction of ATR added to the entry price.
+    /// Buy entries are shifted up, sell entries are shifted down.
+    /// Defaults to 0 (disabled). Typical value: 0.05–0.15.
+    /// </summary>
+    public decimal SessionBreakoutSlippageAtrFraction { get; set; } = 0m;
+
+    /// <summary>
+    /// Maximum confidence boost from breakout depth — how far price has exceeded the session
+    /// range level, normalised by range size. Defaults to 0.15 (up to +15% above base).
+    /// </summary>
+    public decimal SessionBreakoutConfidenceBreachBoostMax { get; set; } = 0.15m;
+
+    /// <summary>
+    /// Minimum range size as a fraction of ATR. Ranges narrower than this are considered
+    /// too tight and likely to produce false breakouts. Defaults to 0.3 (30% of ATR). Set to 0 to disable.
+    /// </summary>
+    public decimal SessionBreakoutMinRangeSizeAtrFraction { get; set; } = 0.3m;
+
     // ── Momentum Trend ─────────────────────────────────────────────────────
 
     /// <summary>Default confidence for momentum trend signals. Defaults to 0.70.</summary>
@@ -1046,6 +1244,102 @@ public class StrategyEvaluatorOptions : ConfigurationOption<StrategyEvaluatorOpt
 
     /// <summary>Signal expiry in minutes for momentum trend. Defaults to 90.</summary>
     public int MomentumTrendExpiryMinutes { get; set; } = 90;
+
+    /// <summary>
+    /// Maximum gap (|Open - PreviousClose|) as a fraction of ATR allowed on the signal bar.
+    /// Large gaps distort ADX/DI calculations. Defaults to 2.0. Set to 0 to disable.
+    /// </summary>
+    public decimal MomentumTrendMaxGapAtrFraction { get; set; } = 2.0m;
+
+    /// <summary>
+    /// Maximum spread as a fraction of ATR allowed for a momentum trend signal.
+    /// Prevents entries when spread is abnormally wide. Defaults to 0.5. Set to 0 to disable.
+    /// </summary>
+    public decimal MomentumTrendMaxSpreadAtrFraction { get; set; } = 0.5m;
+
+    /// <summary>
+    /// Minimum tick volume on the signal bar. Trend signals without volume are
+    /// unreliable. Defaults to 0 (disabled).
+    /// </summary>
+    public decimal MomentumTrendMinVolume { get; set; } = 0m;
+
+    /// <summary>
+    /// Maximum RSI for a bullish momentum trend signal. Prevents buying into an
+    /// overbought condition even when DI cross fires. Defaults to 0 (disabled). Typical: 75.
+    /// </summary>
+    public decimal MomentumTrendMaxRsiForBuy { get; set; } = 0m;
+
+    /// <summary>
+    /// Minimum RSI for a bearish momentum trend signal. Prevents selling into an
+    /// oversold condition even when DI cross fires. Defaults to 0 (disabled). Typical: 25.
+    /// </summary>
+    public decimal MomentumTrendMinRsiForSell { get; set; } = 0m;
+
+    /// <summary>RSI period for the momentum trend overbought/oversold filter. Defaults to 14.</summary>
+    public int MomentumTrendRsiPeriod { get; set; } = 14;
+
+    /// <summary>
+    /// Period for the trend-alignment EMA filter. When > 0, bullish signals require
+    /// close > EMA(period) and bearish require close &lt; EMA(period).
+    /// Defaults to 0 (disabled). Typical value: 50–200.
+    /// </summary>
+    public int MomentumTrendTrendMaPeriod { get; set; } = 0;
+
+    /// <summary>
+    /// Number of consecutive bars where DI must remain on the crossed side before
+    /// the signal fires. Eliminates whipsaw DI crosses that immediately revert.
+    /// Defaults to 0 (fires on the cross bar). Typical value: 1–2.
+    /// </summary>
+    public int MomentumTrendConfirmationBars { get; set; } = 0;
+
+    /// <summary>
+    /// Slippage buffer as a fraction of ATR added to the entry price.
+    /// Buy entries shift up, sell entries shift down.
+    /// Defaults to 0 (disabled). Typical value: 0.05–0.15.
+    /// </summary>
+    public decimal MomentumTrendSlippageAtrFraction { get; set; } = 0m;
+
+    /// <summary>
+    /// Minimum acceptable risk-reward ratio (TP distance / SL distance).
+    /// Signals that cannot achieve this are rejected. Defaults to 1.0. Set to 0 to disable.
+    /// </summary>
+    public decimal MomentumTrendMinRiskRewardRatio { get; set; } = 1.0m;
+
+    /// <summary>
+    /// Maximum confidence boost from ADX strength — how far ADX exceeds the threshold,
+    /// normalised to [0, ConfidenceAdxBoostMax]. Defaults to 0.20.
+    /// </summary>
+    public decimal MomentumTrendConfidenceAdxBoostMax { get; set; } = 0.20m;
+
+    /// <summary>
+    /// When true, use swing-based stop-loss (structural pivot) instead of pure ATR SL.
+    /// Defaults to false.
+    /// </summary>
+    public bool MomentumTrendSwingSlEnabled { get; set; } = false;
+
+    /// <summary>Number of bars to look back for swing pivot SL. Defaults to 10.</summary>
+    public int MomentumTrendSwingSlLookbackBars { get; set; } = 10;
+
+    /// <summary>ATR fraction buffer added beyond the swing point for SL. Defaults to 0.1.</summary>
+    public decimal MomentumTrendSwingSlBufferAtrFraction { get; set; } = 0.1m;
+
+    /// <summary>Minimum SL distance as ATR multiplier when using swing SL. Defaults to 0.5.</summary>
+    public decimal MomentumTrendSwingSlMinAtrMultiplier { get; set; } = 0.5m;
+
+    /// <summary>Maximum SL distance as ATR multiplier when using swing SL. Defaults to 3.0.</summary>
+    public decimal MomentumTrendSwingSlMaxAtrMultiplier { get; set; } = 3.0m;
+
+    /// <summary>
+    /// When true, scale lot size between MomentumTrendMinLotSize and MomentumTrendMaxLotSize
+    /// based on signal confidence. Defaults to false.
+    /// </summary>
+    public bool MomentumTrendConfidenceLotSizing { get; set; } = false;
+
+    /// <summary>Minimum lot size for confidence-based scaling. Defaults to 0.01.</summary>
+    public decimal MomentumTrendMinLotSize { get; set; } = 0.01m;
+
+    /// <summary>Maximum lot size for confidence-based scaling. Defaults to 0.10.</summary>
+    public decimal MomentumTrendMaxLotSize { get; set; } = 0.10m;
 
     // ── Stop-loss / take-profit ATR multipliers ────────────────────────────
 

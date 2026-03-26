@@ -177,7 +177,7 @@ public class BacktestEngineTest
         Assert.Equal(TradeDirection.Buy, trade.Direction);
         Assert.Equal(1.0000m, trade.EntryPrice);
         Assert.Equal(1.0200m, trade.ExitPrice);  // TP level, no slippage
-        Assert.Equal("TakeProfit", trade.ExitReason);
+        Assert.Equal(TradeExitReason.TakeProfit, trade.ExitReason);
 
         // PnL = (1.02 - 1.00) * 0.1 * 100,000 = 200
         Assert.Equal(200m, trade.PnL);
@@ -223,7 +223,7 @@ public class BacktestEngineTest
         Assert.Equal(TradeDirection.Sell, trade.Direction);
         Assert.Equal(1.0500m, trade.EntryPrice);
         Assert.Equal(1.0600m, trade.ExitPrice);  // SL level, no slippage
-        Assert.Equal("StopLoss", trade.ExitReason);
+        Assert.Equal(TradeExitReason.StopLoss, trade.ExitReason);
 
         // PnL = (1.0500 - 1.0600) * 0.1 * 100,000 = -100
         Assert.Equal(-100m, trade.PnL);
@@ -364,7 +364,7 @@ public class BacktestEngineTest
         // Assert
         Assert.Equal(1, result.TotalTrades);
         var trade = result.Trades[0];
-        Assert.Equal("EndOfData", trade.ExitReason);
+        Assert.Equal(TradeExitReason.EndOfData, trade.ExitReason);
         Assert.Equal(1.0050m, trade.ExitPrice); // last bar's Close (no slippage)
         Assert.Equal(candles[2].Timestamp, trade.ExitTime);
 
