@@ -64,6 +64,7 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
     private const string CK_RegimeWindowHours  = "MLTraining:RegimeWindowHours";
     private const string CK_CacheTtlMinutes    = "MLTraining:CacheTtlMinutes";
     private const string CK_MaxCrossSymbols    = "MLTraining:MaxCrossSymbolCount";
+    private const string CK_BlockedArchitectures = "MLTraining:BlockedArchitectures";
 
     private const int    HistoryWindowRuns         = 30;
     private const int    DefaultHistoryMaxDays     = 90;
@@ -435,6 +436,18 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
         var    cacheTtl           = TimeSpan.FromMinutes(cfg.GetInt(CK_CacheTtlMinutes, DefaultCacheTtlMinutes));
         int    maxCrossSymbols    = cfg.GetInt(CK_MaxCrossSymbols,     DefaultMaxCrossSymbols);
 
+        // ── 1b. Parse blocked architectures from config ───────────────────
+        var blockedArchitectures = new HashSet<LearnerArchitecture>();
+        var blockedStr = cfg.GetString(CK_BlockedArchitectures, "");
+        if (!string.IsNullOrWhiteSpace(blockedStr))
+        {
+            foreach (var token in blockedStr.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                if (Enum.TryParse<LearnerArchitecture>(token, ignoreCase: true, out var blocked))
+                    blockedArchitectures.Add(blocked);
+            }
+        }
+
         // ── 2. Staleness gate — ignore stale regime data ────────────────────
         var effectiveRegime = ApplyRegimeStalenessGate(regime, regimeDetectedAt, regimeStaleMins, timeframe);
 
@@ -469,7 +482,12 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
             historyMaxDays, regimeWindowHours, minComposite, ucb1Exploration, cacheTtl, ct)
             .ConfigureAwait(false);
 
-        var candidate = PickBestPassingSampleGate(rankedCandidates, sampleCount, minSamplesStd, minSamplesDeep, timeframe);
+        // Filter out blocked architectures from candidates
+        var filteredCandidates = blockedArchitectures.Count > 0
+            ? rankedCandidates.Where(c => !blockedArchitectures.Contains(c.Arch)).ToList()
+            : rankedCandidates;
+
+        var candidate = PickBestPassingSampleGate(filteredCandidates, sampleCount, minSamplesStd, minSamplesDeep, timeframe);
         int fallbackDepth = 1; // step 3 (historical)
 
         // ── 4. Cold-start: borrow from correlated symbols ─────────────────
@@ -482,7 +500,10 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
                 maxCrossSymbols, cacheTtl, ct)
                 .ConfigureAwait(false);
 
-            candidate = PickBestPassingSampleGate(crossRanked, sampleCount, minSamplesStd, minSamplesDeep, timeframe);
+            var filteredCross = blockedArchitectures.Count > 0
+                ? crossRanked.Where(c => !blockedArchitectures.Contains(c.Arch)).ToList()
+                : crossRanked;
+            candidate = PickBestPassingSampleGate(filteredCross, sampleCount, minSamplesStd, minSamplesDeep, timeframe);
         }
 
         // ── 5. Fall back to operator-configured default ─────────────────────
@@ -490,7 +511,9 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
         {
             fallbackDepth = 3;
             var opDefault = await OperatorDefaultAsync(ctx, cacheTtl, ct).ConfigureAwait(false);
-            if (opDefault.HasValue && PassesSampleGate(opDefault.Value, sampleCount, minSamplesStd, minSamplesDeep, timeframe))
+            if (opDefault.HasValue
+                && !blockedArchitectures.Contains(opDefault.Value)
+                && PassesSampleGate(opDefault.Value, sampleCount, minSamplesStd, minSamplesDeep, timeframe))
                 candidate = opDefault.Value;
         }
 
@@ -499,7 +522,8 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
         {
             fallbackDepth = 4;
             var regDefault = RegimeDefault.GetValueOrDefault(effectiveRegime.Value);
-            if (PassesSampleGate(regDefault, sampleCount, minSamplesStd, minSamplesDeep, timeframe))
+            if (!blockedArchitectures.Contains(regDefault)
+                && PassesSampleGate(regDefault, sampleCount, minSamplesStd, minSamplesDeep, timeframe))
                 candidate = regDefault;
         }
 
@@ -1620,6 +1644,7 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
         CK_MinComposite, CK_RegimeStaleMins, CK_RegimeCooldownMins,
         CK_Ucb1Exploration, CK_RegimeWindowHours,
         CK_CacheTtlMinutes, CK_MaxCrossSymbols,
+        CK_BlockedArchitectures,
     ];
 
     private const string ConfigBatchCacheKey = "TrainerSelector:ConfigBatch";
@@ -1676,6 +1701,9 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
 
         public double GetDouble(string key, double defaultValue)
             => TryParse<double>(key, defaultValue);
+
+        public string GetString(string key, string defaultValue)
+            => _values.TryGetValue(key, out var raw) ? raw : defaultValue;
 
         private T TryParse<T>(string key, T defaultValue) where T : struct
         {
