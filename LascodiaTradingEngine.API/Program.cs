@@ -58,6 +58,20 @@ builder.Services.ConfigureApplicationServices();
 builder.Services.ConfigureDbContexts(builder.Configuration);
 builder.Services.AddSharedApplicationDependency(builder.Configuration);
 
+// Override shared library's size-limited IMemoryCache — ML training and inference
+// call IMemoryCache.Set without specifying Size, which throws when SizeLimit is set.
+// Remove the shared library's IMemoryCache registration and re-add without SizeLimit.
+var cacheDescriptor = builder.Services.FirstOrDefault(d => d.ServiceType == typeof(Microsoft.Extensions.Caching.Memory.IMemoryCache));
+if (cacheDescriptor is not null)
+    builder.Services.Remove(cacheDescriptor);
+builder.Services.AddSingleton<Microsoft.Extensions.Caching.Memory.IMemoryCache>(sp =>
+    new Microsoft.Extensions.Caching.Memory.MemoryCache(
+        new Microsoft.Extensions.Caching.Memory.MemoryCacheOptions
+        {
+            CompactionPercentage = 0.25,
+            ExpirationScanFrequency = TimeSpan.FromMinutes(5)
+        }));
+
 // Remove hosted services for disabled worker groups (must run after all registrations)
 builder.Services.ApplyWorkerGroupFilter(builder.Configuration);
 

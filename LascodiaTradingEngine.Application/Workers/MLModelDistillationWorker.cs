@@ -132,22 +132,30 @@ public class MLModelDistillationWorker : BackgroundService
         var writeDb      = writeCtx.GetDbContext();
 
         // Query prediction logs from the last 2 hours that include latency measurements.
-        // Group by model and compute an approximate P99 by ordering descending and
-        // skipping the top 1% of rows. This is an in-database approximation; for exact
-        // P99 a window function (EF OVER/PERCENTILE_CONT) would be required.
-        var latencyBreaches = await readDb.Set<MLModelPredictionLog>()
+        // Group by model and compute an approximate P99 client-side. The previous
+        // server-side approach used g.Count() inside Skip() which PostgreSQL rejects
+        // because aggregate functions are not allowed in OFFSET.
+        var recentPredictions = await readDb.Set<MLModelPredictionLog>()
             .Where(p => !p.IsDeleted
                      && p.LatencyMs != null
                      && p.PredictedAt >= DateTime.UtcNow.AddHours(-2))
+            .Select(p => new { p.MLModelId, p.LatencyMs })
+            .ToListAsync(ct);
+
+        var latencyBreaches = recentPredictions
             .GroupBy(p => p.MLModelId)
-            .Select(g => new
+            .Select(g =>
             {
-                ModelId  = g.Key,
-                // Approximate P99: sort descending, skip top 1%, take next row's latency.
-                P99Ms    = g.OrderByDescending(p => p.LatencyMs).Skip((int)(g.Count() * 0.01)).FirstOrDefault()!.LatencyMs ?? 0
+                var sorted = g.OrderBy(p => p.LatencyMs).ToList();
+                int p99Idx = Math.Max(0, (int)(sorted.Count * 0.99) - 1);
+                return new
+                {
+                    ModelId = g.Key,
+                    P99Ms   = sorted[p99Idx].LatencyMs ?? 0
+                };
             })
             .Where(x => x.P99Ms > LatencyThresholdMs)
-            .ToListAsync(ct);
+            .ToList();
 
         foreach (var breach in latencyBreaches)
         {

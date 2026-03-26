@@ -778,6 +778,7 @@ public sealed class MLTrainingWorker : BackgroundService
             {
                 Symbol                 = run.Symbol,
                 Timeframe              = run.Timeframe,
+                LearnerArchitecture    = run.LearnerArchitecture,
                 ModelVersion           = modelVersion,
                 Status                 = MLModelStatus.Active,
                 IsActive               = true,
@@ -840,8 +841,72 @@ public sealed class MLTrainingWorker : BackgroundService
 
             // Invalidate TrainerSelector cache so the next selection for this
             // symbol/timeframe picks up the freshly completed run immediately.
-            sp.GetRequiredService<ITrainerSelector>()
-                .InvalidateCache(run.Symbol, run.Timeframe);
+            var trainerSelector = sp.GetRequiredService<ITrainerSelector>();
+            trainerSelector.InvalidateCache(run.Symbol, run.Timeframe);
+
+            // Queue shadow training runs for alternative architectures so that the
+            // MLShadowArbiterWorker can compare them against the newly promoted model.
+            // Only queue shadows when the current run was NOT itself a shadow run
+            // (TriggerType != AutoDegrading) to prevent cascading retrain loops.
+            // Also enforce a 1-hour cooldown per architecture to prevent excessive churn.
+            try
+            {
+                if (run.TriggerType != TriggerType.AutoDegrading)
+                {
+                    var latestRegime = await ctx.Set<MarketRegimeSnapshot>()
+                        .Where(r => r.Symbol == run.Symbol && r.Timeframe == run.Timeframe)
+                        .OrderByDescending(r => r.DetectedAt)
+                        .Select(r => new { Regime = (Domain.Enums.MarketRegime?)r.Regime, r.DetectedAt })
+                        .FirstOrDefaultAsync(stoppingToken);
+
+                    var shadowArchs = await trainerSelector.SelectShadowArchitecturesAsync(
+                        run.LearnerArchitecture, run.Symbol, run.Timeframe, samples.Count,
+                        latestRegime?.Regime, latestRegime?.DetectedAt, stoppingToken);
+
+                    var cooldownCutoff = DateTime.UtcNow.AddHours(-1);
+
+                    foreach (var arch in shadowArchs)
+                    {
+                        // Skip if a run for this architecture is already queued or completed recently
+                        bool recentlyHandled = await ctx.Set<MLTrainingRun>()
+                            .AnyAsync(r => r.Symbol == run.Symbol
+                                        && r.Timeframe == run.Timeframe
+                                        && r.LearnerArchitecture == arch
+                                        && !r.IsDeleted
+                                        && (r.Status == RunStatus.Queued
+                                            || r.Status == RunStatus.Running
+                                            || (r.CompletedAt != null && r.CompletedAt > cooldownCutoff)),
+                                stoppingToken);
+
+                        if (!recentlyHandled)
+                        {
+                            ctx.Set<MLTrainingRun>().Add(new MLTrainingRun
+                            {
+                                Symbol              = run.Symbol,
+                                Timeframe           = run.Timeframe,
+                                TriggerType         = TriggerType.AutoDegrading,
+                                Status              = RunStatus.Queued,
+                                FromDate            = run.FromDate,
+                                ToDate              = run.ToDate,
+                                StartedAt           = DateTime.UtcNow,
+                                LearnerArchitecture = arch,
+                            });
+
+                            _logger.LogInformation(
+                                "Shadow architecture run queued: {Arch} for {Symbol}/{Tf}",
+                                arch, run.Symbol, run.Timeframe);
+                        }
+                    }
+
+                    await db.SaveChangesAsync(stoppingToken);
+                }
+            }
+            catch (Exception shadowEx)
+            {
+                _logger.LogWarning(shadowEx,
+                    "Failed to queue shadow architecture runs for {Symbol}/{Tf} — non-critical",
+                    run.Symbol, run.Timeframe);
+            }
 
             await PublishPromotionAsync(
                 run, model, previousChampion, result.FinalMetrics, result.CvResult,
@@ -1376,9 +1441,10 @@ public sealed class MLTrainingWorker : BackgroundService
 
                 var regimeModel = new MLModel
                 {
-                    Symbol            = run.Symbol,
-                    Timeframe         = run.Timeframe,
-                    RegimeScope       = regimeName,
+                    Symbol              = run.Symbol,
+                    Timeframe           = run.Timeframe,
+                    LearnerArchitecture = run.LearnerArchitecture,
+                    RegimeScope         = regimeName,
                     ModelVersion      = $"{run.Symbol}_{run.Timeframe}_{regimeName}_{run.Id}_{DateTime.UtcNow:yyyyMMddHHmmss}",
                     Status            = MLModelStatus.Active,
                     IsActive          = true,

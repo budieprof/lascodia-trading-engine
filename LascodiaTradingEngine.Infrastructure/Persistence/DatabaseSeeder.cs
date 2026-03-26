@@ -32,6 +32,7 @@ public sealed class DatabaseSeeder
         await SeedStrategiesAsync(db, ct);
         await SeedLivePricesAsync(db, ct);
         await SeedEngineConfigAsync(db, ct);
+        await SeedInitialMLTrainingRunsAsync(db, ct);
 
         _logger.LogInformation("Database seeding completed");
     }
@@ -201,6 +202,38 @@ public sealed class DatabaseSeeder
         _logger.LogInformation("Seeded live prices for {Count} pairs", 10);
     }
 
+    private async Task SeedInitialMLTrainingRunsAsync(DbContext db, CancellationToken ct)
+    {
+        var runs = db.Set<MLTrainingRun>();
+        if (await runs.AnyAsync(ct)) return;
+
+        // Queue an initial training run for each active strategy's symbol/timeframe.
+        // The MLTrainingWorker will pick these up and train the first models.
+        var activeStrategies = await db.Set<Strategy>()
+            .Where(s => s.Status == StrategyStatus.Active && !s.IsDeleted)
+            .Select(s => new { s.Symbol, s.Timeframe })
+            .Distinct()
+            .ToListAsync(ct);
+
+        var now = DateTime.UtcNow;
+        foreach (var s in activeStrategies)
+        {
+            runs.Add(new MLTrainingRun
+            {
+                Symbol      = s.Symbol,
+                Timeframe   = s.Timeframe,
+                TriggerType = TriggerType.Manual,
+                Status      = RunStatus.Queued,
+                FromDate    = now.AddDays(-180),
+                ToDate      = now,
+                StartedAt   = now,
+            });
+        }
+
+        await db.SaveChangesAsync(ct);
+        _logger.LogInformation("Seeded {Count} initial ML training runs", activeStrategies.Count);
+    }
+
     private async Task SeedEngineConfigAsync(DbContext db, CancellationToken ct)
     {
         var configs = db.Set<EngineConfig>();
@@ -274,7 +307,7 @@ public sealed class DatabaseSeeder
             new EngineConfig
             {
                 Key = "MLTraining:Enabled",
-                Value = "false",
+                Value = "true",
                 Description = "Whether ML model training workers are active",
                 DataType = ConfigDataType.Bool,
                 IsHotReloadable = true,
