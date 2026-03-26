@@ -67,12 +67,17 @@ public class ReceiveCandleCommandHandler : IRequestHandler<ReceiveCandleCommand,
         var symbol    = request.Symbol.ToUpperInvariant();
         var timeframe = Enum.Parse<Timeframe>(request.Timeframe, ignoreCase: true);
 
+        // Normalize timestamp to the timeframe boundary to prevent near-duplicate
+        // candles caused by sub-second EA timestamp drift.
+        var normalizedTs = ReceiveCandleBackfill.ReceiveCandleBackfillCommandHandler
+            .NormalizeTimestamp(request.Timestamp, timeframe);
+
         var existing = await dbContext
             .Set<Domain.Entities.Candle>()
             .FirstOrDefaultAsync(
                 x => x.Symbol == symbol
                   && x.Timeframe == timeframe
-                  && x.Timestamp == request.Timestamp
+                  && x.Timestamp == normalizedTs
                   && !x.IsDeleted,
                 cancellationToken);
 
@@ -98,7 +103,7 @@ public class ReceiveCandleCommandHandler : IRequestHandler<ReceiveCandleCommand,
             Low       = request.Low,
             Close     = request.Close,
             Volume    = request.Volume,
-            Timestamp = request.Timestamp,
+            Timestamp = normalizedTs,
             IsClosed  = request.IsClosed,
         };
 

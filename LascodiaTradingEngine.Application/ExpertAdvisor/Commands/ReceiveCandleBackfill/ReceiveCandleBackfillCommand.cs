@@ -82,6 +82,10 @@ public class ReceiveCandleBackfillCommandHandler : IRequestHandler<ReceiveCandle
 
         foreach (var candle in request.Candles)
         {
+            // Normalize the timestamp to the timeframe boundary to prevent near-duplicate
+            // candles (e.g. 22:00:00 vs 22:00:01) from being inserted as separate rows.
+            var normalizedTs = NormalizeTimestamp(candle.Timestamp, timeframe);
+
             // IgnoreQueryFilters so soft-deleted rows are also checked — without this,
             // a soft-deleted candle passes the AnyAsync guard but then triggers a unique
             // constraint violation on SaveChangesAsync (unique index ignores IsDeleted).
@@ -91,7 +95,7 @@ public class ReceiveCandleBackfillCommandHandler : IRequestHandler<ReceiveCandle
                 .AnyAsync(
                     x => x.Symbol == symbol
                       && x.Timeframe == timeframe
-                      && x.Timestamp == candle.Timestamp,
+                      && x.Timestamp == normalizedTs,
                     cancellationToken);
 
             if (exists)
@@ -106,7 +110,7 @@ public class ReceiveCandleBackfillCommandHandler : IRequestHandler<ReceiveCandle
                 Low       = candle.Low,
                 Close     = candle.Close,
                 Volume    = candle.Volume,
-                Timestamp = candle.Timestamp,
+                Timestamp = normalizedTs,
                 IsClosed  = true,
             }, cancellationToken);
 
@@ -145,5 +149,24 @@ public class ReceiveCandleBackfillCommandHandler : IRequestHandler<ReceiveCandle
         }
 
         return ResponseData<int>.Init(inserted, true, $"Inserted {inserted} candles", "00");
+    }
+
+    /// <summary>
+    /// Truncates a candle timestamp to the start of its timeframe period.
+    /// Prevents near-duplicate candles caused by sub-second EA timestamp drift
+    /// (e.g. 22:00:00 vs 22:00:01 for a D1 candle).
+    /// </summary>
+    internal static DateTime NormalizeTimestamp(DateTime ts, Timeframe tf)
+    {
+        return tf switch
+        {
+            Timeframe.M1  => new DateTime(ts.Year, ts.Month, ts.Day, ts.Hour, ts.Minute, 0, DateTimeKind.Utc),
+            Timeframe.M5  => new DateTime(ts.Year, ts.Month, ts.Day, ts.Hour, ts.Minute / 5 * 5, 0, DateTimeKind.Utc),
+            Timeframe.M15 => new DateTime(ts.Year, ts.Month, ts.Day, ts.Hour, ts.Minute / 15 * 15, 0, DateTimeKind.Utc),
+            Timeframe.H1  => new DateTime(ts.Year, ts.Month, ts.Day, ts.Hour, 0, 0, DateTimeKind.Utc),
+            Timeframe.H4  => new DateTime(ts.Year, ts.Month, ts.Day, ts.Hour / 4 * 4, 0, 0, DateTimeKind.Utc),
+            Timeframe.D1  => new DateTime(ts.Year, ts.Month, ts.Day, 0, 0, 0, DateTimeKind.Utc),
+            _             => new DateTime(ts.Year, ts.Month, ts.Day, ts.Hour, ts.Minute, 0, DateTimeKind.Utc),
+        };
     }
 }
