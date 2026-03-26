@@ -119,16 +119,28 @@ public class ReceiveCandleBackfillCommandHandler : IRequestHandler<ReceiveCandle
         }
         catch (DbUpdateException ex)
         {
+            var inner = ex.InnerException?.Message ?? ex.Message;
+
             // Unique constraint violation: a race-condition duplicate slipped through the
             // AnyAsync guard (e.g. two concurrent chunks with overlapping timestamps).
             // Treat as a successful no-op — the candles are already persisted.
-            var inner = ex.InnerException?.Message ?? ex.Message;
             if (inner.Contains("unique", StringComparison.OrdinalIgnoreCase) ||
                 inner.Contains("duplicate", StringComparison.OrdinalIgnoreCase) ||
                 inner.Contains("23505"))   // PostgreSQL unique_violation SQLSTATE
             {
                 return ResponseData<int>.Init(0, true, $"Candles already exist for {symbol}/{timeframe} (constraint conflict, skipped)", "00");
             }
+
+            // Numeric field overflow: one or more historical candles have OHLCV values that
+            // exceed the column's numeric precision (PostgreSQL SQLSTATE 22003).
+            // This happens with certain older broker data — skip the chunk gracefully.
+            if (inner.Contains("22003") ||
+                inner.Contains("numeric field overflow", StringComparison.OrdinalIgnoreCase) ||
+                inner.Contains("overflow", StringComparison.OrdinalIgnoreCase))
+            {
+                return ResponseData<int>.Init(0, true, $"Candle chunk skipped for {symbol}/{timeframe} (numeric overflow in historical data)", "00");
+            }
+
             throw; // Re-throw unexpected DB errors
         }
 
