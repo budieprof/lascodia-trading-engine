@@ -495,14 +495,18 @@ public class EconomicCalendarWorker : BackgroundService
     private static async Task<List<string>> GetActiveCurrenciesAsync(
         IReadApplicationDbContext readContext, CancellationToken ct)
     {
-        var currencies = await readContext.GetDbContext()
+        // Load base/quote pairs first, then flatten client-side.
+        // EF Core cannot translate SelectMany with array construction.
+        var pairs = await readContext.GetDbContext()
             .Set<CurrencyPair>()
             .Where(x => x.IsActive && !x.IsDeleted)
-            .SelectMany(x => new[] { x.BaseCurrency, x.QuoteCurrency })
-            .Distinct()
+            .Select(x => new { x.BaseCurrency, x.QuoteCurrency })
             .ToListAsync(ct);
 
-        return currencies;
+        return pairs
+            .SelectMany(x => new[] { x.BaseCurrency, x.QuoteCurrency })
+            .Distinct()
+            .ToList();
     }
 
     /// <summary>
