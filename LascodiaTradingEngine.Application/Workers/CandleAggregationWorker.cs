@@ -208,26 +208,18 @@ public class CandleAggregationWorker : BackgroundService
             if (actualLastMinute < lastM1InPeriod)
                 break;
 
-            // Check if a candle already exists for this symbol/timeframe/timestamp (upsert guard)
-            var existingCandle = await writeDb.Set<Candle>()
-                .FirstOrDefaultAsync(
+            // Skip if a candle already exists — EA data is authoritative (direct from broker).
+            // The aggregation worker only fills gaps; it never overwrites broker-sourced candles.
+            var exists = await readDb.Set<Candle>()
+                .AsNoTracking()
+                .AnyAsync(
                     c => c.Symbol == symbol
                       && c.Timeframe == targetTf
                       && c.Timestamp == nextPeriodStart
                       && !c.IsDeleted,
                     ct);
 
-            if (existingCandle is not null)
-            {
-                // Update the existing candle with the latest aggregation
-                existingCandle.Open     = m1Candles[0].Open;
-                existingCandle.High     = m1Candles.Max(c => c.High);
-                existingCandle.Low      = m1Candles.Min(c => c.Low);
-                existingCandle.Close    = m1Candles[^1].Close;
-                existingCandle.Volume   = m1Candles.Sum(c => c.Volume);
-                existingCandle.IsClosed = true;
-            }
-            else
+            if (!exists)
             {
                 var aggregated = new Candle
                 {
@@ -243,14 +235,13 @@ public class CandleAggregationWorker : BackgroundService
                 };
 
                 await writeDb.Set<Candle>().AddAsync(aggregated, ct);
+                await writeContext.SaveChangesAsync(ct);
+                synthesized++;
+
+                _logger.LogInformation(
+                    "CandleAggregationWorker: synthesized {Timeframe} candle for {Symbol} at {Timestamp:u}",
+                    targetTf, symbol, nextPeriodStart);
             }
-
-            await writeContext.SaveChangesAsync(ct);
-            synthesized++;
-
-            _logger.LogInformation(
-                "CandleAggregationWorker: synthesized {Timeframe} candle for {Symbol} at {Timestamp:u}",
-                targetTf, symbol, nextPeriodStart);
 
             nextPeriodStart = periodEnd;
         }
