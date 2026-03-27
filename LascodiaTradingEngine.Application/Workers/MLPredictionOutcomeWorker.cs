@@ -307,15 +307,19 @@ public sealed class MLPredictionOutcomeWorker : BackgroundService
     /// that at least one full candle has closed for the given timeframe.
     /// Ensures outcome resolution waits for a meaningful price movement to occur.
     /// </summary>
+    // Minimum duration before attempting outcome resolution. Must be long enough
+    // for the NEXT candle after the prediction to fully close and be written to DB.
+    // E.g. H1 prediction at 12:15 → outcome candle is 13:00 → closes ~14:00 →
+    // DB write ~14:02 → need at least 107 min from prediction time.
     private static TimeSpan TimeframeMinDuration(Timeframe tf) => tf switch
     {
-        Timeframe.M1  => TimeSpan.FromMinutes(2),
-        Timeframe.M5  => TimeSpan.FromMinutes(6),
-        Timeframe.M15 => TimeSpan.FromMinutes(20),
-        Timeframe.H1  => TimeSpan.FromMinutes(70),
+        Timeframe.M1  => TimeSpan.FromMinutes(3),
+        Timeframe.M5  => TimeSpan.FromMinutes(12),
+        Timeframe.M15 => TimeSpan.FromMinutes(35),
+        Timeframe.H1  => TimeSpan.FromMinutes(125),
         Timeframe.H4  => TimeSpan.FromHours(5),
         Timeframe.D1  => TimeSpan.FromHours(26),
-        _             => TimeSpan.FromMinutes(70),
+        _             => TimeSpan.FromMinutes(125),
     };
 
     /// <summary>
