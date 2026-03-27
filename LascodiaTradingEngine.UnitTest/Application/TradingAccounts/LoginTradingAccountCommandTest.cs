@@ -3,6 +3,8 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Moq;
 using MockQueryable.Moq;
+using Microsoft.Extensions.Options;
+using LascodiaTradingEngine.Application.Bridge.Options;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Application.TradingAccounts.Commands.LoginTradingAccount;
@@ -41,7 +43,7 @@ public class LoginTradingAccountCommandTest
             .Build();
 
         _validator = new LoginTradingAccountCommandValidator();
-        _handler = new LoginTradingAccountCommandHandler(_mockReadContext.Object, _configuration);
+        _handler = new LoginTradingAccountCommandHandler(_mockReadContext.Object, _configuration, Options.Create(new BridgeOptions()));
     }
 
     private void SetupTradingAccounts(List<TradingAccount> accounts)

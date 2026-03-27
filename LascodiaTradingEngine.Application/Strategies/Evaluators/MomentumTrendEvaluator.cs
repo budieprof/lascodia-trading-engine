@@ -264,14 +264,35 @@ public class MomentumTrendEvaluator : IStrategyEvaluator
             decimal minStop = atr * _options.MomentumTrendSwingSlMinAtrMultiplier;
             decimal maxStop = atr * _options.MomentumTrendSwingSlMaxAtrMultiplier;
             stopDistance = Math.Clamp(rawSwingStop, minStop, maxStop);
+
+            if (stopDistance != rawSwingStop && _logger.IsEnabled(LogLevel.Debug))
+            {
+                _logger.LogDebug(
+                    "MomentumTrend swing SL clamped for {Symbol} (strategy {StrategyId}): raw {RawStop:F6} → clamped {ClampedStop:F6} (min={MinStop:F6}, max={MaxStop:F6})",
+                    strategy.Symbol, strategy.Id, rawSwingStop, stopDistance, minStop, maxStop);
+            }
         }
         else
         {
             stopDistance = atr * _options.StopLossAtrMultiplier;
         }
 
-        // ── 14. Take-profit calculation ────────────────────────────────────────
-        decimal profitDistance = atr * _options.TakeProfitAtrMultiplier;
+        // ── 14. Take-profit calculation (with optional ADX-driven dynamic scaling) ─
+        decimal tpMultiplier = 1.0m;
+        if (_options.MomentumTrendDynamicSlTp && adxCurr > 0)
+        {
+            decimal strongAdx = _options.MomentumTrendStrongAdxThreshold;
+            decimal t = strongAdx > adxThreshold
+                ? Math.Clamp((adxCurr - adxThreshold) / (strongAdx - adxThreshold), 0m, 1m)
+                : 0m;
+            tpMultiplier = 1m + t * (_options.MomentumTrendStrongTrendTpScale - 1m);
+
+            // Apply SL scaling only to ATR-based stops (swing SL is already structural)
+            if (!_options.MomentumTrendSwingSlEnabled)
+                stopDistance *= 1m + t * (_options.MomentumTrendStrongTrendSlScale - 1m);
+        }
+
+        decimal profitDistance = atr * _options.TakeProfitAtrMultiplier * tpMultiplier;
 
         decimal stopLoss, takeProfit;
         if (isBullish)
@@ -298,11 +319,55 @@ public class MomentumTrendEvaluator : IStrategyEvaluator
         }
 
         // ── 16. Dynamic confidence scoring ─────────────────────────────────────
-        // Confidence scales with how far ADX exceeds the threshold (stronger trend = higher confidence)
+        // Factor 1: ADX strength — how far ADX exceeds the threshold
         decimal adxBonus = Math.Min(
             (adxCurr - adxThreshold) / 50m * _options.MomentumTrendConfidenceAdxBoostMax,
             _options.MomentumTrendConfidenceAdxBoostMax);
-        decimal confidence = Math.Clamp(_options.MomentumTrendConfidence + adxBonus, 0m, 1m);
+
+        // Factor 2: DI separation — how far apart +DI and -DI are at crossover (0..1)
+        decimal diSepBonus = 0m;
+        if (_options.MomentumTrendConfidenceDiSeparationWeight > 0)
+        {
+            decimal diSum = pdiCurr + mdiCurr;
+            decimal diSepScore = diSum > 0
+                ? Math.Min(1.0m, Math.Abs(pdiCurr - mdiCurr) / diSum)
+                : 0m;
+            diSepBonus = diSepScore * _options.MomentumTrendConfidenceDiSeparationWeight;
+        }
+
+        // Factor 3: Volume ratio — signal bar volume vs N-bar average (0..1)
+        decimal volBonus = 0m;
+        if (_options.MomentumTrendConfidenceVolumeWeight > 0
+            && _options.MomentumTrendConfidenceVolumeLookbackBars > 0)
+        {
+            int volLookback = _options.MomentumTrendConfidenceVolumeLookbackBars;
+            int volStart = Math.Max(0, lastIdx - volLookback);
+            decimal volSum = 0m;
+            int volCount = 0;
+            for (int i = volStart; i < lastIdx; i++)
+            {
+                volSum += candles[i].Volume;
+                volCount++;
+            }
+            decimal avgVolume = volCount > 0 ? volSum / volCount : 0m;
+            decimal signalVolume = candles[lastIdx].Volume;
+            // 1× average = 0.5, 2× average = 1.0, 0× = 0.0
+            decimal volScore = avgVolume > 0
+                ? Math.Min(1.0m, signalVolume / (avgVolume * 2m))
+                : 0.5m;
+            volBonus = volScore * _options.MomentumTrendConfidenceVolumeWeight;
+        }
+
+        // Factor 4: Candle pattern — engulfing, hammer, etc. on signal bar (0..1)
+        decimal patternBonus = 0m;
+        if (_options.MomentumTrendConfidenceCandlePatternWeight > 0)
+        {
+            decimal patternScore = IndicatorCalculator.ScoreCandlePatterns(candles, lastIdx, isBullish);
+            patternBonus = patternScore * _options.MomentumTrendConfidenceCandlePatternWeight;
+        }
+
+        decimal confidence = Math.Clamp(
+            _options.MomentumTrendConfidence + adxBonus + diSepBonus + volBonus + patternBonus, 0m, 1m);
 
         // ── 17. Lot sizing ─────────────────────────────────────────────────────
         decimal lotSize = _options.DefaultLotSize;

@@ -1341,6 +1341,56 @@ public class StrategyEvaluatorOptions : ConfigurationOption<StrategyEvaluatorOpt
     /// <summary>Maximum lot size for confidence-based scaling. Defaults to 0.10.</summary>
     public decimal MomentumTrendMaxLotSize { get; set; } = 0.10m;
 
+    /// <summary>
+    /// Weight for DI separation confidence factor — how far +DI is from -DI at crossover,
+    /// normalised by their sum. Stronger directional separation = higher confidence.
+    /// Defaults to 0.15. Set to 0 to disable.
+    /// </summary>
+    public decimal MomentumTrendConfidenceDiSeparationWeight { get; set; } = 0.15m;
+
+    /// <summary>
+    /// Weight for volume ratio confidence factor — signal bar volume vs N-bar average.
+    /// High-volume crosses carry more conviction. Defaults to 0.10. Set to 0 to disable.
+    /// </summary>
+    public decimal MomentumTrendConfidenceVolumeWeight { get; set; } = 0.10m;
+
+    /// <summary>
+    /// Number of bars to compute average volume for the volume confidence factor.
+    /// Defaults to 20.
+    /// </summary>
+    public int MomentumTrendConfidenceVolumeLookbackBars { get; set; } = 20;
+
+    /// <summary>
+    /// Weight for candle pattern confidence factor — engulfing, hammer, etc. on the signal bar.
+    /// Defaults to 0.10. Set to 0 to disable.
+    /// </summary>
+    public decimal MomentumTrendConfidenceCandlePatternWeight { get; set; } = 0.10m;
+
+    /// <summary>
+    /// When true, scale TP and SL multipliers by ADX strength. Stronger trends get wider TP
+    /// and tighter SL. Uses linear interpolation between ADX threshold and
+    /// MomentumTrendStrongAdxThreshold. Defaults to false.
+    /// </summary>
+    public bool MomentumTrendDynamicSlTp { get; set; } = false;
+
+    /// <summary>
+    /// ADX level considered a strong trend for dynamic SL/TP scaling.
+    /// Defaults to 40.
+    /// </summary>
+    public decimal MomentumTrendStrongAdxThreshold { get; set; } = 40m;
+
+    /// <summary>
+    /// SL multiplier scale at strong ADX. Values below 1.0 tighten the stop in strong trends.
+    /// Defaults to 0.8 (20% tighter).
+    /// </summary>
+    public decimal MomentumTrendStrongTrendSlScale { get; set; } = 0.8m;
+
+    /// <summary>
+    /// TP multiplier scale at strong ADX. Values above 1.0 widen the target in strong trends.
+    /// Defaults to 1.3 (30% wider).
+    /// </summary>
+    public decimal MomentumTrendStrongTrendTpScale { get; set; } = 1.3m;
+
     // ── Stop-loss / take-profit ATR multipliers ────────────────────────────
 
     // ── Post-evaluator confidence modifiers ────────────────────────────────

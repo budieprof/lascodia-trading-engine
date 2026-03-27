@@ -4,6 +4,8 @@ using Microsoft.Extensions.Configuration;
 using Moq;
 using MockQueryable.Moq;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
+using Microsoft.Extensions.Options;
+using LascodiaTradingEngine.Application.Bridge.Options;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Application.TradingAccounts.Commands.RegisterTrader;
@@ -43,7 +45,7 @@ public class RegisterTraderCommandTest
             .Build();
 
         _validator = new RegisterTraderCommandValidator();
-        _handler = new RegisterTraderCommandHandler(_mockWriteContext.Object, _configuration);
+        _handler = new RegisterTraderCommandHandler(_mockWriteContext.Object, _configuration, Options.Create(new BridgeOptions()));
     }
 
     private void SetupTradingAccounts(List<TradingAccount> accounts)
