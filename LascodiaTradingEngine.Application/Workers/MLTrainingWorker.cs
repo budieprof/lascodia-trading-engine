@@ -798,11 +798,96 @@ public sealed class MLTrainingWorker : BackgroundService
                     x => x.Symbol == run.Symbol && x.Timeframe == run.Timeframe && x.IsActive,
                     stoppingToken);
 
+            // ── Profitability-based promotion gate ──────────────────────────
+            // Only supersede the current champion if the new model is genuinely
+            // better. A model with lower EV should not replace a profitable champion
+            // unless it offers significantly better balance (F1) or the champion
+            // has been flagged by drift workers.
             if (previousChampion is not null)
             {
+                double champEV    = (double)(previousChampion.ExpectedValue ?? 0m);
+                double champF1    = (double)(previousChampion.F1Score ?? 0m);
+                double champSharpe = (double)(previousChampion.SharpeRatio ?? 0m);
+                double newEV      = m.ExpectedValue;
+                double newF1      = m.F1;
+                double newSharpe  = m.SharpeRatio;
+
+                // Compute a composite profitability score: weighted blend of EV, Sharpe, and F1
+                // EV is weighted highest (profit matters most), F1 provides balance bonus
+                double champScore = champEV * 5.0 + champSharpe * 0.1 + champF1 * 0.5;
+                double newScore   = newEV   * 5.0 + newSharpe   * 0.1 + newF1   * 0.5;
+
+                bool newModelIsBetter =
+                    newScore > champScore                           // composite score is higher
+                    || (newF1 > champF1 + 0.15 && newEV >= -0.01)  // significantly more balanced with non-negative EV
+                    || champEV <= 0.0;                              // champion has zero/negative EV — always replace
+
+                if (!newModelIsBetter)
+                {
+                    _logger.LogInformation(
+                        "Run {RunId}: new model passed gates but is not more profitable than champion {ChampId} " +
+                        "(new: score={NewScore:F4} ev={NewEV:F4} f1={NewF1:F3} | champ: score={ChampScore:F4} ev={ChampEV:F4} f1={ChampF1:F3}). " +
+                        "Saving as Superseded without promoting.",
+                        run.Id, previousChampion.Id, newScore, newEV, newF1, champScore, champEV, champF1);
+
+                    run.Status = RunStatus.Completed;
+                    run.CompletedAt = DateTime.UtcNow;
+                    run.TrainingDurationMs = sw.ElapsedMilliseconds;
+                    run.DirectionAccuracy = (decimal)m.Accuracy;
+                    run.F1Score = (decimal)m.F1;
+                    run.BrierScore = (decimal)m.BrierScore;
+                    run.SharpeRatio = (decimal)m.SharpeRatio;
+                    run.ErrorMessage = null;
+
+                    // Save as a non-active model for shadow evaluation
+                    var nonActiveModel = new MLModel
+                    {
+                        Symbol              = run.Symbol,
+                        Timeframe           = run.Timeframe,
+                        LearnerArchitecture = run.LearnerArchitecture,
+                        ModelVersion        = $"{run.Symbol}_{run.Timeframe}_{run.Id}_{DateTime.UtcNow:yyyyMMddHHmmss}_challenger",
+                        Status              = MLModelStatus.Superseded,
+                        IsActive            = false,
+                        TrainingSamples     = samples.Count,
+                        TrainedAt           = DateTime.UtcNow,
+                        DirectionAccuracy   = (decimal)m.Accuracy,
+                        F1Score             = (decimal)m.F1,
+                        ExpectedValue       = (decimal)m.ExpectedValue,
+                        BrierScore          = (decimal)m.BrierScore,
+                        SharpeRatio         = (decimal)m.SharpeRatio,
+                    };
+                    ctx.Set<MLModel>().Add(nonActiveModel);
+                    run.MLModelId = nonActiveModel.Id;
+                    await db.SaveChangesAsync(stoppingToken);
+
+                    // Create shadow evaluation so the arbiter can compare them on live data
+                    var shadow = new MLShadowEvaluation
+                    {
+                        Symbol            = run.Symbol,
+                        Timeframe         = run.Timeframe,
+                        ChampionModelId   = previousChampion.Id,
+                        ChallengerModelId = nonActiveModel.Id,
+                        Status            = ShadowEvaluationStatus.Running,
+                        RequiredTrades    = hp.ShadowRequiredTrades,
+                        ExpiresAt         = DateTime.UtcNow.AddDays(hp.ShadowExpiryDays),
+                        PromotionThreshold = (decimal)hp.MinAccuracyToPromote,
+                        StartedAt         = DateTime.UtcNow,
+                    };
+                    ctx.Set<MLShadowEvaluation>().Add(shadow);
+                    await db.SaveChangesAsync(stoppingToken);
+
+                    sp.GetRequiredService<ITrainerSelector>().InvalidateCache(run.Symbol, run.Timeframe);
+                    return;
+                }
+
+                // New model is better — proceed with promotion
                 await SnapshotChampionPerformanceAsync(previousChampion, ctx, stoppingToken);
                 previousChampion.IsActive = false;
                 previousChampion.Status   = MLModelStatus.Superseded;
+
+                _logger.LogInformation(
+                    "Promoting run {RunId} over champion {ChampId}: new score={NewScore:F4} > champ score={ChampScore:F4}",
+                    run.Id, previousChampion.Id, newScore, champScore);
             }
 
             var (finalModelBytes, plattA, plattB) = await PatchSnapshotAsync(
