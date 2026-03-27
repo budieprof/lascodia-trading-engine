@@ -1837,39 +1837,16 @@ public sealed class MLTrainingWorker : BackgroundService
             var patterns = new List<string>();
 
             if (error.Contains("f1", StringComparison.OrdinalIgnoreCase))
-            {
                 patterns.Add("f1");
-                overrides.FpCostWeight = Math.Min(hp.FpCostWeight + 0.15, 0.85);
-                overrides.UseClassWeights = true;
-            }
-
             if (error.Contains("accuracy", StringComparison.OrdinalIgnoreCase))
-            {
                 patterns.Add("accuracy");
-                overrides.K = hp.K + 3;
-                overrides.MaxEpochs = (int)(hp.MaxEpochs * 1.5);
-            }
-
             if (error.Contains("sharpe", StringComparison.OrdinalIgnoreCase))
-            {
                 patterns.Add("sharpe");
-                overrides.TemporalDecayLambda = hp.TemporalDecayLambda * 1.5;
-            }
-
             if (error.Contains("ev ", StringComparison.OrdinalIgnoreCase) ||
                 error.Contains("ev -", StringComparison.OrdinalIgnoreCase))
-            {
                 patterns.Add("ev");
-                overrides.UseTripleBarrier = true;
-                overrides.TripleBarrierProfitAtrMult = hp.TripleBarrierProfitAtrMult * 1.2;
-                overrides.TripleBarrierStopAtrMult = hp.TripleBarrierStopAtrMult * 0.8;
-            }
-
             if (error.Contains("brier", StringComparison.OrdinalIgnoreCase))
-            {
                 patterns.Add("brier");
-                overrides.L2Lambda = hp.L2Lambda * 2.0;
-            }
 
             if (patterns.Count == 0)
             {
@@ -1878,6 +1855,128 @@ public sealed class MLTrainingWorker : BackgroundService
             }
 
             overrides.FailurePatterns = string.Join(",", patterns);
+
+            // ── Profitability-aware bias: query top models for same symbol/timeframe ──
+            HyperparamOverrides? refHp = null;
+            long? refModelId = null;
+            try
+            {
+                // Find top profitable models ranked by composite score: EV*5 + Sharpe*0.1 + F1*0.5
+                var topModels = await ctx.Set<MLModel>()
+                    .AsNoTracking()
+                    .Where(m => m.Symbol == failedRun.Symbol
+                             && m.Timeframe == failedRun.Timeframe
+                             && !m.IsDeleted
+                             && m.ExpectedValue != null
+                             && m.ExpectedValue > 0)
+                    .OrderByDescending(m =>
+                        (double)(m.ExpectedValue ?? 0m) * 5.0
+                      + (double)(m.SharpeRatio   ?? 0m) * 0.1
+                      + (double)(m.F1Score       ?? 0m) * 0.5)
+                    .Take(3)
+                    .ToListAsync(ct);
+
+                foreach (var topModel in topModels)
+                {
+                    // Find the training run that produced this model by matching symbol/timeframe/arch
+                    // and CompletedAt close to TrainedAt (within 5 minutes)
+                    var matchedRun = await ctx.Set<MLTrainingRun>()
+                        .AsNoTracking()
+                        .Where(r => r.Symbol == topModel.Symbol
+                                 && r.Timeframe == topModel.Timeframe
+                                 && r.LearnerArchitecture == topModel.LearnerArchitecture
+                                 && r.CompletedAt != null
+                                 && r.CompletedAt >= topModel.TrainedAt.AddMinutes(-5)
+                                 && r.CompletedAt <= topModel.TrainedAt.AddMinutes(5)
+                                 && r.HyperparamConfigJson != null
+                                 && !r.IsDeleted)
+                        .OrderByDescending(r => r.CompletedAt)
+                        .FirstOrDefaultAsync(ct);
+
+                    if (matchedRun?.HyperparamConfigJson is null) continue;
+
+                    try
+                    {
+                        refHp = JsonSerializer.Deserialize<HyperparamOverrides>(matchedRun.HyperparamConfigJson);
+                        if (refHp is not null)
+                        {
+                            refModelId = topModel.Id;
+                            var compositeScore = (double)(topModel.ExpectedValue ?? 0m) * 5.0
+                                               + (double)(topModel.SharpeRatio   ?? 0m) * 0.1
+                                               + (double)(topModel.F1Score       ?? 0m) * 0.5;
+                            _logger.LogInformation(
+                                "Self-tuning: using reference model {ModelId} (score={Score:F3}, EV={EV:F4}, Sharpe={Sharpe:F2}, F1={F1:F3}) hyperparams to bias retry for run {RunId}",
+                                topModel.Id, compositeScore,
+                                topModel.ExpectedValue, topModel.SharpeRatio, topModel.F1Score,
+                                failedRun.Id);
+                            break;
+                        }
+                    }
+                    catch { /* ignore deserialization errors, try next model */ }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Run {RunId}: profitability reference lookup failed — falling back to incremental adjustments", failedRun.Id);
+            }
+
+            // ── Apply adjustments: profitability-biased when reference exists, incremental fallback otherwise ──
+            if (patterns.Contains("f1"))
+            {
+                if (refHp?.FpCostWeight is not null)
+                {
+                    // Blend 70% toward the profitable model's FpCostWeight, 30% current
+                    overrides.FpCostWeight = Math.Min(hp.FpCostWeight * 0.3 + refHp.FpCostWeight.Value * 0.7, 0.85);
+                }
+                else
+                {
+                    overrides.FpCostWeight = Math.Min(hp.FpCostWeight + 0.15, 0.85);
+                }
+
+                overrides.UseClassWeights = refHp?.UseClassWeights ?? true;
+            }
+
+            if (patterns.Contains("accuracy"))
+            {
+                overrides.K = refHp?.K ?? hp.K + 3;
+                overrides.MaxEpochs = refHp?.MaxEpochs ?? (int)(hp.MaxEpochs * 1.5);
+            }
+
+            if (patterns.Contains("sharpe"))
+            {
+                if (refHp?.TemporalDecayLambda is not null)
+                {
+                    // Blend 70% toward the profitable model's decay, 30% current
+                    overrides.TemporalDecayLambda = hp.TemporalDecayLambda * 0.3 + refHp.TemporalDecayLambda.Value * 0.7;
+                }
+                else
+                {
+                    overrides.TemporalDecayLambda = hp.TemporalDecayLambda * 1.5;
+                }
+            }
+
+            if (patterns.Contains("ev"))
+            {
+                if (refHp?.UseTripleBarrier == true)
+                {
+                    overrides.UseTripleBarrier = true;
+                    overrides.TripleBarrierProfitAtrMult = refHp.TripleBarrierProfitAtrMult
+                        ?? hp.TripleBarrierProfitAtrMult * 1.2;
+                    overrides.TripleBarrierStopAtrMult = refHp.TripleBarrierStopAtrMult
+                        ?? hp.TripleBarrierStopAtrMult * 0.8;
+                }
+                else
+                {
+                    overrides.UseTripleBarrier = true;
+                    overrides.TripleBarrierProfitAtrMult = hp.TripleBarrierProfitAtrMult * 1.2;
+                    overrides.TripleBarrierStopAtrMult = hp.TripleBarrierStopAtrMult * 0.8;
+                }
+            }
+
+            if (patterns.Contains("brier"))
+            {
+                overrides.L2Lambda = refHp?.L2Lambda ?? hp.L2Lambda * 2.0;
+            }
 
             // Determine architecture — switch to SMOTE for label imbalance
             var arch = failedRun.LearnerArchitecture;
@@ -1905,9 +2004,10 @@ public sealed class MLTrainingWorker : BackgroundService
 
             await db.SaveChangesAsync(ct);
             _logger.LogInformation(
-                "Self-tuning: queued retry for run {RunId} ({Symbol}/{Tf}) gen={Gen} patterns=[{Patterns}] arch={Arch}",
+                "Self-tuning: queued retry for run {RunId} ({Symbol}/{Tf}) gen={Gen} patterns=[{Patterns}] arch={Arch} refModel={RefModelId}",
                 failedRun.Id, failedRun.Symbol, failedRun.Timeframe,
-                currentGen + 1, overrides.FailurePatterns, arch);
+                currentGen + 1, overrides.FailurePatterns, arch,
+                refModelId.HasValue ? refModelId.Value.ToString() : "none");
         }
         catch (Exception ex)
         {
