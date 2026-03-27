@@ -179,26 +179,33 @@ public class CandleAggregationWorker : BackgroundService
             // is past the period end AND we have M1 data spanning the period.
             var lastM1InPeriod = nextPeriodStart.AddMinutes(periodMinutes - 1);
 
-            // Get all closed M1 candles in this period
+            // Get all closed M1 candles in this period.
+            // Allow up to 30 seconds of timestamp drift (EA sometimes sends XX:00:01 instead of XX:00:00).
+            var driftBuffer = TimeSpan.FromSeconds(30);
             var m1Candles = await readDb.Set<Candle>()
                 .AsNoTracking()
                 .Where(c => c.Symbol == symbol
                          && c.Timeframe == Timeframe.M1
                          && c.IsClosed
                          && !c.IsDeleted
-                         && c.Timestamp >= nextPeriodStart
-                         && c.Timestamp <= lastM1InPeriod)
+                         && c.Timestamp >= nextPeriodStart.Subtract(driftBuffer)
+                         && c.Timestamp < periodEnd.Add(driftBuffer))
                 .OrderBy(c => c.Timestamp)
                 .ToListAsync(ct);
+
+            // Filter to only candles whose truncated minute falls within the period
+            m1Candles = m1Candles
+                .Where(c => TruncateToMinute(c.Timestamp) >= nextPeriodStart
+                         && TruncateToMinute(c.Timestamp) < periodEnd)
+                .ToList();
 
             if (m1Candles.Count == 0)
                 break;
 
-            // Period completeness check: the last M1 candle timestamp must match the
-            // expected final minute of the period (e.g. XX:59 for H1). This ensures
-            // we do not synthesize from partial data.
-            var actualLastTimestamp = m1Candles[^1].Timestamp;
-            if (actualLastTimestamp < lastM1InPeriod)
+            // Period completeness check: the last M1 candle's truncated minute must be
+            // at or after the expected final minute of the period (e.g. XX:59 for H1).
+            var actualLastMinute = TruncateToMinute(m1Candles[^1].Timestamp);
+            if (actualLastMinute < lastM1InPeriod)
                 break;
 
             // Check if a candle already exists for this symbol/timeframe/timestamp (upsert guard)
@@ -254,6 +261,9 @@ public class CandleAggregationWorker : BackgroundService
     /// <summary>
     /// Aligns a timestamp to the start of the enclosing period for the given timeframe.
     /// </summary>
+    private static DateTime TruncateToMinute(DateTime ts) =>
+        new(ts.Year, ts.Month, ts.Day, ts.Hour, ts.Minute, 0, DateTimeKind.Utc);
+
     private static DateTime AlignToPeriodStart(DateTime ts, Timeframe tf, int periodMinutes)
     {
         return tf switch
