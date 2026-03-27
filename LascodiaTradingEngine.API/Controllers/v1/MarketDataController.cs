@@ -5,6 +5,7 @@ using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedLibrary;
 using LascodiaTradingEngine.Application.MarketData.Queries.DTOs;
 using LascodiaTradingEngine.Application.MarketData.Queries.GetCandles;
+using LascodiaTradingEngine.Application.MarketData.Queries.GetCandleWatermarks;
 using LascodiaTradingEngine.Application.MarketData.Queries.GetLatestCandle;
 using LascodiaTradingEngine.Application.MarketData.Queries.GetLivePrice;
 using LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ReceiveTickBatch;
@@ -28,6 +29,11 @@ public class MarketDataController : AuthControllerBase<MarketDataController>
     [HttpGet("live-price/{symbol}")]
     public async Task<ResponseData<LivePriceDto>> GetLivePrice(string symbol)
         => await Mediator.Send(new GetLivePriceQuery { Symbol = symbol.ToUpperInvariant() });
+
+    /// <summary>Get the latest candle timestamp per symbol/timeframe pair (EA startup watermarks)</summary>
+    [HttpGet("candle/watermarks")]
+    public async Task<ResponseData<List<CandleWatermarkDto>>> GetCandleWatermarks()
+        => await Mediator.Send(new GetCandleWatermarksQuery());
 
     /// <summary>Get the latest closed candle for a symbol and timeframe</summary>
     [HttpGet("candle/latest")]
