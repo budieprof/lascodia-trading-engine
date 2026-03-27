@@ -284,7 +284,7 @@ public class SessionBreakoutEvaluator : IStrategyEvaluator
             : 0m;
         decimal confidence = Math.Clamp(_options.SessionBreakoutConfidence + breachBoost, 0m, 1m);
 
-        var now = candles[lastIdx].Timestamp;
+        var now = DateTime.UtcNow;
         var signal = new TradeSignal
         {
             StrategyId       = strategy.Id,

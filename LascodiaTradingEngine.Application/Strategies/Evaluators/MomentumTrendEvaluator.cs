@@ -379,9 +379,9 @@ public class MomentumTrendEvaluator : IStrategyEvaluator
         }
 
         // ── 18. Emit signal ────────────────────────────────────────────────────
-        // Use the last closed candle's timestamp so backtests get simulated
-        // timestamps rather than wallclock time.
-        var now = candles[lastIdx].Timestamp;
+        // Use wallclock time so GeneratedAt/ExpiresAt are accurate in live mode.
+        // On higher timeframes the candle open can lag by hours, causing born-expired signals.
+        var now = DateTime.UtcNow;
         var signal = new TradeSignal
         {
             StrategyId       = strategy.Id,

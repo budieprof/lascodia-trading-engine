@@ -694,7 +694,7 @@ public class MACDDivergenceEvaluator : IStrategyEvaluator
         if (_options.MacdDivergenceCooldownBars > 0)
             _lastSignalTimestamps[strategy.Id] = candles[last].Timestamp;
 
-        var now = candles[last].Timestamp;
+        var now = DateTime.UtcNow;
         return new TradeSignal
         {
             StrategyId       = strategy.Id,
