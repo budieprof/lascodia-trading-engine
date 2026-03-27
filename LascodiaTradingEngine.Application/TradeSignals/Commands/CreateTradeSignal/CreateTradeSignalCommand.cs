@@ -115,10 +115,20 @@ public class CreateTradeSignalCommandHandler : IRequestHandler<CreateTradeSignal
         await db.Set<Domain.Entities.TradeSignal>()
             .AddAsync(entity, cancellationToken);
 
-        // Create the MLModelPredictionLog record immediately so that
-        // MLPredictionOutcomeWorker / drift monitors can resolve the outcome later.
-        // Added in the same SaveChangesAsync call — EF Core resolves the temporary
-        // TradeSignalId FK automatically, ensuring both writes are atomic.
+        // Persist the signal first so it gets a real DB-assigned Id, then write
+        // the prediction log with the resolved FK. Writing both in the same
+        // SaveChangesAsync was failing on ResilientTransaction retries because the
+        // temp TradeSignalId wasn't being resolved correctly across retry boundaries.
+        await _eventBus.SaveAndPublish(_context, new TradeSignalCreatedIntegrationEvent
+        {
+            TradeSignalId = entity.Id,
+            StrategyId    = entity.StrategyId,
+            Symbol        = entity.Symbol,
+            Direction     = entity.Direction.ToString(),
+            EntryPrice    = entity.EntryPrice,
+        });
+
+        // Now entity.Id is the real DB-assigned value — safe to use as FK.
         if (request.MLModelId.HasValue)
         {
             var predLog = new MLModelPredictionLog
@@ -137,18 +147,8 @@ public class CreateTradeSignalCommandHandler : IRequestHandler<CreateTradeSignal
             };
 
             db.Set<MLModelPredictionLog>().Add(predLog);
+            await _context.SaveChangesAsync(cancellationToken);
         }
-
-        //await _context.SaveChangesAsync(cancellationToken);
-
-        await _eventBus.SaveAndPublish(_context,new TradeSignalCreatedIntegrationEvent
-        {
-            TradeSignalId = entity.Id,
-            StrategyId    = entity.StrategyId,
-            Symbol        = entity.Symbol,
-            Direction     = entity.Direction.ToString(),
-            EntryPrice    = entity.EntryPrice,
-        });
 
         return ResponseData<long>.Init(entity.Id, true, "Successful", "00");
     }
