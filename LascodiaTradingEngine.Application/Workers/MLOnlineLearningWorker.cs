@@ -151,10 +151,19 @@ public sealed class MLOnlineLearningWorker : BackgroundService
             try
             {
                 var snap = JsonSerializer.Deserialize<ModelSnapshot>(model.ModelBytes);
-                if (snap?.Weights == null || snap.Biases == null) continue;
+                if (snap == null) continue;
 
-                int K = snap.Weights.Length;
-                int F = snap.Weights[0].Length;
+                // GBM models store their structure in GbmTreesJson rather than the
+                // Weights/Biases arrays used by logistic/ELM architectures.
+                // For GBM, apply the online bias correction to GbmBaseLogOdds instead.
+                bool isGbm = !string.IsNullOrEmpty(snap.GbmTreesJson);
+
+                // For non-GBM models, require valid Weights and Biases arrays.
+                if (!isGbm && (snap.Weights == null || snap.Biases == null
+                            || snap.Weights.Length == 0 || snap.Biases.Length == 0))
+                    continue;
+
+                int K = isGbm ? 0 : snap.Weights!.Length;
 
                 foreach (var log in group)
                 {
@@ -177,12 +186,22 @@ public sealed class MLOnlineLearningWorker : BackgroundService
                     // the correct label.
                     double err = pHat - targetLabel;
 
-                    // Apply error-scaled bias correction to all K learners in the ensemble.
-                    // Without the stored feature vector we cannot update feature weights w,
-                    // only the intercept (bias) term. This still corrects for systematic
-                    // over- or under-confidence without distorting the decision hyperplane.
-                    for (int k = 0; k < K && k < snap.Biases.Length; k++)
-                        snap.Biases[k] -= OnlineLr * err;
+                    if (isGbm)
+                    {
+                        // GBM models use GbmBaseLogOdds as the intercept term.
+                        // Adjusting it shifts the base probability for all predictions,
+                        // correcting systematic over- or under-confidence.
+                        snap.GbmBaseLogOdds -= OnlineLr * err;
+                    }
+                    else
+                    {
+                        // Apply error-scaled bias correction to all K learners in the ensemble.
+                        // Without the stored feature vector we cannot update feature weights w,
+                        // only the intercept (bias) term. This still corrects for systematic
+                        // over- or under-confidence without distorting the decision hyperplane.
+                        for (int k = 0; k < K && k < snap.Biases!.Length; k++)
+                            snap.Biases[k] -= OnlineLr * err;
+                    }
                 }
 
                 // Re-serialise the updated snapshot back into the model blob.

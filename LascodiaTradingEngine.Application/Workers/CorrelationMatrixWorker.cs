@@ -197,7 +197,10 @@ public class CorrelationMatrixWorker : BackgroundService, ICorrelationMatrixProv
         List<(DateTime Date, decimal Return)> returnsA,
         List<(DateTime Date, decimal Return)> returnsB)
     {
-        var dateMapB = returnsB.ToDictionary(r => r.Date, r => r.Return);
+        // Use last-wins to handle duplicate dates from duplicate candles
+        var dateMapB = new Dictionary<DateTime, decimal>();
+        foreach (var (date, ret) in returnsB)
+            dateMapB[date] = ret;
         var alignedA = new List<decimal>();
         var alignedB = new List<decimal>();
 
