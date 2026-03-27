@@ -213,11 +213,9 @@ public sealed class OrderFilledEventHandler : IIntegrationEventHandler<OrderFill
             return;
         }
 
-        // Wrap position creation + audit log in an explicit transaction so both
-        // succeed or fail atomically.
-        var writeContext = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
-        var wdb = writeContext.GetDbContext();
-        await using var transaction = await wdb.Database.BeginTransactionAsync();
+        // OpenPositionCommand internally uses SaveAndPublish which opens its own
+        // ResilientTransaction. Do NOT wrap in an outer BeginTransaction — nested
+        // transactions with NpgsqlRetryingExecutionStrategy throw InvalidOperationException.
 
         // Derive position direction from the order type. OrderType.Buy → Long position
         // (profit when price rises); all other order types (Sell, SellLimit, etc.) → Short
@@ -267,8 +265,6 @@ public sealed class OrderFilledEventHandler : IIntegrationEventHandler<OrderFill
             "({Symbol} @ {Price:F5}, lots={Lots:F2})",
             direction, positionId, @event.OrderId, order.Symbol, @event.FilledPrice, lots);
 
-        // Write a DecisionLog entry inside the transaction so that position creation
-        // and audit are atomic — if the transaction rolls back, neither persists.
         await mediator.Send(new LogDecisionCommand
         {
             EntityType   = "Order",
@@ -279,8 +275,6 @@ public sealed class OrderFilledEventHandler : IIntegrationEventHandler<OrderFill
                            $"{direction} position opened (lots={lots:F2})",
             Source       = "OrderFilledEventHandler"
         });
-
-        await transaction.CommitAsync();
     }
 
     /// <summary>

@@ -68,7 +68,11 @@ public class ClosePositionCommandHandler : IRequestHandler<ClosePositionCommand,
             ? (request.ClosePrice - entity.AverageEntryPrice) * closeLots * contractSize
             : (entity.AverageEntryPrice - request.ClosePrice) * closeLots * contractSize;
 
-        // Wrap position update + EA command queuing in an explicit transaction
+        // Wrap position update + EA command queuing in an explicit transaction.
+        // NpgsqlRetryingExecutionStrategy requires transactional work inside
+        // CreateExecutionStrategy().ExecuteAsync().
+        await dbContext.Database.CreateExecutionStrategy().ExecuteAsync(async () =>
+        {
         await using var transaction = await dbContext.Database.BeginTransactionAsync(cancellationToken);
 
         entity.RealizedPnL += realizedForClose;
@@ -113,6 +117,7 @@ public class ClosePositionCommandHandler : IRequestHandler<ClosePositionCommand,
 
         await _context.SaveChangesAsync(cancellationToken);
         await transaction.CommitAsync(cancellationToken);
+        });
 
         return ResponseData<string>.Init("Closed", true, "Successful", "00");
     }

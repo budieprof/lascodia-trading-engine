@@ -250,10 +250,11 @@ public class CreateOrderFromSignalCommandHandler
         }
 
         // ── Create order ─────────────────────────────────────────────────────
-        // Wrap order creation + signal linkage + attempt recording in an explicit
-        // transaction so that all three writes succeed or fail atomically.
+        // CreateOrderCommand internally uses SaveAndPublish which opens its own
+        // ResilientTransaction. We must NOT wrap this in an outer execution strategy
+        // + BeginTransaction — nested execution strategies with NpgsqlRetryingExecutionStrategy
+        // throw InvalidOperationException.
         var wdb = _writeContext.GetDbContext();
-        await using var transaction = await wdb.Database.BeginTransactionAsync(cancellationToken);
 
         var orderResult = await _mediator.Send(new CreateOrderCommand
         {
@@ -272,41 +273,42 @@ public class CreateOrderFromSignalCommandHandler
 
         if (!orderResult.status || orderResult.data <= 0)
         {
-            await transaction.RollbackAsync(cancellationToken);
             _logger.LogError("CreateOrderFromSignal: CreateOrderCommand failed for signal {SignalId}", signal.Id);
+            await RecordAttemptAsync(signal.Id, account.Id, false, "CreateOrderCommand failed", cancellationToken);
             return ResponseData<long>.Init(0, false, "Failed to create order", "-11");
         }
+
+        long orderId = orderResult.data;
 
         // Write OrderId back to signal
         var signalEntity = await wdb.Set<TradeSignal>()
             .FirstOrDefaultAsync(x => x.Id == signal.Id && !x.IsDeleted, cancellationToken);
         if (signalEntity is not null)
         {
-            signalEntity.OrderId = orderResult.data;
+            signalEntity.OrderId = orderId;
             await _writeContext.SaveChangesAsync(cancellationToken);
         }
 
-        // Record successful attempt and audit log inside the transaction so all
-        // three writes (order, attempt, audit) succeed or fail atomically.
         await RecordAttemptAsync(signal.Id, account.Id, true, null, cancellationToken);
 
         await _mediator.Send(new LogDecisionCommand
         {
             EntityType   = "Order",
-            EntityId     = orderResult.data,
+            EntityId     = orderId,
             DecisionType = "OrderCreated",
             Outcome      = "Pending",
             Reason       = $"Signal {signal.Id} — {signal.Direction} {signal.Symbol} lot={signal.SuggestedLotSize}, account={account.AccountId}",
             Source       = "CreateOrderFromSignalCommand"
         }, cancellationToken);
 
-        await transaction.CommitAsync(cancellationToken);
+        if (orderId <= 0)
+            return ResponseData<long>.Init(0, false, "Failed to create order", "-11");
 
         _logger.LogInformation(
             "CreateOrderFromSignal: order {OrderId} created from signal {SignalId} for account {AccountId}",
-            orderResult.data, signal.Id, account.Id);
+            orderId, signal.Id, account.Id);
 
-        return ResponseData<long>.Init(orderResult.data, true, "Successful", "00");
+        return ResponseData<long>.Init(orderId, true, "Successful", "00");
     }
 
     private async Task RecordAttemptAsync(
