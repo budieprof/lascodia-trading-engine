@@ -157,9 +157,9 @@ public sealed class MLSignalScorer : IMLSignalScorer
         // ── 2. Deserialise model snapshot (cached, with concurrency protection) ─
         var snap = await GetOrDeserializeSnapshotAsync(model);
 
-        if (snap is null || (snap.Weights.Length == 0 && string.IsNullOrEmpty(snap.ConvWeightsJson)))
+        if (snap is null || !HasModelWeights(snap))
         {
-            _logger.LogWarning("Model {Id} snapshot is empty or has no weights", model.Id);
+            _logger.LogWarning("Model {Id} snapshot is empty or has no weights (type={Type})", model.Id, snap?.Type);
             RecordInferenceFailure(model.Id);
             return new MLScoreResult(null, null, null, null);
         }
@@ -340,6 +340,14 @@ public sealed class MLSignalScorer : IMLSignalScorer
     /// of <see cref="Lazy{Task}"/> so that concurrent callers <c>await</c> the same
     /// deserialization task instead of blocking threadpool threads.
     /// </summary>
+    private static bool HasModelWeights(ModelSnapshot snap) =>
+        snap.Weights.Length > 0 ||
+        !string.IsNullOrEmpty(snap.ConvWeightsJson) ||
+        !string.IsNullOrEmpty(snap.GbmTreesJson) ||
+        !string.IsNullOrEmpty(snap.TabNetAttentionJson) ||
+        !string.IsNullOrEmpty(snap.FtTransformerAdditionalLayersJson) ||
+        !string.IsNullOrEmpty(snap.RotationForestJson);
+
     private async Task<ModelSnapshot?> GetOrDeserializeSnapshotAsync(MLModel model)
     {
         var cacheKey = $"{SnapshotCacheKeyPrefix}{model.Id}";
@@ -736,7 +744,7 @@ public sealed class MLSignalScorer : IMLSignalScorer
                 if (altModel is null) continue;
 
                 var altSnap = await GetOrDeserializeSnapshotAsync(altModel);
-                if (altSnap is null || (altSnap.Weights.Length == 0 && string.IsNullOrEmpty(altSnap.ConvWeightsJson)))
+                if (altSnap is null || !HasModelWeights(altSnap))
                     continue;
 
                 int requiredCandles = MLFeatureHelper.LookbackWindow + 2;
