@@ -144,6 +144,8 @@ public sealed class MLTrainingWorker : BackgroundService
     private const string CK_UseClassWeights            = "MLTraining:UseClassWeights";
     private const string CK_TrendingMinAccuracy        = "MLTraining:TrendingMinAccuracy";
     private const string CK_TrendingMinEV              = "MLTraining:TrendingMinEV";
+    private const string CK_SelfTuningEnabled          = "MLTraining:SelfTuningEnabled";
+    private const string CK_MaxSelfTuningRetries       = "MLTraining:MaxSelfTuningRetries";
     private const string CK_FitTemperatureScale        = "MLTraining:FitTemperatureScale";
     private const string CK_MinBrierSkillScore         = "MLTraining:MinBrierSkillScore";
     private const string CK_RecalibrationDecayLambda   = "MLTraining:RecalibrationDecayLambda";
@@ -347,12 +349,19 @@ public sealed class MLTrainingWorker : BackgroundService
                     {
                         hp = hp with
                         {
-                            K                   = overrides.K                   ?? hp.K,
-                            LearningRate        = overrides.LearningRate        ?? hp.LearningRate,
-                            L2Lambda            = overrides.L2Lambda            ?? hp.L2Lambda,
-                            TemporalDecayLambda = overrides.TemporalDecayLambda ?? hp.TemporalDecayLambda,
-                            MaxEpochs           = overrides.MaxEpochs           ?? hp.MaxEpochs,
-                            EmbargoBarCount     = overrides.EmbargoBarCount     ?? hp.EmbargoBarCount,
+                            K                          = overrides.K                          ?? hp.K,
+                            LearningRate               = overrides.LearningRate               ?? hp.LearningRate,
+                            L2Lambda                   = overrides.L2Lambda                   ?? hp.L2Lambda,
+                            TemporalDecayLambda        = overrides.TemporalDecayLambda        ?? hp.TemporalDecayLambda,
+                            MaxEpochs                  = overrides.MaxEpochs                  ?? hp.MaxEpochs,
+                            EmbargoBarCount            = overrides.EmbargoBarCount            ?? hp.EmbargoBarCount,
+                            FpCostWeight               = overrides.FpCostWeight               ?? hp.FpCostWeight,
+                            UseClassWeights            = overrides.UseClassWeights            ?? hp.UseClassWeights,
+                            UseTripleBarrier           = overrides.UseTripleBarrier           ?? hp.UseTripleBarrier,
+                            TripleBarrierProfitAtrMult = overrides.TripleBarrierProfitAtrMult ?? hp.TripleBarrierProfitAtrMult,
+                            TripleBarrierStopAtrMult   = overrides.TripleBarrierStopAtrMult   ?? hp.TripleBarrierStopAtrMult,
+                            LabelSmoothing             = overrides.LabelSmoothing             ?? hp.LabelSmoothing,
+                            NoiseSigma                 = overrides.NoiseSigma                 ?? hp.NoiseSigma,
                         };
                         _logger.LogInformation(
                             "Run {RunId}: applied hyperparameter overrides from HyperparamConfigJson " +
@@ -760,6 +769,7 @@ public sealed class MLTrainingWorker : BackgroundService
                     .InvalidateCache(run.Symbol, run.Timeframe);
                 _logger.LogWarning("Run {RunId} did not pass quality gates — model not promoted", run.Id);
                 await MaybeCreateTrainingFailureAlertAsync(ctx, run, stoppingToken);
+                await MaybeQueueSelfTuningRetryAsync(ctx, db, run, m, hp, stoppingToken);
                 return;
             }
 
@@ -1694,6 +1704,132 @@ public sealed class MLTrainingWorker : BackgroundService
     /// <param name="snapBss">Brier Skill Score extracted from the model snapshot.</param>
     /// <param name="newOobAccuracy">OOB accuracy of the newly trained model.</param>
     /// <param name="parentOobAccuracy">OOB accuracy of the previous champion (for regression guard).</param>
+    // ── Self-tuning retry: analyze failure and queue adjusted run ──────────
+
+    private async Task MaybeQueueSelfTuningRetryAsync(
+        DbContext                  ctx,
+        IWriteApplicationDbContext db,
+        MLTrainingRun              failedRun,
+        EvalMetrics                metrics,
+        TrainingHyperparams        hp,
+        CancellationToken          ct)
+    {
+        try
+        {
+            bool enabled = await GetConfigAsync<bool>(ctx, CK_SelfTuningEnabled, true, ct);
+            if (!enabled) return;
+
+            int maxRetries = await GetConfigAsync<int>(ctx, CK_MaxSelfTuningRetries, 2, ct);
+
+            // Check current generation from the failed run's overrides
+            int currentGen = 0;
+            if (!string.IsNullOrWhiteSpace(failedRun.HyperparamConfigJson))
+            {
+                try
+                {
+                    var prev = JsonSerializer.Deserialize<HyperparamOverrides>(failedRun.HyperparamConfigJson);
+                    currentGen = prev?.SelfTuningGeneration ?? 0;
+                }
+                catch { /* ignore parse errors */ }
+            }
+
+            if (currentGen >= maxRetries)
+            {
+                _logger.LogDebug("Run {RunId}: self-tuning generation {Gen} >= max {Max} — no retry",
+                    failedRun.Id, currentGen, maxRetries);
+                return;
+            }
+
+            // Analyze failure patterns from error message
+            var error = failedRun.ErrorMessage ?? "";
+            var overrides = new HyperparamOverrides
+            {
+                TriggeredBy          = "SelfTuningRetry",
+                ParentRunId          = failedRun.Id,
+                SelfTuningGeneration = currentGen + 1,
+            };
+
+            var patterns = new List<string>();
+
+            if (error.Contains("f1", StringComparison.OrdinalIgnoreCase))
+            {
+                patterns.Add("f1");
+                overrides.FpCostWeight = Math.Min(hp.FpCostWeight + 0.15, 0.85);
+                overrides.UseClassWeights = true;
+            }
+
+            if (error.Contains("accuracy", StringComparison.OrdinalIgnoreCase))
+            {
+                patterns.Add("accuracy");
+                overrides.K = hp.K + 3;
+                overrides.MaxEpochs = (int)(hp.MaxEpochs * 1.5);
+            }
+
+            if (error.Contains("sharpe", StringComparison.OrdinalIgnoreCase))
+            {
+                patterns.Add("sharpe");
+                overrides.TemporalDecayLambda = hp.TemporalDecayLambda * 1.5;
+            }
+
+            if (error.Contains("ev ", StringComparison.OrdinalIgnoreCase) ||
+                error.Contains("ev -", StringComparison.OrdinalIgnoreCase))
+            {
+                patterns.Add("ev");
+                overrides.UseTripleBarrier = true;
+                overrides.TripleBarrierProfitAtrMult = hp.TripleBarrierProfitAtrMult * 1.2;
+                overrides.TripleBarrierStopAtrMult = hp.TripleBarrierStopAtrMult * 0.8;
+            }
+
+            if (error.Contains("brier", StringComparison.OrdinalIgnoreCase))
+            {
+                patterns.Add("brier");
+                overrides.L2Lambda = hp.L2Lambda * 2.0;
+            }
+
+            if (patterns.Count == 0)
+            {
+                _logger.LogDebug("Run {RunId}: no recognizable failure patterns for self-tuning", failedRun.Id);
+                return;
+            }
+
+            overrides.FailurePatterns = string.Join(",", patterns);
+
+            // Determine architecture — switch to SMOTE for label imbalance
+            var arch = failedRun.LearnerArchitecture;
+            if (error.Contains("Label imbalance", StringComparison.OrdinalIgnoreCase))
+            {
+                arch = LearnerArchitecture.Smote;
+                overrides.UseClassWeights = true;
+            }
+
+            var now = DateTime.UtcNow;
+            int windowDays = await GetConfigAsync<int>(ctx, "MLTraining:TrainingDataWindowDays", 365, ct);
+
+            ctx.Set<MLTrainingRun>().Add(new MLTrainingRun
+            {
+                Symbol              = failedRun.Symbol,
+                Timeframe           = failedRun.Timeframe,
+                TriggerType         = TriggerType.AutoDegrading,
+                Status              = RunStatus.Queued,
+                FromDate            = now.AddDays(-windowDays),
+                ToDate              = now,
+                StartedAt           = now,
+                LearnerArchitecture = arch,
+                HyperparamConfigJson = JsonSerializer.Serialize(overrides),
+            });
+
+            await db.SaveChangesAsync(ct);
+            _logger.LogInformation(
+                "Self-tuning: queued retry for run {RunId} ({Symbol}/{Tf}) gen={Gen} patterns=[{Patterns}] arch={Arch}",
+                failedRun.Id, failedRun.Symbol, failedRun.Timeframe,
+                currentGen + 1, overrides.FailurePatterns, arch);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Self-tuning retry failed for run {RunId} — non-critical", failedRun.Id);
+        }
+    }
+
     private static string BuildGateFailureMessage(
         EvalMetrics         m,
         WalkForwardResult   cv,

@@ -68,6 +68,21 @@ public class HyperparamOverrides
     /// </summary>
     public string? RegimeScope         { get; set; }
 
+    // ── Self-tuning override fields ─────────────────────────────────────────
+    public double? FpCostWeight               { get; set; }
+    public bool?   UseClassWeights            { get; set; }
+    public bool?   UseTripleBarrier           { get; set; }
+    public double? TripleBarrierProfitAtrMult { get; set; }
+    public double? TripleBarrierStopAtrMult   { get; set; }
+    public double? LabelSmoothing             { get; set; }
+    public double? NoiseSigma                 { get; set; }
+
+    // ── Self-tuning metadata ────────────────────────────────────────────────
+    public long?   ParentRunId           { get; set; }
+    public int?    SelfTuningGeneration  { get; set; }
+    public string? TriggeredBy           { get; set; }
+    public string? FailurePatterns       { get; set; }
+
     // ── Rec #2: Execution-aware labels ────────────────────────────────────────
 
     /// <summary>
