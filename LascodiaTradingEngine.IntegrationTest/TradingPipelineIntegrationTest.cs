@@ -181,7 +181,6 @@ public class TradingPipelineIntegrationTest : IClassFixture<PostgresFixture>
         {
             var position = new Position
             {
-                TradingAccountId = accountId,
                 OpenOrderId = orderId,
                 Symbol = "EURUSD",
                 Direction = PositionDirection.Long,
@@ -215,9 +214,7 @@ public class TradingPipelineIntegrationTest : IClassFixture<PostgresFixture>
             var position = await ctx.Set<Position>().FindAsync(positionId);
             Assert.NotNull(position);
             position!.Status = PositionStatus.Closed;
-            position.ClosePrice = 1.11000m;
             position.ClosedAt = DateTime.UtcNow;
-            position.CloseReason = TradeExitReason.TakeProfitHit;
             // P&L: (1.11000 - 1.10510) * 0.10 * 100000 = 49.00
             position.RealizedPnL = (1.11000m - 1.10510m) * 0.10m * 100_000m;
             await ctx.SaveChangesAsync();
@@ -240,7 +237,7 @@ public class TradingPipelineIntegrationTest : IClassFixture<PostgresFixture>
 
             // Position closed with P&L
             Assert.Equal(PositionStatus.Closed, position!.Status);
-            Assert.Equal(TradeExitReason.TakeProfitHit, position.CloseReason);
+            Assert.NotNull(position.ClosedAt);
             Assert.Equal(49.00m, position.RealizedPnL);
             Assert.Equal(orderId, position.OpenOrderId);
         }
@@ -352,7 +349,6 @@ public class TradingPipelineIntegrationTest : IClassFixture<PostgresFixture>
         {
             var position = new Position
             {
-                TradingAccountId = accountId,
                 Symbol = "USDJPY",
                 Direction = PositionDirection.Short,
                 OpenLots = 0.05m,
