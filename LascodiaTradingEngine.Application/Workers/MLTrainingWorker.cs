@@ -229,7 +229,27 @@ public sealed class MLTrainingWorker : BackgroundService
                 await WorkerBulkhead.MLTraining.WaitAsync(stoppingToken);
                 try
                 {
-                    await ProcessRunAsync(run, db, ctx, scope.ServiceProvider, stoppingToken);
+                    // Per-job timeout: prevent individual training runs from running forever.
+                    // FtTransformer/TCN can get stuck in infinite loops with certain hyperparams.
+                    int timeoutMinutes = await GetConfigAsync<int>(ctx, "MLTraining:MaxRunTimeMinutes", 30, stoppingToken);
+                    using var jobCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+                    jobCts.CancelAfter(TimeSpan.FromMinutes(timeoutMinutes));
+
+                    try
+                    {
+                        await ProcessRunAsync(run, db, ctx, scope.ServiceProvider, jobCts.Token);
+                    }
+                    catch (OperationCanceledException) when (jobCts.IsCancellationRequested && !stoppingToken.IsCancellationRequested)
+                    {
+                        _logger.LogWarning(
+                            "Run {RunId} ({Symbol}/{Tf}) timed out after {Timeout} minutes — marking as failed",
+                            run.Id, run.Symbol, run.Timeframe, timeoutMinutes);
+
+                        run.Status = RunStatus.Failed;
+                        run.ErrorMessage = $"Timed out after {timeoutMinutes} minutes";
+                        run.CompletedAt = DateTime.UtcNow;
+                        await db.SaveChangesAsync(stoppingToken);
+                    }
                 }
                 finally
                 {
