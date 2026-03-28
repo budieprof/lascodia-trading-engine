@@ -90,10 +90,10 @@ public class OrderController : AuthControllerBase<OrderController>
 
     /// <summary>Submit a batch of execution reports from the EA</summary>
     [HttpPost("execution-report/batch")]
-    public async Task<ResponseData<int>> ExecutionReportBatch(SubmitExecutionReportBatchCommand command)
+    public async Task<ResponseData<ExecutionReportBatchResult>> ExecutionReportBatch(SubmitExecutionReportBatchCommand command)
     {
         if (!ModelState.IsValid)
-            return ResponseData<int>.Init(0, false, "Model state failed", "-11");
+            return ResponseData<ExecutionReportBatchResult>.Init(new ExecutionReportBatchResult(), false, "Model state failed", "-11");
 
         return await Mediator.Send(command);
     }

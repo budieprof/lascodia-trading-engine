@@ -171,17 +171,6 @@ builder.Services.AddOpenTelemetry()
     .WithTracing(tracing =>
     {
         tracing.AddSource("LascodiaTradingEngine");
-        tracing.AddAspNetCoreInstrumentation(o =>
-        {
-            o.RecordException = true;
-            // Don't trace health check / metrics endpoints
-            o.Filter = ctx => !ctx.Request.Path.StartsWithSegments("/health")
-                           && !ctx.Request.Path.StartsWithSegments("/metrics");
-        });
-        tracing.AddHttpClientInstrumentation();
-        // Console exporter in development for local debugging
-        if (builder.Environment.IsDevelopment())
-            tracing.AddConsoleExporter();
     });
 
 // ── Rate Limiting ────────────────────────────────────────────────────────
