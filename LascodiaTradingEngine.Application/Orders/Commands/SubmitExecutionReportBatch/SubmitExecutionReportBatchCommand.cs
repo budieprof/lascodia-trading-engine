@@ -22,9 +22,25 @@ public class ExecutionReportItem
     public DateTime? FilledAt       { get; set; }
 }
 
+// ── Result DTO (per-report status) ───────────────────────────────────────────
+
+public class ExecutionReportBatchResult
+{
+    public int Processed { get; set; }
+    public int Skipped { get; set; }
+    public List<ExecutionReportItemResult> Items { get; set; } = new();
+}
+
+public class ExecutionReportItemResult
+{
+    public long OrderId { get; set; }
+    public bool Success { get; set; }
+    public string? Reason { get; set; }
+}
+
 // ── Command ──────────────────────────────────────────────────────────────────
 
-public class SubmitExecutionReportBatchCommand : IRequest<ResponseData<int>>
+public class SubmitExecutionReportBatchCommand : IRequest<ResponseData<ExecutionReportBatchResult>>
 {
     public List<ExecutionReportItem> Reports { get; set; } = new();
 }
@@ -54,7 +70,7 @@ public class SubmitExecutionReportBatchCommandValidator : AbstractValidator<Subm
 
 // ── Handler ──────────────────────────────────────────────────────────────────
 
-public class SubmitExecutionReportBatchCommandHandler : IRequestHandler<SubmitExecutionReportBatchCommand, ResponseData<int>>
+public class SubmitExecutionReportBatchCommandHandler : IRequestHandler<SubmitExecutionReportBatchCommand, ResponseData<ExecutionReportBatchResult>>
 {
     private readonly IWriteApplicationDbContext _context;
     private readonly IIntegrationEventService _eventBus;
@@ -65,10 +81,10 @@ public class SubmitExecutionReportBatchCommandHandler : IRequestHandler<SubmitEx
         _eventBus = eventBus;
     }
 
-    public async Task<ResponseData<int>> Handle(SubmitExecutionReportBatchCommand request, CancellationToken cancellationToken)
+    public async Task<ResponseData<ExecutionReportBatchResult>> Handle(SubmitExecutionReportBatchCommand request, CancellationToken cancellationToken)
     {
         var dbContext = _context.GetDbContext();
-        int processed = 0;
+        var result = new ExecutionReportBatchResult();
 
         foreach (var report in request.Reports)
         {
@@ -79,10 +95,20 @@ public class SubmitExecutionReportBatchCommandHandler : IRequestHandler<SubmitEx
                     cancellationToken);
 
             if (entity == null)
-                continue; // Skip unknown orders in batch
+            {
+                result.Skipped++;
+                result.Items.Add(new ExecutionReportItemResult
+                    { OrderId = report.OrderId, Success = false, Reason = "Order not found" });
+                continue;
+            }
 
             if (!Enum.TryParse<OrderStatus>(report.Status, ignoreCase: true, out var newStatus))
+            {
+                result.Skipped++;
+                result.Items.Add(new ExecutionReportItemResult
+                    { OrderId = report.OrderId, Success = false, Reason = $"Invalid status: {report.Status}" });
                 continue;
+            }
 
             var previousStatus = entity.Status;
             entity.Status          = newStatus;
@@ -112,10 +138,12 @@ public class SubmitExecutionReportBatchCommandHandler : IRequestHandler<SubmitEx
                 });
             }
 
-            processed++;
+            result.Processed++;
+            result.Items.Add(new ExecutionReportItemResult
+                { OrderId = report.OrderId, Success = true });
         }
 
         await _context.SaveChangesAsync(cancellationToken);
-        return ResponseData<int>.Init(processed, true, "Successful", "00");
+        return ResponseData<ExecutionReportBatchResult>.Init(result, true, "Successful", "00");
     }
 }

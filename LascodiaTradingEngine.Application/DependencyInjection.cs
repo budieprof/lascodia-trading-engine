@@ -76,25 +76,40 @@ public static class DependencyInjection
         // ── HTTP Clients ─────────────────────────────────────────────────────────
         services.AddHttpClient();
 
+        // Shared retry policy for alert/calendar clients: 3 retries with jittered exponential backoff
+        var transientRetryPolicy = HttpPolicyExtensions
+            .HandleTransientHttpError()
+            .OrResult(r => r.StatusCode == System.Net.HttpStatusCode.TooManyRequests)
+            .WaitAndRetryAsync(3, attempt =>
+                TimeSpan.FromSeconds(Math.Pow(2, attempt))
+                + TimeSpan.FromMilliseconds(Random.Shared.Next(0, 500)));
+
         services.AddHttpClient("AlertWebhook", (sp, c) =>
         {
             var opts = sp.GetRequiredService<WebhookAlertOptions>();
             c.Timeout = TimeSpan.FromSeconds(opts.TimeoutSeconds > 0 ? opts.TimeoutSeconds : 30);
-        });
+        })
+        .AddPolicyHandler(transientRetryPolicy);
+
         services.AddHttpClient("AlertTelegram", (sp, c) =>
         {
             var opts = sp.GetRequiredService<TelegramAlertOptions>();
             c.Timeout = TimeSpan.FromSeconds(opts.TimeoutSeconds > 0 ? opts.TimeoutSeconds : 10);
-        });
+        })
+        .AddPolicyHandler(transientRetryPolicy);
+
         services.AddHttpClient("InvestingCalendar", c =>
         {
             c.Timeout = TimeSpan.FromSeconds(10);
             c.DefaultRequestHeaders.Add("User-Agent", "LascodiaTradingEngine/1.0");
-        });
+        })
+        .AddPolicyHandler(transientRetryPolicy);
+
         services.AddHttpClient("OandaCalendar", c =>
         {
             c.Timeout = TimeSpan.FromSeconds(10);
-        });
+        })
+        .AddPolicyHandler(transientRetryPolicy);
         services.AddHttpClient("ForexFactoryCalendar", c =>
         {
             c.Timeout = TimeSpan.FromSeconds(15);

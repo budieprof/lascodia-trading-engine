@@ -157,7 +157,7 @@ builder.Services.AddCors(options =>
     });
 });
 
-// ── Metrics (Prometheus) ─────────────────────────────────────────────────────
+// ── Metrics & Tracing (OpenTelemetry) ────────────────────────────────────────
 builder.Services.AddSingleton<TradingMetrics>();
 builder.Services.AddOpenTelemetry()
     .WithMetrics(metrics =>
@@ -167,6 +167,21 @@ builder.Services.AddOpenTelemetry()
         metrics.AddMeter("Microsoft.AspNetCore.Server.Kestrel");
         metrics.AddMeter("System.Net.Http");
         metrics.AddPrometheusExporter();
+    })
+    .WithTracing(tracing =>
+    {
+        tracing.AddSource("LascodiaTradingEngine");
+        tracing.AddAspNetCoreInstrumentation(o =>
+        {
+            o.RecordException = true;
+            // Don't trace health check / metrics endpoints
+            o.Filter = ctx => !ctx.Request.Path.StartsWithSegments("/health")
+                           && !ctx.Request.Path.StartsWithSegments("/metrics");
+        });
+        tracing.AddHttpClientInstrumentation();
+        // Console exporter in development for local debugging
+        if (builder.Environment.IsDevelopment())
+            tracing.AddConsoleExporter();
     });
 
 // ── Rate Limiting ────────────────────────────────────────────────────────
@@ -249,6 +264,9 @@ app.ConfigureEventBus();
 // Apply the restrictive CORS policy before the shared library's RunAppPipeline
 // (which registers a permissive AllowAnyOrigin policy). The first CORS middleware
 // in the pipeline handles preflight requests and sets response headers.
+// ── Request timing (outermost: captures full pipeline latency) ───────────────
+app.UseMiddleware<RequestTimingMiddleware>();
+
 // ── Security middleware (runs before everything else) ────────────────────────
 app.UseMiddleware<SecurityHeadersMiddleware>();
 app.UseMiddleware<InputSanitizationMiddleware>();

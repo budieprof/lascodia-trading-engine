@@ -25,6 +25,8 @@ public class InDatabaseLivePriceCache : ILivePriceCache
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<InDatabaseLivePriceCache> _logger;
     private Timer? _evictionTimer;
+    private int _persistFailures;        // Consecutive persist failures (for alerting)
+    private DateTime _lastPersistWarn = DateTime.MinValue;
 
     public InDatabaseLivePriceCache(
         IServiceScopeFactory scopeFactory,
@@ -121,10 +123,23 @@ public class InDatabaseLivePriceCache : ILivePriceCache
             }
 
             await writeContext.SaveChangesAsync(CancellationToken.None);
+            Interlocked.Exchange(ref _persistFailures, 0); // Reset on success
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to persist live price for {Symbol}.", symbol);
+            var failures = Interlocked.Increment(ref _persistFailures);
+            // Rate-limit warnings: log at most once per minute to avoid flooding
+            if (failures >= 5 && (DateTime.UtcNow - _lastPersistWarn).TotalSeconds > 60)
+            {
+                _lastPersistWarn = DateTime.UtcNow;
+                _logger.LogWarning("Live price persistence failing repeatedly ({Failures} consecutive failures). " +
+                    "In-memory cache is still serving reads, but prices won't survive a restart. Last error: {Error}",
+                    failures, ex.Message);
+            }
+            else
+            {
+                _logger.LogDebug(ex, "Failed to persist live price for {Symbol} (failure #{Count}).", symbol, failures);
+            }
         }
     }
 }
