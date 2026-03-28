@@ -97,7 +97,9 @@ public sealed class QrfInferenceEngine : IModelInferenceEngine
         }
 
         double avg = InferenceHelpers.AggregateProbs(probs, T, snap.MetaWeights, snap.MetaBias,
-            snap.EnsembleSelectionWeights, snap.LearnerCalAccuracies);
+            snap.EnsembleSelectionWeights,
+            snap.LearnerAccuracyWeights is { Length: > 0 } ? snap.LearnerAccuracyWeights : null,
+            snap.LearnerCalAccuracies);
 
         double variance = 0.0;
         for (int t = 0; t < T; t++) { double d = probs[t] - avg; variance += d * d; }

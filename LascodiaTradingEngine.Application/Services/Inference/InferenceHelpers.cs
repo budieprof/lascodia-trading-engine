@@ -11,12 +11,13 @@ internal static class InferenceHelpers
 {
     /// <summary>
     /// Aggregates per-learner probabilities using the priority chain:
-    /// MetaWeights (stacking) → GES weights → CalAccuracy softmax → plain average.
+    /// MetaWeights (stacking) → GES weights → persisted learner-accuracy weights
+    /// → CalAccuracy softmax fallback → plain average.
     /// </summary>
     internal static double AggregateProbs(
         double[] probs, int count,
         double[]? metaWeights, double metaBias,
-        double[]? gesWeights, double[]? calAccuracies)
+        double[]? gesWeights, double[]? learnerAccuracyWeights, double[]? calAccuracies)
     {
         if (metaWeights is { Length: > 0 } mw && mw.Length == count)
         {
@@ -29,6 +30,17 @@ internal static class InferenceHelpers
         {
             double wSum = 0, pSum = 0;
             for (int t = 0; t < count; t++) { wSum += gw[t]; pSum += gw[t] * probs[t]; }
+            return wSum > 1e-10 ? pSum / wSum : probs.Average();
+        }
+
+        if (learnerAccuracyWeights is { Length: > 0 } law && law.Length == count)
+        {
+            double wSum = 0, pSum = 0;
+            for (int t = 0; t < count; t++)
+            {
+                wSum += law[t];
+                pSum += law[t] * probs[t];
+            }
             return wSum > 1e-10 ? pSum / wSum : probs.Average();
         }
 

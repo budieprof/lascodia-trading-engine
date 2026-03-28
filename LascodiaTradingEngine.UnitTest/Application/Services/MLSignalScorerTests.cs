@@ -166,7 +166,7 @@ public class MLSignalScorerTests
     {
         double[] probs = [0.2, 0.4, 0.6, 0.8];
 
-        double result = InferenceHelpers.AggregateProbs(probs, 4, null, 0.0, null, null);
+        double result = InferenceHelpers.AggregateProbs(probs, 4, null, 0.0, null, null, null);
 
         Assert.Equal(0.5, result, precision: 10);
     }
@@ -177,7 +177,7 @@ public class MLSignalScorerTests
         double[] probs = [0.3, 0.7];
         double[] metaW = [1.0, 1.0];
 
-        double result = InferenceHelpers.AggregateProbs(probs, 2, metaW, 0.0, null, null);
+        double result = InferenceHelpers.AggregateProbs(probs, 2, metaW, 0.0, null, null, null);
 
         // Meta-learner applies sigmoid(metaBias + sum(w_k * p_k))
         // sigmoid(0 + 1.0*0.3 + 1.0*0.7) = sigmoid(1.0) ≈ 0.7311
@@ -190,7 +190,7 @@ public class MLSignalScorerTests
         double[] probs = [0.2, 0.8];
         double[] ges   = [3.0, 1.0]; // heavily favour first learner
 
-        double result = InferenceHelpers.AggregateProbs(probs, 2, null, 0.0, ges, null);
+        double result = InferenceHelpers.AggregateProbs(probs, 2, null, 0.0, ges, null, null);
 
         // Weighted avg: (3*0.2 + 1*0.8) / 4 = 1.4/4 = 0.35
         Assert.Equal(0.35, result, precision: 10);
@@ -202,7 +202,7 @@ public class MLSignalScorerTests
         double[] probs = [0.3, 0.7];
         double[] calAcc = [0.9, 0.5]; // first learner much more accurate
 
-        double result = InferenceHelpers.AggregateProbs(probs, 2, null, 0.0, null, calAcc);
+        double result = InferenceHelpers.AggregateProbs(probs, 2, null, 0.0, null, null, calAcc);
 
         // Softmax-weighted by accuracy: first learner gets higher weight
         Assert.True(result < 0.5, "Should skew toward first learner (0.3) since it has higher accuracy");
@@ -217,8 +217,8 @@ public class MLSignalScorerTests
         double[] calAcc = [0.9, 0.5];
 
         // Meta should win when all are present
-        double withAll  = InferenceHelpers.AggregateProbs(probs, 2, metaW, 0.0, ges, calAcc);
-        double metaOnly = InferenceHelpers.AggregateProbs(probs, 2, metaW, 0.0, null, null);
+        double withAll  = InferenceHelpers.AggregateProbs(probs, 2, metaW, 0.0, ges, null, calAcc);
+        double metaOnly = InferenceHelpers.AggregateProbs(probs, 2, metaW, 0.0, null, null, null);
 
         Assert.Equal(metaOnly, withAll, precision: 10);
     }
@@ -333,7 +333,7 @@ public class MLSignalScorerTests
         double[] probs  = [0.3, 0.7];
         double[] metaW  = [1.0]; // length 1, count is 2 → mismatch
 
-        double result = InferenceHelpers.AggregateProbs(probs, 2, metaW, 0.0, null, null);
+        double result = InferenceHelpers.AggregateProbs(probs, 2, metaW, 0.0, null, null, null);
 
         // Should fall through to average since metaW.Length != count
         Assert.Equal(0.5, result, precision: 10);
@@ -345,8 +345,8 @@ public class MLSignalScorerTests
         double[] probs = [0.5, 0.5];
         double[] metaW = [0.0, 0.0]; // zero weights
 
-        double withoutBias = InferenceHelpers.AggregateProbs(probs, 2, metaW, 0.0, null, null);
-        double withBias    = InferenceHelpers.AggregateProbs(probs, 2, metaW, 2.0, null, null);
+        double withoutBias = InferenceHelpers.AggregateProbs(probs, 2, metaW, 0.0, null, null, null);
+        double withBias    = InferenceHelpers.AggregateProbs(probs, 2, metaW, 2.0, null, null, null);
 
         // sigmoid(0) = 0.5, sigmoid(2) ≈ 0.88
         Assert.Equal(0.5, withoutBias, precision: 5);

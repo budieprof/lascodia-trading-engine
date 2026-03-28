@@ -17,8 +17,6 @@ namespace LascodiaTradingEngine.Application.Services.Inference;
 [RegisterService(ServiceLifetime.Scoped, typeof(IModelInferenceEngine))]
 public sealed class ElmInferenceEngine : IModelInferenceEngine
 {
-    private const double DropoutRate = 0.1;
-
     public bool CanHandle(ModelSnapshot snapshot) =>
         snapshot.Type == "elm"
         && snapshot.Weights is { Length: > 0 }
@@ -52,6 +50,7 @@ public sealed class ElmInferenceEngine : IModelInferenceEngine
         double avg = InferenceHelpers.AggregateProbs(
             probs, K, snapshot.MetaWeights, snapshot.MetaBias,
             snapshot.EnsembleSelectionWeights is { Length: > 0 } ? snapshot.EnsembleSelectionWeights : null,
+            snapshot.LearnerAccuracyWeights is { Length: > 0 } ? snapshot.LearnerAccuracyWeights : null,
             snapshot.LearnerCalAccuracies is { Length: > 0 } ? snapshot.LearnerCalAccuracies : null);
 
         double variance = 0;
@@ -125,6 +124,9 @@ public sealed class ElmInferenceEngine : IModelInferenceEngine
         int K = snap.Weights.Length;
         int hiddenDim = snap.ElmHiddenDim;
         var samples = new double[numSamples];
+        double dropoutRate = snap.ElmDropoutRate.HasValue
+            ? Math.Clamp(snap.ElmDropoutRate.Value, 0.0, 0.5)
+            : 0.1;
 
         for (int s = 0; s < numSamples; s++)
         {
@@ -139,12 +141,14 @@ public sealed class ElmInferenceEngine : IModelInferenceEngine
                     featureCount, hiddenDim,
                     snap.FeatureSubsetIndices?.Length > k ? snap.FeatureSubsetIndices[k] : null,
                     GetActivation(snap.LearnerActivations, k),
-                    rng);
+                    rng,
+                    dropoutRate);
             }
 
             samples[s] = InferenceHelpers.AggregateProbs(
                 probs, K, snap.MetaWeights, snap.MetaBias,
                 snap.EnsembleSelectionWeights is { Length: > 0 } ? snap.EnsembleSelectionWeights : null,
+                snap.LearnerAccuracyWeights is { Length: > 0 } ? snap.LearnerAccuracyWeights : null,
                 snap.LearnerCalAccuracies is { Length: > 0 } ? snap.LearnerCalAccuracies : null);
         }
 
@@ -163,15 +167,15 @@ public sealed class ElmInferenceEngine : IModelInferenceEngine
         float[] features, double[] wOut, double bias,
         double[] wIn, double[] bIn,
         int featureCount, int hiddenSize, int[]? subset,
-        ElmActivation activation, Random rng)
+        ElmActivation activation, Random rng, double dropoutRate)
     {
         int subLen = subset?.Length > 0 ? subset.Length : featureCount;
         double score = bias;
-        double scale = 1.0 / (1.0 - DropoutRate);
+        double scale = dropoutRate > 0.0 ? 1.0 / (1.0 - dropoutRate) : 1.0;
 
         for (int h = 0; h < hiddenSize; h++)
         {
-            if (rng.NextDouble() < DropoutRate) continue;
+            if (dropoutRate > 0.0 && rng.NextDouble() < dropoutRate) continue;
 
             double z = h < bIn.Length ? bIn[h] : 0.0;
             int rowOff = h * subLen;

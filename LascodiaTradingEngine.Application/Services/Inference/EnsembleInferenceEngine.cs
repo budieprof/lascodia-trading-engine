@@ -37,6 +37,7 @@ public sealed class EnsembleInferenceEngine : IModelInferenceEngine
             snapshot.FeatureSubsetIndices, snapshot.MetaWeights, snapshot.MetaBias,
             snapshot.PolyLearnerStartIndex,
             snapshot.EnsembleSelectionWeights.Length > 0 ? snapshot.EnsembleSelectionWeights : null,
+            snapshot.LearnerAccuracyWeights.Length > 0 ? snapshot.LearnerAccuracyWeights : null,
             snapshot.LearnerCalAccuracies.Length > 0 ? snapshot.LearnerCalAccuracies : null,
             snapshot.MlpHiddenWeights, snapshot.MlpHiddenBiases, snapshot.MlpHiddenDim);
 
@@ -64,6 +65,7 @@ public sealed class EnsembleInferenceEngine : IModelInferenceEngine
         double     metaBias                 = 0.0,
         int        polyLearnerStartIndex    = int.MaxValue,
         double[]?  gesWeights               = null,
+        double[]?  learnerAccuracyWeights   = null,
         double[]?  learnerCalAccuracies     = null,
         double[][]? mlpHiddenW              = null,
         double[][]? mlpHiddenB              = null,
@@ -137,7 +139,9 @@ public sealed class EnsembleInferenceEngine : IModelInferenceEngine
             probs[k] = MLFeatureHelper.Sigmoid(zLin);
         }
 
-        double avg = InferenceHelpers.AggregateProbs(probs, weights.Length, metaWeights, metaBias, gesWeights, learnerCalAccuracies);
+        double avg = InferenceHelpers.AggregateProbs(
+            probs, weights.Length, metaWeights, metaBias,
+            gesWeights, learnerAccuracyWeights, learnerCalAccuracies);
 
         // Sample std (N-1)
         int N = probs.Length;
@@ -169,7 +173,10 @@ public sealed class EnsembleInferenceEngine : IModelInferenceEngine
 
             var (prob, _) = EnsembleProb(maskedFeatures, snap.Weights, snap.Biases, featureCount,
                 snap.FeatureSubsetIndices, snap.MetaWeights, snap.MetaBias,
-                snap.PolyLearnerStartIndex, null, null,
+                snap.PolyLearnerStartIndex,
+                snap.EnsembleSelectionWeights.Length > 0 ? snap.EnsembleSelectionWeights : null,
+                snap.LearnerAccuracyWeights.Length > 0 ? snap.LearnerAccuracyWeights : null,
+                snap.LearnerCalAccuracies.Length > 0 ? snap.LearnerCalAccuracies : null,
                 snap.MlpHiddenWeights, snap.MlpHiddenBiases, snap.MlpHiddenDim);
             samples[s] = prob;
         }

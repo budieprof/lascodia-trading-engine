@@ -990,6 +990,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             ElmInputWeights            = inputWeights,
             ElmInputBiases             = inputBiases,
             ElmHiddenDim               = hiddenSize,
+            ElmDropoutRate             = Math.Clamp(hp.ElmDropoutRate, 0.0, 0.5),
             LearnerActivations         = learnerActivations.Select(a => (int)a).ToArray(),
             MagAugWeightsFolds         = magAugWeightsFolds,
             MagAugBiasFolds            = magAugBiasFolds,
@@ -1694,8 +1695,16 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                     hiddenGram[i, j] = HtH[i, j];
 
             var inverseGram = new double[learnerHidden, learnerHidden];
-            _ = ElmMathHelper.TryInvertSpd(hiddenGram, inverseGram, learnerHidden);
-            inverseGrams[k] = inverseGram;
+            if (ElmMathHelper.TryInvertSpd(hiddenGram, inverseGram, learnerHidden))
+            {
+                inverseGrams[k] = inverseGram;
+            }
+            else
+            {
+                _logger.LogWarning(
+                    "ELM learner {K}: failed to invert hidden Gram matrix; online updates disabled for this learner",
+                    k);
+            }
 
             // ── Cholesky solve ──
             double[] wSolve = new double[solveSize];
@@ -1852,6 +1861,53 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             return MLFeatureHelper.Sigmoid(plattASell * rawLogit + plattBSell);
 
         return globalCalibP;
+    }
+
+    private static double ComputeEnsembleStd(
+        float[] features, double[][] weights, double[] biases,
+        double[][] inputWeights, double[][] inputBiases,
+        int featureCount, int[][]? featureSubsets,
+        int[] learnerHiddenSizes, ElmActivation[] learnerActivations,
+        double[]? learnerWeights = null,
+        double[]? stackingWeights = null, double stackingBias = 0.0)
+    {
+        int K = weights.Length;
+        if (K <= 1) return 0.0;
+
+        var probs = new double[K];
+        for (int k = 0; k < K; k++)
+        {
+            probs[k] = ElmLearnerProb(
+                features, weights[k], biases[k], inputWeights[k], inputBiases[k],
+                featureCount, learnerHiddenSizes[k], featureSubsets?[k],
+                k < learnerActivations.Length ? learnerActivations[k] : learnerActivations[0]);
+        }
+
+        double avg;
+        if (stackingWeights is { Length: > 0 } sw && sw.Length == K)
+        {
+            double z = stackingBias;
+            for (int k = 0; k < K; k++) z += sw[k] * probs[k];
+            avg = MLFeatureHelper.Sigmoid(z);
+        }
+        else if (learnerWeights is { Length: > 0 } lw && lw.Length == K)
+        {
+            avg = 0.0;
+            for (int k = 0; k < K; k++) avg += lw[k] * probs[k];
+        }
+        else
+        {
+            avg = probs.Average();
+        }
+
+        double variance = 0.0;
+        for (int k = 0; k < K; k++)
+        {
+            double d = probs[k] - avg;
+            variance += d * d;
+        }
+
+        return Math.Sqrt(variance / (K - 1));
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -2388,21 +2444,10 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                     s.Features, weights, biases, inputWeights, inputBiases,
                     1.0, 0.0, featureCount, hiddenSize, featureSubsets, null, learnerHiddenSizes, learnerActivations, stackingWeights, stackingBias);
 
-            double ensStd = 0;
-            if (weights.Length > 1)
-            {
-                double sumSq = 0;
-                for (int k = 0; k < weights.Length; k++)
-                {
-                    double pk = ElmLearnerProb(
-                        s.Features, weights[k], biases[k], inputWeights[k], inputBiases[k],
-                        featureCount, learnerHiddenSizes[k], featureSubsets?[k],
-                        k < learnerActivations.Length ? learnerActivations[k] : learnerActivations[0]);
-                    double d = pk - calibP;
-                    sumSq += d * d;
-                }
-                ensStd = Math.Sqrt(sumSq / Math.Max(1, weights.Length - 1));
-            }
+            double ensStd = ComputeEnsembleStd(
+                s.Features, weights, biases, inputWeights, inputBiases,
+                featureCount, featureSubsets, learnerHiddenSizes, learnerActivations,
+                stackingWeights: stackingWeights, stackingBias: stackingBias);
 
             metaXs[i] = new double[metaDim];
             metaXs[i][0] = calibP;
@@ -2535,20 +2580,10 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                     s.Features, weights, biases, inputWeights, inputBiases,
                     plattA, plattB, featureCount, hiddenSize, featureSubsets, null, learnerHiddenSizes, learnerActivations, stackingWeights, stackingBias);
 
-            double ensStd = 0;
-            if (weights.Length > 1)
-            {
-                double sumSq = 0;
-                for (int k = 0; k < weights.Length; k++)
-                {
-                    double pk = ElmLearnerProb(
-                        s.Features, weights[k], biases[k], inputWeights[k], inputBiases[k],
-                        featureCount, learnerHiddenSizes[k], featureSubsets?[k],
-                        k < learnerActivations.Length ? learnerActivations[k] : learnerActivations[0]);
-                    sumSq += (pk - calibP) * (pk - calibP);
-                }
-                ensStd = Math.Sqrt(sumSq / Math.Max(1, weights.Length - 1));
-            }
+            double ensStd = ComputeEnsembleStd(
+                s.Features, weights, biases, inputWeights, inputBiases,
+                featureCount, featureSubsets, learnerHiddenSizes, learnerActivations,
+                stackingWeights: stackingWeights, stackingBias: stackingBias);
 
             double mlScore = metaLabelBias;
             double[] mlX = [calibP, ensStd, ..Enumerable.Range(0, Math.Min(5, featureCount)).Select(j => (double)s.Features[j])];
@@ -2897,13 +2932,16 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             ? MLFeatureHelper.Standardize(sample.Features, snapshot.Means, snapshot.Stds)
             : sample.Features;
 
+        int updatedLearners = 0;
         for (int k = 0; k < K; k++)
         {
             if (k >= snapshot.ElmInverseGram.Length || snapshot.ElmInverseGram[k] is null)
                 continue;
+            if (snapshot.ElmInputBiases is null || k >= snapshot.ElmInputBiases.Length)
+                continue;
 
             var inputW = snapshot.ElmInputWeights[k];
-            var inputB = snapshot.ElmInputBiases![k];
+            var inputB = snapshot.ElmInputBiases[k];
             int H      = snapshot.Weights[k].Length;
             if (snapshot.ElmInverseGram[k].GetLength(0) != H || snapshot.ElmInverseGram[k].GetLength(1) != H)
                 continue;
@@ -2926,7 +2964,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                 : ElmActivation.Sigmoid;
             for (int h = 0; h < H; h++)
             {
-                double z = inputB[h];
+                double z = h < inputB.Length ? inputB[h] : 0.0;
                 int rowOff = h * inputDim;
                 for (int f = 0; f < inputDim && rowOff + f < inputW.Length; f++)
                     z += inputW[rowOff + f] * features[f];
@@ -2943,11 +2981,18 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                 target,
                 snapshot.TrainSamples);
             snapshot.Biases[k] = bias;
+            updatedLearners++;
+        }
+
+        if (updatedLearners == 0)
+        {
+            _logger.LogDebug("ELM online update skipped — no learner had a usable inverse Gram matrix");
+            return false;
         }
 
         snapshot.TrainSamples++;
 
-        _logger.LogDebug("ELM online update applied: {K} learners updated with 1 sample", K);
+        _logger.LogDebug("ELM online update applied: {K} learners updated with 1 sample", updatedLearners);
         return true;
     }
 }

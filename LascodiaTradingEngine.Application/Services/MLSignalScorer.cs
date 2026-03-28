@@ -10,6 +10,7 @@ using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 using LascodiaTradingEngine.Application.Services.Inference;
+using LascodiaTradingEngine.Application.Services.ML;
 
 namespace LascodiaTradingEngine.Application.Services;
 
@@ -640,7 +641,7 @@ public sealed class MLSignalScorer : IMLSignalScorer
             {
                 (altRaw, _) = await Task.Run(() => EnsembleInferenceEngine.EnsembleProb(
                     altFeatures, altSnap.Weights, altSnap.Biases, altFc,
-                    altSnap.FeatureSubsetIndices, null, 0.0, int.MaxValue, null, null,
+                    altSnap.FeatureSubsetIndices, null, 0.0, int.MaxValue, null, null, null,
                     altSnap.MlpHiddenWeights, altSnap.MlpHiddenBiases, altSnap.MlpHiddenDim),
                     cancellationToken);
             }
@@ -1195,6 +1196,10 @@ public sealed class MLSignalScorer : IMLSignalScorer
                 mlpOut += snap.QrfMlpW2[h] * hidden[h];
             magnitude = Math.Abs(mlpOut);
         }
+        else if (TryPredictElmMagnitude(features, featureCount, snap, out var elmMagnitude))
+        {
+            magnitude = Math.Abs(elmMagnitude);
+        }
         else if (snap.MagWeights.Length == featureCount)
         {
             magnitude = snap.MagBias;
@@ -1292,5 +1297,98 @@ public sealed class MLSignalScorer : IMLSignalScorer
             calibP, ensembleStd, direction, threshold, confidence,
             magnitude, magnitudeUncertaintyPips, magnitudeP10Pips, magnitudeP90Pips,
             mcDropoutMean, mcDropoutVariance, contributionsJson, shapValuesJson);
+    }
+
+    private static bool TryPredictElmMagnitude(
+        float[] features, int featureCount, ModelSnapshot snap, out double magnitude)
+    {
+        magnitude = 0.0;
+        if (snap.ElmInputWeights is not { Length: > 0 } inputWeights ||
+            snap.ElmInputBiases is not { Length: > 0 } inputBiases ||
+            snap.ElmHiddenDim <= 0)
+        {
+            return false;
+        }
+
+        if (snap.MagAugWeightsFolds is { Length: > 0 } foldWeights &&
+            snap.MagAugBiasFolds is { Length: > 0 } foldBiases)
+        {
+            int used = 0;
+            double sum = 0.0;
+            int foldCount = Math.Min(foldWeights.Length, foldBiases.Length);
+            for (int i = 0; i < foldCount; i++)
+            {
+                if (foldWeights[i] is not { Length: > 0 }) continue;
+                sum += PredictElmMagnitudeAug(
+                    features, featureCount, foldWeights[i], foldBiases[i], snap,
+                    inputWeights, inputBiases);
+                used++;
+            }
+
+            if (used > 0)
+            {
+                magnitude = sum / used;
+                return true;
+            }
+        }
+
+        if (snap.MagAugWeights is { Length: > 0 })
+        {
+            magnitude = PredictElmMagnitudeAug(
+                features, featureCount, snap.MagAugWeights, snap.MagAugBias, snap,
+                inputWeights, inputBiases);
+            return true;
+        }
+
+        return false;
+    }
+
+    private static double PredictElmMagnitudeAug(
+        float[] features, int featureCount, double[] augWeights, double augBias,
+        ModelSnapshot snap, double[][] inputWeights, double[][] inputBiases)
+    {
+        double pred = augBias;
+        for (int j = 0; j < Math.Min(featureCount, Math.Min(features.Length, augWeights.Length)); j++)
+            pred += augWeights[j] * features[j];
+
+        int hiddenSize = snap.ElmHiddenDim;
+        int[] defaultSubset = Enumerable.Range(0, featureCount).ToArray();
+        for (int h = 0; h < hiddenSize; h++)
+        {
+            int augIdx = featureCount + h;
+            if (augIdx >= augWeights.Length) break;
+
+            double hSum = 0.0;
+            int hCount = 0;
+            for (int k = 0; k < inputWeights.Length && k < inputBiases.Length; k++)
+            {
+                var learnerBiases = inputBiases[k];
+                if (learnerBiases is null || h >= learnerBiases.Length) continue;
+
+                var learnerWeights = inputWeights[k];
+                int[] subset = snap.FeatureSubsetIndices is { Length: > 0 } subsets && k < subsets.Length
+                    ? subsets[k]
+                    : defaultSubset;
+                int subLen = subset.Length;
+                double z = learnerBiases[h];
+                int rowOff = h * subLen;
+                for (int si = 0; si < subLen && rowOff + si < learnerWeights.Length; si++)
+                {
+                    int fi = subset[si];
+                    if (fi < features.Length)
+                        z += learnerWeights[rowOff + si] * features[fi];
+                }
+
+                ElmActivation activation = snap.LearnerActivations is { Length: > 0 } activations
+                    ? (ElmActivation)activations[Math.Min(k, activations.Length - 1)]
+                    : ElmActivation.Sigmoid;
+                hSum += ElmMathHelper.Activate(z, activation);
+                hCount++;
+            }
+
+            pred += augWeights[augIdx] * (hCount > 0 ? hSum / hCount : 0.0);
+        }
+
+        return pred;
     }
 }

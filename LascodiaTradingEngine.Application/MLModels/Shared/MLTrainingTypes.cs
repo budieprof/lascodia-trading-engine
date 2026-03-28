@@ -2477,6 +2477,12 @@ public class ModelSnapshot
     public int ElmHiddenDim { get; set; }
 
     /// <summary>
+    /// Effective hidden-unit dropout rate used during ELM training.
+    /// Persisted so MC-dropout inference can mirror the trained sparsity level.
+    /// </summary>
+    public double? ElmDropoutRate { get; set; }
+
+    /// <summary>
     /// ELM: per-learner inverse Gram matrix P = (H^T H + λI)^{-1}, shape [K][H×H] row-major.
     /// Stored after initial training so that <c>ElmModelTrainer.UpdateOnline</c>
     /// can apply Sherman-Morrison rank-1 updates without a full retrain.
