@@ -268,14 +268,14 @@ public sealed class RocketModelTrainer : IMLModelTrainer
         double avgKellyFraction = ComputeAvgKellyFraction(calRocket, calSet, rw, rb, plattA, plattB, dim);
 
         // ── 8. Fit magnitude regressor ────────────────────────────────────────
-        var (magWeights, magBias) = FitLinearRegressor(trainSet, featureCount);
+        var (magWeights, magBias) = FitLinearRegressor(trainSet, featureCount, ct);
 
         // ── 8b. Quantile magnitude regressor ─────────────────────────────────
         double[] magQ90Weights = [];
         double   magQ90Bias    = 0.0;
         if (hp.MagnitudeQuantileTau > 0.0 && trainSet.Count >= hp.MinSamples)
         {
-            (magQ90Weights, magQ90Bias) = FitQuantileRegressor(trainSet, featureCount, hp.MagnitudeQuantileTau);
+            (magQ90Weights, magQ90Bias) = FitQuantileRegressor(trainSet, featureCount, hp.MagnitudeQuantileTau, ct);
             _logger.LogDebug("ROCKET quantile magnitude regressor fitted (τ={Tau:F2}).", hp.MagnitudeQuantileTau);
         }
 
@@ -354,7 +354,7 @@ public sealed class RocketModelTrainer : IMLModelTrainer
             };
 
             var (pw, pb) = TrainRidgeAdam(maskedTrainRocket, maskedTrain, dim, prunedHp, null, null, ct);
-            var (pmw, pmb) = FitLinearRegressor(maskedTrain, featureCount);
+            var (pmw, pmb) = FitLinearRegressor(maskedTrain, featureCount, ct);
             var (pA, pB) = FitPlattScaling(maskedCalRocket, maskedCal, pw, pb, dim);
             var prunedMetrics = EvaluateModel(maskedTestRocket, maskedTest, pw, pb, pmw, pmb, pA, pB, dim, featureCount);
 
@@ -408,12 +408,12 @@ public sealed class RocketModelTrainer : IMLModelTrainer
         _logger.LogInformation("ROCKET conformal qHat={QHat:F4} ({Cov:P0} coverage)", conformalQHat, hp.ConformalCoverage);
 
         // ── 15. Meta-label secondary classifier ──────────────────────────────
-        var (metaLabelWeights, metaLabelBias) = FitMetaLabelModel(calRocket, calSet, rw, rb, dim, featureCount);
+        var (metaLabelWeights, metaLabelBias) = FitMetaLabelModel(calRocket, calSet, rw, rb, dim, featureCount, ct);
         _logger.LogDebug("ROCKET meta-label: bias={B:F4}", metaLabelBias);
 
         // ── 16. Abstention gate ──────────────────────────────────────────────
         var (abstentionWeights, abstentionBias, abstentionThreshold) = FitAbstentionModel(
-            calRocket, calSet, rw, rb, plattA, plattB, metaLabelWeights, metaLabelBias, dim);
+            calRocket, calSet, rw, rb, plattA, plattB, metaLabelWeights, metaLabelBias, dim, ct);
         _logger.LogDebug("ROCKET abstention gate: bias={B:F4} threshold={T:F2}", abstentionBias, abstentionThreshold);
 
         // ── 17. Decision boundary distance ───────────────────────────────────
@@ -1019,7 +1019,7 @@ public sealed class RocketModelTrainer : IMLModelTrainer
             };
 
             var (w, b) = TrainRidgeAdam(foldTrainRocket, foldTrain, dim, cvHp, null, null, ct);
-            var (mw, mb) = FitLinearRegressor(foldTrain, featureCount);
+            var (mw, mb) = FitLinearRegressor(foldTrain, featureCount, ct);
             var m = EvaluateModel(foldTestRocket, foldTest, w, b, mw, mb, 1.0, 0.0, dim, featureCount);
 
             // Feature importance proxy: mean absolute weight contribution per original feature
@@ -1572,7 +1572,8 @@ public sealed class RocketModelTrainer : IMLModelTrainer
 
     private static (double[] Weights, double Bias) FitMetaLabelModel(
         List<double[]> calRocket, List<TrainingSample> calSet,
-        double[] w, double bias, int dim, int featureCount)
+        double[] w, double bias, int dim, int featureCount,
+        CancellationToken ct = default)
     {
         int n = calRocket.Count;
         if (n < 10) return ([], 0.0);
@@ -1611,6 +1612,8 @@ public sealed class RocketModelTrainer : IMLModelTrainer
 
         for (int epoch = 0; epoch < maxEpochs; epoch++)
         {
+            ct.ThrowIfCancellationRequested();
+
             double lr = baseLr * 0.5 * (1.0 + Math.Cos(Math.PI * epoch / maxEpochs));
 
             // Fisher-Yates shuffle
@@ -1711,7 +1714,8 @@ public sealed class RocketModelTrainer : IMLModelTrainer
     private static (double[] Weights, double Bias, double Threshold) FitAbstentionModel(
         List<double[]> calRocket, List<TrainingSample> calSet,
         double[] w, double bias, double plattA, double plattB,
-        double[] metaLabelW, double metaLabelB, int dim)
+        double[] metaLabelW, double metaLabelB, int dim,
+        CancellationToken ct = default)
     {
         int n = calRocket.Count;
         if (n < 10) return ([], 0.0, 0.5);
@@ -1749,6 +1753,8 @@ public sealed class RocketModelTrainer : IMLModelTrainer
 
         for (int epoch = 0; epoch < maxEpochs; epoch++)
         {
+            ct.ThrowIfCancellationRequested();
+
             double lr = baseLr * 0.5 * (1.0 + Math.Cos(Math.PI * epoch / maxEpochs));
 
             // Fisher-Yates shuffle
@@ -1891,7 +1897,8 @@ public sealed class RocketModelTrainer : IMLModelTrainer
     // ═══════════════════════════════════════════════════════════════════════════
 
     private static (double[] Weights, double Bias) FitLinearRegressor(
-        List<TrainingSample> trainSet, int featureCount)
+        List<TrainingSample> trainSet, int featureCount,
+        CancellationToken ct = default)
     {
         int n = trainSet.Count;
         if (n < 5) return (new double[featureCount], 0.0);
@@ -1928,6 +1935,8 @@ public sealed class RocketModelTrainer : IMLModelTrainer
 
         for (int epoch = 0; epoch < maxEpochs; epoch++)
         {
+            ct.ThrowIfCancellationRequested();
+
             double lr = baseLr * 0.5 * (1.0 + Math.Cos(Math.PI * epoch / maxEpochs));
 
             // Fisher-Yates shuffle
@@ -2029,7 +2038,8 @@ public sealed class RocketModelTrainer : IMLModelTrainer
     // ═══════════════════════════════════════════════════════════════════════════
 
     private static (double[] Weights, double Bias) FitQuantileRegressor(
-        List<TrainingSample> trainSet, int featureCount, double tau)
+        List<TrainingSample> trainSet, int featureCount, double tau,
+        CancellationToken ct = default)
     {
         int n = trainSet.Count;
         if (n < 5) return (new double[featureCount], 0.0);
@@ -2065,6 +2075,8 @@ public sealed class RocketModelTrainer : IMLModelTrainer
 
         for (int epoch = 0; epoch < maxEpochs; epoch++)
         {
+            ct.ThrowIfCancellationRequested();
+
             double lr = baseLr * 0.5 * (1.0 + Math.Cos(Math.PI * epoch / maxEpochs));
 
             // Fisher-Yates shuffle

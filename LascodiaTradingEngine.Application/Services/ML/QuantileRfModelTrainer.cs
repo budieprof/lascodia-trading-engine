@@ -528,7 +528,7 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
         }
 
         // ── 19. Magnitude regressor (linear, or 2-layer MLP when QrfMagHiddenDim > 0) ──
-        var (magWeights, magBias) = FitLinearRegressor(trainSet, F, hp);
+        var (magWeights, magBias) = FitLinearRegressor(trainSet, F, hp, ct);
 
         // ── 19b. MLP magnitude regressor — trained in addition to the linear one ─
         // The linear weights are retained for EvaluateModel RMSE consistency; the MLP
@@ -537,7 +537,7 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
         double   mlpB2 = 0.0;
         if (hp.QrfMagHiddenDim > 0 && trainSet.Count >= hp.MinSamples)
         {
-            (mlpW1, mlpB1, mlpW2, mlpB2) = FitMlpMagnitudeRegressor(trainSet, F, hp.QrfMagHiddenDim, hp);
+            (mlpW1, mlpB1, mlpW2, mlpB2) = FitMlpMagnitudeRegressor(trainSet, F, hp.QrfMagHiddenDim, hp, ct);
             _logger.LogInformation(
                 "QRF MLP magnitude regressor fitted (H={H}, params={P}).",
                 hp.QrfMagHiddenDim, F * hp.QrfMagHiddenDim + 2 * hp.QrfMagHiddenDim + 1);
@@ -1511,6 +1511,8 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
 
         for (int epoch = 0; epoch < epochs; epoch++)
         {
+            ct.ThrowIfCancellationRequested();
+
             double lrCosine = baseLr * 0.5 * (1.0 + Math.Cos(Math.PI * epoch / epochs));
 
             foreach (var s in trainSlice)
@@ -1582,7 +1584,8 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
         List<TrainingSample> train,
         int                  F,
         int                  H,
-        TrainingHyperparams  hp)
+        TrainingHyperparams  hp,
+        CancellationToken    ct = default)
     {
         var zeroW1 = new double[H * F];
         var zeroB1 = new double[H];
@@ -1632,6 +1635,8 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
 
         for (int epoch = 0; epoch < epochs; epoch++)
         {
+            ct.ThrowIfCancellationRequested();
+
             double lrCos = baseLr * 0.5 * (1.0 + Math.Cos(Math.PI * epoch / epochs));
 
             foreach (var s in trainSlice)
