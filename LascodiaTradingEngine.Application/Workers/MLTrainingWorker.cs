@@ -147,6 +147,7 @@ public sealed class MLTrainingWorker : BackgroundService
     private const string CK_TrendingMinEV              = "MLTraining:TrendingMinEV";
     private const string CK_SelfTuningEnabled          = "MLTraining:SelfTuningEnabled";
     private const string CK_MaxSelfTuningRetries       = "MLTraining:MaxSelfTuningRetries";
+    private const string CK_BlockedArchitectures       = "MLTraining:BlockedArchitectures";
     private const string CK_FitTemperatureScale        = "MLTraining:FitTemperatureScale";
     private const string CK_MinBrierSkillScore         = "MLTraining:MinBrierSkillScore";
     private const string CK_RecalibrationDecayLambda   = "MLTraining:RecalibrationDecayLambda";
@@ -1846,6 +1847,26 @@ public sealed class MLTrainingWorker : BackgroundService
         {
             bool enabled = await GetConfigAsync<bool>(ctx, CK_SelfTuningEnabled, true, ct);
             if (!enabled) return;
+
+            // Skip retry if the failed run's architecture is blocked
+            var blockedStr = await GetConfigAsync<string>(ctx, CK_BlockedArchitectures, "", ct);
+            if (!string.IsNullOrWhiteSpace(blockedStr))
+            {
+                var blockedArchitectures = new HashSet<LearnerArchitecture>();
+                foreach (var token in blockedStr.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                {
+                    if (Enum.TryParse<LearnerArchitecture>(token, ignoreCase: true, out var blockedArch))
+                        blockedArchitectures.Add(blockedArch);
+                }
+
+                if (blockedArchitectures.Contains(failedRun.LearnerArchitecture))
+                {
+                    _logger.LogInformation(
+                        "Run {RunId}: skipping self-tuning retry — architecture {Arch} is in BlockedArchitectures",
+                        failedRun.Id, failedRun.LearnerArchitecture);
+                    return;
+                }
+            }
 
             int maxRetries = await GetConfigAsync<int>(ctx, CK_MaxSelfTuningRetries, 2, ct);
 
