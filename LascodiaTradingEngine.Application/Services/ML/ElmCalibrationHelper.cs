@@ -149,22 +149,56 @@ internal static class ElmCalibrationHelper
         return completedFolds > 0 ? (sumA / completedFolds, sumB / completedFolds) : (1.0, 0.0);
     }
 
+    internal static double ApplyGlobalCalibration(
+        double rawProb,
+        double plattA,
+        double plattB,
+        double temperatureScale)
+    {
+        double rawLogit = MLFeatureHelper.Logit(Math.Clamp(rawProb, 1e-7, 1.0 - 1e-7));
+        return temperatureScale > 0.0 && temperatureScale < 10.0
+            ? MLFeatureHelper.Sigmoid(rawLogit / temperatureScale)
+            : MLFeatureHelper.Sigmoid(plattA * rawLogit + plattB);
+    }
+
     internal static (double ABuy, double BBuy, double ASell, double BSell) FitClassConditionalPlatt(
         List<TrainingSample> calSet,
         double[][] weights, double[] biases,
         double[][] inputWeights, double[][] inputBiases,
         int featureCount, int hiddenSize, int[][]? featureSubsets,
+        double plattA, double plattB, double temperatureScale,
         Func<float[], double[][], double[], double[][], double[][], int, int, int[][]?, double[]?, double> ensembleRawProb)
     {
-        var buySamples  = calSet.Where(s => s.Direction > 0).ToList();
-        var sellSamples = calSet.Where(s => s.Direction <= 0).ToList();
+        static bool HasBothClasses(List<TrainingSample> samples)
+        {
+            bool hasBuy = false, hasSell = false;
+            foreach (var sample in samples)
+            {
+                if (sample.Direction > 0) hasBuy = true;
+                else hasSell = true;
+                if (hasBuy && hasSell) return true;
+            }
+            return false;
+        }
 
-        var (aBuy, bBuy)   = buySamples.Count >= 5
+        var buySamples = new List<TrainingSample>();
+        var sellSamples = new List<TrainingSample>();
+        foreach (var sample in calSet)
+        {
+            double rawProb = ensembleRawProb(
+                sample.Features, weights, biases, inputWeights, inputBiases,
+                featureCount, hiddenSize, featureSubsets, null);
+            double globalCalibProb = ApplyGlobalCalibration(rawProb, plattA, plattB, temperatureScale);
+            if (globalCalibProb >= 0.5) buySamples.Add(sample);
+            else sellSamples.Add(sample);
+        }
+
+        var (aBuy, bBuy) = buySamples.Count >= 10 && HasBothClasses(buySamples)
             ? FitPlattScaling(buySamples, weights, biases, inputWeights, inputBiases, featureCount, hiddenSize, featureSubsets, ensembleRawProb)
-            : (1.0, 0.0);
-        var (aSell, bSell) = sellSamples.Count >= 5
+            : (0.0, 0.0);
+        var (aSell, bSell) = sellSamples.Count >= 10 && HasBothClasses(sellSamples)
             ? FitPlattScaling(sellSamples, weights, biases, inputWeights, inputBiases, featureCount, hiddenSize, featureSubsets, ensembleRawProb)
-            : (1.0, 0.0);
+            : (0.0, 0.0);
 
         return (aBuy, bBuy, aSell, bSell);
     }

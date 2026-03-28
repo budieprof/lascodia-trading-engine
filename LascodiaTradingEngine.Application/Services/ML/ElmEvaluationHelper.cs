@@ -344,7 +344,7 @@ internal static class ElmEvaluationHelper
         double[][] weights, double[] biases,
         double[][] inputWeights, double[][] inputBiases,
         int featureCount, int hiddenSize, int[][]? featureSubsets,
-        Func<float[], double[], double, double[], double[], int, int, int[]?, double> elmLearnerProb)
+        Func<float[], double[], double, double[], double[], int, int, int[]?, int, double> elmLearnerProb)
     {
         int K = weights.Length;
         if (K < 2 || calSet.Count == 0) return 0;
@@ -359,7 +359,7 @@ internal static class ElmEvaluationHelper
                 double p = elmLearnerProb(
                     calSet[i].Features, weights[k], biases[k],
                     inputWeights[k], inputBiases[k],
-                    featureCount, hiddenSize, featureSubsets?[k]);
+                    featureCount, hiddenSize, featureSubsets?[k], k);
                 if (p >= 0.5) positiveCount++;
             }
             totalDisagreePairs += (long)positiveCount * (K - positiveCount);

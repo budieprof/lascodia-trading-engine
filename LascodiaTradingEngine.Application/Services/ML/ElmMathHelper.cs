@@ -68,6 +68,69 @@ internal static class ElmMathHelper
         return true;
     }
 
+    /// <summary>
+    /// Inverts a symmetric positive-definite matrix via repeated Cholesky solves.
+    /// Returns false if the matrix is not positive-definite.
+    /// </summary>
+    internal static bool TryInvertSpd(double[,] A, double[,] inverse, int n)
+    {
+        var L = new double[n, n];
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j <= i; j++)
+                L[i, j] = A[i, j];
+
+        for (int j = 0; j < n; j++)
+        {
+            double sum = 0;
+            for (int k = 0; k < j; k++)
+                sum += L[j, k] * L[j, k];
+
+            double diag = L[j, j] - sum;
+            if (diag <= 1e-15)
+                return false;
+
+            L[j, j] = Math.Sqrt(diag);
+            double invDiag = 1.0 / L[j, j];
+
+            for (int i = j + 1; i < n; i++)
+            {
+                double s = 0;
+                for (int k = 0; k < j; k++)
+                    s += L[i, k] * L[j, k];
+                L[i, j] = (L[i, j] - s) * invDiag;
+            }
+        }
+
+        var y = new double[n];
+        var x = new double[n];
+        for (int col = 0; col < n; col++)
+        {
+            Array.Clear(y, 0, n);
+            Array.Clear(x, 0, n);
+
+            for (int i = 0; i < n; i++)
+            {
+                double rhs = i == col ? 1.0 : 0.0;
+                for (int k = 0; k < i; k++)
+                    rhs -= L[i, k] * y[k];
+                y[i] = rhs / L[i, i];
+            }
+
+            for (int i = n - 1; i >= 0; i--)
+            {
+                double rhs = y[i];
+                for (int k = i + 1; k < n; k++)
+                    rhs -= L[k, i] * x[k];
+                x[i] = rhs / L[i, i];
+            }
+
+            for (int i = 0; i < n; i++)
+                inverse[i, col] = x[i];
+        }
+
+        return true;
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     //  SIMD-accelerated dot product
     // ═══════════════════════════════════════════════════════════════════════════
