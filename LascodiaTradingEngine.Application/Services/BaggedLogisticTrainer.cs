@@ -1147,6 +1147,9 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
 
                 for (int si = 0; si < trainingBootstrap.Count; si++)
                 {
+                    // Dense cancellation check every 2000 samples to allow prompt timeout
+                    if (si % 2000 == 0 && si > 0) ct.ThrowIfCancellationRequested();
+
                     int sampleIdx = useMiniBatch ? shuffleIdx[si] : si;
                     var sample = trainingBootstrap[sampleIdx];
                     // Only advance Adam timestep per batch boundary (or every sample if batch=1)
@@ -1728,8 +1731,12 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
             // Cosine-annealing LR — matches the direction learner schedule exactly
             double alpha = baseLr * 0.5 * (1.0 + Math.Cos(Math.PI * epoch / epochs));
 
+            int regSi = 0;
             foreach (var s in trainSet)
             {
+                // Dense cancellation check every 2000 samples
+                if (++regSi % 2000 == 0) ct.ThrowIfCancellationRequested();
+
                 t++;
                 beta1t *= AdamBeta1;
                 beta2t *= AdamBeta2;

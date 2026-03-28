@@ -145,6 +145,11 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         int calEnd      = (int)(n * (trainRatio + calRatio));
         int trainStdEnd = Math.Max(0, trainEnd - embargo); // excludes embargo tail
 
+        if (trainStdEnd < 2)
+            throw new InvalidOperationException(
+                $"ElmModelTrainer: embargo ({embargo}) consumes the entire training window ({trainEnd} samples). " +
+                $"Reduce EmbargoBarCount or provide more data.");
+
         // ── 2. Z-score standardisation on training samples only ─────────────────
         // Using all samples would leak the future cal/test distribution into the
         // standardisation statistics, inflating apparent out-of-sample performance.
@@ -324,19 +329,10 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                 learnerAccWeights = null;
         }
 
-        // ── 4d. Greedy Ensemble Selection (GES) ──────────────────────────────
-        double[] gesWeights = hp.EnableGreedyEnsembleSelection && calSet.Count >= 20
-            ? RunGreedyEnsembleSelection(calSet, weights, biases, inputWeights, inputBiases,
-                featureCount, hiddenSize, featureSubsets, learnerHiddenSizes, learnerActivations)
-            : [];
-        if (gesWeights.Length > 0)
-            _logger.LogDebug("ELM GES weights: [{W}]",
-                string.Join(",", gesWeights.Select(w => $"{w:F3}")));
-
         // ── 4e. Stacking meta-learner ────────────────────────────────────────
         var (stackingWeights, stackingBias) = FitStackingMetaLearner(
             calSet, weights, biases, inputWeights, inputBiases,
-            featureCount, hiddenSize, featureSubsets, learnerHiddenSizes, learnerActivations);
+            featureCount, hiddenSize, featureSubsets, learnerHiddenSizes, learnerActivations, ct);
 
         ct.ThrowIfCancellationRequested();
 
@@ -556,7 +552,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             // omitting it here made the pruned vs full comparison apples-to-oranges and
             // systematically penalised the pruned model by ~1–3 % accuracy.
             var (pSw, pSb) = FitStackingMetaLearner(
-                maskedCal, pw, pb, piw, pib, activeFeatureCount, hiddenSize, psub, phs, pla);
+                maskedCal, pw, pb, piw, pib, activeFeatureCount, hiddenSize, psub, phs, pla, ct);
 
             // Use CV Platt so the acceptance comparison uses the same calibration
             // method as the full model (FitPlattScalingCV at step 5), making it
@@ -587,14 +583,9 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                 plattA = pA; plattB = pB;
                 finalMetrics = prunedMetrics;
 
-                // Re-fit stacking and GES on pruned model
-                gesWeights = hp.EnableGreedyEnsembleSelection && maskedCal.Count >= 20
-                    ? RunGreedyEnsembleSelection(maskedCal, pw, pb, piw, pib,
-                        activeFeatureCount, hiddenSize, psub, phs, pla)
-                    : [];
-                (stackingWeights, stackingBias) = FitStackingMetaLearner(
-                    maskedCal, pw, pb, piw, pib,
-                    activeFeatureCount, hiddenSize, psub, phs, pla);
+                // Reuse the stacking weights already fitted on the pruned model (pSw, pSb)
+                // — same inputs would produce identical results.
+                (stackingWeights, stackingBias) = (pSw, pSb);
 
                 (plattABuy, plattBBuy, plattASell, plattBSell) = ElmCalibrationHelper.FitClassConditionalPlatt(
                     maskedCal, pw, pb, piw, pib, activeFeatureCount, hiddenSize, psub,
@@ -864,6 +855,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         }
 
         // ── 23. Serialise model snapshot ────────────────────────────────────
+        var trainedAtUtc = DateTime.UtcNow;
         var snapshot = new ModelSnapshot
         {
             Type                       = ModelType,
@@ -886,7 +878,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             TestSamples                = testSet.Count,
             CalSamples                 = calSet.Count,
             EmbargoSamples             = embargo,
-            TrainedOn                  = DateTime.UtcNow,
+            TrainedOn                  = trainedAtUtc,
             FeatureImportance          = featureImportance,
             FeatureImportanceScores    = calImportanceScores,
             ActiveFeatureMask          = activeMask,
@@ -923,7 +915,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             TemperatureScale           = temperatureScale,
             EnsembleDiversity          = ensembleDiversity,
             BrierSkillScore            = brierSkillScore,
-            TrainedAtUtc               = DateTime.UtcNow,
+            TrainedAtUtc               = trainedAtUtc,
             AgeDecayLambda             = hp.AgeDecayLambda,
             FeatureStabilityScores     = cvResult.FeatureStabilityScores ?? [],
             AdaptiveLabelSmoothing     = adaptiveLabelSmoothing,
@@ -945,7 +937,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             DriftDetectionFeatureStds  = driftFeatureStds,
             MetaWeights                = stackingWeights ?? [],
             MetaBias                   = stackingBias,
-            EnsembleSelectionWeights   = gesWeights,
+            EnsembleSelectionWeights   = [],
         };
 
         var modelBytes = JsonSerializer.SerializeToUtf8Bytes(snapshot, JsonOpts);
@@ -1002,17 +994,35 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                 return;
             }
 
-            var foldTrain = samples[..trainEnd].ToList();
+            var fullFoldTrain = samples[..trainEnd].ToList();
 
             if (hp.PurgeHorizonBars > 0)
             {
                 int purgeFrom = Math.Max(0, testStart - hp.PurgeHorizonBars);
-                if (purgeFrom < foldTrain.Count)
-                    foldTrain = foldTrain[..purgeFrom];
+                if (purgeFrom < fullFoldTrain.Count)
+                    fullFoldTrain = fullFoldTrain[..purgeFrom];
             }
 
             var foldTest = samples[testStart..Math.Min(testEnd, samples.Count)];
             if (foldTest.Count < 20) return;
+
+            // Carve a mini-cal set from the tail of the fold-train window BEFORE fitting
+            // the ensemble, so base learners never see the cal samples via bootstrap.
+            int cvCalSize = fullFoldTrain.Count / 7; // ~14 % of fold-train as mini cal
+            List<TrainingSample> foldTrain;
+            List<TrainingSample>? cvCalSet = null;
+            if (cvCalSize >= 20)
+            {
+                int calStart = fullFoldTrain.Count - cvCalSize;
+                cvCalSet  = fullFoldTrain[calStart..];
+                foldTrain = fullFoldTrain[..calStart];
+            }
+            else
+            {
+                foldTrain = fullFoldTrain;
+            }
+
+            if (foldTrain.Count < hp.MinSamples) return;
 
             var cvLabelSmoothing = hp.LabelSmoothing;
             var (w, b, iw, ib, subs, lhs, cvla) = FitBaggedElm(
@@ -1023,15 +1033,13 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                 foldTrain, featureCount, hiddenSize, iw, ib, subs,
                 hp.ElmMagRegressorLr, hp.ElmMagRegressorMaxEpochs, hp.ElmMagRegressorPatience, hp.ElmActivation);
 
-            // Fit a lightweight Platt calibration on the tail of the fold-train window so
+            // Fit a lightweight Platt calibration on the held-out mini-cal set so
             // that CV fold evaluation uses calibrated probabilities, matching the full
             // training pipeline. Using raw probabilities (plattA=1, plattB=0) overstates
             // Brier/EV metrics on folds where the ensemble is poorly calibrated.
             double cvPlattA = 1.0, cvPlattB = 0.0;
-            int cvCalSize = foldTrain.Count / 7; // ~14 % of fold-train as mini cal
-            if (cvCalSize >= 20)
+            if (cvCalSet is not null)
             {
-                var cvCalSet = foldTrain[(foldTrain.Count - cvCalSize)..];
                 (cvPlattA, cvPlattB) = ElmCalibrationHelper.FitPlattScalingCV(
                     cvCalSet, w, b, iw, ib, featureCount, hiddenSize, subs,
                     (f, ww, bb, iww, ibb, fc, hs, fs, lw) => EnsembleRawProb(f, ww, bb, iww, ibb, fc, hs, fs, lw, lhs, cvla));
@@ -1175,12 +1183,16 @@ public sealed class ElmModelTrainer : IMLModelTrainer
 
         // Use multiple random projections so the selected lambda generalises
         // across diverse hidden layers, not just a single lucky projection.
+        // When mixed activations are enabled, rotate activations across probes
+        // to match FitBaggedElm's per-learner activation diversity.
         int nProbes   = Math.Max(1, Math.Min(Math.Max(1, hp.K), 3));
         int subsetLen = featureCount;
         double scale  = Math.Sqrt(2.0 / (subsetLen + hiddenSize));
 
+        var availableActivations = new[] { ElmActivation.Sigmoid, ElmActivation.Tanh, ElmActivation.Relu };
         var probeWIn = new double[nProbes][];
         var probeBIn = new double[nProbes][];
+        var probeActivations = new ElmActivation[nProbes];
         for (int pi = 0; pi < nProbes; pi++)
         {
             var probeRng = new Random(ElmMathHelper.HashSeed(hp.ElmOuterSeed, pi, 777));
@@ -1188,6 +1200,9 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             probeBIn[pi] = new double[hiddenSize];
             for (int i = 0; i < probeWIn[pi].Length; i++) probeWIn[pi][i] = ElmMathHelper.SampleGaussian(probeRng) * scale;
             for (int h = 0; h < hiddenSize; h++) probeBIn[pi][h] = ElmMathHelper.SampleGaussian(probeRng) * scale;
+            probeActivations[pi] = hp.ElmMixActivations
+                ? availableActivations[pi % availableActivations.Length]
+                : hp.ElmActivation;
         }
 
         int solveSize = hiddenSize + 1;
@@ -1204,6 +1219,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             {
                 double[] wIn = probeWIn[pi];
                 double[] bIn = probeBIn[pi];
+                ElmActivation probeAct = probeActivations[pi];
 
                 for (int fold = 0; fold < cvFolds; fold++)
                 {
@@ -1228,7 +1244,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                             int rowOff = h * subsetLen;
                             for (int si = 0; si < subsetLen; si++)
                                 if (si < features.Length) z += wIn[rowOff + si] * features[si];
-                            hRow[h] = ElmMathHelper.Activate(z, hp.ElmActivation);
+                            hRow[h] = ElmMathHelper.Activate(z, probeAct);
                         }
                         hRow[hiddenSize] = 1.0;
                         double yt = trainSet[t].Direction > 0 ? posLabel : negLabel;
@@ -1261,7 +1277,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                             int rowOff = h * subsetLen;
                             for (int si = 0; si < subsetLen; si++)
                                 if (si < s.Features.Length) z += wIn[rowOff + si] * s.Features[si];
-                            score += wSolve[h] * ElmMathHelper.Activate(z, hp.ElmActivation);
+                            score += wSolve[h] * ElmMathHelper.Activate(z, probeAct);
                         }
                         int pred = MLFeatureHelper.Sigmoid(score) >= 0.5 ? 1 : 0;
                         if (pred == s.Direction) correct++;
@@ -1739,6 +1755,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         ElmActivation activation)
     {
         int K = elmInputWeights.Length;
+        int[] defaultSubset = Enumerable.Range(0, featureCount).ToArray();
         double pred = augBias;
 
         for (int j = 0; j < Math.Min(featureCount, features.Length); j++)
@@ -1747,21 +1764,25 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         for (int h = 0; h < hiddenSize; h++)
         {
             if (featureCount + h >= augWeights.Length) break;
-            double hMean = 0;
+            double hSum = 0;
+            int hCount = 0;
             for (int ki = 0; ki < K; ki++)
             {
-                var wIn = elmInputWeights[ki];
                 var bIn = elmInputBiases[ki];
+                if (h >= bIn.Length) continue; // learner has fewer hidden units
+
+                var wIn = elmInputWeights[ki];
                 int[] sub = featureSubsets is not null && ki < featureSubsets.Length
                     ? featureSubsets[ki]
-                    : Enumerable.Range(0, featureCount).ToArray();
+                    : defaultSubset;
                 int subLen = sub.Length;
                 double z = bIn[h];
                 int rowOff = h * subLen;
                 z += ElmMathHelper.DotProductSimd(wIn, rowOff, features, sub, subLen);
-                hMean += ElmMathHelper.Activate(z, activation);
+                hSum += ElmMathHelper.Activate(z, activation);
+                hCount++;
             }
-            pred += augWeights[featureCount + h] * (hMean / K);
+            pred += augWeights[featureCount + h] * (hCount > 0 ? hSum / hCount : 0.0);
         }
 
         return pred;
@@ -2065,6 +2086,15 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         ElmActivation activation)
     {
         int augDim = featureCount + hiddenSize;
+
+        // Pre-compute default subset once — avoids per-sample per-learner allocation
+        int[] defaultSubset = Enumerable.Range(0, featureCount).ToArray();
+
+        // Pre-compute per-learner effective hidden size (clamped to augDim slots)
+        int[] learnerH = new int[K];
+        for (int ki = 0; ki < K; ki++)
+            learnerH[ki] = Math.Min(hiddenSize, elmInputBiases[ki].Length);
+
         var augFeatures = new double[samples.Count][];
         for (int i = 0; i < samples.Count; i++)
         {
@@ -2073,26 +2103,29 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             for (int j = 0; j < Math.Min(featureCount, f.Length); j++)
                 augFeatures[i][j] = f[j];
 
-            var hMean = new double[hiddenSize];
+            var hSum   = new double[hiddenSize];
+            var hCount = new int[hiddenSize];
             for (int ki = 0; ki < K; ki++)
             {
                 var wIn = elmInputWeights[ki];
                 var bIn = elmInputBiases[ki];
                 int[] sub = featureSubsets is not null && ki < featureSubsets.Length
                     ? featureSubsets[ki]
-                    : Enumerable.Range(0, featureCount).ToArray();
+                    : defaultSubset;
                 int subLen = sub.Length;
+                int effH = learnerH[ki];
 
-                for (int h = 0; h < hiddenSize; h++)
+                for (int h = 0; h < effH; h++)
                 {
                     double z = bIn[h];
                     int rowOff = h * subLen;
                     z += ElmMathHelper.DotProductSimd(wIn, rowOff, f, sub, subLen);
-                    hMean[h] += ElmMathHelper.Activate(z, activation);
+                    hSum[h] += ElmMathHelper.Activate(z, activation);
+                    hCount[h]++;
                 }
             }
             for (int h = 0; h < hiddenSize; h++)
-                augFeatures[i][featureCount + h] = hMean[h] / K;
+                augFeatures[i][featureCount + h] = hCount[h] > 0 ? hSum[h] / hCount[h] : 0.0;
         }
         return augFeatures;
     }
@@ -2106,17 +2139,21 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         double[] equivW = new double[featureCount];
         Array.Copy(augWeights, equivW, featureCount);
 
+        int[] defaultSubset = Enumerable.Range(0, featureCount).ToArray();
+
         double[] meanActivationDeriv = new double[hiddenSize];
+        int[] derivContributors = new int[hiddenSize];
         for (int ki = 0; ki < K; ki++)
         {
             var wIn = elmInputWeights[ki];
             var bIn = elmInputBiases[ki];
+            int effH = Math.Min(hiddenSize, bIn.Length);
             int[] sub = featureSubsets is not null && ki < featureSubsets.Length
                 ? featureSubsets[ki]
-                : Enumerable.Range(0, featureCount).ToArray();
+                : defaultSubset;
             int subLen = sub.Length;
 
-            for (int h = 0; h < hiddenSize; h++)
+            for (int h = 0; h < effH; h++)
             {
                 double derivSum = 0;
                 int rowOff = h * subLen;
@@ -2128,10 +2165,11 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                     derivSum += ActivationDerivative(z, activation);
                 }
                 meanActivationDeriv[h] += derivSum / train.Count;
+                derivContributors[h]++;
             }
         }
         for (int h = 0; h < hiddenSize; h++)
-            meanActivationDeriv[h] /= K;
+            if (derivContributors[h] > 0) meanActivationDeriv[h] /= derivContributors[h];
 
         for (int h = 0; h < hiddenSize; h++)
         {
@@ -2139,13 +2177,18 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             if (Math.Abs(hiddenW) < 1e-10) continue;
 
             double deriv = meanActivationDeriv[h];
+            int contributors = derivContributors[h];
+            if (contributors == 0) continue;
 
             for (int ki = 0; ki < K; ki++)
             {
+                var bIn = elmInputBiases[ki];
+                if (h >= bIn.Length) continue; // learner has fewer hidden units
+
                 var wIn = elmInputWeights[ki];
                 int[] sub = featureSubsets is not null && ki < featureSubsets.Length
                     ? featureSubsets[ki]
-                    : Enumerable.Range(0, featureCount).ToArray();
+                    : defaultSubset;
                 int subLen = sub.Length;
                 int rowOff = h * subLen;
 
@@ -2153,7 +2196,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                 {
                     int fi = sub[si];
                     if (fi < featureCount && rowOff + si < wIn.Length)
-                        equivW[fi] += hiddenW * deriv * wIn[rowOff + si] / K;
+                        equivW[fi] += hiddenW * deriv * wIn[rowOff + si] / contributors;
                 }
             }
         }
@@ -2497,76 +2540,6 @@ public sealed class ElmModelTrainer : IMLModelTrainer
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    //  Greedy Ensemble Selection (GES)
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    /// <summary>
-    /// Greedy forward selection: iteratively adds the learner that minimises log-loss on the
-    /// calibration set. Produces fractional selection weights (counts / total rounds).
-    /// Adapted from BaggedLogisticTrainer for the ELM hidden-layer architecture.
-    /// </summary>
-    private static double[] RunGreedyEnsembleSelection(
-        List<TrainingSample> calSet,
-        double[][] weights, double[] biases,
-        double[][] inputWeights, double[][] inputBiases,
-        int featureCount, int hiddenSize, int[][]? featureSubsets,
-        int[] learnerHiddenSizes, ElmActivation[] learnerActivations,
-        int rounds = 100)
-    {
-        int K = weights.Length;
-        if (calSet.Count < 10 || K < 2) return [];
-
-        int gesN = calSet.Count;
-        var allLP = new double[gesN][];
-        for (int i = 0; i < gesN; i++)
-        {
-            allLP[i] = new double[K];
-            for (int k = 0; k < K; k++)
-            {
-                allLP[i][k] = ElmLearnerProb(
-                    calSet[i].Features, weights[k], biases[k], inputWeights[k], inputBiases[k],
-                    featureCount, learnerHiddenSizes[k], featureSubsets?[k],
-                    k < learnerActivations.Length ? learnerActivations[k] : learnerActivations[0]);
-            }
-        }
-
-        var counts = new int[K];
-        var ensProbs = new double[gesN];
-        int ensSize = 0;
-
-        for (int round = 0; round < rounds; round++)
-        {
-            int bestK = -1;
-            double bestLoss = double.MaxValue;
-
-            for (int k = 0; k < K; k++)
-            {
-                double loss = 0.0;
-                int n1 = ensSize + 1;
-                for (int i = 0; i < gesN; i++)
-                {
-                    double avg = (ensProbs[i] * ensSize + allLP[i][k]) / n1;
-                    double y = calSet[i].Direction > 0 ? 1.0 : 0.0;
-                    loss -= y * Math.Log(avg + 1e-15) + (1 - y) * Math.Log(1 - avg + 1e-15);
-                }
-                if (loss < bestLoss) { bestLoss = loss; bestK = k; }
-            }
-
-            if (bestK < 0) break;
-            for (int i = 0; i < gesN; i++)
-                ensProbs[i] = (ensProbs[i] * ensSize + allLP[i][bestK]) / (ensSize + 1);
-            counts[bestK]++;
-            ensSize++;
-        }
-
-        double totalCount = counts.Sum();
-        if (totalCount <= 0) return [];
-        var result = new double[K];
-        for (int k = 0; k < K; k++) result[k] = counts[k] / totalCount;
-        return result;
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
     //  Stacking meta-learner
     // ═══════════════════════════════════════════════════════════════════════════
 
@@ -2581,7 +2554,8 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         double[][] weights, double[] biases,
         double[][] inputWeights, double[][] inputBiases,
         int featureCount, int hiddenSize, int[][]? featureSubsets,
-        int[] learnerHiddenSizes, ElmActivation[] learnerActivations)
+        int[] learnerHiddenSizes, ElmActivation[] learnerActivations,
+        CancellationToken ct = default)
     {
         int K = weights.Length;
         if (calSet.Count < 20 || K < 2) return ([], 0.0);
@@ -2602,21 +2576,34 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             calLabels[i] = calSet[i].Direction > 0 ? 1.0 : 0.0;
         }
 
+        // 80/20 train/val split for early stopping (consistent with FitMetaLabelModel)
+        int trainCount = Math.Max(1, (int)(n * 0.8));
+        int valStart   = trainCount;
+        int valCount   = n - trainCount;
+
         var mw = new double[K];
         for (int k = 0; k < K; k++) mw[k] = 1.0 / K; // uniform init
         double mb = 0.0;
 
+        var bestMw = new double[K];
+        Array.Copy(mw, bestMw, K);
+        double bestMb   = 0.0;
+        double bestLoss = double.MaxValue;
+        int    patience = 0;
+
         const double lr = 0.01;
         const double l2Lambda = 1e-4;
-        const int epochs = 300;
+        const int maxEpochs = 300;
+        const int maxPatience = 30;
 
         var dW = new double[K]; // pre-allocated
-        for (int epoch = 0; epoch < epochs; epoch++)
+        for (int epoch = 0; epoch < maxEpochs; epoch++)
         {
+            ct.ThrowIfCancellationRequested();
             Array.Clear(dW, 0, K);
             double dB = 0;
 
-            for (int i = 0; i < n; i++)
+            for (int i = 0; i < trainCount; i++)
             {
                 var lp = calLp[i];
                 double z = mb;
@@ -2627,15 +2614,39 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                 dB += err;
             }
 
-            for (int k = 0; k < K; k++) mw[k] -= lr * (dW[k] / n + 2.0 * l2Lambda * mw[k]);
-            mb -= lr * (dB / n + 2.0 * l2Lambda * mb);
+            for (int k = 0; k < K; k++) mw[k] -= lr * (dW[k] / trainCount + 2.0 * l2Lambda * mw[k]);
+            mb -= lr * (dB / trainCount + 2.0 * l2Lambda * mb);
+
+            // Validation loss for early stopping
+            int evalCount = valCount > 0 ? valCount : n;
+            int evalStart = valCount > 0 ? valStart : 0;
+            double loss = 0;
+            for (int i = evalStart; i < evalStart + evalCount; i++)
+            {
+                var lp = calLp[i];
+                double z = mb;
+                for (int k = 0; k < K; k++) z += mw[k] * lp[k];
+                double p = MLFeatureHelper.Sigmoid(z);
+                loss -= calLabels[i] * Math.Log(Math.Max(p, 1e-10))
+                      + (1 - calLabels[i]) * Math.Log(Math.Max(1 - p, 1e-10));
+            }
+            loss /= evalCount;
+
+            if (loss < bestLoss - 1e-7)
+            {
+                bestLoss = loss;
+                bestMb = mb;
+                Array.Copy(mw, bestMw, K);
+                patience = 0;
+            }
+            else if (++patience >= maxPatience) break;
         }
 
         _logger.LogDebug(
             "ELM stacking meta-learner: bias={B:F4} weights=[{W}]",
-            mb, string.Join(",", mw.Select(w => w.ToString("F3"))));
+            bestMb, string.Join(",", bestMw.Select(w => w.ToString("F3"))));
 
-        return (mw, mb);
+        return (bestMw, bestMb);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -2777,13 +2788,16 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             // Compute hidden activation: h = activation(W_in × features + b_in)
             int inputDim = features.Length;
             var hidden   = new double[H];
+            ElmActivation learnerAct = snapshot.LearnerActivations is not null && k < snapshot.LearnerActivations.Length
+                ? (ElmActivation)snapshot.LearnerActivations[k]
+                : ElmActivation.Sigmoid;
             for (int h = 0; h < H; h++)
             {
                 double z = inputB[h];
                 int rowOff = h * inputDim;
                 for (int f = 0; f < inputDim && rowOff + f < inputW.Length; f++)
                     z += inputW[rowOff + f] * features[f];
-                hidden[h] = z > 0 ? z : 0; // ReLU (default)
+                hidden[h] = ElmMathHelper.Activate(z, learnerAct);
             }
 
             // Sherman-Morrison rank-1 update
@@ -2793,7 +2807,8 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                 snapshot.Weights[k],
                 ref bias,
                 hidden,
-                target);
+                target,
+                snapshot.TrainSamples);
             snapshot.Biases[k] = bias;
         }
 

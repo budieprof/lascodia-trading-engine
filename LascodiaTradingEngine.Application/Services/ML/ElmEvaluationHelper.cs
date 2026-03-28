@@ -178,6 +178,8 @@ internal static class ElmEvaluationHelper
         Func<float[], double[][], double[], double[][], double[][], double, double, int, int, int[][]?, double[]?, double> ensembleCalibProb,
         CancellationToken ct)
     {
+        if (testSet.Count == 0) return new float[featureCount];
+
         int baselineCorrect = 0;
         foreach (var s in testSet)
         {
@@ -236,6 +238,8 @@ internal static class ElmEvaluationHelper
         Func<float[], double[][], double[], double[][], double[][], int, int, int[][]?, double[]?, double> ensembleRawProb,
         CancellationToken ct)
     {
+        if (calSet.Count == 0) return new double[featureCount];
+
         int baselineCorrect = 0;
         foreach (var s in calSet)
         {

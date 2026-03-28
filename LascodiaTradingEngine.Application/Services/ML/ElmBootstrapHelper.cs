@@ -56,6 +56,10 @@ internal static class ElmBootstrapHelper
             result.Add(train[sellIdx[SampleFromCdf(sellCdf, rng)]]);
         }
 
+        // Handle odd count — add one more sample from the larger class
+        if (count % 2 != 0)
+            result.Add(train[buyIdx[SampleFromCdf(buyCdf, rng)]]);
+
         return result;
     }
 
@@ -91,6 +95,10 @@ internal static class ElmBootstrapHelper
             drawn.Add(buyIdx[SampleFromCdf(buyCdf, rng2)]);
             drawn.Add(sellIdx[SampleFromCdf(sellCdf, rng2)]);
         }
+
+        // Handle odd count
+        if (count % 2 != 0)
+            drawn.Add(buyIdx[SampleFromCdf(buyCdf, rng2)]);
 
         return drawn;
     }
@@ -266,7 +274,7 @@ internal static class ElmBootstrapHelper
         double cutoff = equalShare * threshold;
         var mask = new bool[featureCount];
         for (int i = 0; i < featureCount; i++)
-            mask[i] = importance[i] >= cutoff;
+            mask[i] = (i < importance.Length ? importance[i] : 0.0f) >= cutoff;
         return mask;
     }
 
@@ -410,7 +418,13 @@ internal static class ElmBootstrapHelper
         List<TrainingSample> train, int featureCount, int recentWindowDays)
     {
         int recentCount = Math.Min(train.Count / 4, recentWindowDays * 24);
-        if (recentCount < 10) return new double[train.Count];
+        if (recentCount < 10)
+        {
+            var uniform = new double[train.Count];
+            double uniformW = train.Count > 0 ? 1.0 / train.Count : 0.0;
+            Array.Fill(uniform, uniformW);
+            return uniform;
+        }
 
         int splitPoint = train.Count - recentCount;
         double[] weights = new double[train.Count];

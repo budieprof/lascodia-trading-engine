@@ -125,6 +125,7 @@ internal static class ElmCalibrationHelper
 
         double sumA = 0, sumB = 0;
         int foldSize = calSet.Count / cvFolds;
+        int completedFolds = 0;
 
         for (int fold = 0; fold < cvFolds; fold++)
         {
@@ -142,9 +143,10 @@ internal static class ElmCalibrationHelper
                 featureCount, hiddenSize, featureSubsets, ensembleRawProb);
             sumA += foldA;
             sumB += foldB;
+            completedFolds++;
         }
 
-        return (sumA / cvFolds, sumB / cvFolds);
+        return completedFolds > 0 ? (sumA / completedFolds, sumB / completedFolds) : (1.0, 0.0);
     }
 
     internal static (double ABuy, double BBuy, double ASell, double BSell) FitClassConditionalPlatt(

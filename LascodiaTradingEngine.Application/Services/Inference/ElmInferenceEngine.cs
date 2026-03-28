@@ -21,6 +21,7 @@ public sealed class ElmInferenceEngine : IModelInferenceEngine
 
     public bool CanHandle(ModelSnapshot snapshot) =>
         snapshot.Type == "elm"
+        && snapshot.Weights is { Length: > 0 }
         && snapshot.ElmInputWeights is { Length: > 0 }
         && snapshot.ElmHiddenDim > 0;
 
@@ -29,7 +30,7 @@ public sealed class ElmInferenceEngine : IModelInferenceEngine
         List<Candle> candleWindow, long modelId,
         int mcDropoutSamples, int mcDropoutSeed)
     {
-        if (snapshot.Weights.Length == 0 || snapshot.ElmInputWeights is null)
+        if (snapshot.Weights is not { Length: > 0 } || snapshot.ElmInputWeights is null)
             return null;
 
         int K = snapshot.Weights.Length;
@@ -50,8 +51,8 @@ public sealed class ElmInferenceEngine : IModelInferenceEngine
 
         double avg = InferenceHelpers.AggregateProbs(
             probs, K, snapshot.MetaWeights, snapshot.MetaBias,
-            snapshot.EnsembleSelectionWeights.Length > 0 ? snapshot.EnsembleSelectionWeights : null,
-            snapshot.LearnerCalAccuracies.Length > 0 ? snapshot.LearnerCalAccuracies : null);
+            snapshot.EnsembleSelectionWeights is { Length: > 0 } ? snapshot.EnsembleSelectionWeights : null,
+            snapshot.LearnerCalAccuracies is { Length: > 0 } ? snapshot.LearnerCalAccuracies : null);
 
         double variance = 0;
         for (int k = 0; k < K; k++) { double d = probs[k] - avg; variance += d * d; }
@@ -127,26 +128,24 @@ public sealed class ElmInferenceEngine : IModelInferenceEngine
 
         for (int s = 0; s < numSamples; s++)
         {
-            var masked = new float[featureCount];
-            double scale = 1.0 / (1.0 - DropoutRate);
-            for (int j = 0; j < featureCount; j++)
-                masked[j] = rng.NextDouble() >= DropoutRate ? (float)(features[j] * scale) : 0f;
-
             var probs = new double[K];
             for (int k = 0; k < K; k++)
             {
-                probs[k] = ElmLearnerProb(
-                    masked, snap.Weights[k], snap.Biases[k],
+                probs[k] = ElmLearnerProbWithHiddenDropout(
+                    features, snap.Weights[k], snap.Biases[k],
                     snap.ElmInputWeights![k],
                     snap.ElmInputBiases is { Length: > 0 } && k < snap.ElmInputBiases.Length
                         ? snap.ElmInputBiases[k] : [],
                     featureCount, hiddenDim,
                     snap.FeatureSubsetIndices?.Length > k ? snap.FeatureSubsetIndices[k] : null,
-                    GetActivation(snap.LearnerActivations, k));
+                    GetActivation(snap.LearnerActivations, k),
+                    rng);
             }
 
             samples[s] = InferenceHelpers.AggregateProbs(
-                probs, K, snap.MetaWeights, snap.MetaBias, null, null);
+                probs, K, snap.MetaWeights, snap.MetaBias,
+                snap.EnsembleSelectionWeights is { Length: > 0 } ? snap.EnsembleSelectionWeights : null,
+                snap.LearnerCalAccuracies is { Length: > 0 } ? snap.LearnerCalAccuracies : null);
         }
 
         double mean = samples.Average();
@@ -155,5 +154,49 @@ public sealed class ElmInferenceEngine : IModelInferenceEngine
         var2 /= numSamples > 1 ? numSamples - 1 : 1;
 
         return ((decimal)mean, (decimal)var2);
+    }
+
+    /// <summary>
+    /// ELM learner forward pass with MC dropout applied to hidden units (matching training).
+    /// </summary>
+    private static double ElmLearnerProbWithHiddenDropout(
+        float[] features, double[] wOut, double bias,
+        double[] wIn, double[] bIn,
+        int featureCount, int hiddenSize, int[]? subset,
+        ElmActivation activation, Random rng)
+    {
+        int subLen = subset?.Length > 0 ? subset.Length : featureCount;
+        double score = bias;
+        double scale = 1.0 / (1.0 - DropoutRate);
+
+        for (int h = 0; h < hiddenSize; h++)
+        {
+            if (rng.NextDouble() < DropoutRate) continue;
+
+            double z = h < bIn.Length ? bIn[h] : 0.0;
+            int rowOff = h * subLen;
+
+            if (subset is { Length: > 0 })
+            {
+                for (int si = 0; si < subLen && rowOff + si < wIn.Length; si++)
+                {
+                    int fi = subset[si];
+                    if (fi < features.Length)
+                        z += wIn[rowOff + si] * features[fi];
+                }
+            }
+            else
+            {
+                int len = Math.Min(subLen, features.Length);
+                for (int si = 0; si < len && rowOff + si < wIn.Length; si++)
+                    z += wIn[rowOff + si] * features[si];
+            }
+
+            double hAct = Activate(z, activation);
+            if (h < wOut.Length)
+                score += wOut[h] * hAct * scale;
+        }
+
+        return MLFeatureHelper.Sigmoid(score);
     }
 }

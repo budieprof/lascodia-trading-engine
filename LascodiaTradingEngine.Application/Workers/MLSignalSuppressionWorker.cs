@@ -277,6 +277,8 @@ public sealed class MLSignalSuppressionWorker : BackgroundService
                     Symbol    = model.Symbol,
                     Timeframe = model.Timeframe,
                     Status    = RunStatus.Queued,
+                    FromDate  = DateTime.UtcNow.AddDays(-365),
+                    ToDate    = DateTime.UtcNow,
                     HyperparamConfigJson = System.Text.Json.JsonSerializer.Serialize(new
                     {
                         triggeredBy      = "MLSignalSuppressionWorker",

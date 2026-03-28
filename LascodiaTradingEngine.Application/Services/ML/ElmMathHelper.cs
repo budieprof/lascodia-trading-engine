@@ -330,7 +330,8 @@ internal static class ElmMathHelper
         double[]  outputWeights,
         ref double outputBias,
         double[]  hiddenActivation,
-        double    target)
+        double    target,
+        int       updateCount = 0)
     {
         int H = hiddenActivation.Length;
 
@@ -379,7 +380,8 @@ internal static class ElmMathHelper
         for (int i = 0; i < H; i++)
             outputWeights[i] += PnewH[i] * error;
 
-        // bias update: simple gradient step (learning rate = 1/n, approximated as small constant)
-        outputBias += 0.001 * error;
+        // bias update: adaptive 1/n learning rate (decays as more samples are seen)
+        double biasLr = updateCount > 0 ? 1.0 / updateCount : 0.001;
+        outputBias += biasLr * error;
     }
 }

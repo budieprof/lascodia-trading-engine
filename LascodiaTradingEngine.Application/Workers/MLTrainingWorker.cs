@@ -420,6 +420,17 @@ public sealed class MLTrainingWorker : BackgroundService
                 }
             }
 
+            // ── Guard: skip meta-learner runs with Symbol="ALL" ──────────────
+            if (string.Equals(run.Symbol, "ALL", StringComparison.OrdinalIgnoreCase))
+            {
+                run.Status       = RunStatus.Failed;
+                run.CompletedAt  = DateTime.UtcNow;
+                run.ErrorMessage = "Symbol 'ALL' is a meta-learner artifact — cannot be trained by the regular pipeline.";
+                await db.SaveChangesAsync(stoppingToken);
+                _logger.LogWarning("Run {RunId}: skipping meta-learner run with Symbol='ALL'.", run.Id);
+                return;
+            }
+
             // ── Load candle data ─────────────────────────────────────────────
             var candles = await ctx.Set<Candle>()
                 .Where(c => c.Symbol    == run.Symbol &&
@@ -759,9 +770,18 @@ public sealed class MLTrainingWorker : BackgroundService
             double trendingMinAccuracy = await GetConfigAsync<double>(ctx, CK_TrendingMinAccuracy, 0.65, stoppingToken);
             double trendingMinEV       = await GetConfigAsync<double>(ctx, CK_TrendingMinEV, 0.02, stoppingToken);
 
+            // ── Profitability-based F1 bypass ───────────────────────────────
+            // High-EV models (ELM, GBM, TabNet) often predict one class exclusively
+            // (F1=0) but deliver strong expected value per trade. Allow them through
+            // if EV ≥ 0.10 and Sharpe ≥ 0.50 — these are selective, high-conviction
+            // models that trade rarely but profitably.
+            double evBypassMinEV     = await GetConfigAsync<double>(ctx, "MLTraining:F1BypassMinEV",     0.10, stoppingToken);
+            double evBypassMinSharpe = await GetConfigAsync<double>(ctx, "MLTraining:F1BypassMinSharpe", 0.50, stoppingToken);
+            bool   evBypassF1       = m.ExpectedValue >= evBypassMinEV && m.SharpeRatio >= evBypassMinSharpe;
+
             bool f1Passed = isTrending
                 ? (m.F1 >= hp.MinF1Score || (m.Accuracy >= trendingMinAccuracy && m.ExpectedValue >= trendingMinEV))
-                : (hp.MinF1Score <= 0 || m.F1 >= hp.MinF1Score);
+                : (hp.MinF1Score <= 0 || m.F1 >= hp.MinF1Score || evBypassF1);
 
             bool passed =
                 m.Accuracy           >= hp.MinAccuracyToPromote                                    &&
@@ -777,7 +797,7 @@ public sealed class MLTrainingWorker : BackgroundService
             _logger.LogInformation(
                 "Quality gates — acc={Acc:P1}/{MinAcc:P1} ev={EV:F4}/{MinEV:F4} " +
                 "brier={Brier:F4}/{MaxBrier:F4} sharpe={Sharpe:F2}/{MinSharpe:F2} " +
-                "f1={F1:F3}/{MinF1:F3} regime={Regime} f1Passed={F1Passed} " +
+                "f1={F1:F3}/{MinF1:F3} regime={Regime} f1Passed={F1Passed} evBypass={EvBypass} " +
                 "wfStd={WfStd:P1}/{MaxWfStd:P1} ece={Ece:F4}/{MaxEce:F4} " +
                 "bss={Bss:F4}/{MinBss:F4} oobReg={OobNew:P1}/{OobParent:P1} passed={Passed}",
                 m.Accuracy,              hp.MinAccuracyToPromote,
@@ -785,7 +805,7 @@ public sealed class MLTrainingWorker : BackgroundService
                 m.BrierScore,            hp.MaxBrierScore,
                 m.SharpeRatio,           hp.MinSharpeRatio,
                 m.F1,                    hp.MinF1Score,
-                currentRegime?.ToString() ?? "unknown", f1Passed,
+                currentRegime?.ToString() ?? "unknown", f1Passed, evBypassF1,
                 cvCheck.StdAccuracy,     hp.MaxWalkForwardStdDev,
                 snapEce,                 hp.MaxEce,
                 snapBss,                 hp.MinBrierSkillScore,
@@ -804,7 +824,7 @@ public sealed class MLTrainingWorker : BackgroundService
             run.SharpeRatio        = (decimal)m.SharpeRatio;
             run.ErrorMessage       = passed ? null : BuildGateFailureMessage(
                 m, cvCheck, hp, snapEce, snapBss, result.FinalMetrics.OobAccuracy, parentOobAccuracy,
-                isTrending, trendingMinAccuracy, trendingMinEV);
+                isTrending, trendingMinAccuracy, trendingMinEV, evBypassF1);
 
             if (!passed)
             {
@@ -1147,7 +1167,18 @@ public sealed class MLTrainingWorker : BackgroundService
                     "Run {RunId} permanently failed after {Attempts} attempt(s).", run.Id, run.AttemptCount);
             }
 
-            try { await db.SaveChangesAsync(CancellationToken.None); }
+            try
+            {
+                // Clear stale tracked entities (e.g. partially-created MLModel) that may
+                // cause FK violations when we only want to persist the run's failure status.
+                // Also reset MLModelId — it may reference a model that was never saved to DB.
+                run.MLModelId = null;
+                ctx.ChangeTracker.Clear();
+                ctx.Attach(run);
+                ctx.Entry(run).State = Microsoft.EntityFrameworkCore.EntityState.Modified;
+
+                await db.SaveChangesAsync(CancellationToken.None);
+            }
             catch (Exception saveEx)
             {
                 _logger.LogError(saveEx, "Failed to persist failure/retry status for run {RunId}", run.Id);
@@ -2089,7 +2120,8 @@ public sealed class MLTrainingWorker : BackgroundService
         double              parentOobAccuracy  = 0.0,
         bool                isTrending         = false,
         double              trendingMinAccuracy = 0.65,
-        double              trendingMinEV       = 0.02)
+        double              trendingMinEV       = 0.02,
+        bool                evBypassF1         = false)
     {
         var failed = new List<string>(8);
 
@@ -2110,7 +2142,7 @@ public sealed class MLTrainingWorker : BackgroundService
             if (!f1Ok)
                 failed.Add($"f1 {m.F1:F3} < {hp.MinF1Score:F3} (trending bypass requires acc≥{trendingMinAccuracy:P0} + ev≥{trendingMinEV:F3})");
         }
-        else if (hp.MinF1Score > 0 && m.F1 < hp.MinF1Score)
+        else if (hp.MinF1Score > 0 && m.F1 < hp.MinF1Score && !evBypassF1)
         {
             failed.Add($"f1 {m.F1:F3} < {hp.MinF1Score:F3}");
         }

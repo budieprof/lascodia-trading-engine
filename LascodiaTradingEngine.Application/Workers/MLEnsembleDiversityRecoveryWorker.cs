@@ -255,6 +255,8 @@ public sealed class MLEnsembleDiversityRecoveryWorker : BackgroundService
             Symbol    = model.Symbol,
             Timeframe = model.Timeframe,
             Status    = RunStatus.Queued,
+            FromDate  = DateTime.UtcNow.AddDays(-365),
+            ToDate    = DateTime.UtcNow,
             HyperparamConfigJson = JsonSerializer.Serialize(new
             {
                 triggeredBy      = "MLEnsembleDiversityRecoveryWorker",

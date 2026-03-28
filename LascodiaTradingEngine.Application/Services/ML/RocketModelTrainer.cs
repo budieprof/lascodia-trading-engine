@@ -842,6 +842,7 @@ public sealed class RocketModelTrainer : IMLModelTrainer
             // Mini-batched training pass
             for (int bStart = 0; bStart < trainN; bStart += batchSize)
             {
+                if (bStart % (batchSize * 20) == 0 && bStart > 0) ct.ThrowIfCancellationRequested();
                 int bEnd = Math.Min(bStart + batchSize, trainN);
                 int bLen = bEnd - bStart;
 
