@@ -178,7 +178,8 @@ public sealed class MLOnlineLearningWorker : BackgroundService
                     // We do a scalar pseudo-gradient from probability error alone because
                     // the raw feature vector is not stored in the prediction log.
                     double targetLabel = (log.ActualDirection == log.PredictedDirection) ? 1.0 : 0.0;
-                    double pHat        = (double)(log.ConfidenceScore);
+                    double pBuy        = MLFeatureHelper.ResolveLoggedCalibratedBuyProbability(log);
+                    double pHat        = log.PredictedDirection == TradeDirection.Buy ? pBuy : 1.0 - pBuy;
 
                     // Cross-entropy gradient w.r.t. the logit: σ(z) − y.
                     // This is the standard logistic regression gradient; subtracting it

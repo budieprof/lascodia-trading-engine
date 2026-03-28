@@ -205,7 +205,7 @@ public sealed class MLSignalScorer : IMLSignalScorer
         // Inference succeeded — clear any prior failure count.
         _inferenceFailures.TryRemove(model.Id, out _);
 
-        var (calibP, ensembleStd, direction, threshold, confidence,
+        var (rawProb, calibP, ensembleStd, direction, threshold, confidence,
              magnitude, magnitudeUncertaintyPips, magnitudeP10Pips, magnitudeP90Pips,
              mcDropoutMean, mcDropoutVariance, contributionsJson, shapValuesJson) = inferenceResult.Value;
 
@@ -269,6 +269,48 @@ public sealed class MLSignalScorer : IMLSignalScorer
              regimeRoutingDecision, minTReconciledProbability,
              estimatedTimeToTargetBars, survivalHazardRate, counterfactualJson) = enrichments;
 
+        if (metaLabelScore.HasValue &&
+            snap.MetaLabelWeights.Length > 0 &&
+            metaLabelScore.Value < (decimal)snap.MetaLabelThreshold)
+        {
+            _logger.LogInformation(
+                "ML meta-label suppression for {Symbol}/{Tf} model {Id}: score={Score:F3} < threshold={Threshold:F3}",
+                signal.Symbol, signalTimeframe, model.Id, metaLabelScore.Value, snap.MetaLabelThreshold);
+
+            return new MLScoreResult(
+                PredictedDirection: null,
+                PredictedMagnitudePips: null,
+                ConfidenceScore: null,
+                MLModelId: model.Id,
+                EnsembleDisagreement: (decimal)ensembleStd,
+                MetaLabelScore: metaLabelScore,
+                AbstentionScore: abstentionScore,
+                ConformalSet: conformalSet,
+                ConformalSetSize: conformalSetSize,
+                EntropyScore: (decimal)entropyScore);
+        }
+
+        if (abstentionScore.HasValue &&
+            snap.AbstentionWeights.Length > 0 &&
+            abstentionScore.Value < (decimal)snap.AbstentionThreshold)
+        {
+            _logger.LogInformation(
+                "ML abstention suppression for {Symbol}/{Tf} model {Id}: score={Score:F3} < threshold={Threshold:F3}",
+                signal.Symbol, signalTimeframe, model.Id, abstentionScore.Value, snap.AbstentionThreshold);
+
+            return new MLScoreResult(
+                PredictedDirection: null,
+                PredictedMagnitudePips: null,
+                ConfidenceScore: null,
+                MLModelId: model.Id,
+                EnsembleDisagreement: (decimal)ensembleStd,
+                MetaLabelScore: metaLabelScore,
+                AbstentionScore: abstentionScore,
+                ConformalSet: conformalSet,
+                ConformalSetSize: conformalSetSize,
+                EntropyScore: (decimal)entropyScore);
+        }
+
         var scoringElapsed = Stopwatch.GetElapsedTime(scoringStart);
         if (scoringElapsed > ScoringBudget)
             _logger.LogWarning(
@@ -316,7 +358,10 @@ public sealed class MLSignalScorer : IMLSignalScorer
             RegimeRoutingDecision:        regimeRoutingDecision,
             MinTReconciledProbability:    minTReconciledProbability,
             EstimatedTimeToTargetBars:    estimatedTimeToTargetBars,
-            SurvivalHazardRate:           survivalHazardRate);
+            SurvivalHazardRate:           survivalHazardRate,
+            RawProbability:               (decimal)rawProb,
+            CalibratedProbability:        (decimal)calibP,
+            DecisionThresholdUsed:        (decimal)threshold);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -441,14 +486,12 @@ public sealed class MLSignalScorer : IMLSignalScorer
         if (snap.FracDiffD <= 0.0)
             return features;
 
-        const double FdThreshold  = 1e-3;
-        const int    MaxFdLags    = 20;
-
         var fdWeights = new List<double> { 1.0 };
-        for (int k = 1; k <= MaxFdLags; k++)
+        int maxAvailableLags = Math.Max(0, orderedCandles.Count - MLFeatureHelper.LookbackWindow);
+        for (int k = 1; k <= maxAvailableLags; k++)
         {
             double w = -fdWeights[k - 1] * (snap.FracDiffD - k + 1) / k;
-            if (Math.Abs(w) < FdThreshold) break;
+            if (Math.Abs(w) < 1e-5) break;
             fdWeights.Add(w);
         }
 
@@ -1085,6 +1128,7 @@ public sealed class MLSignalScorer : IMLSignalScorer
     // ═══════════════════════════════════════════════════════════════════════════
 
     private readonly record struct InferencePipelineResult(
+        double RawProbability,
         double CalibP,
         double EnsembleStd,
         TradeDirection Direction,
@@ -1275,6 +1319,7 @@ public sealed class MLSignalScorer : IMLSignalScorer
         // ── 12. Derive outputs ───────────────────────────────────────────────
         double threshold = 0.5;
         if (currentRegime is not null &&
+            snap.RegimeThresholds is not null &&
             snap.RegimeThresholds.TryGetValue(currentRegime, out var regimeThr) &&
             regimeThr > 0.0)
         {
@@ -1294,7 +1339,7 @@ public sealed class MLSignalScorer : IMLSignalScorer
         double confidence     = Math.Clamp(rawConviction * disgrFactor, 0.0, 1.0);
 
         return new InferencePipelineResult(
-            calibP, ensembleStd, direction, threshold, confidence,
+            rawProb, calibP, ensembleStd, direction, threshold, confidence,
             magnitude, magnitudeUncertaintyPips, magnitudeP10Pips, magnitudeP90Pips,
             mcDropoutMean, mcDropoutVariance, contributionsJson, shapValuesJson);
     }

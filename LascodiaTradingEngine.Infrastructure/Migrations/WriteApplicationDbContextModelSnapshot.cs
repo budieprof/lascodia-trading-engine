@@ -1713,6 +1713,10 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                         .HasPrecision(5, 4)
                         .HasColumnType("numeric(5,4)");
 
+                    b.Property<decimal?>("CalibratedProbability")
+                        .HasPrecision(5, 4)
+                        .HasColumnType("numeric(5,4)");
+
                     b.Property<double?>("ConformalNonConformityScore")
                         .HasColumnType("double precision");
 
@@ -1725,6 +1729,10 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
 
                     b.Property<bool?>("DirectionCorrect")
                         .HasColumnType("boolean");
+
+                    b.Property<decimal?>("DecisionThresholdUsed")
+                        .HasPrecision(5, 4)
+                        .HasColumnType("numeric(5,4)");
 
                     b.Property<decimal?>("EnsembleDisagreement")
                         .HasPrecision(5, 4)
@@ -1794,6 +1802,10 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     b.Property<decimal>("PredictedMagnitudePips")
                         .HasPrecision(18, 5)
                         .HasColumnType("numeric(18,5)");
+
+                    b.Property<decimal?>("RawProbability")
+                        .HasPrecision(5, 4)
+                        .HasColumnType("numeric(5,4)");
 
                     b.Property<string>("RegimeRoutingDecision")
                         .HasColumnType("text");

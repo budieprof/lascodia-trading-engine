@@ -291,6 +291,19 @@ internal static class ElmBootstrapHelper
         }).ToList();
     }
 
+    internal static List<TrainingSample> ApplyZeroMask(List<TrainingSample> samples, bool[] mask)
+    {
+        return samples.Select(s =>
+        {
+            var masked = (float[])s.Features.Clone();
+            for (int i = 0; i < masked.Length && i < mask.Length; i++)
+            {
+                if (!mask[i]) masked[i] = 0f;
+            }
+            return s with { Features = masked };
+        }).ToList();
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     //  SMOTE (Synthetic Minority Oversampling)
     // ═══════════════════════════════════════════════════════════════════════════

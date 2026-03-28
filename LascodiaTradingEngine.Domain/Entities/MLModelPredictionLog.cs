@@ -55,6 +55,27 @@ public class MLModelPredictionLog : Entity<long>
     public decimal ConfidenceScore       { get; set; }
 
     /// <summary>
+    /// Raw Buy-class probability emitted by the base inference engine before any
+    /// Platt, temperature, isotonic, or age-decay calibration is applied.
+    /// Null for legacy logs created before exact probability persistence was added.
+    /// </summary>
+    public decimal? RawProbability       { get; set; }
+
+    /// <summary>
+    /// Final calibrated Buy-class probability used by the scorer to derive
+    /// <see cref="PredictedDirection"/> and conviction at prediction time.
+    /// Null for legacy logs created before exact probability persistence was added.
+    /// </summary>
+    public decimal? CalibratedProbability { get; set; }
+
+    /// <summary>
+    /// Effective decision threshold used at scoring time after applying regime,
+    /// adaptive, and optimal-threshold precedence.
+    /// Null for legacy logs created before threshold persistence was added.
+    /// </summary>
+    public decimal? DecisionThresholdUsed { get; set; }
+
+    /// <summary>
     /// The actual direction the market moved after the signal was acted upon.
     /// Populated by the outcome-recorder worker once the trade closes.
     /// Null while the trade is still open.

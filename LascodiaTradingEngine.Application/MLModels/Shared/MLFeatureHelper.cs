@@ -1,4 +1,5 @@
 using LascodiaTradingEngine.Domain.Entities;
+using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.MLModels.Shared;
 
@@ -693,6 +694,113 @@ public static class MLFeatureHelper
         for (int j = 0; j < features.Length; j++)
             result[j] = (features[j] - means[j]) / stds[j];
         return result;
+    }
+
+    /// <summary>
+    /// Resolves the effective decision threshold using the same precedence as live scoring.
+    /// </summary>
+    public static double ResolveEffectiveDecisionThreshold(ModelSnapshot snap, string? regime = null)
+    {
+        if (regime is not null &&
+            snap.RegimeThresholds is not null &&
+            snap.RegimeThresholds.TryGetValue(regime, out var regimeThreshold) &&
+            regimeThreshold > 0.0)
+        {
+            return regimeThreshold;
+        }
+
+        if (snap.AdaptiveThreshold > 0.0)
+            return snap.AdaptiveThreshold;
+        if (snap.OptimalThreshold > 0.0)
+            return snap.OptimalThreshold;
+
+        return 0.5;
+    }
+
+    /// <summary>
+    /// Reconstructs the logged probability of the Buy class from the scorer's stored
+    /// direction, confidence score, threshold, and optional ensemble disagreement.
+    /// </summary>
+    public static double ReconstructLoggedBuyProbability(
+        TradeDirection predictedDirection,
+        double confidenceScore,
+        double decisionThreshold,
+        decimal? ensembleDisagreement = null)
+    {
+        double confidence = Math.Clamp(confidenceScore, 0.0, 1.0);
+        double rawConviction = confidence;
+
+        if (ensembleDisagreement.HasValue)
+        {
+            double disagreement = Math.Clamp((double)ensembleDisagreement.Value, 0.0, 0.5);
+            double disagreementFactor = Math.Clamp(1.0 - 2.0 * disagreement, 0.0, 1.0);
+            rawConviction = disagreementFactor > 1e-8
+                ? Math.Clamp(confidence / disagreementFactor, 0.0, 1.0)
+                : 0.0;
+        }
+
+        double distanceFromThreshold = rawConviction / 2.0;
+        return predictedDirection == TradeDirection.Buy
+            ? Math.Clamp(decisionThreshold + distanceFromThreshold, decisionThreshold, 1.0)
+            : Math.Clamp(decisionThreshold - distanceFromThreshold, 0.0, decisionThreshold);
+    }
+
+    /// <summary>
+    /// Resolves the exact decision threshold used for a logged prediction when available,
+    /// otherwise falls back to the caller-provided threshold.
+    /// </summary>
+    public static double ResolveLoggedDecisionThreshold(
+        MLModelPredictionLog log,
+        double               fallbackThreshold = 0.5)
+    {
+        if (log.DecisionThresholdUsed.HasValue)
+        {
+            double logged = (double)log.DecisionThresholdUsed.Value;
+            if (double.IsFinite(logged) && logged > 0.0 && logged < 1.0)
+                return logged;
+        }
+
+        return Math.Clamp(fallbackThreshold, 0.0, 1.0);
+    }
+
+    /// <summary>
+    /// Resolves the logged raw Buy-class probability when available, otherwise falls back
+    /// to reconstructing from the legacy threshold-relative confidence contract.
+    /// </summary>
+    public static double ResolveLoggedRawBuyProbability(
+        MLModelPredictionLog log,
+        double               fallbackThreshold = 0.5)
+    {
+        if (log.RawProbability.HasValue)
+            return Math.Clamp((double)log.RawProbability.Value, 0.0, 1.0);
+
+        double decisionThreshold = ResolveLoggedDecisionThreshold(log, fallbackThreshold);
+        return ReconstructLoggedBuyProbability(
+            log.PredictedDirection,
+            (double)log.ConfidenceScore,
+            decisionThreshold,
+            log.EnsembleDisagreement);
+    }
+
+    /// <summary>
+    /// Resolves the logged calibrated Buy-class probability when available, otherwise falls
+    /// back to raw probability or legacy confidence reconstruction for historical rows.
+    /// </summary>
+    public static double ResolveLoggedCalibratedBuyProbability(
+        MLModelPredictionLog log,
+        double               fallbackThreshold = 0.5)
+    {
+        if (log.CalibratedProbability.HasValue)
+            return Math.Clamp((double)log.CalibratedProbability.Value, 0.0, 1.0);
+        if (log.RawProbability.HasValue)
+            return Math.Clamp((double)log.RawProbability.Value, 0.0, 1.0);
+
+        double decisionThreshold = ResolveLoggedDecisionThreshold(log, fallbackThreshold);
+        return ReconstructLoggedBuyProbability(
+            log.PredictedDirection,
+            (double)log.ConfidenceScore,
+            decisionThreshold,
+            log.EnsembleDisagreement);
     }
 
     // ── Math primitives ───────────────────────────────────────────────────────

@@ -3,6 +3,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 using MarketRegimeEnum = LascodiaTradingEngine.Domain.Enums.MarketRegime;
@@ -639,7 +640,7 @@ public sealed class MLShadowArbiterWorker : BackgroundService
     /// Lower is better; a score of 0.25 corresponds to random guessing.
     /// Returns 0 when no resolved logs are available.
     /// </summary>
-    private static double BrierScore(List<MLModelPredictionLog> logs)
+    private static double BrierScore(List<MLModelPredictionLog> logs, double fallbackThreshold = 0.5)
     {
         if (logs.Count == 0) return 0;
         double sum = 0;
@@ -647,10 +648,7 @@ public sealed class MLShadowArbiterWorker : BackgroundService
         foreach (var l in logs)
         {
             if (l.DirectionCorrect is null) continue;
-            double conf = (double)l.ConfidenceScore;
-            double pBuy = l.PredictedDirection == TradeDirection.Buy
-                ? 0.5 + conf / 2.0
-                : 0.5 - conf / 2.0;
+            double pBuy = MLFeatureHelper.ResolveLoggedCalibratedBuyProbability(l, fallbackThreshold);
             double y   = l.ActualDirection == TradeDirection.Buy ? 1.0 : 0.0;
             sum += (pBuy - y) * (pBuy - y);
             n++;

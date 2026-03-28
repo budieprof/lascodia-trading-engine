@@ -1,4 +1,5 @@
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Domain.Entities;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -185,7 +186,10 @@ public sealed class MLErgodicityWorker : BackgroundService
             double[] r = new double[logs.Count];
             for (int i = 0; i < logs.Count; i++)
             {
-                double conf = (double)logs[i].ConfidenceScore;
+                double pBuy = MLFeatureHelper.ResolveLoggedCalibratedBuyProbability(logs[i]);
+                double conf = logs[i].PredictedDirection == LascodiaTradingEngine.Domain.Enums.TradeDirection.Buy
+                    ? pBuy
+                    : 1.0 - pBuy;
                 r[i] = logs[i].DirectionCorrect == true
                     ? conf - 0.5          // correct: positive return proportional to confidence
                     : -(conf - 0.5);      // incorrect: negative return proportional to confidence

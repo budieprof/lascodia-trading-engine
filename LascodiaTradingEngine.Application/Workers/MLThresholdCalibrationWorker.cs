@@ -270,9 +270,7 @@ public sealed class MLThresholdCalibrationWorker : BackgroundService
         // 1. OptimalThreshold (set by training or a previous update)
         // 2. AdaptiveThreshold (set by the adaptive threshold worker)
         // 3. 0.5 (symmetrical default for binary classification)
-        double currentThreshold = snap.OptimalThreshold > 0.0 ? snap.OptimalThreshold
-                                : snap.AdaptiveThreshold > 0.0 ? snap.AdaptiveThreshold
-                                : 0.5;
+        double currentThreshold = MLFeatureHelper.ResolveEffectiveDecisionThreshold(snap);
 
         // Apply nudge, clamped to the configured safety bounds to prevent runaway drift.
         double newThreshold = Math.Clamp(currentThreshold + delta, minThreshold, maxThreshold);

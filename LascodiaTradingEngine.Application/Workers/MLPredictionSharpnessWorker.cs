@@ -3,6 +3,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -192,12 +193,14 @@ public sealed class MLPredictionSharpnessWorker : BackgroundService
         string                                  alertDest,
         CancellationToken                       ct)
     {
-        // Only include logs with a non-zero confidence score; zero confidence logs
-        // are typically placeholder records before the scorer has run.
+        // Prefer rows with explicit probability persistence, but still keep legacy
+        // confidence-based rows for backward compatibility.
         var logs = await readCtx.Set<MLModelPredictionLog>()
             .AsNoTracking()
             .Where(l => l.MLModelId      == model.Id &&
-                        l.ConfidenceScore > 0         &&
+                        (l.ConfidenceScore > 0 ||
+                         l.CalibratedProbability != null ||
+                         l.RawProbability != null) &&
                         !l.IsDeleted)
             .OrderByDescending(l => l.PredictedAt)
             .Take(windowSize)
@@ -224,10 +227,7 @@ public sealed class MLPredictionSharpnessWorker : BackgroundService
         double sumH = 0.0;
         foreach (var log in logs)
         {
-            double conf   = Math.Clamp((double)log.ConfidenceScore, 0.0, 1.0);
-            double p      = log.PredictedDirection == TradeDirection.Buy
-                ? 0.5 + conf / 2.0
-                : 0.5 - conf / 2.0;
+            double p = MLFeatureHelper.ResolveLoggedCalibratedBuyProbability(log);
 
             // Clamp to avoid log(0) — numerically stable lower/upper bounds
             p = Math.Clamp(p, 1e-10, 1.0 - 1e-10);

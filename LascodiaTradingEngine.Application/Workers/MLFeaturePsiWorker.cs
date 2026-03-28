@@ -238,8 +238,22 @@ public sealed class MLFeaturePsiWorker : BackgroundService
         // Standardise using snapshot means/stds so the live features are on the same
         // numerical scale as the quantile breakpoints recorded at training time.
         var recentStandardised = recentSamples
-            .Select(s => MLFeatureHelper.Standardize(s.Features, snap.Means, snap.Stds))
+            .Select(s => s with { Features = MLFeatureHelper.Standardize(s.Features, snap.Means, snap.Stds) })
             .ToList();
+
+        if (snap.FracDiffD > 0.0)
+            recentStandardised = MLFeatureHelper.ApplyFractionalDifferencing(recentStandardised, featureCount, snap.FracDiffD);
+
+        if (snap.ActiveFeatureMask is { Length: > 0 } activeMask && activeMask.Length == featureCount)
+        {
+            for (int i = 0; i < recentStandardised.Count; i++)
+            {
+                var features = (float[])recentStandardised[i].Features.Clone();
+                for (int j = 0; j < featureCount; j++)
+                    if (!activeMask[j]) features[j] = 0f;
+                recentStandardised[i] = recentStandardised[i] with { Features = features };
+            }
+        }
 
         // ── Compute PSI per feature ───────────────────────────────────────────
         // PSI = Σ_i (A_i − E_i) × ln(A_i / E_i)
@@ -264,7 +278,7 @@ public sealed class MLFeaturePsiWorker : BackgroundService
             if (binEdges.Length == 0) continue;
 
             // Build current (actual) feature distribution from recent standardised values.
-            double[] recentVals = recentStandardised.Select(f => j < f.Length ? (double)f[j] : 0.0).ToArray();
+            double[] recentVals = recentStandardised.Select(s => j < s.Features.Length ? (double)s.Features[j] : 0.0).ToArray();
 
             // Training distribution is implicitly uniform across quantile bins (by construction)
             // We approximate by treating each bin edge as a uniform-population bin edge.

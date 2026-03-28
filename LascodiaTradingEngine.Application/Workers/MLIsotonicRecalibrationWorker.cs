@@ -195,10 +195,7 @@ public sealed class MLIsotonicRecalibrationWorker : BackgroundService
 
         if (snap is null) return;
 
-        // Resolve the current threshold in priority order: OptimalThreshold → AdaptiveThreshold → 0.5.
-        double threshold = snap.OptimalThreshold > 0.0 ? snap.OptimalThreshold
-                         : snap.AdaptiveThreshold > 0.0 ? snap.AdaptiveThreshold
-                         : 0.5;
+        double threshold = MLFeatureHelper.ResolveEffectiveDecisionThreshold(snap);
 
         var since = DateTime.UtcNow.AddDays(-windowDays);
 
@@ -206,13 +203,18 @@ public sealed class MLIsotonicRecalibrationWorker : BackgroundService
         var resolved = await readCtx.Set<MLModelPredictionLog>()
             .Where(l => l.MLModelId        == model.Id &&
                         l.PredictedAt      >= since    &&
+                        l.ActualDirection  != null     &&
                         l.DirectionCorrect != null     &&
                         !l.IsDeleted)
             .Select(l => new
             {
                 l.PredictedDirection,
                 l.ConfidenceScore,
-                DirectionCorrect = l.DirectionCorrect!.Value,
+                l.RawProbability,
+                l.CalibratedProbability,
+                l.DecisionThresholdUsed,
+                l.EnsembleDisagreement,
+                l.ActualDirection,
             })
             .ToListAsync(ct);
 
@@ -224,18 +226,24 @@ public sealed class MLIsotonicRecalibrationWorker : BackgroundService
             return;
         }
 
-        // Reconstruct approximate calibP from ConfidenceScore + PredictedDirection + threshold.
-        // Buy:  calibP ≈ T + ConfidenceScore × (1 − T)  → maps [0,1] confidence to [T, 1]
-        // Sell: calibP ≈ T − ConfidenceScore × T         → maps [0,1] confidence to [T, 0]
-        // Sorting by calibP ascending is required for PAVA's monotone-increasing constraint.
+        // Reconstruct the logged buy-probability using the same threshold-relative
+        // confidence contract as the live scorer, then sort ascending for PAVA.
         var pairs = resolved
             .Select(r =>
             {
-                double conf    = Math.Clamp((double)r.ConfidenceScore, 0.0, 1.0);
-                double calibP  = r.PredictedDirection == TradeDirection.Buy
-                    ? threshold + conf * (1.0 - threshold)  // Buy: probability above threshold
-                    : threshold - conf * threshold;          // Sell: probability below threshold
-                double label   = r.DirectionCorrect ? 1.0 : 0.0;
+                double calibP = MLFeatureHelper.ResolveLoggedCalibratedBuyProbability(
+                    new MLModelPredictionLog
+                    {
+                        PredictedDirection = r.PredictedDirection,
+                        ConfidenceScore = r.ConfidenceScore,
+                        RawProbability = r.RawProbability,
+                        CalibratedProbability = r.CalibratedProbability,
+                        DecisionThresholdUsed = r.DecisionThresholdUsed,
+                        EnsembleDisagreement = r.EnsembleDisagreement,
+                        ActualDirection = r.ActualDirection,
+                    },
+                    threshold);
+                double label  = r.ActualDirection == TradeDirection.Buy ? 1.0 : 0.0;
                 return (P: calibP, Y: label);
             })
             .OrderBy(p => p.P)  // PAVA requires sorted input

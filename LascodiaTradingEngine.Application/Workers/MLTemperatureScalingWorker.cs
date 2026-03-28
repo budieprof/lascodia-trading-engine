@@ -1,9 +1,11 @@
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Domain.Entities;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using System.Text.Json;
 
 namespace LascodiaTradingEngine.Application.Workers;
 
@@ -107,10 +109,21 @@ public sealed class MLTemperatureScalingWorker : BackgroundService
 
         foreach (var model in models)
         {
+            ModelSnapshot? snap;
+            try { snap = JsonSerializer.Deserialize<ModelSnapshot>(model.ModelBytes!); }
+            catch { continue; }
+
+            if (snap is null) continue;
+
+            double decisionThreshold = MLFeatureHelper.ResolveEffectiveDecisionThreshold(snap);
+
             // Load the most recent resolved prediction logs for this model.
             var logs = await readDb.Set<MLModelPredictionLog>()
                 .AsNoTracking()
-                .Where(p => p.MLModelId == model.Id && !p.IsDeleted && p.DirectionCorrect != null)
+                .Where(p => p.MLModelId == model.Id &&
+                            !p.IsDeleted &&
+                            p.DirectionCorrect != null &&
+                            p.ActualDirection != null)
                 .OrderByDescending(p => p.PredictedAt)
                 .Take(MaxSamples)
                 .ToListAsync(ct);
@@ -118,12 +131,15 @@ public sealed class MLTemperatureScalingWorker : BackgroundService
             // Require at least 20 logs for a meaningful temperature search.
             if (logs.Count < 20) continue;
 
-            // Build logits from stored confidence scores.
-            // Clamp to (1e-7, 1-1e-7) to avoid log(0) in the logit transform.
-            // logit(p) = log(p / (1 - p)) — the inverse sigmoid (log-odds).
-            double[] confs  = logs.Select(p => Math.Clamp((double)p.ConfidenceScore, 1e-7, 1 - 1e-7)).ToArray();
+            // Reconstruct calibrated buy-probabilities from the logged scoring outputs,
+            // then convert those probabilities to logits for temperature scaling.
+            double[] confs = logs.Select(p =>
+                    Math.Clamp(
+                        MLFeatureHelper.ResolveLoggedRawBuyProbability(p, decisionThreshold),
+                        1e-7, 1 - 1e-7))
+                .ToArray();
             double[] logits = confs.Select(c => Math.Log(c / (1.0 - c))).ToArray();
-            double[] labels = logs.Select(p => (p.DirectionCorrect ?? false) ? 1.0 : 0.0).ToArray();
+            double[] labels = logs.Select(p => p.ActualDirection == Domain.Enums.TradeDirection.Buy ? 1.0 : 0.0).ToArray();
 
             // Pre-calibration NLL and ECE at T = 1 (no temperature scaling — raw model outputs).
             double preNll = ComputeNll(logits, labels, 1.0);

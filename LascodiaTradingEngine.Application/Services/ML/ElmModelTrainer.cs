@@ -161,6 +161,12 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         foreach (var s in samples)
             allStd.Add(s with { Features = MLFeatureHelper.Standardize(s.Features, means, stds) });
 
+        if (hp.FracDiffD > 0.0)
+        {
+            allStd = MLFeatureHelper.ApplyFractionalDifferencing(allStd, featureCount, hp.FracDiffD);
+            _logger.LogInformation("ELM fractional differencing applied: d={D:F2}", hp.FracDiffD);
+        }
+
         double sharpeAnnFactor = hp.SharpeAnnualisationFactor > 0.0
             ? hp.SharpeAnnualisationFactor : DefaultSharpeAnnualisationFactor;
 
@@ -296,41 +302,9 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         ct.ThrowIfCancellationRequested();
 
         // ── 4c. Accuracy-weighted ensemble averaging ─────────────────────────
-        var learnerCalAccuracies = new double[K];
-        double[]? learnerAccWeights = null;
-        if (calSet.Count > 0)
-        {
-            for (int k = 0; k < K; k++)
-            {
-                int correct = 0;
-                foreach (var s in calSet)
-                {
-                    double prob = ElmLearnerProb(
-                        s.Features, weights[k], biases[k], inputWeights[k], inputBiases[k],
-                        featureCount, learnerHiddenSizes[k], featureSubsets?[k],
-                        k < learnerActivations.Length ? learnerActivations[k] : hp.ElmActivation);
-                    if ((prob >= 0.5 ? 1 : 0) == s.Direction) correct++;
-                }
-                learnerCalAccuracies[k] = (double)correct / calSet.Count;
-            }
-            _logger.LogDebug("ELM per-learner cal accuracies: [{Accs}]",
-                string.Join(", ", learnerCalAccuracies.Select(a => $"{a:P0}")));
-
-            learnerAccWeights = new double[K];
-            double tempScale = 5.0;
-            double maxShifted = learnerCalAccuracies.Max() - 0.5;
-            double expSum = 0;
-            for (int k = 0; k < K; k++)
-            {
-                double shifted = learnerCalAccuracies[k] - 0.5;
-                learnerAccWeights[k] = Math.Exp(tempScale * (shifted - maxShifted));
-                expSum += learnerAccWeights[k];
-            }
-            if (expSum > 1e-15)
-                for (int k = 0; k < K; k++) learnerAccWeights[k] /= expSum;
-            else
-                learnerAccWeights = null;
-        }
+        var (learnerCalAccuracies, learnerAccWeights) = ComputeLearnerCalibrationStats(
+            calSet, weights, biases, inputWeights, inputBiases,
+            featureCount, featureSubsets, learnerHiddenSizes, learnerActivations, hp.ElmActivation);
 
         // ── 4e. Stacking meta-learner ────────────────────────────────────────
         var (stackingWeights, stackingBias) = FitStackingMetaLearner(
@@ -341,13 +315,15 @@ public sealed class ElmModelTrainer : IMLModelTrainer
 
         double RawEnsembleProb(float[] features) => EnsembleRawProb(
             features, weights, biases, inputWeights, inputBiases,
-            featureCount, hiddenSize, featureSubsets, null, learnerHiddenSizes, learnerActivations,
+            featureCount, hiddenSize, featureSubsets, learnerAccWeights, learnerHiddenSizes, learnerActivations,
             stackingWeights, stackingBias);
 
         // ── 5. Platt calibration (cross-validated, on stacking output) ──────
         var (plattA, plattB) = ElmCalibrationHelper.FitPlattScalingCV(
             calSet, weights, biases, inputWeights, inputBiases, featureCount, hiddenSize, featureSubsets,
-            (f, w, b, iw, ib, fc, hs, fs, lw) => EnsembleRawProb(f, w, b, iw, ib, fc, hs, fs, lw, learnerHiddenSizes, learnerActivations, stackingWeights, stackingBias));
+            (f, w, b, iw, ib, fc, hs, fs, lw) => EnsembleRawProb(
+                f, w, b, iw, ib, fc, hs, fs, lw ?? learnerAccWeights,
+                learnerHiddenSizes, learnerActivations, stackingWeights, stackingBias));
         _logger.LogDebug("ELM Platt calibration (CV): A={A:F4} B={B:F4}", plattA, plattB);
 
         // ── 5b. Temperature scaling (fit before class-conditional gating so the
@@ -358,7 +334,9 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             temperatureScale = ElmCalibrationHelper.FitTemperatureScaling(
                 calSet, weights, biases, inputWeights, inputBiases,
                 featureCount, hiddenSize, featureSubsets,
-                (f, w, b, iw, ib, fc, hs, fs, lw) => EnsembleRawProb(f, w, b, iw, ib, fc, hs, fs, lw, learnerHiddenSizes, learnerActivations, stackingWeights, stackingBias));
+                (f, w, b, iw, ib, fc, hs, fs, lw) => EnsembleRawProb(
+                    f, w, b, iw, ib, fc, hs, fs, lw ?? learnerAccWeights,
+                    learnerHiddenSizes, learnerActivations, stackingWeights, stackingBias));
             _logger.LogDebug("ELM temperature scaling: T={T:F4}", temperatureScale);
         }
 
@@ -366,7 +344,9 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         var (plattABuy, plattBBuy, plattASell, plattBSell) = ElmCalibrationHelper.FitClassConditionalPlatt(
             calSet, weights, biases, inputWeights, inputBiases, featureCount, hiddenSize, featureSubsets,
             plattA, plattB, temperatureScale,
-            (f, w, b, iw, ib, fc, hs, fs, lw) => EnsembleRawProb(f, w, b, iw, ib, fc, hs, fs, lw, learnerHiddenSizes, learnerActivations, stackingWeights, stackingBias));
+            (f, w, b, iw, ib, fc, hs, fs, lw) => EnsembleRawProb(
+                f, w, b, iw, ib, fc, hs, fs, lw ?? learnerAccWeights,
+                learnerHiddenSizes, learnerActivations, stackingWeights, stackingBias));
 
         double PrimaryCalibProb(float[] features) => ApplyProductionCalibration(
             RawEnsembleProb(features),
@@ -476,7 +456,9 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             ? ElmEvaluationHelper.ComputeCalPermutationImportance(
                 calSet, weights, biases, inputWeights, inputBiases,
                 featureCount, hiddenSize, featureSubsets,
-                (f, w, b, iw, ib, fc, hs, fs, lw) => EnsembleRawProb(f, w, b, iw, ib, fc, hs, fs, lw, learnerHiddenSizes, learnerActivations, stackingWeights, stackingBias), ct)
+                (f, w, b, iw, ib, fc, hs, fs, lw) => EnsembleRawProb(
+                    f, w, b, iw, ib, fc, hs, fs, lw ?? learnerAccWeights,
+                    learnerHiddenSizes, learnerActivations, stackingWeights, stackingBias), ct)
             : new double[featureCount];
 
         ct.ThrowIfCancellationRequested();
@@ -527,9 +509,9 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                 "ELM feature pruning: masking {Pruned}/{Total} low-importance features (active={Active})",
                 prunedCount, featureCount, activeFeatureCount);
 
-            var maskedTrain = ElmBootstrapHelper.ApplyMask(trainSet, activeMask);
-            var maskedCal   = ElmBootstrapHelper.ApplyMask(calSet, activeMask);
-            var maskedTest  = ElmBootstrapHelper.ApplyMask(testSet, activeMask);
+            var maskedTrain = ElmBootstrapHelper.ApplyZeroMask(trainSet, activeMask);
+            var maskedCal   = ElmBootstrapHelper.ApplyZeroMask(calSet, activeMask);
+            var maskedTest  = ElmBootstrapHelper.ApplyZeroMask(testSet, activeMask);
 
             var prunedHp = hp with
             {
@@ -545,8 +527,8 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             try
             {
                 prunedEnsemble = FitBaggedElm(
-                    maskedTrain, prunedHp, activeFeatureCount, hiddenSize, K,
-                    adaptiveLabelSmoothing, prunedWarmStart, densityWeights, ct);
+                    maskedTrain, prunedHp, featureCount, hiddenSize, K,
+                    adaptiveLabelSmoothing, prunedWarmStart, densityWeights, ct, activeMask);
             }
             catch (AggregateException pae) when (pae.InnerExceptions.Count == 1)
             {
@@ -563,46 +545,53 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             if (hp.ElmMagRegressorCvFolds > 1 && maskedTrain.Count >= hp.MinSamples * 2)
             {
                 (pmw, pmb, pmaw, pmab, pMagAugWeightsFolds, pMagAugBiasFolds) = FitElmMagnitudeRegressorCV(
-                    maskedTrain, activeFeatureCount, hiddenSize, piw, pib, psub, pla,
+                    maskedTrain, featureCount, hiddenSize, piw, pib, psub, pla,
                     hp.ElmMagRegressorLr, hp.ElmMagRegressorMaxEpochs, hp.ElmMagRegressorPatience,
                     hp.ElmMagRegressorCvFolds, embargo, ct);
             }
             else
             {
                 (pmw, pmb, pmaw, pmab) = FitElmMagnitudeRegressor(
-                    maskedTrain, activeFeatureCount, hiddenSize, piw, pib, psub, pla,
+                    maskedTrain, featureCount, hiddenSize, piw, pib, psub, pla,
                     hp.ElmMagRegressorLr, hp.ElmMagRegressorMaxEpochs, hp.ElmMagRegressorPatience, ct);
             }
+
+            var (pLearnerCalAccuracies, pLearnerAccWeights) = ComputeLearnerCalibrationStats(
+                maskedCal, pw, pb, piw, pib,
+                featureCount, psub, phs, pla, hp.ElmActivation);
 
             // Fit stacking meta-learner on the pruned model before computing comparison
             // metrics. The full model already uses stacking in EnsembleRawProb/CalibProb;
             // omitting it here made the pruned vs full comparison apples-to-oranges and
             // systematically penalised the pruned model by ~1–3 % accuracy.
             var (pSw, pSb) = FitStackingMetaLearner(
-                maskedCal, pw, pb, piw, pib, activeFeatureCount, hiddenSize, psub, phs, pla, ct);
+                maskedCal, pw, pb, piw, pib, featureCount, hiddenSize, psub, phs, pla, ct);
 
             // Use CV Platt so the acceptance comparison uses the same calibration
             // method as the full model (FitPlattScalingCV at step 5), making it
             // apples-to-apples.
             var (pA, pB) = ElmCalibrationHelper.FitPlattScalingCV(
-                maskedCal, pw, pb, piw, pib, activeFeatureCount, hiddenSize, psub,
-                (f, w, b, iw, ib, fc, hs, fs, lw) => EnsembleRawProb(f, w, b, iw, ib, fc, hs, fs, lw, phs, pla, pSw, pSb));
+                maskedCal, pw, pb, piw, pib, featureCount, hiddenSize, psub,
+                (f, w, b, iw, ib, fc, hs, fs, lw) => EnsembleRawProb(
+                    f, w, b, iw, ib, fc, hs, fs, lw ?? pLearnerAccWeights, phs, pla, pSw, pSb));
             double pTemp = 0.0;
             if (hp.FitTemperatureScale && maskedCal.Count >= 10)
             {
                 pTemp = ElmCalibrationHelper.FitTemperatureScaling(
-                    maskedCal, pw, pb, piw, pib, activeFeatureCount, hiddenSize, psub,
-                    (f, w, b, iw, ib, fc, hs, fs, lw) => EnsembleRawProb(f, w, b, iw, ib, fc, hs, fs, lw, phs, pla, pSw, pSb));
+                    maskedCal, pw, pb, piw, pib, featureCount, hiddenSize, psub,
+                    (f, w, b, iw, ib, fc, hs, fs, lw) => EnsembleRawProb(
+                        f, w, b, iw, ib, fc, hs, fs, lw ?? pLearnerAccWeights, phs, pla, pSw, pSb));
             }
             var (pABuy, pBBuy, pASell, pBSell) = ElmCalibrationHelper.FitClassConditionalPlatt(
-                maskedCal, pw, pb, piw, pib, activeFeatureCount, hiddenSize, psub,
+                maskedCal, pw, pb, piw, pib, featureCount, hiddenSize, psub,
                 pA, pB, pTemp,
-                (f, w, b, iw, ib, fc, hs, fs, lw) => EnsembleRawProb(f, w, b, iw, ib, fc, hs, fs, lw, phs, pla, pSw, pSb));
+                (f, w, b, iw, ib, fc, hs, fs, lw) => EnsembleRawProb(
+                    f, w, b, iw, ib, fc, hs, fs, lw ?? pLearnerAccWeights, phs, pla, pSw, pSb));
             double PPrimaryCalibProb(float[] features) => ApplyProductionCalibration(
-                EnsembleRawProb(features, pw, pb, piw, pib, activeFeatureCount, hiddenSize, psub, null, phs, pla, pSw, pSb),
+                EnsembleRawProb(features, pw, pb, piw, pib, featureCount, hiddenSize, psub, pLearnerAccWeights, phs, pla, pSw, pSb),
                 pA, pB, pTemp, pABuy, pBBuy, pASell, pBSell);
             var prunedMetrics = ElmEvaluationHelper.EvaluateEnsemble(
-                maskedTest, pw, pb, piw, pib, pmw, pmb, pA, pB, activeFeatureCount, hiddenSize, psub,
+                maskedTest, pw, pb, piw, pib, pmw, pmb, pA, pB, featureCount, hiddenSize, psub,
                 pmaw, pmab, sharpeAnnFactor,
                 (f, w, b, iw, ib, pAp, pBp, fc, hs, fs, lw) => PPrimaryCalibProb(f),
                 (f, aw, ab, fc, hs, eiw, eib, fs) => PredictMagnitudeAug(f, aw, ab, fc, hs, eiw, eib, fs, pla));
@@ -618,6 +607,8 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                 learnerHiddenSizes = phs;
                 learnerActivations = pla;
                 inverseGrams = pInvGram;
+                learnerCalAccuracies = pLearnerCalAccuracies;
+                learnerAccWeights = pLearnerAccWeights;
                 magWeights = pmw; magBias = pmb;
                 magAugWeights = pmaw; magAugBias = pmab;
                 magAugWeightsFolds = pMagAugWeightsFolds;
@@ -632,27 +623,33 @@ public sealed class ElmModelTrainer : IMLModelTrainer
 
                 (plattABuy, plattBBuy, plattASell, plattBSell) = (pABuy, pBBuy, pASell, pBSell);
                 avgKellyFraction = ElmCalibrationHelper.ComputeAvgKellyFraction(
-                    maskedCal, pw, pb, piw, pib, plattA, plattB, activeFeatureCount, hiddenSize, psub,
+                    maskedCal, pw, pb, piw, pib, plattA, plattB, featureCount, hiddenSize, psub,
                     (f, w2, b2, iw2, ib2, pAp, pBp, fc, hs, fs, lw) => PPrimaryCalibProb(f));
-                ece = ElmEvaluationHelper.ComputeEce(maskedTest, pw, pb, piw, pib, plattA, plattB, activeFeatureCount, hiddenSize, psub,
+                ece = ElmEvaluationHelper.ComputeEce(maskedTest, pw, pb, piw, pib, plattA, plattB, featureCount, hiddenSize, psub,
                     (f, w2, b2, iw2, ib2, pAp, pBp, fc, hs, fs, lw) => PPrimaryCalibProb(f));
                 optimalThreshold = ElmCalibrationHelper.ComputeOptimalThreshold(
-                    maskedCal, pw, pb, piw, pib, plattA, plattB, activeFeatureCount, hiddenSize, psub,
+                    maskedCal, pw, pb, piw, pib, plattA, plattB, featureCount, hiddenSize, psub,
                     hp.ThresholdSearchMin, hp.ThresholdSearchMax,
                     (f, w2, b2, iw2, ib2, pAp, pBp, fc, hs, fs, lw) => PPrimaryCalibProb(f));
 
                 featureImportance = maskedTest.Count >= 10
                     ? ElmEvaluationHelper.ComputePermutationImportance(
-                        maskedTest, pw, pb, piw, pib, pA, pB, activeFeatureCount, hiddenSize, psub,
+                        maskedTest, pw, pb, piw, pib, pA, pB, featureCount, hiddenSize, psub,
                         (f, w2, b2, iw2, ib2, pAp, pBp, fc, hs, fs, lw) => PPrimaryCalibProb(f), ct)
-                    : new float[activeFeatureCount];
+                    : new float[featureCount];
+                calImportanceScores = maskedCal.Count >= 10
+                    ? ElmEvaluationHelper.ComputeCalPermutationImportance(
+                        maskedCal, pw, pb, piw, pib, featureCount, hiddenSize, psub,
+                        (f, w2, b2, iw2, ib2, fc, hs, fs, lw) => EnsembleRawProb(
+                            f, w2, b2, iw2, ib2, fc, hs, fs, lw ?? pLearnerAccWeights, phs, pla, pSw, pSb), ct)
+                    : new double[featureCount];
 
                 // Advance the effective views so that steps 12-22 use the pruned model's
                 // feature space rather than the original unmasked data.
                 effectiveCalSet       = maskedCal;
                 effectiveTestSet      = maskedTest;
                 effectiveTrainSet     = maskedTrain;
-                effectiveFeatureCount = activeFeatureCount;
+                effectiveFeatureCount = featureCount;
             }
             else
             {
@@ -672,7 +669,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
 
         double PrimaryEffectiveCalibProb(float[] features) => ApplyProductionCalibration(
             EnsembleRawProb(features, weights, biases, inputWeights, inputBiases,
-                effectiveFeatureCount, hiddenSize, featureSubsets, null,
+                effectiveFeatureCount, hiddenSize, featureSubsets, learnerAccWeights,
                 learnerHiddenSizes, learnerActivations, stackingWeights, stackingBias),
             plattA, plattB, temperatureScale, plattABuy, plattBBuy, plattASell, plattBSell);
 
@@ -721,7 +718,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         var (metaLabelWeights, metaLabelBias) = FitMetaLabelModel(
             effectiveCalSet, weights, biases, inputWeights, inputBiases,
             effectiveFeatureCount, hiddenSize, featureSubsets, learnerHiddenSizes, learnerActivations,
-            FinalEffectiveCalibProb,
+            optimalThreshold, FinalEffectiveCalibProb,
             stackingWeights, stackingBias,
             hp.ElmSubModelLr, hp.ElmSubModelMaxEpochs, hp.ElmSubModelPatience, ct);
         _logger.LogDebug("ELM meta-label: bias={B:F4}", metaLabelBias);
@@ -731,7 +728,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             effectiveCalSet, weights, biases, inputWeights, inputBiases,
             plattA, plattB, metaLabelWeights, metaLabelBias,
             effectiveFeatureCount, hiddenSize, featureSubsets, learnerHiddenSizes, learnerActivations,
-            FinalEffectiveCalibProb,
+            optimalThreshold, FinalEffectiveCalibProb,
             stackingWeights, stackingBias,
             hp.ElmSubModelLr, hp.ElmSubModelMaxEpochs, hp.ElmSubModelPatience, ct);
         _logger.LogDebug("ELM abstention gate: bias={B:F4} threshold={T:F2}", abstentionBias, abstentionThreshold);
@@ -741,7 +738,9 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             ? ElmCalibrationHelper.ComputeDecisionBoundaryStats(
                 effectiveCalSet, weights, biases, inputWeights, inputBiases,
                 effectiveFeatureCount, hiddenSize, featureSubsets,
-                (f, w, b, iw, ib, fc, hs, fs, lw) => EnsembleRawProb(f, w, b, iw, ib, fc, hs, fs, lw, learnerHiddenSizes, learnerActivations, stackingWeights, stackingBias))
+                (f, w, b, iw, ib, fc, hs, fs, lw) => EnsembleRawProb(
+                    f, w, b, iw, ib, fc, hs, fs, lw ?? learnerAccWeights,
+                    learnerHiddenSizes, learnerActivations, stackingWeights, stackingBias))
             : (0.0, 0.0);
 
         // ── 17. Durbin-Watson on magnitude residuals ─────────────────────────
@@ -857,7 +856,8 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             {
                 calProbs[i] = EnsembleRawProb(
                     effectiveCalSet[i].Features, weights, biases, inputWeights, inputBiases,
-                    effectiveFeatureCount, hiddenSize, featureSubsets, null, learnerHiddenSizes, learnerActivations, stackingWeights, stackingBias);
+                    effectiveFeatureCount, hiddenSize, featureSubsets, learnerAccWeights,
+                    learnerHiddenSizes, learnerActivations, stackingWeights, stackingBias);
             }
             double probSum = 0, probSumSq = 0;
             for (int i = 0; i < calProbs.Length; i++)
@@ -1104,25 +1104,31 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             double cvPlattA = 1.0, cvPlattB = 0.0;
             double cvTemp = 0.0;
             double cvPlattABuy = 0.0, cvPlattBBuy = 0.0, cvPlattASell = 0.0, cvPlattBSell = 0.0;
+            double[]? cvLearnerAccWeights = null;
             if (cvCalSet is not null)
             {
+                (_, cvLearnerAccWeights) = ComputeLearnerCalibrationStats(
+                    cvCalSet, w, b, iw, ib, featureCount, subs, lhs, cvla, hp.ElmActivation);
                 (cvPlattA, cvPlattB) = ElmCalibrationHelper.FitPlattScalingCV(
                     cvCalSet, w, b, iw, ib, featureCount, hiddenSize, subs,
-                    (f, ww, bb, iww, ibb, fc, hs, fs, lw) => EnsembleRawProb(f, ww, bb, iww, ibb, fc, hs, fs, lw, lhs, cvla));
+                    (f, ww, bb, iww, ibb, fc, hs, fs, lw) => EnsembleRawProb(
+                        f, ww, bb, iww, ibb, fc, hs, fs, lw ?? cvLearnerAccWeights, lhs, cvla));
                 if (hp.FitTemperatureScale && cvCalSet.Count >= 10)
                 {
                     cvTemp = ElmCalibrationHelper.FitTemperatureScaling(
                         cvCalSet, w, b, iw, ib, featureCount, hiddenSize, subs,
-                        (f, ww, bb, iww, ibb, fc, hs, fs, lw) => EnsembleRawProb(f, ww, bb, iww, ibb, fc, hs, fs, lw, lhs, cvla));
+                        (f, ww, bb, iww, ibb, fc, hs, fs, lw) => EnsembleRawProb(
+                            f, ww, bb, iww, ibb, fc, hs, fs, lw ?? cvLearnerAccWeights, lhs, cvla));
                 }
                 (cvPlattABuy, cvPlattBBuy, cvPlattASell, cvPlattBSell) = ElmCalibrationHelper.FitClassConditionalPlatt(
                     cvCalSet, w, b, iw, ib, featureCount, hiddenSize, subs,
                     cvPlattA, cvPlattB, cvTemp,
-                    (f, ww, bb, iww, ibb, fc, hs, fs, lw) => EnsembleRawProb(f, ww, bb, iww, ibb, fc, hs, fs, lw, lhs, cvla));
+                    (f, ww, bb, iww, ibb, fc, hs, fs, lw) => EnsembleRawProb(
+                        f, ww, bb, iww, ibb, fc, hs, fs, lw ?? cvLearnerAccWeights, lhs, cvla));
             }
 
             double CvPrimaryCalibProb(float[] features) => ApplyProductionCalibration(
-                EnsembleRawProb(features, w, b, iw, ib, featureCount, hiddenSize, subs, null, lhs, cvla),
+                EnsembleRawProb(features, w, b, iw, ib, featureCount, hiddenSize, subs, cvLearnerAccWeights, lhs, cvla),
                 cvPlattA, cvPlattB, cvTemp, cvPlattABuy, cvPlattBBuy, cvPlattASell, cvPlattBSell);
 
             var m = ElmEvaluationHelper.EvaluateEnsemble(foldTest, w, b, iw, ib, mw, mb, cvPlattA, cvPlattB, featureCount, hiddenSize, subs,
@@ -1863,6 +1869,51 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         return globalCalibP;
     }
 
+    private (double[] Accuracies, double[]? AccuracyWeights) ComputeLearnerCalibrationStats(
+        List<TrainingSample> calSet,
+        double[][] weights, double[] biases,
+        double[][] inputWeights, double[][] inputBiases,
+        int featureCount, int[][]? featureSubsets,
+        int[] learnerHiddenSizes, ElmActivation[] learnerActivations,
+        ElmActivation defaultActivation)
+    {
+        int K = weights.Length;
+        var accuracies = new double[K];
+        if (calSet.Count == 0) return (accuracies, null);
+
+        for (int k = 0; k < K; k++)
+        {
+            int correct = 0;
+            foreach (var s in calSet)
+            {
+                double prob = ElmLearnerProb(
+                    s.Features, weights[k], biases[k], inputWeights[k], inputBiases[k],
+                    featureCount, learnerHiddenSizes[k], featureSubsets?[k],
+                    k < learnerActivations.Length ? learnerActivations[k] : defaultActivation);
+                if ((prob >= 0.5 ? 1 : 0) == s.Direction) correct++;
+            }
+            accuracies[k] = (double)correct / calSet.Count;
+        }
+
+        _logger.LogDebug("ELM per-learner cal accuracies: [{Accs}]",
+            string.Join(", ", accuracies.Select(a => $"{a:P0}")));
+
+        var accuracyWeights = new double[K];
+        const double tempScale = 5.0;
+        double maxShifted = accuracies.Max() - 0.5;
+        double expSum = 0.0;
+        for (int k = 0; k < K; k++)
+        {
+            double shifted = accuracies[k] - 0.5;
+            accuracyWeights[k] = Math.Exp(tempScale * (shifted - maxShifted));
+            expSum += accuracyWeights[k];
+        }
+
+        if (expSum <= 1e-15) return (accuracies, null);
+        for (int k = 0; k < K; k++) accuracyWeights[k] /= expSum;
+        return (accuracies, accuracyWeights);
+    }
+
     private static double ComputeEnsembleStd(
         float[] features, double[][] weights, double[] biases,
         double[][] inputWeights, double[][] inputBiases,
@@ -2412,6 +2463,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         double[][] inputWeights, double[][] inputBiases,
         int featureCount, int hiddenSize, int[][]? featureSubsets,
         int[] learnerHiddenSizes, ElmActivation[] learnerActivations,
+        double decisionThreshold,
         Func<float[], double>? calibratedProb = null,
         double[]? stackingWeights = null, double stackingBias = 0.0,
         double configLr = 0.0, int configMaxEpochs = 0, int configPatience = 0,
@@ -2455,7 +2507,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             for (int j = 0; j < metaDim - 2; j++)
                 if (j < s.Features.Length) metaXs[i][j + 2] = s.Features[j];
 
-            targets[i] = (calibP >= 0.5 ? 1 : 0) == s.Direction ? 1.0 : 0.0;
+            targets[i] = (calibP >= decisionThreshold ? 1 : 0) == s.Direction ? 1.0 : 0.0;
         }
 
         int metaMaxEpochs = configMaxEpochs > 0 ? configMaxEpochs : 200;
@@ -2548,6 +2600,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         double[] metaLabelWeights, double metaLabelBias,
         int featureCount, int hiddenSize, int[][]? featureSubsets,
         int[] learnerHiddenSizes, ElmActivation[] learnerActivations,
+        double decisionThreshold,
         Func<float[], double>? calibratedProb = null,
         double[]? stackingWeights = null, double stackingBias = 0.0,
         double configLr = 0.0, int configMaxEpochs = 0, int configPatience = 0,
@@ -2592,7 +2645,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             mlScore = MLFeatureHelper.Sigmoid(mlScore);
 
             absXs[i] = [calibP, ensStd, mlScore];
-            absTargets[i] = (calibP >= 0.5 ? 1 : 0) == s.Direction ? 1.0 : 0.0;
+            absTargets[i] = (calibP >= decisionThreshold ? 1 : 0) == s.Direction ? 1.0 : 0.0;
         }
 
         int absMaxEpochs = configMaxEpochs > 0 ? configMaxEpochs : 200;
@@ -2690,9 +2743,9 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                     : EnsembleCalibProb(
                         s.Features, weights, biases, inputWeights, inputBiases,
                         plattA, plattB, featureCount, hiddenSize, featureSubsets, null, learnerHiddenSizes, learnerActivations, stackingWeights, stackingBias);
-                if (Math.Abs(calibP - 0.5) < margin) continue;
+                if (Math.Abs(calibP - decisionThreshold) < margin) continue;
                 t++;
-                if ((calibP >= 0.5 ? 1 : 0) == s.Direction) c++;
+                if ((calibP >= decisionThreshold ? 1 : 0) == s.Direction) c++;
             }
             if (t < 5) continue;
             double acc = (double)c / t;
@@ -2821,12 +2874,10 @@ public sealed class ElmModelTrainer : IMLModelTrainer
     {
         if (warmStart?.ElmInputWeights is null) return null;
 
-        int[] oldToNew = new int[featureCount];
-        Array.Fill(oldToNew, -1);
-        int newIdx = 0;
-        for (int fi = 0; fi < featureCount; fi++)
-            if (activeMask[fi]) oldToNew[fi] = newIdx++;
-        int activeFeatureCount = newIdx;
+        int activeFeatureCount = activeMask.Count(m => m);
+        int[] activeOriginalIndices = Enumerable.Range(0, featureCount)
+            .Where(i => i < activeMask.Length && activeMask[i])
+            .ToArray();
 
         int wsK = warmStart.ElmInputWeights.Length;
         var remappedInputWeights = new double[wsK][];
@@ -2850,9 +2901,9 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             for (int si = 0; si < oldSubLen; si++)
             {
                 int oldFi = oldSub[si];
-                if (oldFi < featureCount && oldToNew[oldFi] >= 0)
+                if (oldFi < featureCount && oldFi < activeMask.Length && activeMask[oldFi])
                 {
-                    newSubList.Add(oldToNew[oldFi]);
+                    newSubList.Add(oldFi);
                     oldSubPositions.Add(si);
                 }
             }
@@ -2863,7 +2914,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                 remappedInputWeights[ki] = new double[hiddenSize * activeFeatureCount];
                 remappedInputBiases[ki]  = (double[])oldBIn.Clone();
                 if (remappedSubsets is not null)
-                    remappedSubsets[ki] = Enumerable.Range(0, activeFeatureCount).ToArray();
+                    remappedSubsets[ki] = activeOriginalIndices;
                 continue;
             }
 
@@ -2918,6 +2969,14 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         if (snapshot.ElmInverseGram is null || snapshot.ElmInverseGram.Length == 0)
         {
             _logger.LogDebug("ELM online update skipped — no inverse Gram matrix in snapshot");
+            return false;
+        }
+
+        if (snapshot.FracDiffD > 0.0)
+        {
+            _logger.LogDebug(
+                "ELM online update skipped — FracDiffD={D:F2} requires historical context not available to single-sample updates",
+                snapshot.FracDiffD);
             return false;
         }
 

@@ -464,10 +464,7 @@ public sealed class MLAdaptiveThresholdWorker : BackgroundService
             // Approximate inverse: calibP ≈ threshold + conf/2 (for Buy direction).
             // For Sell, a high confidence score means the model strongly predicts downward movement,
             // so we subtract conf/2 to move the probability below the threshold midpoint.
-            double conf    = (double)(log.ConfidenceScore);
-            double calibP  = log.PredictedDirection == TradeDirection.Buy
-                ? threshold + conf / 2.0
-                : threshold - conf / 2.0;
+            double calibP = MLFeatureHelper.ResolveLoggedCalibratedBuyProbability(log, threshold);
 
             // The model would have emitted a signal if calibP >= threshold at scoring time.
             bool predicted = calibP >= threshold;

@@ -163,12 +163,6 @@ public sealed class MLConformalRecalibrationWorker : BackgroundService
     // ── Per-model recalibration ───────────────────────────────────────────────
 
     /// <summary>
-    /// Lightweight internal projection type for loading only the fields needed
-    /// to compute nonconformity scores from prediction logs.
-    /// </summary>
-    private sealed record ScoreEntry(double Score, bool WasCorrect);
-
-    /// <summary>
     /// Recalibrates the conformal coverage threshold <c>ConformalQHat</c> for a single model
     /// by recomputing the empirical quantile from recent resolved prediction logs and patching
     /// <c>ModelBytes</c> only when the empirical coverage has drifted beyond the tolerance band.
@@ -215,19 +209,24 @@ public sealed class MLConformalRecalibrationWorker : BackgroundService
         double                                  driftTolerance,
         CancellationToken                       ct)
     {
-        var since = DateTime.UtcNow.AddDays(-windowDays);
+        // Deserialise snapshot to get current QHat stored at training or last recalibration.
+        ModelSnapshot? snap;
+        try { snap = JsonSerializer.Deserialize<ModelSnapshot>(model.ModelBytes!); }
+        catch { return; }
+        if (snap is null) return;
 
-        // Load resolved logs, projecting only the two fields needed for nonconformity score computation.
+        var since = DateTime.UtcNow.AddDays(-windowDays);
+        double decisionThreshold = MLFeatureHelper.ResolveEffectiveDecisionThreshold(snap);
+
+        // Load recent resolved logs and reconstruct their calibrated probabilities exactly
+        // when the scorer persisted them, otherwise fall back to the legacy contract.
         var logs = await readCtx.Set<MLModelPredictionLog>()
             .Where(l => l.MLModelId        == model.Id &&
                         l.PredictedAt      >= since    &&
                         l.DirectionCorrect != null      &&
-                        l.ConfidenceScore  > 0          &&
+                        l.ActualDirection  != null      &&
                         !l.IsDeleted)
             .AsNoTracking()
-            .Select(l => new ScoreEntry(
-                (double)l.ConfidenceScore,
-                l.DirectionCorrect!.Value))
             .ToListAsync(ct);
 
         if (logs.Count < minPredictions)
@@ -238,12 +237,6 @@ public sealed class MLConformalRecalibrationWorker : BackgroundService
             return;
         }
 
-        // Deserialise snapshot to get current QHat stored at training or last recalibration.
-        ModelSnapshot? snap;
-        try { snap = JsonSerializer.Deserialize<ModelSnapshot>(model.ModelBytes!); }
-        catch { return; }
-        if (snap is null) return;
-
         double currentQHat = snap.ConformalQHat;
 
         // Compute nonconformity scores:
@@ -253,7 +246,14 @@ public sealed class MLConformalRecalibrationWorker : BackgroundService
         //   Include Buy  if (1 − pBuy)  ≤ QHat
         //   Include Sell if (1 − pSell) ≤ QHat
         var scores = logs
-            .Select(l => l.WasCorrect ? (1.0 - l.Score) : l.Score)
+            .Select(l =>
+            {
+                double pBuy = MLFeatureHelper.ResolveLoggedCalibratedBuyProbability(l, decisionThreshold);
+                double pTrue = l.ActualDirection == LascodiaTradingEngine.Domain.Enums.TradeDirection.Buy
+                    ? pBuy
+                    : 1.0 - pBuy;
+                return 1.0 - pTrue;
+            })
             .OrderBy(s => s)
             .ToList();
 

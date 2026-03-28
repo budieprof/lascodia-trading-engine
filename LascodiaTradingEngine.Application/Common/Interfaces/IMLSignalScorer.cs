@@ -145,7 +145,25 @@ public record MLScoreResult(
     double?         EstimatedTimeToTargetBars = null,
 
     /// <summary>Instantaneous hazard rate from the Cox model. Higher = sooner arrival.</summary>
-    double?         SurvivalHazardRate = null);
+    double?         SurvivalHazardRate = null,
+
+    /// <summary>
+    /// Raw Buy-class probability emitted by the base inference engine before calibration.
+    /// Null when no active model scored the signal.
+    /// </summary>
+    decimal?        RawProbability = null,
+
+    /// <summary>
+    /// Final calibrated Buy-class probability used for the trade decision.
+    /// Null when no active model scored the signal.
+    /// </summary>
+    decimal?        CalibratedProbability = null,
+
+    /// <summary>
+    /// Effective Buy-threshold applied at scoring time after regime/adaptive overrides.
+    /// Null when no active model scored the signal.
+    /// </summary>
+    decimal?        DecisionThresholdUsed = null);
 
 public interface IMLSignalScorer
 {

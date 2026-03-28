@@ -1,8 +1,10 @@
+using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -257,7 +259,22 @@ public sealed class MLDriftMonitorWorker : BackgroundService
         double accuracy = (double)correct / logs.Count;
 
         // ── Calibration: rolling Brier score ─────────────────────────────────
-        double brierScore = ComputeRollingBrierScore(logs);
+        double fallbackThreshold = 0.5;
+        if (model.ModelBytes is { Length: > 0 })
+        {
+            try
+            {
+                var snap = JsonSerializer.Deserialize<ModelSnapshot>(model.ModelBytes);
+                if (snap is not null)
+                    fallbackThreshold = MLFeatureHelper.ResolveEffectiveDecisionThreshold(snap);
+            }
+            catch
+            {
+                // Keep the neutral default when the snapshot cannot be read.
+            }
+        }
+
+        double brierScore = ComputeRollingBrierScore(logs, fallbackThreshold);
 
         // ── Ensemble disagreement: mean inter-learner std ─────────────────────
         var disagLogs = allLogs.Where(l => l.EnsembleDisagreement.HasValue).ToList();
@@ -387,17 +404,16 @@ public sealed class MLDriftMonitorWorker : BackgroundService
     /// Remaps confidence [0,1] → probability space: p = 0.5 + conf/2 when correct direction,
     /// 0.5 − conf/2 when wrong. Tracks calibration drift independently of accuracy.
     /// </summary>
-    private static double ComputeRollingBrierScore(List<MLModelPredictionLog> logs)
+    private static double ComputeRollingBrierScore(
+        List<MLModelPredictionLog> logs,
+        double                     fallbackThreshold)
     {
         double sum = 0;
         int    n   = 0;
         foreach (var l in logs)
         {
             if (l.DirectionCorrect is null) continue;
-            double conf = (double)l.ConfidenceScore;
-            double pBuy = l.PredictedDirection == TradeDirection.Buy
-                ? 0.5 + conf / 2.0
-                : 0.5 - conf / 2.0;
+            double pBuy = MLFeatureHelper.ResolveLoggedCalibratedBuyProbability(l, fallbackThreshold);
             double y   = l.ActualDirection == TradeDirection.Buy ? 1.0 : 0.0;
             sum += (pBuy - y) * (pBuy - y);
             n++;

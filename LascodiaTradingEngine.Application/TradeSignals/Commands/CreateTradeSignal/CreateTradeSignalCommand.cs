@@ -27,6 +27,9 @@ public class CreateTradeSignalCommand : IRequest<ResponseData<long>>
     public decimal?      MLPredictedMagnitude   { get; set; }
     public decimal?      MLConfidenceScore      { get; set; }
     public long?         MLModelId              { get; set; }
+    public decimal?      MLRawProbability       { get; set; }
+    public decimal?      MLCalibratedProbability { get; set; }
+    public decimal?      MLDecisionThresholdUsed { get; set; }
     /// <summary>
     /// Standard deviation of individual ensemble learner probabilities at scoring time.
     /// Stored on <c>MLModelPredictionLog</c> for live disagreement monitoring.
@@ -141,6 +144,9 @@ public class CreateTradeSignalCommandHandler : IRequestHandler<CreateTradeSignal
                 PredictedDirection     = entity.MLPredictedDirection ?? entity.Direction,
                 PredictedMagnitudePips = entity.MLPredictedMagnitude ?? 0m,
                 ConfidenceScore        = entity.MLConfidenceScore ?? 0m,
+                RawProbability         = request.MLRawProbability,
+                CalibratedProbability  = request.MLCalibratedProbability,
+                DecisionThresholdUsed  = request.MLDecisionThresholdUsed,
                 EnsembleDisagreement   = request.MLEnsembleDisagreement,
                 LatencyMs              = request.MLScoringLatencyMs,
                 PredictedAt            = DateTime.UtcNow,

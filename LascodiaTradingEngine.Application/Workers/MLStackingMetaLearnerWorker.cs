@@ -164,7 +164,9 @@ public sealed class MLStackingMetaLearnerWorker : BackgroundService
                 for (int k = 0; k < K; k++)
                 {
                     var log = sg.FirstOrDefault(l => l.MLModelId == modelIds[k]);
-                    row[k]  = log != null ? (double)log.ConfidenceScore : 0.5;
+                    row[k]  = log != null
+                        ? MLFeatureHelper.ResolveLoggedCalibratedBuyProbability(log)
+                        : 0.5;
                 }
 
                 // Use the first log with a resolved ActualDirection as the ground truth.

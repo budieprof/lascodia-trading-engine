@@ -215,6 +215,7 @@ public sealed class MLRecalibrationWorker : BackgroundService
         var logs  = await readCtx.Set<MLModelPredictionLog>()
             .Where(l => l.MLModelId           == model.Id &&
                         l.PredictedAt         >= since    &&
+                        l.ActualDirection.HasValue        &&
                         l.DirectionCorrect.HasValue       &&
                         !l.IsDeleted)
             .OrderBy(l => l.PredictedAt)
@@ -244,9 +245,11 @@ public sealed class MLRecalibrationWorker : BackgroundService
 
         if (snap is null) return;
 
+        double decisionThreshold = MLFeatureHelper.ResolveEffectiveDecisionThreshold(snap);
+
         // Compute current ECE from prediction logs (using stored predicted probability).
         // This is the baseline to beat; if already acceptable, skip the recalibration work.
-        double currentEce = ComputeEceFromLogs(logs);
+        double currentEce = ComputeEceFromLogs(logs, decisionThreshold);
         _logger.LogDebug(
             "Model {Symbol}/{Tf} id={Id}: ECE={Ece:F4} (max={Max:F4}, samples={N})",
             model.Symbol, model.Timeframe, model.Id, currentEce, maxEce, logs.Count);
@@ -268,16 +271,16 @@ public sealed class MLRecalibrationWorker : BackgroundService
         // Refit Platt scaling (A, B) using temporally-weighted SGD on the resolved prediction logs.
         // Platt scaling maps a raw logit f to a calibrated probability: σ(A·f + B)
         // where σ is the sigmoid function. A=1, B=0 is the identity (no change).
-        var (newPlattA, newPlattB) = RefitPlattFromLogs(logs, logWeights, plattLr, plattEpochs);
+        var (newPlattA, newPlattB) = RefitPlattFromLogs(logs, logWeights, decisionThreshold, plattLr, plattEpochs);
 
         // Refit isotonic calibration breakpoints using PAVA on Platt-transformed scores.
         // Isotonic regression produces a non-decreasing monotone mapping from calibrated
         // probability to empirical accuracy, correcting systematic over/under-confidence.
-        var newIsotonicBp = RefitIsotonicFromLogs(logs, newPlattA, newPlattB);
+        var newIsotonicBp = RefitIsotonicFromLogs(logs, decisionThreshold, newPlattA, newPlattB);
 
         // Verify that the new Platt parameters actually improve ECE before committing.
         // If the new fit is worse than the current calibration, discard it.
-        double newEce = ComputeEceFromLogsWithPlatt(logs, newPlattA, newPlattB);
+        double newEce = ComputeEceFromLogsWithPlatt(logs, decisionThreshold, newPlattA, newPlattB);
         if (newEce >= currentEce)
         {
             _logger.LogDebug(
@@ -289,7 +292,8 @@ public sealed class MLRecalibrationWorker : BackgroundService
         // Refit class-conditional Platt (separate scalers for Buy and Sell).
         // Buy-predicted logs (confidence ≥ 0.5) and Sell-predicted logs (< 0.5) may have
         // systematically different calibration errors; fitting separate (A, B) pairs corrects this.
-        var (newABuy, newBBuy, newASell, newBSell) = RefitClassConditionalPlatt(logs, plattLr, plattEpochs);
+        var (newABuy, newBBuy, newASell, newBSell) = RefitClassConditionalPlatt(
+            logs, decisionThreshold, plattLr, plattEpochs);
 
         // Patch snapshot with new calibration parameters.
         snap.PlattA              = newPlattA;
@@ -341,7 +345,9 @@ public sealed class MLRecalibrationWorker : BackgroundService
     /// </summary>
     /// <param name="logs">Resolved prediction logs with non-null <c>DirectionCorrect</c>.</param>
     /// <returns>ECE in [0, 1]. Lower is better calibrated.</returns>
-    private static double ComputeEceFromLogs(IReadOnlyList<MLModelPredictionLog> logs)
+    private static double ComputeEceFromLogs(
+        IReadOnlyList<MLModelPredictionLog> logs,
+        double decisionThreshold)
     {
         if (logs.Count == 0) return 0.0;
         const int NumBins = 10;
@@ -351,12 +357,12 @@ public sealed class MLRecalibrationWorker : BackgroundService
 
         foreach (var log in logs)
         {
-            double p   = (double)log.ConfidenceScore;
+            double p = MLFeatureHelper.ResolveLoggedCalibratedBuyProbability(log, decisionThreshold);
             int    bin = Math.Clamp((int)(p * NumBins), 0, NumBins - 1);
             binConfSum[bin] += p;
-            // A prediction is deemed correct when the confidence side (≥0.5 = Buy intent)
-            // matches whether the trade direction was correct.
-            bool correct = (p >= 0.5) == (log.DirectionCorrect == true);
+            bool correct = log.ActualDirection.HasValue
+                ? (p >= decisionThreshold) == (log.ActualDirection == TradeDirection.Buy)
+                : (p >= decisionThreshold) == (log.DirectionCorrect == true);
             if (correct) binCorrect[bin]++;
             binCount[bin]++;
         }
@@ -387,6 +393,7 @@ public sealed class MLRecalibrationWorker : BackgroundService
     /// <returns>ECE in [0, 1] after applying the Platt transform.</returns>
     private static double ComputeEceFromLogsWithPlatt(
         IReadOnlyList<MLModelPredictionLog> logs,
+        double                              decisionThreshold,
         double                              plattA,
         double                              plattB)
     {
@@ -398,13 +405,14 @@ public sealed class MLRecalibrationWorker : BackgroundService
 
         foreach (var log in logs)
         {
-            double rawP    = (double)log.ConfidenceScore;
-            // Apply Platt scaling: logit(rawP) → A·logit + B → sigmoid → calibP
+            double rawP = MLFeatureHelper.ResolveLoggedRawBuyProbability(log, decisionThreshold);
             double logit   = MLFeatureHelper.Logit(rawP);
             double calibP  = MLFeatureHelper.Sigmoid(plattA * logit + plattB);
             int    bin     = Math.Clamp((int)(calibP * NumBins), 0, NumBins - 1);
             binConfSum[bin] += calibP;
-            bool correct    = (calibP >= 0.5) == (log.DirectionCorrect == true);
+            bool correct = log.ActualDirection.HasValue
+                ? (calibP >= decisionThreshold) == (log.ActualDirection == TradeDirection.Buy)
+                : (calibP >= decisionThreshold) == (log.DirectionCorrect == true);
             if (correct) binCorrect[bin]++;
             binCount[bin]++;
         }
@@ -486,6 +494,7 @@ public sealed class MLRecalibrationWorker : BackgroundService
     private static (double A, double B) RefitPlattFromLogs(
         IReadOnlyList<MLModelPredictionLog> logs,
         double[]                            sampleWeights,
+        double                              decisionThreshold,
         double                              lr,
         int                                 epochs)
     {
@@ -499,10 +508,10 @@ public sealed class MLRecalibrationWorker : BackgroundService
             {
                 var    log    = logs[i];
                 double w      = sampleWeights[i];
-                double rawP   = (double)log.ConfidenceScore;
+                double rawP = MLFeatureHelper.ResolveLoggedRawBuyProbability(log, decisionThreshold);
                 double logit  = MLFeatureHelper.Logit(rawP);
                 double calibP = MLFeatureHelper.Sigmoid(plattA * logit + plattB);
-                double y      = log.DirectionCorrect == true ? 1.0 : 0.0;
+                double y = log.ActualDirection == TradeDirection.Buy ? 1.0 : 0.0;
                 // Gradient of cross-entropy loss with respect to A and B.
                 double err    = (calibP - y) * w;
                 dA   += err * logit;
@@ -541,6 +550,7 @@ public sealed class MLRecalibrationWorker : BackgroundService
     /// </returns>
     private static double[] RefitIsotonicFromLogs(
         IReadOnlyList<MLModelPredictionLog> logs,
+        double                              decisionThreshold,
         double                              plattA,
         double                              plattB)
     {
@@ -550,9 +560,9 @@ public sealed class MLRecalibrationWorker : BackgroundService
         var pairs = logs
             .Select(l =>
             {
-                double rawP   = (double)l.ConfidenceScore;
+                double rawP = MLFeatureHelper.ResolveLoggedRawBuyProbability(l, decisionThreshold);
                 double calibP = MLFeatureHelper.Sigmoid(plattA * MLFeatureHelper.Logit(rawP) + plattB);
-                return (P: calibP, Y: l.DirectionCorrect == true ? 1.0 : 0.0);
+                return (P: calibP, Y: l.ActualDirection == TradeDirection.Buy ? 1.0 : 0.0);
             })
             .OrderBy(x => x.P)
             .ToList();
@@ -615,20 +625,21 @@ public sealed class MLRecalibrationWorker : BackgroundService
     private static (double ABuy, double BBuy, double ASell, double BSell)
         RefitClassConditionalPlatt(
             IReadOnlyList<MLModelPredictionLog> logs,
+            double                              decisionThreshold,
             double                              lr,
             int                                 epochs)
     {
         var buyPairs  = new List<(double Logit, double Y)>();
         var sellPairs = new List<(double Logit, double Y)>();
 
-        // Partition logs into Buy-predicted (confidence ≥ 0.5) and Sell-predicted (< 0.5).
+        // Partition logs by the direction the scorer actually emitted.
         foreach (var log in logs)
         {
-            double rawP  = (double)log.ConfidenceScore;
+            double rawP = MLFeatureHelper.ResolveLoggedRawBuyProbability(log, decisionThreshold);
             double logit = MLFeatureHelper.Logit(rawP);
-            double y     = log.DirectionCorrect == true ? 1.0 : 0.0;
-            if (rawP >= 0.5) buyPairs.Add((logit, y));
-            else             sellPairs.Add((logit, y));
+            double y     = log.ActualDirection == TradeDirection.Buy ? 1.0 : 0.0;
+            if (log.PredictedDirection == TradeDirection.Buy) buyPairs.Add((logit, y));
+            else                                              sellPairs.Add((logit, y));
         }
 
         // Local SGD fitter: standard Platt mini-batch SGD for a single (logit, label) dataset.

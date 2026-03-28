@@ -130,6 +130,7 @@ public sealed class MLOnlinePlattWorker : BackgroundService
             // Load the most recent resolved prediction logs, ordered newest first.
             var recentLogs = await readDb.Set<MLModelPredictionLog>()
                 .Where(p => p.MLModelId == model.Id
+                         && p.ActualDirection != null
                          && p.DirectionCorrect != null
                          && !p.IsDeleted)
                 .OrderByDescending(p => p.PredictedAt)
@@ -142,17 +143,18 @@ public sealed class MLOnlinePlattWorker : BackgroundService
             // Initialise A and B from the current snapshot values.
             double a = snap.PlattA, b = snap.PlattB;
             double originalA = a; // Save pre-update A for drift computation.
+            double decisionThreshold = MLFeatureHelper.ResolveEffectiveDecisionThreshold(snap);
 
             // Single-pass online SGD over the resolved prediction logs.
             // Processes logs in reverse-chronological order (most recent first).
             foreach (var log in recentLogs)
             {
-                double rawP  = (double)log.ConfidenceScore;
+                double rawP = MLFeatureHelper.ResolveLoggedRawBuyProbability(log, decisionThreshold);
                 // Compute logit, guarding against edge cases (rawP = 0 or 1 would be ±∞).
                 double logit = rawP > 0 && rawP < 1 ? Math.Log(rawP / (1 - rawP)) : 0;
                 // Apply current Platt parameters: calibP = σ(A × logit + B)
                 double p     = 1.0 / (1 + Math.Exp(-(a * logit + b)));
-                double y     = log.DirectionCorrect!.Value ? 1.0 : 0.0;
+                double y     = log.ActualDirection == LascodiaTradingEngine.Domain.Enums.TradeDirection.Buy ? 1.0 : 0.0;
                 // Gradient of cross-entropy loss: ∂L/∂A = err × logit, ∂L/∂B = err
                 double err   = p - y;
                 a -= Lr * err * logit; // update A: scale parameter

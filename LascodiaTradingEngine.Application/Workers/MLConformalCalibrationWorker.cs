@@ -105,14 +105,18 @@ public sealed class MLConformalCalibrationWorker : BackgroundService
                 var snap = JsonSerializer.Deserialize<ModelSnapshot>(model.ModelBytes);
                 // Require both Weights and Biases to be present — models without these cannot score.
                 if (snap?.Weights == null || snap.Biases == null) continue;
+                double decisionThreshold = MLFeatureHelper.ResolveEffectiveDecisionThreshold(snap);
 
                 // Use recent resolved prediction logs as the conformal calibration set.
                 // Up to 500 logs are loaded; at least 50 are required for a meaningful quantile.
                 var calLogs = await readDb.Set<MLModelPredictionLog>()
                     .Where(l => l.MLModelId == model.Id
                              && !l.IsDeleted
+                             && l.ActualDirection.HasValue
                              && l.DirectionCorrect.HasValue
-                             && l.ConfidenceScore > 0)
+                             && (l.ConfidenceScore > 0
+                                 || l.CalibratedProbability != null
+                                 || l.RawProbability != null))
                     .OrderByDescending(l => l.PredictedAt)
                     .Take(500)
                     .ToListAsync(ct);
@@ -128,7 +132,7 @@ public sealed class MLConformalCalibrationWorker : BackgroundService
                 var scores = new List<double>(calLogs.Count);
                 foreach (var log in calLogs)
                 {
-                    double pBuy  = (double)log.ConfidenceScore;
+                    double pBuy = MLFeatureHelper.ResolveLoggedCalibratedBuyProbability(log, decisionThreshold);
                     // pTrue is pBuy when the predicted direction matches actual, else 1 - pBuy.
                     double pTrue = log.PredictedDirection == log.ActualDirection
                         ? pBuy : 1.0 - pBuy;
@@ -153,7 +157,7 @@ public sealed class MLConformalCalibrationWorker : BackgroundService
                 // when the nonconformity score of the true label ≤ τ.
                 int covered = calLogs.Count(l =>
                 {
-                    double pBuy  = (double)l.ConfidenceScore;
+                    double pBuy = MLFeatureHelper.ResolveLoggedCalibratedBuyProbability(l, decisionThreshold);
                     double pSell = 1.0 - pBuy;
                     // Prediction set membership: include Buy if (1 − pBuy) ≤ τ, Sell if (1 − pSell) ≤ τ.
                     bool   inBuy  = (1 - pBuy)  <= threshold;
@@ -169,7 +173,7 @@ public sealed class MLConformalCalibrationWorker : BackgroundService
                 // (1 − p) ≤ τ AND p ≤ τ  ⟺  (1 − τ) ≤ p ≤ τ  ⟺  the probability is near 0.5.
                 int    ambiguousN   = calLogs.Count(l =>
                 {
-                    double p = (double)l.ConfidenceScore;
+                    double p = MLFeatureHelper.ResolveLoggedCalibratedBuyProbability(l, decisionThreshold);
                     return (1 - p) <= threshold && p <= threshold;
                 });
 

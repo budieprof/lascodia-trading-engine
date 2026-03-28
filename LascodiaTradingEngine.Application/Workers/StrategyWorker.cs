@@ -555,7 +555,7 @@ public class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceU
                         EntityId     = strategy.Id,
                         DecisionType = "SignalGeneration",
                         Outcome      = "Suppressed",
-                        Reason       = $"ML model {mlScore.MLModelId} suppressed scoring (cooldown/consensus failure)",
+                        Reason       = $"ML model {mlScore.MLModelId} suppressed scoring (cooldown/consensus/selective gate)",
                         Source       = "StrategyWorker"
                     }, ct);
 
@@ -611,6 +611,9 @@ public class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceU
                     MLPredictedMagnitude   = signal.MLPredictedMagnitude,
                     MLConfidenceScore      = signal.MLConfidenceScore,
                     MLModelId              = signal.MLModelId,
+                    MLRawProbability       = mlScore.RawProbability,
+                    MLCalibratedProbability = mlScore.CalibratedProbability,
+                    MLDecisionThresholdUsed = mlScore.DecisionThresholdUsed,
                     MLEnsembleDisagreement = mlScore.EnsembleDisagreement,
                     Timeframe              = strategy.Timeframe,
                     ExpiresAt              = signal.ExpiresAt

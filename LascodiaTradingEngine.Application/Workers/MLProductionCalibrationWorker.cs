@@ -195,15 +195,19 @@ public sealed class MLProductionCalibrationWorker : BackgroundService
 
         // Baseline ECE measured on the training hold-out set — stored in the snapshot.
         double trainingEce = snap.Ece;
+        double decisionThreshold = MLFeatureHelper.ResolveEffectiveDecisionThreshold(snap);
 
         // ── Load last N resolved prediction logs for this model ───────────────
         // Only logs where DirectionCorrect is known (i.e. the trade has settled)
-        // and ConfidenceScore > 0 are useful for calibration measurement.
+        // and at least one probability representation is available are useful for
+        // calibration measurement.
         var logs = await readCtx.Set<MLModelPredictionLog>()
             .AsNoTracking()
             .Where(l => l.MLModelId        == model.Id &&
                         l.DirectionCorrect != null     &&
-                        l.ConfidenceScore  > 0         &&
+                        (l.ConfidenceScore > 0 ||
+                         l.CalibratedProbability != null ||
+                         l.RawProbability != null) &&
                         !l.IsDeleted)
             .OrderByDescending(l => l.PredictedAt)
             .Take(windowSize)
@@ -238,12 +242,7 @@ public sealed class MLProductionCalibrationWorker : BackgroundService
         {
             if (log.DirectionCorrect is null) continue;
 
-            double conf   = Math.Clamp((double)log.ConfidenceScore, 0.0, 1.0);
-
-            // Map confidence + direction to a [0,1] probability for Buy outcome.
-            double calibP = log.PredictedDirection == TradeDirection.Buy
-                ? 0.5 + conf / 2.0   // Buy prediction: probability in [0.5, 1.0]
-                : 0.5 - conf / 2.0;  // Sell prediction: probability in [0.0, 0.5]
+            double calibP = MLFeatureHelper.ResolveLoggedCalibratedBuyProbability(log, decisionThreshold);
 
             // Assign to one of 10 equal-width bins based on the calibrated probability.
             int bin = Math.Clamp((int)(calibP * CalibrationBins), 0, CalibrationBins - 1);
