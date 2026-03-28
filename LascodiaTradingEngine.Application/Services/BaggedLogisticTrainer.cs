@@ -246,7 +246,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         // head weights; use those directly. Otherwise fall back to the standard OLS pass.
         var (magWeights, magBias) = mtMagWeights is { Length: > 0 }
             ? (mtMagWeights, mtMagBias)
-            : FitLinearRegressor(trainSet, featureCount, hp);
+            : FitLinearRegressor(trainSet, featureCount, hp, ct);
 
         // ── 5b. Fit stacking meta-learner on calibration set ─────────────────
         // Meta-learner maps [p_0,...,p_{K-1}] → final probability via logistic regression,
@@ -345,7 +345,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
             var (pw, pb, _, _, pMtMagW, pMtMagB, _, _) = prunedEnsemble;
             var (pmw, pmb)  = pMtMagW is { Length: > 0 }
                 ? (pMtMagW, pMtMagB)
-                : FitLinearRegressor(maskedTrain, featureCount, prunedHp);
+                : FitLinearRegressor(maskedTrain, featureCount, prunedHp, ct);
             var pMeta       = FitMetaLearner(maskedCal, pw, pb, featureCount, null);
             var (pA, pB)    = FitPlattScaling(maskedCal, pw, pb, featureCount, null, pMeta);
             var prunedMetrics = EvaluateEnsemble(maskedTest, pw, pb, pmw, pmb, pA, pB, featureCount, null, pMeta);
@@ -701,7 +701,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
             };
 
             var (w, b, subs, _, _, _, _, _) = FitEnsemble(foldTrain, cvHp, featureCount, null, null, ct, forceSequential: true);
-            var (mw, mb) = FitLinearRegressor(foldTrain, featureCount, cvHp);
+            var (mw, mb) = FitLinearRegressor(foldTrain, featureCount, cvHp, ct);
             var m        = EvaluateEnsemble(foldTest, w, b, mw, mb, 1.0, 0.0, featureCount, subs);
 
             // Compute per-feature mean |weight| for walk-forward stability scoring
@@ -1521,7 +1521,10 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
                 // Early stopping on validation loss (computed over subset features)
                 double valLoss = ComputeLogLossSubset(valSet, weights[k], bias, subset, hp.LabelSmoothing,
                     isPolyLearner ? featureCount : -1, PolyTopN);
-                if (valLoss < bestValLoss - 1e-6)
+                // Use relative improvement threshold (0.1% of current loss or 0.001, whichever is smaller)
+                // to avoid getting stuck when loss plateaus with sub-1e-6 fluctuations
+                double lossThreshold = Math.Min(Math.Abs(bestValLoss) * 0.001, 0.001);
+                if (valLoss < bestValLoss - lossThreshold)
                 {
                     bestValLoss = valLoss;
                     bestW       = [..weights[k]];
@@ -1530,8 +1533,11 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
                 }
                 else if (++patience >= hp.EarlyStoppingPatience)
                 {
-                    // Only break outside the SWA accumulation phase
-                    if (!useSwa || epoch < hp.SwaStartEpoch) break;
+                    // Always break on patience exhaustion — SWA will average the
+                    // accumulated weights regardless. The previous logic skipped
+                    // the break during the SWA phase, causing an infinite loop
+                    // when validation loss plateaued.
+                    break;
                 }
 
                 // ── Adaptive LR decay (rec 2) ──────────────────────────────────
@@ -1682,7 +1688,8 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
     private static (double[] Weights, double Bias) FitLinearRegressor(
         List<TrainingSample> train,
         int                  featureCount,
-        TrainingHyperparams  hp)
+        TrainingHyperparams  hp,
+        CancellationToken    ct = default)
     {
         var w    = new double[featureCount];
         double b = 0.0;
@@ -1716,6 +1723,8 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
 
         for (int epoch = 0; epoch < epochs; epoch++)
         {
+            ct.ThrowIfCancellationRequested();
+
             // Cosine-annealing LR — matches the direction learner schedule exactly
             double alpha = baseLr * 0.5 * (1.0 + Math.Cos(Math.PI * epoch / epochs));
 

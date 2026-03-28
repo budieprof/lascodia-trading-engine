@@ -1480,7 +1480,8 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
     private static (double[] Weights, double Bias) FitLinearRegressor(
         List<TrainingSample> train,
         int                  F,
-        TrainingHyperparams  hp)
+        TrainingHyperparams  hp,
+        CancellationToken    ct = default)
     {
         var    w = new double[F];
         double b = 0.0;

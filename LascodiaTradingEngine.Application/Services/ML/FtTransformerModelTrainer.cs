@@ -190,7 +190,7 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
         var model = FitTransformer(trainSet, effectiveHp, F, embedDim, numHeads, ffnDim, numLayers, warmStart, ct);
 
         // ── 5. Fit magnitude regressor ────────────────────────────────────────
-        var (magWeights, magBias) = FitLinearRegressor(trainSet, F, effectiveHp);
+        var (magWeights, magBias) = FitLinearRegressor(trainSet, F, effectiveHp, ct);
 
         // ── 6. Platt calibration (on calibration set) ─────────────────────────
         var calBuf = new InferenceBuffers(F, embedDim, numHeads, ffnDim);
@@ -265,7 +265,7 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
             var prunedWarmStart = BuildPrunedWarmStart(model, activeMask, activeF);
 
             var prunedModel = FitTransformer(maskedTrain, prunedHp, activeF, embedDim, numHeads, ffnDim, numLayers, prunedWarmStart, ct);
-            var (pmw, pmb) = FitLinearRegressor(maskedTrain, activeF, prunedHp);
+            var (pmw, pmb) = FitLinearRegressor(maskedTrain, activeF, prunedHp, ct);
             var prunedBuf = new InferenceBuffers(activeF, embedDim, numHeads, ffnDim);
             var (pA, pB) = FitPlattScaling(maskedCal, prunedModel, activeF, prunedBuf);
             var prunedMetrics = EvaluateModel(maskedTest, prunedModel, pmw, pmb, pA, pB, activeF, prunedBuf);
@@ -829,6 +829,8 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
 
         for (int epoch = 0; epoch < hp.MaxEpochs && !ct.IsCancellationRequested; epoch++)
             {
+                ct.ThrowIfCancellationRequested();
+
                 double alpha = hp.LearningRate * lrScale * 0.5 *
                     (1.0 + Math.Cos(Math.PI * epoch / hp.MaxEpochs));
 
@@ -2232,7 +2234,8 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
     // ── Magnitude regressor (mini-batch Adam) ────────────────────────────────
 
     private static (double[] Weights, double Bias) FitLinearRegressor(
-        List<TrainingSample> train, int featureCount, TrainingHyperparams hp)
+        List<TrainingSample> train, int featureCount, TrainingHyperparams hp,
+        CancellationToken ct = default)
     {
         var w    = new double[featureCount];
         double b = 0.0;
@@ -2267,6 +2270,8 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
 
         for (int epoch = 0; epoch < hp.MaxEpochs; epoch++)
         {
+            ct.ThrowIfCancellationRequested();
+
             double alpha = hp.LearningRate * 0.5 * (1.0 + Math.Cos(Math.PI * epoch / hp.MaxEpochs));
 
             // Fisher-Yates shuffle per epoch
