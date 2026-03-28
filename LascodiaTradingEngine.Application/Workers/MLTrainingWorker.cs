@@ -198,6 +198,19 @@ public sealed class MLTrainingWorker : BackgroundService
 
                 pollSecs = await GetConfigAsync<int>(ctx, CK_PollSecs, 30, stoppingToken);
 
+                // ── Concurrency guard — prevent deadlock from too many concurrent runs ──
+                int maxConcurrent = await GetConfigAsync<int>(ctx, "MLTraining:MaxConcurrentRuns", 10, stoppingToken);
+                int currentRunning = await ctx.Set<MLTrainingRun>()
+                    .CountAsync(r => r.Status == RunStatus.Running && !r.IsDeleted, stoppingToken);
+                if (currentRunning >= maxConcurrent)
+                {
+                    _logger.LogDebug(
+                        "Concurrency limit reached ({Running}/{Max}). Waiting for slots.",
+                        currentRunning, maxConcurrent);
+                    await Task.Delay(TimeSpan.FromSeconds(pollSecs), stoppingToken);
+                    continue;
+                }
+
                 // ── Claim one queued run atomically ──────────────────────────
                 var run = await ClaimNextRunAsync(ctx, stoppingToken);
                 if (run is null)
