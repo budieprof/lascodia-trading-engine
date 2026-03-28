@@ -8,6 +8,7 @@ using Lascodia.Trading.Engine.IntegrationEventLogEF.Services;
 using Lascodia.Trading.Engine.IntegrationEventLogEF;
 using LascodiaTradingEngine.Infrastructure.Services;
 using LascodiaTradingEngine.Infrastructure.HealthChecks;
+using LascodiaTradingEngine.Infrastructure.Persistence.Interceptors;
 
 namespace LascodiaTradingEngine.Infrastructure;
 
@@ -15,8 +16,14 @@ public static class DependencyInjection
 {
     public static IServiceCollection ConfigureDbContexts(this IServiceCollection services, IConfiguration configuration)
         {
-            services.AddDbContext<WriteApplicationDbContext>(options =>
-                options.SetPostgresDB<WriteApplicationDbContext>(configuration));
+            // Slow query interceptor: logs queries > 500ms as Warning, > 5000ms as Error
+            services.AddSingleton<SlowQueryInterceptor>();
+
+            services.AddDbContext<WriteApplicationDbContext>((sp, options) =>
+            {
+                options.SetPostgresDB<WriteApplicationDbContext>(configuration);
+                options.AddInterceptors(sp.GetRequiredService<SlowQueryInterceptor>());
+            });
 
             services.AddScoped<IWriteApplicationDbContext>(provider => provider.GetService<WriteApplicationDbContext>()!);
 
@@ -32,8 +39,11 @@ public static class DependencyInjection
             services.AddDbContext<EventLogDbContext>(options =>
                 options.SetPostgresDB<EventLogDbContext>(configuration));
 
-            services.AddDbContext<ReadApplicationDbContext>(options =>
-                options.SetPostgresDB<ReadApplicationDbContext>(configuration, "ReadDbConnection"));
+            services.AddDbContext<ReadApplicationDbContext>((sp, options) =>
+            {
+                options.SetPostgresDB<ReadApplicationDbContext>(configuration, "ReadDbConnection");
+                options.AddInterceptors(sp.GetRequiredService<SlowQueryInterceptor>());
+            });
 
             services.AddScoped<IReadApplicationDbContext>(provider => provider.GetService<ReadApplicationDbContext>()!);
 

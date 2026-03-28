@@ -12,6 +12,7 @@ using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
+using LascodiaTradingEngine.Application.Common.WorkerGroups;
 
 namespace LascodiaTradingEngine.Application.Workers;
 
@@ -224,7 +225,16 @@ public sealed class MLTrainingWorker : BackgroundService
                     "Claimed run Id={RunId} Symbol={Symbol} Timeframe={Tf} Trigger={Trigger}",
                     run.Id, run.Symbol, run.Timeframe, run.TriggerType);
 
-                await ProcessRunAsync(run, db, ctx, scope.ServiceProvider, stoppingToken);
+                // Bulkhead: limit concurrent CPU-bound training to prevent thread pool starvation
+                await WorkerBulkhead.MLTraining.WaitAsync(stoppingToken);
+                try
+                {
+                    await ProcessRunAsync(run, db, ctx, scope.ServiceProvider, stoppingToken);
+                }
+                finally
+                {
+                    WorkerBulkhead.MLTraining.Release();
+                }
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
