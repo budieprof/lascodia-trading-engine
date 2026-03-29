@@ -40,7 +40,7 @@ namespace LascodiaTradingEngine.Application.Workers;
 /// <list type="bullet">
 ///   <item><c>Backtest:SchedulePollSeconds</c>  — how often to check for stale strategies (default 3600 = 1 hour)</item>
 ///   <item><c>Backtest:CooldownDays</c>         — min days between backtests per strategy (default 7)</item>
-///   <item><c>Backtest:WindowDays</c>            — historical data window for each backtest (default 180)</item>
+///   <item><c>Backtest:WindowDays</c>            — historical data window for each backtest (default 365)</item>
 ///   <item><c>Backtest:InitialBalance</c>        — starting equity for simulation (default 10000)</item>
 ///   <item><c>Backtest:MaxQueuedPerCycle</c>     — max runs to queue per scheduling cycle (default 5)</item>
 ///   <item><c>Backtest:MinCandlesRequired</c>    — skip strategy if fewer candles available (default 100)</item>
@@ -151,7 +151,7 @@ public class BacktestWorker : BackgroundService
         CancellationToken ct)
     {
         int cooldownDays      = await GetConfigAsync<int>(readCtx, CK_CooldownDays, 7, ct);
-        int windowDays        = await GetConfigAsync<int>(readCtx, CK_WindowDays, 180, ct);
+        int windowDays        = await GetConfigAsync<int>(readCtx, CK_WindowDays, 365, ct);
         int maxQueuedPerCycle = await GetConfigAsync<int>(readCtx, CK_MaxQueuedPerCycle, 5, ct);
         int minCandles        = await GetConfigAsync<int>(readCtx, CK_MinCandles, 100, ct);
         decimal initialBalance = await GetConfigAsync<decimal>(readCtx, CK_InitialBalance, 10_000m, ct);

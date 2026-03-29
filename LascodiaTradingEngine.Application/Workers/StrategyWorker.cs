@@ -798,11 +798,15 @@ public class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceU
     /// Configurable via <see cref="Domain.Entities.EngineConfig"/>:
     /// <list type="bullet">
     ///   <item><c>Backtest:Gate:Enabled</c>        — master switch (default true)</item>
-    ///   <item><c>Backtest:Gate:MinWinRate</c>      — minimum win rate (default 0.60 = 60%)</item>
-    ///   <item><c>Backtest:Gate:MinProfitFactor</c> — minimum profit factor; must be &gt; 1.0 to be profitable (default 1.0)</item>
-    ///   <item><c>Backtest:Gate:MinTotalTrades</c>  — minimum trade count to be statistically meaningful (default 10)</item>
-    ///   <item><c>Backtest:Gate:MaxDrawdownPct</c>  — maximum drawdown allowed (default 0.25 = 25%)</item>
-    ///   <item><c>Backtest:Gate:MinSharpe</c>       — minimum Sharpe ratio (default 0.0 = must be non-negative)</item>
+    ///   <item><c>Backtest:Gate:MinWinRate</c>            — minimum win rate (default 0.60 = 60%)</item>
+    ///   <item><c>Backtest:Gate:MinProfitFactor</c>       — minimum profit factor; must be &gt; 1.0 (default 1.0)</item>
+    ///   <item><c>Backtest:Gate:MinTotalTrades</c>        — fallback min trades (default 5)</item>
+    ///   <item><c>Backtest:Gate:MinTotalTrades:M5M15</c>  — min trades for M1/M5/M15 (default 10)</item>
+    ///   <item><c>Backtest:Gate:MinTotalTrades:H1</c>     — min trades for H1 (default 5)</item>
+    ///   <item><c>Backtest:Gate:MinTotalTrades:H4</c>     — min trades for H4 (default 5)</item>
+    ///   <item><c>Backtest:Gate:MinTotalTrades:D1</c>     — min trades for D1 (default 3)</item>
+    ///   <item><c>Backtest:Gate:MaxDrawdownPct</c>        — maximum drawdown allowed (default 0.25 = 25%)</item>
+    ///   <item><c>Backtest:Gate:MinSharpe</c>             — minimum Sharpe ratio (default 0.0)</item>
     /// </list>
     /// </para>
     /// </summary>
@@ -823,9 +827,24 @@ public class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceU
         // Only profitable, winning strategies should qualify.
         double minWinRate      = await GetConfigAsync<double>(ctx, "Backtest:Gate:MinWinRate",      0.60, ct);
         double minProfitFactor = await GetConfigAsync<double>(ctx, "Backtest:Gate:MinProfitFactor", 1.0,  ct);
-        int    minTotalTrades  = await GetConfigAsync<int>   (ctx, "Backtest:Gate:MinTotalTrades",  10,   ct);
         double maxDrawdownPct  = await GetConfigAsync<double>(ctx, "Backtest:Gate:MaxDrawdownPct",  0.25, ct);
         double minSharpe       = await GetConfigAsync<double>(ctx, "Backtest:Gate:MinSharpe",       0.0,  ct);
+
+        // Timeframe-adaptive MinTotalTrades: higher timeframes produce fewer signals,
+        // so they need a lower trade threshold to avoid permanently blocking profitable
+        // H4/D1 strategies that only generate 5-8 trades in a 365-day backtest window.
+        int minTradesDefault = await GetConfigAsync<int>(ctx, "Backtest:Gate:MinTotalTrades", 5, ct);
+        int minTradesM5M15   = await GetConfigAsync<int>(ctx, "Backtest:Gate:MinTotalTrades:M5M15", 10, ct);
+        int minTradesH1      = await GetConfigAsync<int>(ctx, "Backtest:Gate:MinTotalTrades:H1",    5,  ct);
+        int minTradesH4      = await GetConfigAsync<int>(ctx, "Backtest:Gate:MinTotalTrades:H4",    5,  ct);
+        int minTradesD1      = await GetConfigAsync<int>(ctx, "Backtest:Gate:MinTotalTrades:D1",    3,  ct);
+
+        // Build a lookup of strategy timeframes for adaptive trade thresholds
+        var strategyTimeframes = await ctx.Set<Domain.Entities.Strategy>()
+            .Where(s => strategyIds.Contains(s.Id) && !s.IsDeleted)
+            .Select(s => new { s.Id, s.Timeframe })
+            .ToListAsync(ct);
+        var timeframeMap = strategyTimeframes.ToDictionary(s => s.Id, s => s.Timeframe);
 
         // Load the most recent completed backtest per strategy (only for strategies in scope)
         var recentBacktests = await ctx.Set<Domain.Entities.BacktestRun>()
@@ -853,6 +872,20 @@ public class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceU
                 var result = System.Text.Json.JsonSerializer.Deserialize<BacktestResult>(bt.ResultJson);
                 if (result is null) continue;
 
+                // Resolve timeframe-adaptive MinTotalTrades
+                int minTotalTrades = minTradesDefault;
+                if (timeframeMap.TryGetValue(bt.StrategyId, out var tf))
+                {
+                    minTotalTrades = tf switch
+                    {
+                        Timeframe.M1 or Timeframe.M5 or Timeframe.M15 => minTradesM5M15,
+                        Timeframe.H1  => minTradesH1,
+                        Timeframe.H4  => minTradesH4,
+                        Timeframe.D1  => minTradesD1,
+                        _             => minTradesDefault,
+                    };
+                }
+
                 bool meetsMinTrades  = result.TotalTrades >= minTotalTrades;
                 bool meetsWinRate    = (double)result.WinRate >= minWinRate;
                 bool meetsPF         = (double)result.ProfitFactor >= minProfitFactor;
@@ -866,10 +899,10 @@ public class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceU
                 else
                 {
                     _logger.LogDebug(
-                        "Strategy {Id}: backtest did not meet qualification — " +
+                        "Strategy {Id} ({Tf}): backtest did not meet qualification — " +
                         "trades={Trades}/{MinTrades} winRate={WR:P1}/{MinWR:P1} " +
                         "pf={PF:F2}/{MinPF:F2} dd={DD:P1}/{MaxDD:P1} sharpe={S:F2}/{MinS:F2}",
-                        bt.StrategyId,
+                        bt.StrategyId, tf,
                         result.TotalTrades, minTotalTrades,
                         (double)result.WinRate, minWinRate,
                         (double)result.ProfitFactor, minProfitFactor,
