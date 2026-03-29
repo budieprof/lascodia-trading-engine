@@ -798,7 +798,7 @@ public class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceU
     /// Configurable via <see cref="Domain.Entities.EngineConfig"/>:
     /// <list type="bullet">
     ///   <item><c>Backtest:Gate:Enabled</c>        — master switch (default true)</item>
-    ///   <item><c>Backtest:Gate:MinWinRate</c>      — minimum win rate (default 0.40 = 40%)</item>
+    ///   <item><c>Backtest:Gate:MinWinRate</c>      — minimum win rate (default 0.60 = 60%)</item>
     ///   <item><c>Backtest:Gate:MinProfitFactor</c> — minimum profit factor; must be &gt; 1.0 to be profitable (default 1.0)</item>
     ///   <item><c>Backtest:Gate:MinTotalTrades</c>  — minimum trade count to be statistically meaningful (default 10)</item>
     ///   <item><c>Backtest:Gate:MaxDrawdownPct</c>  — maximum drawdown allowed (default 0.25 = 25%)</item>
@@ -820,8 +820,8 @@ public class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceU
         }
 
         // Load qualification thresholds from EngineConfig (hot-reloadable)
-        // Only profitable strategies should qualify — ProfitFactor > 1.0 means net positive.
-        double minWinRate      = await GetConfigAsync<double>(ctx, "Backtest:Gate:MinWinRate",      0.40, ct);
+        // Only profitable, winning strategies should qualify.
+        double minWinRate      = await GetConfigAsync<double>(ctx, "Backtest:Gate:MinWinRate",      0.60, ct);
         double minProfitFactor = await GetConfigAsync<double>(ctx, "Backtest:Gate:MinProfitFactor", 1.0,  ct);
         int    minTotalTrades  = await GetConfigAsync<int>   (ctx, "Backtest:Gate:MinTotalTrades",  10,   ct);
         double maxDrawdownPct  = await GetConfigAsync<double>(ctx, "Backtest:Gate:MaxDrawdownPct",  0.25, ct);
