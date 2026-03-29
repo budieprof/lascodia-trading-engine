@@ -14,6 +14,7 @@ using LascodiaTradingEngine.Application.Common.Events;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Options;
 using LascodiaTradingEngine.Application.Common.Utilities;
+using LascodiaTradingEngine.Application.Backtesting.Models;
 using LascodiaTradingEngine.Application.TradeSignals.Commands.CreateTradeSignal;
 using LascodiaTradingEngine.Application.TradeSignals.Commands.ExpireTradeSignal;
 using MarketRegimeEnum = LascodiaTradingEngine.Domain.Enums.MarketRegime;
@@ -250,10 +251,17 @@ public class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceU
             }
         }
 
+        // ── Backtest qualification gate ────────────────────────────────────
+        // Strategies must have at least one successful backtest that meets minimum
+        // quality thresholds before they can generate live signals. This prevents
+        // untested or poorly-performing strategies from producing real trades.
+        var backtestQualifiedIds = await GetBacktestQualifiedStrategyIdsAsync(
+            context.GetDbContext(), strategyIds, _stoppingToken);
+
         // ── Parallel strategy evaluation ─────────────────────────────────────
         // Each strategy gets its own DI scope so scoped services (DbContext, ML scorer,
-        // filters) have independent lifetimes. The pre-fetched regimeCache and
-        // criticalStrategyIds are read-only and safe to share across iterations.
+        // filters) have independent lifetimes. The pre-fetched regimeCache,
+        // criticalStrategyIds, and backtestQualifiedIds are read-only and safe to share.
         var parallelOptions = new ParallelOptions
         {
             MaxDegreeOfParallelism = Math.Max(1, _options.MaxParallelStrategies),
@@ -272,6 +280,18 @@ public class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceU
                         "Strategy {Id} ({Symbol}): health status is Critical — skipping evaluation",
                         strategy.Id, strategy.Symbol);
                     _metrics.TicksSkippedHealthCritical.Add(1, new("symbol", strategy.Symbol), new("strategy_id", strategy.Id));
+                    return;
+                }
+
+                // ── Backtest qualification gate ───────────────────────────────
+                // A strategy must have at least one completed backtest that meets
+                // minimum quality thresholds (WinRate, ProfitFactor, Sharpe) before
+                // it can generate live signals. Untested strategies are skipped.
+                if (!backtestQualifiedIds.Contains(strategy.Id))
+                {
+                    _logger.LogDebug(
+                        "Strategy {Id} ({Symbol}/{Tf}): no qualifying backtest — skipping signal generation",
+                        strategy.Id, strategy.Symbol, strategy.Timeframe);
                     return;
                 }
 
@@ -763,6 +783,124 @@ public class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceU
                 _expirySweepLock.Release();
             }
         }, CancellationToken.None);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    //  Backtest qualification gate
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Returns the set of strategy IDs that have at least one completed backtest meeting
+    /// minimum quality thresholds. Strategies not in this set are blocked from generating
+    /// live signals.
+    ///
+    /// <para>
+    /// Configurable via <see cref="Domain.Entities.EngineConfig"/>:
+    /// <list type="bullet">
+    ///   <item><c>Backtest:Gate:Enabled</c>        — master switch (default true)</item>
+    ///   <item><c>Backtest:Gate:MinWinRate</c>      — minimum win rate, e.g. 0.35 = 35% (default 0.35)</item>
+    ///   <item><c>Backtest:Gate:MinProfitFactor</c> — minimum profit factor (default 0.80)</item>
+    ///   <item><c>Backtest:Gate:MinTotalTrades</c>  — minimum trade count to be statistically meaningful (default 10)</item>
+    ///   <item><c>Backtest:Gate:MaxDrawdownPct</c>  — maximum drawdown allowed (default 0.30 = 30%)</item>
+    ///   <item><c>Backtest:Gate:MinSharpe</c>       — minimum Sharpe ratio (default -1.0, effectively disabled)</item>
+    /// </list>
+    /// </para>
+    /// </summary>
+    private async Task<HashSet<long>> GetBacktestQualifiedStrategyIdsAsync(
+        Microsoft.EntityFrameworkCore.DbContext ctx,
+        List<long> strategyIds,
+        CancellationToken ct)
+    {
+        // Check if the gate is enabled
+        bool gateEnabled = await GetConfigAsync<bool>(ctx, "Backtest:Gate:Enabled", true, ct);
+        if (!gateEnabled)
+        {
+            // Gate disabled — all strategies are qualified
+            return new HashSet<long>(strategyIds);
+        }
+
+        // Load qualification thresholds from EngineConfig (hot-reloadable)
+        double minWinRate      = await GetConfigAsync<double>(ctx, "Backtest:Gate:MinWinRate",      0.35, ct);
+        double minProfitFactor = await GetConfigAsync<double>(ctx, "Backtest:Gate:MinProfitFactor", 0.80, ct);
+        int    minTotalTrades  = await GetConfigAsync<int>   (ctx, "Backtest:Gate:MinTotalTrades",  10,   ct);
+        double maxDrawdownPct  = await GetConfigAsync<double>(ctx, "Backtest:Gate:MaxDrawdownPct",  0.30, ct);
+        double minSharpe       = await GetConfigAsync<double>(ctx, "Backtest:Gate:MinSharpe",       -1.0, ct);
+
+        // Load the most recent completed backtest per strategy (only for strategies in scope)
+        var recentBacktests = await ctx.Set<Domain.Entities.BacktestRun>()
+            .Where(r => strategyIds.Contains(r.StrategyId)
+                        && r.Status == RunStatus.Completed
+                        && !r.IsDeleted
+                        && r.ResultJson != null)
+            .GroupBy(r => r.StrategyId)
+            .Select(g => new
+            {
+                StrategyId = g.Key,
+                ResultJson = g.OrderByDescending(r => r.CompletedAt).First().ResultJson
+            })
+            .ToListAsync(ct);
+
+        var qualifiedIds = new HashSet<long>();
+
+        foreach (var bt in recentBacktests)
+        {
+            if (string.IsNullOrWhiteSpace(bt.ResultJson))
+                continue;
+
+            try
+            {
+                var result = System.Text.Json.JsonSerializer.Deserialize<BacktestResult>(bt.ResultJson);
+                if (result is null) continue;
+
+                bool meetsMinTrades  = result.TotalTrades >= minTotalTrades;
+                bool meetsWinRate    = (double)result.WinRate >= minWinRate;
+                bool meetsPF         = (double)result.ProfitFactor >= minProfitFactor;
+                bool meetsDrawdown   = (double)result.MaxDrawdownPct <= maxDrawdownPct;
+                bool meetsSharpe     = (double)result.SharpeRatio >= minSharpe;
+
+                if (meetsMinTrades && meetsWinRate && meetsPF && meetsDrawdown && meetsSharpe)
+                {
+                    qualifiedIds.Add(bt.StrategyId);
+                }
+                else
+                {
+                    _logger.LogDebug(
+                        "Strategy {Id}: backtest did not meet qualification — " +
+                        "trades={Trades}/{MinTrades} winRate={WR:P1}/{MinWR:P1} " +
+                        "pf={PF:F2}/{MinPF:F2} dd={DD:P1}/{MaxDD:P1} sharpe={S:F2}/{MinS:F2}",
+                        bt.StrategyId,
+                        result.TotalTrades, minTotalTrades,
+                        (double)result.WinRate, minWinRate,
+                        (double)result.ProfitFactor, minProfitFactor,
+                        (double)result.MaxDrawdownPct, maxDrawdownPct,
+                        (double)result.SharpeRatio, minSharpe);
+                }
+            }
+            catch (System.Text.Json.JsonException ex)
+            {
+                _logger.LogWarning(ex,
+                    "Strategy {Id}: failed to deserialise backtest ResultJson — treating as unqualified",
+                    bt.StrategyId);
+            }
+        }
+
+        return qualifiedIds;
+    }
+
+    private static async Task<T> GetConfigAsync<T>(
+        Microsoft.EntityFrameworkCore.DbContext ctx,
+        string key,
+        T defaultValue,
+        CancellationToken ct)
+    {
+        var entry = await ctx.Set<Domain.Entities.EngineConfig>()
+            .AsNoTracking()
+            .FirstOrDefaultAsync(c => c.Key == key, ct);
+
+        if (entry?.Value is null) return defaultValue;
+
+        try   { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
+        catch { return defaultValue; }
     }
 
     public override void Dispose()
