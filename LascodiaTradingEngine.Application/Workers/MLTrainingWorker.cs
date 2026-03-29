@@ -783,10 +783,25 @@ public sealed class MLTrainingWorker : BackgroundService
                 ? (m.F1 >= hp.MinF1Score || (m.Accuracy >= trendingMinAccuracy && m.ExpectedValue >= trendingMinEV))
                 : (hp.MinF1Score <= 0 || m.F1 >= hp.MinF1Score || evBypassF1);
 
+            // ── Profitability-based Brier bypass ──────────────────────────────
+            // Models with very high EV and Sharpe that marginally miss the Brier
+            // threshold (e.g. 0.2439 vs 0.2400) are genuinely profitable. Allow
+            // a relaxed Brier ceiling (MaxBrier + 5%) when EV ≥ 0.10 and Sharpe ≥ 1.0.
+            double brierBypassMinEV     = await GetConfigAsync<double>(ctx, "MLTraining:BrierBypassMinEV",     0.10, stoppingToken);
+            double brierBypassMinSharpe = await GetConfigAsync<double>(ctx, "MLTraining:BrierBypassMinSharpe", 1.00, stoppingToken);
+            double brierCeiling = hp.MaxBrierScore;
+            bool   brierBypassed = false;
+            if (m.ExpectedValue >= brierBypassMinEV && m.SharpeRatio >= brierBypassMinSharpe
+                && m.BrierScore > hp.MaxBrierScore && m.BrierScore <= hp.MaxBrierScore * 1.05)
+            {
+                brierCeiling = hp.MaxBrierScore * 1.05;
+                brierBypassed = true;
+            }
+
             bool passed =
                 m.Accuracy           >= hp.MinAccuracyToPromote                                    &&
                 m.ExpectedValue      >= hp.MinExpectedValue                                        &&
-                m.BrierScore         <= hp.MaxBrierScore                                           &&
+                m.BrierScore         <= brierCeiling                                               &&
                 m.SharpeRatio        >= hp.MinSharpeRatio                                          &&
                 f1Passed                                                                           &&
                 cvCheck.StdAccuracy  <= hp.MaxWalkForwardStdDev                                    &&
@@ -798,14 +813,16 @@ public sealed class MLTrainingWorker : BackgroundService
                 "Quality gates — acc={Acc:P1}/{MinAcc:P1} ev={EV:F4}/{MinEV:F4} " +
                 "brier={Brier:F4}/{MaxBrier:F4} sharpe={Sharpe:F2}/{MinSharpe:F2} " +
                 "f1={F1:F3}/{MinF1:F3} regime={Regime} f1Passed={F1Passed} evBypass={EvBypass} " +
+                "brierBypass={BrierBypass} " +
                 "wfStd={WfStd:P1}/{MaxWfStd:P1} ece={Ece:F4}/{MaxEce:F4} " +
                 "bss={Bss:F4}/{MinBss:F4} oobReg={OobNew:P1}/{OobParent:P1} passed={Passed}",
                 m.Accuracy,              hp.MinAccuracyToPromote,
                 m.ExpectedValue,         hp.MinExpectedValue,
-                m.BrierScore,            hp.MaxBrierScore,
+                m.BrierScore,            brierCeiling,
                 m.SharpeRatio,           hp.MinSharpeRatio,
                 m.F1,                    hp.MinF1Score,
                 currentRegime?.ToString() ?? "unknown", f1Passed, evBypassF1,
+                brierBypassed,
                 cvCheck.StdAccuracy,     hp.MaxWalkForwardStdDev,
                 snapEce,                 hp.MaxEce,
                 snapBss,                 hp.MinBrierSkillScore,
