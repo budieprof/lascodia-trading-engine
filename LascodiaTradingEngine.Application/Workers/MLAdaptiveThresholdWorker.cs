@@ -285,8 +285,9 @@ public sealed class MLAdaptiveThresholdWorker : BackgroundService
 
         if (snap is null) return;
 
-        // Fallback to 0.5 if the current threshold was never set (first adaptation run).
-        double currentThreshold = snap.AdaptiveThreshold > 0.0 ? snap.AdaptiveThreshold : 0.5;
+        // Start from the same deployed threshold precedence as live scoring so the first
+        // adaptive update blends from the true in-production baseline, not an arbitrary 0.5.
+        double currentThreshold = MLFeatureHelper.ResolveEffectiveDecisionThreshold(snap);
 
         // EMA blend: smoothly move the threshold toward the optimal value.
         // Alpha = 0.2 means 20 % weight on the new optimal and 80 % on the existing value.

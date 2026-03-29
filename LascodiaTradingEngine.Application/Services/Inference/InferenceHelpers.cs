@@ -78,4 +78,36 @@ internal static class InferenceHelpers
 
         return calibP;
     }
+
+    /// <summary>
+    /// Applies the same deployed probability calibration stack as the live scorer:
+    /// temperature/global Platt, class-conditional Platt, isotonic, then model-age decay.
+    /// </summary>
+    internal static double ApplyDeployedCalibration(double rawProb, ModelSnapshot snap)
+    {
+        double rawLogit = MLFeatureHelper.Logit(rawProb);
+        double globalCalibP = snap.TemperatureScale > 0.0 && snap.TemperatureScale < 10.0
+            ? MLFeatureHelper.Sigmoid(rawLogit / snap.TemperatureScale)
+            : MLFeatureHelper.Sigmoid(snap.PlattA * rawLogit + snap.PlattB);
+
+        double calibP;
+        if (globalCalibP >= 0.5 && snap.PlattABuy != 0.0)
+            calibP = MLFeatureHelper.Sigmoid(snap.PlattABuy * rawLogit + snap.PlattBBuy);
+        else if (globalCalibP < 0.5 && snap.PlattASell != 0.0)
+            calibP = MLFeatureHelper.Sigmoid(snap.PlattASell * rawLogit + snap.PlattBSell);
+        else
+            calibP = globalCalibP;
+
+        if (snap.IsotonicBreakpoints.Length >= 4)
+            calibP = BaggedLogisticTrainer.ApplyIsotonicCalibration(calibP, snap.IsotonicBreakpoints);
+
+        if (snap.AgeDecayLambda > 0.0 && snap.TrainedAtUtc != default)
+        {
+            double daysSinceTrain = (DateTime.UtcNow - snap.TrainedAtUtc).TotalDays;
+            double decayFactor    = Math.Exp(-snap.AgeDecayLambda * Math.Max(0.0, daysSinceTrain));
+            calibP = 0.5 + (calibP - 0.5) * decayFactor;
+        }
+
+        return calibP;
+    }
 }

@@ -2,6 +2,7 @@ using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Domain.Entities;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -25,10 +26,10 @@ namespace LascodiaTradingEngine.Application.Workers;
 /// The optimal temperature is found by minimising the negative log-likelihood (NLL) on recent
 /// resolved prediction logs using a 20-iteration binary search over T ∈ [0.1, 10.0].
 ///
-/// The worker <b>does not modify ModelBytes</b>; instead it upserts a
-/// <see cref="MLTemperatureScalingLog"/> record so the optimal T value can be read by the
-/// scoring pipeline or inspected offline. The ML ops team can then decide whether to bake T
-/// into the snapshot parameters during the next scheduled retrain.
+/// The worker persists the optimal temperature back into the serialised
+/// <see cref="ModelSnapshot"/> stored in <see cref="MLModel.ModelBytes"/> so live inference
+/// uses the recalibrated temperature immediately. It also upserts a
+/// <see cref="MLTemperatureScalingLog"/> record for diagnostics.
 ///
 /// Runs every 3 days. Requires at least 20 resolved prediction logs per model.
 /// Meta-learner and MAML-initializer models are excluded.
@@ -36,7 +37,9 @@ namespace LascodiaTradingEngine.Application.Workers;
 public sealed class MLTemperatureScalingWorker : BackgroundService
 {
     private readonly IServiceScopeFactory _scopeFactory;
+    private readonly IMemoryCache _cache;
     private readonly ILogger<MLTemperatureScalingWorker> _logger;
+    private const string SnapshotCacheKeyPrefix = "MLSnapshot:";
 
     // Maximum number of recent resolved prediction logs to use per model.
     private const int    MaxSamples   = 200;
@@ -52,9 +55,17 @@ public sealed class MLTemperatureScalingWorker : BackgroundService
     /// Initialises the worker with its required dependencies.
     /// </summary>
     /// <param name="scopeFactory">Creates scoped DI scopes per run cycle.</param>
+    /// <param name="cache">Shared snapshot cache used by the live scorer.</param>
     /// <param name="logger">Structured logger for temperature scaling results.</param>
-    public MLTemperatureScalingWorker(IServiceScopeFactory scopeFactory, ILogger<MLTemperatureScalingWorker> logger)
-    { _scopeFactory = scopeFactory; _logger = logger; }
+    public MLTemperatureScalingWorker(
+        IServiceScopeFactory scopeFactory,
+        IMemoryCache cache,
+        ILogger<MLTemperatureScalingWorker> logger)
+    {
+        _scopeFactory = scopeFactory;
+        _cache = cache;
+        _logger = logger;
+    }
 
     /// <summary>
     /// Main hosted-service loop. Runs every 3 days, delegating to <see cref="RunAsync"/>.
@@ -89,7 +100,8 @@ public sealed class MLTemperatureScalingWorker : BackgroundService
     ///         </list>
     ///   </item>
     ///   <item>Computes post-calibration NLL and ECE using T*: calibP = σ(logit / T*).</item>
-    ///   <item>Upserts a <see cref="MLTemperatureScalingLog"/> record with all diagnostics.</item>
+    ///   <item>Writes the optimal temperature back into <c>ModelBytes</c> and upserts a
+    ///         <see cref="MLTemperatureScalingLog"/> record with diagnostics.</item>
     /// </list>
     /// </summary>
     /// <param name="ct">Cooperative cancellation token.</param>
@@ -172,6 +184,15 @@ public sealed class MLTemperatureScalingWorker : BackgroundService
             double postNll   = ComputeNll(logits, labels, optT);
             double[] calConf = logits.Select(lg => Sigmoid(lg / optT)).ToArray();
             double postEce   = ComputeEce(calConf, labels);
+
+            var writeModel = await writeDb.Set<MLModel>()
+                .FirstOrDefaultAsync(x => x.Id == model.Id && !x.IsDeleted, ct);
+            if (writeModel != null)
+            {
+                snap.TemperatureScale = optT;
+                writeModel.ModelBytes = JsonSerializer.SerializeToUtf8Bytes(snap);
+                _cache.Remove($"{SnapshotCacheKeyPrefix}{model.Id}");
+            }
 
             // Upsert the temperature scaling log: one record per model, updated in place.
             var existing = await writeDb.Set<MLTemperatureScalingLog>()

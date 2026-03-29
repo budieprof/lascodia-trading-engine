@@ -209,6 +209,27 @@ public sealed class MLSignalScorer : IMLSignalScorer
              magnitude, magnitudeUncertaintyPips, magnitudeP10Pips, magnitudeP90Pips,
              mcDropoutMean, mcDropoutVariance, contributionsJson, shapValuesJson) = inferenceResult.Value;
 
+        if (Stopwatch.GetElapsedTime(scoringStart) < ScoringBudget)
+        {
+            double? stackedProb = await TryBlendWithStackingMetaAsync(
+                model, calibP, rawFeatures, featureCount, window, cotEntry,
+                currentRegime, signalTimeframe, db, cancellationToken);
+            if (stackedProb.HasValue)
+            {
+                rawProb = stackedProb.Value;
+                calibP  = stackedProb.Value;
+                direction = calibP >= threshold ? TradeDirection.Buy : TradeDirection.Sell;
+                double rawConviction = Math.Abs(calibP - threshold) * 2.0;
+                double disagreementFactor = Math.Clamp(1.0 - 2.0 * ensembleStd, 0.0, 1.0);
+                confidence = Math.Clamp(rawConviction * disagreementFactor, 0.0, 1.0);
+            }
+        }
+        else
+        {
+            _logger.LogDebug("Scoring budget exceeded — skipping stacking meta blend for {Symbol}/{Tf}",
+                signal.Symbol, signalTimeframe);
+        }
+
         // ── 12b–f. Confidence dampenings (regime, transition, cold-start, cross-TF) ─
         confidence = await _configService.ApplyAllDampeningsAsync(
             confidence, model.Id, currentRegime,
@@ -227,7 +248,7 @@ public sealed class MLSignalScorer : IMLSignalScorer
             {
                 bool passed = await RunConsensusFilter(
                     consensusMin, model.Id, signal.Symbol, signalTimeframe, direction,
-                    rawFeatures, featureCount, window, db, cancellationToken);
+                    rawFeatures, featureCount, window, cotEntry, currentRegime, db, cancellationToken);
                 if (!passed)
                     return new MLScoreResult(null, null, null, null);
             }
@@ -460,6 +481,24 @@ public sealed class MLSignalScorer : IMLSignalScorer
         return features;
     }
 
+    private static (float[] Means, float[] Stds) ResolveStandardisationStats(
+        ModelSnapshot snap, string? currentRegime, int featureCount)
+    {
+        float[] means = snap.Means;
+        float[] stds = snap.Stds;
+        if (currentRegime is not null &&
+            snap.RegimeMeans.TryGetValue(currentRegime, out var regimeMeans) &&
+            snap.RegimeStds.TryGetValue(currentRegime, out var regimeStds) &&
+            regimeMeans.Length == featureCount &&
+            regimeStds.Length == featureCount)
+        {
+            means = regimeMeans;
+            stds = regimeStds;
+        }
+
+        return (means, stds);
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // Helper: apply feature mask (zero pruned features)
     // ═══════════════════════════════════════════════════════════════════════════
@@ -563,6 +602,7 @@ public sealed class MLSignalScorer : IMLSignalScorer
         int consensusMin, long primaryModelId,
         string symbol, Timeframe timeframe, TradeDirection direction,
         float[] rawFeatures, int featureCount, List<Candle> candleWindow,
+        CotFeatureEntry cotEntry, string? currentRegime,
         Microsoft.EntityFrameworkCore.DbContext db, CancellationToken cancellationToken)
     {
         int agreedCount = 1; // primary model always counts
@@ -615,7 +655,8 @@ public sealed class MLSignalScorer : IMLSignalScorer
         var linkedToken = quorumCts.Token;
 
         var scoreTasks = altEntries.Select(entry => ScoreAlternateModelAsync(
-            entry.Id, entry.Snap, rawFeatures, featureCount, candleWindow, linkedToken)).ToList();
+            entry.Id, entry.Snap, rawFeatures, featureCount, candleWindow,
+            cotEntry, symbol, timeframe, currentRegime, linkedToken)).ToList();
 
         // Process results as they complete — cancel remaining tasks once quorum is met.
         foreach (var completedTask in scoreTasks)
@@ -659,6 +700,157 @@ public sealed class MLSignalScorer : IMLSignalScorer
         return true;
     }
 
+    private async Task<double?> TryBlendWithStackingMetaAsync(
+        MLModel primaryModel,
+        double primaryCalibratedProbability,
+        float[] rawFeatures,
+        int featureCount,
+        List<Candle> candleWindow,
+        CotFeatureEntry cotEntry,
+        string? currentRegime,
+        Timeframe timeframe,
+        Microsoft.EntityFrameworkCore.DbContext db,
+        CancellationToken cancellationToken)
+    {
+        MLStackingMetaModel? stacker;
+        try
+        {
+            using var stackerCts = CreateLinkedTimeout(cancellationToken);
+            stacker = await db.Set<MLStackingMetaModel>()
+                .AsNoTracking()
+                .Where(x => x.Symbol == primaryModel.Symbol &&
+                            x.Timeframe == timeframe &&
+                            x.IsActive &&
+                            !x.IsDeleted)
+                .OrderByDescending(x => x.TrainedAt)
+                .FirstOrDefaultAsync(stackerCts.Token);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            _logger.LogDebug("Stacking meta lookup timed out for {Symbol}/{Tf}", primaryModel.Symbol, timeframe);
+            return null;
+        }
+
+        if (stacker is null)
+            return null;
+
+        long[] baseModelIds;
+        double[] metaWeights;
+        try
+        {
+            baseModelIds = JsonSerializer.Deserialize<long[]>(stacker.BaseModelIdsJson, JsonOptions) ?? [];
+            metaWeights = JsonSerializer.Deserialize<double[]>(stacker.MetaWeightsJson, JsonOptions) ?? [];
+        }
+        catch (JsonException)
+        {
+            _logger.LogWarning("Failed to parse stacking meta payload for {Symbol}/{Tf} stacker {Id}",
+                stacker.Symbol, stacker.Timeframe, stacker.Id);
+            return null;
+        }
+
+        if (baseModelIds.Length < 2 || metaWeights.Length != baseModelIds.Length)
+            return null;
+
+        var lookupIds = baseModelIds.Where(id => id != primaryModel.Id).Distinct().ToArray();
+        Dictionary<long, MLModel> baseModels;
+        try
+        {
+            using var modelCts = CreateLinkedTimeout(cancellationToken);
+            baseModels = await db.Set<MLModel>()
+                .AsNoTracking()
+                .Where(m => lookupIds.Contains(m.Id) &&
+                            !m.IsDeleted &&
+                            m.ModelBytes != null)
+                .ToDictionaryAsync(m => m.Id, modelCts.Token);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            _logger.LogDebug("Stacking base-model lookup timed out for {Symbol}/{Tf}", primaryModel.Symbol, timeframe);
+            return null;
+        }
+
+        var probs = new double[baseModelIds.Length];
+        for (int i = 0; i < baseModelIds.Length; i++)
+        {
+            long modelId = baseModelIds[i];
+            if (modelId == primaryModel.Id)
+            {
+                probs[i] = primaryCalibratedProbability;
+                continue;
+            }
+
+            if (!baseModels.TryGetValue(modelId, out var altModel))
+            {
+                probs[i] = 0.5;
+                continue;
+            }
+
+            var altSnap = await GetOrDeserializeSnapshotAsync(altModel);
+            if (altSnap is null || !HasModelWeights(altSnap))
+            {
+                probs[i] = 0.5;
+                continue;
+            }
+
+            double? altProb = await ScoreModelCalibratedProbabilityAsync(
+                altModel.Id, altSnap, rawFeatures, featureCount, candleWindow,
+                cotEntry, primaryModel.Symbol, timeframe, currentRegime, cancellationToken);
+            probs[i] = altProb ?? 0.5;
+        }
+
+        double metaZ = stacker.MetaBias;
+        for (int i = 0; i < probs.Length; i++)
+            metaZ += metaWeights[i] * probs[i];
+
+        double stackedProb = MLFeatureHelper.Sigmoid(metaZ);
+        _logger.LogDebug(
+            "Stacking meta blend applied for {Symbol}/{Tf} using {Count} base models: p={Prob:F4}",
+            primaryModel.Symbol, timeframe, probs.Length, stackedProb);
+        return stackedProb;
+    }
+
+    private async Task<double?> ScoreModelCalibratedProbabilityAsync(
+        long modelId,
+        ModelSnapshot snap,
+        float[] rawFeatures,
+        int featureCount,
+        List<Candle> candleWindow,
+        CotFeatureEntry cotEntry,
+        string symbol,
+        Timeframe timeframe,
+        string? currentRegime,
+        CancellationToken cancellationToken)
+    {
+        int modelFeatureCount = snap.Features.Length > 0 ? snap.Features.Length : featureCount;
+        var (means, stds) = ResolveStandardisationStats(snap, currentRegime, modelFeatureCount);
+        float[] features = StandardiseFeatures(rawFeatures, means, stds, modelFeatureCount);
+
+        features = ApplyFractionalDifferencing(
+            features, snap, candleWindow, modelFeatureCount,
+            means, stds, cotEntry, symbol, timeframe, modelId);
+        ApplyFeatureMask(features, snap.ActiveFeatureMask, modelFeatureCount);
+
+        var engine = ResolveEngine(snap);
+        if (engine is null) return null;
+
+        await _inferenceSemaphore.WaitAsync(cancellationToken);
+        InferenceResult? inference;
+        try
+        {
+            inference = await Task.Run(() => engine.RunInference(
+                features, modelFeatureCount, snap, candleWindow, modelId, 0, 0),
+                cancellationToken);
+        }
+        finally
+        {
+            _inferenceSemaphore.Release();
+        }
+
+        return inference is null
+            ? null
+            : InferenceHelpers.ApplyDeployedCalibration(inference.Value.Probability, snap);
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // Helper: score a single alternate model for consensus (parallelisable)
     // ═══════════════════════════════════════════════════════════════════════════
@@ -666,46 +858,16 @@ public sealed class MLSignalScorer : IMLSignalScorer
     private async Task<(TradeDirection Direction, double CalibP)?> ScoreAlternateModelAsync(
         long altModelId, ModelSnapshot altSnap,
         float[] rawFeatures, int featureCount, List<Candle> candleWindow,
+        CotFeatureEntry cotEntry, string symbol, Timeframe timeframe, string? currentRegime,
         CancellationToken cancellationToken)
     {
-        int altFc = altSnap.Features.Length > 0 ? altSnap.Features.Length : rawFeatures.Length;
-        float[] altFeatures = StandardiseFeatures(rawFeatures, altSnap.Means, altSnap.Stds, altFc);
-
-        ApplyFeatureMask(altFeatures, altSnap.ActiveFeatureMask, altFc);
-
-        var altEngine = ResolveEngine(altSnap);
-        if (altEngine is null) return null;
-
-        await _inferenceSemaphore.WaitAsync(cancellationToken);
-        double altRaw;
-        try
-        {
-            if (altEngine is EnsembleInferenceEngine)
-            {
-                (altRaw, _) = await Task.Run(() => EnsembleInferenceEngine.EnsembleProb(
-                    altFeatures, altSnap.Weights, altSnap.Biases, altFc,
-                    altSnap.FeatureSubsetIndices, null, 0.0, int.MaxValue, null, null, null,
-                    altSnap.MlpHiddenWeights, altSnap.MlpHiddenBiases, altSnap.MlpHiddenDim),
-                    cancellationToken);
-            }
-            else
-            {
-                var altResult = await Task.Run(() => altEngine.RunInference(
-                    altFeatures, altFc, altSnap, candleWindow, altModelId, 0, 0),
-                    cancellationToken);
-                if (altResult is null) return null;
-                altRaw = altResult.Value.Probability;
-            }
-        }
-        finally
-        {
-            _inferenceSemaphore.Release();
-        }
-
-        double altCalibP = InferenceHelpers.ApplyBasicCalibration(altRaw, altSnap);
-        double altThr = altSnap.OptimalThreshold > 0.0 ? altSnap.OptimalThreshold : 0.5;
-        var altDir = altCalibP >= altThr ? TradeDirection.Buy : TradeDirection.Sell;
-        return (altDir, altCalibP);
+        double? altCalibP = await ScoreModelCalibratedProbabilityAsync(
+            altModelId, altSnap, rawFeatures, featureCount, candleWindow,
+            cotEntry, symbol, timeframe, currentRegime, cancellationToken);
+        if (!altCalibP.HasValue) return null;
+        double altThr = MLFeatureHelper.ResolveEffectiveDecisionThreshold(altSnap, currentRegime);
+        var altDir = altCalibP.Value >= altThr ? TradeDirection.Buy : TradeDirection.Sell;
+        return (altDir, altCalibP.Value);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -725,6 +887,9 @@ public sealed class MLSignalScorer : IMLSignalScorer
         int altFc = altSnap.Features.Length > 0 ? altSnap.Features.Length : altRawFeatures.Length;
         var altFeatures = StandardiseFeatures(altRawFeatures, altSnap.Means, altSnap.Stds, altFc);
 
+        altFeatures = ApplyFractionalDifferencing(
+            altFeatures, altSnap, altWindow, altFc,
+            altSnap.Means, altSnap.Stds, cotEntry, altModel.Symbol, tf, altModel.Id);
         ApplyFeatureMask(altFeatures, altSnap.ActiveFeatureMask, altFc);
 
         var altEngine = ResolveEngine(altSnap);
@@ -744,7 +909,7 @@ public sealed class MLSignalScorer : IMLSignalScorer
         }
         if (altResult is null) return null;
 
-        double calibP = InferenceHelpers.ApplyBasicCalibration(altResult.Value.Probability, altSnap);
+        double calibP = InferenceHelpers.ApplyDeployedCalibration(altResult.Value.Probability, altSnap);
         return (tf, calibP);
     }
 

@@ -133,9 +133,9 @@ public sealed class MLConformalCalibrationWorker : BackgroundService
                 foreach (var log in calLogs)
                 {
                     double pBuy = MLFeatureHelper.ResolveLoggedCalibratedBuyProbability(log, decisionThreshold);
-                    // pTrue is pBuy when the predicted direction matches actual, else 1 - pBuy.
-                    double pTrue = log.PredictedDirection == log.ActualDirection
-                        ? pBuy : 1.0 - pBuy;
+                    double pTrue = log.ActualDirection == Domain.Enums.TradeDirection.Buy
+                        ? pBuy
+                        : 1.0 - pBuy;
                     scores.Add(1.0 - pTrue);
                 }
                 scores.Sort(); // Sorted ascending for quantile lookup.

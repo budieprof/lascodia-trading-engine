@@ -2,6 +2,7 @@ using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Domain.Entities;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -30,8 +31,10 @@ namespace LascodiaTradingEngine.Application.Workers;
 ///   A ← A − lr × err × logit(rawP)
 ///   B ← B − lr × err
 ///
-/// The updated A and B are written directly to <see cref="MLModel.PlattA"/> and
-/// <see cref="MLModel.PlattB"/> (columns on the model entity, not in ModelBytes).
+/// The updated A and B are persisted back into the serialised <see cref="ModelSnapshot"/>
+/// stored in <see cref="MLModel.ModelBytes"/> so the live scorer picks them up immediately.
+/// The entity-level <see cref="MLModel.PlattA"/> / <see cref="MLModel.PlattB"/> columns are
+/// also kept in sync for diagnostics and audit visibility.
 ///
 /// <b>Drift tracking:</b> an Exponential Moving Average (EMA) of |A − A_original| is
 /// maintained in <see cref="MLModel.PlattCalibrationDrift"/>:
@@ -48,7 +51,9 @@ namespace LascodiaTradingEngine.Application.Workers;
 public sealed class MLOnlinePlattWorker : BackgroundService
 {
     private readonly IServiceScopeFactory _scopeFactory;
+    private readonly IMemoryCache _cache;
     private readonly ILogger<MLOnlinePlattWorker> _logger;
+    private const string SnapshotCacheKeyPrefix = "MLSnapshot:";
 
     // Number of most-recent resolved prediction logs to include in each SGD pass.
     private const int WindowSize = 100;
@@ -65,10 +70,15 @@ public sealed class MLOnlinePlattWorker : BackgroundService
     /// Initialises the worker with its required dependencies.
     /// </summary>
     /// <param name="scopeFactory">Creates scoped DI scopes per run cycle.</param>
+    /// <param name="cache">Shared snapshot cache used by the live scorer.</param>
     /// <param name="logger">Structured logger for Platt update events.</param>
-    public MLOnlinePlattWorker(IServiceScopeFactory scopeFactory, ILogger<MLOnlinePlattWorker> logger)
+    public MLOnlinePlattWorker(
+        IServiceScopeFactory scopeFactory,
+        IMemoryCache cache,
+        ILogger<MLOnlinePlattWorker> logger)
     {
         _scopeFactory = scopeFactory;
+        _cache        = cache;
         _logger       = logger;
     }
 
@@ -95,13 +105,9 @@ public sealed class MLOnlinePlattWorker : BackgroundService
     ///   <item>Loads the last <see cref="WindowSize"/> resolved prediction logs (requires ≥ 30).</item>
     ///   <item>Runs a single SGD pass over the logs, updating A and B in-place.</item>
     ///   <item>Computes the absolute A-parameter drift and updates the EMA drift tracker.</item>
-    ///   <item>Persists the new A, B, drift, update count, and timestamp to the model record.</item>
+    ///   <item>Persists the new A, B, drift, update count, and timestamp to the model record
+    ///         and refreshes <c>ModelBytes</c> so live inference observes the update.</item>
     /// </list>
-    ///
-    /// Note: the updated A and B are stored on the <see cref="MLModel"/> entity columns
-    /// (<c>PlattA</c>, <c>PlattB</c>), not inside <c>ModelBytes</c>. This is intentional:
-    /// online Platt updates are lightweight corrections applied between full retrains.
-    /// The scoring pipeline reads from these columns with higher priority than the snapshot.
     /// </summary>
     /// <param name="ct">Cooperative cancellation token.</param>
     private async Task RunAsync(CancellationToken ct)
@@ -176,11 +182,15 @@ public sealed class MLOnlinePlattWorker : BackgroundService
                 .FirstOrDefaultAsync(m => m.Id == model.Id && !m.IsDeleted, ct);
             if (writeModel == null) continue;
 
+            snap.PlattA = a;
+            snap.PlattB = b;
             writeModel.PlattA                = (decimal)a;
             writeModel.PlattB                = (decimal)b;
+            writeModel.ModelBytes            = JsonSerializer.SerializeToUtf8Bytes(snap);
             writeModel.PlattCalibrationDrift = newDrift;
             writeModel.OnlineLearningUpdateCount++;      // audit counter
             writeModel.LastOnlineLearningAt  = DateTime.UtcNow;
+            _cache.Remove($"{SnapshotCacheKeyPrefix}{model.Id}");
 
             _logger.LogDebug("MLOnlinePlattWorker: {S}/{T} PlattA={A:F4} PlattB={B:F4} Drift={D:F4}",
                 model.Symbol, model.Timeframe, a, b, newDrift);

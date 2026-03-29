@@ -12,7 +12,7 @@ namespace LascodiaTradingEngine.Application.Workers;
 /// <summary>
 /// Watches live feature PSI (Population Stability Index) for active ML models and
 /// automatically enqueues a new <see cref="MLTrainingRun"/> when the average PSI across
-/// all features exceeds <c>MLPsiAutoRetrain:PsiThreshold</c>.
+/// all tracked features exceeds <c>MLPsiAutoRetrain:PsiThreshold</c>.
 ///
 /// PSI is computed by comparing the current feature distribution (last
 /// <c>MLPsiAutoRetrain:WindowDays</c> days of predictions) against the training-time quantile
@@ -21,7 +21,8 @@ namespace LascodiaTradingEngine.Application.Workers;
 /// The auto-retrain is skipped when:
 /// <list type="bullet">
 ///   <item>A training run is already queued or running for the symbol/timeframe.</item>
-///   <item>Fewer than <c>MLPsiAutoRetrain:MinPredictions</c> recent prediction logs are available.</item>
+///   <item>Fewer than <c>MLPsiAutoRetrain:MinPredictions</c> recent feature samples can be built
+///         from recent candles.</item>
 /// </list>
 /// </summary>
 public sealed class MLPsiAutoRetrainWorker : BackgroundService
@@ -142,34 +143,16 @@ public sealed class MLPsiAutoRetrainWorker : BackgroundService
     }
 
     /// <summary>
-    /// Checks whether the confidence-score distribution of a single model's recent
-    /// predictions has shifted significantly (PSI breach) from the training-time
-    /// distribution and, if so, enqueues a new <see cref="MLTrainingRun"/>.
+    /// Checks whether a single model's recent feature distribution has shifted
+    /// significantly (PSI breach) from the training-time distribution and, if so,
+    /// enqueues a new <see cref="MLTrainingRun"/>.
     /// </summary>
     /// <remarks>
-    /// PSI auto-retrain methodology:
-    ///
-    /// The Population Stability Index (PSI) quantifies distributional shift between
-    /// two samples:
-    ///   PSI = Σ_b (pObs_b − pExp_b) × log(pObs_b / pExp_b)
-    /// Standard interpretation:
-    /// <list type="bullet">
-    ///   <item>PSI &lt; 0.10: no significant shift — model remains representative.</item>
-    ///   <item>0.10 ≤ PSI &lt; 0.25: moderate shift — monitor closely.</item>
-    ///   <item>PSI ≥ 0.25: major shift — retrain required.</item>
-    /// </list>
-    ///
-    /// <b>Confidence-score proxy:</b> Full feature-level PSI requires raw feature values
-    /// at inference time, which the prediction log does not store (storing them would
-    /// double the log table size). Instead, the model's output confidence score is used
-    /// as a 1-D distributional proxy. A shift in the confidence distribution is a strong
-    /// signal that the model's feature inputs have drifted — the model has become
-    /// under- or over-confident relative to its training-time calibration.
-    ///
-    /// <b>Expected distribution:</b> A well-calibrated model produces confidence scores
-    /// that are approximately uniform over [0, 1] when averaged across many signals.
-    /// The PSI baseline is therefore a 10-bin uniform distribution (each bin expects
-    /// 10% of scores). Departures from uniformity indicate calibration drift.
+    /// The worker rebuilds recent feature vectors from candles, standardises them with the
+    /// snapshot's training-time means/stds, reapplies fractional differencing and the active
+    /// feature mask, then compares each feature's recent distribution with the stored
+    /// training-time quantile breakpoints. The average feature PSI is used as the retrain
+    /// trigger, matching the worker's contract and avoiding confidence-score proxy drift.
     /// </remarks>
     /// <param name="model">The model being checked.</param>
     /// <param name="readCtx">Read-only EF context for training runs and prediction logs.</param>
@@ -210,38 +193,81 @@ public sealed class MLPsiAutoRetrainWorker : BackgroundService
         // Skip models whose snapshots were created before the FeatureQuantileBreakpoints field
         // was introduced (pre-Round-7 snapshots). An empty array is a sentinel for "not computed".
         if (snap is null || snap.FeatureQuantileBreakpoints.Length == 0) return;
+        int featureCount = snap.Features.Length > 0 ? snap.Features.Length : MLFeatureHelper.FeatureCount;
 
-        // Load recent prediction-log confidence scores for the PSI confidence-score proxy.
-        // We use the confidence score as a 1-D proxy; full feature-level PSI requires
-        // feature values at inference time, which are not stored in the prediction log.
-        var since  = DateTime.UtcNow.AddDays(-windowDays);
-        var scores = await readCtx.Set<MLModelPredictionLog>()
-            .Where(l => l.MLModelId   == model.Id &&
-                        l.PredictedAt >= since    &&
-                        !l.IsDeleted)
-            .Select(l => (double)l.ConfidenceScore)
+        // Load recent candles and rebuild the same feature pipeline used by the trainer.
+        var since = DateTime.UtcNow.AddDays(-windowDays);
+        var candles = await readCtx.Set<Candle>()
+            .AsNoTracking()
+            .Where(c => c.Symbol == model.Symbol &&
+                        c.Timeframe == model.Timeframe &&
+                        c.Timestamp >= since &&
+                        !c.IsDeleted)
+            .OrderBy(c => c.Timestamp)
             .ToListAsync(ct);
 
-        // Require a minimum number of recent predictions for a stable PSI estimate.
-        if (scores.Count < minPredictions)
+        if (candles.Count < MLFeatureHelper.LookbackWindow + 5)
         {
             _logger.LogDebug(
-                "PSI auto-retrain: {Symbol}/{Tf} only {N} recent predictions (need {Min}) — skip.",
-                model.Symbol, model.Timeframe, scores.Count, minPredictions);
+                "PSI auto-retrain: {Symbol}/{Tf} only {N} candles in window — skip.",
+                model.Symbol, model.Timeframe, candles.Count);
             return;
         }
 
-        // Compute PSI on the confidence-score distribution.
-        double psi = ComputeConfidenceScorePsi(scores, snap);
+        var recentSamples = MLFeatureHelper.BuildTrainingSamples(candles);
+        if (recentSamples.Count < minPredictions)
+        {
+            _logger.LogDebug(
+                "PSI auto-retrain: {Symbol}/{Tf} only {N} recent feature samples (need {Min}) — skip.",
+                model.Symbol, model.Timeframe, recentSamples.Count, minPredictions);
+            return;
+        }
+
+        var recentStandardised = recentSamples
+            .Select(s => s with { Features = MLFeatureHelper.Standardize(s.Features, snap.Means, snap.Stds) })
+            .ToList();
+
+        if (snap.FracDiffD > 0.0)
+            recentStandardised = MLFeatureHelper.ApplyFractionalDifferencing(recentStandardised, featureCount, snap.FracDiffD);
+
+        if (snap.ActiveFeatureMask is { Length: > 0 } activeMask && activeMask.Length == featureCount)
+        {
+            for (int i = 0; i < recentStandardised.Count; i++)
+            {
+                var masked = (float[])recentStandardised[i].Features.Clone();
+                for (int j = 0; j < featureCount; j++)
+                    if (!activeMask[j]) masked[j] = 0f;
+                recentStandardised[i] = recentStandardised[i] with { Features = masked };
+            }
+        }
+
+        var psiValues = new List<double>();
+        for (int j = 0; j < Math.Min(featureCount, snap.FeatureQuantileBreakpoints.Length); j++)
+        {
+            double[] binEdges = snap.FeatureQuantileBreakpoints[j];
+            if (binEdges.Length == 0) continue;
+
+            double[] recentVals = recentStandardised
+                .Select(s => j < s.Features.Length ? (double)s.Features[j] : 0.0)
+                .ToArray();
+            if (recentVals.Length == 0) continue;
+
+            double[] trainVals = GenerateUniformFromEdges(binEdges, recentVals.Length);
+            psiValues.Add(MLFeatureHelper.ComputeFeaturePsi(binEdges, trainVals, recentVals));
+        }
+
+        if (psiValues.Count == 0) return;
+
+        double psi = psiValues.Average();
         _logger.LogDebug(
-            "PSI auto-retrain: {Symbol}/{Tf} model {Id}: PSI(conf)={PSI:F4} (threshold={Thr:F2})",
+            "PSI auto-retrain: {Symbol}/{Tf} model {Id}: PSI(avg-feature)={PSI:F4} (threshold={Thr:F2})",
             model.Symbol, model.Timeframe, model.Id, psi, psiThreshold);
 
         // No significant distributional shift — model remains representative.
         if (psi < psiThreshold) return;
 
         _logger.LogWarning(
-            "PSI breach for {Symbol}/{Tf} model {Id}: PSI(conf)={PSI:F4} ≥ {Thr:F2} — " +
+            "PSI breach for {Symbol}/{Tf} model {Id}: PSI(avg-feature)={PSI:F4} ≥ {Thr:F2} — " +
             "auto-enqueuing training run.",
             model.Symbol, model.Timeframe, model.Id, psi, psiThreshold);
 
@@ -271,65 +297,26 @@ public sealed class MLPsiAutoRetrainWorker : BackgroundService
             model.Symbol, model.Timeframe, psi);
     }
 
-    // ── PSI computation (confidence-score distribution vs uniform baseline) ───
+    // ── PSI helper ───────────────────────────────────────────────────────────
 
-    /// <summary>
-    /// Computes the Population Stability Index (PSI) between the observed confidence-score
-    /// distribution (10 equal-width bins over [0, 1]) and a uniform expected distribution.
-    /// </summary>
-    /// <remarks>
-    /// PSI formula:
-    ///   PSI = Σ_b (p_obs_b − p_exp_b) × ln(p_obs_b / p_exp_b)
-    ///
-    /// Binning: 10 equal-width bins of width 0.1 over [0, 1].
-    /// Expected distribution: uniform (each bin expects 10% of scores) — this is the
-    /// baseline for a well-calibrated model producing diverse confidence outputs.
-    ///
-    /// Numerical guard: both p_obs and p_exp are clamped to ≥ 1e-10 to avoid log(0).
-    ///
-    /// Interpretation:
-    /// <list type="bullet">
-    ///   <item>PSI &lt; 0.10 — negligible shift; no action needed.</item>
-    ///   <item>0.10 ≤ PSI &lt; 0.25 — moderate shift; monitor.</item>
-    ///   <item>PSI ≥ 0.25 — major shift; retrain recommended.</item>
-    /// </list>
-    /// </remarks>
-    /// <param name="scores">Recent model confidence scores in [0, 1].</param>
-    /// <param name="snap">
-    /// Model snapshot (not currently used in this 1-D confidence proxy; included for
-    /// future extension to full feature-level PSI using FeatureQuantileBreakpoints).
-    /// </param>
-    /// <returns>The computed PSI value (≥ 0).</returns>
-    private static double ComputeConfidenceScorePsi(
-        IReadOnlyList<double> scores,
-        ModelSnapshot         snap)
+    private static double[] GenerateUniformFromEdges(double[] edges, int n)
     {
-        const int NumBin  = 10;
-        double    binSize = 1.0 / NumBin;
+        int bins = edges.Length + 1;
+        int perBin = Math.Max(1, n / bins);
+        var result = new List<double>(bins * perBin);
 
-        var observed  = new double[NumBin]; // count of scores in each bin
+        double prevEdge = edges.Length > 0 ? edges[0] - (edges[^1] - edges[0]) * 0.5 : -3.0;
 
-        // Distribute scores into equal-width bins.
-        // Clamp to [0, NumBin-1] so that a score of exactly 1.0 does not overflow.
-        foreach (double s in scores)
+        for (int b = 0; b < bins; b++)
         {
-            int b = Math.Clamp((int)(s / binSize), 0, NumBin - 1);
-            observed[b]++;
+            double lo = b == 0 ? prevEdge : edges[b - 1];
+            double hi = b < edges.Length ? edges[b] : edges[^1] + (edges[^1] - edges[0]) * 0.5;
+            double mid = (lo + hi) / 2.0;
+            for (int i = 0; i < perBin; i++)
+                result.Add(mid);
         }
 
-        // Compute PSI as the sum of (pObs − pExp) × ln(pObs / pExp) across all bins.
-        double n = scores.Count;
-        double psi = 0.0;
-        for (int b = 0; b < NumBin; b++)
-        {
-            // Normalise observed counts to proportions; guard against log(0).
-            double pObs = Math.Max(observed[b] / n, 1e-10);
-            // Uniform expected proportion (1/NumBin); guard against log(0).
-            double pExp = Math.Max(1.0 / NumBin, 1e-10);
-            psi += (pObs - pExp) * Math.Log(pObs / pExp);
-        }
-
-        return psi;
+        return [.. result];
     }
 
     // ── Config helper ─────────────────────────────────────────────────────────
