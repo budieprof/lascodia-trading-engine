@@ -617,6 +617,10 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
                 plattA      = pA;  plattB = pB;
                 isotonicBp  = pBp;
                 // Recompute calibration-dependent values
+                (plattABuy, plattBBuy, plattASell, plattBSell) =
+                    FitClassConditionalPlatt(calSet, allTrees, trainSet);
+                if (hp.FitTemperatureScale && calSet.Count >= 10)
+                    temperatureScale = FitTemperatureScaling(calSet, allTrees, trainSet);
                 ece              = ComputeEce(testSet, allTrees, trainSet, plattA, plattB, isotonicBp);
                 optimalThreshold = ComputeOptimalThreshold(calSet, allTrees, trainSet, plattA, plattB, isotonicBp,
                     hp.ThresholdSearchMin, hp.ThresholdSearchMax);
@@ -691,18 +695,8 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
         double brierSkillScore = ComputeBrierSkillScore(testSet, allTrees, trainSet, plattA, plattB, isotonicBp);
         _logger.LogInformation("Brier Skill Score (BSS)={BSS:F4}", brierSkillScore);
 
-        // ── 30. Greedy Ensemble Selection (#3) ────────────────────────────────
-        double[] gesWeights = hp.EnableGreedyEnsembleSelection && calSet.Count >= 20
-            ? RunGreedyTreeSelection(calSet, allTrees, trainSet)
-            : [];
-        if (gesWeights.Length > 0)
-            _logger.LogDebug("GES: {N} trees selected with non-zero weight.", gesWeights.Count(w => w > 0));
-
-        // ── 31. Stacking meta-learner on per-tree probs (#2) ──────────────────
-        var (metaWeights, metaBias) = FitMetaLearner(calSet, allTrees, trainSet);
-        _logger.LogDebug("Meta-learner: {T} tree weights, bias={B:F4}", metaWeights.Length, metaBias);
-
-        // ── 32. OOB-contribution tree pruning (#4) ────────────────────────────
+        // ── 30. OOB-contribution tree pruning (#4) — must run BEFORE GES/meta-learner
+        //        so their weight arrays match the final tree count.
         int oobPrunedCount = 0;
         if (hp.OobPruningEnabled && newTrees.Count >= 2)
         {
@@ -714,6 +708,17 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
                     "OOB pruning: removed {N}/{K} new trees whose removal improved OOB accuracy.",
                     oobPrunedCount, oobPrunedCount + newTrees.Count);
         }
+
+        // ── 31. Greedy Ensemble Selection (#3) ────────────────────────────────
+        double[] gesWeights = hp.EnableGreedyEnsembleSelection && calSet.Count >= 20
+            ? RunGreedyTreeSelection(calSet, allTrees, trainSet)
+            : [];
+        if (gesWeights.Length > 0)
+            _logger.LogDebug("GES: {N} trees selected with non-zero weight.", gesWeights.Count(w => w > 0));
+
+        // ── 32. Stacking meta-learner on per-tree probs (#2) ──────────────────
+        var (metaWeights, metaBias) = FitMetaLearner(calSet, allTrees, trainSet);
+        _logger.LogDebug("Meta-learner: {T} tree weights, bias={B:F4}", metaWeights.Length, metaBias);
 
         // ── 33. Ensemble (tree) diversity metric (#5) ─────────────────────────
         double ensembleDiversity = ComputeTreeDiversity(allTrees, trainSet);
@@ -769,6 +774,7 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
             PlattBBuy                  = plattBBuy,
             PlattASell                 = plattASell,
             PlattBSell                 = plattBSell,
+            AvgKellyFraction           = avgKellyFraction,
             Metrics                    = evalMetrics,
             OobAccuracy                = oobAccuracy,
             TrainSamples               = trainSet.Count,
@@ -1121,7 +1127,7 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
         var leftIndices  = sampleIdx.Where(idx => (double)trainSet[idx].Features[bestFeat] <= bestThresh).ToList();
         var rightIndices = sampleIdx.Where(idx => (double)trainSet[idx].Features[bestFeat] >  bestThresh).ToList();
 
-        if (leftIndices.Count < MinLeaf || rightIndices.Count < MinLeaf)
+        if (leftIndices.Count < minLeaf || rightIndices.Count < minLeaf)
         {
             int posCount = 0;
             foreach (int idx in sampleIdx) if (trainSet[idx].Direction > 0) posCount++;
@@ -1382,7 +1388,7 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
             double p    = PredictProb(s.Features, allTrees, trainSet, plattA, plattB, isotonicBp);
             int    binI = Math.Clamp((int)(p * bins), 0, bins - 1);
             binConf[binI] += p;
-            if ((p >= 0.5 ? 1 : 0) == (s.Direction > 0 ? 1 : 0)) binAcc[binI]++;
+            if (s.Direction > 0) binAcc[binI]++; // positive-class frequency, not classification accuracy
             binCnt[binI]++;
         }
 
@@ -2989,6 +2995,13 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
 
         foreach (var s in trainSet)
             IncrementLeafCount(nodes, rootIndex, s.Features, s.Direction > 0);
+
+        // Sync LeafDirection with repopulated counts so serialization matches training-time probs
+        foreach (var n in nodes)
+            if (n.SplitFeat < 0) // leaf node
+                n.LeafDirection = n.LeafTotalCount > 0
+                    ? (double)n.LeafPosCount / n.LeafTotalCount
+                    : 0.5;
     }
 
     private static void IncrementLeafCount(List<TreeNode> nodes, int nodeIndex, float[] features, bool isPositive)

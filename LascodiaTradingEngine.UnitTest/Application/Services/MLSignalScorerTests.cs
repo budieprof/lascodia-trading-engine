@@ -378,6 +378,38 @@ public class MLSignalScorerTests
     }
 
     [Fact]
+    public void EnsembleProb_Excludes_Inactive_Pruned_Learners_From_Std()
+    {
+        var (_, stdProb) = EnsembleInferenceEngine.EnsembleProb(
+            [0f],
+            weights: [[0.0], [0.0]],
+            biases:
+            [
+                MLFeatureHelper.Logit(0.2),
+                0.0
+            ],
+            featureCount: 1);
+
+        Assert.Equal(0.0, stdProb, precision: 6);
+    }
+
+    [Fact]
+    public void EnsembleProb_Uses_Polynomial_Inputs_For_Mlp_Learners()
+    {
+        var (prob, _) = EnsembleInferenceEngine.EnsembleProb(
+            [2f, 3f, 0f, 0f, 0f],
+            weights: [[1.0]],
+            biases: [0.0],
+            featureCount: 5,
+            subsets: [[5]],
+            mlpHiddenW: [[1.0]],
+            mlpHiddenB: [[0.0]],
+            mlpHiddenDim: 1);
+
+        Assert.True(prob > 0.99);
+    }
+
+    [Fact]
     public void ComputeShapContributionsJson_Uses_Projected_Mlp_Weights()
     {
         string? json = ScoringEnrichmentCalculator.ComputeShapContributionsJson(

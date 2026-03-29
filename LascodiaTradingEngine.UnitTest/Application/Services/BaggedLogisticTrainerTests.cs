@@ -117,4 +117,63 @@ public class BaggedLogisticTrainerTests
         Assert.Equal(0.0, weights[1], precision: 6);
         Assert.Equal(1.0 / 3.0, weights[2], precision: 6);
     }
+
+    [Fact]
+    public void AggregateSelectedLearnerProbs_Uses_Stacker_With_Neutral_Fill_For_Missing_Oob_Learners()
+    {
+        double[] probs = [0.2, 0.8];
+        var meta = new BaggedLogisticTrainer.MetaLearner([8.0, -8.0], 0.0);
+
+        double aggregated = BaggedLogisticTrainer.AggregateSelectedLearnerProbs(
+            probs,
+            learnerIndices: [0],
+            meta);
+
+        Assert.Equal(MLFeatureHelper.Sigmoid(8.0 * 0.2 - 8.0 * 0.5), aggregated, precision: 6);
+    }
+
+    [Fact]
+    public void RunGreedyEnsembleSelection_Excludes_Inactive_Learners()
+    {
+        var calSet = Enumerable.Range(0, 12)
+            .Select(_ => new TrainingSample([0f], 1, 1f))
+            .ToList();
+
+        double[][] weights = [[0.0], [0.0]];
+        double[] biases =
+        [
+            MLFeatureHelper.Logit(0.9),
+            MLFeatureHelper.Logit(0.1)
+        ];
+
+        var gesWeights = BaggedLogisticTrainer.RunGreedyEnsembleSelection(
+            calSet,
+            weights,
+            biases,
+            featureCount: 1,
+            subsets: null,
+            activeLearners: [false, true]);
+
+        Assert.Equal(0.0, gesWeights[0], precision: 6);
+        Assert.True(gesWeights[1] > 0.999);
+    }
+
+    [Fact]
+    public void ComputeEnsembleDiversity_Excludes_Inactive_Learners()
+    {
+        double[][] weights =
+        [
+            [1.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+        ];
+
+        double diversity = BaggedLogisticTrainer.ComputeEnsembleDiversity(
+            weights,
+            featureCount: 2,
+            subsets: null,
+            activeLearners: [true, true, false]);
+
+        Assert.Equal(1.0, diversity, precision: 6);
+    }
 }

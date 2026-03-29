@@ -77,6 +77,23 @@ public sealed class EnsembleInferenceEngine : IModelInferenceEngine
         var probs = new double[weights.Length];
         for (int k = 0; k < weights.Length; k++)
         {
+            bool isPolyLearner = BaggedLogisticTrainer.LearnerUsesPolynomialInputs(
+                k, featureCount, subsets, mlpHiddenW, mlpHiddenDim, weights);
+            float[] effectiveFeatures;
+            if (isPolyLearner)
+            {
+                effectiveFeatures = new float[featureCount + 10];
+                Array.Copy(features, effectiveFeatures, featureCount);
+                int idx = featureCount;
+                for (int a = 0; a < 5; a++)
+                    for (int b = a + 1; b < 5; b++)
+                        effectiveFeatures[idx++] = features[a] * features[b];
+            }
+            else
+            {
+                effectiveFeatures = features;
+            }
+
             // ── MLP forward pass ──────────────────────────────────────────────
             if (useMlp && k < mlpHiddenW!.Length && mlpHiddenW[k] is not null &&
                 k < mlpHiddenB!.Length && mlpHiddenB[k] is not null)
@@ -87,9 +104,9 @@ public sealed class EnsembleInferenceEngine : IModelInferenceEngine
                 int subLen = subset.Length > 0 ? subset.Length : featureCount;
                 if (subset.Length == 0)
                 {
-                    subset = new int[featureCount];
-                    for (int j = 0; j < featureCount; j++) subset[j] = j;
-                    subLen = featureCount;
+                    subset = new int[effectiveFeatures.Length];
+                    for (int j = 0; j < effectiveFeatures.Length; j++) subset[j] = j;
+                    subLen = effectiveFeatures.Length;
                 }
 
                 double z = biases[k];
@@ -98,7 +115,7 @@ public sealed class EnsembleInferenceEngine : IModelInferenceEngine
                     double act = hB[h];
                     int rowOff = h * subLen;
                     for (int si = 0; si < subLen && rowOff + si < hW.Length; si++)
-                        act += hW[rowOff + si] * features[subset[si]];
+                        act += hW[rowOff + si] * effectiveFeatures[subset[si]];
                     double hidden = Math.Max(0.0, act); // ReLU
                     if (h < weights[k].Length)
                         z += weights[k][h] * hidden;
@@ -110,7 +127,7 @@ public sealed class EnsembleInferenceEngine : IModelInferenceEngine
             // ── Linear logistic forward pass ──────────────────────────────────
             double zLin = biases[k];
 
-            float[] effectiveFeatures = features;
+            effectiveFeatures = features;
             if (k >= polyLearnerStartIndex && featureCount >= 5)
             {
                 var aug = new float[featureCount + 10];
@@ -142,13 +159,31 @@ public sealed class EnsembleInferenceEngine : IModelInferenceEngine
         double avg = InferenceHelpers.AggregateProbs(
             probs, weights.Length, metaWeights, metaBias,
             gesWeights, learnerAccuracyWeights, learnerCalAccuracies);
-        double meanProb = probs.Length > 0 ? probs.Average() : 0.5;
+        var activeLearners = BaggedLogisticTrainer.ComputeActiveLearnerMask(weights, biases);
+        double sumProb = 0.0;
+        int activeCount = 0;
+        for (int k = 0; k < probs.Length; k++)
+        {
+            if (k >= activeLearners.Length || !activeLearners[k])
+                continue;
+            sumProb += probs[k];
+            activeCount++;
+        }
+
+        double meanProb = activeCount > 0
+            ? sumProb / activeCount
+            : (probs.Length > 0 ? probs.Average() : 0.5);
 
         // Sample std (N-1)
-        int N = probs.Length;
         double variance = 0.0;
-        for (int k = 0; k < N; k++) { double d = probs[k] - meanProb; variance += d * d; }
-        double std = N > 1 ? Math.Sqrt(variance / (N - 1)) : 0.0;
+        for (int k = 0; k < probs.Length; k++)
+        {
+            if (activeCount > 0 && (k >= activeLearners.Length || !activeLearners[k]))
+                continue;
+            double d = probs[k] - meanProb;
+            variance += d * d;
+        }
+        double std = activeCount > 1 ? Math.Sqrt(variance / (activeCount - 1)) : 0.0;
 
         return (avg, std);
     }

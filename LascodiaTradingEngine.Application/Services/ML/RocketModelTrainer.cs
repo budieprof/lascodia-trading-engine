@@ -789,7 +789,8 @@ public sealed class RocketModelTrainer : IMLModelTrainer
         double rocketCwBuy = 1.0, rocketCwSell = 1.0;
         if (hp.UseClassWeights)
         {
-            int bc = labels.Count(s => s.Direction > 0), sc = trainN - bc;
+            int bc = 0; for (int ii = 0; ii < trainN; ii++) if (labels[ii].Direction > 0) bc++;
+            int sc = trainN - bc;
             if (bc > 0 && sc > 0) { rocketCwBuy = (double)trainN / (2.0 * bc); rocketCwSell = (double)trainN / (2.0 * sc); }
         }
 
@@ -1230,7 +1231,7 @@ public sealed class RocketModelTrainer : IMLModelTrainer
 
         static (double A, double B) FitSgd(List<(double Logit, double Y)> pairs, int ep)
         {
-            if (pairs.Count < 5) return (0.0, 0.0);
+            if (pairs.Count < 5) return (1.0, 0.0); // identity on logit scale
             double a = 1.0, b = 0.0;
             for (int e = 0; e < ep; e++)
             {
@@ -1347,7 +1348,7 @@ public sealed class RocketModelTrainer : IMLModelTrainer
             double p   = CalibratedProb(rocketFeatures[i], w, bias, plattA, plattB, dim);
             int    bin = Math.Clamp((int)(p * NumBins), 0, NumBins - 1);
             binConfSum[bin] += p;
-            if ((p >= 0.5) == (samples[i].Direction == 1)) binCorrect[bin]++;
+            if (samples[i].Direction == 1) binCorrect[bin]++; // positive-class frequency, not accuracy
             binCount[bin]++;
         }
 
