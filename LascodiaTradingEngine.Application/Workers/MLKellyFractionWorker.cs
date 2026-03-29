@@ -1,19 +1,16 @@
 using LascodiaTradingEngine.Application.Common.Interfaces;
-using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Domain.Entities;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using System.Text.Json;
 
 namespace LascodiaTradingEngine.Application.Workers;
 
 /// <summary>
 /// Computes the Kelly Criterion optimal position-sizing fraction (f*) for each active
-/// ML model using simulated returns from recent candle data. Suppresses models with
-/// negative expected value (f* &lt; 0) and caps the position fraction at 25%.
-/// Runs every 24 hours.
+/// ML model from recent resolved live prediction logs. Suppresses models with negative
+/// expected value (f* &lt; 0) and caps the position fraction at 25%. Runs every 24 hours.
 /// </summary>
 /// <remarks>
 /// <b>Kelly Criterion background:</b>
@@ -38,14 +35,17 @@ namespace LascodiaTradingEngine.Application.Workers;
 /// geometric growth rate. The model is flagged <c>IsSuppressed = true</c> so the signal
 /// pipeline ignores its outputs until the next successful retrain.
 ///
-/// <b>Polling interval:</b> 24 hours. Daily computation uses a 60-day candle lookback
+/// <b>Polling interval:</b> 24 hours. Daily computation uses a 60-day live-outcome window
 /// for statistical stability while reflecting recent market conditions.
 ///
 /// <b>ML lifecycle contribution:</b> Provides a final risk-adjusted position sizing
-/// gate before signals reach the order execution layer.
+/// gate before signals reach the order execution layer by writing a live Kelly cap
+/// and suppressing clearly negative-EV models.
 /// </remarks>
 public sealed class MLKellyFractionWorker : BackgroundService
 {
+    private const string KellyConfigKeyPrefix = "MLKelly:";
+    private const string KellyCapKeySuffix = ":KellyCap";
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<MLKellyFractionWorker> _logger;
 
@@ -81,26 +81,22 @@ public sealed class MLKellyFractionWorker : BackgroundService
     }
 
     /// <summary>
-    /// Core Kelly computation cycle. Simulates trade returns from a 60-day candle
-    /// history using each model's first learner weights, then computes and persists
-    /// the Kelly fraction and Half-Kelly to <c>MLKellyFractionLog</c>. Models with
-    /// negative expected value are suppressed.
+    /// Core Kelly computation cycle. Reconstructs realised signed returns from recent
+    /// resolved production predictions, then computes and persists the Kelly fraction
+    /// and Half-Kelly to <c>MLKellyFractionLog</c>. Models with negative expected
+    /// value are suppressed.
     /// </summary>
     /// <remarks>
-    /// Simulation methodology:
+    /// Live-outcome methodology:
     /// <list type="number">
     ///   <item>
-    ///     Load up to 60 days of candles for the model's symbol/timeframe.
-    ///     Skip models with fewer than 20 candles.
+    ///     Load recent resolved <see cref="MLModelPredictionLog"/> rows for the last 60 days.
+    ///     Require both <c>DirectionCorrect</c> and <c>ActualMagnitudePips</c>.
     ///   </item>
     ///   <item>
-    ///     Deserialise the model snapshot and extract the first learner's weight vector
-    ///     (index 0) as a signal proxy for the full ensemble direction.
-    ///   </item>
-    ///   <item>
-    ///     For each training sample, compute the signal from the dot product of weights
-    ///     and features (+1 = Buy, −1 = Sell). Multiply by the next-bar close return
-    ///     to get signed P&amp;L. Accumulate wins and losses separately.
+    ///     Convert each resolved prediction into a realised signed return proxy:
+    ///     <c>+|ActualMagnitudePips|</c> when the direction was correct,
+    ///     <c>-|ActualMagnitudePips|</c> when it was wrong.
     ///   </item>
     ///   <item>
     ///     Compute p, q, b, f* and Half-Kelly. Cap at ±25%.
@@ -119,7 +115,7 @@ public sealed class MLKellyFractionWorker : BackgroundService
         var readDb   = readCtx.GetDbContext();
         var writeDb  = writeCtx.GetDbContext();
 
-        // Exclude meta-learners and MAML initialisers — they have no direct candle history.
+        // Exclude meta-learners and MAML initialisers — they do not emit direct live trade signals.
         var models = await readDb.Set<MLModel>()
             .AsNoTracking()
             .Where(m => m.IsActive && !m.IsDeleted && !m.IsMetaLearner && !m.IsMamlInitializer
@@ -128,47 +124,28 @@ public sealed class MLKellyFractionWorker : BackgroundService
 
         foreach (var model in models)
         {
-            // 60-day candle lookback: recent enough to reflect current regime,
-            // long enough for stable win-rate and win/loss ratio estimates.
-            var candles = await readDb.Set<Candle>()
+            var logs = await readDb.Set<MLModelPredictionLog>()
                 .AsNoTracking()
-                .Where(c => c.Symbol == model.Symbol && c.Timeframe == model.Timeframe
-                         && c.Timestamp >= DateTime.UtcNow.AddDays(-60) && !c.IsDeleted)
-                .OrderBy(c => c.Timestamp)
+                .Where(l => l.MLModelId == model.Id
+                         && !l.IsDeleted
+                         && l.DirectionCorrect != null
+                         && l.ActualMagnitudePips != null
+                         && l.PredictedAt >= DateTime.UtcNow.AddDays(-60))
+                .OrderByDescending(l => l.PredictedAt)
                 .ToListAsync(ct);
 
-            if (candles.Count < 20) continue;
-
-            ModelSnapshot? snap;
-            try { snap = JsonSerializer.Deserialize<ModelSnapshot>(model.ModelBytes!); }
-            catch { continue; }
-            if (snap?.Weights == null || snap.Weights.Length == 0) continue;
-
-            // Use first learner's weight vector as a directional signal proxy.
-            double[] weights = snap.Weights[0];
-            var samples = MLFeatureHelper.BuildTrainingSamples(candles);
-            if (samples.Count < 10) continue;
+            if (logs.Count < 30) continue;
 
             var wins   = new List<double>(); // magnitudes of profitable predictions
             var losses = new List<double>(); // magnitudes (absolute) of losing predictions
 
-            for (int i = 0; i < samples.Count - 1; i++)
+            foreach (var log in logs)
             {
-                var s = samples[i];
+                double magnitude = (double)Math.Abs(log.ActualMagnitudePips!.Value);
+                if (magnitude <= 0.0) continue;
 
-                // Compute the linear model score: positive = Buy signal, negative = Sell.
-                double dot = 0;
-                for (int j = 0; j < weights.Length && j < s.Features.Length; j++)
-                    dot += weights[j] * s.Features[j];
-                int signal = dot >= 0 ? 1 : -1;
-
-                // Signed next-bar return: positive if the signal direction was correct.
-                double nextClose = (double)candles[i + 1].Close;
-                double thisClose = (double)candles[i].Close;
-                double ret = (nextClose - thisClose) / (thisClose + 1e-8) * signal;
-
-                if (ret > 0) wins.Add(ret);
-                else         losses.Add(Math.Abs(ret));
+                if (log.DirectionCorrect!.Value) wins.Add(magnitude);
+                else                             losses.Add(magnitude);
             }
 
             // Require at least one win and one loss to compute a meaningful b ratio.
@@ -186,6 +163,7 @@ public sealed class MLKellyFractionWorker : BackgroundService
 
             // Negative expected value flag: if f* < 0, the model loses money on average.
             bool negEv = fStar < 0;
+            double deployedKellyCap = Math.Max(0.0, halfKelly);
 
             // Persist Kelly computation as an audit log record.
             writeDb.Set<MLKellyFractionLog>().Add(new MLKellyFractionLog
@@ -201,6 +179,13 @@ public sealed class MLKellyFractionWorker : BackgroundService
                 ComputedAt    = DateTime.UtcNow
             });
 
+            string configKey = $"{KellyConfigKeyPrefix}{model.Symbol}:{model.Timeframe}{KellyCapKeySuffix}";
+            await UpsertConfigAsync(
+                writeDb,
+                configKey,
+                deployedKellyCap.ToString("F4", System.Globalization.CultureInfo.InvariantCulture),
+                ct);
+
             // Suppress the model if it has negative EV to prevent live trading on a
             // geometrically destructive model. The suppression is lifted on the next
             // successful retrain which resets IsSuppressed = false.
@@ -215,6 +200,32 @@ public sealed class MLKellyFractionWorker : BackgroundService
             _logger.LogInformation(
                 "MLKellyFractionWorker: {S}/{T} f*={F:F4} halfKelly={H:F4} winRate={P:F3} b={B:F3} negEV={N}",
                 model.Symbol, model.Timeframe, fStar, halfKelly, p, b, negEv);
+        }
+    }
+
+    private static async Task UpsertConfigAsync(
+        Microsoft.EntityFrameworkCore.DbContext writeCtx,
+        string                                  key,
+        string                                  value,
+        CancellationToken                       ct)
+    {
+        int rows = await writeCtx.Set<EngineConfig>()
+            .Where(c => c.Key == key)
+            .ExecuteUpdateAsync(s => s
+                .SetProperty(c => c.Value, value)
+                .SetProperty(c => c.LastUpdatedAt, DateTime.UtcNow), ct);
+
+        if (rows == 0)
+        {
+            writeCtx.Set<EngineConfig>().Add(new EngineConfig
+            {
+                Key             = key,
+                Value           = value,
+                DataType        = Domain.Enums.ConfigDataType.Decimal,
+                Description     = "Daily Kelly sizing cap written by MLKellyFractionWorker.",
+                IsHotReloadable = true,
+                LastUpdatedAt   = DateTime.UtcNow,
+            });
         }
     }
 }

@@ -299,6 +299,14 @@ public sealed class MLSignalSuppressionWorker : BackgroundService
             // This can happen after a retrain produces a better model whose new predictions
             // push the rolling window accuracy back above the floor, or if market conditions
             // shift so that the existing model is once again predictive.
+            if (!await MLSuppressionStateHelper.CanLiftSuppressionAsync(writeCtx, model, ct))
+            {
+                _logger.LogDebug(
+                    "Suppression: keeping {Symbol}/{Tf} model {Id} suppressed — another active suppression reason still applies.",
+                    model.Symbol, model.Timeframe, model.Id);
+                return;
+            }
+
             _logger.LogInformation(
                 "Suppression: LIFTING suppression for {Symbol}/{Tf} model {Id} — rolling accuracy " +
                 "{Acc:P1} has recovered above floor {Floor:P1}.",

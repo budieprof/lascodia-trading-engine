@@ -137,10 +137,13 @@ public sealed class MLConformalBreakerWorker : BackgroundService
             // Deactivate the breaker log record.
             breaker.IsActive = false;
 
-            // Restore the model's IsSuppressed flag to false.
+            // Restore the model's IsSuppressed flag only when no other active
+            // suppression reason is still holding the model offline.
             var suppressed = await writeDb.Set<MLModel>()
                 .FirstOrDefaultAsync(m => m.Id == breaker.MLModelId, ct);
-            if (suppressed is not null)
+            if (suppressed is not null &&
+                await MLSuppressionStateHelper.CanLiftSuppressionAsync(
+                    writeDb, suppressed, ct, ignoreConformalBreakerId: breaker.Id))
                 suppressed.IsSuppressed = false;
 
             _logger.LogInformation(
@@ -155,15 +158,19 @@ public sealed class MLConformalBreakerWorker : BackgroundService
 
         foreach (var model in activeModels)
         {
-            // Load the most-recent resolved prediction logs for this model, ordered
-            // chronologically ascending so the run scan processes them in time order.
-            var logs = await readDb.Set<MLModelPredictionLog>()
+            // Load the most recent resolved prediction logs for this model, then
+            // reorder them oldest->newest so the run scan preserves time order.
+            var recentLogs = await readDb.Set<MLModelPredictionLog>()
                 .Where(l => l.MLModelId == model.Id
                             && l.DirectionCorrect != null
                             && !l.IsDeleted)
-                .OrderBy(l => l.PredictedAt)
+                .OrderByDescending(l => l.PredictedAt)
                 .Take(MaxLogs)
                 .ToListAsync(ct);
+
+            var logs = recentLogs
+                .OrderBy(l => l.PredictedAt)
+                .ToList();
 
             // Need at least MinLogs resolved predictions for a statistically meaningful check.
             if (logs.Count < MinLogs) continue;

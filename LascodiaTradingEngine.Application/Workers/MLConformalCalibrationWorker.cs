@@ -2,6 +2,7 @@ using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Domain.Entities;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -24,16 +25,23 @@ namespace LascodiaTradingEngine.Application.Workers;
 public sealed class MLConformalCalibrationWorker : BackgroundService
 {
     private readonly IServiceScopeFactory _scopeFactory;
+    private readonly IMemoryCache _cache;
     private readonly ILogger<MLConformalCalibrationWorker> _logger;
+    private const string SnapshotCacheKeyPrefix = "MLSnapshot:";
 
     /// <summary>
     /// Initialises the worker with its required dependencies.
     /// </summary>
     /// <param name="scopeFactory">Creates scoped DI scopes per polling cycle.</param>
+    /// <param name="cache">Shared snapshot cache used by the live scorer.</param>
     /// <param name="logger">Structured logger for conformal calibration events.</param>
-    public MLConformalCalibrationWorker(IServiceScopeFactory scopeFactory, ILogger<MLConformalCalibrationWorker> logger)
+    public MLConformalCalibrationWorker(
+        IServiceScopeFactory scopeFactory,
+        IMemoryCache cache,
+        ILogger<MLConformalCalibrationWorker> logger)
     {
         _scopeFactory = scopeFactory;
+        _cache        = cache;
         _logger       = logger;
     }
 
@@ -103,8 +111,7 @@ public sealed class MLConformalCalibrationWorker : BackgroundService
             try
             {
                 var snap = JsonSerializer.Deserialize<ModelSnapshot>(model.ModelBytes);
-                // Require both Weights and Biases to be present — models without these cannot score.
-                if (snap?.Weights == null || snap.Biases == null) continue;
+                if (snap is null || !HasModelWeights(snap)) continue;
                 double decisionThreshold = MLFeatureHelper.ResolveEffectiveDecisionThreshold(snap);
 
                 // Use recent resolved prediction logs as the conformal calibration set.
@@ -177,6 +184,13 @@ public sealed class MLConformalCalibrationWorker : BackgroundService
                     return (1 - p) <= threshold && p <= threshold;
                 });
 
+                var writeModel = await writeDb.Set<MLModel>()
+                    .FirstOrDefaultAsync(m => m.Id == model.Id && !m.IsDeleted, ct);
+                if (writeModel == null) continue;
+
+                snap.ConformalQHat = threshold;
+                writeModel.ModelBytes = JsonSerializer.SerializeToUtf8Bytes(snap);
+
                 // Persist the calibration record with all computed diagnostics.
                 writeDb.Set<MLConformalCalibration>().Add(new MLConformalCalibration
                 {
@@ -194,6 +208,7 @@ public sealed class MLConformalCalibrationWorker : BackgroundService
                 });
 
                 await writeDb.SaveChangesAsync(ct);
+                _cache.Remove($"{SnapshotCacheKeyPrefix}{model.Id}");
                 _logger.LogInformation(
                     "Conformal calibration: model {Id} τ={T:F4} coverage={C:P1} ambiguous={A:P1}",
                     model.Id, threshold, empCoverage, (double)ambiguousN / calLogs.Count);
@@ -204,4 +219,12 @@ public sealed class MLConformalCalibrationWorker : BackgroundService
             }
         }
     }
+
+    private static bool HasModelWeights(ModelSnapshot snap) =>
+        snap.Weights.Length > 0 ||
+        !string.IsNullOrEmpty(snap.ConvWeightsJson) ||
+        !string.IsNullOrEmpty(snap.GbmTreesJson) ||
+        !string.IsNullOrEmpty(snap.TabNetAttentionJson) ||
+        !string.IsNullOrEmpty(snap.FtTransformerAdditionalLayersJson) ||
+        !string.IsNullOrEmpty(snap.RotationForestJson);
 }

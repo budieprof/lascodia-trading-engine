@@ -1,4 +1,3 @@
-using LascodiaTradingEngine.Application.Common.Events;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Domain.Entities;
@@ -19,10 +18,10 @@ namespace LascodiaTradingEngine.Application.Workers;
 /// </summary>
 /// <remarks>
 /// Each update:
-///   1. Loads the prediction log record and its feature vector (via ContributionsJson context).
+///   1. Loads newly resolved prediction logs since the model's last online-update timestamp.
 ///   2. Deserialises the active model's <see cref="ModelSnapshot"/>.
 ///   3. Runs a single forward + backward pass computing the cross-entropy gradient.
-///   4. Updates each ensemble learner's weight vector by −lr × gradient.
+///   4. Updates each ensemble learner's bias term by −lr × gradient.
 ///   5. Re-serialises the snapshot and patches <c>MLModel.ModelBytes</c>.
 ///   6. Increments <c>MLModel.OnlineLearningUpdateCount</c>.
 ///
@@ -78,12 +77,11 @@ public sealed class MLOnlineLearningWorker : BackgroundService
     /// Online / incremental learning update methodology:
     /// <list type="number">
     ///   <item>
-    ///     <b>Outcome discovery:</b> Query <see cref="MLModelPredictionLog"/> records
-    ///     from the last 2 hours where <c>DirectionCorrect</c> is now set (the outcome
-    ///     worker has resolved the trade) and <c>ShapValuesJson</c> is still null (used
-    ///     as a lightweight "not yet online-updated" flag to avoid reprocessing). Take
-    ///     at most <see cref="BatchSize"/> records ordered oldest-first to process in
-    ///     chronological sequence.
+    ///     <b>Outcome discovery:</b> For each active model, query resolved
+    ///     <see cref="MLModelPredictionLog"/> rows whose <c>OutcomeRecordedAt</c> is newer
+    ///     than the model's <c>LastOnlineLearningAt</c> watermark (or, on first run, newer
+    ///     than 2 hours ago). Take at most <see cref="BatchSize"/> records ordered oldest-first
+    ///     to process in chronological sequence.
     ///   </item>
     ///   <item>
     ///     <b>Model grouping:</b> Group logs by <c>MLModelId</c> so each model's
@@ -122,36 +120,31 @@ public sealed class MLOnlineLearningWorker : BackgroundService
         var readDb   = readCtx.GetDbContext();
         var writeDb  = writeCtx.GetDbContext();
 
-        // Fetch recently resolved logs whose outcomes have not yet been applied as
-        // online learning updates. ShapValuesJson == null acts as a "pending" flag;
-        // the outcome worker sets this field after the online update is confirmed.
-        var cutoff = DateTime.UtcNow.AddHours(-2);
-        var logs = await readDb.Set<MLModelPredictionLog>()
-            .Where(l => !l.IsDeleted
-                     && l.DirectionCorrect.HasValue
-                     && l.OutcomeRecordedAt >= cutoff
-                     && l.ShapValuesJson == null)   // use ShapValuesJson as "online-updated" flag
-            .OrderBy(l => l.OutcomeRecordedAt)
-            .Take(BatchSize)
+        var activeModels = await writeDb.Set<MLModel>()
+            .Where(m => m.IsActive && !m.IsDeleted && m.ModelBytes != null)
             .ToListAsync(ct);
 
-        if (logs.Count == 0) return;
-
-        // Group logs by model so we perform one SaveChanges per model rather than one
-        // per log record. This keeps write amplification low for busy symbols.
-        var byModel = logs.GroupBy(l => l.MLModelId);
-        foreach (var group in byModel)
+        foreach (var model in activeModels)
         {
-            // Load the live model from the write context to ensure we hold a tracked
-            // instance so EF Core detects the ModelBytes change on SaveChanges.
-            var model = await writeDb.Set<MLModel>()
-                .FirstOrDefaultAsync(m => m.Id == group.Key && m.IsActive && !m.IsDeleted, ct);
-            if (model?.ModelBytes == null) continue;
+            if (model.ModelBytes == null) continue;
 
             try
             {
                 var snap = JsonSerializer.Deserialize<ModelSnapshot>(model.ModelBytes);
                 if (snap == null) continue;
+
+                DateTime outcomeCutoff = model.LastOnlineLearningAt ?? DateTime.UtcNow.AddHours(-2);
+                var logs = await readDb.Set<MLModelPredictionLog>()
+                    .Where(l => !l.IsDeleted
+                             && l.MLModelId == model.Id
+                             && l.DirectionCorrect.HasValue
+                             && l.OutcomeRecordedAt != null
+                             && l.OutcomeRecordedAt > outcomeCutoff)
+                    .OrderBy(l => l.OutcomeRecordedAt)
+                    .Take(BatchSize)
+                    .ToListAsync(ct);
+
+                if (logs.Count == 0) continue;
 
                 // GBM models store their structure in GbmTreesJson rather than the
                 // Weights/Biases arrays used by logistic/ELM architectures.
@@ -165,18 +158,10 @@ public sealed class MLOnlineLearningWorker : BackgroundService
 
                 int K = isGbm ? 0 : snap.Weights!.Length;
 
-                foreach (var log in group)
+                int appliedCount = 0;
+                DateTime latestOutcomeRecordedAt = outcomeCutoff;
+                foreach (var log in logs)
                 {
-                    // Reconstruct feature vector from stored SHAP contributions (proxy).
-                    // In a full implementation the raw feature vector would be stored;
-                    // here we use the stored ContributionsJson as a presence gate — if
-                    // ContributionsJson is absent the log cannot contribute a gradient.
-                    if (string.IsNullOrEmpty(log.ContributionsJson)) continue;
-
-                    // Parse top-3 feature indices from ContributionsJson.
-                    // Format: [{"Feature":"Rsi","Value":0.042},...]
-                    // We do a scalar pseudo-gradient from probability error alone because
-                    // the raw feature vector is not stored in the prediction log.
                     double targetLabel = (log.ActualDirection == log.PredictedDirection) ? 1.0 : 0.0;
                     double pBuy        = MLFeatureHelper.ResolveLoggedCalibratedBuyProbability(log);
                     double pHat        = log.PredictedDirection == TradeDirection.Buy ? pBuy : 1.0 - pBuy;
@@ -203,24 +188,30 @@ public sealed class MLOnlineLearningWorker : BackgroundService
                         for (int k = 0; k < K && k < snap.Biases!.Length; k++)
                             snap.Biases[k] -= OnlineLr * err;
                     }
+
+                    appliedCount++;
+                    if (log.OutcomeRecordedAt!.Value > latestOutcomeRecordedAt)
+                        latestOutcomeRecordedAt = log.OutcomeRecordedAt.Value;
                 }
+
+                if (appliedCount == 0) continue;
 
                 // Re-serialise the updated snapshot back into the model blob.
                 model.ModelBytes = JsonSerializer.SerializeToUtf8Bytes(snap);
 
                 // Track cumulative online updates so monitoring workers can flag models
                 // that have diverged significantly from their batch-trained baseline.
-                model.OnlineLearningUpdateCount += group.Count();
-                model.LastOnlineLearningAt       = DateTime.UtcNow;
+                model.OnlineLearningUpdateCount += appliedCount;
+                model.LastOnlineLearningAt       = latestOutcomeRecordedAt;
 
                 await writeDb.SaveChangesAsync(ct);
                 _logger.LogDebug(
                     "MLOnlineLearningWorker updated model {Id} with {N} outcomes.",
-                    model.Id, group.Count());
+                    model.Id, appliedCount);
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Online learning failed for model {Id}", group.Key);
+                _logger.LogWarning(ex, "Online learning failed for model {Id}", model.Id);
             }
         }
     }

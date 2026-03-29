@@ -30,6 +30,8 @@ internal sealed class MLConfigService
 
     private const string KellyLiveCacheKeyPrefix = "MLKellyLive:";
     private static readonly TimeSpan KellyLiveCacheDuration = TimeSpan.FromMinutes(15);
+    private const string KellyCapCacheKeyPrefix = "MLKellyCap:";
+    private static readonly TimeSpan KellyCapCacheDuration = TimeSpan.FromMinutes(15);
 
     private const string CooldownCacheKeyPrefix = "MLCooldownExp:";
     private static readonly TimeSpan CooldownCacheDuration = TimeSpan.FromMinutes(2);
@@ -144,6 +146,24 @@ internal sealed class MLConfigService
             _logger.LogDebug(
                 "KellyLiveAdvisor: {Symbol}/{Tf} model {Id} — liveMultiplier={Mult:F3} kelly→{Kelly:F4}",
                 symbol, timeframe, modelId, kellyLiveMult, kellyFraction);
+        }
+
+        var kcCacheKey  = $"{KellyCapCacheKeyPrefix}{symbol}:{timeframe}:KellyCap";
+        var kcConfigKey = $"MLKelly:{symbol}:{timeframe}:KellyCap";
+        var kellyCap = await GetCachedConfigAsync(
+            kcCacheKey, kcConfigKey, 1.0,
+            s => double.TryParse(s,
+                System.Globalization.NumberStyles.Any,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var v) ? v : (double?)null,
+            KellyCapCacheDuration, db, cancellationToken);
+
+        if (kellyCap >= 0.0 && kellyCap < kellyFraction)
+        {
+            kellyFraction = kellyCap;
+            _logger.LogDebug(
+                "KellyRiskCap: {Symbol}/{Tf} model {Id} — cap={Cap:F4} applied.",
+                symbol, timeframe, modelId, kellyFraction);
         }
 
         return kellyFraction;
