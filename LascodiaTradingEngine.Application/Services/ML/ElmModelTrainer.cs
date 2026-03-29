@@ -1926,6 +1926,8 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         double[]? stackingWeights = null, double stackingBias = 0.0)
     {
         int K = weights.Length;
+        if (K <= 0)
+            return 0.5;
 
         // Stacking meta-learner: logistic regression over per-learner probabilities.
         // When active, this replaces both uniform and accuracy-weighted averaging,
@@ -1993,6 +1995,9 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         int[] learnerHiddenSizes, ElmActivation[] learnerActivations,
         double[]? stackingWeights = null, double stackingBias = 0.0)
     {
+        if (weights.Length <= 0)
+            return 0.5;
+
         double raw = EnsembleRawProb(features, weights, biases, inputWeights, inputBiases,
             featureCount, hiddenSize, featureSubsets, learnerWeights, learnerHiddenSizes, learnerActivations,
             stackingWeights, stackingBias);
@@ -2030,7 +2035,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
     {
         int K = weights.Length;
         var accuracies = new double[K];
-        if (calSet.Count == 0) return (accuracies, null);
+        if (K <= 0 || calSet.Count == 0) return (accuracies, null);
 
         for (int k = 0; k < K; k++)
         {

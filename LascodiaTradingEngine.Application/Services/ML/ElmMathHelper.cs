@@ -296,25 +296,38 @@ internal static class ElmMathHelper
     internal static double ComputeSharpe(double[] returns, double annualisationFactor = 252.0)
     {
         if (returns.Length < 2) return 0;
+        double safeAnnualisationFactor = double.IsFinite(annualisationFactor) && annualisationFactor > 0.0
+            ? annualisationFactor
+            : 252.0;
         double sum = 0;
-        for (int i = 0; i < returns.Length; i++) sum += returns[i];
+        for (int i = 0; i < returns.Length; i++)
+            sum += double.IsFinite(returns[i]) ? returns[i] : 0.0;
         double mean = sum / returns.Length;
         double varSum = 0;
         for (int i = 0; i < returns.Length; i++)
         {
-            double d = returns[i] - mean;
+            double safeReturn = double.IsFinite(returns[i]) ? returns[i] : 0.0;
+            double d = safeReturn - mean;
             varSum += d * d;
         }
-        double std = Math.Sqrt(varSum / (returns.Length - 1));
-        return std > 1e-10 ? mean / std * Math.Sqrt(annualisationFactor) : 0;
+        double std = Math.Sqrt(Math.Max(0.0, varSum / (returns.Length - 1)));
+        double sharpe = std > 1e-10 ? mean / std * Math.Sqrt(safeAnnualisationFactor) : 0.0;
+        return double.IsFinite(sharpe) ? sharpe : 0.0;
     }
 
     internal static double StdDev(IList<double> values, double mean)
     {
         if (values.Count < 2) return 0;
+        double safeMean = double.IsFinite(mean) ? mean : 0.0;
         double sum = 0;
-        for (int i = 0; i < values.Count; i++) { double d = values[i] - mean; sum += d * d; }
-        return Math.Sqrt(sum / (values.Count - 1));
+        for (int i = 0; i < values.Count; i++)
+        {
+            double safeValue = double.IsFinite(values[i]) ? values[i] : 0.0;
+            double d = safeValue - safeMean;
+            sum += d * d;
+        }
+        double std = Math.Sqrt(Math.Max(0.0, sum / (values.Count - 1)));
+        return double.IsFinite(std) ? std : 0.0;
     }
 
     internal static double ComputeSharpeTrend(IReadOnlyList<double> sharpePerFold)
@@ -324,11 +337,15 @@ internal static class ElmMathHelper
         double sx = 0, sy = 0, sxy = 0, sxx = 0;
         for (int i = 0; i < n; i++)
         {
-            sx += i; sy += sharpePerFold[i];
-            sxy += i * sharpePerFold[i]; sxx += i * i;
+            double safeSharpe = double.IsFinite(sharpePerFold[i]) ? sharpePerFold[i] : 0.0;
+            sx += i;
+            sy += safeSharpe;
+            sxy += i * safeSharpe;
+            sxx += i * i;
         }
         double den = n * sxx - sx * sx;
-        return Math.Abs(den) > 1e-15 ? (n * sxy - sx * sy) / den : 0;
+        double trend = Math.Abs(den) > 1e-15 ? (n * sxy - sx * sy) / den : 0.0;
+        return double.IsFinite(trend) ? trend : 0.0;
     }
 
     internal static void ShuffleArray(int[] arr, Random rng)
@@ -344,6 +361,9 @@ internal static class ElmMathHelper
         (int Predicted, int Actual)[] predictions, double annualisationFactor = 252.0)
     {
         if (predictions.Length == 0) return (0, 0);
+        double safeAnnualisationFactor = double.IsFinite(annualisationFactor) && annualisationFactor > 0.0
+            ? annualisationFactor
+            : 252.0;
 
         // Anchor the curve above zero so an immediate losing streak still registers as drawdown.
         double equity = 1.0, peak = 1.0, maxDD = 0.0;
@@ -366,8 +386,10 @@ internal static class ElmMathHelper
             double d = returns[i] - mean;
             varSum += d * d;
         }
-        double std = returns.Length > 1 ? Math.Sqrt(varSum / (returns.Length - 1)) : 0;
-        double sharpe = std > 1e-10 ? mean / std * Math.Sqrt(annualisationFactor) : 0;
+        double std = returns.Length > 1 ? Math.Sqrt(Math.Max(0.0, varSum / (returns.Length - 1))) : 0.0;
+        double sharpe = std > 1e-10 ? mean / std * Math.Sqrt(safeAnnualisationFactor) : 0.0;
+        if (!double.IsFinite(sharpe))
+            sharpe = 0.0;
 
         return (maxDD, sharpe);
     }

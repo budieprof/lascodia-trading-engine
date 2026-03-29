@@ -249,6 +249,8 @@ internal static class ElmBootstrapHelper
         for (int j = 0; j < featureCount; j++)
         {
             double importance = j < importanceScores.Length ? importanceScores[j] : 0.0;
+            if (!double.IsFinite(importance))
+                importance = 0.0;
             double w = Math.Max(0.0, importance) + epsilon;
             rawWeights[j] = w;
             sum += w;
@@ -282,12 +284,13 @@ internal static class ElmBootstrapHelper
 
     internal static int[] GenerateFeatureSubsetFromPool(int[] pool, double ratio, int seed)
     {
-        if (pool.Length == 0)
+        int[] cleanPool = pool.Where(index => index >= 0).Distinct().ToArray();
+        if (cleanPool.Length == 0)
             return [];
 
         double safeRatio = double.IsFinite(ratio) ? Math.Clamp(ratio, 0.0, 1.0) : 1.0;
-        int subsetSize = Math.Clamp(Math.Max(1, (int)Math.Ceiling(pool.Length * safeRatio)), 1, pool.Length);
-        var indices = (int[])pool.Clone();
+        int subsetSize = Math.Clamp(Math.Max(1, (int)Math.Ceiling(cleanPool.Length * safeRatio)), 1, cleanPool.Length);
+        var indices = (int[])cleanPool.Clone();
         var rng = new Random(seed);
 
         for (int i = 0; i < subsetSize; i++)
@@ -305,53 +308,59 @@ internal static class ElmBootstrapHelper
     internal static int[] GenerateBiasedFeatureSubsetFromPool(
         int[] pool, double ratio, double[] importanceScores, int seed)
     {
-        if (pool.Length == 0)
+        int[] cleanPool = pool.Where(index => index >= 0).Distinct().ToArray();
+        if (cleanPool.Length == 0)
             return [];
 
         double safeRatio = double.IsFinite(ratio) ? Math.Clamp(ratio, 0.0, 1.0) : 1.0;
-        int subCount = Math.Clamp(Math.Max(1, (int)Math.Ceiling(pool.Length * safeRatio)), 1, pool.Length);
+        int subCount = Math.Clamp(Math.Max(1, (int)Math.Ceiling(cleanPool.Length * safeRatio)), 1, cleanPool.Length);
         var rng = new Random(seed);
-        double epsilon = 1.0 / pool.Length;
+        double epsilon = 1.0 / cleanPool.Length;
 
-        var rawWeights = new double[pool.Length];
+        var rawWeights = new double[cleanPool.Length];
         double sum = 0.0;
-        for (int j = 0; j < pool.Length; j++)
+        for (int j = 0; j < cleanPool.Length; j++)
         {
-            int fi = pool[j];
-            double importance = fi < importanceScores.Length ? importanceScores[fi] : 0.0;
+            int fi = cleanPool[j];
+            double importance = fi >= 0 && fi < importanceScores.Length ? importanceScores[fi] : 0.0;
+            if (!double.IsFinite(importance))
+                importance = 0.0;
             double w = Math.Max(0.0, importance) + epsilon;
             rawWeights[j] = w;
             sum += w;
         }
 
         if (sum <= 1e-15)
-            return GenerateFeatureSubsetFromPool(pool, ratio, seed);
+            return GenerateFeatureSubsetFromPool(cleanPool, ratio, seed);
 
-        var cdf = new double[pool.Length];
+        var cdf = new double[cleanPool.Length];
         cdf[0] = rawWeights[0] / sum;
-        for (int j = 1; j < pool.Length; j++)
+        for (int j = 1; j < cleanPool.Length; j++)
             cdf[j] = cdf[j - 1] + rawWeights[j] / sum;
 
         var selected = new HashSet<int>(subCount);
         int attempts = 0;
-        while (selected.Count < subCount && attempts < pool.Length * 10)
+        while (selected.Count < subCount && attempts < cleanPool.Length * 10)
         {
             attempts++;
             double u = rng.NextDouble();
             int idx = Array.BinarySearch(cdf, u);
             if (idx < 0) idx = ~idx;
-            idx = Math.Clamp(idx, 0, pool.Length - 1);
-            selected.Add(pool[idx]);
+            idx = Math.Clamp(idx, 0, cleanPool.Length - 1);
+            selected.Add(cleanPool[idx]);
         }
 
-        for (int j = 0; j < pool.Length && selected.Count < subCount; j++)
-            selected.Add(pool[j]);
+        for (int j = 0; j < cleanPool.Length && selected.Count < subCount; j++)
+            selected.Add(cleanPool[j]);
 
         return [.. selected.OrderBy(x => x)];
     }
 
     internal static bool[] BuildFeatureMask(float[] importance, double threshold, int featureCount)
     {
+        if (featureCount <= 0)
+            return [];
+
         if (threshold <= 0) return Enumerable.Repeat(true, featureCount).ToArray();
 
         var normalised = ElmEvaluationHelper.NormalisePositiveImportance(importance, featureCount);
@@ -414,7 +423,9 @@ internal static class ElmBootstrapHelper
         int k = Math.Min(kNeighbors, n - 1);
         var rng = new Random(seed);
         var result = new List<(TrainingSample, bool)>(syntheticCount);
-        int featureLen = minoritySamples[0].Features.Length;
+        int featureLen = minoritySamples.Min(sample => sample.Features.Length);
+        if (featureLen <= 0 || k <= 0)
+            return [];
 
         int candidatePoolSize = Math.Min(n - 1, Math.Max(3 * k, (int)(Math.Sqrt(n) * k)));
         bool useExact = n <= 500;
@@ -430,7 +441,11 @@ internal static class ElmBootstrapHelper
                     double d = 0;
                     for (int f = 0; f < featureLen; f++)
                     {
-                        double diff = minoritySamples[i].Features[f] - minoritySamples[j].Features[f];
+                        double left = minoritySamples[i].Features[f];
+                        double right = minoritySamples[j].Features[f];
+                        if (!double.IsFinite(left)) left = 0.0;
+                        if (!double.IsFinite(right)) right = 0.0;
+                        double diff = left - right;
                         d += diff * diff;
                     }
                     dists[j] = (d, j);
@@ -471,7 +486,11 @@ internal static class ElmBootstrapHelper
                     double d = 0;
                     for (int f = 0; f < featureLen; f++)
                     {
-                        double diff = minoritySamples[i].Features[f] - minoritySamples[j].Features[f];
+                        double left = minoritySamples[i].Features[f];
+                        double right = minoritySamples[j].Features[f];
+                        if (!double.IsFinite(left)) left = 0.0;
+                        if (!double.IsFinite(right)) right = 0.0;
+                        double diff = left - right;
                         d += diff * diff;
                     }
                     candidates[ci] = (d, j);
@@ -497,10 +516,19 @@ internal static class ElmBootstrapHelper
             var nnFeatures = minoritySamples[nnIdx].Features;
             var synFeatures = new float[featureLen];
             for (int f = 0; f < featureLen; f++)
-                synFeatures[f] = (float)(baseFeatures[f] + lambda * (nnFeatures[f] - baseFeatures[f]));
+            {
+                double baseFeature = baseFeatures[f];
+                double nnFeature = nnFeatures[f];
+                if (!double.IsFinite(baseFeature)) baseFeature = 0.0;
+                if (!double.IsFinite(nnFeature)) nnFeature = 0.0;
+                synFeatures[f] = (float)(baseFeature + lambda * (nnFeature - baseFeature));
+            }
 
-            double synMag = minoritySamples[baseIdx].Magnitude +
-                            lambda * (minoritySamples[nnIdx].Magnitude - minoritySamples[baseIdx].Magnitude);
+            double baseMagnitude = double.IsFinite(minoritySamples[baseIdx].Magnitude) ? minoritySamples[baseIdx].Magnitude : 0.0;
+            double nnMagnitude = double.IsFinite(minoritySamples[nnIdx].Magnitude) ? minoritySamples[nnIdx].Magnitude : 0.0;
+            double synMag = baseMagnitude + lambda * (nnMagnitude - baseMagnitude);
+            if (!double.IsFinite(synMag))
+                synMag = 0.0;
 
             result.Add((new TrainingSample(
                 synFeatures,

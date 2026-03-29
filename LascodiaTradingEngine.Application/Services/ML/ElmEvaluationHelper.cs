@@ -365,7 +365,12 @@ internal static class ElmEvaluationHelper
                 for (int j = 0; j < Math.Min(magWeights.Length, train[i].Features.Length); j++)
                     pred += magWeights[j] * train[i].Features[j];
             }
-            residuals[i] = train[i].Magnitude - pred;
+            if (!double.IsFinite(pred))
+                pred = 0.0;
+
+            double targetMagnitude = double.IsFinite(train[i].Magnitude) ? train[i].Magnitude : 0.0;
+            double residual = targetMagnitude - pred;
+            residuals[i] = double.IsFinite(residual) ? residual : 0.0;
         }
 
         double sumDiffSq = 0, sumSq = 0;
@@ -401,12 +406,12 @@ internal static class ElmEvaluationHelper
             int positiveCount = 0;
             for (int k = 0; k < K; k++)
             {
-                double p = elmLearnerProb(
+                double p = ClampProbability(elmLearnerProb(
                     calSet[i].Features, weights[k], biases[k],
                     inputWeights[k], inputBiases[k],
                     featureCount, hiddenSize,
                     featureSubsets is not null && k < featureSubsets.Length ? featureSubsets[k] : null,
-                    k);
+                    k));
                 if (p >= 0.5) positiveCount++;
             }
             totalDisagreePairs += (long)positiveCount * (K - positiveCount);

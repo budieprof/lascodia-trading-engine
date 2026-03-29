@@ -134,6 +134,10 @@ internal static class ElmCalibrationHelper
         Func<float[], double[][], double[], double[][], double[][], int, int, int[][]?, double[]?, double> ensembleRawProb,
         int cvFolds = 3)
     {
+        if (cvFolds < 2)
+            return FitPlattScaling(calSet, weights, biases, inputWeights, inputBiases,
+                featureCount, hiddenSize, featureSubsets, ensembleRawProb);
+
         if (calSet.Count < cvFolds * 20)
             return FitPlattScaling(calSet, weights, biases, inputWeights, inputBiases,
                 featureCount, hiddenSize, featureSubsets, ensembleRawProb);
@@ -343,6 +347,7 @@ internal static class ElmCalibrationHelper
         Func<float[], double[][], double[], double[][], double[][], double, double, int, int, int[][]?, double[]?, double> ensembleCalibProb)
     {
         if (calSet.Count < 5) return 0.5;
+        double safeAlpha = double.IsFinite(alpha) ? Math.Clamp(alpha, 0.0, 1.0) : 0.5;
 
         var residuals = new double[calSet.Count];
         for (int i = 0; i < calSet.Count; i++)
@@ -357,7 +362,7 @@ internal static class ElmCalibrationHelper
         }
         Array.Sort(residuals);
 
-        int idx = (int)Math.Ceiling((1.0 - alpha) * (calSet.Count + 1)) - 1;
+        int idx = (int)Math.Ceiling((1.0 - safeAlpha) * (calSet.Count + 1)) - 1;
         idx = Math.Clamp(idx, 0, calSet.Count - 1);
         return residuals[idx];
     }
