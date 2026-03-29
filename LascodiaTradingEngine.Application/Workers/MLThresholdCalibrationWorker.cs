@@ -210,8 +210,9 @@ public sealed class MLThresholdCalibrationWorker : BackgroundService
         // Project only the fields needed for the confusion matrix to minimise data transfer.
         var resolved = await readCtx.Set<MLModelPredictionLog>()
             .Where(l => l.MLModelId        == model.Id &&
-                        l.PredictedAt      >= since    &&
-                        l.DirectionCorrect != null     &&
+                        l.OutcomeRecordedAt != null   &&
+                        l.OutcomeRecordedAt >= since  &&
+                        l.DirectionCorrect != null    &&
                         !l.IsDeleted)
             .Select(l => new
             {

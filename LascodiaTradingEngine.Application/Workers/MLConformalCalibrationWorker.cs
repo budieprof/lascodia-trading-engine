@@ -121,10 +121,13 @@ public sealed class MLConformalCalibrationWorker : BackgroundService
                              && !l.IsDeleted
                              && l.ActualDirection.HasValue
                              && l.DirectionCorrect.HasValue
+                             && l.OutcomeRecordedAt != null
                              && (l.ConfidenceScore > 0
+                                 || l.ServedCalibratedProbability != null
                                  || l.CalibratedProbability != null
                                  || l.RawProbability != null))
-                    .OrderByDescending(l => l.PredictedAt)
+                    .OrderByDescending(l => l.OutcomeRecordedAt)
+                    .ThenByDescending(l => l.Id)
                     .Take(500)
                     .ToListAsync(ct);
 
@@ -139,7 +142,7 @@ public sealed class MLConformalCalibrationWorker : BackgroundService
                 var scores = new List<double>(calLogs.Count);
                 foreach (var log in calLogs)
                 {
-                    double pBuy = MLFeatureHelper.ResolveLoggedCalibratedBuyProbability(log, decisionThreshold);
+                    double pBuy = MLFeatureHelper.ResolveLoggedServedBuyProbability(log, decisionThreshold);
                     double pTrue = log.ActualDirection == Domain.Enums.TradeDirection.Buy
                         ? pBuy
                         : 1.0 - pBuy;
@@ -164,7 +167,7 @@ public sealed class MLConformalCalibrationWorker : BackgroundService
                 // when the nonconformity score of the true label ≤ τ.
                 int covered = calLogs.Count(l =>
                 {
-                    double pBuy = MLFeatureHelper.ResolveLoggedCalibratedBuyProbability(l, decisionThreshold);
+                    double pBuy = MLFeatureHelper.ResolveLoggedServedBuyProbability(l, decisionThreshold);
                     double pSell = 1.0 - pBuy;
                     // Prediction set membership: include Buy if (1 − pBuy) ≤ τ, Sell if (1 − pSell) ≤ τ.
                     bool   inBuy  = (1 - pBuy)  <= threshold;
@@ -180,7 +183,7 @@ public sealed class MLConformalCalibrationWorker : BackgroundService
                 // (1 − p) ≤ τ AND p ≤ τ  ⟺  (1 − τ) ≤ p ≤ τ  ⟺  the probability is near 0.5.
                 int    ambiguousN   = calLogs.Count(l =>
                 {
-                    double p = MLFeatureHelper.ResolveLoggedCalibratedBuyProbability(l, decisionThreshold);
+                    double p = MLFeatureHelper.ResolveLoggedServedBuyProbability(l, decisionThreshold);
                     return (1 - p) <= threshold && p <= threshold;
                 });
 

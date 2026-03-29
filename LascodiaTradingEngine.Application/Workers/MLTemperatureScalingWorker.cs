@@ -1,5 +1,6 @@
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.MLModels.Shared;
+using LascodiaTradingEngine.Application.Services;
 using LascodiaTradingEngine.Domain.Entities;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Caching.Memory;
@@ -129,14 +130,16 @@ public sealed class MLTemperatureScalingWorker : BackgroundService
 
             double decisionThreshold = MLFeatureHelper.ResolveEffectiveDecisionThreshold(snap);
 
-            // Load the most recent resolved prediction logs for this model.
+            // Load the most recently resolved prediction logs for this model.
             var logs = await readDb.Set<MLModelPredictionLog>()
                 .AsNoTracking()
                 .Where(p => p.MLModelId == model.Id &&
                             !p.IsDeleted &&
                             p.DirectionCorrect != null &&
-                            p.ActualDirection != null)
-                .OrderByDescending(p => p.PredictedAt)
+                            p.ActualDirection != null &&
+                            p.OutcomeRecordedAt != null)
+                .OrderByDescending(p => p.OutcomeRecordedAt)
+                .ThenByDescending(p => p.Id)
                 .Take(MaxSamples)
                 .ToListAsync(ct);
 
@@ -190,6 +193,7 @@ public sealed class MLTemperatureScalingWorker : BackgroundService
             if (writeModel != null && latestSnap != null)
             {
                 latestSnap.TemperatureScale = optT;
+                latestSnap.Ece = ComputeSnapshotEce(logs, latestSnap, decisionThreshold);
                 writeModel.ModelBytes = JsonSerializer.SerializeToUtf8Bytes(latestSnap);
                 _cache.Remove($"{SnapshotCacheKeyPrefix}{model.Id}");
             }
@@ -233,6 +237,59 @@ public sealed class MLTemperatureScalingWorker : BackgroundService
         }
 
         await writeDb.SaveChangesAsync(ct);
+    }
+
+    private static double ComputeSnapshotEce(
+        IReadOnlyList<MLModelPredictionLog> logs,
+        ModelSnapshot                       snap,
+        double                              fallbackThreshold)
+    {
+        if (logs.Count == 0) return 0.0;
+        const int bins = 10;
+        var binConf = new double[bins];
+        var binLabel = new double[bins];
+        var binN = new int[bins];
+
+        foreach (var log in logs)
+        {
+            double rawP = MLFeatureHelper.ResolveLoggedRawBuyProbability(log, fallbackThreshold);
+            double p = ApplySnapshotCalibration(rawP, snap);
+            double y = log.ActualDirection == Domain.Enums.TradeDirection.Buy ? 1.0 : 0.0;
+            int bin = Math.Clamp((int)(p * bins), 0, bins - 1);
+            binConf[bin] += p;
+            binLabel[bin] += y;
+            binN[bin]++;
+        }
+
+        double ece = 0.0;
+        for (int i = 0; i < bins; i++)
+        {
+            if (binN[i] == 0) continue;
+            ece += (double)binN[i] / logs.Count * Math.Abs(binLabel[i] / binN[i] - binConf[i] / binN[i]);
+        }
+
+        return ece;
+    }
+
+    private static double ApplySnapshotCalibration(double rawP, ModelSnapshot snap)
+    {
+        double rawLogit = Math.Log(Math.Clamp(rawP, 1e-7, 1 - 1e-7) / (1.0 - Math.Clamp(rawP, 1e-7, 1 - 1e-7)));
+        double globalCalibP = snap.TemperatureScale > 0.0 && snap.TemperatureScale < 10.0
+            ? Sigmoid(rawLogit / snap.TemperatureScale)
+            : Sigmoid(snap.PlattA * rawLogit + snap.PlattB);
+
+        double calibP;
+        if (globalCalibP >= 0.5 && snap.PlattABuy != 0.0)
+            calibP = Sigmoid(snap.PlattABuy * rawLogit + snap.PlattBBuy);
+        else if (globalCalibP < 0.5 && snap.PlattASell != 0.0)
+            calibP = Sigmoid(snap.PlattASell * rawLogit + snap.PlattBSell);
+        else
+            calibP = globalCalibP;
+
+        if (snap.IsotonicBreakpoints.Length >= 4)
+            calibP = BaggedLogisticTrainer.ApplyIsotonicCalibration(calibP, snap.IsotonicBreakpoints);
+
+        return calibP;
     }
 
     /// <summary>

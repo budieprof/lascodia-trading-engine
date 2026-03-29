@@ -214,11 +214,13 @@ public sealed class MLRecalibrationWorker : BackgroundService
         var since = DateTime.UtcNow.AddDays(-windowDays);
         var logs  = await readCtx.Set<MLModelPredictionLog>()
             .Where(l => l.MLModelId           == model.Id &&
-                        l.PredictedAt         >= since    &&
                         l.ActualDirection.HasValue        &&
                         l.DirectionCorrect.HasValue       &&
+                        l.OutcomeRecordedAt != null       &&
+                        l.OutcomeRecordedAt >= since      &&
                         !l.IsDeleted)
-            .OrderBy(l => l.PredictedAt)
+            .OrderBy(l => l.OutcomeRecordedAt)
+            .ThenBy(l => l.Id)
             .AsNoTracking()
             .ToListAsync(ct);
 
@@ -266,16 +268,46 @@ public sealed class MLRecalibrationWorker : BackgroundService
         // Refit Platt scaling (A, B) using temporally-weighted SGD on the resolved prediction logs.
         // Platt scaling maps a raw logit f to a calibrated probability: σ(A·f + B)
         // where σ is the sigmoid function. A=1, B=0 is the identity (no change).
-        var (newPlattA, newPlattB) = RefitPlattFromLogs(logs, logWeights, decisionThreshold, plattLr, plattEpochs);
+        bool useTemperature = snap.TemperatureScale > 0.0 && snap.TemperatureScale < 10.0;
+        var (newPlattA, newPlattB) = useTemperature
+            ? (snap.PlattA, snap.PlattB)
+            : RefitPlattFromLogs(logs, logWeights, decisionThreshold, plattLr, plattEpochs);
 
-        // Refit isotonic calibration breakpoints using PAVA on Platt-transformed scores.
-        // Isotonic regression produces a non-decreasing monotone mapping from calibrated
-        // probability to empirical accuracy, correcting systematic over/under-confidence.
-        var newIsotonicBp = RefitIsotonicFromLogs(logs, decisionThreshold, newPlattA, newPlattB);
+        // Refit class-conditional Platt (separate scalers for Buy and Sell).
+        // Buy-predicted logs (confidence ≥ 0.5) and Sell-predicted logs (< 0.5) may have
+        // systematically different calibration errors; fitting separate (A, B) pairs corrects this.
+        var (newABuy, newBBuy, newASell, newBSell) = RefitClassConditionalPlatt(
+            logs, decisionThreshold, snap.TemperatureScale, newPlattA, newPlattB, plattLr, plattEpochs);
 
-        // Verify that the new Platt parameters actually improve ECE before committing.
-        // If the new fit is worse than the current calibration, discard it.
-        double newEce = ComputeEceFromLogsWithPlatt(logs, decisionThreshold, newPlattA, newPlattB);
+        // Refit isotonic calibration breakpoints on the same pre-isotonic calibration path
+        // that production will actually use after this update.
+        var newIsotonicBp = RefitIsotonicFromLogs(
+            logs,
+            decisionThreshold,
+            snap.TemperatureScale,
+            newPlattA,
+            newPlattB,
+            newABuy,
+            newBBuy,
+            newASell,
+            newBSell,
+            snap.AgeDecayLambda,
+            snap.TrainedAtUtc);
+
+        // Verify that the full patched calibration stack actually improves ECE before committing.
+        double newEce = ComputeEceFromLogsWithCalibration(
+            logs,
+            decisionThreshold,
+            snap.TemperatureScale,
+            newPlattA,
+            newPlattB,
+            newABuy,
+            newBBuy,
+            newASell,
+            newBSell,
+            newIsotonicBp,
+            snap.AgeDecayLambda,
+            snap.TrainedAtUtc);
         if (newEce >= currentEce)
         {
             _logger.LogDebug(
@@ -284,16 +316,11 @@ public sealed class MLRecalibrationWorker : BackgroundService
             return;
         }
 
-        // Refit class-conditional Platt (separate scalers for Buy and Sell).
-        // Buy-predicted logs (confidence ≥ 0.5) and Sell-predicted logs (< 0.5) may have
-        // systematically different calibration errors; fitting separate (A, B) pairs corrects this.
-        var (newABuy, newBBuy, newASell, newBSell) = RefitClassConditionalPlatt(
-            logs, decisionThreshold, plattLr, plattEpochs);
-
         // Patch snapshot with new calibration parameters.
         snap.PlattA              = newPlattA;
         snap.PlattB              = newPlattB;
         snap.IsotonicBreakpoints = newIsotonicBp;
+        snap.Ece                 = newEce;
         // Only update class-conditional Platt if the fitting produced non-zero parameters
         // (FitSgd returns (0, 0) when a class has fewer than 5 samples).
         if (newABuy  != 0.0) { snap.PlattABuy  = newABuy;  snap.PlattBBuy  = newBBuy;  }
@@ -316,13 +343,13 @@ public sealed class MLRecalibrationWorker : BackgroundService
     // ── Calibration helpers ───────────────────────────────────────────────────
 
     /// <summary>
-    /// Computes Expected Calibration Error (ECE) directly from stored
-    /// <see cref="MLModelPredictionLog.ConfidenceScore"/> values using 10 equal-width bins.
+    /// Computes Expected Calibration Error (ECE) directly from logged Buy-class probabilities
+    /// using 10 equal-width bins.
     ///
-    /// A prediction is considered "correct" when the relationship between confidence and
-    /// direction matches: confidence ≥ 0.5 ⟺ DirectionCorrect is true.
+    /// For calibration, each bin compares mean predicted <c>P(Buy)</c> against the empirical
+    /// Buy frequency in that bin rather than thresholded direction correctness.
     ///
-    /// ECE = Σ_m (|B_m| / n) × |acc(B_m) − conf(B_m)|
+    /// ECE = Σ_m (|B_m| / n) × |mean(y in B_m) − mean(p in B_m)|
     /// </summary>
     /// <param name="logs">Resolved prediction logs with non-null <c>DirectionCorrect</c>.</param>
     /// <returns>ECE in [0, 1]. Lower is better calibrated.</returns>
@@ -333,7 +360,7 @@ public sealed class MLRecalibrationWorker : BackgroundService
         if (logs.Count == 0) return 0.0;
         const int NumBins = 10;
         var binConfSum = new double[NumBins];
-        var binCorrect = new int[NumBins];
+        var binLabelSum = new double[NumBins];
         var binCount   = new int[NumBins];
 
         foreach (var log in logs)
@@ -341,10 +368,8 @@ public sealed class MLRecalibrationWorker : BackgroundService
             double p = MLFeatureHelper.ResolveLoggedCalibratedBuyProbability(log, decisionThreshold);
             int    bin = Math.Clamp((int)(p * NumBins), 0, NumBins - 1);
             binConfSum[bin] += p;
-            bool correct = log.ActualDirection.HasValue
-                ? (p >= decisionThreshold) == (log.ActualDirection == TradeDirection.Buy)
-                : (p >= decisionThreshold) == (log.DirectionCorrect == true);
-            if (correct) binCorrect[bin]++;
+            double y = log.ActualDirection == TradeDirection.Buy ? 1.0 : 0.0;
+            binLabelSum[bin] += y;
             binCount[bin]++;
         }
 
@@ -354,47 +379,51 @@ public sealed class MLRecalibrationWorker : BackgroundService
         {
             if (binCount[b] == 0) continue;
             double avgConf = binConfSum[b] / binCount[b];
-            double acc     = binCorrect[b] / (double)binCount[b];
-            ece += Math.Abs(acc - avgConf) * binCount[b] / n;
+            double avgLabel = binLabelSum[b] / binCount[b];
+            ece += Math.Abs(avgLabel - avgConf) * binCount[b] / n;
         }
         return ece;
     }
 
-    /// <summary>
-    /// Computes ECE after applying Platt scaling to the stored confidence scores.
-    /// Used to evaluate whether the newly fitted Platt (A, B) parameters produce a
-    /// lower ECE than the currently stored parameters before committing the update.
-    ///
-    /// Platt transform: calibP = σ(A × logit(rawP) + B)
-    /// where logit(p) = log(p / (1 − p)) and σ is the sigmoid function.
-    /// </summary>
-    /// <param name="logs">Resolved prediction logs.</param>
-    /// <param name="plattA">Scale parameter A for the Platt sigmoid.</param>
-    /// <param name="plattB">Bias parameter B for the Platt sigmoid.</param>
-    /// <returns>ECE in [0, 1] after applying the Platt transform.</returns>
-    private static double ComputeEceFromLogsWithPlatt(
+    private static double ComputeEceFromLogsWithCalibration(
         IReadOnlyList<MLModelPredictionLog> logs,
         double                              decisionThreshold,
+        double                              temperatureScale,
         double                              plattA,
-        double                              plattB)
+        double                              plattB,
+        double                              plattABuy,
+        double                              plattBBuy,
+        double                              plattASell,
+        double                              plattBSell,
+        double[]                            isotonicBreakpoints,
+        double                              ageDecayLambda,
+        DateTime                            trainedAtUtc)
     {
         if (logs.Count == 0) return 0.0;
         const int NumBins = 10;
         var binConfSum = new double[NumBins];
-        var binCorrect = new int[NumBins];
+        var binLabelSum = new double[NumBins];
         var binCount   = new int[NumBins];
 
         foreach (var log in logs)
         {
             double rawP = MLFeatureHelper.ResolveLoggedRawBuyProbability(log, decisionThreshold);
-            double logit   = MLFeatureHelper.Logit(rawP);
-            double calibP  = MLFeatureHelper.Sigmoid(plattA * logit + plattB);
+            double calibP = ApplyCalibrationWithoutAgeDecay(
+                rawP,
+                temperatureScale,
+                plattA,
+                plattB,
+                plattABuy,
+                plattBBuy,
+                plattASell,
+                plattBSell,
+                isotonicBreakpoints,
+                ageDecayLambda,
+                trainedAtUtc);
             int    bin     = Math.Clamp((int)(calibP * NumBins), 0, NumBins - 1);
             binConfSum[bin] += calibP;
-            bool correct = log.ActualDirection.HasValue
-                ? (calibP >= decisionThreshold) == (log.ActualDirection == TradeDirection.Buy)
-                : (calibP >= decisionThreshold) == (log.DirectionCorrect == true);
-            if (correct) binCorrect[bin]++;
+            double y = log.ActualDirection == TradeDirection.Buy ? 1.0 : 0.0;
+            binLabelSum[bin] += y;
             binCount[bin]++;
         }
 
@@ -404,8 +433,8 @@ public sealed class MLRecalibrationWorker : BackgroundService
         {
             if (binCount[b] == 0) continue;
             double avgConf = binConfSum[b] / binCount[b];
-            double acc     = binCorrect[b] / (double)binCount[b];
-            ece += Math.Abs(acc - avgConf) * binCount[b] / n;
+            double avgLabel = binLabelSum[b] / binCount[b];
+            ece += Math.Abs(avgLabel - avgConf) * binCount[b] / n;
         }
         return ece;
     }
@@ -442,7 +471,8 @@ public sealed class MLRecalibrationWorker : BackgroundService
         double sum = 0.0;
         for (int i = 0; i < n; i++)
         {
-            double days = (now - logs[i].PredictedAt).TotalDays;
+            DateTime resolvedAt = logs[i].OutcomeRecordedAt ?? logs[i].PredictedAt;
+            double days = (now - resolvedAt).TotalDays;
             // Exponential decay: older samples receive geometrically smaller weights.
             weights[i]  = Math.Exp(-lambda * days);
             sum        += weights[i];
@@ -532,8 +562,15 @@ public sealed class MLRecalibrationWorker : BackgroundService
     private static double[] RefitIsotonicFromLogs(
         IReadOnlyList<MLModelPredictionLog> logs,
         double                              decisionThreshold,
+        double                              temperatureScale,
         double                              plattA,
-        double                              plattB)
+        double                              plattB,
+        double                              plattABuy,
+        double                              plattBBuy,
+        double                              plattASell,
+        double                              plattBSell,
+        double                              ageDecayLambda,
+        DateTime                            trainedAtUtc)
     {
         if (logs.Count < 10) return [];
 
@@ -542,7 +579,18 @@ public sealed class MLRecalibrationWorker : BackgroundService
             .Select(l =>
             {
                 double rawP = MLFeatureHelper.ResolveLoggedRawBuyProbability(l, decisionThreshold);
-                double calibP = MLFeatureHelper.Sigmoid(plattA * MLFeatureHelper.Logit(rawP) + plattB);
+                double calibP = ApplyCalibrationWithoutAgeDecay(
+                    rawP,
+                    temperatureScale,
+                    plattA,
+                    plattB,
+                    plattABuy,
+                    plattBBuy,
+                    plattASell,
+                    plattBSell,
+                    [],
+                    ageDecayLambda,
+                    trainedAtUtc);
                 return (P: calibP, Y: l.ActualDirection == TradeDirection.Buy ? 1.0 : 0.0);
             })
             .OrderBy(x => x.P)
@@ -607,20 +655,28 @@ public sealed class MLRecalibrationWorker : BackgroundService
         RefitClassConditionalPlatt(
             IReadOnlyList<MLModelPredictionLog> logs,
             double                              decisionThreshold,
+            double                              temperatureScale,
+            double                              globalPlattA,
+            double                              globalPlattB,
             double                              lr,
             int                                 epochs)
     {
         var buyPairs  = new List<(double Logit, double Y)>();
         var sellPairs = new List<(double Logit, double Y)>();
 
-        // Partition logs by the direction the scorer actually emitted.
+        // Partition by the same global calibration branch that live inference uses before
+        // applying the class-conditional scaler: temperature/global Platt, then >= 0.5.
         foreach (var log in logs)
         {
             double rawP = MLFeatureHelper.ResolveLoggedRawBuyProbability(log, decisionThreshold);
             double logit = MLFeatureHelper.Logit(rawP);
             double y     = log.ActualDirection == TradeDirection.Buy ? 1.0 : 0.0;
-            if (log.PredictedDirection == TradeDirection.Buy) buyPairs.Add((logit, y));
-            else                                              sellPairs.Add((logit, y));
+            double globalCalibP = temperatureScale > 0.0 && temperatureScale < 10.0
+                ? MLFeatureHelper.Sigmoid(logit / temperatureScale)
+                : MLFeatureHelper.Sigmoid(globalPlattA * logit + globalPlattB);
+
+            if (globalCalibP >= 0.5) buyPairs.Add((logit, y));
+            else                     sellPairs.Add((logit, y));
         }
 
         // Local SGD fitter: standard Platt mini-batch SGD for a single (logit, label) dataset.
@@ -649,6 +705,45 @@ public sealed class MLRecalibrationWorker : BackgroundService
         var (aBuy,  bBuy)  = FitSgd(buyPairs,  lr, epochs);
         var (aSell, bSell) = FitSgd(sellPairs, lr, epochs);
         return (aBuy, bBuy, aSell, bSell);
+    }
+
+    private static double ApplyCalibrationWithoutAgeDecay(
+        double   rawP,
+        double   temperatureScale,
+        double   plattA,
+        double   plattB,
+        double   plattABuy,
+        double   plattBBuy,
+        double   plattASell,
+        double   plattBSell,
+        double[] isotonicBreakpoints,
+        double   ageDecayLambda,
+        DateTime trainedAtUtc)
+    {
+        double rawLogit = MLFeatureHelper.Logit(rawP);
+        double globalCalibP = temperatureScale > 0.0 && temperatureScale < 10.0
+            ? MLFeatureHelper.Sigmoid(rawLogit / temperatureScale)
+            : MLFeatureHelper.Sigmoid(plattA * rawLogit + plattB);
+
+        double calibP;
+        if (globalCalibP >= 0.5 && plattABuy != 0.0)
+            calibP = MLFeatureHelper.Sigmoid(plattABuy * rawLogit + plattBBuy);
+        else if (globalCalibP < 0.5 && plattASell != 0.0)
+            calibP = MLFeatureHelper.Sigmoid(plattASell * rawLogit + plattBSell);
+        else
+            calibP = globalCalibP;
+
+        if (isotonicBreakpoints.Length >= 4)
+            calibP = BaggedLogisticTrainer.ApplyIsotonicCalibration(calibP, isotonicBreakpoints);
+
+        if (ageDecayLambda > 0.0 && trainedAtUtc != default)
+        {
+            double daysSinceTrain = (DateTime.UtcNow - trainedAtUtc).TotalDays;
+            double decayFactor = Math.Exp(-ageDecayLambda * Math.Max(0.0, daysSinceTrain));
+            calibP = 0.5 + (calibP - 0.5) * decayFactor;
+        }
+
+        return calibP;
     }
 
     // ── Config helper ─────────────────────────────────────────────────────────

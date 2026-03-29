@@ -25,6 +25,8 @@ namespace LascodiaTradingEngine.Application.Workers;
 /// </remarks>
 public sealed class MLStackingMetaLearnerWorker : BackgroundService
 {
+    private const int TrainingWindowDays = 60;
+
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<MLStackingMetaLearnerWorker> _logger;
 
@@ -114,7 +116,12 @@ public sealed class MLStackingMetaLearnerWorker : BackgroundService
         // Meta-learners and MAML initialisers are excluded — they are not first-level
         // predictors and including them would introduce circular self-reference.
         var activeModels = await readDb.Set<MLModel>()
-            .Where(m => m.IsActive && !m.IsDeleted && !m.IsMetaLearner && !m.IsMamlInitializer)
+            .Where(m => m.IsActive &&
+                        !m.IsDeleted &&
+                        !m.IsMetaLearner &&
+                        !m.IsMamlInitializer &&
+                        !m.IsSuppressed &&
+                        !m.IsFallbackChampion)
             .ToListAsync(ct);
 
         // Only proceed for (symbol, timeframe) pairs that have multiple base models.
@@ -128,13 +135,21 @@ public sealed class MLStackingMetaLearnerWorker : BackgroundService
         {
             var (symbol, timeframe) = group.Key;
             var modelIds = group.Select(m => m.Id).ToList();
+            DateTime cohortStart = group.Max(m => m.ActivatedAt ?? m.TrainedAt);
+            DateTime since = DateTime.UtcNow.AddDays(-TrainingWindowDays);
+            if (cohortStart > since)
+                since = cohortStart;
 
-            // Collect all resolved prediction logs for these models, keyed by TradeSignalId.
-            // DirectionCorrect must be set (outcome resolved) for the row to be trainable.
+            // Train on the current active cohort over a bounded recent window so the stacker
+            // does not learn from stale pre-cohort or long-obsolete calibration regimes.
             var allLogs = await readDb.Set<MLModelPredictionLog>()
                 .Where(l => modelIds.Contains(l.MLModelId)
                          && !l.IsDeleted
-                         && l.DirectionCorrect.HasValue)
+                         && l.DirectionCorrect.HasValue
+                         && l.ActualDirection.HasValue
+                         && l.CalibratedProbability != null
+                         && l.OutcomeRecordedAt != null
+                         && l.OutcomeRecordedAt >= since)
                 .ToListAsync(ct);
 
             // Build stacking dataset: for each TradeSignalId, assemble a K-dimensional

@@ -227,7 +227,7 @@ public sealed class MLPredictionSharpnessWorker : BackgroundService
         double sumH = 0.0;
         foreach (var log in logs)
         {
-            double p = MLFeatureHelper.ResolveLoggedCalibratedBuyProbability(log);
+            double p = MLFeatureHelper.ResolveLoggedServedBuyProbability(log);
 
             // Clamp to avoid log(0) — numerically stable lower/upper bounds
             p = Math.Clamp(p, 1e-10, 1.0 - 1e-10);

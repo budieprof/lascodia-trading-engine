@@ -220,13 +220,16 @@ public sealed class MLConformalRecalibrationWorker : BackgroundService
 
         // Load recent resolved logs and reconstruct their calibrated probabilities exactly
         // when the scorer persisted them, otherwise fall back to the legacy contract.
-        var logs = await readCtx.Set<MLModelPredictionLog>()
-            .Where(l => l.MLModelId        == model.Id &&
-                        l.PredictedAt      >= since    &&
+            var logs = await readCtx.Set<MLModelPredictionLog>()
+                .Where(l => l.MLModelId        == model.Id &&
                         l.DirectionCorrect != null      &&
                         l.ActualDirection  != null      &&
+                        l.OutcomeRecordedAt != null     &&
+                        l.OutcomeRecordedAt >= since    &&
                         !l.IsDeleted)
             .AsNoTracking()
+            .OrderBy(l => l.OutcomeRecordedAt)
+            .ThenBy(l => l.Id)
             .ToListAsync(ct);
 
         if (logs.Count < minPredictions)
@@ -248,7 +251,7 @@ public sealed class MLConformalRecalibrationWorker : BackgroundService
         var scores = logs
             .Select(l =>
             {
-                double pBuy = MLFeatureHelper.ResolveLoggedCalibratedBuyProbability(l, decisionThreshold);
+                double pBuy = MLFeatureHelper.ResolveLoggedServedBuyProbability(l, decisionThreshold);
                 double pTrue = l.ActualDirection == LascodiaTradingEngine.Domain.Enums.TradeDirection.Buy
                     ? pBuy
                     : 1.0 - pBuy;

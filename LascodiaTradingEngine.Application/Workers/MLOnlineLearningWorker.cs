@@ -146,24 +146,45 @@ public sealed class MLOnlineLearningWorker : BackgroundService
                              && l.OutcomeRecordedAt != null
                              && l.OutcomeRecordedAt > outcomeCutoff)
                     .OrderBy(l => l.OutcomeRecordedAt)
+                    .ThenBy(l => l.Id)
                     .Take(BatchSize)
                     .ToListAsync(ct);
 
                 if (logs.Count == 0) continue;
+
+                // Consume the entire trailing timestamp bucket before advancing the watermark.
+                // Otherwise, if more than BatchSize rows share the same OutcomeRecordedAt,
+                // the strict `>` watermark comparison would permanently skip the remainder.
+                if (logs.Count == BatchSize && logs[^1].OutcomeRecordedAt.HasValue)
+                {
+                    DateTime spillTimestamp = logs[^1].OutcomeRecordedAt!.Value;
+                    long spillAfterId = logs[^1].Id;
+
+                    var spillover = await readDb.Set<MLModelPredictionLog>()
+                        .Where(l => !l.IsDeleted
+                                 && l.MLModelId == model.Id
+                                 && l.ActualDirection.HasValue
+                                 && l.DirectionCorrect.HasValue
+                                 && l.OutcomeRecordedAt == spillTimestamp
+                                 && l.Id > spillAfterId)
+                        .OrderBy(l => l.Id)
+                        .ToListAsync(ct);
+
+                    if (spillover.Count > 0)
+                        logs.AddRange(spillover);
+                }
 
                 var (writeModel, snap) = await MLModelSnapshotWriteHelper
                     .LoadTrackedLatestSnapshotAsync(writeDb, model.Id, ct);
                 if (writeModel == null || snap == null)
                     continue;
 
-                // GBM models store their structure in GbmTreesJson rather than the
-                // Weights/Biases arrays used by logistic/ELM architectures.
-                // For GBM, apply the online bias correction to GbmBaseLogOdds instead.
+                // Online bias updates are only valid for architectures whose live inference
+                // actually consumes the fields we are about to modify.
+                // GBM uses GbmBaseLogOdds; bagged ensembles / ELM / ROCKET use Biases.
                 bool isGbm = !string.IsNullOrEmpty(snap.GbmTreesJson);
-
-                // For non-GBM models, require valid Weights and Biases arrays.
-                if (!isGbm && (snap.Weights == null || snap.Biases == null
-                            || snap.Weights.Length == 0 || snap.Biases.Length == 0))
+                bool supportsBiasOnlyUpdate = SupportsOnlineBiasUpdate(snap);
+                if (!supportsBiasOnlyUpdate)
                     continue;
 
                 int K = isGbm ? 0 : snap.Weights!.Length;
@@ -173,7 +194,7 @@ public sealed class MLOnlineLearningWorker : BackgroundService
                 foreach (var log in logs)
                 {
                     double targetLabel = log.ActualDirection == TradeDirection.Buy ? 1.0 : 0.0;
-                    double pHat        = MLFeatureHelper.ResolveLoggedCalibratedBuyProbability(log);
+                    double pHat        = MLFeatureHelper.ResolveLoggedRawBuyProbability(log);
 
                     // Cross-entropy gradient w.r.t. the logit: σ(z) − y.
                     // This is the standard logistic regression gradient; subtracting it
@@ -224,5 +245,23 @@ public sealed class MLOnlineLearningWorker : BackgroundService
                 _logger.LogWarning(ex, "Online learning failed for model {Id}", model.Id);
             }
         }
+    }
+
+    private static bool SupportsOnlineBiasUpdate(ModelSnapshot snap)
+    {
+        if (!string.IsNullOrEmpty(snap.GbmTreesJson))
+            return true;
+
+        if (snap.Type is "TCN" or "TABNET" or "quantilerf" or "AdaBoost" or "DANN" or "FTTRANSFORMER" or "svgp")
+            return false;
+
+        if (snap.Type == "ROCKET")
+            return snap.Weights is { Length: > 0 } && snap.Biases is { Length: > 0 };
+
+        if (snap.Type == "elm")
+            return snap.Weights is { Length: > 0 } && snap.Biases is { Length: > 0 };
+
+        // Default ensemble path: logistic / MLP / poly learners use snapshot.Biases directly.
+        return snap.Weights is { Length: > 0 } && snap.Biases is { Length: > 0 };
     }
 }

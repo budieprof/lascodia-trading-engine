@@ -154,10 +154,18 @@ public record MLScoreResult(
     decimal?        RawProbability = null,
 
     /// <summary>
-    /// Final calibrated Buy-class probability used for the trade decision.
+    /// Base model's calibrated Buy-class probability before any post-calibration
+    /// stacking/meta blending is applied.
     /// Null when no active model scored the signal.
     /// </summary>
     decimal?        CalibratedProbability = null,
+
+    /// <summary>
+    /// Effective calibrated Buy-class probability that drove the live trade decision
+    /// after all scorer-side blending, including stacking meta when active.
+    /// Null when no active model scored the signal.
+    /// </summary>
+    decimal?        ServedCalibratedProbability = null,
 
     /// <summary>
     /// Effective Buy-threshold applied at scoring time after regime/adaptive overrides.

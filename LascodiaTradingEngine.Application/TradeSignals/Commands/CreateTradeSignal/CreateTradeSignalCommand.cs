@@ -29,6 +29,7 @@ public class CreateTradeSignalCommand : IRequest<ResponseData<long>>
     public long?         MLModelId              { get; set; }
     public decimal?      MLRawProbability       { get; set; }
     public decimal?      MLCalibratedProbability { get; set; }
+    public decimal?      MLServedCalibratedProbability { get; set; }
     public decimal?      MLDecisionThresholdUsed { get; set; }
     /// <summary>
     /// Standard deviation of individual ensemble learner probabilities at scoring time.
@@ -146,6 +147,7 @@ public class CreateTradeSignalCommandHandler : IRequestHandler<CreateTradeSignal
                 ConfidenceScore        = entity.MLConfidenceScore ?? 0m,
                 RawProbability         = request.MLRawProbability,
                 CalibratedProbability  = request.MLCalibratedProbability,
+                ServedCalibratedProbability = request.MLServedCalibratedProbability,
                 DecisionThresholdUsed  = request.MLDecisionThresholdUsed,
                 EnsembleDisagreement   = request.MLEnsembleDisagreement,
                 LatencyMs              = request.MLScoringLatencyMs,

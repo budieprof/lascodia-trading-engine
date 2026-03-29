@@ -244,14 +244,17 @@ public sealed class MLAdaptiveThresholdWorker : BackgroundService
         // ── Load resolved prediction logs ─────────────────────────────────────
         // Only resolved logs (DirectionCorrect != null) are useful — pending outcomes
         // cannot contribute to the EV sweep since we don't know whether they were correct.
-        // OrderByDescending ensures we get the most recent windowSize records.
+        // OrderByDescending on OutcomeRecordedAt ensures we get the most recently
+        // resolved outcomes rather than merely the most recently predicted ones.
         var logs = await readCtx.Set<MLModelPredictionLog>()
             .AsNoTracking()
             .Where(l => l.MLModelId        == model.Id &&
                         l.DirectionCorrect != null   &&
                         l.ActualDirection.HasValue   &&
+                        l.OutcomeRecordedAt != null  &&
                         !l.IsDeleted)
-            .OrderByDescending(l => l.PredictedAt)
+            .OrderByDescending(l => l.OutcomeRecordedAt)
+            .ThenByDescending(l => l.Id)
             .Take(windowSize)
             .ToListAsync(ct);
 
@@ -379,9 +382,11 @@ public sealed class MLAdaptiveThresholdWorker : BackgroundService
                     if (ev > regimeBestEv) { regimeBestEv = ev; regimeBestThr = thr; }
                 }
 
-                // Fetch the current regime-specific threshold (default 0.5 if not yet set).
+                // Start a new regime-specific threshold from the currently deployed
+                // global baseline, not a hardcoded 0.5, so the first regime override
+                // blends smoothly from what production is already using.
                 double currentRegimeThr = snap.RegimeThresholds.TryGetValue(regimeName, out var existing)
-                    ? existing : 0.5;
+                    ? existing : currentThreshold;
 
                 // Apply the same EMA blend to the regime-conditioned threshold.
                 double newRegimeThr = emaAlpha * regimeBestThr + (1.0 - emaAlpha) * currentRegimeThr;
@@ -463,7 +468,7 @@ public sealed class MLAdaptiveThresholdWorker : BackgroundService
             // Approximate inverse: calibP ≈ threshold + conf/2 (for Buy direction).
             // For Sell, a high confidence score means the model strongly predicts downward movement,
             // so we subtract conf/2 to move the probability below the threshold midpoint.
-            double calibP = MLFeatureHelper.ResolveLoggedCalibratedBuyProbability(log, threshold);
+            double calibP = MLFeatureHelper.ResolveLoggedServedBuyProbability(log, threshold);
 
             bool predictedBuy = calibP >= threshold;
             bool actualBuy    = log.ActualDirection == TradeDirection.Buy;

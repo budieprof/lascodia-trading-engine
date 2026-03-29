@@ -613,6 +613,7 @@ public class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceU
                     MLModelId              = signal.MLModelId,
                     MLRawProbability       = mlScore.RawProbability,
                     MLCalibratedProbability = mlScore.CalibratedProbability,
+                    MLServedCalibratedProbability = mlScore.ServedCalibratedProbability,
                     MLDecisionThresholdUsed = mlScore.DecisionThresholdUsed,
                     MLEnsembleDisagreement = mlScore.EnsembleDisagreement,
                     Timeframe              = strategy.Timeframe,

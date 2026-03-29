@@ -205,11 +205,13 @@ public sealed class MLProductionCalibrationWorker : BackgroundService
             .AsNoTracking()
             .Where(l => l.MLModelId        == model.Id &&
                         l.DirectionCorrect != null     &&
-                        (l.ConfidenceScore > 0 ||
-                         l.CalibratedProbability != null ||
+                        l.ActualDirection != null      &&
+                        l.OutcomeRecordedAt != null    &&
+                        (l.CalibratedProbability != null ||
                          l.RawProbability != null) &&
                         !l.IsDeleted)
-            .OrderByDescending(l => l.PredictedAt)
+            .OrderByDescending(l => l.OutcomeRecordedAt)
+            .ThenByDescending(l => l.Id)
             .Take(windowSize)
             .ToListAsync(ct);
 
@@ -223,36 +225,31 @@ public sealed class MLProductionCalibrationWorker : BackgroundService
         }
 
         // ── Compute production ECE ────────────────────────────────────────────
-        // Reconstruct calibrated probability from confidence + direction.
-        // ConfidenceScore was computed as Math.Clamp(rawConviction × disgrFactor, 0, 1).
-        // We approximate calibP as:
-        //   P(Buy) ≈ 0.5 + confidence/2  when predicted Buy
-        //   P(Buy) ≈ 0.5 - confidence/2  when predicted Sell
-        //
+        // This worker monitors the base model's deployed calibration surface, so it uses
+        // the logged base calibrated probability rather than the served stacked probability.
         // Binning strategy: 10 equal-width bins over [0, 1].
         // For each bin m:
-        //   acc(Bm)  = fraction of predictions in bin m that were correct
-        //   conf(Bm) = mean predicted calibP for predictions in bin m
-        //   ECE      = Σ_m (|Bm| / n) × |acc(Bm) − conf(Bm)|
+        //   label(Bm) = empirical Buy frequency in bin m
+        //   conf(Bm)  = mean predicted P(Buy) for predictions in bin m
+        //   ECE       = Σ_m (|Bm| / n) × |label(Bm) − conf(Bm)|
         var binAcc  = new double[CalibrationBins]; // accumulates correct-prediction count per bin
         var binConf = new double[CalibrationBins]; // accumulates sum of calibP per bin
         var binN    = new int[CalibrationBins];    // count of predictions per bin
 
         foreach (var log in logs)
         {
-            if (log.DirectionCorrect is null) continue;
-
             double calibP = MLFeatureHelper.ResolveLoggedCalibratedBuyProbability(log, decisionThreshold);
+            double y = log.ActualDirection == TradeDirection.Buy ? 1.0 : 0.0;
 
             // Assign to one of 10 equal-width bins based on the calibrated probability.
             int bin = Math.Clamp((int)(calibP * CalibrationBins), 0, CalibrationBins - 1);
             binN[bin]++;
             binConf[bin] += calibP;
-            if (log.DirectionCorrect.Value) binAcc[bin]++;
+            binAcc[bin] += y;
         }
 
         double prodEce = 0.0;
-        int total = logs.Count(l => l.DirectionCorrect.HasValue);
+        int total = logs.Count;
 
         // Compute weighted ECE sum across all non-empty bins.
         for (int m = 0; m < CalibrationBins; m++)

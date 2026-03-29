@@ -17,6 +17,9 @@ public class MLModelPredictionLogDto : IMapFrom<MLModelPredictionLog>
     public TradeDirection PredictedDirection      { get; set; }
     public decimal        PredictedMagnitudePips  { get; set; }
     public decimal        ConfidenceScore         { get; set; }
+    public decimal?       RawProbability          { get; set; }
+    public decimal?       CalibratedProbability   { get; set; }
+    public decimal?       ServedCalibratedProbability { get; set; }
     public TradeDirection? ActualDirection        { get; set; }
     public decimal?       ActualMagnitudePips     { get; set; }
     public bool?          WasProfitable           { get; set; }

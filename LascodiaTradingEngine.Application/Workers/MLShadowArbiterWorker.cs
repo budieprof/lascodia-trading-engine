@@ -648,7 +648,7 @@ public sealed class MLShadowArbiterWorker : BackgroundService
         foreach (var l in logs)
         {
             if (l.DirectionCorrect is null) continue;
-            double pBuy = MLFeatureHelper.ResolveLoggedCalibratedBuyProbability(l, fallbackThreshold);
+            double pBuy = MLFeatureHelper.ResolveLoggedServedBuyProbability(l, fallbackThreshold);
             double y   = l.ActualDirection == TradeDirection.Buy ? 1.0 : 0.0;
             sum += (pBuy - y) * (pBuy - y);
             n++;

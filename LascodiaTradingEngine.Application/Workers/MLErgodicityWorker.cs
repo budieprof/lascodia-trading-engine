@@ -166,9 +166,13 @@ public sealed class MLErgodicityWorker : BackgroundService
             // Cap at 200 records to bound memory usage per model.
             var logs = await readCtx.Set<MLModelPredictionLog>()
                 .AsNoTracking()
-                .Where(l => l.MLModelId == model.Id && !l.IsDeleted && l.PredictedAt >= cutoff
-                            && l.DirectionCorrect.HasValue)
-                .OrderByDescending(l => l.PredictedAt)
+                .Where(l => l.MLModelId == model.Id &&
+                            !l.IsDeleted &&
+                            l.DirectionCorrect.HasValue &&
+                            l.OutcomeRecordedAt != null &&
+                            l.OutcomeRecordedAt >= cutoff)
+                .OrderByDescending(l => l.OutcomeRecordedAt)
+                .ThenByDescending(l => l.Id)
                 .Take(200)
                 .ToListAsync(ct);
 
@@ -186,7 +190,7 @@ public sealed class MLErgodicityWorker : BackgroundService
             double[] r = new double[logs.Count];
             for (int i = 0; i < logs.Count; i++)
             {
-                double pBuy = MLFeatureHelper.ResolveLoggedCalibratedBuyProbability(logs[i]);
+                double pBuy = MLFeatureHelper.ResolveLoggedServedBuyProbability(logs[i]);
                 double conf = logs[i].PredictedDirection == LascodiaTradingEngine.Domain.Enums.TradeDirection.Buy
                     ? pBuy
                     : 1.0 - pBuy;

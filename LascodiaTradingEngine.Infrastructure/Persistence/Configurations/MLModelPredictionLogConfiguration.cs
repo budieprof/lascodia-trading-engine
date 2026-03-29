@@ -19,6 +19,10 @@ public class MLModelPredictionLogConfiguration : IEntityTypeConfiguration<MLMode
 
         builder.Property(x => x.PredictedMagnitudePips).HasPrecision(18, 5);
         builder.Property(x => x.ConfidenceScore).HasPrecision(5, 4);
+        builder.Property(x => x.RawProbability).HasPrecision(5, 4);
+        builder.Property(x => x.CalibratedProbability).HasPrecision(5, 4);
+        builder.Property(x => x.ServedCalibratedProbability).HasPrecision(5, 4);
+        builder.Property(x => x.DecisionThresholdUsed).HasPrecision(5, 4);
         builder.Property(x => x.ActualMagnitudePips).HasPrecision(18, 5);
         builder.Property(x => x.ResolutionSource).HasMaxLength(30);
         builder.Property(x => x.EnsembleDisagreement).HasPrecision(5, 4);

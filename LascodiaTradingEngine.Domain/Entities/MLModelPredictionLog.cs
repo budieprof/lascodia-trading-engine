@@ -62,11 +62,20 @@ public class MLModelPredictionLog : Entity<long>
     public decimal? RawProbability       { get; set; }
 
     /// <summary>
-    /// Final calibrated Buy-class probability used by the scorer to derive
-    /// <see cref="PredictedDirection"/> and conviction at prediction time.
+    /// Base model's calibrated Buy-class probability after its own calibration stack
+    /// (temperature / Platt / isotonic / age decay) but before any scorer-side
+    /// stacking/meta blend is applied.
     /// Null for legacy logs created before exact probability persistence was added.
     /// </summary>
     public decimal? CalibratedProbability { get; set; }
+
+    /// <summary>
+    /// Effective calibrated Buy-class probability that actually drove the served
+    /// production decision after scorer-side blending (for example, stacking meta).
+    /// When null, consumers should fall back to <see cref="CalibratedProbability"/>
+    /// for backward compatibility with older rows.
+    /// </summary>
+    public decimal? ServedCalibratedProbability { get; set; }
 
     /// <summary>
     /// Effective decision threshold used at scoring time after applying regime,

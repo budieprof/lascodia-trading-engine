@@ -205,21 +205,28 @@ public sealed class MLSignalScorer : IMLSignalScorer
         // Inference succeeded — clear any prior failure count.
         _inferenceFailures.TryRemove(model.Id, out _);
 
-        var (rawProb, calibP, ensembleStd, direction, threshold, confidence,
+        var (baseRawProb, baseCalibP, ensembleStd, baseDirection, threshold, baseConfidence,
              magnitude, magnitudeUncertaintyPips, magnitudeP10Pips, magnitudeP90Pips,
              mcDropoutMean, mcDropoutVariance, contributionsJson, shapValuesJson) = inferenceResult.Value;
+
+        // Keep the base model's exact probabilities separate from the effective served
+        // probability. Online learning / recalibration workers should consume the base-model
+        // outputs from logs, while the live decision may still be post-processed by a
+        // stacking meta-learner.
+        double effectiveCalibP      = baseCalibP;
+        TradeDirection direction    = baseDirection;
+        double confidence           = baseConfidence;
 
         if (Stopwatch.GetElapsedTime(scoringStart) < ScoringBudget)
         {
             double? stackedProb = await TryBlendWithStackingMetaAsync(
-                model, calibP, rawFeatures, featureCount, window, cotEntry,
+                model, baseCalibP, rawFeatures, featureCount, window, cotEntry,
                 currentRegime, signalTimeframe, db, cancellationToken);
             if (stackedProb.HasValue)
             {
-                rawProb = stackedProb.Value;
-                calibP  = stackedProb.Value;
-                direction = calibP >= threshold ? TradeDirection.Buy : TradeDirection.Sell;
-                double rawConviction = Math.Abs(calibP - threshold) * 2.0;
+                effectiveCalibP = stackedProb.Value;
+                direction = effectiveCalibP >= threshold ? TradeDirection.Buy : TradeDirection.Sell;
+                double rawConviction = Math.Abs(effectiveCalibP - threshold) * 2.0;
                 double disagreementFactor = Math.Clamp(1.0 - 2.0 * ensembleStd, 0.0, 1.0);
                 confidence = Math.Clamp(rawConviction * disagreementFactor, 0.0, 1.0);
             }
@@ -262,7 +269,7 @@ public sealed class MLSignalScorer : IMLSignalScorer
         // ── 13. Half-Kelly fraction ───────────────────────────────────────────
         // f* = max(0, 2p − 1) × 0.5 — caps bet size to half the full-Kelly optimum,
         // reducing variance at the cost of a small EV reduction.
-        double kellyFraction = Math.Max(0.0, 2.0 * calibP - 1.0) * HalfKellyFactor;
+        double kellyFraction = Math.Max(0.0, 2.0 * effectiveCalibP - 1.0) * HalfKellyFactor;
 
         // ── 13b. BSS-based Kelly multiplier (Round 9) ─────────────────────────
         if (snap.BrierSkillScore < BssFloor)
@@ -281,7 +288,7 @@ public sealed class MLSignalScorer : IMLSignalScorer
 
         // ── 14–23. Compute enrichments ────────────────────────────────────────
         var ctx = new ScoringContext(
-            calibP, ensembleStd, threshold, features, featureCount, snap,
+            effectiveCalibP, ensembleStd, threshold, features, featureCount, snap,
             signal, model, currentRegime, signalTimeframe, cotEntry,
             scoringStart, db);
         var enrichments = await ComputeEnrichmentsAsync(ctx, cancellationToken);
@@ -345,7 +352,7 @@ public sealed class MLSignalScorer : IMLSignalScorer
             "conformal={Conf2} meta={Meta} jackknife={JK} abstention={Abs} ood={OOD} " +
             "mcVar={McVar} minT={MinT} survival={Surv} elapsed={Elapsed:F3}s",
             signal.Symbol, signalTimeframe, model.Id, model.RegimeScope ?? "global",
-            direction, calibP, threshold, ensembleStd, confidence, magnitude, kellyFraction,
+            direction, effectiveCalibP, threshold, ensembleStd, confidence, magnitude, kellyFraction,
             conformalSet ?? "n/a", metaLabelScore?.ToString("F3") ?? "n/a", jackknifeInterval ?? "n/a",
             abstentionScore?.ToString("F3") ?? "n/a", isOod,
             mcDropoutVariance?.ToString("F4") ?? "n/a",
@@ -380,8 +387,9 @@ public sealed class MLSignalScorer : IMLSignalScorer
             MinTReconciledProbability:    minTReconciledProbability,
             EstimatedTimeToTargetBars:    estimatedTimeToTargetBars,
             SurvivalHazardRate:           survivalHazardRate,
-            RawProbability:               (decimal)rawProb,
-            CalibratedProbability:        (decimal)calibP,
+            RawProbability:               (decimal)baseRawProb,
+            CalibratedProbability:        (decimal)baseCalibP,
+            ServedCalibratedProbability:  (decimal)effectiveCalibP,
             DecisionThresholdUsed:        (decimal)threshold);
     }
 
@@ -748,7 +756,9 @@ public sealed class MLSignalScorer : IMLSignalScorer
             return null;
         }
 
-        if (baseModelIds.Length < 2 || metaWeights.Length != baseModelIds.Length)
+        if (baseModelIds.Length < 2 ||
+            metaWeights.Length != baseModelIds.Length ||
+            !baseModelIds.Contains(primaryModel.Id))
             return null;
 
         var lookupIds = baseModelIds.Where(id => id != primaryModel.Id).Distinct().ToArray();
@@ -759,6 +769,11 @@ public sealed class MLSignalScorer : IMLSignalScorer
             baseModels = await db.Set<MLModel>()
                 .AsNoTracking()
                 .Where(m => lookupIds.Contains(m.Id) &&
+                            m.Symbol == primaryModel.Symbol &&
+                            m.Timeframe == timeframe &&
+                            m.IsActive &&
+                            !m.IsSuppressed &&
+                            !m.IsFallbackChampion &&
                             !m.IsDeleted &&
                             m.ModelBytes != null)
                 .ToDictionaryAsync(m => m.Id, modelCts.Token);
@@ -766,6 +781,14 @@ public sealed class MLSignalScorer : IMLSignalScorer
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
             _logger.LogDebug("Stacking base-model lookup timed out for {Symbol}/{Tf}", primaryModel.Symbol, timeframe);
+            return null;
+        }
+
+        if (lookupIds.Any(id => !baseModels.ContainsKey(id)))
+        {
+            _logger.LogDebug(
+                "Stacking meta skipped for {Symbol}/{Tf} because the active base-model set no longer matches stacker {PrimaryId}.",
+                primaryModel.Symbol, timeframe, primaryModel.Id);
             return null;
         }
 

@@ -202,9 +202,10 @@ public sealed class MLIsotonicRecalibrationWorker : BackgroundService
         // Load only the fields needed for PAVA fitting to minimise data transfer.
         var resolved = await readCtx.Set<MLModelPredictionLog>()
             .Where(l => l.MLModelId        == model.Id &&
-                        l.PredictedAt      >= since    &&
-                        l.ActualDirection  != null     &&
-                        l.DirectionCorrect != null     &&
+                        l.OutcomeRecordedAt != null   &&
+                        l.OutcomeRecordedAt >= since  &&
+                        l.ActualDirection  != null    &&
+                        l.DirectionCorrect != null    &&
                         !l.IsDeleted)
             .Select(l => new
             {
@@ -270,11 +271,39 @@ public sealed class MLIsotonicRecalibrationWorker : BackgroundService
             return;
 
         latestSnap.IsotonicBreakpoints = newBreakpoints;
+        latestSnap.Ece = ComputeEce(
+            pairs.Select(p => (P: BaggedLogisticTrainer.ApplyIsotonicCalibration(p.P, newBreakpoints), p.Y)).ToList());
         writeModel.ModelBytes = JsonSerializer.SerializeToUtf8Bytes(latestSnap);
         await writeCtx.SaveChangesAsync(ct);
 
         // Evict the scorer cache so the updated breakpoints are used immediately.
         _cache.Remove($"{SnapshotCacheKeyPrefix}{model.Id}");
+    }
+
+    private static double ComputeEce(IReadOnlyList<(double P, double Y)> pairs)
+    {
+        if (pairs.Count == 0) return 0.0;
+        const int bins = 10;
+        var binConf = new double[bins];
+        var binLabel = new double[bins];
+        var binN = new int[bins];
+
+        foreach (var (p, y) in pairs)
+        {
+            int bin = Math.Clamp((int)(p * bins), 0, bins - 1);
+            binConf[bin] += p;
+            binLabel[bin] += y;
+            binN[bin]++;
+        }
+
+        double ece = 0.0;
+        for (int i = 0; i < bins; i++)
+        {
+            if (binN[i] == 0) continue;
+            ece += (double)binN[i] / pairs.Count * Math.Abs(binLabel[i] / binN[i] - binConf[i] / binN[i]);
+        }
+
+        return ece;
     }
 
     // ── PAVA (Pool Adjacent Violators Algorithm) ──────────────────────────────

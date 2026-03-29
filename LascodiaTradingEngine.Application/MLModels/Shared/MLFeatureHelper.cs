@@ -803,6 +803,20 @@ public static class MLFeatureHelper
             log.EnsembleDisagreement);
     }
 
+    /// <summary>
+    /// Resolves the effective served Buy-class probability that actually drove the live
+    /// trade decision. Falls back to the base calibrated probability for older rows.
+    /// </summary>
+    public static double ResolveLoggedServedBuyProbability(
+        MLModelPredictionLog log,
+        double               fallbackThreshold = 0.5)
+    {
+        if (log.ServedCalibratedProbability.HasValue)
+            return Math.Clamp((double)log.ServedCalibratedProbability.Value, 0.0, 1.0);
+
+        return ResolveLoggedCalibratedBuyProbability(log, fallbackThreshold);
+    }
+
     // ── Math primitives ───────────────────────────────────────────────────────
 
     public static double Sigmoid(double x) =>

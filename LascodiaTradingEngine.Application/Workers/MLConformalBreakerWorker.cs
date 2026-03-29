@@ -163,13 +163,16 @@ public sealed class MLConformalBreakerWorker : BackgroundService
             var recentLogs = await readDb.Set<MLModelPredictionLog>()
                 .Where(l => l.MLModelId == model.Id
                             && l.DirectionCorrect != null
+                            && l.OutcomeRecordedAt != null
                             && !l.IsDeleted)
-                .OrderByDescending(l => l.PredictedAt)
+                .OrderByDescending(l => l.OutcomeRecordedAt)
+                .ThenByDescending(l => l.Id)
                 .Take(MaxLogs)
                 .ToListAsync(ct);
 
             var logs = recentLogs
-                .OrderBy(l => l.PredictedAt)
+                .OrderBy(l => l.OutcomeRecordedAt)
+                .ThenBy(l => l.Id)
                 .ToList();
 
             // Need at least MinLogs resolved predictions for a statistically meaningful check.

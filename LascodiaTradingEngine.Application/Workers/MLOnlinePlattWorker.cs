@@ -122,13 +122,15 @@ public sealed class MLOnlinePlattWorker : BackgroundService
 
         foreach (var model in activeModels)
         {
-            // Load the most recent resolved prediction logs, ordered newest first.
+            // Load the most recently resolved prediction logs, ordered by actual resolution time.
             var recentLogs = await readDb.Set<MLModelPredictionLog>()
                 .Where(p => p.MLModelId == model.Id
                          && p.ActualDirection != null
                          && p.DirectionCorrect != null
+                         && p.OutcomeRecordedAt != null
                          && !p.IsDeleted)
-                .OrderByDescending(p => p.PredictedAt)
+                .OrderByDescending(p => p.OutcomeRecordedAt)
+                .ThenByDescending(p => p.Id)
                 .Take(WindowSize)
                 .ToListAsync(ct);
 
@@ -138,6 +140,12 @@ public sealed class MLOnlinePlattWorker : BackgroundService
             var (writeModel, snap) = await MLModelSnapshotWriteHelper
                 .LoadTrackedLatestSnapshotAsync(writeDb, model.Id, ct);
             if (writeModel == null || snap == null)
+                continue;
+
+            // Live inference prioritizes temperature scaling over global Platt.
+            // Skip these snapshots here so the worker does not produce updates that
+            // are immediately ignored in production.
+            if (snap.TemperatureScale > 0.0 && snap.TemperatureScale < 10.0)
                 continue;
 
             // Initialise A and B from the current snapshot values.
