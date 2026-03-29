@@ -18,6 +18,14 @@ namespace LascodiaTradingEngine.Application.Workers;
 /// against historical candle data via the <see cref="IBacktestEngine"/>.
 ///
 /// <para>
+/// <b>Auto-scheduling:</b> In addition to processing manually queued runs, the worker
+/// periodically scans all active strategies and automatically queues backtest runs for
+/// any strategy that has not been backtested within the configured cooldown period
+/// (<c>Backtest:CooldownDays</c>, default 7). This ensures every active strategy has
+/// up-to-date backtest metrics without requiring manual intervention.
+/// </para>
+///
+/// <para>
 /// <b>Pipeline position:</b> BacktestWorker sits at the entry point of the
 /// validation pipeline. Once a backtest completes successfully, it automatically
 /// seeds the next stage by queuing a <see cref="WalkForwardRun"/> for the same
@@ -25,61 +33,54 @@ namespace LascodiaTradingEngine.Application.Workers;
 /// evaluates out-of-sample generalisation. The full chain is:
 /// <br/>
 /// <c>BacktestRun (Queued) → BacktestWorker → WalkForwardRun (Queued) → WalkForwardWorker</c>
-/// <br/>
-/// Separately, an OptimizationRun that passes auto-approval also queues a fresh
-/// BacktestRun to re-validate the newly promoted parameters.
 /// </para>
 ///
 /// <para>
-/// <b>Polling model:</b> The worker wakes every <see cref="PollingInterval"/> seconds
-/// (10 s), picks the single oldest queued run (FIFO by <c>StartedAt</c>), and processes
-/// it to completion before sleeping again. One run per wake cycle keeps resource usage
-/// bounded and avoids parallel write conflicts on shared strategy rows.
+/// <b>Scheduling configuration (read from <see cref="EngineConfig"/>):</b>
+/// <list type="bullet">
+///   <item><c>Backtest:SchedulePollSeconds</c>  — how often to check for stale strategies (default 3600 = 1 hour)</item>
+///   <item><c>Backtest:CooldownDays</c>         — min days between backtests per strategy (default 7)</item>
+///   <item><c>Backtest:WindowDays</c>            — historical data window for each backtest (default 180)</item>
+///   <item><c>Backtest:InitialBalance</c>        — starting equity for simulation (default 10000)</item>
+///   <item><c>Backtest:MaxQueuedPerCycle</c>     — max runs to queue per scheduling cycle (default 5)</item>
+///   <item><c>Backtest:MinCandlesRequired</c>    — skip strategy if fewer candles available (default 100)</item>
+///   <item><c>Backtest:Enabled</c>               — master switch for auto-scheduling (default true)</item>
+/// </list>
 /// </para>
 ///
 /// <para>
 /// <b>Error handling:</b> If the backtest itself throws (e.g. no candle data, missing
 /// strategy), the run is marked <see cref="RunStatus.Failed"/> with the exception
 /// message preserved in <c>ErrorMessage</c>. Unexpected polling-loop exceptions are
-/// caught and logged without crashing the service, so the worker keeps retrying on the
-/// next tick.
+/// caught and logged without crashing the service.
 /// </para>
 ///
 /// <para>
 /// <b>Event publication:</b> On success, a <see cref="BacktestCompletedIntegrationEvent"/>
-/// is published to the event bus so downstream consumers (e.g. alert workers, dashboard
-/// services) can react without polling the database themselves.
+/// is published to the event bus so downstream consumers can react without polling.
 /// </para>
 /// </summary>
 public class BacktestWorker : BackgroundService
 {
     private readonly ILogger<BacktestWorker> _logger;
-
-    /// <summary>
-    /// Used to create per-iteration DI scopes so that scoped services such as
-    /// <see cref="IWriteApplicationDbContext"/> and <see cref="IReadApplicationDbContext"/>
-    /// are properly disposed after each processing cycle.
-    /// </summary>
     private readonly IServiceScopeFactory _scopeFactory;
-
-    /// <summary>
-    /// Singleton backtest engine that simulates strategy execution over historical
-    /// candle data, returning metrics such as win rate, profit factor, and Sharpe ratio.
-    /// </summary>
     private readonly IBacktestEngine _backtestEngine;
 
-    /// <summary>
-    /// How long the worker sleeps between polling cycles. A 10-second interval keeps
-    /// latency low for interactive backtest requests while avoiding tight-loop CPU burn.
-    /// </summary>
-    private static readonly TimeSpan PollingInterval = TimeSpan.FromSeconds(10);
+    // ── EngineConfig keys ───────────────────────────────────────────────────
+    private const string CK_SchedulePollSecs   = "Backtest:SchedulePollSeconds";
+    private const string CK_CooldownDays       = "Backtest:CooldownDays";
+    private const string CK_WindowDays         = "Backtest:WindowDays";
+    private const string CK_InitialBalance     = "Backtest:InitialBalance";
+    private const string CK_MaxQueuedPerCycle  = "Backtest:MaxQueuedPerCycle";
+    private const string CK_MinCandles         = "Backtest:MinCandlesRequired";
+    private const string CK_Enabled            = "Backtest:Enabled";
 
-    /// <summary>
-    /// Initialises the worker with its required dependencies.
-    /// </summary>
-    /// <param name="logger">Structured logger for diagnostic output.</param>
-    /// <param name="scopeFactory">Factory for creating per-cycle DI scopes.</param>
-    /// <param name="backtestEngine">Engine that executes a strategy over a candle slice.</param>
+    /// <summary>Fast polling interval for processing queued runs (10 seconds).</summary>
+    private static readonly TimeSpan ProcessingPollInterval = TimeSpan.FromSeconds(10);
+
+    /// <summary>Tracks when the next auto-scheduling scan should run.</summary>
+    private DateTime _nextScheduleScanUtc = DateTime.MinValue;
+
     public BacktestWorker(
         ILogger<BacktestWorker> logger,
         IServiceScopeFactory scopeFactory,
@@ -90,42 +91,176 @@ public class BacktestWorker : BackgroundService
         _backtestEngine = backtestEngine;
     }
 
-    /// <summary>
-    /// Entry point invoked by the hosted-service runtime. Runs a continuous polling
-    /// loop that delegates each tick to <see cref="ProcessNextQueuedRunAsync"/> and
-    /// waits <see cref="PollingInterval"/> between iterations.
-    /// </summary>
-    /// <param name="stoppingToken">
-    /// Signalled by the runtime when the application is shutting down, causing the
-    /// loop to exit gracefully after the current processing cycle completes.
-    /// </param>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("BacktestWorker starting");
+        _logger.LogInformation("BacktestWorker starting (with auto-scheduling).");
 
         while (!stoppingToken.IsCancellationRequested)
         {
             try
             {
+                await using var scope = _scopeFactory.CreateAsyncScope();
+                var writeContext = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+                var readContext  = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+                var ctx         = readContext.GetDbContext();
+
+                // ── Auto-scheduling: periodically queue backtests for stale strategies ──
+                if (DateTime.UtcNow >= _nextScheduleScanUtc)
+                {
+                    int schedulePollSecs = await GetConfigAsync<int>(ctx, CK_SchedulePollSecs, 3600, stoppingToken);
+                    _nextScheduleScanUtc = DateTime.UtcNow.AddSeconds(schedulePollSecs);
+
+                    bool enabled = await GetConfigAsync<bool>(ctx, CK_Enabled, true, stoppingToken);
+                    if (enabled)
+                    {
+                        await ScheduleBacktestsForStaleStrategiesAsync(
+                            ctx, writeContext.GetDbContext(), stoppingToken);
+                    }
+                }
+
+                // ── Process next queued run ─────────────────────────────────────────
                 await ProcessNextQueuedRunAsync(stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
-                // Graceful shutdown — exit the loop cleanly without logging as an error.
                 break;
             }
             catch (Exception ex)
             {
-                // Any other unexpected exception in the outer loop is logged and swallowed
-                // so the worker stays alive and retries on the next tick.
                 _logger.LogError(ex, "Unexpected error in BacktestWorker polling loop");
             }
 
-            await Task.Delay(PollingInterval, stoppingToken);
+            await Task.Delay(ProcessingPollInterval, stoppingToken);
         }
 
-        _logger.LogInformation("BacktestWorker stopped");
+        _logger.LogInformation("BacktestWorker stopped.");
     }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    //  Auto-scheduling: queue backtests for strategies that haven't been tested recently
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Scans all active strategies and queues a <see cref="BacktestRun"/> for each one
+    /// that has not been backtested within the configured cooldown period. Skips strategies
+    /// that already have a queued or running backtest, or that lack sufficient candle data.
+    /// </summary>
+    private async Task ScheduleBacktestsForStaleStrategiesAsync(
+        Microsoft.EntityFrameworkCore.DbContext readCtx,
+        Microsoft.EntityFrameworkCore.DbContext writeCtx,
+        CancellationToken ct)
+    {
+        int cooldownDays      = await GetConfigAsync<int>(readCtx, CK_CooldownDays, 7, ct);
+        int windowDays        = await GetConfigAsync<int>(readCtx, CK_WindowDays, 180, ct);
+        int maxQueuedPerCycle = await GetConfigAsync<int>(readCtx, CK_MaxQueuedPerCycle, 5, ct);
+        int minCandles        = await GetConfigAsync<int>(readCtx, CK_MinCandles, 100, ct);
+        decimal initialBalance = await GetConfigAsync<decimal>(readCtx, CK_InitialBalance, 10_000m, ct);
+
+        // Load all active strategies
+        var activeStrategies = await readCtx.Set<Strategy>()
+            .Where(s => s.Status == StrategyStatus.Active && !s.IsDeleted)
+            .AsNoTracking()
+            .Select(s => new { s.Id, s.Symbol, s.Timeframe, s.Name })
+            .ToListAsync(ct);
+
+        if (activeStrategies.Count == 0) return;
+
+        // Load strategy IDs that already have a queued or running backtest (skip these)
+        var pendingStrategyIds = await readCtx.Set<BacktestRun>()
+            .Where(r => (r.Status == RunStatus.Queued || r.Status == RunStatus.Running) && !r.IsDeleted)
+            .Select(r => r.StrategyId)
+            .Distinct()
+            .ToListAsync(ct);
+        var pendingSet = new HashSet<long>(pendingStrategyIds);
+
+        // Load the most recent completed/failed backtest per strategy
+        var recentBacktests = await readCtx.Set<BacktestRun>()
+            .Where(r => (r.Status == RunStatus.Completed || r.Status == RunStatus.Failed) && !r.IsDeleted)
+            .GroupBy(r => r.StrategyId)
+            .Select(g => new { StrategyId = g.Key, LastCompletedAt = g.Max(r => r.CompletedAt) })
+            .ToListAsync(ct);
+        var lastBacktestMap = recentBacktests.ToDictionary(r => r.StrategyId, r => r.LastCompletedAt);
+
+        var cooldownThreshold = DateTime.UtcNow.AddDays(-cooldownDays);
+        int queued = 0;
+
+        foreach (var strategy in activeStrategies)
+        {
+            if (queued >= maxQueuedPerCycle) break;
+            ct.ThrowIfCancellationRequested();
+
+            // Skip if already has a pending backtest
+            if (pendingSet.Contains(strategy.Id))
+                continue;
+
+            // Skip if backtested recently (within cooldown)
+            if (lastBacktestMap.TryGetValue(strategy.Id, out var lastCompleted)
+                && lastCompleted.HasValue
+                && lastCompleted.Value >= cooldownThreshold)
+            {
+                continue;
+            }
+
+            // Verify sufficient candle data exists for this symbol/timeframe
+            var windowStart = DateTime.UtcNow.AddDays(-windowDays);
+            int candleCount = await readCtx.Set<Candle>()
+                .CountAsync(c =>
+                    c.Symbol    == strategy.Symbol &&
+                    c.Timeframe == strategy.Timeframe &&
+                    c.Timestamp >= windowStart &&
+                    c.IsClosed && !c.IsDeleted, ct);
+
+            if (candleCount < minCandles)
+            {
+                _logger.LogDebug(
+                    "BacktestWorker: skipping auto-backtest for strategy {Id} ({Name}) — " +
+                    "only {Count} candles available (need {Min}).",
+                    strategy.Id, strategy.Name, candleCount, minCandles);
+                continue;
+            }
+
+            // Queue the backtest run
+            var run = new BacktestRun
+            {
+                StrategyId     = strategy.Id,
+                Symbol         = strategy.Symbol,
+                Timeframe      = strategy.Timeframe,
+                FromDate       = windowStart,
+                ToDate         = DateTime.UtcNow,
+                InitialBalance = initialBalance,
+                Status         = RunStatus.Queued,
+                StartedAt      = DateTime.UtcNow,
+            };
+
+            writeCtx.Set<BacktestRun>().Add(run);
+            queued++;
+
+            _logger.LogInformation(
+                "BacktestWorker: auto-queued backtest for strategy {Id} ({Name}) " +
+                "{Symbol}/{Tf} — window {From:yyyy-MM-dd} to {To:yyyy-MM-dd} ({Candles} candles).",
+                strategy.Id, strategy.Name, strategy.Symbol, strategy.Timeframe,
+                windowStart, DateTime.UtcNow, candleCount);
+        }
+
+        if (queued > 0)
+        {
+            await writeCtx.SaveChangesAsync(ct);
+            _logger.LogInformation(
+                "BacktestWorker: auto-scheduled {Count} backtest run(s) for stale strategies " +
+                "(cooldown={Cooldown}d, window={Window}d).",
+                queued, cooldownDays, windowDays);
+        }
+        else
+        {
+            _logger.LogDebug(
+                "BacktestWorker: no strategies need auto-backtesting (all within {Cooldown}d cooldown).",
+                cooldownDays);
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    //  Run processing (unchanged logic, restructured for async scope)
+    // ════════════════════════════════════════════════════════════════════════════
 
     /// <summary>
     /// Core processing method for a single polling tick. Looks up the oldest
@@ -133,17 +268,8 @@ public class BacktestWorker : BackgroundService
     /// persists the result, auto-queues a <see cref="WalkForwardRun"/>, and publishes
     /// the completion event. Returns immediately (no-op) when the queue is empty.
     /// </summary>
-    /// <remarks>
-    /// A fresh DI scope is created for each call so that EF Core DbContext instances
-    /// (which are scoped) are isolated per run and disposed promptly after the
-    /// <c>using</c> block exits. This avoids stale change-tracker state accumulating
-    /// across successive runs.
-    /// </remarks>
-    /// <param name="ct">Cancellation token propagated from <see cref="ExecuteAsync"/>.</param>
     private async Task ProcessNextQueuedRunAsync(CancellationToken ct)
     {
-        // Create a fresh DI scope so scoped DbContext instances are properly isolated
-        // and disposed at the end of this processing cycle.
         using var scope   = _scopeFactory.CreateScope();
         var writeContext  = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
         var readContext   = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
@@ -151,29 +277,21 @@ public class BacktestWorker : BackgroundService
 
         var db = writeContext.GetDbContext();
 
-        // Pick the oldest queued run (FIFO by StartedAt) to ensure fair processing
-        // order when multiple runs are queued simultaneously.
         var run = await db.Set<BacktestRun>()
             .Where(r => r.Status == RunStatus.Queued && !r.IsDeleted)
             .OrderBy(r => r.StartedAt)
             .FirstOrDefaultAsync(ct);
 
-        // Nothing in the queue — sleep until the next polling tick.
         if (run == null) return;
 
         _logger.LogInformation(
             "BacktestWorker: processing run {RunId} for strategy {StrategyId}", run.Id, run.StrategyId);
 
-        // Immediately flip the status to Running and persist it so that no other worker
-        // instance (or future polling tick) picks up the same run concurrently.
         run.Status = RunStatus.Running;
         await writeContext.SaveChangesAsync(ct);
 
         try
         {
-            // Load strategy from the read-side context to keep CQRS separation intact.
-            // The strategy's ParametersJson drives which evaluator logic is applied
-            // inside the backtest engine.
             var strategy = await readContext.GetDbContext()
                 .Set<Strategy>()
                 .FirstOrDefaultAsync(s => s.Id == run.StrategyId && !s.IsDeleted, ct);
@@ -181,9 +299,6 @@ public class BacktestWorker : BackgroundService
             if (strategy == null)
                 throw new InvalidOperationException($"Strategy {run.StrategyId} not found.");
 
-            // Fetch closed candles that fall within the run's date window, ordered
-            // chronologically. Only closed (completed) candles are used — open candles
-            // would include partial bars that distort indicator calculations.
             var candles = await readContext.GetDbContext()
                 .Set<Candle>()
                 .Where(c =>
@@ -191,7 +306,7 @@ public class BacktestWorker : BackgroundService
                     c.Timeframe == run.Timeframe &&
                     c.Timestamp >= run.FromDate  &&
                     c.Timestamp <= run.ToDate    &&
-                    c.IsClosed                   &&  // Exclude the current in-progress bar
+                    c.IsClosed                   &&
                     !c.IsDeleted)
                 .OrderBy(c => c.Timestamp)
                 .ToListAsync(ct);
@@ -200,14 +315,9 @@ public class BacktestWorker : BackgroundService
                 throw new InvalidOperationException(
                     $"No closed candles found for {run.Symbol}/{run.Timeframe} between {run.FromDate:yyyy-MM-dd} and {run.ToDate:yyyy-MM-dd}.");
 
-            // Execute the backtest: the engine replays the strategy's signal logic bar-by-bar
-            // over the candle slice, simulating entries, exits, and position management,
-            // then returns aggregate performance metrics (WinRate, ProfitFactor, SharpeRatio, etc.).
             var result = await _backtestEngine.RunAsync(strategy, candles, run.InitialBalance, ct);
 
             run.Status      = RunStatus.Completed;
-            // Serialise the full result object so it can be surfaced via the API without
-            // requiring a separate normalised result table.
             run.ResultJson  = JsonSerializer.Serialize(result);
             run.CompletedAt = DateTime.UtcNow;
 
@@ -216,11 +326,6 @@ public class BacktestWorker : BackgroundService
                 run.Id, result.TotalTrades, (double)result.WinRate);
 
             // ── Auto-queue a WalkForwardRun using the same window ─────────────────
-            // Walk-forward validation uses a 70/30 in-sample/out-of-sample split of the
-            // same total date range. This mirrors common industry practice where ~70% of
-            // data is used to "train" (fit indicators / confirm regime) and ~30% tests
-            // whether the strategy generalises to truly unseen data. The split is
-            // expressed in calendar days rather than bar count to remain timeframe-agnostic.
             var walkForwardRun = new WalkForwardRun
             {
                 StrategyId        = run.StrategyId,
@@ -228,9 +333,7 @@ public class BacktestWorker : BackgroundService
                 Timeframe         = run.Timeframe,
                 FromDate          = run.FromDate,
                 ToDate            = run.ToDate,
-                // 70% of total days allocated to in-sample (strategy fitting / look-back)
                 InSampleDays      = (int)((run.ToDate - run.FromDate).TotalDays * 0.7),
-                // 30% of total days allocated to out-of-sample (blind forward evaluation)
                 OutOfSampleDays   = (int)((run.ToDate - run.FromDate).TotalDays * 0.3),
                 InitialBalance    = run.InitialBalance,
                 Status            = RunStatus.Queued,
@@ -245,23 +348,14 @@ public class BacktestWorker : BackgroundService
         }
         catch (Exception ex)
         {
-            // Mark the run as failed and capture the exception message for operator visibility.
-            // The WalkForwardRun is NOT queued when the backtest itself fails, preventing
-            // downstream OOS validation from running on a broken or data-deficient parameter set.
             _logger.LogError(ex, "BacktestWorker: run {RunId} failed", run.Id);
             run.Status       = RunStatus.Failed;
             run.ErrorMessage = ex.Message;
             run.CompletedAt  = DateTime.UtcNow;
         }
 
-        // Persist the final status (Completed/Failed), result JSON, walk-forward row,
-        // and CompletedAt timestamp in a single SaveChanges call.
         await writeContext.SaveChangesAsync(ct);
 
-        // ── Publish BacktestCompletedIntegrationEvent ─────────────────────────
-        // Only published on success. Downstream consumers (e.g. alert dispatchers,
-        // reporting services) subscribe to this event via the event bus rather than
-        // polling the database, keeping the system loosely coupled.
         if (run.Status == RunStatus.Completed)
         {
             await eventService.SaveAndPublish(writeContext, new BacktestCompletedIntegrationEvent
@@ -276,5 +370,23 @@ public class BacktestWorker : BackgroundService
                 CompletedAt    = run.CompletedAt ?? DateTime.UtcNow
             });
         }
+    }
+
+    // ── Config helper ─────────────────────────────────────────────────────────
+
+    private static async Task<T> GetConfigAsync<T>(
+        Microsoft.EntityFrameworkCore.DbContext ctx,
+        string                                  key,
+        T                                       defaultValue,
+        CancellationToken                       ct)
+    {
+        var entry = await ctx.Set<EngineConfig>()
+            .AsNoTracking()
+            .FirstOrDefaultAsync(c => c.Key == key, ct);
+
+        if (entry?.Value is null) return defaultValue;
+
+        try   { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
+        catch { return defaultValue; }
     }
 }
