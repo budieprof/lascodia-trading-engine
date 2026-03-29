@@ -5,6 +5,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.AuditTrail.Commands.LogDecision;
+using LascodiaTradingEngine.Application.Backtesting.Models;
 using LascodiaTradingEngine.Application.Backtesting.Services;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
@@ -83,26 +84,23 @@ public class OptimizationWorker : BackgroundService
     /// </summary>
     private const decimal AutoApprovalMinHealthScore = 0.55m;
 
+    // ── EngineConfig keys for auto-scheduling ─────────────────────────────
+    private const string CK_SchedulePollSecs   = "Optimization:SchedulePollSeconds";
+    private const string CK_CooldownDays       = "Optimization:CooldownDays";
+    private const string CK_MaxQueuedPerCycle  = "Optimization:MaxQueuedPerCycle";
+    private const string CK_AutoScheduleEnabled = "Optimization:AutoScheduleEnabled";
+    private const string CK_MinWinRate         = "Backtest:Gate:MinWinRate";
+    private const string CK_MinProfitFactor    = "Backtest:Gate:MinProfitFactor";
+    private const string CK_MinTotalTrades     = "Backtest:Gate:MinTotalTrades";
+
     private readonly ILogger<OptimizationWorker> _logger;
-
-    /// <summary>
-    /// Used to create per-iteration DI scopes so scoped services (DbContexts, MediatR
-    /// handlers) are properly isolated and disposed after each processing cycle.
-    /// </summary>
     private readonly IServiceScopeFactory _scopeFactory;
-
-    /// <summary>
-    /// Singleton backtest engine used to evaluate each candidate parameter set by
-    /// replaying the strategy's logic over the historical candle slice.
-    /// </summary>
     private readonly IBacktestEngine _backtestEngine;
 
-    /// <summary>
-    /// How long the worker sleeps between polling cycles. 30 seconds balances
-    /// responsiveness for queued runs against the CPU cost of multi-iteration
-    /// grid-search backtests.
-    /// </summary>
     private static readonly TimeSpan PollingInterval = TimeSpan.FromSeconds(30);
+
+    /// <summary>Tracks when the next auto-scheduling scan should run.</summary>
+    private DateTime _nextScheduleScanUtc = DateTime.MinValue;
 
     /// <summary>
     /// Initialises the worker with its required dependencies.
@@ -131,30 +129,46 @@ public class OptimizationWorker : BackgroundService
     /// </param>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("OptimizationWorker starting");
+        _logger.LogInformation("OptimizationWorker starting (with auto-scheduling).");
 
         while (!stoppingToken.IsCancellationRequested)
         {
             try
             {
+                // ── Auto-scheduling: queue optimizations for underperforming strategies ──
+                if (DateTime.UtcNow >= _nextScheduleScanUtc)
+                {
+                    await using var schedScope = _scopeFactory.CreateAsyncScope();
+                    var readDb  = schedScope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+                    var writeDb = schedScope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+                    var ctx     = readDb.GetDbContext();
+
+                    int schedulePollSecs = await GetConfigAsync<int>(ctx, CK_SchedulePollSecs, 7200, stoppingToken);
+                    _nextScheduleScanUtc = DateTime.UtcNow.AddSeconds(schedulePollSecs);
+
+                    bool enabled = await GetConfigAsync<bool>(ctx, CK_AutoScheduleEnabled, true, stoppingToken);
+                    if (enabled)
+                    {
+                        await ScheduleOptimizationsForUnderperformingStrategiesAsync(
+                            ctx, writeDb.GetDbContext(), stoppingToken);
+                    }
+                }
+
                 await ProcessNextQueuedRunAsync(stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
-                // Graceful shutdown — exit without logging as an error.
                 break;
             }
             catch (Exception ex)
             {
-                // Swallow unexpected outer-loop exceptions so the worker stays alive
-                // and continues retrying on the next tick.
                 _logger.LogError(ex, "Unexpected error in OptimizationWorker polling loop");
             }
 
             await Task.Delay(PollingInterval, stoppingToken);
         }
 
-        _logger.LogInformation("OptimizationWorker stopped");
+        _logger.LogInformation("OptimizationWorker stopped.");
     }
 
     /// <summary>
@@ -577,4 +591,161 @@ public class OptimizationWorker : BackgroundService
         CreatedAt      = source.CreatedAt,
         IsDeleted      = source.IsDeleted
     };
+
+    // ════════════════════════════════════════════════════════════════════════════
+    //  Auto-scheduling: queue optimizations for strategies that failed backtest gate
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Scans active strategies with completed backtests that don't meet the signal-generation
+    /// qualification gate (win rate, profit factor, etc.) and queues optimization runs to
+    /// improve their parameters. Strategies that already have a pending optimization or were
+    /// recently optimized are skipped.
+    ///
+    /// <para>
+    /// Configuration keys (read from <see cref="EngineConfig"/>):
+    /// <list type="bullet">
+    ///   <item><c>Optimization:AutoScheduleEnabled</c>  — master switch (default true)</item>
+    ///   <item><c>Optimization:SchedulePollSeconds</c>  — scan interval (default 7200 = 2 hours)</item>
+    ///   <item><c>Optimization:CooldownDays</c>         — min days between optimizations per strategy (default 14)</item>
+    ///   <item><c>Optimization:MaxQueuedPerCycle</c>    — max runs to queue per scan (default 3)</item>
+    /// </list>
+    /// </para>
+    /// </summary>
+    private async Task ScheduleOptimizationsForUnderperformingStrategiesAsync(
+        Microsoft.EntityFrameworkCore.DbContext readCtx,
+        Microsoft.EntityFrameworkCore.DbContext writeCtx,
+        CancellationToken ct)
+    {
+        int cooldownDays      = await GetConfigAsync<int>(readCtx, CK_CooldownDays, 14, ct);
+        int maxQueuedPerCycle = await GetConfigAsync<int>(readCtx, CK_MaxQueuedPerCycle, 3, ct);
+
+        // Load backtest qualification thresholds (same keys as StrategyWorker gate)
+        double minWinRate      = await GetConfigAsync<double>(readCtx, CK_MinWinRate, 0.60, ct);
+        double minProfitFactor = await GetConfigAsync<double>(readCtx, CK_MinProfitFactor, 1.0, ct);
+        int    minTotalTrades  = await GetConfigAsync<int>(readCtx, CK_MinTotalTrades, 10, ct);
+
+        // Load active strategies
+        var activeStrategies = await readCtx.Set<Strategy>()
+            .Where(s => s.Status == StrategyStatus.Active && !s.IsDeleted)
+            .AsNoTracking()
+            .Select(s => new { s.Id, s.Name, s.Symbol, s.Timeframe, s.ParametersJson })
+            .ToListAsync(ct);
+
+        if (activeStrategies.Count == 0) return;
+
+        // Skip strategies that already have a pending optimization
+        var pendingOptIds = await readCtx.Set<OptimizationRun>()
+            .Where(r => (r.Status == OptimizationRunStatus.Queued || r.Status == OptimizationRunStatus.Running)
+                        && !r.IsDeleted)
+            .Select(r => r.StrategyId)
+            .Distinct()
+            .ToListAsync(ct);
+        var pendingSet = new HashSet<long>(pendingOptIds);
+
+        // Skip strategies optimized recently (within cooldown)
+        var cooldownThreshold = DateTime.UtcNow.AddDays(-cooldownDays);
+        var recentOptIds = await readCtx.Set<OptimizationRun>()
+            .Where(r => (r.Status == OptimizationRunStatus.Completed || r.Status == OptimizationRunStatus.Approved)
+                        && !r.IsDeleted
+                        && r.CompletedAt >= cooldownThreshold)
+            .Select(r => r.StrategyId)
+            .Distinct()
+            .ToListAsync(ct);
+        var recentOptSet = new HashSet<long>(recentOptIds);
+
+        // Load the most recent completed backtest per strategy
+        var recentBacktests = await readCtx.Set<BacktestRun>()
+            .Where(r => r.Status == RunStatus.Completed && !r.IsDeleted && r.ResultJson != null)
+            .GroupBy(r => r.StrategyId)
+            .Select(g => new
+            {
+                StrategyId = g.Key,
+                ResultJson = g.OrderByDescending(r => r.CompletedAt).First().ResultJson
+            })
+            .ToListAsync(ct);
+        var backtestMap = recentBacktests.ToDictionary(r => r.StrategyId, r => r.ResultJson);
+
+        int queued = 0;
+
+        foreach (var strategy in activeStrategies)
+        {
+            if (queued >= maxQueuedPerCycle) break;
+            ct.ThrowIfCancellationRequested();
+
+            // Skip if already has a pending optimization
+            if (pendingSet.Contains(strategy.Id)) continue;
+
+            // Skip if recently optimized
+            if (recentOptSet.Contains(strategy.Id)) continue;
+
+            // Skip if no backtest exists yet (BacktestWorker will handle it first)
+            if (!backtestMap.TryGetValue(strategy.Id, out var resultJson) || string.IsNullOrWhiteSpace(resultJson))
+                continue;
+
+            // Parse backtest result and check if it FAILS the qualification gate
+            BacktestResult? result;
+            try { result = JsonSerializer.Deserialize<BacktestResult>(resultJson); }
+            catch { continue; }
+            if (result is null) continue;
+
+            bool meetsGate = result.TotalTrades >= minTotalTrades
+                && (double)result.WinRate >= minWinRate
+                && (double)result.ProfitFactor >= minProfitFactor;
+
+            // Only optimize strategies that FAIL the gate — already-qualified strategies don't need tuning
+            if (meetsGate) continue;
+
+            // Queue optimization run
+            var run = new OptimizationRun
+            {
+                StrategyId             = strategy.Id,
+                TriggerType            = TriggerType.Scheduled,
+                Status                 = OptimizationRunStatus.Queued,
+                BaselineParametersJson = strategy.ParametersJson,
+                StartedAt              = DateTime.UtcNow,
+            };
+
+            writeCtx.Set<OptimizationRun>().Add(run);
+            queued++;
+
+            _logger.LogInformation(
+                "OptimizationWorker: auto-queued optimization for strategy {Id} ({Name}) " +
+                "{Symbol}/{Tf} — backtest WinRate={WR:P1} PF={PF:F2} (below gate thresholds).",
+                strategy.Id, strategy.Name, strategy.Symbol, strategy.Timeframe,
+                (double)result.WinRate, (double)result.ProfitFactor);
+        }
+
+        if (queued > 0)
+        {
+            await writeCtx.SaveChangesAsync(ct);
+            _logger.LogInformation(
+                "OptimizationWorker: auto-scheduled {Count} optimization run(s) for underperforming strategies.",
+                queued);
+        }
+        else
+        {
+            _logger.LogDebug(
+                "OptimizationWorker: no strategies need auto-optimization (all qualified or within {Cooldown}d cooldown).",
+                cooldownDays);
+        }
+    }
+
+    // ── Config helper ─────────────────────────────────────────────────────────
+
+    private static async Task<T> GetConfigAsync<T>(
+        Microsoft.EntityFrameworkCore.DbContext ctx,
+        string key,
+        T defaultValue,
+        CancellationToken ct)
+    {
+        var entry = await ctx.Set<EngineConfig>()
+            .AsNoTracking()
+            .FirstOrDefaultAsync(c => c.Key == key, ct);
+
+        if (entry?.Value is null) return defaultValue;
+
+        try   { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
+        catch { return defaultValue; }
+    }
 }
