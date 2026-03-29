@@ -622,10 +622,11 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                 double calib = PPreIsotonicCalibProb(features);
                 calib = pIso.Length >= 4 ? ElmCalibrationHelper.ApplyIsotonicCalibration(calib, pIso) : calib;
 
-                if (hp.AgeDecayLambda > 0.0)
+                double safeAgeDecayLambda = ClampNonNegativeFinite(hp.AgeDecayLambda);
+                if (safeAgeDecayLambda > 0.0)
                 {
                     double daysSinceTrain = (DateTime.UtcNow - pTrainedAtUtc).TotalDays;
-                    double decayFactor = Math.Exp(-hp.AgeDecayLambda * Math.Max(0.0, daysSinceTrain));
+                    double decayFactor = Math.Exp(-safeAgeDecayLambda * Math.Max(0.0, daysSinceTrain));
                     calib = 0.5 + (calib - 0.5) * decayFactor;
                 }
 
@@ -780,10 +781,11 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                 ? ElmCalibrationHelper.ApplyIsotonicCalibration(calib, isotonicBp)
                 : calib;
 
-            if (hp.AgeDecayLambda > 0.0)
+            double safeAgeDecayLambda = ClampNonNegativeFinite(hp.AgeDecayLambda);
+            if (safeAgeDecayLambda > 0.0)
             {
                 double daysSinceTrain = (DateTime.UtcNow - trainedAtUtc).TotalDays;
-                double decayFactor = Math.Exp(-hp.AgeDecayLambda * Math.Max(0.0, daysSinceTrain));
+                double decayFactor = Math.Exp(-safeAgeDecayLambda * Math.Max(0.0, daysSinceTrain));
                 calib = 0.5 + (calib - 0.5) * decayFactor;
             }
 
@@ -888,11 +890,13 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                 for (int k = 0; k < K; k++)
                 {
                     if (!oobMask[k][i]) continue;
-                    oobSum += ElmLearnerProb(
+                    oobSum += ClampProbabilityOrNeutral(ElmLearnerProb(
                         effectiveTrainSet[i].Features, weights[k], biases[k],
                         inputWeights[k], inputBiases[k],
-                        effectiveFeatureCount, learnerHiddenSizes[k], featureSubsets?[k],
-                        ResolveLearnerActivation(learnerActivations, k));
+                        effectiveFeatureCount,
+                        ResolveLearnerHiddenSize(learnerHiddenSizes, k, hiddenSize, inputBiases[k]),
+                        ResolveLearnerSubset(featureSubsets, k),
+                        ResolveLearnerActivation(learnerActivations, k)));
                     oobLearners++;
                 }
                 if (oobLearners == 0) continue;
@@ -1931,35 +1935,51 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             double z = stackingBias;
             for (int k = 0; k < K; k++)
             {
-                double pk = ElmLearnerProb(
+                double pk = ClampProbabilityOrNeutral(ElmLearnerProb(
                     features, weights[k], biases[k], inputWeights[k], inputBiases[k],
-                    featureCount, learnerHiddenSizes[k], featureSubsets?[k],
-                    ResolveLearnerActivation(learnerActivations, k));
-                z += stackingWeights[k] * pk;
+                    featureCount,
+                    ResolveLearnerHiddenSize(learnerHiddenSizes, k, hiddenSize, inputBiases[k]),
+                    ResolveLearnerSubset(featureSubsets, k),
+                    ResolveLearnerActivation(learnerActivations, k)));
+                double stackingWeight = double.IsFinite(stackingWeights[k]) ? stackingWeights[k] : 0.0;
+                z += stackingWeight * pk;
             }
-            return MLFeatureHelper.Sigmoid(z);
+            return ClampProbabilityOrNeutral(MLFeatureHelper.Sigmoid(z));
         }
 
         if (learnerWeights is not null && learnerWeights.Length == K)
         {
             double sum = 0;
+            double sumWeights = 0.0;
             for (int k = 0; k < K; k++)
             {
-                sum += learnerWeights[k] * ElmLearnerProb(
+                double learnerWeight = double.IsFinite(learnerWeights[k]) && learnerWeights[k] > 0.0
+                    ? learnerWeights[k]
+                    : 0.0;
+                if (learnerWeight <= 0.0)
+                    continue;
+
+                sum += learnerWeight * ClampProbabilityOrNeutral(ElmLearnerProb(
                     features, weights[k], biases[k], inputWeights[k], inputBiases[k],
-                    featureCount, learnerHiddenSizes[k], featureSubsets?[k],
-                    ResolveLearnerActivation(learnerActivations, k));
+                    featureCount,
+                    ResolveLearnerHiddenSize(learnerHiddenSizes, k, hiddenSize, inputBiases[k]),
+                    ResolveLearnerSubset(featureSubsets, k),
+                    ResolveLearnerActivation(learnerActivations, k)));
+                sumWeights += learnerWeight;
             }
-            return sum;
+            if (sumWeights > 1e-15)
+                return ClampProbabilityOrNeutral(sum / sumWeights);
         }
 
         double uniSum = 0;
         for (int k = 0; k < K; k++)
         {
-            uniSum += ElmLearnerProb(
+            uniSum += ClampProbabilityOrNeutral(ElmLearnerProb(
                 features, weights[k], biases[k], inputWeights[k], inputBiases[k],
-                featureCount, learnerHiddenSizes[k], featureSubsets?[k],
-                ResolveLearnerActivation(learnerActivations, k));
+                featureCount,
+                ResolveLearnerHiddenSize(learnerHiddenSizes, k, hiddenSize, inputBiases[k]),
+                ResolveLearnerSubset(featureSubsets, k),
+                ResolveLearnerActivation(learnerActivations, k)));
         }
         return uniSum / K;
     }
@@ -2017,10 +2037,12 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             int correct = 0;
             foreach (var s in calSet)
             {
-                double prob = ElmLearnerProb(
+                double prob = ClampProbabilityOrNeutral(ElmLearnerProb(
                     s.Features, weights[k], biases[k], inputWeights[k], inputBiases[k],
-                    featureCount, learnerHiddenSizes[k], featureSubsets?[k],
-                    ResolveLearnerActivation(learnerActivations, k));
+                    featureCount,
+                    ResolveLearnerHiddenSize(learnerHiddenSizes, k, inputBiases[k].Length, inputBiases[k]),
+                    ResolveLearnerSubset(featureSubsets, k),
+                    ResolveLearnerActivation(learnerActivations, k)));
                 if ((prob >= 0.5 ? 1 : 0) == ToBinaryLabel(s.Direction)) correct++;
             }
             accuracies[k] = (double)correct / calSet.Count;
@@ -2061,7 +2083,9 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         {
             probs[k] = ClampProbabilityOrNeutral(ElmLearnerProb(
                 features, weights[k], biases[k], inputWeights[k], inputBiases[k],
-                featureCount, learnerHiddenSizes[k], featureSubsets?[k],
+                featureCount,
+                ResolveLearnerHiddenSize(learnerHiddenSizes, k, inputBiases[k].Length, inputBiases[k]),
+                ResolveLearnerSubset(featureSubsets, k),
                 ResolveLearnerActivation(learnerActivations, k)));
         }
 
@@ -2069,14 +2093,24 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         if (stackingWeights is { Length: > 0 } sw && sw.Length == K)
         {
             double z = stackingBias;
-            for (int k = 0; k < K; k++) z += sw[k] * probs[k];
+            for (int k = 0; k < K; k++)
+            {
+                double stackingWeight = double.IsFinite(sw[k]) ? sw[k] : 0.0;
+                z += stackingWeight * probs[k];
+            }
             avg = ClampProbabilityOrNeutral(MLFeatureHelper.Sigmoid(z));
         }
         else if (learnerWeights is { Length: > 0 } lw && lw.Length == K)
         {
-            avg = 0.0;
-            for (int k = 0; k < K; k++) avg += lw[k] * probs[k];
-            avg = ClampProbabilityOrNeutral(avg);
+            double sumP = 0.0;
+            double sumW = 0.0;
+            for (int k = 0; k < K; k++)
+            {
+                double learnerWeight = double.IsFinite(lw[k]) && lw[k] > 0.0 ? lw[k] : 0.0;
+                sumP += learnerWeight * probs[k];
+                sumW += learnerWeight;
+            }
+            avg = ClampProbabilityOrNeutral(sumW > 1e-15 ? sumP / sumW : probs.Average());
         }
         else
         {
@@ -2107,7 +2141,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         int[] defaultSubset = Enumerable.Range(0, featureCount).ToArray();
         double pred = augBias;
 
-        for (int j = 0; j < Math.Min(featureCount, features.Length); j++)
+        for (int j = 0; j < Math.Min(Math.Min(featureCount, features.Length), augWeights.Length); j++)
             pred += augWeights[j] * features[j];
 
         for (int h = 0; h < hiddenSize; h++)
@@ -2507,7 +2541,11 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         ElmActivation[] learnerActivations)
     {
         double[] equivW = new double[featureCount];
-        Array.Copy(augWeights, equivW, featureCount);
+        if (augWeights.Length > 0)
+            Array.Copy(augWeights, equivW, Math.Min(featureCount, augWeights.Length));
+
+        if (train.Count == 0 || hiddenSize <= 0)
+            return equivW;
 
         int[] defaultSubset = Enumerable.Range(0, featureCount).ToArray();
 
@@ -2546,6 +2584,9 @@ public sealed class ElmModelTrainer : IMLModelTrainer
 
         for (int h = 0; h < hiddenSize; h++)
         {
+            if (featureCount + h >= augWeights.Length)
+                break;
+
             double hiddenW = augWeights[featureCount + h];
             if (Math.Abs(hiddenW) < 1e-10) continue;
 
@@ -2644,11 +2685,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                 featureCount, featureSubsets, learnerHiddenSizes, learnerActivations,
                 stackingWeights: stackingWeights, stackingBias: stackingBias));
 
-            metaXs[i] = new double[metaDim];
-            metaXs[i][0] = calibP;
-            metaXs[i][1] = ensStd;
-            for (int j = 0; j < metaDim - 2; j++)
-                if (j < s.Features.Length) metaXs[i][j + 2] = s.Features[j];
+            metaXs[i] = BuildMetaLabelFeatureVector(calibP, ensStd, s.Features, featureCount);
 
             targets[i] = (calibP >= decisionThreshold ? 1 : 0) == ToBinaryLabel(s.Direction) ? 1.0 : 0.0;
         }
@@ -2781,11 +2818,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                 featureCount, featureSubsets, learnerHiddenSizes, learnerActivations,
                 stackingWeights: stackingWeights, stackingBias: stackingBias));
 
-            double mlScore = metaLabelBias;
-            double[] mlX = [calibP, ensStd, ..Enumerable.Range(0, Math.Min(5, featureCount)).Select(j => (double)s.Features[j])];
-            for (int j = 0; j < Math.Min(metaLabelWeights.Length, mlX.Length); j++)
-                mlScore += metaLabelWeights[j] * mlX[j];
-            mlScore = MLFeatureHelper.Sigmoid(mlScore);
+            double mlScore = ComputeMetaLabelScore(calibP, ensStd, s.Features, featureCount, metaLabelWeights, metaLabelBias);
 
             absXs[i] = [calibP, ensStd, mlScore];
             absTargets[i] = (calibP >= decisionThreshold ? 1 : 0) == ToBinaryLabel(s.Direction) ? 1.0 : 0.0;
@@ -2891,11 +2924,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                     featureCount, featureSubsets, learnerHiddenSizes, learnerActivations,
                     stackingWeights: stackingWeights, stackingBias: stackingBias));
 
-                double mlScore = metaLabelBias;
-                double[] mlX = [calibP, ensStd, ..Enumerable.Range(0, Math.Min(5, featureCount)).Select(j => (double)s.Features[j])];
-                for (int j = 0; j < Math.Min(metaLabelWeights.Length, mlX.Length); j++)
-                    mlScore += metaLabelWeights[j] * mlX[j];
-                mlScore = MLFeatureHelper.Sigmoid(mlScore);
+                double mlScore = ComputeMetaLabelScore(calibP, ensStd, s.Features, featureCount, metaLabelWeights, metaLabelBias);
 
                 double absZ = ab + aw[0] * calibP + aw[1] * ensStd + aw[2] * mlScore;
                 if (MLFeatureHelper.Sigmoid(absZ) < threshold) continue;
@@ -2943,10 +2972,12 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             calLp[i] = new double[K];
             for (int k = 0; k < K; k++)
             {
-                calLp[i][k] = ElmLearnerProb(
+                calLp[i][k] = ClampProbabilityOrNeutral(ElmLearnerProb(
                     calSet[i].Features, weights[k], biases[k], inputWeights[k], inputBiases[k],
-                    featureCount, learnerHiddenSizes[k], featureSubsets?[k],
-                    ResolveLearnerActivation(learnerActivations, k));
+                    featureCount,
+                    ResolveLearnerHiddenSize(learnerHiddenSizes, k, hiddenSize, inputBiases[k]),
+                    ResolveLearnerSubset(featureSubsets, k),
+                    ResolveLearnerActivation(learnerActivations, k)));
             }
             calLabels[i] = calSet[i].Direction > 0 ? 1.0 : 0.0;
         }
@@ -3350,6 +3381,45 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         return value;
     }
 
+    private static double SanitizeFiniteOrDefault(double value, double fallback) =>
+        double.IsFinite(value) ? value : fallback;
+
+    private static double[] BuildMetaLabelFeatureVector(
+        double calibP,
+        double ensStd,
+        float[] features,
+        int featureCount)
+    {
+        int featureTerms = Math.Min(Math.Min(5, Math.Max(0, featureCount)), features.Length);
+        var metaFeatures = new double[2 + Math.Min(5, Math.Max(0, featureCount))];
+        metaFeatures[0] = ClampProbabilityOrNeutral(calibP);
+        metaFeatures[1] = ClampNonNegativeFinite(ensStd);
+
+        for (int j = 0; j < featureTerms; j++)
+            metaFeatures[j + 2] = SanitizeFiniteOrDefault(features[j], 0.0);
+
+        return metaFeatures;
+    }
+
+    private static double ComputeMetaLabelScore(
+        double calibP,
+        double ensStd,
+        float[] features,
+        int featureCount,
+        double[] metaLabelWeights,
+        double metaLabelBias)
+    {
+        if (metaLabelWeights.Length == 0)
+            return 0.5;
+
+        double[] metaFeatures = BuildMetaLabelFeatureVector(calibP, ensStd, features, featureCount);
+        double metaZ = SanitizeFiniteOrDefault(metaLabelBias, 0.0);
+        for (int j = 0; j < Math.Min(metaLabelWeights.Length, metaFeatures.Length); j++)
+            metaZ += SanitizeFiniteOrDefault(metaLabelWeights[j], 0.0) * metaFeatures[j];
+
+        return ClampProbabilityOrNeutral(MLFeatureHelper.Sigmoid(metaZ));
+    }
+
     private static ElmActivation ResolveLearnerActivation(ElmActivation[] learnerActivations, int learnerIndex)
     {
         if (learnerActivations.Length == 0)
@@ -3369,6 +3439,30 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             ? learnerActivations[learnerIndex]
             : learnerActivations[0];
         return (ElmActivation)activation;
+    }
+
+    private static int[]? ResolveLearnerSubset(int[][]? featureSubsets, int learnerIndex)
+    {
+        if (featureSubsets is null || learnerIndex < 0 || learnerIndex >= featureSubsets.Length)
+            return null;
+
+        return featureSubsets[learnerIndex];
+    }
+
+    private static int ResolveLearnerHiddenSize(
+        int[] learnerHiddenSizes,
+        int learnerIndex,
+        int defaultHiddenSize,
+        double[] learnerBiases)
+    {
+        int hiddenSize = learnerIndex >= 0 && learnerIndex < learnerHiddenSizes.Length
+            ? learnerHiddenSizes[learnerIndex]
+            : defaultHiddenSize;
+
+        if (hiddenSize < 0)
+            hiddenSize = 0;
+
+        return Math.Min(hiddenSize, learnerBiases.Length);
     }
 
     private static bool WarmStartMatchesLearnerSubset(

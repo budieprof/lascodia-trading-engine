@@ -657,10 +657,14 @@ internal static class ElmBootstrapHelper
             {
                 var bp = parentBp[j];
                 if (bp is null || bp.Length < 2) continue;
-                checkedCount++;
-                double v = train[i].Features[j];
                 double q10 = bp[0];
                 double q90 = bp[^1];
+                if (!double.IsFinite(q10) || !double.IsFinite(q90))
+                    continue;
+                checkedCount++;
+                double v = train[i].Features[j];
+                if (!double.IsFinite(v))
+                    continue;
                 if (v < q10 || v > q90) outsideCount++;
             }
             weights[i] = 1.0 + (double)outsideCount / Math.Max(1, checkedCount);
@@ -668,7 +672,15 @@ internal static class ElmBootstrapHelper
 
         double sum = 0;
         for (int i = 0; i < weights.Length; i++) sum += weights[i];
-        if (sum > 1e-15) for (int i = 0; i < weights.Length; i++) weights[i] /= sum;
+        if (double.IsFinite(sum) && sum > 1e-15)
+        {
+            for (int i = 0; i < weights.Length; i++) weights[i] /= sum;
+        }
+        else
+        {
+            double uniform = 1.0 / weights.Length;
+            for (int i = 0; i < weights.Length; i++) weights[i] = uniform;
+        }
         return weights;
     }
 

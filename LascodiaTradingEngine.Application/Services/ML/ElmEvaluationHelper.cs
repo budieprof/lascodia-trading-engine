@@ -57,7 +57,8 @@ internal static class ElmEvaluationHelper
             if (pred == 0 && actual == 0) tn++;
             brierSum += (calibP - y) * (calibP - y);
 
-            double absMag = Math.Max(0.001, Math.Abs(s.Magnitude));
+            double targetMagnitude = double.IsFinite(s.Magnitude) ? s.Magnitude : 0.0;
+            double absMag = Math.Max(0.001, Math.Abs(targetMagnitude));
             if (pred == actual)
                 evWinSum += absMag;
             else
@@ -76,7 +77,10 @@ internal static class ElmEvaluationHelper
                 for (int j = 0; j < Math.Min(magWeights.Length, s.Features.Length); j++)
                     magPred += magWeights[j] * s.Features[j];
             }
-            double magErr = magPred - s.Magnitude;
+            if (!double.IsFinite(magPred))
+                magPred = 0.0;
+
+            double magErr = magPred - targetMagnitude;
             magSse += magErr * magErr;
 
             returns[i] = (pred == 1 ? 1 : -1) * (s.Direction > 0 ? 1 : -1) * absMag;
@@ -400,7 +404,9 @@ internal static class ElmEvaluationHelper
                 double p = elmLearnerProb(
                     calSet[i].Features, weights[k], biases[k],
                     inputWeights[k], inputBiases[k],
-                    featureCount, hiddenSize, featureSubsets?[k], k);
+                    featureCount, hiddenSize,
+                    featureSubsets is not null && k < featureSubsets.Length ? featureSubsets[k] : null,
+                    k);
                 if (p >= 0.5) positiveCount++;
             }
             totalDisagreePairs += (long)positiveCount * (K - positiveCount);
@@ -431,6 +437,8 @@ internal static class ElmEvaluationHelper
             foreach (var s in train)
             {
                 double v = s.Features[j];
+                if (!double.IsFinite(v))
+                    v = 0.0;
                 sum += v; sumSq += v * v;
             }
             double mean = sum / train.Count;
@@ -486,6 +494,8 @@ internal static class ElmEvaluationHelper
             foreach (var s in train)
             {
                 double v = s.Features[j];
+                if (!double.IsFinite(v))
+                    v = 0.0;
                 sum += v; sumSq += v * v;
             }
             double mean = sum / train.Count;
@@ -557,7 +567,10 @@ internal static class ElmEvaluationHelper
         int n = samples.Count;
         var indexed = new (float Value, int Idx)[n];
         for (int i = 0; i < n; i++)
-            indexed[i] = (samples[i].Features[featureIdx], i);
+        {
+            float value = samples[i].Features[featureIdx];
+            indexed[i] = (float.IsFinite(value) ? value : 0f, i);
+        }
         Array.Sort(indexed, (a, b) => a.Value.CompareTo(b.Value));
 
         int[] result = new int[n];
@@ -586,7 +599,11 @@ internal static class ElmEvaluationHelper
         for (int j = 0; j < effectiveFeatureCount; j++)
         {
             var series = new double[samples.Count];
-            for (int i = 0; i < samples.Count; i++) series[i] = samples[i].Features[j];
+            for (int i = 0; i < samples.Count; i++)
+            {
+                double value = samples[i].Features[j];
+                series[i] = double.IsFinite(value) ? value : 0.0;
+            }
             double pValue = MLFeatureHelper.AdfTest(series, maxLags: 4);
             if (pValue > 0.05) nonStat++;
         }

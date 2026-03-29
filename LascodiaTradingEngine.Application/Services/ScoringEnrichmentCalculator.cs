@@ -41,11 +41,12 @@ internal static class ScoringEnrichmentCalculator
 
     internal static (string? Set, int? Size) ComputeConformalSet(double calibP, double conformalQHat)
     {
-        if (conformalQHat <= 0.0 || conformalQHat >= 1.0)
+        if (!double.IsFinite(conformalQHat) || conformalQHat <= 0.0 || conformalQHat >= 1.0)
             return (null, null);
 
-        bool includeBuy  = calibP >= 1.0 - conformalQHat;
-        bool includeSell = calibP <= conformalQHat;
+        double probability = ClampProbabilityOrNeutral(calibP);
+        bool includeBuy  = probability >= 1.0 - conformalQHat;
+        bool includeSell = probability <= conformalQHat;
         string set = (includeBuy, includeSell) switch
         {
             (true,  false) => "Buy",
@@ -73,16 +74,20 @@ internal static class ScoringEnrichmentCalculator
         if (metaLabelWeights.Length == 0)
             return null;
 
-        int metaFeatCount = 2 + Math.Min(5, featureCount);
-        double metaZ = metaLabelBias;
-        if (metaLabelWeights.Length >= metaFeatCount)
+        double metaZ = SanitizeFiniteOrDefault(metaLabelBias, 0.0);
+        if (metaLabelWeights.Length >= 1)
+            metaZ += SanitizeFiniteOrDefault(metaLabelWeights[0], 0.0) * ClampProbabilityOrNeutral(calibP);
+        if (metaLabelWeights.Length >= 2)
+            metaZ += SanitizeFiniteOrDefault(metaLabelWeights[1], 0.0) * ClampNonNegativeFinite(ensembleStd);
+
+        int featureTerms = Math.Min(Math.Min(5, featureCount), features.Length);
+        for (int j = 0; j < featureTerms && 2 + j < metaLabelWeights.Length; j++)
         {
-            metaZ += metaLabelWeights[0] * calibP;
-            metaZ += metaLabelWeights[1] * ensembleStd;
-            for (int j = 0; j < Math.Min(5, featureCount) && 2 + j < metaLabelWeights.Length; j++)
-                metaZ += metaLabelWeights[2 + j] * features[j];
+            metaZ += SanitizeFiniteOrDefault(metaLabelWeights[2 + j], 0.0) *
+                     SanitizeFiniteOrDefault(features[j], 0.0);
         }
-        return (decimal)MLFeatureHelper.Sigmoid(metaZ);
+
+        return (decimal)ClampProbabilityOrNeutral(MLFeatureHelper.Sigmoid(metaZ));
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -106,9 +111,9 @@ internal static class ScoringEnrichmentCalculator
 
     internal static double ComputeEntropy(double calibP)
     {
-        double ep = Math.Clamp(calibP, 1e-10, 1.0 - 1e-10);
+        double ep = Math.Clamp(ClampProbabilityOrNeutral(calibP), 1e-10, 1.0 - 1e-10);
         double entropy = -(ep * Math.Log2(ep) + (1 - ep) * Math.Log2(1 - ep));
-        return Math.Clamp(entropy, 0.0, 1.0);
+        return double.IsFinite(entropy) ? Math.Clamp(entropy, 0.0, 1.0) : 0.0;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -119,18 +124,25 @@ internal static class ScoringEnrichmentCalculator
         float[] features, int featureCount,
         double[] featureVariances, double oodThreshold, double defaultOodThresholdSigma)
     {
-        if (featureVariances.Length < featureCount)
+        int effectiveFeatureCount = Math.Min(featureCount, Math.Min(features.Length, featureVariances.Length));
+        if (effectiveFeatureCount <= 0)
             return (null, false);
 
         double mahaSq = 0.0;
-        for (int j = 0; j < featureCount; j++)
+        for (int j = 0; j < effectiveFeatureCount; j++)
         {
-            double v = featureVariances[j] > 1e-8 ? featureVariances[j] : 1.0;
-            mahaSq += (features[j] * features[j]) / v;
-        }
-        double score = Math.Sqrt(mahaSq / featureCount);
+            double v = featureVariances[j];
+            if (!double.IsFinite(v) || v <= 1e-8)
+                v = 1.0;
 
-        double threshold = oodThreshold > 0.0 ? oodThreshold : defaultOodThresholdSigma;
+            double feature = SanitizeFiniteOrDefault(features[j], 0.0);
+            mahaSq += (feature * feature) / v;
+        }
+        double score = double.IsFinite(mahaSq) ? Math.Sqrt(mahaSq / effectiveFeatureCount) : 0.0;
+
+        double threshold = double.IsFinite(oodThreshold) && oodThreshold > 0.0
+            ? oodThreshold
+            : SanitizeFiniteOrDefault(defaultOodThresholdSigma, 3.0);
         bool isOod = score > threshold;
 
         return (score, isOod);
@@ -148,25 +160,32 @@ internal static class ScoringEnrichmentCalculator
         if (!metaLabelScore.HasValue)
             return null;
 
-        if (abstentionWeights.Length == 5)
+        if (abstentionWeights.Length >= 5)
         {
             var af = new double[]
             {
-                calibP, ensembleStd, (double)metaLabelScore.Value,
-                oodMahalanobisScore ?? 0.0,
-                entropyScore,
+                ClampProbabilityOrNeutral(calibP),
+                ClampNonNegativeFinite(ensembleStd),
+                ClampProbabilityOrNeutral((double)metaLabelScore.Value),
+                ClampNonNegativeFinite(oodMahalanobisScore ?? 0.0),
+                ClampProbabilityOrNeutral(entropyScore),
             };
-            double az = abstentionBias;
-            for (int i = 0; i < 5; i++) az += abstentionWeights[i] * af[i];
-            return (decimal)MLFeatureHelper.Sigmoid(az);
+            double az = SanitizeFiniteOrDefault(abstentionBias, 0.0);
+            for (int i = 0; i < 5; i++) az += SanitizeFiniteOrDefault(abstentionWeights[i], 0.0) * af[i];
+            return (decimal)ClampProbabilityOrNeutral(MLFeatureHelper.Sigmoid(az));
         }
 
-        if (abstentionWeights.Length == 3)
+        if (abstentionWeights.Length >= 3)
         {
-            var af = new double[] { calibP, ensembleStd, (double)metaLabelScore.Value };
-            double az = abstentionBias;
-            for (int i = 0; i < 3; i++) az += abstentionWeights[i] * af[i];
-            return (decimal)MLFeatureHelper.Sigmoid(az);
+            var af = new double[]
+            {
+                ClampProbabilityOrNeutral(calibP),
+                ClampNonNegativeFinite(ensembleStd),
+                ClampProbabilityOrNeutral((double)metaLabelScore.Value),
+            };
+            double az = SanitizeFiniteOrDefault(abstentionBias, 0.0);
+            for (int i = 0; i < 3; i++) az += SanitizeFiniteOrDefault(abstentionWeights[i], 0.0) * af[i];
+            return (decimal)ClampProbabilityOrNeutral(MLFeatureHelper.Sigmoid(az));
         }
 
         return null;
@@ -197,10 +216,14 @@ internal static class ScoringEnrichmentCalculator
             return (null, null);
 
         double riskScore = 0.0;
-        if (featureImportanceScores.Length >= featureCount)
+        int usableFeatures = Math.Min(featureCount, Math.Min(features.Length, featureImportanceScores.Length));
+        if (usableFeatures > 0)
         {
-            for (int j = 0; j < featureCount; j++)
-                riskScore += featureImportanceScores[j] * features[j];
+            for (int j = 0; j < usableFeatures; j++)
+            {
+                riskScore += SanitizeFiniteOrDefault(featureImportanceScores[j], 0.0) *
+                             SanitizeFiniteOrDefault(features[j], 0.0);
+            }
         }
         double expRisk = Math.Exp(Math.Clamp(riskScore, -10.0, 10.0));
 
@@ -208,7 +231,8 @@ internal static class ScoringEnrichmentCalculator
         double cumHazard = 0.0;
         for (int t = 0; t < survivalHazard.Length; t++)
         {
-            cumHazard += survivalHazard[t] * expRisk;
+            double hazard = ClampNonNegativeFinite(survivalHazard[t]);
+            cumHazard += hazard * expRisk;
             double survivalProb = Math.Exp(-cumHazard);
             if (survivalProb <= 0.5)
             {
@@ -218,9 +242,31 @@ internal static class ScoringEnrichmentCalculator
         }
         estimatedBars ??= (double)survivalHazard.Length;
 
-        double hazardRate = survivalHazard[0] * expRisk;
+        double hazardRate = ClampNonNegativeFinite(survivalHazard[0]) * expRisk;
         return (estimatedBars, hazardRate);
     }
+
+    private static double ClampProbabilityOrNeutral(double probability)
+    {
+        if (!double.IsFinite(probability))
+            return 0.5;
+
+        return Math.Clamp(probability, 0.0, 1.0);
+    }
+
+    private static double ClampNonNegativeFinite(double value)
+    {
+        if (!double.IsFinite(value) || value < 0.0)
+            return 0.0;
+
+        return value;
+    }
+
+    private static double SanitizeFiniteOrDefault(double value, double fallback)
+        => double.IsFinite(value) ? value : fallback;
+
+    private static double SanitizeFiniteOrDefault(float value, double fallback)
+        => float.IsFinite(value) ? value : fallback;
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Counterfactual explanation
@@ -245,24 +291,28 @@ internal static class ScoringEnrichmentCalculator
             var projection = BaggedLogisticTrainer.ProjectLearnerToFeatureSpace(
                 k, weights, featureCount, subsets, mlpHiddenWeights, mlpHiddenDim);
             for (int j = 0; j < featureCount; j++)
-                avgWeights[j] += projection[j];
+                avgWeights[j] += SanitizeFiniteOrDefault(projection[j], 0.0);
         }
 
         for (int j = 0; j < featureCount; j++)
             avgWeights[j] /= Math.Max(1, weights.Length);
 
-        double gradient = calibP * (1.0 - calibP);
+        double probability = ClampProbabilityOrNeutral(calibP);
+        double gradient = probability * (1.0 - probability);
         if (gradient < 1e-10) return null;
 
-        double gap = threshold - calibP;
+        double targetThreshold = ClampProbabilityOrNeutral(threshold);
+        double gap = targetThreshold - probability;
 
         var perturbations = new List<(string Name, double Delta)>();
         for (int j = 0; j < featureCount && j < featureNames.Length; j++)
         {
             double wj = avgWeights[j];
-            if (Math.Abs(wj) < 1e-10) continue;
+            if (!double.IsFinite(wj) || Math.Abs(wj) < 1e-10) continue;
 
             double delta = gap / (gradient * wj);
+            if (!double.IsFinite(delta))
+                continue;
             perturbations.Add((featureNames[j], Math.Round(delta, 3)));
         }
 
@@ -321,13 +371,14 @@ internal static class ScoringEnrichmentCalculator
                 var projection = BaggedLogisticTrainer.ProjectLearnerToFeatureSpace(
                     k, weights, featureCount, subsets, mlpHiddenWeights, mlpHiddenDim);
                 for (int j = 0; j < featureCount; j++)
-                    weightSum[j] += projection[j];
+                    weightSum[j] += SanitizeFiniteOrDefault(projection[j], 0.0);
             }
 
             for (int j = 0; j < contribs.Length; j++)
             {
                 double wBar = weightSum[j] / Math.Max(1, weights.Length);
-                double phi  = j < features.Length ? wBar * features[j] : 0.0;
+                double featureValue = j < features.Length ? SanitizeFiniteOrDefault(features[j], 0.0) : 0.0;
+                double phi  = wBar * featureValue;
                 contribs[j] = (featureNames[j], phi);
             }
         }
@@ -335,8 +386,11 @@ internal static class ScoringEnrichmentCalculator
         {
             for (int j = 0; j < contribs.Length; j++)
             {
-                double imp = j < featureImportanceScores.Length ? featureImportanceScores[j] : 0.0;
-                double phi = j < features.Length ? imp * features[j] : 0.0;
+                double imp = j < featureImportanceScores.Length
+                    ? SanitizeFiniteOrDefault(featureImportanceScores[j], 0.0)
+                    : 0.0;
+                double featureValue = j < features.Length ? SanitizeFiniteOrDefault(features[j], 0.0) : 0.0;
+                double phi = imp * featureValue;
                 contribs[j] = (featureNames[j], phi);
             }
         }

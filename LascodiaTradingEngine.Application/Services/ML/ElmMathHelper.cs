@@ -143,12 +143,19 @@ internal static class ElmMathHelper
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static double DotProductSimd(double[] weights, int weightOffset, float[] features, int[] subset, int subsetLen)
     {
+        if (subsetLen <= 0 || weightOffset < 0 || weightOffset >= weights.Length)
+            return 0.0;
+
+        int usableLen = Math.Min(subsetLen, weights.Length - weightOffset);
+        if (usableLen <= 0)
+            return 0.0;
+
         double sum = 0.0;
 
-        if (Vector.IsHardwareAccelerated && subsetLen >= Vector<double>.Count * 2)
+        if (Vector.IsHardwareAccelerated && usableLen >= Vector<double>.Count * 2)
         {
             int vecSize = Vector<double>.Count;
-            int vecEnd = subsetLen - (subsetLen % vecSize);
+            int vecEnd = usableLen - (usableLen % vecSize);
             var vSum = Vector<double>.Zero;
             Span<double> featureBuf = stackalloc double[vecSize];
 
@@ -167,7 +174,7 @@ internal static class ElmMathHelper
             for (int vi = 0; vi < vecSize; vi++)
                 sum += vSum[vi];
 
-            for (int si = vecEnd; si < subsetLen; si++)
+            for (int si = vecEnd; si < usableLen; si++)
             {
                 int fi = subset[si];
                 if (fi >= 0 && fi < features.Length)
@@ -176,7 +183,7 @@ internal static class ElmMathHelper
         }
         else
         {
-            for (int si = 0; si < subsetLen; si++)
+            for (int si = 0; si < usableLen; si++)
             {
                 int fi = subset[si];
                 if (fi >= 0 && fi < features.Length)
@@ -193,12 +200,19 @@ internal static class ElmMathHelper
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static double DotProductSimdContiguous(double[] weights, int weightOffset, float[] features, int length)
     {
+        if (length <= 0 || weightOffset < 0 || weightOffset >= weights.Length)
+            return 0.0;
+
+        int usableLen = Math.Min(length, Math.Min(features.Length, weights.Length - weightOffset));
+        if (usableLen <= 0)
+            return 0.0;
+
         double sum = 0.0;
 
-        if (Vector.IsHardwareAccelerated && length >= Vector<double>.Count * 2)
+        if (Vector.IsHardwareAccelerated && usableLen >= Vector<double>.Count * 2)
         {
             int vecSize = Vector<double>.Count;
-            int vecEnd = length - (length % vecSize);
+            int vecEnd = usableLen - (usableLen % vecSize);
             var vSum = Vector<double>.Zero;
             Span<double> featureBuf = stackalloc double[vecSize];
 
@@ -214,12 +228,12 @@ internal static class ElmMathHelper
             for (int vi = 0; vi < vecSize; vi++)
                 sum += vSum[vi];
 
-            for (int i = vecEnd; i < length; i++)
+            for (int i = vecEnd; i < usableLen; i++)
                 sum += weights[weightOffset + i] * features[i];
         }
         else
         {
-            for (int i = 0; i < length; i++)
+            for (int i = 0; i < usableLen; i++)
                 sum += weights[weightOffset + i] * features[i];
         }
 

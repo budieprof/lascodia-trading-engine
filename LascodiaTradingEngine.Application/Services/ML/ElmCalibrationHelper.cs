@@ -457,29 +457,39 @@ internal static class ElmCalibrationHelper
     {
         double clampedRaw = ClampLogitProbability(rawP);
         double rawLogit = MLFeatureHelper.Logit(clampedRaw);
-        double globalCalibP = temperatureScale > 0.0 && temperatureScale < 10.0
-            ? MLFeatureHelper.Sigmoid(rawLogit / temperatureScale)
-            : MLFeatureHelper.Sigmoid(plattA * rawLogit + plattB);
+        double safeTemperature = double.IsFinite(temperatureScale) ? temperatureScale : 0.0;
+        double safePlattA = double.IsFinite(plattA) ? plattA : 1.0;
+        double safePlattB = double.IsFinite(plattB) ? plattB : 0.0;
+        double safePlattABuy = double.IsFinite(plattABuy) ? plattABuy : 0.0;
+        double safePlattBBuy = double.IsFinite(plattBBuy) ? plattBBuy : 0.0;
+        double safePlattASell = double.IsFinite(plattASell) ? plattASell : 0.0;
+        double safePlattBSell = double.IsFinite(plattBSell) ? plattBSell : 0.0;
+        double globalCalibP = safeTemperature > 0.0 && safeTemperature < 10.0
+            ? MLFeatureHelper.Sigmoid(rawLogit / safeTemperature)
+            : MLFeatureHelper.Sigmoid(safePlattA * rawLogit + safePlattB);
 
         double calibP;
-        if (globalCalibP >= 0.5 && plattABuy != 0.0)
-            calibP = MLFeatureHelper.Sigmoid(plattABuy * rawLogit + plattBBuy);
-        else if (globalCalibP < 0.5 && plattASell != 0.0)
-            calibP = MLFeatureHelper.Sigmoid(plattASell * rawLogit + plattBSell);
+        if (globalCalibP >= 0.5 && safePlattABuy != 0.0)
+            calibP = MLFeatureHelper.Sigmoid(safePlattABuy * rawLogit + safePlattBBuy);
+        else if (globalCalibP < 0.5 && safePlattASell != 0.0)
+            calibP = MLFeatureHelper.Sigmoid(safePlattASell * rawLogit + safePlattBSell);
         else
             calibP = globalCalibP;
 
         if (isotonicBreakpoints is { Length: >= 4 })
             calibP = ApplyIsotonicCalibration(calibP, isotonicBreakpoints);
 
-        if (ageDecayLambda > 0.0 && trainedAtUtc != default)
+        double safeAgeDecayLambda = double.IsFinite(ageDecayLambda) && ageDecayLambda > 0.0
+            ? ageDecayLambda
+            : 0.0;
+        if (safeAgeDecayLambda > 0.0 && trainedAtUtc != default)
         {
             double daysSinceTrain = (DateTime.UtcNow - trainedAtUtc).TotalDays;
-            double decayFactor = Math.Exp(-ageDecayLambda * Math.Max(0.0, daysSinceTrain));
+            double decayFactor = Math.Exp(-safeAgeDecayLambda * Math.Max(0.0, daysSinceTrain));
             calibP = 0.5 + (calibP - 0.5) * decayFactor;
         }
 
-        return Math.Clamp(calibP, 0.0, 1.0);
+        return ClampProbability(calibP);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -576,7 +586,8 @@ internal static class ElmCalibrationHelper
                 bool predictedBuy = probs[i] >= thr;
                 bool actualBuy = calSet[i].Direction > 0;
                 bool correct = predictedBuy == actualBuy;
-                ev += (correct ? 1.0 : -1.0) * Math.Abs(calSet[i].Magnitude);
+                double absMagnitude = Math.Abs(double.IsFinite(calSet[i].Magnitude) ? calSet[i].Magnitude : 0.0);
+                ev += (correct ? 1.0 : -1.0) * Math.Max(0.001, absMagnitude);
             }
 
             ev /= calSet.Count;

@@ -21,6 +21,15 @@ public class ScoringEnrichmentCalculatorTests
     }
 
     [Fact]
+    public void ComputeConformalSet_Returns_Null_When_QHat_Is_NonFinite()
+    {
+        var (set, size) = ScoringEnrichmentCalculator.ComputeConformalSet(double.NaN, double.NaN);
+
+        Assert.Null(set);
+        Assert.Null(size);
+    }
+
+    [Fact]
     public void ComputeConformalSet_Returns_Buy_When_High_Probability()
     {
         // calibP=0.9, qHat=0.2 → includeBuy=(0.9≥0.8)=true, includeSell=(0.9≤0.2)=false
@@ -85,6 +94,14 @@ public class ScoringEnrichmentCalculatorTests
         Assert.InRange(entropy, 0.0, 1.0);
     }
 
+    [Fact]
+    public void ComputeEntropy_Treats_NonFinite_Probability_As_Neutral()
+    {
+        double entropy = ScoringEnrichmentCalculator.ComputeEntropy(double.NaN);
+
+        Assert.Equal(1.0, entropy, precision: 6);
+    }
+
     // ────────────────────────────────────────────────────────────────────────
     //  ComputeJackknifeInterval
     // ────────────────────────────────────────────────────────────────────────
@@ -112,11 +129,13 @@ public class ScoringEnrichmentCalculatorTests
     // ────────────────────────────────────────────────────────────────────────
 
     [Fact]
-    public void ComputeOodMahalanobis_Returns_Null_When_Variances_Too_Short()
+    public void ComputeOodMahalanobis_Clamps_To_Available_Variance_Width()
     {
         var (score, isOod) = ScoringEnrichmentCalculator.ComputeOodMahalanobis(
             new float[] { 1f, 2f }, 2, new double[] { 1.0 }, 3.0, 3.0);
-        Assert.Null(score);
+
+        Assert.NotNull(score);
+        Assert.Equal(1.0, score!.Value, precision: 6);
         Assert.False(isOod);
     }
 
@@ -143,6 +162,17 @@ public class ScoringEnrichmentCalculatorTests
         Assert.False(isOod);
     }
 
+    [Fact]
+    public void ComputeOodMahalanobis_Clamps_To_Available_Feature_Width_And_Sanitises_Inputs()
+    {
+        var (score, isOod) = ScoringEnrichmentCalculator.ComputeOodMahalanobis(
+            new float[] { 10f }, 2, new double[] { double.NaN, 1.0 }, double.NaN, 3.0);
+
+        Assert.NotNull(score);
+        Assert.Equal(100.0 / 1.0, score!.Value * score.Value, precision: 6);
+        Assert.True(isOod);
+    }
+
     // ────────────────────────────────────────────────────────────────────────
     //  ComputeMetaLabelScore
     // ────────────────────────────────────────────────────────────────────────
@@ -165,6 +195,18 @@ public class ScoringEnrichmentCalculatorTests
 
         Assert.NotNull(result);
         Assert.InRange(result!.Value, 0m, 1m);
+    }
+
+    [Fact]
+    public void ComputeMetaLabelScore_Uses_Available_Weight_Prefix_And_Sanitises_NonFinite_Values()
+    {
+        var result = ScoringEnrichmentCalculator.ComputeMetaLabelScore(
+            0.6, 0.2, new float[] { 1f, float.NaN }, 2,
+            new double[] { 2.0, -1.0, 0.5 },
+            double.NaN);
+
+        Assert.NotNull(result);
+        Assert.InRange(result!.Value, 0.81m, 0.82m);
     }
 
     // ────────────────────────────────────────────────────────────────────────
@@ -205,6 +247,18 @@ public class ScoringEnrichmentCalculatorTests
         var result = ScoringEnrichmentCalculator.ComputeAbstentionScore(
             0.7, 0.1, 0.8m, null, 0.3, new double[] { 1, -1 }, 0.0);
         Assert.Null(result);
+    }
+
+    [Fact]
+    public void ComputeAbstentionScore_Sanitises_NonFinite_Inputs_And_Weights()
+    {
+        var result = ScoringEnrichmentCalculator.ComputeAbstentionScore(
+            double.NaN, double.NaN, 0.8m, double.NaN, double.NaN,
+            new double[] { double.NaN, 2.0, double.NaN },
+            double.NaN);
+
+        Assert.NotNull(result);
+        Assert.Equal(0.5m, result!.Value);
     }
 
     // ────────────────────────────────────────────────────────────────────────
@@ -271,6 +325,20 @@ public class ScoringEnrichmentCalculatorTests
         Assert.Equal(3.0, bars!.Value);
     }
 
+    [Fact]
+    public void ComputeSurvivalAnalysis_Clamps_To_Available_Feature_Width_And_Sanitises_Hazard()
+    {
+        var (bars, rate) = ScoringEnrichmentCalculator.ComputeSurvivalAnalysis(
+            new float[] { 1f }, 2,
+            new double[] { double.NaN, 0.4 },
+            new double[] { 2.0, 5.0 });
+
+        Assert.NotNull(bars);
+        Assert.NotNull(rate);
+        Assert.Equal(2.0, bars!.Value, precision: 6);
+        Assert.Equal(0.0, rate!.Value, precision: 6);
+    }
+
     // ────────────────────────────────────────────────────────────────────────
     //  ComputeCounterfactualJson
     // ────────────────────────────────────────────────────────────────────────
@@ -307,6 +375,21 @@ public class ScoringEnrichmentCalculatorTests
         var result = ScoringEnrichmentCalculator.ComputeCounterfactualJson(
             new float[] { 1f }, weights, new double[] { 0.0 },
             null, new[] { "f1" }, 1, 1.0 - 1e-12, 0.5);
+        Assert.Null(result);
+    }
+
+    [Fact]
+    public void ComputeCounterfactualJson_Sanitises_NonFinite_Probability_Threshold_And_Weights()
+    {
+        var result = ScoringEnrichmentCalculator.ComputeCounterfactualJson(
+            new float[] { 1f },
+            new[] { new double[] { double.NaN } },
+            null,
+            new[] { "f1" },
+            1,
+            double.NaN,
+            double.NaN);
+
         Assert.Null(result);
     }
 
@@ -350,5 +433,20 @@ public class ScoringEnrichmentCalculatorTests
 
         Assert.NotNull(result);
         Assert.Contains("RSI", result!);
+    }
+
+    [Fact]
+    public void ComputeShapContributionsJson_Sanitises_NonFinite_Weights_Importance_And_Features()
+    {
+        var result = ScoringEnrichmentCalculator.ComputeShapContributionsJson(
+            new float[] { float.NaN, 2f },
+            new[] { new double[] { double.NaN, 3.0 } },
+            null,
+            new[] { "f0", "f1" },
+            2,
+            new[] { double.NaN, 5.0 });
+
+        Assert.NotNull(result);
+        Assert.DoesNotContain("NaN", result!);
     }
 }
