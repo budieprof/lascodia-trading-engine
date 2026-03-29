@@ -1275,8 +1275,15 @@ public sealed class MLSignalScorer : IMLSignalScorer
             try
             {
                 counterfactualJson = ScoringEnrichmentCalculator.ComputeCounterfactualJson(
-                    features, snap.Weights, snap.Biases, snap.FeatureSubsetIndices,
-                    snap.Features, featureCount, calibP, threshold);
+                    features,
+                    snap.Weights,
+                    snap.FeatureSubsetIndices,
+                    snap.Features,
+                    featureCount,
+                    calibP,
+                    threshold,
+                    snap.MlpHiddenWeights,
+                    snap.MlpHiddenDim);
             }
             catch (Exception ex)
             {
@@ -1477,8 +1484,14 @@ public sealed class MLSignalScorer : IMLSignalScorer
         try
         {
             contributionsJson = ScoringEnrichmentCalculator.ComputeShapContributionsJson(
-                features, snap.Weights, snap.FeatureSubsetIndices, snap.Features, featureCount,
-                snap.FeatureImportanceScores);
+                features,
+                snap.Weights,
+                snap.FeatureSubsetIndices,
+                snap.Features,
+                featureCount,
+                snap.FeatureImportanceScores,
+                snap.MlpHiddenWeights,
+                snap.MlpHiddenDim);
         }
         catch (Exception ex)
         {

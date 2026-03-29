@@ -470,15 +470,23 @@ public sealed class TcnModelTrainer : IMLModelTrainer
                 plattA       = pA;
                 plattB       = pB;
                 finalMetrics = prunedMetrics;
-                // Re-compute class-conditional Platt and Kelly on pruned model
+                // Re-compute all calibration artifacts on pruned model
                 (plattABuy, plattBBuy, plattASell, plattBSell) =
                     FitClassConditionalPlatt(maskedCal, prunedTcn, filters, useAttentionPool);
                 avgKellyFraction = ComputeAvgKellyFraction(maskedCal, prunedTcn, pA, pB, filters, useAttentionPool);
+                isotonicBp       = FitIsotonicCalibration(maskedCal, prunedTcn, pA, pB, filters, useAttentionPool);
+                if (hp.FitTemperatureScale && maskedCal.Count >= 10)
+                    temperatureScale = FitTemperatureScaling(maskedCal, prunedTcn, filters, useAttentionPool);
+                conformalQHat    = ComputeConformalQHat(maskedCal, prunedTcn, pA, pB, conformalAlpha, filters, useAttentionPool);
                 ece = ComputeEce(maskedTest, prunedTcn, pA, pB, filters, useAttentionPool);
                 optimalThreshold = ComputeOptimalThreshold(
                     maskedCal, prunedTcn, pA, pB,
                     hp.ThresholdSearchMin / 100.0, hp.ThresholdSearchMax / 100.0,
                     filters, useAttentionPool);
+                brierSkillScore  = ComputeBrierSkillScore(maskedTest, prunedTcn, pA, pB, filters, useAttentionPool);
+                if (maskedCal.Count >= 10)
+                    (abstentionWeights, abstentionBias, abstentionThreshold) =
+                        FitTcnAbstentionModel(maskedCal, prunedTcn, pA, pB, filters, useAttentionPool);
             }
             else
             {
@@ -790,7 +798,10 @@ public sealed class TcnModelTrainer : IMLModelTrainer
 
         // ── Temporal decay weights (blended with density-ratio weights) ─────
         double[] temporalWeights = ComputeTemporalWeights(trainSet.Count, hp.TemporalDecayLambda);
-        if (densityWeights is { Length: > 0 } && densityWeights.Length == temporalWeights.Length)
+        // densityWeights are computed on the full train split passed to FitTcnModel,
+        // while temporalWeights are computed on the inner trainSet (after val split).
+        // The inner trainSet is a prefix of the full split, so truncate densityWeights.
+        if (densityWeights is { Length: > 0 } && densityWeights.Length >= temporalWeights.Length)
         {
             var blended = new double[temporalWeights.Length];
             double blendSum = 0;
@@ -2978,7 +2989,7 @@ public sealed class TcnModelTrainer : IMLModelTrainer
 
         static (double A, double B) FitSgd(List<(double Logit, double Y)> pairs)
         {
-            if (pairs.Count < 5) return (0.0, 0.0);
+            if (pairs.Count < 5) return (1.0, 0.0); // identity on logit scale (preserves uncalibrated probs)
             double a = 1.0, b = 0.0;
             for (int ep = 0; ep < epochs; ep++)
             {

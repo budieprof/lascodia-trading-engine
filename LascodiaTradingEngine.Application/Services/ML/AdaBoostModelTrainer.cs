@@ -681,9 +681,13 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
 
             // Calibrate the pruned model
             var (pPlattA, pPlattB)  = FitPlattScaling(maskedCal, pStumps, pAlphas);
-            double[] pIsotonicBp    = FitIsotonicCalibration(maskedCal, pStumps, pAlphas, pPlattA, pPlattB);
+            var (pPlattABuy, pPlattBBuy, pPlattASell, pPlattBSell) =
+                FitClassConditionalPlatt(maskedCal, pStumps, pAlphas);
+            double[] pIsotonicBp    = FitIsotonicCalibration(maskedCal, pStumps, pAlphas, pPlattA, pPlattB,
+                                                              pPlattABuy, pPlattBBuy, pPlattASell, pPlattBSell);
             var pMetrics            = EvaluateModel(maskedTest, pStumps, pAlphas,
-                                                    magWeights, magBias, pPlattA, pPlattB, pIsotonicBp);
+                                                    magWeights, magBias, pPlattA, pPlattB, pIsotonicBp,
+                                                    pPlattABuy, pPlattBBuy, pPlattASell, pPlattBSell);
 
             // Accept pruned model only if accuracy doesn't degrade by more than 1 %
             var baseMetrics = EvaluateModel(testSet, stumps, alphas,
@@ -698,7 +702,23 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
                 alphas     = pAlphas;
                 plattA     = pPlattA;
                 plattB     = pPlattB;
+                plattABuy  = pPlattABuy;   plattBBuy  = pPlattBBuy;
+                plattASell = pPlattASell;   plattBSell = pPlattBSell;
                 isotonicBp = pIsotonicBp;
+                calSet     = maskedCal;    // downstream conformalQHat/evalMetrics use masked features
+                testSet    = maskedTest;   // downstream brierSkillScore uses masked features
+                avgKellyFraction = ComputeAvgKellyFraction(maskedCal, pStumps, pAlphas, pPlattA, pPlattB);
+                ece = ComputeEce(maskedTest, pStumps, pAlphas, pPlattA, pPlattB, pIsotonicBp,
+                                  plattABuy: pPlattABuy, plattBBuy: pPlattBBuy,
+                                  plattASell: pPlattASell, plattBSell: pPlattBSell);
+                optimalThreshold = ComputeOptimalThreshold(
+                    maskedCal, pStumps, pAlphas, pPlattA, pPlattB, pIsotonicBp,
+                    hp.ThresholdSearchMin, hp.ThresholdSearchMax,
+                    pPlattABuy, pPlattBBuy, pPlattASell, pPlattBSell);
+                if (hp.FitTemperatureScale && maskedCal.Count >= 10)
+                    temperatureScale = FitTemperatureScaling(maskedCal, pStumps, pAlphas);
+                // conformalQHat and brierSkillScore are recomputed below at their declaration sites
+                // using the now-updated stumps/alphas/platt variables.
             }
             else
             {
@@ -1620,7 +1640,7 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
                                       plattABuy, plattBBuy, plattASell, plattBSell);
             int    binI = Math.Clamp((int)(p * bins), 0, bins - 1);
             binConf[binI] += p;
-            if ((p >= 0.5 ? 1 : 0) == (s.Direction > 0 ? 1 : 0)) binAcc[binI]++;
+            if (s.Direction > 0) binAcc[binI]++; // positive-class frequency, not classification accuracy
             binCnt[binI]++;
         }
 

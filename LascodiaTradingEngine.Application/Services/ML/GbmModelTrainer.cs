@@ -297,6 +297,10 @@ public sealed class GbmModelTrainer : IMLModelTrainer
                 innerTrainCount  = pInnerTrainCount;
                 trainSet         = maskedTrain; // downstream OOB/Jackknife/DW must use masked features
                 testSet          = maskedTest;  // downstream BSS must use masked features
+                // Re-fit class-conditional Platt and Kelly on pruned model
+                (plattABuy, plattBBuy, plattASell, plattBSell) =
+                    FitClassConditionalPlatt(maskedCal, trees, baseLogOdds, lr, featureCount);
+                avgKellyFraction = ComputeAvgKellyFraction(maskedCal, trees, baseLogOdds, lr, plattA, plattB, featureCount);
                 ece              = ComputeEce(maskedTest, trees, baseLogOdds, lr, plattA, plattB, featureCount);
                 optimalThreshold = ComputeOptimalThreshold(maskedCal, trees, baseLogOdds, lr, plattA, plattB, featureCount,
                     hp.ThresholdSearchMin, hp.ThresholdSearchMax);

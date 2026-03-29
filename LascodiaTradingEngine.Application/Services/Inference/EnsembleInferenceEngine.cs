@@ -142,11 +142,12 @@ public sealed class EnsembleInferenceEngine : IModelInferenceEngine
         double avg = InferenceHelpers.AggregateProbs(
             probs, weights.Length, metaWeights, metaBias,
             gesWeights, learnerAccuracyWeights, learnerCalAccuracies);
+        double meanProb = probs.Length > 0 ? probs.Average() : 0.5;
 
         // Sample std (N-1)
         int N = probs.Length;
         double variance = 0.0;
-        for (int k = 0; k < N; k++) { double d = probs[k] - avg; variance += d * d; }
+        for (int k = 0; k < N; k++) { double d = probs[k] - meanProb; variance += d * d; }
         double std = N > 1 ? Math.Sqrt(variance / (N - 1)) : 0.0;
 
         return (avg, std);

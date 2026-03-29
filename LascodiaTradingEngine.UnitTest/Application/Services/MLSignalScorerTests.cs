@@ -2,6 +2,7 @@ using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Application.Services;
 using LascodiaTradingEngine.Application.Services.Inference;
 using LascodiaTradingEngine.Domain.Entities;
+using System.Text.Json;
 
 namespace LascodiaTradingEngine.UnitTest.Application.Services;
 
@@ -351,6 +352,67 @@ public class MLSignalScorerTests
         // sigmoid(0) = 0.5, sigmoid(2) ≈ 0.88
         Assert.Equal(0.5, withoutBias, precision: 5);
         Assert.True(withBias > 0.85);
+    }
+
+    [Fact]
+    public void EnsembleProb_Computes_Std_From_Learner_Mean_Not_Aggregated_Output()
+    {
+        double[][] weights = [[0.0], [0.0]];
+        double[] biases =
+        [
+            MLFeatureHelper.Logit(0.2),
+            MLFeatureHelper.Logit(0.8)
+        ];
+        double[] metaW = [5.0, 0.0];
+
+        var (_, stdProb) = EnsembleInferenceEngine.EnsembleProb(
+            [0f],
+            weights,
+            biases,
+            featureCount: 1,
+            subsets: null,
+            metaWeights: metaW,
+            metaBias: 0.0);
+
+        Assert.Equal(Math.Sqrt(0.18), stdProb, precision: 6);
+    }
+
+    [Fact]
+    public void ComputeShapContributionsJson_Uses_Projected_Mlp_Weights()
+    {
+        string? json = ScoringEnrichmentCalculator.ComputeShapContributionsJson(
+            [1f, 2f, 3f, 4f],
+            [[2.0, 3.0]],
+            [[1, 3]],
+            ["f0", "f1", "f2", "f3"],
+            4,
+            [],
+            [[5.0, 7.0, 11.0, 13.0]],
+            2);
+
+        Assert.NotNull(json);
+        using var doc = JsonDocument.Parse(json!);
+        Assert.Equal("f3", doc.RootElement[0].GetProperty("Feature").GetString());
+        Assert.Equal(212.0, doc.RootElement[0].GetProperty("Value").GetDouble(), precision: 6);
+    }
+
+    [Fact]
+    public void ComputeCounterfactualJson_Uses_Projected_Mlp_Weights()
+    {
+        string? json = ScoringEnrichmentCalculator.ComputeCounterfactualJson(
+            [1f, 2f, 3f, 4f],
+            [[2.0, 3.0]],
+            [[1, 3]],
+            ["f0", "f1", "f2", "f3"],
+            4,
+            calibP: 0.6,
+            threshold: 0.5,
+            mlpHiddenWeights: [[5.0, 7.0, 11.0, 13.0]],
+            mlpHiddenDim: 2);
+
+        Assert.NotNull(json);
+        using var doc = JsonDocument.Parse(json!);
+        Assert.True(doc.RootElement.TryGetProperty("f3", out _));
     }
 
     // ────────────────────────────────────────────────────────────────────────

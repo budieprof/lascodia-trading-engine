@@ -227,31 +227,29 @@ internal static class ScoringEnrichmentCalculator
     // ═══════════════════════════════════════════════════════════════════════════
 
     internal static string? ComputeCounterfactualJson(
-        float[] features, double[][] weights, double[] biases, int[][]? subsets,
-        string[] featureNames, int featureCount, double calibP, double threshold)
+        float[]     features,
+        double[][]  weights,
+        int[][]?    subsets,
+        string[]    featureNames,
+        int         featureCount,
+        double      calibP,
+        double      threshold,
+        double[][]? mlpHiddenWeights = null,
+        int         mlpHiddenDim = 0)
     {
         if (weights.Length == 0 || featureNames.Length == 0) return null;
 
         var avgWeights = new double[featureCount];
-        var counts = new int[featureCount];
         for (int k = 0; k < weights.Length; k++)
         {
-            int[] active = subsets?.Length > k && subsets[k] is { Length: > 0 } s
-                ? s
-                : Enumerable.Range(0, Math.Min(featureCount, weights[k].Length)).ToArray();
-
-            foreach (int j in active)
-            {
-                if (j < weights[k].Length && j < featureCount)
-                {
-                    avgWeights[j] += weights[k][j];
-                    counts[j]++;
-                }
-            }
+            var projection = BaggedLogisticTrainer.ProjectLearnerToFeatureSpace(
+                k, weights, featureCount, subsets, mlpHiddenWeights, mlpHiddenDim);
+            for (int j = 0; j < featureCount; j++)
+                avgWeights[j] += projection[j];
         }
 
         for (int j = 0; j < featureCount; j++)
-            if (counts[j] > 0) avgWeights[j] /= counts[j];
+            avgWeights[j] /= Math.Max(1, weights.Length);
 
         double gradient = calibP * (1.0 - calibP);
         if (gradient < 1e-10) return null;
@@ -276,17 +274,39 @@ internal static class ScoringEnrichmentCalculator
         return top3.Count > 0 ? JsonSerializer.Serialize(top3) : null;
     }
 
+    internal static string? ComputeCounterfactualJson(
+        float[]     features,
+        double[][]  weights,
+        double[]    biases,
+        int[][]?    subsets,
+        string[]    featureNames,
+        int         featureCount,
+        double      calibP,
+        double      threshold)
+    {
+        return ComputeCounterfactualJson(
+            features,
+            weights,
+            subsets,
+            featureNames,
+            featureCount,
+            calibP,
+            threshold);
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // SHAP attribution
     // ═══════════════════════════════════════════════════════════════════════════
 
     internal static string? ComputeShapContributionsJson(
-        float[]   features,
-        double[][] weights,
-        int[][]?  subsets,
-        string[]  featureNames,
-        int       featureCount,
-        double[]  featureImportanceScores)
+        float[]     features,
+        double[][]  weights,
+        int[][]?    subsets,
+        string[]    featureNames,
+        int         featureCount,
+        double[]    featureImportanceScores,
+        double[][]? mlpHiddenWeights = null,
+        int         mlpHiddenDim = 0)
     {
         if (featureNames.Length == 0) return null;
 
@@ -295,27 +315,18 @@ internal static class ScoringEnrichmentCalculator
         if (weights is { Length: > 0 })
         {
             var weightSum = new double[featureCount];
-            var countPer  = new int[featureCount];
 
             for (int k = 0; k < weights.Length; k++)
             {
-                int[] active = subsets?.Length > k && subsets[k] is { Length: > 0 } s
-                    ? s
-                    : Enumerable.Range(0, Math.Min(featureCount, weights[k].Length)).ToArray();
-
-                foreach (int j in active)
-                {
-                    if (j < weights[k].Length)
-                    {
-                        weightSum[j] += weights[k][j];
-                        countPer[j]++;
-                    }
-                }
+                var projection = BaggedLogisticTrainer.ProjectLearnerToFeatureSpace(
+                    k, weights, featureCount, subsets, mlpHiddenWeights, mlpHiddenDim);
+                for (int j = 0; j < featureCount; j++)
+                    weightSum[j] += projection[j];
             }
 
             for (int j = 0; j < contribs.Length; j++)
             {
-                double wBar = countPer[j] > 0 ? weightSum[j] / countPer[j] : 0.0;
+                double wBar = weightSum[j] / Math.Max(1, weights.Length);
                 double phi  = j < features.Length ? wBar * features[j] : 0.0;
                 contribs[j] = (featureNames[j], phi);
             }
@@ -342,5 +353,23 @@ internal static class ScoringEnrichmentCalculator
             .ToArray();
 
         return JsonSerializer.Serialize(top5);
+    }
+
+    internal static string? ComputeShapContributionsJson(
+        float[]     features,
+        double[][]  weights,
+        double[]    biases,
+        int[][]?    subsets,
+        string[]    featureNames,
+        int         featureCount,
+        double[]    featureImportanceScores)
+    {
+        return ComputeShapContributionsJson(
+            features,
+            weights,
+            subsets,
+            featureNames,
+            featureCount,
+            featureImportanceScores);
     }
 }

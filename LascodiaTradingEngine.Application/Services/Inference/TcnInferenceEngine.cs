@@ -90,7 +90,8 @@ public sealed class TcnInferenceEngine : IModelInferenceEngine
                 seqStd, tcnSnap.ConvW, tcnSnap.ConvB, resW, blockInC,
                 filters, numBlocks, dilations,
                 tcnSnap.UseLayerNorm, tcnSnap.LayerNormGamma, tcnSnap.LayerNormBeta, activation,
-                tcnSnap.AttnQueryW!, tcnSnap.AttnKeyW!, tcnSnap.AttnValueW!)
+                tcnSnap.AttnQueryW!, tcnSnap.AttnKeyW!, tcnSnap.AttnValueW!,
+                tcnSnap.AttentionHeads > 0 ? tcnSnap.AttentionHeads : 1)
             : TcnModelTrainer.CausalConvForwardFull(
                 seqStd, tcnSnap.ConvW, tcnSnap.ConvB, resW, blockInC,
                 filters, numBlocks, dilations,
@@ -160,7 +161,8 @@ public sealed class TcnInferenceEngine : IModelInferenceEngine
                     maskedSeq, tcnSnap.ConvW, tcnSnap.ConvB, resW, blockInC,
                     filters, numBlocks, dilations,
                     tcnSnap.UseLayerNorm, tcnSnap.LayerNormGamma, tcnSnap.LayerNormBeta, activation,
-                    tcnSnap.AttnQueryW!, tcnSnap.AttnKeyW!, tcnSnap.AttnValueW!)
+                    tcnSnap.AttnQueryW!, tcnSnap.AttnKeyW!, tcnSnap.AttnValueW!,
+                    tcnSnap.AttentionHeads > 0 ? tcnSnap.AttentionHeads : 1)
                 : TcnModelTrainer.CausalConvForwardFull(
                     maskedSeq, tcnSnap.ConvW, tcnSnap.ConvB, resW, blockInC,
                     filters, numBlocks, dilations,

@@ -346,11 +346,14 @@ public sealed class DannModelTrainer : IMLModelTrainer
                 plattA       = pA;   plattB   = pB;
                 finalMetrics = prunedMetrics;
                 F            = activeF;
+                trainSet     = maskedTrain; // downstream Jackknife/PSI/DW use masked features
+                testSet      = maskedTest;  // downstream BSS uses masked features
                 ece          = ComputeEce(maskedTest, model, plattA, plattB, F);
                 optimalThreshold = ComputeOptimalThreshold(maskedCal, model, plattA, plattB, F,
                     hp.ThresholdSearchMin, hp.ThresholdSearchMax);
                 var (pAB, pBB, pAS, pBS) = FitClassConditionalPlatt(maskedCal, model, F);
                 plattABuy = pAB; plattBBuy = pBB; plattASell = pAS; plattBSell = pBS;
+                avgKellyFraction = ComputeAvgKellyFraction(maskedCal, model, plattA, plattB, F);
             }
             else
             {
@@ -399,8 +402,7 @@ public sealed class DannModelTrainer : IMLModelTrainer
         {
             // Floor at 1e-4 so warm-start LR reductions (lr/3 → lr/10) don't starve the regressor.
             double qrLr = hp.DannQuantileRegressorLr > 0.0 ? hp.DannQuantileRegressorLr : Math.Max(lr / 10.0, 1e-4);
-            (magQ90Weights, magQ90Bias) = FitQuantileRegressor(
-                prunedCount > 0 ? ApplyMask(trainSet, activeMask) : trainSet, F, hp.MagnitudeQuantileTau, qrLr);
+            (magQ90Weights, magQ90Bias) = FitQuantileRegressor(trainSet, F, hp.MagnitudeQuantileTau, qrLr);
             _logger.LogDebug("DANN quantile magnitude regressor fitted (τ={Tau:F2}).", hp.MagnitudeQuantileTau);
         }
 
@@ -411,8 +413,7 @@ public sealed class DannModelTrainer : IMLModelTrainer
         _logger.LogDebug("DANN decision boundary: mean={Mean:F4} std={Std:F4}", dbMean, dbStd);
 
         // ── 20. Durbin-Watson on magnitude residuals ──────────────────────────
-        double durbinWatson = ComputeDurbinWatson(
-            prunedCount > 0 ? ApplyMask(trainSet, activeMask) : trainSet, magWeights, magBias, F);
+        double durbinWatson = ComputeDurbinWatson(trainSet, magWeights, magBias, F);
         _logger.LogDebug("DANN Durbin-Watson={DW:F4}", durbinWatson);
         if (hp.DurbinWatsonThreshold > 0.0 && durbinWatson < hp.DurbinWatsonThreshold)
             _logger.LogWarning(
@@ -423,9 +424,7 @@ public sealed class DannModelTrainer : IMLModelTrainer
         string[] redundantPairs = [];
         if (hp.MutualInfoRedundancyThreshold > 0.0)
         {
-            redundantPairs = ComputeRedundantFeaturePairs(
-                prunedCount > 0 ? ApplyMask(trainSet, activeMask) : trainSet,
-                F, hp.MutualInfoRedundancyThreshold);
+            redundantPairs = ComputeRedundantFeaturePairs(trainSet, F, hp.MutualInfoRedundancyThreshold);
             if (redundantPairs.Length > 0)
                 _logger.LogWarning("DANN MI redundancy: {N} pairs exceed threshold", redundantPairs.Length);
         }
@@ -1308,8 +1307,8 @@ public sealed class DannModelTrainer : IMLModelTrainer
         var buySamples  = calSet.Where(s => s.Direction == 1).ToList();
         var sellSamples = calSet.Where(s => s.Direction == 0).ToList();
 
-        var (ab, bb) = buySamples.Count  >= 4 ? FitPlattScaling(buySamples,  model, F) : (0.0, 0.0);
-        var (as2, bs) = sellSamples.Count >= 4 ? FitPlattScaling(sellSamples, model, F) : (0.0, 0.0);
+        var (ab, bb) = buySamples.Count  >= 4 ? FitPlattScaling(buySamples,  model, F) : (1.0, 0.0);
+        var (as2, bs) = sellSamples.Count >= 4 ? FitPlattScaling(sellSamples, model, F) : (1.0, 0.0);
         return (ab, bb, as2, bs);
     }
 

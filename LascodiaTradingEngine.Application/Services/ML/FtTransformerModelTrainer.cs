@@ -280,8 +280,15 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
                 plattA       = pA;   plattB   = pB;
                 finalMetrics = prunedMetrics;
                 F            = activeF;
+                trainSet     = maskedTrain;  // downstream DW/PSI use masked features
+                testSet      = maskedTest;   // downstream BSS uses masked features
+                calSet       = maskedCal;    // downstream conformal/temperature use masked features
+                calBuf       = prunedBuf;    // inference buffers sized for activeF
                 ece          = ComputeEce(maskedTest, model, pA, pB, F, prunedBuf);
                 optimalThreshold = ComputeOptimalThreshold(maskedCal, model, pA, pB, F, prunedBuf);
+                (plattABuy, plattBBuy, plattASell, plattBSell) =
+                    FitClassConditionalPlatt(maskedCal, model, F, prunedBuf);
+                avgKellyFraction = ComputeAvgKellyFraction(maskedCal, model, pA, pB, F, prunedBuf);
             }
             else
             {
@@ -2399,7 +2406,7 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
     private static (double ABuy, double BBuy, double ASell, double BSell) FitClassConditionalPlatt(
         List<TrainingSample> calSet, TransformerModel model, int featureCount, InferenceBuffers buf)
     {
-        if (calSet.Count < 20) return (0, 0, 0, 0);
+        if (calSet.Count < 20) return (1.0, 0.0, 1.0, 0.0); // identity on logit scale
 
         var buyLogits  = new List<double>();
         var buyLabels  = new List<double>();
@@ -2424,7 +2431,7 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
 
     private static (double A, double B) FitPlattOnSubset(List<double> logits, List<double> labels)
     {
-        if (logits.Count < 5) return (0, 0);
+        if (logits.Count < 5) return (1.0, 0.0); // identity on logit scale
         double A = 1.0, B = 0.0;
         int n = logits.Count;
         double prevLoss = double.MaxValue;
@@ -2671,7 +2678,7 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
             double p = MLFeatureHelper.Sigmoid(plattA * MLFeatureHelper.Logit(raw) + plattB);
             int bin = Math.Clamp((int)(p * NumBins), 0, NumBins - 1);
             binConfSum[bin] += p;
-            if ((p >= 0.5) == (s.Direction == 1)) binCorrect[bin]++;
+            if (s.Direction == 1) binCorrect[bin]++; // positive-class frequency, not classification accuracy
             binCount[bin]++;
         }
 
