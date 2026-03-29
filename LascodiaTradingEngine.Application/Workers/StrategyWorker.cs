@@ -798,11 +798,11 @@ public class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceU
     /// Configurable via <see cref="Domain.Entities.EngineConfig"/>:
     /// <list type="bullet">
     ///   <item><c>Backtest:Gate:Enabled</c>        — master switch (default true)</item>
-    ///   <item><c>Backtest:Gate:MinWinRate</c>      — minimum win rate, e.g. 0.35 = 35% (default 0.35)</item>
-    ///   <item><c>Backtest:Gate:MinProfitFactor</c> — minimum profit factor (default 0.80)</item>
+    ///   <item><c>Backtest:Gate:MinWinRate</c>      — minimum win rate (default 0.40 = 40%)</item>
+    ///   <item><c>Backtest:Gate:MinProfitFactor</c> — minimum profit factor; must be &gt; 1.0 to be profitable (default 1.0)</item>
     ///   <item><c>Backtest:Gate:MinTotalTrades</c>  — minimum trade count to be statistically meaningful (default 10)</item>
-    ///   <item><c>Backtest:Gate:MaxDrawdownPct</c>  — maximum drawdown allowed (default 0.30 = 30%)</item>
-    ///   <item><c>Backtest:Gate:MinSharpe</c>       — minimum Sharpe ratio (default -1.0, effectively disabled)</item>
+    ///   <item><c>Backtest:Gate:MaxDrawdownPct</c>  — maximum drawdown allowed (default 0.25 = 25%)</item>
+    ///   <item><c>Backtest:Gate:MinSharpe</c>       — minimum Sharpe ratio (default 0.0 = must be non-negative)</item>
     /// </list>
     /// </para>
     /// </summary>
@@ -820,11 +820,12 @@ public class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceU
         }
 
         // Load qualification thresholds from EngineConfig (hot-reloadable)
-        double minWinRate      = await GetConfigAsync<double>(ctx, "Backtest:Gate:MinWinRate",      0.35, ct);
-        double minProfitFactor = await GetConfigAsync<double>(ctx, "Backtest:Gate:MinProfitFactor", 0.80, ct);
+        // Only profitable strategies should qualify — ProfitFactor > 1.0 means net positive.
+        double minWinRate      = await GetConfigAsync<double>(ctx, "Backtest:Gate:MinWinRate",      0.40, ct);
+        double minProfitFactor = await GetConfigAsync<double>(ctx, "Backtest:Gate:MinProfitFactor", 1.0,  ct);
         int    minTotalTrades  = await GetConfigAsync<int>   (ctx, "Backtest:Gate:MinTotalTrades",  10,   ct);
-        double maxDrawdownPct  = await GetConfigAsync<double>(ctx, "Backtest:Gate:MaxDrawdownPct",  0.30, ct);
-        double minSharpe       = await GetConfigAsync<double>(ctx, "Backtest:Gate:MinSharpe",       -1.0, ct);
+        double maxDrawdownPct  = await GetConfigAsync<double>(ctx, "Backtest:Gate:MaxDrawdownPct",  0.25, ct);
+        double minSharpe       = await GetConfigAsync<double>(ctx, "Backtest:Gate:MinSharpe",       0.0,  ct);
 
         // Load the most recent completed backtest per strategy (only for strategies in scope)
         var recentBacktests = await ctx.Set<Domain.Entities.BacktestRun>()
