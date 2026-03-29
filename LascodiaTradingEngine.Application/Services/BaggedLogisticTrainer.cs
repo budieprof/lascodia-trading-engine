@@ -947,8 +947,10 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         double brierSkillScore = ComputeBrierSkillScore(postPruneTestSet, FinalProductionProb);
         _logger.LogInformation("Brier Skill Score (BSS)={BSS:F4} (>0 beats naive predictor)", brierSkillScore);
 
-        var finalFeatureImportance = postPruneTestSet.Count >= 10
-            ? ComputePermutationImportance(postPruneTestSet, FinalProductionProb, featureCount, optimalThreshold, ct)
+        // Persist feature-importance weights from the calibration split so downstream workers
+        // can consume them without pulling operational side-data from the held-out test split.
+        var finalFeatureImportance = postPruneCalSet.Count >= 10
+            ? ComputePermutationImportance(postPruneCalSet, FinalProductionProb, featureCount, optimalThreshold, ct)
             : new float[featureCount];
         var finalTopFeatures = finalFeatureImportance
             .Select((imp, idx) => (Importance: imp, Name: MLFeatureHelper.FeatureNames[idx]))
