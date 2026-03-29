@@ -51,7 +51,7 @@ public sealed class GbmModelTrainer : IMLModelTrainer
 {
     // ── Constants ────────────────────────────────────────────────────────────
     private const string ModelType    = "GBM";
-    private const string ModelVersion = "2.0";
+    private const string ModelVersion = "2.1"; // 2.1: fixed leaf sign (G/(H+λ) not −G), corrected class weighting
 
     private const double AdamBeta1   = 0.9;
     private const double AdamBeta2   = 0.999;
@@ -204,7 +204,7 @@ public sealed class GbmModelTrainer : IMLModelTrainer
         }
 
         // ── 4. Fit GBM ensemble ─────────────────────────────────────────────
-        var (trees, baseLogOdds, treeBagMasks) = FitGbmEnsemble(trainSet, featureCount, numRounds, maxDepth, lr,
+        var (trees, baseLogOdds, treeBagMasks, innerTrainCount) = FitGbmEnsemble(trainSet, featureCount, numRounds, maxDepth, lr,
             effectiveLabelSmoothing, warmStart, densityWeights, hp.TemporalDecayLambda,
             hp.FeatureSampleRatio, hp.L2Lambda, ct, hp.UseClassWeights);
 
@@ -278,7 +278,7 @@ public sealed class GbmModelTrainer : IMLModelTrainer
             var maskedTest  = ApplyMask(testSet, activeMask);
 
             int prunedRounds = Math.Max(10, numRounds / 2);
-            var (pTrees, pBLO, _) = FitGbmEnsemble(maskedTrain, featureCount, prunedRounds, maxDepth, lr,
+            var (pTrees, pBLO, pBagMasks, pInnerTrainCount) = FitGbmEnsemble(maskedTrain, featureCount, prunedRounds, maxDepth, lr,
                 effectiveLabelSmoothing, null, densityWeights, hp.TemporalDecayLambda,
                 hp.FeatureSampleRatio, hp.L2Lambda, ct, hp.UseClassWeights);
             var (pA, pB)       = FitPlattScaling(maskedCal, pTrees, pBLO, lr, featureCount);
@@ -293,6 +293,10 @@ public sealed class GbmModelTrainer : IMLModelTrainer
                 magWeights   = pmw;       magBias     = pmb;
                 plattA       = pA;        plattB      = pB;
                 finalMetrics = prunedMetrics;
+                treeBagMasks     = pBagMasks;
+                innerTrainCount  = pInnerTrainCount;
+                trainSet         = maskedTrain; // downstream OOB/Jackknife/DW must use masked features
+                testSet          = maskedTest;  // downstream BSS must use masked features
                 ece              = ComputeEce(maskedTest, trees, baseLogOdds, lr, plattA, plattB, featureCount);
                 optimalThreshold = ComputeOptimalThreshold(maskedCal, trees, baseLogOdds, lr, plattA, plattB, featureCount,
                     hp.ThresholdSearchMin, hp.ThresholdSearchMax);
@@ -304,8 +308,12 @@ public sealed class GbmModelTrainer : IMLModelTrainer
                 activeMask  = new bool[featureCount]; Array.Fill(activeMask, true);
             }
         }
-        else if (prunedCount == 0)
+        else
         {
+            // Either no features were pruned (prunedCount == 0) or too few would remain
+            // (featureCount - prunedCount < 10). In both cases, reset to all-active so
+            // downstream postPruneCalSet uses unmasked features matching the unpruned trees.
+            prunedCount = 0;
             activeMask = new bool[featureCount]; Array.Fill(activeMask, true);
         }
 
@@ -321,12 +329,15 @@ public sealed class GbmModelTrainer : IMLModelTrainer
         _logger.LogInformation("GBM conformal qHat={QHat:F4} ({Cov:P0} coverage)", conformalQHat, hp.ConformalCoverage);
 
         // ── 11c. OOB accuracy (true OOB using per-tree bag membership) ─────
-        double oobAccuracy = ComputeOobAccuracy(trainSet, trees, treeBagMasks, baseLogOdds, lr, featureCount);
+        // Bag mask indices are relative to the inner trainSet (after FitGbmEnsemble's val split),
+        // so slice to innerTrainCount to avoid including the val-split tail as always-OOB.
+        var oobTrainSet = trainSet[..Math.Min(innerTrainCount, trainSet.Count)];
+        double oobAccuracy = ComputeOobAccuracy(oobTrainSet, trees, treeBagMasks, baseLogOdds, lr, featureCount);
         _logger.LogInformation("GBM OOB accuracy={OobAcc:P1}", oobAccuracy);
         finalMetrics = finalMetrics with { OobAccuracy = oobAccuracy };
 
         // ── 11d. Jackknife+ residuals ───────────────────────────────────────
-        double[] jackknifeResiduals = ComputeJackknifeResiduals(trainSet, trees, baseLogOdds, lr, featureCount);
+        double[] jackknifeResiduals = ComputeJackknifeResiduals(oobTrainSet, trees, treeBagMasks, baseLogOdds, lr, featureCount);
         _logger.LogInformation("GBM Jackknife+ residuals: {N} samples", jackknifeResiduals.Length);
 
         // ── 11e. Meta-label model ───────────────────────────────────────────
@@ -473,7 +484,7 @@ public sealed class GbmModelTrainer : IMLModelTrainer
     //  GBM ENSEMBLE FITTING
     // ═══════════════════════════════════════════════════════════════════════
 
-    private (List<GbmTree> Trees, double BaseLogOdds, List<HashSet<int>> TreeBagMasks) FitGbmEnsemble(
+    private (List<GbmTree> Trees, double BaseLogOdds, List<HashSet<int>> TreeBagMasks, int InnerTrainCount) FitGbmEnsemble(
         List<TrainingSample> train,
         int                  featureCount,
         int                  numRounds,
@@ -488,13 +499,18 @@ public sealed class GbmModelTrainer : IMLModelTrainer
         CancellationToken    ct,
         bool                 useClassWeights = false)
     {
-        int valSize  = Math.Max(20, train.Count / 10);
-        var valSet   = train[^valSize..];
-        var trainSet = train[..^valSize];
+        // Clamp valSize so inner trainSet always has at least 10 samples
+        int valSize  = Math.Min(Math.Max(20, train.Count / 10), Math.Max(0, train.Count - 10));
+        if (valSize < 5) valSize = 0; // too small to split — skip validation
+        var valSet   = valSize > 0 ? train[^valSize..] : new List<TrainingSample>();
+        var trainSet = valSize > 0 ? train[..^valSize] : train;
 
-        // Temporal + density blended weights
+        // Temporal + density blended weights.
+        // densityWeights are computed on the full train split passed to FitGbmEnsemble,
+        // while temporalWeights are computed on the inner trainSet (after val split).
+        // The inner trainSet is a prefix of the full split, so truncate densityWeights.
         var temporalWeights = ComputeTemporalWeights(trainSet.Count, temporalDecayLambda);
-        if (densityWeights is { Length: > 0 } && densityWeights.Length == temporalWeights.Length)
+        if (densityWeights is { Length: > 0 } && densityWeights.Length >= temporalWeights.Length)
         {
             double sum = 0.0;
             for (int i = 0; i < temporalWeights.Length; i++)
@@ -545,19 +561,30 @@ public sealed class GbmModelTrainer : IMLModelTrainer
 
         if (warmStart?.GbmTreesJson is not null && warmStart.Type == ModelType)
         {
-            try
+            // Reject pre-2.1 trees: they have inverted leaf signs (−G/(H+λ) instead of G/(H+λ))
+            bool versionCompatible = string.Compare(warmStart.Version ?? "0", "2.1", StringComparison.Ordinal) >= 0;
+            if (!versionCompatible)
             {
-                var priorTrees = JsonSerializer.Deserialize<List<GbmTree>>(warmStart.GbmTreesJson, JsonOptions);
-                if (priorTrees is { Count: > 0 })
-                {
-                    trees.AddRange(priorTrees);
-                    _logger.LogInformation("GBM warm-start: loaded {N} prior trees (gen={Gen})",
-                        priorTrees.Count, warmStart.GenerationNumber);
-                }
+                _logger.LogWarning(
+                    "GBM warm-start: discarding prior trees from version {V} (leaf sign incompatible with ≥2.1)",
+                    warmStart.Version);
             }
-            catch (JsonException ex)
+            else
             {
-                _logger.LogWarning(ex, "GBM warm-start: failed to deserialise prior trees, starting fresh.");
+                try
+                {
+                    var priorTrees = JsonSerializer.Deserialize<List<GbmTree>>(warmStart.GbmTreesJson, JsonOptions);
+                    if (priorTrees is { Count: > 0 })
+                    {
+                        trees.AddRange(priorTrees);
+                        _logger.LogInformation("GBM warm-start: loaded {N} prior trees (gen={Gen})",
+                            priorTrees.Count, warmStart.GenerationNumber);
+                    }
+                }
+                catch (JsonException ex)
+                {
+                    _logger.LogWarning(ex, "GBM warm-start: failed to deserialise prior trees, starting fresh.");
+                }
             }
         }
 
@@ -665,14 +692,18 @@ public sealed class GbmModelTrainer : IMLModelTrainer
                 double cw = trainSet[i].Direction > 0 ? classWeightBuy : classWeightSell;
                 residuals[i]     = (y - p) * cw;       // first-order gradient (negative), class-weighted
                 hessians[i]      = p * (1 - p) * cw;   // second-order (Hessian diagonal), class-weighted
-                sampleWeights[i] = temporalWeights[i] * cw; // split criterion also class-weighted
+                sampleWeights[i] = temporalWeights[i];  // class weight already in residuals/hessians
             }
 
-            // Fit a weighted regression tree using Newton-Raphson leaf values
+            // Fit a weighted regression tree using Newton-Raphson leaf values.
+            // MinChildWeight must be scaled by 1/N because temporal weights are normalised
+            // to sum=1, making H ≈ avg(p(1−p)) ≈ 0.25 regardless of N. Without scaling,
+            // H < 1.0 is always true and every tree degenerates to a single-node stump.
+            double scaledMinCW = n > 0 ? MinChildWeight / n : MinChildWeight;
             var indices = rowSample.ToList();
             var tree    = new GbmTree();
             BuildTree(tree, indices, trainSet, residuals, hessians, sampleWeights,
-                colSample, maxDepth, l2Lambda, MinChildWeight);
+                colSample, maxDepth, l2Lambda, scaledMinCW);
             trees.Add(tree);
 
             // Clip leaf values to prevent extreme predictions
@@ -719,7 +750,7 @@ public sealed class GbmModelTrainer : IMLModelTrainer
             bagMasks = bestBagMasks;
         }
 
-        return (trees, baseLogOdds, bagMasks);
+        return (trees, baseLogOdds, bagMasks, trainSet.Count);
 
         static int hp_patience(int rounds) => Math.Max(3, rounds / 10);
     }
@@ -912,11 +943,12 @@ public sealed class GbmModelTrainer : IMLModelTrainer
                 sampleWeights[i] = temporalWeights[i];
             }
 
+            double scaledMinCW = n > 0 ? MinChildWeight / n : MinChildWeight;
             var allCols = Enumerable.Range(0, featureCount).ToArray();
             var indices = Enumerable.Range(0, n).ToList();
             var tree    = new GbmTree();
             BuildTree(tree, indices, train, residuals, hessians, sampleWeights,
-                allCols, maxDepth, 0.0, MinChildWeight);
+                allCols, maxDepth, 0.0, scaledMinCW);
             trees.Add(tree);
             ClipLeafValues(tree, LeafClipValue);
 
@@ -947,7 +979,7 @@ public sealed class GbmModelTrainer : IMLModelTrainer
     /// Builds a single node of the regression tree using the XGBoost gain formula:
     ///   Gain = ½ [ G_L²/(H_L+λ) + G_R²/(H_R+λ) − G²/(H+λ) ]
     /// where G = Σ g_i, H = Σ h_i (weighted by sample weights).
-    /// Leaf value = −G / (H + λ) (Newton-Raphson optimal step with L2 regularisation).
+    /// Leaf value = G / (H + λ) (Newton-Raphson optimal step; G stores negative gradient y−p).
     /// </summary>
     private static void BuildNode(
         List<GbmNode> nodes, int nodeIdx,
@@ -966,8 +998,10 @@ public sealed class GbmModelTrainer : IMLModelTrainer
             H += sampleWeights[i] * hessians[i];
         }
 
-        // Newton-Raphson optimal leaf value with L2 regularisation: −G / (H + λ)
-        double leafVal = (H + l2Lambda) > 1e-15 ? -G / (H + l2Lambda) : 0;
+        // Newton-Raphson optimal leaf value with L2 regularisation: G / (H + λ)
+        // G stores pseudo-residuals (y − p), i.e. the negative gradient, so the correct
+        // step is +G/(H+λ) (not −G) to push predictions toward the true labels.
+        double leafVal = (H + l2Lambda) > 1e-15 ? G / (H + l2Lambda) : 0;
         node.LeafValue = leafVal;
 
         // Stopping conditions: max depth, too few samples, or insufficient Hessian mass
@@ -1224,6 +1258,14 @@ public sealed class GbmModelTrainer : IMLModelTrainer
         return (plattA, plattB);
     }
 
+    /// <summary>
+    /// Fits separate Platt calibrators for Buy and Sell subsets using the FULL calSet
+    /// but weighting each calibrator's loss toward its target class. This avoids the
+    /// degenerate single-class problem of fitting on subsets where all labels are identical.
+    /// Buy calibrator: labels are 1 for buy, 0 for sell (same as global Platt).
+    /// Sell calibrator: labels are 1 for sell, 0 for buy (inverted).
+    /// Each calibrator is fitted with samples weighted 3:1 toward its target class.
+    /// </summary>
     private static (double ABuy, double BBuy, double ASell, double BSell) FitClassConditionalPlatt(
         List<TrainingSample> calSet,
         List<GbmTree>        trees,
@@ -1231,13 +1273,57 @@ public sealed class GbmModelTrainer : IMLModelTrainer
         double               lr,
         int                  featureCount)
     {
-        var buySamples  = calSet.Where(s => s.Direction > 0).ToList();
-        var sellSamples = calSet.Where(s => s.Direction <= 0).ToList();
+        if (calSet.Count < 20) return (0.0, 0.0, 0.0, 0.0);
 
-        var (aBuy, bBuy)   = buySamples.Count >= 10
-            ? FitPlattScaling(buySamples, trees, baseLogOdds, lr, featureCount) : (0.0, 0.0);
-        var (aSell, bSell) = sellSamples.Count >= 10
-            ? FitPlattScaling(sellSamples, trees, baseLogOdds, lr, featureCount) : (0.0, 0.0);
+        int n = calSet.Count;
+        var logits = new double[n];
+        var isBuy  = new bool[n];
+        for (int i = 0; i < n; i++)
+        {
+            double raw = GbmProb(calSet[i].Features, trees, baseLogOdds, lr, featureCount);
+            raw        = Math.Clamp(raw, 1e-7, 1.0 - 1e-7);
+            logits[i]  = Logit(raw);
+            isBuy[i]   = calSet[i].Direction > 0;
+        }
+
+        const double sgdLr  = 0.01;
+        const int    epochs = 200;
+
+        // Buy calibrator: standard labels (buy=1, sell=0), upweight buy samples
+        double aBuy = 1.0, bBuy = 0.0;
+        for (int epoch = 0; epoch < epochs; epoch++)
+        {
+            double dA = 0, dB = 0;
+            for (int i = 0; i < n; i++)
+            {
+                double calibP = Sigmoid(aBuy * logits[i] + bBuy);
+                double label  = isBuy[i] ? 1.0 : 0.0;
+                double w      = isBuy[i] ? 3.0 : 1.0;
+                double err    = (calibP - label) * w;
+                dA += err * logits[i];
+                dB += err;
+            }
+            aBuy -= sgdLr * dA / n;
+            bBuy -= sgdLr * dB / n;
+        }
+
+        // Sell calibrator: inverted labels (sell=1, buy=0), upweight sell samples
+        double aSell = 1.0, bSell = 0.0;
+        for (int epoch = 0; epoch < epochs; epoch++)
+        {
+            double dA = 0, dB = 0;
+            for (int i = 0; i < n; i++)
+            {
+                double calibP = Sigmoid(aSell * logits[i] + bSell);
+                double label  = isBuy[i] ? 0.0 : 1.0;
+                double w      = isBuy[i] ? 1.0 : 3.0;
+                double err    = (calibP - label) * w;
+                dA += err * logits[i];
+                dB += err;
+            }
+            aSell -= sgdLr * dA / n;
+            bSell -= sgdLr * dB / n;
+        }
 
         return (aBuy, bBuy, aSell, bSell);
     }
@@ -1308,16 +1394,16 @@ public sealed class GbmModelTrainer : IMLModelTrainer
     {
         if (testSet.Count < bins) return 1.0;
 
-        var binCorrect = new double[bins];
-        var binConf    = new double[bins];
-        var binCount   = new int[bins];
+        var binPositive = new double[bins];
+        var binConf     = new double[bins];
+        var binCount    = new int[bins];
 
         foreach (var s in testSet)
         {
             double p  = GbmCalibProb(s.Features, trees, baseLogOdds, lr, plattA, plattB, featureCount);
             int bin   = Math.Clamp((int)(p * bins), 0, bins - 1);
             binConf[bin] += p;
-            binCorrect[bin] += (p >= 0.5) == (s.Direction > 0) ? 1 : 0;
+            binPositive[bin] += s.Direction > 0 ? 1 : 0; // actual positive rate, not prediction correctness
             binCount[bin]++;
         }
 
@@ -1326,7 +1412,7 @@ public sealed class GbmModelTrainer : IMLModelTrainer
         for (int b = 0; b < bins; b++)
         {
             if (binCount[b] == 0) continue;
-            double acc  = binCorrect[b] / binCount[b];
+            double acc  = binPositive[b] / binCount[b];
             double conf = binConf[b] / binCount[b];
             ece += Math.Abs(acc - conf) * binCount[b] / n;
         }
@@ -1566,22 +1652,41 @@ public sealed class GbmModelTrainer : IMLModelTrainer
     //  JACKKNIFE+ RESIDUALS
     // ═══════════════════════════════════════════════════════════════════════
 
+    /// <summary>
+    /// True Jackknife+ nonconformity residuals: r_i = |trueLabel − oobP| where oobP is
+    /// the probability predicted only by trees whose bootstrap bag did NOT include sample i.
+    /// Returns residuals sorted in ascending order.
+    /// </summary>
     private static double[] ComputeJackknifeResiduals(
-        List<TrainingSample> trainSet, List<GbmTree> trees, double baseLogOdds,
-        double lr, int featureCount)
+        List<TrainingSample> trainSet, List<GbmTree> trees, List<HashSet<int>> bagMasks,
+        double baseLogOdds, double lr, int featureCount)
     {
         if (trainSet.Count < 10 || trees.Count < 2) return [];
+        if (bagMasks.Count != trees.Count) return [];
 
-        var residuals = new double[trainSet.Count];
+        var residuals = new List<double>(trainSet.Count);
+
         for (int i = 0; i < trainSet.Count; i++)
         {
-            double fullScore = GbmScore(trainSet[i].Features, trees, baseLogOdds, lr, featureCount);
-            double fullP     = Sigmoid(fullScore);
-            double y         = trainSet[i].Direction > 0 ? 1.0 : 0.0;
-            residuals[i]     = Math.Abs(y - fullP);
+            double oobScore = baseLogOdds;
+            int oobTreeCount = 0;
+
+            for (int t = 0; t < trees.Count; t++)
+            {
+                if (bagMasks[t].Contains(i)) continue; // skip: sample was in-bag
+                oobScore += lr * Predict(trees[t], trainSet[i].Features);
+                oobTreeCount++;
+            }
+
+            if (oobTreeCount == 0) continue; // in-bag for every tree — skip
+
+            double oobP = Sigmoid(oobScore);
+            double y    = trainSet[i].Direction > 0 ? 1.0 : 0.0;
+            residuals.Add(Math.Abs(y - oobP));
         }
-        Array.Sort(residuals);
-        return residuals;
+
+        residuals.Sort();
+        return [..residuals];
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1694,7 +1799,20 @@ public sealed class GbmModelTrainer : IMLModelTrainer
                 double calibP = GbmCalibProb(s.Features, trees, baseLogOdds, lr, plattA, plattB, featureCount);
                 double rawP = GbmProb(s.Features, trees, baseLogOdds, lr, featureCount);
                 rawP = Math.Clamp(rawP, 1e-7, 1.0 - 1e-7);
-                double ms = metaLabelWeights.Length > 0 ? Sigmoid(metaLabelBias) : 0.5;
+
+                // Compute full per-sample meta-label score (matching training computation)
+                double ms = 0.5;
+                if (metaLabelWeights.Length > 0)
+                {
+                    var mf = new[] { rawP, Logit(rawP),
+                        s.Features.Length > 0 ? s.Features[0] : 0,
+                        s.Features.Length > 1 ? s.Features[1] : 0,
+                        s.Features.Length > 2 ? s.Features[2] : 0 };
+                    double mlScore = metaLabelBias;
+                    for (int j2 = 0; j2 < Math.Min(metaLabelWeights.Length, mf.Length); j2++)
+                        mlScore += metaLabelWeights[j2] * mf[j2];
+                    ms = Sigmoid(mlScore);
+                }
                 var af = new[] { calibP, Math.Abs(calibP - 0.5), ms };
                 double z = b;
                 for (int j = 0; j < dim; j++) z += w[j] * af[j];

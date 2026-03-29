@@ -574,6 +574,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                 maskedCal, pw, pb, piw, pib, featureCount, hiddenSize, psub,
                 (f, w, b, iw, ib, fc, hs, fs, lw) => EnsembleRawProb(
                     f, w, b, iw, ib, fc, hs, fs, lw ?? pLearnerAccWeights, phs, pla, pSw, pSb));
+            var pTrainedAtUtc = DateTime.UtcNow;
             double pTemp = 0.0;
             if (hp.FitTemperatureScale && maskedCal.Count >= 10)
             {
@@ -587,9 +588,52 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                 pA, pB, pTemp,
                 (f, w, b, iw, ib, fc, hs, fs, lw) => EnsembleRawProb(
                     f, w, b, iw, ib, fc, hs, fs, lw ?? pLearnerAccWeights, phs, pla, pSw, pSb));
-            double PPrimaryCalibProb(float[] features) => ApplyProductionCalibration(
+
+            double PPreIsotonicCalibProb(float[] features) => ApplyProductionCalibration(
                 EnsembleRawProb(features, pw, pb, piw, pib, featureCount, hiddenSize, psub, pLearnerAccWeights, phs, pla, pSw, pSb),
                 pA, pB, pTemp, pABuy, pBBuy, pASell, pBSell);
+
+            double[] pIso = ElmCalibrationHelper.FitIsotonicCalibration(
+                maskedCal, pw, pb, piw, pib, pA, pB, featureCount, hiddenSize, psub,
+                (f, w, b, iw, ib, pAp, pBp, fc, hs, fs, lw) => PPreIsotonicCalibProb(f));
+
+            if (hp.FitTemperatureScale && maskedCal.Count >= 10)
+            {
+                double refitPTemp = ElmCalibrationHelper.FitTemperatureScaling(
+                    maskedCal, pw, pb, piw, pib, featureCount, hiddenSize, psub,
+                    (f, w, b, iw, ib, fc, hs, fs, lw) => EnsembleRawProb(
+                        f, w, b, iw, ib, fc, hs, fs, lw ?? pLearnerAccWeights, phs, pla, pSw, pSb),
+                    pA, pB, pABuy, pBBuy, pASell, pBSell, pIso, hp.AgeDecayLambda, pTrainedAtUtc);
+
+                if (Math.Abs(refitPTemp - pTemp) > 1e-6)
+                {
+                    pTemp = refitPTemp;
+                    (pABuy, pBBuy, pASell, pBSell) = ElmCalibrationHelper.FitClassConditionalPlatt(
+                        maskedCal, pw, pb, piw, pib, featureCount, hiddenSize, psub,
+                        pA, pB, pTemp,
+                        (f, w, b, iw, ib, fc, hs, fs, lw) => EnsembleRawProb(
+                            f, w, b, iw, ib, fc, hs, fs, lw ?? pLearnerAccWeights, phs, pla, pSw, pSb));
+                    pIso = ElmCalibrationHelper.FitIsotonicCalibration(
+                        maskedCal, pw, pb, piw, pib, pA, pB, featureCount, hiddenSize, psub,
+                        (f, w, b, iw, ib, pAp, pBp, fc, hs, fs, lw) => PPreIsotonicCalibProb(f));
+                }
+            }
+
+            double PPrimaryCalibProb(float[] features)
+            {
+                double calib = PPreIsotonicCalibProb(features);
+                calib = pIso.Length >= 4 ? ElmCalibrationHelper.ApplyIsotonicCalibration(calib, pIso) : calib;
+
+                if (hp.AgeDecayLambda > 0.0)
+                {
+                    double daysSinceTrain = (DateTime.UtcNow - pTrainedAtUtc).TotalDays;
+                    double decayFactor = Math.Exp(-hp.AgeDecayLambda * Math.Max(0.0, daysSinceTrain));
+                    calib = 0.5 + (calib - 0.5) * decayFactor;
+                }
+
+                return calib;
+            }
+
             var prunedMetrics = ElmEvaluationHelper.EvaluateEnsemble(
                 maskedTest, pw, pb, piw, pib, pmw, pmb, pA, pB, featureCount, hiddenSize, psub,
                 pmaw, pmab, sharpeAnnFactor,

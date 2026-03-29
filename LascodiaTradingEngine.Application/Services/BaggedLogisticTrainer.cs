@@ -272,10 +272,12 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
 
         // ── 6b. Class-conditional Platt (Buy / Sell separate scalers) ────────
         var (plattABuy, plattBBuy, plattASell, plattBSell) =
-            FitClassConditionalPlatt(calSet, weights, biases, featureCount, featureSubsets, meta, mlp);
+            FitClassConditionalPlatt(calSet, weights, biases, featureCount, featureSubsets, meta, mlp, plattA, plattB);
         _logger.LogDebug(
             "Class-conditional Platt — Buy: A={AB:F4} B={BB:F4}  Sell: A={AS:F4} B={BS:F4}",
             plattABuy, plattBBuy, plattASell, plattBSell);
+
+        double temperatureScale = 0.0; // 0 = disabled until the final temperature search runs
 
         // ── 6c. Average Kelly fraction on cal set ─────────────────────────────
         double avgKellyFraction = ComputeAvgKellyFraction(
@@ -360,7 +362,59 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
                 : FitLinearRegressor(maskedTrain, featureCount, prunedHp, ct);
             var pMeta       = FitMetaLearner(maskedCal, pw, pb, featureCount, null, pMlp);
             var (pA, pB)    = FitPlattScaling(maskedCal, pw, pb, featureCount, null, pMeta, pMlp);
-            var prunedMetrics = EvaluateEnsemble(maskedTest, pw, pb, pmw, pmb, pA, pB, featureCount, null, pMeta, pMlp);
+            var pTrainedAtUtc = DateTime.UtcNow;
+            double pTemp = 0.0;
+            if (hp.FitTemperatureScale && maskedCal.Count >= 10)
+            {
+                pTemp = FitTemperatureScaling(
+                    maskedCal, pw, pb,
+                    pA, pB,
+                    0.0, 0.0, 0.0, 0.0,
+                    [],
+                    0.0,
+                    pTrainedAtUtc,
+                    featureCount, null, pMeta, pMlp);
+            }
+
+            var (pABuy, pBBuy, pASell, pBSell) = FitClassConditionalPlatt(
+                maskedCal, pw, pb, featureCount, null, pMeta, pMlp, pA, pB, pTemp);
+
+            double PPreIsotonicProb(float[] features)
+            {
+                double raw = EnsembleProb(features, pw, pb, featureCount, null, pMeta, pMlp.HiddenW, pMlp.HiddenB, pMlp.HiddenDim);
+                return ApplyProductionCalibration(
+                    raw, pA, pB, pTemp, pABuy, pBBuy, pASell, pBSell, [], 0.0, pTrainedAtUtc);
+            }
+
+            double[] pIso = FitIsotonicCalibration(maskedCal, PPreIsotonicProb);
+            if (hp.FitTemperatureScale && maskedCal.Count >= 10)
+            {
+                double refitTemp = FitTemperatureScaling(
+                    maskedCal, pw, pb,
+                    pA, pB,
+                    pABuy, pBBuy, pASell, pBSell,
+                    pIso,
+                    hp.AgeDecayLambda,
+                    pTrainedAtUtc,
+                    featureCount, null, pMeta, pMlp);
+
+                if (Math.Abs(refitTemp - pTemp) > 1e-6)
+                {
+                    pTemp = refitTemp;
+                    (pABuy, pBBuy, pASell, pBSell) = FitClassConditionalPlatt(
+                        maskedCal, pw, pb, featureCount, null, pMeta, pMlp, pA, pB, pTemp);
+                    pIso = FitIsotonicCalibration(maskedCal, PPreIsotonicProb);
+                }
+            }
+
+            double PFinalProductionProb(float[] features)
+            {
+                double raw = EnsembleProb(features, pw, pb, featureCount, null, pMeta, pMlp.HiddenW, pMlp.HiddenB, pMlp.HiddenDim);
+                return ApplyProductionCalibration(
+                    raw, pA, pB, pTemp, pABuy, pBBuy, pASell, pBSell, pIso, hp.AgeDecayLambda, pTrainedAtUtc);
+            }
+
+            var prunedMetrics = EvaluateEnsemble(maskedTest, pmw, pmb, PFinalProductionProb);
 
             if (prunedMetrics.Accuracy >= finalMetrics.Accuracy - 0.005)
             {
@@ -378,9 +432,13 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
                 gesWeights = hp.EnableGreedyEnsembleSelection && maskedCal.Count >= 20
                     ? RunGreedyEnsembleSelection(maskedCal, pw, pb, featureCount, null, mlp: pMlp)
                     : [];
-                ece              = ComputeEce(maskedTest, pw, pb, pA, pB, featureCount, null, pMeta, pMlp);
-                optimalThreshold = ComputeOptimalThreshold(maskedCal, pw, pb, pA, pB, featureCount, null, pMeta,
-                    hp.ThresholdSearchMin, hp.ThresholdSearchMax, pMlp);
+                temperatureScale = pTemp;
+                (plattABuy, plattBBuy, plattASell, plattBSell) = (pABuy, pBBuy, pASell, pBSell);
+                ece = ComputeProductionEce(
+                    maskedTest, pw, pb, pA, pB, pTemp, pABuy, pBBuy, pASell, pBSell, pIso,
+                    hp.AgeDecayLambda, pTrainedAtUtc, featureCount, null, pMeta, pMlp);
+                optimalThreshold = ComputeOptimalThreshold(maskedCal, PFinalProductionProb,
+                    hp.ThresholdSearchMin, hp.ThresholdSearchMax);
             }
             else
             {
@@ -510,7 +568,6 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         var trainedAtUtc = DateTime.UtcNow;
 
         // ── 11l. Temperature scaling ─────────────────────────────────────────
-        double temperatureScale = 0.0; // 0 = disabled
         if (hp.FitTemperatureScale && postPruneCalSet.Count >= 10)
         {
             temperatureScale = FitTemperatureScaling(
@@ -531,6 +588,58 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
                 meta,
                 mlp);
             _logger.LogDebug("Temperature scaling: T={T:F4} (1.0=no correction)", temperatureScale);
+        }
+
+        (plattABuy, plattBBuy, plattASell, plattBSell) = FitClassConditionalPlatt(
+            postPruneCalSet, weights, biases, featureCount, featureSubsets, meta, mlp, plattA, plattB, temperatureScale);
+
+        double PreIsotonicProductionProb(float[] features)
+        {
+            double raw = EnsembleProb(
+                features, weights, biases, featureCount, featureSubsets, meta, mlp.HiddenW, mlp.HiddenB, mlp.HiddenDim);
+            return ApplyProductionCalibration(
+                raw,
+                plattA,
+                plattB,
+                temperatureScale,
+                plattABuy,
+                plattBBuy,
+                plattASell,
+                plattBSell,
+                [],
+                0.0,
+                trainedAtUtc);
+        }
+
+        isotonicBp = FitIsotonicCalibration(postPruneCalSet, PreIsotonicProductionProb);
+
+        if (hp.FitTemperatureScale && postPruneCalSet.Count >= 10)
+        {
+            double refitTemperatureScale = FitTemperatureScaling(
+                postPruneCalSet,
+                weights,
+                biases,
+                plattA,
+                plattB,
+                plattABuy,
+                plattBBuy,
+                plattASell,
+                plattBSell,
+                isotonicBp,
+                hp.AgeDecayLambda,
+                trainedAtUtc,
+                featureCount,
+                featureSubsets,
+                meta,
+                mlp);
+
+            if (Math.Abs(refitTemperatureScale - temperatureScale) > 1e-6)
+            {
+                temperatureScale = refitTemperatureScale;
+                (plattABuy, plattBBuy, plattASell, plattBSell) = FitClassConditionalPlatt(
+                    postPruneCalSet, weights, biases, featureCount, featureSubsets, meta, mlp, plattA, plattB, temperatureScale);
+                isotonicBp = FitIsotonicCalibration(postPruneCalSet, PreIsotonicProductionProb);
+            }
         }
 
         double FinalProductionProb(float[] features)
@@ -3110,6 +3219,47 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         return bp;
     }
 
+    private static double[] FitIsotonicCalibration(
+        List<TrainingSample>  calSet,
+        Func<float[], double> calibratedProb)
+    {
+        if (calSet.Count < 10) return [];
+
+        int cn = calSet.Count;
+        var pairs = new (double P, double Y)[cn];
+        for (int i = 0; i < cn; i++)
+        {
+            double p = Math.Clamp(calibratedProb(calSet[i].Features), 0.0, 1.0);
+            pairs[i] = (p, calSet[i].Direction > 0 ? 1.0 : 0.0);
+        }
+        Array.Sort(pairs, (a, b) => a.P.CompareTo(b.P));
+
+        var stack = new List<(double SumY, double SumP, int Count)>(pairs.Length);
+        foreach (var (p, y) in pairs)
+        {
+            stack.Add((y, p, 1));
+            while (stack.Count >= 2)
+            {
+                var last = stack[^1];
+                var prev = stack[^2];
+                if (prev.SumY / prev.Count > last.SumY / last.Count)
+                {
+                    stack.RemoveAt(stack.Count - 1);
+                    stack[^1] = (prev.SumY + last.SumY, prev.SumP + last.SumP, prev.Count + last.Count);
+                }
+                else break;
+            }
+        }
+
+        var bp = new double[stack.Count * 2];
+        for (int i = 0; i < stack.Count; i++)
+        {
+            bp[i * 2] = stack[i].SumP / stack[i].Count;
+            bp[i * 2 + 1] = stack[i].SumY / stack[i].Count;
+        }
+        return bp;
+    }
+
     /// <summary>
     /// Applies isotonic calibration via linear interpolation over the PAVA breakpoints.
     /// Returns <paramref name="p"/> unchanged when fewer than 4 breakpoint values exist.
@@ -4047,7 +4197,10 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
             int                  featureCount,
             int[][]?             subsets,
             MetaLearner          meta = default,
-            MlpState             mlp  = default)
+            MlpState             mlp  = default,
+            double               plattA = 1.0,
+            double               plattB = 0.0,
+            double               temperatureScale = 0.0)
     {
         const double lr     = 0.01;
         const int    epochs = 200;
@@ -4060,8 +4213,11 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
             double rawP  = EnsembleProb(s.Features, weights, biases, featureCount, subsets, meta, mlp.HiddenW, mlp.HiddenB, mlp.HiddenDim);
             rawP         = Math.Clamp(rawP, 1e-7, 1.0 - 1e-7); // guard against ±Inf logits
             double logit = MLFeatureHelper.Logit(rawP);
+            double globalCalibP = temperatureScale > 0.0 && temperatureScale < 10.0
+                ? MLFeatureHelper.Sigmoid(logit / temperatureScale)
+                : MLFeatureHelper.Sigmoid(plattA * logit + plattB);
             double y     = s.Direction > 0 ? 1.0 : 0.0;
-            if (rawP >= 0.5) buySamples.Add((logit, y));
+            if (globalCalibP >= 0.5) buySamples.Add((logit, y));
             else             sellSamples.Add((logit, y));
         }
 

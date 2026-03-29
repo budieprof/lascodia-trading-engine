@@ -213,7 +213,8 @@ public sealed class MLSignalSuppressionWorker : BackgroundService
         // cannot contribute to accuracy measurement and must be excluded.
         var resolved = await readCtx.Set<MLModelPredictionLog>()
             .Where(l => l.MLModelId        == model.Id &&
-                        l.PredictedAt      >= since    &&
+                        l.OutcomeRecordedAt != null    &&
+                        l.OutcomeRecordedAt >= since   &&
                         l.DirectionCorrect != null      &&
                         !l.IsDeleted)
             .AsNoTracking()

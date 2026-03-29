@@ -131,8 +131,9 @@ public sealed class MLKellyFractionWorker : BackgroundService
                          && !l.IsDeleted
                          && l.DirectionCorrect != null
                          && l.ActualMagnitudePips != null
-                         && l.PredictedAt >= DateTime.UtcNow.AddDays(-60))
-                .OrderByDescending(l => l.PredictedAt)
+                         && l.OutcomeRecordedAt != null
+                         && l.OutcomeRecordedAt >= DateTime.UtcNow.AddDays(-60))
+                .OrderByDescending(l => l.OutcomeRecordedAt)
                 .ToListAsync(ct);
 
             if (logs.Count < 30)
