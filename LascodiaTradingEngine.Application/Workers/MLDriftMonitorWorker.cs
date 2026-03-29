@@ -235,7 +235,8 @@ public sealed class MLDriftMonitorWorker : BackgroundService
             .Where(l => l.MLModelId        == model.Id &&
                         !l.IsDeleted                   &&
                         l.DirectionCorrect != null     &&
-                        l.PredictedAt      >= windowStart)
+                        l.OutcomeRecordedAt != null    &&
+                        l.OutcomeRecordedAt >= windowStart)
             .AsNoTracking()
             .ToListAsync(ct);
 

@@ -667,6 +667,8 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             Array.Fill(activeMask, true);
         }
 
+        var trainedAtUtc = DateTime.UtcNow;
+
         double PrimaryEffectiveCalibProb(float[] features) => ApplyProductionCalibration(
             EnsembleRawProb(features, weights, biases, inputWeights, inputBiases,
                 effectiveFeatureCount, hiddenSize, featureSubsets, learnerAccWeights,
@@ -680,12 +682,68 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             (f, w, b, iw, ib, pA, pB, fc, hs, fs, lw) => PrimaryEffectiveCalibProb(f));
         _logger.LogInformation("ELM isotonic calibration: {N} PAVA breakpoints", isotonicBp.Length / 2);
 
+        if (hp.FitTemperatureScale && effectiveCalSet.Count >= 10)
+        {
+            double finalTemperatureScale = ElmCalibrationHelper.FitTemperatureScaling(
+                effectiveCalSet,
+                weights,
+                biases,
+                inputWeights,
+                inputBiases,
+                effectiveFeatureCount,
+                hiddenSize,
+                featureSubsets,
+                (f, w, b, iw, ib, fc, hs, fs, lw) => EnsembleRawProb(
+                    f, w, b, iw, ib, fc, hs, fs, lw ?? learnerAccWeights,
+                    learnerHiddenSizes, learnerActivations, stackingWeights, stackingBias),
+                plattA,
+                plattB,
+                plattABuy,
+                plattBBuy,
+                plattASell,
+                plattBSell,
+                isotonicBp,
+                hp.AgeDecayLambda,
+                trainedAtUtc);
+
+            if (Math.Abs(finalTemperatureScale - temperatureScale) > 1e-6)
+            {
+                temperatureScale = finalTemperatureScale;
+                (plattABuy, plattBBuy, plattASell, plattBSell) = ElmCalibrationHelper.FitClassConditionalPlatt(
+                    effectiveCalSet, weights, biases, inputWeights, inputBiases, effectiveFeatureCount, hiddenSize, featureSubsets,
+                    plattA, plattB, temperatureScale,
+                    (f, w, b, iw, ib, fc, hs, fs, lw) => EnsembleRawProb(
+                        f, w, b, iw, ib, fc, hs, fs, lw ?? learnerAccWeights,
+                        learnerHiddenSizes, learnerActivations, stackingWeights, stackingBias));
+
+                double RefitPrimaryCalibProb(float[] features) => ApplyProductionCalibration(
+                    EnsembleRawProb(features, weights, biases, inputWeights, inputBiases,
+                        effectiveFeatureCount, hiddenSize, featureSubsets, learnerAccWeights,
+                        learnerHiddenSizes, learnerActivations, stackingWeights, stackingBias),
+                    plattA, plattB, temperatureScale, plattABuy, plattBBuy, plattASell, plattBSell);
+
+                isotonicBp = ElmCalibrationHelper.FitIsotonicCalibration(
+                    effectiveCalSet, weights, biases, inputWeights, inputBiases,
+                    plattA, plattB, effectiveFeatureCount, hiddenSize, featureSubsets,
+                    (f, w, b, iw, ib, pA, pB, fc, hs, fs, lw) => RefitPrimaryCalibProb(f));
+            }
+        }
+
         double FinalEffectiveCalibProb(float[] features)
         {
             double calib = PrimaryEffectiveCalibProb(features);
-            return isotonicBp.Length >= 4
+            calib = isotonicBp.Length >= 4
                 ? ElmCalibrationHelper.ApplyIsotonicCalibration(calib, isotonicBp)
                 : calib;
+
+            if (hp.AgeDecayLambda > 0.0)
+            {
+                double daysSinceTrain = (DateTime.UtcNow - trainedAtUtc).TotalDays;
+                double decayFactor = Math.Exp(-hp.AgeDecayLambda * Math.Max(0.0, daysSinceTrain));
+                calib = 0.5 + (calib - 0.5) * decayFactor;
+            }
+
+            return calib;
         }
 
         finalMetrics = ElmEvaluationHelper.EvaluateEnsemble(
@@ -917,7 +975,6 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         }
 
         // ── 23. Serialise model snapshot ────────────────────────────────────
-        var trainedAtUtc = DateTime.UtcNow;
         var snapshot = new ModelSnapshot
         {
             Type                       = ModelType,

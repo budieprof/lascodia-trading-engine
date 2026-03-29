@@ -322,18 +322,24 @@ internal static class ElmCalibrationHelper
         double[][] weights, double[] biases,
         double[][] inputWeights, double[][] inputBiases,
         int featureCount, int hiddenSize, int[][]? featureSubsets,
-        Func<float[], double[][], double[], double[][], double[][], int, int, int[][]?, double[]?, double> ensembleRawProb)
+        Func<float[], double[][], double[], double[][], double[][], int, int, int[][]?, double[]?, double> ensembleRawProb,
+        double plattA = 1.0, double plattB = 0.0,
+        double plattABuy = 0.0, double plattBBuy = 0.0,
+        double plattASell = 0.0, double plattBSell = 0.0,
+        double[]? isotonicBreakpoints = null,
+        double ageDecayLambda = 0.0,
+        DateTime trainedAtUtc = default)
     {
         if (calSet.Count < 5) return 1.0;
 
-        double[] logits = new double[calSet.Count];
+        double[] rawProbs = new double[calSet.Count];
         double[] targets = new double[calSet.Count];
         for (int i = 0; i < calSet.Count; i++)
         {
             double raw = ensembleRawProb(
                 calSet[i].Features, weights, biases, inputWeights, inputBiases,
                 featureCount, hiddenSize, featureSubsets, null);
-            logits[i] = Math.Log(Math.Max(raw, 1e-7) / Math.Max(1 - raw, 1e-7));
+            rawProbs[i] = Math.Clamp(raw, 1e-7, 1.0 - 1e-7);
             targets[i] = calSet[i].Direction > 0 ? 1.0 : 0.0;
         }
 
@@ -342,7 +348,18 @@ internal static class ElmCalibrationHelper
             double loss = 0;
             for (int i = 0; i < calSet.Count; i++)
             {
-                double p = MLFeatureHelper.Sigmoid(logits[i] / T);
+                double p = ApplyTemperatureAwareCalibration(
+                    rawProbs[i],
+                    T,
+                    plattA,
+                    plattB,
+                    plattABuy,
+                    plattBBuy,
+                    plattASell,
+                    plattBSell,
+                    isotonicBreakpoints,
+                    ageDecayLambda,
+                    trainedAtUtc);
                 loss -= targets[i] * Math.Log(Math.Max(p, 1e-10))
                       + (1 - targets[i]) * Math.Log(Math.Max(1 - p, 1e-10));
             }
@@ -374,6 +391,46 @@ internal static class ElmCalibrationHelper
         }
 
         return (a + b) / 2.0;
+    }
+
+    private static double ApplyTemperatureAwareCalibration(
+        double rawP,
+        double temperatureScale,
+        double plattA,
+        double plattB,
+        double plattABuy,
+        double plattBBuy,
+        double plattASell,
+        double plattBSell,
+        double[]? isotonicBreakpoints,
+        double ageDecayLambda,
+        DateTime trainedAtUtc)
+    {
+        double clampedRaw = Math.Clamp(rawP, 1e-7, 1.0 - 1e-7);
+        double rawLogit = MLFeatureHelper.Logit(clampedRaw);
+        double globalCalibP = temperatureScale > 0.0 && temperatureScale < 10.0
+            ? MLFeatureHelper.Sigmoid(rawLogit / temperatureScale)
+            : MLFeatureHelper.Sigmoid(plattA * rawLogit + plattB);
+
+        double calibP;
+        if (globalCalibP >= 0.5 && plattABuy != 0.0)
+            calibP = MLFeatureHelper.Sigmoid(plattABuy * rawLogit + plattBBuy);
+        else if (globalCalibP < 0.5 && plattASell != 0.0)
+            calibP = MLFeatureHelper.Sigmoid(plattASell * rawLogit + plattBSell);
+        else
+            calibP = globalCalibP;
+
+        if (isotonicBreakpoints is { Length: >= 4 })
+            calibP = ApplyIsotonicCalibration(calibP, isotonicBreakpoints);
+
+        if (ageDecayLambda > 0.0 && trainedAtUtc != default)
+        {
+            double daysSinceTrain = (DateTime.UtcNow - trainedAtUtc).TotalDays;
+            double decayFactor = Math.Exp(-ageDecayLambda * Math.Max(0.0, daysSinceTrain));
+            calibP = 0.5 + (calibP - 0.5) * decayFactor;
+        }
+
+        return Math.Clamp(calibP, 0.0, 1.0);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

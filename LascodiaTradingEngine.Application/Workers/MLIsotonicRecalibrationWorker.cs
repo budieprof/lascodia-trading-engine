@@ -227,12 +227,14 @@ public sealed class MLIsotonicRecalibrationWorker : BackgroundService
             return;
         }
 
-        // Reconstruct the logged buy-probability using the same threshold-relative
-        // confidence contract as the live scorer, then sort ascending for PAVA.
+        // Fit isotonic on the pre-isotonic base calibration surface:
+        // raw -> temperature/global Platt -> class-conditional Platt.
+        // Using the already logged calibrated probability here would double-fit over the
+        // previous isotonic / age-decay layers rather than replacing the isotonic stage itself.
         var pairs = resolved
             .Select(r =>
             {
-                double calibP = MLFeatureHelper.ResolveLoggedCalibratedBuyProbability(
+                double rawP = MLFeatureHelper.ResolveLoggedRawBuyProbability(
                     new MLModelPredictionLog
                     {
                         PredictedDirection = r.PredictedDirection,
@@ -244,13 +246,14 @@ public sealed class MLIsotonicRecalibrationWorker : BackgroundService
                         ActualDirection = r.ActualDirection,
                     },
                     threshold);
+                double calibP = ApplyPreIsotonicCalibration(rawP, snap);
                 double label  = r.ActualDirection == TradeDirection.Buy ? 1.0 : 0.0;
-                return (P: calibP, Y: label);
+                return (RawP: rawP, P: calibP, Y: label);
             })
             .OrderBy(p => p.P)  // PAVA requires sorted input
             .ToList();
 
-        double[] newBreakpoints = FitPAVA(pairs);
+        double[] newBreakpoints = FitPAVA(pairs.Select(p => (p.P, p.Y)).ToList());
 
         // Require at least 2 breakpoint segments (4 values) to be useful.
         if (newBreakpoints.Length < 4)
@@ -272,7 +275,7 @@ public sealed class MLIsotonicRecalibrationWorker : BackgroundService
 
         latestSnap.IsotonicBreakpoints = newBreakpoints;
         latestSnap.Ece = ComputeEce(
-            pairs.Select(p => (P: BaggedLogisticTrainer.ApplyIsotonicCalibration(p.P, newBreakpoints), p.Y)).ToList());
+            pairs.Select(p => (P: ApplyFullCalibration(p.RawP, latestSnap, newBreakpoints), p.Y)).ToList());
         writeModel.ModelBytes = JsonSerializer.SerializeToUtf8Bytes(latestSnap);
         await writeCtx.SaveChangesAsync(ct);
 
@@ -304,6 +307,42 @@ public sealed class MLIsotonicRecalibrationWorker : BackgroundService
         }
 
         return ece;
+    }
+
+    private static double ApplyPreIsotonicCalibration(double rawP, ModelSnapshot snap)
+    {
+        double clampedRaw = Math.Clamp(rawP, 1e-7, 1.0 - 1e-7);
+        double rawLogit = MLFeatureHelper.Logit(clampedRaw);
+        double globalCalibP = snap.TemperatureScale > 0.0 && snap.TemperatureScale < 10.0
+            ? MLFeatureHelper.Sigmoid(rawLogit / snap.TemperatureScale)
+            : MLFeatureHelper.Sigmoid(snap.PlattA * rawLogit + snap.PlattB);
+
+        if (globalCalibP >= 0.5 && snap.PlattABuy != 0.0)
+            return MLFeatureHelper.Sigmoid(snap.PlattABuy * rawLogit + snap.PlattBBuy);
+        if (globalCalibP < 0.5 && snap.PlattASell != 0.0)
+            return MLFeatureHelper.Sigmoid(snap.PlattASell * rawLogit + snap.PlattBSell);
+
+        return globalCalibP;
+    }
+
+    private static double ApplyFullCalibration(
+        double        rawP,
+        ModelSnapshot snap,
+        double[]?     isotonicOverride = null)
+    {
+        double calibP = ApplyPreIsotonicCalibration(rawP, snap);
+        var breakpoints = isotonicOverride ?? snap.IsotonicBreakpoints;
+        if (breakpoints.Length >= 4)
+            calibP = BaggedLogisticTrainer.ApplyIsotonicCalibration(calibP, breakpoints);
+
+        if (snap.AgeDecayLambda > 0.0 && snap.TrainedAtUtc != default)
+        {
+            double daysSinceTrain = (DateTime.UtcNow - snap.TrainedAtUtc).TotalDays;
+            double decayFactor = Math.Exp(-snap.AgeDecayLambda * Math.Max(0.0, daysSinceTrain));
+            calibP = 0.5 + (calibP - 0.5) * decayFactor;
+        }
+
+        return Math.Clamp(calibP, 0.0, 1.0);
     }
 
     // ── PAVA (Pool Adjacent Violators Algorithm) ──────────────────────────────

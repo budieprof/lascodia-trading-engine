@@ -146,19 +146,16 @@ public sealed class MLTemperatureScalingWorker : BackgroundService
             // Require at least 20 logs for a meaningful temperature search.
             if (logs.Count < 20) continue;
 
-            // Reconstruct calibrated buy-probabilities from the logged scoring outputs,
-            // then convert those probabilities to logits for temperature scaling.
-            double[] confs = logs.Select(p =>
+            double[] rawProbs = logs.Select(p =>
                     Math.Clamp(
                         MLFeatureHelper.ResolveLoggedRawBuyProbability(p, decisionThreshold),
                         1e-7, 1 - 1e-7))
                 .ToArray();
-            double[] logits = confs.Select(c => Math.Log(c / (1.0 - c))).ToArray();
             double[] labels = logs.Select(p => p.ActualDirection == Domain.Enums.TradeDirection.Buy ? 1.0 : 0.0).ToArray();
 
-            // Pre-calibration NLL and ECE at T = 1 (no temperature scaling — raw model outputs).
-            double preNll = ComputeNll(logits, labels, 1.0);
-            double preEce = ComputeEce(confs, labels);
+            // Evaluate the currently deployed base calibration surface before searching.
+            double preNll = ComputeSnapshotNll(rawProbs, labels, snap);
+            double preEce = ComputeSnapshotEce(rawProbs, labels, snap);
 
             // Binary search for optimal temperature T* ∈ [0.1, 10.0] that minimises NLL.
             // The search uses a numerical gradient check: compare NLL at tMid vs tMid + 0.01.
@@ -169,8 +166,8 @@ public sealed class MLTemperatureScalingWorker : BackgroundService
                 double tMid     = (tLow + tHigh) / 2.0;
                 double tMidPlus = tMid + 0.01;      // small step for finite-difference gradient
 
-                double nllMid     = ComputeNll(logits, labels, tMid);
-                double nllMidPlus = ComputeNll(logits, labels, tMidPlus);
+                double nllMid     = ComputeSnapshotNll(rawProbs, labels, snap, tMid);
+                double nllMidPlus = ComputeSnapshotNll(rawProbs, labels, snap, tMidPlus);
 
                 // Gradient direction: if NLL decreases going higher, move tLow up (need larger T).
                 // If NLL increases going higher, move tHigh down (need smaller T).
@@ -182,18 +179,15 @@ public sealed class MLTemperatureScalingWorker : BackgroundService
                 optT = (tLow + tHigh) / 2.0;
             }
 
-            // Post-calibration NLL and ECE at optimal temperature T*.
-            // calibP = σ(logit / T*) — softer probabilities when T* > 1.
-            double postNll   = ComputeNll(logits, labels, optT);
-            double[] calConf = logits.Select(lg => Sigmoid(lg / optT)).ToArray();
-            double postEce   = ComputeEce(calConf, labels);
+            double postNll   = ComputeSnapshotNll(rawProbs, labels, snap, optT);
+            double postEce   = ComputeSnapshotEce(rawProbs, labels, snap, optT);
 
             var (writeModel, latestSnap) = await MLModelSnapshotWriteHelper
                 .LoadTrackedLatestSnapshotAsync(writeDb, model.Id, ct);
             if (writeModel != null && latestSnap != null)
             {
                 latestSnap.TemperatureScale = optT;
-                latestSnap.Ece = ComputeSnapshotEce(logs, latestSnap, decisionThreshold);
+                latestSnap.Ece = ComputeSnapshotEce(rawProbs, labels, latestSnap);
                 writeModel.ModelBytes = JsonSerializer.SerializeToUtf8Bytes(latestSnap);
                 _cache.Remove($"{SnapshotCacheKeyPrefix}{model.Id}");
             }
@@ -240,21 +234,21 @@ public sealed class MLTemperatureScalingWorker : BackgroundService
     }
 
     private static double ComputeSnapshotEce(
-        IReadOnlyList<MLModelPredictionLog> logs,
-        ModelSnapshot                       snap,
-        double                              fallbackThreshold)
+        IReadOnlyList<double> rawProbs,
+        IReadOnlyList<double> labels,
+        ModelSnapshot         snap,
+        double?               temperatureOverride = null)
     {
-        if (logs.Count == 0) return 0.0;
+        if (rawProbs.Count == 0) return 0.0;
         const int bins = 10;
         var binConf = new double[bins];
         var binLabel = new double[bins];
         var binN = new int[bins];
 
-        foreach (var log in logs)
+        for (int i = 0; i < rawProbs.Count; i++)
         {
-            double rawP = MLFeatureHelper.ResolveLoggedRawBuyProbability(log, fallbackThreshold);
-            double p = ApplySnapshotCalibration(rawP, snap);
-            double y = log.ActualDirection == Domain.Enums.TradeDirection.Buy ? 1.0 : 0.0;
+            double p = ApplySnapshotCalibration(rawProbs[i], snap, temperatureOverride);
+            double y = labels[i];
             int bin = Math.Clamp((int)(p * bins), 0, bins - 1);
             binConf[bin] += p;
             binLabel[bin] += y;
@@ -265,17 +259,22 @@ public sealed class MLTemperatureScalingWorker : BackgroundService
         for (int i = 0; i < bins; i++)
         {
             if (binN[i] == 0) continue;
-            ece += (double)binN[i] / logs.Count * Math.Abs(binLabel[i] / binN[i] - binConf[i] / binN[i]);
+            ece += (double)binN[i] / rawProbs.Count * Math.Abs(binLabel[i] / binN[i] - binConf[i] / binN[i]);
         }
 
         return ece;
     }
 
-    private static double ApplySnapshotCalibration(double rawP, ModelSnapshot snap)
+    private static double ApplySnapshotCalibration(
+        double        rawP,
+        ModelSnapshot snap,
+        double?       temperatureOverride = null)
     {
-        double rawLogit = Math.Log(Math.Clamp(rawP, 1e-7, 1 - 1e-7) / (1.0 - Math.Clamp(rawP, 1e-7, 1 - 1e-7)));
-        double globalCalibP = snap.TemperatureScale > 0.0 && snap.TemperatureScale < 10.0
-            ? Sigmoid(rawLogit / snap.TemperatureScale)
+        double clampedRaw = Math.Clamp(rawP, 1e-7, 1 - 1e-7);
+        double rawLogit = Math.Log(clampedRaw / (1.0 - clampedRaw));
+        double temperatureScale = temperatureOverride ?? snap.TemperatureScale;
+        double globalCalibP = temperatureScale > 0.0 && temperatureScale < 10.0
+            ? Sigmoid(rawLogit / temperatureScale)
             : Sigmoid(snap.PlattA * rawLogit + snap.PlattB);
 
         double calibP;
@@ -289,7 +288,14 @@ public sealed class MLTemperatureScalingWorker : BackgroundService
         if (snap.IsotonicBreakpoints.Length >= 4)
             calibP = BaggedLogisticTrainer.ApplyIsotonicCalibration(calibP, snap.IsotonicBreakpoints);
 
-        return calibP;
+        if (snap.AgeDecayLambda > 0.0 && snap.TrainedAtUtc != default)
+        {
+            double daysSinceTrain = (DateTime.UtcNow - snap.TrainedAtUtc).TotalDays;
+            double decayFactor = Math.Exp(-snap.AgeDecayLambda * Math.Max(0.0, daysSinceTrain));
+            calibP = 0.5 + (calibP - 0.5) * decayFactor;
+        }
+
+        return Math.Clamp(calibP, 0.0, 1.0);
     }
 
     /// <summary>
@@ -306,19 +312,20 @@ public sealed class MLTemperatureScalingWorker : BackgroundService
     /// <param name="labels">Binary labels: 1.0 = correct, 0.0 = incorrect.</param>
     /// <param name="temperature">Temperature scalar T to divide logits by before sigmoid.</param>
     /// <returns>Mean NLL over all samples.</returns>
-    private static double ComputeNll(double[] logits, double[] labels, double temperature)
+    private static double ComputeSnapshotNll(
+        IReadOnlyList<double> rawProbs,
+        IReadOnlyList<double> labels,
+        ModelSnapshot         snap,
+        double?               temperatureOverride = null)
     {
         double nll = 0;
-        for (int i = 0; i < logits.Length; i++)
+        for (int i = 0; i < rawProbs.Count; i++)
         {
-            // Apply temperature scaling: calibP = σ(logit / T)
-            double p = Sigmoid(logits[i] / temperature);
-            // Clamp to avoid log(0) in the NLL computation.
+            double p = ApplySnapshotCalibration(rawProbs[i], snap, temperatureOverride);
             p = Math.Clamp(p, 1e-7, 1 - 1e-7);
-            // Binary cross-entropy contribution for sample i.
             nll += -(labels[i] * Math.Log(p) + (1 - labels[i]) * Math.Log(1 - p));
         }
-        return nll / logits.Length; // mean NLL
+        return nll / rawProbs.Count;
     }
 
     /// <summary>
