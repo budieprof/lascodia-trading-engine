@@ -881,9 +881,17 @@ public sealed class MLTrainingWorker : BackgroundService
                 double champScore = champEV * 5.0 + champSharpe * 0.1 + champF1 * 0.5;
                 double newScore   = newEV   * 5.0 + newSharpe   * 0.1 + newF1   * 0.5;
 
+                // Hard rule: a less profitable model must never replace a more profitable one.
+                // The F1 bypass only applies when the champion has low EV (≤0.05) or the
+                // challenger retains at least 50 % of the champion's EV — prevents a model
+                // with marginal F1 improvement from destroying a high-EV champion.
+                bool f1BypassAllowed = newF1 > champF1 + 0.15
+                    && newEV >= -0.01
+                    && (champEV <= 0.05 || newEV >= champEV * 0.5);
+
                 bool newModelIsBetter =
                     newScore > champScore                           // composite score is higher
-                    || (newF1 > champF1 + 0.15 && newEV >= -0.01)  // significantly more balanced with non-negative EV
+                    || f1BypassAllowed                              // F1 balance bypass (guarded by EV floor)
                     || champEV <= 0.0;                              // champion has zero/negative EV — always replace
 
                 if (!newModelIsBetter)
