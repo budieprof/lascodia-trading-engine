@@ -252,14 +252,28 @@ public sealed class SvgpModelTrainer : IMLModelTrainer
         inducingPts            = KMeansRefine(trainSet, inducingPts, F, iters: 30);
 
         // Warm-start: import inducing points from prior snapshot when geometry matches.
-        if (warmStart?.SvgpInducingPoints is { Length: > 0 } priorIp
-            && priorIp[0].Length == M * F)
+        // New format: double[M][F] (each sub-array is one inducing point).
+        // Legacy format: double[1][M*F] (single flat array) — handle both for backward compat.
+        if (warmStart?.SvgpInducingPoints is { Length: > 0 } priorIp)
         {
-            _logger.LogInformation("SVGP warm-start: importing inducing points from prior snapshot.");
-            for (int m = 0; m < M; m++)
-                for (int fi = 0; fi < F; fi++)
-                    inducingPts[m][fi] = priorIp[0][m * F + fi];
-            inducingPts = KMeansRefine(trainSet, inducingPts, F, iters: 5);
+            bool isNewFormat = priorIp.Length == M && priorIp[0].Length == F;
+            bool isLegacyFlat = priorIp.Length == 1 && priorIp[0].Length == M * F;
+
+            if (isNewFormat)
+            {
+                _logger.LogInformation("SVGP warm-start: importing {M} inducing points from prior snapshot.", M);
+                for (int m = 0; m < M; m++)
+                    Array.Copy(priorIp[m], inducingPts[m], F);
+                inducingPts = KMeansRefine(trainSet, inducingPts, F, iters: 5);
+            }
+            else if (isLegacyFlat)
+            {
+                _logger.LogInformation("SVGP warm-start: importing {M} inducing points (legacy flat format).", M);
+                for (int m = 0; m < M; m++)
+                    for (int fi = 0; fi < F; fi++)
+                        inducingPts[m][fi] = priorIp[0][m * F + fi];
+                inducingPts = KMeansRefine(trainSet, inducingPts, F, iters: 5);
+            }
         }
 
         // ── 5. Importance weights (density-ratio × covariate-shift) ──────────
@@ -339,7 +353,7 @@ public sealed class SvgpModelTrainer : IMLModelTrainer
         // ── 8b. Class-conditional Platt (Buy / Sell) ─────────────────────────
         var (plattABuy, plattBBuy, plattASell, plattBSell) = calSet.Count >= 10
             ? FitClassConditionalPlatt(calMeans, calSet)
-            : (0.0, 0.0, 0.0, 0.0);
+            : (1.0, 0.0, 1.0, 0.0); // identity on logit scale
 
         // ── 9. Platt-calibrated probabilities ────────────────────────────────
         float[] calibCalProbs  = CalibratePlatt(calMeans,  plattA, plattB);
@@ -477,7 +491,8 @@ public sealed class SvgpModelTrainer : IMLModelTrainer
         }
 
         // ── 18. Build model snapshot ──────────────────────────────────────────
-        var svgpFlat = inducingPts.SelectMany(p => p).ToArray();
+        // Store inducing points as double[M][F] so the inference engine reads M = Z.Length correctly.
+        var svgpPoints = inducingPts.Select(p => p.ToArray()).ToArray();
         var snapshot = new ModelSnapshot
         {
             Type                       = ModelType,
@@ -499,7 +514,7 @@ public sealed class SvgpModelTrainer : IMLModelTrainer
             EmbargoSamples             = embargo,
             TrainedOn                  = DateTime.UtcNow,
             TrainedAtUtc               = DateTime.UtcNow,
-            SvgpInducingPoints         = new[] { svgpFlat },
+            SvgpInducingPoints         = svgpPoints,
             // ── True SVGP variational parameters (full-rank S = L_S L_S^T) ────
             SvgpVariationalMean        = svgpState.VarMean,
             SvgpVariationalLogSDiag    = svgpState.LogSDiag,
@@ -1311,7 +1326,7 @@ public sealed class SvgpModelTrainer : IMLModelTrainer
 
         static (double A, double B) FitSgd(List<(double Logit, double Y)> pairs)
         {
-            if (pairs.Count < 5) return (0.0, 0.0);
+            if (pairs.Count < 5) return (1.0, 0.0); // identity on logit scale
             double a = 1.0, b = 0.0;
             for (int ep = 0; ep < epochs; ep++)
             {
@@ -1477,7 +1492,7 @@ public sealed class SvgpModelTrainer : IMLModelTrainer
             double p = calibProbs[i];
             int    b = Math.Clamp((int)(p * bins), 0, bins - 1);
             cnt[b]++;
-            sumAcc[b]  += (p >= 0.5 ? 1 : 0) == samples[i].Direction ? 1.0 : 0.0;
+            sumAcc[b]  += samples[i].Direction > 0 ? 1.0 : 0.0; // positive-class frequency, not accuracy
             sumConf[b] += p;
         }
         double ece = 0;

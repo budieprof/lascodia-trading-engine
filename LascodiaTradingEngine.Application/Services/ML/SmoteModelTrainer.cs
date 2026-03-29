@@ -590,6 +590,9 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
                     ? FitClassConditionalPlatt(maskedCal, pEns) : (1.0, 0.0, 1.0, 0.0);
                 avgKellyFraction = maskedCal.Count >= MinEvalSamples
                     ? ComputeAvgKellyFraction(maskedCal, pEns, pA, pB) : 0.0;
+                // Reassign balancedTrain and F so downstream Jackknife/DW/OOB/PSI use masked features
+                balancedTrain = maskedTrain;
+                F = reducedF;
             }
             else
             {
@@ -611,9 +614,10 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         // Rebuild EnsembleState: when pruning was accepted, use reducedF with null featureSubsets
         // (matching pEns) so weight indexing is sequential 0..reducedF-1. The keptIndices featureSubsets
         // are only used at serialization time for the inference engine's feature-space mapping.
-        int postF = prunedCount > 0 ? F - prunedCount : F;
+        // F is already reducedF when pruning was accepted (reassigned in acceptance block),
+        // or the original F when pruning was rejected/skipped.
         ens = prunedCount > 0
-            ? new EnsembleState(weights, biases, postF, null, meta, ensMlpHW, ensMlpHB, hp.MlpHiddenDim)
+            ? new EnsembleState(weights, biases, F, null, meta, ensMlpHW, ensMlpHB, hp.MlpHiddenDim)
             : new EnsembleState(weights, biases, F, featureSubsets, meta, ensMlpHW, ensMlpHB, hp.MlpHiddenDim);
         double[] isotonicBp = FitIsotonicCalibration(postPruneCalSet, ens, plattA, plattB);
         if (_logger.IsEnabled(LogLevel.Information))
@@ -661,7 +665,7 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         if (hp.OobPruningEnabled && K >= 2)
         {
             oobPrunedCount = PruneByOobContribution(
-                balancedTrain, weights, biases, F, featureSubsets,
+                balancedTrain, weights, biases, F, ens.FeatureSubsets,
                 ensMlpHW, ensMlpHB, hp.MlpHiddenDim, K);
             if (oobPrunedCount > 0)
                 _logger.LogInformation("OOB pruning: removed {N}/{K} learners.", oobPrunedCount, K);

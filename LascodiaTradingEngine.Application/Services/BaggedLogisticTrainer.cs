@@ -127,13 +127,8 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         // ── 1. Final-model split boundaries + leakage-safe standardisation ───
         // Fit standardisation only on the actual training prefix so future cal/test
         // distribution does not leak into either walk-forward CV or the final model.
-        int trainEnd    = (int)(sampleCount * 0.70);
-        int calEnd      = (int)(sampleCount * 0.80);
         int embargo     = hp.EmbargoBarCount;
-        int trainStdEnd = Math.Max(0, trainEnd - embargo);
-        if (trainStdEnd <= 0)
-            throw new InvalidOperationException(
-                $"Embargo ({embargo}) consumes the entire training window ({trainEnd} samples).");
+        var (trainStdEnd, calStart, calEnd, testStart) = ComputeFinalSplitBoundaries(sampleCount, embargo);
 
         var (means, stds) = ComputeStandardizationStats(samples[..trainStdEnd]);
         var allStd        = ApplyStandardization(samples, means, stds);
@@ -152,9 +147,8 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
 
         // ── 3. Final model splits: 70 % train | 10 % Platt cal | ~18 % test ──
         var trainSet = allStd[..trainStdEnd];
-        var calSet   = allStd[(calEnd > trainEnd ? trainEnd + embargo : trainEnd)
-                               ..(calEnd < sampleCount ? calEnd : sampleCount)];
-        var testSet  = allStd[Math.Min(calEnd + embargo, sampleCount)..];
+        var calSet   = allStd[calStart..calEnd];
+        var testSet  = allStd[testStart..];
 
         if (trainSet.Count < hp.MinSamples)
             throw new InvalidOperationException(
@@ -322,7 +316,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
             : new float[featureCount];
 
         var topFeatures = featureImportance
-            .Select((imp, idx) => (Importance: imp, Name: MLFeatureHelper.FeatureNames[idx]))
+            .Select((imp, idx) => (Importance: imp, Name: GetFeatureDisplayName(idx)))
             .OrderByDescending(x => x.Importance)
             .Take(5);
         _logger.LogInformation(
@@ -553,7 +547,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
                 (plattABuy, plattBBuy, plattASell, plattBSell) = (pABuy, pBBuy, pASell, pBSell);
                 ece = ComputeProductionEce(
                     maskedTest, pw, pb, pA, pB, pTemp, pABuy, pBBuy, pASell, pBSell, pIso,
-                    hp.AgeDecayLambda, pTrainedAtUtc, featureCount, null, pMeta, pMlp);
+                    hp.AgeDecayLambda, pTrainedAtUtc, featureCount, pSubsets, pMeta, pMlp);
                 optimalThreshold = pOptimalThreshold;
             }
             else
@@ -953,7 +947,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
             ? ComputePermutationImportance(postPruneCalSet, FinalProductionProb, featureCount, optimalThreshold, ct)
             : new float[featureCount];
         var finalTopFeatures = finalFeatureImportance
-            .Select((imp, idx) => (Importance: imp, Name: MLFeatureHelper.FeatureNames[idx]))
+            .Select((imp, idx) => (Importance: imp, Name: GetFeatureDisplayName(idx)))
             .OrderByDescending(x => x.Importance)
             .Take(5);
         _logger.LogInformation(
@@ -967,13 +961,14 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         var standardisedTrainFeatures = new List<float[]>(postPruneTrainSet.Count);
         foreach (var s in postPruneTrainSet) standardisedTrainFeatures.Add(s.Features);
         var featureQuantileBreakpoints = MLFeatureHelper.ComputeFeatureQuantileBreakpoints(standardisedTrainFeatures);
+        avgKellyFraction = ComputeAvgKellyFraction(postPruneCalSet, FinalProductionProb);
 
         // ── 12. Serialise model snapshot ──────────────────────────────────────
         var snapshot = new ModelSnapshot
         {
             Type                       = ModelType,
             Version                    = ModelVersion,
-            Features                   = MLFeatureHelper.FeatureNames,
+            Features                   = BuildFeatureNames(featureCount),
             Means                      = means,
             Stds                       = stds,
             BaseLearnersK              = hp.K,
@@ -1291,9 +1286,9 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         int polyPairCount = PolyTopN * (PolyTopN - 1) / 2; // = 10
         int polyFeatureCount = featureCount + polyPairCount;
 
-        int valSize  = Math.Max(20, train.Count / 10);
-        var valSet   = train[^valSize..];
-        var trainSet = train[..^valSize];
+        var (useValidationHoldout, valSize) = ComputeEnsembleValidationPlan(train.Count);
+        var valSet   = useValidationHoldout ? train[^valSize..] : train;
+        var trainSet = useValidationHoldout ? train[..^valSize] : train;
 
         var temporalWeights = ComputeTemporalWeights(trainSet.Count, hp.TemporalDecayLambda);
         bool useNoise       = hp.NoiseSigma > 0.0;
@@ -1437,8 +1432,16 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
                             "Skipped MLP hidden warm-start for learner {K}: subset mapping was not compatible.",
                             k);
                     }
-                    if (warmStart.MlpHiddenBiases is not null && k < warmStart.MlpHiddenBiases.Length)
-                        Array.Copy(warmStart.MlpHiddenBiases[k], hB!, hB!.Length);
+                    if (warmStart.MlpHiddenBiases is not null &&
+                        k < warmStart.MlpHiddenBiases.Length &&
+                        !TryCopyWarmStartMlpHiddenBiases(warmStart.MlpHiddenBiases[k], hB!))
+                    {
+                        _logger.LogDebug(
+                            "Skipped MLP hidden-bias warm-start for learner {K}: saved bias length {Saved} != expected {Expected}.",
+                            k,
+                            warmStart.MlpHiddenBiases[k].Length,
+                            hB!.Length);
+                    }
                 }
             }
             else
@@ -1663,9 +1666,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
                     if (!double.IsFinite(p)) continue; // NaN/Inf guard
 
                     // Asymmetric loss: FpCostWeight > 0.5 → more FP penalty → higher precision
-                    double errWeight = Math.Abs(hp.FpCostWeight - 0.5) > 1e-6
-                        ? (sample.Direction == 0 ? 2.0 * hp.FpCostWeight : 2.0 * (1.0 - hp.FpCostWeight))
-                        : 1.0;
+                    double errWeight = ComputeAsymmetricErrorWeight(sample.Direction, hp.FpCostWeight);
                     // Class weight: minority class gets higher gradient contribution
                     double cw = sample.Direction > 0 ? classWeightBuy : classWeightSell;
                     double err = (p - y) * errWeight * cw;
@@ -1907,6 +1908,12 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
 
                         if (useMlp)
                         {
+                            var hiddenSignals = ComputeMlpHiddenBackpropSignals(
+                                totalErr,
+                                weights[k],
+                                hiddenAct!,
+                                hiddenDim);
+
                             for (int h = 0; h < hiddenDim; h++)
                             {
                                 double grad = rawGrads[h];
@@ -1917,8 +1924,8 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
                             // Hidden layer backprop: dL/dhidden[h] = totalErr * Wo[h] * ReLU'(preact)
                             for (int h = 0; h < hiddenDim; h++)
                             {
-                                if (hiddenAct![h] <= 0.0) continue; // ReLU gate
-                                double dHidden = totalErr * weights[k][h]; // gradient through output
+                                double dHidden = hiddenSignals[h];
+                                if (dHidden == 0.0) continue;
                                 int rowOff = h * subsetLen;
                                 for (int si2 = 0; si2 < subsetLen; si2++)
                                 {
@@ -2055,16 +2062,23 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
                     foreach (var sv in valSet)
                     {
                         double zv;
+                        float[] valFeatures = isPolyLearner
+                            ? AugmentWithPolyFeatures(sv.Features, featureCount, PolyTopN)
+                            : sv.Features;
                         if (useMlp)
                         {
                             // MLP forward pass: hidden = ReLU(Wh × x_subset + bh), z = Wo · hidden + bias
                             zv = bias;
-                            for (int h = 0; h < hiddenDim; h++)
+                            int hiddenUnits = GetUsableHiddenUnitCount(hiddenDim, weights[k], hB!);
+                            for (int h = 0; h < hiddenUnits; h++)
                             {
                                 double act = hB![h];
                                 int rowOff = h * subsetLen;
-                                for (int si2 = 0; si2 < subsetLen; si2++)
-                                    act += hW![rowOff + si2] * sv.Features[subset[si2]];
+                                for (int si2 = 0; si2 < subsetLen && rowOff + si2 < hW!.Length; si2++)
+                                {
+                                    if (TryGetFeatureValue(valFeatures, subset[si2], out double featureValue))
+                                        act += hW[rowOff + si2] * featureValue;
+                                }
                                 double hidden = Math.Max(0.0, act); // ReLU
                                 zv += weights[k][h] * hidden;
                             }
@@ -2072,7 +2086,9 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
                         else
                         {
                             zv = bias;
-                            foreach (int j in subset) zv += weights[k][j] * sv.Features[j];
+                            foreach (int j in subset)
+                                if ((uint)j < (uint)weights[k].Length && (uint)j < (uint)valFeatures.Length)
+                                    zv += weights[k][j] * valFeatures[j];
                         }
                         if ((MLFeatureHelper.Sigmoid(zv) >= 0.5) == (sv.Direction == 1)) correct++;
                     }
@@ -2523,8 +2539,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
             foreach (var s in testSet)
             {
                 double rawProb   = EnsembleProb(s.Features, weights, biases, featureCount, subsets, meta, mlp.HiddenW, mlp.HiddenB, mlp.HiddenDim);
-                rawProb          = Math.Clamp(rawProb, 1e-7, 1.0 - 1e-7); // guard against ±Inf logits
-                double calibP    = MLFeatureHelper.Sigmoid(plattA * MLFeatureHelper.Logit(rawProb) + plattB);
+                double calibP    = ApplyGlobalPlattCalibration(rawProb, plattA, plattB);
                 bool predictedUp = calibP >= 0.5;
                 bool actualUp    = s.Direction == 1;
                 bool correct     = predictedUp == actualUp;
@@ -2673,8 +2688,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         foreach (var s in testSet)
         {
             double raw  = EnsembleProb(s.Features, weights, biases, featureCount, subsets, meta, mlp.HiddenW, mlp.HiddenB, mlp.HiddenDim);
-            raw         = Math.Clamp(raw, 1e-7, 1.0 - 1e-7); // guard against ±Inf logits
-            double p    = MLFeatureHelper.Sigmoid(plattA * MLFeatureHelper.Logit(raw) + plattB);
+            double p    = ApplyGlobalPlattCalibration(raw, plattA, plattB);
             int    bin  = Math.Clamp((int)(p * NumBins), 0, NumBins - 1);
 
             binConfSum[bin] += p;
@@ -2856,8 +2870,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         for (int i = 0; i < dataSet.Count; i++)
         {
             double raw = EnsembleProb(dataSet[i].Features, weights, biases, featureCount, subsets, meta, mlp.HiddenW, mlp.HiddenB, mlp.HiddenDim);
-            raw        = Math.Clamp(raw, 1e-7, 1.0 - 1e-7); // guard against ±Inf logits
-            probs[i]   = MLFeatureHelper.Sigmoid(plattA * MLFeatureHelper.Logit(raw) + plattB);
+            probs[i]   = ApplyGlobalPlattCalibration(raw, plattA, plattB);
         }
 
         double bestEv        = double.MinValue;
@@ -2932,9 +2945,13 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
     /// Samples <c>⌈ratio × featureCount⌉</c> feature indices without replacement.
     /// Indices are sorted for deterministic access order.
     /// </summary>
-    private static int[] GenerateFeatureSubset(int featureCount, double ratio, int seed)
+    internal static int[] GenerateFeatureSubset(int featureCount, double ratio, int seed)
     {
-        int subCount = Math.Max(1, (int)Math.Ceiling(ratio * featureCount));
+        if (featureCount <= 0)
+            return [];
+
+        double safeRatio = double.IsFinite(ratio) ? Math.Clamp(ratio, 0.0, 1.0) : 1.0;
+        int subCount = Math.Clamp(Math.Max(1, (int)Math.Ceiling(safeRatio * featureCount)), 1, featureCount);
         var rng      = new Random(seed);
 
         // Partial Fisher-Yates: O(subCount) vs the original O(F log F) double-sort via LINQ.
@@ -2955,16 +2972,25 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
     // ── Sharpe ratio ──────────────────────────────────────────────────────────
 
     /// <summary>Computes Sharpe ratio over the first <paramref name="count"/> entries of a buffer.</summary>
-    private static double ComputeSharpe(double[] buffer, int count)
+    internal static double ComputeSharpe(double[] buffer, int count)
     {
         if (count < 2) return 0;
         double sum = 0;
-        for (int i = 0; i < count; i++) sum += buffer[i];
+        for (int i = 0; i < count; i++)
+        {
+            if (!double.IsFinite(buffer[i]))
+                return 0.0;
+            sum += buffer[i];
+        }
         double mean = sum / count;
         double varSum = 0;
         for (int i = 0; i < count; i++) { double d = buffer[i] - mean; varSum += d * d; }
         double std = Math.Sqrt(varSum / (count - 1));
-        return std < 1e-10 ? 0 : mean / std * Math.Sqrt(252);
+        if (!double.IsFinite(std) || std < 1e-10)
+            return 0.0;
+
+        double sharpe = mean / std * Math.Sqrt(252);
+        return double.IsFinite(sharpe) ? sharpe : 0.0;
     }
 
     // ── Temporal weighting ────────────────────────────────────────────────────
@@ -2972,10 +2998,26 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
     public static double[] ComputeTemporalWeights(int count, double lambda)
     {
         if (count == 0) return [];
+        if (!double.IsFinite(lambda))
+        {
+            var uniform = new double[count];
+            Array.Fill(uniform, 1.0 / count);
+            return uniform;
+        }
+
         var w = new double[count];
         for (int i = 0; i < count; i++)
-            w[i] = Math.Exp(lambda * ((double)i / Math.Max(1, count - 1) - 1.0));
+        {
+            double exponent = lambda * ((double)i / Math.Max(1, count - 1) - 1.0);
+            w[i] = Math.Exp(Math.Clamp(exponent, -700.0, 700.0));
+        }
         double sum = w.Sum();
+        if (!double.IsFinite(sum) || sum <= 0.0)
+        {
+            Array.Fill(w, 1.0 / count);
+            return w;
+        }
+
         for (int i = 0; i < count; i++)
             w[i] /= sum;
         return w;
@@ -3046,25 +3088,42 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         return result;
     }
 
-    private static double[] BuildNormalisedCdf(double[] weights)
+    internal static double[] BuildNormalisedCdf(double[] weights)
     {
-        double sum = weights.Sum();
+        if (weights.Length == 0)
+            return [];
+
+        var sanitized = new double[weights.Length];
+        double sum = 0.0;
+        for (int i = 0; i < weights.Length; i++)
+        {
+            double weight = double.IsFinite(weights[i]) ? Math.Max(0.0, weights[i]) : 0.0;
+            sanitized[i] = weight;
+            sum += weight;
+        }
+
         var cdf    = new double[weights.Length];
-        if (sum <= 0)
+        if (!double.IsFinite(sum) || sum <= 0)
         {
             // Degenerate case: all weights are zero — fall back to a uniform distribution
             // so bootstrap sampling remains random rather than always returning index 0.
             for (int i = 0; i < cdf.Length; i++) cdf[i] = (i + 1.0) / cdf.Length;
             return cdf;
         }
-        cdf[0] = weights[0] / sum;
+
+        cdf[0] = sanitized[0] / sum;
         for (int i = 1; i < weights.Length; i++)
-            cdf[i] = cdf[i - 1] + weights[i] / sum;
+            cdf[i] = cdf[i - 1] + sanitized[i] / sum;
+
+        cdf[^1] = 1.0;
         return cdf;
     }
 
-    private static int SampleFromCdf(double[] cdf, Random rng)
+    internal static int SampleFromCdf(double[] cdf, Random rng)
     {
+        if (cdf.Length == 0)
+            return 0;
+
         double u   = rng.NextDouble();
         int    idx = Array.BinarySearch(cdf, u);
         if (idx < 0) idx = ~idx;
@@ -3079,8 +3138,29 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
             throw new InvalidOperationException("BaggedLogisticTrainer: no training samples provided.");
 
         int featureCount = samples[0].Features.Length;
-        for (int i = 1; i < samples.Count; i++)
+        if (featureCount <= 0)
+            throw new InvalidOperationException("BaggedLogisticTrainer: training samples must contain at least one feature.");
+
+        for (int i = 0; i < samples.Count; i++)
         {
+            if (samples[i].Direction is not (1 or 0 or -1))
+                throw new InvalidOperationException(
+                    $"BaggedLogisticTrainer: sample {i} has invalid direction {samples[i].Direction}; expected 1 for Buy and 0/-1 for non-Buy.");
+
+            if (!float.IsFinite(samples[i].Magnitude))
+                throw new InvalidOperationException(
+                    $"BaggedLogisticTrainer: sample {i} has non-finite magnitude.");
+
+            for (int j = 0; j < samples[i].Features.Length; j++)
+            {
+                if (!float.IsFinite(samples[i].Features[j]))
+                    throw new InvalidOperationException(
+                        $"BaggedLogisticTrainer: sample {i} feature {j} is non-finite.");
+            }
+
+            if (i == 0)
+                continue;
+
             if (samples[i].Features.Length != featureCount)
                 throw new InvalidOperationException(
                     $"BaggedLogisticTrainer: inconsistent feature count — sample 0 has {featureCount} features, sample {i} has {samples[i].Features.Length}.");
@@ -3095,6 +3175,34 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         var rawFeatures = new List<float[]>(fitSamples.Count);
         foreach (var s in fitSamples) rawFeatures.Add(s.Features);
         return MLFeatureHelper.ComputeStandardization(rawFeatures);
+    }
+
+    internal static (int TrainStdEnd, int CalStart, int CalEnd, int TestStart) ComputeFinalSplitBoundaries(
+        int sampleCount,
+        int embargo)
+    {
+        int trainEnd = (int)(sampleCount * 0.70);
+        int calEnd = (int)(sampleCount * 0.80);
+        int trainStdEnd = Math.Max(0, trainEnd - embargo);
+        if (trainStdEnd <= 0)
+            throw new InvalidOperationException(
+                $"Embargo ({embargo}) consumes the entire training window ({trainEnd} samples).");
+
+        // trainStdEnd already excludes the train/cal embargo, so calibration should begin
+        // exactly one embargo window later rather than applying the gap twice.
+        int calStart = Math.Min(sampleCount, trainStdEnd + embargo);
+        int boundedCalEnd = Math.Min(sampleCount, Math.Max(calEnd, calStart));
+        int testStart = Math.Min(sampleCount, boundedCalEnd + Math.Max(0, embargo));
+        return (trainStdEnd, calStart, boundedCalEnd, testStart);
+    }
+
+    internal static (bool UseValidationHoldout, int ValSize) ComputeEnsembleValidationPlan(int sampleCount)
+    {
+        if (sampleCount < 30)
+            return (false, 0);
+
+        int valSize = Math.Clamp(Math.Max(5, sampleCount / 10), 1, sampleCount - 1);
+        return (true, valSize);
     }
 
     internal static List<TrainingSample> ApplyStandardization(
@@ -3114,7 +3222,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         return standardised;
     }
 
-    private static bool[] BuildFeatureMask(float[] importance, double threshold, int featureCount)
+    internal static bool[] BuildFeatureMask(float[] importance, double threshold, int featureCount)
     {
         if (threshold <= 0.0 || featureCount == 0)
         {
@@ -3126,7 +3234,15 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         double minImportance = threshold / featureCount;
         var mask = new bool[featureCount];
         for (int j = 0; j < featureCount; j++)
+        {
+            if (j >= importance.Length || !float.IsFinite(importance[j]))
+            {
+                mask[j] = true;
+                continue;
+            }
+
             mask[j] = importance[j] >= minImportance;
+        }
 
         return mask;
     }
@@ -3177,7 +3293,10 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
                     contribution += weights[learnerIndex][h] * hW[hwIndex];
                 }
 
-                int inputIndex = subset is { Length: > 0 } && col < subset.Length ? subset[col] : col;
+                if (subset is { Length: > 0 } && col >= subset.Length)
+                    continue;
+
+                int inputIndex = subset is { Length: > 0 } ? subset[col] : col;
                 AccumulateProjectedFeatureContribution(projection, inputIndex, featureCount, contribution);
             }
 
@@ -3249,6 +3368,61 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         bool predictedUp = probability >= decisionThreshold;
         bool actualUp = direction == 1;
         return predictedUp == actualUp;
+    }
+
+    internal static string GetFeatureDisplayName(int index)
+    {
+        return index >= 0 && index < MLFeatureHelper.FeatureNames.Length
+            ? MLFeatureHelper.FeatureNames[index]
+            : $"Feature{index}";
+    }
+
+    internal static string[] BuildFeatureNames(int featureCount)
+    {
+        if (featureCount <= 0)
+            return [];
+
+        var names = new string[featureCount];
+        for (int i = 0; i < featureCount; i++)
+            names[i] = GetFeatureDisplayName(i);
+        return names;
+    }
+
+    internal static void CopyRawFeatureWindow(
+        double[] destination,
+        float[]  source,
+        int      destinationOffset,
+        int      maxRawFeatures)
+    {
+        if (destinationOffset < 0 || destinationOffset >= destination.Length || maxRawFeatures <= 0)
+            return;
+
+        int copyCount = Math.Min(maxRawFeatures, Math.Min(source.Length, destination.Length - destinationOffset));
+        for (int i = 0; i < copyCount; i++)
+            destination[destinationOffset + i] = source[i];
+
+        int clearFrom = destinationOffset + copyCount;
+        int clearTo = Math.Min(destination.Length, destinationOffset + maxRawFeatures);
+        for (int i = clearFrom; i < clearTo; i++)
+            destination[i] = 0.0;
+    }
+
+    internal static double ApplyGlobalPlattCalibration(double rawProbability, double plattA, double plattB)
+    {
+        double clampedRaw = Math.Clamp(rawProbability, 1e-7, 1.0 - 1e-7);
+        return MLFeatureHelper.Sigmoid(plattA * MLFeatureHelper.Logit(clampedRaw) + plattB);
+    }
+
+    internal static double ComputeAsymmetricErrorWeight(int direction, double fpCostWeight)
+    {
+        if (Math.Abs(fpCostWeight - 0.5) <= 1e-6)
+            return 1.0;
+
+        // Labels are encoded as +1 (Buy) and -1 (Sell). False-positive weighting
+        // applies to negative-class examples, not to the impossible label value 0.
+        return direction > 0
+            ? 2.0 * (1.0 - fpCostWeight)
+            : 2.0 * fpCostWeight;
     }
 
     internal static bool LearnerUsesPolynomialInputs(
@@ -3391,6 +3565,34 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         return true;
     }
 
+    internal static bool TryCopyWarmStartMlpHiddenBiases(double[] source, double[] destination)
+    {
+        if (source.Length != destination.Length)
+            return false;
+
+        Array.Copy(source, destination, destination.Length);
+        return true;
+    }
+
+    internal static double[] ComputeMlpHiddenBackpropSignals(
+        double   totalErr,
+        double[] outputWeights,
+        double[] hiddenActivations,
+        int      hiddenDim)
+    {
+        var signals = new double[hiddenDim];
+        int count = Math.Min(hiddenDim, Math.Min(outputWeights.Length, hiddenActivations.Length));
+        for (int h = 0; h < count; h++)
+        {
+            if (hiddenActivations[h] <= 0.0)
+                continue;
+
+            signals[h] = totalErr * outputWeights[h];
+        }
+
+        return signals;
+    }
+
     internal static int SanitizeLearners(
         double[][]  weights,
         double[]    biases,
@@ -3459,7 +3661,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         var active = new bool[weights.Length];
         for (int k = 0; k < weights.Length; k++)
         {
-            bool isActive = k >= biases.Length || Math.Abs(biases[k]) > 1e-12;
+            bool isActive = k < biases.Length && Math.Abs(biases[k]) > 1e-12;
             if (!isActive)
             {
                 for (int j = 0; j < weights[k].Length; j++)
@@ -3522,7 +3724,24 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    private static double ComputeLearnerProbability(
+    private static bool TryGetFeatureValue(float[] features, int featureIndex, out double value)
+    {
+        if ((uint)featureIndex < (uint)features.Length)
+        {
+            value = features[featureIndex];
+            return true;
+        }
+
+        value = 0.0;
+        return false;
+    }
+
+    private static int GetUsableHiddenUnitCount(int requestedHiddenDim, double[] outputWeights, double[] hiddenBiases)
+    {
+        return Math.Min(requestedHiddenDim, Math.Min(outputWeights.Length, hiddenBiases.Length));
+    }
+
+    internal static double ComputeLearnerProbability(
         float[]      features,
         int          learnerIndex,
         double[][]   weights,
@@ -3562,15 +3781,18 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
             }
 
             double z = learnerIndex < biases.Length ? biases[learnerIndex] : 0.0;
-            for (int h = 0; h < mlpHiddenDim; h++)
+            int hiddenUnits = GetUsableHiddenUnitCount(mlpHiddenDim, weights[learnerIndex], hB);
+            for (int h = 0; h < hiddenUnits; h++)
             {
                 double act = hB[h];
                 int rowOff = h * subsetLen;
                 for (int si = 0; si < subsetLen && rowOff + si < hW.Length; si++)
-                    act += hW[rowOff + si] * mlpFeatures[subset[si]];
+                {
+                    if (TryGetFeatureValue(mlpFeatures, subset[si], out double featureValue))
+                        act += hW[rowOff + si] * featureValue;
+                }
                 double hidden = Math.Max(0.0, act);
-                if (h < weights[learnerIndex].Length)
-                    z += weights[learnerIndex][h] * hidden;
+                z += weights[learnerIndex][h] * hidden;
             }
 
             return MLFeatureHelper.Sigmoid(z);
@@ -3585,7 +3807,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         if (subsets?.Length > learnerIndex && subsets[learnerIndex] is { Length: > 0 } subset2)
         {
             foreach (int j in subset2)
-                if (j < learnerFeatures.Length && j < weights[learnerIndex].Length)
+                if ((uint)j < (uint)learnerFeatures.Length && (uint)j < (uint)weights[learnerIndex].Length)
                     zLin += weights[learnerIndex][j] * learnerFeatures[j];
         }
         else
@@ -3728,7 +3950,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         return (avg, std);
     }
 
-    private static double[] ComputeLearnerCalAccuracies(
+    internal static double[] ComputeLearnerCalAccuracies(
         List<TrainingSample> calSet,
         double[][]           weights,
         double[]             biases,
@@ -3746,8 +3968,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
                 mlp.HiddenW, mlp.HiddenB, mlp.HiddenDim);
             for (int k = 0; k < weights.Length; k++)
             {
-                int predictedDirection = lp[k] >= 0.5 ? 1 : 0;
-                if (predictedDirection == s.Direction)
+                if (IsPredictionCorrect(lp[k], s.Direction))
                     learnerCalAccuracies[k]++;
             }
         }
@@ -3790,7 +4011,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
             {
                 var hW = mlpHiddenW[k];
                 var hB = mlpHiddenB[k];
-                int[] subset = subsets?.Length > k ? subsets[k] : [];
+                int[] subset = subsets?.Length > k && subsets[k] is { Length: > 0 } s ? s : [];
                 int subLen = subset.Length > 0 ? subset.Length : featureCount;
                 // If no subset stored, build a full-range index for contiguous access
                 if (subset.Length == 0)
@@ -3800,16 +4021,19 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
                     subLen = kFeatures.Length;
                 }
 
-                double z = biases[k];
-                for (int h = 0; h < mlpHiddenDim; h++)
+                double z = k < biases.Length ? biases[k] : 0.0;
+                int hiddenUnits = GetUsableHiddenUnitCount(mlpHiddenDim, weights[k], hB);
+                for (int h = 0; h < hiddenUnits; h++)
                 {
                     double act = hB[h];
                     int rowOff = h * subLen;
                     for (int si = 0; si < subLen && rowOff + si < hW.Length; si++)
-                        act += hW[rowOff + si] * kFeatures[subset[si]];
+                    {
+                        if (TryGetFeatureValue(kFeatures, subset[si], out double featureValue))
+                            act += hW[rowOff + si] * featureValue;
+                    }
                     double hidden = Math.Max(0.0, act); // ReLU
-                    if (h < weights[k].Length)
-                        z += weights[k][h] * hidden;
+                    z += weights[k][h] * hidden;
                 }
                 probs[k] = MLFeatureHelper.Sigmoid(z);
             }
@@ -3817,15 +4041,17 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
             {
                 // Linear logistic forward pass
                 int kDim = weights[k].Length;
-                double z = biases[k];
-                if (subsets is not null && k < subsets.Length)
+                double z = k < biases.Length ? biases[k] : 0.0;
+                if (subsets?.Length > k && subsets[k] is { Length: > 0 } subset2)
                 {
-                    foreach (int j in subsets[k])
-                        z += weights[k][j] * kFeatures[j];
+                    foreach (int j in subset2)
+                        if ((uint)j < (uint)weights[k].Length && (uint)j < (uint)kFeatures.Length)
+                            z += weights[k][j] * kFeatures[j];
                 }
                 else
                 {
-                    for (int j = 0; j < kDim; j++)
+                    int len = Math.Min(kDim, kFeatures.Length);
+                    for (int j = 0; j < len; j++)
                         z += weights[k][j] * kFeatures[j];
                 }
                 probs[k] = MLFeatureHelper.Sigmoid(z);
@@ -3867,7 +4093,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
     /// <summary>Log-loss for a single learner using only the specified feature subset.
     /// Pass <paramref name="baseFeatureCount"/> >= 0 to enable poly feature augmentation.
     /// When <paramref name="mlpHiddenW"/> is non-null, uses MLP forward pass.</summary>
-    private static double ComputeLogLossSubset(
+    internal static double ComputeLogLossSubset(
         List<TrainingSample> set,
         double[]             w,
         double               b,
@@ -3893,21 +4119,26 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
             if (useMlp)
             {
                 z = b;
-                for (int h = 0; h < mlpHiddenDim; h++)
+                int hiddenUnits = GetUsableHiddenUnitCount(mlpHiddenDim, w, mlpHiddenB!);
+                for (int h = 0; h < hiddenUnits; h++)
                 {
                     double act = mlpHiddenB![h];
                     int rowOff = h * subsetLen;
-                    for (int si = 0; si < subsetLen; si++)
-                        act += mlpHiddenW![rowOff + si] * features[subset[si]];
+                    for (int si = 0; si < subsetLen && rowOff + si < mlpHiddenW!.Length; si++)
+                    {
+                        if (TryGetFeatureValue(features, subset[si], out double featureValue))
+                            act += mlpHiddenW[rowOff + si] * featureValue;
+                    }
                     double hidden = Math.Max(0.0, act); // ReLU
-                    if (h < w.Length) z += w[h] * hidden;
+                    z += w[h] * hidden;
                 }
             }
             else
             {
                 z = b;
                 foreach (int j in subset)
-                    z += w[j] * features[j];
+                    if ((uint)j < (uint)w.Length && (uint)j < (uint)features.Length)
+                        z += w[j] * features[j];
             }
             double p = MLFeatureHelper.Sigmoid(z);
             double y = s.Direction > 0 ? 1.0 - labelSmoothing : labelSmoothing;
@@ -3935,8 +4166,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
             double wt     = 1.0 + (double)i / n;
             var    s      = testSet[i];
             double rawP   = EnsembleProb(s.Features, weights, biases, featureCount, subsets, meta, mlp.HiddenW, mlp.HiddenB, mlp.HiddenDim);
-            rawP          = Math.Clamp(rawP, 1e-7, 1.0 - 1e-7); // guard against ±Inf logits
-            double calibP = MLFeatureHelper.Sigmoid(plattA * MLFeatureHelper.Logit(rawP) + plattB);
+            double calibP = ApplyGlobalPlattCalibration(rawP, plattA, plattB);
             weightSum  += wt;
             correctSum += (calibP >= 0.5) == (s.Direction == 1) ? wt : 0;
         }
@@ -4012,7 +4242,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
                 Array.Copy(testSet[idx].Features, scratch, scratch.Length);
                 scratch[j]   = vals[idx];
                 double rawP   = EnsembleProb(scratch, weights, biases, featureCount, subsets, meta, mlp.HiddenW, mlp.HiddenB, mlp.HiddenDim);
-                double calibP = MLFeatureHelper.Sigmoid(plattA * MLFeatureHelper.Logit(rawP) + plattB);
+                double calibP = ApplyGlobalPlattCalibration(rawP, plattA, plattB);
                 if (IsPredictionCorrect(calibP, testSet[idx].Direction, decisionThreshold)) correct++;
             }
             double shuffledAcc = (double)correct / tn;
@@ -4090,7 +4320,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         foreach (var s in set)
         {
             double rawP   = EnsembleProb(s.Features, weights, biases, featureCount, subsets, meta, mlp.HiddenW, mlp.HiddenB, mlp.HiddenDim);
-            double calibP = MLFeatureHelper.Sigmoid(plattA * MLFeatureHelper.Logit(rawP) + plattB);
+            double calibP = ApplyGlobalPlattCalibration(rawP, plattA, plattB);
             if (IsPredictionCorrect(calibP, s.Direction, decisionThreshold)) correct++;
         }
         return (double)correct / set.Count;
@@ -4259,8 +4489,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         for (int i = 0; i < cn; i++)
         {
             double raw = EnsembleProb(calSet[i].Features, weights, biases, featureCount, subsets, meta, mlp.HiddenW, mlp.HiddenB, mlp.HiddenDim);
-            raw        = Math.Clamp(raw, 1e-7, 1.0 - 1e-7); // guard against ±Inf logits
-            double p   = MLFeatureHelper.Sigmoid(plattA * MLFeatureHelper.Logit(raw) + plattB);
+            double p   = ApplyGlobalPlattCalibration(raw, plattA, plattB);
             pairs[i]   = (p, calSet[i].Direction > 0 ? 1.0 : 0.0);
         }
         Array.Sort(pairs, (a, b) => a.P.CompareTo(b.P));
@@ -4390,7 +4619,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         foreach (var s in calSet)
         {
             double raw = EnsembleProb(s.Features, weights, biases, featureCount, subsets, meta, mlp.HiddenW, mlp.HiddenB, mlp.HiddenDim);
-            double p   = MLFeatureHelper.Sigmoid(plattA * MLFeatureHelper.Logit(raw) + plattB);
+            double p   = ApplyGlobalPlattCalibration(raw, plattA, plattB);
             if (isotonicBp.Length >= 4)
                 p = ApplyIsotonicCalibration(p, isotonicBp);
             scores.Add(s.Direction > 0 ? 1.0 - p : p);
@@ -4447,14 +4676,16 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
     /// Computes max peak-to-trough drawdown and Sharpe ratio from a sequence of unit trade P&amp;L.
     /// Each prediction contributes +1 (correct) or -1 (incorrect) to the running P&amp;L.
     /// </summary>
-    private static (double MaxDrawdown, double Sharpe) ComputeEquityCurveStats(
+    internal static (double MaxDrawdown, double Sharpe) ComputeEquityCurveStats(
         (int Predicted, int Actual)[] predictions)
     {
         if (predictions.Length == 0) return (0.0, 0.0);
 
         var returns = new double[predictions.Length];
-        double equity = 0.0;
-        double peak   = 0.0;
+        // Anchor the curve at 1.0 so an immediate losing streak still registers
+        // as drawdown instead of being masked by the old peak==0 shortcut.
+        double equity = 1.0;
+        double peak   = 1.0;
         double maxDD  = 0.0;
 
         for (int i = 0; i < predictions.Length; i++)
@@ -4463,7 +4694,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
             returns[i] = ret;
             equity    += ret;
             if (equity > peak) peak = equity;
-            double dd = peak > 0 ? (peak - equity) / peak : 0.0;
+            double dd = (peak - equity) / Math.Max(peak, 1e-12);
             if (dd > maxDD) maxDD = dd;
         }
 
@@ -4551,9 +4782,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
                 // Build meta-features: [calibP, ensStd, feat[0..4]] — reuse pre-allocated array.
                 metaF[0] = calibP;
                 metaF[1] = ensStd;
-                int rawTop = Math.Min(5, featureCount);
-                for (int i = 0; i < rawTop; i++)
-                    metaF[2 + i] = s.Features[i];
+                CopyRawFeatureWindow(metaF, s.Features, destinationOffset: 2, maxRawFeatures: 5);
 
                 // Label: 1 if ensemble prediction was correct
                 int predicted = calibP >= decisionThreshold ? 1 : -1;
@@ -4784,8 +5013,11 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
                     {
                         double act = hiddenBiases[h];
                         int rowOffset = h * subsetLen;
-                        for (int si = 0; si < subsetLen; si++)
-                            act += hiddenWeights[rowOffset + si] * sampleFeatures[subset[si]];
+                        for (int si = 0; si < subsetLen && rowOffset + si < hiddenWeights.Length; si++)
+                        {
+                            if (TryGetFeatureValue(sampleFeatures, subset[si], out double featureValue))
+                                act += hiddenWeights[rowOffset + si] * featureValue;
+                        }
                         hiddenAct![h] = Math.Max(0.0, act);
                         z += weights[k][h] * hiddenAct[h];
                     }
@@ -4794,7 +5026,8 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
                 {
                     z = bias;
                     foreach (int j in subset)
-                        z += weights[k][j] * sampleFeatures[j];
+                        if ((uint)j < (uint)weights[k].Length && (uint)j < (uint)sampleFeatures.Length)
+                            z += weights[k][j] * sampleFeatures[j];
                 }
 
                 double p   = MLFeatureHelper.Sigmoid(z);
@@ -4806,6 +5039,12 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
 
                 if (useMlp)
                 {
+                    var hiddenSignals = ComputeMlpHiddenBackpropSignals(
+                        err,
+                        weights[k],
+                        hiddenAct!,
+                        hiddenDim);
+
                     for (int h = 0; h < hiddenDim; h++)
                     {
                         double grad = err * hiddenAct![h] + hp.L2Lambda * weights[k][h];
@@ -4816,14 +5055,17 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
 
                     for (int h = 0; h < hiddenDim; h++)
                     {
-                        if (hiddenAct![h] <= 0.0) continue;
-
-                        double dHidden = err * weights[k][h];
+                        double dHidden = hiddenSignals[h];
+                        if (dHidden == 0.0) continue;
                         int rowOffset = h * subsetLen;
                         for (int si = 0; si < subsetLen; si++)
                         {
                             int hiddenIndex = rowOffset + si;
-                            double grad = dHidden * sampleFeatures[subset[si]] + hp.L2Lambda * mlpHiddenW![k][hiddenIndex];
+                            if (hiddenIndex >= mlpHiddenW![k].Length)
+                                break;
+                            if (!TryGetFeatureValue(sampleFeatures, subset[si], out double featureValue))
+                                continue;
+                            double grad = dHidden * featureValue + hp.L2Lambda * mlpHiddenW[k][hiddenIndex];
                             mHW![hiddenIndex] = AdamBeta1 * mHW[hiddenIndex] + (1 - AdamBeta1) * grad;
                             vHW![hiddenIndex] = AdamBeta2 * vHW[hiddenIndex] + (1 - AdamBeta2) * grad * grad;
                             mlpHiddenW[k][hiddenIndex] -= alphAt * mHW[hiddenIndex] / (Math.Sqrt(vHW[hiddenIndex]) + AdamEpsilon);
@@ -4838,6 +5080,8 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
                 {
                     foreach (int j in subset)
                     {
+                        if ((uint)j >= (uint)weights[k].Length || (uint)j >= (uint)sampleFeatures.Length)
+                            continue;
                         double grad = err * sampleFeatures[j] + hp.L2Lambda * weights[k][j];
                         mW[j] = AdamBeta1 * mW[j] + (1 - AdamBeta1) * grad;
                         vW[j] = AdamBeta2 * vW[j] + (1 - AdamBeta2) * grad * grad;
@@ -4862,13 +5106,17 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
     /// This biases feature subsets toward historically important features while keeping
     /// all features eligible. Returns a sorted array of sampled indices.
     /// </summary>
-    private static int[] GenerateBiasedFeatureSubset(
+    internal static int[] GenerateBiasedFeatureSubset(
         int     featureCount,
         double  ratio,
         double[] importanceScores,
         int     seed)
     {
-        int subCount = Math.Max(1, (int)Math.Ceiling(ratio * featureCount));
+        if (featureCount <= 0)
+            return [];
+
+        double safeRatio = double.IsFinite(ratio) ? Math.Clamp(ratio, 0.0, 1.0) : 1.0;
+        int subCount = Math.Clamp(Math.Max(1, (int)Math.Ceiling(safeRatio * featureCount)), 1, featureCount);
         var rng      = new Random(seed);
         double epsilon = 1.0 / featureCount;
 
@@ -4877,7 +5125,10 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         double sum = 0.0;
         for (int j = 0; j < featureCount; j++)
         {
-            double w = (j < importanceScores.Length ? importanceScores[j] : 0.0) + epsilon;
+            double importance = j < importanceScores.Length && double.IsFinite(importanceScores[j])
+                ? Math.Max(0.0, importanceScores[j])
+                : 0.0;
+            double w = importance + epsilon;
             rawWeights[j] = w;
             sum += w;
         }
@@ -5246,7 +5497,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
     /// ‖∇_x P(Buy|x)‖ over the supplied calibration set using finite differences.
     /// This keeps the statistic valid for linear, subsampled, polynomial, and MLP learners.
     /// </summary>
-    private static (double Mean, double Std) ComputeDecisionBoundaryStats(
+    internal static (double Mean, double Std) ComputeDecisionBoundaryStats(
         List<TrainingSample>  calSet,
         Func<float[], double> probabilityProvider,
         bool[]?               activeFeatureMask = null)
@@ -5273,7 +5524,11 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
 
                 double pPlus = probabilityProvider(plus);
                 double pMinus = probabilityProvider(minus);
+                if (!double.IsFinite(pPlus) || !double.IsFinite(pMinus))
+                    continue;
                 double grad = (pPlus - pMinus) / (2.0 * Epsilon);
+                if (!double.IsFinite(grad))
+                    continue;
                 gradSq += grad * grad;
 
                 plus[j] = calSet[i].Features[j];
@@ -5313,7 +5568,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
     /// DW > 2.5 → negative autocorrelation.
     /// Returns 2.0 when the training set is too small to compute reliably.
     /// </summary>
-    private static double ComputeDurbinWatson(
+    internal static double ComputeDurbinWatson(
         List<TrainingSample> trainSet,
         double[]             magWeights,
         double               magBias,
@@ -5328,6 +5583,8 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
             for (int j = 0; j < featureCount && j < magWeights.Length; j++)
                 pred += magWeights[j] * trainSet[i].Features[j];
             residuals[i] = trainSet[i].Magnitude - pred;
+            if (!double.IsFinite(residuals[i]))
+                return 2.0;
         }
 
         double sumSqDiff = 0.0;
@@ -5335,6 +5592,8 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         for (int i = 1; i < residuals.Length; i++)
         {
             double diff   = residuals[i] - residuals[i - 1];
+            if (!double.IsFinite(diff))
+                return 2.0;
             sumSqDiff    += diff * diff;
         }
         for (int i = 0; i < residuals.Length; i++)
@@ -5399,8 +5658,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
 
                 // Compute meta-label score [ensP, ensStd, feat[0..4]] → logistic (reuse mf).
                 mf[0] = calibP; mf[1] = ensStd;
-                int top = Math.Min(5, featureCount);
-                for (int i = 0; i < top; i++) mf[2 + i] = s.Features[i];
+                CopyRawFeatureWindow(mf, s.Features, destinationOffset: 2, maxRawFeatures: 5);
                 double mz = metaLabelBias;
                 for (int i = 0; i < MetaDim && i < metaLabelWeights.Length; i++)
                     mz += metaLabelWeights[i] * mf[i];
@@ -5571,8 +5829,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         foreach (var s in calSet)
         {
             double rawP   = EnsembleProb(s.Features, weights, biases, featureCount, subsets, meta, mlp.HiddenW, mlp.HiddenB, mlp.HiddenDim);
-            rawP          = Math.Clamp(rawP, 1e-7, 1.0 - 1e-7); // guard against ±Inf logits
-            double calibP = MLFeatureHelper.Sigmoid(plattA * MLFeatureHelper.Logit(rawP) + plattB);
+            double calibP = ApplyGlobalPlattCalibration(rawP, plattA, plattB);
             sum += Math.Max(0.0, 2.0 * calibP - 1.0);
         }
         return sum / calSet.Count * 0.5;
@@ -5648,7 +5905,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
                     }
 
                 if (mi >= maxMi)
-                    result.Add($"{MLFeatureHelper.FeatureNames[i]}:{MLFeatureHelper.FeatureNames[j]}");
+                    result.Add($"{GetFeatureDisplayName(i)}:{GetFeatureDisplayName(j)}");
             }
         }
 
@@ -5937,8 +6194,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         foreach (var s in testSet)
         {
             double rawP   = EnsembleProb(s.Features, weights, biases, featureCount, subsets, meta, mlp.HiddenW, mlp.HiddenB, mlp.HiddenDim);
-            rawP          = Math.Clamp(rawP, 1e-7, 1.0 - 1e-7); // guard against ±Inf logits
-            double calibP = MLFeatureHelper.Sigmoid(plattA * MLFeatureHelper.Logit(rawP) + plattB);
+            double calibP = ApplyGlobalPlattCalibration(rawP, plattA, plattB);
             double y      = s.Direction > 0 ? 1.0 : 0.0;
             double diff   = calibP - y;
             sumBrier += diff * diff;

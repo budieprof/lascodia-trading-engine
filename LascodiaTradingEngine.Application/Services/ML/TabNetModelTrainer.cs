@@ -331,9 +331,15 @@ public sealed class TabNetModelTrainer : IMLModelTrainer
                 plattA       = pA;  plattB  = pB;
                 finalMetrics = prunedMetrics;
                 F            = maskedF;
+                trainSet     = maskedTrain;  // downstream DW/PSI use masked features
+                testSet      = maskedTest;   // downstream BSS uses masked features
+                calSet       = maskedCal;    // downstream conformal/temperature use masked features
                 ece              = ComputeEce(maskedTest, wAttention, wf, wOut, bOut, nSteps, F, plattA, plattB);
                 optimalThreshold = ComputeOptimalThreshold(maskedCal, wAttention, wf, wOut, bOut, nSteps, F,
                     plattA, plattB, hp.ThresholdSearchMin, hp.ThresholdSearchMax);
+                (plattABuy, plattBBuy, plattASell, plattBSell) =
+                    FitClassConditionalPlatt(maskedCal, wAttention, wf, wOut, bOut, nSteps, F);
+                avgKellyFraction = ComputeAvgKellyFraction(maskedCal, wAttention, wf, wOut, bOut, nSteps, F, plattA, plattB);
             }
             else
             {
@@ -1087,8 +1093,8 @@ public sealed class TabNetModelTrainer : IMLModelTrainer
     {
         var buySamples  = calSet.Where(s => s.Direction > 0).ToList();
         var sellSamples = calSet.Where(s => s.Direction <= 0).ToList();
-        var (aBuy,  bBuy)  = buySamples.Count  >= 10 ? FitPlattScaling(buySamples,  wAttention, wf, wOut, bOut, nSteps, F) : (0.0, 0.0);
-        var (aSell, bSell) = sellSamples.Count >= 10 ? FitPlattScaling(sellSamples, wAttention, wf, wOut, bOut, nSteps, F) : (0.0, 0.0);
+        var (aBuy,  bBuy)  = buySamples.Count  >= 10 ? FitPlattScaling(buySamples,  wAttention, wf, wOut, bOut, nSteps, F) : (1.0, 0.0);
+        var (aSell, bSell) = sellSamples.Count >= 10 ? FitPlattScaling(sellSamples, wAttention, wf, wOut, bOut, nSteps, F) : (1.0, 0.0);
         return (aBuy, bBuy, aSell, bSell);
     }
 
@@ -1170,7 +1176,7 @@ public sealed class TabNetModelTrainer : IMLModelTrainer
             double p = TabNetCalibProbFromFloats(s.Features, wAttention, wf, wOut, bOut, nSteps, F, plattA, plattB);
             int bin  = Math.Clamp((int)(p * bins), 0, bins - 1);
             binConf[bin]    += p;
-            binCorrect[bin] += (p >= 0.5) == (s.Direction > 0) ? 1 : 0;
+            binCorrect[bin] += s.Direction > 0 ? 1 : 0; // positive-class frequency, not accuracy
             binCount[bin]++;
         }
 

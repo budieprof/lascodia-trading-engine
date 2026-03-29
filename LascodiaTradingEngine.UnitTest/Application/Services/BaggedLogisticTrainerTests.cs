@@ -17,6 +17,62 @@ public class BaggedLogisticTrainerTests
     }
 
     [Fact]
+    public void ValidateTrainingSamples_Throws_For_Zero_Features()
+    {
+        var samples = new List<TrainingSample>
+        {
+            new([], 1, 1f),
+        };
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            BaggedLogisticTrainer.ValidateTrainingSamples(samples));
+
+        Assert.Contains("at least one feature", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void ValidateTrainingSamples_Throws_For_Invalid_Direction_Label()
+    {
+        var samples = new List<TrainingSample>
+        {
+            new([1f], 2, 1f),
+        };
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            BaggedLogisticTrainer.ValidateTrainingSamples(samples));
+
+        Assert.Contains("invalid direction", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void ValidateTrainingSamples_Throws_For_NonFinite_Feature()
+    {
+        var samples = new List<TrainingSample>
+        {
+            new([float.NaN], 1, 1f),
+        };
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            BaggedLogisticTrainer.ValidateTrainingSamples(samples));
+
+        Assert.Contains("non-finite", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void ValidateTrainingSamples_Throws_For_NonFinite_Magnitude()
+    {
+        var samples = new List<TrainingSample>
+        {
+            new([1f], 1, float.PositiveInfinity),
+        };
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            BaggedLogisticTrainer.ValidateTrainingSamples(samples));
+
+        Assert.Contains("non-finite magnitude", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void ComputeStandardizationStats_Uses_Only_Fit_Samples()
     {
         var fitSamples = new List<TrainingSample>
@@ -34,6 +90,41 @@ public class BaggedLogisticTrainerTests
     }
 
     [Fact]
+    public void ComputeFinalSplitBoundaries_Uses_Single_Embargo_Between_Train_And_Calibration()
+    {
+        var (trainStdEnd, calStart, calEnd, testStart) =
+            BaggedLogisticTrainer.ComputeFinalSplitBoundaries(sampleCount: 100, embargo: 5);
+
+        Assert.Equal(65, trainStdEnd);
+        Assert.Equal(70, calStart);
+        Assert.Equal(80, calEnd);
+        Assert.Equal(85, testStart);
+    }
+
+    [Theory]
+    [InlineData(1, 0.80, 0.40)]
+    [InlineData(-1, 0.80, 1.60)]
+    [InlineData(-1, 0.50, 1.00)]
+    public void ComputeAsymmetricErrorWeight_Uses_Project_Label_Encoding(
+        int direction,
+        double fpCostWeight,
+        double expected)
+    {
+        double actual = BaggedLogisticTrainer.ComputeAsymmetricErrorWeight(direction, fpCostWeight);
+
+        Assert.Equal(expected, actual, precision: 6);
+    }
+
+    [Fact]
+    public void ComputeEnsembleValidationPlan_Disables_Holdout_For_Small_Sets()
+    {
+        var plan = BaggedLogisticTrainer.ComputeEnsembleValidationPlan(sampleCount: 20);
+
+        Assert.False(plan.UseValidationHoldout);
+        Assert.Equal(0, plan.ValSize);
+    }
+
+    [Fact]
     public void TryCopyWarmStartMlpHiddenWeights_Remaps_By_Feature_Index()
     {
         double[] source = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0];
@@ -46,6 +137,16 @@ public class BaggedLogisticTrainerTests
 
         Assert.True(copied);
         Assert.Equal([30.0, 20.0, 10.0, 60.0, 50.0, 40.0], destination);
+    }
+
+    [Fact]
+    public void TryCopyWarmStartMlpHiddenBiases_Rejects_Length_Mismatch()
+    {
+        bool copied = BaggedLogisticTrainer.TryCopyWarmStartMlpHiddenBiases(
+            source: [1.0, 2.0],
+            destination: new double[3]);
+
+        Assert.False(copied);
     }
 
     [Fact]
@@ -103,6 +204,239 @@ public class BaggedLogisticTrainerTests
         Assert.Equal(0.0, projection[2], precision: 6);
         Assert.Equal(0.0, projection[3], precision: 6);
         Assert.Equal(0.0, projection[4], precision: 6);
+    }
+
+    [Fact]
+    public void ProjectLearnerToFeatureSpace_Skips_Unmapped_Mlp_Columns_When_Subset_Is_Truncated()
+    {
+        double[][] weights = [[10.0]];
+        double[][] hiddenW = [[2.0, 100.0]];
+        int[][] subsets = [[0]];
+
+        var projection = BaggedLogisticTrainer.ProjectLearnerToFeatureSpace(
+            learnerIndex: 0,
+            weights,
+            featureCount: 2,
+            subsets,
+            hiddenW,
+            mlpHiddenDim: 1);
+
+        Assert.Equal(20.0, projection[0], precision: 6);
+        Assert.Equal(0.0, projection[1], precision: 6);
+    }
+
+    [Fact]
+    public void CopyRawFeatureWindow_Clears_Stale_Tail_Entries()
+    {
+        double[] destination = [0.0, 0.0, 9.0, 8.0, 7.0, 6.0, 5.0];
+
+        BaggedLogisticTrainer.CopyRawFeatureWindow(
+            destination,
+            source: [1f, 2f],
+            destinationOffset: 2,
+            maxRawFeatures: 5);
+
+        Assert.Equal([0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 0.0], destination);
+    }
+
+    [Fact]
+    public void GetFeatureDisplayName_Falls_Back_For_Out_Of_Range_Index()
+    {
+        string name = BaggedLogisticTrainer.GetFeatureDisplayName(999);
+
+        Assert.Equal("Feature999", name);
+    }
+
+    [Fact]
+    public void BuildFeatureNames_Uses_Fallback_Names_Beyond_Known_Metadata()
+    {
+        string[] names = BaggedLogisticTrainer.BuildFeatureNames(MLFeatureHelper.FeatureNames.Length + 2);
+
+        Assert.Equal(MLFeatureHelper.FeatureNames.Length + 2, names.Length);
+        Assert.Equal($"Feature{MLFeatureHelper.FeatureNames.Length}", names[^2]);
+        Assert.Equal($"Feature{MLFeatureHelper.FeatureNames.Length + 1}", names[^1]);
+    }
+
+    [Fact]
+    public void ComputeMlpHiddenBackpropSignals_Uses_Frozen_Output_Weights_And_Relu_Gate()
+    {
+        var signals = BaggedLogisticTrainer.ComputeMlpHiddenBackpropSignals(
+            totalErr: 2.0,
+            outputWeights: [3.0, 5.0],
+            hiddenActivations: [4.0, 0.0],
+            hiddenDim: 2);
+
+        Assert.Equal([6.0, 0.0], signals);
+    }
+
+    [Fact]
+    public void ApplyGlobalPlattCalibration_Clamps_Extreme_Raw_Probabilities()
+    {
+        double calibrated = BaggedLogisticTrainer.ApplyGlobalPlattCalibration(
+            rawProbability: 1.0,
+            plattA: 1.0,
+            plattB: 0.0);
+
+        Assert.True(double.IsFinite(calibrated));
+        Assert.InRange(calibrated, 0.999999, 0.99999995);
+    }
+
+    [Fact]
+    public void ComputeLearnerCalAccuracies_Credits_Correct_Sell_Predictions()
+    {
+        var calSet = new List<TrainingSample>
+        {
+            new([0f], -1, 1f),
+            new([0f],  1, 1f),
+        };
+
+        double[][] weights =
+        [
+            [0.0],
+            [0.0],
+        ];
+        double[] biases =
+        [
+            MLFeatureHelper.Logit(0.1),
+            MLFeatureHelper.Logit(0.9),
+        ];
+
+        var accuracies = BaggedLogisticTrainer.ComputeLearnerCalAccuracies(
+            calSet,
+            weights,
+            biases,
+            featureCount: 1,
+            featureSubsets: null);
+
+        Assert.Equal(0.5, accuracies[0], precision: 6);
+        Assert.Equal(0.5, accuracies[1], precision: 6);
+    }
+
+    [Fact]
+    public void ComputeLearnerCalAccuracies_Treats_Null_Subset_Entries_As_Full_Feature_Use()
+    {
+        var calSet = new List<TrainingSample>
+        {
+            new([1f], 1, 1f),
+        };
+
+        double[][] weights = [[2.0]];
+        double[] biases = [0.0];
+        int[][] featureSubsets = [null!];
+
+        var accuracies = BaggedLogisticTrainer.ComputeLearnerCalAccuracies(
+            calSet,
+            weights,
+            biases,
+            featureCount: 1,
+            featureSubsets);
+
+        Assert.Equal(1.0, accuracies[0], precision: 6);
+    }
+
+    [Fact]
+    public void ComputeLearnerProbability_Ignores_Invalid_Linear_Subset_Indices()
+    {
+        double probability = BaggedLogisticTrainer.ComputeLearnerProbability(
+            features: [1f],
+            learnerIndex: 0,
+            weights: [[2.0]],
+            biases: [0.0],
+            featureCount: 1,
+            subsets: [[0, 4, -1]],
+            polyLearnerStartIndex: 1,
+            mlpHiddenW: null,
+            mlpHiddenB: null,
+            mlpHiddenDim: 0);
+
+        Assert.True(probability > 0.88);
+    }
+
+    [Fact]
+    public void ComputeLearnerProbability_Ignores_Invalid_Mlp_Subset_Indices()
+    {
+        double probability = BaggedLogisticTrainer.ComputeLearnerProbability(
+            features: [1f],
+            learnerIndex: 0,
+            weights: [[3.0]],
+            biases: [0.0],
+            featureCount: 1,
+            subsets: [[0, 5]],
+            polyLearnerStartIndex: 1,
+            mlpHiddenW: [[2.0, 7.0]],
+            mlpHiddenB: [[0.0]],
+            mlpHiddenDim: 1);
+
+        Assert.True(probability > 0.99);
+    }
+
+    [Fact]
+    public void ComputeLearnerProbability_Tolerates_Truncated_MlpHiddenBiases()
+    {
+        double probability = BaggedLogisticTrainer.ComputeLearnerProbability(
+            features: [1f],
+            learnerIndex: 0,
+            weights: [[1.0, 9.0]],
+            biases: [0.0],
+            featureCount: 1,
+            subsets: null,
+            polyLearnerStartIndex: 1,
+            mlpHiddenW: [[2.0, 100.0]],
+            mlpHiddenB: [[0.0]],
+            mlpHiddenDim: 2);
+
+        Assert.Equal(MLFeatureHelper.Sigmoid(2.0), probability, precision: 6);
+    }
+
+    [Fact]
+    public void ComputeLogLossSubset_Ignores_Invalid_Subset_Indices()
+    {
+        var samples = new List<TrainingSample>
+        {
+            new([1f], 1, 1f),
+        };
+
+        double loss = BaggedLogisticTrainer.ComputeLogLossSubset(
+            samples,
+            w: [2.0],
+            b: 0.0,
+            subset: [0, 8, -1]);
+
+        Assert.True(double.IsFinite(loss));
+        Assert.True(loss < 0.2);
+    }
+
+    [Fact]
+    public void ComputeLearnerCalAccuracies_Tolerates_Short_Bias_Array()
+    {
+        var calSet = new List<TrainingSample>
+        {
+            new([1f], 1, 1f),
+        };
+
+        var accuracies = BaggedLogisticTrainer.ComputeLearnerCalAccuracies(
+            calSet,
+            weights: [[2.0]],
+            biases: [],
+            featureCount: 1,
+            featureSubsets: null);
+
+        Assert.Equal(1.0, accuracies[0], precision: 6);
+    }
+
+    [Fact]
+    public void ComputeEquityCurveStats_Registers_Drawdown_For_Immediate_Losses()
+    {
+        var predictions = new (int Predicted, int Actual)[]
+        {
+            (1, -1),
+            (1, -1),
+        };
+
+        var (maxDrawdown, sharpe) = BaggedLogisticTrainer.ComputeEquityCurveStats(predictions);
+
+        Assert.True(maxDrawdown > 1.0);
+        Assert.True(double.IsFinite(sharpe));
     }
 
     [Fact]
@@ -209,5 +543,187 @@ public class BaggedLogisticTrainerTests
         bool actual = BaggedLogisticTrainer.IsPredictionCorrect(probability, direction, threshold);
 
         Assert.Equal(expected, actual);
+    }
+
+    [Fact]
+    public void BuildNormalisedCdf_Returns_Empty_For_Empty_Input()
+    {
+        double[] cdf = BaggedLogisticTrainer.BuildNormalisedCdf([]);
+
+        Assert.Empty(cdf);
+    }
+
+    [Fact]
+    public void BuildNormalisedCdf_Falls_Back_To_Uniform_For_NonFinite_Weights()
+    {
+        double[] cdf = BaggedLogisticTrainer.BuildNormalisedCdf([double.NaN, double.PositiveInfinity]);
+
+        Assert.Equal([0.5, 1.0], cdf);
+    }
+
+    [Fact]
+    public void BuildNormalisedCdf_Clamps_Negative_Weights_To_Zero()
+    {
+        double[] cdf = BaggedLogisticTrainer.BuildNormalisedCdf([-5.0, 3.0]);
+
+        Assert.Equal([0.0, 1.0], cdf);
+    }
+
+    [Fact]
+    public void SampleFromCdf_Returns_Zero_For_Empty_Cdf()
+    {
+        int index = BaggedLogisticTrainer.SampleFromCdf([], new Random(1));
+
+        Assert.Equal(0, index);
+    }
+
+    [Fact]
+    public void ComputeTemporalWeights_Falls_Back_To_Uniform_For_NonFinite_Lambda()
+    {
+        double[] weights = BaggedLogisticTrainer.ComputeTemporalWeights(3, double.NaN);
+
+        Assert.Equal(1.0 / 3.0, weights[0], precision: 6);
+        Assert.Equal(1.0 / 3.0, weights[1], precision: 6);
+        Assert.Equal(1.0 / 3.0, weights[2], precision: 6);
+    }
+
+    [Fact]
+    public void ComputeTemporalWeights_Remains_Finite_For_Large_Negative_Lambda()
+    {
+        double[] weights = BaggedLogisticTrainer.ComputeTemporalWeights(3, -10000.0);
+
+        Assert.All(weights, weight => Assert.True(double.IsFinite(weight)));
+        Assert.Equal(1.0, weights.Sum(), precision: 6);
+    }
+
+    [Fact]
+    public void ComputeSharpe_Returns_Zero_For_NonFinite_Buffer()
+    {
+        double sharpe = BaggedLogisticTrainer.ComputeSharpe([1.0, double.NaN], 2);
+
+        Assert.Equal(0.0, sharpe, precision: 6);
+    }
+
+    [Fact]
+    public void ComputeDecisionBoundaryStats_Skips_NonFinite_Probability_Values()
+    {
+        var calSet = new List<TrainingSample>
+        {
+            new([0f], 1, 1f),
+        };
+
+        var (mean, std) = BaggedLogisticTrainer.ComputeDecisionBoundaryStats(
+            calSet,
+            _ => double.NaN);
+
+        Assert.Equal(0.0, mean, precision: 6);
+        Assert.Equal(0.0, std, precision: 6);
+    }
+
+    [Fact]
+    public void ComputeDurbinWatson_Returns_Default_For_NonFinite_Residuals()
+    {
+        var trainSet = new List<TrainingSample>
+        {
+            new([1f], 1, float.PositiveInfinity),
+            new([2f], 1, 1f),
+            new([3f], 1, 1f),
+            new([4f], 1, 1f),
+            new([5f], 1, 1f),
+            new([6f], 1, 1f),
+            new([7f], 1, 1f),
+            new([8f], 1, 1f),
+            new([9f], 1, 1f),
+            new([10f], 1, 1f),
+        };
+
+        double dw = BaggedLogisticTrainer.ComputeDurbinWatson(
+            trainSet,
+            magWeights: [1.0],
+            magBias: 0.0,
+            featureCount: 1);
+
+        Assert.Equal(2.0, dw, precision: 6);
+    }
+
+    [Fact]
+    public void ComputeActiveLearnerMask_Does_Not_Activate_Zero_Learner_When_Bias_Is_Missing()
+    {
+        bool[] active = BaggedLogisticTrainer.ComputeActiveLearnerMask(
+            weights: [[0.0], [1.0]],
+            biases: []);
+
+        Assert.False(active[0]);
+        Assert.True(active[1]);
+    }
+
+    [Fact]
+    public void GenerateFeatureSubset_Returns_Empty_For_Zero_Features()
+    {
+        int[] subset = BaggedLogisticTrainer.GenerateFeatureSubset(
+            featureCount: 0,
+            ratio: 0.5,
+            seed: 1);
+
+        Assert.Empty(subset);
+    }
+
+    [Fact]
+    public void GenerateFeatureSubset_Clamps_Oversized_Ratio_To_FeatureCount()
+    {
+        int[] subset = BaggedLogisticTrainer.GenerateFeatureSubset(
+            featureCount: 3,
+            ratio: 2.0,
+            seed: 1);
+
+        Assert.Equal([0, 1, 2], subset);
+    }
+
+    [Fact]
+    public void GenerateBiasedFeatureSubset_Returns_Empty_For_Zero_Features()
+    {
+        int[] subset = BaggedLogisticTrainer.GenerateBiasedFeatureSubset(
+            featureCount: 0,
+            ratio: 0.5,
+            importanceScores: [],
+            seed: 1);
+
+        Assert.Empty(subset);
+    }
+
+    [Fact]
+    public void GenerateBiasedFeatureSubset_Clamps_Oversized_Ratio_To_FeatureCount()
+    {
+        int[] subset = BaggedLogisticTrainer.GenerateBiasedFeatureSubset(
+            featureCount: 3,
+            ratio: 2.0,
+            importanceScores: [0.1, 0.2, 0.3],
+            seed: 1);
+
+        Assert.Equal(3, subset.Length);
+        Assert.Equal([0, 1, 2], subset);
+    }
+
+    [Fact]
+    public void GenerateBiasedFeatureSubset_Ignores_NonFinite_And_Negative_ImportanceScores()
+    {
+        int[] subset = BaggedLogisticTrainer.GenerateBiasedFeatureSubset(
+            featureCount: 3,
+            ratio: 1.0,
+            importanceScores: [double.NaN, -5.0, 0.2],
+            seed: 1);
+
+        Assert.Equal([0, 1, 2], subset);
+    }
+
+    [Fact]
+    public void BuildFeatureMask_Keeps_Missing_Importance_Entries_Active()
+    {
+        bool[] mask = BaggedLogisticTrainer.BuildFeatureMask(
+            importance: [0.1f],
+            threshold: 1.0,
+            featureCount: 3);
+
+        Assert.Equal([false, true, true], mask);
     }
 }
