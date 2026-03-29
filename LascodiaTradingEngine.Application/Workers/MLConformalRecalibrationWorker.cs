@@ -288,23 +288,14 @@ public sealed class MLConformalRecalibrationWorker : BackgroundService
             model.Symbol, model.Timeframe, model.Id,
             coverageDrift, empiricalCoverage, nominalCoverage, currentQHat, newQHat);
 
-        // Patch the ConformalQHat in-place on the existing snapshot object.
-        snap.ConformalQHat = newQHat;
-
-        byte[] updatedBytes;
-        try { updatedBytes = JsonSerializer.SerializeToUtf8Bytes(snap); }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex,
-                "ConformalRecal: {Symbol}/{Tf} model {Id}: failed to serialise patched snapshot — skip.",
-                model.Symbol, model.Timeframe, model.Id);
+        var (writeModel, latestSnap) = await MLModelSnapshotWriteHelper
+            .LoadTrackedLatestSnapshotAsync(writeCtx, model.Id, ct);
+        if (writeModel == null || latestSnap == null)
             return;
-        }
 
-        // Persist the patched snapshot bytes using a targeted update.
-        await writeCtx.Set<MLModel>()
-            .Where(m => m.Id == model.Id)
-            .ExecuteUpdateAsync(s => s.SetProperty(m => m.ModelBytes, updatedBytes), ct);
+        latestSnap.ConformalQHat = newQHat;
+        writeModel.ModelBytes = JsonSerializer.SerializeToUtf8Bytes(latestSnap);
+        await writeCtx.SaveChangesAsync(ct);
 
         // Invalidate the scorer's 30-min cache so the patched snapshot is loaded on the next score.
         _cache.Remove($"MLSnapshot:{model.Id}");

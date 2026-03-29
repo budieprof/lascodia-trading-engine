@@ -259,12 +259,10 @@ public sealed class MLThresholdCalibrationWorker : BackgroundService
             return;
         }
 
-        // Deserialise snapshot, update threshold, re-serialise.
-        ModelSnapshot? snap;
-        try { snap = JsonSerializer.Deserialize<ModelSnapshot>(model.ModelBytes!); }
-        catch { return; }
-
-        if (snap is null) return;
+        var (writeModel, snap) = await MLModelSnapshotWriteHelper
+            .LoadTrackedLatestSnapshotAsync(writeCtx, model.Id, ct);
+        if (writeModel == null || snap == null)
+            return;
 
         // Resolve the authoritative current threshold in priority order:
         // 1. OptimalThreshold (set by training or a previous update)
@@ -280,12 +278,8 @@ public sealed class MLThresholdCalibrationWorker : BackgroundService
             model.Symbol, model.Timeframe, model.Id, currentThreshold, newThreshold, delta);
 
         snap.OptimalThreshold = newThreshold;
-        byte[] updatedBytes = JsonSerializer.SerializeToUtf8Bytes(snap);
-
-        // Persist updated snapshot bytes with a targeted update (avoids loading the full entity).
-        await writeCtx.Set<MLModel>()
-            .Where(m => m.Id == model.Id)
-            .ExecuteUpdateAsync(s => s.SetProperty(m => m.ModelBytes, updatedBytes), ct);
+        writeModel.ModelBytes = JsonSerializer.SerializeToUtf8Bytes(snap);
+        await writeCtx.SaveChangesAsync(ct);
 
         // Evict the scorer cache so the new threshold is used on the next signal-scoring call.
         _cache.Remove($"{SnapshotCacheKeyPrefix}{model.Id}");

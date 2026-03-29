@@ -140,6 +140,7 @@ public sealed class MLSuppressionRollbackWorker : BackgroundService
                             m.Timeframe == model.Timeframe &&
                             m.Status == MLModelStatus.Superseded &&
                             m.Id != model.Id &&
+                            !m.IsSuppressed &&
                             m.ModelBytes != null &&
                             !m.IsDeleted)
                 .OrderByDescending(m => m.ActivatedAt)

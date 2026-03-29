@@ -163,10 +163,9 @@ public sealed class MLPositionSizeAdvisorWorker : BackgroundService
 
             try
             {
-                // The config key is unique per (symbol, timeframe) — multiple models sharing
-                // the same pair write to the same key; the last writer wins (acceptable since
-                // all models on the same pair should produce similar multipliers).
-                string configKey = $"{KeyPrefix}{model.Symbol}:{model.Timeframe}{KeySuffix}";
+                // Scope the live multiplier to the concrete model id so coexisting active,
+                // fallback, or shadow-adjacent models cannot overwrite one another's sizing.
+                string configKey = $"{KeyPrefix}{model.Symbol}:{model.Timeframe}:{model.Id}{KeySuffix}";
 
                 // If the model has no stored training accuracy (e.g. imported externally),
                 // we cannot compute a meaningful ratio — fall back to no-op multiplier.

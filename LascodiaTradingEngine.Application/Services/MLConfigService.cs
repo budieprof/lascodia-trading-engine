@@ -130,37 +130,63 @@ internal sealed class MLConfigService
         double kellyFraction, string symbol, Timeframe timeframe, long modelId,
         DbContext db, CancellationToken cancellationToken)
     {
-        var klCacheKey  = $"{KellyLiveCacheKeyPrefix}{symbol}:{timeframe}:LiveMultiplier";
-        var klConfigKey = $"MLKelly:{symbol}:{timeframe}:LiveMultiplier";
-        var kellyLiveMult = await GetCachedConfigAsync(
-            klCacheKey, klConfigKey, 1.0,
+        var klCacheKey  = $"{KellyLiveCacheKeyPrefix}{symbol}:{timeframe}:{modelId}:LiveMultiplier";
+        var klConfigKey = $"MLKelly:{symbol}:{timeframe}:{modelId}:LiveMultiplier";
+        double? kellyLiveMult = await GetCachedConfigNullableAsync(
+            klCacheKey, klConfigKey,
             s => double.TryParse(s,
                 System.Globalization.NumberStyles.Any,
                 System.Globalization.CultureInfo.InvariantCulture,
                 out var v) ? v : (double?)null,
             KellyLiveCacheDuration, db, cancellationToken);
 
-        if (kellyLiveMult < 1.0)
+        if (!kellyLiveMult.HasValue)
         {
-            kellyFraction *= kellyLiveMult;
-            _logger.LogDebug(
-                "KellyLiveAdvisor: {Symbol}/{Tf} model {Id} — liveMultiplier={Mult:F3} kelly→{Kelly:F4}",
-                symbol, timeframe, modelId, kellyLiveMult, kellyFraction);
+            var legacyCacheKey  = $"{KellyLiveCacheKeyPrefix}{symbol}:{timeframe}:LiveMultiplier";
+            var legacyConfigKey = $"MLKelly:{symbol}:{timeframe}:LiveMultiplier";
+            kellyLiveMult = await GetCachedConfigAsync(
+                legacyCacheKey, legacyConfigKey, 1.0,
+                s => double.TryParse(s,
+                    System.Globalization.NumberStyles.Any,
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    out var v) ? v : (double?)null,
+                KellyLiveCacheDuration, db, cancellationToken);
         }
 
-        var kcCacheKey  = $"{KellyCapCacheKeyPrefix}{symbol}:{timeframe}:KellyCap";
-        var kcConfigKey = $"MLKelly:{symbol}:{timeframe}:KellyCap";
-        var kellyCap = await GetCachedConfigAsync(
-            kcCacheKey, kcConfigKey, 1.0,
+        if (kellyLiveMult.GetValueOrDefault(1.0) < 1.0)
+        {
+            kellyFraction *= kellyLiveMult.Value;
+            _logger.LogDebug(
+                "KellyLiveAdvisor: {Symbol}/{Tf} model {Id} — liveMultiplier={Mult:F3} kelly→{Kelly:F4}",
+                symbol, timeframe, modelId, kellyLiveMult.Value, kellyFraction);
+        }
+
+        var kcCacheKey  = $"{KellyCapCacheKeyPrefix}{symbol}:{timeframe}:{modelId}:KellyCap";
+        var kcConfigKey = $"MLKelly:{symbol}:{timeframe}:{modelId}:KellyCap";
+        double? kellyCap = await GetCachedConfigNullableAsync(
+            kcCacheKey, kcConfigKey,
             s => double.TryParse(s,
                 System.Globalization.NumberStyles.Any,
                 System.Globalization.CultureInfo.InvariantCulture,
                 out var v) ? v : (double?)null,
             KellyCapCacheDuration, db, cancellationToken);
 
-        if (kellyCap >= 0.0 && kellyCap < kellyFraction)
+        if (!kellyCap.HasValue)
         {
-            kellyFraction = kellyCap;
+            var legacyCacheKey  = $"{KellyCapCacheKeyPrefix}{symbol}:{timeframe}:KellyCap";
+            var legacyConfigKey = $"MLKelly:{symbol}:{timeframe}:KellyCap";
+            kellyCap = await GetCachedConfigAsync(
+                legacyCacheKey, legacyConfigKey, 1.0,
+                s => double.TryParse(s,
+                    System.Globalization.NumberStyles.Any,
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    out var v) ? v : (double?)null,
+                KellyCapCacheDuration, db, cancellationToken);
+        }
+
+        if (kellyCap.HasValue && kellyCap.Value >= 0.0 && kellyCap.Value < kellyFraction)
+        {
+            kellyFraction = kellyCap.Value;
             _logger.LogDebug(
                 "KellyRiskCap: {Symbol}/{Tf} model {Id} — cap={Cap:F4} applied.",
                 symbol, timeframe, modelId, kellyFraction);

@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -67,7 +68,9 @@ public sealed class MLAdaptiveThresholdWorker : BackgroundService
     private const string CK_MinDrift         = "MLAdaptiveThreshold:MinThresholdDrift";
 
     private readonly IServiceScopeFactory                  _scopeFactory;
+    private readonly IMemoryCache                          _cache;
     private readonly ILogger<MLAdaptiveThresholdWorker>    _logger;
+    private const string SnapshotCacheKeyPrefix = "MLSnapshot:";
 
     /// <summary>
     /// Initialises the worker with scope factory and logger.
@@ -76,9 +79,11 @@ public sealed class MLAdaptiveThresholdWorker : BackgroundService
     /// <param name="logger">Structured logger for threshold adaptation events and diagnostics.</param>
     public MLAdaptiveThresholdWorker(
         IServiceScopeFactory                 scopeFactory,
+        IMemoryCache                         cache,
         ILogger<MLAdaptiveThresholdWorker>   logger)
     {
         _scopeFactory = scopeFactory;
+        _cache        = cache;
         _logger       = logger;
     }
 
@@ -242,8 +247,9 @@ public sealed class MLAdaptiveThresholdWorker : BackgroundService
         // OrderByDescending ensures we get the most recent windowSize records.
         var logs = await readCtx.Set<MLModelPredictionLog>()
             .AsNoTracking()
-            .Where(l => l.MLModelId      == model.Id &&
+            .Where(l => l.MLModelId        == model.Id &&
                         l.DirectionCorrect != null   &&
+                        l.ActualDirection.HasValue   &&
                         !l.IsDeleted)
             .OrderByDescending(l => l.PredictedAt)
             .Take(windowSize)
@@ -276,14 +282,10 @@ public sealed class MLAdaptiveThresholdWorker : BackgroundService
             }
         }
 
-        // ── Deserialise snapshot ──────────────────────────────────────────────
-        // The ModelSnapshot is stored as JSON in MLModel.ModelBytes. Deserialisation failure
-        // (e.g. corrupted bytes) is caught in the outer try/catch in AdaptAllModelsAsync.
-        ModelSnapshot? snap = null;
-        try { snap = JsonSerializer.Deserialize<ModelSnapshot>(model.ModelBytes!); }
-        catch { return; }
-
-        if (snap is null) return;
+        var (writeModel, snap) = await MLModelSnapshotWriteHelper
+            .LoadTrackedLatestSnapshotAsync(writeCtx, model.Id, ct);
+        if (writeModel == null || snap == null)
+            return;
 
         // Start from the same deployed threshold precedence as live scoring so the first
         // adaptive update blends from the true in-production baseline, not an arbitrary 0.5.
@@ -407,13 +409,9 @@ public sealed class MLAdaptiveThresholdWorker : BackgroundService
         // ── Write updated snapshot back to ModelBytes ─────────────────────────
         // Serialise the entire ModelSnapshot to UTF-8 JSON bytes and update in place.
         // ExecuteUpdateAsync avoids loading the full entity into the change tracker.
-        byte[] updatedBytes = JsonSerializer.SerializeToUtf8Bytes(snap);
-
-        await writeCtx.Set<MLModel>()
-            .Where(m => m.Id == model.Id)
-            .ExecuteUpdateAsync(s => s
-                .SetProperty(m => m.ModelBytes, updatedBytes),
-                ct);
+        writeModel.ModelBytes = JsonSerializer.SerializeToUtf8Bytes(snap);
+        await writeCtx.SaveChangesAsync(ct);
+        _cache.Remove($"{SnapshotCacheKeyPrefix}{model.Id}");
     }
 
     // ── EV computation ────────────────────────────────────────────────────────
@@ -467,13 +465,12 @@ public sealed class MLAdaptiveThresholdWorker : BackgroundService
             // so we subtract conf/2 to move the probability below the threshold midpoint.
             double calibP = MLFeatureHelper.ResolveLoggedCalibratedBuyProbability(log, threshold);
 
-            // The model would have emitted a signal if calibP >= threshold at scoring time.
-            bool predicted = calibP >= threshold;
-            bool actual    = log.DirectionCorrect.Value;
+            bool predictedBuy = calibP >= threshold;
+            bool actualBuy    = log.ActualDirection == TradeDirection.Buy;
 
             // Compare simulated prediction to actual outcome.
-            if (predicted == actual) wins++;
-            else                     losses++;
+            if (predictedBuy == actualBuy) wins++;
+            else                          losses++;
         }
 
         int total = wins + losses;

@@ -124,6 +124,7 @@ public sealed class MLKellyFractionWorker : BackgroundService
 
         foreach (var model in models)
         {
+            string configKey = $"{KellyConfigKeyPrefix}{model.Symbol}:{model.Timeframe}:{model.Id}{KellyCapKeySuffix}";
             var logs = await readDb.Set<MLModelPredictionLog>()
                 .AsNoTracking()
                 .Where(l => l.MLModelId == model.Id
@@ -134,7 +135,11 @@ public sealed class MLKellyFractionWorker : BackgroundService
                 .OrderByDescending(l => l.PredictedAt)
                 .ToListAsync(ct);
 
-            if (logs.Count < 30) continue;
+            if (logs.Count < 30)
+            {
+                await PersistNeutralKellyStateAsync(writeDb, model, configKey, ct);
+                continue;
+            }
 
             var wins   = new List<double>(); // magnitudes of profitable predictions
             var losses = new List<double>(); // magnitudes (absolute) of losing predictions
@@ -149,7 +154,11 @@ public sealed class MLKellyFractionWorker : BackgroundService
             }
 
             // Require at least one win and one loss to compute a meaningful b ratio.
-            if (wins.Count == 0 || losses.Count == 0) continue;
+            if (wins.Count == 0 || losses.Count == 0)
+            {
+                await PersistNeutralKellyStateAsync(writeDb, model, configKey, ct);
+                continue;
+            }
 
             // Kelly formula: f* = (p × b − q) / b
             double p     = (double)wins.Count / (wins.Count + losses.Count); // win probability
@@ -179,7 +188,6 @@ public sealed class MLKellyFractionWorker : BackgroundService
                 ComputedAt    = DateTime.UtcNow
             });
 
-            string configKey = $"{KellyConfigKeyPrefix}{model.Symbol}:{model.Timeframe}{KellyCapKeySuffix}";
             await UpsertConfigAsync(
                 writeDb,
                 configKey,
@@ -189,13 +197,20 @@ public sealed class MLKellyFractionWorker : BackgroundService
             // Suppress the model if it has negative EV to prevent live trading on a
             // geometrically destructive model. The suppression is lifted on the next
             // successful retrain which resets IsSuppressed = false.
+            var tracked = await writeDb.Set<MLModel>().FindAsync(new object[] { model.Id }, ct);
             if (negEv)
             {
-                var tracked = await writeDb.Set<MLModel>().FindAsync(new object[] { model.Id }, ct);
                 if (tracked != null) tracked.IsSuppressed = true;
             }
 
             await writeDb.SaveChangesAsync(ct);
+
+            if (!negEv && tracked?.IsSuppressed == true &&
+                await MLSuppressionStateHelper.CanLiftSuppressionAsync(writeDb, tracked, ct))
+            {
+                tracked.IsSuppressed = false;
+                await writeDb.SaveChangesAsync(ct);
+            }
 
             _logger.LogInformation(
                 "MLKellyFractionWorker: {S}/{T} f*={F:F4} halfKelly={H:F4} winRate={P:F3} b={B:F3} negEV={N}",
@@ -226,6 +241,37 @@ public sealed class MLKellyFractionWorker : BackgroundService
                 IsHotReloadable = true,
                 LastUpdatedAt   = DateTime.UtcNow,
             });
+        }
+    }
+
+    private static async Task PersistNeutralKellyStateAsync(
+        Microsoft.EntityFrameworkCore.DbContext writeDb,
+        MLModel                                 model,
+        string                                  configKey,
+        CancellationToken                       ct)
+    {
+        writeDb.Set<MLKellyFractionLog>().Add(new MLKellyFractionLog
+        {
+            MLModelId     = model.Id,
+            Symbol        = model.Symbol,
+            Timeframe     = model.Timeframe.ToString(),
+            KellyFraction = 0.0,
+            HalfKelly     = 0.0,
+            WinRate       = 0.5,
+            WinLossRatio  = 1.0,
+            NegativeEV    = false,
+            ComputedAt    = DateTime.UtcNow
+        });
+
+        await UpsertConfigAsync(writeDb, configKey, "1.0000", ct);
+        await writeDb.SaveChangesAsync(ct);
+
+        var tracked = await writeDb.Set<MLModel>().FindAsync(new object[] { model.Id }, ct);
+        if (tracked?.IsSuppressed == true &&
+            await MLSuppressionStateHelper.CanLiftSuppressionAsync(writeDb, tracked, ct))
+        {
+            tracked.IsSuppressed = false;
+            await writeDb.SaveChangesAsync(ct);
         }
     }
 }

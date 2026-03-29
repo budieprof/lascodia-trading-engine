@@ -184,12 +184,12 @@ public sealed class MLConformalCalibrationWorker : BackgroundService
                     return (1 - p) <= threshold && p <= threshold;
                 });
 
-                var writeModel = await writeDb.Set<MLModel>()
-                    .FirstOrDefaultAsync(m => m.Id == model.Id && !m.IsDeleted, ct);
-                if (writeModel == null) continue;
+                var (writeModel, latestSnap) = await MLModelSnapshotWriteHelper
+                    .LoadTrackedLatestSnapshotAsync(writeDb, model.Id, ct);
+                if (writeModel == null || latestSnap == null) continue;
 
-                snap.ConformalQHat = threshold;
-                writeModel.ModelBytes = JsonSerializer.SerializeToUtf8Bytes(snap);
+                latestSnap.ConformalQHat = threshold;
+                writeModel.ModelBytes = JsonSerializer.SerializeToUtf8Bytes(latestSnap);
 
                 // Persist the calibration record with all computed diagnostics.
                 writeDb.Set<MLConformalCalibration>().Add(new MLConformalCalibration

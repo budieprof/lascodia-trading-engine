@@ -264,13 +264,14 @@ public sealed class MLIsotonicRecalibrationWorker : BackgroundService
             "IsotonicRecal: {Symbol}/{Tf} model {Id}: fitted {N} PAVA breakpoints from {Count} samples.",
             model.Symbol, model.Timeframe, model.Id, newBreakpoints.Length / 2, resolved.Count);
 
-        // Overwrite the existing isotonic breakpoints with the freshly fitted ones.
-        snap.IsotonicBreakpoints = newBreakpoints;
-        byte[] updatedBytes = JsonSerializer.SerializeToUtf8Bytes(snap);
+        var (writeModel, latestSnap) = await MLModelSnapshotWriteHelper
+            .LoadTrackedLatestSnapshotAsync(writeCtx, model.Id, ct);
+        if (writeModel == null || latestSnap == null)
+            return;
 
-        await writeCtx.Set<MLModel>()
-            .Where(m => m.Id == model.Id)
-            .ExecuteUpdateAsync(s => s.SetProperty(m => m.ModelBytes, updatedBytes), ct);
+        latestSnap.IsotonicBreakpoints = newBreakpoints;
+        writeModel.ModelBytes = JsonSerializer.SerializeToUtf8Bytes(latestSnap);
+        await writeCtx.SaveChangesAsync(ct);
 
         // Evict the scorer cache so the updated breakpoints are used immediately.
         _cache.Remove($"{SnapshotCacheKeyPrefix}{model.Id}");

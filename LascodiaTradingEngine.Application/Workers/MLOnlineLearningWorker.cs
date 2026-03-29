@@ -3,6 +3,7 @@ using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -31,11 +32,13 @@ namespace LascodiaTradingEngine.Application.Workers;
 public sealed class MLOnlineLearningWorker : BackgroundService
 {
     private readonly IServiceScopeFactory   _scopeFactory;
+    private readonly IMemoryCache           _cache;
     private readonly ILogger<MLOnlineLearningWorker> _logger;
 
     private const double OnlineLr        = 1e-4;
     private const int    BatchSize       = 32;
     private const int    PollIntervalSec = 60;
+    private const string SnapshotCacheKeyPrefix = "MLSnapshot:";
 
     /// <summary>
     /// Initialises the worker with its DI scope factory and logger.
@@ -45,9 +48,13 @@ public sealed class MLOnlineLearningWorker : BackgroundService
     /// are correctly disposed after each batch.
     /// </param>
     /// <param name="logger">Structured logger scoped to this worker type.</param>
-    public MLOnlineLearningWorker(IServiceScopeFactory scopeFactory, ILogger<MLOnlineLearningWorker> logger)
+    public MLOnlineLearningWorker(
+        IServiceScopeFactory scopeFactory,
+        IMemoryCache cache,
+        ILogger<MLOnlineLearningWorker> logger)
     {
         _scopeFactory = scopeFactory;
+        _cache        = cache;
         _logger       = logger;
     }
 
@@ -130,13 +137,11 @@ public sealed class MLOnlineLearningWorker : BackgroundService
 
             try
             {
-                var snap = JsonSerializer.Deserialize<ModelSnapshot>(model.ModelBytes);
-                if (snap == null) continue;
-
                 DateTime outcomeCutoff = model.LastOnlineLearningAt ?? DateTime.UtcNow.AddHours(-2);
                 var logs = await readDb.Set<MLModelPredictionLog>()
                     .Where(l => !l.IsDeleted
                              && l.MLModelId == model.Id
+                             && l.ActualDirection.HasValue
                              && l.DirectionCorrect.HasValue
                              && l.OutcomeRecordedAt != null
                              && l.OutcomeRecordedAt > outcomeCutoff)
@@ -145,6 +150,11 @@ public sealed class MLOnlineLearningWorker : BackgroundService
                     .ToListAsync(ct);
 
                 if (logs.Count == 0) continue;
+
+                var (writeModel, snap) = await MLModelSnapshotWriteHelper
+                    .LoadTrackedLatestSnapshotAsync(writeDb, model.Id, ct);
+                if (writeModel == null || snap == null)
+                    continue;
 
                 // GBM models store their structure in GbmTreesJson rather than the
                 // Weights/Biases arrays used by logistic/ELM architectures.
@@ -162,9 +172,8 @@ public sealed class MLOnlineLearningWorker : BackgroundService
                 DateTime latestOutcomeRecordedAt = outcomeCutoff;
                 foreach (var log in logs)
                 {
-                    double targetLabel = (log.ActualDirection == log.PredictedDirection) ? 1.0 : 0.0;
-                    double pBuy        = MLFeatureHelper.ResolveLoggedCalibratedBuyProbability(log);
-                    double pHat        = log.PredictedDirection == TradeDirection.Buy ? pBuy : 1.0 - pBuy;
+                    double targetLabel = log.ActualDirection == TradeDirection.Buy ? 1.0 : 0.0;
+                    double pHat        = MLFeatureHelper.ResolveLoggedCalibratedBuyProbability(log);
 
                     // Cross-entropy gradient w.r.t. the logit: σ(z) − y.
                     // This is the standard logistic regression gradient; subtracting it
@@ -197,12 +206,13 @@ public sealed class MLOnlineLearningWorker : BackgroundService
                 if (appliedCount == 0) continue;
 
                 // Re-serialise the updated snapshot back into the model blob.
-                model.ModelBytes = JsonSerializer.SerializeToUtf8Bytes(snap);
+                writeModel.ModelBytes = JsonSerializer.SerializeToUtf8Bytes(snap);
+                _cache.Remove($"{SnapshotCacheKeyPrefix}{model.Id}");
 
                 // Track cumulative online updates so monitoring workers can flag models
                 // that have diverged significantly from their batch-trained baseline.
-                model.OnlineLearningUpdateCount += appliedCount;
-                model.LastOnlineLearningAt       = latestOutcomeRecordedAt;
+                writeModel.OnlineLearningUpdateCount += appliedCount;
+                writeModel.LastOnlineLearningAt       = latestOutcomeRecordedAt;
 
                 await writeDb.SaveChangesAsync(ct);
                 _logger.LogDebug(

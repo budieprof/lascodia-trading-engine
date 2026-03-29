@@ -230,20 +230,15 @@ public sealed class MLRecalibrationWorker : BackgroundService
             return;
         }
 
-        // Deserialise snapshot to access existing Platt parameters and isotonic breakpoints.
-        ModelSnapshot? snap;
-        try
+        var (writeModel, snap) = await MLModelSnapshotWriteHelper
+            .LoadTrackedLatestSnapshotAsync(writeCtx, model.Id, ct);
+        if (writeModel == null || snap == null)
         {
-            snap = JsonSerializer.Deserialize<ModelSnapshot>(model.ModelBytes!);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex,
-                "Recalibration: failed to deserialise snapshot for model {Id} — skipping.", model.Id);
+            _logger.LogWarning(
+                "Recalibration: failed to load the latest snapshot for model {Id} — skipping.",
+                model.Id);
             return;
         }
-
-        if (snap is null) return;
 
         double decisionThreshold = MLFeatureHelper.ResolveEffectiveDecisionThreshold(snap);
 
@@ -304,22 +299,8 @@ public sealed class MLRecalibrationWorker : BackgroundService
         if (newABuy  != 0.0) { snap.PlattABuy  = newABuy;  snap.PlattBBuy  = newBBuy;  }
         if (newASell != 0.0) { snap.PlattASell = newASell; snap.PlattBSell = newBSell; }
 
-        byte[] updatedBytes;
-        try
-        {
-            updatedBytes = JsonSerializer.SerializeToUtf8Bytes(snap);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Recalibration: failed to re-serialise snapshot for model {Id}.", model.Id);
-            return;
-        }
-
-        // Persist the patched snapshot bytes directly into ModelBytes using a targeted update
-        // (avoids loading the full entity into EF change tracker).
-        await writeCtx.Set<MLModel>()
-            .Where(m => m.Id == model.Id)
-            .ExecuteUpdateAsync(s => s.SetProperty(m => m.ModelBytes, updatedBytes), ct);
+        writeModel.ModelBytes = JsonSerializer.SerializeToUtf8Bytes(snap);
+        await writeCtx.SaveChangesAsync(ct);
 
         // Evict the scorer's 30-min cache entry so MLSignalScorer picks up the new parameters
         // on its very next scoring call, rather than continuing to use the stale snapshot.

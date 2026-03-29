@@ -2,6 +2,7 @@ using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Domain.Entities;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -33,7 +34,9 @@ namespace LascodiaTradingEngine.Application.Workers;
 public sealed class MLSharpeEnsembleWorker : BackgroundService
 {
     private readonly IServiceScopeFactory _scopeFactory;
+    private readonly IMemoryCache _cache;
     private readonly ILogger<MLSharpeEnsembleWorker> _logger;
+    private const string SnapshotCacheKeyPrefix = "MLSnapshot:";
 
     /// <summary>
     /// Number of most-recent resolved prediction logs that would be required for future
@@ -50,9 +53,13 @@ public sealed class MLSharpeEnsembleWorker : BackgroundService
     /// contexts are correctly disposed after each run.
     /// </param>
     /// <param name="logger">Structured logger scoped to this worker type.</param>
-    public MLSharpeEnsembleWorker(IServiceScopeFactory scopeFactory, ILogger<MLSharpeEnsembleWorker> logger)
+    public MLSharpeEnsembleWorker(
+        IServiceScopeFactory scopeFactory,
+        IMemoryCache cache,
+        ILogger<MLSharpeEnsembleWorker> logger)
     {
         _scopeFactory = scopeFactory;
+        _cache        = cache;
         _logger       = logger;
     }
 
@@ -157,11 +164,13 @@ public sealed class MLSharpeEnsembleWorker : BackgroundService
                 .Select(w => w / sum)
                 .ToArray();
 
-            var writeModel = await writeDb.Set<MLModel>()
-                .FirstOrDefaultAsync(m => m.Id == model.Id && !m.IsDeleted, ct);
-            if (writeModel == null) continue;
+            var (writeModel, latestSnap) = await MLModelSnapshotWriteHelper
+                .LoadTrackedLatestSnapshotAsync(writeDb, model.Id, ct);
+            if (writeModel == null || latestSnap == null) continue;
 
-            writeModel.ModelBytes = JsonSerializer.SerializeToUtf8Bytes(snap);
+            latestSnap.EnsembleSelectionWeights = snap.EnsembleSelectionWeights;
+            writeModel.ModelBytes = JsonSerializer.SerializeToUtf8Bytes(latestSnap);
+            _cache.Remove($"{SnapshotCacheKeyPrefix}{model.Id}");
             _logger.LogDebug("MLSharpeEnsembleWorker: backfilled ensemble weights from learner-accuracy weights for {S}/{T}.",
                 model.Symbol, model.Timeframe);
         }

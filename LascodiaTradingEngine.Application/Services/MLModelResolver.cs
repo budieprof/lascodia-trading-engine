@@ -64,6 +64,7 @@ internal sealed class MLModelResolver
                             x.Timeframe   == signalTimeframe &&
                             x.RegimeScope == currentRegime &&
                             x.IsActive    &&
+                            !x.IsFallbackChampion &&
                             !x.IsDeleted)
                 .OrderByDescending(x => x.ExpectedValue ?? -1m)
                 .ThenByDescending(x => x.ActivatedAt)
@@ -78,6 +79,7 @@ internal sealed class MLModelResolver
                             x.Timeframe   == signalTimeframe &&
                             x.RegimeScope == null &&
                             x.IsActive    &&
+                            !x.IsFallbackChampion &&
                             !x.IsDeleted)
                 .OrderByDescending(x => x.ExpectedValue ?? -1m)
                 .ThenByDescending(x => x.ActivatedAt)
@@ -103,7 +105,9 @@ internal sealed class MLModelResolver
                     .Where(x => x.Symbol           == signal.Symbol      &&
                                 x.Timeframe        == signalTimeframe     &&
                                 x.IsFallbackChampion                      &&
-                                x.IsActive         && !x.IsDeleted)
+                                x.IsActive         &&
+                                !x.IsSuppressed    &&
+                                !x.IsDeleted)
                     .OrderByDescending(x => x.ExpectedValue ?? -1m)
                     .ThenByDescending(x => x.ActivatedAt)
                     .FirstOrDefaultAsync(fbCts.Token);

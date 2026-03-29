@@ -185,12 +185,12 @@ public sealed class MLTemperatureScalingWorker : BackgroundService
             double[] calConf = logits.Select(lg => Sigmoid(lg / optT)).ToArray();
             double postEce   = ComputeEce(calConf, labels);
 
-            var writeModel = await writeDb.Set<MLModel>()
-                .FirstOrDefaultAsync(x => x.Id == model.Id && !x.IsDeleted, ct);
-            if (writeModel != null)
+            var (writeModel, latestSnap) = await MLModelSnapshotWriteHelper
+                .LoadTrackedLatestSnapshotAsync(writeDb, model.Id, ct);
+            if (writeModel != null && latestSnap != null)
             {
-                snap.TemperatureScale = optT;
-                writeModel.ModelBytes = JsonSerializer.SerializeToUtf8Bytes(snap);
+                latestSnap.TemperatureScale = optT;
+                writeModel.ModelBytes = JsonSerializer.SerializeToUtf8Bytes(latestSnap);
                 _cache.Remove($"{SnapshotCacheKeyPrefix}{model.Id}");
             }
 

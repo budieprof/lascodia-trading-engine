@@ -44,8 +44,6 @@ namespace LascodiaTradingEngine.Application.Workers;
 /// A rising drift EMA indicates the model's calibration is deteriorating and may warrant
 /// a full recalibration pass by <see cref="MLRecalibrationWorker"/>.
 ///
-/// The worker updates <see cref="MLModel.OnlineLearningUpdateCount"/> and
-/// <see cref="MLModel.LastOnlineLearningAt"/> for audit and monitoring purposes.
 /// Runs every 24 hours.
 /// </summary>
 public sealed class MLOnlinePlattWorker : BackgroundService
@@ -124,15 +122,6 @@ public sealed class MLOnlinePlattWorker : BackgroundService
 
         foreach (var model in activeModels)
         {
-            // Skip models without serialised weights — no snapshot to read A, B from.
-            if (model.ModelBytes == null) continue;
-
-            // Deserialise snapshot to read the current Platt A and B baseline values.
-            ModelSnapshot? snap;
-            try { snap = JsonSerializer.Deserialize<ModelSnapshot>(model.ModelBytes); }
-            catch { continue; }
-            if (snap == null) continue;
-
             // Load the most recent resolved prediction logs, ordered newest first.
             var recentLogs = await readDb.Set<MLModelPredictionLog>()
                 .Where(p => p.MLModelId == model.Id
@@ -145,6 +134,11 @@ public sealed class MLOnlinePlattWorker : BackgroundService
 
             // Require at least 30 resolved logs for a statistically meaningful SGD update.
             if (recentLogs.Count < 30) continue;
+
+            var (writeModel, snap) = await MLModelSnapshotWriteHelper
+                .LoadTrackedLatestSnapshotAsync(writeDb, model.Id, ct);
+            if (writeModel == null || snap == null)
+                continue;
 
             // Initialise A and B from the current snapshot values.
             double a = snap.PlattA, b = snap.PlattB;
@@ -173,28 +167,22 @@ public sealed class MLOnlinePlattWorker : BackgroundService
 
             // EMA drift tracker: smoothed exponential moving average of per-update drift.
             // newDrift = α × currentDrift + (1 − α) × previousEma
-            double newDrift = model.PlattCalibrationDrift.HasValue
-                ? EmaAlpha * drift + (1 - EmaAlpha) * model.PlattCalibrationDrift.Value
+            double newDrift = writeModel.PlattCalibrationDrift.HasValue
+                ? EmaAlpha * drift + (1 - EmaAlpha) * writeModel.PlattCalibrationDrift.Value
                 : drift; // first-time initialisation: use raw drift
 
             // Persist the updated Platt parameters and drift signal on the model entity.
-            var writeModel = await writeDb.Set<MLModel>()
-                .FirstOrDefaultAsync(m => m.Id == model.Id && !m.IsDeleted, ct);
-            if (writeModel == null) continue;
-
             snap.PlattA = a;
             snap.PlattB = b;
             writeModel.PlattA                = (decimal)a;
             writeModel.PlattB                = (decimal)b;
             writeModel.ModelBytes            = JsonSerializer.SerializeToUtf8Bytes(snap);
             writeModel.PlattCalibrationDrift = newDrift;
-            writeModel.OnlineLearningUpdateCount++;      // audit counter
-            writeModel.LastOnlineLearningAt  = DateTime.UtcNow;
+            await writeDb.SaveChangesAsync(ct);
             _cache.Remove($"{SnapshotCacheKeyPrefix}{model.Id}");
 
             _logger.LogDebug("MLOnlinePlattWorker: {S}/{T} PlattA={A:F4} PlattB={B:F4} Drift={D:F4}",
                 model.Symbol, model.Timeframe, a, b, newDrift);
         }
-        await writeDb.SaveChangesAsync(ct);
     }
 }
