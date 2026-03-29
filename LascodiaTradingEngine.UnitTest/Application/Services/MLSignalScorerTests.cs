@@ -324,6 +324,52 @@ public class MLSignalScorerTests
         Assert.Equal(0.3, result, precision: 5);
     }
 
+    [Fact]
+    public void ApplyBasicCalibration_Treats_NonFinite_Raw_Probability_As_Neutral()
+    {
+        var snap = new ModelSnapshot { PlattA = 2.0, PlattB = -1.0 };
+
+        double result = InferenceHelpers.ApplyBasicCalibration(double.NaN, snap);
+
+        Assert.InRange(result, 0.26, 0.27);
+    }
+
+    [Fact]
+    public void ApplyDeployedCalibration_Sanitises_Malformed_Isotonic_And_NonFinite_Raw_Probability()
+    {
+        var snap = new ModelSnapshot
+        {
+            PlattA = 1.0,
+            PlattB = 0.0,
+            IsotonicBreakpoints = [double.NaN, 0.1, 0.25, -0.5, 0.75, 2.0, 0.5]
+        };
+
+        double result = InferenceHelpers.ApplyDeployedCalibration(double.NaN, snap);
+
+        Assert.Equal(0.5, result, precision: 6);
+    }
+
+    [Fact]
+    public void ApplyDeployedCalibration_Sanitises_NonFinite_Calibration_Parameters()
+    {
+        var snap = new ModelSnapshot
+        {
+            TemperatureScale = double.PositiveInfinity,
+            PlattA = double.NaN,
+            PlattB = double.NaN,
+            PlattABuy = double.NaN,
+            PlattBBuy = double.NaN,
+            PlattASell = double.NaN,
+            PlattBSell = double.NaN,
+            AgeDecayLambda = double.PositiveInfinity,
+            TrainedAtUtc = DateTime.UtcNow
+        };
+
+        double result = InferenceHelpers.ApplyDeployedCalibration(0.8, snap);
+
+        Assert.Equal(0.8, result, precision: 6);
+    }
+
     // ────────────────────────────────────────────────────────────────────────
     //  AggregateProbs — edge cases
     // ────────────────────────────────────────────────────────────────────────
@@ -352,6 +398,38 @@ public class MLSignalScorerTests
         // sigmoid(0) = 0.5, sigmoid(2) ≈ 0.88
         Assert.Equal(0.5, withoutBias, precision: 5);
         Assert.True(withBias > 0.85);
+    }
+
+    [Fact]
+    public void AggregateProbs_Treats_NonFinite_Probabilities_As_Neutral()
+    {
+        double[] probs = [double.NaN, 1.0];
+
+        double result = InferenceHelpers.AggregateProbs(probs, 2, null, 0.0, null, null, null);
+
+        Assert.Equal(0.75, result, precision: 6);
+    }
+
+    [Fact]
+    public void AggregateProbs_Ignores_NonFinite_Ges_Weights()
+    {
+        double[] probs = [0.2, 0.8];
+        double[] ges = [double.NaN, 1.0];
+
+        double result = InferenceHelpers.AggregateProbs(probs, 2, null, 0.0, ges, null, null);
+
+        Assert.Equal(0.8, result, precision: 6);
+    }
+
+    [Fact]
+    public void AggregateProbs_Ignores_NonFinite_Meta_Weights()
+    {
+        double[] probs = [0.2, 0.8];
+        double[] metaW = [double.NaN, double.NaN];
+
+        double result = InferenceHelpers.AggregateProbs(probs, 2, metaW, double.NaN, null, null, null);
+
+        Assert.Equal(0.5, result, precision: 6);
     }
 
     [Fact]

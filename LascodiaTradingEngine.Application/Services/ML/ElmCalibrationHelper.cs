@@ -55,7 +55,7 @@ internal static class ElmCalibrationHelper
             double raw = ensembleRawProb(
                 calSet[i].Features, weights, biases, inputWeights, inputBiases,
                 featureCount, hiddenSize, featureSubsets, null);
-            rawLogits[i] = MLFeatureHelper.Logit(Math.Clamp(raw, 1e-7, 1.0 - 1e-7));
+            rawLogits[i] = MLFeatureHelper.Logit(ClampLogitProbability(raw));
         }
 
         const int plattBatchSize = 256;
@@ -170,7 +170,7 @@ internal static class ElmCalibrationHelper
         double plattB,
         double temperatureScale)
     {
-        double rawLogit = MLFeatureHelper.Logit(Math.Clamp(rawProb, 1e-7, 1.0 - 1e-7));
+        double rawLogit = MLFeatureHelper.Logit(ClampLogitProbability(rawProb));
         return temperatureScale > 0.0 && temperatureScale < 10.0
             ? MLFeatureHelper.Sigmoid(rawLogit / temperatureScale)
             : MLFeatureHelper.Sigmoid(plattA * rawLogit + plattB);
@@ -236,9 +236,9 @@ internal static class ElmCalibrationHelper
         for (int i = 0; i < calSet.Count; i++)
         {
             pairs[i] = (
-                ensembleCalibProb(
+                ClampProbability(ensembleCalibProb(
                     calSet[i].Features, weights, biases, inputWeights, inputBiases,
-                    plattA, plattB, featureCount, hiddenSize, featureSubsets, null),
+                    plattA, plattB, featureCount, hiddenSize, featureSubsets, null)),
                 ToBinaryLabel(calSet[i].Direction));
         }
         Array.Sort(pairs, (a, b) => a.Pred.CompareTo(b.Pred));
@@ -278,22 +278,55 @@ internal static class ElmCalibrationHelper
 
     internal static double ApplyIsotonicCalibration(double p, double[] breakpoints)
     {
-        if (breakpoints.Length < 2) return p;
-        int n = breakpoints.Length / 2;
-        if (p <= breakpoints[0]) return breakpoints[1];
-        if (p >= breakpoints[(n - 1) * 2]) return breakpoints[(n - 1) * 2 + 1];
+        double clampedP = ClampProbability(p);
+        if (breakpoints.Length < 2)
+            return clampedP;
 
-        for (int i = 0; i < n - 1; i++)
+        var clean = new List<(double X, double Y)>(breakpoints.Length / 2);
+        for (int i = 0; i + 1 < breakpoints.Length; i += 2)
         {
-            double x0 = breakpoints[i * 2], y0 = breakpoints[i * 2 + 1];
-            double x1 = breakpoints[(i + 1) * 2], y1 = breakpoints[(i + 1) * 2 + 1];
-            if (p >= x0 && p <= x1)
+            double rawX = breakpoints[i];
+            double rawY = breakpoints[i + 1];
+            if (!double.IsFinite(rawX) || !double.IsFinite(rawY))
+                continue;
+
+            double x = ClampProbability(rawX);
+            double y = ClampProbability(rawY);
+            if (clean.Count > 0)
             {
-                double t = (x1 - x0) > 1e-10 ? (p - x0) / (x1 - x0) : 0.5;
-                return y0 + t * (y1 - y0);
+                var last = clean[^1];
+                if (x < last.X)
+                    continue;
+
+                if (Math.Abs(x - last.X) <= 1e-12)
+                {
+                    clean[^1] = (x, y);
+                    continue;
+                }
             }
+
+            clean.Add((x, y));
         }
-        return p;
+
+        if (clean.Count == 0)
+            return clampedP;
+        if (clean.Count == 1)
+            return clean[0].Y;
+        if (clampedP <= clean[0].X)
+            return clean[0].Y;
+
+        for (int i = 0; i < clean.Count - 1; i++)
+        {
+            var (x0, y0) = clean[i];
+            var (x1, y1) = clean[i + 1];
+            if (clampedP > x1)
+                continue;
+
+            double t = (x1 - x0) > 1e-10 ? (clampedP - x0) / (x1 - x0) : 0.5;
+            return ClampProbability(y0 + t * (y1 - y0));
+        }
+
+        return clean[^1].Y;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -317,6 +350,7 @@ internal static class ElmCalibrationHelper
             double calibP = ensembleCalibProb(
                 calSet[i].Features, weights, biases, inputWeights, inputBiases,
                 plattA, plattB, featureCount, hiddenSize, featureSubsets, null);
+            calibP = ClampProbability(calibP);
             if (isotonicBp.Length > 0) calibP = ApplyIsotonicCalibration(calibP, isotonicBp);
             double y = ToBinaryLabel(calSet[i].Direction);
             residuals[i] = Math.Abs(y - calibP);
@@ -354,7 +388,7 @@ internal static class ElmCalibrationHelper
             double raw = ensembleRawProb(
                 calSet[i].Features, weights, biases, inputWeights, inputBiases,
                 featureCount, hiddenSize, featureSubsets, null);
-            rawProbs[i] = Math.Clamp(raw, 1e-7, 1.0 - 1e-7);
+            rawProbs[i] = ClampLogitProbability(raw);
             targets[i] = ToBinaryLabel(calSet[i].Direction);
         }
 
@@ -421,7 +455,7 @@ internal static class ElmCalibrationHelper
         double ageDecayLambda,
         DateTime trainedAtUtc)
     {
-        double clampedRaw = Math.Clamp(rawP, 1e-7, 1.0 - 1e-7);
+        double clampedRaw = ClampLogitProbability(rawP);
         double rawLogit = MLFeatureHelper.Logit(clampedRaw);
         double globalCalibP = temperatureScale > 0.0 && temperatureScale < 10.0
             ? MLFeatureHelper.Sigmoid(rawLogit / temperatureScale)
@@ -465,9 +499,9 @@ internal static class ElmCalibrationHelper
         double sum = 0;
         foreach (var s in calSet)
         {
-            double p = Math.Clamp(ensembleCalibProb(
+            double p = ClampProbability(ensembleCalibProb(
                 s.Features, weights, biases, inputWeights, inputBiases,
-                plattA, plattB, featureCount, hiddenSize, featureSubsets, null), 0.0, 1.0);
+                plattA, plattB, featureCount, hiddenSize, featureSubsets, null));
 
             // Kelly fraction for roughly symmetric payoff trades simplifies to max(0, 2p - 1).
             sum += Math.Max(0.0, 2.0 * p - 1.0);
@@ -494,7 +528,7 @@ internal static class ElmCalibrationHelper
             double raw = ensembleRawProb(
                 s.Features, weights, biases, inputWeights, inputBiases,
                 featureCount, hiddenSize, featureSubsets, null);
-            double logit = MLFeatureHelper.Logit(Math.Clamp(raw, 1e-7, 1.0 - 1e-7));
+            double logit = MLFeatureHelper.Logit(ClampLogitProbability(raw));
             double dist = Math.Abs(logit);
             sum += dist;
             sumSq += dist * dist;
@@ -525,9 +559,9 @@ internal static class ElmCalibrationHelper
         double[] probs = new double[calSet.Count];
         for (int i = 0; i < calSet.Count; i++)
         {
-            probs[i] = Math.Clamp(ensembleCalibProb(
+            probs[i] = ClampProbability(ensembleCalibProb(
                 calSet[i].Features, weights, biases, inputWeights, inputBiases,
-                plattA, plattB, featureCount, hiddenSize, featureSubsets, null), 0.0, 1.0);
+                plattA, plattB, featureCount, hiddenSize, featureSubsets, null));
         }
 
         int lo = Math.Clamp(searchMin, 1, 99);
@@ -550,5 +584,21 @@ internal static class ElmCalibrationHelper
         }
 
         return bestThreshold;
+    }
+
+    private static double ClampProbability(double probability)
+    {
+        if (!double.IsFinite(probability))
+            return 0.5;
+
+        return Math.Clamp(probability, 0.0, 1.0);
+    }
+
+    private static double ClampLogitProbability(double probability)
+    {
+        if (!double.IsFinite(probability))
+            return 0.5;
+
+        return Math.Clamp(probability, 1e-7, 1.0 - 1e-7);
     }
 }

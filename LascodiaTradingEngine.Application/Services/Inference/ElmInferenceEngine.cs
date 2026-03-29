@@ -64,13 +64,13 @@ public sealed class ElmInferenceEngine : IModelInferenceEngine
                 featureCount,
                 snapshot.ElmHiddenDim);
 
-            probs[validLearners.Count] = ElmLearnerProb(
+            probs[validLearners.Count] = ClampProbabilityOrNeutral(ElmLearnerProb(
                 features, wOut, biases[k],
                 wIn,
                 inputBiases ?? [],
                 featureCount, learnerHidden,
                 subset,
-                GetActivation(snapshot.LearnerActivations, k));
+                GetActivation(snapshot.LearnerActivations, k)));
             validLearners.Add(k);
         }
 
@@ -78,16 +78,16 @@ public sealed class ElmInferenceEngine : IModelInferenceEngine
         if (validCount == 0)
             return null;
 
-        double avg = InferenceHelpers.AggregateProbs(
+        double avg = ClampProbabilityOrNeutral(InferenceHelpers.AggregateProbs(
             probs, validCount,
             SelectLearnerValues(snapshot.MetaWeights, validLearners), snapshot.MetaBias,
             SelectLearnerValues(snapshot.EnsembleSelectionWeights, validLearners),
             SelectLearnerValues(snapshot.LearnerAccuracyWeights, validLearners),
-            SelectLearnerValues(snapshot.LearnerCalAccuracies, validLearners));
+            SelectLearnerValues(snapshot.LearnerCalAccuracies, validLearners)));
 
         double variance = 0;
         for (int k = 0; k < validCount; k++) { double d = probs[k] - avg; variance += d * d; }
-        double std = validCount > 1 ? Math.Sqrt(variance / (validCount - 1)) : 0.0;
+        double std = validCount > 1 && double.IsFinite(variance) ? Math.Sqrt(variance / (validCount - 1)) : 0.0;
 
         decimal? mcMean = null, mcVar = null;
         if (mcDropoutSamples > 0)
@@ -192,7 +192,7 @@ public sealed class ElmInferenceEngine : IModelInferenceEngine
                     subset,
                     featureCount,
                     snap.ElmHiddenDim);
-                probs[validLearners.Count] = ElmLearnerProbWithHiddenDropout(
+                probs[validLearners.Count] = ClampProbabilityOrNeutral(ElmLearnerProbWithHiddenDropout(
                     features, wOut, biases[k],
                     wIn,
                     inputBiases ?? [],
@@ -200,7 +200,7 @@ public sealed class ElmInferenceEngine : IModelInferenceEngine
                     subset,
                     GetActivation(snap.LearnerActivations, k),
                     rng,
-                    dropoutRate);
+                    dropoutRate));
                 validLearners.Add(k);
             }
 
@@ -211,18 +211,23 @@ public sealed class ElmInferenceEngine : IModelInferenceEngine
                 continue;
             }
 
-            samples[s] = InferenceHelpers.AggregateProbs(
+            samples[s] = ClampProbabilityOrNeutral(InferenceHelpers.AggregateProbs(
                 probs, validCount,
                 SelectLearnerValues(snap.MetaWeights, validLearners), snap.MetaBias,
                 SelectLearnerValues(snap.EnsembleSelectionWeights, validLearners),
                 SelectLearnerValues(snap.LearnerAccuracyWeights, validLearners),
-                SelectLearnerValues(snap.LearnerCalAccuracies, validLearners));
+                SelectLearnerValues(snap.LearnerCalAccuracies, validLearners)));
         }
 
         double mean = samples.Average();
         double var2 = 0;
         for (int s = 0; s < numSamples; s++) { double d = samples[s] - mean; var2 += d * d; }
         var2 /= numSamples > 1 ? numSamples - 1 : 1;
+
+        if (!double.IsFinite(mean))
+            mean = 0.5;
+        if (!double.IsFinite(var2) || var2 < 0.0)
+            var2 = 0.0;
 
         return ((decimal)mean, (decimal)var2);
     }
@@ -311,5 +316,13 @@ public sealed class ElmInferenceEngine : IModelInferenceEngine
         }
 
         return selected;
+    }
+
+    private static double ClampProbabilityOrNeutral(double probability)
+    {
+        if (!double.IsFinite(probability))
+            return 0.5;
+
+        return Math.Clamp(probability, 0.0, 1.0);
     }
 }

@@ -1367,38 +1367,13 @@ public sealed class MLSignalScorer : IMLSignalScorer
             return null;
         }
 
-        double rawProb              = engineResult.Value.Probability;
-        double ensembleStd          = engineResult.Value.EnsembleStd;
+        double rawProb              = ClampProbabilityOrNeutral(engineResult.Value.Probability);
+        double ensembleStd          = ClampNonNegativeFinite(engineResult.Value.EnsembleStd);
         decimal? mcDropoutMean      = engineResult.Value.McDropoutMean;
         decimal? mcDropoutVariance  = engineResult.Value.McDropoutVariance;
 
-        // ── 9. Platt / temperature scaling (with class-conditional fallback) ──
-        double rawLogit = MLFeatureHelper.Logit(rawProb);
-        double globalCalibP;
-        if (snap.TemperatureScale > 0.0 && snap.TemperatureScale < 10.0)
-            globalCalibP = MLFeatureHelper.Sigmoid(rawLogit / snap.TemperatureScale);
-        else
-            globalCalibP = MLFeatureHelper.Sigmoid(snap.PlattA * rawLogit + snap.PlattB);
-
-        double calibP;
-        if (globalCalibP >= 0.5 && snap.PlattABuy != 0.0)
-            calibP = MLFeatureHelper.Sigmoid(snap.PlattABuy * rawLogit + snap.PlattBBuy);
-        else if (globalCalibP < 0.5 && snap.PlattASell != 0.0)
-            calibP = MLFeatureHelper.Sigmoid(snap.PlattASell * rawLogit + snap.PlattBSell);
-        else
-            calibP = globalCalibP;
-
-        // ── 9b. Isotonic calibration ─────────────────────────────────────────
-        if (snap.IsotonicBreakpoints.Length >= 4)
-            calibP = BaggedLogisticTrainer.ApplyIsotonicCalibration(calibP, snap.IsotonicBreakpoints);
-
-        // ── 9c. Model age decay ──────────────────────────────────────────────
-        if (snap.AgeDecayLambda > 0.0 && snap.TrainedAtUtc != default)
-        {
-            double daysSinceTrain = (DateTime.UtcNow - snap.TrainedAtUtc).TotalDays;
-            double decayFactor    = Math.Exp(-snap.AgeDecayLambda * Math.Max(0.0, daysSinceTrain));
-            calibP = 0.5 + (calibP - 0.5) * decayFactor;
-        }
+        // ── 9. Deployed calibration stack ────────────────────────────────────
+        double calibP = InferenceHelpers.ApplyDeployedCalibration(rawProb, snap);
 
         // ── 9d. Feature stability diagnostic ─────────────────────────────────
         if (_logger.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug) &&
@@ -1565,9 +1540,13 @@ public sealed class MLSignalScorer : IMLSignalScorer
             for (int i = 0; i < foldCount; i++)
             {
                 if (foldWeights[i] is not { Length: > 0 }) continue;
-                sum += PredictElmMagnitudeAug(
+                double foldPrediction = PredictElmMagnitudeAug(
                     features, featureCount, foldWeights[i], foldBiases[i], snap,
                     inputWeights, inputBiases);
+                if (!double.IsFinite(foldPrediction))
+                    continue;
+
+                sum += foldPrediction;
                 used++;
             }
 
@@ -1580,9 +1559,13 @@ public sealed class MLSignalScorer : IMLSignalScorer
 
         if (snap.MagAugWeights is { Length: > 0 })
         {
-            magnitude = PredictElmMagnitudeAug(
+            double singlePrediction = PredictElmMagnitudeAug(
                 features, featureCount, snap.MagAugWeights, snap.MagAugBias, snap,
                 inputWeights, inputBiases);
+            if (!double.IsFinite(singlePrediction))
+                return false;
+
+            magnitude = singlePrediction;
             return true;
         }
 
@@ -1637,5 +1620,21 @@ public sealed class MLSignalScorer : IMLSignalScorer
         }
 
         return pred;
+    }
+
+    private static double ClampProbabilityOrNeutral(double probability)
+    {
+        if (!double.IsFinite(probability))
+            return 0.5;
+
+        return Math.Clamp(probability, 0.0, 1.0);
+    }
+
+    private static double ClampNonNegativeFinite(double value)
+    {
+        if (!double.IsFinite(value) || value < 0.0)
+            return 0.0;
+
+        return value;
     }
 }

@@ -641,12 +641,19 @@ internal static class ElmBootstrapHelper
     internal static double[] ComputeCovariateShiftWeights(
         List<TrainingSample> train, double[][] parentBp, int featureCount)
     {
+        if (train.Count == 0)
+            return [];
+
+        int effectiveFeatureCount = Math.Min(
+            Math.Min(featureCount, parentBp.Length),
+            train.Min(s => s.Features.Length));
+
         double[] weights = new double[train.Count];
         for (int i = 0; i < train.Count; i++)
         {
             int outsideCount = 0;
             int checkedCount = 0;
-            for (int j = 0; j < Math.Min(featureCount, parentBp.Length); j++)
+            for (int j = 0; j < effectiveFeatureCount; j++)
             {
                 var bp = parentBp[j];
                 if (bp is null || bp.Length < 2) continue;

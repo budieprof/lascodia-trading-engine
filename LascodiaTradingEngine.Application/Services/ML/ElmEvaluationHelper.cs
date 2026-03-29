@@ -42,9 +42,9 @@ internal static class ElmEvaluationHelper
         for (int i = 0; i < testSet.Count; i++)
         {
             var s = testSet[i];
-            double calibP = Math.Clamp(ensembleCalibProb(
+            double calibP = ClampProbability(ensembleCalibProb(
                 s.Features, weights, biases, inputWeights, inputBiases,
-                plattA, plattB, featureCount, hiddenSize, featureSubsets, null), 0.0, 1.0);
+                plattA, plattB, featureCount, hiddenSize, featureSubsets, null));
 
             int pred = calibP >= 0.5 ? 1 : 0;
             int actual = ToBinaryLabel(s.Direction);
@@ -145,9 +145,9 @@ internal static class ElmEvaluationHelper
 
         foreach (var s in samples)
         {
-            double p = Math.Clamp(ensembleCalibProb(
+            double p = ClampProbability(ensembleCalibProb(
                 s.Features, weights, biases, inputWeights, inputBiases,
-                plattA, plattB, featureCount, hiddenSize, featureSubsets, null), 0.0, 1.0);
+                plattA, plattB, featureCount, hiddenSize, featureSubsets, null));
             int bin = Math.Clamp((int)(p * bins), 0, bins - 1);
             binCounts[bin]++;
             binAcc[bin]  += ToBinaryLabel(s.Direction);
@@ -185,9 +185,9 @@ internal static class ElmEvaluationHelper
 
         foreach (var s in testSet)
         {
-            double p = Math.Clamp(ensembleCalibProb(
+            double p = ClampProbability(ensembleCalibProb(
                 s.Features, weights, biases, inputWeights, inputBiases,
-                plattA, plattB, featureCount, hiddenSize, featureSubsets, null), 0.0, 1.0);
+                plattA, plattB, featureCount, hiddenSize, featureSubsets, null));
             double y = s.Direction > 0 ? 1.0 : 0.0;
             brierModel += (p - y) * (p - y);
             brierNaive += (naiveP - y) * (naiveP - y);
@@ -218,9 +218,9 @@ internal static class ElmEvaluationHelper
         int baselineCorrect = 0;
         foreach (var s in testSet)
         {
-            double p = ensembleCalibProb(
+            double p = ClampProbability(ensembleCalibProb(
                 s.Features, weights, biases, inputWeights, inputBiases,
-                plattA, plattB, featureCount, hiddenSize, featureSubsets, null);
+                plattA, plattB, featureCount, hiddenSize, featureSubsets, null));
             if ((p >= 0.5 ? 1 : 0) == ToBinaryLabel(s.Direction)) baselineCorrect++;
         }
         double baselineAcc = (double)baselineCorrect / testSet.Count;
@@ -241,19 +241,20 @@ internal static class ElmEvaluationHelper
                 (shuffled[i], shuffled[j]) = (shuffled[j], shuffled[i]);
             }
 
-            int fLen = testSet[0].Features.Length;
-            var buffer = new float[fLen];
+            int bufferLen = testSet.Max(s => s.Features.Length);
+            var buffer = new float[bufferLen];
 
             int correct = 0;
             for (int i = 0; i < testSet.Count; i++)
             {
                 var orig = testSet[i].Features;
-                Array.Copy(orig, buffer, fLen);
+                Array.Clear(buffer, 0, buffer.Length);
+                Array.Copy(orig, buffer, orig.Length);
                 buffer[f] = shuffled[i];
 
-                double p = ensembleCalibProb(
+                double p = ClampProbability(ensembleCalibProb(
                     buffer, weights, biases, inputWeights, inputBiases,
-                    plattA, plattB, featureCount, hiddenSize, featureSubsets, null);
+                    plattA, plattB, featureCount, hiddenSize, featureSubsets, null));
                 if ((p >= 0.5 ? 1 : 0) == ToBinaryLabel(testSet[i].Direction)) correct++;
 
                 buffer[f] = orig[f];
@@ -282,9 +283,9 @@ internal static class ElmEvaluationHelper
         int baselineCorrect = 0;
         foreach (var s in calSet)
         {
-            double p = ensembleRawProb(
+            double p = ClampProbability(ensembleRawProb(
                 s.Features, weights, biases, inputWeights, inputBiases,
-                featureCount, hiddenSize, featureSubsets, null);
+                featureCount, hiddenSize, featureSubsets, null));
             if ((p >= 0.5 ? 1 : 0) == ToBinaryLabel(s.Direction)) baselineCorrect++;
         }
         double baselineAcc = (double)baselineCorrect / calSet.Count;
@@ -305,18 +306,19 @@ internal static class ElmEvaluationHelper
                 (shuffled[i], shuffled[j]) = (shuffled[j], shuffled[i]);
             }
 
-            int fLen = calSet[0].Features.Length;
-            var buffer = new float[fLen];
+            int bufferLen = calSet.Max(s => s.Features.Length);
+            var buffer = new float[bufferLen];
 
             int correct = 0;
             for (int i = 0; i < calSet.Count; i++)
             {
                 var orig = calSet[i].Features;
-                Array.Copy(orig, buffer, fLen);
+                Array.Clear(buffer, 0, buffer.Length);
+                Array.Copy(orig, buffer, orig.Length);
                 buffer[f] = shuffled[i];
-                double p = ensembleRawProb(
+                double p = ClampProbability(ensembleRawProb(
                     buffer, weights, biases, inputWeights, inputBiases,
-                    featureCount, hiddenSize, featureSubsets, null);
+                    featureCount, hiddenSize, featureSubsets, null));
                 if ((p >= 0.5 ? 1 : 0) == ToBinaryLabel(calSet[i].Direction)) correct++;
                 buffer[f] = orig[f];
             }
@@ -417,9 +419,13 @@ internal static class ElmEvaluationHelper
     {
         if (train.Count < 20 || featureCount < 2) return [];
 
-        int topN = Math.Min(10, featureCount);
-        double[] variances = new double[featureCount];
-        for (int j = 0; j < featureCount; j++)
+        int effectiveFeatureCount = Math.Min(featureCount, train.Min(s => s.Features.Length));
+        if (effectiveFeatureCount < 2)
+            return [];
+
+        int topN = Math.Min(10, effectiveFeatureCount);
+        double[] variances = new double[effectiveFeatureCount];
+        for (int j = 0; j < effectiveFeatureCount; j++)
         {
             double sum = 0, sumSq = 0;
             foreach (var s in train)
@@ -468,9 +474,13 @@ internal static class ElmEvaluationHelper
     {
         if (train.Count < 20 || featureCount < 2) return [];
 
-        int topN = Math.Min(10, featureCount);
-        double[] variances = new double[featureCount];
-        for (int j = 0; j < featureCount; j++)
+        int effectiveFeatureCount = Math.Min(featureCount, train.Min(s => s.Features.Length));
+        if (effectiveFeatureCount < 2)
+            return [];
+
+        int topN = Math.Min(10, effectiveFeatureCount);
+        double[] variances = new double[effectiveFeatureCount];
+        for (int j = 0; j < effectiveFeatureCount; j++)
         {
             double sum = 0, sumSq = 0;
             foreach (var s in train)
@@ -568,8 +578,12 @@ internal static class ElmEvaluationHelper
         if (samples.Count < 20 || featureCount <= 0)
             return 0;
 
+        int effectiveFeatureCount = Math.Min(featureCount, samples.Min(s => s.Features.Length));
+        if (effectiveFeatureCount <= 0)
+            return 0;
+
         int nonStat = 0;
-        for (int j = 0; j < featureCount; j++)
+        for (int j = 0; j < effectiveFeatureCount; j++)
         {
             var series = new double[samples.Count];
             for (int i = 0; i < samples.Count; i++) series[i] = samples[i].Features[j];
@@ -577,5 +591,13 @@ internal static class ElmEvaluationHelper
             if (pValue > 0.05) nonStat++;
         }
         return nonStat;
+    }
+
+    private static double ClampProbability(double probability)
+    {
+        if (!double.IsFinite(probability))
+            return 0.5;
+
+        return Math.Clamp(probability, 0.0, 1.0);
     }
 }

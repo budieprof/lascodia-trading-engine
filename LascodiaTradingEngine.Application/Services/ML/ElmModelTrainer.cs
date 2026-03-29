@@ -1976,7 +1976,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         double raw = EnsembleRawProb(features, weights, biases, inputWeights, inputBiases,
             featureCount, hiddenSize, featureSubsets, learnerWeights, learnerHiddenSizes, learnerActivations,
             stackingWeights, stackingBias);
-        double logit = MLFeatureHelper.Logit(Math.Clamp(raw, 1e-7, 1.0 - 1e-7));
+        double logit = MLFeatureHelper.Logit(ClampProbabilityForLogit(raw));
         return MLFeatureHelper.Sigmoid(plattA * logit + plattB);
     }
 
@@ -1990,7 +1990,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         double plattASell,
         double plattBSell)
     {
-        double rawLogit = MLFeatureHelper.Logit(Math.Clamp(rawProb, 1e-7, 1.0 - 1e-7));
+        double rawLogit = MLFeatureHelper.Logit(ClampProbabilityForLogit(rawProb));
         double globalCalibP = ElmCalibrationHelper.ApplyGlobalCalibration(rawProb, plattA, plattB, temperatureScale);
 
         if (globalCalibP >= 0.5 && plattABuy != 0.0)
@@ -2059,10 +2059,10 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         var probs = new double[K];
         for (int k = 0; k < K; k++)
         {
-            probs[k] = ElmLearnerProb(
+            probs[k] = ClampProbabilityOrNeutral(ElmLearnerProb(
                 features, weights[k], biases[k], inputWeights[k], inputBiases[k],
                 featureCount, learnerHiddenSizes[k], featureSubsets?[k],
-                ResolveLearnerActivation(learnerActivations, k));
+                ResolveLearnerActivation(learnerActivations, k)));
         }
 
         double avg;
@@ -2070,12 +2070,13 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         {
             double z = stackingBias;
             for (int k = 0; k < K; k++) z += sw[k] * probs[k];
-            avg = MLFeatureHelper.Sigmoid(z);
+            avg = ClampProbabilityOrNeutral(MLFeatureHelper.Sigmoid(z));
         }
         else if (learnerWeights is { Length: > 0 } lw && lw.Length == K)
         {
             avg = 0.0;
             for (int k = 0; k < K; k++) avg += lw[k] * probs[k];
+            avg = ClampProbabilityOrNeutral(avg);
         }
         else
         {
@@ -2089,7 +2090,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             variance += d * d;
         }
 
-        return Math.Sqrt(variance / (K - 1));
+        return double.IsFinite(variance) ? Math.Sqrt(variance / (K - 1)) : 0.0;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -2632,16 +2633,16 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         for (int i = 0; i < calSet.Count; i++)
         {
             var s = calSet[i];
-            double calibP = calibratedProb is not null
+            double calibP = ClampProbabilityOrNeutral(calibratedProb is not null
                 ? calibratedProb(s.Features)
                 : EnsembleCalibProb(
                     s.Features, weights, biases, inputWeights, inputBiases,
-                    1.0, 0.0, featureCount, hiddenSize, featureSubsets, null, learnerHiddenSizes, learnerActivations, stackingWeights, stackingBias);
+                    1.0, 0.0, featureCount, hiddenSize, featureSubsets, null, learnerHiddenSizes, learnerActivations, stackingWeights, stackingBias));
 
-            double ensStd = ComputeEnsembleStd(
+            double ensStd = ClampNonNegativeFinite(ComputeEnsembleStd(
                 s.Features, weights, biases, inputWeights, inputBiases,
                 featureCount, featureSubsets, learnerHiddenSizes, learnerActivations,
-                stackingWeights: stackingWeights, stackingBias: stackingBias);
+                stackingWeights: stackingWeights, stackingBias: stackingBias));
 
             metaXs[i] = new double[metaDim];
             metaXs[i][0] = calibP;
@@ -2769,16 +2770,16 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         for (int i = 0; i < calSet.Count; i++)
         {
             var s = calSet[i];
-            double calibP = calibratedProb is not null
+            double calibP = ClampProbabilityOrNeutral(calibratedProb is not null
                 ? calibratedProb(s.Features)
                 : EnsembleCalibProb(
                     s.Features, weights, biases, inputWeights, inputBiases,
-                    plattA, plattB, featureCount, hiddenSize, featureSubsets, null, learnerHiddenSizes, learnerActivations, stackingWeights, stackingBias);
+                    plattA, plattB, featureCount, hiddenSize, featureSubsets, null, learnerHiddenSizes, learnerActivations, stackingWeights, stackingBias));
 
-            double ensStd = ComputeEnsembleStd(
+            double ensStd = ClampNonNegativeFinite(ComputeEnsembleStd(
                 s.Features, weights, biases, inputWeights, inputBiases,
                 featureCount, featureSubsets, learnerHiddenSizes, learnerActivations,
-                stackingWeights: stackingWeights, stackingBias: stackingBias);
+                stackingWeights: stackingWeights, stackingBias: stackingBias));
 
             double mlScore = metaLabelBias;
             double[] mlX = [calibP, ensStd, ..Enumerable.Range(0, Math.Min(5, featureCount)).Select(j => (double)s.Features[j])];
@@ -2880,15 +2881,15 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             int c = 0, t = 0;
             foreach (var s in calSet)
             {
-                double calibP = calibratedProb is not null
+                double calibP = ClampProbabilityOrNeutral(calibratedProb is not null
                     ? calibratedProb(s.Features)
                     : EnsembleCalibProb(
                         s.Features, weights, biases, inputWeights, inputBiases,
-                        plattA, plattB, featureCount, hiddenSize, featureSubsets, null, learnerHiddenSizes, learnerActivations, stackingWeights, stackingBias);
-                double ensStd = ComputeEnsembleStd(
+                        plattA, plattB, featureCount, hiddenSize, featureSubsets, null, learnerHiddenSizes, learnerActivations, stackingWeights, stackingBias));
+                double ensStd = ClampNonNegativeFinite(ComputeEnsembleStd(
                     s.Features, weights, biases, inputWeights, inputBiases,
                     featureCount, featureSubsets, learnerHiddenSizes, learnerActivations,
-                    stackingWeights: stackingWeights, stackingBias: stackingBias);
+                    stackingWeights: stackingWeights, stackingBias: stackingBias));
 
                 double mlScore = metaLabelBias;
                 double[] mlX = [calibP, ensStd, ..Enumerable.Range(0, Math.Min(5, featureCount)).Select(j => (double)s.Features[j])];
@@ -3153,7 +3154,9 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             return false;
 
         int K = Math.Min(snapshot.Weights.Length, snapshot.Biases.Length);
-        double smoothing = Math.Clamp(snapshot.AdaptiveLabelSmoothing, 0.0, 0.49);
+        double smoothing = double.IsFinite(snapshot.AdaptiveLabelSmoothing)
+            ? Math.Clamp(snapshot.AdaptiveLabelSmoothing, 0.0, 0.49)
+            : 0.0;
         double target = sample.Direction > 0 ? 1.0 - smoothing : smoothing;
 
         // Standardise using the snapshot's stored means/stds
@@ -3321,6 +3324,30 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                 ? MLFeatureHelper.FeatureNames[i]
                 : $"F{i}";
         return names;
+    }
+
+    private static double ClampProbabilityForLogit(double probability)
+    {
+        if (!double.IsFinite(probability))
+            return 0.5;
+
+        return Math.Clamp(probability, 1e-7, 1.0 - 1e-7);
+    }
+
+    private static double ClampProbabilityOrNeutral(double probability)
+    {
+        if (!double.IsFinite(probability))
+            return 0.5;
+
+        return Math.Clamp(probability, 0.0, 1.0);
+    }
+
+    private static double ClampNonNegativeFinite(double value)
+    {
+        if (!double.IsFinite(value) || value < 0.0)
+            return 0.0;
+
+        return value;
     }
 
     private static ElmActivation ResolveLearnerActivation(ElmActivation[] learnerActivations, int learnerIndex)

@@ -400,9 +400,19 @@ internal static class ElmMathHelper
         if (H <= 0 ||
             inverseGramFlat.Length != H * H ||
             coefficients.Length < H ||
-            featureVector.Length != H)
+            featureVector.Length != H ||
+            !double.IsFinite(target))
         {
             return false;
+        }
+
+        for (int i = 0; i < inverseGramFlat.Length; i++)
+            if (!double.IsFinite(inverseGramFlat[i]))
+                return false;
+        for (int i = 0; i < H; i++)
+        {
+            if (!double.IsFinite(coefficients[i]) || !double.IsFinite(featureVector[i]))
+                return false;
         }
 
         // Ph = P × h  (H-vector)
@@ -420,7 +430,7 @@ internal static class ElmMathHelper
         for (int j = 0; j < H; j++)
             denom += featureVector[j] * Ph[j];
 
-        if (Math.Abs(denom) < 1e-15)
+        if (!double.IsFinite(denom) || denom <= 1e-15)
             return false; // degenerate — skip this sample
 
         double invDenom = 1.0 / denom;
@@ -444,11 +454,17 @@ internal static class ElmMathHelper
             for (int j = 0; j < H; j++)
                 sum += inverseGramFlat[i * H + j] * featureVector[j];
             PnewH[i] = sum;
+            if (!double.IsFinite(PnewH[i]))
+                return false;
         }
 
         // w_new = w + P_new h × error
         for (int i = 0; i < H; i++)
+        {
             coefficients[i] += PnewH[i] * error;
+            if (!double.IsFinite(coefficients[i]))
+                return false;
+        }
 
         return true;
     }

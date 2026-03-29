@@ -25,16 +25,22 @@ internal static class InferenceHelpers
 
         if (metaWeights is { Length: > 0 } mw && mw.Length == count)
         {
-            double metaZ = metaBias;
-            for (int t = 0; t < count; t++) metaZ += mw[t] * probs[t];
-            return MLFeatureHelper.Sigmoid(metaZ);
+            double metaZ = double.IsFinite(metaBias) ? metaBias : 0.0;
+            for (int t = 0; t < count; t++)
+                metaZ += (double.IsFinite(mw[t]) ? mw[t] : 0.0) * ClampProbability(probs[t]);
+            return ClampProbability(MLFeatureHelper.Sigmoid(metaZ));
         }
 
         if (gesWeights is { Length: > 0 } gw && gw.Length == count)
         {
             double wSum = 0, pSum = 0;
-            for (int t = 0; t < count; t++) { wSum += gw[t]; pSum += gw[t] * probs[t]; }
-            return wSum > 1e-10 ? pSum / wSum : AverageFirstCount(probs, count);
+            for (int t = 0; t < count; t++)
+            {
+                double weight = SanitizeNonNegative(gw[t]);
+                wSum += weight;
+                pSum += weight * ClampProbability(probs[t]);
+            }
+            return wSum > 1e-10 ? ClampProbability(pSum / wSum) : AverageFirstCount(probs, count);
         }
 
         if (learnerAccuracyWeights is { Length: > 0 } law && law.Length == count)
@@ -42,24 +48,30 @@ internal static class InferenceHelpers
             double wSum = 0, pSum = 0;
             for (int t = 0; t < count; t++)
             {
-                wSum += law[t];
-                pSum += law[t] * probs[t];
+                double weight = SanitizeNonNegative(law[t]);
+                wSum += weight;
+                pSum += weight * ClampProbability(probs[t]);
             }
-            return wSum > 1e-10 ? pSum / wSum : AverageFirstCount(probs, count);
+            return wSum > 1e-10 ? ClampProbability(pSum / wSum) : AverageFirstCount(probs, count);
         }
 
         if (calAccuracies is { Length: > 0 } ca && ca.Length == count)
         {
             const double Alpha = 4.0;
-            double maxAcc = ca.Max();
-            double sumExp = ca.Sum(a => Math.Exp(Alpha * (a - maxAcc)));
+            double[] sanitized = new double[count];
+            for (int t = 0; t < count; t++)
+                sanitized[t] = ClampProbability(ca[t]);
+
+            double maxAcc = sanitized.Max();
+            double sumExp = sanitized.Sum(a => Math.Exp(Alpha * (a - maxAcc)));
             double wSum = 0, pSum = 0;
             for (int t = 0; t < count; t++)
             {
-                double w = Math.Exp(Alpha * (ca[t] - maxAcc)) / sumExp;
-                wSum += w; pSum += w * probs[t];
+                double w = sumExp > 1e-10 ? Math.Exp(Alpha * (sanitized[t] - maxAcc)) / sumExp : 0.0;
+                wSum += w;
+                pSum += w * ClampProbability(probs[t]);
             }
-            return wSum > 1e-10 ? pSum / wSum : AverageFirstCount(probs, count);
+            return wSum > 1e-10 ? ClampProbability(pSum / wSum) : AverageFirstCount(probs, count);
         }
 
         return AverageFirstCount(probs, count);
@@ -72,15 +84,18 @@ internal static class InferenceHelpers
     /// </summary>
     internal static double ApplyBasicCalibration(double rawProb, ModelSnapshot snap)
     {
-        double rawLogit = MLFeatureHelper.Logit(Math.Clamp(rawProb, 1e-7, 1.0 - 1e-7));
-        double calibP = snap.TemperatureScale > 0.0 && snap.TemperatureScale < 10.0
-            ? MLFeatureHelper.Sigmoid(rawLogit / snap.TemperatureScale)
-            : MLFeatureHelper.Sigmoid(snap.PlattA * rawLogit + snap.PlattB);
+        double rawLogit = MLFeatureHelper.Logit(ClampLogitProbability(rawProb));
+        double temperatureScale = SanitizeTemperatureScale(snap.TemperatureScale);
+        double plattA = SanitizeFiniteOrDefault(snap.PlattA, 1.0);
+        double plattB = SanitizeFiniteOrDefault(snap.PlattB, 0.0);
+        double calibP = temperatureScale > 0.0
+            ? MLFeatureHelper.Sigmoid(rawLogit / temperatureScale)
+            : MLFeatureHelper.Sigmoid(plattA * rawLogit + plattB);
 
         if (snap.IsotonicBreakpoints.Length >= 4)
-            calibP = BaggedLogisticTrainer.ApplyIsotonicCalibration(calibP, snap.IsotonicBreakpoints);
+            calibP = ApplyIsotonicCalibrationSafe(calibP, snap.IsotonicBreakpoints);
 
-        return calibP;
+        return ClampProbability(calibP);
     }
 
     /// <summary>
@@ -89,30 +104,38 @@ internal static class InferenceHelpers
     /// </summary>
     internal static double ApplyDeployedCalibration(double rawProb, ModelSnapshot snap)
     {
-        double rawLogit = MLFeatureHelper.Logit(Math.Clamp(rawProb, 1e-7, 1.0 - 1e-7));
-        double globalCalibP = snap.TemperatureScale > 0.0 && snap.TemperatureScale < 10.0
-            ? MLFeatureHelper.Sigmoid(rawLogit / snap.TemperatureScale)
-            : MLFeatureHelper.Sigmoid(snap.PlattA * rawLogit + snap.PlattB);
+        double rawLogit = MLFeatureHelper.Logit(ClampLogitProbability(rawProb));
+        double temperatureScale = SanitizeTemperatureScale(snap.TemperatureScale);
+        double plattA = SanitizeFiniteOrDefault(snap.PlattA, 1.0);
+        double plattB = SanitizeFiniteOrDefault(snap.PlattB, 0.0);
+        double plattABuy = SanitizeFiniteOrDefault(snap.PlattABuy, 0.0);
+        double plattBBuy = SanitizeFiniteOrDefault(snap.PlattBBuy, 0.0);
+        double plattASell = SanitizeFiniteOrDefault(snap.PlattASell, 0.0);
+        double plattBSell = SanitizeFiniteOrDefault(snap.PlattBSell, 0.0);
+        double globalCalibP = temperatureScale > 0.0
+            ? MLFeatureHelper.Sigmoid(rawLogit / temperatureScale)
+            : MLFeatureHelper.Sigmoid(plattA * rawLogit + plattB);
 
         double calibP;
-        if (globalCalibP >= 0.5 && snap.PlattABuy != 0.0)
-            calibP = MLFeatureHelper.Sigmoid(snap.PlattABuy * rawLogit + snap.PlattBBuy);
-        else if (globalCalibP < 0.5 && snap.PlattASell != 0.0)
-            calibP = MLFeatureHelper.Sigmoid(snap.PlattASell * rawLogit + snap.PlattBSell);
+        if (globalCalibP >= 0.5 && plattABuy != 0.0)
+            calibP = MLFeatureHelper.Sigmoid(plattABuy * rawLogit + plattBBuy);
+        else if (globalCalibP < 0.5 && plattASell != 0.0)
+            calibP = MLFeatureHelper.Sigmoid(plattASell * rawLogit + plattBSell);
         else
             calibP = globalCalibP;
 
         if (snap.IsotonicBreakpoints.Length >= 4)
-            calibP = BaggedLogisticTrainer.ApplyIsotonicCalibration(calibP, snap.IsotonicBreakpoints);
+            calibP = ApplyIsotonicCalibrationSafe(calibP, snap.IsotonicBreakpoints);
 
-        if (snap.AgeDecayLambda > 0.0 && snap.TrainedAtUtc != default)
+        double ageDecayLambda = SanitizeNonNegative(snap.AgeDecayLambda);
+        if (ageDecayLambda > 0.0 && snap.TrainedAtUtc != default)
         {
             double daysSinceTrain = (DateTime.UtcNow - snap.TrainedAtUtc).TotalDays;
-            double decayFactor    = Math.Exp(-snap.AgeDecayLambda * Math.Max(0.0, daysSinceTrain));
+            double decayFactor    = Math.Exp(-ageDecayLambda * Math.Max(0.0, daysSinceTrain));
             calibP = 0.5 + (calibP - 0.5) * decayFactor;
         }
 
-        return calibP;
+        return ClampProbability(calibP);
     }
 
     private static double AverageFirstCount(double[] probs, int count)
@@ -122,7 +145,92 @@ internal static class InferenceHelpers
 
         double sum = 0.0;
         for (int i = 0; i < count; i++)
-            sum += probs[i];
-        return sum / count;
+            sum += ClampProbability(probs[i]);
+        return ClampProbability(sum / count);
+    }
+
+    private static double ApplyIsotonicCalibrationSafe(double probability, double[] breakpoints)
+    {
+        double clampedProbability = ClampProbability(probability);
+        if (breakpoints.Length < 2)
+            return clampedProbability;
+
+        var clean = new List<(double X, double Y)>(breakpoints.Length / 2);
+        for (int i = 0; i + 1 < breakpoints.Length; i += 2)
+        {
+            if (!double.IsFinite(breakpoints[i]) || !double.IsFinite(breakpoints[i + 1]))
+                continue;
+
+            double x = ClampProbability(breakpoints[i]);
+            double y = ClampProbability(breakpoints[i + 1]);
+            if (clean.Count > 0)
+            {
+                var last = clean[^1];
+                if (x < last.X)
+                    continue;
+
+                if (Math.Abs(x - last.X) <= 1e-12)
+                {
+                    clean[^1] = (x, y);
+                    continue;
+                }
+            }
+
+            clean.Add((x, y));
+        }
+
+        if (clean.Count == 0)
+            return clampedProbability;
+        if (clean.Count == 1)
+            return clean[0].Y;
+        if (clampedProbability <= clean[0].X)
+            return clean[0].Y;
+
+        for (int i = 0; i < clean.Count - 1; i++)
+        {
+            var (x0, y0) = clean[i];
+            var (x1, y1) = clean[i + 1];
+            if (clampedProbability > x1)
+                continue;
+
+            double t = (x1 - x0) > 1e-10 ? (clampedProbability - x0) / (x1 - x0) : 0.5;
+            return ClampProbability(y0 + t * (y1 - y0));
+        }
+
+        return clean[^1].Y;
+    }
+
+    private static double ClampProbability(double probability)
+    {
+        if (!double.IsFinite(probability))
+            return 0.5;
+
+        return Math.Clamp(probability, 0.0, 1.0);
+    }
+
+    private static double ClampLogitProbability(double probability)
+    {
+        if (!double.IsFinite(probability))
+            return 0.5;
+
+        return Math.Clamp(probability, 1e-7, 1.0 - 1e-7);
+    }
+
+    private static double SanitizeNonNegative(double value)
+    {
+        if (!double.IsFinite(value) || value < 0.0)
+            return 0.0;
+
+        return value;
+    }
+
+    private static double SanitizeFiniteOrDefault(double value, double fallback)
+    {
+        return double.IsFinite(value) ? value : fallback;
+    }
+
+    private static double SanitizeTemperatureScale(double value)
+    {
+        return double.IsFinite(value) && value > 0.0 && value < 10.0 ? value : 0.0;
     }
 }
