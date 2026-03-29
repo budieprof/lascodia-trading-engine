@@ -158,7 +158,7 @@ internal static class ElmMathHelper
                 for (int vi = 0; vi < vecSize; vi++)
                 {
                     int fi = subset[si + vi];
-                    featureBuf[vi] = fi < features.Length ? features[fi] : 0.0;
+                    featureBuf[vi] = fi >= 0 && fi < features.Length ? features[fi] : 0.0;
                 }
                 var vF = new Vector<double>(featureBuf);
                 vSum += vW * vF;
@@ -170,7 +170,7 @@ internal static class ElmMathHelper
             for (int si = vecEnd; si < subsetLen; si++)
             {
                 int fi = subset[si];
-                if (fi < features.Length)
+                if (fi >= 0 && fi < features.Length)
                     sum += weights[weightOffset + si] * features[fi];
             }
         }
@@ -179,7 +179,7 @@ internal static class ElmMathHelper
             for (int si = 0; si < subsetLen; si++)
             {
                 int fi = subset[si];
-                if (fi < features.Length)
+                if (fi >= 0 && fi < features.Length)
                     sum += weights[weightOffset + si] * features[fi];
             }
         }
@@ -389,16 +389,21 @@ internal static class ElmMathHelper
     /// Computed by applying the frozen input weights + activation function to the raw features.
     /// </param>
     /// <param name="target">The direction label for the new sample (1.0 = Buy, 0.0 = Sell).</param>
-    internal static void ShermanMorrisonUpdate(
+    internal static bool ShermanMorrisonUpdate(
         double[]  inverseGramFlat,
         int       gramDim,
-        double[]  outputWeights,
-        ref double outputBias,
-        double[]  hiddenActivation,
-        double    target,
-        int       updateCount = 0)
+        double[]  coefficients,
+        double[]  featureVector,
+        double    target)
     {
         int H = gramDim;
+        if (H <= 0 ||
+            inverseGramFlat.Length != H * H ||
+            coefficients.Length < H ||
+            featureVector.Length != H)
+        {
+            return false;
+        }
 
         // Ph = P × h  (H-vector)
         var Ph = new double[H];
@@ -406,17 +411,17 @@ internal static class ElmMathHelper
         {
             double sum = 0;
             for (int j = 0; j < H; j++)
-                sum += inverseGramFlat[i * H + j] * hiddenActivation[j];
+                sum += inverseGramFlat[i * H + j] * featureVector[j];
             Ph[i] = sum;
         }
 
         // denominator = 1 + h^T P h
         double denom = 1.0;
         for (int j = 0; j < H; j++)
-            denom += hiddenActivation[j] * Ph[j];
+            denom += featureVector[j] * Ph[j];
 
         if (Math.Abs(denom) < 1e-15)
-            return; // degenerate — skip this sample
+            return false; // degenerate — skip this sample
 
         double invDenom = 1.0 / denom;
 
@@ -426,9 +431,9 @@ internal static class ElmMathHelper
                 inverseGramFlat[i * H + j] -= Ph[i] * Ph[j] * invDenom;
 
         // prediction error: e = y − (w^T h + b)
-        double prediction = outputBias;
+        double prediction = 0.0;
         for (int j = 0; j < H; j++)
-            prediction += outputWeights[j] * hiddenActivation[j];
+            prediction += coefficients[j] * featureVector[j];
         double error = target - prediction;
 
         // P_new × h (recompute with updated P)
@@ -437,16 +442,14 @@ internal static class ElmMathHelper
         {
             double sum = 0;
             for (int j = 0; j < H; j++)
-                sum += inverseGramFlat[i * H + j] * hiddenActivation[j];
+                sum += inverseGramFlat[i * H + j] * featureVector[j];
             PnewH[i] = sum;
         }
 
         // w_new = w + P_new h × error
         for (int i = 0; i < H; i++)
-            outputWeights[i] += PnewH[i] * error;
+            coefficients[i] += PnewH[i] * error;
 
-        // bias update: adaptive 1/n learning rate (decays as more samples are seen)
-        double biasLr = updateCount > 0 ? 1.0 / updateCount : 0.001;
-        outputBias += biasLr * error;
+        return true;
     }
 }

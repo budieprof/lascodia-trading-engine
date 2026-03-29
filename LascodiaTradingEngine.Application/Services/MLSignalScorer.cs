@@ -1622,12 +1622,12 @@ public sealed class MLSignalScorer : IMLSignalScorer
                 for (int si = 0; si < subLen && rowOff + si < learnerWeights.Length; si++)
                 {
                     int fi = subset[si];
-                    if (fi < features.Length)
+                    if (fi >= 0 && fi < features.Length)
                         z += learnerWeights[rowOff + si] * features[fi];
                 }
 
                 ElmActivation activation = snap.LearnerActivations is { Length: > 0 } activations
-                    ? (ElmActivation)activations[Math.Min(k, activations.Length - 1)]
+                    ? (ElmActivation)(k < activations.Length ? activations[k] : activations[0])
                     : ElmActivation.Sigmoid;
                 hSum += ElmMathHelper.Activate(z, activation);
                 hCount++;

@@ -17,7 +17,7 @@ internal static class ElmBootstrapHelper
         if (count <= 0)
             return [];
 
-        double safeLambda = double.IsFinite(lambda) ? lambda : 0.0;
+        double safeLambda = double.IsFinite(lambda) && lambda > 0.0 ? lambda : 0.0;
         var w = new double[count];
         double maxExponent = double.MinValue;
         for (int i = 0; i < count; i++)
@@ -354,11 +354,15 @@ internal static class ElmBootstrapHelper
     {
         if (threshold <= 0) return Enumerable.Repeat(true, featureCount).ToArray();
 
+        var normalised = ElmEvaluationHelper.NormalisePositiveImportance(importance, featureCount);
+        if (normalised.Length == 0 || normalised.Sum(v => v) <= 1e-12f)
+            return Enumerable.Repeat(true, featureCount).ToArray();
+
         double equalShare = 1.0 / featureCount;
         double cutoff = equalShare * threshold;
         var mask = new bool[featureCount];
         for (int i = 0; i < featureCount; i++)
-            mask[i] = (i < importance.Length ? importance[i] : 0.0f) >= cutoff;
+            mask[i] = normalised[i] >= cutoff;
         return mask;
     }
 

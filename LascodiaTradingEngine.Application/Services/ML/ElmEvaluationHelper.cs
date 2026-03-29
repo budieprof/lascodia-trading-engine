@@ -96,6 +96,34 @@ internal static class ElmEvaluationHelper
         return new EvalMetrics(accuracy, prec, rec, f1, magRmse, ev, brier, wAcc, sharpe, tp, fp, fn, tn);
     }
 
+    internal static float[] NormalisePositiveImportance(float[] importance, int featureCount)
+    {
+        if (featureCount <= 0)
+            return [];
+
+        var normalised = new float[featureCount];
+        double sum = 0.0;
+        int copyLen = Math.Min(featureCount, importance.Length);
+        for (int i = 0; i < copyLen; i++)
+        {
+            float value = importance[i];
+            if (!float.IsFinite(value) || value <= 0f)
+                continue;
+
+            normalised[i] = value;
+            sum += value;
+        }
+
+        if (sum <= 1e-12)
+            return normalised;
+
+        float invSum = (float)(1.0 / sum);
+        for (int i = 0; i < normalised.Length; i++)
+            normalised[i] *= invSum;
+
+        return normalised;
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     //  ECE (Expected Calibration Error)
     // ═══════════════════════════════════════════════════════════════════════════
@@ -183,6 +211,10 @@ internal static class ElmEvaluationHelper
     {
         if (testSet.Count == 0) return new float[featureCount];
 
+        int effectiveFeatureCount = testSet.Min(s => s.Features.Length);
+        if (effectiveFeatureCount <= 0)
+            return new float[featureCount];
+
         int baselineCorrect = 0;
         foreach (var s in testSet)
         {
@@ -194,7 +226,7 @@ internal static class ElmEvaluationHelper
         double baselineAcc = (double)baselineCorrect / testSet.Count;
 
         var importance = new float[featureCount];
-        Parallel.For(0, featureCount, new ParallelOptions
+        Parallel.For(0, effectiveFeatureCount, new ParallelOptions
         {
             CancellationToken = ct,
             MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount)
@@ -243,6 +275,10 @@ internal static class ElmEvaluationHelper
     {
         if (calSet.Count == 0) return new double[featureCount];
 
+        int effectiveFeatureCount = calSet.Min(s => s.Features.Length);
+        if (effectiveFeatureCount <= 0)
+            return new double[featureCount];
+
         int baselineCorrect = 0;
         foreach (var s in calSet)
         {
@@ -254,7 +290,7 @@ internal static class ElmEvaluationHelper
         double baselineAcc = (double)baselineCorrect / calSet.Count;
 
         var importance = new double[featureCount];
-        Parallel.For(0, featureCount, new ParallelOptions
+        Parallel.For(0, effectiveFeatureCount, new ParallelOptions
         {
             CancellationToken = ct,
             MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount)

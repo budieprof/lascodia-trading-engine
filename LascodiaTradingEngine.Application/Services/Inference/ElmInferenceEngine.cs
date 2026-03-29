@@ -115,7 +115,7 @@ public sealed class ElmInferenceEngine : IModelInferenceEngine
                 for (int si = 0; si < subLen && rowOff + si < wIn.Length; si++)
                 {
                     int fi = subset[si];
-                    if (fi < features.Length)
+                    if (fi >= 0 && fi < features.Length)
                         z += wIn[rowOff + si] * features[fi];
                 }
             }
@@ -144,9 +144,11 @@ public sealed class ElmInferenceEngine : IModelInferenceEngine
 
     private static ElmActivation GetActivation(int[]? learnerActivations, int k)
     {
-        if (learnerActivations is null || k >= learnerActivations.Length)
+        if (learnerActivations is null || learnerActivations.Length == 0)
             return ElmActivation.Sigmoid;
-        return (ElmActivation)learnerActivations[k];
+        return (ElmActivation)(k < learnerActivations.Length
+            ? learnerActivations[k]
+            : learnerActivations[0]);
     }
 
     private static (decimal Mean, decimal Variance) ComputeMcDropout(
@@ -250,7 +252,7 @@ public sealed class ElmInferenceEngine : IModelInferenceEngine
                 for (int si = 0; si < subLen && rowOff + si < wIn.Length; si++)
                 {
                     int fi = subset[si];
-                    if (fi < features.Length)
+                    if (fi >= 0 && fi < features.Length)
                         z += wIn[rowOff + si] * features[fi];
                 }
             }
