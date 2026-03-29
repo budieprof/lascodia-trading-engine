@@ -45,6 +45,7 @@ public class RSIReversionEvaluator : IStrategyEvaluator
     {
         int period = 14;
         ParseParameters(strategy.ParametersJson, ref period, out _, out _);
+        period = Math.Clamp(period, 2, 500); // match EvaluateAsync clamping
 
         // Wilder RSI needs 2×period for proper warmup; ATR also needs its own window
         int rsiRequired = period * 2 + 1;
@@ -73,6 +74,10 @@ public class RSIReversionEvaluator : IStrategyEvaluator
 
         int required = Math.Max(Math.Max(period * 2 + 1, _options.AtrPeriodForSlTp), period + 1) + 1;
         if (candles.Count < required)
+            return Task.FromResult<TradeSignal?>(null);
+
+        // Validate candle ordering — misordered candles produce garbage indicators
+        if (!IsCandleOrderValid(candles))
             return Task.FromResult<TradeSignal?>(null);
 
         int last = candles.Count - 1;
@@ -339,6 +344,17 @@ public class RSIReversionEvaluator : IStrategyEvaluator
             if (root.TryGetProperty("Oversold",   out var os) && os.TryGetDecimal(out var osVal))   oversold   = osVal;
             if (root.TryGetProperty("Overbought", out var ob) && ob.TryGetDecimal(out var obVal))   overbought = obVal;
         }
-        catch { /* use defaults */ }
+        catch (Exception ex) when (ex is JsonException or FormatException or InvalidOperationException)
+        {
+            /* use defaults for malformed JSON */
+        }
+    }
+
+    private static bool IsCandleOrderValid(IReadOnlyList<Candle> candles)
+    {
+        for (int i = 1; i < candles.Count; i++)
+            if (candles[i].Timestamp <= candles[i - 1].Timestamp)
+                return false;
+        return true;
     }
 }

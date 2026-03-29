@@ -14,14 +14,36 @@ internal static class ElmBootstrapHelper
 
     internal static double[] ComputeTemporalWeights(int count, double lambda)
     {
+        if (count <= 0)
+            return [];
+
+        double safeLambda = double.IsFinite(lambda) ? lambda : 0.0;
         var w = new double[count];
+        double maxExponent = double.MinValue;
+        for (int i = 0; i < count; i++)
+        {
+            double exponent = safeLambda * i / Math.Max(1, count);
+            w[i] = exponent;
+            maxExponent = Math.Max(maxExponent, exponent);
+        }
+
         double sum = 0;
         for (int i = 0; i < count; i++)
         {
-            w[i] = Math.Exp(lambda * i / count);
+            w[i] = Math.Exp(w[i] - maxExponent);
             sum += w[i];
         }
-        if (sum > 1e-15) for (int i = 0; i < count; i++) w[i] /= sum;
+
+        if (sum > 1e-15)
+        {
+            for (int i = 0; i < count; i++)
+                w[i] /= sum;
+            return w;
+        }
+
+        double uniform = 1.0 / count;
+        for (int i = 0; i < count; i++)
+            w[i] = uniform;
         return w;
     }
 
@@ -58,7 +80,12 @@ internal static class ElmBootstrapHelper
 
         // Handle odd count — add one more sample from the larger class
         if (count % 2 != 0)
-            result.Add(train[buyIdx[SampleFromCdf(buyCdf, rng)]]);
+        {
+            bool sampleBuy = buyIdx.Count >= sellIdx.Count;
+            result.Add(sampleBuy
+                ? train[buyIdx[SampleFromCdf(buyCdf, rng)]]
+                : train[sellIdx[SampleFromCdf(sellCdf, rng)]]);
+        }
 
         return result;
     }
@@ -98,7 +125,12 @@ internal static class ElmBootstrapHelper
 
         // Handle odd count
         if (count % 2 != 0)
-            drawn.Add(buyIdx[SampleFromCdf(buyCdf, rng2)]);
+        {
+            bool sampleBuy = buyIdx.Count >= sellIdx.Count;
+            drawn.Add(sampleBuy
+                ? buyIdx[SampleFromCdf(buyCdf, rng2)]
+                : sellIdx[SampleFromCdf(sellCdf, rng2)]);
+        }
 
         return drawn;
     }
@@ -116,30 +148,60 @@ internal static class ElmBootstrapHelper
 
     internal static double[] BuildClassCdf(List<int> indices, double[] weights)
     {
+        if (indices.Count == 0)
+            return [];
+
         var cdf = new double[indices.Count];
         double sum = 0;
         for (int i = 0; i < indices.Count; i++)
         {
             double w = indices[i] < weights.Length ? weights[indices[i]] : 1.0;
+            w = double.IsFinite(w) && w > 0.0 ? w : 0.0;
             sum += w;
             cdf[i] = sum;
         }
+
         if (sum > 1e-15)
-            for (int i = 0; i < cdf.Length; i++) cdf[i] /= sum;
-        return cdf;
+        {
+            for (int i = 0; i < cdf.Length; i++)
+                cdf[i] /= sum;
+            cdf[^1] = 1.0;
+            return cdf;
+        }
+
+        return BuildUniformCdf(indices.Count);
     }
 
     internal static double[] BuildNormalisedCdf(double[] weights)
     {
+        if (weights.Length == 0)
+            return [];
+
         var cdf = new double[weights.Length];
         double sum = 0;
-        for (int i = 0; i < weights.Length; i++) { sum += weights[i]; cdf[i] = sum; }
-        if (sum > 1e-15) for (int i = 0; i < cdf.Length; i++) cdf[i] /= sum;
-        return cdf;
+        for (int i = 0; i < weights.Length; i++)
+        {
+            double w = double.IsFinite(weights[i]) && weights[i] > 0.0 ? weights[i] : 0.0;
+            sum += w;
+            cdf[i] = sum;
+        }
+
+        if (sum > 1e-15)
+        {
+            for (int i = 0; i < cdf.Length; i++)
+                cdf[i] /= sum;
+            cdf[^1] = 1.0;
+            return cdf;
+        }
+
+        return BuildUniformCdf(weights.Length);
     }
 
     internal static int SampleFromCdf(double[] cdf, Random rng)
     {
+        if (cdf.Length == 0)
+            return 0;
+
         double u = rng.NextDouble();
         int idx = Array.BinarySearch(cdf, u);
         return idx >= 0 ? idx : Math.Min(~idx, cdf.Length - 1);
@@ -151,7 +213,11 @@ internal static class ElmBootstrapHelper
 
     internal static int[] GenerateFeatureSubset(int featureCount, double ratio, int seed)
     {
-        int subsetSize = Math.Max(1, (int)Math.Ceiling(featureCount * ratio));
+        if (featureCount <= 0)
+            return [];
+
+        double safeRatio = double.IsFinite(ratio) ? Math.Clamp(ratio, 0.0, 1.0) : 1.0;
+        int subsetSize = Math.Clamp(Math.Max(1, (int)Math.Ceiling(featureCount * safeRatio)), 1, featureCount);
         var indices = Enumerable.Range(0, featureCount).ToArray();
         var rng = new Random(seed);
 
@@ -170,7 +236,11 @@ internal static class ElmBootstrapHelper
     internal static int[] GenerateBiasedFeatureSubset(
         int featureCount, double ratio, double[] importanceScores, int seed)
     {
-        int subCount = Math.Max(1, (int)Math.Ceiling(ratio * featureCount));
+        if (featureCount <= 0)
+            return [];
+
+        double safeRatio = double.IsFinite(ratio) ? Math.Clamp(ratio, 0.0, 1.0) : 1.0;
+        int subCount = Math.Clamp(Math.Max(1, (int)Math.Ceiling(safeRatio * featureCount)), 1, featureCount);
         var rng      = new Random(seed);
         double epsilon = 1.0 / featureCount;
 
@@ -178,10 +248,14 @@ internal static class ElmBootstrapHelper
         double sum = 0.0;
         for (int j = 0; j < featureCount; j++)
         {
-            double w = (j < importanceScores.Length ? importanceScores[j] : 0.0) + epsilon;
+            double importance = j < importanceScores.Length ? importanceScores[j] : 0.0;
+            double w = Math.Max(0.0, importance) + epsilon;
             rawWeights[j] = w;
             sum += w;
         }
+
+        if (sum <= 1e-15)
+            return GenerateFeatureSubset(featureCount, ratio, seed);
 
         var cdf = new double[featureCount];
         cdf[0] = rawWeights[0] / sum;
@@ -208,8 +282,11 @@ internal static class ElmBootstrapHelper
 
     internal static int[] GenerateFeatureSubsetFromPool(int[] pool, double ratio, int seed)
     {
-        int subsetSize = Math.Max(1, (int)Math.Ceiling(pool.Length * ratio));
-        subsetSize = Math.Min(subsetSize, pool.Length);
+        if (pool.Length == 0)
+            return [];
+
+        double safeRatio = double.IsFinite(ratio) ? Math.Clamp(ratio, 0.0, 1.0) : 1.0;
+        int subsetSize = Math.Clamp(Math.Max(1, (int)Math.Ceiling(pool.Length * safeRatio)), 1, pool.Length);
         var indices = (int[])pool.Clone();
         var rng = new Random(seed);
 
@@ -228,8 +305,11 @@ internal static class ElmBootstrapHelper
     internal static int[] GenerateBiasedFeatureSubsetFromPool(
         int[] pool, double ratio, double[] importanceScores, int seed)
     {
-        int subCount = Math.Max(1, (int)Math.Ceiling(pool.Length * ratio));
-        subCount = Math.Min(subCount, pool.Length);
+        if (pool.Length == 0)
+            return [];
+
+        double safeRatio = double.IsFinite(ratio) ? Math.Clamp(ratio, 0.0, 1.0) : 1.0;
+        int subCount = Math.Clamp(Math.Max(1, (int)Math.Ceiling(pool.Length * safeRatio)), 1, pool.Length);
         var rng = new Random(seed);
         double epsilon = 1.0 / pool.Length;
 
@@ -238,10 +318,14 @@ internal static class ElmBootstrapHelper
         for (int j = 0; j < pool.Length; j++)
         {
             int fi = pool[j];
-            double w = (fi < importanceScores.Length ? importanceScores[fi] : 0.0) + epsilon;
+            double importance = fi < importanceScores.Length ? importanceScores[fi] : 0.0;
+            double w = Math.Max(0.0, importance) + epsilon;
             rawWeights[j] = w;
             sum += w;
         }
+
+        if (sum <= 1e-15)
+            return GenerateFeatureSubsetFromPool(pool, ratio, seed);
 
         var cdf = new double[pool.Length];
         cdf[0] = rawWeights[0] / sum;
@@ -428,9 +512,10 @@ internal static class ElmBootstrapHelper
     // ═══════════════════════════════════════════════════════════════════════════
 
     internal static double[] ComputeDensityRatioWeights(
-        List<TrainingSample> train, int featureCount, int recentWindowDays)
+        List<TrainingSample> train, int featureCount, int recentWindowDays, int barsPerDay = 24)
     {
-        int recentCount = Math.Min(train.Count / 4, recentWindowDays * 24);
+        int effectiveBarsPerDay = barsPerDay > 0 ? barsPerDay : 24;
+        int recentCount = Math.Min(train.Count / 4, recentWindowDays * effectiveBarsPerDay);
         if (recentCount < 10)
         {
             var uniform = new double[train.Count];
@@ -556,21 +641,35 @@ internal static class ElmBootstrapHelper
         for (int i = 0; i < train.Count; i++)
         {
             int outsideCount = 0;
+            int checkedCount = 0;
             for (int j = 0; j < Math.Min(featureCount, parentBp.Length); j++)
             {
                 var bp = parentBp[j];
                 if (bp is null || bp.Length < 2) continue;
+                checkedCount++;
                 double v = train[i].Features[j];
-                double q10 = bp[(int)(bp.Length * 0.1)];
-                double q90 = bp[(int)(bp.Length * 0.9)];
+                double q10 = bp[0];
+                double q90 = bp[^1];
                 if (v < q10 || v > q90) outsideCount++;
             }
-            weights[i] = 1.0 + (double)outsideCount / Math.Max(1, featureCount);
+            weights[i] = 1.0 + (double)outsideCount / Math.Max(1, checkedCount);
         }
 
         double sum = 0;
         for (int i = 0; i < weights.Length; i++) sum += weights[i];
         if (sum > 1e-15) for (int i = 0; i < weights.Length; i++) weights[i] /= sum;
         return weights;
+    }
+
+    private static double[] BuildUniformCdf(int count)
+    {
+        if (count <= 0)
+            return [];
+
+        var cdf = new double[count];
+        for (int i = 0; i < count; i++)
+            cdf[i] = (i + 1.0) / count;
+        cdf[^1] = 1.0;
+        return cdf;
     }
 }

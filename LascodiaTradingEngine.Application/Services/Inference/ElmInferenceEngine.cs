@@ -21,7 +21,7 @@ public sealed class ElmInferenceEngine : IModelInferenceEngine
         snapshot.Type == "elm"
         && snapshot.Weights is { Length: > 0 }
         && snapshot.ElmInputWeights is { Length: > 0 }
-        && snapshot.ElmHiddenDim > 0;
+        && snapshot.Biases is { Length: > 0 };
 
     public InferenceResult? RunInference(
         float[] features, int featureCount, ModelSnapshot snapshot,
@@ -31,31 +31,63 @@ public sealed class ElmInferenceEngine : IModelInferenceEngine
         if (snapshot.Weights is not { Length: > 0 } || snapshot.ElmInputWeights is null)
             return null;
 
-        int K = snapshot.Weights.Length;
-        int hiddenDim = snapshot.ElmHiddenDim;
+        var biases = snapshot.Biases;
+        if (biases is null)
+            return null;
+
+        int K = Math.Min(
+            snapshot.Weights.Length,
+            Math.Min(biases.Length, snapshot.ElmInputWeights.Length));
+        if (K <= 0)
+            return null;
+
         var probs = new double[K];
+        var validLearners = new List<int>(K);
 
         for (int k = 0; k < K; k++)
         {
-            probs[k] = ElmLearnerProb(
-                features, snapshot.Weights[k], snapshot.Biases[k],
-                snapshot.ElmInputWeights[k],
-                snapshot.ElmInputBiases is { Length: > 0 } && k < snapshot.ElmInputBiases.Length
-                    ? snapshot.ElmInputBiases[k] : [],
-                featureCount, hiddenDim,
-                snapshot.FeatureSubsetIndices?.Length > k ? snapshot.FeatureSubsetIndices[k] : null,
+            if (snapshot.Weights[k] is not { Length: > 0 } wOut ||
+                snapshot.ElmInputWeights[k] is not { Length: > 0 } wIn)
+            {
+                continue;
+            }
+
+            var subset = snapshot.FeatureSubsetIndices?.Length > k ? snapshot.FeatureSubsetIndices[k] : null;
+            var inputBiases = snapshot.ElmInputBiases is { Length: > 0 } && k < snapshot.ElmInputBiases.Length
+                ? snapshot.ElmInputBiases[k]
+                : [];
+            int learnerHidden = ResolveLearnerHiddenSize(
+                wOut,
+                wIn,
+                inputBiases,
+                subset,
+                featureCount,
+                snapshot.ElmHiddenDim);
+
+            probs[validLearners.Count] = ElmLearnerProb(
+                features, wOut, biases[k],
+                wIn,
+                inputBiases ?? [],
+                featureCount, learnerHidden,
+                subset,
                 GetActivation(snapshot.LearnerActivations, k));
+            validLearners.Add(k);
         }
 
+        int validCount = validLearners.Count;
+        if (validCount == 0)
+            return null;
+
         double avg = InferenceHelpers.AggregateProbs(
-            probs, K, snapshot.MetaWeights, snapshot.MetaBias,
-            snapshot.EnsembleSelectionWeights is { Length: > 0 } ? snapshot.EnsembleSelectionWeights : null,
-            snapshot.LearnerAccuracyWeights is { Length: > 0 } ? snapshot.LearnerAccuracyWeights : null,
-            snapshot.LearnerCalAccuracies is { Length: > 0 } ? snapshot.LearnerCalAccuracies : null);
+            probs, validCount,
+            SelectLearnerValues(snapshot.MetaWeights, validLearners), snapshot.MetaBias,
+            SelectLearnerValues(snapshot.EnsembleSelectionWeights, validLearners),
+            SelectLearnerValues(snapshot.LearnerAccuracyWeights, validLearners),
+            SelectLearnerValues(snapshot.LearnerCalAccuracies, validLearners));
 
         double variance = 0;
-        for (int k = 0; k < K; k++) { double d = probs[k] - avg; variance += d * d; }
-        double std = K > 1 ? Math.Sqrt(variance / (K - 1)) : 0.0;
+        for (int k = 0; k < validCount; k++) { double d = probs[k] - avg; variance += d * d; }
+        double std = validCount > 1 ? Math.Sqrt(variance / (validCount - 1)) : 0.0;
 
         decimal? mcMean = null, mcVar = null;
         if (mcDropoutSamples > 0)
@@ -121,8 +153,15 @@ public sealed class ElmInferenceEngine : IModelInferenceEngine
         float[] features, ModelSnapshot snap, int featureCount, int numSamples, int seed)
     {
         var rng = new Random(seed);
-        int K = snap.Weights.Length;
-        int hiddenDim = snap.ElmHiddenDim;
+        var biases = snap.Biases;
+        if (biases is null)
+            return (0m, 0m);
+
+        int K = Math.Min(
+            snap.Weights.Length,
+            Math.Min(biases.Length, snap.ElmInputWeights?.Length ?? 0));
+        if (K <= 0)
+            return (0m, 0m);
         var samples = new double[numSamples];
         double dropoutRate = snap.ElmDropoutRate.HasValue
             ? Math.Clamp(snap.ElmDropoutRate.Value, 0.0, 0.5)
@@ -131,25 +170,51 @@ public sealed class ElmInferenceEngine : IModelInferenceEngine
         for (int s = 0; s < numSamples; s++)
         {
             var probs = new double[K];
+            var validLearners = new List<int>(K);
             for (int k = 0; k < K; k++)
             {
-                probs[k] = ElmLearnerProbWithHiddenDropout(
-                    features, snap.Weights[k], snap.Biases[k],
-                    snap.ElmInputWeights![k],
-                    snap.ElmInputBiases is { Length: > 0 } && k < snap.ElmInputBiases.Length
-                        ? snap.ElmInputBiases[k] : [],
-                    featureCount, hiddenDim,
-                    snap.FeatureSubsetIndices?.Length > k ? snap.FeatureSubsetIndices[k] : null,
+                if (snap.Weights[k] is not { Length: > 0 } wOut ||
+                    snap.ElmInputWeights![k] is not { Length: > 0 } wIn)
+                {
+                    continue;
+                }
+
+                var subset = snap.FeatureSubsetIndices?.Length > k ? snap.FeatureSubsetIndices[k] : null;
+                var inputBiases = snap.ElmInputBiases is { Length: > 0 } && k < snap.ElmInputBiases.Length
+                    ? snap.ElmInputBiases[k]
+                    : [];
+                int learnerHidden = ResolveLearnerHiddenSize(
+                    wOut,
+                    wIn,
+                    inputBiases,
+                    subset,
+                    featureCount,
+                    snap.ElmHiddenDim);
+                probs[validLearners.Count] = ElmLearnerProbWithHiddenDropout(
+                    features, wOut, biases[k],
+                    wIn,
+                    inputBiases ?? [],
+                    featureCount, learnerHidden,
+                    subset,
                     GetActivation(snap.LearnerActivations, k),
                     rng,
                     dropoutRate);
+                validLearners.Add(k);
+            }
+
+            int validCount = validLearners.Count;
+            if (validCount == 0)
+            {
+                samples[s] = 0.5;
+                continue;
             }
 
             samples[s] = InferenceHelpers.AggregateProbs(
-                probs, K, snap.MetaWeights, snap.MetaBias,
-                snap.EnsembleSelectionWeights is { Length: > 0 } ? snap.EnsembleSelectionWeights : null,
-                snap.LearnerAccuracyWeights is { Length: > 0 } ? snap.LearnerAccuracyWeights : null,
-                snap.LearnerCalAccuracies is { Length: > 0 } ? snap.LearnerCalAccuracies : null);
+                probs, validCount,
+                SelectLearnerValues(snap.MetaWeights, validLearners), snap.MetaBias,
+                SelectLearnerValues(snap.EnsembleSelectionWeights, validLearners),
+                SelectLearnerValues(snap.LearnerAccuracyWeights, validLearners),
+                SelectLearnerValues(snap.LearnerCalAccuracies, validLearners));
         }
 
         double mean = samples.Average();
@@ -202,5 +267,47 @@ public sealed class ElmInferenceEngine : IModelInferenceEngine
         }
 
         return MLFeatureHelper.Sigmoid(score);
+    }
+
+    private static int ResolveLearnerHiddenSize(
+        double[] wOut,
+        double[] wIn,
+        double[]? bIn,
+        int[]? subset,
+        int featureCount,
+        int fallbackHiddenDim)
+    {
+        int subsetLen = subset?.Length > 0 ? subset.Length : featureCount;
+        int hiddenFromWeights = wOut.Length;
+        int hiddenFromBiases = bIn?.Length ?? 0;
+        int hiddenFromInputs = subsetLen > 0 ? wIn.Length / subsetLen : 0;
+
+        int resolved = hiddenFromWeights;
+        if (hiddenFromBiases > 0)
+            resolved = Math.Min(resolved, hiddenFromBiases);
+        if (hiddenFromInputs > 0)
+            resolved = Math.Min(resolved, hiddenFromInputs);
+
+        if (resolved > 0)
+            return resolved;
+
+        return fallbackHiddenDim > 0 ? fallbackHiddenDim : hiddenFromWeights;
+    }
+
+    private static double[]? SelectLearnerValues(double[]? values, List<int> learnerIndices)
+    {
+        if (values is not { Length: > 0 } || learnerIndices.Count == 0)
+            return null;
+
+        var selected = new double[learnerIndices.Count];
+        for (int i = 0; i < learnerIndices.Count; i++)
+        {
+            int sourceIndex = learnerIndices[i];
+            if (sourceIndex < 0 || sourceIndex >= values.Length)
+                return null;
+            selected[i] = values[sourceIndex];
+        }
+
+        return selected;
     }
 }

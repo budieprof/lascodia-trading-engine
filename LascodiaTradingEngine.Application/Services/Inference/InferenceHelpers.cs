@@ -19,6 +19,10 @@ internal static class InferenceHelpers
         double[]? metaWeights, double metaBias,
         double[]? gesWeights, double[]? learnerAccuracyWeights, double[]? calAccuracies)
     {
+        count = Math.Clamp(count, 0, probs.Length);
+        if (count <= 0)
+            return 0.5;
+
         if (metaWeights is { Length: > 0 } mw && mw.Length == count)
         {
             double metaZ = metaBias;
@@ -30,7 +34,7 @@ internal static class InferenceHelpers
         {
             double wSum = 0, pSum = 0;
             for (int t = 0; t < count; t++) { wSum += gw[t]; pSum += gw[t] * probs[t]; }
-            return wSum > 1e-10 ? pSum / wSum : probs.Average();
+            return wSum > 1e-10 ? pSum / wSum : AverageFirstCount(probs, count);
         }
 
         if (learnerAccuracyWeights is { Length: > 0 } law && law.Length == count)
@@ -41,7 +45,7 @@ internal static class InferenceHelpers
                 wSum += law[t];
                 pSum += law[t] * probs[t];
             }
-            return wSum > 1e-10 ? pSum / wSum : probs.Average();
+            return wSum > 1e-10 ? pSum / wSum : AverageFirstCount(probs, count);
         }
 
         if (calAccuracies is { Length: > 0 } ca && ca.Length == count)
@@ -55,10 +59,10 @@ internal static class InferenceHelpers
                 double w = Math.Exp(Alpha * (ca[t] - maxAcc)) / sumExp;
                 wSum += w; pSum += w * probs[t];
             }
-            return wSum > 1e-10 ? pSum / wSum : probs.Average();
+            return wSum > 1e-10 ? pSum / wSum : AverageFirstCount(probs, count);
         }
 
-        return probs.Average();
+        return AverageFirstCount(probs, count);
     }
 
     /// <summary>
@@ -68,7 +72,7 @@ internal static class InferenceHelpers
     /// </summary>
     internal static double ApplyBasicCalibration(double rawProb, ModelSnapshot snap)
     {
-        double rawLogit = MLFeatureHelper.Logit(rawProb);
+        double rawLogit = MLFeatureHelper.Logit(Math.Clamp(rawProb, 1e-7, 1.0 - 1e-7));
         double calibP = snap.TemperatureScale > 0.0 && snap.TemperatureScale < 10.0
             ? MLFeatureHelper.Sigmoid(rawLogit / snap.TemperatureScale)
             : MLFeatureHelper.Sigmoid(snap.PlattA * rawLogit + snap.PlattB);
@@ -85,7 +89,7 @@ internal static class InferenceHelpers
     /// </summary>
     internal static double ApplyDeployedCalibration(double rawProb, ModelSnapshot snap)
     {
-        double rawLogit = MLFeatureHelper.Logit(rawProb);
+        double rawLogit = MLFeatureHelper.Logit(Math.Clamp(rawProb, 1e-7, 1.0 - 1e-7));
         double globalCalibP = snap.TemperatureScale > 0.0 && snap.TemperatureScale < 10.0
             ? MLFeatureHelper.Sigmoid(rawLogit / snap.TemperatureScale)
             : MLFeatureHelper.Sigmoid(snap.PlattA * rawLogit + snap.PlattB);
@@ -109,5 +113,16 @@ internal static class InferenceHelpers
         }
 
         return calibP;
+    }
+
+    private static double AverageFirstCount(double[] probs, int count)
+    {
+        if (count <= 0)
+            return 0.5;
+
+        double sum = 0.0;
+        for (int i = 0; i < count; i++)
+            sum += probs[i];
+        return sum / count;
     }
 }

@@ -11,6 +11,8 @@ internal static class ElmEvaluationHelper
 {
     private const double DefaultSharpeAnnualisationFactor = 252.0;
 
+    private static int ToBinaryLabel(int direction) => direction > 0 ? 1 : 0;
+
     // ═══════════════════════════════════════════════════════════════════════════
     //  Ensemble evaluation
     // ═══════════════════════════════════════════════════════════════════════════
@@ -40,22 +42,23 @@ internal static class ElmEvaluationHelper
         for (int i = 0; i < testSet.Count; i++)
         {
             var s = testSet[i];
-            double calibP = ensembleCalibProb(
+            double calibP = Math.Clamp(ensembleCalibProb(
                 s.Features, weights, biases, inputWeights, inputBiases,
-                plattA, plattB, featureCount, hiddenSize, featureSubsets, null);
+                plattA, plattB, featureCount, hiddenSize, featureSubsets, null), 0.0, 1.0);
 
             int pred = calibP >= 0.5 ? 1 : 0;
-            double y = s.Direction > 0 ? 1.0 : 0.0;
+            int actual = ToBinaryLabel(s.Direction);
+            double y = actual;
 
-            if (pred == s.Direction) correct++;
-            if (pred == 1 && s.Direction == 1) tp++;
-            if (pred == 1 && s.Direction == 0) fp++;
-            if (pred == 0 && s.Direction == 1) fn++;
-            if (pred == 0 && s.Direction == 0) tn++;
+            if (pred == actual) correct++;
+            if (pred == 1 && actual == 1) tp++;
+            if (pred == 1 && actual == 0) fp++;
+            if (pred == 0 && actual == 1) fn++;
+            if (pred == 0 && actual == 0) tn++;
             brierSum += (calibP - y) * (calibP - y);
 
             double absMag = Math.Max(0.001, Math.Abs(s.Magnitude));
-            if (pred == s.Direction)
+            if (pred == actual)
                 evWinSum += absMag;
             else
                 evLossSum += absMag;
@@ -106,7 +109,7 @@ internal static class ElmEvaluationHelper
         Func<float[], double[][], double[], double[][], double[][], double, double, int, int, int[][]?, double[]?, double> ensembleCalibProb,
         int bins = 10)
     {
-        if (samples.Count == 0) return 0;
+        if (samples.Count == 0 || bins <= 0) return 0;
 
         int[] binCounts = new int[bins];
         double[] binAcc = new double[bins];
@@ -114,12 +117,12 @@ internal static class ElmEvaluationHelper
 
         foreach (var s in samples)
         {
-            double p = ensembleCalibProb(
+            double p = Math.Clamp(ensembleCalibProb(
                 s.Features, weights, biases, inputWeights, inputBiases,
-                plattA, plattB, featureCount, hiddenSize, featureSubsets, null);
+                plattA, plattB, featureCount, hiddenSize, featureSubsets, null), 0.0, 1.0);
             int bin = Math.Clamp((int)(p * bins), 0, bins - 1);
             binCounts[bin]++;
-            binAcc[bin]  += (p >= 0.5 ? 1 : 0) == s.Direction ? 1.0 : 0.0;
+            binAcc[bin]  += ToBinaryLabel(s.Direction);
             binConf[bin] += p;
         }
 
@@ -154,9 +157,9 @@ internal static class ElmEvaluationHelper
 
         foreach (var s in testSet)
         {
-            double p = ensembleCalibProb(
+            double p = Math.Clamp(ensembleCalibProb(
                 s.Features, weights, biases, inputWeights, inputBiases,
-                plattA, plattB, featureCount, hiddenSize, featureSubsets, null);
+                plattA, plattB, featureCount, hiddenSize, featureSubsets, null), 0.0, 1.0);
             double y = s.Direction > 0 ? 1.0 : 0.0;
             brierModel += (p - y) * (p - y);
             brierNaive += (naiveP - y) * (naiveP - y);
@@ -186,7 +189,7 @@ internal static class ElmEvaluationHelper
             double p = ensembleCalibProb(
                 s.Features, weights, biases, inputWeights, inputBiases,
                 plattA, plattB, featureCount, hiddenSize, featureSubsets, null);
-            if ((p >= 0.5 ? 1 : 0) == s.Direction) baselineCorrect++;
+            if ((p >= 0.5 ? 1 : 0) == ToBinaryLabel(s.Direction)) baselineCorrect++;
         }
         double baselineAcc = (double)baselineCorrect / testSet.Count;
 
@@ -219,7 +222,7 @@ internal static class ElmEvaluationHelper
                 double p = ensembleCalibProb(
                     buffer, weights, biases, inputWeights, inputBiases,
                     plattA, plattB, featureCount, hiddenSize, featureSubsets, null);
-                if ((p >= 0.5 ? 1 : 0) == testSet[i].Direction) correct++;
+                if ((p >= 0.5 ? 1 : 0) == ToBinaryLabel(testSet[i].Direction)) correct++;
 
                 buffer[f] = orig[f];
             }
@@ -246,7 +249,7 @@ internal static class ElmEvaluationHelper
             double p = ensembleRawProb(
                 s.Features, weights, biases, inputWeights, inputBiases,
                 featureCount, hiddenSize, featureSubsets, null);
-            if ((p >= 0.5 ? 1 : 0) == s.Direction) baselineCorrect++;
+            if ((p >= 0.5 ? 1 : 0) == ToBinaryLabel(s.Direction)) baselineCorrect++;
         }
         double baselineAcc = (double)baselineCorrect / calSet.Count;
 
@@ -278,7 +281,7 @@ internal static class ElmEvaluationHelper
                 double p = ensembleRawProb(
                     buffer, weights, biases, inputWeights, inputBiases,
                     featureCount, hiddenSize, featureSubsets, null);
-                if ((p >= 0.5 ? 1 : 0) == calSet[i].Direction) correct++;
+                if ((p >= 0.5 ? 1 : 0) == ToBinaryLabel(calSet[i].Direction)) correct++;
                 buffer[f] = orig[f];
             }
             importance[f] = baselineAcc - (double)correct / calSet.Count;
@@ -526,13 +529,16 @@ internal static class ElmEvaluationHelper
 
     internal static int CountNonStationaryFeatures(List<TrainingSample> samples, int featureCount)
     {
+        if (samples.Count < 20 || featureCount <= 0)
+            return 0;
+
         int nonStat = 0;
         for (int j = 0; j < featureCount; j++)
         {
             var series = new double[samples.Count];
             for (int i = 0; i < samples.Count; i++) series[i] = samples[i].Features[j];
-            double adf = MLFeatureHelper.AdfTest(series);
-            if (adf > -1.95) nonStat++;
+            double pValue = MLFeatureHelper.AdfTest(series, maxLags: 4);
+            if (pValue > 0.05) nonStat++;
         }
         return nonStat;
     }

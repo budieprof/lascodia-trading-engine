@@ -55,6 +55,8 @@ public sealed class ElmModelTrainer : IMLModelTrainer
 
     public ElmModelTrainer(ILogger<ElmModelTrainer> logger) => _logger = logger;
 
+    private static int ToBinaryLabel(int direction) => direction > 0 ? 1 : 0;
+
     // ── IMLModelTrainer ───────────────────────────────────────────────────────
 
     public async Task<TrainingResult> TrainAsync(
@@ -78,16 +80,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
     {
         ct.ThrowIfCancellationRequested();
 
-        if (samples.Count == 0)
-            throw new InvalidOperationException("ElmModelTrainer: no training samples provided.");
-
-        int featureCount = samples[0].Features.Length;
-        for (int i = 1; i < samples.Count; i++)
-        {
-            if (samples[i].Features.Length != featureCount)
-                throw new InvalidOperationException(
-                    $"ElmModelTrainer: inconsistent feature count — sample 0 has {featureCount} features, sample {i} has {samples[i].Features.Length}.");
-        }
+        int featureCount = ValidateTrainingSamples(samples);
         int hiddenSize   = hp.ElmHiddenSize is > 0 ? hp.ElmHiddenSize.Value : DefaultHiddenSize;
         int K            = Math.Max(1, hp.K);
 
@@ -212,7 +205,8 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         double[]? densityWeights = null;
         if (hp.DensityRatioWindowDays > 0 && trainSet.Count >= 50)
         {
-            densityWeights = ElmBootstrapHelper.ComputeDensityRatioWeights(trainSet, featureCount, hp.DensityRatioWindowDays);
+            densityWeights = ElmBootstrapHelper.ComputeDensityRatioWeights(
+                trainSet, featureCount, hp.DensityRatioWindowDays, hp.BarsPerDay);
             _logger.LogDebug("ELM density-ratio weights computed (recentWindow={W}d).", hp.DensityRatioWindowDays);
         }
 
@@ -900,7 +894,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
 
                 double oobProb = oobSum / oobLearners;
                 oobTotal++;
-                if ((oobProb >= 0.5 ? 1 : 0) == effectiveTrainSet[i].Direction) oobCorrect++;
+                if ((oobProb >= 0.5 ? 1 : 0) == ToBinaryLabel(effectiveTrainSet[i].Direction)) oobCorrect++;
             }
             oobAccuracy = oobTotal > 0 ? (double)oobCorrect / oobTotal : 0;
             _logger.LogInformation("ELM true OOB accuracy={OobAcc:P1} ({OobN}/{Total} samples had OOB learners)",
@@ -915,7 +909,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             var residuals = new double[effectiveCalSet.Count];
             for (int i = 0; i < effectiveCalSet.Count; i++)
             {
-                double y = effectiveCalSet[i].Direction > 0 ? 1.0 : 0.0;
+                double y = ToBinaryLabel(effectiveCalSet[i].Direction);
                 residuals[i] = Math.Abs(y - FinalEffectiveCalibProb(effectiveCalSet[i].Features));
             }
             Array.Sort(residuals);
@@ -927,7 +921,8 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             effectiveCalSet, weights, biases, inputWeights, inputBiases,
             effectiveFeatureCount, hiddenSize, featureSubsets,
             (f, wk, bk, iwk, ibk, fc, hs, sub, learnerIdx) => ElmLearnerProb(
-                f, wk, bk, iwk, ibk, fc, hs, sub,
+                f, wk, bk, iwk, ibk, fc,
+                learnerIdx >= 0 && learnerIdx < learnerHiddenSizes.Length ? learnerHiddenSizes[learnerIdx] : hs, sub,
                 learnerIdx < learnerActivations.Length ? learnerActivations[learnerIdx] : hp.ElmActivation));
         _logger.LogDebug("ELM ensemble diversity={Div:F4}", ensembleDiversity);
 
@@ -1024,7 +1019,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         {
             Type                       = ModelType,
             Version                    = ModelVersion,
-            Features                   = MLFeatureHelper.FeatureNames,
+            Features                   = BuildSnapshotFeatureNames(featureCount),
             Means                      = means,
             Stds                       = stds,
             BaseLearnersK              = K,
@@ -1469,7 +1464,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                             score += wSolve[h] * ElmMathHelper.Activate(z, probeAct);
                         }
                         int pred = MLFeatureHelper.Sigmoid(score) >= 0.5 ? 1 : 0;
-                        if (pred == s.Direction) correct++;
+                        if (pred == ToBinaryLabel(s.Direction)) correct++;
                         valCount++;
                     }
 
@@ -1692,7 +1687,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             {
                 Array.Copy(warmStart.ElmInputWeights[k], wIn, wIn.Length);
                 if (warmStart.ElmInputBiases is not null && k < warmStart.ElmInputBiases.Length)
-                    Array.Copy(warmStart.ElmInputBiases[k], bIn, bIn.Length);
+                    Array.Copy(warmStart.ElmInputBiases[k], bIn, Math.Min(warmStart.ElmInputBiases[k].Length, bIn.Length));
             }
             else
             {
@@ -1877,7 +1872,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         double score = bias;
         for (int h = 0; h < hiddenSize; h++)
         {
-            double z = bIn[h];
+            double z = h < bIn.Length ? bIn[h] : 0.0;
             int rowOff = h * subsetLen;
             if (subset is not null)
                 z += ElmMathHelper.DotProductSimd(wIn, rowOff, features, subset, subsetLen);
@@ -1913,7 +1908,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                 double pk = ElmLearnerProb(
                     features, weights[k], biases[k], inputWeights[k], inputBiases[k],
                     featureCount, learnerHiddenSizes[k], featureSubsets?[k],
-                    k < learnerActivations.Length ? learnerActivations[k] : learnerActivations[0]);
+                    ResolveLearnerActivation(learnerActivations, k));
                 z += stackingWeights[k] * pk;
             }
             return MLFeatureHelper.Sigmoid(z);
@@ -1927,7 +1922,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                 sum += learnerWeights[k] * ElmLearnerProb(
                     features, weights[k], biases[k], inputWeights[k], inputBiases[k],
                     featureCount, learnerHiddenSizes[k], featureSubsets?[k],
-                    k < learnerActivations.Length ? learnerActivations[k] : learnerActivations[0]);
+                    ResolveLearnerActivation(learnerActivations, k));
             }
             return sum;
         }
@@ -1938,7 +1933,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             uniSum += ElmLearnerProb(
                 features, weights[k], biases[k], inputWeights[k], inputBiases[k],
                 featureCount, learnerHiddenSizes[k], featureSubsets?[k],
-                k < learnerActivations.Length ? learnerActivations[k] : learnerActivations[0]);
+                ResolveLearnerActivation(learnerActivations, k));
         }
         return uniSum / K;
     }
@@ -2001,7 +1996,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                     s.Features, weights[k], biases[k], inputWeights[k], inputBiases[k],
                     featureCount, learnerHiddenSizes[k], featureSubsets?[k],
                     k < learnerActivations.Length ? learnerActivations[k] : defaultActivation);
-                if ((prob >= 0.5 ? 1 : 0) == s.Direction) correct++;
+                if ((prob >= 0.5 ? 1 : 0) == ToBinaryLabel(s.Direction)) correct++;
             }
             accuracies[k] = (double)correct / calSet.Count;
         }
@@ -2042,7 +2037,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             probs[k] = ElmLearnerProb(
                 features, weights[k], biases[k], inputWeights[k], inputBiases[k],
                 featureCount, learnerHiddenSizes[k], featureSubsets?[k],
-                k < learnerActivations.Length ? learnerActivations[k] : learnerActivations[0]);
+                ResolveLearnerActivation(learnerActivations, k));
         }
 
         double avg;
@@ -2108,7 +2103,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                 int rowOff = h * subLen;
                 z += ElmMathHelper.DotProductSimd(wIn, rowOff, features, sub, subLen);
                 ElmActivation learnerAct = learnerActivations.Length > 0
-                    ? learnerActivations[Math.Min(ki, learnerActivations.Length - 1)]
+                    ? ResolveLearnerActivation(learnerActivations, ki)
                     : ElmActivation.Sigmoid;
                 hSum += ElmMathHelper.Activate(z, learnerAct);
                 hCount++;
@@ -2133,6 +2128,11 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         int K = elmInputWeights.Length;
         int augDim = featureCount + hiddenSize;
         int valSize = Math.Max(10, train.Count / 10);
+        if (train.Count <= valSize)
+            valSize = Math.Max(1, train.Count / 5);
+        if (train.Count - valSize < 1)
+            return (new double[featureCount], 0.0,
+                new double[featureCount + hiddenSize], 0.0);
         var trainSubset = train[..^valSize];
 
         double[] w = new double[augDim];
@@ -2313,6 +2313,10 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         int K = elmInputWeights.Length;
         int augDim = featureCount + hiddenSize;
         int valSize = Math.Max(10, train.Count / 10);
+        if (train.Count <= valSize)
+            valSize = Math.Max(1, train.Count / 5);
+        if (train.Count - valSize < 1)
+            return (new double[featureCount], 0.0);
         var trainSubset = train[..^valSize];
         int trainSubCount = trainSubset.Count;
 
@@ -2456,7 +2460,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                     int rowOff = h * subLen;
                     z += ElmMathHelper.DotProductSimd(wIn, rowOff, f, sub, subLen);
                     ElmActivation learnerAct = learnerActivations.Length > 0
-                        ? learnerActivations[Math.Min(ki, learnerActivations.Length - 1)]
+                        ? ResolveLearnerActivation(learnerActivations, ki)
                         : ElmActivation.Sigmoid;
                     hSum[h] += ElmMathHelper.Activate(z, learnerAct);
                     hCount[h]++;
@@ -2501,7 +2505,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                     var f = train[i].Features;
                     z += ElmMathHelper.DotProductSimd(wIn, rowOff, f, sub, subLen);
                     ElmActivation learnerAct = learnerActivations.Length > 0
-                        ? learnerActivations[Math.Min(ki, learnerActivations.Length - 1)]
+                        ? ResolveLearnerActivation(learnerActivations, ki)
                         : ElmActivation.Sigmoid;
                     derivSum += ActivationDerivative(z, learnerAct);
                 }
@@ -2618,7 +2622,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             for (int j = 0; j < metaDim - 2; j++)
                 if (j < s.Features.Length) metaXs[i][j + 2] = s.Features[j];
 
-            targets[i] = (calibP >= decisionThreshold ? 1 : 0) == s.Direction ? 1.0 : 0.0;
+            targets[i] = (calibP >= decisionThreshold ? 1 : 0) == ToBinaryLabel(s.Direction) ? 1.0 : 0.0;
         }
 
         int metaMaxEpochs = configMaxEpochs > 0 ? configMaxEpochs : 200;
@@ -2756,7 +2760,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             mlScore = MLFeatureHelper.Sigmoid(mlScore);
 
             absXs[i] = [calibP, ensStd, mlScore];
-            absTargets[i] = (calibP >= decisionThreshold ? 1 : 0) == s.Direction ? 1.0 : 0.0;
+            absTargets[i] = (calibP >= decisionThreshold ? 1 : 0) == ToBinaryLabel(s.Direction) ? 1.0 : 0.0;
         }
 
         int absMaxEpochs = configMaxEpochs > 0 ? configMaxEpochs : 200;
@@ -2843,9 +2847,9 @@ public sealed class ElmModelTrainer : IMLModelTrainer
 
         double bestThr = 0.5;
         double bestAcc = 0;
-        for (int pct = 0; pct <= 30; pct++)
+        for (int pct = 30; pct <= 70; pct++)
         {
-            double margin = pct / 100.0;
+            double threshold = pct / 100.0;
             int c = 0, t = 0;
             foreach (var s in calSet)
             {
@@ -2854,13 +2858,29 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                     : EnsembleCalibProb(
                         s.Features, weights, biases, inputWeights, inputBiases,
                         plattA, plattB, featureCount, hiddenSize, featureSubsets, null, learnerHiddenSizes, learnerActivations, stackingWeights, stackingBias);
-                if (Math.Abs(calibP - decisionThreshold) < margin) continue;
+                double ensStd = ComputeEnsembleStd(
+                    s.Features, weights, biases, inputWeights, inputBiases,
+                    featureCount, featureSubsets, learnerHiddenSizes, learnerActivations,
+                    stackingWeights: stackingWeights, stackingBias: stackingBias);
+
+                double mlScore = metaLabelBias;
+                double[] mlX = [calibP, ensStd, ..Enumerable.Range(0, Math.Min(5, featureCount)).Select(j => (double)s.Features[j])];
+                for (int j = 0; j < Math.Min(metaLabelWeights.Length, mlX.Length); j++)
+                    mlScore += metaLabelWeights[j] * mlX[j];
+                mlScore = MLFeatureHelper.Sigmoid(mlScore);
+
+                double absZ = ab + aw[0] * calibP + aw[1] * ensStd + aw[2] * mlScore;
+                if (MLFeatureHelper.Sigmoid(absZ) < threshold) continue;
                 t++;
-                if ((calibP >= decisionThreshold ? 1 : 0) == s.Direction) c++;
+                if ((calibP >= decisionThreshold ? 1 : 0) == ToBinaryLabel(s.Direction)) c++;
             }
             if (t < 5) continue;
             double acc = (double)c / t;
-            if (acc > bestAcc) { bestAcc = acc; bestThr = 0.5 + margin; }
+            if (acc > bestAcc && t >= calSet.Count / 4)
+            {
+                bestAcc = acc;
+                bestThr = threshold;
+            }
         }
 
         return (aw, ab, bestThr);
@@ -3091,10 +3111,10 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             return false;
         }
 
-        if (snapshot.Weights is null || snapshot.ElmInputWeights is null)
+        if (snapshot.Weights is null || snapshot.Biases is null || snapshot.ElmInputWeights is null)
             return false;
 
-        int K = snapshot.Weights.Length;
+        int K = Math.Min(snapshot.Weights.Length, snapshot.Biases.Length);
         double target = sample.Direction > 0 ? 1.0 : 0.0;
 
         // Standardise using the snapshot's stored means/stds
@@ -3107,7 +3127,11 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         {
             if (k >= snapshot.ElmInverseGram.Length || snapshot.ElmInverseGram[k] is null)
                 continue;
+            if (k >= snapshot.ElmInputWeights.Length || snapshot.Weights[k] is null || snapshot.Weights[k].Length == 0)
+                continue;
             if (snapshot.ElmInputBiases is null || k >= snapshot.ElmInputBiases.Length)
+                continue;
+            if (snapshot.ElmInputBiases[k] is null)
                 continue;
 
             var inputW = snapshot.ElmInputWeights[k];
@@ -3115,7 +3139,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             int H      = snapshot.Weights[k].Length;
             int gramDim = snapshot.ElmInverseGramDim is not null && k < snapshot.ElmInverseGramDim.Length
                 ? snapshot.ElmInverseGramDim[k] : H;
-            if (snapshot.ElmInverseGram[k].Length != gramDim * gramDim || gramDim != H)
+            if (gramDim <= 0 || snapshot.ElmInverseGram[k].Length != gramDim * gramDim || gramDim != H)
                 continue;
 
             // Resolve feature subset for this learner
@@ -3123,9 +3147,13 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             if (snapshot.FeatureSubsetIndices is not null && k < snapshot.FeatureSubsetIndices.Length)
             {
                 var subset = snapshot.FeatureSubsetIndices[k];
+                if (subset is null || subset.Length == 0)
+                    continue;
                 features = new float[subset.Length];
                 for (int i = 0; i < subset.Length; i++)
-                    features[i] = stdFeatures[subset[i]];
+                    features[i] = subset[i] >= 0 && subset[i] < stdFeatures.Length
+                        ? stdFeatures[subset[i]]
+                        : 0f;
             }
 
             // Compute hidden activation: h = activation(W_in × features + b_in)
@@ -3167,5 +3195,61 @@ public sealed class ElmModelTrainer : IMLModelTrainer
 
         _logger.LogDebug("ELM online update applied: {K} learners updated with 1 sample", updatedLearners);
         return true;
+    }
+
+    private static int ValidateTrainingSamples(IReadOnlyList<TrainingSample> samples)
+    {
+        if (samples.Count == 0)
+            throw new InvalidOperationException("ElmModelTrainer: no training samples provided.");
+
+        int featureCount = samples[0].Features.Length;
+        if (featureCount <= 0)
+            throw new InvalidOperationException("ElmModelTrainer: training samples must contain at least one feature.");
+
+        for (int i = 0; i < samples.Count; i++)
+        {
+            if (samples[i].Direction is not (1 or 0 or -1))
+                throw new InvalidOperationException(
+                    $"ElmModelTrainer: sample {i} has invalid direction {samples[i].Direction}; expected 1 for Buy and 0/-1 for non-Buy.");
+
+            if (!float.IsFinite(samples[i].Magnitude))
+                throw new InvalidOperationException($"ElmModelTrainer: sample {i} has non-finite magnitude.");
+
+            if (samples[i].Features.Length != featureCount)
+                throw new InvalidOperationException(
+                    $"ElmModelTrainer: inconsistent feature count — sample 0 has {featureCount} features, sample {i} has {samples[i].Features.Length}.");
+
+            for (int j = 0; j < samples[i].Features.Length; j++)
+            {
+                if (!float.IsFinite(samples[i].Features[j]))
+                    throw new InvalidOperationException(
+                        $"ElmModelTrainer: sample {i} feature {j} is non-finite.");
+            }
+        }
+
+        return featureCount;
+    }
+
+    private static string[] BuildSnapshotFeatureNames(int featureCount)
+    {
+        if (featureCount <= 0)
+            return [];
+
+        var names = new string[featureCount];
+        for (int i = 0; i < featureCount; i++)
+            names[i] = i < MLFeatureHelper.FeatureNames.Length
+                ? MLFeatureHelper.FeatureNames[i]
+                : $"F{i}";
+        return names;
+    }
+
+    private static ElmActivation ResolveLearnerActivation(ElmActivation[] learnerActivations, int learnerIndex)
+    {
+        if (learnerActivations.Length == 0)
+            return ElmActivation.Sigmoid;
+
+        return learnerIndex < learnerActivations.Length
+            ? learnerActivations[learnerIndex]
+            : learnerActivations[0];
     }
 }

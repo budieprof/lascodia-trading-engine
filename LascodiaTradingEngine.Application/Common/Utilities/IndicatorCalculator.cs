@@ -32,11 +32,13 @@ public static class IndicatorCalculator
     /// </summary>
     public static decimal Atr(IReadOnlyList<Candle> candles, int endIndex, int period)
     {
+        if (endIndex < 1) return 0m; // TrueRange requires index >= 1
         decimal sumTr = 0m;
-        int start = endIndex - period + 1;
+        int start = Math.Max(1, endIndex - period + 1); // guard: TrueRange accesses candles[index-1]
+        int count = endIndex - start + 1;
         for (int i = start; i <= endIndex; i++)
             sumTr += TrueRange(candles, i);
-        return sumTr / period;
+        return count > 0 ? sumTr / count : 0m;
     }
 
     // ═════════════════════════════════════════════════════════════════════════
@@ -50,16 +52,20 @@ public static class IndicatorCalculator
     /// </summary>
     public static decimal WilderAtr(IReadOnlyList<Candle> candles, int endIndex, int period)
     {
+        if (endIndex < 1) return 0m; // TrueRange requires index >= 1
         int seedStart = endIndex - period * 2 + 1;
         if (seedStart < 1) seedStart = 1;
 
         int seedEnd = seedStart + period - 1;
         if (seedEnd > endIndex) seedEnd = endIndex;
 
+        int seedCount = seedEnd - seedStart + 1;
+        if (seedCount <= 0) return 0m; // degenerate: no valid bars
+
         decimal atr = 0m;
         for (int i = seedStart; i <= seedEnd; i++)
             atr += TrueRange(candles, i);
-        atr /= seedEnd - seedStart + 1;
+        atr /= seedCount;
 
         for (int i = seedEnd + 1; i <= endIndex; i++)
         {
@@ -248,6 +254,7 @@ public static class IndicatorCalculator
     /// </summary>
     public static decimal SimpleRsi(IReadOnlyList<Candle> candles, int endIndex, int period)
     {
+        if (endIndex < period || period < 1) return 50m; // insufficient data
         int startIndex = endIndex - period;
 
         decimal avgGain = 0m, avgLoss = 0m;

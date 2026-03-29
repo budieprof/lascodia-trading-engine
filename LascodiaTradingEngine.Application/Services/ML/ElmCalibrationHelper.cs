@@ -9,6 +9,8 @@ namespace LascodiaTradingEngine.Application.Services.ML;
 /// </summary>
 internal static class ElmCalibrationHelper
 {
+    private static int ToBinaryLabel(int direction) => direction > 0 ? 1 : 0;
+
     // ═══════════════════════════════════════════════════════════════════════════
     //  Platt calibration
     // ═══════════════════════════════════════════════════════════════════════════
@@ -21,6 +23,19 @@ internal static class ElmCalibrationHelper
         Func<float[], double[][], double[], double[][], double[][], int, int, int[][]?, double[]?, double> ensembleRawProb)
     {
         if (calSet.Count < 5) return (1.0, 0.0);
+
+        bool hasPositive = false, hasNegative = false;
+        foreach (var sample in calSet)
+        {
+            if (sample.Direction > 0) hasPositive = true;
+            else hasNegative = true;
+
+            if (hasPositive && hasNegative)
+                break;
+        }
+
+        if (!hasPositive || !hasNegative)
+            return (1.0, 0.0);
 
         double a = 1.0, b = 0.0;
         double bestA = a, bestB = b;
@@ -66,7 +81,7 @@ internal static class ElmCalibrationHelper
                 {
                     int i = useBatch ? batchOrder[bIdx] : bIdx;
                     double p = MLFeatureHelper.Sigmoid(a * rawLogits[i] + b);
-                    double y = calSet[i].Direction > 0 ? 1.0 : 0.0;
+                    double y = ToBinaryLabel(calSet[i].Direction);
                     double err = p - y;
                     gradA += err * rawLogits[i];
                     gradB += err;
@@ -91,7 +106,7 @@ internal static class ElmCalibrationHelper
             for (int i = 0; i < calSet.Count; i++)
             {
                 double p = MLFeatureHelper.Sigmoid(a * rawLogits[i] + b);
-                double y = calSet[i].Direction > 0 ? 1.0 : 0.0;
+                double y = ToBinaryLabel(calSet[i].Direction);
                 loss -= y * Math.Log(Math.Max(p, 1e-10)) + (1 - y) * Math.Log(Math.Max(1 - p, 1e-10));
             }
             loss /= calSet.Count;
@@ -224,7 +239,7 @@ internal static class ElmCalibrationHelper
                 ensembleCalibProb(
                     calSet[i].Features, weights, biases, inputWeights, inputBiases,
                     plattA, plattB, featureCount, hiddenSize, featureSubsets, null),
-                calSet[i].Direction > 0 ? 1.0 : 0.0);
+                ToBinaryLabel(calSet[i].Direction));
         }
         Array.Sort(pairs, (a, b) => a.Pred.CompareTo(b.Pred));
 
@@ -303,7 +318,7 @@ internal static class ElmCalibrationHelper
                 calSet[i].Features, weights, biases, inputWeights, inputBiases,
                 plattA, plattB, featureCount, hiddenSize, featureSubsets, null);
             if (isotonicBp.Length > 0) calibP = ApplyIsotonicCalibration(calibP, isotonicBp);
-            double y = calSet[i].Direction > 0 ? 1.0 : 0.0;
+            double y = ToBinaryLabel(calSet[i].Direction);
             residuals[i] = Math.Abs(y - calibP);
         }
         Array.Sort(residuals);
@@ -340,7 +355,7 @@ internal static class ElmCalibrationHelper
                 calSet[i].Features, weights, biases, inputWeights, inputBiases,
                 featureCount, hiddenSize, featureSubsets, null);
             rawProbs[i] = Math.Clamp(raw, 1e-7, 1.0 - 1e-7);
-            targets[i] = calSet[i].Direction > 0 ? 1.0 : 0.0;
+            targets[i] = ToBinaryLabel(calSet[i].Direction);
         }
 
         double BceLoss(double T)
@@ -447,28 +462,15 @@ internal static class ElmCalibrationHelper
     {
         if (calSet.Count == 0) return 0;
 
-        double winMagSum = 0, lossMagSum = 0;
-        int winCount = 0, lossCount = 0;
-        foreach (var s in calSet)
-        {
-            double mag = Math.Max(1e-6, Math.Abs(s.Magnitude));
-            if (s.Direction > 0) { winMagSum += mag; winCount++; }
-            else { lossMagSum += mag; lossCount++; }
-        }
-
-        double avgWin  = winCount > 0 ? winMagSum / winCount : 1.0;
-        double avgLoss = lossCount > 0 ? lossMagSum / lossCount : 1.0;
-        double b = avgLoss > 1e-10 ? avgWin / avgLoss : 1.0;
-
         double sum = 0;
         foreach (var s in calSet)
         {
-            double p = ensembleCalibProb(
+            double p = Math.Clamp(ensembleCalibProb(
                 s.Features, weights, biases, inputWeights, inputBiases,
-                plattA, plattB, featureCount, hiddenSize, featureSubsets, null);
-            double q = 1.0 - p;
-            double kelly = (p * b - q) / b;
-            sum += Math.Max(0, kelly);
+                plattA, plattB, featureCount, hiddenSize, featureSubsets, null), 0.0, 1.0);
+
+            // Kelly fraction for roughly symmetric payoff trades simplifies to max(0, 2p - 1).
+            sum += Math.Max(0.0, 2.0 * p - 1.0);
         }
         return (sum / calSet.Count) * 0.5;
     }
@@ -492,7 +494,7 @@ internal static class ElmCalibrationHelper
             double raw = ensembleRawProb(
                 s.Features, weights, biases, inputWeights, inputBiases,
                 featureCount, hiddenSize, featureSubsets, null);
-            double logit = Math.Log(Math.Max(raw, 1e-7) / Math.Max(1 - raw, 1e-7));
+            double logit = MLFeatureHelper.Logit(Math.Clamp(raw, 1e-7, 1.0 - 1e-7));
             double dist = Math.Abs(logit);
             sum += dist;
             sumSq += dist * dist;
@@ -523,9 +525,9 @@ internal static class ElmCalibrationHelper
         double[] probs = new double[calSet.Count];
         for (int i = 0; i < calSet.Count; i++)
         {
-            probs[i] = ensembleCalibProb(
+            probs[i] = Math.Clamp(ensembleCalibProb(
                 calSet[i].Features, weights, biases, inputWeights, inputBiases,
-                plattA, plattB, featureCount, hiddenSize, featureSubsets, null);
+                plattA, plattB, featureCount, hiddenSize, featureSubsets, null), 0.0, 1.0);
         }
 
         int lo = Math.Clamp(searchMin, 1, 99);
@@ -534,19 +536,16 @@ internal static class ElmCalibrationHelper
         for (int pct = lo; pct <= hi; pct++)
         {
             double thr = pct / 100.0;
-            int correct = 0, total = 0;
+            double ev = 0.0;
             for (int i = 0; i < calSet.Count; i++)
             {
-                double p = probs[i];
-                if (p >= thr || p < (1.0 - thr))
-                {
-                    total++;
-                    int pred = p >= 0.5 ? 1 : 0;
-                    if (pred == calSet[i].Direction) correct++;
-                }
+                bool predictedBuy = probs[i] >= thr;
+                bool actualBuy = calSet[i].Direction > 0;
+                bool correct = predictedBuy == actualBuy;
+                ev += (correct ? 1.0 : -1.0) * Math.Abs(calSet[i].Magnitude);
             }
-            if (total < 5) continue;
-            double ev = (double)correct / total - 0.5;
+
+            ev /= calSet.Count;
             if (ev > bestEV) { bestEV = ev; bestThreshold = thr; }
         }
 

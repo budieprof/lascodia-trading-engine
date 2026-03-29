@@ -331,7 +331,8 @@ internal static class ElmMathHelper
     {
         if (predictions.Length == 0) return (0, 0);
 
-        double equity = 0, peak = 0, maxDD = 0;
+        // Anchor the curve above zero so an immediate losing streak still registers as drawdown.
+        double equity = 1.0, peak = 1.0, maxDD = 0.0;
         double[] returns = new double[predictions.Length];
 
         for (int i = 0; i < predictions.Length; i++)
@@ -341,7 +342,7 @@ internal static class ElmMathHelper
             equity += r;
             peak = Math.Max(peak, equity);
             double dd = peak - equity;
-            maxDD = Math.Max(maxDD, peak > 0 ? dd / peak : 0);
+            maxDD = Math.Max(maxDD, peak > 0 ? dd / peak : 0.0);
         }
 
         double mean = returns.Average();
