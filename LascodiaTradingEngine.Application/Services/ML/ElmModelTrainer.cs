@@ -262,7 +262,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         // ── 4. Fit bagged ELM ensemble ──────────────────────────────────────
         (double[][] weights, double[] biases, double[][] inputWeights, double[][] inputBiases,
          int[][]? featureSubsets, int[] learnerHiddenSizes, ElmActivation[] learnerActivations,
-         double[][,] inverseGrams) ensembleResult;
+         double[][] inverseGramsFlat, int[] inverseGramDims) ensembleResult;
         try
         {
             ensembleResult = FitBaggedElm(trainSet, hp, featureCount, hiddenSize, K,
@@ -273,7 +273,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ae.InnerException!).Throw();
             throw;
         }
-        var (weights, biases, inputWeights, inputBiases, featureSubsets, learnerHiddenSizes, learnerActivations, inverseGrams) = ensembleResult;
+        var (weights, biases, inputWeights, inputBiases, featureSubsets, learnerHiddenSizes, learnerActivations, inverseGramsFlat, inverseGramDims) = ensembleResult;
 
         // ── 4b. Post-training NaN/Inf weight sanitisation ──────────────────
         int sanitizedCount = 0;
@@ -523,7 +523,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             ModelSnapshot? prunedWarmStart = RemapWarmStartForPruning(warmStart, activeMask, featureCount, hiddenSize);
 
             (double[][] pw, double[] pb, double[][] piw, double[][] pib,
-             int[][]? psub, int[] phs, ElmActivation[] pla, double[][,] pInvGram) prunedEnsemble;
+             int[][]? psub, int[] phs, ElmActivation[] pla, double[][] pInvGramFlat, int[] pInvGramDims) prunedEnsemble;
             try
             {
                 prunedEnsemble = FitBaggedElm(
@@ -535,7 +535,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                 System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(pae.InnerException!).Throw();
                 throw;
             }
-            var (pw, pb, piw, pib, psub, phs, pla, pInvGram) = prunedEnsemble;
+            var (pw, pb, piw, pib, psub, phs, pla, pInvGramFlat, pInvGramDims) = prunedEnsemble;
 
             // ── Mirror the magnitude-regressor CV path used for the full model ──
             double[] pmw, pmaw;
@@ -650,7 +650,8 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                 featureSubsets = psub;
                 learnerHiddenSizes = phs;
                 learnerActivations = pla;
-                inverseGrams = pInvGram;
+                inverseGramsFlat = pInvGramFlat;
+                inverseGramDims = pInvGramDims;
                 learnerCalAccuracies = pLearnerCalAccuracies;
                 learnerAccWeights = pLearnerAccWeights;
                 magWeights = pmw; magBias = pmb;
@@ -1087,7 +1088,8 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             SanitizedLearnerCount      = sanitizedCount,
             ConformalCoverage          = hp.ConformalCoverage,
             ElmOutputWeights           = null,
-            ElmInverseGram             = inverseGrams,
+            ElmInverseGram             = inverseGramsFlat,
+            ElmInverseGramDim          = inverseGramDims,
             ElmInputWeights            = inputWeights,
             ElmInputBiases             = inputBiases,
             ElmHiddenDim               = hiddenSize,
@@ -1190,7 +1192,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             if (foldTrain.Count < hp.MinSamples) return;
 
             var cvLabelSmoothing = hp.LabelSmoothing;
-            var (w, b, iw, ib, subs, lhs, cvla, _) = FitBaggedElm(
+            var (w, b, iw, ib, subs, lhs, cvla, _, _) = FitBaggedElm(
                 foldTrain, hp, featureCount, hiddenSize, Math.Max(1, K / 2),
                 cvLabelSmoothing, null, null, ct,
                 maxInnerParallelism: cvInnerParallelism);
@@ -1493,7 +1495,8 @@ public sealed class ElmModelTrainer : IMLModelTrainer
     private (double[][] Weights, double[] Biases,
              double[][] InputWeights, double[][] InputBiases,
              int[][]? FeatureSubsets, int[] LearnerHiddenSizes,
-             ElmActivation[] LearnerActivations, double[][,] InverseGrams) FitBaggedElm(
+             ElmActivation[] LearnerActivations,
+             double[][] InverseGramsFlat, int[] InverseGramDims) FitBaggedElm(
         List<TrainingSample> train,
         TrainingHyperparams  hp,
         int                  featureCount,
@@ -1513,7 +1516,8 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         var cgDidNotConverge = new bool[K];
         var learnerHiddenSizes = new int[K];
         var learnerActivations = new ElmActivation[K];
-        var inverseGrams = new double[K][,];
+        var inverseGramsFlat = new double[K][];
+        var inverseGramDims  = new int[K];
 
         bool useSubsampling = hp.FeatureSampleRatio > 0.0 && hp.FeatureSampleRatio < 1.0;
         var featureSubsets   = useSubsampling ? new int[K][] : null;
@@ -1804,7 +1808,13 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             var inverseGram = new double[learnerHidden, learnerHidden];
             if (ElmMathHelper.TryInvertSpd(hiddenGram, inverseGram, learnerHidden))
             {
-                inverseGrams[k] = inverseGram;
+                // Flatten 2D → 1D row-major for JSON serialisation (System.Text.Json cannot handle double[,])
+                var flat = new double[learnerHidden * learnerHidden];
+                for (int i = 0; i < learnerHidden; i++)
+                    for (int j = 0; j < learnerHidden; j++)
+                        flat[i * learnerHidden + j] = inverseGram[i, j];
+                inverseGramsFlat[k] = flat;
+                inverseGramDims[k]  = learnerHidden;
             }
             else
             {
@@ -1850,7 +1860,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                 "ELM Cholesky solver failed for {N}/{K} learners — consider increasing ridge lambda.",
                 cgFailCount, K);
 
-        return (weights, biases, inputWeights, inputBiases, featureSubsets, learnerHiddenSizes, learnerActivations, inverseGrams);
+        return (weights, biases, inputWeights, inputBiases, featureSubsets, learnerHiddenSizes, learnerActivations, inverseGramsFlat, inverseGramDims);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -3103,7 +3113,9 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             var inputW = snapshot.ElmInputWeights[k];
             var inputB = snapshot.ElmInputBiases[k];
             int H      = snapshot.Weights[k].Length;
-            if (snapshot.ElmInverseGram[k].GetLength(0) != H || snapshot.ElmInverseGram[k].GetLength(1) != H)
+            int gramDim = snapshot.ElmInverseGramDim is not null && k < snapshot.ElmInverseGramDim.Length
+                ? snapshot.ElmInverseGramDim[k] : H;
+            if (snapshot.ElmInverseGram[k].Length != gramDim * gramDim || gramDim != H)
                 continue;
 
             // Resolve feature subset for this learner
@@ -3135,6 +3147,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             double bias = snapshot.Biases![k];
             ElmMathHelper.ShermanMorrisonUpdate(
                 snapshot.ElmInverseGram[k],
+                gramDim,
                 snapshot.Weights[k],
                 ref bias,
                 hidden,

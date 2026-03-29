@@ -176,4 +176,38 @@ public class BaggedLogisticTrainerTests
 
         Assert.Equal(1.0, diversity, precision: 6);
     }
+
+    [Fact]
+    public void ComputeMeanProjectedFeatureImportance_Excludes_Inactive_Learners()
+    {
+        double[][] weights =
+        [
+            [2.0, 0.0],
+            [0.0, 0.0],
+        ];
+        double[] biases = [1.0, 0.0];
+
+        var importance = BaggedLogisticTrainer.ComputeMeanProjectedFeatureImportance(
+            weights,
+            biases,
+            featureCount: 2);
+
+        Assert.Equal(2.0, importance[0], precision: 6);
+        Assert.Equal(0.0, importance[1], precision: 6);
+    }
+
+    [Theory]
+    [InlineData(0.55, 1, 0.60, false)]
+    [InlineData(0.65, 1, 0.60, true)]
+    [InlineData(0.35, 0, 0.40, true)]
+    public void IsPredictionCorrect_Uses_Provided_Threshold(
+        double probability,
+        int direction,
+        double threshold,
+        bool expected)
+    {
+        bool actual = BaggedLogisticTrainer.IsPredictionCorrect(probability, direction, threshold);
+
+        Assert.Equal(expected, actual);
+    }
 }

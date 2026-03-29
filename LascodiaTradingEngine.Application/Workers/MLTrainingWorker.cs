@@ -921,6 +921,9 @@ public sealed class MLTrainingWorker : BackgroundService
                         SharpeRatio         = (decimal)m.SharpeRatio,
                     };
                     ctx.Set<MLModel>().Add(nonActiveModel);
+                    await db.SaveChangesAsync(stoppingToken);
+                    // Set FK after save so nonActiveModel.Id is the real DB-generated ID,
+                    // not a temporary negative value that triggers FK violations.
                     run.MLModelId = nonActiveModel.Id;
                     await db.SaveChangesAsync(stoppingToken);
 
@@ -990,9 +993,11 @@ public sealed class MLTrainingWorker : BackgroundService
 
             ctx.Set<MLModel>().Add(model);
 
-            // First save to get the model Id, then link the run
+            // Save model first to get the real DB-generated Id (not a temp negative value),
+            // then link the run in a separate save to avoid FK violations.
             await db.SaveChangesAsync(stoppingToken);
             run.MLModelId = model.Id;
+            await db.SaveChangesAsync(stoppingToken);
 
             // ── Shadow evaluation for challenger vs champion ─────────────────
             // When a previous champion exists the newly promoted model does NOT immediately

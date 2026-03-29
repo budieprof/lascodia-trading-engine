@@ -389,14 +389,15 @@ internal static class ElmMathHelper
     /// </param>
     /// <param name="target">The direction label for the new sample (1.0 = Buy, 0.0 = Sell).</param>
     internal static void ShermanMorrisonUpdate(
-        double[,] inverseGram,
+        double[]  inverseGramFlat,
+        int       gramDim,
         double[]  outputWeights,
         ref double outputBias,
         double[]  hiddenActivation,
         double    target,
         int       updateCount = 0)
     {
-        int H = hiddenActivation.Length;
+        int H = gramDim;
 
         // Ph = P × h  (H-vector)
         var Ph = new double[H];
@@ -404,7 +405,7 @@ internal static class ElmMathHelper
         {
             double sum = 0;
             for (int j = 0; j < H; j++)
-                sum += inverseGram[i, j] * hiddenActivation[j];
+                sum += inverseGramFlat[i * H + j] * hiddenActivation[j];
             Ph[i] = sum;
         }
 
@@ -421,7 +422,7 @@ internal static class ElmMathHelper
         // P_new = P − (Ph × Ph^T) / denom  (rank-1 downdate)
         for (int i = 0; i < H; i++)
             for (int j = 0; j < H; j++)
-                inverseGram[i, j] -= Ph[i] * Ph[j] * invDenom;
+                inverseGramFlat[i * H + j] -= Ph[i] * Ph[j] * invDenom;
 
         // prediction error: e = y − (w^T h + b)
         double prediction = outputBias;
@@ -435,7 +436,7 @@ internal static class ElmMathHelper
         {
             double sum = 0;
             for (int j = 0; j < H; j++)
-                sum += inverseGram[i, j] * hiddenActivation[j];
+                sum += inverseGramFlat[i * H + j] * hiddenActivation[j];
             PnewH[i] = sum;
         }
 

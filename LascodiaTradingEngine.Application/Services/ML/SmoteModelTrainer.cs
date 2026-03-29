@@ -478,7 +478,7 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
 
         // ── M3: Class-conditional Platt ───────────────────────────────────────
         var (plattABuy, plattBBuy, plattASell, plattBSell) = calSet.Count >= MinCalSamples
-            ? FitClassConditionalPlatt(calSet, ens) : (0.0, 0.0, 0.0, 0.0);
+            ? FitClassConditionalPlatt(calSet, ens) : (1.0, 0.0, 1.0, 0.0);
 
         // ── M9: Average Kelly fraction ────────────────────────────────────────
         double avgKellyFraction = calSet.Count >= MinEvalSamples
@@ -585,6 +585,11 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
                 int[] keptIndices = Enumerable.Range(0, F).Where(j => activeMask[j]).ToArray();
                 featureSubsets = new int[K][];
                 for (int ki = 0; ki < K; ki++) featureSubsets[ki] = keptIndices;
+                // Recompute calibration artifacts stale from the unpruned model
+                (plattABuy, plattBBuy, plattASell, plattBSell) = maskedCal.Count >= MinCalSamples
+                    ? FitClassConditionalPlatt(maskedCal, pEns) : (1.0, 0.0, 1.0, 0.0);
+                avgKellyFraction = maskedCal.Count >= MinEvalSamples
+                    ? ComputeAvgKellyFraction(maskedCal, pEns, pA, pB) : 0.0;
             }
             else
             {
@@ -603,8 +608,13 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         var postPruneCalSet = prunedCount > 0 ? ApplyMask(calSet, activeMask) : calSet;
 
         // ── H8: Isotonic calibration ──────────────────────────────────────────
-        // Rebuild EnsembleState in case pruning changed weights/biases/featureSubsets
-        ens = new EnsembleState(weights, biases, F, featureSubsets, meta, ensMlpHW, ensMlpHB, hp.MlpHiddenDim);
+        // Rebuild EnsembleState: when pruning was accepted, use reducedF with null featureSubsets
+        // (matching pEns) so weight indexing is sequential 0..reducedF-1. The keptIndices featureSubsets
+        // are only used at serialization time for the inference engine's feature-space mapping.
+        int postF = prunedCount > 0 ? F - prunedCount : F;
+        ens = prunedCount > 0
+            ? new EnsembleState(weights, biases, postF, null, meta, ensMlpHW, ensMlpHB, hp.MlpHiddenDim)
+            : new EnsembleState(weights, biases, F, featureSubsets, meta, ensMlpHW, ensMlpHB, hp.MlpHiddenDim);
         double[] isotonicBp = FitIsotonicCalibration(postPruneCalSet, ens, plattA, plattB);
         if (_logger.IsEnabled(LogLevel.Information))
             _logger.LogInformation("Isotonic calibration: {N} PAVA breakpoints", isotonicBp.Length / 2);
@@ -1106,11 +1116,17 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
 
         // Temporal weights (blended with density-ratio weights if provided)
         double[] temporalWeights = ComputeTemporalWeights(n, hp.TemporalDecayLambda);
-        if (densityWeights is { Length: > 0 } && densityWeights.Length == temporalWeights.Length)
+        // densityWeights may be shorter than temporalWeights (pre-SMOTE vs post-SMOTE).
+        // Blend only the overlapping prefix; synthetic samples keep temporal-only weights.
+        if (densityWeights is { Length: > 0 } && densityWeights.Length >= 1)
         {
             var blended = new double[n];
             double wSum = 0;
-            for (int i = 0; i < n; i++) { blended[i] = temporalWeights[i] * densityWeights[i]; wSum += blended[i]; }
+            for (int i = 0; i < n; i++)
+            {
+                blended[i] = temporalWeights[i] * (i < densityWeights.Length ? densityWeights[i] : 1.0);
+                wSum += blended[i];
+            }
             if (wSum > 1e-15) for (int i = 0; i < n; i++) blended[i] /= wSum;
             temporalWeights = blended;
         }
@@ -1899,7 +1915,7 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         }
 
         if (buyPredSet.Count < 5 || sellPredSet.Count < 5)
-            return (0.0, 0.0, 0.0, 0.0);
+            return (1.0, 0.0, 1.0, 0.0); // identity on logit scale
 
         static (double A, double B) FitOnSubset(
             List<TrainingSample> sub, double[][] w, double[] b, int f,

@@ -2483,12 +2483,20 @@ public class ModelSnapshot
     public double? ElmDropoutRate { get; set; }
 
     /// <summary>
-    /// ELM: per-learner inverse Gram matrix P = (H^T H + λI)^{-1}, shape [K][H×H] row-major.
+    /// ELM: per-learner inverse Gram matrix P = (H^T H + λI)^{-1}, flattened row-major [K][H*H].
     /// Stored after initial training so that <c>ElmModelTrainer.UpdateOnline</c>
     /// can apply Sherman-Morrison rank-1 updates without a full retrain.
     /// Null for models trained before online update support was added.
+    /// System.Text.Json cannot serialise <c>double[,]</c>, so we store flattened 1D arrays
+    /// and use <see cref="ElmInverseGramDim"/> to recover the square dimension.
     /// </summary>
-    public double[][,]? ElmInverseGram { get; set; }
+    public double[][]? ElmInverseGram { get; set; }
+
+    /// <summary>
+    /// Per-learner hidden dimension H for each inverse Gram matrix in <see cref="ElmInverseGram"/>.
+    /// <c>ElmInverseGram[k]</c> has length <c>ElmInverseGramDim[k] * ElmInverseGramDim[k]</c>.
+    /// </summary>
+    public int[]? ElmInverseGramDim { get; set; }
 
     /// <summary>Rec #450 DLinear: trend component linear projection weights.</summary>
     public double[]? DLinearTrendWeights { get; set; }
