@@ -511,6 +511,61 @@ public class OptimizationWorker : BackgroundService
                 }
                 break;
 
+            case StrategyType.MomentumTrend:
+                // AdxPeriod determines the lookback for trend strength measurement.
+                // AdxThreshold is the minimum ADX value to confirm a trending regime —
+                // lower values (18) catch trends earlier with more noise; higher values (30)
+                // require stronger confirmation but miss early entries.
+                foreach (var adxPeriod in new[] { 10, 14, 20 })
+                foreach (var adxThreshold in new[] { 18, 22, 25, 30 })
+                {
+                    grid.Add(new Dictionary<string, object>
+                    {
+                        ["AdxPeriod"]    = adxPeriod,
+                        ["AdxThreshold"] = adxThreshold
+                    });
+                }
+                break;
+
+            case StrategyType.MACDDivergence:
+                // Standard MACD uses (12, 26, 9) but faster settings can catch divergences
+                // earlier. DivergenceLookback controls how many bars to scan for price/MACD
+                // divergence patterns.
+                foreach (var fast in new[] { 8, 12, 16 })
+                foreach (var slow in new[] { 21, 26, 30 })
+                foreach (var signal in new[] { 7, 9, 12 })
+                {
+                    if (fast >= slow) continue;
+                    grid.Add(new Dictionary<string, object>
+                    {
+                        ["FastPeriod"]         = fast,
+                        ["SlowPeriod"]         = slow,
+                        ["SignalPeriod"]        = signal,
+                        ["DivergenceLookback"]  = 20
+                    });
+                }
+                break;
+
+            case StrategyType.SessionBreakout:
+                // Session breakout timing: range accumulation period → breakout window.
+                // ThresholdMultiplier scales ATR to determine how far price must breach
+                // the session range to qualify as a genuine breakout.
+                foreach (var rangeStart in new[] { 0, 2, 4 })
+                foreach (var rangeEnd in new[] { 6, 8 })
+                foreach (var thresholdMult in new[] { 0.3, 0.5, 0.8 })
+                {
+                    if (rangeStart >= rangeEnd) continue;
+                    grid.Add(new Dictionary<string, object>
+                    {
+                        ["RangeStartHourUtc"]   = rangeStart,
+                        ["RangeEndHourUtc"]     = rangeEnd,
+                        ["BreakoutStartHour"]   = rangeEnd,
+                        ["BreakoutEndHour"]     = rangeEnd + 8,
+                        ["ThresholdMultiplier"] = thresholdMult
+                    });
+                }
+                break;
+
             default:
                 // For custom or unknown types, return a single default parameter set.
                 // The backtest engine will use the evaluator's hard-coded defaults,
