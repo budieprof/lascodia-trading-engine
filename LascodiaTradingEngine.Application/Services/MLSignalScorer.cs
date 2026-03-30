@@ -1597,7 +1597,9 @@ public sealed class MLSignalScorer : IMLSignalScorer
                 var learnerWeights = inputWeights[k];
                 if (learnerWeights is null || learnerWeights.Length == 0) continue;
                 int[] subset = snap.FeatureSubsetIndices is { Length: > 0 } subsets && k < subsets.Length
-                    ? subsets[k] ?? defaultSubset
+                    ? subsets[k] is { Length: > 0 } learnerSubset
+                        ? learnerSubset
+                        : defaultSubset
                     : defaultSubset;
                 int subLen = subset.Length;
                 double z = learnerBiases[h];

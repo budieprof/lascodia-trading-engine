@@ -216,6 +216,7 @@ internal static class ElmBootstrapHelper
             return BuildNormalisedCdf(temporalWeights);
 
         var adjustedWeights = new double[sampleCount];
+        Array.Fill(adjustedWeights, 1.0);
         if (temporalWeights.Length > 0)
             Array.Copy(temporalWeights, adjustedWeights, Math.Min(sampleCount, temporalWeights.Length));
 
@@ -386,7 +387,15 @@ internal static class ElmBootstrapHelper
         double cutoff = equalShare * threshold;
         var mask = new bool[featureCount];
         for (int i = 0; i < featureCount; i++)
+        {
+            if (i >= importance.Length || !float.IsFinite(importance[i]))
+            {
+                mask[i] = true;
+                continue;
+            }
+
             mask[i] = normalised[i] >= cutoff;
+        }
         return mask;
     }
 

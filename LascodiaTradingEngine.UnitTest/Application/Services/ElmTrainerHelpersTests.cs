@@ -1,4 +1,5 @@
 using LascodiaTradingEngine.Application.MLModels.Shared;
+using LascodiaTradingEngine.Application.Services;
 using LascodiaTradingEngine.Application.Services.Inference;
 using LascodiaTradingEngine.Application.Services.ML;
 using LascodiaTradingEngine.Domain.Enums;
@@ -988,6 +989,17 @@ public class ElmTrainerHelpersTests
     }
 
     [Fact]
+    public void BuildFeatureMask_Keeps_Missing_Importance_Entries_Active()
+    {
+        bool[] mask = ElmBootstrapHelper.BuildFeatureMask(
+            importance: [0.2f],
+            threshold: 1.0,
+            featureCount: 3);
+
+        Assert.Equal([true, true, true], mask);
+    }
+
+    [Fact]
     public void ComputeConformalQHat_Sanitises_NonFinite_Alpha()
     {
         double qHat = ElmCalibrationHelper.ComputeConformalQHat(
@@ -1145,6 +1157,30 @@ public class ElmTrainerHelpersTests
         Assert.Equal(0.0, snapshot.Weights[1][0], precision: 6);
         Assert.Equal(0.5, snapshot.Biases[0], precision: 6);
         Assert.Equal(0.5, snapshot.Biases[1], precision: 6);
+    }
+
+    [Fact]
+    public void UpdateOnline_Treats_Empty_Subset_Metadata_As_Full_Feature_Use()
+    {
+        var trainer = new ElmModelTrainer(NullLogger<ElmModelTrainer>.Instance);
+        var snapshot = new ModelSnapshot
+        {
+            Weights = [[0.0]],
+            Biases = [0.0],
+            ElmInputWeights = [[1.0]],
+            ElmInputBiases = [[0.0]],
+            ElmInverseGram = [[1.0, 0.0, 0.0, 1.0]],
+            ElmInverseGramDim = [2],
+            Means = [0f],
+            Stds = [1f],
+            FeatureSubsetIndices = [[]],
+        };
+
+        bool updated = trainer.UpdateOnline(snapshot, new TrainingSample([1f], 1, 1f));
+
+        Assert.True(updated);
+        Assert.NotEqual(0.0, snapshot.Biases[0]);
+        Assert.Equal(1, snapshot.TrainSamples);
     }
 
     [Fact]
@@ -1571,6 +1607,39 @@ public class ElmTrainerHelpersTests
     }
 
     [Fact]
+    public void EvaluateEnsemble_Uses_Configured_Decision_Threshold()
+    {
+        var testSet = new List<TrainingSample>
+        {
+            new([0.6f], 0, 1f),
+        };
+
+        EvalMetrics metrics = ElmEvaluationHelper.EvaluateEnsemble(
+            testSet,
+            weights: [],
+            biases: [],
+            inputWeights: [],
+            inputBiases: [],
+            magWeights: [],
+            magBias: 0.0,
+            plattA: 1.0,
+            plattB: 0.0,
+            featureCount: 1,
+            hiddenSize: 0,
+            featureSubsets: null,
+            magAugWeights: Array.Empty<double>(),
+            magAugBias: 0.0,
+            sharpeAnnualisationFactor: 252.0,
+            ensembleCalibProb: (features, _, _, _, _, _, _, _, _, _, _) => features[0],
+            predictMagnitudeAug: (_, _, _, _, _, _, _, _) => 0.0,
+            decisionThreshold: 0.7);
+
+        Assert.Equal(1.0, metrics.Accuracy, precision: 6);
+        Assert.Equal(1.0, metrics.ExpectedValue, precision: 6);
+        Assert.Equal(1, metrics.TN);
+    }
+
+    [Fact]
     public void ComputeDurbinWatson_Remains_Finite_When_Magnitude_Predictions_Are_NonFinite()
     {
         double durbinWatson = ElmEvaluationHelper.ComputeDurbinWatson(
@@ -1773,6 +1842,34 @@ public class ElmTrainerHelpersTests
     }
 
     [Fact]
+    public void MlSignalScorer_PredictElmMagnitudeAug_Treats_Empty_Subset_Metadata_As_Full_Feature_Use()
+    {
+        MethodInfo predictElmMagnitudeAug = typeof(MLSignalScorer).GetMethod(
+            "PredictElmMagnitudeAug",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        var snapshot = new ModelSnapshot
+        {
+            ElmHiddenDim = 1,
+            FeatureSubsetIndices = [[]],
+            LearnerActivations = [(int)ElmActivation.Relu],
+        };
+
+        double prediction = (double)predictElmMagnitudeAug.Invoke(null,
+        [
+            new[] { 2f },
+            1,
+            new[] { 0.0, 1.5 },
+            0.25,
+            snapshot,
+            new[] { new[] { 2.0 } },
+            new[] { new[] { 0.0 } },
+        ])!;
+
+        Assert.Equal(6.25, prediction, precision: 6);
+    }
+
+    [Fact]
     public void ProjectAugWeightsToFeatureSpace_Handles_Empty_Train_And_Truncated_Augmented_Weights()
     {
         MethodInfo projectAugWeights = typeof(ElmModelTrainer).GetMethod(
@@ -1886,6 +1983,28 @@ public class ElmTrainerHelpersTests
         Assert.NotNull(remapped);
         Assert.Equal([0], remapped!.FeatureSubsetIndices![0]);
         Assert.Equal([2.0], remapped.ElmInputWeights[0], new PrecisionComparer(6));
+    }
+
+    [Fact]
+    public void RemapWarmStartForPruning_Treats_Empty_Subset_Metadata_As_Full_Feature_Use()
+    {
+        MethodInfo remap = typeof(ElmModelTrainer).GetMethod(
+            "RemapWarmStartForPruning",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        var warmStart = new ModelSnapshot
+        {
+            ElmInputWeights = [[1.0, 2.0, 3.0]],
+            ElmInputBiases = [[0.1]],
+            FeatureSubsetIndices = [[]],
+            FeatureImportanceScores = [1.0, 0.0, 1.0],
+        };
+
+        var remapped = (ModelSnapshot?)remap.Invoke(null, [warmStart, new[] { true, false, true }, 3, 1]);
+
+        Assert.NotNull(remapped);
+        Assert.Equal([0, 2], remapped!.FeatureSubsetIndices![0]);
+        Assert.Equal([1.0, 3.0], remapped.ElmInputWeights[0], new PrecisionComparer(6));
     }
 
     [Fact]
@@ -2051,6 +2170,44 @@ public class ElmTrainerHelpersTests
             seed: 7);
 
         Assert.All(indices, index => Assert.InRange(index, 0, train.Count - 1));
+    }
+
+    [Fact]
+    public void BiasedBootstrap_Assigns_Default_Weight_To_Missing_Tail_Entries()
+    {
+        var train = new List<TrainingSample>
+        {
+            new([1f], 1, 1f),
+            new([2f], 1, 1f),
+        };
+
+        var bootstrap = ElmBootstrapHelper.BiasedBootstrap(
+            train,
+            temporalWeights: [0.2],
+            count: 50,
+            seed: 7);
+
+        Assert.Contains(train[1], bootstrap);
+    }
+
+    [Fact]
+    public void SanitizeLearnerOutputs_Also_Cleans_Pruned_Replacement_Learners()
+    {
+        MethodInfo sanitize = typeof(ElmModelTrainer).GetMethod(
+            "SanitizeLearnerOutputs",
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
+
+        var trainer = new ElmModelTrainer(NullLogger<ElmModelTrainer>.Instance);
+        double[][] weights = [[double.NaN], [1.0]];
+        double[] biases = [1.0, 2.0];
+
+        int sanitized = (int)sanitize.Invoke(trainer, [weights, biases, "test"])!;
+
+        Assert.Equal(1, sanitized);
+        Assert.Equal([0.0], weights[0]);
+        Assert.Equal(0.0, biases[0], precision: 6);
+        Assert.Equal([1.0], weights[1]);
+        Assert.Equal(2.0, biases[1], precision: 6);
     }
 
     private sealed class PrecisionComparer(int precision) : IEqualityComparer<double>

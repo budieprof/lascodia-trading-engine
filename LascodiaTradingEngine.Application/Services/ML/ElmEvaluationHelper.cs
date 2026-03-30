@@ -27,12 +27,16 @@ internal static class ElmEvaluationHelper
         double[]? magAugWeights, double magAugBias,
         double sharpeAnnualisationFactor,
         Func<float[], double[][], double[], double[][], double[][], double, double, int, int, int[][]?, double[]?, double> ensembleCalibProb,
-        Func<float[], double[], double, int, int, double[][], double[][], int[][]?, double> predictMagnitudeAug)
+        Func<float[], double[], double, int, int, double[][], double[][], int[][]?, double> predictMagnitudeAug,
+        double decisionThreshold = 0.5)
     {
         if (testSet.Count == 0)
             return new EvalMetrics(0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0);
 
         bool useAug = magAugWeights is not null && magAugWeights.Length == featureCount + hiddenSize;
+        double safeDecisionThreshold = double.IsFinite(decisionThreshold)
+            ? Math.Clamp(decisionThreshold, 0.0, 1.0)
+            : 0.5;
 
         int correct = 0, tp = 0, fp = 0, fn = 0, tn = 0;
         double brierSum = 0, magSse = 0;
@@ -46,7 +50,7 @@ internal static class ElmEvaluationHelper
                 s.Features, weights, biases, inputWeights, inputBiases,
                 plattA, plattB, featureCount, hiddenSize, featureSubsets, null));
 
-            int pred = calibP >= 0.5 ? 1 : 0;
+            int pred = calibP >= safeDecisionThreshold ? 1 : 0;
             int actual = ToBinaryLabel(s.Direction);
             double y = actual;
 

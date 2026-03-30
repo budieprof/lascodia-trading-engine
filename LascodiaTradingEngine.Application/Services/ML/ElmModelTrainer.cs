@@ -273,28 +273,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         var (weights, biases, inputWeights, inputBiases, featureSubsets, learnerHiddenSizes, learnerActivations, inverseGramsFlat, inverseGramDims) = ensembleResult;
 
         // ── 4b. Post-training NaN/Inf weight sanitisation ──────────────────
-        int sanitizedCount = 0;
-        for (int k = 0; k < K; k++)
-        {
-            bool needsSanitize = !double.IsFinite(biases[k]);
-            if (!needsSanitize)
-            {
-                for (int j = 0; j < weights[k].Length; j++)
-                {
-                    if (!double.IsFinite(weights[k][j])) { needsSanitize = true; break; }
-                }
-            }
-            if (needsSanitize)
-            {
-                Array.Clear(weights[k], 0, weights[k].Length);
-                biases[k] = 0.0;
-                sanitizedCount++;
-                _logger.LogWarning("ELM: sanitized learner {K}: non-finite weights replaced with zeros.", k);
-            }
-        }
-        if (sanitizedCount > 0)
-            _logger.LogWarning("ELM post-training sanitization: {N}/{K} learners had non-finite weights.",
-                sanitizedCount, K);
+        int sanitizedCount = SanitizeLearnerOutputs(weights, biases, "ELM");
 
         ct.ThrowIfCancellationRequested();
 
@@ -406,11 +385,6 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             (f, w, b, iw, ib, pA, pB, fc, hs, fs, lw) => PrimaryCalibProb(f),
             (f, aw, ab, fc, hs, eiw, eib, fs) => PredictMagnitudeAug(f, aw, ab, fc, hs, eiw, eib, fs, learnerActivations));
 
-        _logger.LogInformation(
-            "ELM final eval — acc={Acc:P1} f1={F1:F3} ev={EV:F4} brier={Brier:F4} sharpe={Sharpe:F2}",
-            finalMetrics.Accuracy, finalMetrics.F1,
-            finalMetrics.ExpectedValue, finalMetrics.BrierScore, finalMetrics.SharpeRatio);
-
         ct.ThrowIfCancellationRequested();
 
         // ── 8. ECE post-Platt ───────────────────────────────────────────────
@@ -511,6 +485,18 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             var maskedCal   = ElmBootstrapHelper.ApplyZeroMask(calSet, activeMask);
             var maskedTest  = ElmBootstrapHelper.ApplyZeroMask(testSet, activeMask);
 
+            double currentAcceptanceThreshold = ElmCalibrationHelper.ComputeOptimalThreshold(
+                maskedCal, weights, biases, inputWeights, inputBiases, plattA, plattB, featureCount, hiddenSize, featureSubsets,
+                hp.ThresholdSearchMin, hp.ThresholdSearchMax,
+                (f, w, b, iw, ib, pA, pB, fc, hs, fs, lw) => PrimaryCalibProb(f));
+            var currentAcceptanceMetrics = ElmEvaluationHelper.EvaluateEnsemble(
+                maskedCal, weights, biases, inputWeights, inputBiases,
+                magWeights, magBias, plattA, plattB, featureCount, hiddenSize, featureSubsets,
+                magAugWeights, magAugBias, sharpeAnnFactor,
+                (f, w, b, iw, ib, pA, pB, fc, hs, fs, lw) => PrimaryCalibProb(f),
+                (f, aw, ab, fc, hs, eiw, eib, fs) => PredictMagnitudeAug(f, aw, ab, fc, hs, eiw, eib, fs, learnerActivations),
+                currentAcceptanceThreshold);
+
             var prunedHp = hp with
             {
                 FeatureSampleRatio = hp.FeatureSampleRatio > 0.0 && hp.FeatureSampleRatio < 1.0
@@ -534,6 +520,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                 throw;
             }
             var (pw, pb, piw, pib, psub, phs, pla, pInvGramFlat, pInvGramDims) = prunedEnsemble;
+            int pSanitizedCount = SanitizeLearnerOutputs(pw, pb, "ELM pruned");
 
             // ── Mirror the magnitude-regressor CV path used for the full model ──
             double[] pmw, pmaw;
@@ -633,17 +620,23 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                 return calib;
             }
 
+            double pOptimalThreshold = ElmCalibrationHelper.ComputeOptimalThreshold(
+                maskedCal, pw, pb, piw, pib, pA, pB, featureCount, hiddenSize, psub,
+                hp.ThresholdSearchMin, hp.ThresholdSearchMax,
+                (f, w, b, iw, ib, pAp, pBp, fc, hs, fs, lw) => PPrimaryCalibProb(f));
+
             var prunedMetrics = ElmEvaluationHelper.EvaluateEnsemble(
-                maskedTest, pw, pb, piw, pib, pmw, pmb, pA, pB, featureCount, hiddenSize, psub,
+                maskedCal, pw, pb, piw, pib, pmw, pmb, pA, pB, featureCount, hiddenSize, psub,
                 pmaw, pmab, sharpeAnnFactor,
                 (f, w, b, iw, ib, pAp, pBp, fc, hs, fs, lw) => PPrimaryCalibProb(f),
-                (f, aw, ab, fc, hs, eiw, eib, fs) => PredictMagnitudeAug(f, aw, ab, fc, hs, eiw, eib, fs, pla));
+                (f, aw, ab, fc, hs, eiw, eib, fs) => PredictMagnitudeAug(f, aw, ab, fc, hs, eiw, eib, fs, pla),
+                pOptimalThreshold);
 
-            if (prunedMetrics.Accuracy >= finalMetrics.Accuracy - 0.005)
+            if (prunedMetrics.Accuracy >= currentAcceptanceMetrics.Accuracy - 0.005)
             {
                 _logger.LogInformation(
                     "ELM pruned model accepted: acc={Acc:P1} (was {Old:P1}), reduced features {Full}→{Active}",
-                    prunedMetrics.Accuracy, finalMetrics.Accuracy, featureCount, activeFeatureCount);
+                    prunedMetrics.Accuracy, currentAcceptanceMetrics.Accuracy, featureCount, activeFeatureCount);
                 weights = pw; biases = pb;
                 inputWeights = piw; inputBiases = pib;
                 featureSubsets = psub;
@@ -657,6 +650,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                 magAugWeights = pmaw; magAugBias = pmab;
                 magAugWeightsFolds = pMagAugWeightsFolds;
                 magAugBiasFolds    = pMagAugBiasFolds;
+                sanitizedCount = pSanitizedCount;
                 plattA = pA; plattB = pB;
                 temperatureScale = pTemp;
                 finalMetrics = prunedMetrics;
@@ -671,10 +665,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                     (f, w2, b2, iw2, ib2, pAp, pBp, fc, hs, fs, lw) => PPrimaryCalibProb(f));
                 ece = ElmEvaluationHelper.ComputeEce(maskedTest, pw, pb, piw, pib, plattA, plattB, featureCount, hiddenSize, psub,
                     (f, w2, b2, iw2, ib2, pAp, pBp, fc, hs, fs, lw) => PPrimaryCalibProb(f));
-                optimalThreshold = ElmCalibrationHelper.ComputeOptimalThreshold(
-                    maskedCal, pw, pb, piw, pib, plattA, plattB, featureCount, hiddenSize, psub,
-                    hp.ThresholdSearchMin, hp.ThresholdSearchMax,
-                    (f, w2, b2, iw2, ib2, pAp, pBp, fc, hs, fs, lw) => PPrimaryCalibProb(f));
+                optimalThreshold = pOptimalThreshold;
 
                 featureImportance = maskedTest.Count >= 10
                     ? ElmEvaluationHelper.ComputePermutationImportance(
@@ -792,12 +783,6 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             return calib;
         }
 
-        finalMetrics = ElmEvaluationHelper.EvaluateEnsemble(
-            effectiveTestSet, weights, biases, inputWeights, inputBiases,
-            magWeights, magBias, plattA, plattB, effectiveFeatureCount, hiddenSize, featureSubsets,
-            magAugWeights, magAugBias, sharpeAnnFactor,
-            (f, w, b, iw, ib, pA, pB, fc, hs, fs, lw) => FinalEffectiveCalibProb(f),
-            (f, aw, ab, fc, hs, eiw, eib, fs) => PredictMagnitudeAug(f, aw, ab, fc, hs, eiw, eib, fs, learnerActivations));
         ece = ElmEvaluationHelper.ComputeEce(
             effectiveTestSet, weights, biases, inputWeights, inputBiases,
             plattA, plattB, effectiveFeatureCount, hiddenSize, featureSubsets,
@@ -807,6 +792,18 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             plattA, plattB, effectiveFeatureCount, hiddenSize, featureSubsets,
             hp.ThresholdSearchMin, hp.ThresholdSearchMax,
             (f, w, b, iw, ib, pA, pB, fc, hs, fs, lw) => FinalEffectiveCalibProb(f));
+        finalMetrics = ElmEvaluationHelper.EvaluateEnsemble(
+            effectiveTestSet, weights, biases, inputWeights, inputBiases,
+            magWeights, magBias, plattA, plattB, effectiveFeatureCount, hiddenSize, featureSubsets,
+            magAugWeights, magAugBias, sharpeAnnFactor,
+            (f, w, b, iw, ib, pA, pB, fc, hs, fs, lw) => FinalEffectiveCalibProb(f),
+            (f, aw, ab, fc, hs, eiw, eib, fs) => PredictMagnitudeAug(f, aw, ab, fc, hs, eiw, eib, fs, learnerActivations),
+            optimalThreshold);
+
+        _logger.LogInformation(
+            "ELM final eval — acc={Acc:P1} f1={F1:F3} ev={EV:F4} brier={Brier:F4} sharpe={Sharpe:F2} thr={Thr:F2}",
+            finalMetrics.Accuracy, finalMetrics.F1,
+            finalMetrics.ExpectedValue, finalMetrics.BrierScore, finalMetrics.SharpeRatio, optimalThreshold);
 
         // ── 13. Conformal prediction threshold ───────────────────────────────
         double conformalAlpha = Math.Clamp(1.0 - hp.ConformalCoverage, 0.01, 0.50);
@@ -3173,7 +3170,9 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             oldBIn ??= Array.Empty<double>();
 
             int[] oldSub = warmStart.FeatureSubsetIndices is not null && ki < warmStart.FeatureSubsetIndices.Length
-                ? warmStart.FeatureSubsetIndices[ki] ?? Array.Empty<int>()
+                ? warmStart.FeatureSubsetIndices[ki] is { Length: > 0 } warmSubset
+                    ? warmSubset
+                    : Enumerable.Range(0, featureCount).ToArray()
                 : Enumerable.Range(0, featureCount).ToArray();
             int oldSubLen = oldSub.Length;
             int oldHidden = oldBIn.Length > 0
@@ -3328,13 +3327,14 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             if (snapshot.FeatureSubsetIndices is not null && k < snapshot.FeatureSubsetIndices.Length)
             {
                 var subset = snapshot.FeatureSubsetIndices[k];
-                if (subset is null || subset.Length == 0)
-                    continue;
-                features = new float[subset.Length];
-                for (int i = 0; i < subset.Length; i++)
-                    features[i] = subset[i] >= 0 && subset[i] < maskedFeatures.Length
-                        ? maskedFeatures[subset[i]]
-                        : 0f;
+                if (subset is { Length: > 0 })
+                {
+                    features = new float[subset.Length];
+                    for (int i = 0; i < subset.Length; i++)
+                        features[i] = subset[i] >= 0 && subset[i] < maskedFeatures.Length
+                            ? maskedFeatures[subset[i]]
+                            : 0f;
+                }
             }
 
             // Compute hidden activation: h = activation(W_in × features + b_in)
@@ -3406,6 +3406,46 @@ public sealed class ElmModelTrainer : IMLModelTrainer
 
         _logger.LogDebug("ELM online update applied: {K} learners updated with 1 sample", updatedLearners);
         return true;
+    }
+
+    private int SanitizeLearnerOutputs(double[][] weights, double[] biases, string label)
+    {
+        int learnerCount = Math.Min(weights.Length, biases.Length);
+        int sanitizedCount = 0;
+
+        for (int k = 0; k < learnerCount; k++)
+        {
+            weights[k] ??= [];
+
+            bool needsSanitize = !double.IsFinite(biases[k]);
+            if (!needsSanitize)
+            {
+                for (int j = 0; j < weights[k].Length; j++)
+                {
+                    if (!double.IsFinite(weights[k][j]))
+                    {
+                        needsSanitize = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!needsSanitize)
+                continue;
+
+            if (weights[k].Length > 0)
+                Array.Clear(weights[k], 0, weights[k].Length);
+            biases[k] = 0.0;
+            sanitizedCount++;
+            _logger.LogWarning("{Label}: sanitized learner {K}: non-finite weights replaced with zeros.", label, k);
+        }
+
+        if (sanitizedCount > 0)
+            _logger.LogWarning(
+                "{Label} post-training sanitization: {N}/{K} learners had non-finite weights.",
+                label, sanitizedCount, learnerCount);
+
+        return sanitizedCount;
     }
 
     private static int ValidateTrainingSamples(IReadOnlyList<TrainingSample> samples)
