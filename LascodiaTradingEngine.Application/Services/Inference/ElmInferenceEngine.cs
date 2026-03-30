@@ -85,8 +85,13 @@ public sealed class ElmInferenceEngine : IModelInferenceEngine
             SelectLearnerValues(snapshot.LearnerAccuracyWeights, validLearners),
             SelectLearnerValues(snapshot.LearnerCalAccuracies, validLearners)));
 
+        double meanProb = 0.0;
+        for (int k = 0; k < validCount; k++)
+            meanProb += probs[k];
+        meanProb /= validCount;
+
         double variance = 0;
-        for (int k = 0; k < validCount; k++) { double d = probs[k] - avg; variance += d * d; }
+        for (int k = 0; k < validCount; k++) { double d = probs[k] - meanProb; variance += d * d; }
         double std = validCount > 1 && double.IsFinite(variance) ? Math.Sqrt(variance / (validCount - 1)) : 0.0;
 
         decimal? mcMean = null, mcVar = null;

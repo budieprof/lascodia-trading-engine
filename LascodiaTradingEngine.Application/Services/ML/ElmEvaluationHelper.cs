@@ -215,7 +215,8 @@ internal static class ElmEvaluationHelper
         double plattA, double plattB,
         int featureCount, int hiddenSize, int[][]? featureSubsets,
         Func<float[], double[][], double[], double[][], double[][], double, double, int, int, int[][]?, double[]?, double> ensembleCalibProb,
-        CancellationToken ct)
+        CancellationToken ct,
+        double decisionThreshold = 0.5)
     {
         if (testSet.Count == 0) return new float[featureCount];
 
@@ -223,13 +224,17 @@ internal static class ElmEvaluationHelper
         if (effectiveFeatureCount <= 0)
             return new float[featureCount];
 
+        double safeDecisionThreshold = double.IsFinite(decisionThreshold)
+            ? Math.Clamp(decisionThreshold, 0.0, 1.0)
+            : 0.5;
+
         int baselineCorrect = 0;
         foreach (var s in testSet)
         {
             double p = ClampProbability(ensembleCalibProb(
                 s.Features, weights, biases, inputWeights, inputBiases,
                 plattA, plattB, featureCount, hiddenSize, featureSubsets, null));
-            if ((p >= 0.5 ? 1 : 0) == ToBinaryLabel(s.Direction)) baselineCorrect++;
+            if ((p >= safeDecisionThreshold ? 1 : 0) == ToBinaryLabel(s.Direction)) baselineCorrect++;
         }
         double baselineAcc = (double)baselineCorrect / testSet.Count;
 
@@ -264,7 +269,7 @@ internal static class ElmEvaluationHelper
                 double p = ClampProbability(ensembleCalibProb(
                     buffer, weights, biases, inputWeights, inputBiases,
                     plattA, plattB, featureCount, hiddenSize, featureSubsets, null));
-                if ((p >= 0.5 ? 1 : 0) == ToBinaryLabel(testSet[i].Direction)) correct++;
+                if ((p >= safeDecisionThreshold ? 1 : 0) == ToBinaryLabel(testSet[i].Direction)) correct++;
             }
             double permAcc = (double)correct / testSet.Count;
             importance[f] = (float)(baselineAcc - permAcc);

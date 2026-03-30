@@ -144,6 +144,37 @@ public class ElmTrainerHelpersTests
     }
 
     [Fact]
+    public void ComputePermutationImportance_Uses_Configured_Decision_Threshold()
+    {
+        var samples = new List<TrainingSample>
+        {
+            new([0.1f], 0, 1f),
+            new([0.8f], 1, 1f),
+            new([0.2f], 0, 1f),
+            new([0.9f], 1, 1f),
+            new([0.3f], 0, 1f),
+            new([0.95f], 1, 1f),
+        };
+
+        float[] importance = ElmEvaluationHelper.ComputePermutationImportance(
+            samples,
+            weights: [],
+            biases: [],
+            inputWeights: [],
+            inputBiases: [],
+            plattA: 1.0,
+            plattB: 0.0,
+            featureCount: 1,
+            hiddenSize: 1,
+            featureSubsets: null,
+            ensembleCalibProb: (features, _, _, _, _, _, _, _, _, _, _) => features[0],
+            ct: CancellationToken.None,
+            decisionThreshold: 0.7);
+
+        Assert.True(importance[0] > 0f);
+    }
+
+    [Fact]
     public void ComputeCalPermutationImportance_Clamps_To_Available_Feature_Width()
     {
         var samples = new List<TrainingSample>
@@ -1867,6 +1898,36 @@ public class ElmTrainerHelpersTests
         ])!;
 
         Assert.Equal(6.25, prediction, precision: 6);
+    }
+
+    [Fact]
+    public void ElmInferenceEngine_Computes_Std_Around_Learner_Mean_Not_Stacked_Output()
+    {
+        var engine = new ElmInferenceEngine();
+        var snapshot = new ModelSnapshot
+        {
+            Type = "elm",
+            Weights = [[0.0], [0.0]],
+            Biases = [-2.1972245773362196, 2.1972245773362196],
+            ElmInputWeights = [[0.0], [0.0]],
+            ElmInputBiases = [[0.0], [0.0]],
+            ElmHiddenDim = 1,
+            MetaWeights = [0.0, 10.0],
+            MetaBias = 0.0,
+        };
+
+        var result = engine.RunInference(
+            [1f],
+            1,
+            snapshot,
+            new List<LascodiaTradingEngine.Domain.Entities.Candle>(),
+            1,
+            0,
+            0);
+
+        Assert.NotNull(result);
+        Assert.True(result.Value.Probability > 0.99);
+        Assert.Equal(0.565685, result.Value.EnsembleStd, precision: 6);
     }
 
     [Fact]

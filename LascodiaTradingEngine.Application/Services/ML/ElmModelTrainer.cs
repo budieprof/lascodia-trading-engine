@@ -407,7 +407,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             ? ElmEvaluationHelper.ComputePermutationImportance(
                 testSet, weights, biases, inputWeights, inputBiases,
                 plattA, plattB, featureCount, hiddenSize, featureSubsets,
-                (f, w, b, iw, ib, pA, pB, fc, hs, fs, lw) => PrimaryCalibProb(f), ct)
+                (f, w, b, iw, ib, pA, pB, fc, hs, fs, lw) => PrimaryCalibProb(f), ct, optimalThreshold)
             : new float[featureCount];
         featureImportance = ElmEvaluationHelper.NormalisePositiveImportance(featureImportance, featureCount);
 
@@ -670,7 +670,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                 featureImportance = maskedTest.Count >= 10
                     ? ElmEvaluationHelper.ComputePermutationImportance(
                         maskedTest, pw, pb, piw, pib, pA, pB, featureCount, hiddenSize, psub,
-                        (f, w2, b2, iw2, ib2, pAp, pBp, fc, hs, fs, lw) => PPrimaryCalibProb(f), ct)
+                        (f, w2, b2, iw2, ib2, pAp, pBp, fc, hs, fs, lw) => PPrimaryCalibProb(f), ct, pOptimalThreshold)
                     : new float[featureCount];
                 featureImportance = ElmEvaluationHelper.NormalisePositiveImportance(featureImportance, featureCount);
                 calImportanceScores = maskedCal.Count >= 10
