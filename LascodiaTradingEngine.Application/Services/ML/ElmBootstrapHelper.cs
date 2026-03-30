@@ -105,7 +105,7 @@ internal static class ElmBootstrapHelper
 
         if (buyIdx.Count == 0 || sellIdx.Count == 0)
         {
-            var cdf = BuildNormalisedCdf(temporalWeights);
+            var cdf = BuildBootstrapCdf(temporalWeights, train.Count);
             var rng = new Random(seed);
             for (int i = 0; i < count; i++)
                 drawn.Add(SampleFromCdf(cdf, rng));
@@ -138,7 +138,7 @@ internal static class ElmBootstrapHelper
     internal static List<TrainingSample> BiasedBootstrap(
         List<TrainingSample> train, double[] temporalWeights, int count, int seed)
     {
-        var cdf = BuildNormalisedCdf(temporalWeights);
+        var cdf = BuildBootstrapCdf(temporalWeights, train.Count);
         var rng = new Random(seed);
         var result = new List<TrainingSample>(count);
         for (int i = 0; i < count; i++)
@@ -205,6 +205,21 @@ internal static class ElmBootstrapHelper
         double u = rng.NextDouble();
         int idx = Array.BinarySearch(cdf, u);
         return idx >= 0 ? idx : Math.Min(~idx, cdf.Length - 1);
+    }
+
+    private static double[] BuildBootstrapCdf(double[] temporalWeights, int sampleCount)
+    {
+        if (sampleCount <= 0)
+            return [];
+
+        if (temporalWeights.Length == sampleCount)
+            return BuildNormalisedCdf(temporalWeights);
+
+        var adjustedWeights = new double[sampleCount];
+        if (temporalWeights.Length > 0)
+            Array.Copy(temporalWeights, adjustedWeights, Math.Min(sampleCount, temporalWeights.Length));
+
+        return BuildNormalisedCdf(adjustedWeights);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -600,12 +615,24 @@ internal static class ElmBootstrapHelper
                 int i = trainIndices[ti];
                 var f = train[i].Features;
                 double z = b;
-                for (int j = 0; j < Math.Min(w.Length, f.Length); j++) z += w[j] * f[j];
+                for (int j = 0; j < Math.Min(w.Length, f.Length); j++)
+                {
+                    double value = f[j];
+                    if (!double.IsFinite(value))
+                        value = 0.0;
+                    z += w[j] * value;
+                }
                 double p = MLFeatureHelper.Sigmoid(z);
                 double y = i >= splitPoint ? 1.0 : 0.0;
                 double err = p - y;
                 gradB += err;
-                for (int j = 0; j < Math.Min(w.Length, f.Length); j++) gradW[j] += err * f[j];
+                for (int j = 0; j < Math.Min(w.Length, f.Length); j++)
+                {
+                    double value = f[j];
+                    if (!double.IsFinite(value))
+                        value = 0.0;
+                    gradW[j] += err * value;
+                }
             }
 
             double gB = gradB / trainSize + 2.0 * l2Lambda * b;
@@ -628,7 +655,13 @@ internal static class ElmBootstrapHelper
                 int i = valIndices[vi];
                 double z = b;
                 var f = train[i].Features;
-                for (int j = 0; j < Math.Min(w.Length, f.Length); j++) z += w[j] * f[j];
+                for (int j = 0; j < Math.Min(w.Length, f.Length); j++)
+                {
+                    double value = f[j];
+                    if (!double.IsFinite(value))
+                        value = 0.0;
+                    z += w[j] * value;
+                }
                 double p = MLFeatureHelper.Sigmoid(z);
                 double y = i >= splitPoint ? 1.0 : 0.0;
                 valLoss -= y * Math.Log(Math.Max(p, 1e-10))
@@ -657,7 +690,13 @@ internal static class ElmBootstrapHelper
         {
             double z = b;
             var f = train[i].Features;
-            for (int j = 0; j < Math.Min(w.Length, f.Length); j++) z += w[j] * f[j];
+            for (int j = 0; j < Math.Min(w.Length, f.Length); j++)
+            {
+                double value = f[j];
+                if (!double.IsFinite(value))
+                    value = 0.0;
+                z += w[j] * value;
+            }
             double p = MLFeatureHelper.Sigmoid(z);
             weights[i] = Math.Clamp(p / Math.Max(1 - p, 1e-6), 0.1, 10.0);
             sum += weights[i];
@@ -674,7 +713,7 @@ internal static class ElmBootstrapHelper
 
         int effectiveFeatureCount = Math.Min(
             Math.Min(featureCount, parentBp.Length),
-            train.Min(s => s.Features.Length));
+            train.Max(s => s.Features.Length));
 
         double[] weights = new double[train.Count];
         for (int i = 0; i < train.Count; i++)
@@ -685,12 +724,22 @@ internal static class ElmBootstrapHelper
             {
                 var bp = parentBp[j];
                 if (bp is null || bp.Length < 2) continue;
-                double q10 = bp[0];
-                double q90 = bp[^1];
+                double q10 = double.PositiveInfinity;
+                double q90 = double.NegativeInfinity;
+                for (int bi = 0; bi < bp.Length; bi++)
+                {
+                    double value = bp[bi];
+                    if (!double.IsFinite(value))
+                        continue;
+
+                    q10 = Math.Min(q10, value);
+                    q90 = Math.Max(q90, value);
+                }
+
                 if (!double.IsFinite(q10) || !double.IsFinite(q90))
                     continue;
                 checkedCount++;
-                double v = train[i].Features[j];
+                double v = j < train[i].Features.Length ? train[i].Features[j] : 0.0;
                 if (!double.IsFinite(v))
                     continue;
                 if (v < q10 || v > q90) outsideCount++;

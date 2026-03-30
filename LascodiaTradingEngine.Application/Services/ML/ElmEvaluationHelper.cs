@@ -215,7 +215,7 @@ internal static class ElmEvaluationHelper
     {
         if (testSet.Count == 0) return new float[featureCount];
 
-        int effectiveFeatureCount = testSet.Min(s => s.Features.Length);
+        int effectiveFeatureCount = Math.Min(featureCount, testSet.Max(s => s.Features.Length));
         if (effectiveFeatureCount <= 0)
             return new float[featureCount];
 
@@ -238,7 +238,8 @@ internal static class ElmEvaluationHelper
         {
             var rng = new Random(f * 71);
             var shuffled = new float[testSet.Count];
-            for (int i = 0; i < testSet.Count; i++) shuffled[i] = testSet[i].Features[f];
+            for (int i = 0; i < testSet.Count; i++)
+                shuffled[i] = f < testSet[i].Features.Length ? testSet[i].Features[f] : 0f;
             for (int i = shuffled.Length - 1; i > 0; i--)
             {
                 int j = rng.Next(i + 1);
@@ -260,8 +261,6 @@ internal static class ElmEvaluationHelper
                     buffer, weights, biases, inputWeights, inputBiases,
                     plattA, plattB, featureCount, hiddenSize, featureSubsets, null));
                 if ((p >= 0.5 ? 1 : 0) == ToBinaryLabel(testSet[i].Direction)) correct++;
-
-                buffer[f] = orig[f];
             }
             double permAcc = (double)correct / testSet.Count;
             importance[f] = (float)(baselineAcc - permAcc);
@@ -280,7 +279,7 @@ internal static class ElmEvaluationHelper
     {
         if (calSet.Count == 0) return new double[featureCount];
 
-        int effectiveFeatureCount = calSet.Min(s => s.Features.Length);
+        int effectiveFeatureCount = Math.Min(featureCount, calSet.Max(s => s.Features.Length));
         if (effectiveFeatureCount <= 0)
             return new double[featureCount];
 
@@ -303,7 +302,8 @@ internal static class ElmEvaluationHelper
         {
             var rng = new Random(f * 71);
             var shuffled = new float[calSet.Count];
-            for (int i = 0; i < calSet.Count; i++) shuffled[i] = calSet[i].Features[f];
+            for (int i = 0; i < calSet.Count; i++)
+                shuffled[i] = f < calSet[i].Features.Length ? calSet[i].Features[f] : 0f;
             for (int i = shuffled.Length - 1; i > 0; i--)
             {
                 int j = rng.Next(i + 1);
@@ -324,7 +324,6 @@ internal static class ElmEvaluationHelper
                     buffer, weights, biases, inputWeights, inputBiases,
                     featureCount, hiddenSize, featureSubsets, null));
                 if ((p >= 0.5 ? 1 : 0) == ToBinaryLabel(calSet[i].Direction)) correct++;
-                buffer[f] = orig[f];
             }
             importance[f] = baselineAcc - (double)correct / calSet.Count;
         });
@@ -396,28 +395,47 @@ internal static class ElmEvaluationHelper
         int featureCount, int hiddenSize, int[][]? featureSubsets,
         Func<float[], double[], double, double[], double[], int, int, int[]?, int, double> elmLearnerProb)
     {
-        int K = weights.Length;
+        int K = Math.Min(
+            weights.Length,
+            Math.Min(biases.Length, Math.Min(inputWeights.Length, inputBiases.Length)));
         if (K < 2 || calSet.Count == 0) return 0;
 
         long totalDisagreePairs = 0;
+        long totalPossiblePairs = 0;
 
         for (int i = 0; i < calSet.Count; i++)
         {
             int positiveCount = 0;
+            int activeLearners = 0;
             for (int k = 0; k < K; k++)
             {
+                if (weights[k] is not { Length: > 0 } ||
+                    inputWeights[k] is not { Length: > 0 } ||
+                    inputBiases[k] is not { Length: > 0 })
+                {
+                    continue;
+                }
+
                 double p = ClampProbability(elmLearnerProb(
                     calSet[i].Features, weights[k], biases[k],
                     inputWeights[k], inputBiases[k],
                     featureCount, hiddenSize,
-                    featureSubsets is not null && k < featureSubsets.Length ? featureSubsets[k] : null,
+                    featureSubsets is not null && k < featureSubsets.Length && featureSubsets[k] is { Length: > 0 }
+                        ? featureSubsets[k]
+                        : null,
                     k));
+                activeLearners++;
                 if (p >= 0.5) positiveCount++;
             }
-            totalDisagreePairs += (long)positiveCount * (K - positiveCount);
+
+            if (activeLearners < 2)
+                continue;
+
+            totalDisagreePairs += (long)positiveCount * (activeLearners - positiveCount);
+            totalPossiblePairs += (long)activeLearners * (activeLearners - 1) / 2;
         }
 
-        double totalPossible = (double)calSet.Count * K * (K - 1) / 2.0;
+        double totalPossible = totalPossiblePairs;
         return totalPossible > 0 ? totalDisagreePairs / totalPossible : 0;
     }
 
@@ -430,7 +448,7 @@ internal static class ElmEvaluationHelper
     {
         if (train.Count < 20 || featureCount < 2) return [];
 
-        int effectiveFeatureCount = Math.Min(featureCount, train.Min(s => s.Features.Length));
+        int effectiveFeatureCount = Math.Min(featureCount, train.Max(s => s.Features.Length));
         if (effectiveFeatureCount < 2)
             return [];
 
@@ -441,7 +459,7 @@ internal static class ElmEvaluationHelper
             double sum = 0, sumSq = 0;
             foreach (var s in train)
             {
-                double v = s.Features[j];
+                double v = j < s.Features.Length ? s.Features[j] : 0.0;
                 if (!double.IsFinite(v))
                     v = 0.0;
                 sum += v; sumSq += v * v;
@@ -487,7 +505,7 @@ internal static class ElmEvaluationHelper
     {
         if (train.Count < 20 || featureCount < 2) return [];
 
-        int effectiveFeatureCount = Math.Min(featureCount, train.Min(s => s.Features.Length));
+        int effectiveFeatureCount = Math.Min(featureCount, train.Max(s => s.Features.Length));
         if (effectiveFeatureCount < 2)
             return [];
 
@@ -498,7 +516,7 @@ internal static class ElmEvaluationHelper
             double sum = 0, sumSq = 0;
             foreach (var s in train)
             {
-                double v = s.Features[j];
+                double v = j < s.Features.Length ? s.Features[j] : 0.0;
                 if (!double.IsFinite(v))
                     v = 0.0;
                 sum += v; sumSq += v * v;
@@ -573,7 +591,7 @@ internal static class ElmEvaluationHelper
         var indexed = new (float Value, int Idx)[n];
         for (int i = 0; i < n; i++)
         {
-            float value = samples[i].Features[featureIdx];
+            float value = featureIdx < samples[i].Features.Length ? samples[i].Features[featureIdx] : 0f;
             indexed[i] = (float.IsFinite(value) ? value : 0f, i);
         }
         Array.Sort(indexed, (a, b) => a.Value.CompareTo(b.Value));
@@ -596,7 +614,7 @@ internal static class ElmEvaluationHelper
         if (samples.Count < 20 || featureCount <= 0)
             return 0;
 
-        int effectiveFeatureCount = Math.Min(featureCount, samples.Min(s => s.Features.Length));
+        int effectiveFeatureCount = Math.Min(featureCount, samples.Max(s => s.Features.Length));
         if (effectiveFeatureCount <= 0)
             return 0;
 
@@ -606,7 +624,7 @@ internal static class ElmEvaluationHelper
             var series = new double[samples.Count];
             for (int i = 0; i < samples.Count; i++)
             {
-                double value = samples[i].Features[j];
+                double value = j < samples[i].Features.Length ? samples[i].Features[j] : 0.0;
                 series[i] = double.IsFinite(value) ? value : 0.0;
             }
             double pValue = MLFeatureHelper.AdfTest(series, maxLags: 4);

@@ -115,6 +115,34 @@ public class ElmTrainerHelpersTests
     }
 
     [Fact]
+    public void ComputePermutationImportance_Does_Not_Let_One_Truncated_Row_Hide_A_Higher_Feature()
+    {
+        var samples = new List<TrainingSample>
+        {
+            new([0f, 1f], 1, 1f),
+            new([0f, 0f], 0, 1f),
+            new([0f], 0, 1f),
+            new([0f, 1f], 1, 1f),
+        };
+
+        float[] importance = ElmEvaluationHelper.ComputePermutationImportance(
+            samples,
+            weights: [],
+            biases: [],
+            inputWeights: [],
+            inputBiases: [],
+            plattA: 1.0,
+            plattB: 0.0,
+            featureCount: 2,
+            hiddenSize: 1,
+            featureSubsets: null,
+            ensembleCalibProb: (features, _, _, _, _, _, _, _, _, _, _) => features.Length > 1 ? features[1] : 0f,
+            ct: CancellationToken.None);
+
+        Assert.True(importance[1] > 0f);
+    }
+
+    [Fact]
     public void ComputeCalPermutationImportance_Clamps_To_Available_Feature_Width()
     {
         var samples = new List<TrainingSample>
@@ -163,6 +191,32 @@ public class ElmTrainerHelpersTests
 
         Assert.Equal(2, importance.Length);
         Assert.All(importance, value => Assert.True(double.IsFinite(value)));
+    }
+
+    [Fact]
+    public void ComputeCalPermutationImportance_Does_Not_Let_One_Truncated_Row_Hide_A_Higher_Feature()
+    {
+        var samples = new List<TrainingSample>
+        {
+            new([0f, 0.9f], 1, 1f),
+            new([0f, 0.1f], 0, 1f),
+            new([0f], 0, 1f),
+            new([0f, 0.9f], 1, 1f),
+        };
+
+        double[] importance = ElmEvaluationHelper.ComputeCalPermutationImportance(
+            samples,
+            weights: [],
+            biases: [],
+            inputWeights: [],
+            inputBiases: [],
+            featureCount: 2,
+            hiddenSize: 1,
+            featureSubsets: null,
+            ensembleRawProb: (features, _, _, _, _, _, _, _, _) => features.Length > 1 ? features[1] : 0f,
+            ct: CancellationToken.None);
+
+        Assert.True(importance[1] > 0.0);
     }
 
     [Fact]
@@ -280,6 +334,27 @@ public class ElmTrainerHelpersTests
 
         Assert.Equal(2, weights.Length);
         Assert.All(weights, weight => Assert.True(double.IsFinite(weight) && weight >= 0.0));
+        Assert.Equal(1.0, weights.Sum(), precision: 6);
+    }
+
+    [Fact]
+    public void ComputeCovariateShiftWeights_Uses_Min_And_Max_When_Breakpoints_Are_Unsorted()
+    {
+        var samples = new List<TrainingSample>
+        {
+            new([2.5f], 1, 1f),
+            new([0.5f], 0, 1f),
+        };
+
+        double[] weights = ElmBootstrapHelper.ComputeCovariateShiftWeights(
+            samples,
+            parentBp:
+            [
+                [3.0, 1.0, 2.0],
+            ],
+            featureCount: 1);
+
+        Assert.True(weights[1] > weights[0]);
         Assert.Equal(1.0, weights.Sum(), precision: 6);
     }
 
@@ -557,6 +632,67 @@ public class ElmTrainerHelpersTests
     }
 
     [Fact]
+    public void ShermanMorrisonUpdate_Does_Not_Corrupt_State_When_Update_Becomes_NonFinite()
+    {
+        double[] inverseGram = [1e308];
+        double[] coefficients = [0.0];
+
+        bool updated = ElmMathHelper.ShermanMorrisonUpdate(
+            inverseGramFlat: inverseGram,
+            gramDim: 1,
+            coefficients: coefficients,
+            featureVector: [1e308],
+            target: 1.0);
+
+        Assert.False(updated);
+        Assert.Equal([1e308], inverseGram, new PrecisionComparer(6));
+        Assert.Equal([0.0], coefficients, new PrecisionComparer(6));
+    }
+
+    [Fact]
+    public void CholeskySolve_Rejects_NonFinite_Matrix_Instead_Of_Returning_NaN_Solution()
+    {
+        double[,] matrix = { { double.NaN } };
+        double[] rhs = [1.0];
+        double[] solution = [0.0];
+
+        bool solved = ElmMathHelper.CholeskySolve(matrix, rhs, solution, n: 1);
+
+        Assert.False(solved);
+        Assert.Equal(0.0, solution[0], precision: 6);
+    }
+
+    [Fact]
+    public void TryInvertSpd_Rejects_NonFinite_Matrix_Instead_Of_Returning_NaN_Inverse()
+    {
+        double[,] matrix = { { double.NaN } };
+        double[,] inverse = { { 0.0 } };
+
+        bool inverted = ElmMathHelper.TryInvertSpd(matrix, inverse, n: 1);
+
+        Assert.False(inverted);
+        Assert.Equal(0.0, inverse[0, 0], precision: 6);
+    }
+
+    [Fact]
+    public void ShermanMorrisonUpdate_Rolls_Back_When_Weight_Update_Becomes_NonFinite()
+    {
+        double[] inverseGram = [1.0];
+        double[] coefficients = [1e308];
+
+        bool updated = ElmMathHelper.ShermanMorrisonUpdate(
+            inverseGramFlat: inverseGram,
+            gramDim: 1,
+            coefficients: coefficients,
+            featureVector: [1e308],
+            target: 0.0);
+
+        Assert.False(updated);
+        Assert.Equal([1.0], inverseGram, new PrecisionComparer(6));
+        Assert.Equal([1e308], coefficients, new PrecisionComparer(6));
+    }
+
+    [Fact]
     public void ComputeAvgKellyFraction_Uses_Probability_Edge_Not_Label_Magnitude_Buckets()
     {
         var calSet = new List<TrainingSample>
@@ -729,6 +865,27 @@ public class ElmTrainerHelpersTests
         double[] cdf = ElmBootstrapHelper.BuildNormalisedCdf([0.0, 0.0, double.NaN]);
 
         Assert.Equal([1.0 / 3.0, 2.0 / 3.0, 1.0], cdf, new PrecisionComparer(6));
+    }
+
+    [Fact]
+    public void ComputeDensityRatioWeights_Sanitises_NonFinite_Features_And_Remains_Normalised()
+    {
+        var train = Enumerable.Range(0, 40)
+            .Select(i => new TrainingSample(
+                [i == 0 ? float.NaN : (float)i],
+                i < 30 ? 0 : 1,
+                1f))
+            .ToList();
+
+        double[] weights = ElmBootstrapHelper.ComputeDensityRatioWeights(
+            train,
+            featureCount: 1,
+            recentWindowDays: 20,
+            barsPerDay: 1);
+
+        Assert.Equal(40, weights.Length);
+        Assert.All(weights, weight => Assert.True(double.IsFinite(weight) && weight >= 0.0));
+        Assert.Equal(1.0, weights.Sum(), precision: 6);
     }
 
     [Fact]
@@ -1255,6 +1412,29 @@ public class ElmTrainerHelpersTests
     }
 
     [Fact]
+    public void ComputeRedundantFeaturePairIndices_Does_Not_Throw_When_A_Higher_Feature_Is_Missing_In_One_Row()
+    {
+        var samples = new List<TrainingSample>();
+        for (int i = 0; i < 30; i++)
+        {
+            samples.Add(i == 0
+                ? new TrainingSample([0f], i % 2, 1f)
+                : new TrainingSample([0f, i], i % 2, 1f));
+        }
+
+        var redundant = ElmEvaluationHelper.ComputeRedundantFeaturePairIndices(
+            samples,
+            featureCount: 2,
+            threshold: 0.1);
+
+        Assert.All(redundant, pair =>
+        {
+            Assert.InRange(pair.IndexI, 0, 1);
+            Assert.InRange(pair.IndexJ, 0, 1);
+        });
+    }
+
+    [Fact]
     public void CountNonStationaryFeatures_Sanitises_NonFinite_Feature_Values()
     {
         var samples = Enumerable.Range(0, 40)
@@ -1267,6 +1447,27 @@ public class ElmTrainerHelpersTests
         int nonStationary = ElmEvaluationHelper.CountNonStationaryFeatures(samples, featureCount: 2);
 
         Assert.InRange(nonStationary, 0, 2);
+    }
+
+    [Fact]
+    public void CountNonStationaryFeatures_Does_Not_Let_One_Truncated_Row_Hide_A_NonStationary_Feature()
+    {
+        var samples = new List<TrainingSample>();
+        double randomWalk = 0.0;
+        var rng = new Random(17);
+
+        for (int i = 0; i < 120; i++)
+        {
+            randomWalk += rng.NextDouble() - 0.5;
+            float stationary = (float)(rng.NextDouble() - 0.5);
+            samples.Add(i == 0
+                ? new TrainingSample([stationary], i % 2, 1f)
+                : new TrainingSample([stationary, (float)randomWalk], i % 2, 1f));
+        }
+
+        int nonStationary = ElmEvaluationHelper.CountNonStationaryFeatures(samples, featureCount: 2);
+
+        Assert.Equal(1, nonStationary);
     }
 
     [Fact]
@@ -1309,6 +1510,29 @@ public class ElmTrainerHelpersTests
             hiddenSize: 1,
             featureSubsets: null,
             elmLearnerProb: (_, _, _, _, _, _, _, _, learnerIdx) => learnerIdx == 0 ? double.NaN : 0.9);
+
+        Assert.Equal(0.0, diversity, precision: 6);
+    }
+
+    [Fact]
+    public void ComputeEnsembleDiversity_Skips_Truncated_Core_Metadata_Instead_Of_Throwing()
+    {
+        var calSet = new List<TrainingSample>
+        {
+            new([1f], 1, 1f),
+            new([0f], 0, 1f),
+        };
+
+        double diversity = ElmEvaluationHelper.ComputeEnsembleDiversity(
+            calSet,
+            weights: [new[] { 0.0 }, new[] { 0.0 }],
+            biases: [0.0],
+            inputWeights: [new[] { 0.0 }, new[] { 0.0 }],
+            inputBiases: [new[] { 0.0 }, new[] { 0.0 }],
+            featureCount: 1,
+            hiddenSize: 1,
+            featureSubsets: null,
+            elmLearnerProb: (_, _, _, _, _, _, _, _, _) => 0.8);
 
         Assert.Equal(0.0, diversity, precision: 6);
     }
@@ -1525,6 +1749,30 @@ public class ElmTrainerHelpersTests
     }
 
     [Fact]
+    public void PredictMagnitudeAug_Handles_Truncated_InputBias_Metadata()
+    {
+        MethodInfo predictMagnitudeAug = typeof(ElmModelTrainer).GetMethod(
+            "PredictMagnitudeAug",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        double prediction = (double)predictMagnitudeAug.Invoke(null,
+        [
+            new[] { 2f },
+            new[] { 0.0, 1.5 },
+            0.25,
+            1,
+            1,
+            new[] { new[] { 2.0 }, new[] { 4.0 } },
+            new[] { new[] { 0.5 } },
+            null!,
+            new[] { ElmActivation.Sigmoid },
+        ])!;
+
+        Assert.True(double.IsFinite(prediction));
+        Assert.InRange(prediction, 0.25, 2.0);
+    }
+
+    [Fact]
     public void ProjectAugWeightsToFeatureSpace_Handles_Empty_Train_And_Truncated_Augmented_Weights()
     {
         MethodInfo projectAugWeights = typeof(ElmModelTrainer).GetMethod(
@@ -1545,6 +1793,29 @@ public class ElmTrainerHelpersTests
         ])!;
 
         Assert.Equal([2.0, 0.0], projected, new PrecisionComparer(6));
+    }
+
+    [Fact]
+    public void ProjectAugWeightsToFeatureSpace_Ignores_Negative_Subset_Indices()
+    {
+        MethodInfo projectAugWeights = typeof(ElmModelTrainer).GetMethod(
+            "ProjectAugWeightsToFeatureSpace",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        double[] projected = (double[])projectAugWeights.Invoke(null,
+        [
+            new[] { 0.0, 2.0 },
+            1,
+            1,
+            1,
+            new List<TrainingSample> { new([1f], 1, 1f) },
+            new[] { new[] { 3.0 } },
+            new[] { new[] { 0.0 } },
+            new[] { new[] { -1 } },
+            new[] { ElmActivation.Sigmoid },
+        ])!;
+
+        Assert.Equal([0.0], projected, new PrecisionComparer(6));
     }
 
     [Fact]
@@ -1597,6 +1868,27 @@ public class ElmTrainerHelpersTests
     }
 
     [Fact]
+    public void RemapWarmStartForPruning_Ignores_Negative_Subset_Indices()
+    {
+        MethodInfo remap = typeof(ElmModelTrainer).GetMethod(
+            "RemapWarmStartForPruning",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        var warmStart = new ModelSnapshot
+        {
+            ElmInputWeights = [[1.0, 2.0]],
+            ElmInputBiases = [[0.1]],
+            FeatureSubsetIndices = [[-1, 0]],
+        };
+
+        var remapped = (ModelSnapshot?)remap.Invoke(null, [warmStart, new[] { true }, 1, 1]);
+
+        Assert.NotNull(remapped);
+        Assert.Equal([0], remapped!.FeatureSubsetIndices![0]);
+        Assert.Equal([2.0], remapped.ElmInputWeights[0], new PrecisionComparer(6));
+    }
+
+    [Fact]
     public void EnsembleCalibProb_Handles_Truncated_Metadata_Arrays()
     {
         MethodInfo ensembleCalibProb = typeof(ElmModelTrainer).GetMethod(
@@ -1623,6 +1915,142 @@ public class ElmTrainerHelpersTests
         ])!;
 
         Assert.Equal(0.5, calibrated, precision: 6);
+    }
+
+    [Fact]
+    public void ComputeEnsembleStd_Skips_Learners_With_Truncated_Core_Metadata()
+    {
+        MethodInfo computeStd = typeof(ElmModelTrainer).GetMethod(
+            "ComputeEnsembleStd",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        double std = (double)computeStd.Invoke(null,
+        [
+            new[] { 1f },
+            new[] { new[] { 0.0 }, new[] { 0.0 } },
+            new[] { 0.0 },
+            new[] { new[] { 0.0 }, new[] { 0.0 } },
+            new[] { new[] { 0.0 } },
+            1,
+            null!,
+            new[] { 1, 1 },
+            new[] { ElmActivation.Sigmoid },
+            null!,
+            null!,
+            0.0,
+        ])!;
+
+        Assert.Equal(0.0, std, precision: 6);
+    }
+
+    [Fact]
+    public void ComputeEnsembleStd_Uses_Original_LearnerWeight_Indices_When_Invalid_Learners_Are_Skipped()
+    {
+        MethodInfo computeStd = typeof(ElmModelTrainer).GetMethod(
+            "ComputeEnsembleStd",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        double std = (double)computeStd.Invoke(null,
+        [
+            new[] { 1f },
+            new[] { Array.Empty<double>(), new[] { 0.0 }, new[] { 0.0 } },
+            new[] { 0.0, 0.0, 0.0 },
+            new[] { Array.Empty<double>(), new[] { 0.0 }, new[] { 0.0 } },
+            new[] { Array.Empty<double>(), new[] { 0.0 }, new[] { 0.0 } },
+            1,
+            null!,
+            new[] { 1, 1, 1 },
+            new[] { ElmActivation.Sigmoid, ElmActivation.Sigmoid, ElmActivation.Sigmoid },
+            new[] { 10.0, 1.0, 1.0 },
+            null!,
+            0.0,
+        ])!;
+
+        Assert.Equal(0.0, std, precision: 6);
+    }
+
+    [Fact]
+    public void ComputeEnsembleStd_Averages_Only_Valid_Learners_When_No_Weights_Are_Provided()
+    {
+        MethodInfo computeStd = typeof(ElmModelTrainer).GetMethod(
+            "ComputeEnsembleStd",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        double std = (double)computeStd.Invoke(null,
+        [
+            new[] { 1f },
+            new[] { Array.Empty<double>(), new[] { 0.0 }, new[] { 0.0 } },
+            new[] { 0.0, 0.0, 0.0 },
+            new[] { Array.Empty<double>(), new[] { 0.0 }, new[] { 0.0 } },
+            new[] { Array.Empty<double>(), new[] { 0.0 }, new[] { 0.0 } },
+            1,
+            null!,
+            new[] { 1, 1, 1 },
+            new[] { ElmActivation.Sigmoid, ElmActivation.Sigmoid, ElmActivation.Sigmoid },
+            null!,
+            null!,
+            0.0,
+        ])!;
+
+        Assert.Equal(0.0, std, precision: 6);
+    }
+
+    [Fact]
+    public void UpdateOnline_Returns_False_When_InverseGram_Metadata_Is_Missing()
+    {
+        var trainer = new ElmModelTrainer(NullLogger<ElmModelTrainer>.Instance);
+        var snapshot = new ModelSnapshot
+        {
+            Weights = [[0.0]],
+            Biases = [0.0],
+            ElmInputWeights = [[1.0]],
+            ElmInputBiases = [[0.0]],
+            ElmInverseGram = null,
+            Means = [0f],
+            Stds = [1f],
+        };
+
+        bool updated = trainer.UpdateOnline(snapshot, new TrainingSample([1f], 1, 1f));
+
+        Assert.False(updated);
+        Assert.Equal(0, snapshot.TrainSamples);
+    }
+
+    [Fact]
+    public void BiasedBootstrap_Clamps_Mismatched_Weight_Arrays_To_Training_Count()
+    {
+        var train = new List<TrainingSample>
+        {
+            new([1f], 1, 1f),
+            new([2f], 0, 1f),
+        };
+
+        var bootstrap = ElmBootstrapHelper.BiasedBootstrap(
+            train,
+            temporalWeights: [0.1, 0.2, 0.7],
+            count: 20,
+            seed: 7);
+
+        Assert.Equal(20, bootstrap.Count);
+        Assert.All(bootstrap, sample => Assert.Contains(sample, train));
+    }
+
+    [Fact]
+    public void ReplayBootstrapIndices_Clamps_Mismatched_Weight_Arrays_To_Training_Count()
+    {
+        var train = new List<TrainingSample>
+        {
+            new([1f], 1, 1f),
+            new([2f], 0, 1f),
+        };
+
+        var indices = ElmBootstrapHelper.ReplayBootstrapIndices(
+            train,
+            temporalWeights: [0.1, 0.2, 0.7],
+            count: 20,
+            seed: 7);
+
+        Assert.All(indices, index => Assert.InRange(index, 0, train.Count - 1));
     }
 
     private sealed class PrecisionComparer(int precision) : IEqualityComparer<double>

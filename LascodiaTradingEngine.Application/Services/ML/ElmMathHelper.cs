@@ -21,10 +21,29 @@ internal static class ElmMathHelper
     /// </summary>
     internal static bool CholeskySolve(double[,] A, double[] b, double[] x, int n)
     {
+        if (n <= 0 ||
+            A.GetLength(0) < n ||
+            A.GetLength(1) < n ||
+            b.Length < n ||
+            x.Length < n)
+        {
+            return false;
+        }
+
         var L = new double[n, n];
         for (int i = 0; i < n; i++)
+        {
+            if (!double.IsFinite(b[i]))
+                return false;
+
             for (int j = 0; j <= i; j++)
-                L[i, j] = A[i, j];
+            {
+                double value = A[i, j];
+                if (!double.IsFinite(value))
+                    return false;
+                L[i, j] = value;
+            }
+        }
 
         for (int j = 0; j < n; j++)
         {
@@ -74,10 +93,26 @@ internal static class ElmMathHelper
     /// </summary>
     internal static bool TryInvertSpd(double[,] A, double[,] inverse, int n)
     {
+        if (n <= 0 ||
+            A.GetLength(0) < n ||
+            A.GetLength(1) < n ||
+            inverse.GetLength(0) < n ||
+            inverse.GetLength(1) < n)
+        {
+            return false;
+        }
+
         var L = new double[n, n];
         for (int i = 0; i < n; i++)
+        {
             for (int j = 0; j <= i; j++)
-                L[i, j] = A[i, j];
+            {
+                double value = A[i, j];
+                if (!double.IsFinite(value))
+                    return false;
+                L[i, j] = value;
+            }
+        }
 
         for (int j = 0; j < n; j++)
         {
@@ -470,17 +505,21 @@ internal static class ElmMathHelper
             return false; // degenerate — skip this sample
 
         double invDenom = 1.0 / denom;
+        var updatedInverseGram = new double[inverseGramFlat.Length];
+        Array.Copy(inverseGramFlat, updatedInverseGram, inverseGramFlat.Length);
 
         // P_new = P − (Ph × Ph^T) / denom  (rank-1 downdate)
         for (int i = 0; i < H; i++)
             for (int j = 0; j < H; j++)
-                inverseGramFlat[i * H + j] -= Ph[i] * Ph[j] * invDenom;
+                updatedInverseGram[i * H + j] -= Ph[i] * Ph[j] * invDenom;
 
         // prediction error: e = y − (w^T h + b)
         double prediction = 0.0;
         for (int j = 0; j < H; j++)
             prediction += coefficients[j] * featureVector[j];
         double error = target - prediction;
+        if (!double.IsFinite(error))
+            return false;
 
         // P_new × h (recompute with updated P)
         var PnewH = new double[H];
@@ -488,20 +527,25 @@ internal static class ElmMathHelper
         {
             double sum = 0;
             for (int j = 0; j < H; j++)
-                sum += inverseGramFlat[i * H + j] * featureVector[j];
+                sum += updatedInverseGram[i * H + j] * featureVector[j];
             PnewH[i] = sum;
             if (!double.IsFinite(PnewH[i]))
                 return false;
         }
 
+        var updatedCoefficients = new double[coefficients.Length];
+        Array.Copy(coefficients, updatedCoefficients, coefficients.Length);
+
         // w_new = w + P_new h × error
         for (int i = 0; i < H; i++)
         {
-            coefficients[i] += PnewH[i] * error;
-            if (!double.IsFinite(coefficients[i]))
+            updatedCoefficients[i] += PnewH[i] * error;
+            if (!double.IsFinite(updatedCoefficients[i]))
                 return false;
         }
 
+        Array.Copy(updatedInverseGram, inverseGramFlat, inverseGramFlat.Length);
+        Array.Copy(updatedCoefficients, coefficients, coefficients.Length);
         return true;
     }
 }

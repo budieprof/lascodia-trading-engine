@@ -1925,7 +1925,9 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         int[] learnerHiddenSizes, ElmActivation[] learnerActivations,
         double[]? stackingWeights = null, double stackingBias = 0.0)
     {
-        int K = weights.Length;
+        int K = Math.Min(
+            weights.Length,
+            Math.Min(biases.Length, Math.Min(inputWeights.Length, inputBiases.Length)));
         if (K <= 0)
             return 0.5;
 
@@ -1937,6 +1939,13 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             double z = stackingBias;
             for (int k = 0; k < K; k++)
             {
+                if (weights[k] is not { Length: > 0 } ||
+                    inputWeights[k] is not { Length: > 0 } ||
+                    inputBiases[k] is null)
+                {
+                    continue;
+                }
+
                 double pk = ClampProbabilityOrNeutral(ElmLearnerProb(
                     features, weights[k], biases[k], inputWeights[k], inputBiases[k],
                     featureCount,
@@ -1960,6 +1969,12 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                     : 0.0;
                 if (learnerWeight <= 0.0)
                     continue;
+                if (weights[k] is not { Length: > 0 } ||
+                    inputWeights[k] is not { Length: > 0 } ||
+                    inputBiases[k] is null)
+                {
+                    continue;
+                }
 
                 sum += learnerWeight * ClampProbabilityOrNeutral(ElmLearnerProb(
                     features, weights[k], biases[k], inputWeights[k], inputBiases[k],
@@ -1974,16 +1989,25 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         }
 
         double uniSum = 0;
+        int uniCount = 0;
         for (int k = 0; k < K; k++)
         {
+            if (weights[k] is not { Length: > 0 } ||
+                inputWeights[k] is not { Length: > 0 } ||
+                inputBiases[k] is null)
+            {
+                continue;
+            }
+
             uniSum += ClampProbabilityOrNeutral(ElmLearnerProb(
                 features, weights[k], biases[k], inputWeights[k], inputBiases[k],
                 featureCount,
                 ResolveLearnerHiddenSize(learnerHiddenSizes, k, hiddenSize, inputBiases[k]),
                 ResolveLearnerSubset(featureSubsets, k),
                 ResolveLearnerActivation(learnerActivations, k)));
+            uniCount++;
         }
-        return uniSum / K;
+        return uniCount > 0 ? uniSum / uniCount : 0.5;
     }
 
     private static double EnsembleCalibProb(
@@ -2033,12 +2057,21 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         int featureCount, int[][]? featureSubsets,
         int[] learnerHiddenSizes, ElmActivation[] learnerActivations)
     {
-        int K = weights.Length;
+        int K = Math.Min(
+            weights.Length,
+            Math.Min(biases.Length, Math.Min(inputWeights.Length, inputBiases.Length)));
         var accuracies = new double[K];
         if (K <= 0 || calSet.Count == 0) return (accuracies, null);
 
         for (int k = 0; k < K; k++)
         {
+            if (weights[k] is not { Length: > 0 } ||
+                inputWeights[k] is not { Length: > 0 } ||
+                inputBiases[k] is null)
+            {
+                continue;
+            }
+
             int correct = 0;
             foreach (var s in calSet)
             {
@@ -2080,56 +2113,77 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         double[]? learnerWeights = null,
         double[]? stackingWeights = null, double stackingBias = 0.0)
     {
-        int K = weights.Length;
-        if (K <= 1) return 0.0;
+        int maxK = Math.Min(
+            weights.Length,
+            Math.Min(biases.Length, Math.Min(inputWeights.Length, inputBiases.Length)));
+        if (maxK <= 1) return 0.0;
 
-        var probs = new double[K];
-        for (int k = 0; k < K; k++)
+        var probs = new double[maxK];
+        var validIndices = new int[maxK];
+        int validCount = 0;
+        for (int k = 0; k < maxK; k++)
         {
-            probs[k] = ClampProbabilityOrNeutral(ElmLearnerProb(
+            if (weights[k] is not { Length: > 0 } ||
+                inputWeights[k] is not { Length: > 0 } ||
+                inputBiases[k] is null)
+            {
+                continue;
+            }
+
+            probs[validCount++] = ClampProbabilityOrNeutral(ElmLearnerProb(
                 features, weights[k], biases[k], inputWeights[k], inputBiases[k],
                 featureCount,
                 ResolveLearnerHiddenSize(learnerHiddenSizes, k, inputBiases[k].Length, inputBiases[k]),
                 ResolveLearnerSubset(featureSubsets, k),
                 ResolveLearnerActivation(learnerActivations, k)));
+            validIndices[validCount - 1] = k;
         }
 
+        if (validCount <= 1)
+            return 0.0;
+
         double avg;
-        if (stackingWeights is { Length: > 0 } sw && sw.Length == K)
+        if (stackingWeights is { Length: > 0 } sw)
         {
             double z = stackingBias;
-            for (int k = 0; k < K; k++)
+            for (int k = 0; k < validCount; k++)
             {
-                double stackingWeight = double.IsFinite(sw[k]) ? sw[k] : 0.0;
+                int originalIndex = validIndices[k];
+                double stackingWeight = originalIndex < sw.Length && double.IsFinite(sw[originalIndex])
+                    ? sw[originalIndex]
+                    : 0.0;
                 z += stackingWeight * probs[k];
             }
             avg = ClampProbabilityOrNeutral(MLFeatureHelper.Sigmoid(z));
         }
-        else if (learnerWeights is { Length: > 0 } lw && lw.Length == K)
+        else if (learnerWeights is { Length: > 0 } lw)
         {
             double sumP = 0.0;
             double sumW = 0.0;
-            for (int k = 0; k < K; k++)
+            for (int k = 0; k < validCount; k++)
             {
-                double learnerWeight = double.IsFinite(lw[k]) && lw[k] > 0.0 ? lw[k] : 0.0;
+                int originalIndex = validIndices[k];
+                double learnerWeight = originalIndex < lw.Length && double.IsFinite(lw[originalIndex]) && lw[originalIndex] > 0.0
+                    ? lw[originalIndex]
+                    : 0.0;
                 sumP += learnerWeight * probs[k];
                 sumW += learnerWeight;
             }
-            avg = ClampProbabilityOrNeutral(sumW > 1e-15 ? sumP / sumW : probs.Average());
+            avg = ClampProbabilityOrNeutral(sumW > 1e-15 ? sumP / sumW : probs[..validCount].Average());
         }
         else
         {
-            avg = probs.Average();
+            avg = probs[..validCount].Average();
         }
 
         double variance = 0.0;
-        for (int k = 0; k < K; k++)
+        for (int k = 0; k < validCount; k++)
         {
             double d = probs[k] - avg;
             variance += d * d;
         }
 
-        return double.IsFinite(variance) ? Math.Sqrt(variance / (K - 1)) : 0.0;
+        return double.IsFinite(variance) ? Math.Sqrt(variance / (validCount - 1)) : 0.0;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -2142,7 +2196,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         double[][] elmInputWeights, double[][] elmInputBiases, int[][]? featureSubsets,
         ElmActivation[] learnerActivations)
     {
-        int K = elmInputWeights.Length;
+        int K = Math.Min(elmInputWeights.Length, elmInputBiases.Length);
         int[] defaultSubset = Enumerable.Range(0, featureCount).ToArray();
         double pred = augBias;
 
@@ -2156,11 +2210,17 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             int hCount = 0;
             for (int ki = 0; ki < K; ki++)
             {
+                if (elmInputWeights[ki] is not { Length: > 0 } ||
+                    elmInputBiases[ki] is not { Length: > 0 })
+                {
+                    continue;
+                }
+
                 var bIn = elmInputBiases[ki];
                 if (h >= bIn.Length) continue; // learner has fewer hidden units
 
                 var wIn = elmInputWeights[ki];
-                int[] sub = featureSubsets is not null && ki < featureSubsets.Length
+                int[] sub = featureSubsets is not null && ki < featureSubsets.Length && featureSubsets[ki] is { Length: > 0 }
                     ? featureSubsets[ki]
                     : defaultSubset;
                 int subLen = sub.Length;
@@ -2491,6 +2551,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         double[][] elmInputWeights, double[][] elmInputBiases, int[][]? featureSubsets,
         ElmActivation[] learnerActivations)
     {
+        K = Math.Min(K, Math.Min(elmInputWeights.Length, elmInputBiases.Length));
         int augDim = featureCount + hiddenSize;
 
         // Pre-compute default subset once — avoids per-sample per-learner allocation
@@ -2499,7 +2560,9 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         // Pre-compute per-learner effective hidden size (clamped to augDim slots)
         int[] learnerH = new int[K];
         for (int ki = 0; ki < K; ki++)
-            learnerH[ki] = Math.Min(hiddenSize, elmInputBiases[ki].Length);
+            learnerH[ki] = elmInputBiases[ki] is { Length: > 0 } && elmInputWeights[ki] is { Length: > 0 }
+                ? Math.Min(hiddenSize, elmInputBiases[ki].Length)
+                : 0;
 
         var augFeatures = new double[samples.Count][];
         for (int i = 0; i < samples.Count; i++)
@@ -2513,9 +2576,15 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             var hCount = new int[hiddenSize];
             for (int ki = 0; ki < K; ki++)
             {
+                if (elmInputWeights[ki] is not { Length: > 0 } ||
+                    elmInputBiases[ki] is not { Length: > 0 })
+                {
+                    continue;
+                }
+
                 var wIn = elmInputWeights[ki];
                 var bIn = elmInputBiases[ki];
-                int[] sub = featureSubsets is not null && ki < featureSubsets.Length
+                int[] sub = featureSubsets is not null && ki < featureSubsets.Length && featureSubsets[ki] is { Length: > 0 }
                     ? featureSubsets[ki]
                     : defaultSubset;
                 int subLen = sub.Length;
@@ -2545,6 +2614,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         double[][] elmInputWeights, double[][] elmInputBiases, int[][]? featureSubsets,
         ElmActivation[] learnerActivations)
     {
+        K = Math.Min(K, Math.Min(elmInputWeights.Length, elmInputBiases.Length));
         double[] equivW = new double[featureCount];
         if (augWeights.Length > 0)
             Array.Copy(augWeights, equivW, Math.Min(featureCount, augWeights.Length));
@@ -2558,10 +2628,16 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         int[] derivContributors = new int[hiddenSize];
         for (int ki = 0; ki < K; ki++)
         {
+            if (elmInputWeights[ki] is not { Length: > 0 } ||
+                elmInputBiases[ki] is not { Length: > 0 })
+            {
+                continue;
+            }
+
             var wIn = elmInputWeights[ki];
             var bIn = elmInputBiases[ki];
             int effH = Math.Min(hiddenSize, bIn.Length);
-            int[] sub = featureSubsets is not null && ki < featureSubsets.Length
+            int[] sub = featureSubsets is not null && ki < featureSubsets.Length && featureSubsets[ki] is { Length: > 0 }
                 ? featureSubsets[ki]
                 : defaultSubset;
             int subLen = sub.Length;
@@ -2601,11 +2677,17 @@ public sealed class ElmModelTrainer : IMLModelTrainer
 
             for (int ki = 0; ki < K; ki++)
             {
+                if (elmInputWeights[ki] is not { Length: > 0 } ||
+                    elmInputBiases[ki] is not { Length: > 0 })
+                {
+                    continue;
+                }
+
                 var bIn = elmInputBiases[ki];
                 if (h >= bIn.Length) continue; // learner has fewer hidden units
 
                 var wIn = elmInputWeights[ki];
-                int[] sub = featureSubsets is not null && ki < featureSubsets.Length
+                int[] sub = featureSubsets is not null && ki < featureSubsets.Length && featureSubsets[ki] is { Length: > 0 }
                     ? featureSubsets[ki]
                     : defaultSubset;
                 int subLen = sub.Length;
@@ -2614,7 +2696,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                 for (int si = 0; si < subLen; si++)
                 {
                     int fi = sub[si];
-                    if (fi < featureCount && rowOff + si < wIn.Length)
+                    if (fi >= 0 && fi < featureCount && rowOff + si < wIn.Length)
                         equivW[fi] += hiddenW * deriv * wIn[rowOff + si] / contributors;
                 }
             }
@@ -2966,7 +3048,9 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         int[] learnerHiddenSizes, ElmActivation[] learnerActivations,
         CancellationToken ct = default)
     {
-        int K = weights.Length;
+        int K = Math.Min(
+            weights.Length,
+            Math.Min(biases.Length, Math.Min(inputWeights.Length, inputBiases.Length)));
         if (calSet.Count < 20 || K < 2) return ([], 0.0);
 
         int n = calSet.Count;
@@ -2977,6 +3061,13 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             calLp[i] = new double[K];
             for (int k = 0; k < K; k++)
             {
+                if (weights[k] is not { Length: > 0 } ||
+                    inputWeights[k] is not { Length: > 0 } ||
+                    inputBiases[k] is null)
+                {
+                    continue;
+                }
+
                 calLp[i][k] = ClampProbabilityOrNeutral(ElmLearnerProb(
                     calSet[i].Features, weights[k], biases[k], inputWeights[k], inputBiases[k],
                     featureCount,
@@ -3076,12 +3167,13 @@ public sealed class ElmModelTrainer : IMLModelTrainer
 
         for (int ki = 0; ki < wsK; ki++)
         {
-            var oldWIn = warmStart.ElmInputWeights[ki];
+            var oldWIn = warmStart.ElmInputWeights[ki] ?? Array.Empty<double>();
             var oldBIn = warmStart.ElmInputBiases is not null && ki < warmStart.ElmInputBiases.Length
                 ? warmStart.ElmInputBiases[ki] : new double[hiddenSize];
+            oldBIn ??= Array.Empty<double>();
 
             int[] oldSub = warmStart.FeatureSubsetIndices is not null && ki < warmStart.FeatureSubsetIndices.Length
-                ? warmStart.FeatureSubsetIndices[ki]
+                ? warmStart.FeatureSubsetIndices[ki] ?? Array.Empty<int>()
                 : Enumerable.Range(0, featureCount).ToArray();
             int oldSubLen = oldSub.Length;
             int oldHidden = oldBIn.Length > 0
@@ -3095,7 +3187,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             for (int si = 0; si < oldSubLen; si++)
             {
                 int oldFi = oldSub[si];
-                if (oldFi < featureCount && oldFi < activeMask.Length && activeMask[oldFi])
+                if (oldFi >= 0 && oldFi < featureCount && oldFi < activeMask.Length && activeMask[oldFi])
                 {
                     newSubList.Add(oldFi);
                     oldSubPositions.Add(si);
