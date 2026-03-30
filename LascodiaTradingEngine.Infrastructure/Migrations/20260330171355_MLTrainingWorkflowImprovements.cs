@@ -67,14 +67,6 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                 type: "text",
                 nullable: true);
 
-            migrationBuilder.AddColumn<decimal>(
-                name: "ServedCalibratedProbability",
-                table: "MLModelPredictionLog",
-                type: "numeric(5,4)",
-                precision: 5,
-                scale: 4,
-                nullable: true);
-
             migrationBuilder.AddColumn<DateTime>(
                 name: "LastChallengedAt",
                 table: "MLModel",
@@ -175,10 +167,6 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
 
             migrationBuilder.DropColumn(
                 name: "CommitteeModelIdsJson",
-                table: "MLModelPredictionLog");
-
-            migrationBuilder.DropColumn(
-                name: "ServedCalibratedProbability",
                 table: "MLModelPredictionLog");
 
             migrationBuilder.DropColumn(
