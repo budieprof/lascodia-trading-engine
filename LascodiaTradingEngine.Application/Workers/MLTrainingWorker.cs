@@ -974,8 +974,17 @@ public sealed class MLTrainingWorker : BackgroundService
 
                 // New model is better — proceed with promotion
                 await SnapshotChampionPerformanceAsync(previousChampion, ctx, stoppingToken);
-                previousChampion.IsActive = false;
-                previousChampion.Status   = MLModelStatus.Superseded;
+
+                // Deactivate ALL active models for this symbol/timeframe, not just the one
+                // returned by FirstOrDefaultAsync. Multiple models can accumulate as active
+                // when concurrent promotions from different architectures each only deactivate
+                // the single model they found, leaving others orphaned as active.
+                await ctx.Set<MLModel>()
+                    .Where(m => m.Symbol == run.Symbol && m.Timeframe == run.Timeframe
+                                && m.IsActive && !m.IsDeleted)
+                    .ExecuteUpdateAsync(s => s
+                        .SetProperty(m => m.IsActive, false)
+                        .SetProperty(m => m.Status, MLModelStatus.Superseded), stoppingToken);
 
                 _logger.LogInformation(
                     "Promoting run {RunId} over champion {ChampId}: new score={NewScore:F4} > champ score={ChampScore:F4}",
@@ -986,6 +995,16 @@ public sealed class MLTrainingWorker : BackgroundService
                 result.ModelBytes, run, candles, samples, buyCount, sellCount,
                 imbalanceRatio, cotNetMin, cotNetMax, cotMomMin, cotMomMax,
                 ctx, stoppingToken);
+
+            // ── Safety: ensure no other active models remain for this symbol/timeframe ──
+            // This catches edge cases where the FirstOrDefaultAsync above returned null
+            // (no champion found) but orphaned active models still exist from prior bugs.
+            await ctx.Set<MLModel>()
+                .Where(m => m.Symbol == run.Symbol && m.Timeframe == run.Timeframe
+                            && m.IsActive && !m.IsDeleted)
+                .ExecuteUpdateAsync(s => s
+                    .SetProperty(m => m.IsActive, false)
+                    .SetProperty(m => m.Status, MLModelStatus.Superseded), stoppingToken);
 
             // ── Persist new model ────────────────────────────────────────────
             var cv           = result.CvResult;

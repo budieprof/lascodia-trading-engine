@@ -524,8 +524,12 @@ public sealed class MLShadowArbiterWorker : BackgroundService
                 shadow.ChampionModelId);
         }
 
+        // Deactivate ALL active models for this symbol/timeframe — not just the one champion
+        // from this shadow eval. Multiple active models can accumulate when concurrent promotions
+        // from different architectures or training runs each only deactivate a single model.
         await writeCtx.Set<MLModel>()
-            .Where(m => m.Id == shadow.ChampionModelId)
+            .Where(m => m.Symbol == shadow.Symbol && m.Timeframe == shadow.Timeframe
+                        && m.IsActive && !m.IsDeleted)
             .ExecuteUpdateAsync(s => s
                 .SetProperty(m => m.IsActive, false)
                 .SetProperty(m => m.Status,   MLModelStatus.Superseded),
