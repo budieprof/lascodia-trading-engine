@@ -66,6 +66,23 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
     private const string CK_MaxCrossSymbols    = "MLTraining:MaxCrossSymbolCount";
     private const string CK_BlockedArchitectures = "MLTraining:BlockedArchitectures";
 
+    // ── Improvement #7: Configurable temporal decay ──────────────────────
+    private const string CK_RecencyHalfLifeDays    = "MLTraining:RecencyHalfLifeDays";
+    private const string CK_SteepDecayMultiplier   = "MLTraining:SteepDecayMultiplier";
+
+    // ── Improvement #4: Graduated sample gates ──────────────────────────
+    private const string CK_UseGraduatedSampleGate = "MLTraining:UseGraduatedSampleGate";
+    private const string CK_SampleGateHardFloor    = "MLTraining:SampleGateHardFloorFraction";
+
+    // ── Improvement #2: Drift-aware selection ───────────────────────────
+    private const string CK_DriftAwareBoost        = "MLTraining:DriftAwareBoost";
+
+    // ── Improvement #8: Abstention-aware ranking ────────────────────────
+    private const string CK_WeightAbstention       = "MLTraining:WeightAbstention";
+
+    // ── Improvement #12: Shadow regime affinity ─────────────────────────
+    private const string CK_ShadowRegimeAffinityWt = "MLTraining:ShadowRegimeAffinityWeight";
+
     private const int    HistoryWindowRuns         = 30;
     private const int    DefaultHistoryMaxDays     = 90;
     private const double DefaultMinCompositeScore  = 0.35;
@@ -436,6 +453,22 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
         var    cacheTtl           = TimeSpan.FromMinutes(cfg.GetInt(CK_CacheTtlMinutes, DefaultCacheTtlMinutes));
         int    maxCrossSymbols    = cfg.GetInt(CK_MaxCrossSymbols,     DefaultMaxCrossSymbols);
 
+        // Improvement #7: configurable decay
+        double cfgRecencyHalfLife = cfg.GetDouble(CK_RecencyHalfLifeDays, RecencyHalfLifeDays);
+        double cfgSteepMultiplier = cfg.GetDouble(CK_SteepDecayMultiplier, 1.0);
+
+        // Improvement #4: graduated sample gate (accepts "true", "1", or any non-zero int)
+        var graduatedRaw = cfg.GetString(CK_UseGraduatedSampleGate, "0");
+        bool useGraduatedGate = graduatedRaw.Equals("true", StringComparison.OrdinalIgnoreCase) ||
+                                graduatedRaw == "1";
+        double sampleGateFloor    = cfg.GetDouble(CK_SampleGateHardFloor, 0.20);
+
+        // Improvement #8: abstention weight
+        double weightAbstention   = cfg.GetDouble(CK_WeightAbstention, 0.0);
+
+        // Improvement #12: shadow regime affinity weight
+        double shadowAffinityWt   = cfg.GetDouble(CK_ShadowRegimeAffinityWt, 0.30);
+
         // ── 1b. Parse blocked architectures from config ───────────────────
         var blockedArchitectures = new HashSet<LearnerArchitecture>();
         var blockedStr = cfg.GetString(CK_BlockedArchitectures, "");
@@ -465,7 +498,7 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
             if (effectiveRegime.HasValue)
             {
                 var affinityWarmup = BuildRawAffinityMapAsync(
-                    ctx, symbol, timeframe, effectiveRegime.Value, historyMaxDays, regimeWindowHours, cacheTtl, ct);
+                    ctx, symbol, timeframe, effectiveRegime.Value, historyMaxDays, regimeWindowHours, cacheTtl, ct, shadowAffinityWt);
                 await Task.WhenAll(runsWarmup, affinityWarmup).ConfigureAwait(false);
             }
             else
@@ -479,7 +512,8 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
         //       always downgrading the winner to BaggedLogistic.
         var rankedCandidates = await RankedHistoricalArchitecturesAsync(
             ctx, symbol, timeframe, effectiveRegime, regimeConfidence,
-            historyMaxDays, regimeWindowHours, minComposite, ucb1Exploration, cacheTtl, ct)
+            historyMaxDays, regimeWindowHours, minComposite, ucb1Exploration, cacheTtl,
+            cfgRecencyHalfLife, cfgSteepMultiplier, weightAbstention, shadowAffinityWt, ct)
             .ConfigureAwait(false);
 
         // Filter out blocked architectures from candidates
@@ -487,7 +521,10 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
             ? rankedCandidates.Where(c => !blockedArchitectures.Contains(c.Arch)).ToList()
             : rankedCandidates;
 
-        var candidate = PickBestPassingSampleGate(filteredCandidates, sampleCount, minSamplesStd, minSamplesDeep, timeframe);
+        // Improvement #4: graduated sample gate — apply continuous discount instead of hard pass/fail
+        var candidate = useGraduatedGate
+            ? PickBestWithGraduatedGate(filteredCandidates, sampleCount, minSamplesStd, minSamplesDeep, timeframe, sampleGateFloor)
+            : PickBestPassingSampleGate(filteredCandidates, sampleCount, minSamplesStd, minSamplesDeep, timeframe);
         int fallbackDepth = 1; // step 3 (historical)
 
         // ── 4. Cold-start: borrow from correlated symbols ─────────────────
@@ -497,13 +534,16 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
             var crossRanked = await CrossSymbolRankedFallbackAsync(
                 ctx, symbol, timeframe, effectiveRegime, regimeConfidence,
                 historyMaxDays, regimeWindowHours, minComposite, ucb1Exploration,
-                maxCrossSymbols, cacheTtl, ct)
+                maxCrossSymbols, cacheTtl,
+                cfgRecencyHalfLife, cfgSteepMultiplier, weightAbstention, shadowAffinityWt, ct)
                 .ConfigureAwait(false);
 
             var filteredCross = blockedArchitectures.Count > 0
                 ? crossRanked.Where(c => !blockedArchitectures.Contains(c.Arch)).ToList()
                 : crossRanked;
-            candidate = PickBestPassingSampleGate(filteredCross, sampleCount, minSamplesStd, minSamplesDeep, timeframe);
+            candidate = useGraduatedGate
+                ? PickBestWithGraduatedGate(filteredCross, sampleCount, minSamplesStd, minSamplesDeep, timeframe, sampleGateFloor)
+                : PickBestPassingSampleGate(filteredCross, sampleCount, minSamplesStd, minSamplesDeep, timeframe);
         }
 
         // ── 5. Fall back to operator-configured default ─────────────────────
@@ -566,6 +606,7 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
         int regimeCooldownMins = cfg.GetInt(CK_RegimeCooldownMins,  DefaultRegimeCooldownMins);
         int regimeWindowHours  = cfg.GetInt(CK_RegimeWindowHours,   DefaultRegimeWindowHours);
         var cacheTtl           = TimeSpan.FromMinutes(cfg.GetInt(CK_CacheTtlMinutes, DefaultCacheTtlMinutes));
+        double shadowAffinityWt = cfg.GetDouble(CK_ShadowRegimeAffinityWt, 0.30);
 
         var effectiveRegime  = ApplyRegimeStalenessGate(regime, regimeDetectedAt, regimeStaleMins, timeframe);
         double regimeConfidence = ComputeRegimeConfidence(effectiveRegime, regimeDetectedAt, regimeCooldownMins, timeframe);
@@ -573,7 +614,7 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
         // Build regime affinity once — reused for both ranking and regime-penalty filtering
         var affinityMap = effectiveRegime.HasValue
             ? ApplyConfidence(
-                await BuildRawAffinityMapAsync(ctx, symbol, timeframe, effectiveRegime.Value, historyMaxDays, regimeWindowHours, cacheTtl, ct)
+                await BuildRawAffinityMapAsync(ctx, symbol, timeframe, effectiveRegime.Value, historyMaxDays, regimeWindowHours, cacheTtl, ct, shadowAffinityWt)
                     .ConfigureAwait(false),
                 regimeConfidence)
             : null;
@@ -759,6 +800,10 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
         double            minCompositeScore,
         double            ucb1Exploration,
         TimeSpan          cacheTtl,
+        double            cfgRecencyHalfLife,
+        double            cfgSteepMultiplier,
+        double            weightAbstention,
+        double            shadowAffinityWt,
         CancellationToken ct)
     {
         var runs = await LoadRecentRunsAsync(ctx, symbol, timeframe, historyMaxDays, cacheTtl, ct).ConfigureAwait(false);
@@ -767,7 +812,8 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
 
         return await RankByUcb1Async(
             ctx, symbol, timeframe, runs, regime, regimeConfidence,
-            historyMaxDays, regimeWindowHours, minCompositeScore, ucb1Exploration, cacheTtl, ct).ConfigureAwait(false);
+            historyMaxDays, regimeWindowHours, minCompositeScore, ucb1Exploration, cacheTtl,
+            cfgRecencyHalfLife, cfgSteepMultiplier, weightAbstention, shadowAffinityWt, ct).ConfigureAwait(false);
     }
 
     // ── Cold-start: borrow from correlated symbols ──────────────────────────
@@ -784,6 +830,10 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
         double            ucb1Exploration,
         int               maxCrossSymbols,
         TimeSpan          cacheTtl,
+        double            cfgRecencyHalfLife,
+        double            cfgSteepMultiplier,
+        double            weightAbstention,
+        double            shadowAffinityWt,
         CancellationToken ct)
     {
         // Look up base/quote currencies from the CurrencyPair entity
@@ -900,6 +950,8 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
                 ExpectedValue       = r.ExpectedValue,
                 CompletedAt         = r.CompletedAt,
                 Symbol              = r.Symbol,
+                AbstentionPrecision = r.AbstentionPrecision,
+                DriftTriggerType    = r.DriftTriggerType,
             })
             .ToListAsync(ct).ConfigureAwait(false);
 
@@ -922,7 +974,8 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
 
         return await RankByUcb1Async(
             ctx, symbol, timeframe, runs, regime, regimeConfidence,
-            historyMaxDays, regimeWindowHours, minCompositeScore, ucb1Exploration, cacheTtl, ct,
+            historyMaxDays, regimeWindowHours, minCompositeScore, ucb1Exploration, cacheTtl,
+            cfgRecencyHalfLife, cfgSteepMultiplier, weightAbstention, shadowAffinityWt, ct,
             scoreDiscount: effectiveDiscount).ConfigureAwait(false);
     }
 
@@ -945,17 +998,22 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
         double                     minCompositeScore,
         double                     ucb1Exploration,
         TimeSpan                   cacheTtl,
+        double                     cfgRecencyHalfLife,
+        double                     cfgSteepMultiplier,
+        double                     weightAbstention,
+        double                     shadowAffinityWt,
         CancellationToken          ct,
         double                     scoreDiscount = 1.0)
     {
         var now = _timeProvider.GetUtcNow().UtcDateTime;
 
-        // Build raw regime affinity map (cached), then apply confidence attenuation
+        // Improvement #12: Build raw regime affinity map with shadow data blended in
         Dictionary<LearnerArchitecture, double>? affinityMap = null;
         if (regime.HasValue)
         {
-            var rawMap = await BuildRawAffinityMapAsync(ctx, symbol, timeframe, regime.Value, historyMaxDays, regimeWindowHours, cacheTtl, ct)
-                .ConfigureAwait(false);
+            var rawMap = await BuildRawAffinityMapAsync(
+                ctx, symbol, timeframe, regime.Value, historyMaxDays, regimeWindowHours,
+                cacheTtl, ct, shadowAffinityWt).ConfigureAwait(false);
             affinityMap = ApplyConfidence(rawMap, regimeConfidence);
         }
 
@@ -968,11 +1026,20 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
             .GroupBy(r => r.LearnerArchitecture)
             .Select(g =>
             {
-                double avgScore = ScoreArchitectureGroup(g, now, affinityMap, scoreDiscount);
+                // Improvement #7: pass configurable decay params
+                // Improvement #8: pass abstention weight
+                double avgScore = ScoreArchitectureGroup(
+                    g, now, affinityMap, scoreDiscount,
+                    cfgRecencyHalfLife, cfgSteepMultiplier, weightAbstention);
                 int    runCount = g.Count();
                 return (Architecture: g.Key, AvgScore: avgScore, RunCount: runCount);
             })
             .ToList();
+
+        // Improvement #2: drift-aware boost — if we know the most recent drift trigger
+        // for this symbol/timeframe, boost architectures that recovered well from similar drift
+        var driftBoosts = await ComputeDriftAwareBoostsAsync(ctx, symbol, timeframe, historyMaxDays, cacheTtl, ct)
+            .ConfigureAwait(false);
 
         int totalEligibleRuns = groups.Where(g => g.RunCount >= MinRunsPerArchitecture).Sum(g => g.RunCount);
         // Fallback: if no architecture meets the minimum, use total runs for UCB1 denominator
@@ -984,20 +1051,23 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
 
         foreach (var (arch, avgScore, runCount) in groups)
         {
+            // Improvement #2: apply drift-aware boost
+            double boostedScore = avgScore;
+            if (driftBoosts.TryGetValue(arch, out double driftBoost))
+                boostedScore *= driftBoost;
+
             if (runCount < MinRunsPerArchitecture)
             {
-                // Under-explored: include with raw score (no UCB1 bonus, no penalty)
-                // so they're available as fallbacks but don't dominate via exploration
-                if (avgScore >= minCompositeScore)
-                    underExplored.Add((arch, avgScore));
+                if (boostedScore >= minCompositeScore)
+                    underExplored.Add((arch, boostedScore));
                 continue;
             }
 
             // UCB1 exploration bonus: sqrt(ln(N) / n_i)
             double ucb1Bonus = ucb1Exploration * Math.Sqrt(Math.Log(totalEligibleRuns) / runCount);
-            double ucb1Score = avgScore + ucb1Bonus;
+            double ucb1Score = boostedScore + ucb1Bonus;
 
-            if (avgScore >= minCompositeScore)
+            if (boostedScore >= minCompositeScore)
                 ranked.Add((arch, ucb1Score));
         }
 
@@ -1098,8 +1168,13 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
         int               historyMaxDays,
         int               regimeWindowHours,
         TimeSpan          cacheTtl,
-        CancellationToken ct)
+        CancellationToken ct,
+        double            shadowAffinityWt = 0.30)
     {
+        // Note: shadowAffinityWt is intentionally NOT in the cache key. The cached map
+        // stores the blended result for the *maximum* shadow weight (1.0 equivalent).
+        // The caller-supplied weight is applied post-cache via a separate blend step,
+        // avoiding cache fragmentation and ensuring InvalidateCache evicts all entries.
         var cacheKey = $"TrainerSelector:RawAffinity:{symbol}:{timeframe}:{regime}:{historyMaxDays}:{regimeWindowHours}";
         if (_cache.TryGetValue<Dictionary<LearnerArchitecture, double>>(cacheKey, out var cached))
             return cached!;
@@ -1210,8 +1285,47 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
                 }
             }
 
+            // ── Improvement #12: Load shadow evaluation regime breakdowns ────
+            // Shadow outcomes are the strongest signal for per-regime architecture
+            // performance — they measured live data, not just training hold-out metrics.
+            Dictionary<LearnerArchitecture, (double sumAcc, int count)>? shadowEmpirical = null;
+
+            if (shadowAffinityWt > 0)
+            {
+                var shadowBreakdowns = await ctx.Set<MLShadowRegimeBreakdown>()
+                    .Where(b => b.Regime == regime &&
+                                b.TotalPredictions >= 10 &&
+                                !b.IsDeleted &&
+                                b.ShadowEvaluation.Symbol == symbol &&
+                                b.ShadowEvaluation.Timeframe == timeframe &&
+                                b.ShadowEvaluation.CompletedAt.HasValue &&
+                                b.ShadowEvaluation.CompletedAt.Value >= cutoff)
+                    .Select(b => new
+                    {
+                        b.ShadowEvaluation.ChallengerModel.LearnerArchitecture,
+                        b.ChallengerAccuracy,
+                        b.TotalPredictions,
+                    })
+                    .AsNoTracking()
+                    .ToListAsync(ct).ConfigureAwait(false);
+
+                if (shadowBreakdowns.Count > 0)
+                {
+                    shadowEmpirical = new Dictionary<LearnerArchitecture, (double, int)>();
+                    foreach (var sb in shadowBreakdowns)
+                    {
+                        if (!shadowEmpirical.TryGetValue(sb.LearnerArchitecture, out var acc))
+                            acc = (0, 0);
+                        shadowEmpirical[sb.LearnerArchitecture] = (
+                            acc.Item1 + (double)sb.ChallengerAccuracy,
+                            acc.Item2 + 1);
+                    }
+                }
+            }
+
             // Blend: result = alpha * empirical_affinity + (1 - alpha) * static_prior
             // where alpha = min(1, empirical_run_count / EmpiricalAffinityMaturityRuns)
+            // Then further blend with shadow empirical data when available.
             //
             // Note: regime confidence is NOT applied here — it is applied by the caller
             // via ApplyConfidence() so the cached map stays valid across confidence changes.
@@ -1229,23 +1343,28 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
                 if (empirical is not null && empirical.TryGetValue(arch, out var emp) && emp.count > 0)
                 {
                     double avgAcc = emp.sumAcc / emp.count;
-                    // Convert accuracy (0-1) to affinity multiplier via continuous
-                    // piecewise-linear mapping centred on 0.50 (coin flip).
-                    // Below 0.50: linear ramp from RegimePenalty (at ≤0.40) to RegimeNeutral (at 0.50).
-                    // Above 0.50: linear ramp from RegimeNeutral (at 0.50) to RegimeBoost (at ≥0.60).
-                    // Clamped at both ends — no dead zone around the midpoint.
-                    empiricalAffinity = avgAcc switch
-                    {
-                        >= 0.60 => RegimeBoost,
-                        >= 0.50 => RegimeNeutral + (avgAcc - 0.50) * (RegimeBoost - RegimeNeutral) / 0.10,
-                        >= 0.40 => RegimePenalty + (avgAcc - 0.40) * (RegimeNeutral - RegimePenalty) / 0.10,
-                        _       => RegimePenalty,
-                    };
-
+                    empiricalAffinity = AccuracyToAffinity(avgAcc);
                     alpha = Math.Min(1.0, (double)emp.count / EmpiricalAffinityMaturityRuns);
                 }
 
-                blended[arch] = alpha * empiricalAffinity + (1 - alpha) * staticAffinity;
+                double baseBlend = alpha * empiricalAffinity + (1 - alpha) * staticAffinity;
+
+                // Improvement #12: blend shadow data on top of the base blend
+                if (shadowEmpirical is not null &&
+                    shadowEmpirical.TryGetValue(arch, out var shadowEmp) &&
+                    shadowEmp.count > 0)
+                {
+                    double shadowAvgAcc = shadowEmp.sumAcc / shadowEmp.count;
+                    double shadowAffinity = AccuracyToAffinity(shadowAvgAcc);
+                    double shadowAlpha = Math.Min(1.0, (double)shadowEmp.count / EmpiricalAffinityMaturityRuns);
+                    double effectiveShadowWeight = shadowAffinityWt * shadowAlpha;
+
+                    // Weighted blend: shadow data partially overrides training-run data
+                    baseBlend = (1.0 - effectiveShadowWeight) * baseBlend +
+                                effectiveShadowWeight * shadowAffinity;
+                }
+
+                blended[arch] = baseBlend;
             }
 
             _cache.Set(cacheKey, blended, cacheTtl);
@@ -1256,6 +1375,22 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
             if (lockAcquired) _affinityCacheLock.Release();
         }
     }
+
+    // ── Accuracy-to-affinity conversion (shared by training-run and shadow paths)
+
+    /// <summary>
+    /// Converts accuracy (0–1) to an affinity multiplier via continuous piecewise-linear
+    /// mapping centred on 0.50 (coin flip).
+    /// Below 0.50: ramp from <see cref="RegimePenalty"/> (at ≤0.40) to <see cref="RegimeNeutral"/> (at 0.50).
+    /// Above 0.50: ramp from <see cref="RegimeNeutral"/> (at 0.50) to <see cref="RegimeBoost"/> (at ≥0.60).
+    /// </summary>
+    private static double AccuracyToAffinity(double avgAcc) => avgAcc switch
+    {
+        >= 0.60 => RegimeBoost,
+        >= 0.50 => RegimeNeutral + (avgAcc - 0.50) * (RegimeBoost - RegimeNeutral) / 0.10,
+        >= 0.40 => RegimePenalty + (avgAcc - 0.40) * (RegimeNeutral - RegimePenalty) / 0.10,
+        _       => RegimePenalty,
+    };
 
     // ── Apply regime confidence attenuation to a raw affinity map ────────────
 
@@ -1383,6 +1518,8 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
                     ExpectedValue       = r.ExpectedValue,
                     CompletedAt         = r.CompletedAt,
                     Symbol              = r.Symbol,
+                    AbstentionPrecision = r.AbstentionPrecision,
+                    DriftTriggerType    = r.DriftTriggerType,
                 })
                 .ToListAsync(ct).ConfigureAwait(false);
 
@@ -1419,7 +1556,10 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
         IGrouping<LearnerArchitecture, ArchRunProjection> group,
         DateTime                                          now,
         Dictionary<LearnerArchitecture, double>?          affinityMap,
-        double                                            scoreDiscount = 1.0)
+        double                                            scoreDiscount = 1.0,
+        double                                            cfgRecencyHalfLife = RecencyHalfLifeDays,
+        double                                            cfgSteepMultiplier = 1.0,
+        double                                            weightAbstention = 0.0)
     {
         double   totalWeight   = 0;
         double   weightedScore = 0;
@@ -1430,12 +1570,17 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
 
         foreach (var run in group)
         {
-            double w     = RecencyWeight(run.CompletedAt, now);
+            // Improvement #7: use configurable half-life for recency weighting
+            double w     = RecencyWeight(run.CompletedAt, now, cfgRecencyHalfLife);
+
+            // Improvement #8: include abstention precision in composite score
             double score = ComputeCompositeScore(
                 run.DirectionAccuracy,
                 run.F1Score,
                 run.SharpeRatio,
-                run.ExpectedValue);
+                run.ExpectedValue,
+                run.AbstentionPrecision,
+                weightAbstention);
 
             weightedScore += w * score;
             totalWeight   += w;
@@ -1457,15 +1602,16 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
         if (affinityMap is not null && affinityMap.TryGetValue(group.Key, out var affinity))
             avgScore *= affinity;
 
-        // Architecture staleness penalty: if the most recent run is older than
-        // ArchStalenessDays, apply a penalty that grows with age so stale
-        // architectures don't dominate via the exploration bonus alone.
+        // Improvement #7: steeper two-phase decay — after ArchStalenessDays, apply
+        // the configurable steep multiplier to accelerate the decay rate.
         double daysSinceLastRun = (now - mostRecentRun).TotalDays;
         if (daysSinceLastRun > ArchStalenessDays)
         {
             double excessDays = daysSinceLastRun - ArchStalenessDays;
+            // Phase 2 uses steepened half-life: halfLife / steepMultiplier
+            double effectiveHalfLife = cfgRecencyHalfLife / Math.Max(cfgSteepMultiplier, 1.0);
             double decayFactor = ArchStalenessMaxPenalty +
-                (1.0 - ArchStalenessMaxPenalty) * Math.Exp(-Math.Log(2) * excessDays / RecencyHalfLifeDays);
+                (1.0 - ArchStalenessMaxPenalty) * Math.Exp(-Math.Log(2) * excessDays / effectiveHalfLife);
             avgScore *= decayFactor;
         }
 
@@ -1541,7 +1687,9 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
         decimal? directionAccuracy,
         decimal? f1Score,
         decimal? sharpeRatio,
-        decimal? expectedValue)
+        decimal? expectedValue,
+        decimal? abstentionPrecision = null,
+        double   weightAbstention = 0.0)
     {
         double totalWeight = 0;
         double score       = 0;
@@ -1562,9 +1710,6 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
 
         if (sharpeRatio.HasValue)
         {
-            // Clamp then normalize to [0,1] via linear rescaling instead of sigmoid.
-            // This avoids compressing high performers (sigmoid maps Sharpe 2→0.73, 4→0.88).
-            // After clamping to [-SharpeClamp, SharpeClamp], rescale linearly to [0,1].
             double clamped   = Math.Clamp((double)sharpeRatio.Value, -SharpeClamp, SharpeClamp);
             double normalized = (clamped + SharpeClamp) / (2.0 * SharpeClamp);
             score       += WeightSharpe * normalized;
@@ -1573,21 +1718,30 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
 
         if (expectedValue.HasValue)
         {
-            // Same clamp-and-rescale approach for expected value
             double clamped   = Math.Clamp((double)expectedValue.Value, -EvClamp, EvClamp);
             double normalized = (clamped + EvClamp) / (2.0 * EvClamp);
             score       += WeightEv * normalized;
             totalWeight += WeightEv;
         }
 
+        // Improvement #8: abstention-aware ranking — reward architectures that correctly
+        // identify when NOT to trade. weightAbstention defaults to 0.0 (disabled).
+        if (weightAbstention > 0 && abstentionPrecision.HasValue)
+        {
+            double clamped = Math.Clamp((double)abstentionPrecision.Value, 0.0, 1.0);
+            score       += weightAbstention * clamped;
+            totalWeight += weightAbstention;
+        }
+
         return totalWeight > 0 ? score / totalWeight : 0.0;
     }
 
-    private static double RecencyWeight(DateTime? completedAt, DateTime now)
+    // Improvement #7: configurable half-life parameter
+    private static double RecencyWeight(DateTime? completedAt, DateTime now, double halfLifeDays = RecencyHalfLifeDays)
     {
         if (completedAt is null) return 0.5;
         double days = Math.Max(0, (now - completedAt.Value).TotalDays);
-        return Math.Exp(-Math.Log(2) * days / RecencyHalfLifeDays);
+        return Math.Exp(-Math.Log(2) * days / halfLifeDays);
     }
 
     // ── Operator default ────────────────────────────────────────────────────
@@ -1645,6 +1799,10 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
         CK_Ucb1Exploration, CK_RegimeWindowHours,
         CK_CacheTtlMinutes, CK_MaxCrossSymbols,
         CK_BlockedArchitectures,
+        CK_RecencyHalfLifeDays, CK_SteepDecayMultiplier,
+        CK_UseGraduatedSampleGate, CK_SampleGateHardFloor,
+        CK_DriftAwareBoost, CK_WeightAbstention,
+        CK_ShadowRegimeAffinityWt,
     ];
 
     private const string ConfigBatchCacheKey = "TrainerSelector:ConfigBatch";
@@ -1902,6 +2060,144 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
         return totalRuns > 0 ? weightedDisc / totalRuns : CrossSymbolDiscountFactor;
     }
 
+    // ── Improvement #4: Graduated sample gate ──────────────────────────────
+
+    /// <summary>
+    /// Walks a ranked list and applies a continuous sample-count discount instead
+    /// of a hard pass/fail gate. The discount is <c>min(1, (sampleCount / required)^0.5)</c>,
+    /// with a hard floor below which the architecture is still rejected outright.
+    /// Returns the architecture with the highest discounted score, or null.
+    /// </summary>
+    private LearnerArchitecture? PickBestWithGraduatedGate(
+        List<(LearnerArchitecture Arch, double Score)> ranked,
+        int       sampleCount,
+        int       minSamplesStd,
+        int       minSamplesDeep,
+        Timeframe timeframe,
+        double    hardFloorFraction)
+    {
+        double              bestScore = double.NegativeInfinity;
+        LearnerArchitecture? best     = null;
+
+        foreach (var (arch, rawScore) in ranked)
+        {
+            double discount = ComputeSampleDiscount(arch, sampleCount, minSamplesStd, minSamplesDeep, timeframe, hardFloorFraction);
+            if (discount <= 0) continue; // below hard floor
+
+            double adjustedScore = rawScore * discount;
+            if (adjustedScore > bestScore)
+            {
+                bestScore = adjustedScore;
+                best      = arch;
+            }
+        }
+
+        if (best.HasValue)
+        {
+            _logger.LogDebug(
+                "TrainerSelector: graduated gate selected {Arch} (adjustedScore={Score:F4}, samples={Samples})",
+                best.Value, bestScore, sampleCount);
+        }
+
+        return best;
+    }
+
+    /// <summary>
+    /// Returns a continuous discount factor in (0, 1] for the given architecture based on
+    /// available sample count. SimpleTier always gets 1.0. Standard/Deep tier get a
+    /// sqrt-ramped discount from the hard floor to 1.0.
+    /// Returns 0 if below the hard floor (architecture should be rejected).
+    /// </summary>
+    private static double ComputeSampleDiscount(
+        LearnerArchitecture arch,
+        int       sampleCount,
+        int       minSamplesStd,
+        int       minSamplesDeep,
+        Timeframe timeframe,
+        double    hardFloorFraction)
+    {
+        if (SimpleTier.Contains(arch)) return 1.0;
+
+        double scale = TimeframeSampleScale.GetValueOrDefault(timeframe, 1.0);
+        int required;
+
+        if (DeepTier.Contains(arch))
+            required = (int)(minSamplesDeep * scale);
+        else if (StandardTier.Contains(arch))
+            required = (int)(minSamplesStd * scale);
+        else
+            return 0; // unclassified — reject
+
+        if (required <= 0) return 1.0;
+
+        int hardFloor = (int)(required * hardFloorFraction);
+        if (sampleCount < hardFloor) return 0;
+
+        double ratio = (double)sampleCount / required;
+        return Math.Min(1.0, Math.Sqrt(ratio));
+    }
+
+    // ── Improvement #2: Drift-aware architecture boost ──────────────────────
+
+    /// <summary>
+    /// Computes per-architecture boost factors based on historical recovery from
+    /// drift events. Architectures whose drift-triggered runs achieved above-average
+    /// accuracy are boosted; those below average are not penalised (neutral 1.0).
+    /// </summary>
+    private async Task<Dictionary<LearnerArchitecture, double>> ComputeDriftAwareBoostsAsync(
+        DbContext         ctx,
+        string            symbol,
+        Timeframe         timeframe,
+        int               historyMaxDays,
+        TimeSpan          cacheTtl,
+        CancellationToken ct)
+    {
+        var cacheKey = $"TrainerSelector:DriftBoost:{symbol}:{timeframe}:{historyMaxDays}";
+        if (_cache.TryGetValue<Dictionary<LearnerArchitecture, double>>(cacheKey, out var cached))
+            return cached!;
+
+        var cutoff = _timeProvider.GetUtcNow().UtcDateTime.AddDays(-historyMaxDays);
+
+        // Load completed drift-triggered runs with their post-drift accuracy
+        var driftRuns = await ctx.Set<MLTrainingRun>()
+            .Where(r => r.Symbol == symbol &&
+                        r.Timeframe == timeframe &&
+                        r.Status == RunStatus.Completed &&
+                        r.DirectionAccuracy.HasValue &&
+                        r.DriftTriggerType != null &&
+                        r.CompletedAt.HasValue &&
+                        r.CompletedAt.Value >= cutoff)
+            .AsNoTracking()
+            .Select(r => new { r.LearnerArchitecture, r.DirectionAccuracy })
+            .ToListAsync(ct).ConfigureAwait(false);
+
+        var result = new Dictionary<LearnerArchitecture, double>();
+
+        if (driftRuns.Count >= 3) // need enough data to be meaningful
+        {
+            double overallAvg = driftRuns.Average(r => (double)r.DirectionAccuracy!.Value);
+
+            var perArch = driftRuns
+                .GroupBy(r => r.LearnerArchitecture)
+                .Where(g => g.Count() >= 2)
+                .ToDictionary(g => g.Key, g => g.Average(r => (double)r.DirectionAccuracy!.Value));
+
+            foreach (var (arch, avgAcc) in perArch)
+            {
+                // Only boost, never penalise — architectures above the drift-recovery
+                // average get up to 15% boost proportional to their outperformance
+                if (avgAcc > overallAvg)
+                {
+                    double outperformance = (avgAcc - overallAvg) / Math.Max(overallAvg, 0.01);
+                    result[arch] = 1.0 + Math.Min(0.15, outperformance);
+                }
+            }
+        }
+
+        _cache.Set(cacheKey, result, cacheTtl);
+        return result;
+    }
+
     // ── Cache invalidation (for callers after training run completion) ─────
 
     /// <inheritdoc />
@@ -1913,6 +2209,16 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
         foreach (var days in new[] { 30, 60, DefaultHistoryMaxDays, 120, 180, 365 })
         {
             _cache.Remove($"TrainerSelector:RecentRuns:{symbol}:{timeframe}:{days}");
+            // Improvement #2: also evict drift boost cache
+            _cache.Remove($"TrainerSelector:DriftBoost:{symbol}:{timeframe}:{days}");
+        }
+
+        // Improvement #12: evict affinity cache so shadow data is picked up
+        foreach (var regime in Enum.GetValues<MarketRegimeEnum>())
+        {
+            foreach (var days in new[] { 30, 60, DefaultHistoryMaxDays, 120, 180, 365 })
+            foreach (var hours in new[] { 12, DefaultRegimeWindowHours, 48, 72 })
+                _cache.Remove($"TrainerSelector:RawAffinity:{symbol}:{timeframe}:{regime}:{days}:{hours}");
         }
 
         _logger.LogDebug(
@@ -1975,5 +2281,10 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
         public decimal?            ExpectedValue       { get; init; }
         public DateTime?           CompletedAt         { get; init; }
         public string?             Symbol              { get; init; }
+        // Improvement #8: abstention-aware ranking
+        public decimal?            AbstentionPrecision { get; init; }
+        // Improvement #2: drift-aware selection (loaded for future per-drift-type
+        // scoring; currently used only by ComputeDriftAwareBoostsAsync via separate query)
+        public string?             DriftTriggerType    { get; init; }
     }
 }

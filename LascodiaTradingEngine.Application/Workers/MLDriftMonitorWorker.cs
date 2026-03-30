@@ -145,6 +145,16 @@ public sealed class MLDriftMonitorWorker : BackgroundService
                         relDegradation, requiredConsecutiveFailures,
                         sharpeDegradation, minClosedTrades,
                         stoppingToken);
+
+                    // Improvement #10: proactive champion tenure challenge
+                    try
+                    {
+                        await CheckChampionTenureAsync(model, ctx, writeCtx, trainingDays, stoppingToken);
+                    }
+                    catch (Exception tenureEx)
+                    {
+                        _logger.LogDebug(tenureEx, "Tenure check failed for model {Id} — non-critical", model.Id);
+                    }
                 }
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
@@ -378,24 +388,126 @@ public sealed class MLDriftMonitorWorker : BackgroundService
 
         // ── Queue a new AutoDegrading training run ────────────────────────────
         var now = DateTime.UtcNow;
+
+        // Improvement #2: determine primary drift trigger type and build metadata.
+        // Count active signals to distinguish single from multi-signal drift.
+        int activeSignals = (accuracyDrift ? 1 : 0) + (calibrationDrift ? 1 : 0) +
+                            (disagreementDrift ? 1 : 0) + (relativeDrift ? 1 : 0) +
+                            (sharpeDrift ? 1 : 0);
+
+        string driftTrigger = activeSignals == 1
+            ? (accuracyDrift     ? "AccuracyDrift"
+             : calibrationDrift  ? "CalibrationDrift"
+             : disagreementDrift ? "DisagreementDrift"
+             : sharpeDrift       ? "SharpeDrift"
+             :                     "RelativeDegradation")
+            : "MultiSignal";
+
+        string driftMetadata = System.Text.Json.JsonSerializer.Serialize(new
+        {
+            accuracy       = accuracyDrift     ? accuracy          : (double?)null,
+            threshold      = accuracyDrift     ? threshold         : (double?)null,
+            brierScore     = calibrationDrift  ? brierScore        : (double?)null,
+            disagreement   = disagreementDrift ? meanDisagreement  : (double?)null,
+        });
+
         var run = new MLTrainingRun
         {
-            Symbol      = model.Symbol,
-            Timeframe   = model.Timeframe,
-            TriggerType = TriggerType.AutoDegrading,
-            Status      = RunStatus.Queued,
-            FromDate    = now.AddDays(-trainingDays),
-            ToDate      = now,
-            StartedAt   = now,
+            Symbol           = model.Symbol,
+            Timeframe        = model.Timeframe,
+            TriggerType      = TriggerType.AutoDegrading,
+            Status           = RunStatus.Queued,
+            FromDate         = now.AddDays(-trainingDays),
+            ToDate           = now,
+            StartedAt        = now,
+            DriftTriggerType = driftTrigger,
+            DriftMetadataJson = driftMetadata,
+            Priority         = 1, // Improvement #9: drift-triggered = priority 1
         };
 
         writeCtx.Set<MLTrainingRun>().Add(run);
         await writeCtx.SaveChangesAsync(ct);
 
         _logger.LogWarning(
-            "Drift detected for model {Id} ({Symbol}/{Tf}): [{Reason}] over {N} predictions. " +
+            "Drift detected for model {Id} ({Symbol}/{Tf}): [{Reason}] (trigger={Trigger}) over {N} predictions. " +
             "Queued retraining run {RunId}.",
-            model.Id, model.Symbol, model.Timeframe, driftReason, logs.Count, run.Id);
+            model.Id, model.Symbol, model.Timeframe, driftReason, driftTrigger, logs.Count, run.Id);
+    }
+
+    // ── Improvement #10: Champion tenure tracking ──────────────────────────
+
+    /// <summary>
+    /// Checks whether the model has exceeded the maximum champion tenure without being
+    /// challenged. If so, queues a proactive training run to ensure the model hasn't
+    /// silently degraded below optimal performance.
+    /// </summary>
+    private async Task CheckChampionTenureAsync(
+        MLModel                           model,
+        Microsoft.EntityFrameworkCore.DbContext readCtx,
+        Microsoft.EntityFrameworkCore.DbContext writeCtx,
+        int                               trainingDays,
+        CancellationToken                 ct)
+    {
+        // Read tenure config
+        var enabledStr = await readCtx.Set<EngineConfig>()
+            .Where(c => c.Key == "MLTraining:ProactiveChallengeEnabled" && !c.IsDeleted)
+            .Select(c => c.Value).FirstOrDefaultAsync(ct);
+        if (enabledStr != "true" && enabledStr != "1") return;
+
+        var maxTenureStr = await readCtx.Set<EngineConfig>()
+            .Where(c => c.Key == "MLTraining:MaxChampionTenureDays" && !c.IsDeleted)
+            .Select(c => c.Value).FirstOrDefaultAsync(ct);
+        int maxTenureDays = int.TryParse(maxTenureStr, out var mt) ? mt : 30;
+
+        var minBetweenStr = await readCtx.Set<EngineConfig>()
+            .Where(c => c.Key == "MLTraining:MinDaysBetweenChallenges" && !c.IsDeleted)
+            .Select(c => c.Value).FirstOrDefaultAsync(ct);
+        int minDaysBetween = int.TryParse(minBetweenStr, out var mb) ? mb : 7;
+
+        if (!model.ActivatedAt.HasValue) return;
+
+        var now = DateTime.UtcNow;
+        double tenureDays = (now - model.ActivatedAt.Value).TotalDays;
+        if (tenureDays < maxTenureDays) return;
+
+        // Check cooldown since last challenge
+        if (model.LastChallengedAt.HasValue &&
+            (now - model.LastChallengedAt.Value).TotalDays < minDaysBetween)
+            return;
+
+        // Check if a run is already queued/running
+        bool alreadyQueued = await readCtx.Set<MLTrainingRun>()
+            .AnyAsync(r => r.Symbol    == model.Symbol &&
+                           r.Timeframe == model.Timeframe &&
+                           (r.Status == RunStatus.Queued || r.Status == RunStatus.Running), ct);
+        if (alreadyQueued) return;
+
+        // Queue a proactive challenge run
+        var run = new MLTrainingRun
+        {
+            Symbol           = model.Symbol,
+            Timeframe        = model.Timeframe,
+            TriggerType      = TriggerType.Scheduled,
+            Status           = RunStatus.Queued,
+            FromDate         = now.AddDays(-trainingDays),
+            ToDate           = now,
+            StartedAt        = now,
+            Priority         = 2, // Improvement #9: tenure challenge = priority 2
+        };
+
+        writeCtx.Set<MLTrainingRun>().Add(run);
+
+        // Update LastChallengedAt to prevent redundant challenges
+        await writeCtx.Set<MLModel>()
+            .Where(m => m.Id == model.Id)
+            .ExecuteUpdateAsync(s => s.SetProperty(m => m.LastChallengedAt, now), ct);
+
+        await writeCtx.SaveChangesAsync(ct);
+
+        _logger.LogInformation(
+            "Tenure challenge: model {Id} ({Symbol}/{Tf}) active for {Days:F0} days " +
+            "(max tenure={MaxDays}). Queued proactive retraining run {RunId}.",
+            model.Id, model.Symbol, model.Timeframe, tenureDays, maxTenureDays, run.Id);
     }
 
     // ── Metric helpers ────────────────────────────────────────────────────────

@@ -171,7 +171,20 @@ public record MLScoreResult(
     /// Effective Buy-threshold applied at scoring time after regime/adaptive overrides.
     /// Null when no active model scored the signal.
     /// </summary>
-    decimal?        DecisionThresholdUsed = null);
+    decimal?        DecisionThresholdUsed = null,
+
+    // ── Improvement #1: Ensemble scoring committee ─────────────────────────
+    /// <summary>
+    /// JSON array of model IDs that contributed to this prediction as committee members.
+    /// Format: <c>[42, 87, 103]</c>. Null when single-model scoring was used.
+    /// </summary>
+    string?         CommitteeModelIdsJson = null,
+    /// <summary>
+    /// Standard deviation of committee member probabilities (0.0–0.5).
+    /// Higher values indicate disagreement among committee members.
+    /// Null when single-model scoring was used.
+    /// </summary>
+    decimal?        CommitteeDisagreement = null);
 
 public interface IMLSignalScorer
 {

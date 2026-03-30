@@ -116,6 +116,24 @@ public class MLShadowEvaluation : Entity<long>
     /// </summary>
     public decimal PromotionThreshold  { get; set; } = 0.02m;
 
+    // ── Improvement #3: Parallel shadow tournament ────────────────────────
+
+    /// <summary>
+    /// Groups related shadow evaluations into a single tournament round.
+    /// All evaluations sharing the same <c>TournamentGroupId</c> are resolved
+    /// together by <c>MLShadowArbiterWorker</c> — the best challenger across
+    /// the group wins, and all others are rejected in one pass.
+    /// Null for legacy evaluations created before parallel tournaments were introduced.
+    /// </summary>
+    public Guid?   TournamentGroupId   { get; set; }
+
+    /// <summary>
+    /// Rank of this challenger within its tournament group after evaluation.
+    /// 1 = tournament winner (promoted or best performer), 2+ = runners-up.
+    /// Null while the evaluation is running or for non-tournament evaluations.
+    /// </summary>
+    public int?    TournamentRank      { get; set; }
+
     /// <summary>Soft-delete flag. Filtered out by the global EF Core query filter.</summary>
     public bool    IsDeleted           { get; set; }
 

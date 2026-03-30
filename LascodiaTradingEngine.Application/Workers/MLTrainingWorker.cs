@@ -295,6 +295,22 @@ public sealed class MLTrainingWorker : BackgroundService
     /// until the back-off period has elapsed.
     /// </summary>
     /// <returns>The claimed <see cref="MLTrainingRun"/>, or <c>null</c> if the queue is empty.</returns>
+    /// <summary>
+    /// Produces a deterministic <see cref="Guid"/> for tournament grouping so that all
+    /// shadow evaluations created for the same champion within the same UTC hour share
+    /// one group. Uses the champion model ID and the truncated-to-hour UTC timestamp.
+    /// </summary>
+    private static Guid DeterministicTournamentGroup(long championModelId)
+    {
+        var now = DateTime.UtcNow;
+        // Truncate to hour so all shadows created within the same hour share a group
+        var hourKey = new DateTime(now.Year, now.Month, now.Day, now.Hour, 0, 0, DateTimeKind.Utc);
+        var bytes = new byte[16];
+        BitConverter.TryWriteBytes(bytes.AsSpan(0, 8), championModelId);
+        BitConverter.TryWriteBytes(bytes.AsSpan(8, 8), hourKey.Ticks);
+        return new Guid(bytes);
+    }
+
     private static async Task<MLTrainingRun?> ClaimNextRunAsync(
         Microsoft.EntityFrameworkCore.DbContext ctx,
         CancellationToken                       ct)
@@ -319,12 +335,23 @@ public sealed class MLTrainingWorker : BackgroundService
                 .SetProperty(r => r.ErrorMessage,     "Re-queued: previous worker instance did not complete (stale claim recovery)."),
                 ct);
 
+        // ── Improvement #11: Systemic pause check ────────────────────────
+        // When correlated failure is detected, only process emergency/drift runs
+        var systemicPause = await ctx.Set<EngineConfig>()
+            .Where(c => c.Key == "MLTraining:SystemicPauseActive" && !c.IsDeleted)
+            .Select(c => c.Value).FirstOrDefaultAsync(ct);
+        bool isPaused = systemicPause == "true" || systemicPause == "1";
+
         // ── Claim one queued run atomically ───────────────────────────────
-        // Atomic UPDATE: only succeeds for one worker even if many race concurrently.
+        // Improvement #9: Order by Priority first (lower = higher priority),
+        // then by StartedAt for FIFO within the same priority level.
+        // During systemic pause, only claim fast-lane runs (Priority <= 1).
         var rowsUpdated = await runSet
             .Where(r => r.Status == RunStatus.Queued && r.WorkerInstanceId == null &&
-                        (r.NextRetryAt == null || r.NextRetryAt <= DateTime.UtcNow))
-            .OrderBy(r => r.StartedAt)
+                        (r.NextRetryAt == null || r.NextRetryAt <= DateTime.UtcNow) &&
+                        (!isPaused || r.Priority <= 1 || r.IsEmergencyRetrain))
+            .OrderBy(r => r.Priority)
+            .ThenBy(r => r.StartedAt)
             .Take(1)
             .ExecuteUpdateAsync(s => s
                 .SetProperty(r => r.Status,           RunStatus.Running)
@@ -952,18 +979,23 @@ public sealed class MLTrainingWorker : BackgroundService
                     run.MLModelId = nonActiveModel.Id;
                     await db.SaveChangesAsync(stoppingToken);
 
-                    // Create shadow evaluation so the arbiter can compare them on live data
+                    // Improvement #3: Create shadow evaluation with tournament group ID.
+                    // Derive the group from the champion ID so that all challengers for the
+                    // same champion within the same hour share a tournament group. This lets
+                    // the MLShadowArbiterWorker evaluate them as a cohort.
+                    var tournamentGroup = DeterministicTournamentGroup(previousChampion.Id);
                     var shadow = new MLShadowEvaluation
                     {
-                        Symbol            = run.Symbol,
-                        Timeframe         = run.Timeframe,
-                        ChampionModelId   = previousChampion.Id,
-                        ChallengerModelId = nonActiveModel.Id,
-                        Status            = ShadowEvaluationStatus.Running,
-                        RequiredTrades    = hp.ShadowRequiredTrades,
-                        ExpiresAt         = DateTime.UtcNow.AddDays(hp.ShadowExpiryDays),
+                        Symbol             = run.Symbol,
+                        Timeframe          = run.Timeframe,
+                        ChampionModelId    = previousChampion.Id,
+                        ChallengerModelId  = nonActiveModel.Id,
+                        Status             = ShadowEvaluationStatus.Running,
+                        RequiredTrades     = hp.ShadowRequiredTrades,
+                        ExpiresAt          = DateTime.UtcNow.AddDays(hp.ShadowExpiryDays),
                         PromotionThreshold = (decimal)hp.MinAccuracyToPromote,
-                        StartedAt         = DateTime.UtcNow,
+                        StartedAt          = DateTime.UtcNow,
+                        TournamentGroupId  = tournamentGroup,
                     };
                     ctx.Set<MLShadowEvaluation>().Add(shadow);
                     await db.SaveChangesAsync(stoppingToken);
@@ -1057,6 +1089,10 @@ public sealed class MLTrainingWorker : BackgroundService
             // new model is activated immediately without a shadow evaluation period.
             if (previousChampion is not null)
             {
+                // Improvement #3: assign tournament group for parallel shadow evaluation.
+                // Use deterministic group derived from champion ID + hour so all challengers
+                // for the same champion within the same hour join the same tournament.
+                var tournamentGroup = DeterministicTournamentGroup(previousChampion.Id);
                 var shadow = new MLShadowEvaluation
                 {
                     Symbol             = run.Symbol,
@@ -1068,11 +1104,12 @@ public sealed class MLTrainingWorker : BackgroundService
                     ExpiresAt          = DateTime.UtcNow.AddDays(hp.ShadowExpiryDays),
                     PromotionThreshold = (decimal)hp.MinAccuracyToPromote,
                     StartedAt          = DateTime.UtcNow,
+                    TournamentGroupId  = tournamentGroup,
                 };
                 ctx.Set<MLShadowEvaluation>().Add(shadow);
                 _logger.LogInformation(
-                    "Shadow eval queued: champion={Champion} vs challenger={Challenger}",
-                    previousChampion.Id, model.Id);
+                    "Shadow eval queued: champion={Champion} vs challenger={Challenger} tournament={Tournament}",
+                    previousChampion.Id, model.Id, tournamentGroup);
             }
 
             await db.SaveChangesAsync(stoppingToken);

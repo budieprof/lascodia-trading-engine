@@ -292,6 +292,64 @@ public class MLTrainingRun : Entity<long>
     /// <summary><c>true</c> when curriculum learning ordering was applied during training.</summary>
     public bool    CurriculumApplied       { get; set; }
 
+    // ── Improvement #2: Drift-aware trainer selection ──────────────────────
+
+    /// <summary>
+    /// Identifies which drift criterion triggered this training run:
+    /// <c>"AccuracyDrift"</c>, <c>"CalibrationDrift"</c>, <c>"CovariateShift"</c>,
+    /// <c>"SharpeDrift"</c>, <c>"DisagreementDrift"</c>, or <c>"MultiSignal"</c>
+    /// when multiple signals fired simultaneously.
+    /// Null for manually triggered, scheduled, or tenure-challenge runs.
+    /// Used by <see cref="TrainerSelector"/> to bias architecture selection based on
+    /// which drift type triggered the retrain.
+    /// </summary>
+    public string?  DriftTriggerType     { get; set; }
+
+    /// <summary>
+    /// JSON object containing the drift metrics that triggered this run.
+    /// Format varies by <see cref="DriftTriggerType"/>:
+    /// <list type="bullet">
+    ///   <item>AccuracyDrift: <c>{"accuracy":0.47,"threshold":0.50}</c></item>
+    ///   <item>CovariateShift: <c>{"maxPsi":0.28,"psiFeature":"Rsi","msz":1.7}</c></item>
+    ///   <item>SharpeDrift: <c>{"liveSharpe":0.15,"trainSharpe":0.80}</c></item>
+    /// </list>
+    /// Null when <see cref="DriftTriggerType"/> is null.
+    /// </summary>
+    public string?  DriftMetadataJson    { get; set; }
+
+    // ── Improvement #8: Abstention-aware trainer ranking ────────────────────
+
+    /// <summary>
+    /// Fraction of evaluation-set signals where the model's abstention gate fired
+    /// (abstention score below threshold), in the range 0.0–1.0. Higher values
+    /// indicate the model frequently declines to trade.
+    /// Null while the run is in progress or when abstention is not computed.
+    /// </summary>
+    public decimal? AbstentionRate       { get; set; }
+
+    /// <summary>
+    /// Precision of the abstention gate: among signals the model chose to abstain on,
+    /// what fraction would have been losing trades? Range 0.0–1.0, higher is better.
+    /// Null while the run is in progress or when abstention is not computed.
+    /// </summary>
+    public decimal? AbstentionPrecision  { get; set; }
+
+    // ── Improvement #9: Training budget allocation ──────────────────────────
+
+    /// <summary>
+    /// Queue priority for this training run. Lower values are processed first.
+    /// <list type="bullet">
+    ///   <item>0 — Emergency (structural break)</item>
+    ///   <item>1 — Drift-triggered (accuracy/covariate degradation)</item>
+    ///   <item>2 — Tenure challenge (proactive)</item>
+    ///   <item>3 — Manual (operator-initiated)</item>
+    ///   <item>5 — Scheduled (routine)</item>
+    /// </list>
+    /// Defaults to 5 (lowest priority). Used by <c>MLTrainingWorker.ClaimNextRunAsync</c>
+    /// when two-lane queue is enabled.
+    /// </summary>
+    public int      Priority             { get; set; } = 5;
+
     /// <summary>Soft-delete flag. Filtered out by the global EF Core query filter.</summary>
     public bool     IsDeleted          { get; set; }
 

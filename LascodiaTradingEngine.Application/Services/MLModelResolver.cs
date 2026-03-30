@@ -141,6 +141,86 @@ internal sealed class MLModelResolver
         return (model, currentRegime);
     }
 
+    // ── Improvement #1: Ensemble scoring committee ────────────────────────
+
+    /// <summary>
+    /// Resolves up to <paramref name="maxSize"/> active models from different
+    /// <c>ModelFamily</c> groups for the given symbol/timeframe. The primary
+    /// model (resolved by <see cref="ResolveActiveModelAsync"/>) is always
+    /// included as the first element. Additional committee members are drawn
+    /// from non-suppressed, non-fallback active models with different
+    /// <see cref="MLModel.LearnerArchitecture"/> family classifications.
+    /// </summary>
+    /// <returns>
+    /// A list of (Model, CurrentRegime) tuples. Empty if no active model exists.
+    /// The first element is always the primary model.
+    /// </returns>
+    internal async Task<List<(MLModel Model, string? CurrentRegime)>> ResolveCommitteeModelsAsync(
+        TradeSignal signal, Timeframe signalTimeframe, int maxSize, CancellationToken ct)
+    {
+        var (primary, regime) = await ResolveActiveModelAsync(signal, signalTimeframe, ct);
+        if (primary is null)
+            return [];
+
+        var result = new List<(MLModel, string?)>(maxSize) { (primary, regime) };
+        if (maxSize <= 1)
+            return result;
+
+        // Load all active, non-suppressed global models for this symbol/timeframe
+        var db = _context.GetDbContext();
+        var candidates = await db.Set<MLModel>()
+            .AsNoTracking()
+            .Where(x => x.Symbol    == signal.Symbol &&
+                        x.Timeframe == signalTimeframe &&
+                        x.IsActive  &&
+                        !x.IsSuppressed &&
+                        !x.IsFallbackChampion &&
+                        !x.IsDeleted &&
+                        x.Id != primary.Id &&
+                        x.ModelBytes != null)
+            .OrderByDescending(x => x.ExpectedValue ?? -1m)
+            .ThenByDescending(x => x.ActivatedAt)
+            .Take(10) // reasonable upper bound to prevent large scans
+            .ToListAsync(ct);
+
+        // Select candidates from different model families than the primary
+        var usedFamilies = new HashSet<int> { FamilyOf(primary.LearnerArchitecture) };
+
+        foreach (var candidate in candidates)
+        {
+            if (result.Count >= maxSize) break;
+            if (candidate.ModelBytes is not { Length: > 0 }) continue;
+
+            int family = FamilyOf(candidate.LearnerArchitecture);
+            if (!usedFamilies.Add(family)) continue;
+
+            result.Add((candidate, regime));
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Maps a <see cref="LearnerArchitecture"/> to its model family integer.
+    /// Mirrors the <c>ModelFamily</c> enum in <c>TrainerSelector</c>.
+    /// </summary>
+    private static int FamilyOf(LearnerArchitecture arch) => arch switch
+    {
+        LearnerArchitecture.BaggedLogistic  => 0, // BaggedEnsemble
+        LearnerArchitecture.Elm             => 0,
+        LearnerArchitecture.Smote           => 0,
+        LearnerArchitecture.Gbm             => 1, // TreeBoosting
+        LearnerArchitecture.AdaBoost        => 1,
+        LearnerArchitecture.QuantileRf      => 1,
+        LearnerArchitecture.Rocket          => 2, // ConvKernel
+        LearnerArchitecture.TemporalConvNet => 2,
+        LearnerArchitecture.FtTransformer   => 3, // Transformer
+        LearnerArchitecture.TabNet          => 3,
+        LearnerArchitecture.Svgp            => 4, // GaussianProcess
+        LearnerArchitecture.Dann            => 5, // DomainAdaptation
+        _                                   => 99,
+    };
+
     private static CancellationTokenSource CreateLinkedTimeout(CancellationToken parent)
     {
         var cts = CancellationTokenSource.CreateLinkedTokenSource(parent);

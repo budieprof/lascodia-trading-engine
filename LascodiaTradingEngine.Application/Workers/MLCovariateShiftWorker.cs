@@ -343,15 +343,27 @@ public sealed class MLCovariateShiftWorker : BackgroundService
 
         // ── 7. Queue retraining ───────────────────────────────────────────────
         var now = DateTime.UtcNow;
+
+        // Improvement #2: tag with covariate shift metadata
+        string covariateMetadata = System.Text.Json.JsonSerializer.Serialize(new
+        {
+            maxPsi,
+            psiFeature = featureName,
+            msz        = multivariateScore,
+        });
+
         var run = new MLTrainingRun
         {
-            Symbol      = model.Symbol,
-            Timeframe   = model.Timeframe,
-            TriggerType = TriggerType.AutoDegrading,
-            Status      = RunStatus.Queued,
-            FromDate    = now.AddDays(-trainingDays),
-            ToDate      = now,
-            StartedAt   = now,
+            Symbol            = model.Symbol,
+            Timeframe         = model.Timeframe,
+            TriggerType       = TriggerType.AutoDegrading,
+            Status            = RunStatus.Queued,
+            FromDate          = now.AddDays(-trainingDays),
+            ToDate            = now,
+            StartedAt         = now,
+            DriftTriggerType  = "CovariateShift",
+            DriftMetadataJson = covariateMetadata,
+            Priority          = 1, // Improvement #9: drift-triggered = priority 1
         };
 
         writeCtx.Set<MLTrainingRun>().Add(run);

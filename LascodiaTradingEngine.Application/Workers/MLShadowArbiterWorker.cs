@@ -420,6 +420,118 @@ public sealed class MLShadowArbiterWorker : BackgroundService
         if (regimeSegments.Any(kv => kv.Value.Count > 0))
             await writeCtx.SaveChangesAsync(ct);
 
+        // ── Improvement #3: Tournament resolution ────────────────────────────
+        // If this shadow belongs to a tournament group, check if all siblings
+        // have also completed. If so, pick the best challenger across the group.
+        if (shadow.TournamentGroupId.HasValue && decision == PromotionDecision.AutoPromoted)
+        {
+            var tournamentSiblings = await writeCtx.Set<MLShadowEvaluation>()
+                .Where(s => s.TournamentGroupId == shadow.TournamentGroupId &&
+                            s.Id != shadow.Id &&
+                            !s.IsDeleted)
+                .ToListAsync(ct);
+
+            // Check if any siblings are still running or being processed — if so, defer
+            // promotion until all are resolved to pick the tournament winner fairly
+            bool siblingsStillRunning = tournamentSiblings.Any(s =>
+                s.Status == ShadowEvaluationStatus.Running ||
+                s.Status == ShadowEvaluationStatus.Processing);
+
+            if (siblingsStillRunning)
+            {
+                _logger.LogInformation(
+                    "Shadow eval {Id}: tournament group {Group} has unresolved siblings — " +
+                    "deferring promotion until tournament completes.",
+                    shadow.Id, shadow.TournamentGroupId);
+
+                // Persist tentative rank via ExecuteUpdateAsync (shadow may be untracked)
+                await writeCtx.Set<MLShadowEvaluation>()
+                    .Where(s => s.Id == shadow.Id)
+                    .ExecuteUpdateAsync(s => s
+                        .SetProperty(e => e.TournamentRank, 0), ct);
+                return;
+            }
+
+            // All siblings completed — rank all challengers that were individually
+            // auto-promoted (regime guard passed). Rejected/flagged challengers are
+            // excluded from winning the tournament to prevent bypassing regime checks.
+            // Re-load the current shadow from writeCtx to get the freshly persisted
+            // ChallengerDirectionAccuracy (the in-memory shadow has stale values from
+            // the initial AsNoTracking read).
+            var freshCurrentShadow = await writeCtx.Set<MLShadowEvaluation>()
+                .FirstOrDefaultAsync(s => s.Id == shadow.Id, ct);
+
+            var promotableCandidates = tournamentSiblings
+                .Where(s => s.Status != ShadowEvaluationStatus.Running &&
+                            s.Status != ShadowEvaluationStatus.Processing &&
+                            s.PromotionDecision == PromotionDecision.AutoPromoted);
+
+            // Include the current shadow only if freshly loaded
+            var allCandidates = freshCurrentShadow is not null
+                ? promotableCandidates.Append(freshCurrentShadow)
+                : promotableCandidates;
+
+            var ranked = allCandidates
+                .OrderByDescending(s => s.ChallengerDirectionAccuracy)
+                .ToList();
+
+            if (ranked.Count == 0)
+            {
+                // No individually-promoted challengers survived the regime guard —
+                // treat as if the tournament produced no winner.
+                _logger.LogInformation(
+                    "Tournament {Group}: no auto-promoted challengers — no winner.",
+                    shadow.TournamentGroupId);
+                decision = PromotionDecision.FlaggedForReview;
+            }
+            else
+            {
+                // Rank all candidates and persist
+                for (int i = 0; i < ranked.Count; i++)
+                {
+                    await writeCtx.Set<MLShadowEvaluation>()
+                        .Where(s => s.Id == ranked[i].Id)
+                        .ExecuteUpdateAsync(s => s
+                            .SetProperty(e => e.TournamentRank, i + 1), ct);
+
+                    // Retire all non-winners' challenger models
+                    if (i > 0)
+                    {
+                        await writeCtx.Set<MLModel>()
+                            .Where(m => m.Id == ranked[i].ChallengerModelId)
+                            .ExecuteUpdateAsync(s => s
+                                .SetProperty(m => m.IsActive, false)
+                                .SetProperty(m => m.Status, MLModelStatus.Superseded), ct);
+                    }
+                }
+
+                // Also retire challengers from non-promotable (rejected/flagged) siblings
+                foreach (var rejected in tournamentSiblings
+                    .Where(s => s.PromotionDecision != PromotionDecision.AutoPromoted &&
+                                !ranked.Any(r => r.Id == s.Id)))
+                {
+                    await writeCtx.Set<MLModel>()
+                        .Where(m => m.Id == rejected.ChallengerModelId)
+                        .ExecuteUpdateAsync(s => s
+                            .SetProperty(m => m.IsActive, false)
+                            .SetProperty(m => m.Status, MLModelStatus.Superseded), ct);
+
+                    await writeCtx.Set<MLShadowEvaluation>()
+                        .Where(s => s.Id == rejected.Id)
+                        .ExecuteUpdateAsync(s => s
+                            .SetProperty(e => e.TournamentRank, ranked.Count + 1), ct);
+                }
+
+                // The tournament winner is the top-ranked candidate
+                shadow = ranked[0];
+
+                _logger.LogInformation(
+                    "Tournament {Group}: winner is challenger {ChalId} (acc={Acc:P1}) from {Count} candidates.",
+                    shadow.TournamentGroupId, shadow.ChallengerModelId,
+                    shadow.ChallengerDirectionAccuracy, ranked.Count);
+            }
+        }
+
         // ── Act on the decision ───────────────────────────────────────────────
         if (decision == PromotionDecision.AutoPromoted)
         {
@@ -436,6 +548,16 @@ public sealed class MLShadowArbiterWorker : BackgroundService
             }
 
             await PromoteChallengerAsync(shadow, writeCtx, ct);
+
+            // Improvement #12: invalidate TrainerSelector cache so shadow regime
+            // affinity data is picked up immediately
+            try
+            {
+                using var cacheScope = _scopeFactory.CreateScope();
+                cacheScope.ServiceProvider.GetService<ITrainerSelector>()
+                    ?.InvalidateCache(shadow.Symbol, shadow.Timeframe);
+            }
+            catch { /* non-critical */ }
         }
         else
         {

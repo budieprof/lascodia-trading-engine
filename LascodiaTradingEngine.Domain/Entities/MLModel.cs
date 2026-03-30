@@ -251,6 +251,16 @@ public class MLModel : Entity<long>
     /// </summary>
     public double? PlattCalibrationDrift   { get; set; }
 
+    // ── Improvement #10: Champion tenure tracking ─────────────────────────
+
+    /// <summary>
+    /// UTC timestamp of the last time a proactive tenure-challenge training run
+    /// was queued against this champion model. Prevents redundant challenges
+    /// within the <c>MLTraining:MinDaysBetweenChallenges</c> window.
+    /// Null until the first tenure challenge.
+    /// </summary>
+    public DateTime? LastChallengedAt       { get; set; }
+
     /// <summary>Soft-delete flag. Filtered out by the global EF Core query filter.</summary>
     public bool    IsDeleted               { get; set; }
 

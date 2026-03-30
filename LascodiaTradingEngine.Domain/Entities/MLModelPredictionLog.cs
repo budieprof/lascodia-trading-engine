@@ -283,6 +283,21 @@ public class MLModelPredictionLog : Entity<long>
     /// </summary>
     public double? SurvivalHazardRate        { get; set; }
 
+    // ── Improvement #1: Ensemble scoring committee ────────────────────────
+
+    /// <summary>
+    /// JSON array of model IDs that contributed to this prediction as committee members.
+    /// Format: <c>[42, 87, 103]</c>. Null when single-model scoring was used.
+    /// </summary>
+    public string? CommitteeModelIdsJson  { get; set; }
+
+    /// <summary>
+    /// Standard deviation of committee member probabilities (0.0–0.5).
+    /// Higher values indicate disagreement among committee members.
+    /// Null when single-model scoring was used.
+    /// </summary>
+    public decimal? CommitteeDisagreement { get; set; }
+
     /// <summary>Soft-delete flag. Filtered out by the global EF Core query filter.</summary>
     public bool    IsDeleted             { get; set; }
 
