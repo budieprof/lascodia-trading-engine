@@ -142,6 +142,44 @@ public class Order : Entity<long>
     /// </summary>
     public long? ParentOrderId { get; set; }
 
+    // ── Execution algorithm & time-in-force (Improvements 1.2, 1.3, 1.4) ──
+
+    /// <summary>
+    /// Algorithmic execution strategy: Direct (single order), TWAP (time-sliced),
+    /// or VWAP (volume-weighted slicing). Defaults to Direct for standard orders.
+    /// </summary>
+    public ExecutionAlgorithmType ExecutionAlgorithm { get; set; } = ExecutionAlgorithmType.Direct;
+
+    /// <summary>
+    /// Order time-in-force policy: GTC, IOC, FOK, or GTD.
+    /// Enforced by the EA on MT5 and reported back via execution reports.
+    /// </summary>
+    public TimeInForce TimeInForce { get; set; } = TimeInForce.GTC;
+
+    /// <summary>
+    /// Maximum tolerable slippage in pips. The EA must reject fills that exceed this
+    /// threshold and report partial fill + rejection. Null disables slippage tolerance.
+    /// </summary>
+    public decimal? MaxSlippagePips { get; set; }
+
+    /// <summary>
+    /// For TWAP/VWAP orders: total number of child orders to split into.
+    /// Null for Direct execution.
+    /// </summary>
+    public int? AlgoSliceCount { get; set; }
+
+    /// <summary>
+    /// For TWAP/VWAP orders: total duration in seconds over which to execute the slices.
+    /// Null for Direct execution.
+    /// </summary>
+    public int? AlgoDurationSeconds { get; set; }
+
+    /// <summary>
+    /// For GTD orders: expiry date/time after which the order is automatically cancelled.
+    /// Null for other time-in-force types.
+    /// </summary>
+    public DateTime? GtdExpiresAt { get; set; }
+
     // ── Timestamps ───────────────────────────────────────────────────────────
 
     /// <summary>UTC timestamp when this order record was created in the system.</summary>

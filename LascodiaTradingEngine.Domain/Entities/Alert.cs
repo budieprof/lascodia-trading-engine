@@ -58,6 +58,33 @@ public class Alert : Entity<long>
     /// </summary>
     public DateTime? LastTriggeredAt { get; set; }
 
+    // ── Alert severity & escalation (Improvement 15.2) ──────────────────────
+
+    /// <summary>
+    /// Severity tier controlling escalation and notification channels:
+    /// Critical (SMS+Telegram+Webhook, immediate), High (Telegram+Webhook, 5min),
+    /// Medium (Webhook, 15min), Info (Webhook only, no escalation).
+    /// </summary>
+    public AlertSeverity Severity { get; set; } = AlertSeverity.Medium;
+
+    /// <summary>
+    /// Deduplication key to prevent the same alert firing repeatedly during a sustained condition.
+    /// Alerts with the same key within the cooldown window are suppressed. Null disables dedup.
+    /// </summary>
+    public string? DeduplicationKey { get; set; }
+
+    /// <summary>
+    /// Minimum seconds between firings for the same deduplication key.
+    /// Prevents alert storms during sustained breaches.
+    /// </summary>
+    public int CooldownSeconds { get; set; } = 300;
+
+    /// <summary>
+    /// When the alert condition cleared and the alert auto-resolved. Null if still active or
+    /// not yet auto-resolved. Enables "alert cleared" notifications.
+    /// </summary>
+    public DateTime? AutoResolvedAt { get; set; }
+
     /// <summary>Soft-delete flag. Filtered out by the global EF Core query filter.</summary>
     public bool    IsDeleted      { get; set; }
 }

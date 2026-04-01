@@ -17,6 +17,7 @@ using LascodiaTradingEngine.Application.Common.Utilities;
 using LascodiaTradingEngine.Application.Backtesting.Models;
 using LascodiaTradingEngine.Application.TradeSignals.Commands.CreateTradeSignal;
 using LascodiaTradingEngine.Application.TradeSignals.Commands.ExpireTradeSignal;
+using LascodiaTradingEngine.Application.Services;
 using MarketRegimeEnum = LascodiaTradingEngine.Domain.Enums.MarketRegime;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -53,6 +54,8 @@ public class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceU
     private readonly IDistributedLock _distributedLock;
     private readonly StrategyEvaluatorOptions _options;
     private readonly TradingMetrics _metrics;
+    private readonly ISignalConflictResolver _signalConflictResolver;
+    private readonly RegimeCoherenceChecker _regimeCoherenceChecker;
 
     /// <summary>Tracks the last signal creation time per strategy to enforce cooldown.</summary>
     private readonly ConcurrentDictionary<long, DateTime> _lastSignalTime = new();
@@ -83,15 +86,19 @@ public class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceU
         IEnumerable<IStrategyEvaluator> evaluators,
         IDistributedLock distributedLock,
         StrategyEvaluatorOptions options,
-        TradingMetrics metrics)
+        TradingMetrics metrics,
+        ISignalConflictResolver signalConflictResolver,
+        RegimeCoherenceChecker regimeCoherenceChecker)
     {
-        _logger          = logger;
-        _scopeFactory    = scopeFactory;
-        _eventBus        = eventBus;
-        _evaluators      = evaluators;
-        _distributedLock = distributedLock;
-        _options         = options;
-        _metrics         = metrics;
+        _logger                  = logger;
+        _scopeFactory            = scopeFactory;
+        _eventBus                = eventBus;
+        _evaluators              = evaluators;
+        _distributedLock         = distributedLock;
+        _options                 = options;
+        _metrics                 = metrics;
+        _signalConflictResolver  = signalConflictResolver;
+        _regimeCoherenceChecker  = regimeCoherenceChecker;
     }
 
     /// <summary>
@@ -257,6 +264,48 @@ public class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceU
         // untested or poorly-performing strategies from producing real trades.
         var backtestQualifiedIds = await GetBacktestQualifiedStrategyIdsAsync(
             context.GetDbContext(), strategyIds, _stoppingToken);
+
+        // ── Pre-fetch Sharpe ratios for conflict resolution scoring ──────────
+        // Used by the SignalConflictResolver to rank competing signals from the
+        // same symbol. Fetched once before the parallel loop to avoid N+1 queries.
+        var strategySharpeCache = new Dictionary<long, decimal>();
+        if (strategyIds.Count > 0)
+        {
+            var sharpeData = await context.GetDbContext()
+                .Set<Domain.Entities.StrategyPerformanceSnapshot>()
+                .Where(x => strategyIds.Contains(x.StrategyId) && !x.IsDeleted)
+                .GroupBy(x => x.StrategyId)
+                .Select(g => new
+                {
+                    StrategyId = g.Key,
+                    SharpeRatio = g.OrderByDescending(x => x.EvaluatedAt).First().SharpeRatio
+                })
+                .ToListAsync(_stoppingToken);
+
+            foreach (var s in sharpeData)
+                strategySharpeCache[s.StrategyId] = s.SharpeRatio;
+        }
+
+        // ── Regime coherence check (cross-timeframe alignment) ───────────────
+        // If regimes across H1/H4/D1 disagree for this symbol, the coherence
+        // score is low and all signals for the symbol may be suppressed.
+        decimal regimeCoherence = await _regimeCoherenceChecker.GetCoherenceScoreAsync(
+            @event.Symbol, _stoppingToken);
+
+        if (_options.MinRegimeCoherence > 0 && regimeCoherence < _options.MinRegimeCoherence)
+        {
+            _logger.LogInformation(
+                "StrategyWorker: regime coherence for {Symbol} is {Coherence:F2} (< {Threshold:F2}) — suppressing all signals",
+                @event.Symbol, regimeCoherence, _options.MinRegimeCoherence);
+            _metrics.SignalsFiltered.Add(1, new("symbol", @event.Symbol), new("stage", "regime_coherence"));
+            return;
+        }
+
+        // ── Candidate signal collection bag ──────────────────────────────────
+        // Instead of publishing signals immediately inside the parallel loop,
+        // we collect candidates here and resolve conflicts after all strategies
+        // have been evaluated. This enables cross-strategy conflict detection.
+        var candidateSignals = new ConcurrentBag<(PendingSignal Pending, MLScoreResult MlScore)>();
 
         // ── Parallel strategy evaluation ─────────────────────────────────────
         // Each strategy gets its own DI scope so scoped services (DbContext, ML scorer,
@@ -616,70 +665,36 @@ public class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceU
                 signal.MLConfidenceScore    = mlScore.ConfidenceScore;
                 signal.MLModelId            = mlScore.MLModelId;
 
-                // ── Persist the trade signal via CQRS command ─────────────────
-                var result = await strategyMediator.Send(new CreateTradeSignalCommand
-                {
-                    StrategyId             = signal.StrategyId,
-                    Symbol                 = signal.Symbol,
-                    Direction              = signal.Direction.ToString(),
-                    EntryPrice             = signal.EntryPrice,
-                    StopLoss               = signal.StopLoss,
-                    TakeProfit             = signal.TakeProfit,
-                    SuggestedLotSize       = signal.SuggestedLotSize,
-                    Confidence             = signal.Confidence,
-                    MLPredictedDirection   = signal.MLPredictedDirection?.ToString(),
-                    MLPredictedMagnitude   = signal.MLPredictedMagnitude,
-                    MLConfidenceScore      = signal.MLConfidenceScore,
-                    MLModelId              = signal.MLModelId,
-                    MLRawProbability       = mlScore.RawProbability,
-                    MLCalibratedProbability = mlScore.CalibratedProbability,
-                    MLServedCalibratedProbability = mlScore.ServedCalibratedProbability,
-                    MLDecisionThresholdUsed = mlScore.DecisionThresholdUsed,
-                    MLEnsembleDisagreement = mlScore.EnsembleDisagreement,
-                    Timeframe              = strategy.Timeframe,
-                    ExpiresAt              = signal.ExpiresAt
-                }, ct);
-
-                // On successful creation, publish the integration event so
-                // SignalOrderBridgeWorker can pick it up for risk checking and order creation.
-                if (result.status && result.data > 0)
-                {
-                    // Resolve write context only when we actually need to publish
-                    var writeContext = strategyScope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
-                    var eventService = strategyScope.ServiceProvider.GetRequiredService<IIntegrationEventService>();
-
-                    await eventService.SaveAndPublish(writeContext, new TradeSignalCreatedIntegrationEvent
-                    {
-                        TradeSignalId = result.data,
-                        StrategyId    = signal.StrategyId,
-                        Symbol        = signal.Symbol,
-                        Direction     = signal.Direction.ToString(),
-                        EntryPrice    = signal.EntryPrice
-                    });
-
-                    // Record cooldown timestamp
-                    _lastSignalTime[strategy.Id] = DateTime.UtcNow;
-
-                    _metrics.SignalsGenerated.Add(1, new("symbol", signal.Symbol), new("strategy_type", strategy.StrategyType.ToString()));
-
-                    await strategyMediator.Send(new LogDecisionCommand
-                    {
-                        EntityType   = "TradeSignal",
-                        EntityId     = result.data,
-                        DecisionType = "SignalGenerated",
-                        Outcome      = "Created",
-                        Reason       = $"Strategy {strategy.Id} generated {signal.Direction} signal on {signal.Symbol} at {signal.EntryPrice}, " +
-                                       $"SL={signal.StopLoss:F5}, TP={signal.TakeProfit:F5}, Confidence={signal.Confidence:P2}",
-                        Source       = "StrategyWorker"
-                    }, ct);
-                }
+                // ── Collect candidate signal for conflict resolution ─────────
+                // Instead of persisting immediately, add to the candidate bag.
+                // After all strategies evaluate, the conflict resolver will pick
+                // the best signal per symbol and suppress opposing-direction conflicts.
+                strategySharpeCache.TryGetValue(strategy.Id, out var stratSharpe);
+                candidateSignals.Add((
+                    new PendingSignal(
+                        StrategyId:           signal.StrategyId,
+                        Symbol:               signal.Symbol,
+                        Timeframe:            strategy.Timeframe,
+                        StrategyType:         strategy.StrategyType,
+                        Direction:            signal.Direction,
+                        EntryPrice:           signal.EntryPrice,
+                        StopLoss:             signal.StopLoss,
+                        TakeProfit:           signal.TakeProfit,
+                        SuggestedLotSize:     signal.SuggestedLotSize,
+                        Confidence:           signal.Confidence,
+                        MLConfidenceScore:    mlScore.ConfidenceScore,
+                        MLModelId:            mlScore.MLModelId,
+                        EstimatedCapacityLots: strategy.EstimatedCapacityLots,
+                        StrategySharpeRatio:  stratSharpe != 0 ? stratSharpe : null,
+                        ExpiresAt:            signal.ExpiresAt),
+                    mlScore));
 
                 // Reset failure counter on any successful evaluation (no exception).
-                // Circuit breaker is only fully reset when a signal is actually generated,
-                // to avoid prematurely exiting half-open state on no-signal evaluations.
+                // Circuit breaker is NOT reset here — it is only reset after the signal
+                // survives conflict resolution and is actually persisted, to avoid
+                // prematurely exiting half-open state for strategies that keep losing
+                // conflict resolution.
                 _consecutiveFailures.TryRemove(strategy.Id, out _);
-                if (signal is not null && result.status && result.data > 0)
-                    _circuitOpenedAt.TryRemove(strategy.Id, out _);
             }
             catch (Exception ex)
             {
@@ -696,6 +711,106 @@ public class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceU
                     evalStopwatch.Elapsed.TotalMilliseconds,
                     new("symbol", strategy.Symbol),
                     new("strategy_type", strategy.StrategyType.ToString()));
+            }
+        });
+
+        // ══════════════════════════════════════════════════════════════════════
+        //  Post-loop: Signal conflict resolution and publishing
+        // ══════════════════════════════════════════════════════════════════════
+        // Now that all strategies have been evaluated in parallel, resolve
+        // cross-strategy conflicts (opposing directions suppressed, same-direction
+        // deduplication by priority score) before persisting any signals.
+        if (candidateSignals.IsEmpty)
+            return;
+
+        var allCandidates = candidateSignals.ToList();
+        var pendingOnly = allCandidates.Select(c => c.Pending).ToList();
+        var winners = _signalConflictResolver.Resolve(pendingOnly);
+        // Use reference equality to match exact winner instances, not just StrategyId.
+        // A strategy could produce multiple candidates (e.g. different timeframes), and
+        // the resolver may keep some but not all — StrategyId alone can't distinguish them.
+        var winnerSet = new HashSet<PendingSignal>(winners, ReferenceEqualityComparer.Instance);
+
+        // Log suppressed signals
+        var suppressedCount = allCandidates.Count - winners.Count;
+        if (suppressedCount > 0)
+        {
+            _logger.LogInformation(
+                "SignalConflictResolver: {Total} candidates → {Winners} winners, {Suppressed} suppressed for {Symbol}",
+                allCandidates.Count, winners.Count, suppressedCount, @event.Symbol);
+            _metrics.SignalsFiltered.Add(suppressedCount, new("symbol", @event.Symbol), new("stage", "conflict_resolution"));
+        }
+
+        // Persist and publish winning signals concurrently (each gets its own DI scope)
+        var winnerCandidates = allCandidates.Where(c => winnerSet.Contains(c.Pending)).ToList();
+        var publishOptions = new ParallelOptions
+        {
+            MaxDegreeOfParallelism = Math.Min(winnerCandidates.Count, 4),
+            CancellationToken = _stoppingToken
+        };
+        await Parallel.ForEachAsync(winnerCandidates, publishOptions, async (candidate, ct) =>
+        {
+            var (pending, mlScore) = candidate;
+            using var publishScope = _scopeFactory.CreateScope();
+            var mediator     = publishScope.ServiceProvider.GetRequiredService<IMediator>();
+            var writeContext  = publishScope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+            var eventService = publishScope.ServiceProvider.GetRequiredService<IIntegrationEventService>();
+
+            var result = await mediator.Send(new CreateTradeSignalCommand
+            {
+                StrategyId             = pending.StrategyId,
+                Symbol                 = pending.Symbol,
+                Direction              = pending.Direction.ToString(),
+                EntryPrice             = pending.EntryPrice,
+                StopLoss               = pending.StopLoss,
+                TakeProfit             = pending.TakeProfit,
+                SuggestedLotSize       = pending.SuggestedLotSize,
+                Confidence             = pending.Confidence,
+                MLPredictedDirection   = mlScore.PredictedDirection?.ToString(),
+                MLPredictedMagnitude   = mlScore.PredictedMagnitudePips,
+                MLConfidenceScore      = mlScore.ConfidenceScore,
+                MLModelId              = mlScore.MLModelId,
+                MLRawProbability       = mlScore.RawProbability,
+                MLCalibratedProbability = mlScore.CalibratedProbability,
+                MLServedCalibratedProbability = mlScore.ServedCalibratedProbability,
+                MLDecisionThresholdUsed = mlScore.DecisionThresholdUsed,
+                MLEnsembleDisagreement = mlScore.EnsembleDisagreement,
+                Timeframe              = pending.Timeframe,
+                ExpiresAt              = pending.ExpiresAt
+            }, ct);
+
+            if (result.status && result.data > 0)
+            {
+                await eventService.SaveAndPublish(writeContext, new TradeSignalCreatedIntegrationEvent
+                {
+                    TradeSignalId = result.data,
+                    StrategyId    = pending.StrategyId,
+                    Symbol        = pending.Symbol,
+                    Direction     = pending.Direction.ToString(),
+                    EntryPrice    = pending.EntryPrice
+                });
+
+                // Signal survived conflict resolution and was persisted — fully reset circuit breaker
+                _circuitOpenedAt.TryRemove(pending.StrategyId, out _);
+
+                // Record cooldown timestamp (TryAdd avoids overwriting a timestamp
+                // set by a parallel winner for the same strategy on a different timeframe)
+                var now = DateTime.UtcNow;
+                _lastSignalTime.AddOrUpdate(pending.StrategyId, now, (_, existing) => existing > now ? existing : now);
+
+                _metrics.SignalsGenerated.Add(1, new("symbol", pending.Symbol), new("strategy_type", pending.StrategyType.ToString()));
+
+                await mediator.Send(new LogDecisionCommand
+                {
+                    EntityType   = "TradeSignal",
+                    EntityId     = result.data,
+                    DecisionType = "SignalGenerated",
+                    Outcome      = "Created",
+                    Reason       = $"Strategy {pending.StrategyId} generated {pending.Direction} signal on {pending.Symbol} at {pending.EntryPrice}, " +
+                                   $"SL={pending.StopLoss:F5}, TP={pending.TakeProfit:F5}, Confidence={pending.Confidence:P2}" +
+                                   (suppressedCount > 0 ? $" (won conflict resolution over {suppressedCount} candidates)" : ""),
+                    Source       = "StrategyWorker"
+                }, ct);
             }
         });
     }

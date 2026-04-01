@@ -28,4 +28,13 @@ public interface ITcpBridgeSessionRegistry
 
     /// <summary>Total number of registered sessions across all accounts.</summary>
     int TotalSessionCount { get; }
+
+    /// <summary>Associates a session with an EA instance ID for command routing.</summary>
+    void RegisterInstanceMapping(string sessionId, string instanceId);
+
+    /// <summary>Pushes a message to all sessions for a specific EA instance.</summary>
+    Task PushToInstanceAsync(string instanceId, string messageJson, CancellationToken ct = default);
+
+    /// <summary>Gets all unique instance IDs with active sessions.</summary>
+    IReadOnlyList<string> GetConnectedInstanceIds();
 }

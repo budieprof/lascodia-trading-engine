@@ -24,16 +24,26 @@ public class RiskChecker : IRiskChecker
     private readonly CorrelationGroupOptions _correlationGroups;
     private readonly TimeProvider _timeProvider;
     private readonly ILogger<RiskChecker> _logger;
+    private readonly IPortfolioRiskCalculator? _portfolioRisk;
+    private readonly IGapRiskModel? _gapRiskModel;
 
-    public RiskChecker(RiskCheckerOptions options, CorrelationGroupOptions correlationGroups, TimeProvider timeProvider, ILogger<RiskChecker> logger)
+    public RiskChecker(
+        RiskCheckerOptions options,
+        CorrelationGroupOptions correlationGroups,
+        TimeProvider timeProvider,
+        ILogger<RiskChecker> logger,
+        IPortfolioRiskCalculator? portfolioRisk = null,
+        IGapRiskModel? gapRiskModel = null)
     {
         _options = options;
         _correlationGroups = correlationGroups;
         _timeProvider = timeProvider;
         _logger = logger;
+        _portfolioRisk = portfolioRisk;
+        _gapRiskModel = gapRiskModel;
     }
 
-    public Task<RiskCheckResult> CheckAsync(
+    public async Task<RiskCheckResult> CheckAsync(
         TradeSignal signal,
         RiskCheckContext context,
         CancellationToken cancellationToken)
@@ -249,8 +259,15 @@ public class RiskChecker : IRiskChecker
             decimal riskPips = Math.Abs(signal.EntryPrice - signal.StopLoss.Value);
             decimal riskAmount = signal.SuggestedLotSize * contractSize * riskPips * quoteToAccountRate * slippageBuffer;
 
-            // Apply weekend/holiday gap risk multiplier if within the gap window
+            // Apply weekend/holiday gap risk multiplier if within the gap window.
+            // Use the dynamic gap risk model when available; take the higher of static vs dynamic
+            // to avoid accidentally downgrading protection when the dynamic model returns a lower value.
             decimal gapMultiplier = GetGapRiskMultiplier(profile.WeekendGapRiskMultiplier);
+            if (gapMultiplier > 1.0m && _gapRiskModel is not null)
+            {
+                var gapEstimate = await _gapRiskModel.GetGapMultiplierAsync(signal.Symbol, cancellationToken);
+                gapMultiplier = Math.Max(gapMultiplier, gapEstimate.GapMultiplier);
+            }
             if (gapMultiplier > 1.0m)
                 riskAmount *= gapMultiplier;
 
@@ -345,6 +362,14 @@ public class RiskChecker : IRiskChecker
                     $". Current: {effectiveEquity / account.MarginUsed * 100m:F0}%.");
         }
 
+        // ── 20. Portfolio VaR gate (optional — requires IPortfolioRiskCalculator) ──
+        if (_portfolioRisk is not null)
+        {
+            var marginalVaR = await _portfolioRisk.ComputeMarginalAsync(signal, context.Account, context.OpenPositions, cancellationToken);
+            if (marginalVaR.WouldBreachLimit)
+                return Fail($"Portfolio VaR95 would breach limit: post-trade VaR={marginalVaR.PostTradeVaR95:F2}, marginal={marginalVaR.MarginalVaR95:F2}");
+        }
+
         return Pass();
     }
 
@@ -357,13 +382,13 @@ public class RiskChecker : IRiskChecker
         CancellationToken cancellationToken)
     {
         if (currentBalance < 0)
-            return Fail($"Current balance ({currentBalance}) is negative; trading halted.");
+            return Task.FromResult(Fail($"Current balance ({currentBalance}) is negative; trading halted."));
 
         // ── Minimum equity floor ──────────────────────────────────────────────
         if (profile.MinEquityFloor > 0 && currentBalance < profile.MinEquityFloor)
-            return Fail(
+            return Task.FromResult(Fail(
                 $"Current balance ({currentBalance:F2}) is below the minimum equity floor of " +
-                $"{profile.MinEquityFloor:F2}. All trading is halted.");
+                $"{profile.MinEquityFloor:F2}. All trading is halted."));
 
         // ── Total drawdown (peak-to-trough) ─────────────────────────────────
         if (peakBalance > 0)
@@ -371,9 +396,9 @@ public class RiskChecker : IRiskChecker
             decimal totalDrawdownPct = (peakBalance - currentBalance) / peakBalance * 100m;
 
             if (totalDrawdownPct >= profile.MaxTotalDrawdownPct)
-                return Fail(
+                return Task.FromResult(Fail(
                     $"Total drawdown of {totalDrawdownPct:F2}% has reached or exceeded the profile limit of {profile.MaxTotalDrawdownPct}%. " +
-                    "Automated trading is paused until the account recovers.");
+                    "Automated trading is paused until the account recovers."));
         }
 
         // ── Daily drawdown (from today's starting balance) ──────────────────
@@ -382,9 +407,9 @@ public class RiskChecker : IRiskChecker
             decimal dailyDrawdownPct = (dailyStartBalance - currentBalance) / dailyStartBalance * 100m;
 
             if (dailyDrawdownPct >= profile.MaxDailyDrawdownPct)
-                return Fail(
+                return Task.FromResult(Fail(
                     $"Daily drawdown of {dailyDrawdownPct:F2}% has reached or exceeded the profile limit of {profile.MaxDailyDrawdownPct}%. " +
-                    "No further orders will be placed today.");
+                    "No further orders will be placed today."));
         }
 
         // ── Absolute daily loss cap (account-level) ─────────────────────────
@@ -392,13 +417,17 @@ public class RiskChecker : IRiskChecker
         {
             decimal dailyLoss = dailyStartBalance - currentBalance;
             if (dailyLoss >= maxAbsoluteDailyLoss)
-                return Fail(
+                return Task.FromResult(Fail(
                     $"Daily loss of {dailyLoss:F2} has reached or exceeded the absolute cap of " +
-                    $"{maxAbsoluteDailyLoss:F2}. No further orders will be placed today.");
+                    $"{maxAbsoluteDailyLoss:F2}. No further orders will be placed today."));
         }
 
-        return Pass();
+        return Task.FromResult(Pass());
     }
+
+    // NOTE: CheckDrawdownAsync is intentionally synchronous (no await) to avoid
+    // unnecessary async state machine overhead for pure-computation checks.
+    // It returns Task<> to match the IRiskChecker interface contract.
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -667,9 +696,9 @@ public class RiskChecker : IRiskChecker
         return false;
     }
 
-    private static Task<RiskCheckResult> Fail(string reason) =>
-        Task.FromResult(new RiskCheckResult(Passed: false, BlockReason: reason));
+    private static RiskCheckResult Fail(string reason) =>
+        new(Passed: false, BlockReason: reason);
 
-    private static Task<RiskCheckResult> Pass() =>
-        Task.FromResult(new RiskCheckResult(Passed: true, BlockReason: null));
+    private static RiskCheckResult Pass() =>
+        new(Passed: true, BlockReason: null);
 }

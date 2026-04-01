@@ -10,7 +10,8 @@ namespace LascodiaTradingEngine.Application.Bridge.DTOs;
 /// <summary>Auth handshake sent by the EA immediately after connecting.</summary>
 public record BridgeAuthMessage(
     string Type,        // "auth" | "reauth"
-    string Token);      // JWT Bearer token
+    string Token,       // JWT Bearer token
+    string? InstanceId = null);  // EA instance ID for command routing
 
 /// <summary>Execution report pushed by the EA after a fill.</summary>
 public record BridgeReportMessage(
@@ -84,3 +85,24 @@ public record BridgeAuthFailMessage(
 
 /// <summary>Heartbeat reply.</summary>
 public record BridgePongMessage(string Type);     // "pong"
+
+/// <summary>Engine → EA: pushed command for execution.</summary>
+public record BridgeCommandMessage(
+    string Type,                 // "command"
+    long Id,
+    int CommandType,             // ENUM_ENGINE_COMMAND (0=ModifySLTP, 1=ClosePosition, etc.)
+    long? Mt5Ticket,
+    string Symbol,
+    double? NewStopLoss,
+    double? NewTakeProfit,
+    double? CloseLots,
+    string? Parameters,          // JSON string for additional params
+    long CreatedAt);             // Unix seconds
+
+/// <summary>EA → Engine: acknowledgement of a pushed command.</summary>
+public record BridgeCommandAckMessage(
+    string Type,                 // "command_ack"
+    long CommandId,
+    bool Success,
+    string? Status,              // "Success", "Failed", "TimedOut", "Deferred"
+    string? Result);

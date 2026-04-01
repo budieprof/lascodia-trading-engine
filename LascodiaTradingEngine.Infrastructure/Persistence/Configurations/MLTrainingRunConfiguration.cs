@@ -29,6 +29,9 @@ public class MLTrainingRunConfiguration : IEntityTypeConfiguration<MLTrainingRun
         builder.HasIndex(x => new { x.Symbol, x.Timeframe, x.Status });
         builder.HasIndex(x => x.MLModelId);
 
+        // ── Improvement 3.4: Data lineage ──
+        builder.Property(x => x.DatasetHash).HasMaxLength(64);
+
         builder.HasOne(x => x.MLModel)
                .WithMany(x => x.TrainingRuns)
                .HasForeignKey(x => x.MLModelId)

@@ -328,8 +328,8 @@ These types are discovered and registered **automatically by reflection** — yo
 | `IBrokerOrderExecutor` | `OandaOrderExecutor` | Scoped |
 | `IRiskChecker` | `RiskChecker` | Scoped |
 | `IBacktestEngine` | `BacktestEngine` | Singleton |
-| `IAlertChannelSender` | `WebhookAlertSender`, `EmailAlertSender`, `TelegramAlertSender` | Scoped (all 3 registered; `IAlertDispatcher` resolves via `IEnumerable<IAlertChannelSender>`) |
-| `IAlertDispatcher` | `AlertDispatcher` | Scoped |
+| `IAlertChannelSender` | `WebhookAlertSender`, `EmailAlertSender`, `TelegramAlertSender` | Scoped (all 3 registered) |
+| `IAlertDispatcher` | `AlertDispatcher` | Singleton (holds dedup state; resolves scoped senders via `IServiceScopeFactory`) |
 | `IMLModelTrainer` | `BaggedLogisticTrainer` | Scoped |
 | `IMLSignalScorer` | `MLSignalScorer` | Scoped |
 | `IMultiTimeframeFilter` | `MultiTimeframeFilter` | Scoped |

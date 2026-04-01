@@ -54,7 +54,7 @@ builder.Host.ConfigureContainer<ContainerBuilder>(builder => { });
 
 builder.Services.BindConfigurationOptions(builder.Configuration);
 
-builder.Services.ConfigureApplicationServices();
+builder.Services.ConfigureApplicationServices(builder.Configuration);
 builder.Services.ConfigureDbContexts(builder.Configuration);
 builder.Services.AddSharedApplicationDependency(builder.Configuration);
 

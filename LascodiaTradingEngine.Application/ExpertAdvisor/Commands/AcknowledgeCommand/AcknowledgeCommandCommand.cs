@@ -11,6 +11,7 @@ namespace LascodiaTradingEngine.Application.ExpertAdvisor.Commands.AcknowledgeCo
 public class AcknowledgeCommandCommand : IRequest<ResponseData<string>>
 {
     public long Id { get; set; }
+    public string? Status { get; set; }
     public string? Result { get; set; }
 }
 
@@ -22,6 +23,9 @@ public class AcknowledgeCommandCommandValidator : AbstractValidator<AcknowledgeC
     {
         RuleFor(x => x.Id)
             .GreaterThan(0).WithMessage("Command Id must be greater than zero");
+
+        RuleFor(x => x.Status)
+            .NotEmpty().WithMessage("Status is required (e.g. Success, Failed, TimedOut, Deferred)");
     }
 }
 
@@ -50,11 +54,13 @@ public class AcknowledgeCommandCommandHandler : IRequestHandler<AcknowledgeComma
         if (entity.Acknowledged)
             return ResponseData<string>.Init(null, false, "Command already acknowledged", "-409");
 
-        entity.Acknowledged   = true;
-        entity.AcknowledgedAt = DateTime.UtcNow;
-        entity.AckResult      = request.Result;
+        bool wasRequeued = entity.ProcessAck(request.Status, request.Result);
 
         await _context.SaveChangesAsync(cancellationToken);
+
+        if (wasRequeued)
+            return ResponseData<string>.Init(null, true,
+                $"Command re-queued for retry ({entity.RetryCount}/{Domain.Entities.EACommand.MaxRetries})", "00");
 
         return ResponseData<string>.Init(null, true, "Successful", "00");
     }

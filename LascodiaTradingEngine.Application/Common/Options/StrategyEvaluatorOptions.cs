@@ -1472,6 +1472,14 @@ public class StrategyEvaluatorOptions : ConfigurationOption<StrategyEvaluatorOpt
     public List<MarketRegimeEnum> BlockedRegimes { get; set; } = [MarketRegimeEnum.Crisis];
 
     /// <summary>
+    /// Minimum cross-timeframe regime coherence score (0.0–1.0) required before
+    /// signal generation is allowed for a symbol. When regimes across H1/H4/D1
+    /// disagree, the coherence score is low and all signals are suppressed.
+    /// Defaults to 0.50. Set to 0 to disable the coherence filter.
+    /// </summary>
+    public decimal MinRegimeCoherence { get; set; } = 0.50m;
+
+    /// <summary>
     /// Maximum number of strategies to evaluate concurrently per price tick.
     /// Higher values improve throughput when many strategies share the same symbol,
     /// at the cost of increased DB connection usage. Defaults to 4. Set to 1 to disable parallelism.

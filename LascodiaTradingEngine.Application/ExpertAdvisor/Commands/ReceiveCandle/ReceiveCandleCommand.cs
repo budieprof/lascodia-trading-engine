@@ -1,6 +1,7 @@
 using FluentValidation;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Enums;
@@ -55,10 +56,17 @@ public class ReceiveCandleCommandValidator : AbstractValidator<ReceiveCandleComm
 public class ReceiveCandleCommandHandler : IRequestHandler<ReceiveCandleCommand, ResponseData<long>>
 {
     private readonly IWriteApplicationDbContext _context;
+    private readonly IMarketDataAnomalyDetector _anomalyDetector;
+    private readonly ILogger<ReceiveCandleCommandHandler> _logger;
 
-    public ReceiveCandleCommandHandler(IWriteApplicationDbContext context)
+    public ReceiveCandleCommandHandler(
+        IWriteApplicationDbContext context,
+        IMarketDataAnomalyDetector anomalyDetector,
+        ILogger<ReceiveCandleCommandHandler> logger)
     {
         _context = context;
+        _anomalyDetector = anomalyDetector;
+        _logger = logger;
     }
 
     public async Task<ResponseData<long>> Handle(ReceiveCandleCommand request, CancellationToken cancellationToken)
@@ -66,6 +74,34 @@ public class ReceiveCandleCommandHandler : IRequestHandler<ReceiveCandleCommand,
         var dbContext  = _context.GetDbContext();
         var symbol    = request.Symbol.ToUpperInvariant();
         var timeframe = Enum.Parse<Timeframe>(request.Timeframe, ignoreCase: true);
+
+        // ── Candle quality validation (Improvement 4.3) ──────────────────────
+        var qualityResult = _anomalyDetector.ValidateCandle(
+            request.Open, request.High, request.Low, request.Close,
+            (long)request.Volume, request.Timestamp, null);
+
+        if (!qualityResult.IsValid)
+        {
+            _logger.LogWarning(
+                "Candle quality check failed for {Symbol} at {Timestamp}: {Reason}",
+                request.Symbol, request.Timestamp, qualityResult.Description);
+
+            // Persist a quarantine record so the rejected candle can be reviewed later
+            await dbContext.Set<Domain.Entities.MarketDataAnomaly>().AddAsync(new Domain.Entities.MarketDataAnomaly
+            {
+                AnomalyType = Domain.Enums.MarketDataAnomalyType.InvalidOhlc,
+                Symbol = symbol,
+                InstanceId = request.InstanceId,
+                AnomalousValue = request.Close,
+                ExpectedValue = null,
+                Description = $"Candle rejected: {qualityResult.Description} (O={request.Open}, H={request.High}, L={request.Low}, C={request.Close}, V={request.Volume})",
+                WasQuarantined = true,
+                DetectedAt = DateTime.UtcNow,
+            }, cancellationToken);
+            await _context.SaveChangesAsync(cancellationToken);
+
+            return ResponseData<long>.Init(0, false, $"Candle quality check failed: {qualityResult.Description}", "-11");
+        }
 
         // Normalize timestamp to the timeframe boundary to prevent near-duplicate
         // candles caused by sub-second EA timestamp drift.

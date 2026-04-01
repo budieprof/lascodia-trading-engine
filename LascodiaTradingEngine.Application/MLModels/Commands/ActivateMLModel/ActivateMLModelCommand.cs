@@ -1,6 +1,7 @@
 using FluentValidation;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
+using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Enums;
@@ -29,10 +30,17 @@ public class ActivateMLModelCommandValidator : AbstractValidator<ActivateMLModel
 public class ActivateMLModelCommandHandler : IRequestHandler<ActivateMLModelCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;
+    private readonly IApprovalWorkflow _approvalWorkflow;
+    private readonly ICurrentUserService _currentUser;
 
-    public ActivateMLModelCommandHandler(IWriteApplicationDbContext context)
+    public ActivateMLModelCommandHandler(
+        IWriteApplicationDbContext context,
+        IApprovalWorkflow approvalWorkflow,
+        ICurrentUserService currentUser)
     {
         _context = context;
+        _approvalWorkflow = approvalWorkflow;
+        _currentUser = currentUser;
     }
 
     public async Task<ResponseData<string>> Handle(ActivateMLModelCommand request, CancellationToken cancellationToken)
@@ -44,6 +52,24 @@ public class ActivateMLModelCommandHandler : IRequestHandler<ActivateMLModelComm
 
         if (model is null)
             return ResponseData<string>.Init(null, false, "ML model not found", "-14");
+
+        // ── Four-eyes approval gate ──
+        long currentAccountId = long.TryParse(_currentUser.UserId, out var parsedUid) ? parsedUid : 0;
+        if (!await _approvalWorkflow.IsApprovedAsync(ApprovalOperationType.ModelPromotion, request.Id, cancellationToken))
+        {
+            await _approvalWorkflow.RequestApprovalAsync(
+                ApprovalOperationType.ModelPromotion,
+                request.Id,
+                "MLModel",
+                $"Activate ML model '{model.ModelVersion}' for {model.Symbol}/{model.Timeframe}",
+                System.Text.Json.JsonSerializer.Serialize(new { request.Id }),
+                currentAccountId,
+                cancellationToken);
+            return ResponseData<string>.Init(null, false, "Pending four-eyes approval", "-202");
+        }
+
+        if (!await _approvalWorkflow.ConsumeApprovalAsync(ApprovalOperationType.ModelPromotion, request.Id, cancellationToken))
+            return ResponseData<string>.Init(null, false, "Approval was already consumed by a concurrent request", "-409");
 
         // Deactivate previously active models for the same Symbol + Timeframe
         var previousModels = await db.Set<Domain.Entities.MLModel>()

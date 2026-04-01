@@ -66,5 +66,19 @@ public class MLModelConfiguration : IEntityTypeConfiguration<MLModel>
                .WithMany()
                .HasForeignKey(x => x.DistilledFromModelId)
                .OnDelete(DeleteBehavior.SetNull);
+
+        // ── Improvements 3.2, 10.3: Rollback chain & robustness ──
+        builder.Property(x => x.FragilityScore).HasPrecision(18, 8);
+        builder.Property(x => x.DatasetHash).HasMaxLength(64); // SHA-256 hex
+
+        builder.HasOne<MLModel>()
+               .WithMany()
+               .HasForeignKey(x => x.PreviousChampionModelId)
+               .OnDelete(DeleteBehavior.SetNull);
+
+        builder.HasMany(x => x.LifecycleLogs)
+               .WithOne(x => x.MLModel)
+               .HasForeignKey(x => x.MLModelId)
+               .OnDelete(DeleteBehavior.Cascade);
     }
 }

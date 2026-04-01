@@ -321,4 +321,33 @@ public class MLModel : Entity<long>
     /// (K=5 expanding-window models averaged with uniform 1/K weights).
     /// </summary>
     public bool    IsCvbEnsemble          { get; set; }
+
+    // ── Rollback chain & robustness (Improvements 3.2, 10.3) ─────────────────
+
+    /// <summary>
+    /// Explicit FK to the champion model this model replaced at promotion time.
+    /// Enables multi-hop rollback (depth=2 restores the predecessor's predecessor).
+    /// Null for the first model on a symbol/timeframe.
+    /// </summary>
+    public long? PreviousChampionModelId { get; set; }
+
+    /// <summary>
+    /// Adversarial fragility score: average L2 norm of minimum perturbation required
+    /// to flip the model's directional prediction. Lower = more fragile. Computed
+    /// during shadow evaluation adversarial robustness analysis.
+    /// Null until adversarial testing has been run.
+    /// </summary>
+    public decimal? FragilityScore { get; set; }
+
+    /// <summary>
+    /// SHA-256 hash of the exact training dataset (sorted feature matrix bytes) used
+    /// to train this model. Enables bit-exact reproducibility audits per MiFID II /
+    /// SEC Rule 15c3-5 requirements for algorithmic trading models.
+    /// </summary>
+    public string? DatasetHash { get; set; }
+
+    // ── Navigation: lifecycle log ────────────────────────────────────────────
+
+    /// <summary>Immutable lifecycle transition log (promotions, rollbacks, suppressions).</summary>
+    public virtual ICollection<MLModelLifecycleLog> LifecycleLogs { get; set; } = new List<MLModelLifecycleLog>();
 }

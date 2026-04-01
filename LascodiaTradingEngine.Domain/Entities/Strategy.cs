@@ -64,6 +64,25 @@ public class Strategy : Entity<long>
     /// <summary>UTC timestamp when this strategy was first created.</summary>
     public DateTime CreatedAt    { get; set; } = DateTime.UtcNow;
 
+    // ── Lifecycle governance (Improvement 12.3) ──────────────────────────────
+
+    /// <summary>
+    /// Graduated lifecycle stage: Draft → PaperTrading → BacktestQualified → ShadowLive → Approved → Active.
+    /// Each stage has a minimum duration enforced by the engine. New strategies start as Draft.
+    /// </summary>
+    public StrategyLifecycleStage LifecycleStage { get; set; } = StrategyLifecycleStage.Draft;
+
+    /// <summary>When the strategy entered its current lifecycle stage.</summary>
+    public DateTime? LifecycleStageEnteredAt { get; set; }
+
+    // ── Capacity estimation (Improvement 9.1) ────────────────────────────────
+
+    /// <summary>
+    /// Maximum lot size the strategy can absorb before expected alpha is eroded by market impact.
+    /// Computed by the StrategyCapacityWorker. Null until first capacity estimate.
+    /// </summary>
+    public decimal? EstimatedCapacityLots { get; set; }
+
     /// <summary>Soft-delete flag. Filtered out by the global EF Core query filter.</summary>
     public bool    IsDeleted     { get; set; }
 

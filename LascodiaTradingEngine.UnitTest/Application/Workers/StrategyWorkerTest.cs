@@ -15,6 +15,7 @@ using LascodiaTradingEngine.Application.Common.Events;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Options;
 using LascodiaTradingEngine.Application.TradeSignals.Commands.CreateTradeSignal;
+using LascodiaTradingEngine.Application.Services;
 using LascodiaTradingEngine.Application.Workers;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
@@ -144,7 +145,9 @@ public class StrategyWorkerTest : IDisposable
             new[] { _mockEvaluator.Object },
             _mockDistributedLock.Object,
             _options,
-            _metrics);
+            _metrics,
+            new SignalConflictResolver(new Mock<ILogger<SignalConflictResolver>>().Object),
+            new RegimeCoherenceChecker(_mockScopeFactory.Object, new Mock<ILogger<RegimeCoherenceChecker>>().Object));
     }
 
     public void Dispose() => _meterFactory.Dispose();
@@ -168,6 +171,14 @@ public class StrategyWorkerTest : IDisposable
         _mockDbContext.Setup(c => c.Set<Candle>()).Returns(candles.AsQueryable().BuildMockDbSet().Object);
         _mockDbContext.Setup(c => c.Set<StrategyPerformanceSnapshot>()).Returns(snapshots.AsQueryable().BuildMockDbSet().Object);
         _mockDbContext.Setup(c => c.Set<TradeSignal>()).Returns(new List<TradeSignal>().AsQueryable().BuildMockDbSet().Object);
+        // Disable the backtest gate so all strategies qualify by default in unit tests
+        var configs = new List<EngineConfig>
+        {
+            new() { Key = "Backtest:Gate:Enabled", Value = "false", DataType = ConfigDataType.Bool }
+        };
+        _mockDbContext.Setup(c => c.Set<EngineConfig>()).Returns(configs.AsQueryable().BuildMockDbSet().Object);
+        _mockDbContext.Setup(c => c.Set<MarketRegimeSnapshot>()).Returns(new List<MarketRegimeSnapshot>().AsQueryable().BuildMockDbSet().Object);
+        _mockDbContext.Setup(c => c.Set<BacktestRun>()).Returns(new List<BacktestRun>().AsQueryable().BuildMockDbSet().Object);
     }
 
     private PriceUpdatedIntegrationEvent CreatePriceEvent(string symbol = "EURUSD") => new()

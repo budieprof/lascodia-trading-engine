@@ -33,11 +33,20 @@ public class ActivateStrategyCommandHandler : IRequestHandler<ActivateStrategyCo
 {
     private readonly IWriteApplicationDbContext _context;
     private readonly IIntegrationEventService _eventBus;
+    private readonly IApprovalWorkflow _approvalWorkflow;
 
-    public ActivateStrategyCommandHandler(IWriteApplicationDbContext context, IIntegrationEventService eventBus)
+    private readonly ICurrentUserService _currentUser;
+
+    public ActivateStrategyCommandHandler(
+        IWriteApplicationDbContext context,
+        IIntegrationEventService eventBus,
+        IApprovalWorkflow approvalWorkflow,
+        ICurrentUserService currentUser)
     {
         _context  = context;
         _eventBus = eventBus;
+        _approvalWorkflow = approvalWorkflow;
+        _currentUser = currentUser;
     }
 
     public async Task<ResponseData<string>> Handle(ActivateStrategyCommand request, CancellationToken cancellationToken)
@@ -49,7 +58,39 @@ public class ActivateStrategyCommandHandler : IRequestHandler<ActivateStrategyCo
         if (entity == null)
             return ResponseData<string>.Init(null, false, "Strategy not found", "-14");
 
+        // ── Lifecycle stage enforcement ──
+        if (entity.LifecycleStage != StrategyLifecycleStage.Approved && entity.LifecycleStage != StrategyLifecycleStage.Active)
+        {
+            return ResponseData<string>.Init(null, false,
+                $"Strategy must reach Approved lifecycle stage before activation. Current stage: {entity.LifecycleStage}", "-11");
+        }
+
+        // ── Four-eyes approval gate ──
+        long currentAccountId = long.TryParse(_currentUser.UserId, out var parsedUid) ? parsedUid : 0;
+        if (!await _approvalWorkflow.IsApprovedAsync(ApprovalOperationType.StrategyActivation, request.Id, cancellationToken))
+        {
+            await _approvalWorkflow.RequestApprovalAsync(
+                ApprovalOperationType.StrategyActivation,
+                request.Id,
+                "Strategy",
+                $"Activate strategy '{entity.Name}' for {entity.Symbol}/{entity.Timeframe}",
+                System.Text.Json.JsonSerializer.Serialize(new { request.Id }),
+                currentAccountId,
+                cancellationToken);
+            return ResponseData<string>.Init(null, false, "Pending four-eyes approval", "-202");
+        }
+
+        if (!await _approvalWorkflow.ConsumeApprovalAsync(ApprovalOperationType.StrategyActivation, request.Id, cancellationToken))
+            return ResponseData<string>.Init(null, false, "Approval was already consumed by a concurrent request", "-409");
+
         entity.Status = StrategyStatus.Active;
+
+        // ── Update lifecycle stage on successful activation (skip if already Active to preserve timestamp) ──
+        if (entity.LifecycleStage != StrategyLifecycleStage.Active)
+        {
+            entity.LifecycleStage = StrategyLifecycleStage.Active;
+            entity.LifecycleStageEnteredAt = DateTime.UtcNow;
+        }
 
         // ── Auto-queue an initial BacktestRun so the strategy has a performance baseline ──
         var toDate   = DateTime.UtcNow;

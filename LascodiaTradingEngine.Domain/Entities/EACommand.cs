@@ -8,9 +8,12 @@ namespace LascodiaTradingEngine.Domain.Entities;
 /// The EA polls for pending commands, executes them on the broker, and acknowledges completion.
 /// </summary>
 /// <remarks>
-/// Commands flow engine -> EA (pull model). The EA calls GET /commands with its instance ID
-/// to retrieve unacknowledged commands, executes them via MQL5, and calls PUT /commands/{id}/ack
-/// to confirm execution. The engine never pushes commands directly.
+/// Commands flow engine -> EA via two delivery paths:
+/// 1. Push (primary): The <see cref="Workers.TcpBridgeWorker"/> pushes commands over the
+///    persistent TCP connection into the DLL's command ring buffer.
+/// 2. Pull (fallback): The EA polls GET /commands with its instance ID as an HTTP fallback.
+/// In both cases the EA calls PUT /commands/{id}/ack to confirm execution. Retryable
+/// statuses (TimedOut, Deferred) re-queue the command up to <see cref="MaxRetries"/> times.
 /// </remarks>
 public class EACommand : Entity<long>
 {
@@ -56,6 +59,70 @@ public class EACommand : Entity<long>
     /// Null until acknowledged.
     /// </summary>
     public string? AckResult { get; set; }
+
+    /// <summary>
+    /// Number of times this command has been re-queued after a retryable ACK
+    /// (TimedOut / Deferred).  Capped at <see cref="MaxRetries"/> to prevent
+    /// infinite re-delivery loops.
+    /// </summary>
+    public int RetryCount { get; set; }
+
+    /// <summary>Maximum retry attempts before the command is permanently acknowledged.</summary>
+    public const int MaxRetries = 3;
+
+    // ── Shared retry/ack logic ──────────────────────────────────────────────
+
+    /// <summary>
+    /// Determines whether a status string represents a retryable outcome.
+    /// Used by both the REST ACK endpoint and the TCP bridge ACK handler.
+    /// </summary>
+    public static bool IsRetryableStatus(string? status) =>
+        status is not null
+        && (status.Contains("TimedOut", StringComparison.OrdinalIgnoreCase)
+         || status.Contains("Deferred", StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>
+    /// Attempts to re-queue this command for retry. Returns true if re-queued,
+    /// false if max retries are exhausted (caller should finalize).
+    /// </summary>
+    public bool TryRequeue(string? status, string? result)
+    {
+        if (RetryCount >= MaxRetries)
+            return false;
+
+        RetryCount++;
+        AckResult = $"{status}: {result}";
+        return true;
+    }
+
+    /// <summary>
+    /// Marks this command as permanently acknowledged (successful, failed, or max retries exhausted).
+    /// </summary>
+    public void FinalizeAck(bool isRetryable, bool success, string? result)
+    {
+        Acknowledged   = true;
+        AcknowledgedAt = DateTime.UtcNow;
+        AckResult      = isRetryable
+            ? $"Max retries exceeded ({RetryCount}/{MaxRetries}): {result}"
+            : (success ? (result ?? "OK") : (result ?? "FAILED"));
+    }
+
+    /// <summary>
+    /// Unified ACK processing used by both the REST endpoint and the TCP bridge handler.
+    /// Returns <c>true</c> if the command was re-queued for retry (caller should save but not finalize),
+    /// <c>false</c> if the command was finalized (caller should save).
+    /// </summary>
+    public bool ProcessAck(string? status, string? result)
+    {
+        bool isRetryable = IsRetryableStatus(status);
+
+        if (isRetryable && TryRequeue(status, result))
+            return true;
+
+        bool success = !isRetryable && string.Equals(status, "Success", StringComparison.OrdinalIgnoreCase);
+        FinalizeAck(isRetryable, success, result);
+        return false;
+    }
 
     /// <summary>UTC timestamp when this command was created/queued.</summary>
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;

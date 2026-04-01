@@ -14,7 +14,9 @@ using LascodiaTradingEngine.Application.Services.EconomicCalendar;
 using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Application.Services.MarketData;
 using LascodiaTradingEngine.Application.Bridge.Services;
-using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Behaviors;
+using LascodiaTradingEngine.Application.Common.Options;
+using MediatR;
 using Microsoft.Extensions.Logging;
 using Polly;
 using Polly.Extensions.Http;
@@ -23,11 +25,11 @@ namespace LascodiaTradingEngine.Application;
 
 public static class DependencyInjection
 {
-    public static IServiceCollection ConfigureApplicationServices(this IServiceCollection services)
+    public static IServiceCollection ConfigureApplicationServices(this IServiceCollection services, IConfiguration configuration)
     {
         services.ConfigureAppServices(Assembly.GetExecutingAssembly());
         services.AutoRegisterAttributedServices(Assembly.GetExecutingAssembly());
-        ConfigureInfrastructureServices(services);
+        ConfigureInfrastructureServices(services, configuration);
         return services;
     }
 
@@ -55,7 +57,7 @@ public static class DependencyInjection
         Lascodia.Trading.Engine.SharedApplication.DependencyInjection.AutoRegisterConfigurationOptions(services, configuration, Assembly.GetExecutingAssembly());
     }
 
-    public static IServiceCollection ConfigureInfrastructureServices(this IServiceCollection services)
+    public static IServiceCollection ConfigureInfrastructureServices(this IServiceCollection services, IConfiguration configuration)
     {
         // ── Strategy Worker ──────────────────────────────────────────────────────
         // Registered as singleton so the same instance is used both as the hosted
@@ -166,6 +168,14 @@ public static class DependencyInjection
                     sp.GetRequiredService<InvestingComCalendarFeed>()
                 },
                 sp.GetRequiredService<ILogger<CompositeCalendarFeed>>()));
+
+        // ── Chaos Testing pipeline behavior (open generic — cannot use [RegisterService]) ──
+        // Only register when explicitly enabled to avoid per-request overhead in production.
+        // Read directly from IConfiguration to avoid the BuildServiceProvider() anti-pattern
+        // (which creates a throwaway DI container and misses later registrations).
+        var chaosSection = configuration.GetSection(nameof(ChaosTestingOptions));
+        if (chaosSection.GetValue<bool>(nameof(ChaosTestingOptions.Enabled)))
+            services.AddTransient(typeof(IPipelineBehavior<,>), typeof(ChaosTestingBehavior<,>));
 
         return services;
     }

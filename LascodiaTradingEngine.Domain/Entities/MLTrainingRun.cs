@@ -350,6 +350,24 @@ public class MLTrainingRun : Entity<long>
     /// </summary>
     public int      Priority             { get; set; } = 5;
 
+    // ── Data lineage & reproducibility (Improvement 3.4) ────────────────────
+
+    /// <summary>
+    /// SHA-256 hash of the sorted training feature matrix bytes. Enables exact dataset
+    /// identification for reproducibility audits. Matches the value stored in
+    /// <see cref="MLModel.DatasetHash"/> for the produced model.
+    /// </summary>
+    public string? DatasetHash { get; set; }
+
+    /// <summary>
+    /// Inclusive start candle ID used to build the training set. Together with
+    /// <see cref="CandleIdRangeEnd"/>, defines the exact candle range for reproduction.
+    /// </summary>
+    public long? CandleIdRangeStart { get; set; }
+
+    /// <summary>Inclusive end candle ID used to build the training set.</summary>
+    public long? CandleIdRangeEnd { get; set; }
+
     /// <summary>Soft-delete flag. Filtered out by the global EF Core query filter.</summary>
     public bool     IsDeleted          { get; set; }
 

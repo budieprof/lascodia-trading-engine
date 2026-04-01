@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.IdentityModel.Tokens.Jwt;
 using System.Net;
 using System.Net.Sockets;
@@ -43,6 +44,15 @@ public class TcpBridgeWorker : BackgroundService
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<TcpBridgeWorker> _logger;
 
+    /// <summary>
+    /// Tracks command IDs already pushed in the current push-loop lifetime to
+    /// avoid duplicate delivery.  Shared with <see cref="ProcessCommandAckAsync"/>
+    /// so retryable ACKs can evict the ID and allow immediate re-push.
+    /// </summary>
+    private readonly ConcurrentDictionary<long, byte> _pushedCommandIds = new();
+    private const int MaxPushedCommandIdsCacheSize = 5000;
+    private int _pushEvictionCycleCount;
+
     public TcpBridgeWorker(
         IOptions<BridgeOptions> options,
         ITcpBridgeSessionRegistry registry,
@@ -66,9 +76,10 @@ public class TcpBridgeWorker : BackgroundService
         _logger.LogInformation("TcpBridgeWorker starting on {BindAddress}:{Port}",
             _options.BindAddress, _options.Port);
 
-        // Run signal poller and TCP listener concurrently
+        // Run signal poller, command push loop, and TCP listener concurrently
         await Task.WhenAll(
             SharedSignalPollerAsync(stoppingToken),
+            PushCommandsLoopAsync(stoppingToken),
             TcpListenerLoopAsync(stoppingToken));
     }
 
@@ -175,11 +186,26 @@ public class TcpBridgeWorker : BackgroundService
                 _registry.RegisterSession(sessionId, accountId,
                     json => WriteLineAsync(stream, json, ct));
 
+                // ── Map session to EA instance for command routing ──────────
+                var instanceId = authMsg.InstanceId;
+                if (!string.IsNullOrWhiteSpace(instanceId))
+                {
+                    _registry.RegisterInstanceMapping(sessionId, instanceId);
+                }
+                else
+                {
+                    // Fallback: look up active instance for this account
+                    instanceId = await ResolveInstanceIdAsync(accountId, ct);
+                    if (instanceId is not null)
+                        _registry.RegisterInstanceMapping(sessionId, instanceId);
+                }
+
                 await WriteLineAsync(stream,
                     JsonSerializer.Serialize(new BridgeAuthOkMessage("auth_ok"), JsonOpts), ct);
 
-                _logger.LogInformation("Bridge: session {SessionId} opened for account {AccountId} from {Remote}",
-                    sessionId, accountId, remote);
+                _logger.LogInformation(
+                    "Bridge: session {SessionId} opened for account {AccountId}, instance {InstanceId} from {Remote}",
+                    sessionId, accountId, instanceId ?? "(none)", remote);
 
                 // ── Report receive loop ─────────────────────────────────────
                 await ReportReceiveLoopAsync(stream, sessionId, accountId, ct);
@@ -227,6 +253,12 @@ public class TcpBridgeWorker : BackgroundService
             if (msgType == "report")
             {
                 await ProcessReportAsync(line, accountId, ct);
+            }
+            else if (msgType == "command_ack")
+            {
+                var ackMsg = JsonSerializer.Deserialize<BridgeCommandAckMessage>(line, JsonOpts);
+                if (ackMsg is not null)
+                    await ProcessCommandAckAsync(ackMsg, ct);
             }
             else if (msgType == "reauth")
             {
@@ -381,6 +413,200 @@ public class TcpBridgeWorker : BackgroundService
         }
 
         _logger.LogInformation("TcpBridgeWorker: shared signal poller stopped");
+    }
+
+    // ── Command push loop ──────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Polls the DB for un-acknowledged commands targeting connected EA instances
+    /// and pushes them over the bridge. Follows the same pattern as
+    /// <see cref="SharedSignalPollerAsync"/>.
+    /// </summary>
+    private async Task PushCommandsLoopAsync(CancellationToken ct)
+    {
+        _logger.LogInformation("TcpBridgeWorker: command push loop starting");
+
+        // Wait briefly for initial connections to register
+        await Task.Delay(TimeSpan.FromSeconds(3), ct);
+
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                var connectedInstances = _registry.GetConnectedInstanceIds();
+                if (connectedInstances.Count == 0)
+                {
+                    await Task.Delay(1000, ct);
+                    continue;
+                }
+
+                using var scope = _scopeFactory.CreateScope();
+                // Use write context to avoid read-replica lag causing duplicate pushes
+                // after a command has just been acknowledged via ProcessCommandAckAsync.
+                var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+
+                var commands = await writeCtx.GetDbContext()
+                    .Set<Domain.Entities.EACommand>()
+                    .Where(c => !c.Acknowledged && !c.IsDeleted
+                             && c.RetryCount <= Domain.Entities.EACommand.MaxRetries
+                             && connectedInstances.Contains(c.TargetInstanceId))
+                    .OrderBy(c => c.CreatedAt)
+                    .Take(50)
+                    .ToListAsync(ct);
+
+                foreach (var cmd in commands)
+                {
+                    if (!_pushedCommandIds.TryAdd(cmd.Id, 0)) continue; // Already pushed this cycle
+
+                    // Parse optional SL/TP/lots from Parameters JSON
+                    double? newSl = null, newTp = null, closeLots = null;
+                    if (!string.IsNullOrEmpty(cmd.Parameters))
+                    {
+                        try
+                        {
+                            using var paramsDoc = JsonDocument.Parse(cmd.Parameters);
+                            var root = paramsDoc.RootElement;
+                            if (root.TryGetProperty("stopLoss", out var slProp) && slProp.TryGetDouble(out var sl))
+                                newSl = sl;
+                            if (root.TryGetProperty("takeProfit", out var tpProp) && tpProp.TryGetDouble(out var tp))
+                                newTp = tp;
+                            if (root.TryGetProperty("closeLots", out var lotsProp) && lotsProp.TryGetDouble(out var lots))
+                                closeLots = lots;
+                        }
+                        catch { /* Parameters is opaque JSON — fields are optional */ }
+                    }
+
+                    var msg = new BridgeCommandMessage(
+                        Type:          "command",
+                        Id:            cmd.Id,
+                        CommandType:   (int)cmd.CommandType,
+                        Mt5Ticket:     cmd.TargetTicket,
+                        Symbol:        cmd.Symbol,
+                        NewStopLoss:   newSl,
+                        NewTakeProfit: newTp,
+                        CloseLots:     closeLots,
+                        Parameters:    cmd.Parameters,
+                        CreatedAt:     new DateTimeOffset(cmd.CreatedAt, TimeSpan.Zero).ToUnixTimeSeconds());
+
+                    var json = JsonSerializer.Serialize(msg, JsonOpts);
+                    await _registry.PushToInstanceAsync(cmd.TargetInstanceId, json, ct);
+                }
+
+                // Evict acknowledged IDs periodically: every 100 cycles or when the hard cap
+                // is reached to prevent unbounded memory growth.
+                _pushEvictionCycleCount++;
+                if (_pushedCommandIds.Count > MaxPushedCommandIdsCacheSize
+                    || (_pushEvictionCycleCount % 100 == 0 && _pushedCommandIds.Count > 0))
+                {
+                    var pushedSnapshot = _pushedCommandIds.Keys.ToList();
+                    var stillPendingIds = new HashSet<long>();
+
+                    // Chunk the IN(...) query to avoid oversized SQL parameters lists
+                    foreach (var chunk in pushedSnapshot.Chunk(500))
+                    {
+                        var chunkIds = await writeCtx.GetDbContext()
+                            .Set<Domain.Entities.EACommand>()
+                            .Where(c => !c.Acknowledged && !c.IsDeleted && chunk.Contains(c.Id))
+                            .Select(c => c.Id)
+                            .ToListAsync(ct);
+                        stillPendingIds.UnionWith(chunkIds);
+                    }
+
+                    foreach (var key in pushedSnapshot)
+                    {
+                        if (!stillPendingIds.Contains(key))
+                            _pushedCommandIds.TryRemove(key, out _);
+                    }
+                }
+
+                // Backoff when idle to reduce DB polling; poll faster when commands are flowing
+                await Task.Delay(commands.Count > 0 ? 1000 : 5000, ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "TcpBridgeWorker: command push error");
+                await Task.Delay(5000, ct); // backoff on error
+            }
+        }
+
+        _logger.LogInformation("TcpBridgeWorker: command push loop stopped");
+    }
+
+    // ── Command ack processing ───────────────────────────────────────────────
+
+    private async Task ProcessCommandAckAsync(BridgeCommandAckMessage ack, CancellationToken ct)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+
+        var command = await writeCtx.GetDbContext()
+            .Set<Domain.Entities.EACommand>()
+            .FirstOrDefaultAsync(c => c.Id == ack.CommandId && !c.IsDeleted, ct);
+
+        if (command is null)
+        {
+            _logger.LogWarning("TcpBridge: command_ack for unknown command {CommandId}", ack.CommandId);
+            return;
+        }
+
+        if (command.Acknowledged)
+        {
+            _logger.LogDebug("TcpBridge: command {Id} already acknowledged, ignoring duplicate ack", ack.CommandId);
+            return;
+        }
+
+        bool wasRequeued = command.ProcessAck(ack.Status, ack.Result);
+
+        await writeCtx.SaveChangesAsync(ct);
+
+        // Evict from pushed set so the push loop re-delivers immediately on retry,
+        // or stays clean on final ACK.
+        _pushedCommandIds.TryRemove(ack.CommandId, out _);
+
+        if (wasRequeued)
+        {
+            _logger.LogInformation(
+                "TcpBridge: command {Id} re-queued for retry ({Attempt}/{Max}) — {Result}",
+                ack.CommandId, command.RetryCount, Domain.Entities.EACommand.MaxRetries, ack.Result);
+        }
+        else
+        {
+            _logger.LogDebug("TcpBridge: command {Id} acknowledged (success={Success})",
+                ack.CommandId, ack.Success);
+        }
+    }
+
+    // ── Instance ID resolution ───────────────────────────────────────────────
+
+    /// <summary>
+    /// Looks up the active EA instance for a trading account when the auth message
+    /// does not include an explicit instanceId.
+    /// </summary>
+    private async Task<string?> ResolveInstanceIdAsync(long accountId, CancellationToken ct)
+    {
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var readCtx = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+
+            return await readCtx.GetDbContext()
+                .Set<Domain.Entities.EAInstance>()
+                .Where(e => e.TradingAccountId == accountId
+                         && e.Status == Domain.Enums.EAInstanceStatus.Active
+                         && !e.IsDeleted)
+                .OrderByDescending(e => e.LastHeartbeat)
+                .Select(e => e.InstanceId)
+                .FirstOrDefaultAsync(ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "TcpBridge: failed to resolve instance for account {AccountId}", accountId);
+            return null;
+        }
     }
 
     // ── JWT validation ────────────────────────────────────────────────────────

@@ -30,6 +30,12 @@ public class StrategyConfiguration : IEntityTypeConfiguration<Strategy>
             .HasConversion<string>()
             .HasMaxLength(50);
 
+        builder.Property(x => x.LifecycleStage)
+            .HasConversion<string>()
+            .HasMaxLength(20);
+
+        builder.Property(x => x.EstimatedCapacityLots).HasPrecision(18, 2);
+
         builder.HasQueryFilter(x => !x.IsDeleted);
 
         builder.HasIndex(x => x.Symbol);

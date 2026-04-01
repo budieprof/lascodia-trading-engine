@@ -17,6 +17,9 @@ public class OrderConfiguration : IEntityTypeConfiguration<Order>
         builder.Property(x => x.ExecutionType).HasConversion<string>().IsRequired().HasMaxLength(15);
         builder.Property(x => x.Status).HasConversion<string>().IsRequired().HasMaxLength(20);
         builder.Property(x => x.TrailingStopType).HasConversion<string>().HasMaxLength(20);
+        builder.Property(x => x.ExecutionAlgorithm).HasConversion<string>().HasMaxLength(20);
+        builder.Property(x => x.TimeInForce).HasConversion<string>().HasMaxLength(20);
+        builder.Property(x => x.MaxSlippagePips).HasPrecision(18, 5);
         builder.Property(x => x.Quantity).HasPrecision(18, 5);
         builder.Property(x => x.Price).HasPrecision(18, 8);
         builder.Property(x => x.StopLoss).HasPrecision(18, 8);
