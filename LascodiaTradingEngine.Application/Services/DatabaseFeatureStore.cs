@@ -3,7 +3,6 @@ using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.DependencyInjection;
 using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
@@ -18,7 +17,7 @@ namespace LascodiaTradingEngine.Application.Services;
 /// Registered as Singleton — uses IServiceScopeFactory to avoid captive DbContext.
 /// </summary>
 [RegisterService(ServiceLifetime.Singleton, typeof(IFeatureStore))]
-public class DatabaseFeatureStore : Common.Interfaces.IFeatureStore
+public class DatabaseFeatureStore : IFeatureStore
 {
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<DatabaseFeatureStore> _logger;
