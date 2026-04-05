@@ -48,6 +48,11 @@ public class RejectOptimizationCommandHandler : IRequestHandler<RejectOptimizati
             return ResponseData<string>.Init(null, false, "Optimization run not found", "-14");
 
         run.Status = OptimizationRunStatus.Rejected;
+        run.CompletedAt ??= DateTime.UtcNow;
+        run.ErrorMessage = null;
+        run.FailureCategory = null;
+        run.ExecutionLeaseExpiresAt = null;
+        run.ExecutionLeaseToken = null;
 
         await _context.SaveChangesAsync(cancellationToken);
 

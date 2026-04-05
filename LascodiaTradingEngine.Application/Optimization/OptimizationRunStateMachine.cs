@@ -47,6 +47,7 @@ internal static class OptimizationRunStateMachine
                 run.ErrorMessage = null;
                 run.FailureCategory = null;
                 run.ExecutionLeaseExpiresAt = null;
+                run.ExecutionLeaseToken = null;
                 break;
 
             case OptimizationRunStatus.Completed:
@@ -54,12 +55,14 @@ internal static class OptimizationRunStateMachine
                 run.ErrorMessage = null;
                 run.FailureCategory = null;
                 run.ExecutionLeaseExpiresAt = null;
+                run.ExecutionLeaseToken = null;
                 break;
 
             case OptimizationRunStatus.Failed:
                 run.CompletedAt = utcNow;
                 run.ErrorMessage = errorMessage;
                 run.ExecutionLeaseExpiresAt = null;
+                run.ExecutionLeaseToken = null;
                 break;
 
             case OptimizationRunStatus.Approved:
@@ -69,6 +72,7 @@ internal static class OptimizationRunStateMachine
                 run.ErrorMessage = null;
                 run.FailureCategory = null;
                 run.ExecutionLeaseExpiresAt = null;
+                run.ExecutionLeaseToken = null;
                 break;
 
             case OptimizationRunStatus.Rejected:
@@ -77,6 +81,7 @@ internal static class OptimizationRunStateMachine
                 run.ErrorMessage = null;
                 run.FailureCategory = null;
                 run.ExecutionLeaseExpiresAt = null;
+                run.ExecutionLeaseToken = null;
                 break;
 
             case OptimizationRunStatus.Abandoned:
@@ -84,6 +89,7 @@ internal static class OptimizationRunStateMachine
                     run.CompletedAt = utcNow;
                 run.ErrorMessage = errorMessage ?? "Retry budget exhausted — moved to dead-letter queue";
                 run.ExecutionLeaseExpiresAt = null;
+                run.ExecutionLeaseToken = null;
                 break;
         }
     }

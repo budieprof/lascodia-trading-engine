@@ -107,7 +107,9 @@ public partial class OptimizationWorker
         var extendedCooldownThreshold = DateTime.UtcNow.AddDays(-config.CooldownDays * 2);
 
         var recentOptIds = await db.Set<OptimizationRun>()
-            .Where(r => (r.Status == OptimizationRunStatus.Completed || r.Status == OptimizationRunStatus.Approved)
+            .Where(r => (r.Status == OptimizationRunStatus.Completed
+                      || r.Status == OptimizationRunStatus.Approved
+                      || r.Status == OptimizationRunStatus.Rejected)
                         && !r.IsDeleted && r.CompletedAt >= cooldownThreshold)
             .Select(r => r.StrategyId)
             .Distinct()
@@ -115,7 +117,9 @@ public partial class OptimizationWorker
         var recentOptSet = new HashSet<long>(recentOptIds);
 
         var recentExtendedOptIds = await db.Set<OptimizationRun>()
-            .Where(r => (r.Status == OptimizationRunStatus.Completed || r.Status == OptimizationRunStatus.Approved)
+            .Where(r => (r.Status == OptimizationRunStatus.Completed
+                      || r.Status == OptimizationRunStatus.Approved
+                      || r.Status == OptimizationRunStatus.Rejected)
                         && !r.IsDeleted && r.CompletedAt >= extendedCooldownThreshold)
             .Select(r => r.StrategyId)
             .Distinct()
@@ -129,7 +133,9 @@ public partial class OptimizationWorker
         {
             var strategiesWithRecentRuns = await db.Set<OptimizationRun>()
                 .Where(r => !r.IsDeleted
-                          && (r.Status == OptimizationRunStatus.Completed || r.Status == OptimizationRunStatus.Approved)
+                          && (r.Status == OptimizationRunStatus.Completed
+                           || r.Status == OptimizationRunStatus.Approved
+                           || r.Status == OptimizationRunStatus.Rejected)
                           && r.CompletedAt >= extendedCooldownThreshold)
                 .GroupBy(r => r.StrategyId)
                 .Select(g => new
@@ -265,7 +271,9 @@ public partial class OptimizationWorker
             var strategyIds = candidates.Select(c => c.StrategyId).ToList();
             var approvalRates = await db.Set<OptimizationRun>()
                 .Where(r => strategyIds.Contains(r.StrategyId)
-                         && (r.Status == OptimizationRunStatus.Completed || r.Status == OptimizationRunStatus.Approved)
+                         && (r.Status == OptimizationRunStatus.Completed
+                          || r.Status == OptimizationRunStatus.Approved
+                          || r.Status == OptimizationRunStatus.Rejected)
                          && !r.IsDeleted)
                 .GroupBy(r => r.StrategyId)
                 .Select(g => new
@@ -348,7 +356,9 @@ public partial class OptimizationWorker
         // Count consecutive non-approved completed runs (most recent first)
         var recentStatuses = await db.Set<OptimizationRun>()
             .Where(r => r.StrategyId == strategyId && !r.IsDeleted
-                     && (r.Status == OptimizationRunStatus.Completed || r.Status == OptimizationRunStatus.Approved))
+                     && (r.Status == OptimizationRunStatus.Completed
+                      || r.Status == OptimizationRunStatus.Approved
+                      || r.Status == OptimizationRunStatus.Rejected))
             .OrderByDescending(r => r.CompletedAt)
             .Take(maxConsecutiveFailures + 1)
             .Select(r => r.Status)

@@ -1,4 +1,6 @@
+using System.Data;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Domain.Entities;
@@ -21,6 +23,7 @@ namespace LascodiaTradingEngine.Application.Optimization;
 internal static class OptimizationRunClaimer
 {
     private const string ClaimAdvisoryLockKey = "OptimizationRunClaimer:ClaimNextRun";
+    internal readonly record struct ClaimResult(long? RunId, Guid LeaseToken, bool WasDeferred);
 
     /// <summary>
     /// Atomically claims the next queued optimization run by setting its status to Running,
@@ -32,17 +35,18 @@ internal static class OptimizationRunClaimer
     /// <param name="leaseDuration">How long the execution lease lasts before expiry.</param>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>The ID of the claimed run, or null if no queued run is available.</returns>
-    internal static async Task<long?> ClaimNextRunAsync(
+    internal static async Task<ClaimResult> ClaimNextRunAsync(
         DbContext writeDb, int maxConcurrentRuns, TimeSpan leaseDuration, CancellationToken ct)
     {
         var nowUtc = DateTime.UtcNow;
         var leaseExpiry = nowUtc.Add(leaseDuration);
+        var leaseToken = Guid.NewGuid();
         var tableName = GetQuotedTableName(writeDb, typeof(OptimizationRun));
 
         // When MaxConcurrentRuns <= 0, skip the concurrency guard (unlimited).
         // Otherwise, the subquery only returns a row if the count of Running runs is below the limit.
         var concurrencyGuard = maxConcurrentRuns > 0
-            ? $@"AND (SELECT COUNT(*) FROM {tableName} WHERE ""Status"" = {{0}} AND ""IsDeleted"" = false) < {{4}}"
+            ? $@"AND (SELECT COUNT(*) FROM {tableName} WHERE ""Status"" = @runningStatus AND ""IsDeleted"" = false) < @maxConcurrentRuns"
             : "";
 
         var claimSql = $@"
@@ -50,9 +54,9 @@ internal static class OptimizationRunClaimer
                 SELECT pg_try_advisory_xact_lock(hashtext('{ClaimAdvisoryLockKey}')) AS acquired
             ),
             candidate AS (
-                SELECT ""Id"" FROM {tableName}
-                WHERE ""Status"" = {{3}} AND ""IsDeleted"" = false
-                  AND (""DeferredUntilUtc"" IS NULL OR ""DeferredUntilUtc"" <= {{1}})
+                SELECT ""Id"", (""DeferredUntilUtc"" IS NOT NULL) AS ""WasDeferred"" FROM {tableName}
+                WHERE ""Status"" = @queuedStatus AND ""IsDeleted"" = false
+                  AND (""DeferredUntilUtc"" IS NULL OR ""DeferredUntilUtc"" <= @nowUtc)
                   AND EXISTS (SELECT 1 FROM claim_guard WHERE acquired)
                   {concurrencyGuard}
                 ORDER BY ""StartedAt""
@@ -60,33 +64,42 @@ internal static class OptimizationRunClaimer
                 FOR UPDATE SKIP LOCKED
             )
             UPDATE {tableName}
-            SET ""Status"" = {{0}},
-                ""StartedAt"" = {{1}},
-                ""LastHeartbeatAt"" = {{1}},
-                ""ExecutionLeaseExpiresAt"" = {{2}},
+            SET ""Status"" = @runningStatus,
+                ""StartedAt"" = @nowUtc,
+                ""LastHeartbeatAt"" = @nowUtc,
+                ""ExecutionLeaseExpiresAt"" = @leaseExpiry,
+                ""ExecutionLeaseToken"" = @leaseToken,
                 ""DeferredUntilUtc"" = NULL
             WHERE ""Id"" = (SELECT ""Id"" FROM candidate)
-            RETURNING ""Id""";
+            RETURNING ""Id"", COALESCE((SELECT ""WasDeferred"" FROM candidate), false) AS ""WasDeferred""";
 
-        var claimParams = maxConcurrentRuns > 0
-            ? new object[]
-            {
-                OptimizationRunStatus.Running.ToString(),
-                nowUtc,
-                leaseExpiry,
-                OptimizationRunStatus.Queued.ToString(),
-                maxConcurrentRuns,
-            }
-            : new object[]
-            {
-                OptimizationRunStatus.Running.ToString(),
-                nowUtc,
-                leaseExpiry,
-                OptimizationRunStatus.Queued.ToString(),
-            };
+        var connection = writeDb.Database.GetDbConnection();
+        if (connection.State != ConnectionState.Open)
+            await connection.OpenAsync(ct);
 
-        return await writeDb.Database.SqlQueryRaw<long?>(claimSql, claimParams)
-            .FirstOrDefaultAsync(ct);
+        await using var command = connection.CreateCommand();
+        command.CommandText = claimSql;
+
+        if (writeDb.Database.CurrentTransaction is not null)
+            command.Transaction = writeDb.Database.CurrentTransaction.GetDbTransaction();
+
+        AddParameter(command, "@runningStatus", OptimizationRunStatus.Running.ToString());
+        AddParameter(command, "@queuedStatus", OptimizationRunStatus.Queued.ToString());
+        AddParameter(command, "@nowUtc", nowUtc);
+        AddParameter(command, "@leaseExpiry", leaseExpiry);
+        AddParameter(command, "@leaseToken", leaseToken);
+
+        if (maxConcurrentRuns > 0)
+            AddParameter(command, "@maxConcurrentRuns", maxConcurrentRuns);
+
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        if (!await reader.ReadAsync(ct))
+            return new ClaimResult(null, leaseToken, false);
+
+        return new ClaimResult(
+            reader.GetInt64(0),
+            leaseToken,
+            !reader.IsDBNull(1) && reader.GetBoolean(1));
     }
 
     /// <summary>
@@ -126,7 +139,8 @@ internal static class OptimizationRunClaimer
                     .SetProperty(r => r.Status, OptimizationRunStatus.Queued)
                     .SetProperty(r => r.StartedAt, nowUtc)
                     .SetProperty(r => r.DeferredUntilUtc, (DateTime?)null)
-                    .SetProperty(r => r.ExecutionLeaseExpiresAt, (DateTime?)null), ct);
+                    .SetProperty(r => r.ExecutionLeaseExpiresAt, (DateTime?)null)
+                    .SetProperty(r => r.ExecutionLeaseToken, (Guid?)null), ct);
         }
 
         int orphaned = 0;
@@ -138,7 +152,8 @@ internal static class OptimizationRunClaimer
                     .SetProperty(r => r.Status, OptimizationRunStatus.Failed)
                     .SetProperty(r => r.ErrorMessage, "Strategy deleted during optimization run")
                     .SetProperty(r => r.CompletedAt, nowUtc)
-                    .SetProperty(r => r.ExecutionLeaseExpiresAt, (DateTime?)null), ct);
+                    .SetProperty(r => r.ExecutionLeaseExpiresAt, (DateTime?)null)
+                    .SetProperty(r => r.ExecutionLeaseToken, (Guid?)null), ct);
         }
 
         return (requeued, orphaned);
@@ -149,6 +164,14 @@ internal static class OptimizationRunClaimer
     {
         run.LastHeartbeatAt = DateTime.UtcNow;
         run.ExecutionLeaseExpiresAt = run.LastHeartbeatAt.Value.Add(leaseDuration);
+    }
+
+    private static void AddParameter(System.Data.Common.DbCommand command, string name, object? value)
+    {
+        var parameter = command.CreateParameter();
+        parameter.ParameterName = name;
+        parameter.Value = value ?? DBNull.Value;
+        command.Parameters.Add(parameter);
     }
 
     private static string GetQuotedTableName(DbContext db, Type entityType)

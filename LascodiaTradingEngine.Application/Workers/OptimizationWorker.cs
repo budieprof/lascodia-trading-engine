@@ -375,7 +375,8 @@ public partial class OptimizationWorker : BackgroundService
                     .SetProperty(r => r.StartedAt, nowUtc)
                     .SetProperty(r => r.FailureCategory, (OptimizationFailureCategory?)null)
                     .SetProperty(r => r.DeferredUntilUtc, (DateTime?)null)
-                    .SetProperty(r => r.ExecutionLeaseExpiresAt, (DateTime?)null), stoppingToken);
+                    .SetProperty(r => r.ExecutionLeaseExpiresAt, (DateTime?)null)
+                    .SetProperty(r => r.ExecutionLeaseToken, (Guid?)null), stoppingToken);
 
             // Mark orphaned runs (deleted strategy) as failed instead of re-queuing
             int orphaned = await recoveryDb.Set<OptimizationRun>()
@@ -386,7 +387,8 @@ public partial class OptimizationWorker : BackgroundService
                     .SetProperty(r => r.Status, OptimizationRunStatus.Failed)
                     .SetProperty(r => r.FailureCategory, OptimizationFailureCategory.StrategyRemoved)
                     .SetProperty(r => r.ErrorMessage, "Strategy deleted during optimization run")
-                    .SetProperty(r => r.CompletedAt, nowUtc), stoppingToken);
+                    .SetProperty(r => r.CompletedAt, nowUtc)
+                    .SetProperty(r => r.ExecutionLeaseToken, (Guid?)null), stoppingToken);
 
             if (orphaned > 0)
                 _logger.LogWarning(
@@ -472,10 +474,10 @@ public partial class OptimizationWorker : BackgroundService
             var config0 = await LoadConfigurationAsync(db, ct);
             maxConcurrentRuns = config0.MaxConcurrentRuns;
         }
-        var claimedRunId = await OptimizationRunClaimer.ClaimNextRunAsync(
+        var claimResult = await OptimizationRunClaimer.ClaimNextRunAsync(
             writeDb, maxConcurrentRuns, ExecutionLeaseDuration, ct);
 
-        if (!claimedRunId.HasValue)
+        if (!claimResult.RunId.HasValue)
         {
             // Check for cold-start: no queued runs AND no active strategies
             bool anyActive = await db.Set<Strategy>()
@@ -490,12 +492,10 @@ public partial class OptimizationWorker : BackgroundService
         }
 
         var run = await writeDb.Set<OptimizationRun>()
-            .FirstOrDefaultAsync(x => x.Id == claimedRunId.Value, ct);
+            .FirstOrDefaultAsync(x => x.Id == claimResult.RunId.Value, ct);
         if (run is null) return;
 
-        // Track how often previously-deferred runs are rechecked. High counts for a
-        // single run indicate a condition that won't self-resolve (e.g., dead EA symbol).
-        if (run.DeferredUntilUtc.HasValue)
+        if (claimResult.WasDeferred)
             _metrics.OptimizationDeferredRechecks.Add(1);
 
         var sw = Stopwatch.StartNew();
@@ -505,6 +505,7 @@ public partial class OptimizationWorker : BackgroundService
         Task? leaseHeartbeatTask = null;
         var runCt = ct;
         bool completionPersisted = false;
+        Guid claimedLeaseToken = claimResult.LeaseToken;
 
         using var runActivity = s_activitySource.StartActivity("optimization.run");
         runActivity?.SetTag("run.id", run.Id);
@@ -513,7 +514,7 @@ public partial class OptimizationWorker : BackgroundService
         try
         {
             leaseHeartbeatCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            leaseHeartbeatTask = MaintainExecutionLeaseAsync(run.Id, leaseHeartbeatCts.Token);
+            leaseHeartbeatTask = MaintainExecutionLeaseAsync(run.Id, claimedLeaseToken, leaseHeartbeatCts.Token);
 
             // ── Stage 2: Load config + pre-flight checks ────────────────────
             config = await LoadRunScopedConfigurationAsync(run, db, writeCtx, ct);
@@ -667,6 +668,45 @@ public partial class OptimizationWorker : BackgroundService
             run.FailureCategory = OptimizationFailureCategory.DataQuality;
             run.DeferredUntilUtc = DateTime.UtcNow.AddHours(1);
             await writeCtx.SaveChangesAsync(ct);
+        }
+        catch (DbUpdateConcurrencyException ex)
+        {
+            if (await HasLeaseOwnershipChangedAsync(writeDb, run.Id, claimedLeaseToken, ct))
+            {
+                _logger.LogWarning(
+                    ex,
+                    "OptimizationWorker: stopping stale owner for run {RunId} after lease ownership changed",
+                    run.Id);
+                return;
+            }
+
+            if (ShouldPreservePersistedResult(completionPersisted, run.Status))
+            {
+                _logger.LogError(ex,
+                    "OptimizationWorker: post-completion concurrency conflict for run {RunId} after result persistence — keeping status {Status}",
+                    run.Id, run.Status);
+                return;
+            }
+
+            _logger.LogError(ex, "OptimizationWorker: concurrency conflict while processing run {RunId}", run.Id);
+            if (OptimizationRunStateMachine.CanTransition(run.Status, OptimizationRunStatus.Failed))
+            {
+                run.FailureCategory = OptimizationFailureCategory.Transient;
+                OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Failed, DateTime.UtcNow, ex.Message);
+            }
+
+            await writeCtx.SaveChangesAsync(ct);
+            _metrics.OptimizationRunsFailed.Add(1);
+
+            await mediator.Send(new LogDecisionCommand
+            {
+                EntityType = "OptimizationRun",
+                EntityId = run.Id,
+                DecisionType = "OptimizationFailed",
+                Outcome = "ConcurrencyConflict",
+                Reason = ex.Message,
+                Source = "OptimizationWorker"
+            }, ct);
         }
         catch (OperationCanceledException) when (runCts is not null && runCts.IsCancellationRequested && !ct.IsCancellationRequested)
         {
@@ -2604,7 +2644,26 @@ public partial class OptimizationWorker : BackgroundService
         return TimeSpan.FromTicks(boundedTicks);
     }
 
-    private async Task MaintainExecutionLeaseAsync(long runId, CancellationToken ct)
+    private static bool HasLeaseOwnershipChanged(Guid expectedLeaseToken, OptimizationRunStatus currentStatus, Guid? currentLeaseToken)
+        => currentStatus != OptimizationRunStatus.Running || currentLeaseToken != expectedLeaseToken;
+
+    private static async Task<bool> HasLeaseOwnershipChangedAsync(
+        DbContext writeDb,
+        long runId,
+        Guid expectedLeaseToken,
+        CancellationToken ct)
+    {
+        var current = await writeDb.Set<OptimizationRun>()
+            .IgnoreQueryFilters()
+            .AsNoTracking()
+            .Where(r => r.Id == runId)
+            .Select(r => new { r.Status, r.ExecutionLeaseToken })
+            .FirstOrDefaultAsync(ct);
+
+        return current is null || HasLeaseOwnershipChanged(expectedLeaseToken, current.Status, current.ExecutionLeaseToken);
+    }
+
+    private async Task MaintainExecutionLeaseAsync(long runId, Guid leaseToken, CancellationToken ct)
     {
         using var timer = new PeriodicTimer(GetExecutionLeaseHeartbeatInterval());
 
@@ -2622,7 +2681,8 @@ public partial class OptimizationWorker : BackgroundService
                     int updated = await db.Set<OptimizationRun>()
                         .Where(r => r.Id == runId
                                  && !r.IsDeleted
-                                 && r.Status == OptimizationRunStatus.Running)
+                                 && r.Status == OptimizationRunStatus.Running
+                                 && r.ExecutionLeaseToken == leaseToken)
                         .ExecuteUpdateAsync(s => s
                             .SetProperty(r => r.LastHeartbeatAt, nowUtc)
                             .SetProperty(r => r.ExecutionLeaseExpiresAt, nowUtc.Add(ExecutionLeaseDuration)), ct);

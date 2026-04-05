@@ -338,6 +338,96 @@ public class OptimizationWorkerTest
     }
 
     [Fact]
+    public async Task AutoScheduleUnderperformersAsync_SkipsRecentlyRejectedStrategyDuringCooldown()
+    {
+        var strategies = new List<Strategy>
+        {
+            new()
+            {
+                Id = 52,
+                Name = "RejectedRecently",
+                Status = StrategyStatus.Active,
+                StrategyType = StrategyType.BreakoutScalper,
+                Symbol = "EURUSD",
+                Timeframe = Timeframe.H1,
+                ParametersJson = """{"Fast":11}""",
+                IsDeleted = false
+            }
+        };
+
+        var optimizationRuns = new List<OptimizationRun>
+        {
+            new()
+            {
+                Id = 400,
+                StrategyId = 52,
+                Status = OptimizationRunStatus.Rejected,
+                CompletedAt = DateTime.UtcNow.AddDays(-2),
+                StartedAt = DateTime.UtcNow.AddDays(-2).AddHours(-1),
+                BestParametersJson = """{"Fast":13}""",
+                BaselineParametersJson = """{"Fast":11}""",
+                BestHealthScore = 0.41m,
+                BaselineHealthScore = 0.40m,
+                IsDeleted = false
+            }
+        };
+
+        var backtestRuns = new List<BacktestRun>
+        {
+            new()
+            {
+                Id = 401,
+                StrategyId = 52,
+                Status = RunStatus.Completed,
+                CompletedAt = DateTime.UtcNow.AddDays(-1),
+                ResultJson = JsonSerializer.Serialize(new BacktestResult
+                {
+                    TotalTrades = 24,
+                    WinRate = 0.35m,
+                    ProfitFactor = 0.82m,
+                    MaxDrawdownPct = 15m,
+                    SharpeRatio = 0.10m
+                }),
+                IsDeleted = false
+            }
+        };
+
+        var snapshots = new List<StrategyPerformanceSnapshot>();
+
+        var strategyDbSet = strategies.AsQueryable().BuildMockDbSet();
+        var optRunDbSet = optimizationRuns.AsQueryable().BuildMockDbSet();
+        optRunDbSet.Setup(d => d.Add(It.IsAny<OptimizationRun>()))
+            .Callback<OptimizationRun>(r => optimizationRuns.Add(r));
+        var backtestRunDbSet = backtestRuns.AsQueryable().BuildMockDbSet();
+        var snapshotDbSet = snapshots.AsQueryable().BuildMockDbSet();
+
+        var db = new Mock<DbContext>();
+        db.Setup(c => c.Set<Strategy>()).Returns(strategyDbSet.Object);
+        db.Setup(c => c.Set<OptimizationRun>()).Returns(optRunDbSet.Object);
+        db.Setup(c => c.Set<BacktestRun>()).Returns(backtestRunDbSet.Object);
+        db.Setup(c => c.Set<StrategyPerformanceSnapshot>()).Returns(snapshotDbSet.Object);
+
+        var readCtx = new Mock<IReadApplicationDbContext>();
+        readCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
+
+        var writeCtx = new Mock<IWriteApplicationDbContext>();
+        writeCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
+        writeCtx.Setup(x => x.SaveChangesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(1);
+
+        var worker = CreateWorker();
+        var config = CreateOptimizationConfig(cooldownDays: 14, maxConsecutiveFailuresBeforeEscalation: 3);
+
+        var method = typeof(OptimizationWorker).GetMethod(
+            "AutoScheduleUnderperformersAsync",
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
+
+        await (Task)method.Invoke(worker, [readCtx.Object, writeCtx.Object, config, CancellationToken.None])!;
+
+        Assert.Single(optimizationRuns);
+        Assert.Equal(OptimizationRunStatus.Rejected, optimizationRuns[0].Status);
+    }
+
+    [Fact]
     public async Task AutoScheduleUnderperformersAsync_SchedulesGatePassingStrategy_WhenTrendShowsNonMonotonicDecline()
     {
         var strategies = new List<Strategy>
@@ -2787,6 +2877,23 @@ public class OptimizationWorkerTest
         Assert.NotNull(run.CompletedAt);
     }
 
+    [Fact]
+    public void StateMachine_Transition_ClearsExecutionLeaseToken()
+    {
+        var run = new OptimizationRun
+        {
+            Id = 102,
+            Status = OptimizationRunStatus.Running,
+            ExecutionLeaseToken = Guid.NewGuid(),
+            ExecutionLeaseExpiresAt = DateTime.UtcNow.AddMinutes(5)
+        };
+
+        OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Completed, DateTime.UtcNow);
+
+        Assert.Null(run.ExecutionLeaseToken);
+        Assert.Null(run.ExecutionLeaseExpiresAt);
+    }
+
     // ── #10: Deferred run filtering tests ──────────────────────────────────
 
     [Fact]
@@ -3666,6 +3773,23 @@ public class OptimizationWorkerTest
         Assert.InRange(
             (run.ExecutionLeaseExpiresAt!.Value - run.LastHeartbeatAt!.Value).TotalMinutes,
             9.9, 10.1);
+    }
+
+    [Fact]
+    public void HasLeaseOwnershipChanged_ReturnsTrue_WhenTokenOrStatusDiffers()
+    {
+        var method = typeof(OptimizationWorker).GetMethod(
+            "HasLeaseOwnershipChanged",
+            BindingFlags.NonPublic | BindingFlags.Static,
+            binder: null,
+            [typeof(Guid), typeof(OptimizationRunStatus), typeof(Guid?)],
+            modifiers: null)!;
+
+        var expectedToken = Guid.NewGuid();
+
+        Assert.False((bool)method.Invoke(null, [expectedToken, OptimizationRunStatus.Running, expectedToken])!);
+        Assert.True((bool)method.Invoke(null, [expectedToken, OptimizationRunStatus.Running, Guid.NewGuid()])!);
+        Assert.True((bool)method.Invoke(null, [expectedToken, OptimizationRunStatus.Completed, expectedToken])!);
     }
 
     [Fact]

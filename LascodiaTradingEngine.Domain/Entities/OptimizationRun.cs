@@ -138,6 +138,13 @@ public class OptimizationRun : Entity<long>
     public DateTime? ExecutionLeaseExpiresAt { get; set; }
 
     /// <summary>
+    /// Unique ownership token for the current execution lease. Changes every time a worker
+    /// claims or reclaims the run so stale workers cannot continue heartbeating or persist
+    /// results after losing ownership.
+    /// </summary>
+    public Guid? ExecutionLeaseToken { get; set; }
+
+    /// <summary>
     /// UTC timestamp before which this run should not be claimed by the worker. Set when
     /// a run is deferred (seasonal blackout, drawdown recovery, regime transition, EA
     /// unavailability, data quality). Prevents the worker from re-evaluating deferred runs
