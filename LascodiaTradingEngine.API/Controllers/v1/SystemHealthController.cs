@@ -6,6 +6,10 @@ using LascodiaTradingEngine.Application.SystemHealth.Queries.GetEngineStatus;
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
+/// <summary>
+/// Exposes engine health status including worker states, EA connectivity, and data availability.
+/// Route: api/v1/lascodia-trading-engine/health
+/// </summary>
 [Route("api/v1/lascodia-trading-engine/health")]
 [ApiController]
 public class SystemHealthController : AuthControllerBase<SystemHealthController>

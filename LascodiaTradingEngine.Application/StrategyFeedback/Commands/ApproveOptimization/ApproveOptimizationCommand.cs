@@ -9,8 +9,13 @@ namespace LascodiaTradingEngine.Application.StrategyFeedback.Commands.ApproveOpt
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Approves a completed optimization run and applies the best parameters to the strategy.
+/// Only runs with Completed status can be approved.
+/// </summary>
 public class ApproveOptimizationCommand : IRequest<ResponseData<string>>
 {
+    /// <summary>The unique identifier of the optimization run to approve.</summary>
     public long Id { get; set; }
 }
 
@@ -26,6 +31,10 @@ public class ApproveOptimizationCommandValidator : AbstractValidator<ApproveOpti
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Marks the optimization run as Approved and copies the best parameters JSON
+/// to the strategy's ParametersJson field.
+/// </summary>
 public class ApproveOptimizationCommandHandler : IRequestHandler<ApproveOptimizationCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

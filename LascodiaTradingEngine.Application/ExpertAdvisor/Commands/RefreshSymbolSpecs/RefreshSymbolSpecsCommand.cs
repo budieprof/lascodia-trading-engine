@@ -15,11 +15,15 @@ namespace LascodiaTradingEngine.Application.ExpertAdvisor.Commands.RefreshSymbol
 /// </summary>
 public class RefreshSymbolSpecsCommand : IRequest<ResponseData<string>>
 {
+    /// <summary>Trading account ID whose coordinator EA instance should refresh symbol specs.</summary>
     public long TradingAccountId { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Validates that TradingAccountId is a positive number.
+/// </summary>
 public class RefreshSymbolSpecsCommandValidator : AbstractValidator<RefreshSymbolSpecsCommand>
 {
     public RefreshSymbolSpecsCommandValidator()
@@ -31,6 +35,11 @@ public class RefreshSymbolSpecsCommandValidator : AbstractValidator<RefreshSymbo
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Handles symbol spec refresh by locating the coordinator EA instance for the given trading account
+/// and queuing a RequestBackfill command with action "refreshSymbolSpecs". Returns -14 if no active
+/// coordinator is found.
+/// </summary>
 public class RefreshSymbolSpecsCommandHandler : IRequestHandler<RefreshSymbolSpecsCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

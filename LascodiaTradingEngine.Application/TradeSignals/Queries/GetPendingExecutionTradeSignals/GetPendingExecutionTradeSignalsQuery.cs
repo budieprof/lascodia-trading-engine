@@ -21,6 +21,7 @@ public class GetPendingExecutionTradeSignalsQuery : IRequest<ResponseData<List<T
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Queries approved signals with no assigned order that have not yet expired, ordered by generation date ascending.</summary>
 public class GetPendingExecutionTradeSignalsQueryHandler : IRequestHandler<GetPendingExecutionTradeSignalsQuery, ResponseData<List<TradeSignalDto>>>
 {
     private readonly IReadApplicationDbContext _context;

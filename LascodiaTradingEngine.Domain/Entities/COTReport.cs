@@ -63,6 +63,13 @@ public class COTReport : Entity<long>
     public decimal NetNonCommercialPositioning  { get; set; }
 
     /// <summary>
+    /// Total open interest — the total number of outstanding futures contracts across all
+    /// participant categories. Rising OI in a trending market confirms participation;
+    /// falling OI suggests the move is weakening.
+    /// </summary>
+    public long    TotalOpenInterest            { get; set; }
+
+    /// <summary>
     /// Week-over-week change in <see cref="NetNonCommercialPositioning"/>.
     /// A large positive change signals accelerating bullish momentum; a large negative change
     /// signals accelerating bearish momentum among speculative traders.

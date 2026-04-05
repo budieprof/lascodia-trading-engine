@@ -11,22 +11,31 @@ namespace LascodiaTradingEngine.Application.TradeSignals.Queries.GetPagedTradeSi
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Returns a paginated list of trade signals with optional filtering by symbol, status, direction, strategy, and date range.</summary>
 public class GetPagedTradeSignalsQuery : PagerRequestWithFilterType<TradeSignalQueryFilter, ResponseData<PagedData<TradeSignalDto>>>
 {
 }
 
+/// <summary>Filter criteria for the paged trade signals query.</summary>
 public class TradeSignalQueryFilter
 {
+    /// <summary>Free-text search applied to the Symbol field.</summary>
     public string?   Search     { get; set; }   // filters on Symbol
+    /// <summary>Filter by <see cref="TradeSignalStatus"/> enum name.</summary>
     public string?   Status     { get; set; }
+    /// <summary>Filter by <see cref="TradeDirection"/> enum name ("Buy" or "Sell").</summary>
     public string?   Direction  { get; set; }
+    /// <summary>Filter by originating strategy identifier.</summary>
     public long?     StrategyId { get; set; }
+    /// <summary>Inclusive start of the GeneratedAt date range.</summary>
     public DateTime? From       { get; set; }
+    /// <summary>Inclusive end of the GeneratedAt date range.</summary>
     public DateTime? To         { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Executes the paged trade signals query with multi-field filtering, ordered by generation date descending.</summary>
 public class GetPagedTradeSignalsQueryHandler
     : IRequestHandler<GetPagedTradeSignalsQuery, ResponseData<PagedData<TradeSignalDto>>>
 {

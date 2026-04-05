@@ -3,6 +3,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Services;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -244,6 +245,17 @@ public sealed class MLPredictionOutcomeWorker : BackgroundService
                         ct);
 
                 totalResolved++;
+
+                // Feed prediction outcome back to the ML scorer's quality circuit breaker.
+                // Consecutive wrong predictions will suppress scoring for the model until
+                // the cooldown expires, providing rapid protection before drift monitors react.
+                if (log.MLModelId > 0)
+                {
+                    if (directionCorrect)
+                        MLSignalScorer.RecordPredictionWin(log.MLModelId);
+                    else
+                        MLSignalScorer.RecordPredictionLoss(log.MLModelId);
+                }
 
                 _logger.LogDebug(
                     "Resolved log {Id} ({Symbol}/{Tf}): predicted={Pred} actual={Act} correct={OK}",

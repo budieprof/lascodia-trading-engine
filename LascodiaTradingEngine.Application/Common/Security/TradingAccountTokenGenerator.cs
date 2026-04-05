@@ -13,6 +13,12 @@ namespace LascodiaTradingEngine.Application.Common.Security;
 /// </summary>
 public static class TradingAccountTokenGenerator
 {
+    /// <summary>
+    /// Generates a JWT token containing the trading account's identity claims.
+    /// The token is scoped to a single <see cref="TradingAccount"/> with configurable expiration.
+    /// </summary>
+    /// <param name="account">The trading account to generate the token for.</param>
+    /// <param name="configuration">Application configuration providing JWT settings (SecretKey, Issuer, Audience, ExpirationMinutes).</param>
     public static AuthTokenResult GenerateToken(TradingAccount account, IConfiguration configuration)
     {
         var jwtSection = configuration.GetSection("JwtSettings");
@@ -63,10 +69,18 @@ public static class TradingAccountTokenGenerator
     }
 }
 
+/// <summary>
+/// Result of JWT token generation, containing the token string, expiration, and account summary.
+/// </summary>
 public class AuthTokenResult
 {
+    /// <summary>The JWT token string.</summary>
     public string Token        { get; set; } = string.Empty;
+
+    /// <summary>UTC expiration time of the token.</summary>
     public DateTime ExpiresAt  { get; set; }
+
+    /// <summary>Token type (always "Bearer").</summary>
     public string TokenType    { get; set; } = "Bearer";
     public AuthAccountSummary Account { get; set; } = null!;
 
@@ -99,13 +113,29 @@ public class AuthTokenResult
     public int? BridgePort { get; set; }
 }
 
+/// <summary>
+/// Summary of the authenticated trading account returned alongside the JWT token.
+/// </summary>
 public class AuthAccountSummary
 {
+    /// <summary>Database Id of the trading account.</summary>
     public long   Id           { get; set; }
+
+    /// <summary>Broker-assigned account identifier.</summary>
     public string AccountId    { get; set; } = string.Empty;
+
+    /// <summary>Human-readable account name.</summary>
     public string AccountName  { get; set; } = string.Empty;
+
+    /// <summary>Broker server address (e.g. "MetaQuotes-Demo").</summary>
     public string BrokerServer { get; set; } = string.Empty;
+
+    /// <summary>Broker name (e.g. "OANDA", "ICMarkets").</summary>
     public string BrokerName   { get; set; } = string.Empty;
+
+    /// <summary>Account type (Demo, Live, etc.).</summary>
     public AccountType AccountType  { get; set; }
+
+    /// <summary>Account base currency (e.g. "USD", "EUR").</summary>
     public string Currency     { get; set; } = string.Empty;
 }

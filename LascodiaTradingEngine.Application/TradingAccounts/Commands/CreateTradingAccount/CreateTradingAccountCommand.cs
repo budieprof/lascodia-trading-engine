@@ -11,6 +11,10 @@ namespace LascodiaTradingEngine.Application.TradingAccounts.Commands.CreateTradi
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Creates a new trading account with an auto-generated AES-256-GCM encrypted password and API key.
+/// Rejects duplicate AccountId+BrokerServer combinations.
+/// </summary>
 public class CreateTradingAccountCommand : IRequest<ResponseData<long>>
 {
     public required string AccountId    { get; set; }
@@ -53,6 +57,10 @@ public class CreateTradingAccountCommandValidator : AbstractValidator<CreateTrad
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Checks for duplicate accounts, generates encrypted credentials, and persists the new trading account.
+/// The account is created as inactive by default.
+/// </summary>
 public class CreateTradingAccountCommandHandler : IRequestHandler<CreateTradingAccountCommand, ResponseData<long>>
 {
     private readonly IWriteApplicationDbContext _context;

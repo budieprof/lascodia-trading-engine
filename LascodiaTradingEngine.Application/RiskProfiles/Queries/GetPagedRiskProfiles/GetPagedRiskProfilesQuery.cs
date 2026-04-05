@@ -10,17 +10,21 @@ namespace LascodiaTradingEngine.Application.RiskProfiles.Queries.GetPagedRiskPro
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Retrieves a paginated list of risk profiles with optional name search, default profiles listed first.</summary>
 public class GetPagedRiskProfilesQuery : PagerRequestWithFilterType<RiskProfileQueryFilter, ResponseData<PagedData<RiskProfileDto>>>
 {
 }
 
+/// <summary>Filter criteria for the paged risk profiles query.</summary>
 public class RiskProfileQueryFilter
 {
+    /// <summary>Free-text search across risk profile names.</summary>
     public string? Search { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Queries risk profiles ordered with the default profile first, with optional name search filter.</summary>
 public class GetPagedRiskProfilesQueryHandler
     : IRequestHandler<GetPagedRiskProfilesQuery, ResponseData<PagedData<RiskProfileDto>>>
 {

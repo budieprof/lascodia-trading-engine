@@ -12,13 +12,19 @@ namespace LascodiaTradingEngine.Application.Strategies.Commands.ActivateStrategy
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Activates a strategy that has reached the Approved lifecycle stage. Requires four-eyes
+/// approval, queues an initial backtest run, and publishes a <see cref="StrategyActivatedIntegrationEvent"/>.
+/// </summary>
 public class ActivateStrategyCommand : IRequest<ResponseData<string>>
 {
+    /// <summary>Strategy identifier to activate.</summary>
     public long Id { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>Validates that the strategy Id is a positive value.</summary>
 public class ActivateStrategyCommandValidator : AbstractValidator<ActivateStrategyCommand>
 {
     public ActivateStrategyCommandValidator()
@@ -29,6 +35,10 @@ public class ActivateStrategyCommandValidator : AbstractValidator<ActivateStrate
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Enforces lifecycle stage and four-eyes approval gates, transitions the strategy to Active
+/// status, queues a one-year initial backtest, and publishes a <see cref="StrategyActivatedIntegrationEvent"/>.
+/// </summary>
 public class ActivateStrategyCommandHandler : IRequestHandler<ActivateStrategyCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

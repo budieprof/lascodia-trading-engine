@@ -9,16 +9,32 @@ namespace LascodiaTradingEngine.Application.MLEvaluation.Commands.RecordPredicti
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Records the actual market outcome for a previously predicted trade signal.
+/// Updates all MLModelPredictionLog records associated with the signal, setting the actual direction,
+/// magnitude, profitability, and whether the prediction was correct. The MLShadowArbiterWorker
+/// uses these outcomes to advance shadow evaluations.
+/// </summary>
 public class RecordPredictionOutcomeCommand : IRequest<ResponseData<string>>
 {
+    /// <summary>Database ID of the trade signal whose outcome is being recorded.</summary>
     public long    TradeSignalId        { get; set; }
+
+    /// <summary>Actual market direction that occurred: "Buy" or "Sell".</summary>
     public required string ActualDirection { get; set; }
+
+    /// <summary>Actual price movement magnitude in pips.</summary>
     public decimal ActualMagnitudePips  { get; set; }
+
+    /// <summary>Whether the trade would have been profitable based on the actual outcome.</summary>
     public bool    WasProfitable        { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Validates that TradeSignalId is positive and ActualDirection is a valid TradeDirection enum value.
+/// </summary>
 public class RecordPredictionOutcomeCommandValidator : AbstractValidator<RecordPredictionOutcomeCommand>
 {
     public RecordPredictionOutcomeCommandValidator()
@@ -34,6 +50,11 @@ public class RecordPredictionOutcomeCommandValidator : AbstractValidator<RecordP
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Handles prediction outcome recording. Loads all MLModelPredictionLog entries for the given
+/// trade signal, then updates each with the actual direction, magnitude, profitability, and
+/// direction correctness. Returns -14 if no prediction logs exist for the signal.
+/// </summary>
 public class RecordPredictionOutcomeCommandHandler : IRequestHandler<RecordPredictionOutcomeCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

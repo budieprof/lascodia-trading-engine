@@ -10,6 +10,10 @@ using LascodiaTradingEngine.Application.Backtesting.Queries.GetPagedBacktestRuns
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
+/// <summary>
+/// Manages backtest run submission and retrieval of historical strategy simulation results.
+/// Route: api/v1/lascodia-trading-engine/backtest
+/// </summary>
 [Route("api/v1/lascodia-trading-engine/backtest")]
 [ApiController]
 public class BacktestController : AuthControllerBase<BacktestController>

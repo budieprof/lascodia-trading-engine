@@ -10,13 +10,16 @@ namespace LascodiaTradingEngine.Application.Orders.Queries.GetOrder;
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Retrieves a single order by its identifier, projected as an <see cref="OrderDto"/>.</summary>
 public class GetOrderQuery : IRequest<ResponseData<OrderDto>>
 {
+    /// <summary>Order identifier to look up.</summary>
     public required long Id { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Fetches a single order from the read context and maps it to <see cref="OrderDto"/>.</summary>
 public class GetOrderQueryHandler : IRequestHandler<GetOrderQuery, ResponseData<OrderDto>>
 {
     private readonly IReadApplicationDbContext _context;

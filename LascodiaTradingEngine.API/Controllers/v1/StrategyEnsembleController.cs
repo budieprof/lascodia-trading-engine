@@ -10,6 +10,10 @@ using LascodiaTradingEngine.Application.StrategyEnsemble.Queries.GetPagedStrateg
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
+/// <summary>
+/// Manages strategy ensemble weight allocations and Sharpe-ratio-based rebalancing across active strategies.
+/// Route: api/v1/lascodia-trading-engine/strategy-ensemble
+/// </summary>
 [Route("api/v1/lascodia-trading-engine/strategy-ensemble")]
 [ApiController]
 public class StrategyEnsembleController : AuthControllerBase<StrategyEnsembleController>

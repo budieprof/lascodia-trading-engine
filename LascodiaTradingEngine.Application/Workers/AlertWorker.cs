@@ -76,6 +76,22 @@ namespace LascodiaTradingEngine.Application.Workers;
 /// </para>
 ///
 /// <para>
+/// <b>Auto-resolution:</b>
+/// Level-based alerts (PriceLevel, DrawdownBreached) support auto-resolution. When a
+/// previously triggered alert's condition clears (price drops back below threshold,
+/// drawdown recovers), a "resolved" notification is dispatched and
+/// <see cref="Alert.AutoResolvedAt"/> is set. This auto-resets when the condition
+/// triggers again.
+/// </para>
+///
+/// <para>
+/// <b>Severity-based routing:</b>
+/// Alerts are dispatched via <see cref="IAlertDispatcher.DispatchBySeverityAsync"/>
+/// which routes notifications to channels based on the alert's <see cref="AlertSeverity"/>:
+/// Critical/High → Telegram + Webhook, Medium/Info → Webhook.
+/// </para>
+///
+/// <para>
 /// <b>Pipeline position:</b> AlertWorker sits at the end of the monitoring pipeline.
 /// It does not generate events itself; it reacts to data written by other workers
 /// (price cache, <see cref="DrawdownMonitorWorker"/>, strategy/order workers) and
@@ -98,6 +114,20 @@ public class AlertWorker : BackgroundService
     /// <summary>Max backoff delay on consecutive failures (5 minutes).</summary>
     private static readonly TimeSpan MaxBackoff = TimeSpan.FromMinutes(5);
     private int _consecutiveFailures;
+
+    /// <summary>
+    /// Alert types that the polling-based worker evaluates. Other types (MLModelDegraded,
+    /// DataQualityIssue, etc.) are dispatched directly by their respective specialized
+    /// workers and do not need polling.
+    /// </summary>
+    private static readonly HashSet<AlertType> PolledAlertTypes = new()
+    {
+        AlertType.PriceLevel,
+        AlertType.DrawdownBreached,
+        AlertType.SignalGenerated,
+        AlertType.OrderFilled,
+        AlertType.PositionClosed
+    };
 
     private readonly ILogger<AlertWorker>  _logger;
     private readonly IServiceScopeFactory  _scopeFactory;
@@ -190,10 +220,11 @@ public class AlertWorker : BackgroundService
         var writeContext     = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
         var dispatcher       = scope.ServiceProvider.GetRequiredService<IAlertDispatcher>();
 
-        // Load all active alerts — IsActive is controlled by the operator via the API.
+        // Load only alert types that this worker handles. Other types (MLModelDegraded,
+        // DataQualityIssue, etc.) are dispatched by their respective specialized workers.
         var alerts = await readContext.GetDbContext()
             .Set<Alert>()
-            .Where(x => x.IsActive && !x.IsDeleted)
+            .Where(x => x.IsActive && !x.IsDeleted && PolledAlertTypes.Contains(x.AlertType))
             .ToListAsync(ct);
 
         if (alerts.Count == 0) return;
@@ -206,35 +237,48 @@ public class AlertWorker : BackgroundService
             try
             {
                 // Dispatch to the appropriate type-specific evaluator.
-                // The switch expression returns a (triggered, message) tuple.
-                var (triggered, message) = alert.AlertType switch
+                // Returns (triggered, message, eventTimestamp) where eventTimestamp is the
+                // timestamp of the event that caused the trigger (for event-based types) or
+                // null (for level-based types that use UtcNow).
+                var (triggered, message, eventTimestamp) = alert.AlertType switch
                 {
                     AlertType.PriceLevel       => EvaluatePriceLevel(alert),
                     AlertType.DrawdownBreached => await EvaluateDrawdownAsync(alert, readContext, ct),
                     AlertType.SignalGenerated  => await EvaluateSignalGeneratedAsync(alert, readContext, ct),
                     AlertType.OrderFilled      => await EvaluateOrderFilledAsync(alert, readContext, ct),
                     AlertType.PositionClosed   => await EvaluatePositionClosedAsync(alert, readContext, ct),
-                    _                          => (false, string.Empty)
+                    _                          => (false, string.Empty, (DateTime?)null)
                 };
+
+                // Auto-resolution for level-based alerts: if the condition has cleared
+                // since the last trigger, send a "resolved" notification.
+                if (!triggered && IsLevelBased(alert.AlertType) && alert.LastTriggeredAt.HasValue)
+                {
+                    if (await HandleAutoResolutionAsync(alert, writeContext, dispatcher, ct))
+                        anyUpdated = true;
+                    continue;
+                }
 
                 if (!triggered) continue;
 
+                // Clear any previous auto-resolution since the condition is active again.
                 // Load the entity via the write context so EF tracks the property change.
-                // Using the read context here would not mark the entity as Modified.
                 var tracked = await writeContext.GetDbContext()
                     .Set<Alert>()
                     .FirstOrDefaultAsync(x => x.Id == alert.Id, ct);
 
                 if (tracked is null) continue;
 
-                // Update the trigger timestamp — prevents this alert from firing again
-                // within the cooldown window (level types) or on the same event (event types).
-                tracked.LastTriggeredAt = DateTime.UtcNow;
-                anyUpdated = true;
+                // Dispatch FIRST, then update the cursor. If dispatch throws, the cursor
+                // does not advance and the event will be retried on the next cycle.
+                await dispatcher.DispatchBySeverityAsync(alert, message, ct);
 
-                // Deliver the notification through all configured channels
-                // (Webhook, Email, Telegram) via the alert dispatcher.
-                await dispatcher.DispatchAsync(alert, message, ct);
+                // For event-based types, set cursor to the event's own timestamp so
+                // subsequent events in the same batch are picked up on the next cycle.
+                // For level-based types, use UtcNow (cooldown prevents re-triggering).
+                tracked.LastTriggeredAt = eventTimestamp ?? DateTime.UtcNow;
+                tracked.AutoResolvedAt  = null; // Reset auto-resolution on re-trigger
+                anyUpdated = true;
 
                 _logger.LogInformation(
                     "AlertWorker: fired alert {AlertId} ({Type}/{Symbol}) — {Message}",
@@ -254,6 +298,31 @@ public class AlertWorker : BackgroundService
             await writeContext.SaveChangesAsync(ct);
     }
 
+    /// <summary>
+    /// Checks whether a previously triggered level-based alert should auto-resolve
+    /// (condition has cleared). Dispatches a "resolved" notification and sets
+    /// <see cref="Alert.AutoResolvedAt"/>.
+    /// </summary>
+    /// <returns><c>true</c> if the alert was auto-resolved and needs saving.</returns>
+    private async Task<bool> HandleAutoResolutionAsync(
+        Alert alert, IWriteApplicationDbContext writeContext,
+        IAlertDispatcher dispatcher, CancellationToken ct)
+    {
+        // Already resolved — nothing to do until the condition triggers again.
+        if (alert.AutoResolvedAt.HasValue) return false;
+
+        var tracked = await writeContext.GetDbContext()
+            .Set<Alert>()
+            .FirstOrDefaultAsync(x => x.Id == alert.Id, ct);
+
+        if (tracked is null) return false;
+
+        // Dispatch the auto-resolve notification. The dispatcher sets AutoResolvedAt
+        // and sends a "resolved" message through the severity-based channels.
+        await dispatcher.TryAutoResolveAsync(tracked, conditionStillActive: false, ct);
+        return true;
+    }
+
     // ── Evaluators ────────────────────────────────────────────────────────────
 
     /// <summary>
@@ -271,31 +340,36 @@ public class AlertWorker : BackgroundService
     /// </para>
     /// </summary>
     /// <param name="alert">The alert to evaluate.</param>
-    /// <returns>A tuple indicating whether the alert triggered and the notification message.</returns>
-    private (bool Triggered, string Message) EvaluatePriceLevel(Alert alert)
+    /// <returns>A tuple indicating whether the alert triggered, the notification message,
+    /// and null event timestamp (level-based uses UtcNow).</returns>
+    private (bool Triggered, string Message, DateTime? EventTimestamp) EvaluatePriceLevel(Alert alert)
     {
         // Enforce the 60-minute cooldown to prevent repeated firings while price stays above/below threshold.
-        if (InCooldown(alert)) return (false, string.Empty);
+        if (InCooldown(alert)) return (false, string.Empty, null);
 
         var price = _priceCache.Get(alert.Symbol);
-        if (price is null) return (false, string.Empty); // Symbol not in cache — skip silently
+        if (price is null) return (false, string.Empty, null); // Symbol not in cache — skip silently
 
         // Mid-price is the standard reference for level-based alerts;
         // using the spread mid avoids false triggers from wide bid/ask spreads.
         decimal mid = (price.Value.Bid + price.Value.Ask) / 2m;
 
         JsonElement condition;
-        try { condition = JsonDocument.Parse(alert.ConditionJson).RootElement; }
+        try
+        {
+            using var doc = JsonDocument.Parse(alert.ConditionJson);
+            condition = doc.RootElement.Clone();
+        }
         catch (JsonException ex)
         {
             _logger.LogWarning(ex,
                 "AlertWorker: malformed ConditionJson for PriceLevel alert {AlertId} ({Symbol}) — skipping until operator fixes the definition",
                 alert.Id, alert.Symbol);
-            return (false, string.Empty);
+            return (false, string.Empty, null);
         }
 
-        if (!condition.TryGetProperty("Price",     out var priceEl))     return (false, string.Empty);
-        if (!condition.TryGetProperty("Direction", out var directionEl)) return (false, string.Empty);
+        if (!condition.TryGetProperty("Price",     out var priceEl))     return (false, string.Empty, null);
+        if (!condition.TryGetProperty("Direction", out var directionEl)) return (false, string.Empty, null);
 
         decimal threshold = priceEl.GetDecimal();
         string  direction = directionEl.GetString() ?? string.Empty;
@@ -306,8 +380,8 @@ public class AlertWorker : BackgroundService
             : mid <= threshold;
 
         return hit
-            ? (true, $"{alert.Symbol} mid price {mid:F5} is {direction.ToLower()} threshold {threshold:F5}")
-            : (false, string.Empty);
+            ? (true, $"{alert.Symbol} mid price {mid:F5} is {direction.ToLower()} threshold {threshold:F5}", null)
+            : (false, string.Empty, null);
     }
 
     /// <summary>
@@ -320,10 +394,10 @@ public class AlertWorker : BackgroundService
     /// ConditionJson schema: <c>{"ThresholdPct": 5.0}</c>
     /// </para>
     /// </summary>
-    private async Task<(bool Triggered, string Message)> EvaluateDrawdownAsync(
+    private async Task<(bool Triggered, string Message, DateTime? EventTimestamp)> EvaluateDrawdownAsync(
         Alert alert, IReadApplicationDbContext ctx, CancellationToken ct)
     {
-        if (InCooldown(alert)) return (false, string.Empty);
+        if (InCooldown(alert)) return (false, string.Empty, null);
 
         // The most recent snapshot is the authoritative current drawdown level.
         var snapshot = await ctx.GetDbContext()
@@ -331,34 +405,39 @@ public class AlertWorker : BackgroundService
             .OrderByDescending(x => x.RecordedAt)
             .FirstOrDefaultAsync(ct);
 
-        if (snapshot is null) return (false, string.Empty);
+        if (snapshot is null) return (false, string.Empty, null);
 
         JsonElement condition;
-        try { condition = JsonDocument.Parse(alert.ConditionJson).RootElement; }
+        try
+        {
+            using var doc = JsonDocument.Parse(alert.ConditionJson);
+            condition = doc.RootElement.Clone();
+        }
         catch (JsonException ex)
         {
             _logger.LogWarning(ex,
                 "AlertWorker: malformed ConditionJson for DrawdownBreached alert {AlertId} — skipping until operator fixes the definition",
                 alert.Id);
-            return (false, string.Empty);
+            return (false, string.Empty, null);
         }
 
-        if (!condition.TryGetProperty("ThresholdPct", out var thresholdEl)) return (false, string.Empty);
+        if (!condition.TryGetProperty("ThresholdPct", out var thresholdEl)) return (false, string.Empty, null);
 
         decimal threshold = thresholdEl.GetDecimal();
 
         return snapshot.DrawdownPct >= threshold
-            ? (true, $"Drawdown {snapshot.DrawdownPct:F2}% breached threshold {threshold:F2}%")
-            : (false, string.Empty);
+            ? (true, $"Drawdown {snapshot.DrawdownPct:F2}% breached threshold {threshold:F2}%", null)
+            : (false, string.Empty, null);
     }
 
     /// <summary>
     /// Evaluates a <see cref="AlertType.SignalGenerated"/> alert by checking for a new
     /// <see cref="TradeSignal"/> for the alert's symbol created after the last trigger time.
     /// Takes the earliest qualifying signal (oldest-first) so signals are not skipped if
-    /// multiple arrive between polling cycles.
+    /// multiple arrive between polling cycles. Returns the signal's own timestamp as the
+    /// event cursor so subsequent signals are picked up on the next cycle.
     /// </summary>
-    private async Task<(bool Triggered, string Message)> EvaluateSignalGeneratedAsync(
+    private async Task<(bool Triggered, string Message, DateTime? EventTimestamp)> EvaluateSignalGeneratedAsync(
         Alert alert, IReadApplicationDbContext ctx, CancellationToken ct)
     {
         // Use DateTime.MinValue as the starting cursor when the alert has never fired,
@@ -373,16 +452,19 @@ public class AlertWorker : BackgroundService
             .OrderBy(x => x.GeneratedAt) // Oldest first — process events in chronological order
             .FirstOrDefaultAsync(ct);
 
-        if (signal is null) return (false, string.Empty);
+        if (signal is null) return (false, string.Empty, null);
 
-        return (true, $"New trade signal generated for {alert.Symbol} at {signal.GeneratedAt:u}");
+        return (true,
+            $"New trade signal generated for {alert.Symbol} at {signal.GeneratedAt:u}",
+            signal.GeneratedAt);
     }
 
     /// <summary>
     /// Evaluates a <see cref="AlertType.OrderFilled"/> alert by checking for a new filled
     /// <see cref="Order"/> for the alert's symbol with a fill timestamp after the last trigger.
+    /// Returns the order's fill timestamp as the event cursor.
     /// </summary>
-    private async Task<(bool Triggered, string Message)> EvaluateOrderFilledAsync(
+    private async Task<(bool Triggered, string Message, DateTime? EventTimestamp)> EvaluateOrderFilledAsync(
         Alert alert, IReadApplicationDbContext ctx, CancellationToken ct)
     {
         var since = alert.LastTriggeredAt ?? DateTime.MinValue;
@@ -396,16 +478,19 @@ public class AlertWorker : BackgroundService
             .OrderBy(x => x.FilledAt) // Oldest first — advance cursor one event at a time
             .FirstOrDefaultAsync(ct);
 
-        if (order is null) return (false, string.Empty);
+        if (order is null) return (false, string.Empty, null);
 
-        return (true, $"Order {order.Id} filled for {alert.Symbol} at {order.FilledAt:u}");
+        return (true,
+            $"Order {order.Id} filled for {alert.Symbol} at {order.FilledAt:u}",
+            order.FilledAt);
     }
 
     /// <summary>
     /// Evaluates a <see cref="AlertType.PositionClosed"/> alert by checking for a
     /// <see cref="Position"/> closed for the alert's symbol after the last trigger time.
+    /// Returns the position's close timestamp as the event cursor.
     /// </summary>
-    private async Task<(bool Triggered, string Message)> EvaluatePositionClosedAsync(
+    private async Task<(bool Triggered, string Message, DateTime? EventTimestamp)> EvaluatePositionClosedAsync(
         Alert alert, IReadApplicationDbContext ctx, CancellationToken ct)
     {
         var since = alert.LastTriggeredAt ?? DateTime.MinValue;
@@ -419,9 +504,11 @@ public class AlertWorker : BackgroundService
             .OrderBy(x => x.ClosedAt) // Oldest first
             .FirstOrDefaultAsync(ct);
 
-        if (position is null) return (false, string.Empty);
+        if (position is null) return (false, string.Empty, null);
 
-        return (true, $"Position {position.Id} closed for {alert.Symbol} at {position.ClosedAt:u}");
+        return (true,
+            $"Position {position.Id} closed for {alert.Symbol} at {position.ClosedAt:u}",
+            position.ClosedAt);
     }
 
     /// <summary>
@@ -434,4 +521,12 @@ public class AlertWorker : BackgroundService
     private static bool InCooldown(Alert alert) =>
         alert.LastTriggeredAt.HasValue
         && DateTime.UtcNow - alert.LastTriggeredAt.Value < LevelCooldown;
+
+    /// <summary>
+    /// Returns <c>true</c> for alert types that represent a sustained condition
+    /// (PriceLevel, DrawdownBreached) as opposed to discrete events (SignalGenerated, etc.).
+    /// Level-based alerts support cooldowns and auto-resolution.
+    /// </summary>
+    private static bool IsLevelBased(AlertType type) =>
+        type is AlertType.PriceLevel or AlertType.DrawdownBreached;
 }

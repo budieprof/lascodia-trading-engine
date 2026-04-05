@@ -9,13 +9,16 @@ namespace LascodiaTradingEngine.Application.StrategyFeedback.Queries.GetOptimiza
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Retrieves a single optimization run by its unique identifier.</summary>
 public class GetOptimizationRunQuery : IRequest<ResponseData<OptimizationRunDto>>
 {
+    /// <summary>The unique identifier of the optimization run.</summary>
     public required long Id { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Fetches a single optimization run by ID from the read-only context.</summary>
 public class GetOptimizationRunQueryHandler : IRequestHandler<GetOptimizationRunQuery, ResponseData<OptimizationRunDto>>
 {
     private readonly IReadApplicationDbContext _context;

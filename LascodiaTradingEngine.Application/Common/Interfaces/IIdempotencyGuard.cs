@@ -11,10 +11,12 @@ public record IdempotencyCheckResult(
 
 public interface IIdempotencyGuard
 {
+    /// <summary>Checks whether a request with the given idempotency key has already been processed.</summary>
     Task<IdempotencyCheckResult> CheckAsync(
         string idempotencyKey,
         CancellationToken cancellationToken);
 
+    /// <summary>Records a processed request's idempotency key and cached response for future deduplication.</summary>
     Task RecordAsync(
         string idempotencyKey,
         string endpoint,

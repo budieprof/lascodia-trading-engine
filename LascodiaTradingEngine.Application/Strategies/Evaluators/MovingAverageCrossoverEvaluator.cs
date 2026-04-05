@@ -11,6 +11,11 @@ using LascodiaTradingEngine.Application.Common.Attributes;
 
 namespace LascodiaTradingEngine.Application.Strategies.Evaluators;
 
+/// <summary>
+/// Evaluates moving average crossover signals using fast/slow MA pairs with optional
+/// trend filter, ADX confirmation, and whipsaw detection. Produces Buy/Sell trade signals
+/// with ATR-based stop-loss and take-profit levels.
+/// </summary>
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyEvaluator))]
 public class MovingAverageCrossoverEvaluator : IStrategyEvaluator
 {

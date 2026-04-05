@@ -6,6 +6,7 @@ using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.ExecutionQuality.Queries.DTOs;
 
+/// <summary>Data transfer object for an execution quality measurement including slippage, latency, and fill metrics.</summary>
 public class ExecutionQualityLogDto : IMapFrom<ExecutionQualityLog>
 {
     public long           Id             { get; set; }

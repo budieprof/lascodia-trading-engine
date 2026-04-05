@@ -1,3 +1,7 @@
+// Program.cs — Application entry point for the Lascodia Trading Engine API.
+// Configures DI, JWT authentication, CORS, rate limiting, OpenTelemetry metrics,
+// EF Core database contexts, middleware pipeline, and background worker registration.
+
 using LascodiaTradingEngine.Application;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Services.Cache;
@@ -53,6 +57,12 @@ builder.Host.UseServiceProviderFactory(new AutofacServiceProviderFactory());
 builder.Host.ConfigureContainer<ContainerBuilder>(builder => { });
 
 builder.Services.BindConfigurationOptions(builder.Configuration);
+
+// Validate critical configuration options at startup — fail fast on misconfiguration
+builder.Services.AddSingleton<Microsoft.Extensions.Options.IValidateOptions<LascodiaTradingEngine.Application.Common.Options.StrategyEvaluatorOptions>,
+    LascodiaTradingEngine.Application.Common.Options.StrategyEvaluatorOptionsValidator>();
+builder.Services.AddSingleton<Microsoft.Extensions.Options.IValidateOptions<LascodiaTradingEngine.Application.Bridge.Options.BridgeOptions>,
+    LascodiaTradingEngine.Application.Bridge.Options.BridgeOptionsValidator>();
 
 builder.Services.ConfigureApplicationServices(builder.Configuration);
 builder.Services.ConfigureDbContexts(builder.Configuration);
@@ -272,7 +282,21 @@ if (app.Environment.IsDevelopment())
     app.UseSwaggerUI();
 }
 
-// Detailed health check breakdown endpoint
+// Liveness probe — lightweight check for Kubernetes kubelet. Only includes checks tagged "live".
+// Returns Healthy if the process is running and not deadlocked. Does NOT check external deps.
+app.MapHealthChecks("/health/live", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions
+{
+    Predicate = check => check.Tags.Contains("live"),
+});
+
+// Readiness probe — full dependency check. Only passes when DB, event bus, and broker are connected.
+// Kubernetes uses this to stop routing traffic until the engine is fully operational.
+app.MapHealthChecks("/health/ready", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions
+{
+    Predicate = check => check.Tags.Contains("ready"),
+});
+
+// Detailed health check breakdown endpoint — runs ALL checks and returns a JSON breakdown
 app.MapHealthChecks("/health/detail", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions
 {
     ResponseWriter = async (context, report) =>

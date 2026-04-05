@@ -11,22 +11,39 @@ namespace LascodiaTradingEngine.Application.MLModels.Queries.GetPagedMLModels;
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Retrieves a paginated list of ML models, optionally filtered by symbol, timeframe, active status, and model status.
+/// Results are ordered by TrainedAt descending (newest first).
+/// </summary>
 public class GetPagedMLModelsQuery : PagerRequestWithFilterType<MLModelQueryFilter, ResponseData<PagedData<MLModelDto>>>
 {
 }
 
 // ── Filter ────────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Filter criteria for paginated ML model queries.
+/// </summary>
 public class MLModelQueryFilter
 {
+    /// <summary>Filter by instrument symbol (e.g. "EURUSD").</summary>
     public string? Symbol    { get; set; }
+
+    /// <summary>Filter by chart timeframe (e.g. "H1").</summary>
     public string? Timeframe { get; set; }
+
+    /// <summary>Filter by active status (true = active only, false = inactive only).</summary>
     public bool?   IsActive  { get; set; }
+
+    /// <summary>Filter by model status (e.g. "Active", "Superseded", "Training").</summary>
     public string? Status    { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Handles paginated ML model retrieval with optional Symbol, Timeframe, IsActive, and Status filters.
+/// </summary>
 public class GetPagedMLModelsQueryHandler
     : IRequestHandler<GetPagedMLModelsQuery, ResponseData<PagedData<MLModelDto>>>
 {

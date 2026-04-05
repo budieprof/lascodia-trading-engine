@@ -6,6 +6,7 @@ using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.WalkForward.Queries.DTOs;
 
+/// <summary>Data transfer object for a walk-forward analysis run including window configuration, scores, and status.</summary>
 public class WalkForwardRunDto : IMapFrom<WalkForwardRun>
 {
     public long      Id                        { get; set; }

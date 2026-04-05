@@ -9,13 +9,16 @@ namespace LascodiaTradingEngine.Application.WalkForward.Queries.GetWalkForwardRu
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Retrieves a single walk-forward run by its unique identifier.</summary>
 public class GetWalkForwardRunQuery : IRequest<ResponseData<WalkForwardRunDto>>
 {
+    /// <summary>The unique identifier of the walk-forward run.</summary>
     public required long Id { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Fetches a single walk-forward run by ID from the read-only context.</summary>
 public class GetWalkForwardRunQueryHandler : IRequestHandler<GetWalkForwardRunQuery, ResponseData<WalkForwardRunDto>>
 {
     private readonly IReadApplicationDbContext _context;

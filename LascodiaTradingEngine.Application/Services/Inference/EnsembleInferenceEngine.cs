@@ -200,9 +200,10 @@ public sealed class EnsembleInferenceEngine : IModelInferenceEngine
         var samples = new double[numSamples];
         for (int s = 0; s < numSamples; s++)
         {
-            var maskedFeatures = new float[featureCount];
+            var actualLength = features.Length;
+            var maskedFeatures = new float[actualLength];
             double scale = 1.0 / (1.0 - DropoutRate);
-            for (int j = 0; j < featureCount; j++)
+            for (int j = 0; j < actualLength; j++)
                 maskedFeatures[j] = rng.NextDouble() >= DropoutRate
                     ? (float)(features[j] * scale)
                     : 0f;

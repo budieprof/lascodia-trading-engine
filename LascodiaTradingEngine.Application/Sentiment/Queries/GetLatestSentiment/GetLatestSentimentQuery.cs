@@ -9,13 +9,16 @@ namespace LascodiaTradingEngine.Application.Sentiment.Queries.GetLatestSentiment
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Retrieves the most recent sentiment snapshot for a given symbol's base currency.</summary>
 public class GetLatestSentimentQuery : IRequest<ResponseData<SentimentSnapshotDto>>
 {
+    /// <summary>The trading symbol; the first 3 characters are used as the currency key.</summary>
     public required string Symbol { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Fetches the latest sentiment snapshot for the derived base currency, ordered by capture date descending.</summary>
 public class GetLatestSentimentQueryHandler
     : IRequestHandler<GetLatestSentimentQuery, ResponseData<SentimentSnapshotDto>>
 {

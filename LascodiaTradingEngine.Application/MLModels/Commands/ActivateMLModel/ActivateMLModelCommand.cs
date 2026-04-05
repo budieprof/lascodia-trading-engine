@@ -4,19 +4,29 @@ using Microsoft.EntityFrameworkCore;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.MLModels.Commands.ActivateMLModel;
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Activates an ML model for live signal scoring on its target symbol/timeframe.
+/// Requires four-eyes approval before execution. Deactivates any previously active model
+/// for the same symbol/timeframe (marks them as Superseded).
+/// </summary>
 public class ActivateMLModelCommand : IRequest<ResponseData<string>>
 {
+    /// <summary>Database ID of the ML model to activate.</summary>
     public long Id { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Validates that the model Id is a positive number.
+/// </summary>
 public class ActivateMLModelCommandValidator : AbstractValidator<ActivateMLModelCommand>
 {
     public ActivateMLModelCommandValidator()
@@ -27,6 +37,11 @@ public class ActivateMLModelCommandValidator : AbstractValidator<ActivateMLModel
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Handles ML model activation. Enforces four-eyes approval workflow (returns -202 if pending approval),
+/// deactivates existing active models for the same symbol/timeframe (setting status to Superseded),
+/// then activates the target model and records the activation timestamp.
+/// </summary>
 public class ActivateMLModelCommandHandler : IRequestHandler<ActivateMLModelCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;
@@ -66,6 +81,31 @@ public class ActivateMLModelCommandHandler : IRequestHandler<ActivateMLModelComm
                 currentAccountId,
                 cancellationToken);
             return ResponseData<string>.Init(null, false, "Pending four-eyes approval", "-202");
+        }
+
+        // ── Approval staleness check ──
+        // Verify the approval was granted recently (configurable, default 24 hours).
+        // Stale approvals must be re-requested to prevent activating a model long after
+        // conditions may have changed.
+        var approvalExpiryEntry = await db.Set<EngineConfig>()
+            .AsNoTracking()
+            .FirstOrDefaultAsync(c => c.Key == "MLApproval:MaxApprovalAgeHours" && !c.IsDeleted, cancellationToken);
+        int maxApprovalAgeHours = int.TryParse(approvalExpiryEntry?.Value, out var mah) ? mah : 24;
+
+        var approval = await db.Set<ApprovalRequest>()
+            .AsNoTracking()
+            .Where(a => a.OperationType  == ApprovalOperationType.ModelPromotion &&
+                        a.TargetEntityId == request.Id &&
+                        a.Status         == ApprovalStatus.Approved &&
+                        !a.IsDeleted)
+            .OrderByDescending(a => a.ResolvedAt)
+            .FirstOrDefaultAsync(cancellationToken);
+
+        if (approval?.ResolvedAt is not null &&
+            (DateTime.UtcNow - approval.ResolvedAt.Value).TotalHours > maxApprovalAgeHours)
+        {
+            return ResponseData<string>.Init(null, false,
+                "Approval expired — please re-request approval.", "-11");
         }
 
         if (!await _approvalWorkflow.ConsumeApprovalAsync(ApprovalOperationType.ModelPromotion, request.Id, cancellationToken))

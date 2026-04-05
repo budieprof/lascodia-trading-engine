@@ -4,6 +4,10 @@ using LascodiaTradingEngine.Domain.Entities;
 
 namespace LascodiaTradingEngine.Infrastructure.Persistence.Configurations;
 
+/// <summary>
+/// EF Core entity configuration for <see cref="TickRecord"/>. Defines table mapping,
+/// column types, indexes, relationships, and the soft-delete query filter.
+/// </summary>
 public class TickRecordConfiguration : IEntityTypeConfiguration<TickRecord>
 {
     public void Configure(EntityTypeBuilder<TickRecord> builder)

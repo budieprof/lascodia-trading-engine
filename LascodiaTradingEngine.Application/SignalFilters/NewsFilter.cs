@@ -47,10 +47,30 @@ public class NewsFilter : INewsFilter
 
     private static List<string> ExtractCurrencies(string symbol)
     {
-        // Standard 6-character forex symbol: first 3 = base, last 3 = quote
-        if (symbol.Length >= 6)
-            return [symbol[..3].ToUpperInvariant(), symbol[3..6].ToUpperInvariant()];
+        if (string.IsNullOrWhiteSpace(symbol))
+            return [];
 
-        return [symbol.ToUpperInvariant()];
+        var upper = symbol.ToUpperInvariant();
+
+        // Standard 6-character forex symbol: first 3 = base, last 3 = quote (e.g. EURUSD)
+        // Also handles 6+ char symbols like XAUUSD, XAGUSD
+        if (upper.Length >= 6 && upper.All(char.IsLetterOrDigit))
+            return [upper[..3], upper[3..6]];
+
+        // 3-character symbol (e.g. index CFD like "SPX") — treat as single currency
+        if (upper.Length == 3)
+            return [upper];
+
+        // Non-standard symbol (crypto like "BTCUSD" is 6 chars so handled above;
+        // but "BTC/USD" with separator or short names like "US30" are not forex).
+        // Extract known 3-letter ISO codes by checking if any suffix/prefix matches.
+        var currencies = new List<string>();
+        if (upper.Length >= 3)
+        {
+            currencies.Add(upper[..3]);
+            if (upper.Length >= 6)
+                currencies.Add(upper[^3..]);
+        }
+        return currencies.Count > 0 ? currencies : [upper];
     }
 }

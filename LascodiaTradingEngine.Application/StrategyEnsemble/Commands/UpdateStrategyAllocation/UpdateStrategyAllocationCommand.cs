@@ -8,6 +8,7 @@ namespace LascodiaTradingEngine.Application.StrategyEnsemble.Commands.UpdateStra
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>Manually sets the ensemble weight and rolling Sharpe ratio for a single strategy allocation.</summary>
 public class UpdateStrategyAllocationCommand : IRequest<ResponseData<string>>
 {
     public long    StrategyId        { get; set; }
@@ -31,6 +32,7 @@ public class UpdateStrategyAllocationCommandValidator : AbstractValidator<Update
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Upserts a strategy allocation with the specified weight and Sharpe ratio. Creates the record if it does not exist.</summary>
 public class UpdateStrategyAllocationCommandHandler
     : IRequestHandler<UpdateStrategyAllocationCommand, ResponseData<string>>
 {

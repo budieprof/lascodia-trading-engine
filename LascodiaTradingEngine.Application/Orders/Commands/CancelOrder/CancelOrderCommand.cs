@@ -10,13 +10,19 @@ using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.Orders.Commands.CancelOrder;
 
+/// <summary>
+/// Cancels a pending, submitted, or partially-filled order. If the order has been sent to the
+/// broker, an <see cref="Domain.Entities.EACommand"/> is queued so the EA cancels it on MT5.
+/// </summary>
 public class CancelOrderCommand : IRequest<ResponseData<string>>
 {
+    /// <summary>Order identifier to cancel.</summary>
     public long Id { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>Validates that the order Id is a positive value.</summary>
 public class CancelOrderCommandValidator : AbstractValidator<CancelOrderCommand>
 {
     public CancelOrderCommandValidator()
@@ -25,6 +31,10 @@ public class CancelOrderCommandValidator : AbstractValidator<CancelOrderCommand>
     }
 }
 
+/// <summary>
+/// Sets the order status to Cancelled, enforces ownership via <see cref="IEAOwnershipGuard"/>,
+/// and queues an EA command to cancel the order on MT5 if it has a broker ticket.
+/// </summary>
 public class CancelOrderCommandHandler : IRequestHandler<CancelOrderCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

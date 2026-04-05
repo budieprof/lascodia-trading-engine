@@ -11,12 +11,20 @@ namespace LascodiaTradingEngine.Application.ExpertAdvisor.Queries.GetActiveInsta
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Retrieves all currently active EA instances, ordered by most recent heartbeat.
+/// Used by the dashboard and health monitoring to display connected EA fleet status.
+/// </summary>
 public class GetActiveInstancesQuery : IRequest<ResponseData<List<EAInstanceDto>>>
 {
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Handles active instance retrieval. Queries EAInstance records with Active status,
+/// projected to DTOs via AutoMapper, ordered by most recent heartbeat descending.
+/// </summary>
 public class GetActiveInstancesQueryHandler : IRequestHandler<GetActiveInstancesQuery, ResponseData<List<EAInstanceDto>>>
 {
     private readonly IReadApplicationDbContext _context;

@@ -11,20 +11,33 @@ namespace LascodiaTradingEngine.Application.MLEvaluation.Queries.GetPagedMLShado
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Retrieves a paginated list of ML shadow evaluations, optionally filtered by symbol and status.
+/// Results are ordered by StartedAt descending (most recent first).
+/// </summary>
 public class GetPagedMLShadowEvaluationsQuery : PagerRequestWithFilterType<MLShadowEvaluationQueryFilter, ResponseData<PagedData<MLShadowEvaluationDto>>>
 {
 }
 
 // ── Filter ────────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Filter criteria for paginated shadow evaluation queries.
+/// </summary>
 public class MLShadowEvaluationQueryFilter
 {
+    /// <summary>Filter by instrument symbol.</summary>
     public string? Symbol { get; set; }
+
+    /// <summary>Filter by evaluation status (e.g. "Running", "Completed").</summary>
     public string? Status { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Handles paginated shadow evaluation retrieval with optional Symbol and Status filters.
+/// </summary>
 public class GetPagedMLShadowEvaluationsQueryHandler
     : IRequestHandler<GetPagedMLShadowEvaluationsQuery, ResponseData<PagedData<MLShadowEvaluationDto>>>
 {

@@ -13,6 +13,10 @@ namespace LascodiaTradingEngine.Application.EngineConfiguration.Commands.UpsertE
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Creates or updates an engine configuration key-value pair. Risk-related keys require
+/// four-eyes approval before the change is applied. All changes are audit-logged.
+/// </summary>
 public class UpsertEngineConfigCommand : IRequest<ResponseData<long>>
 {
     public string  Key              { get; set; } = string.Empty;
@@ -24,6 +28,7 @@ public class UpsertEngineConfigCommand : IRequest<ResponseData<long>>
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>Validates key, value, and data type for the engine configuration upsert.</summary>
 public class UpsertEngineConfigCommandValidator : AbstractValidator<UpsertEngineConfigCommand>
 {
     public UpsertEngineConfigCommandValidator()
@@ -43,6 +48,11 @@ public class UpsertEngineConfigCommandValidator : AbstractValidator<UpsertEngine
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Upserts an engine config entry. Risk-related keys (containing Risk, Max, Limit, VaR, Drawdown)
+/// gate behind four-eyes approval. Creates an <see cref="Domain.Entities.EngineConfigAuditLog"/>
+/// and a <see cref="Domain.Entities.DecisionLog"/> entry for every change.
+/// </summary>
 public class UpsertEngineConfigCommandHandler : IRequestHandler<UpsertEngineConfigCommand, ResponseData<long>>
 {
     private readonly IWriteApplicationDbContext _context;

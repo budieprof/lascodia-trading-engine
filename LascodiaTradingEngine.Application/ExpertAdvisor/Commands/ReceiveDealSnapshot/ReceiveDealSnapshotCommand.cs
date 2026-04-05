@@ -15,27 +15,57 @@ namespace LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ReceiveDealSn
 /// </summary>
 public class ReceiveDealSnapshotCommand : IRequest<ResponseData<string>>
 {
+    /// <summary>Unique identifier of the EA instance providing the deal snapshot.</summary>
     public required string InstanceId { get; set; }
+
+    /// <summary>List of recent deals (filled trades) to process.</summary>
     public List<DealSnapshotItem> Deals { get; set; } = new();
 }
 
+/// <summary>
+/// Represents a single completed deal (trade fill) from MetaTrader 5's deal history.
+/// </summary>
 public class DealSnapshotItem
 {
+    /// <summary>Broker-assigned deal ticket number.</summary>
     public long     Ticket        { get; set; }
+
+    /// <summary>Ticket of the order that generated this deal.</summary>
     public long     OrderTicket   { get; set; }
+
+    /// <summary>Ticket of the position this deal belongs to.</summary>
     public long     PositionTicket { get; set; }
+
+    /// <summary>Instrument symbol.</summary>
     public required string Symbol { get; set; }
-    public required string DealType { get; set; }  // "Buy" | "Sell"
+
+    /// <summary>Deal direction: "Buy" or "Sell".</summary>
+    public required string DealType { get; set; }
+
+    /// <summary>Filled volume in lots.</summary>
     public decimal  Volume        { get; set; }
+
+    /// <summary>Execution price of the deal.</summary>
     public decimal  Price         { get; set; }
+
+    /// <summary>Realised profit/loss from this deal.</summary>
     public decimal  Profit        { get; set; }
+
+    /// <summary>Broker commission charged for this deal.</summary>
     public decimal  Commission    { get; set; }
+
+    /// <summary>Swap charges applied to this deal.</summary>
     public decimal  Swap          { get; set; }
+
+    /// <summary>UTC time when the deal was executed.</summary>
     public DateTime DealTime      { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Validates InstanceId is non-empty and Deals is not null.
+/// </summary>
 public class ReceiveDealSnapshotCommandValidator : AbstractValidator<ReceiveDealSnapshotCommand>
 {
     public ReceiveDealSnapshotCommandValidator()
@@ -50,6 +80,11 @@ public class ReceiveDealSnapshotCommandValidator : AbstractValidator<ReceiveDeal
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Handles deal snapshot processing. Matches each deal's OrderTicket to an existing engine Order
+/// by BrokerOrderId. If the order is found and not yet filled, updates it with the fill price,
+/// quantity, status (Filled), and fill timestamp from the deal.
+/// </summary>
 public class ReceiveDealSnapshotCommandHandler : IRequestHandler<ReceiveDealSnapshotCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

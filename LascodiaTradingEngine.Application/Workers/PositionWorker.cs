@@ -163,11 +163,19 @@ public class PositionWorker : BackgroundService
                     using var priceCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                     priceCts.CancelAfter(TimeSpan.FromSeconds(30));
 
-                    await mediator.Send(new UpdatePositionPriceCommand
+                    var priceUpdateResult = await mediator.Send(new UpdatePositionPriceCommand
                     {
                         Id           = position.Id,
                         CurrentPrice = currentPrice
                     }, priceCts.Token);
+
+                    if (priceUpdateResult?.status != true)
+                    {
+                        _logger.LogWarning(
+                            "PositionWorker: price update failed for position {Id} ({Symbol}) — skipping SL/TP checks this cycle. Reason: {Reason}",
+                            position.Id, position.Symbol, priceUpdateResult?.message ?? "unknown");
+                        continue;
+                    }
                     priceUpdated++;
 
                     // Lock per position to prevent concurrent close from PositionWorker
@@ -191,11 +199,19 @@ public class PositionWorker : BackgroundService
                             using var closeCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                             closeCts.CancelAfter(TimeSpan.FromSeconds(30));
 
-                            await mediator.Send(new ClosePositionCommand
+                            var slCloseResult = await mediator.Send(new ClosePositionCommand
                             {
                                 Id         = position.Id,
                                 ClosePrice = currentPrice
                             }, closeCts.Token);
+
+                            if (slCloseResult?.status != true)
+                            {
+                                _logger.LogWarning(
+                                    "PositionWorker: SL close failed for position {Id} ({Symbol}) — {Reason}",
+                                    position.Id, position.Symbol, slCloseResult?.message ?? "unknown");
+                                continue;
+                            }
 
                             await mediator.Send(new LogDecisionCommand
                             {
@@ -228,11 +244,19 @@ public class PositionWorker : BackgroundService
                             using var closeCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                             closeCts.CancelAfter(TimeSpan.FromSeconds(30));
 
-                            await mediator.Send(new ClosePositionCommand
+                            var tpCloseResult = await mediator.Send(new ClosePositionCommand
                             {
                                 Id         = position.Id,
                                 ClosePrice = currentPrice
                             }, closeCts.Token);
+
+                            if (tpCloseResult?.status != true)
+                            {
+                                _logger.LogWarning(
+                                    "PositionWorker: TP close failed for position {Id} ({Symbol}) — {Reason}",
+                                    position.Id, position.Symbol, tpCloseResult?.message ?? "unknown");
+                                continue;
+                            }
 
                             await mediator.Send(new LogDecisionCommand
                             {

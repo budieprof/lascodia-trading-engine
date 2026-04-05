@@ -8,8 +8,10 @@ namespace LascodiaTradingEngine.Application.TradingAccounts.Commands.ActivateTra
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>Activates a trading account and deactivates all other accounts, ensuring only one is active at a time.</summary>
 public class ActivateTradingAccountCommand : IRequest<ResponseData<string>>
 {
+    /// <summary>The unique identifier of the trading account to activate.</summary>
     public long Id { get; set; }
 }
 
@@ -25,6 +27,7 @@ public class ActivateTradingAccountCommandValidator : AbstractValidator<Activate
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Sets the target account as active and deactivates all sibling accounts in a single transaction.</summary>
 public class ActivateTradingAccountCommandHandler : IRequestHandler<ActivateTradingAccountCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

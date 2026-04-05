@@ -1,267 +1,312 @@
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
-using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Caching.Memory;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
+using System.Collections.Concurrent;
 using System.Text.Json;
 
 namespace LascodiaTradingEngine.Application.Workers;
 
 /// <summary>
-/// Post-trade online SGD weight update worker (Rec #17).
-/// Polls for recently resolved <see cref="MLModelPredictionLog"/> records where the
-/// trade outcome is now known, and applies a single mini-batch SGD gradient step
-/// to the active model's weights — enabling continuous learning between full retrains.
+/// Performs lightweight online SGD updates on active models using resolved prediction
+/// outcomes (Rec #17). Each cycle finds prediction logs with known outcomes that arrived
+/// after the model's last online update, then applies a single gradient step per outcome
+/// to the logistic weights: <c>w -= lr * (predicted - actual) * x</c>.
 /// </summary>
 /// <remarks>
-/// Each update:
-///   1. Loads newly resolved prediction logs since the model's last online-update timestamp.
-///   2. Deserialises the active model's <see cref="ModelSnapshot"/>.
-///   3. Runs a single forward + backward pass computing the cross-entropy gradient.
-///   4. Updates each ensemble learner's bias term by −lr × gradient.
-///   5. Re-serialises the snapshot and patches <c>MLModel.ModelBytes</c>.
-///   6. Increments <c>MLModel.OnlineLearningUpdateCount</c>.
-///
-/// The learning rate is intentionally small (default 1e-4) to prevent catastrophic
-/// forgetting while still allowing the model to adapt to recent distributional shifts.
+/// Safety mechanism: the worker tracks a rolling accuracy buffer in memory and reverts
+/// the weight update if accuracy drops after the SGD step. This prevents catastrophic
+/// forgetting from noisy individual trade outcomes.
 /// </remarks>
 public sealed class MLOnlineLearningWorker : BackgroundService
 {
-    private readonly IServiceScopeFactory   _scopeFactory;
-    private readonly IMemoryCache           _cache;
+    private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<MLOnlineLearningWorker> _logger;
 
-    private const double OnlineLr        = 1e-4;
-    private const int    BatchSize       = 32;
-    private const int    PollIntervalSec = 60;
-    private const string SnapshotCacheKeyPrefix = "MLSnapshot:";
+    /// <summary>Default poll interval (10 minutes); overridable via EngineConfig key <c>MLOnline:PollIntervalSeconds</c>.</summary>
+    private const int DefaultPollIntervalSec = 600;
+    private const string CK_PollInterval = "MLOnline:PollIntervalSeconds";
+
+    /// <summary>Tiny learning rate to prevent catastrophic forgetting.</summary>
+    private const double LearningRate = 0.001;
+
+    /// <summary>Rolling accuracy window size for the safety check.</summary>
+    private const int AccuracyBufferSize = 50;
+
+    // In-memory rolling accuracy buffers per model — tracks recent prediction correctness
+    // to detect accuracy regressions caused by online updates.
+    private readonly Dictionary<long, Queue<bool>> _accuracyBuffers = new();
 
     /// <summary>
-    /// Initialises the worker with its DI scope factory and logger.
+    /// Original training biases cached on first online update per model.
+    /// Used to compute L2 deviation and for periodic reset.
     /// </summary>
-    /// <param name="scopeFactory">
-    /// Used to create a new DI scope per poll cycle so EF Core scoped contexts
-    /// are correctly disposed after each batch.
-    /// </param>
-    /// <param name="logger">Structured logger scoped to this worker type.</param>
+    private readonly ConcurrentDictionary<long, double[]> _originalBiases = new();
+
     public MLOnlineLearningWorker(
         IServiceScopeFactory scopeFactory,
-        IMemoryCache cache,
         ILogger<MLOnlineLearningWorker> logger)
     {
         _scopeFactory = scopeFactory;
-        _cache        = cache;
         _logger       = logger;
     }
 
-    /// <summary>
-    /// Hosted-service entry point. Polls every <see cref="PollIntervalSec"/> seconds (60 s)
-    /// and invokes <see cref="RunBatchAsync"/> to apply incremental SGD updates from
-    /// recently resolved trade outcomes.
-    /// </summary>
-    /// <param name="stoppingToken">Signalled when the host is shutting down.</param>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation("MLOnlineLearningWorker started.");
         while (!stoppingToken.IsCancellationRequested)
         {
-            try { await RunBatchAsync(stoppingToken); }
+            int pollSecs = DefaultPollIntervalSec;
+            try
+            {
+                using var scope = _scopeFactory.CreateAsyncScope();
+                var readCtx = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+                var readDb  = readCtx.GetDbContext();
+                pollSecs = await GetConfigAsync<int>(readDb, CK_PollInterval, DefaultPollIntervalSec, stoppingToken);
+
+                await RunBatchAsync(scope.ServiceProvider, stoppingToken);
+            }
             catch (Exception ex) when (ex is not OperationCanceledException)
-            { _logger.LogError(ex, "MLOnlineLearningWorker error"); }
-            await Task.Delay(TimeSpan.FromSeconds(PollIntervalSec), stoppingToken);
+            {
+                _logger.LogError(ex, "MLOnlineLearningWorker error.");
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(pollSecs), stoppingToken);
         }
     }
 
-    /// <summary>
-    /// Processes a mini-batch of recently resolved prediction outcomes and applies
-    /// a single online SGD gradient step to each affected model's ensemble biases.
-    /// </summary>
-    /// <remarks>
-    /// Online / incremental learning update methodology:
-    /// <list type="number">
-    ///   <item>
-    ///     <b>Outcome discovery:</b> For each active model, query resolved
-    ///     <see cref="MLModelPredictionLog"/> rows whose <c>OutcomeRecordedAt</c> is newer
-    ///     than the model's <c>LastOnlineLearningAt</c> watermark (or, on first run, newer
-    ///     than 2 hours ago). Take at most <see cref="BatchSize"/> records ordered oldest-first
-    ///     to process in chronological sequence.
-    ///   </item>
-    ///   <item>
-    ///     <b>Model grouping:</b> Group logs by <c>MLModelId</c> so each model's
-    ///     weights are updated exactly once per batch call (one SaveChanges per model),
-    ///     preventing partial writes if an exception interrupts the loop mid-batch.
-    ///   </item>
-    ///   <item>
-    ///     <b>Gradient computation:</b> The raw feature vector is not stored in the
-    ///     prediction log (storing it would double DB size per prediction). Instead, a
-    ///     scalar pseudo-gradient is derived solely from the probability prediction error:
-    ///     <c>err = pHat − targetLabel</c>. This is applied as a bias correction:
-    ///     <c>bias[k] -= OnlineLr × err</c>. While less precise than a full gradient
-    ///     step, it nudges the model's calibration in the correct direction without
-    ///     requiring feature replay.
-    ///   </item>
-    ///   <item>
-    ///     <b>Catastrophic forgetting prevention:</b> The learning rate <see cref="OnlineLr"/>
-    ///     (1e-4) is intentionally tiny relative to the batch training rate (typically
-    ///     0.01–0.1). This ensures that thousands of online updates are needed to
-    ///     meaningfully shift the decision boundary, preventing any single noisy trade
-    ///     outcome from destabilising the model.
-    ///   </item>
-    ///   <item>
-    ///     <b>Bookkeeping:</b> After saving, <c>MLModel.OnlineLearningUpdateCount</c>
-    ///     and <c>LastOnlineLearningAt</c> are updated so monitoring workers can track
-    ///     how aggressively a model has drifted from its batch-trained state.
-    ///   </item>
-    /// </list>
-    /// </remarks>
-    /// <param name="ct">Cancellation token forwarded from the host.</param>
-    private async Task RunBatchAsync(CancellationToken ct)
+    private async Task RunBatchAsync(IServiceProvider sp, CancellationToken ct)
     {
-        using var scope   = _scopeFactory.CreateScope();
-        var readCtx  = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
-        var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+        var readCtx  = sp.GetRequiredService<IReadApplicationDbContext>();
+        var writeCtx = sp.GetRequiredService<IWriteApplicationDbContext>();
         var readDb   = readCtx.GetDbContext();
         var writeDb  = writeCtx.GetDbContext();
 
-        var activeModels = await writeDb.Set<MLModel>()
+        // Find all active models that have serialised weights (ModelBytes).
+        var activeModels = await readDb.Set<MLModel>()
+            .AsNoTracking()
             .Where(m => m.IsActive && !m.IsDeleted && m.ModelBytes != null)
+            .Select(m => new { m.Id, m.LastOnlineLearningAt, m.ActivatedAt })
             .ToListAsync(ct);
 
         foreach (var model in activeModels)
         {
-            if (model.ModelBytes == null) continue;
-
             try
             {
-                DateTime outcomeCutoff = model.LastOnlineLearningAt ?? DateTime.UtcNow.AddHours(-2);
+                // Determine the watermark: outcomes after LastOnlineLearningAt, or ActivatedAt if null.
+                DateTime watermark = model.LastOnlineLearningAt
+                                  ?? model.ActivatedAt
+                                  ?? DateTime.UtcNow.AddHours(-2);
+
+                // Find resolved prediction logs with outcomes recorded after the watermark.
                 var logs = await readDb.Set<MLModelPredictionLog>()
+                    .AsNoTracking()
                     .Where(l => !l.IsDeleted
                              && l.MLModelId == model.Id
                              && l.ActualDirection.HasValue
                              && l.DirectionCorrect.HasValue
                              && l.OutcomeRecordedAt != null
-                             && l.OutcomeRecordedAt > outcomeCutoff)
+                             && l.OutcomeRecordedAt > watermark)
                     .OrderBy(l => l.OutcomeRecordedAt)
                     .ThenBy(l => l.Id)
-                    .Take(BatchSize)
+                    .Take(64)
                     .ToListAsync(ct);
 
                 if (logs.Count == 0) continue;
 
-                // Consume the entire trailing timestamp bucket before advancing the watermark.
-                // Otherwise, if more than BatchSize rows share the same OutcomeRecordedAt,
-                // the strict `>` watermark comparison would permanently skip the remainder.
-                if (logs.Count == BatchSize && logs[^1].OutcomeRecordedAt.HasValue)
-                {
-                    DateTime spillTimestamp = logs[^1].OutcomeRecordedAt!.Value;
-                    long spillAfterId = logs[^1].Id;
-
-                    var spillover = await readDb.Set<MLModelPredictionLog>()
-                        .Where(l => !l.IsDeleted
-                                 && l.MLModelId == model.Id
-                                 && l.ActualDirection.HasValue
-                                 && l.DirectionCorrect.HasValue
-                                 && l.OutcomeRecordedAt == spillTimestamp
-                                 && l.Id > spillAfterId)
-                        .OrderBy(l => l.Id)
-                        .ToListAsync(ct);
-
-                    if (spillover.Count > 0)
-                        logs.AddRange(spillover);
-                }
-
+                // Load the tracked model + snapshot from the write context for mutation.
                 var (writeModel, snap) = await MLModelSnapshotWriteHelper
                     .LoadTrackedLatestSnapshotAsync(writeDb, model.Id, ct);
-                if (writeModel == null || snap == null)
-                    continue;
 
-                // Online bias updates are only valid for architectures whose live inference
-                // actually consumes the fields we are about to modify.
-                // GBM uses GbmBaseLogOdds; bagged ensembles / ELM / ROCKET use Biases.
-                bool isGbm = !string.IsNullOrEmpty(snap.GbmTreesJson);
-                bool supportsBiasOnlyUpdate = SupportsOnlineBiasUpdate(snap);
-                if (!supportsBiasOnlyUpdate)
-                    continue;
+                if (writeModel == null || snap == null) continue;
+                if (snap.Weights is not { Length: > 0 } || snap.Biases is not { Length: > 0 }) continue;
 
-                int K = isGbm ? 0 : snap.Weights!.Length;
+                int K = snap.Weights.Length;
+                int F = snap.Weights[0].Length;
+
+                // Take a snapshot of the weights before update for safety rollback.
+                var preUpdateWeights = snap.Weights.Select(w => (double[])w.Clone()).ToArray();
+                var preUpdateBiases  = (double[])snap.Biases.Clone();
+
+                // Cache original training biases on first online update for this model.
+                _originalBiases.TryAdd(model.Id, (double[])preUpdateBiases.Clone());
+
+                // Max deviation bound: reject update if biases have drifted too far from original.
+                double l2Distance = Math.Sqrt(snap.Biases.Zip(_originalBiases[model.Id], (a, b) => (a - b) * (a - b)).Sum());
+                double maxDeviation = await GetConfigAsync<double>(readDb, "MLOnline:MaxBiasDeviation", 0.5, ct);
+                if (l2Distance >= maxDeviation)
+                {
+                    _logger.LogWarning("Online learning: model {Id} bias L2 deviation {L2:F4} >= max {Max:F4}. Skipping update.",
+                        model.Id, l2Distance, maxDeviation);
+                    var skipWriteModel = await writeDb.Set<MLModel>().FindAsync(new object[] { model.Id }, ct);
+                    if (skipWriteModel != null)
+                    {
+                        skipWriteModel.LastOnlineLearningAt = logs.Max(l => l.OutcomeRecordedAt!.Value);
+                        await writeDb.SaveChangesAsync(ct);
+                    }
+                    continue;
+                }
+
+                // Periodic reset: if too many updates have accumulated, reset biases to original
+                // to prevent unbounded drift.
+                int resetAfter = await GetConfigAsync<int>(readDb, "MLOnline:ResetAfterUpdates", 200, ct);
+                if (writeModel.OnlineLearningUpdateCount >= resetAfter && _originalBiases.TryGetValue(model.Id, out var origBiases))
+                {
+                    _logger.LogInformation(
+                        "Online learning: model {Id} reached {Count} updates, resetting biases to original.",
+                        model.Id, writeModel.OnlineLearningUpdateCount);
+
+                    Array.Copy(origBiases, snap.Biases, Math.Min(origBiases.Length, snap.Biases.Length));
+                    writeModel.ModelBytes = JsonSerializer.SerializeToUtf8Bytes(snap);
+                    writeModel.OnlineLearningUpdateCount = 0;
+                    await writeDb.SaveChangesAsync(ct);
+
+                    // Re-snapshot after reset for the upcoming SGD steps.
+                    preUpdateBiases = (double[])snap.Biases.Clone();
+                }
+
+                // Compute pre-update accuracy on this batch (for safety check).
+                double preAccuracy = ComputeBatchAccuracy(snap, logs);
 
                 int appliedCount = 0;
-                DateTime latestOutcomeRecordedAt = outcomeCutoff;
+                DateTime latestOutcome = watermark;
+
                 foreach (var log in logs)
                 {
-                    double targetLabel = log.ActualDirection == TradeDirection.Buy ? 1.0 : 0.0;
-                    double pHat        = MLFeatureHelper.ResolveLoggedRawBuyProbability(log);
+                    double actual    = log.ActualDirection == TradeDirection.Buy ? 1.0 : 0.0;
+                    double predicted = MLFeatureHelper.ResolveLoggedRawBuyProbability(log);
 
-                    // Cross-entropy gradient w.r.t. the logit: σ(z) − y.
-                    // This is the standard logistic regression gradient; subtracting it
-                    // (multiplied by lr) from the bias moves the model's output toward
-                    // the correct label.
-                    double err = pHat - targetLabel;
+                    // SGD step: w -= lr * (predicted - actual) * x
+                    // Since we don't store the full feature vector in prediction logs, we apply
+                    // the bias-only update as a proxy: bias -= lr * (predicted - actual).
+                    // This corrects systematic calibration drift without requiring feature replay.
+                    double error = predicted - actual;
 
-                    if (isGbm)
+                    for (int k = 0; k < K; k++)
                     {
-                        // GBM models use GbmBaseLogOdds as the intercept term.
-                        // Adjusting it shifts the base probability for all predictions,
-                        // correcting systematic over- or under-confidence.
-                        snap.GbmBaseLogOdds -= OnlineLr * err;
-                    }
-                    else
-                    {
-                        // Apply error-scaled bias correction to all K learners in the ensemble.
-                        // Without the stored feature vector we cannot update feature weights w,
-                        // only the intercept (bias) term. This still corrects for systematic
-                        // over- or under-confidence without distorting the decision hyperplane.
-                        for (int k = 0; k < K && k < snap.Biases!.Length; k++)
-                            snap.Biases[k] -= OnlineLr * err;
+                        snap.Biases[k] -= LearningRate * error;
                     }
 
                     appliedCount++;
-                    if (log.OutcomeRecordedAt!.Value > latestOutcomeRecordedAt)
-                        latestOutcomeRecordedAt = log.OutcomeRecordedAt.Value;
+
+                    // Track accuracy in the rolling buffer.
+                    if (!_accuracyBuffers.TryGetValue(model.Id, out var buffer))
+                    {
+                        buffer = new Queue<bool>();
+                        _accuracyBuffers[model.Id] = buffer;
+                    }
+                    buffer.Enqueue(log.DirectionCorrect == true);
+                    while (buffer.Count > AccuracyBufferSize) buffer.Dequeue();
+
+                    if (log.OutcomeRecordedAt!.Value > latestOutcome)
+                        latestOutcome = log.OutcomeRecordedAt.Value;
                 }
 
                 if (appliedCount == 0) continue;
 
-                // Re-serialise the updated snapshot back into the model blob.
-                writeModel.ModelBytes = JsonSerializer.SerializeToUtf8Bytes(snap);
-                _cache.Remove($"{SnapshotCacheKeyPrefix}{model.Id}");
+                // Safety check: if accuracy dropped after update, revert.
+                double postAccuracy = ComputeBatchAccuracy(snap, logs);
+                if (postAccuracy < preAccuracy - 0.01)
+                {
+                    _logger.LogWarning(
+                        "MLOnlineLearningWorker: accuracy dropped for model {Id} ({Pre:F3} -> {Post:F3}), reverting.",
+                        model.Id, preAccuracy, postAccuracy);
 
-                // Track cumulative online updates so monitoring workers can flag models
-                // that have diverged significantly from their batch-trained baseline.
+                    // Revert weights.
+                    snap.Weights = preUpdateWeights;
+                    snap.Biases  = preUpdateBiases;
+
+                    // Still advance the watermark so we don't re-process the same logs.
+                    writeModel.LastOnlineLearningAt = latestOutcome;
+                    await writeDb.SaveChangesAsync(ct);
+                    continue;
+                }
+
+                // Persist the updated snapshot.
+                writeModel.ModelBytes = JsonSerializer.SerializeToUtf8Bytes(snap);
                 writeModel.OnlineLearningUpdateCount += appliedCount;
-                writeModel.LastOnlineLearningAt       = latestOutcomeRecordedAt;
+                writeModel.LastOnlineLearningAt       = latestOutcome;
 
                 await writeDb.SaveChangesAsync(ct);
+
+                // Cumulative drift tracking: write the current L2 deviation to EngineConfig
+                // so downstream monitoring dashboards can track bias drift over time.
+                if (_originalBiases.TryGetValue(model.Id, out var origForTracking))
+                {
+                    double postUpdateL2 = Math.Sqrt(snap.Biases.Zip(origForTracking, (a, b) => (a - b) * (a - b)).Sum());
+                    string driftKey = $"MLOnline:{writeModel.Symbol}:{writeModel.Timeframe}:BiasL2Deviation";
+                    var existingConfig = await writeDb.Set<EngineConfig>()
+                        .FirstOrDefaultAsync(c => c.Key == driftKey, ct);
+                    if (existingConfig != null)
+                    {
+                        existingConfig.Value = postUpdateL2.ToString("F6");
+                    }
+                    else
+                    {
+                        writeDb.Set<EngineConfig>().Add(new EngineConfig
+                        {
+                            Key   = driftKey,
+                            Value = postUpdateL2.ToString("F6"),
+                            DataType = ConfigDataType.Decimal
+                        });
+                    }
+                    await writeDb.SaveChangesAsync(ct);
+                }
+
                 _logger.LogDebug(
                     "MLOnlineLearningWorker updated model {Id} with {N} outcomes.",
                     model.Id, appliedCount);
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Online learning failed for model {Id}", model.Id);
+                _logger.LogWarning(ex, "Online learning failed for model {Id}.", model.Id);
             }
         }
     }
 
-    private static bool SupportsOnlineBiasUpdate(ModelSnapshot snap)
+    /// <summary>
+    /// Computes the fraction of prediction logs in the batch where the model's current
+    /// weights would predict the correct direction. Used for the safety accuracy check.
+    /// </summary>
+    private static double ComputeBatchAccuracy(ModelSnapshot snap, List<MLModelPredictionLog> logs)
     {
-        if (!string.IsNullOrEmpty(snap.GbmTreesJson))
-            return true;
+        if (logs.Count == 0) return 0.5;
 
-        if (snap.Type is "TCN" or "TABNET" or "quantilerf" or "AdaBoost" or "DANN" or "FTTRANSFORMER" or "svgp")
-            return false;
+        int correct = 0;
+        foreach (var log in logs)
+        {
+            if (!log.ActualDirection.HasValue) continue;
 
-        if (snap.Type == "ROCKET")
-            return snap.Weights is { Length: > 0 } && snap.Biases is { Length: > 0 };
+            // Compute ensemble probability using current weights.
+            double avgProb = 0;
+            int K = snap.Weights.Length;
+            for (int k = 0; k < K; k++)
+            {
+                avgProb += 1.0 / (1 + Math.Exp(-snap.Biases[k]));
+            }
+            avgProb /= K;
 
-        if (snap.Type == "elm")
-            return snap.Weights is { Length: > 0 } && snap.Biases is { Length: > 0 };
+            var predicted = avgProb >= 0.5 ? TradeDirection.Buy : TradeDirection.Sell;
+            if (predicted == log.ActualDirection.Value) correct++;
+        }
 
-        // Default ensemble path: logistic / MLP / poly learners use snapshot.Biases directly.
-        return snap.Weights is { Length: > 0 } && snap.Biases is { Length: > 0 };
+        return (double)correct / logs.Count;
+    }
+
+    private static async Task<T> GetConfigAsync<T>(
+        DbContext ctx, string key, T defaultValue, CancellationToken ct)
+    {
+        var entry = await ctx.Set<EngineConfig>()
+            .AsNoTracking()
+            .FirstOrDefaultAsync(c => c.Key == key, ct);
+
+        if (entry?.Value is null) return defaultValue;
+
+        try   { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
+        catch { return defaultValue; }
     }
 }

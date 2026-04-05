@@ -2,6 +2,10 @@ using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.Backtesting.Models;
 
+/// <summary>
+/// Comprehensive result of a backtest simulation including equity curve, trade statistics,
+/// risk-adjusted returns, streak analysis, cost breakdown, and individual trade records.
+/// </summary>
 public record BacktestResult
 {
     // ── Core Equity ──────────────────────────────────────────────────────────
@@ -49,6 +53,9 @@ public record BacktestResult
     public List<BacktestTrade> Trades { get; init; } = new();
 }
 
+/// <summary>
+/// Individual trade record from a backtest simulation with entry/exit details, PnL, and costs.
+/// </summary>
 public record BacktestTrade
 {
     public TradeDirection Direction    { get; init; }

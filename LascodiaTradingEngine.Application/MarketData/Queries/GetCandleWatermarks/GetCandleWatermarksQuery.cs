@@ -17,6 +17,10 @@ public class GetCandleWatermarksQuery : IRequest<ResponseData<List<CandleWaterma
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Handles candle watermark retrieval. Groups all non-deleted candles by (Symbol, Timeframe)
+/// and selects the maximum timestamp per group, returning the results as CandleWatermarkDto list.
+/// </summary>
 public class GetCandleWatermarksQueryHandler
     : IRequestHandler<GetCandleWatermarksQuery, ResponseData<List<CandleWatermarkDto>>>
 {

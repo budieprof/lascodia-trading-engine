@@ -12,8 +12,19 @@ using LascodiaTradingEngine.Infrastructure.Persistence.Interceptors;
 
 namespace LascodiaTradingEngine.Infrastructure;
 
+/// <summary>
+/// Infrastructure-layer dependency injection registrations for EF Core DbContexts,
+/// integration event log, distributed locking, and health checks.
+/// </summary>
 public static class DependencyInjection
 {
+    /// <summary>
+    /// Registers the write and read <see cref="DbContext"/> instances, the integration event log context,
+    /// the PostgreSQL advisory lock service, and all custom health checks against the provided configuration.
+    /// </summary>
+    /// <param name="services">The service collection to extend.</param>
+    /// <param name="configuration">Application configuration containing connection strings.</param>
+    /// <returns>The same <see cref="IServiceCollection"/> for chaining.</returns>
     public static IServiceCollection ConfigureDbContexts(this IServiceCollection services, IConfiguration configuration)
         {
             // Slow query interceptor: logs queries > 500ms as Warning, > 5000ms as Error
@@ -49,6 +60,12 @@ public static class DependencyInjection
 
             // Distributed lock via PostgreSQL advisory locks — no extra infrastructure needed.
             services.AddSingleton<IDistributedLock, PostgresAdvisoryLock>();
+
+            // Event log reader for the IntegrationEventRetryWorker outbox poller
+            services.AddScoped<IEventLogReader, EventLogReader>();
+
+            // Processed event tracker for cross-instance integration event deduplication
+            services.AddScoped<IProcessedEventTracker, ProcessedEventTracker>();
 
             // Deep health checks — registered as named checks for /health endpoint.
             services.AddHealthChecks()

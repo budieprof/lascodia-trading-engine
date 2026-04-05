@@ -4,6 +4,10 @@ using LascodiaTradingEngine.Domain.Entities;
 
 namespace LascodiaTradingEngine.Infrastructure.Persistence.Configurations;
 
+/// <summary>
+/// EF Core entity configuration for <see cref="ApprovalRequest"/>. Defines table mapping,
+/// column types, indexes, relationships, and the soft-delete query filter.
+/// </summary>
 public class ApprovalRequestConfiguration : IEntityTypeConfiguration<ApprovalRequest>
 {
     public void Configure(EntityTypeBuilder<ApprovalRequest> builder)

@@ -7,6 +7,10 @@ namespace LascodiaTradingEngine.Application.CurrencyPairs.Commands.CreateCurrenc
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Registers a new tradable currency pair (or instrument) with its symbol specification.
+/// Symbols are normalised to uppercase on creation.
+/// </summary>
 public class CreateCurrencyPairCommand : IRequest<ResponseData<long>>
 {
     public required string Symbol        { get; set; }
@@ -21,6 +25,7 @@ public class CreateCurrencyPairCommand : IRequest<ResponseData<long>>
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>Validates symbol, currency codes, lot constraints, and contract size for the new currency pair.</summary>
 public class CreateCurrencyPairCommandValidator : AbstractValidator<CreateCurrencyPairCommand>
 {
     public CreateCurrencyPairCommandValidator()
@@ -57,6 +62,7 @@ public class CreateCurrencyPairCommandValidator : AbstractValidator<CreateCurren
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Persists a new currency pair entity with uppercase-normalised symbol and currency codes.</summary>
 public class CreateCurrencyPairCommandHandler : IRequestHandler<CreateCurrencyPairCommand, ResponseData<long>>
 {
     private readonly IWriteApplicationDbContext _context;

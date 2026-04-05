@@ -9,9 +9,15 @@ namespace LascodiaTradingEngine.Application.PaperTrading.Commands.SetPaperTradin
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Switches the engine between paper (simulation) and live trading mode by updating
+/// the <c>Engine:PaperMode</c> configuration key. Records a decision log for audit.
+/// </summary>
 public class SetPaperTradingModeCommand : IRequest<ResponseData<string>>
 {
+    /// <summary>True to enable paper trading mode; false to switch to live mode.</summary>
     public bool    IsPaperMode { get; set; }
+    /// <summary>Optional reason for the mode change (audit trail).</summary>
     public string? Reason      { get; set; }
 }
 
@@ -27,6 +33,10 @@ public class SetPaperTradingModeCommandValidator : AbstractValidator<SetPaperTra
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Upserts the <c>Engine:PaperMode</c> config key and writes an audit decision log entry.
+/// Both operations are committed in a single SaveChanges call for atomicity.
+/// </summary>
 public class SetPaperTradingModeCommandHandler
     : IRequestHandler<SetPaperTradingModeCommand, ResponseData<string>>
 {

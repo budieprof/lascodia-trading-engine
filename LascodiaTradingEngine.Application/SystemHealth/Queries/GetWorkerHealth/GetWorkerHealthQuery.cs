@@ -10,6 +10,7 @@ public class GetWorkerHealthQuery : IRequest<ResponseData<IReadOnlyList<WorkerHe
 {
 }
 
+/// <summary>Retrieves health snapshots from the worker health monitor for all registered background workers.</summary>
 public class GetWorkerHealthQueryHandler
     : IRequestHandler<GetWorkerHealthQuery, ResponseData<IReadOnlyList<WorkerHealthSnapshot>>>
 {

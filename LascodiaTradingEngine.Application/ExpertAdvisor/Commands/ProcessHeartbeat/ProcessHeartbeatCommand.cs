@@ -10,18 +10,31 @@ namespace LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ProcessHeartb
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Processes a heartbeat from an EA instance to confirm it is still alive and connected.
+/// Updates the instance's LastHeartbeat timestamp and returns the current server time
+/// so the EA can detect clock drift.
+/// </summary>
 public class ProcessHeartbeatCommand : IRequest<ResponseData<HeartbeatResponse>>
 {
+    /// <summary>Unique identifier of the EA instance sending the heartbeat.</summary>
     public required string InstanceId { get; set; }
 }
 
+/// <summary>
+/// Response payload returned to the EA after a successful heartbeat, containing the engine's current UTC time.
+/// </summary>
 public class HeartbeatResponse
 {
+    /// <summary>Current UTC time on the engine server. The EA uses this to detect clock skew.</summary>
     public DateTime ServerTime { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Validates that the InstanceId is non-empty.
+/// </summary>
 public class ProcessHeartbeatCommandValidator : AbstractValidator<ProcessHeartbeatCommand>
 {
     public ProcessHeartbeatCommandValidator()
@@ -33,6 +46,10 @@ public class ProcessHeartbeatCommandValidator : AbstractValidator<ProcessHeartbe
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Handles heartbeat processing. Verifies caller ownership, updates LastHeartbeat on the active
+/// EAInstance record, and returns the current server time. Returns -14 if the instance is not found or inactive.
+/// </summary>
 public class ProcessHeartbeatCommandHandler : IRequestHandler<ProcessHeartbeatCommand, ResponseData<HeartbeatResponse>>
 {
     private readonly IWriteApplicationDbContext _context;

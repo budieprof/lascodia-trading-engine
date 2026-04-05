@@ -11,19 +11,25 @@ namespace LascodiaTradingEngine.Application.Positions.Queries.GetPagedPositions;
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Returns a paginated list of positions with optional filtering by symbol, status, and paper-trading flag.</summary>
 public class GetPagedPositionsQuery : PagerRequestWithFilterType<PositionQueryFilter, ResponseData<PagedData<PositionDto>>>
 {
 }
 
+/// <summary>Filter criteria for the paged positions query.</summary>
 public class PositionQueryFilter
 {
+    /// <summary>Filter by exact currency pair symbol.</summary>
     public string? Symbol  { get; set; }
+    /// <summary>Filter by <see cref="PositionStatus"/> enum name.</summary>
     public string? Status  { get; set; }
+    /// <summary>Filter by paper-trading flag.</summary>
     public bool?   IsPaper { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Executes the paged positions query with optional symbol, status, and paper-trading filters, ordered by open date descending.</summary>
 public class GetPagedPositionsQueryHandler
     : IRequestHandler<GetPagedPositionsQuery, ResponseData<PagedData<PositionDto>>>
 {

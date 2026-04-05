@@ -9,13 +9,16 @@ namespace LascodiaTradingEngine.Application.RiskProfiles.Queries.GetRiskProfile;
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Retrieves a single risk profile by its unique identifier.</summary>
 public class GetRiskProfileQuery : IRequest<ResponseData<RiskProfileDto>>
 {
+    /// <summary>The unique identifier of the risk profile.</summary>
     public required long Id { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Fetches a single risk profile by ID from the read-only context.</summary>
 public class GetRiskProfileQueryHandler : IRequestHandler<GetRiskProfileQuery, ResponseData<RiskProfileDto>>
 {
     private readonly IReadApplicationDbContext _context;

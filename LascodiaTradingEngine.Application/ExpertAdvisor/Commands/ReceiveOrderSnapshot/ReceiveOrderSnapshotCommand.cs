@@ -9,27 +9,58 @@ namespace LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ReceiveOrderS
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Receives a snapshot of pending orders from the broker via an EA instance.
+/// Upserts engine Order records by matching on BrokerOrderId + Symbol.
+/// Called during EA startup and periodically to synchronise pending order state.
+/// </summary>
 public class ReceiveOrderSnapshotCommand : IRequest<ResponseData<string>>
 {
+    /// <summary>Unique identifier of the EA instance providing the snapshot.</summary>
     public required string InstanceId { get; set; }
+
+    /// <summary>List of pending orders as reported by the broker. Capped at 500 items.</summary>
     public List<OrderSnapshotItem> Orders { get; set; } = new();
 }
 
+/// <summary>
+/// Represents a single pending order from the broker's perspective (MetaTrader 5 order data).
+/// </summary>
 public class OrderSnapshotItem
 {
+    /// <summary>Broker-assigned order ticket number.</summary>
     public long     Ticket        { get; set; }
+
+    /// <summary>Instrument symbol (e.g. "EURUSD").</summary>
     public required string Symbol { get; set; }
-    public required string OrderType  { get; set; }  // "Buy" | "Sell"
-    public required string ExecutionType { get; set; }  // "Limit" | "Stop" | "StopLimit"
+
+    /// <summary>Order direction: "Buy" or "Sell".</summary>
+    public required string OrderType  { get; set; }
+
+    /// <summary>Execution method: "Limit", "Stop", or "StopLimit".</summary>
+    public required string ExecutionType { get; set; }
+
+    /// <summary>Order volume in lots.</summary>
     public decimal  Volume        { get; set; }
+
+    /// <summary>Order trigger/limit price.</summary>
     public decimal  Price         { get; set; }
+
+    /// <summary>Stop loss level attached to the order, if set.</summary>
     public decimal? StopLoss      { get; set; }
+
+    /// <summary>Take profit level attached to the order, if set.</summary>
     public decimal? TakeProfit    { get; set; }
+
+    /// <summary>UTC time when the order was placed on the broker.</summary>
     public DateTime PlacedTime    { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Validates InstanceId is non-empty, Orders is not null, and batch size does not exceed 500 items.
+/// </summary>
 public class ReceiveOrderSnapshotCommandValidator : AbstractValidator<ReceiveOrderSnapshotCommand>
 {
     public ReceiveOrderSnapshotCommandValidator()
@@ -45,6 +76,11 @@ public class ReceiveOrderSnapshotCommandValidator : AbstractValidator<ReceiveOrd
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Handles order snapshot processing. For each order: updates price, volume, SL/TP on the existing
+/// engine Order if matched by BrokerOrderId + Symbol, or creates a new Order record with Submitted
+/// status for unknown broker orders.
+/// </summary>
 public class ReceiveOrderSnapshotCommandHandler : IRequestHandler<ReceiveOrderSnapshotCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

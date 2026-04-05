@@ -4,8 +4,16 @@ using Microsoft.EntityFrameworkCore;
 
 namespace LascodiaTradingEngine.Application.Workers;
 
+/// <summary>
+/// Shared helper that determines whether an ML model's signal suppression can be safely lifted
+/// by checking conformal breaker state, emergency retrain status, and Kelly fraction.
+/// </summary>
 internal static class MLSuppressionStateHelper
 {
+    /// <summary>
+    /// Returns <c>true</c> if all suppression conditions have cleared for the given model:
+    /// no active conformal breakers, no emergency retrain in progress, and no negative-EV Kelly fraction.
+    /// </summary>
     internal static async Task<bool> CanLiftSuppressionAsync(
         DbContext db,
         MLModel model,

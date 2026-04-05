@@ -21,6 +21,7 @@ public class ClosePositionOrderCommand : IRequest<ResponseData<long>>
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>Validates symbol, direction, and quantity for the close-position counter-order.</summary>
 public class ClosePositionOrderCommandValidator : AbstractValidator<ClosePositionOrderCommand>
 {
     public ClosePositionOrderCommandValidator()
@@ -36,6 +37,7 @@ public class ClosePositionOrderCommandValidator : AbstractValidator<ClosePositio
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Creates a Market counter-order in Pending status to close or partially close an open position.</summary>
 public class ClosePositionOrderCommandHandler : IRequestHandler<ClosePositionOrderCommand, ResponseData<long>>
 {
     private readonly IWriteApplicationDbContext _context;

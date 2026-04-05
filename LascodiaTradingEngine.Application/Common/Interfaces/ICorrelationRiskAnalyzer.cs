@@ -14,6 +14,10 @@ public record CorrelationRiskResult(
 
 public interface ICorrelationRiskAnalyzer
 {
+    /// <summary>
+    /// Evaluates correlation-based concentration risk of adding the proposed signal
+    /// to the existing portfolio of open positions.
+    /// </summary>
     Task<CorrelationRiskResult> EvaluateAsync(
         TradeSignal proposedSignal,
         IReadOnlyList<Position> openPositions,
@@ -21,6 +25,7 @@ public interface ICorrelationRiskAnalyzer
         decimal maxConcentrationThreshold,
         CancellationToken cancellationToken);
 
+    /// <summary>Returns the pairwise Pearson correlation matrix for the given symbols over the specified window.</summary>
     Task<IReadOnlyDictionary<string, decimal>> GetCorrelationMatrixAsync(
         IReadOnlyList<string> symbols,
         int windowDays,

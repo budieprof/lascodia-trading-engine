@@ -9,14 +9,21 @@ namespace LascodiaTradingEngine.Application.Positions.Commands.UpdatePositionPri
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Updates an open position's current market price and recalculates its unrealized P&amp;L
+/// using the actual contract size from the currency pair specification.
+/// </summary>
 public class UpdatePositionPriceCommand : IRequest<ResponseData<string>>
 {
+    /// <summary>Position identifier to update.</summary>
     public long    Id           { get; set; }
+    /// <summary>Latest market price for the position's symbol.</summary>
     public decimal CurrentPrice { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>Validates that both Id and CurrentPrice are positive values.</summary>
 public class UpdatePositionPriceCommandValidator : AbstractValidator<UpdatePositionPriceCommand>
 {
     public UpdatePositionPriceCommandValidator()
@@ -28,6 +35,10 @@ public class UpdatePositionPriceCommandValidator : AbstractValidator<UpdatePosit
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Sets the current price on the position and recalculates unrealized P&amp;L factoring
+/// in position direction and actual contract size from the currency pair spec.
+/// </summary>
 public class UpdatePositionPriceCommandHandler : IRequestHandler<UpdatePositionPriceCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

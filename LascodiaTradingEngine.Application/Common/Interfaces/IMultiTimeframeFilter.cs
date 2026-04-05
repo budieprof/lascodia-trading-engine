@@ -1,8 +1,12 @@
 namespace LascodiaTradingEngine.Application.Common.Interfaces;
 
+/// <summary>
+/// Validates trade signals against higher-timeframe trend alignment.
+/// Prevents counter-trend entries by requiring confirmation from at least one higher timeframe.
+/// </summary>
 public interface IMultiTimeframeFilter
 {
-    /// Returns true if higher timeframes confirm the signal direction.
+    /// <summary>Returns <c>true</c> if higher timeframes confirm the signal direction.</summary>
     Task<bool> IsConfirmedAsync(string symbol, string signalDirection, string primaryTimeframe, CancellationToken ct);
 
     /// <summary>

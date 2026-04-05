@@ -10,20 +10,33 @@ namespace LascodiaTradingEngine.Application.Positions.Commands.OpenPosition;
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Opens a new position with the specified entry parameters. The position is persisted
+/// in Open status and a <see cref="PositionOpenedIntegrationEvent"/> is published.
+/// </summary>
 public class OpenPositionCommand : IRequest<ResponseData<long>>
 {
+    /// <summary>Currency pair symbol (e.g. "EURUSD").</summary>
     public required string Symbol            { get; set; }
+    /// <summary>Position direction: "Long" or "Short".</summary>
     public required string Direction         { get; set; }  // "Long" | "Short"
+    /// <summary>Position size in lots.</summary>
     public decimal         OpenLots          { get; set; }
+    /// <summary>Average entry price at which the position was opened.</summary>
     public decimal         AverageEntryPrice { get; set; }
+    /// <summary>Optional stop-loss price level.</summary>
     public decimal?        StopLoss          { get; set; }
+    /// <summary>Optional take-profit price level.</summary>
     public decimal?        TakeProfit        { get; set; }
+    /// <summary>Whether this is a paper-trading (simulated) position.</summary>
     public bool            IsPaper           { get; set; }
+    /// <summary>Identifier of the order that opened this position.</summary>
     public long?           OpenOrderId       { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>Validates symbol, direction, lot size, and entry price for opening a new position.</summary>
 public class OpenPositionCommandValidator : AbstractValidator<OpenPositionCommand>
 {
     public OpenPositionCommandValidator()
@@ -46,6 +59,7 @@ public class OpenPositionCommandValidator : AbstractValidator<OpenPositionComman
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Persists a new position in Open status and publishes a <see cref="PositionOpenedIntegrationEvent"/>.</summary>
 public class OpenPositionCommandHandler : IRequestHandler<OpenPositionCommand, ResponseData<long>>
 {
     private readonly IWriteApplicationDbContext _context;

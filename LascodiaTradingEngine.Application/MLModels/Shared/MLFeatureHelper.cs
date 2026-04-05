@@ -1,3 +1,5 @@
+using LascodiaTradingEngine.Application.Common.Utilities;
+using LascodiaTradingEngine.Application.Services;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -66,6 +68,30 @@ public static class MLFeatureHelper
         // ── Rec #263: Feature grouping ───────────────────────────────────────
         "FeatureGroupCorr", "MomentumVolatilityRatio"
     ];
+
+    /// <summary>Extended feature vector length including cross-pair, news, sentiment, and proxy features.</summary>
+    public const int ExtendedFeatureCount = 57;
+
+    /// <summary>Names of the 24 extended features (12 cross-pair + news + sentiment + tick flow + economic surprise + 6 proxy).</summary>
+    public static readonly string[] ExtendedFeatureNames =
+    [
+        "XP1_Return", "XP1_RsiDelta", "XP1_AtrRatio", "XP1_Correlation",
+        "XP2_Return", "XP2_RsiDelta", "XP2_AtrRatio", "XP2_Correlation",
+        "XP3_Return", "XP3_RsiDelta", "XP3_AtrRatio", "XP3_Correlation",
+        "NewsProximity", "SentimentAlignment",
+        "TickDelta", "TickDeltaDivergence", "SpreadZScore", "EconomicSurprise",
+        "AtrAcceleration", "BbwRateOfChange", "VolPercentile",
+        "TickIntensity", "BidAskImbalance", "CalendarDensity",
+    ];
+
+    /// <summary>Pre-computed proxy feature data for the extended ML vector.</summary>
+    public sealed record ProxyFeatureData(
+        float AtrAcceleration,
+        float BbwRateOfChange,
+        float VolPercentile,
+        float TickIntensity,
+        float BidAskImbalance,
+        float CalendarDensity);
 
     // ── Training sample builder ───────────────────────────────────────────────
 
@@ -3549,6 +3575,239 @@ public static class MLFeatureHelper
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Appends a news proximity feature: decays from 1.0 at event time to 0.0 at 24h away.
+    /// Returns a new array with length <paramref name="existing"/>.Length + 1.
+    /// </summary>
+    public static float[] AppendNewsProximityFeature(float[] existing, double minutesUntilNextHighImpact)
+    {
+        var extended = new float[existing.Length + 1];
+        existing.CopyTo(extended, 0);
+        // Decay: 1.0 at event, 0.0 at 24h (1440 min), clamped [0, 1]
+        extended[existing.Length] = (float)Math.Clamp(1.0 - minutesUntilNextHighImpact / 1440.0, 0.0, 1.0);
+        return extended;
+    }
+
+    /// <summary>
+    /// Appends a sentiment alignment feature: positive when sentiment agrees with trade direction.
+    /// Returns a new array with length <paramref name="existing"/>.Length + 1.
+    /// </summary>
+    public static float[] AppendSentimentAlignmentFeature(float[] existing,
+        decimal baseSentiment, decimal quoteSentiment)
+    {
+        var extended = new float[existing.Length + 1];
+        existing.CopyTo(extended, 0);
+        // Net sentiment: positive base + negative quote = bullish for the pair
+        float alignment = (float)(baseSentiment - quoteSentiment);
+        extended[existing.Length] = Math.Clamp(alignment, -1f, 1f);
+        return extended;
+    }
+
+    /// <summary>
+    /// Combines base features with all extended features into a single float[57] vector.
+    /// Handles the case where cross-pair features may not be available (zeros them).
+    /// </summary>
+    public static float[] BuildExtendedFeatureVector(
+        float[] baseFeatures,
+        float[]? crossPairFeatures,
+        double minutesUntilNextHighImpact,
+        decimal baseSentiment, decimal quoteSentiment,
+        TickFlowSnapshot? tickFlow = null,
+        decimal priceReturn = 0m,
+        float economicSurprise = 0f,
+        ProxyFeatureData? proxyData = null)
+    {
+        var extended = new float[ExtendedFeatureCount];
+        Array.Copy(baseFeatures, extended, Math.Min(baseFeatures.Length, FeatureCount));
+
+        // Cross-pair features (12 elements at indices 33-44)
+        if (crossPairFeatures != null && crossPairFeatures.Length > 0)
+            Array.Copy(crossPairFeatures, 0, extended, FeatureCount, Math.Min(12, crossPairFeatures.Length));
+
+        // News proximity (position 45)
+        extended[FeatureCount + 12] = (float)Math.Clamp(1.0 - minutesUntilNextHighImpact / 1440.0, 0.0, 1.0);
+
+        // Sentiment alignment (position 46)
+        extended[FeatureCount + 13] = Math.Clamp((float)(baseSentiment - quoteSentiment), -1f, 1f);
+
+        // Tick flow features (positions 47-49)
+        if (tickFlow != null)
+        {
+            // TickDelta: net buying/selling pressure from tick sequence
+            extended[FeatureCount + 14] = Math.Clamp((float)tickFlow.TickDelta, -1f, 1f);
+
+            // TickDeltaDivergence: price vs delta direction mismatch
+            float deltaSign = Math.Sign((float)tickFlow.TickDelta);
+            float priceSign = Math.Sign((float)priceReturn);
+            extended[FeatureCount + 15] = (priceSign != 0 && deltaSign != 0 && priceSign != deltaSign)
+                ? -priceSign  // divergence: opposite of price direction
+                : 0f;
+
+            // SpreadZScore: current spread vs historical distribution
+            if (tickFlow.SpreadStdDev > 0)
+                extended[FeatureCount + 16] = Math.Clamp(
+                    (float)((tickFlow.CurrentSpread - tickFlow.SpreadMean) / tickFlow.SpreadStdDev), -3f, 3f);
+        }
+
+        // Economic surprise (position 50)
+        extended[FeatureCount + 17] = Math.Clamp(economicSurprise, -1f, 1f);
+
+        // Proxy features (positions 51-56)
+        if (proxyData != null)
+        {
+            extended[FeatureCount + 18] = Math.Clamp(proxyData.AtrAcceleration, -1f, 1f);
+            extended[FeatureCount + 19] = Math.Clamp(proxyData.BbwRateOfChange, -1f, 1f);
+            extended[FeatureCount + 20] = Math.Clamp(proxyData.VolPercentile, 0f, 1f);
+            extended[FeatureCount + 21] = Math.Clamp(proxyData.TickIntensity, 0f, 3f);
+            extended[FeatureCount + 22] = Math.Clamp(proxyData.BidAskImbalance, -1f, 1f);
+            extended[FeatureCount + 23] = Math.Clamp(proxyData.CalendarDensity, 0f, 1f);
+        }
+
+        return extended;
+    }
+
+    /// <summary>
+    /// Parses economic data strings like "200K", "3.5%", "1.2M" to decimal values.
+    /// Returns null if unparseable.
+    /// </summary>
+    public static decimal? ParseEconomicValue(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+        raw = raw.Trim();
+
+        decimal multiplier = 1m;
+        bool isPercent = false;
+
+        if (raw.EndsWith('%')) { isPercent = true; raw = raw[..^1].Trim(); }
+        else if (raw.EndsWith("T", StringComparison.OrdinalIgnoreCase)) { multiplier = 1_000_000_000_000m; raw = raw[..^1].Trim(); }
+        else if (raw.EndsWith("B", StringComparison.OrdinalIgnoreCase)) { multiplier = 1_000_000_000m; raw = raw[..^1].Trim(); }
+        else if (raw.EndsWith("M", StringComparison.OrdinalIgnoreCase)) { multiplier = 1_000_000m; raw = raw[..^1].Trim(); }
+        else if (raw.EndsWith("K", StringComparison.OrdinalIgnoreCase)) { multiplier = 1_000m; raw = raw[..^1].Trim(); }
+
+        if (decimal.TryParse(raw, System.Globalization.NumberStyles.Float,
+            System.Globalization.CultureInfo.InvariantCulture, out var value))
+        {
+            return isPercent ? value / 100m : value * multiplier;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Computes economic surprise: (Actual - Forecast) / |Previous|, clamped [-1, 1].
+    /// Returns 0 if any value is unparseable.
+    /// </summary>
+    public static float ComputeEconomicSurprise(string? actual, string? forecast, string? previous)
+    {
+        var a = ParseEconomicValue(actual);
+        var f = ParseEconomicValue(forecast);
+        var p = ParseEconomicValue(previous);
+        if (a == null || f == null || p == null || p == 0) return 0f;
+        return Math.Clamp((float)((a.Value - f.Value) / Math.Abs(p.Value)), -1f, 1f);
+    }
+
+    /// <summary>
+    /// Computes proxy features from candle window, tick data, and economic calendar.
+    /// All features degrade gracefully to 0 when data is insufficient.
+    /// </summary>
+    public static ProxyFeatureData ComputeProxyFeatures(
+        IReadOnlyList<Candle> candles, int lastIdx,
+        TickFlowSnapshot? tickFlow,
+        IReadOnlyList<(decimal Bid, decimal Ask, DateTime Timestamp)>? recentTicks,
+        int upcomingEventCount)
+    {
+        // 1. ATR Acceleration: ATR(5) / ATR(20) - 1.0
+        float atrAccel = 0f;
+        if (lastIdx >= 20)
+        {
+            decimal atr5 = IndicatorCalculator.WilderAtr(candles, lastIdx, 5);
+            decimal atr20 = IndicatorCalculator.WilderAtr(candles, lastIdx, 20);
+            if (atr20 > 0) atrAccel = (float)((atr5 / atr20) - 1.0m);
+        }
+
+        // 2. BBW Rate of Change: (BBW_now - BBW_5ago) / BBW_5ago
+        float bbwRoc = 0f;
+        if (lastIdx >= 25)
+        {
+            decimal sma20 = IndicatorCalculator.Sma(candles, lastIdx, 20);
+            decimal std20 = IndicatorCalculator.StdDev(candles, lastIdx, 20, sma20);
+            decimal bbwNow = sma20 > 0 ? 2m * std20 / sma20 : 0m;
+
+            decimal sma20_5 = IndicatorCalculator.Sma(candles, lastIdx - 5, 20);
+            decimal std20_5 = IndicatorCalculator.StdDev(candles, lastIdx - 5, 20, sma20_5);
+            decimal bbw5Ago = sma20_5 > 0 ? 2m * std20_5 / sma20_5 : 0m;
+
+            if (bbw5Ago > 0) bbwRoc = (float)((bbwNow - bbw5Ago) / bbw5Ago);
+        }
+
+        // 3. Volatility Percentile: where is current 20-bar vol in the 90-bar distribution?
+        float volPctl = 0.5f;
+        if (lastIdx >= 90)
+        {
+            // Current 20-bar realized vol (RMS of returns)
+            var returns20 = new List<double>(20);
+            for (int i = lastIdx - 19; i <= lastIdx; i++)
+                if (candles[i - 1].Close > 0)
+                    returns20.Add((double)(candles[i].Close - candles[i - 1].Close) / (double)candles[i - 1].Close);
+            double currentVol = returns20.Count > 1
+                ? Math.Sqrt(returns20.Select(r => r * r).Average())
+                : 0;
+
+            // Count how many 20-bar windows in the last 90 bars had lower vol
+            int lowerCount = 0, totalWindows = 0;
+            for (int start = lastIdx - 89; start <= lastIdx - 19; start++)
+            {
+                var windowReturns = new List<double>(20);
+                for (int j = start; j < start + 20 && j <= lastIdx; j++)
+                    if (candles[j - 1].Close > 0)
+                        windowReturns.Add((double)(candles[j].Close - candles[j - 1].Close) / (double)candles[j - 1].Close);
+                if (windowReturns.Count > 1)
+                {
+                    double windowVol = Math.Sqrt(windowReturns.Select(r => r * r).Average());
+                    if (windowVol < currentVol) lowerCount++;
+                    totalWindows++;
+                }
+            }
+            if (totalWindows > 0) volPctl = (float)lowerCount / totalWindows;
+        }
+
+        // 4. Tick Intensity: recent tick rate vs older tick rate (split-window comparison)
+        float tickIntensity = 1f;
+        if (recentTicks is { Count: >= 10 })
+        {
+            // Split ticks into recent half and older half to create independent baseline
+            int half = recentTicks.Count / 2;
+            var recentSpan = (recentTicks[0].Timestamp - recentTicks[half].Timestamp).TotalMinutes;
+            var olderSpan = (recentTicks[half].Timestamp - recentTicks[^1].Timestamp).TotalMinutes;
+
+            if (recentSpan > 0 && olderSpan > 0)
+            {
+                double recentRate = half / recentSpan;
+                double olderRate = (recentTicks.Count - half) / olderSpan;
+                if (olderRate > 0)
+                    tickIntensity = (float)(recentRate / olderRate);
+            }
+        }
+
+        // 5. Bid-Ask Imbalance: are asks moving faster than bids?
+        float bidAskImbalance = 0f;
+        if (recentTicks is { Count: >= 5 })
+        {
+            decimal totalAskMove = 0m, totalBidMove = 0m;
+            for (int i = 1; i < recentTicks.Count; i++)
+            {
+                totalAskMove += Math.Abs(recentTicks[i - 1].Ask - recentTicks[i].Ask);
+                totalBidMove += Math.Abs(recentTicks[i - 1].Bid - recentTicks[i].Bid);
+            }
+            decimal totalMove = totalAskMove + totalBidMove;
+            if (totalMove > 0) bidAskImbalance = (float)((totalAskMove - totalBidMove) / totalMove);
+        }
+
+        // 6. Calendar Density: upcoming high/medium events in 24h, divided by 5
+        float calendarDensity = Math.Min(upcomingEventCount / 5f, 1f);
+
+        return new ProxyFeatureData(atrAccel, bbwRoc, volPctl, tickIntensity, bidAskImbalance, calendarDensity);
     }
 
     /// <summary>Simple ATR over the last N candles.</summary>

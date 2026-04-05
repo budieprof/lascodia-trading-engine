@@ -9,9 +9,15 @@ namespace LascodiaTradingEngine.Application.DrawdownRecovery.Commands.RecordDraw
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Records a drawdown snapshot and computes the current recovery mode based on configured thresholds.
+/// Used by the <c>DrawdownMonitorWorker</c> to track equity drawdowns in real time.
+/// </summary>
 public class RecordDrawdownSnapshotCommand : IRequest<ResponseData<string>>
 {
+    /// <summary>Current account equity value.</summary>
     public decimal CurrentEquity { get; set; }
+    /// <summary>All-time peak equity (high-water mark).</summary>
     public decimal PeakEquity    { get; set; }
 }
 
@@ -31,6 +37,11 @@ public class RecordDrawdownSnapshotCommandValidator : AbstractValidator<RecordDr
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Calculates drawdown percentage from peak equity, determines the recovery mode
+/// (Normal, Reduced, or Halted) based on risk thresholds, and persists the snapshot.
+/// Returns the computed recovery mode name.
+/// </summary>
 public class RecordDrawdownSnapshotCommandHandler
     : IRequestHandler<RecordDrawdownSnapshotCommand, ResponseData<string>>
 {

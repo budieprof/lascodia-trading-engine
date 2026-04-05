@@ -8,18 +8,29 @@ namespace LascodiaTradingEngine.Application.Backtesting.Commands.RunBacktest;
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Queues a backtest run for a strategy over historical candle data. The backtest is executed
+/// asynchronously by the <c>BacktestWorker</c>.
+/// </summary>
 public class RunBacktestCommand : IRequest<ResponseData<long>>
 {
+    /// <summary>The strategy to backtest.</summary>
     public long     StrategyId     { get; set; }
+    /// <summary>The trading symbol to simulate (e.g., EURUSD).</summary>
     public required string Symbol  { get; set; }
+    /// <summary>The candle timeframe (M1, M5, M15, H1, H4, D1).</summary>
     public required string Timeframe { get; set; }
+    /// <summary>Start date of the historical data window.</summary>
     public DateTime FromDate       { get; set; }
+    /// <summary>End date of the historical data window.</summary>
     public DateTime ToDate         { get; set; }
+    /// <summary>Starting equity for the simulated account.</summary>
     public decimal  InitialBalance { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>Validates backtest parameters including strategy ID, timeframe, date range, and initial balance.</summary>
 public class RunBacktestCommandValidator : AbstractValidator<RunBacktestCommand>
 {
     public RunBacktestCommandValidator()
@@ -45,6 +56,10 @@ public class RunBacktestCommandValidator : AbstractValidator<RunBacktestCommand>
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Creates a new <see cref="Domain.Entities.BacktestRun"/> with Queued status.
+/// The <c>BacktestWorker</c> picks it up for asynchronous execution.
+/// </summary>
 public class RunBacktestCommandHandler : IRequestHandler<RunBacktestCommand, ResponseData<long>>
 {
     private readonly IWriteApplicationDbContext _context;

@@ -4,6 +4,10 @@ using LascodiaTradingEngine.Domain.Entities;
 
 namespace LascodiaTradingEngine.Infrastructure.Persistence.Configurations;
 
+/// <summary>
+/// EF Core entity configuration for <see cref="COTReport"/>. Defines table mapping,
+/// column types, indexes, relationships, and the soft-delete query filter.
+/// </summary>
 public class COTReportConfiguration : IEntityTypeConfiguration<COTReport>
 {
     public void Configure(EntityTypeBuilder<COTReport> builder)
@@ -17,6 +21,6 @@ public class COTReportConfiguration : IEntityTypeConfiguration<COTReport>
 
         builder.HasQueryFilter(x => !x.IsDeleted);
 
-        builder.HasIndex(x => new { x.Currency, x.ReportDate });
+        builder.HasIndex(x => new { x.Currency, x.ReportDate }).IsUnique();
     }
 }

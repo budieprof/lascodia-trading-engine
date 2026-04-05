@@ -9,13 +9,16 @@ namespace LascodiaTradingEngine.Application.Positions.Queries.GetPosition;
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Retrieves a single position by its identifier, projected as a <see cref="PositionDto"/>.</summary>
 public class GetPositionQuery : IRequest<ResponseData<PositionDto>>
 {
+    /// <summary>Position identifier to look up.</summary>
     public required long Id { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Fetches a single position from the read context and maps it to <see cref="PositionDto"/>.</summary>
 public class GetPositionQueryHandler : IRequestHandler<GetPositionQuery, ResponseData<PositionDto>>
 {
     private readonly IReadApplicationDbContext _context;

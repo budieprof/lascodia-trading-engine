@@ -6,8 +6,10 @@ using LascodiaTradingEngine.Domain.Enums;
 namespace LascodiaTradingEngine.Application.SignalFilters;
 
 /// <summary>
-/// Confirms a signal direction by checking SMA20 trend on higher timeframes.
+/// Confirms a signal direction by checking trend on higher timeframes.
 /// Returns true when the majority of applicable higher timeframes agree with the signal direction.
+/// Uses a configurable SMA period (default 50) for trend determination.
+/// D1 signals return false (unconfirmed) since no higher timeframe exists to validate against.
 /// </summary>
 [RegisterService]
 public class MultiTimeframeFilter : IMultiTimeframeFilter
@@ -25,6 +27,9 @@ public class MultiTimeframeFilter : IMultiTimeframeFilter
         [Timeframe.D1]  = [],
     };
 
+    /// <summary>Default SMA period for trend confirmation on higher timeframes.</summary>
+    private const int DefaultSmaPeriod = 50;
+
     private readonly IReadApplicationDbContext _context;
 
     public MultiTimeframeFilter(IReadApplicationDbContext context)
@@ -39,7 +44,9 @@ public class MultiTimeframeFilter : IMultiTimeframeFilter
         CancellationToken ct)
     {
         var (confirmations, total) = await CountConfirmationsAsync(symbol, signalDirection, primaryTimeframe, ct);
-        if (total == 0) return true;
+        // No higher timeframes available (e.g. D1 signals) — cannot confirm, return false
+        // to force downstream callers to handle the unconfirmed case explicitly.
+        if (total == 0) return false;
         return confirmations > total / 2;
     }
 
@@ -50,7 +57,8 @@ public class MultiTimeframeFilter : IMultiTimeframeFilter
         CancellationToken ct)
     {
         var (confirmations, total) = await CountConfirmationsAsync(symbol, signalDirection, primaryTimeframe, ct);
-        if (total == 0) return 1.0m;
+        // No higher timeframes available — return 0 (no confirmation) instead of 1.0
+        if (total == 0) return 0m;
         return (decimal)confirmations / total;
     }
 
@@ -65,6 +73,7 @@ public class MultiTimeframeFilter : IMultiTimeframeFilter
             return (0, 0);
 
         int confirmations = 0;
+        int smaPeriod = DefaultSmaPeriod;
 
         foreach (var tf in higherTfs)
         {
@@ -72,18 +81,18 @@ public class MultiTimeframeFilter : IMultiTimeframeFilter
                 .Set<Domain.Entities.Candle>()
                 .Where(x => x.Symbol == symbol && x.Timeframe == tf && !x.IsDeleted)
                 .OrderByDescending(x => x.Timestamp)
-                .Take(20)
+                .Take(smaPeriod)
                 .ToListAsync(ct);
 
-            if (candles.Count < 20)
+            if (candles.Count < smaPeriod)
                 continue;
 
-            decimal sma20      = candles.Average(x => x.Close);
+            decimal sma         = candles.Average(x => x.Close);
             decimal latestClose = candles[0].Close;
 
             bool confirms = signalDirection == "Buy"
-                ? latestClose > sma20
-                : latestClose < sma20;
+                ? latestClose > sma
+                : latestClose < sma;
 
             if (confirms)
                 confirmations++;

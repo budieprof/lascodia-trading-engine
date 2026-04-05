@@ -11,16 +11,24 @@ using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.Orders.Commands.ModifyOrder;
 
+/// <summary>
+/// Modifies the stop-loss and/or take-profit levels of an existing order. If the order
+/// has been submitted to the broker, an EA command is queued to update SL/TP on MT5.
+/// </summary>
 public class ModifyOrderCommand : IRequest<ResponseData<string>>
 {
+    /// <summary>Order identifier (populated from route).</summary>
     [JsonIgnore]
     public long Id { get; set; }
+    /// <summary>New stop-loss price level (null to leave unchanged).</summary>
     public decimal? StopLoss   { get; set; }
+    /// <summary>New take-profit price level (null to leave unchanged).</summary>
     public decimal? TakeProfit { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>Validates that the order Id is positive and optional SL/TP values are positive when provided.</summary>
 public class ModifyOrderCommandValidator : AbstractValidator<ModifyOrderCommand>
 {
     public ModifyOrderCommandValidator()
@@ -33,6 +41,10 @@ public class ModifyOrderCommandValidator : AbstractValidator<ModifyOrderCommand>
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Updates SL/TP on the order entity and queues a <c>ModifySLTP</c> EA command
+/// if the order has been submitted to the broker. Enforces account ownership.
+/// </summary>
 public class ModifyOrderCommandHandler : IRequestHandler<ModifyOrderCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

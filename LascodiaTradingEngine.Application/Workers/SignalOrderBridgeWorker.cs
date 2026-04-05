@@ -118,6 +118,26 @@ public class SignalOrderBridgeWorker : BackgroundService, IIntegrationEventHandl
             return;
         }
 
+        // ── Cross-instance deduplication ─────────────────────────────────────
+        // In multi-instance deployments, the same event can be delivered to multiple
+        // engine instances. The processed event tracker uses a DB-level atomic check
+        // to ensure only one instance handles each event.
+        try
+        {
+            using var dedupScope = _scopeFactory.CreateScope();
+            var tracker = dedupScope.ServiceProvider.GetRequiredService<IProcessedEventTracker>();
+            if (!await tracker.TryMarkAsProcessedAsync(@event.Id, nameof(SignalOrderBridgeWorker), _shutdownCts.Token))
+            {
+                _inFlight.TryRemove(@event.TradeSignalId, out _);
+                return;
+            }
+        }
+        catch (OperationCanceledException) when (_shutdownCts.IsCancellationRequested)
+        {
+            _inFlight.TryRemove(@event.TradeSignalId, out _);
+            return;
+        }
+
         try
         {
             await _concurrencyLimiter.WaitAsync(_shutdownCts.Token);

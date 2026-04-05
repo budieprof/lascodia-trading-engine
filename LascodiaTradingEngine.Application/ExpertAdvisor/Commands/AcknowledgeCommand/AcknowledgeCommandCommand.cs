@@ -8,15 +8,28 @@ namespace LascodiaTradingEngine.Application.ExpertAdvisor.Commands.AcknowledgeCo
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Acknowledges an EA command that was previously queued for execution. The EA calls this after
+/// processing (or failing to process) a command. Supports retry logic via the EACommand.ProcessAck method --
+/// failed commands with remaining retries are automatically re-queued.
+/// </summary>
 public class AcknowledgeCommandCommand : IRequest<ResponseData<string>>
 {
+    /// <summary>Database ID of the EACommand to acknowledge.</summary>
     public long Id { get; set; }
+
+    /// <summary>Execution outcome: "Success", "Failed", "TimedOut", or "Deferred".</summary>
     public string? Status { get; set; }
+
+    /// <summary>Optional result details or error message from the EA's execution attempt.</summary>
     public string? Result { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Validates that Id is positive and Status is non-empty (must be one of Success, Failed, TimedOut, Deferred).
+/// </summary>
 public class AcknowledgeCommandCommandValidator : AbstractValidator<AcknowledgeCommandCommand>
 {
     public AcknowledgeCommandCommandValidator()
@@ -31,6 +44,10 @@ public class AcknowledgeCommandCommandValidator : AbstractValidator<AcknowledgeC
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Handles command acknowledgement. Locates the EACommand by ID, rejects if already acknowledged (409),
+/// then delegates to EACommand.ProcessAck which marks it complete or re-queues for retry on failure.
+/// </summary>
 public class AcknowledgeCommandCommandHandler : IRequestHandler<AcknowledgeCommandCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

@@ -68,6 +68,23 @@ public class StrategyEvaluatorTests : IDisposable
         MaCrossoverSlippageAtrFraction = 0         // no slippage buffer
     };
 
+    /// <summary>
+    /// Options with the RSI reversion hardening filters disabled so crossover tests only
+    /// exercise the RSI threshold logic and the shared SL/TP defaults.
+    /// </summary>
+    private static StrategyEvaluatorOptions RsiCoreOptions() => new()
+    {
+        RsiReversionMaxSpreadAtrFraction = 0,
+        RsiReversionMaxGapAtrFraction = 0,
+        RsiReversionMinVolume = 0,
+        RsiReversionRequireCandleConfirmation = false,
+        RsiReversionRequireDivergence = false,
+        RsiReversionSlippageAtrFraction = 0,
+        RsiReversionSwingSlEnabled = false,
+        RsiReversionMidlineTpEnabled = false,
+        RsiReversionMinRiskRewardRatio = 0
+    };
+
     // ────────────────────────────────────────────────────────────────────────
     //  Helpers
     // ────────────────────────────────────────────────────────────────────────
@@ -103,7 +120,7 @@ public class StrategyEvaluatorTests : IDisposable
             decimal close = closePrices[i];
             candles.Add(new Candle
             {
-                Id = i + 1,
+                Id = candles.Count + 1,
                 Symbol = "EURUSD",
                 Timeframe = Timeframe.H1,
                 Open = close - spread * 0.5m,
@@ -706,7 +723,7 @@ public class StrategyEvaluatorTests : IDisposable
     [Fact]
     public async Task Rsi_Buy_Signal_When_RSI_Crosses_Above_Oversold()
     {
-        var evaluator = new RSIReversionEvaluator(_defaultOptions);
+        var evaluator = new RSIReversionEvaluator(RsiCoreOptions());
         // Use a short period (5) so we need fewer candles and can control the RSI precisely.
         var strategy = CreateStrategy(StrategyType.RSIReversion,
             parametersJson: "{\"Period\":5,\"Oversold\":30,\"Overbought\":70}");
@@ -754,7 +771,7 @@ public class StrategyEvaluatorTests : IDisposable
     [Fact]
     public async Task Rsi_Sell_Signal_When_RSI_Crosses_Below_Overbought()
     {
-        var evaluator = new RSIReversionEvaluator(_defaultOptions);
+        var evaluator = new RSIReversionEvaluator(RsiCoreOptions());
         var strategy = CreateStrategy(StrategyType.RSIReversion,
             parametersJson: "{\"Period\":5,\"Oversold\":30,\"Overbought\":70}");
 
@@ -826,11 +843,9 @@ public class StrategyEvaluatorTests : IDisposable
     [Fact]
     public async Task Rsi_Uses_Configurable_Options()
     {
-        var customOptions = new StrategyEvaluatorOptions
-        {
-            DefaultLotSize = 0.03m,
-            RsiReversionExpiryMinutes = 45
-        };
+        var customOptions = RsiCoreOptions();
+        customOptions.DefaultLotSize = 0.03m;
+        customOptions.RsiReversionExpiryMinutes = 45;
         var evaluator = new RSIReversionEvaluator(customOptions);
         var strategy = CreateStrategy(StrategyType.RSIReversion,
             parametersJson: "{\"Period\":5,\"Oversold\":30,\"Overbought\":70}");
@@ -1071,17 +1086,43 @@ public class StrategyEvaluatorTests : IDisposable
     /// Helper that generates candles with specific hour timestamps for session tests.
     /// </summary>
     private static List<Candle> GenerateSessionCandles(
-        (int Hour, decimal Close)[] hourPrices, decimal spread = 0.0010m)
+        (int Hour, decimal Close)[] hourPrices,
+        decimal spread = 0.0010m,
+        int preHistoryBars = 0,
+        decimal? preHistoryClose = null)
     {
         var candles = new List<Candle>();
         var baseDate = new DateTime(2026, 3, 20, 0, 0, 0, DateTimeKind.Utc);
+        decimal historyClose = preHistoryClose ?? (hourPrices.Length > 0 ? hourPrices[0].Close : 1.1000m);
 
+        for (int i = preHistoryBars; i > 0; i--)
+        {
+            candles.Add(new Candle
+            {
+                Id = candles.Count + 1,
+                Symbol = "EURUSD",
+                Timeframe = Timeframe.H1,
+                Open = historyClose - spread * 0.5m,
+                High = historyClose + spread,
+                Low = historyClose - spread,
+                Close = historyClose,
+                Volume = 1000m,
+                Timestamp = baseDate.AddHours(-i),
+                IsClosed = true
+            });
+        }
+
+        int dayOffset = 0;
+        int? previousHour = null;
         for (int i = 0; i < hourPrices.Length; i++)
         {
             decimal close = hourPrices[i].Close;
+            if (previousHour.HasValue && hourPrices[i].Hour <= previousHour.Value)
+                dayOffset++;
+
             candles.Add(new Candle
             {
-                Id = i + 1,
+                Id = candles.Count + 1,
                 Symbol = "EURUSD",
                 Timeframe = Timeframe.H1,
                 Open = close - spread * 0.5m,
@@ -1089,9 +1130,10 @@ public class StrategyEvaluatorTests : IDisposable
                 Low = close - spread,
                 Close = close,
                 Volume = 1000m,
-                Timestamp = baseDate.AddHours(hourPrices[i].Hour),
+                Timestamp = baseDate.AddDays(dayOffset).AddHours(hourPrices[i].Hour),
                 IsClosed = true
             });
+            previousHour = hourPrices[i].Hour;
         }
         return candles;
     }
@@ -1099,23 +1141,24 @@ public class StrategyEvaluatorTests : IDisposable
     [Fact]
     public async Task Session_Buy_Signal_When_Price_Breaks_Above_Asian_Range()
     {
-        var evaluator = new SessionBreakoutEvaluator(_defaultOptions, NullLogger<SessionBreakoutEvaluator>.Instance, _metrics);
+        var sessionCoreOptions = new StrategyEvaluatorOptions
+        {
+            SessionBreakoutMaxGapAtrFraction = 0
+        };
+        var evaluator = new SessionBreakoutEvaluator(sessionCoreOptions, NullLogger<SessionBreakoutEvaluator>.Instance, _metrics);
         var strategy = CreateStrategy(StrategyType.SessionBreakout,
             parametersJson: "{\"RangeStartHourUtc\":0,\"RangeEndHourUtc\":8,\"BreakoutStartHour\":8,\"BreakoutEndHour\":12,\"ThresholdMultiplier\":0.1}");
 
         // Asian session (hours 0-7): tight range around 1.1000
-        // London session (hours 8+): breakout above
+        // Pre-history bars satisfy the evaluator's minimum warmup requirement.
         var hourPrices = new (int Hour, decimal Close)[]
         {
             (0, 1.1000m), (1, 1.1005m), (2, 1.0995m), (3, 1.1002m),
             (4, 1.0998m), (5, 1.1003m), (6, 1.0997m), (7, 1.1001m),
-            // London — 6 bars for ATR
-            (8,  1.1010m), (9,  1.1020m), (10, 1.1030m), (11, 1.1040m),
-            (8,  1.1015m), (9,  1.1025m), (10, 1.1035m), (11, 1.1045m),
             // Breakout bar
             (9, 1.1100m) // breaks well above Asian high of 1.1005+spread
         };
-        var candles = GenerateSessionCandles(hourPrices);
+        var candles = GenerateSessionCandles(hourPrices, preHistoryBars: 53, preHistoryClose: 1.1000m);
 
         var signal = await evaluator.EvaluateAsync(
             strategy, candles, (1.1098m, 1.1102m), CancellationToken.None);
@@ -1140,10 +1183,9 @@ public class StrategyEvaluatorTests : IDisposable
         {
             (0, 1.1000m), (1, 1.1005m), (2, 1.0995m), (3, 1.1002m),
             (4, 1.0998m), (5, 1.1003m), (6, 1.0997m), (7, 1.1001m),
-            (0, 1.1000m), (1, 1.1005m), (2, 1.0995m), (3, 1.1002m),
-            (4, 1.0998m), (5, 1.1003m), (6, 1.0997m), (7, 1.1001m),
+            (13, 1.1200m),
         };
-        var candles = GenerateSessionCandles(hourPrices);
+        var candles = GenerateSessionCandles(hourPrices, preHistoryBars: 53, preHistoryClose: 1.1000m);
 
         var signal = await evaluator.EvaluateAsync(
             strategy, candles, (1.1200m, 1.1202m), CancellationToken.None);

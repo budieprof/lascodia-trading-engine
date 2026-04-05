@@ -10,10 +10,12 @@ namespace LascodiaTradingEngine.Application.TradingAccounts.Queries.GetPagedTrad
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Retrieves a paginated list of trading accounts with optional broker and paper-mode filters.</summary>
 public class GetPagedTradingAccountsQuery : PagerRequestWithFilterType<TradingAccountQueryFilter, ResponseData<PagedData<TradingAccountDto>>>
 {
 }
 
+/// <summary>Filter criteria for the paged trading accounts query.</summary>
 public class TradingAccountQueryFilter
 {
     public string? BrokerServer { get; set; }

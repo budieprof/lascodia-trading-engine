@@ -9,6 +9,11 @@ using LascodiaTradingEngine.Application.TradingAccounts.Commands.LoginTradingAcc
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
+/// <summary>
+/// Handles unauthenticated trading account registration and login endpoints.
+/// EA instances use passwordless login; web dashboard requires password. Rate-limited to resist brute-force.
+/// Route: api/v1/lascodia-trading-engine/auth
+/// </summary>
 [Route("api/v1/lascodia-trading-engine/auth")]
 [ApiController]
 public class TradingAccountAuthController : ControllerBase

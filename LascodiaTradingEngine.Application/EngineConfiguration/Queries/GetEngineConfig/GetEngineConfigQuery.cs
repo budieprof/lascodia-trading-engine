@@ -9,13 +9,16 @@ namespace LascodiaTradingEngine.Application.EngineConfiguration.Queries.GetEngin
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Retrieves a single engine configuration entry by its key.</summary>
 public class GetEngineConfigQuery : IRequest<ResponseData<EngineConfigDto>>
 {
+    /// <summary>The configuration key to look up.</summary>
     public string Key { get; set; } = string.Empty;
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Fetches an engine config entry by key from the read-only context.</summary>
 public class GetEngineConfigQueryHandler : IRequestHandler<GetEngineConfigQuery, ResponseData<EngineConfigDto>>
 {
     private readonly IReadApplicationDbContext _context;

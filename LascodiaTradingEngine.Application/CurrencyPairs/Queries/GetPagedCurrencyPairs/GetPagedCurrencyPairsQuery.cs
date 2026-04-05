@@ -10,18 +10,23 @@ namespace LascodiaTradingEngine.Application.CurrencyPairs.Queries.GetPagedCurren
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Retrieves a paginated list of currency pairs with optional search and active-status filters.</summary>
 public class GetPagedCurrencyPairsQuery : PagerRequestWithFilterType<CurrencyPairQueryFilter, ResponseData<PagedData<CurrencyPairDto>>>
 {
 }
 
+/// <summary>Filter criteria for the paged currency pairs query.</summary>
 public class CurrencyPairQueryFilter
 {
+    /// <summary>Free-text search across symbol, base currency, and quote currency.</summary>
     public string? Search   { get; set; }
+    /// <summary>Filter by active/inactive status.</summary>
     public bool?   IsActive { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Queries currency pairs ordered alphabetically by symbol with optional search and active-status filters.</summary>
 public class GetPagedCurrencyPairsQueryHandler
     : IRequestHandler<GetPagedCurrencyPairsQuery, ResponseData<PagedData<CurrencyPairDto>>>
 {

@@ -7,13 +7,22 @@ namespace LascodiaTradingEngine.Application.MarketData.Queries.GetLivePrice;
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Retrieves the current live bid/ask price for a symbol from the in-memory price cache.
+/// Returns -14 if no live price is available (e.g. no EA streaming data for this symbol).
+/// </summary>
 public class GetLivePriceQuery : IRequest<ResponseData<LivePriceDto>>
 {
+    /// <summary>Instrument symbol to look up (e.g. "EURUSD").</summary>
     public required string Symbol { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Handles live price lookup. Reads from the ILivePriceCache (populated by tick ingestion)
+/// and constructs a LivePriceDto with bid, ask, calculated spread, and timestamp.
+/// </summary>
 public class GetLivePriceQueryHandler : IRequestHandler<GetLivePriceQuery, ResponseData<LivePriceDto>>
 {
     private readonly ILivePriceCache _cache;

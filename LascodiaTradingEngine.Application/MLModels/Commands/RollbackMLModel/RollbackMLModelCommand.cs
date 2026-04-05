@@ -71,6 +71,40 @@ public class RollbackMLModelCommandHandler
             return ResponseData<long>.Init(0, false,
                 "No active model found for the given symbol/timeframe.", "-14");
 
+        // ── Rollback depth limit ─────────────────────────────────────────────
+        // Read max depth from EngineConfig (default 3). Walk the PreviousChampionModelId
+        // chain backwards from the current active model to count consecutive rollbacks.
+        var maxDepthEntry = await db.Set<EngineConfig>()
+            .AsNoTracking()
+            .FirstOrDefaultAsync(c => c.Key == "MLModel:MaxRollbackDepth" && !c.IsDeleted, cancellationToken);
+        int maxDepth = int.TryParse(maxDepthEntry?.Value, out var md) ? md : 3;
+
+        int rollbackDepth = 0;
+        long? walkId = current.PreviousChampionModelId;
+        while (walkId.HasValue && rollbackDepth < maxDepth + 1)
+        {
+            var ancestor = await db.Set<MLModel>()
+                .AsNoTracking()
+                .Where(m => m.Id == walkId.Value && !m.IsDeleted)
+                .Select(m => new { m.Id, m.Status, m.PreviousChampionModelId })
+                .FirstOrDefaultAsync(cancellationToken);
+
+            if (ancestor is null) break;
+
+            // A superseded ancestor in the chain indicates it was previously rolled back from
+            if (ancestor.Status == MLModelStatus.Superseded)
+                rollbackDepth++;
+            else
+                break; // non-superseded ancestor means the chain of rollbacks ends
+
+            walkId = ancestor.PreviousChampionModelId;
+        }
+
+        if (rollbackDepth >= maxDepth)
+            return ResponseData<long>.Init(0, false,
+                $"Rollback depth limit ({maxDepth}) reached — cannot roll back further. Manual intervention required.",
+                "-11");
+
         // Find the most recently superseded model (previous champion by ActivatedAt)
         var previous = await db.Set<MLModel>()
             .Where(m => m.Symbol    == request.Symbol &&

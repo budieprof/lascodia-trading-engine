@@ -173,24 +173,11 @@ public sealed class MLDirectionStreakWorker : BackgroundService
 
     /// <summary>
     /// Evaluates the direction streak for a single ML model over the most recent
-    /// <paramref name="windowSize"/> prediction log records.
+    /// <paramref name="windowSize"/> prediction log records. Applies three complementary
+    /// tests: (1) dominant-fraction threshold, (2) Wald-Wolfowitz runs test for randomness,
+    /// (3) Shannon entropy threshold. Severe streaks queue automatic retraining with
+    /// class-rebalancing metadata.
     /// </summary>
-    /// <param name="modelId">Database ID of the model to check.</param>
-    /// <param name="symbol">Currency pair symbol (e.g. "EURUSD").</param>
-    /// <param name="timeframe">Timeframe of the model.</param>
-    /// <param name="windowSize">
-    /// Number of most-recent predictions to examine. The check is only performed
-    /// when at least this many records are available — requiring the full window
-    /// prevents spurious alerts on newly deployed models.
-    /// </param>
-    /// <param name="maxFraction">
-    /// Maximum fraction of predictions allowed in the dominant direction before
-    /// an alert is raised. E.g. 0.85 means &gt;85% same direction triggers the check.
-    /// </param>
-    /// <param name="alertDest">Webhook destination for the alert.</param>
-    /// <param name="readCtx">Read-only EF DbContext.</param>
-    /// <param name="writeCtx">Write EF DbContext.</param>
-    /// <param name="ct">Cancellation token.</param>
     private async Task CheckModelStreakAsync(
         long                                    modelId,
         string                                  symbol,
@@ -202,9 +189,6 @@ public sealed class MLDirectionStreakWorker : BackgroundService
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
         CancellationToken                       ct)
     {
-        // Load the N most recent predictions (resolved or unresolved — we only care about direction).
-        // Using OrderByDescending + Take is more efficient than a date-range filter when the
-        // goal is simply "the latest N records".
         var recent = await readCtx.Set<MLModelPredictionLog>()
             .Where(l => l.MLModelId == modelId && !l.IsDeleted)
             .OrderByDescending(l => l.PredictedAt)
@@ -213,8 +197,6 @@ public sealed class MLDirectionStreakWorker : BackgroundService
             .Select(l => l.PredictedDirection)
             .ToListAsync(ct);
 
-        // Require a full window before evaluating — an incomplete window can produce
-        // artificially high dominance fractions on models with few predictions.
         if (recent.Count < windowSize)
         {
             _logger.LogDebug(
@@ -223,56 +205,156 @@ public sealed class MLDirectionStreakWorker : BackgroundService
             return;
         }
 
-        // ── Streak computation ────────────────────────────────────────────────
-        // Count each direction, identify the dominant side, and compute its fraction.
-        // Tie-breaking favours Buy (arbitrary; the alert fires regardless of which side wins).
-        int    buyCount       = recent.Count(d => d == TradeDirection.Buy);
-        int    sellCount      = recent.Count - buyCount;
-        int    dominantCount  = Math.Max(buyCount, sellCount);
-        double dominantFrac   = (double)dominantCount / recent.Count;
-        var    dominantDir    = buyCount >= sellCount ? TradeDirection.Buy : TradeDirection.Sell;
+        // ── Basic direction counts ───────────────────────────────────────────
+        int    n             = recent.Count;
+        int    buyCount      = recent.Count(d => d == TradeDirection.Buy);
+        int    sellCount     = n - buyCount;
+        int    dominantCount = Math.Max(buyCount, sellCount);
+        double dominantFrac  = (double)dominantCount / n;
+        var    dominantDir   = buyCount >= sellCount ? TradeDirection.Buy : TradeDirection.Sell;
+
+        // ── Shannon entropy ──────────────────────────────────────────────────
+        // Binary entropy: H = -p*log2(p) - (1-p)*log2(1-p). Max = 1.0 (balanced),
+        // Min = 0.0 (all same direction). Low entropy indicates directional lock.
+        double pBuy    = (double)buyCount / n;
+        double entropy = 0.0;
+        if (pBuy > 0 && pBuy < 1)
+            entropy = -(pBuy * Math.Log2(pBuy) + (1.0 - pBuy) * Math.Log2(1.0 - pBuy));
+
+        // ── Wald-Wolfowitz runs test for randomness ──────────────────────────
+        // A "run" is a maximal consecutive sequence of the same direction.
+        // Too few runs indicates directional lock; too many indicates alternating bias.
+        int runs = 1;
+        for (int i = 1; i < n; i++)
+        {
+            if (recent[i] != recent[i - 1])
+                runs++;
+        }
+
+        // Expected runs and variance under the null hypothesis of random order:
+        // E(R) = 1 + 2*n1*n2/(n1+n2)
+        // Var(R) = 2*n1*n2*(2*n1*n2 - n1 - n2) / ((n1+n2)^2 * (n1+n2-1))
+        double n1 = buyCount;
+        double n2 = sellCount;
+        double expectedRuns = 1.0 + (2.0 * n1 * n2) / (n1 + n2);
+        double varRuns = (n1 + n2) > 1
+            ? (2.0 * n1 * n2 * (2.0 * n1 * n2 - n1 - n2)) / ((n1 + n2) * (n1 + n2) * ((n1 + n2) - 1.0))
+            : 0;
+        double runsZScore = varRuns > 0 ? (runs - expectedRuns) / Math.Sqrt(varRuns) : 0;
+
+        // ── Longest consecutive run ──────────────────────────────────────────
+        int longestRun = 1, currentRun = 1;
+        for (int i = 1; i < n; i++)
+        {
+            if (recent[i] == recent[i - 1]) currentRun++;
+            else                             currentRun = 1;
+            longestRun = Math.Max(longestRun, currentRun);
+        }
 
         _logger.LogDebug(
-            "DirectionStreak: model {Id} ({Symbol}/{Tf}) — last {N}: Buy={B} Sell={S} dominant={Dir} ({Frac:P1})",
-            modelId, symbol, timeframe, recent.Count, buyCount, sellCount, dominantDir, dominantFrac);
+            "DirectionStreak: model {Id} ({Symbol}/{Tf}) — Buy={B} Sell={S} dominant={Dir} ({Frac:P1}) " +
+            "entropy={H:F3} runs={R} runsZ={Z:F2} longestRun={LR}",
+            modelId, symbol, timeframe, buyCount, sellCount, dominantDir, dominantFrac,
+            entropy, runs, runsZScore, longestRun);
 
-        // If dominant fraction is within the acceptable range, no action needed.
-        if (dominantFrac <= maxFraction) return;
+        // ── Determine if any test indicates directional lock ─────────────────
+        // 1. Dominant fraction exceeds threshold (original check)
+        bool fracFailed   = dominantFrac > maxFraction;
+        // 2. Entropy below 0.5 indicates severe imbalance (50% of max possible)
+        bool entropyFailed = entropy < 0.5;
+        // 3. Runs Z-score < -2.0 indicates significantly fewer runs than expected (p < 0.05)
+        bool runsFailed    = runsZScore < -2.0;
+        // 4. Longest consecutive run exceeds 60% of window (e.g., 18/30 same direction in a row)
+        bool longestRunFailed = longestRun > (int)(windowSize * 0.6);
+
+        // Require at least 2 of 4 tests to fail to avoid false positives from any single test
+        int failCount = (fracFailed ? 1 : 0) + (entropyFailed ? 1 : 0)
+                      + (runsFailed ? 1 : 0) + (longestRunFailed ? 1 : 0);
+
+        if (failCount < 2) return;
+
+        // ── Determine severity: 3+ tests = severe (retrain), 2 = warning (alert only) ──
+        bool isSevere = failCount >= 3;
 
         _logger.LogWarning(
-            "DirectionStreak: model {Id} ({Symbol}/{Tf}) — {Frac:P1} of last {N} predictions are {Dir} " +
-            "(threshold {Thr:P0}). Possible directional bias.",
-            modelId, symbol, timeframe, dominantFrac, recent.Count, dominantDir, maxFraction);
+            "DirectionStreak: model {Id} ({Symbol}/{Tf}) — {FailCount}/4 tests failed. " +
+            "fracFailed={FF} entropyFailed={EF} runsFailed={RF} longestRunFailed={LRF}. Severity={Sev}",
+            modelId, symbol, timeframe, failCount, fracFailed, entropyFailed, runsFailed, longestRunFailed,
+            isSevere ? "SEVERE" : "WARNING");
 
-        // ── Deduplicated alert ────────────────────────────────────────────────
-        // Only fire one active MLModelDegraded alert per symbol at a time to prevent
-        // alert flooding. Operators resolve the alert after investigating.
+        // ── Deduplicated alert ───────────────────────────────────────────────
+        string dedupKey = $"direction-streak:{symbol}:{timeframe}:{modelId}";
         bool alertExists = await readCtx.Set<Alert>()
-            .AnyAsync(a => a.Symbol    == symbol                     &&
-                           a.AlertType == AlertType.MLModelDegraded  &&
-                           a.IsActive  && !a.IsDeleted, ct);
+            .AnyAsync(a => a.DeduplicationKey == dedupKey
+                        && a.IsActive && !a.IsDeleted, ct);
 
-        if (alertExists) return;
-
-        writeCtx.Set<Alert>().Add(new Alert
+        if (!alertExists)
         {
-            AlertType     = AlertType.MLModelDegraded,
-            Symbol        = symbol,
-            Channel       = AlertChannel.Webhook,
-            Destination   = alertDest,
-            ConditionJson = System.Text.Json.JsonSerializer.Serialize(new
+            writeCtx.Set<Alert>().Add(new Alert
             {
-                reason            = "direction_streak",
-                severity          = "warning",
-                symbol,
-                timeframe         = timeframe.ToString(),
-                modelId,
-                dominantDirection = dominantDir.ToString(),
-                dominantFraction  = dominantFrac,
-                windowSize,
-            }),
-            IsActive = true,
-        });
+                AlertType        = AlertType.MLModelDegraded,
+                Symbol           = symbol,
+                Channel          = isSevere ? AlertChannel.Telegram : AlertChannel.Webhook,
+                Destination      = alertDest,
+                Severity         = isSevere ? AlertSeverity.High : AlertSeverity.Medium,
+                DeduplicationKey = dedupKey,
+                CooldownSeconds  = 3600,
+                ConditionJson    = System.Text.Json.JsonSerializer.Serialize(new
+                {
+                    reason            = "direction_streak",
+                    severity          = isSevere ? "severe" : "warning",
+                    symbol,
+                    timeframe         = timeframe.ToString(),
+                    modelId,
+                    dominantDirection = dominantDir.ToString(),
+                    dominantFraction  = Math.Round(dominantFrac, 4),
+                    entropy           = Math.Round(entropy, 4),
+                    runsZScore        = Math.Round(runsZScore, 4),
+                    runs,
+                    expectedRuns      = Math.Round(expectedRuns, 2),
+                    longestConsecutiveRun = longestRun,
+                    windowSize,
+                    testsFailedCount  = failCount,
+                    detectedAt        = DateTime.UtcNow.ToString("O")
+                }),
+                IsActive = true,
+            });
+        }
+
+        // ── Auto-queue retrain for severe streaks ────────────────────────────
+        if (isSevere)
+        {
+            bool retrainExists = await readCtx.Set<MLTrainingRun>()
+                .AnyAsync(r => r.Symbol == symbol
+                            && r.Timeframe == timeframe
+                            && r.Status == RunStatus.Queued
+                            && !r.IsDeleted, ct);
+
+            if (!retrainExists)
+            {
+                writeCtx.Set<MLTrainingRun>().Add(new MLTrainingRun
+                {
+                    Symbol               = symbol,
+                    Timeframe            = timeframe,
+                    Status               = RunStatus.Queued,
+                    ErrorMessage         = $"[DirectionStreak] Auto-retrain: {failCount}/4 tests failed " +
+                                           $"(dominant={dominantDir} {dominantFrac:P0}, entropy={entropy:F3}, " +
+                                           $"runsZ={runsZScore:F2}, longestRun={longestRun}). " +
+                                           "Recommend class-rebalancing and dropout regularisation.",
+                    HyperparamConfigJson = System.Text.Json.JsonSerializer.Serialize(new
+                    {
+                        triggeredBy           = "MLDirectionStreakWorker",
+                        classRebalance        = true,
+                        dominantDirection     = dominantDir.ToString(),
+                        dominantFraction      = dominantFrac,
+                    }),
+                });
+
+                _logger.LogWarning(
+                    "DirectionStreak: queued retrain for {Symbol}/{Tf} model {Id} due to severe directional lock",
+                    symbol, timeframe, modelId);
+            }
+        }
 
         await writeCtx.SaveChangesAsync(ct);
     }

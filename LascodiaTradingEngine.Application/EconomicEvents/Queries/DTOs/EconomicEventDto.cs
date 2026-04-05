@@ -6,6 +6,7 @@ using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.EconomicEvents.Queries.DTOs;
 
+/// <summary>Data transfer object for a scheduled economic event including forecast, previous, and actual values.</summary>
 public class EconomicEventDto : IMapFrom<EconomicEvent>
 {
     public long                Id          { get; set; }

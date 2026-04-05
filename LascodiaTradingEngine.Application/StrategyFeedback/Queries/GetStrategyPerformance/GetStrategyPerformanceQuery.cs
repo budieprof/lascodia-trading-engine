@@ -9,13 +9,16 @@ namespace LascodiaTradingEngine.Application.StrategyFeedback.Queries.GetStrategy
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Retrieves the latest performance snapshot for a specific strategy.</summary>
 public class GetStrategyPerformanceQuery : IRequest<ResponseData<StrategyPerformanceSnapshotDto>>
 {
+    /// <summary>The strategy to retrieve performance data for.</summary>
     public required long StrategyId { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Fetches the most recent performance snapshot for the given strategy, ordered by evaluation date descending.</summary>
 public class GetStrategyPerformanceQueryHandler
     : IRequestHandler<GetStrategyPerformanceQuery, ResponseData<StrategyPerformanceSnapshotDto>>
 {

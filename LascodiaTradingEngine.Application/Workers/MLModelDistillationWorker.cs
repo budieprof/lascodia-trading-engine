@@ -5,222 +5,180 @@ using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
+using System.Text.Json;
 
 namespace LascodiaTradingEngine.Application.Workers;
 
 /// <summary>
-/// Triggers knowledge-distillation training runs when the inference latency of the
-/// active ensemble model consistently breaches the P99 threshold configured in EngineConfig.
+/// Distills large ensemble models into smaller, faster BaggedLogistic models with K=3
+/// when inference latency exceeds a configurable threshold. The resulting student model
+/// is trained by <c>MLTrainingWorker</c> using soft labels from the teacher ensemble.
 /// </summary>
 /// <remarks>
-/// Knowledge distillation trains a compact student model to mimic the ensemble teacher's
-/// soft probability outputs (temperature-scaled). The student has K=1 (or a small K) and
-/// converges faster because it learns from soft labels rather than hard 0/1 outcomes.
-///
 /// Flow:
-/// 1. Read rolling P99 latency from the most recent <c>MLInferenceLatencyWorker</c> output.
-/// 2. When P99 > threshold for 3 consecutive cycles, queue a distillation run.
-/// 3. The training run has <c>IsDistillationRun = true</c>; <c>MLTrainingWorker</c> detects
-///    this flag and routes the run to a single-learner trainer using the teacher's soft labels.
-/// 4. On promotion, the produced model has <c>IsDistilled = true</c> and
-///    <c>DistilledFromModelId</c> pointing at the teacher.
+/// 1. Polls every 6 hours (configurable via <c>MLDistillation:PollIntervalSeconds</c>).
+/// 2. Finds active models where <c>LearnerArchitecture != BaggedLogistic</c> AND the
+///    rolling P99 inference latency from recent <see cref="MLModelPredictionLog"/> records
+///    exceeds the threshold.
+/// 3. Queues an <see cref="MLTrainingRun"/> with <c>IsDistillationRun = true</c>,
+///    targeting BaggedLogistic with K=3 (small ensemble).
+/// 4. The training worker detects the distillation flag and produces a student model
+///    with <c>IsDistilled = true</c> and <c>DistilledFromModelId</c> set to the teacher.
 /// </remarks>
-public class MLModelDistillationWorker : BackgroundService
+public sealed class MLModelDistillationWorker : BackgroundService
 {
-    private readonly ILogger<MLModelDistillationWorker> _logger;
     private readonly IServiceScopeFactory _scopeFactory;
+    private readonly ILogger<MLModelDistillationWorker> _logger;
 
-    private static readonly TimeSpan _interval      = TimeSpan.FromMinutes(30);
-    private static readonly TimeSpan _initialDelay  = TimeSpan.FromMinutes(8);
+    /// <summary>Default poll interval (6 hours); overridable via EngineConfig key.</summary>
+    private const int DefaultPollIntervalSec = 21600;
+    private const string CK_PollInterval      = "MLDistillation:PollIntervalSeconds";
+    private const string CK_LatencyThresholdMs = "MLDistillation:LatencyThresholdMs";
 
-    /// <summary>P99 latency in milliseconds above which distillation is triggered.</summary>
-    private const int LatencyThresholdMs = 200;
+    /// <summary>Default P99 latency threshold in milliseconds above which distillation is triggered.</summary>
+    private const int DefaultLatencyThresholdMs = 200;
 
-    /// <summary>Number of consecutive high-latency cycles before triggering distillation.</summary>
-    private const int ConsecutiveCyclesThreshold = 3;
+    /// <summary>Student ensemble size — small enough for low latency while preserving diversity.</summary>
+    private const int StudentK = 3;
 
-    // Track consecutive breaches per model (in-process state; resets on restart)
-    private readonly Dictionary<long, int> _breachCounts = new();
-
-    /// <summary>
-    /// Initialises the worker with its logger and DI scope factory.
-    /// </summary>
-    /// <param name="logger">Structured logger scoped to this worker type.</param>
-    /// <param name="scopeFactory">
-    /// Used to create a new DI scope on every poll cycle so that scoped EF Core
-    /// contexts are correctly disposed between polls.
-    /// </param>
     public MLModelDistillationWorker(
-        ILogger<MLModelDistillationWorker> logger,
-        IServiceScopeFactory scopeFactory)
+        IServiceScopeFactory scopeFactory,
+        ILogger<MLModelDistillationWorker> logger)
     {
-        _logger       = logger;
         _scopeFactory = scopeFactory;
+        _logger       = logger;
     }
 
-    /// <summary>
-    /// Hosted-service entry point. Waits <see cref="_initialDelay"/> after startup
-    /// then polls every <see cref="_interval"/> (30 min), calling
-    /// <see cref="RunCycleAsync"/> to check for sustained latency breaches.
-    /// </summary>
-    /// <param name="stoppingToken">Signalled when the host is shutting down.</param>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("MLModelDistillationWorker starting");
+        _logger.LogInformation("MLModelDistillationWorker started.");
 
-        // Stagger startup to avoid contention with heavier workers during boot.
-        await Task.Delay(_initialDelay, stoppingToken);
+        // Stagger startup to avoid contention with heavier workers.
+        await Task.Delay(TimeSpan.FromMinutes(5), stoppingToken);
 
         while (!stoppingToken.IsCancellationRequested)
         {
-            try { await RunCycleAsync(stoppingToken); }
-            catch (OperationCanceledException) { break; }
-            catch (Exception ex) { _logger.LogError(ex, "MLModelDistillationWorker cycle failed"); }
+            int pollSecs = DefaultPollIntervalSec;
+            try
+            {
+                using var scope = _scopeFactory.CreateAsyncScope();
+                var readCtx = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+                var readDb  = readCtx.GetDbContext();
+                pollSecs = await GetConfigAsync<int>(readDb, CK_PollInterval, DefaultPollIntervalSec, stoppingToken);
 
-            await Task.Delay(_interval, stoppingToken);
+                await RunCycleAsync(scope.ServiceProvider, stoppingToken);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogError(ex, "MLModelDistillationWorker cycle failed.");
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(pollSecs), stoppingToken);
         }
     }
 
-    /// <summary>
-    /// Core distillation detection cycle. Computes the rolling P99 inference latency
-    /// for each active model from recent <see cref="MLModelPredictionLog"/> records,
-    /// increments an in-process breach counter per model, and queues a distillation
-    /// training run once <see cref="ConsecutiveCyclesThreshold"/> consecutive breaches
-    /// are observed.
-    /// </summary>
-    /// <remarks>
-    /// Knowledge distillation methodology:
-    /// <list type="number">
-    ///   <item>
-    ///     Query all prediction logs written in the last 2 hours that carry a
-    ///     <c>LatencyMs</c> measurement. Group by <c>MLModelId</c> and compute the
-    ///     approximate P99 (skip the top 1% of sorted latencies). Models whose P99
-    ///     exceeds <see cref="LatencyThresholdMs"/> are candidates for distillation.
-    ///   </item>
-    ///   <item>
-    ///     Use the in-memory <see cref="_breachCounts"/> dictionary as a hysteresis
-    ///     filter. A single high-latency sample could be a transient spike; only after
-    ///     <see cref="ConsecutiveCyclesThreshold"/> consecutive 30-minute cycles all
-    ///     breaching the threshold do we treat the latency regression as persistent.
-    ///   </item>
-    ///   <item>
-    ///     Before queuing, check whether a distillation run is already in flight
-    ///     (any run with <c>IsDistillationRun = true</c> that has not yet completed
-    ///     or failed). This prevents duplicate student training runs stacking up.
-    ///   </item>
-    ///   <item>
-    ///     Queue the distillation <see cref="MLTrainingRun"/> with
-    ///     <c>IsDistillationRun = true</c> and <c>K = 1</c>. The <c>MLTrainingWorker</c>
-    ///     detects this flag and routes the run to a single-learner trainer that uses
-    ///     temperature-scaled soft labels from the teacher ensemble rather than hard
-    ///     0/1 direction labels. The resulting student model is dramatically smaller
-    ///     and faster while retaining most of the teacher's predictive signal.
-    ///   </item>
-    ///   <item>
-    ///     Reset the breach counter to zero after queuing, so a new independent
-    ///     threshold-crossing period must elapse before another distillation is triggered.
-    ///   </item>
-    /// </list>
-    /// </remarks>
-    /// <param name="ct">Cancellation token forwarded from the host.</param>
-    private async Task RunCycleAsync(CancellationToken ct)
+    private async Task RunCycleAsync(IServiceProvider sp, CancellationToken ct)
     {
-        using var scope  = _scopeFactory.CreateScope();
-        var readCtx      = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
-        var writeCtx     = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
-        var readDb       = readCtx.GetDbContext();
-        var writeDb      = writeCtx.GetDbContext();
+        var readCtx  = sp.GetRequiredService<IReadApplicationDbContext>();
+        var writeCtx = sp.GetRequiredService<IWriteApplicationDbContext>();
+        var readDb   = readCtx.GetDbContext();
+        var writeDb  = writeCtx.GetDbContext();
 
-        // Query prediction logs from the last 2 hours that include latency measurements.
-        // Group by model and compute an approximate P99 client-side. The previous
-        // server-side approach used g.Count() inside Skip() which PostgreSQL rejects
-        // because aggregate functions are not allowed in OFFSET.
+        int latencyThreshold = await GetConfigAsync<int>(readDb, CK_LatencyThresholdMs, DefaultLatencyThresholdMs, ct);
+
+        // Find active models that are NOT already BaggedLogistic (distillation targets
+        // complex architectures that have higher inference cost).
+        var candidates = await readDb.Set<MLModel>()
+            .AsNoTracking()
+            .Where(m => m.IsActive && !m.IsDeleted
+                     && m.LearnerArchitecture != LearnerArchitecture.BaggedLogistic)
+            .Select(m => new { m.Id, m.Symbol, m.Timeframe, m.LearnerArchitecture })
+            .ToListAsync(ct);
+
+        if (candidates.Count == 0) return;
+
+        // Compute rolling P99 latency from recent prediction logs (last 6 hours).
         var recentPredictions = await readDb.Set<MLModelPredictionLog>()
+            .AsNoTracking()
             .Where(p => !p.IsDeleted
                      && p.LatencyMs != null
-                     && p.PredictedAt >= DateTime.UtcNow.AddHours(-2))
+                     && p.PredictedAt >= DateTime.UtcNow.AddHours(-6))
             .Select(p => new { p.MLModelId, p.LatencyMs })
             .ToListAsync(ct);
 
-        var latencyBreaches = recentPredictions
+        var latencyByModel = recentPredictions
             .GroupBy(p => p.MLModelId)
-            .Select(g =>
-            {
-                var sorted = g.OrderBy(p => p.LatencyMs).ToList();
-                int p99Idx = Math.Max(0, (int)(sorted.Count * 0.99) - 1);
-                return new
+            .ToDictionary(
+                g => g.Key,
+                g =>
                 {
-                    ModelId = g.Key,
-                    P99Ms   = sorted[p99Idx].LatencyMs ?? 0
-                };
-            })
-            .Where(x => x.P99Ms > LatencyThresholdMs)
-            .ToList();
+                    var sorted = g.OrderBy(p => p.LatencyMs).ToList();
+                    int p99Idx = Math.Max(0, (int)(sorted.Count * 0.99) - 1);
+                    return sorted[p99Idx].LatencyMs ?? 0;
+                });
 
-        foreach (var breach in latencyBreaches)
+        foreach (var candidate in candidates)
         {
-            // Increment in-process hysteresis counter for this model.
-            // State is intentionally in-process (not persisted) so it resets on restart,
-            // which is acceptable — a restart represents a recovery event that clears
-            // transient state anyway.
-            _breachCounts.TryGetValue(breach.ModelId, out int count);
-            _breachCounts[breach.ModelId] = count + 1;
-
-            // Only act after ConsecutiveCyclesThreshold sustained breaches.
-            // This prevents distillation being triggered by a single noisy measurement.
-            if (_breachCounts[breach.ModelId] < ConsecutiveCyclesThreshold) continue;
-
-            // Check if distillation run already queued or distilled model already active.
-            // A queued, pending, or running distillation run indicates work is in progress.
-            bool alreadyQueued = await writeDb.Set<MLTrainingRun>()
-                .AnyAsync(r => r.IsDistillationRun
-                            && r.Status != RunStatus.Completed
-                            && r.Status != RunStatus.Failed
-                            && !r.IsDeleted, ct);
-
-            if (alreadyQueued) continue;
-
-            // Fetch the teacher model — must still be active at queue time.
-            var teacher = await writeDb.Set<MLModel>()
-                .FirstOrDefaultAsync(m => m.Id == breach.ModelId && m.IsActive && !m.IsDeleted, ct);
-
-            if (teacher == null) continue;
-
-            // Queue a distillation training run.
-            // K=1 produces a single lightweight logistic student that mimics the full
-            // ensemble's soft probability outputs (temperature-scaled cross-entropy loss).
-            // MaxEpochs=30 is sufficient for the student to converge on soft labels;
-            // fewer epochs reduce the risk of the student overfitting to teacher noise.
-            var distillRun = new MLTrainingRun
+            try
             {
-                Symbol              = teacher.Symbol,
-                Timeframe           = teacher.Timeframe,
-                TriggerType         = TriggerType.Scheduled,
-                Status              = RunStatus.Queued,
-                // 180-day window provides sufficient recency without reaching back to
-                // market regimes that may differ from the teacher's training distribution.
-                FromDate            = DateTime.UtcNow.AddDays(-180),
-                ToDate              = DateTime.UtcNow,
-                IsDistillationRun   = true,
-                LearnerArchitecture = teacher.LearnerArchitecture,
-                HyperparamConfigJson = System.Text.Json.JsonSerializer.Serialize(new
+                // Check if this model's P99 latency exceeds the threshold.
+                if (!latencyByModel.TryGetValue(candidate.Id, out var p99Ms)) continue;
+                if (p99Ms <= latencyThreshold) continue;
+
+                // Check if a distillation run is already in flight for this symbol/timeframe.
+                bool alreadyQueued = await writeDb.Set<MLTrainingRun>()
+                    .AnyAsync(r => r.IsDistillationRun
+                                && r.Symbol == candidate.Symbol
+                                && r.Timeframe == candidate.Timeframe
+                                && r.Status != RunStatus.Completed
+                                && r.Status != RunStatus.Failed
+                                && !r.IsDeleted, ct);
+
+                if (alreadyQueued) continue;
+
+                // Queue a distillation training run targeting BaggedLogistic with K=3.
+                var distillRun = new MLTrainingRun
                 {
-                    TeacherModelId = teacher.Id,
-                    K              = 1,  // single lightweight student
-                    MaxEpochs      = 30,
-                })
-            };
+                    Symbol              = candidate.Symbol,
+                    Timeframe           = candidate.Timeframe,
+                    TriggerType         = TriggerType.Scheduled,
+                    Status              = RunStatus.Queued,
+                    FromDate            = DateTime.UtcNow.AddDays(-180),
+                    ToDate              = DateTime.UtcNow,
+                    IsDistillationRun   = true,
+                    LearnerArchitecture = LearnerArchitecture.BaggedLogistic,
+                    HyperparamConfigJson = JsonSerializer.Serialize(new
+                    {
+                        TeacherModelId = candidate.Id,
+                        K              = StudentK,
+                        MaxEpochs      = 30,
+                    })
+                };
 
-            writeDb.Set<MLTrainingRun>().Add(distillRun);
-            await writeDb.SaveChangesAsync(ct);
+                writeDb.Set<MLTrainingRun>().Add(distillRun);
+                await writeDb.SaveChangesAsync(ct);
 
-            // Reset breach counter so a new independent latency episode must be
-            // observed before another distillation run is queued.
-            _breachCounts[breach.ModelId] = 0;
-
-            _logger.LogInformation(
-                "Distillation run queued for {Symbol}/{Timeframe} — P99 latency breached {Threshold}ms",
-                teacher.Symbol, teacher.Timeframe, LatencyThresholdMs);
+                _logger.LogInformation(
+                    "Distillation run queued for {Symbol}/{Timeframe} (P99={P99}ms > {Threshold}ms, arch={Arch}).",
+                    candidate.Symbol, candidate.Timeframe, p99Ms, latencyThreshold, candidate.LearnerArchitecture);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Distillation check failed for model {Id}.", candidate.Id);
+            }
         }
+    }
+
+    private static async Task<T> GetConfigAsync<T>(
+        DbContext ctx, string key, T defaultValue, CancellationToken ct)
+    {
+        var entry = await ctx.Set<EngineConfig>()
+            .AsNoTracking()
+            .FirstOrDefaultAsync(c => c.Key == key, ct);
+
+        if (entry?.Value is null) return defaultValue;
+
+        try   { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
+        catch { return defaultValue; }
     }
 }

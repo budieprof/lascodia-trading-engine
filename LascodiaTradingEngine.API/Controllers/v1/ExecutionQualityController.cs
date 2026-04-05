@@ -10,6 +10,10 @@ using LascodiaTradingEngine.Application.ExecutionQuality.Queries.GetPagedExecuti
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
+/// <summary>
+/// Records and queries execution quality metrics such as slippage, fill latency, and rejection rates.
+/// Route: api/v1/lascodia-trading-engine/execution-quality
+/// </summary>
 [Route("api/v1/lascodia-trading-engine/execution-quality")]
 [ApiController]
 public class ExecutionQualityController : AuthControllerBase<ExecutionQualityController>

@@ -8,8 +8,10 @@ namespace LascodiaTradingEngine.Application.CurrencyPairs.Commands.DeleteCurrenc
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>Soft-deletes a currency pair by its identifier.</summary>
 public class DeleteCurrencyPairCommand : IRequest<ResponseData<string>>
 {
+    /// <summary>The unique identifier of the currency pair to delete.</summary>
     public long Id { get; set; }
 }
 
@@ -25,6 +27,7 @@ public class DeleteCurrencyPairCommandValidator : AbstractValidator<DeleteCurren
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Marks the currency pair as soft-deleted.</summary>
 public class DeleteCurrencyPairCommandHandler : IRequestHandler<DeleteCurrencyPairCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

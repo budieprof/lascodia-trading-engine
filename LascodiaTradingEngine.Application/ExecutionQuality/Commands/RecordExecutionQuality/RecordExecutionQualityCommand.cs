@@ -8,6 +8,10 @@ namespace LascodiaTradingEngine.Application.ExecutionQuality.Commands.RecordExec
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Records an execution quality measurement for a filled order, capturing slippage,
+/// latency, partial fill status, and fill rate for execution analytics.
+/// </summary>
 public class RecordExecutionQualityCommand : IRequest<ResponseData<long>>
 {
     public long     OrderId        { get; set; }
@@ -43,6 +47,7 @@ public class RecordExecutionQualityCommandValidator : AbstractValidator<RecordEx
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Persists an execution quality log entry with session, slippage, and latency metrics.</summary>
 public class RecordExecutionQualityCommandHandler
     : IRequestHandler<RecordExecutionQualityCommand, ResponseData<long>>
 {

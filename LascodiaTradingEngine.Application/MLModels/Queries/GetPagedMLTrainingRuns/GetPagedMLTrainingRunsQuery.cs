@@ -11,21 +11,36 @@ namespace LascodiaTradingEngine.Application.MLModels.Queries.GetPagedMLTrainingR
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Retrieves a paginated list of ML training runs, optionally filtered by symbol, timeframe, and run status.
+/// Results are ordered by StartedAt descending (most recent first).
+/// </summary>
 public class GetPagedMLTrainingRunsQuery : PagerRequestWithFilterType<MLTrainingRunQueryFilter, ResponseData<PagedData<MLTrainingRunDto>>>
 {
 }
 
 // ── Filter ────────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Filter criteria for paginated ML training run queries.
+/// </summary>
 public class MLTrainingRunQueryFilter
 {
+    /// <summary>Filter by instrument symbol.</summary>
     public string? Symbol    { get; set; }
+
+    /// <summary>Filter by chart timeframe.</summary>
     public string? Timeframe { get; set; }
+
+    /// <summary>Filter by run status (e.g. "Queued", "Running", "Completed", "Failed").</summary>
     public string? Status    { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Handles paginated ML training run retrieval with optional Symbol, Timeframe, and Status filters.
+/// </summary>
 public class GetPagedMLTrainingRunsQueryHandler
     : IRequestHandler<GetPagedMLTrainingRunsQuery, ResponseData<PagedData<MLTrainingRunDto>>>
 {

@@ -9,8 +9,10 @@ namespace LascodiaTradingEngine.Application.StrategyFeedback.Commands.RejectOpti
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>Rejects an optimization run, discarding the proposed parameter changes.</summary>
 public class RejectOptimizationCommand : IRequest<ResponseData<string>>
 {
+    /// <summary>The unique identifier of the optimization run to reject.</summary>
     public long Id { get; set; }
 }
 
@@ -26,6 +28,7 @@ public class RejectOptimizationCommandValidator : AbstractValidator<RejectOptimi
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Marks the optimization run as Rejected without modifying the strategy parameters.</summary>
 public class RejectOptimizationCommandHandler : IRequestHandler<RejectOptimizationCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

@@ -7,12 +7,14 @@ namespace LascodiaTradingEngine.Application.PaperTrading.Queries.GetPaperTrading
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Checks whether the engine is currently running in paper (simulation) trading mode.</summary>
 public class GetPaperTradingStatusQuery : IRequest<ResponseData<bool>>
 {
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Reads the <c>Engine:PaperMode</c> config key. Returns false if the key does not exist.</summary>
 public class GetPaperTradingStatusQueryHandler
     : IRequestHandler<GetPaperTradingStatusQuery, ResponseData<bool>>
 {

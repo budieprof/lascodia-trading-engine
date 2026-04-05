@@ -24,10 +24,25 @@ public class SubmitExecutionReportCommand : IRequest<ResponseData<string>>
     public required string Status  { get; set; }  // "Filled" | "Rejected" | "Cancelled"
     public string?  RejectionReason { get; set; }
     public DateTime? FilledAt      { get; set; }
+
+    // ── EA telemetry fields ─────────────────────────────────────────────────
+    public long?    SignalId           { get; set; }
+    public long?    Mt5DealTicket      { get; set; }
+    public long?    MagicNumber        { get; set; }
+    public decimal? RequestedPrice     { get; set; }
+    public decimal? SlippagePips       { get; set; }
+    public int?     SlippagePoints     { get; set; }
+    public decimal? Commission         { get; set; }
+    public int?     ExecutionLatencyMs { get; set; }
+    public int?     QueueDwellMs       { get; set; }
+    public string?  FillPolicy         { get; set; }
+    public string?  AccountMode        { get; set; }
+    public int?     BrokerRetcode      { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>Validates that the order Id is positive and Status is one of Filled, Rejected, or Cancelled.</summary>
 public class SubmitExecutionReportCommandValidator : AbstractValidator<SubmitExecutionReportCommand>
 {
     public SubmitExecutionReportCommandValidator()
@@ -37,13 +52,17 @@ public class SubmitExecutionReportCommandValidator : AbstractValidator<SubmitExe
 
         RuleFor(x => x.Status)
             .NotEmpty().WithMessage("Status cannot be empty")
-            .Must(s => s is "Filled" or "Rejected" or "Cancelled")
-            .WithMessage("Status must be Filled, Rejected, or Cancelled");
+            .Must(s => s is "Filled" or "Rejected" or "Cancelled" or "PartialFill" or "Failed")
+            .WithMessage("Status must be Filled, Rejected, Cancelled, PartialFill, or Failed");
     }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Applies the EA execution report to the order entity. On first transition to Filled,
+/// publishes an <see cref="OrderFilledIntegrationEvent"/> to trigger downstream position management.
+/// </summary>
 public class SubmitExecutionReportCommandHandler : IRequestHandler<SubmitExecutionReportCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;
@@ -85,15 +104,20 @@ public class SubmitExecutionReportCommandHandler : IRequestHandler<SubmitExecuti
 
             await _eventBus.SaveAndPublish(_context, new OrderFilledIntegrationEvent
             {
-                OrderId        = entity.Id,
-                StrategyId     = entity.StrategyId,
-                Symbol         = entity.Symbol,
-                Session        = entity.Session,
-                RequestedPrice = entity.Price,
-                FilledPrice    = filledPrice,
-                WasPartialFill = fillRate < 1m,
-                FillRate       = fillRate,
-                FilledAt       = entity.FilledAt ?? DateTime.UtcNow,
+                OrderId            = entity.Id,
+                StrategyId         = entity.StrategyId,
+                Symbol             = entity.Symbol,
+                Session            = entity.Session,
+                RequestedPrice     = request.RequestedPrice ?? entity.Price,
+                FilledPrice        = filledPrice,
+                WasPartialFill     = fillRate < 1m,
+                FillRate           = fillRate,
+                FilledAt           = entity.FilledAt ?? DateTime.UtcNow,
+                SubmitToFillMs     = request.ExecutionLatencyMs ?? 0,
+                SlippagePips       = request.SlippagePips,
+                Commission         = request.Commission,
+                QueueDwellMs       = request.QueueDwellMs,
+                BrokerRetcode      = request.BrokerRetcode,
             });
         }
         else

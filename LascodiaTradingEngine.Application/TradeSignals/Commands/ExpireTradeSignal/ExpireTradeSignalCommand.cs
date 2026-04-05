@@ -9,13 +9,16 @@ namespace LascodiaTradingEngine.Application.TradeSignals.Commands.ExpireTradeSig
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>Marks a trade signal as expired, preventing further execution attempts.</summary>
 public class ExpireTradeSignalCommand : IRequest<ResponseData<string>>
 {
+    /// <summary>Trade signal identifier to expire.</summary>
     public long Id { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>Validates that the trade signal Id is a positive value.</summary>
 public class ExpireTradeSignalCommandValidator : AbstractValidator<ExpireTradeSignalCommand>
 {
     public ExpireTradeSignalCommandValidator()
@@ -26,6 +29,7 @@ public class ExpireTradeSignalCommandValidator : AbstractValidator<ExpireTradeSi
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Transitions the signal to Expired status regardless of its current state.</summary>
 public class ExpireTradeSignalCommandHandler : IRequestHandler<ExpireTradeSignalCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

@@ -9,6 +9,10 @@ using LascodiaTradingEngine.Application.AuditTrail.Queries.GetPagedDecisionLogs;
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
+/// <summary>
+/// Provides immutable decision audit logging and paginated retrieval of audit entries.
+/// Route: api/v1/lascodia-trading-engine/audit-trail
+/// </summary>
 [Route("api/v1/lascodia-trading-engine/audit-trail")]
 [ApiController]
 public class AuditTrailController : AuthControllerBase<AuditTrailController>

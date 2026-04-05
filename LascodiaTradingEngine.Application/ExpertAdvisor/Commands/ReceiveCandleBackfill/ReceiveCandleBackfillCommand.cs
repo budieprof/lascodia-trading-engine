@@ -9,26 +9,57 @@ namespace LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ReceiveCandle
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Bulk-inserts historical candle data for a single symbol and timeframe. Called during EA startup
+/// to backfill the engine's candle history so indicator calculations have sufficient bars.
+/// Duplicates (matching Symbol + Timeframe + normalised Timestamp) are silently skipped.
+/// </summary>
 public class ReceiveCandleBackfillCommand : IRequest<ResponseData<int>>
 {
+    /// <summary>Unique identifier of the EA instance sending the backfill data.</summary>
     public required string InstanceId { get; set; }
+
+    /// <summary>Instrument symbol for all candles in this batch (e.g. "EURUSD").</summary>
     public required string Symbol     { get; set; }
+
+    /// <summary>Timeframe for all candles in this batch (e.g. "H1", "D1").</summary>
     public required string Timeframe  { get; set; }
+
+    /// <summary>Historical candles to insert. Capped at 10,000 per request.</summary>
     public List<BackfillCandleItem> Candles { get; set; } = new();
 }
 
+/// <summary>
+/// A single historical OHLCV candle for backfill ingestion. All candles in a backfill batch
+/// share the same symbol and timeframe (specified on the parent command).
+/// </summary>
 public class BackfillCandleItem
 {
+    /// <summary>Opening price of the historical candle.</summary>
     public decimal  Open      { get; set; }
+
+    /// <summary>Highest price during the candle period.</summary>
     public decimal  High      { get; set; }
+
+    /// <summary>Lowest price during the candle period.</summary>
     public decimal  Low       { get; set; }
+
+    /// <summary>Closing price of the historical candle.</summary>
     public decimal  Close     { get; set; }
+
+    /// <summary>Tick volume for the candle period.</summary>
     public decimal  Volume    { get; set; }
+
+    /// <summary>Candle open time. Normalised to the timeframe boundary during processing.</summary>
     public DateTime Timestamp { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Validates backfill requests: non-empty InstanceId, valid Symbol (max 10 chars), valid Timeframe enum,
+/// non-empty candle list (max 10,000), and per-candle OHLC positivity, High &gt;= Low, non-negative Volume.
+/// </summary>
 public class ReceiveCandleBackfillCommandValidator : AbstractValidator<ReceiveCandleBackfillCommand>
 {
     public ReceiveCandleBackfillCommandValidator()
@@ -64,6 +95,11 @@ public class ReceiveCandleBackfillCommandValidator : AbstractValidator<ReceiveCa
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Handles historical candle backfill. Normalises timestamps to timeframe boundaries, skips duplicates
+/// (including soft-deleted rows via IgnoreQueryFilters), and bulk-inserts new candles as IsClosed = true.
+/// Gracefully handles unique constraint violations and numeric overflow from legacy broker data.
+/// </summary>
 public class ReceiveCandleBackfillCommandHandler : IRequestHandler<ReceiveCandleBackfillCommand, ResponseData<int>>
 {
     private readonly IWriteApplicationDbContext _context;

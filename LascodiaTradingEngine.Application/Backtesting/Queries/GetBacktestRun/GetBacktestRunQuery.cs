@@ -9,13 +9,18 @@ namespace LascodiaTradingEngine.Application.Backtesting.Queries.GetBacktestRun;
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Retrieves a single backtest run by its unique identifier.
+/// </summary>
 public class GetBacktestRunQuery : IRequest<ResponseData<BacktestRunDto>>
 {
+    /// <summary>The unique identifier of the backtest run.</summary>
     public required long Id { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Fetches a single backtest run by ID from the read-only context.</summary>
 public class GetBacktestRunQueryHandler : IRequestHandler<GetBacktestRunQuery, ResponseData<BacktestRunDto>>
 {
     private readonly IReadApplicationDbContext _context;

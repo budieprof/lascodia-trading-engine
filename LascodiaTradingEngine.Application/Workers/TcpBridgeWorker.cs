@@ -252,7 +252,17 @@ public class TcpBridgeWorker : BackgroundService
 
             if (msgType == "report")
             {
-                await ProcessReportAsync(line, accountId, ct);
+                try
+                {
+                    await ProcessReportAsync(line, accountId, ct);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex,
+                        "Bridge: failed to process execution report from account {AccountId} — report dropped (session stays open)",
+                        accountId);
+                }
             }
             else if (msgType == "command_ack")
             {

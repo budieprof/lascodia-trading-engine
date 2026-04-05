@@ -3,14 +3,17 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.Workers;
 
 /// <summary>
-/// Pre-computes feature vectors for active symbol/timeframe combinations after each candle close.
-/// Reduces ML scoring latency by having features ready before the next tick arrives.
+/// Pre-computes the full 33-element ML feature vector for active symbol/timeframe
+/// combinations after each candle close. Uses <see cref="MLFeatureHelper.BuildFeatureVector"/>
+/// to guarantee training/serving parity. Reduces ML scoring latency by having features
+/// ready before the next tick arrives.
 /// </summary>
 public class FeaturePreComputationWorker : BackgroundService
 {
@@ -68,44 +71,109 @@ public class FeaturePreComputationWorker : BackgroundService
             .ToListAsync(ct);
 
         int preComputed = 0;
+        int skippedInsufficient = 0;
 
         foreach (var pair in activeSymbolTimeframes)
         {
             if (ct.IsCancellationRequested) break;
 
-            // Get the latest closed candle for this symbol/timeframe
-            var latestCandle = await readCtx.GetDbContext()
-                .Set<Candle>()
-                .Where(c => c.Symbol == pair.Symbol && c.Timeframe == pair.Timeframe
-                         && c.IsClosed && !c.IsDeleted)
-                .OrderByDescending(c => c.Timestamp)
-                .FirstOrDefaultAsync(ct);
-
-            if (latestCandle is null) continue;
-
-            // Check if feature vector already exists for this candle
-            var existing = await featureStore.GetAsync(
-                pair.Symbol, pair.Timeframe, latestCandle.Timestamp, ct);
-
-            if (existing is not null) continue;
-
-            // Build and persist feature vector (placeholder: OHLCV features)
-            var features = new double[]
+            try
             {
-                (double)latestCandle.Open, (double)latestCandle.High,
-                (double)latestCandle.Low, (double)latestCandle.Close,
-                (double)latestCandle.Volume
-            };
+                // Load the lookback window + 2 (current + previous) of closed candles
+                var candles = await readCtx.GetDbContext()
+                    .Set<Candle>()
+                    .Where(c => c.Symbol == pair.Symbol && c.Timeframe == pair.Timeframe
+                             && c.IsClosed && !c.IsDeleted)
+                    .OrderByDescending(c => c.Timestamp)
+                    .Take(MLFeatureHelper.LookbackWindow + 2)
+                    .ToListAsync(ct);
 
-            await featureStore.PersistAsync(new StoredFeatureVector(
-                latestCandle.Id, pair.Symbol, pair.Timeframe, latestCandle.Timestamp,
-                features, featureStore.CurrentSchemaVersion,
-                new[] { "Open", "High", "Low", "Close", "Volume" }), ct);
+                // Need at least LookbackWindow + 2 candles (window + current + previous)
+                if (candles.Count < MLFeatureHelper.LookbackWindow + 2)
+                {
+                    skippedInsufficient++;
+                    continue;
+                }
 
-            preComputed++;
+                // Reverse to chronological order
+                candles.Reverse();
+
+                var current  = candles[^1];
+                var previous = candles[^2];
+                // Window must include `previous` as its last element to match
+                // BuildTrainingSamples: window = candles[i-LookbackWindow..i-1]
+                var window   = candles.GetRange(candles.Count - 1 - MLFeatureHelper.LookbackWindow,
+                                                MLFeatureHelper.LookbackWindow);
+
+                // Check if feature vector already exists for this candle
+                var existing = await featureStore.GetAsync(
+                    pair.Symbol, pair.Timeframe, current.Timestamp, ct);
+
+                if (existing is not null) continue;
+
+                // Load COT data for the base currency (if available)
+                var cotEntry = await LoadCotEntryAsync(readCtx, pair.Symbol, ct);
+
+                // Build the full 33-element feature vector using the shared helper
+                float[] floatFeatures = MLFeatureHelper.BuildFeatureVector(window, current, previous, cotEntry);
+                double[] features = Array.ConvertAll(floatFeatures, f => (double)f);
+
+                await featureStore.PersistAsync(new StoredFeatureVector(
+                    current.Id, pair.Symbol, pair.Timeframe, current.Timestamp,
+                    features, featureStore.CurrentSchemaVersion,
+                    MLFeatureHelper.FeatureNames), ct);
+
+                preComputed++;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "FeaturePreComputationWorker: failed to compute features for {Symbol}/{Tf}",
+                    pair.Symbol, pair.Timeframe);
+            }
         }
 
-        if (preComputed > 0)
-            _logger.LogInformation("FeaturePreComputationWorker: pre-computed {Count} feature vectors", preComputed);
+        if (preComputed > 0 || skippedInsufficient > 0)
+            _logger.LogInformation(
+                "FeaturePreComputationWorker: pre-computed {Count} feature vectors, skipped {Skipped} (insufficient candles)",
+                preComputed, skippedInsufficient);
+    }
+
+    /// <summary>
+    /// Loads the latest COT report for the base currency of the given symbol.
+    /// Returns <see cref="CotFeatureEntry.Zero"/> if no report is available.
+    /// </summary>
+    private static async Task<CotFeatureEntry> LoadCotEntryAsync(
+        IReadApplicationDbContext readCtx, string symbol, CancellationToken ct)
+    {
+        if (symbol.Length < 3) return CotFeatureEntry.Zero;
+
+        string baseCurrency = symbol[..3];
+
+        var latestCot = await readCtx.GetDbContext()
+            .Set<COTReport>()
+            .Where(c => c.Currency == baseCurrency && !c.IsDeleted)
+            .OrderByDescending(c => c.ReportDate)
+            .FirstOrDefaultAsync(ct);
+
+        if (latestCot is null) return CotFeatureEntry.Zero;
+
+        // Load the previous week's report for momentum calculation
+        var previousCot = await readCtx.GetDbContext()
+            .Set<COTReport>()
+            .Where(c => c.Currency == baseCurrency && !c.IsDeleted
+                     && c.ReportDate < latestCot.ReportDate)
+            .OrderByDescending(c => c.ReportDate)
+            .FirstOrDefaultAsync(ct);
+
+        float netNorm = (float)(latestCot.NetNonCommercialPositioning / 100_000m);
+        float momentum = previousCot is not null
+            ? (float)((latestCot.NetNonCommercialPositioning - previousCot.NetNonCommercialPositioning) / 10_000m)
+            : 0f;
+
+        return new CotFeatureEntry(
+            Math.Clamp(netNorm, -3f, 3f),
+            Math.Clamp(momentum, -3f, 3f),
+            HasData: true);
     }
 }

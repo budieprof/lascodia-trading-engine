@@ -15,6 +15,10 @@ using LascodiaTradingEngine.Application.Strategies.Queries.GetPagedStrategies;
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
+/// <summary>
+/// Manages trading strategy lifecycle: creation, updates, activation, pausing, deletion, and risk profile assignment.
+/// Route: api/v1/lascodia-trading-engine/strategy
+/// </summary>
 [Route("api/v1/lascodia-trading-engine/strategy")]
 [ApiController]
 public class StrategyController : AuthControllerBase<StrategyController>

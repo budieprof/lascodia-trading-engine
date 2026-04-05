@@ -9,12 +9,14 @@ namespace LascodiaTradingEngine.Application.DrawdownRecovery.Queries.GetLatestDr
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Retrieves the most recent drawdown snapshot to determine the current recovery mode.</summary>
 public class GetLatestDrawdownSnapshotQuery : IRequest<ResponseData<DrawdownSnapshotDto>>
 {
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Fetches the latest drawdown snapshot ordered by recording date descending.</summary>
 public class GetLatestDrawdownSnapshotQueryHandler
     : IRequestHandler<GetLatestDrawdownSnapshotQuery, ResponseData<DrawdownSnapshotDto>>
 {

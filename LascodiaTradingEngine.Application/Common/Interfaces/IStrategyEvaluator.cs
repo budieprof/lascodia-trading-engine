@@ -3,8 +3,13 @@ using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.Common.Interfaces;
 
+/// <summary>
+/// Evaluates a specific strategy type against market data to produce trade signals.
+/// Implementations are resolved by <see cref="StrategyType"/> at runtime.
+/// </summary>
 public interface IStrategyEvaluator
 {
+    /// <summary>The strategy type this evaluator handles.</summary>
     StrategyType StrategyType { get; }
 
     /// <summary>

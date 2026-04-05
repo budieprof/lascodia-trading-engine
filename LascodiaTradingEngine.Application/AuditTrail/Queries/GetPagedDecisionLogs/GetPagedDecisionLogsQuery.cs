@@ -10,24 +10,38 @@ namespace LascodiaTradingEngine.Application.AuditTrail.Queries.GetPagedDecisionL
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Retrieves a paginated list of decision log entries with optional filtering by entity, decision type, outcome, and date range.
+/// </summary>
 public class GetPagedDecisionLogsQuery : PagerRequestWithFilterType<DecisionLogQueryFilter, ResponseData<PagedData<DecisionLogDto>>>
 {
 }
 
 // ── Filter ────────────────────────────────────────────────────────────────────
 
+/// <summary>Filter criteria for the paged decision logs query.</summary>
 public class DecisionLogQueryFilter
 {
+    /// <summary>Filter by entity type name.</summary>
     public string?   EntityType   { get; set; }
+    /// <summary>Filter by specific entity ID.</summary>
     public long?     EntityId     { get; set; }
+    /// <summary>Filter by decision type category.</summary>
     public string?   DecisionType { get; set; }
+    /// <summary>Filter by decision outcome.</summary>
     public string?   Outcome      { get; set; }
+    /// <summary>Inclusive start of the date range filter (UTC).</summary>
     public DateTime? From         { get; set; }
+    /// <summary>Inclusive end of the date range filter (UTC).</summary>
     public DateTime? To           { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Queries immutable decision logs ordered by creation date descending. No soft-delete filter
+/// is applied because decision logs are append-only.
+/// </summary>
 public class GetPagedDecisionLogsQueryHandler
     : IRequestHandler<GetPagedDecisionLogsQuery, ResponseData<PagedData<DecisionLogDto>>>
 {

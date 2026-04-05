@@ -2,9 +2,16 @@ using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.Common.Interfaces;
 
+/// <summary>
+/// Determines the active trading session (Sydney, Tokyo, London, NewYork, Overlap) for a given
+/// UTC time and checks whether trading is permitted in the current session.
+/// </summary>
 public interface ISessionFilter
 {
+    /// <summary>Returns the trading session active at the given UTC time.</summary>
     TradingSession GetCurrentSession(DateTime utcTime);
+
+    /// <summary>Returns <c>true</c> if the given session is in the allowed sessions list.</summary>
     bool IsSessionAllowed(TradingSession session, IReadOnlyList<TradingSession> allowedSessions);
 
     /// <summary>

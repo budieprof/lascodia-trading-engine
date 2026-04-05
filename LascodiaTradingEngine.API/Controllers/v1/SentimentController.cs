@@ -11,6 +11,10 @@ using LascodiaTradingEngine.Application.Sentiment.Queries.GetPagedCOTReports;
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
+/// <summary>
+/// Records market sentiment snapshots and ingests COT (Commitment of Traders) reports for sentiment analysis.
+/// Route: api/v1/lascodia-trading-engine/sentiment
+/// </summary>
 [Route("api/v1/lascodia-trading-engine/sentiment")]
 [ApiController]
 public class SentimentController : AuthControllerBase<SentimentController>

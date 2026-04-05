@@ -11,20 +11,27 @@ namespace LascodiaTradingEngine.Application.Backtesting.Queries.GetPagedBacktest
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Retrieves a paginated list of backtest runs with optional filtering by strategy and status.
+/// </summary>
 public class GetPagedBacktestRunsQuery : PagerRequestWithFilterType<BacktestRunQueryFilter, ResponseData<PagedData<BacktestRunDto>>>
 {
 }
 
 // ── Filter ────────────────────────────────────────────────────────────────────
 
+/// <summary>Filter criteria for the paged backtest runs query.</summary>
 public class BacktestRunQueryFilter
 {
+    /// <summary>Filter by the strategy that was backtested.</summary>
     public long?   StrategyId { get; set; }
+    /// <summary>Filter by run status (Queued, Running, Completed, Failed).</summary>
     public string? Status     { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Queries backtest runs ordered by start date descending with optional strategy and status filters.</summary>
 public class GetPagedBacktestRunsQueryHandler
     : IRequestHandler<GetPagedBacktestRunsQuery, ResponseData<PagedData<BacktestRunDto>>>
 {

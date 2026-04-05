@@ -4,6 +4,10 @@ using LascodiaTradingEngine.Domain.Entities;
 
 namespace LascodiaTradingEngine.Infrastructure.Persistence.Configurations;
 
+/// <summary>
+/// EF Core entity configuration for <see cref="BacktestRun"/>. Defines table mapping,
+/// column types, indexes, relationships, and the soft-delete query filter.
+/// </summary>
 public class BacktestRunConfiguration : IEntityTypeConfiguration<BacktestRun>
 {
     public void Configure(EntityTypeBuilder<BacktestRun> builder)
@@ -20,6 +24,9 @@ public class BacktestRunConfiguration : IEntityTypeConfiguration<BacktestRun>
 
         builder.HasIndex(x => x.StrategyId);
         builder.HasIndex(x => new { x.StrategyId, x.Status });
+        builder.HasIndex(x => x.SourceOptimizationRunId)
+            .IsUnique()
+            .HasFilter("\"SourceOptimizationRunId\" IS NOT NULL AND \"IsDeleted\" = false");
 
         builder.HasOne(x => x.Strategy)
                .WithMany(x => x.BacktestRuns)

@@ -476,6 +476,35 @@ public sealed class MLTrainingWorker : BackgroundService
                 throw new InvalidOperationException(
                     $"Insufficient candles: {candles.Count} (need {minRequired})");
 
+            // ── Training data quality validation ────────────────────────────
+            var dataWarnings = ValidateCandleData(candles);
+            if (dataWarnings.Count > 0)
+            {
+                double failPct = (double)dataWarnings.Count / candles.Count;
+                var reasonSummary = string.Join("; ", dataWarnings
+                    .GroupBy(w => w.Reason)
+                    .Select(g => $"{g.Key}={g.Count()}"));
+
+                if (failPct > 0.05)
+                {
+                    // >5% flagged — abort training
+                    run.Status      = RunStatus.Failed;
+                    run.CompletedAt = DateTime.UtcNow;
+                    run.ErrorMessage =
+                        $"Training data quality check failed: {dataWarnings.Count}/{candles.Count} candles flagged — {reasonSummary}";
+                    await db.SaveChangesAsync(stoppingToken);
+                    _logger.LogError(
+                        "Run {RunId}: data quality check FAILED — {Flagged}/{Total} ({Pct:P1}) candles flagged: {Reasons}",
+                        run.Id, dataWarnings.Count, candles.Count, failPct, reasonSummary);
+                    return;
+                }
+
+                // 1-5% flagged — warn but continue
+                _logger.LogWarning(
+                    "Run {RunId}: data quality warnings — {Flagged}/{Total} ({Pct:P1}) candles flagged: {Reasons}",
+                    run.Id, dataWarnings.Count, candles.Count, failPct, reasonSummary);
+            }
+
             // ── Freshness gate: reject stale data before training ────────────
             int maxCandleAgeMinutes = await GetConfigAsync<int>(ctx, CK_MaxCandleAgeMinutes, 0, stoppingToken);
             if (maxCandleAgeMinutes > 0)
@@ -869,6 +898,26 @@ public sealed class MLTrainingWorker : BackgroundService
             run.ErrorMessage       = passed ? null : BuildGateFailureMessage(
                 m, cvCheck, hp, snapEce, snapBss, result.FinalMetrics.OobAccuracy, parentOobAccuracy,
                 isTrending, trendingMinAccuracy, trendingMinEV, evBypassF1);
+
+            // ── Training cost tracking (observability) ──────────────────────
+            {
+                long peakMemoryBytes = GC.GetTotalMemory(forceFullCollection: false);
+                double peakMemoryMb = peakMemoryBytes / (1024.0 * 1024.0);
+                var costPrefix = $"MLTrainingCost:{run.Symbol}:{run.Timeframe}";
+
+                await UpsertConfigAsync(ctx, $"{costPrefix}:LastDurationMs",
+                    run.TrainingDurationMs.Value.ToString(), stoppingToken);
+                await UpsertConfigAsync(ctx, $"{costPrefix}:LastSampleCount",
+                    run.TotalSamples.ToString(), stoppingToken);
+                await UpsertConfigAsync(ctx, $"{costPrefix}:LastPeakMemoryMB",
+                    peakMemoryMb.ToString("F1"), stoppingToken);
+
+                _logger.LogInformation(
+                    "Training cost for run {RunId} ({Symbol}/{Tf}): duration={DurationMs}ms " +
+                    "samples={Samples} peakMemory={MemMB:F1}MB",
+                    run.Id, run.Symbol, run.Timeframe,
+                    run.TrainingDurationMs.Value, run.TotalSamples, peakMemoryMb);
+            }
 
             if (!passed)
             {
@@ -1907,7 +1956,8 @@ public sealed class MLTrainingWorker : BackgroundService
             SelfDistillTemp:             Cfg<double>("MLTraining:SelfDistillTemp",          3.0),
             FgsmEpsilon:                 Cfg<double>("MLTraining:FgsmEpsilon",              0.01),
             MinF1Score:                  Cfg<double>(CK_MinF1,                             0.10),
-            UseClassWeights:             Cfg<bool>  (CK_UseClassWeights,                   true));
+            UseClassWeights:             Cfg<bool>  (CK_UseClassWeights,                   true),
+            MinIsotonicCalibrationSamples: Cfg<int> ("MLTraining:MinIsotonicCalibrationSamples", 50));
     }
 
     /// <summary>
@@ -1934,6 +1984,36 @@ public sealed class MLTrainingWorker : BackgroundService
 
         try   { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
         catch { return defaultValue; }
+    }
+
+    /// <summary>
+    /// Upserts a value into <see cref="EngineConfig"/>. If the key already exists, updates
+    /// the value; otherwise inserts a new row. Used for training cost tracking metrics.
+    /// </summary>
+    private static async Task UpsertConfigAsync(
+        Microsoft.EntityFrameworkCore.DbContext ctx,
+        string                                  key,
+        string                                  value,
+        CancellationToken                       ct)
+    {
+        int updated = await ctx.Set<EngineConfig>()
+            .Where(c => c.Key == key)
+            .ExecuteUpdateAsync(s => s
+                .SetProperty(c => c.Value, value)
+                .SetProperty(c => c.LastUpdatedAt, DateTime.UtcNow), ct);
+
+        if (updated == 0)
+        {
+            ctx.Set<EngineConfig>().Add(new EngineConfig
+            {
+                Key             = key,
+                Value           = value,
+                DataType        = ConfigDataType.String,
+                IsHotReloadable = true,
+                LastUpdatedAt   = DateTime.UtcNow,
+            });
+            await ctx.SaveChangesAsync(ct);
+        }
     }
 
     // ── Quality gate failure message ──────────────────────────────────────────
@@ -2244,4 +2324,66 @@ public sealed class MLTrainingWorker : BackgroundService
 
         return $"Quality gate failed: {string.Join(", ", failed)}";
     }
+
+    // ── Training data poisoning detection ─────────────────────────────────────
+
+    /// <summary>
+    /// Validates candle data for common data quality issues that could poison ML training:
+    /// zero/negative OHLC, inverted High/Low, extreme single-bar price spikes (&gt;20%),
+    /// and suspiciously identical consecutive closes (&gt;10 in a row indicating a stuck feed).
+    /// </summary>
+    private static List<CandleValidationWarning> ValidateCandleData(List<Candle> candles)
+    {
+        var warnings = new List<CandleValidationWarning>();
+        int consecutiveIdenticalCloses = 1;
+
+        for (int i = 0; i < candles.Count; i++)
+        {
+            var c = candles[i];
+
+            // Check for zero or negative OHLC values
+            if (c.Open <= 0 || c.High <= 0 || c.Low <= 0 || c.Close <= 0)
+            {
+                warnings.Add(new CandleValidationWarning(i, c.Timestamp, "ZeroOrNegativeOHLC"));
+                consecutiveIdenticalCloses = 1;
+                continue; // skip further checks on invalid candle
+            }
+
+            // Check for inverted High/Low
+            if (c.High < c.Low)
+            {
+                warnings.Add(new CandleValidationWarning(i, c.Timestamp, "HighLessThanLow"));
+            }
+
+            // Check for extreme price spikes (close-to-close return > 20%)
+            if (i > 0 && candles[i - 1].Close > 0)
+            {
+                double prevClose = (double)candles[i - 1].Close;
+                double returnPct = Math.Abs(((double)c.Close - prevClose) / prevClose);
+                if (returnPct > 0.20)
+                {
+                    warnings.Add(new CandleValidationWarning(i, c.Timestamp, "ExtremePriceSpike"));
+                }
+            }
+
+            // Check for suspiciously identical consecutive closes (>10 in a row)
+            if (i > 0 && c.Close == candles[i - 1].Close)
+            {
+                consecutiveIdenticalCloses++;
+                if (consecutiveIdenticalCloses > 10)
+                {
+                    warnings.Add(new CandleValidationWarning(i, c.Timestamp, "IdenticalConsecutiveCloses"));
+                }
+            }
+            else
+            {
+                consecutiveIdenticalCloses = 1;
+            }
+        }
+
+        return warnings;
+    }
+
+    /// <summary>Per-candle validation warning with position and reason.</summary>
+    private readonly record struct CandleValidationWarning(int Index, DateTime Timestamp, string Reason);
 }

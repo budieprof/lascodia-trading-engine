@@ -104,6 +104,16 @@ public sealed class MLSignalScorer : IMLSignalScorer
     private const int CircuitBreakerThreshold = 3;
     private static readonly TimeSpan CircuitBreakerCooldown = TimeSpan.FromMinutes(5);
 
+    /// <summary>
+    /// Tracks consecutive wrong predictions per model ID (fed by MLPredictionOutcomeWorker).
+    /// When a model accumulates <see cref="PredictionCircuitBreakerThreshold"/> consecutive
+    /// incorrect predictions, scoring is suppressed for <see cref="PredictionCircuitBreakerCooldown"/>
+    /// to prevent the strategy from acting on a degraded model before drift monitors can react.
+    /// </summary>
+    private static readonly ConcurrentDictionary<long, (int ConsecutiveLosses, DateTime LastLoss)> _predictionLosses = new();
+    private const int PredictionCircuitBreakerThreshold = 10;
+    private static readonly TimeSpan PredictionCircuitBreakerCooldown = TimeSpan.FromMinutes(30);
+
     private readonly IReadApplicationDbContext          _context;
     private readonly IMemoryCache                      _cache;
     private readonly ILogger<MLSignalScorer>           _logger;
@@ -152,6 +162,18 @@ public sealed class MLSignalScorer : IMLSignalScorer
             _logger.LogDebug(
                 "Circuit breaker open for model {Id} ({Count} consecutive failures) — skipping until {ResetAt:HH:mm} UTC",
                 model.Id, failure.Count, failure.LastFailure + CircuitBreakerCooldown);
+            return new MLScoreResult(null, null, null, null);
+        }
+
+        // ── 1c. Prediction quality circuit breaker — skip models with consecutive wrong predictions ──
+        if (_predictionLosses.TryGetValue(model.Id, out var losses) &&
+            losses.ConsecutiveLosses >= PredictionCircuitBreakerThreshold &&
+            DateTime.UtcNow - losses.LastLoss < PredictionCircuitBreakerCooldown)
+        {
+            _logger.LogWarning(
+                "Prediction quality circuit breaker open for model {Id} ({Count} consecutive wrong predictions) — " +
+                "suppressing scoring until {ResetAt:HH:mm} UTC",
+                model.Id, losses.ConsecutiveLosses, losses.LastLoss + PredictionCircuitBreakerCooldown);
             return new MLScoreResult(null, null, null, null);
         }
 
@@ -403,6 +425,30 @@ public sealed class MLSignalScorer : IMLSignalScorer
             modelId,
             _ => (1, DateTime.UtcNow),
             (_, existing) => (existing.Count + 1, DateTime.UtcNow));
+    }
+
+    /// <summary>
+    /// Records a wrong prediction outcome for the given model. Called by
+    /// <c>MLPredictionOutcomeWorker</c> when a prediction's actual outcome
+    /// is resolved and found to be incorrect. After <see cref="PredictionCircuitBreakerThreshold"/>
+    /// consecutive wrong predictions, scoring is suppressed until the cooldown expires.
+    /// </summary>
+    internal static void RecordPredictionLoss(long modelId)
+    {
+        _predictionLosses.AddOrUpdate(
+            modelId,
+            _ => (1, DateTime.UtcNow),
+            (_, existing) => (existing.ConsecutiveLosses + 1, DateTime.UtcNow));
+    }
+
+    /// <summary>
+    /// Records a correct prediction outcome, resetting the consecutive loss counter
+    /// for the model. Called by <c>MLPredictionOutcomeWorker</c> when a prediction
+    /// matches the actual market outcome.
+    /// </summary>
+    internal static void RecordPredictionWin(long modelId)
+    {
+        _predictionLosses.TryRemove(modelId, out _);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

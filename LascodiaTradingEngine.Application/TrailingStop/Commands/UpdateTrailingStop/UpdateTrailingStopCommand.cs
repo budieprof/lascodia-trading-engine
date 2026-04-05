@@ -9,6 +9,10 @@ namespace LascodiaTradingEngine.Application.TrailingStop.Commands.UpdateTrailing
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Enables or updates the trailing stop configuration on an open position,
+/// specifying the type (ATR, Fixed, Percentage) and value.
+/// </summary>
 public class UpdateTrailingStopCommand : IRequest<ResponseData<string>>
 {
     public long    PositionId         { get; set; }
@@ -37,6 +41,7 @@ public class UpdateTrailingStopCommandValidator : AbstractValidator<UpdateTraili
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Enables trailing stop on the position and persists the type and value.</summary>
 public class UpdateTrailingStopCommandHandler : IRequestHandler<UpdateTrailingStopCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

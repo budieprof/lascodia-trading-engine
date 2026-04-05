@@ -15,14 +15,24 @@ namespace LascodiaTradingEngine.Application.MarketData.Commands.UpdateLiveCandle
 /// </summary>
 public class UpdateLiveCandleCommand : IRequest<ResponseData<string>>
 {
+    /// <summary>Instrument symbol (e.g. "EURUSD").</summary>
     public required string Symbol    { get; set; }
+
+    /// <summary>Current bid price.</summary>
     public decimal         Bid       { get; set; }
+
+    /// <summary>Current ask price.</summary>
     public decimal         Ask       { get; set; }
+
+    /// <summary>UTC timestamp of the price update.</summary>
     public DateTime        Timestamp { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Validates that Symbol is non-empty (max 20 chars) and Bid/Ask are positive.
+/// </summary>
 public class UpdateLiveCandleCommandValidator : AbstractValidator<UpdateLiveCandleCommand>
 {
     public UpdateLiveCandleCommandValidator()
@@ -35,6 +45,11 @@ public class UpdateLiveCandleCommandValidator : AbstractValidator<UpdateLiveCand
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Handles live price cache updates. Writes the bid/ask to the ILivePriceCache and publishes
+/// a PriceUpdatedIntegrationEvent for downstream consumers (strategy evaluation, risk monitoring, etc.).
+/// Does not persist to the database.
+/// </summary>
 public class UpdateLiveCandleCommandHandler : IRequestHandler<UpdateLiveCandleCommand, ResponseData<string>>
 {
     private readonly ILivePriceCache _cache;

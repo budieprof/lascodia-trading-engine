@@ -9,13 +9,18 @@ namespace LascodiaTradingEngine.Application.Alerts.Commands.DeleteAlert;
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Soft-deletes an existing alert rule by its identifier.
+/// </summary>
 public class DeleteAlertCommand : IRequest<ResponseData<string>>
 {
+    /// <summary>The unique identifier of the alert to delete.</summary>
     [JsonIgnore] public long Id { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>Validates that the alert ID is a positive value.</summary>
 public class DeleteAlertCommandValidator : AbstractValidator<DeleteAlertCommand>
 {
     public DeleteAlertCommandValidator()
@@ -26,6 +31,9 @@ public class DeleteAlertCommandValidator : AbstractValidator<DeleteAlertCommand>
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Marks the alert as soft-deleted. Returns not-found if the alert does not exist.
+/// </summary>
 public class DeleteAlertCommandHandler : IRequestHandler<DeleteAlertCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

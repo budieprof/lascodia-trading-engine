@@ -8,14 +8,21 @@ namespace LascodiaTradingEngine.Application.Strategies.Commands.AssignRiskProfil
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Assigns (or clears) a risk profile on a strategy. Pass null for <c>RiskProfileId</c>
+/// to remove the current assignment and fall back to the default risk profile.
+/// </summary>
 public class AssignRiskProfileCommand : IRequest<ResponseData<string>>
 {
+    /// <summary>Strategy to update.</summary>
     public long  StrategyId    { get; set; }
+    /// <summary>Risk profile to assign, or null to clear the assignment.</summary>
     public long? RiskProfileId { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>Validates that StrategyId is positive and optional RiskProfileId is positive when provided.</summary>
 public class AssignRiskProfileCommandValidator : AbstractValidator<AssignRiskProfileCommand>
 {
     public AssignRiskProfileCommandValidator()
@@ -27,6 +34,7 @@ public class AssignRiskProfileCommandValidator : AbstractValidator<AssignRiskPro
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Updates the strategy's <c>RiskProfileId</c> foreign key. Returns not-found if the strategy does not exist.</summary>
 public class AssignRiskProfileCommandHandler : IRequestHandler<AssignRiskProfileCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

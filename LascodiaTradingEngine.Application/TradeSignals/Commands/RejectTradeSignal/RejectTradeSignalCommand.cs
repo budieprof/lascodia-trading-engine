@@ -9,14 +9,18 @@ namespace LascodiaTradingEngine.Application.TradeSignals.Commands.RejectTradeSig
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>Rejects a pending trade signal with an optional reason, preventing it from being executed.</summary>
 public class RejectTradeSignalCommand : IRequest<ResponseData<string>>
 {
+    /// <summary>Trade signal identifier to reject.</summary>
     public long   Id     { get; set; }
+    /// <summary>Human-readable rejection reason.</summary>
     public string Reason { get; set; } = string.Empty;
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>Validates that the trade signal Id is a positive value.</summary>
 public class RejectTradeSignalCommandValidator : AbstractValidator<RejectTradeSignalCommand>
 {
     public RejectTradeSignalCommandValidator()
@@ -27,6 +31,7 @@ public class RejectTradeSignalCommandValidator : AbstractValidator<RejectTradeSi
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Transitions the signal from Pending to Rejected and records the rejection reason.</summary>
 public class RejectTradeSignalCommandHandler : IRequestHandler<RejectTradeSignalCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

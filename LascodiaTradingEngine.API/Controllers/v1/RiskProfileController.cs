@@ -12,6 +12,10 @@ using LascodiaTradingEngine.Application.RiskProfiles.Queries.GetPagedRiskProfile
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
+/// <summary>
+/// Manages risk profile definitions that govern position sizing, drawdown limits, and exposure constraints.
+/// Route: api/v1/lascodia-trading-engine/risk-profile
+/// </summary>
 [Route("api/v1/lascodia-trading-engine/risk-profile")]
 [ApiController]
 public class RiskProfileController : AuthControllerBase<RiskProfileController>

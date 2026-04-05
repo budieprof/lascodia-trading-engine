@@ -9,6 +9,10 @@ using LascodiaTradingEngine.Application.Positions.Queries.GetPagedPositions;
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
+/// <summary>
+/// Queries open and closed trading positions with individual lookup and paginated listing.
+/// Route: api/v1/lascodia-trading-engine/position
+/// </summary>
 [Route("api/v1/lascodia-trading-engine/position")]
 [ApiController]
 public class PositionController : AuthControllerBase<PositionController>

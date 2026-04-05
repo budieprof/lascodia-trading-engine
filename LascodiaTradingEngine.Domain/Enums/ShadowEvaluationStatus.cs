@@ -1,2 +1,22 @@
 namespace LascodiaTradingEngine.Domain.Enums;
-public enum ShadowEvaluationStatus { Running = 0, Completed = 1, Promoted = 2, Rejected = 3, Processing = 4 }
+
+/// <summary>
+/// Tracks the lifecycle of an ML model shadow evaluation against live data.
+/// </summary>
+public enum ShadowEvaluationStatus
+{
+    /// <summary>Evaluation is actively collecting live predictions.</summary>
+    Running = 0,
+
+    /// <summary>Evaluation period has ended and metrics are finalised.</summary>
+    Completed = 1,
+
+    /// <summary>Model passed evaluation and was promoted to production.</summary>
+    Promoted = 2,
+
+    /// <summary>Model failed evaluation criteria and was rejected.</summary>
+    Rejected = 3,
+
+    /// <summary>Evaluation results are being processed by the arbiter.</summary>
+    Processing = 4
+}

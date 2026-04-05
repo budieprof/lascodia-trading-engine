@@ -9,13 +9,16 @@ namespace LascodiaTradingEngine.Application.Strategies.Queries.GetStrategy;
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Retrieves a single strategy by its identifier, projected as a <see cref="StrategyDto"/>.</summary>
 public class GetStrategyQuery : IRequest<ResponseData<StrategyDto>>
 {
+    /// <summary>Strategy identifier to look up.</summary>
     public required long Id { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Fetches a single strategy from the read context and maps it to <see cref="StrategyDto"/>.</summary>
 public class GetStrategyQueryHandler : IRequestHandler<GetStrategyQuery, ResponseData<StrategyDto>>
 {
     private readonly IReadApplicationDbContext _context;

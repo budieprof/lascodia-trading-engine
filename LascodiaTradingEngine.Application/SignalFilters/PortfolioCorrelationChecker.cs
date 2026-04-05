@@ -34,15 +34,22 @@ public class PortfolioCorrelationChecker : IPortfolioCorrelationChecker
         if (group == null)
             return false;  // Symbol not in any known correlation group
 
-        // Count open positions in the same correlation group
-        var openCount = await _context.GetDbContext()
+        // Count open positions in the same correlation group with matching direction.
+        // Hedging positions (opposite direction) reduce net exposure and should not
+        // count toward the correlation limit. Only same-direction positions amplify risk.
+        bool isLong = string.Equals(direction, "Long", StringComparison.OrdinalIgnoreCase)
+                   || string.Equals(direction, "Buy", StringComparison.OrdinalIgnoreCase);
+        var matchingDirection = isLong ? PositionDirection.Long : PositionDirection.Short;
+
+        var sameDirectionCount = await _context.GetDbContext()
             .Set<Domain.Entities.Position>()
             .CountAsync(x => !x.IsDeleted
                           && x.Status == PositionStatus.Open
+                          && x.Direction == matchingDirection
                           && group.Contains(x.Symbol),
                         ct);
 
-        return openCount >= maxCorrelatedPositions;
+        return sameDirectionCount >= maxCorrelatedPositions;
     }
 
     private string[]? FindCorrelationGroup(string symbol)

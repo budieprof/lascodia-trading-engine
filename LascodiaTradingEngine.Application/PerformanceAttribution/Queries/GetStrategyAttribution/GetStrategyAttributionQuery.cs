@@ -8,13 +8,19 @@ namespace LascodiaTradingEngine.Application.PerformanceAttribution.Queries.GetSt
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Retrieves performance attribution data for a single strategy.</summary>
 public class GetStrategyAttributionQuery : IRequest<ResponseData<PerformanceAttributionDto>>
 {
+    /// <summary>The strategy to compute attribution for.</summary>
     public long StrategyId { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Loads the strategy and its latest performance snapshot, then builds the attribution DTO.
+/// Returns not-found if the strategy or snapshot does not exist.
+/// </summary>
 public class GetStrategyAttributionQueryHandler
     : IRequestHandler<GetStrategyAttributionQuery, ResponseData<PerformanceAttributionDto>>
 {

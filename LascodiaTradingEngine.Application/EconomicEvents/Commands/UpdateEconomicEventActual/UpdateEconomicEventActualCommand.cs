@@ -8,9 +8,14 @@ namespace LascodiaTradingEngine.Application.EconomicEvents.Commands.UpdateEconom
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Updates the actual released value for a scheduled economic event after its announcement.
+/// </summary>
 public class UpdateEconomicEventActualCommand : IRequest<ResponseData<string>>
 {
+    /// <summary>The unique identifier of the economic event.</summary>
     public long   Id     { get; set; }
+    /// <summary>The actual released value (e.g., "3.5%").</summary>
     public required string Actual { get; set; }
 }
 
@@ -30,6 +35,7 @@ public class UpdateEconomicEventActualCommandValidator : AbstractValidator<Updat
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Writes the actual value to the economic event entity after the data is released.</summary>
 public class UpdateEconomicEventActualCommandHandler : IRequestHandler<UpdateEconomicEventActualCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

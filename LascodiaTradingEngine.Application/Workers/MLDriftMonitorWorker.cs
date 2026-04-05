@@ -48,13 +48,8 @@ public sealed class MLDriftMonitorWorker : BackgroundService
     private const string CK_SharpeDegradation   = "MLDrift:SharpeDegradationRatio";
     // P&L feedback — minimum closed trades in window before Sharpe comparison is active
     private const string CK_MinClosedTrades     = "MLDrift:MinClosedTradesForSharpe";
-
-    /// <summary>
-    /// Tracks how many consecutive poll windows each active model has been in a degraded state.
-    /// Key = MLModel.Id, Value = consecutive failure count.
-    /// Reset to 0 when the model is healthy.
-    /// </summary>
-    private readonly Dictionary<long, int> _consecutiveFailures = new();
+    // Queue depth limiter — maximum concurrent Queued training runs before drift workers stop queuing
+    private const string CK_MaxQueueDepth       = "MLTraining:MaxQueueDepth";
 
     private readonly IServiceScopeFactory       _scopeFactory;
     private readonly ILogger<MLDriftMonitorWorker> _logger;
@@ -130,11 +125,6 @@ public sealed class MLDriftMonitorWorker : BackgroundService
                     "Drift monitor checking {Count} active models (window={Days}d threshold={Thr:P1} relDeg={Rel:P0})",
                     activeModels.Count, windowDays, threshold, relDegradation);
 
-                // Clean up consecutive failure tracking for models no longer active
-                var activeIds = new HashSet<long>(activeModels.Select(m => m.Id));
-                foreach (var key in _consecutiveFailures.Keys.Where(k => !activeIds.Contains(k)).ToList())
-                    _consecutiveFailures.Remove(key);
-
                 foreach (var model in activeModels)
                 {
                     stoppingToken.ThrowIfCancellationRequested();
@@ -154,6 +144,16 @@ public sealed class MLDriftMonitorWorker : BackgroundService
                     catch (Exception tenureEx)
                     {
                         _logger.LogDebug(tenureEx, "Tenure check failed for model {Id} — non-critical", model.Id);
+                    }
+
+                    // Model expiry policy: force retraining when a model exceeds MaxModelAgeDays
+                    try
+                    {
+                        await CheckModelExpiryAsync(model, ctx, writeCtx, trainingDays, stoppingToken);
+                    }
+                    catch (Exception expiryEx)
+                    {
+                        _logger.LogDebug(expiryEx, "Model expiry check failed for model {Id} — non-critical", model.Id);
                     }
                 }
             }
@@ -204,8 +204,10 @@ public sealed class MLDriftMonitorWorker : BackgroundService
     /// <para><b>Consecutive-window guard:</b> a single bad window (e.g. a flash event) is
     /// not enough to trigger retraining. The model must fail on
     /// <paramref name="requiredConsecutiveFailures"/> consecutive poll cycles before a new
-    /// <see cref="MLTrainingRun"/> is queued. The counter is stored in
-    /// <see cref="_consecutiveFailures"/> and reset to 0 on any healthy cycle.</para>
+    /// <see cref="MLTrainingRun"/> is queued. The counter is persisted in <see cref="EngineConfig"/>
+    /// under key <c>MLDrift:{Symbol}:{Timeframe}:ConsecutiveFailures</c> so it survives worker
+    /// restarts — eliminating the in-memory amnesia bug where a restart would reset a model
+    /// that was 2/3 windows toward a retrain trigger.</para>
     ///
     /// <para><b>Deduplication:</b> if a run for the same symbol/timeframe is already
     /// queued or running, this method skips queueing to avoid pile-up.</para>
@@ -279,9 +281,11 @@ public sealed class MLDriftMonitorWorker : BackgroundService
                 if (snap is not null)
                     fallbackThreshold = MLFeatureHelper.ResolveEffectiveDecisionThreshold(snap);
             }
-            catch
+            catch (Exception ex)
             {
-                // Keep the neutral default when the snapshot cannot be read.
+                _logger.LogWarning(ex,
+                    "MLDriftMonitorWorker: failed to deserialize ModelSnapshot for model {ModelId} — using fallback threshold {Threshold}",
+                    model.Id, fallbackThreshold);
             }
         }
 
@@ -339,17 +343,22 @@ public sealed class MLDriftMonitorWorker : BackgroundService
 
         bool anyDrift = accuracyDrift || calibrationDrift || disagreementDrift || relativeDrift || sharpeDrift;
 
+        // ── Persisted consecutive failure counter ────────────────────────────
+        // Stored in EngineConfig so it survives worker restarts. Key pattern:
+        //   MLDrift:{Symbol}:{Timeframe}:ConsecutiveFailures
+        var failKey = $"MLDrift:{model.Symbol}:{model.Timeframe}:ConsecutiveFailures";
+
         if (!anyDrift)
         {
-            // Model is healthy — reset consecutive failure counter
-            _consecutiveFailures[model.Id] = 0;
+            // Model is healthy — reset persisted consecutive failure counter
+            await ResetPersistedFailureCountAsync(writeCtx, failKey, ct);
             return;
         }
 
         // ── Consecutive window tracking ─────────────────────────────────────
-        _consecutiveFailures.TryGetValue(model.Id, out int failCount);
+        int failCount = await GetConfigAsync<int>(readCtx, failKey, 0, ct);
         failCount++;
-        _consecutiveFailures[model.Id] = failCount;
+        await UpsertConfigAsync(writeCtx, failKey, failCount.ToString(), ct);
 
         string driftReason = string.Join(", ", new[]
         {
@@ -368,8 +377,8 @@ public sealed class MLDriftMonitorWorker : BackgroundService
             return;
         }
 
-        // Threshold met — reset counter and proceed to queue retraining
-        _consecutiveFailures[model.Id] = 0;
+        // Threshold met — reset persisted counter and proceed to queue retraining
+        await ResetPersistedFailureCountAsync(writeCtx, failKey, ct);
 
         // ── Check whether a retraining run is already queued or running ──────
         bool alreadyQueued = await readCtx.Set<MLTrainingRun>()
@@ -383,6 +392,22 @@ public sealed class MLDriftMonitorWorker : BackgroundService
             _logger.LogDebug(
                 "Model {Id} ({Symbol}/{Tf}): drift detected [{Reason}] but retraining already queued",
                 model.Id, model.Symbol, model.Timeframe, driftReason);
+            return;
+        }
+
+        // ── Global queue depth limiter ──────────────────────────────────────
+        // Prevents thundering-herd when many models drift simultaneously —
+        // caps the total number of Queued runs. Emergency runs (Priority <= 1)
+        // bypass the limiter so drift-triggered retrains are never blocked.
+        int maxQueueDepth = await GetConfigAsync<int>(readCtx, CK_MaxQueueDepth, 10, ct);
+        int currentQueueDepth = await readCtx.Set<MLTrainingRun>()
+            .CountAsync(r => r.Status == RunStatus.Queued, ct);
+
+        if (currentQueueDepth >= maxQueueDepth)
+        {
+            _logger.LogWarning(
+                "Model {Id} ({Symbol}/{Tf}): drift detected [{Reason}] but queue depth {Depth} >= max {Max} — skipping",
+                model.Id, model.Symbol, model.Timeframe, driftReason, currentQueueDepth, maxQueueDepth);
             return;
         }
 
@@ -510,6 +535,63 @@ public sealed class MLDriftMonitorWorker : BackgroundService
             model.Id, model.Symbol, model.Timeframe, tenureDays, maxTenureDays, run.Id);
     }
 
+    // ── Model expiry policy ─────────────────────────────────────────────────
+
+    /// <summary>
+    /// Checks whether the active model has exceeded <c>MLTraining:MaxModelAgeDays</c> (default 90).
+    /// If the model is expired and no queued/running retraining run exists, queues an emergency
+    /// retraining run with Priority=0 (highest) and DriftTriggerType="ModelExpiry".
+    /// </summary>
+    private async Task CheckModelExpiryAsync(
+        MLModel                                    model,
+        Microsoft.EntityFrameworkCore.DbContext     readCtx,
+        Microsoft.EntityFrameworkCore.DbContext     writeCtx,
+        int                                        trainingDays,
+        CancellationToken                          ct)
+    {
+        if (!model.ActivatedAt.HasValue) return;
+
+        int maxAgeDays = await GetConfigAsync<int>(readCtx, "MLTraining:MaxModelAgeDays", 90, ct);
+        double ageDays = (DateTime.UtcNow - model.ActivatedAt.Value).TotalDays;
+
+        if (ageDays <= maxAgeDays) return;
+
+        // Check if a retraining run is already queued or running
+        bool alreadyQueued = await readCtx.Set<MLTrainingRun>()
+            .AnyAsync(r => r.Symbol    == model.Symbol &&
+                           r.Timeframe == model.Timeframe &&
+                           (r.Status == RunStatus.Queued || r.Status == RunStatus.Running), ct);
+
+        if (alreadyQueued) return;
+
+        _logger.LogWarning(
+            "Model {Id} ({Symbol}/{Tf}): exceeded max age ({Age:F0} days > {Max} days). " +
+            "Queuing emergency retraining.",
+            model.Id, model.Symbol, model.Timeframe, ageDays, maxAgeDays);
+
+        var now = DateTime.UtcNow;
+        var run = new MLTrainingRun
+        {
+            Symbol           = model.Symbol,
+            Timeframe        = model.Timeframe,
+            TriggerType      = TriggerType.AutoDegrading,
+            Status           = RunStatus.Queued,
+            FromDate         = now.AddDays(-trainingDays),
+            ToDate           = now,
+            StartedAt        = now,
+            DriftTriggerType = "ModelExpiry",
+            Priority         = 0, // emergency priority
+        };
+
+        writeCtx.Set<MLTrainingRun>().Add(run);
+        await writeCtx.SaveChangesAsync(ct);
+
+        _logger.LogWarning(
+            "Model expiry: model {Id} ({Symbol}/{Tf}) active for {Age:F0} days (max={Max}). " +
+            "Queued emergency retraining run {RunId} (Priority=0).",
+            model.Id, model.Symbol, model.Timeframe, ageDays, maxAgeDays, run.Id);
+    }
+
     // ── Metric helpers ────────────────────────────────────────────────────────
 
     /// <summary>
@@ -555,5 +637,46 @@ public sealed class MLDriftMonitorWorker : BackgroundService
 
         try   { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
         catch { return defaultValue; }
+    }
+
+    /// <summary>
+    /// Upserts a value into <see cref="EngineConfig"/>. If the key already exists, updates
+    /// the value; otherwise inserts a new row. Used to persist the consecutive failure counter
+    /// across worker restarts.
+    /// </summary>
+    private static async Task UpsertConfigAsync(
+        Microsoft.EntityFrameworkCore.DbContext ctx,
+        string                                  key,
+        string                                  value,
+        CancellationToken                       ct)
+    {
+        int updated = await ctx.Set<EngineConfig>()
+            .Where(c => c.Key == key)
+            .ExecuteUpdateAsync(s => s.SetProperty(c => c.Value, value), ct);
+
+        if (updated == 0)
+        {
+            ctx.Set<EngineConfig>().Add(new EngineConfig
+            {
+                Key      = key,
+                Value    = value,
+                DataType = ConfigDataType.Int,
+            });
+            await ctx.SaveChangesAsync(ct);
+        }
+    }
+
+    /// <summary>
+    /// Resets (or removes) the persisted consecutive failure counter for a model that is healthy.
+    /// Uses <c>ExecuteUpdateAsync</c> to set the value to "0" — avoids loading the entity.
+    /// </summary>
+    private static async Task ResetPersistedFailureCountAsync(
+        Microsoft.EntityFrameworkCore.DbContext ctx,
+        string                                  key,
+        CancellationToken                       ct)
+    {
+        await ctx.Set<EngineConfig>()
+            .Where(c => c.Key == key)
+            .ExecuteUpdateAsync(s => s.SetProperty(c => c.Value, "0"), ct);
     }
 }

@@ -10,6 +10,7 @@ using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Workers;
 using LascodiaTradingEngine.Application.Common.Events;
 using LascodiaTradingEngine.Application.Services.Alerts.Options;
+using LascodiaTradingEngine.Application.Services.COTData;
 using LascodiaTradingEngine.Application.Services.EconomicCalendar;
 using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Application.Services.MarketData;
@@ -23,8 +24,15 @@ using Polly.Extensions.Http;
 
 namespace LascodiaTradingEngine.Application;
 
+/// <summary>
+/// Registers all Application layer services, workers, HTTP clients, and event bus subscriptions.
+/// </summary>
 public static class DependencyInjection
 {
+    /// <summary>
+    /// Registers MediatR handlers, FluentValidation validators, AutoMapper profiles, background
+    /// workers, HTTP clients, and explicitly configured services for the Application layer.
+    /// </summary>
     public static IServiceCollection ConfigureApplicationServices(this IServiceCollection services, IConfiguration configuration)
     {
         services.ConfigureAppServices(Assembly.GetExecutingAssembly());
@@ -33,6 +41,10 @@ public static class DependencyInjection
         return services;
     }
 
+    /// <summary>
+    /// Subscribes all <c>IIntegrationEventHandler</c> implementations to the event bus
+    /// and registers cleanup on application shutdown.
+    /// </summary>
     public static void ConfigureEventBus(this IApplicationBuilder app)
     {
         var eventBus = app.ApplicationServices.GetRequiredService<IEventBus>();
@@ -52,11 +64,19 @@ public static class DependencyInjection
         });
     }
 
+    /// <summary>
+    /// Auto-discovers and binds all <c>ConfigurationOption&lt;T&gt;</c> subclasses to their
+    /// matching configuration sections.
+    /// </summary>
     public static void BindConfigurationOptions(this IServiceCollection services, IConfiguration configuration)
     {
         Lascodia.Trading.Engine.SharedApplication.DependencyInjection.AutoRegisterConfigurationOptions(services, configuration, Assembly.GetExecutingAssembly());
     }
 
+    /// <summary>
+    /// Registers singleton workers, named HTTP clients with retry policies, and infrastructure
+    /// services that require explicit wiring (e.g. TCP bridge, candle aggregator, calendar feeds).
+    /// </summary>
     public static IServiceCollection ConfigureInfrastructureServices(this IServiceCollection services, IConfiguration configuration)
     {
         // ── Strategy Worker ──────────────────────────────────────────────────────
@@ -112,6 +132,24 @@ public static class DependencyInjection
             c.Timeout = TimeSpan.FromSeconds(10);
         })
         .AddPolicyHandler(transientRetryPolicy);
+
+        // DeepSeek V3 API client
+        services.AddHttpClient("DeepSeek", (sp, c) =>
+        {
+            var opts = sp.GetRequiredService<DeepSeekOptions>();
+            c.BaseAddress = new Uri(opts.BaseUrl);
+            c.Timeout = TimeSpan.FromSeconds(opts.TimeoutSeconds > 0 ? opts.TimeoutSeconds : 30);
+            c.DefaultRequestHeaders.Add("Authorization", $"Bearer {opts.ApiKey}");
+            c.DefaultRequestHeaders.Add("Accept", "application/json");
+        }).AddPolicyHandler(transientRetryPolicy);
+
+        // RSS Feed client
+        services.AddHttpClient("RssFeed", c =>
+        {
+            c.Timeout = TimeSpan.FromSeconds(15);
+            c.DefaultRequestHeaders.Add("User-Agent", "LascodiaTradingEngine/1.0");
+            c.DefaultRequestHeaders.Add("Accept", "application/rss+xml, application/xml, text/xml");
+        }).AddPolicyHandler(transientRetryPolicy);
         services.AddHttpClient("ForexFactoryCalendar", c =>
         {
             c.Timeout = TimeSpan.FromSeconds(15);
@@ -156,6 +194,15 @@ public static class DependencyInjection
         // ── Time abstraction ─────────────────────────────────────────────────────
         services.AddSingleton(TimeProvider.System);
 
+        // ── COT Data Feed (CFTC bulk CSV) ───────────────────────────────────────
+        services.AddHttpClient("CftcCOT", c =>
+        {
+            c.Timeout = TimeSpan.FromSeconds(60);
+            c.DefaultRequestHeaders.Add("User-Agent", "LascodiaTradingEngine/1.0");
+        })
+        .AddPolicyHandler(transientRetryPolicy);
+        services.AddScoped<ICOTDataFeed, CftcCOTDataFeed>();
+
         // ── Economic Calendar Feeds (composite factory) ──────────────────────────
         services.AddSingleton<ForexFactoryFetchThrottle>();
         services.AddScoped<ForexFactoryCalendarFeed>();
@@ -168,6 +215,9 @@ public static class DependencyInjection
                     sp.GetRequiredService<InvestingComCalendarFeed>()
                 },
                 sp.GetRequiredService<ILogger<CompositeCalendarFeed>>()));
+
+        // ── Sentiment Feed (DeepSeek NLP — delegates to IDeepSeekSentimentService) ──────
+        services.AddScoped<ISentimentFeed, Services.DeepSeekSentimentFeed>();
 
         // ── Chaos Testing pipeline behavior (open generic — cannot use [RegisterService]) ──
         // Only register when explicitly enabled to avoid per-request overhead in production.

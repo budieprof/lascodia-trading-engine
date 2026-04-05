@@ -3,6 +3,10 @@ using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.Common.Interfaces;
 
+/// <summary>
+/// Comprehensive ML scoring output for a trade signal, including predicted direction,
+/// magnitude, confidence, uncertainty estimates, and explainability artifacts.
+/// </summary>
 public record MLScoreResult(
     TradeDirection? PredictedDirection,
     decimal?        PredictedMagnitudePips,

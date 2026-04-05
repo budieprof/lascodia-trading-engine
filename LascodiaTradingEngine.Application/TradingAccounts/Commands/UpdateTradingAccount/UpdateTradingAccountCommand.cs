@@ -9,6 +9,7 @@ namespace LascodiaTradingEngine.Application.TradingAccounts.Commands.UpdateTradi
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>Partially updates a trading account's display name, currency, or paper trading flag.</summary>
 public class UpdateTradingAccountCommand : IRequest<ResponseData<string>>
 {
     [JsonIgnore] public long    Id          { get; set; }
@@ -31,6 +32,7 @@ public class UpdateTradingAccountCommandValidator : AbstractValidator<UpdateTrad
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Applies partial updates to the trading account; only non-null fields are written.</summary>
 public class UpdateTradingAccountCommandHandler : IRequestHandler<UpdateTradingAccountCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

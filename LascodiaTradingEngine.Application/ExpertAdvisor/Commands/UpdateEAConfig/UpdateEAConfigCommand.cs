@@ -55,6 +55,9 @@ public class UpdateEAConfigCommand : IRequest<ResponseData<string>>
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Validates non-negative values for MaxPosPerSymbol, MaxLotPerOrder, and MaxSpreadPoints.
+/// </summary>
 public class UpdateEAConfigCommandValidator : AbstractValidator<UpdateEAConfigCommand>
 {
     public UpdateEAConfigCommandValidator()
@@ -67,6 +70,11 @@ public class UpdateEAConfigCommandValidator : AbstractValidator<UpdateEAConfigCo
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Handles EA config hot-reload. Serialises the safety parameters to JSON, determines the target
+/// instances (all active, or a specific one), and queues an UpdateConfig EACommand for each.
+/// Returns -14 if no active instances match the target.
+/// </summary>
 public class UpdateEAConfigCommandHandler : IRequestHandler<UpdateEAConfigCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

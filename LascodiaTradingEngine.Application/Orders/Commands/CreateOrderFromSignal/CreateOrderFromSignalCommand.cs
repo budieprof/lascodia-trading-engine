@@ -28,6 +28,7 @@ public class CreateOrderFromSignalCommand : IRequest<ResponseData<long>>
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>Validates that both TradeSignalId and TradingAccountId are positive.</summary>
 public class CreateOrderFromSignalCommandValidator : AbstractValidator<CreateOrderFromSignalCommand>
 {
     public CreateOrderFromSignalCommandValidator()
@@ -39,6 +40,11 @@ public class CreateOrderFromSignalCommandValidator : AbstractValidator<CreateOrd
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Loads the approved trade signal and target account, runs Tier 2 account-level risk checks,
+/// evaluates entry timing, and delegates to <see cref="Orders.Commands.CreateOrder.CreateOrderCommand"/>
+/// for order creation. Records a <see cref="Domain.Entities.SignalAccountAttempt"/> on both success and failure.
+/// </summary>
 public class CreateOrderFromSignalCommandHandler
     : IRequestHandler<CreateOrderFromSignalCommand, ResponseData<long>>
 {

@@ -2,6 +2,10 @@ using LascodiaTradingEngine.Domain.Entities;
 
 namespace LascodiaTradingEngine.Application.Common.Interfaces;
 
+/// <summary>
+/// Coordinates alert dispatch across configured channels (Webhook, Email, Telegram)
+/// with deduplication and severity-based routing.
+/// </summary>
 public interface IAlertDispatcher
 {
     /// <summary>Dispatches an alert to the channel configured on the alert entity.</summary>

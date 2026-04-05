@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Threading.Channels;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -24,28 +25,77 @@ using LascodiaTradingEngine.Domain.Enums;
 namespace LascodiaTradingEngine.Application.Workers;
 
 /// <summary>
-/// Core signal-generation worker that reacts to live price ticks via the event bus.
-/// For every <see cref="PriceUpdatedIntegrationEvent"/>, this worker:
+/// Core signal-generation worker — the "brain" of the trading engine.
+///
+/// This worker is entirely event-driven: it subscribes to <see cref="PriceUpdatedIntegrationEvent"/>
+/// on the event bus (published by <see cref="ExpertAdvisor.Commands.ReceiveTickBatch.ReceiveTickBatchCommandHandler"/>)
+/// and evaluates every active strategy whose symbol matches the updated price.
+///
+/// <b>Signal generation pipeline (per price tick):</b>
 /// <list type="number">
-///   <item>Verifies at least one active EA instance owns the symbol (data availability).</item>
-///   <item>Applies session and news blackout filters to decide whether trading is allowed.</item>
-///   <item>Loads all active strategies matching the updated symbol.</item>
-///   <item>Filters out strategies with Critical health status.</item>
-///   <item>Evaluates each strategy using its registered <see cref="IStrategyEvaluator"/>.</item>
-///   <item>Runs market regime, multi-timeframe confirmation, portfolio correlation, and Hawkes burst filters.</item>
-///   <item>Scores the signal through the ML pipeline (<see cref="IMLSignalScorer"/>), including
-///         abstention gating and suppression logic.</item>
-///   <item>Creates a <see cref="Domain.Entities.TradeSignal"/> and publishes a
-///         <see cref="TradeSignalCreatedIntegrationEvent"/> for downstream consumption
-///         by <see cref="SignalOrderBridgeWorker"/>.</item>
+///   <item><b>Global filters</b> (applied once per tick, before strategy loop):
+///     <list type="bullet">
+///       <item>Stale tick rejection — drops events older than <c>MaxTickAgeSeconds</c> from the event bus backlog.</item>
+///       <item>EA health check — verifies at least one active EA instance with a fresh heartbeat owns the symbol.</item>
+///       <item>Session filter — blocks trading outside allowed sessions (e.g. Asian, London, NY).</item>
+///       <item>News blackout — blocks trading around high-impact economic events.</item>
+///       <item>Regime coherence — suppresses all signals when H1/H4/D1 regimes disagree on direction.</item>
+///     </list>
+///   </item>
+///   <item><b>Pre-fetch phase</b> (batched DB queries to avoid N+1 inside the parallel loop):
+///     <list type="bullet">
+///       <item>Strategy health snapshots — identifies Critical-status strategies to skip.</item>
+///       <item>Market regime snapshots — pre-fetches per-timeframe regime for the symbol.</item>
+///       <item>Backtest qualification — loads most recent backtest per strategy and checks quality thresholds.</item>
+///       <item>Sharpe ratio cache — pre-fetches latest Sharpe for conflict resolution scoring.</item>
+///     </list>
+///   </item>
+///   <item><b>Parallel strategy evaluation</b> (one iteration per active strategy matching the symbol):
+///     <list type="bullet">
+///       <item>Strategy health filter — skips Critical strategies.</item>
+///       <item>Backtest qualification gate — blocks untested or low-quality strategies.</item>
+///       <item>Circuit breaker — stops evaluating strategies with repeated failures (half-open recovery).</item>
+///       <item>Signal cooldown — prevents rapid-fire signals from the same strategy.</item>
+///       <item>Distributed lock — prevents concurrent evaluation of the same strategy from overlapping ticks.</item>
+///       <item>Strategy evaluator — runs the strategy-specific logic (MA crossover, RSI reversion, breakout scalper).</item>
+///       <item>Confidence modifiers — scales confidence by session quality and MTF confirmation strength.</item>
+///       <item>Market regime filter — blocks signals in unfavourable regimes.</item>
+///       <item>Multi-timeframe confirmation — requires higher-timeframe alignment.</item>
+///       <item>Portfolio correlation check — limits correlated positions.</item>
+///       <item>Hawkes burst filter — detects and suppresses signal clustering episodes.</item>
+///       <item>ML scoring — runs the active ML model for directional prediction, abstention gating, and suppression.</item>
+///     </list>
+///   </item>
+///   <item><b>Post-loop conflict resolution</b>:
+///     <list type="bullet">
+///       <item>Collects all candidate signals from the parallel loop into a <see cref="ConcurrentBag{T}"/>.</item>
+///       <item><see cref="ISignalConflictResolver"/> resolves opposing-direction conflicts and deduplicates same-direction
+///             signals using a priority score (Sharpe, ML confidence, capacity).</item>
+///       <item>Winning signals are persisted via <see cref="CreateTradeSignalCommand"/> and published as
+///             <see cref="TradeSignalCreatedIntegrationEvent"/> for downstream consumption by
+///             <see cref="SignalOrderBridgeWorker"/>.</item>
+///     </list>
+///   </item>
 /// </list>
-/// Additionally, a background timer sweeps for expired pending/approved signals every 5 minutes.
-/// <para>
-/// <b>Thread safety:</b> A distributed lock per strategy prevents overlapping evaluations
-/// when price events arrive faster than evaluation completes.
-/// </para>
+///
+/// <b>Background timer:</b> A 5-minute sweep expires pending/approved signals that have exceeded
+/// their TTL, and purges stale in-memory cooldown/circuit-breaker entries for deactivated strategies.
+///
+/// <b>Thread safety:</b>
+/// <list type="bullet">
+///   <item>A <see cref="IDistributedLock"/> per strategy prevents overlapping evaluations when price
+///         events arrive faster than evaluation completes.</item>
+///   <item>In-memory state (<c>_lastSignalTime</c>, <c>_consecutiveFailures</c>, <c>_circuitOpenedAt</c>)
+///         uses <see cref="ConcurrentDictionary{TKey,TValue}"/> for lock-free concurrent access.</item>
+///   <item>The expiry sweep is guarded by a <see cref="SemaphoreSlim"/> to prevent concurrent executions.</item>
+/// </list>
+///
+/// <b>DI lifetime:</b> Singleton (registered as both <see cref="IHostedService"/> and
+/// <see cref="IIntegrationEventHandler{T}"/> forwarding to the same instance). Creates scoped
+/// <see cref="IServiceScope"/> instances for each price event and each parallel strategy iteration
+/// to isolate scoped services (DbContext, ML scorer, filters).
 /// </summary>
-public class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceUpdatedIntegrationEvent>
+public partial class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceUpdatedIntegrationEvent>
 {
     private readonly ILogger<StrategyWorker> _logger;
     private readonly IServiceScopeFactory _scopeFactory;
@@ -69,6 +119,19 @@ public class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceU
     /// <summary>Prevents concurrent expiry sweep executions from the timer.</summary>
     private readonly SemaphoreSlim _expirySweepLock = new(1, 1);
 
+    /// <summary>
+    /// Bounded channel for tick backpressure. When ticks arrive faster than evaluation
+    /// completes, the newest tick per symbol replaces the oldest (DropOldest policy).
+    /// This makes tick loss explicit and bounded rather than implicit and unbounded.
+    /// </summary>
+    private readonly Channel<PriceUpdatedIntegrationEvent> _tickChannel =
+        Channel.CreateBounded<PriceUpdatedIntegrationEvent>(new BoundedChannelOptions(256)
+        {
+            FullMode = BoundedChannelFullMode.DropOldest,
+            SingleReader = false,
+            SingleWriter = false,
+        });
+
     /// <summary>Timer that periodically expires stale pending trade signals.</summary>
     private Timer? _expirySweepTimer;
 
@@ -79,6 +142,11 @@ public class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceU
     /// </summary>
     private CancellationToken _stoppingToken = CancellationToken.None;
 
+    /// <summary>
+    /// All dependencies are injected as singletons (or singleton-safe factories like
+    /// <see cref="IServiceScopeFactory"/>) because this worker is itself a singleton.
+    /// Scoped services (DbContext, ML scorer, etc.) are resolved per-event via scope factories.
+    /// </summary>
     public StrategyWorker(
         ILogger<StrategyWorker> logger,
         IServiceScopeFactory scopeFactory,
@@ -91,22 +159,27 @@ public class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceU
         RegimeCoherenceChecker regimeCoherenceChecker)
     {
         _logger                  = logger;
-        _scopeFactory            = scopeFactory;
-        _eventBus                = eventBus;
-        _evaluators              = evaluators;
-        _distributedLock         = distributedLock;
-        _options                 = options;
-        _metrics                 = metrics;
-        _signalConflictResolver  = signalConflictResolver;
-        _regimeCoherenceChecker  = regimeCoherenceChecker;
+        _scopeFactory            = scopeFactory;    // Creates per-event/per-strategy DI scopes
+        _eventBus                = eventBus;         // Event bus for subscribing to PriceUpdatedIntegrationEvent
+        _evaluators              = evaluators;       // All registered IStrategyEvaluator implementations (one per StrategyType)
+        _distributedLock         = distributedLock;  // Prevents concurrent evaluation of the same strategy
+        _options                 = options;          // Configurable thresholds (cooldowns, circuit breaker, regime blocking, etc.)
+        _metrics                 = metrics;          // OpenTelemetry metrics for observability
+        _signalConflictResolver  = signalConflictResolver;  // Resolves opposing/duplicate signals from competing strategies
+        _regimeCoherenceChecker  = regimeCoherenceChecker;  // Cross-timeframe regime alignment scoring
     }
 
     /// <summary>
-    /// Subscribes to price-update events on the event bus and starts the signal expiry sweep timer.
-    /// The worker is entirely event-driven — it does no polling of its own. The expiry sweep
-    /// runs on a 5-minute interval to clean up pending signals that have exceeded their TTL.
+    /// Subscribes to price-update events on the event bus, starts a bounded-channel consumer
+    /// loop for tick backpressure, and launches the signal expiry sweep timer.
+    ///
+    /// <b>Backpressure design:</b> The event bus invokes <see cref="Handle"/> on every tick,
+    /// which writes the event into a <see cref="BoundedChannel{T}"/> (capacity 256, DropOldest).
+    /// This loop reads from the channel and runs the evaluation pipeline. When ticks arrive
+    /// faster than evaluation completes, the oldest queued ticks are dropped — the latest
+    /// price is always most relevant. This makes tick loss explicit and bounded.
     /// </summary>
-    protected override Task ExecuteAsync(CancellationToken stoppingToken)
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _stoppingToken = stoppingToken;
 
@@ -120,19 +193,51 @@ public class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceU
         stoppingToken.Register(() =>
         {
             _expirySweepTimer?.Dispose();
+            _tickChannel.Writer.TryComplete();
             _eventBus.Unsubscribe<PriceUpdatedIntegrationEvent, StrategyWorker>();
         });
 
-        return Task.CompletedTask;
+        // Consume ticks from the bounded channel — this is the main evaluation loop
+        await foreach (var @event in _tickChannel.Reader.ReadAllAsync(stoppingToken))
+        {
+            try
+            {
+                await ProcessPriceUpdateAsync(@event);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "StrategyWorker: unhandled error processing tick for {Symbol}", @event.Symbol);
+                _metrics.WorkerErrors.Add(1, new("worker", "StrategyWorker"), new("operation", "tick_processing"));
+            }
+        }
     }
 
     /// <summary>
-    /// Handles a price-update event from the event bus. This is the main entry point for
-    /// the strategy evaluation pipeline. Each invocation processes all active strategies
-    /// for the updated symbol through a multi-stage filter chain before creating signals.
+    /// Event bus entry point — writes the price event into the bounded channel for
+    /// backpressure-controlled consumption. The actual evaluation pipeline runs in
+    /// <see cref="ProcessPriceUpdateAsync"/>. When the channel is full (256 items),
+    /// the oldest queued tick is dropped (DropOldest policy).
     /// </summary>
-    /// <param name="event">Contains the updated symbol, bid, and ask prices.</param>
     public async Task Handle(PriceUpdatedIntegrationEvent @event)
+    {
+        if (!_tickChannel.Writer.TryWrite(@event))
+        {
+            _metrics.TicksDroppedBackpressure.Add(1, new KeyValuePair<string, object?>("symbol", @event.Symbol));
+        }
+        await Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Core evaluation pipeline — processes a single price-update event through the
+    /// multi-stage filter chain and generates trade signals for matching strategies.
+    /// Called from the bounded-channel consumer loop in <see cref="ExecuteAsync"/>.
+    /// Internal for unit test access (InternalsVisibleTo).
+    /// </summary>
+    internal async Task ProcessPriceUpdateAsync(PriceUpdatedIntegrationEvent @event)
     {
         // Create a DI scope for the pre-loop checks (EA health, session, news, strategy loading).
         // Each parallel strategy iteration creates its own scope for scoped services.
@@ -223,7 +328,7 @@ public class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceU
         if (strategyIds.Count > 0)
         {
             // Get the latest health snapshot per strategy using a grouped query
-            var latestSnapshots = await context.GetDbContext()
+            var latestSnapshotsCriticalStrategyIds = await context.GetDbContext()
                 .Set<Domain.Entities.StrategyPerformanceSnapshot>()
                 .Where(x => strategyIds.Contains(x.StrategyId) && !x.IsDeleted)
                 .GroupBy(x => x.StrategyId)
@@ -236,7 +341,7 @@ public class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceU
                 .Select(x => x.StrategyId)
                 .ToListAsync(_stoppingToken);
 
-            criticalStrategyIds = new HashSet<long>(latestSnapshots);
+            criticalStrategyIds = [.. latestSnapshotsCriticalStrategyIds];
         }
 
         // ── Pre-fetch regime snapshots for all distinct timeframes ───────────
@@ -248,13 +353,13 @@ public class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceU
             var timeframes = strategies.Select(s => s.Timeframe).Distinct();
             foreach (var tf in timeframes)
             {
-                var regime = await context.GetDbContext()
+                var symbolLatestRegimePerTimeframe = await context.GetDbContext()
                     .Set<Domain.Entities.MarketRegimeSnapshot>()
                     .Where(x => x.Symbol == @event.Symbol && x.Timeframe == tf && !x.IsDeleted)
                     .OrderByDescending(x => x.DetectedAt)
                     .Select(x => x.Regime)
                     .FirstOrDefaultAsync(_stoppingToken);
-                regimeCache[tf] = regime;
+                regimeCache[tf] = symbolLatestRegimePerTimeframe;
             }
         }
 
@@ -282,8 +387,10 @@ public class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceU
                 })
                 .ToListAsync(_stoppingToken);
 
-            foreach (var s in sharpeData)
-                strategySharpeCache[s.StrategyId] = s.SharpeRatio;
+            strategySharpeCache = sharpeData.ToDictionary(s => s.StrategyId, s => s.SharpeRatio);
+
+            //foreach (var s in sharpeData)
+            //    strategySharpeCache[s.StrategyId] = s.SharpeRatio;
         }
 
         // ── Regime coherence check (cross-timeframe alignment) ───────────────
@@ -304,13 +411,19 @@ public class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceU
         // ── Candidate signal collection bag ──────────────────────────────────
         // Instead of publishing signals immediately inside the parallel loop,
         // we collect candidates here and resolve conflicts after all strategies
-        // have been evaluated. This enables cross-strategy conflict detection.
+        // have been evaluated. This two-phase approach (collect → resolve → publish)
+        // enables cross-strategy conflict detection: e.g. if Strategy A says BUY EURUSD
+        // and Strategy B says SELL EURUSD on the same tick, the conflict resolver picks
+        // the winner based on Sharpe ratio, ML confidence, and estimated capacity.
         var candidateSignals = new ConcurrentBag<(PendingSignal Pending, MLScoreResult MlScore)>();
 
         // ── Parallel strategy evaluation ─────────────────────────────────────
         // Each strategy gets its own DI scope so scoped services (DbContext, ML scorer,
         // filters) have independent lifetimes. The pre-fetched regimeCache,
-        // criticalStrategyIds, and backtestQualifiedIds are read-only and safe to share.
+        // criticalStrategyIds, and backtestQualifiedIds are read-only and safe to share
+        // across parallel iterations without synchronisation.
+        // MaxDegreeOfParallelism caps CPU utilisation to prevent thread pool starvation
+        // when many strategies are active on a single symbol.
         var parallelOptions = new ParallelOptions
         {
             MaxDegreeOfParallelism = Math.Max(1, _options.MaxParallelStrategies),
@@ -396,6 +509,12 @@ public class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceU
                     return;
                 }
 
+                // Resolve the strategy-specific evaluator by matching the StrategyType enum.
+                // Each evaluator implements the trading logic for one strategy type:
+                //   - BreakoutScalperEvaluator → StrategyType.BreakoutScalper
+                //   - MovingAverageCrossoverEvaluator → StrategyType.MovingAverageCrossover
+                //   - RSIReversionEvaluator → StrategyType.RSIReversion
+                // If no evaluator is registered, the strategy is skipped and a decision log is created.
                 var evaluator = _evaluators.FirstOrDefault(e => e.StrategyType == strategy.StrategyType);
                 if (evaluator is null)
                 {
@@ -479,9 +598,85 @@ public class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceU
                     return;
                 }
 
-                // Run the strategy-specific evaluation logic (e.g., MA crossover, RSI reversion)
-                // Returns null if no signal condition is met on this tick.
-                var signal = await evaluator.EvaluateAsync(strategy, candles, (price.Value.Bid, price.Value.Ask), ct);
+                // ── Regime-conditional parameter swap ────────────────────────────────
+                // If the OptimizationWorker has stored regime-specific parameters for
+                // the current market regime, apply them for this evaluation. We create
+                // a shallow copy to avoid dirtying the tracked entity in the outer
+                // DbContext's change tracker.
+                var evalStrategy = strategy;
+                if (regimeCache.TryGetValue(strategy.Timeframe, out var currentRegime))
+                {
+                    var regimeParams = await strategyContext.GetDbContext()
+                        .Set<Domain.Entities.StrategyRegimeParams>()
+                        .Where(p => p.StrategyId == strategy.Id
+                                 && p.Regime == currentRegime
+                                 && !p.IsDeleted)
+                        .Select(p => p.ParametersJson)
+                        .FirstOrDefaultAsync(ct);
+
+                    if (regimeParams is not null)
+                    {
+                        _logger.LogDebug(
+                            "Strategy {Id} ({Symbol}/{Tf}): applying regime-conditional params for {Regime}",
+                            strategy.Id, strategy.Symbol, strategy.Timeframe, currentRegime);
+                        evalStrategy = new Domain.Entities.Strategy
+                        {
+                            Id                      = strategy.Id,
+                            Name                    = strategy.Name,
+                            Description             = strategy.Description,
+                            StrategyType            = strategy.StrategyType,
+                            Symbol                  = strategy.Symbol,
+                            Timeframe               = strategy.Timeframe,
+                            ParametersJson          = regimeParams,
+                            Status                  = strategy.Status,
+                            RiskProfileId           = strategy.RiskProfileId,
+                            CreatedAt               = strategy.CreatedAt,
+                            LifecycleStage          = strategy.LifecycleStage,
+                            LifecycleStageEnteredAt = strategy.LifecycleStageEnteredAt,
+                            EstimatedCapacityLots   = strategy.EstimatedCapacityLots,
+                            IsDeleted               = strategy.IsDeleted,
+                        };
+                    }
+                }
+
+                // ── Gradual rollout parameter routing ──────────────────────────────
+                // If an optimization rollout is in progress (RolloutPct < 100), route
+                // traffic between old and new parameters deterministically based on a
+                // seed derived from the tick timestamp. This ensures the same tick
+                // always picks the same parameter set, enabling consistent A/B comparison.
+                if (strategy.RolloutPct is not null and < 100)
+                {
+                    int rolloutSeed = HashCode.Combine(strategy.Id, @event.Timestamp.Ticks / TimeSpan.TicksPerMinute);
+                    string selectedParams = Optimization.GradualRolloutManager.SelectParameters(strategy, rolloutSeed);
+                    if (selectedParams != evalStrategy.ParametersJson)
+                    {
+                        evalStrategy = new Domain.Entities.Strategy
+                        {
+                            Id                      = evalStrategy.Id,
+                            Name                    = evalStrategy.Name,
+                            Description             = evalStrategy.Description,
+                            StrategyType            = evalStrategy.StrategyType,
+                            Symbol                  = evalStrategy.Symbol,
+                            Timeframe               = evalStrategy.Timeframe,
+                            ParametersJson          = selectedParams,
+                            Status                  = evalStrategy.Status,
+                            RiskProfileId           = evalStrategy.RiskProfileId,
+                            CreatedAt               = evalStrategy.CreatedAt,
+                            LifecycleStage          = evalStrategy.LifecycleStage,
+                            LifecycleStageEnteredAt = evalStrategy.LifecycleStageEnteredAt,
+                            EstimatedCapacityLots   = evalStrategy.EstimatedCapacityLots,
+                            IsDeleted               = evalStrategy.IsDeleted,
+                        };
+                    }
+                }
+
+                // ── Core strategy evaluation ─────────────────────────────────────
+                // This is where the actual trading logic runs. The evaluator analyses
+                // the historical candles and current bid/ask to determine if a trade
+                // signal should be generated (e.g., MA crossover detected, RSI hit
+                // oversold level). Returns null if no signal condition is met on this
+                // tick — which is the common case (most ticks don't trigger signals).
+                var signal = await evaluator.EvaluateAsync(evalStrategy, candles, (price.Value.Bid, price.Value.Ask), ct);
                 if (signal is null) return;
 
                 // ── Post-evaluator confidence modifiers ──────────────────────
@@ -606,10 +801,18 @@ public class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceU
                 }
 
                 // ── ML scoring ──────────────────────────────────────────────
+                // The ML pipeline runs the active model (if any) to:
+                //   1. Predict the likely direction (Buy/Sell) and magnitude in pips
+                //   2. Produce a calibrated probability and confidence score
+                //   3. Determine if the model should abstain (low-confidence environments)
+                //   4. Check ensemble disagreement across bagged learners
+                // The ML score enriches the signal and can veto it entirely.
                 var mlScore = await strategyMlScorer.ScoreAsync(signal, candles, ct);
 
-                // ML suppression: when the scorer returns all nulls (cooldown, suppression,
-                // or consensus failure), skip signal creation entirely.
+                // ML suppression: when the scorer returns a model ID but null predicted
+                // direction, it means the model actively chose NOT to score (cooldown period,
+                // consensus failure among bagged learners, or selective scoring gate).
+                // This is different from "no ML model active" (MLModelId == null).
                 if (mlScore.MLModelId.HasValue && !mlScore.PredictedDirection.HasValue)
                 {
                     _logger.LogInformation(
@@ -717,18 +920,26 @@ public class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceU
         // ══════════════════════════════════════════════════════════════════════
         //  Post-loop: Signal conflict resolution and publishing
         // ══════════════════════════════════════════════════════════════════════
-        // Now that all strategies have been evaluated in parallel, resolve
-        // cross-strategy conflicts (opposing directions suppressed, same-direction
-        // deduplication by priority score) before persisting any signals.
+        // At this point, all strategies have been evaluated in parallel and their
+        // candidate signals collected. Before persisting any of them, the conflict
+        // resolver applies two rules:
+        //   1. Opposing direction suppression: if Strategy A says BUY EURUSD and
+        //      Strategy B says SELL EURUSD, only the higher-priority signal survives.
+        //      Priority is scored by: Sharpe ratio > ML confidence > estimated capacity.
+        //   2. Same-direction deduplication: multiple strategies generating the same
+        //      direction on the same symbol are deduplicated — only the highest-priority
+        //      signal is persisted to avoid redundant orders.
         if (candidateSignals.IsEmpty)
             return;
 
         var allCandidates = candidateSignals.ToList();
         var pendingOnly = allCandidates.Select(c => c.Pending).ToList();
         var winners = _signalConflictResolver.Resolve(pendingOnly);
-        // Use reference equality to match exact winner instances, not just StrategyId.
-        // A strategy could produce multiple candidates (e.g. different timeframes), and
-        // the resolver may keep some but not all — StrategyId alone can't distinguish them.
+        // Use reference equality (not value equality) to match exact winner instances.
+        // A strategy could theoretically produce multiple candidates on different timeframes,
+        // and the resolver may keep some but not all — StrategyId alone can't distinguish them.
+        // ReferenceEqualityComparer ensures we match the exact PendingSignal objects the
+        // resolver returned, not just objects with the same property values.
         var winnerSet = new HashSet<PendingSignal>(winners, ReferenceEqualityComparer.Instance);
 
         // Log suppressed signals
@@ -741,7 +952,9 @@ public class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceU
             _metrics.SignalsFiltered.Add(suppressedCount, new("symbol", @event.Symbol), new("stage", "conflict_resolution"));
         }
 
-        // Persist and publish winning signals concurrently (each gets its own DI scope)
+        // Persist and publish winning signals concurrently. Each winner gets its own DI scope
+        // because CreateTradeSignalCommand writes to the DB and SaveAndPublish emits an
+        // integration event — both require scoped write contexts with independent transactions.
         var winnerCandidates = allCandidates.Where(c => winnerSet.Contains(c.Pending)).ToList();
         var publishOptions = new ParallelOptions
         {
@@ -815,248 +1028,6 @@ public class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceU
         });
     }
 
-    /// <summary>
-    /// Timer callback that sweeps for pending and approved trade signals whose <c>ExpiresAt</c>
-    /// has passed. Expired signals are transitioned via <see cref="ExpireTradeSignalCommand"/>
-    /// so they are no longer eligible for order creation by <see cref="SignalOrderBridgeWorker"/>.
-    /// Runs on a fire-and-forget <see cref="Task.Run"/> to avoid blocking the timer thread.
-    /// Processes up to <see cref="StrategyEvaluatorOptions.ExpirySweepBatchSize"/> signals per cycle.
-    /// Protected by a <see cref="SemaphoreSlim"/> to prevent concurrent sweeps.
-    /// </summary>
-    private void RunExpirySweep(object? state)
-    {
-        _ = Task.Run(async () =>
-        {
-            if (_stoppingToken.IsCancellationRequested) return;
-
-            // Skip if a previous sweep is still running
-            if (!await _expirySweepLock.WaitAsync(0, _stoppingToken)) return;
-
-            try
-            {
-                using var scope  = _scopeFactory.CreateScope();
-                var mediator     = scope.ServiceProvider.GetRequiredService<IMediator>();
-                var context      = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
-
-                // Find pending and approved signals that have exceeded their time-to-live
-                var expiredIds = await context.GetDbContext()
-                    .Set<Domain.Entities.TradeSignal>()
-                    .Where(x => (x.Status == TradeSignalStatus.Pending || x.Status == TradeSignalStatus.Approved)
-                                && x.ExpiresAt < DateTime.UtcNow
-                                && !x.IsDeleted)
-                    .OrderBy(x => x.ExpiresAt)
-                    .Take(_options.ExpirySweepBatchSize)
-                    .Select(x => x.Id)
-                    .ToListAsync(_stoppingToken);
-
-                // Expire each signal individually via the CQRS command
-                foreach (var id in expiredIds)
-                {
-                    if (_stoppingToken.IsCancellationRequested) break;
-                    await mediator.Send(new ExpireTradeSignalCommand { Id = id }, _stoppingToken);
-                }
-
-                if (expiredIds.Count > 0)
-                    _logger.LogInformation("Signal expiry sweep: expired {Count} signals", expiredIds.Count);
-
-                // Purge stale cooldown entries for strategies that are no longer active.
-                // This prevents the ConcurrentDictionary from growing unbounded over time.
-                var activeStrategyIds = await context.GetDbContext()
-                    .Set<Domain.Entities.Strategy>()
-                    .Where(x => x.Status == StrategyStatus.Active && !x.IsDeleted)
-                    .Select(x => x.Id)
-                    .ToListAsync(_stoppingToken);
-
-                var activeSet = new HashSet<long>(activeStrategyIds);
-                foreach (var key in _lastSignalTime.Keys)
-                {
-                    if (!activeSet.Contains(key))
-                        _lastSignalTime.TryRemove(key, out _);
-                }
-                foreach (var key in _consecutiveFailures.Keys)
-                {
-                    if (!activeSet.Contains(key))
-                        _consecutiveFailures.TryRemove(key, out _);
-                }
-                foreach (var key in _circuitOpenedAt.Keys)
-                {
-                    if (!activeSet.Contains(key))
-                        _circuitOpenedAt.TryRemove(key, out _);
-                }
-            }
-            catch (OperationCanceledException) when (_stoppingToken.IsCancellationRequested)
-            {
-                // Graceful shutdown — expected
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error in signal expiry sweep");
-                _metrics.WorkerErrors.Add(1, new("worker", "StrategyWorker"), new("operation", "expiry_sweep"));
-            }
-            finally
-            {
-                _expirySweepLock.Release();
-            }
-        }, CancellationToken.None);
-    }
-
-    // ════════════════════════════════════════════════════════════════════════════
-    //  Backtest qualification gate
-    // ════════════════════════════════════════════════════════════════════════════
-
-    /// <summary>
-    /// Returns the set of strategy IDs that have at least one completed backtest meeting
-    /// minimum quality thresholds. Strategies not in this set are blocked from generating
-    /// live signals.
-    ///
-    /// <para>
-    /// Configurable via <see cref="Domain.Entities.EngineConfig"/>:
-    /// <list type="bullet">
-    ///   <item><c>Backtest:Gate:Enabled</c>        — master switch (default true)</item>
-    ///   <item><c>Backtest:Gate:MinWinRate</c>            — minimum win rate (default 0.60 = 60%)</item>
-    ///   <item><c>Backtest:Gate:MinProfitFactor</c>       — minimum profit factor; must be &gt; 1.0 (default 1.0)</item>
-    ///   <item><c>Backtest:Gate:MinTotalTrades</c>        — fallback min trades (default 5)</item>
-    ///   <item><c>Backtest:Gate:MinTotalTrades:M5M15</c>  — min trades for M1/M5/M15 (default 10)</item>
-    ///   <item><c>Backtest:Gate:MinTotalTrades:H1</c>     — min trades for H1 (default 5)</item>
-    ///   <item><c>Backtest:Gate:MinTotalTrades:H4</c>     — min trades for H4 (default 5)</item>
-    ///   <item><c>Backtest:Gate:MinTotalTrades:D1</c>     — min trades for D1 (default 3)</item>
-    ///   <item><c>Backtest:Gate:MaxDrawdownPct</c>        — maximum drawdown allowed (default 0.25 = 25%)</item>
-    ///   <item><c>Backtest:Gate:MinSharpe</c>             — minimum Sharpe ratio (default 0.0)</item>
-    /// </list>
-    /// </para>
-    /// </summary>
-    private async Task<HashSet<long>> GetBacktestQualifiedStrategyIdsAsync(
-        Microsoft.EntityFrameworkCore.DbContext ctx,
-        List<long> strategyIds,
-        CancellationToken ct)
-    {
-        // Check if the gate is enabled
-        bool gateEnabled = await GetConfigAsync<bool>(ctx, "Backtest:Gate:Enabled", true, ct);
-        if (!gateEnabled)
-        {
-            // Gate disabled — all strategies are qualified
-            return new HashSet<long>(strategyIds);
-        }
-
-        // Load qualification thresholds from EngineConfig (hot-reloadable)
-        // Only profitable, winning strategies should qualify.
-        double minWinRate      = await GetConfigAsync<double>(ctx, "Backtest:Gate:MinWinRate",      0.60, ct);
-        double minProfitFactor = await GetConfigAsync<double>(ctx, "Backtest:Gate:MinProfitFactor", 1.0,  ct);
-        double maxDrawdownPct  = await GetConfigAsync<double>(ctx, "Backtest:Gate:MaxDrawdownPct",  0.25, ct);
-        double minSharpe       = await GetConfigAsync<double>(ctx, "Backtest:Gate:MinSharpe",       0.0,  ct);
-
-        // Timeframe-adaptive MinTotalTrades: higher timeframes produce fewer signals,
-        // so they need a lower trade threshold to avoid permanently blocking profitable
-        // H4/D1 strategies that only generate 5-8 trades in a 365-day backtest window.
-        int minTradesDefault = await GetConfigAsync<int>(ctx, "Backtest:Gate:MinTotalTrades", 5, ct);
-        int minTradesM5M15   = await GetConfigAsync<int>(ctx, "Backtest:Gate:MinTotalTrades:M5M15", 10, ct);
-        int minTradesH1      = await GetConfigAsync<int>(ctx, "Backtest:Gate:MinTotalTrades:H1",    5,  ct);
-        int minTradesH4      = await GetConfigAsync<int>(ctx, "Backtest:Gate:MinTotalTrades:H4",    5,  ct);
-        int minTradesD1      = await GetConfigAsync<int>(ctx, "Backtest:Gate:MinTotalTrades:D1",    3,  ct);
-
-        // Build a lookup of strategy timeframes for adaptive trade thresholds
-        var strategyTimeframes = await ctx.Set<Domain.Entities.Strategy>()
-            .Where(s => strategyIds.Contains(s.Id) && !s.IsDeleted)
-            .Select(s => new { s.Id, s.Timeframe })
-            .ToListAsync(ct);
-        var timeframeMap = strategyTimeframes.ToDictionary(s => s.Id, s => s.Timeframe);
-
-        // Load the most recent completed backtest per strategy (only for strategies in scope)
-        var recentBacktests = await ctx.Set<Domain.Entities.BacktestRun>()
-            .Where(r => strategyIds.Contains(r.StrategyId)
-                        && r.Status == RunStatus.Completed
-                        && !r.IsDeleted
-                        && r.ResultJson != null)
-            .GroupBy(r => r.StrategyId)
-            .Select(g => new
-            {
-                StrategyId = g.Key,
-                ResultJson = g.OrderByDescending(r => r.CompletedAt).First().ResultJson
-            })
-            .ToListAsync(ct);
-
-        var qualifiedIds = new HashSet<long>();
-
-        foreach (var bt in recentBacktests)
-        {
-            if (string.IsNullOrWhiteSpace(bt.ResultJson))
-                continue;
-
-            try
-            {
-                var result = System.Text.Json.JsonSerializer.Deserialize<BacktestResult>(bt.ResultJson);
-                if (result is null) continue;
-
-                // Resolve timeframe-adaptive MinTotalTrades
-                int minTotalTrades = minTradesDefault;
-                if (timeframeMap.TryGetValue(bt.StrategyId, out var tf))
-                {
-                    minTotalTrades = tf switch
-                    {
-                        Timeframe.M1 or Timeframe.M5 or Timeframe.M15 => minTradesM5M15,
-                        Timeframe.H1  => minTradesH1,
-                        Timeframe.H4  => minTradesH4,
-                        Timeframe.D1  => minTradesD1,
-                        _             => minTradesDefault,
-                    };
-                }
-
-                bool meetsMinTrades  = result.TotalTrades >= minTotalTrades;
-                bool meetsWinRate    = (double)result.WinRate >= minWinRate;
-                bool meetsPF         = (double)result.ProfitFactor >= minProfitFactor;
-                bool meetsDrawdown   = (double)result.MaxDrawdownPct <= maxDrawdownPct;
-                bool meetsSharpe     = (double)result.SharpeRatio >= minSharpe;
-
-                if (meetsMinTrades && meetsWinRate && meetsPF && meetsDrawdown && meetsSharpe)
-                {
-                    qualifiedIds.Add(bt.StrategyId);
-                }
-                else
-                {
-                    _logger.LogDebug(
-                        "Strategy {Id} ({Tf}): backtest did not meet qualification — " +
-                        "trades={Trades}/{MinTrades} winRate={WR:P1}/{MinWR:P1} " +
-                        "pf={PF:F2}/{MinPF:F2} dd={DD:P1}/{MaxDD:P1} sharpe={S:F2}/{MinS:F2}",
-                        bt.StrategyId, tf,
-                        result.TotalTrades, minTotalTrades,
-                        (double)result.WinRate, minWinRate,
-                        (double)result.ProfitFactor, minProfitFactor,
-                        (double)result.MaxDrawdownPct, maxDrawdownPct,
-                        (double)result.SharpeRatio, minSharpe);
-                }
-            }
-            catch (System.Text.Json.JsonException ex)
-            {
-                _logger.LogWarning(ex,
-                    "Strategy {Id}: failed to deserialise backtest ResultJson — treating as unqualified",
-                    bt.StrategyId);
-            }
-        }
-
-        return qualifiedIds;
-    }
-
-    private static async Task<T> GetConfigAsync<T>(
-        Microsoft.EntityFrameworkCore.DbContext ctx,
-        string key,
-        T defaultValue,
-        CancellationToken ct)
-    {
-        var entry = await ctx.Set<Domain.Entities.EngineConfig>()
-            .AsNoTracking()
-            .FirstOrDefaultAsync(c => c.Key == key, ct);
-
-        if (entry?.Value is null) return defaultValue;
-
-        try   { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
-        catch { return defaultValue; }
-    }
-
-    public override void Dispose()
-    {
-        _expirySweepTimer?.Dispose();
-        _expirySweepLock.Dispose();
-        base.Dispose();
-        GC.SuppressFinalize(this);
-    }
+    // ── Expiry sweep, backtest gates, config helper, and Dispose are in
+    //    StrategyWorker.Maintenance.cs and StrategyWorker.Gates.cs ──
 }

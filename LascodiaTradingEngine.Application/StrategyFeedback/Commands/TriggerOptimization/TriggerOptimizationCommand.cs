@@ -8,6 +8,10 @@ namespace LascodiaTradingEngine.Application.StrategyFeedback.Commands.TriggerOpt
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Queues a parameter optimization run for a strategy. The <c>OptimizationWorker</c>
+/// picks up queued runs and searches for improved strategy parameters.
+/// </summary>
 public class TriggerOptimizationCommand : IRequest<ResponseData<long>>
 {
     public long   StrategyId  { get; set; }
@@ -27,6 +31,7 @@ public class TriggerOptimizationCommandValidator : AbstractValidator<TriggerOpti
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Creates a new optimization run entity with Queued status for asynchronous processing.</summary>
 public class TriggerOptimizationCommandHandler : IRequestHandler<TriggerOptimizationCommand, ResponseData<long>>
 {
     private readonly IWriteApplicationDbContext _context;

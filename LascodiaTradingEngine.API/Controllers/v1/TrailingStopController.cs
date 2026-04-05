@@ -7,6 +7,10 @@ using LascodiaTradingEngine.Application.TrailingStop.Commands.ScalePosition;
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
+/// <summary>
+/// Manages trailing stop configuration and position scaling operations on open positions.
+/// Route: api/v1/lascodia-trading-engine/trailing-stop
+/// </summary>
 [Route("api/v1/lascodia-trading-engine/trailing-stop")]
 [ApiController]
 public class TrailingStopController : AuthControllerBase<TrailingStopController>

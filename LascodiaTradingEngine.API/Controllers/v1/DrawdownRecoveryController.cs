@@ -8,6 +8,10 @@ using LascodiaTradingEngine.Application.DrawdownRecovery.Queries.GetLatestDrawdo
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
+/// <summary>
+/// Records drawdown snapshots and queries the current recovery mode for risk management.
+/// Route: api/v1/lascodia-trading-engine/drawdown-recovery
+/// </summary>
 [Route("api/v1/lascodia-trading-engine/drawdown-recovery")]
 [ApiController]
 public class DrawdownRecoveryController : AuthControllerBase<DrawdownRecoveryController>

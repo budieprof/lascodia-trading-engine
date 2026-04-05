@@ -8,8 +8,18 @@ using Microsoft.EntityFrameworkCore;
 
 namespace LascodiaTradingEngine.Infrastructure.Persistence.DbContexts;
 
+    /// <summary>
+    /// Abstract base DbContext for the trading engine. Inherits shared-library auditing and
+    /// soft-delete behaviour from <see cref="BaseApplicationDbContext{T}"/>, disables lazy-loading
+    /// proxies to prevent unbounded entity-graph retention, and auto-registers all domain entities
+    /// from the <see cref="Order"/> assembly via <c>RegisterAllEntities</c>.
+    /// </summary>
+    /// <typeparam name="T">The concrete DbContext type (used for strongly-typed <see cref="DbContextOptions{T}"/>).</typeparam>
     public abstract class ApplicationDbContext<T> : BaseApplicationDbContext<T> where T : DbContext
     {
+        /// <summary>
+        /// Initializes a new instance of the <see cref="ApplicationDbContext{T}"/> class.
+        /// </summary>
         public ApplicationDbContext(DbContextOptions<T> options, IHttpContextAccessor httpContextAccessor, Assembly assembly)
             : base(options, httpContextAccessor, assembly)
         {

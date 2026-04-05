@@ -12,6 +12,10 @@ public static class IndicatorCalculator
     // True Range
     // ═════════════════════════════════════════════════════════════════════════
 
+    /// <summary>
+    /// Computes the True Range for the candle at <paramref name="index"/>:
+    /// max(high - low, |high - prevClose|, |low - prevClose|).
+    /// </summary>
     public static decimal TrueRange(IReadOnlyList<Candle> candles, int index)
     {
         decimal high      = candles[index].High;
@@ -542,5 +546,66 @@ public static class IndicatorCalculator
         var c = new decimal[candles.Count];
         for (int i = 0; i < candles.Count; i++) c[i] = candles[i].Close;
         return c;
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // VWAP (Volume-Weighted Average Price)
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Computes the Volume-Weighted Average Price (VWAP) from sessionStartIndex to endIndex.
+    /// VWAP = Σ(TypicalPrice × Volume) / Σ(Volume) where TypicalPrice = (H+L+C)/3.
+    /// Returns 0 if total volume is zero.
+    /// </summary>
+    public static decimal Vwap(IReadOnlyList<Candle> candles, int endIndex, int sessionStartIndex)
+    {
+        if (sessionStartIndex < 0 || endIndex < sessionStartIndex || endIndex >= candles.Count)
+            return 0m;
+
+        decimal sumPV = 0m, sumV = 0m;
+        for (int i = sessionStartIndex; i <= endIndex; i++)
+        {
+            var c = candles[i];
+            decimal typicalPrice = (c.High + c.Low + c.Close) / 3m;
+            sumPV += typicalPrice * c.Volume;
+            sumV += c.Volume;
+        }
+        return sumV > 0 ? sumPV / sumV : 0m;
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // OLS Hedge Ratio (linear regression)
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Computes the OLS (Ordinary Least Squares) linear regression hedge ratio.
+    /// Returns (alpha, beta) where y ≈ alpha + beta * x.
+    /// Returns (0, 0) if the regression is degenerate (insufficient data or zero variance).
+    /// </summary>
+    public static (decimal Alpha, decimal Beta) OlsHedgeRatio(decimal[] y, decimal[] x)
+    {
+        int n = Math.Min(y.Length, x.Length);
+        if (n < 3) return (0m, 0m);
+
+        // Use centered formulation to avoid catastrophic cancellation
+        // (n*sumX2 - sumX*sumX can lose precision with large price values like JPY pairs)
+        decimal meanX = 0m, meanY = 0m;
+        for (int i = 0; i < n; i++) { meanX += x[i]; meanY += y[i]; }
+        meanX /= n; meanY /= n;
+
+        decimal ssXX = 0m, ssXY = 0m;
+        for (int i = 0; i < n; i++)
+        {
+            decimal dx = x[i] - meanX;
+            decimal dy = y[i] - meanY;
+            ssXX += dx * dx;
+            ssXY += dx * dy;
+        }
+
+        if (Math.Abs(ssXX) < 0.000000001m) return (0m, 0m);
+
+        decimal beta = ssXY / ssXX;
+        decimal alpha = meanY - beta * meanX;
+        return (alpha, beta);
     }
 }

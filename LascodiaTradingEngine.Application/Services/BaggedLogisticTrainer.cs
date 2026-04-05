@@ -800,7 +800,8 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
                 trainedAtUtc);
         }
 
-        double[] isotonicBp = FitIsotonicCalibration(postPruneCalSet, PreIsotonicProductionProb);
+        double[] isotonicBp = FitIsotonicCalibrationGuarded(
+            postPruneCalSet, PreIsotonicProductionProb, hp.MinIsotonicCalibrationSamples);
         _logger.LogInformation("Isotonic calibration: {N} PAVA breakpoints", isotonicBp.Length / 2);
 
         if (hp.FitTemperatureScale && postPruneCalSet.Count >= 10)
@@ -823,7 +824,8 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
                 temperatureScale = refitTemperatureScale;
                 (plattABuy, plattBBuy, plattASell, plattBSell) = FitClassConditionalPlatt(
                     postPruneCalSet, FinalRawProb, plattA, plattB, temperatureScale);
-                isotonicBp = FitIsotonicCalibration(postPruneCalSet, PreIsotonicProductionProb);
+                isotonicBp = FitIsotonicCalibrationGuarded(
+                    postPruneCalSet, PreIsotonicProductionProb, hp.MinIsotonicCalibrationSamples);
             }
         }
 
@@ -4563,6 +4565,79 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
             bp[i * 2 + 1] = stack[i].SumY / stack[i].Count;
         }
         return bp;
+    }
+
+    /// <summary>
+    /// Guarded isotonic calibration that prevents overfitting on small calibration sets.
+    /// <list type="bullet">
+    ///   <item>If <paramref name="calSet"/> has fewer than <paramref name="minSamples"/> samples,
+    ///         isotonic calibration is skipped entirely (returns empty breakpoints).</item>
+    ///   <item>If the calibration set has between <paramref name="minSamples"/> and 2× that
+    ///         threshold, leave-one-out cross-validation is used: if LOO error is worse than
+    ///         pre-isotonic error, isotonic calibration is skipped.</item>
+    ///   <item>Otherwise, proceeds to standard PAVA fitting.</item>
+    /// </list>
+    /// </summary>
+    private double[] FitIsotonicCalibrationGuarded(
+        List<TrainingSample>  calSet,
+        Func<float[], double> calibratedProb,
+        int                   minSamples)
+    {
+        if (calSet.Count < minSamples)
+        {
+            _logger.LogDebug(
+                "Skipping isotonic calibration: only {N} calibration samples (min {Min} required)",
+                calSet.Count, minSamples);
+            return [];
+        }
+
+        // For small calibration sets (minSamples .. 2×minSamples), apply LOO overfitting guard
+        if (calSet.Count <= minSamples * 2)
+        {
+            // Compute pre-isotonic log-loss (baseline without isotonic)
+            double preIsotonicError = 0;
+            foreach (var s in calSet)
+            {
+                double p = Math.Clamp(calibratedProb(s.Features), 1e-7, 1.0 - 1e-7);
+                double y = s.Direction > 0 ? 1.0 : 0.0;
+                preIsotonicError += -(y * Math.Log(p) + (1 - y) * Math.Log(1 - p));
+            }
+            preIsotonicError /= calSet.Count;
+
+            // LOO cross-validation: for each sample, fit isotonic on all others, evaluate on held-out
+            double looError = 0;
+            for (int i = 0; i < calSet.Count; i++)
+            {
+                var looSet = new List<TrainingSample>(calSet.Count - 1);
+                for (int j = 0; j < calSet.Count; j++)
+                    if (j != i) looSet.Add(calSet[j]);
+
+                double[] looBp = FitIsotonicCalibration(looSet, calibratedProb);
+
+                double p = Math.Clamp(calibratedProb(calSet[i].Features), 1e-7, 1.0 - 1e-7);
+                if (looBp.Length >= 4)
+                    p = Math.Clamp(ApplyIsotonicCalibration(p, looBp), 1e-7, 1.0 - 1e-7);
+
+                double y = calSet[i].Direction > 0 ? 1.0 : 0.0;
+                looError += -(y * Math.Log(p) + (1 - y) * Math.Log(1 - p));
+            }
+            looError /= calSet.Count;
+
+            if (looError >= preIsotonicError)
+            {
+                _logger.LogWarning(
+                    "Skipping isotonic calibration: LOO error {Loo:F4} >= pre-isotonic error {Pre:F4} " +
+                    "({N} samples — likely overfitting)",
+                    looError, preIsotonicError, calSet.Count);
+                return [];
+            }
+
+            _logger.LogDebug(
+                "Isotonic LOO guard passed: LOO error {Loo:F4} < pre-isotonic {Pre:F4} ({N} samples)",
+                looError, preIsotonicError, calSet.Count);
+        }
+
+        return FitIsotonicCalibration(calSet, calibratedProb);
     }
 
     /// <summary>

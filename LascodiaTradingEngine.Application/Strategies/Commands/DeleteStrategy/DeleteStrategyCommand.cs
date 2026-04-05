@@ -9,13 +9,16 @@ namespace LascodiaTradingEngine.Application.Strategies.Commands.DeleteStrategy;
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>Soft-deletes a strategy by setting its <c>IsDeleted</c> flag.</summary>
 public class DeleteStrategyCommand : IRequest<ResponseData<string>>
 {
+    /// <summary>Strategy identifier (populated from route).</summary>
     [JsonIgnore] public long Id { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>Validates that the strategy Id is a positive value.</summary>
 public class DeleteStrategyCommandValidator : AbstractValidator<DeleteStrategyCommand>
 {
     public DeleteStrategyCommandValidator()
@@ -26,6 +29,7 @@ public class DeleteStrategyCommandValidator : AbstractValidator<DeleteStrategyCo
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Marks the strategy as soft-deleted. Returns not-found if the strategy does not exist.</summary>
 public class DeleteStrategyCommandHandler : IRequestHandler<DeleteStrategyCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

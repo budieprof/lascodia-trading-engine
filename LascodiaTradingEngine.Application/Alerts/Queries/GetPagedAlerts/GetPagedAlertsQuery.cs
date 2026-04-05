@@ -11,19 +11,29 @@ namespace LascodiaTradingEngine.Application.Alerts.Queries.GetPagedAlerts;
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Retrieves a paginated list of alert rules with optional filtering by symbol, type, and active status.
+/// </summary>
 public class GetPagedAlertsQuery : PagerRequestWithFilterType<AlertQueryFilter, ResponseData<PagedData<AlertDto>>>
 {
 }
 
+/// <summary>Filter criteria for the paged alerts query.</summary>
 public class AlertQueryFilter
 {
+    /// <summary>Filter by trading symbol.</summary>
     public string? Symbol    { get; set; }
+    /// <summary>Filter by alert type enum name.</summary>
     public string? AlertType { get; set; }
+    /// <summary>Filter by active/inactive status.</summary>
     public bool?   IsActive  { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Queries alerts with optional symbol, type, and active-status filters, returning paginated results.
+/// </summary>
 public class GetPagedAlertsQueryHandler
     : IRequestHandler<GetPagedAlertsQuery, ResponseData<PagedData<AlertDto>>>
 {

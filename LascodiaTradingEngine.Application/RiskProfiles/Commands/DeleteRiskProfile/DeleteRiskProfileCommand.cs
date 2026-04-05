@@ -8,8 +8,10 @@ namespace LascodiaTradingEngine.Application.RiskProfiles.Commands.DeleteRiskProf
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>Soft-deletes a risk profile. The default risk profile cannot be deleted.</summary>
 public class DeleteRiskProfileCommand : IRequest<ResponseData<string>>
 {
+    /// <summary>The unique identifier of the risk profile to delete.</summary>
     public long Id { get; set; }
 }
 
@@ -25,6 +27,7 @@ public class DeleteRiskProfileCommandValidator : AbstractValidator<DeleteRiskPro
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Marks the risk profile as soft-deleted. Rejects deletion of the default profile.</summary>
 public class DeleteRiskProfileCommandHandler : IRequestHandler<DeleteRiskProfileCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

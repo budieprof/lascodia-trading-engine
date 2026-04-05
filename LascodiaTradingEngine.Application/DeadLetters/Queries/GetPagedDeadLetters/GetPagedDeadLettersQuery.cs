@@ -11,12 +11,14 @@ namespace LascodiaTradingEngine.Application.DeadLetters.Queries.GetPagedDeadLett
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Retrieves a paginated list of dead-lettered events with optional handler, event type, resolution, and date range filters.</summary>
 public class GetPagedDeadLettersQuery : PagerRequestWithFilterType<DeadLetterQueryFilter, ResponseData<PagedData<DeadLetterEventDto>>>
 {
 }
 
 // ── Filter ────────────────────────────────────────────────────────────────────
 
+/// <summary>Filter criteria for the paged dead letters query.</summary>
 public class DeadLetterQueryFilter
 {
     public string?   HandlerName { get; set; }
@@ -28,6 +30,7 @@ public class DeadLetterQueryFilter
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Queries dead letter events ordered by dead-lettered date descending, ignoring global query filters to include all records.</summary>
 public class GetPagedDeadLettersQueryHandler
     : IRequestHandler<GetPagedDeadLettersQuery, ResponseData<PagedData<DeadLetterEventDto>>>
 {

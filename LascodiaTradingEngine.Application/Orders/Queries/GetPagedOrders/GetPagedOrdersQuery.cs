@@ -11,19 +11,25 @@ namespace LascodiaTradingEngine.Application.Orders.Queries.GetPagedOrders;
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Returns a paginated list of orders with optional filtering by symbol, status, and order type.</summary>
 public class GetPagedOrdersQuery : PagerRequestWithFilterType<OrderQueryFilter, ResponseData<PagedData<OrderDto>>>
 {
 }
 
+/// <summary>Filter criteria for the paged orders query.</summary>
 public class OrderQueryFilter
 {
+    /// <summary>Free-text search applied to the Symbol field.</summary>
     public string? Search    { get; set; }
+    /// <summary>Filter by <see cref="OrderStatus"/> enum name.</summary>
     public string? Status    { get; set; }
+    /// <summary>Filter by <see cref="Domain.Enums.OrderType"/> enum name ("Buy" or "Sell").</summary>
     public string? OrderType { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Executes the paged orders query with optional symbol, status, and order-type filters, ordered by creation date descending.</summary>
 public class GetPagedOrdersQueryHandler
     : IRequestHandler<GetPagedOrdersQuery, ResponseData<PagedData<OrderDto>>>
 {

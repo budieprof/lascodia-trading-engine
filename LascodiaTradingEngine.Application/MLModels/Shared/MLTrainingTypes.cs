@@ -1303,7 +1303,14 @@ public record TrainingHyperparams(
     /// training features appear non-stationary (|ρ₁| &gt; 0.97) and <see cref="FracDiffD"/> == 0.
     /// False = log a warning only (default). Enable when feature stationarity is a hard requirement.
     /// </summary>
-    bool QrfStationarityGateEnabled = false
+    bool QrfStationarityGateEnabled = false,
+    /// <summary>
+    /// Minimum number of calibration samples required for isotonic calibration (PAVA).
+    /// Below this threshold, isotonic calibration is skipped entirely to prevent overfitting.
+    /// When the calibration set has between this value and 2x this value, leave-one-out
+    /// cross-validation is used to guard against isotonic overfitting. Default 50.
+    /// </summary>
+    int MinIsotonicCalibrationSamples = 50
     );
 
 // ── Evaluation metrics ────────────────────────────────────────────────────────

@@ -10,13 +10,16 @@ namespace LascodiaTradingEngine.Application.Orders.Commands.DeleteOrder;
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>Soft-deletes an order by setting its <c>IsDeleted</c> flag.</summary>
 public class DeleteOrderCommand : IRequest<ResponseData<string>>
 {
+    /// <summary>Order identifier (populated from route).</summary>
     [JsonIgnore] public long Id { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>Validates that the order Id is a positive value.</summary>
 public class DeleteOrderCommandValidator : AbstractValidator<DeleteOrderCommand>
 {
     public DeleteOrderCommandValidator()
@@ -27,6 +30,7 @@ public class DeleteOrderCommandValidator : AbstractValidator<DeleteOrderCommand>
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Marks the order as soft-deleted. Returns not-found if the order does not exist.</summary>
 public class DeleteOrderCommandHandler : IRequestHandler<DeleteOrderCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

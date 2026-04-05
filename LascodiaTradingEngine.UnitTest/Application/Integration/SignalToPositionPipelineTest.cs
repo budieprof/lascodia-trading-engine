@@ -45,6 +45,7 @@ public class SignalToPositionPipelineTest : IDisposable
     private readonly Mock<IAlertDispatcher> _mockAlertDispatcher;
     private readonly Mock<IIntegrationEventService> _mockEventService;
     private readonly Mock<IDistributedLock> _mockDistributedLock;
+    private readonly Mock<IProcessedEventTracker> _mockProcessedEventTracker;
     private readonly TestMeterFactory _meterFactory;
     private readonly TradingMetrics _metrics;
 
@@ -82,6 +83,7 @@ public class SignalToPositionPipelineTest : IDisposable
         _mockAlertDispatcher = new Mock<IAlertDispatcher>();
         _mockEventService    = new Mock<IIntegrationEventService>();
         _mockDistributedLock = new Mock<IDistributedLock>();
+        _mockProcessedEventTracker = new Mock<IProcessedEventTracker>();
         _meterFactory        = new TestMeterFactory();
         _metrics             = new TradingMetrics(_meterFactory);
 
@@ -111,6 +113,9 @@ public class SignalToPositionPipelineTest : IDisposable
         _mockDistributedLock
             .Setup(l => l.TryAcquireAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(mockHandle.Object);
+        _mockProcessedEventTracker
+            .Setup(t => t.TryMarkAsProcessedAsync(It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true);
 
         // ── SignalOrderBridgeWorker setup ──────────────────────────────────────
 
@@ -127,6 +132,7 @@ public class SignalToPositionPipelineTest : IDisposable
             provider.Setup(p => p.GetService(typeof(IMediator))).Returns(_mockMediator.Object);
             provider.Setup(p => p.GetService(typeof(ISignalValidator))).Returns(_mockSignalValidator.Object);
             provider.Setup(p => p.GetService(typeof(IAlertDispatcher))).Returns(_mockAlertDispatcher.Object);
+            provider.Setup(p => p.GetService(typeof(IProcessedEventTracker))).Returns(_mockProcessedEventTracker.Object);
 
             var mockNewsFilter = new Mock<INewsFilter>();
             mockNewsFilter

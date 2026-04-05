@@ -44,6 +44,13 @@ public class BacktestOptions
     public decimal SpreadPriceUnits { get; set; }
 
     /// <summary>
+    /// Time-varying spread function. When provided, overrides <see cref="SpreadPriceUnits"/>
+    /// on a per-bar basis. Receives the bar's timestamp and returns the spread in price units.
+    /// When null (default), the fixed SpreadPriceUnits is used.
+    /// </summary>
+    public Func<DateTime, decimal>? SpreadFunction { get; set; }
+
+    /// <summary>
     /// Percentage of the gap to apply as additional slippage when a bar opens beyond
     /// SL/TP levels (gap scenario). For example, 0.5 means 50% of the gap is applied.
     /// Defaults to 0 (SL/TP fill at exact level even through gaps).
@@ -121,13 +128,18 @@ public class BacktestEngine : IBacktestEngine
         DateTime      entryTime  = DateTime.MinValue;
         decimal       entrySlippage = 0m;  // slippage incurred on entry
 
-        decimal halfSpread = options.SpreadPriceUnits / 2m;
+        bool useDynamicSpread = options.SpreadFunction != null;
+        decimal fixedHalfSpread = options.SpreadPriceUnits / 2m;
 
         // Walk bar-by-bar
         for (int i = 0; i < candles.Count; i++)
         {
             var bar = candles[i];
             ct.ThrowIfCancellationRequested();
+
+            decimal halfSpread = useDynamicSpread
+                ? Math.Max(0m, options.SpreadFunction!(candles[i].Timestamp)) / 2m
+                : fixedHalfSpread;
 
             // ── Check SL/TP on the current bar if in trade ───────────
             if (inTrade)
@@ -244,7 +256,10 @@ public class BacktestEngine : IBacktestEngine
         if (inTrade && candles.Count > 0)
         {
             var lastBar = candles[candles.Count - 1];
-            decimal exitSlip = options.SlippagePriceUnits + halfSpread;
+            decimal lastHalfSpread = useDynamicSpread
+                ? Math.Max(0m, options.SpreadFunction!(lastBar.Timestamp)) / 2m
+                : fixedHalfSpread;
+            decimal exitSlip = options.SlippagePriceUnits + lastHalfSpread;
             decimal exitPrice = direction == TradeDirection.Buy
                 ? lastBar.Close - exitSlip
                 : lastBar.Close + exitSlip;

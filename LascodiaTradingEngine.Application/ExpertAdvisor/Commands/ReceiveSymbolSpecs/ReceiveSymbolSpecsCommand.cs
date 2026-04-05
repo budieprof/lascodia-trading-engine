@@ -8,26 +8,55 @@ namespace LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ReceiveSymbol
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Receives symbol specification data from an EA instance and upserts CurrencyPair records.
+/// Called during EA startup to synchronise broker-specific contract details (lot sizes, decimal places, etc.)
+/// into the engine's symbol catalogue.
+/// </summary>
 public class ReceiveSymbolSpecsCommand : IRequest<ResponseData<string>>
 {
+    /// <summary>Unique identifier of the EA instance providing the symbol specs.</summary>
     public required string InstanceId { get; set; }
+
+    /// <summary>List of symbol specifications to upsert into the CurrencyPair table.</summary>
     public List<SymbolSpecItem> Specs { get; set; } = new();
 }
 
+/// <summary>
+/// Represents the contract specification for a single trading symbol as reported by MetaTrader 5.
+/// </summary>
 public class SymbolSpecItem
 {
+    /// <summary>Instrument symbol name (e.g. "EURUSD").</summary>
     public required string Symbol     { get; set; }
+
+    /// <summary>Number of decimal places in the price (e.g. 5 for EURUSD = 1.12345).</summary>
     public int    Digits              { get; set; }
+
+    /// <summary>Contract size in base currency units (e.g. 100000 for a standard forex lot).</summary>
     public decimal ContractSize       { get; set; }
+
+    /// <summary>Minimum tradeable volume in lots.</summary>
     public decimal MinVolume          { get; set; }
+
+    /// <summary>Maximum tradeable volume in lots.</summary>
     public decimal MaxVolume          { get; set; }
+
+    /// <summary>Minimum volume increment (lot step).</summary>
     public decimal VolumeStep         { get; set; }
+
+    /// <summary>Base currency of the pair (e.g. "EUR" for EURUSD).</summary>
     public string  BaseCurrency       { get; set; } = string.Empty;
+
+    /// <summary>Quote currency of the pair (e.g. "USD" for EURUSD).</summary>
     public string  QuoteCurrency      { get; set; } = string.Empty;
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Validates that InstanceId is non-empty and at least one symbol spec is provided.
+/// </summary>
 public class ReceiveSymbolSpecsCommandValidator : AbstractValidator<ReceiveSymbolSpecsCommand>
 {
     public ReceiveSymbolSpecsCommandValidator()
@@ -42,6 +71,11 @@ public class ReceiveSymbolSpecsCommandValidator : AbstractValidator<ReceiveSymbo
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Handles symbol spec ingestion. For each spec, upserts the CurrencyPair record — updating
+/// decimal places, contract size, lot constraints, and currencies for existing symbols, or
+/// creating a new active CurrencyPair for unknown symbols.
+/// </summary>
 public class ReceiveSymbolSpecsCommandHandler : IRequestHandler<ReceiveSymbolSpecsCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

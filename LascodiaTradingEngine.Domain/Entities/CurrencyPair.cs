@@ -74,6 +74,22 @@ public class CurrencyPair : Entity<long>
     /// </summary>
     public bool   IsActive      { get; set; } = true;
 
+    /// <summary>
+    /// JSON-encoded trading hours for this instrument (e.g. <c>{"mon":"00:05-23:55","sat":"closed"}</c>).
+    /// Used by the StrategyGenerationWorker to adjust candle staleness checks for instruments
+    /// with non-standard trading sessions (e.g. XAUUSD trades Sunday 23:00 UTC, US indices
+    /// have a 17:00-18:00 ET daily break). Null means 24/5 FX default schedule.
+    /// </summary>
+    public string? TradingHoursJson { get; set; }
+
+    /// <summary>
+    /// Average spread for this instrument in broker points (not pips).
+    /// Populated by the EA via <c>ReceiveSymbolSpecsCommand</c> from the broker's
+    /// spread data. Used by the OptimizationWorker for symbol-specific transaction
+    /// cost modelling. Zero means no spread data available (falls back to config default).
+    /// </summary>
+    public double SpreadPoints   { get; set; }
+
     /// <summary>Soft-delete flag. Filtered out by the global EF Core query filter.</summary>
     public bool   IsDeleted     { get; set; }
 }

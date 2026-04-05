@@ -9,6 +9,10 @@ using LascodiaTradingEngine.Application.EngineConfiguration.Queries.GetAllEngine
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
+/// <summary>
+/// Manages runtime engine configuration key-value entries with upsert and retrieval.
+/// Route: api/v1/lascodia-trading-engine/config
+/// </summary>
 [Route("api/v1/lascodia-trading-engine/config")]
 [ApiController]
 public class EngineConfigurationController : AuthControllerBase<EngineConfigurationController>

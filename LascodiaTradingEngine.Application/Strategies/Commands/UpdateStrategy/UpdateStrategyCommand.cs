@@ -10,21 +10,31 @@ namespace LascodiaTradingEngine.Application.Strategies.Commands.UpdateStrategy;
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>Partially updates an existing strategy. Only non-null fields are applied.</summary>
 public class UpdateStrategyCommand : IRequest<ResponseData<string>>
 {
+    /// <summary>Strategy identifier (populated from route).</summary>
     [JsonIgnore] public long Id { get; set; }
 
+    /// <summary>Updated strategy name.</summary>
     public string? Name           { get; set; }
+    /// <summary>Updated description.</summary>
     public string? Description    { get; set; }
+    /// <summary>Updated strategy type enum name.</summary>
     public string? StrategyType   { get; set; }
+    /// <summary>Updated currency pair symbol.</summary>
     public string? Symbol         { get; set; }
+    /// <summary>Updated candle timeframe.</summary>
     public string? Timeframe      { get; set; }
+    /// <summary>Updated JSON-serialized strategy parameters.</summary>
     public string? ParametersJson { get; set; }
+    /// <summary>Updated risk profile assignment.</summary>
     public long?   RiskProfileId  { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>Validates that the Id is present and optional fields have valid enum values when provided.</summary>
 public class UpdateStrategyCommandValidator : AbstractValidator<UpdateStrategyCommand>
 {
     private static readonly string[] ValidStrategyTypes = ["MovingAverageCrossover", "RSIReversion", "BreakoutScalper", "Custom"];
@@ -58,6 +68,7 @@ public class UpdateStrategyCommandValidator : AbstractValidator<UpdateStrategyCo
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Applies partial updates to an existing strategy entity. Returns not-found if the strategy does not exist.</summary>
 public class UpdateStrategyCommandHandler : IRequestHandler<UpdateStrategyCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

@@ -82,11 +82,12 @@ public class StrategyHealthWorker : BackgroundService
     private const int DefaultRebalanceDays = 7;
 
     /// <summary>
-    /// In-process timestamp of the last successful ensemble rebalance. Reset to
-    /// <see cref="DateTime.MinValue"/> on worker restart, causing an immediate rebalance
-    /// on the first post-restart cycle.
+    /// In-process timestamp of the last successful ensemble rebalance. Initialised from
+    /// the persisted <c>StrategyHealth:LastRebalancedAtUtc</c> config key on first use
+    /// to avoid redundant rebalance churn on restart.
     /// </summary>
     private DateTime _lastRebalancedAt = DateTime.MinValue;
+    private bool _lastRebalancedAtLoaded;
 
     /// <summary>Max backoff delay on consecutive failures (5 minutes).</summary>
     private static readonly TimeSpan MaxBackoff = TimeSpan.FromMinutes(5);
@@ -179,6 +180,22 @@ public class StrategyHealthWorker : BackgroundService
         }
         catch { /* use default */ }
 
+        // Hydrate from persisted config on first access to avoid restart-triggered rebalance churn
+        if (!_lastRebalancedAtLoaded)
+        {
+            _lastRebalancedAtLoaded = true;
+            try
+            {
+                using var loadScope = _scopeFactory.CreateScope();
+                var loadCtx = loadScope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+                var persisted = await GetConfigAsync<string>(loadCtx, "StrategyHealth:LastRebalancedAtUtc", "", ct);
+                if (DateTime.TryParse(persisted, System.Globalization.CultureInfo.InvariantCulture,
+                        System.Globalization.DateTimeStyles.RoundtripKind, out var parsed))
+                    _lastRebalancedAt = parsed;
+            }
+            catch { /* use in-memory default */ }
+        }
+
         if (DateTime.UtcNow - _lastRebalancedAt < TimeSpan.FromDays(rebalanceDays))
             return;
 
@@ -186,10 +203,15 @@ public class StrategyHealthWorker : BackgroundService
         {
             using var scope  = _scopeFactory.CreateScope();
             var mediator     = scope.ServiceProvider.GetRequiredService<IMediator>();
+            var writeCtx     = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
 
             _logger.LogInformation("StrategyHealthWorker: triggering scheduled weekly ensemble rebalance");
             await mediator.Send(new RebalanceEnsembleCommand(), ct);
             _lastRebalancedAt = DateTime.UtcNow;
+
+            // Persist so the next restart doesn't immediately retrigger
+            await UpsertConfigAsync(writeCtx, "StrategyHealth:LastRebalancedAtUtc",
+                _lastRebalancedAt.ToString("O", System.Globalization.CultureInfo.InvariantCulture), ct);
 
             _logger.LogInformation("StrategyHealthWorker: weekly ensemble rebalance completed");
         }
@@ -387,16 +409,14 @@ public class StrategyHealthWorker : BackgroundService
 
         decimal totalPnL = pnlList.Sum();
 
-        // ── Health score ──────────────────────────────────────────────────────
-        // Formula: 0.4*WinRate + 0.3*min(1, PF/2) + 0.3*max(0, 1 - MaxDrawdownPct/20)
-        //   Win rate term (40 %): rewards strategies that win more often than they lose.
-        //   Profit factor term (30 %): rewards strategies with a high reward-risk ratio.
-        //   Drawdown term (30 %): penalises strategies that experience deep drawdowns;
-        //     the penalty reaches its maximum (contributing 0) at 20 % drawdown.
-        decimal healthScore =
-            0.4m * winRate
-            + 0.3m * Math.Min(1m, profitFactor / 2m)
-            + 0.3m * Math.Max(0m, 1m - maxDrawdown / 20m);
+        // ── Health score (5-factor, aligned with OptimizationWorker) ─────────
+        // Formula: 0.25*WinRate + 0.20*min(1, PF/2) + 0.20*max(0, 1 - DD/20) + 0.15*min(1, max(0, Sharpe)/2) + 0.20*min(1, Trades/50)
+        //   Win rate (25%): rewards strategies that win more often than they lose.
+        //   Profit factor (20%): rewards strategies with a high reward-risk ratio.
+        //   Drawdown (20%): penalises deep drawdowns; zero contribution at 20%.
+        //   Sharpe (15%): rewards consistency of returns; capped at Sharpe = 2.0.
+        //   Sample size (20%): penalises too-few-trades — noise vs edge.
+        decimal healthScore = Optimization.OptimizationHealthScorer.ComputeHealthScore(winRate, profitFactor, maxDrawdown, sharpe, totalTrades);
 
         // Classify into three bands used to drive automated responses.
         StrategyHealthStatus healthStatus = healthScore >= 0.6m ? StrategyHealthStatus.Healthy
@@ -519,5 +539,25 @@ public class StrategyHealthWorker : BackgroundService
 
         try   { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
         catch { return defaultValue; }
+    }
+
+    private static async Task UpsertConfigAsync(
+        IWriteApplicationDbContext writeCtx, string key, string value, CancellationToken ct)
+    {
+        var db = writeCtx.GetDbContext();
+        int rows = await db.Set<EngineConfig>()
+            .Where(c => c.Key == key)
+            .ExecuteUpdateAsync(s => s.SetProperty(c => c.Value, value), ct);
+
+        if (rows == 0)
+        {
+            db.Set<EngineConfig>().Add(new EngineConfig
+            {
+                Key      = key,
+                Value    = value,
+                DataType = ConfigDataType.String,
+            });
+            await writeCtx.SaveChangesAsync(ct);
+        }
     }
 }

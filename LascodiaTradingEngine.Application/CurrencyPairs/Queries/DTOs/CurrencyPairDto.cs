@@ -5,6 +5,7 @@ using LascodiaTradingEngine.Domain.Entities;
 
 namespace LascodiaTradingEngine.Application.CurrencyPairs.Queries.DTOs;
 
+/// <summary>Data transfer object for a tradable currency pair including symbol specifications and lot constraints.</summary>
 public class CurrencyPairDto : IMapFrom<CurrencyPair>
 {
     public long    Id             { get; set; }

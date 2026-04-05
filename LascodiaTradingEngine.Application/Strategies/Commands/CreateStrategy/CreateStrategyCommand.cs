@@ -9,19 +9,30 @@ namespace LascodiaTradingEngine.Application.Strategies.Commands.CreateStrategy;
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Creates a new trading strategy in Paused status with the specified type, symbol, and timeframe.
+/// </summary>
 public class CreateStrategyCommand : IRequest<ResponseData<long>>
 {
+    /// <summary>Human-readable strategy name.</summary>
     public required string Name           { get; set; }
+    /// <summary>Detailed description of the strategy logic.</summary>
     public required string Description    { get; set; }
+    /// <summary>Strategy type: MovingAverageCrossover, RSIReversion, BreakoutScalper, or Custom.</summary>
     public required string StrategyType   { get; set; }
+    /// <summary>Currency pair symbol the strategy trades.</summary>
     public required string Symbol         { get; set; }
+    /// <summary>Candle timeframe: M1, M5, M15, H1, H4, or D1.</summary>
     public required string Timeframe      { get; set; }
+    /// <summary>JSON-serialized strategy-specific parameters.</summary>
     public string          ParametersJson { get; set; } = "{}";
+    /// <summary>Optional risk profile to assign to the strategy.</summary>
     public long?           RiskProfileId  { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>Validates strategy name, description, type, symbol, and timeframe against allowed values.</summary>
 public class CreateStrategyCommandValidator : AbstractValidator<CreateStrategyCommand>
 {
     private static readonly string[] ValidStrategyTypes = ["MovingAverageCrossover", "RSIReversion", "BreakoutScalper", "Custom"];
@@ -54,6 +65,7 @@ public class CreateStrategyCommandValidator : AbstractValidator<CreateStrategyCo
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Persists a new strategy entity in Paused status with the supplied configuration.</summary>
 public class CreateStrategyCommandHandler : IRequestHandler<CreateStrategyCommand, ResponseData<long>>
 {
     private readonly IWriteApplicationDbContext _context;

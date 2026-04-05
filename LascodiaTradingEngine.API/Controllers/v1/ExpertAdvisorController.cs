@@ -24,6 +24,11 @@ using Microsoft.AspNetCore.RateLimiting;
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
+/// <summary>
+/// Handles all MQL5 Expert Advisor integration: instance registration, heartbeats, symbol specs,
+/// position/order/deal snapshots, reconciliation, signal feedback, and pending command retrieval.
+/// Rate-limited per EA instance. Route: api/v1/lascodia-trading-engine/ea
+/// </summary>
 [Route("api/v1/lascodia-trading-engine/ea")]
 [ApiController]
 [EnableRateLimiting("ea")]

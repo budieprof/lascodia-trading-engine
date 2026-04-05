@@ -6,6 +6,7 @@ using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.StrategyFeedback.Queries.DTOs;
 
+/// <summary>Data transfer object for an optimization run including parameters, scores, and approval status.</summary>
 public class OptimizationRunDto : IMapFrom<OptimizationRun>
 {
     public long                  Id                     { get; set; }
@@ -17,6 +18,10 @@ public class OptimizationRunDto : IMapFrom<OptimizationRun>
     public decimal?  BestHealthScore        { get; set; }
     public string?   BaselineParametersJson { get; set; }
     public decimal?  BaselineHealthScore    { get; set; }
+    public string?   ConfigSnapshotJson     { get; set; }
+    public string?   RunMetadataJson        { get; set; }
+    public string?   ApprovalReportJson     { get; set; }
+    public int       DeterministicSeed      { get; set; }
     public string?   ErrorMessage           { get; set; }
     public DateTime  StartedAt              { get; set; }
     public DateTime? CompletedAt            { get; set; }

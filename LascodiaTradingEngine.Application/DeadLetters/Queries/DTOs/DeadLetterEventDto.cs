@@ -5,6 +5,7 @@ using LascodiaTradingEngine.Domain.Entities;
 
 namespace LascodiaTradingEngine.Application.DeadLetters.Queries.DTOs;
 
+/// <summary>Data transfer object for a dead-lettered integration event including handler, payload, error, and resolution status.</summary>
 public class DeadLetterEventDto : IMapFrom<DeadLetterEvent>
 {
     public long     Id             { get; set; }

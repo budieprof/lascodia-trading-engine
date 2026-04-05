@@ -9,18 +9,29 @@ namespace LascodiaTradingEngine.Application.Orders.Commands.UpdateOrderStatus;
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Transitions an order to a new status and optionally updates broker-side fill details.
+/// Used by internal workers to reflect execution outcomes.
+/// </summary>
 public class UpdateOrderStatusCommand : IRequest<ResponseData<string>>
 {
+    /// <summary>Order identifier.</summary>
     public long    Id             { get; set; }
+    /// <summary>Target <see cref="OrderStatus"/> as a string enum name.</summary>
     public string  Status         { get; set; } = string.Empty;
+    /// <summary>Broker-assigned order ticket (e.g. MT5 ticket number).</summary>
     public string? BrokerOrderId  { get; set; }
+    /// <summary>Actual fill price from the broker.</summary>
     public decimal? FilledPrice   { get; set; }
+    /// <summary>Actual filled quantity from the broker.</summary>
     public decimal? FilledQuantity { get; set; }
+    /// <summary>Reason the order was rejected, if applicable.</summary>
     public string? RejectionReason { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>Validates that Id is positive and Status is a valid <see cref="OrderStatus"/> enum name.</summary>
 public class UpdateOrderStatusCommandValidator : AbstractValidator<UpdateOrderStatusCommand>
 {
     public UpdateOrderStatusCommandValidator()
@@ -35,6 +46,7 @@ public class UpdateOrderStatusCommandValidator : AbstractValidator<UpdateOrderSt
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Applies the status transition and updates fill details (price, quantity, timestamp) when provided.</summary>
 public class UpdateOrderStatusCommandHandler : IRequestHandler<UpdateOrderStatusCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

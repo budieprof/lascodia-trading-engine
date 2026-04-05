@@ -9,6 +9,7 @@ namespace LascodiaTradingEngine.Application.CurrencyPairs.Commands.UpdateCurrenc
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>Updates all fields of an existing currency pair including symbol specification and active status.</summary>
 public class UpdateCurrencyPairCommand : IRequest<ResponseData<string>>
 {
     [JsonIgnore]
@@ -56,6 +57,7 @@ public class UpdateCurrencyPairCommandValidator : AbstractValidator<UpdateCurren
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Applies a full update to the currency pair entity with uppercase-normalised values.</summary>
 public class UpdateCurrencyPairCommandHandler : IRequestHandler<UpdateCurrencyPairCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

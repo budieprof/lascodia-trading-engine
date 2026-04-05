@@ -8,12 +8,17 @@ namespace LascodiaTradingEngine.Application.PerformanceAttribution.Queries.GetAl
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Retrieves performance attribution data for all active strategies using their latest performance snapshots.</summary>
 public class GetAllAttributionsQuery : IRequest<ResponseData<List<PerformanceAttributionDto>>>
 {
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Loads all active strategies and their latest performance snapshots, then computes
+/// per-strategy attribution metrics including win rate, PnL, Sharpe ratio, and max drawdown.
+/// </summary>
 public class GetAllAttributionsQueryHandler
     : IRequestHandler<GetAllAttributionsQuery, ResponseData<List<PerformanceAttributionDto>>>
 {

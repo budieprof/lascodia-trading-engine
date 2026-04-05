@@ -13,6 +13,10 @@ using LascodiaTradingEngine.Application.TradeSignals.Queries.GetPendingExecution
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
+/// <summary>
+/// Manages trade signal workflow: approval, rejection, expiry, and pending-execution queries for EA consumption.
+/// Route: api/v1/lascodia-trading-engine/trade-signal
+/// </summary>
 [Route("api/v1/lascodia-trading-engine/trade-signal")]
 [ApiController]
 public class TradeSignalController : AuthControllerBase<TradeSignalController>

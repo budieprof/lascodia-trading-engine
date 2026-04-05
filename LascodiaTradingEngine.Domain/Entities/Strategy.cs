@@ -83,6 +83,42 @@ public class Strategy : Entity<long>
     /// </summary>
     public decimal? EstimatedCapacityLots { get; set; }
 
+    // ── Gradual parameter rollout ─────────────────────────────────────────────
+
+    /// <summary>
+    /// Percentage of signals that use the new (optimized) parameters. Starts at 25% after
+    /// auto-approval and ramps to 100% after N successful signals. When null or 100, all
+    /// signals use the current <see cref="ParametersJson"/>.
+    /// </summary>
+    public int? RolloutPct { get; set; }
+
+    /// <summary>
+    /// Snapshot of the pre-optimization parameters. Used for rollback if the new params
+    /// underperform during the gradual rollout window. Null when no rollout is active.
+    /// </summary>
+    public string? RollbackParametersJson { get; set; }
+
+    /// <summary>
+    /// UTC timestamp when the current gradual rollout started. Used to enforce the
+    /// observation window and trigger automatic rollback if performance degrades.
+    /// </summary>
+    public DateTime? RolloutStartedAt { get; set; }
+
+    /// <summary>
+    /// ID of the optimization run that triggered the current rollout. Links the rollout
+    /// to its approval context for audit trail.
+    /// </summary>
+    public long? RolloutOptimizationRunId { get; set; }
+
+    // ── Screening metadata (auto-generated strategies) ───────────────────────
+
+    /// <summary>
+    /// Structured screening metrics serialised as JSON. Populated by the StrategyGenerationWorker
+    /// for auto-generated strategies. Contains IS/OOS metrics, equity R², Monte Carlo p-value,
+    /// walk-forward results, and generation context. Null for manually created strategies.
+    /// </summary>
+    public string? ScreeningMetricsJson { get; set; }
+
     /// <summary>Soft-delete flag. Filtered out by the global EF Core query filter.</summary>
     public bool    IsDeleted     { get; set; }
 

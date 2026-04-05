@@ -36,7 +36,7 @@ namespace LascodiaTradingEngine.Application.Workers;
 /// Config keys (EngineConfig, all hot-reloadable):
 /// <list type="bullet">
 ///   <item><description><c>ExecQuality:PollIntervalMinutes</c> — default 15</description></item>
-///   <item><description><c>ExecQuality:WindowFills</c> — default 20 (minimum fills required)</description></item>
+///   <item><description><c>ExecQuality:WindowFills</c> — default 50 (minimum fills required for statistical significance)</description></item>
 ///   <item><description><c>ExecQuality:MaxAvgSlippagePips</c> — default 3.0</description></item>
 ///   <item><description><c>ExecQuality:MaxAvgLatencyMs</c> — default 2000</description></item>
 ///   <item><description><c>ExecQuality:AutoPauseEnabled</c> — default true</description></item>
@@ -74,6 +74,7 @@ public sealed class ExecutionQualityCircuitBreakerWorker : BackgroundService
     /// effectively putting it into observation-only mode.
     /// </summary>
     private const string CK_AutoPause    = "ExecQuality:AutoPauseEnabled";
+    private const string CK_HysteresisMargin = "ExecQuality:HysteresisMarginPct";
 
     private readonly IServiceScopeFactory                              _scopeFactory;
     private readonly ILogger<ExecutionQualityCircuitBreakerWorker>     _logger;
@@ -125,14 +126,15 @@ public sealed class ExecutionQualityCircuitBreakerWorker : BackgroundService
 
                 // Read all thresholds from EngineConfig — hot-reloadable without restart.
                 pollMins            = await GetConfigAsync<int>   (ctx, CK_PollMins,    15,   stoppingToken);
-                int    windowFills  = await GetConfigAsync<int>   (ctx, CK_WindowFills, 20,   stoppingToken);
+                int    windowFills  = await GetConfigAsync<int>   (ctx, CK_WindowFills, 50,   stoppingToken);
                 double maxSlippage  = await GetConfigAsync<double>(ctx, CK_MaxSlippage, 3.0,  stoppingToken);
                 double maxLatencyMs = await GetConfigAsync<double>(ctx, CK_MaxLatencyMs,2000, stoppingToken);
                 bool   autoPause    = await GetConfigAsync<bool>  (ctx, CK_AutoPause,   true, stoppingToken);
+                double hysteresisMargin = await GetConfigAsync<double>(ctx, CK_HysteresisMargin, 0.20, stoppingToken);
 
                 await CheckAllStrategiesAsync(
                     ctx, writeCtx, mediator,
-                    windowFills, maxSlippage, maxLatencyMs, autoPause,
+                    windowFills, maxSlippage, maxLatencyMs, autoPause, hysteresisMargin,
                     stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
@@ -174,6 +176,7 @@ public sealed class ExecutionQualityCircuitBreakerWorker : BackgroundService
         double                                  maxSlippage,
         double                                  maxLatencyMs,
         bool                                    autoPause,
+        double                                  hysteresisMargin,
         CancellationToken                       ct)
     {
         // Only evaluate strategies that have at least one execution quality log.
@@ -197,7 +200,7 @@ public sealed class ExecutionQualityCircuitBreakerWorker : BackgroundService
             ct.ThrowIfCancellationRequested();
             await CheckStrategyAsync(
                 strategyId, readCtx, writeCtx, mediator,
-                windowFills, maxSlippage, maxLatencyMs, autoPause, ct);
+                windowFills, maxSlippage, maxLatencyMs, autoPause, hysteresisMargin, ct);
         }
     }
 
@@ -243,6 +246,7 @@ public sealed class ExecutionQualityCircuitBreakerWorker : BackgroundService
         double                                  maxSlippage,
         double                                  maxLatencyMs,
         bool                                    autoPause,
+        double                                  hysteresisMargin,
         CancellationToken                       ct)
     {
         // Load the most recent N fills for this strategy, ordered newest-first.
@@ -272,9 +276,48 @@ public sealed class ExecutionQualityCircuitBreakerWorker : BackgroundService
         bool slippageBreached = avgSlippage  > maxSlippage;
         bool latencyBreached  = avgLatency   > maxLatencyMs;
 
+        // Hysteresis: if a strategy was previously paused by this circuit breaker and
+        // its metrics have recovered below the recovery threshold (trip - margin),
+        // auto-resume it. This prevents flapping where metrics oscillate around the
+        // threshold boundary. E.g., with maxSlippage=3.0 and margin=0.20, the strategy
+        // trips at >3.0 but only recovers when avgSlippage drops below 2.4 (3.0 * 0.80).
+        double slippageRecovery = maxSlippage * (1.0 - hysteresisMargin);
+        double latencyRecovery  = maxLatencyMs * (1.0 - hysteresisMargin);
+
         if (!slippageBreached && !latencyBreached)
         {
-            // Both metrics within acceptable bounds — no action needed.
+            // Check if this strategy was paused by circuit breaker and has now recovered
+            // below the hysteresis recovery threshold — auto-resume it.
+            bool fullyRecovered = avgSlippage <= slippageRecovery && avgLatency <= latencyRecovery;
+            if (fullyRecovered && autoPause)
+            {
+                int resumed = await writeCtx.Set<Strategy>()
+                    .Where(s => s.Id == strategyId && s.Status == StrategyStatus.Paused && !s.IsDeleted)
+                    .ExecuteUpdateAsync(s => s
+                        .SetProperty(x => x.Status, StrategyStatus.Active),
+                        ct);
+
+                if (resumed > 0)
+                {
+                    _logger.LogInformation(
+                        "ExecQualityCircuitBreaker: strategy {Id} AUTO-RESUMED — metrics recovered below hysteresis threshold " +
+                        "(avgSlippage={Slip:F2} <= {SlipRecovery:F2}, avgLatency={Lat:F0} <= {LatRecovery:F0})",
+                        strategyId, avgSlippage, slippageRecovery, avgLatency, latencyRecovery);
+
+                    await mediator.Send(new LogDecisionCommand
+                    {
+                        EntityType   = "Strategy",
+                        EntityId     = strategyId,
+                        DecisionType = "ExecQualityRecovery",
+                        Outcome      = "Resumed",
+                        Reason       = $"Metrics recovered: avgSlippage={avgSlippage:F2} pips <= {slippageRecovery:F2}, " +
+                                       $"avgLatency={avgLatency:F0} ms <= {latencyRecovery:F0} " +
+                                       $"(hysteresis margin={hysteresisMargin:P0})",
+                        Source       = "ExecutionQualityCircuitBreakerWorker"
+                    }, ct);
+                }
+            }
+
             _logger.LogDebug(
                 "ExecQualityCircuitBreaker: strategy {Id} OK — avgSlippage={Slip:F2} pips, avgLatency={Lat:F0} ms.",
                 strategyId, avgSlippage, avgLatency);

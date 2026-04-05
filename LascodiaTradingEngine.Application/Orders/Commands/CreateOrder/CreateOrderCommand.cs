@@ -10,24 +10,41 @@ namespace LascodiaTradingEngine.Application.Orders.Commands.CreateOrder;
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Creates a new trading order with the specified parameters. The order is persisted
+/// in Pending status and an <see cref="OrderCreatedIntegrationEvent"/> is published.
+/// </summary>
 public class CreateOrderCommand : IRequest<ResponseData<long>>
 {
+    /// <summary>Optional originating trade signal identifier.</summary>
     public long?   TradeSignalId  { get; set; }
+    /// <summary>Strategy that generated this order.</summary>
     public long    StrategyId     { get; set; }
+    /// <summary>Trading account under which the order is placed.</summary>
     public long    TradingAccountId { get; set; }
+    /// <summary>Currency pair symbol (e.g. "EURUSD").</summary>
     public required string Symbol { get; set; }
+    /// <summary>Trade direction: "Buy" or "Sell".</summary>
     public required string OrderType { get; set; }    // "Buy" | "Sell"
+    /// <summary>Execution method: "Market", "Limit", "Stop", or "StopLimit".</summary>
     public string  ExecutionType  { get; set; } = "Market";  // "Market" | "Limit" | "Stop" | "StopLimit"
+    /// <summary>Order lot size / quantity.</summary>
     public decimal Quantity       { get; set; }
+    /// <summary>Requested price. Zero for Market orders.</summary>
     public decimal Price          { get; set; }  // 0 for Market orders
+    /// <summary>Optional stop-loss price level.</summary>
     public decimal? StopLoss      { get; set; }
+    /// <summary>Optional take-profit price level.</summary>
     public decimal? TakeProfit    { get; set; }
+    /// <summary>Whether this is a paper-trading (simulated) order.</summary>
     public bool    IsPaper        { get; set; }
+    /// <summary>Free-text notes attached to the order.</summary>
     public string? Notes          { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>Validates <see cref="CreateOrderCommand"/> inputs including symbol, order type, execution type, quantity, and price constraints.</summary>
 public class CreateOrderCommandValidator : AbstractValidator<CreateOrderCommand>
 {
     public CreateOrderCommandValidator()
@@ -60,6 +77,7 @@ public class CreateOrderCommandValidator : AbstractValidator<CreateOrderCommand>
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Persists a new order in Pending status and publishes an <see cref="OrderCreatedIntegrationEvent"/> via the event bus.</summary>
 public class CreateOrderCommandHandler : IRequestHandler<CreateOrderCommand, ResponseData<long>>
 {
     private readonly IWriteApplicationDbContext _context;

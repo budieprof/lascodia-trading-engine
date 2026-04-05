@@ -15,6 +15,11 @@ using LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ReceiveCandleBack
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
+/// <summary>
+/// Provides market data access: live prices, candle queries, tick batch ingestion from EA instances,
+/// and candle backfill for historical data initialization.
+/// Route: api/v1/lascodia-trading-engine/market-data
+/// </summary>
 [Route("api/v1/lascodia-trading-engine/market-data")]
 [ApiController]
 public class MarketDataController : AuthControllerBase<MarketDataController>

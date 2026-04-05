@@ -12,11 +12,19 @@ namespace LascodiaTradingEngine.Application.TradingAccounts.Commands.LoginTradin
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Authenticates a trading account. Web logins require a password; EA logins authenticate
+/// via API key (plaintext or server-encrypted blob). Returns a JWT scoped to the account.
+/// </summary>
 public class LoginTradingAccountCommand : IRequest<ResponseData<AuthTokenResult>>
 {
+    /// <summary>The broker-assigned account identifier.</summary>
     public required string AccountId    { get; set; }
+    /// <summary>The broker server address for account lookup.</summary>
     public required string BrokerServer { get; set; }
+    /// <summary>Password for web login (required when LoginSource is "web").</summary>
     public string?         Password     { get; set; }
+    /// <summary>Plaintext API key for EA login.</summary>
     public string?         ApiKey       { get; set; }
     /// <summary>
     /// Server-encrypted API key blob. The EA can send this instead of the plain-text
@@ -47,6 +55,10 @@ public class LoginTradingAccountCommandValidator : AbstractValidator<LoginTradin
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Validates credentials (password for web, API key or encrypted blob for EA), checks
+/// account active status, generates a JWT token, and optionally includes bridge endpoint info.
+/// </summary>
 public class LoginTradingAccountCommandHandler : IRequestHandler<LoginTradingAccountCommand, ResponseData<AuthTokenResult>>
 {
     private readonly IReadApplicationDbContext _context;

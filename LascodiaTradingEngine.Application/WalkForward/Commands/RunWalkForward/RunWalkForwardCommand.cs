@@ -8,6 +8,10 @@ namespace LascodiaTradingEngine.Application.WalkForward.Commands.RunWalkForward;
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Queues a walk-forward analysis run that divides the date range into in-sample/out-of-sample
+/// windows and evaluates strategy robustness. Executed asynchronously by the <c>WalkForwardWorker</c>.
+/// </summary>
 public class RunWalkForwardCommand : IRequest<ResponseData<long>>
 {
     public long     StrategyId       { get; set; }
@@ -48,6 +52,7 @@ public class RunWalkForwardCommandValidator : AbstractValidator<RunWalkForwardCo
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Creates a new walk-forward run entity with Queued status for asynchronous processing.</summary>
 public class RunWalkForwardCommandHandler : IRequestHandler<RunWalkForwardCommand, ResponseData<long>>
 {
     private readonly IWriteApplicationDbContext _context;

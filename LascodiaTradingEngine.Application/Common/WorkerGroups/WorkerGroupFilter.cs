@@ -36,6 +36,7 @@ public static class WorkerGroupFilter
     [
         typeof(RegimeDetectionWorker),
         typeof(SentimentWorker),
+        typeof(NewsSentimentWorker),
         typeof(COTDataWorker),
         typeof(EconomicCalendarWorker),
     ];
@@ -62,7 +63,7 @@ public static class WorkerGroupFilter
         typeof(MLTrainingDataFreshnessWorker),
         typeof(MLTransferLearningWorker),
         typeof(MLModelDistillationWorker),
-        typeof(MLMamlMetaLearnerWorker),
+        typeof(MLAverageWeightInitWorker),
         typeof(MLOnlineLearningWorker),
         typeof(MLPredictionLogPruningWorker),
     ];

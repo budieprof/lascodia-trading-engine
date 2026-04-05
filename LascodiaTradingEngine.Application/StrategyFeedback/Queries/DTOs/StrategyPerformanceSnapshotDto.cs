@@ -5,6 +5,7 @@ using LascodiaTradingEngine.Domain.Entities;
 
 namespace LascodiaTradingEngine.Application.StrategyFeedback.Queries.DTOs;
 
+/// <summary>Data transfer object for a strategy performance snapshot including trade stats, Sharpe ratio, and health score.</summary>
 public class StrategyPerformanceSnapshotDto : IMapFrom<StrategyPerformanceSnapshot>
 {
     public long     Id             { get; set; }

@@ -10,11 +10,14 @@ namespace LascodiaTradingEngine.Application.TradingAccounts.Commands.RotateApiKe
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>Generates a new 64-character API key for a trading account, invalidating the previous key.</summary>
 public class RotateApiKeyCommand : IRequest<ResponseData<RotateApiKeyResult>>
 {
+    /// <summary>The unique identifier of the trading account.</summary>
     public long Id { get; set; }
 }
 
+/// <summary>Result containing the new plaintext API key and its encrypted blob for secure storage.</summary>
 public class RotateApiKeyResult
 {
     public string ApiKey { get; set; } = string.Empty;
@@ -33,6 +36,10 @@ public class RotateApiKeyCommandValidator : AbstractValidator<RotateApiKeyComman
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Validates caller ownership, generates a new random API key, encrypts it with AES-256-GCM,
+/// and returns both the plaintext key and encrypted blob.
+/// </summary>
 public class RotateApiKeyCommandHandler : IRequestHandler<RotateApiKeyCommand, ResponseData<RotateApiKeyResult>>
 {
     private readonly IWriteApplicationDbContext _context;

@@ -11,15 +11,32 @@ namespace LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ReceiveOrderB
 /// </summary>
 public class ReceiveOrderBookSnapshotCommand : IRequest<ResponseData<long>>
 {
+    /// <summary>Instrument symbol (e.g. "EURUSD").</summary>
     public string Symbol { get; set; } = string.Empty;
+
+    /// <summary>Best bid price at the time of capture.</summary>
     public decimal BidPrice { get; set; }
+
+    /// <summary>Best ask price at the time of capture.</summary>
     public decimal AskPrice { get; set; }
+
+    /// <summary>Total volume available at the best bid level.</summary>
     public decimal BidVolume { get; set; }
+
+    /// <summary>Total volume available at the best ask level.</summary>
     public decimal AskVolume { get; set; }
+
+    /// <summary>EA instance that captured this order book snapshot.</summary>
     public string InstanceId { get; set; } = string.Empty;
+
+    /// <summary>Optional idempotency key to prevent duplicate snapshots.</summary>
     public string? IdempotencyKey { get; set; }
 }
 
+/// <summary>
+/// Validates Symbol (non-empty, max 10 chars), positive Bid/Ask prices, non-negative volumes,
+/// and non-empty InstanceId (max 100 chars).
+/// </summary>
 public class ReceiveOrderBookSnapshotCommandValidator : AbstractValidator<ReceiveOrderBookSnapshotCommand>
 {
     public ReceiveOrderBookSnapshotCommandValidator()
@@ -33,6 +50,10 @@ public class ReceiveOrderBookSnapshotCommandValidator : AbstractValidator<Receiv
     }
 }
 
+/// <summary>
+/// Handles order book snapshot persistence. Creates an OrderBookSnapshot record with the top-of-book
+/// data, calculated spread, and capture timestamp. Used for liquidity assessment by risk management.
+/// </summary>
 public class ReceiveOrderBookSnapshotCommandHandler : IRequestHandler<ReceiveOrderBookSnapshotCommand, ResponseData<long>>
 {
     private readonly IWriteApplicationDbContext _context;

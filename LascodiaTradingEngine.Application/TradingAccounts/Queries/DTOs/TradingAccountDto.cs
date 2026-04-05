@@ -6,6 +6,7 @@ using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.TradingAccounts.Queries.DTOs;
 
+/// <summary>Data transfer object for a trading account including balance, margin, and broker details. Excludes sensitive credentials.</summary>
 public class TradingAccountDto : IMapFrom<TradingAccount>
 {
     public long        Id              { get; set; }

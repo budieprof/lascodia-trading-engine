@@ -182,16 +182,72 @@ public class MarketRegimeDetector : IMarketRegimeDetector
         return count > 0 ? sum / count : CalculateBollingerBandWidth(candles, bbPeriod);
     }
 
+    /// <summary>
+    /// Calculates ADX using Wilder's smoothed directional movement (+DI/-DI → DX → ADX).
+    /// Falls back to an ATR-based proxy if there are insufficient candles for the full calculation.
+    /// </summary>
     internal static decimal CalculateAdxProxy(IReadOnlyList<Candle> candles, int period)
     {
-        // Simplified ADX proxy: use 14-period True Range average relative to price range
-        decimal atr      = CalculateAtr(candles, period);
-        decimal avgClose = candles.TakeLast(period).Average(c => c.Close);
+        // Need at least 2*period candles for Wilder's smoothing
+        if (candles.Count < period * 2 + 1)
+        {
+            // Fallback: ATR-based proxy for insufficient data
+            decimal atr      = CalculateAtr(candles, period);
+            decimal avgClose = candles.TakeLast(period).Average(c => c.Close);
+            if (avgClose <= 0m) return 0m;
+            return Math.Min(100m, atr / avgClose * 10000m * 2m);
+        }
 
-        if (avgClose <= 0m) return 0m;
+        // Wilder's +DM/-DM and TR for each bar
+        int start = candles.Count - period * 2;
+        decimal smoothedPlusDm  = 0m, smoothedMinusDm = 0m, smoothedTr = 0m;
 
-        // Scale to approximate ADX range (0-100)
-        decimal adxProxy = atr / avgClose * 10000m * 2m;
-        return Math.Min(100m, adxProxy);
+        // Seed the first period with simple sums
+        for (int i = start + 1; i <= start + period; i++)
+        {
+            decimal high = candles[i].High, low = candles[i].Low;
+            decimal prevHigh = candles[i - 1].High, prevLow = candles[i - 1].Low, prevClose = candles[i - 1].Close;
+
+            decimal upMove   = high - prevHigh;
+            decimal downMove = prevLow - low;
+            smoothedPlusDm  += upMove > downMove && upMove > 0 ? upMove : 0m;
+            smoothedMinusDm += downMove > upMove && downMove > 0 ? downMove : 0m;
+            smoothedTr      += Math.Max(high - low, Math.Max(Math.Abs(high - prevClose), Math.Abs(low - prevClose)));
+        }
+
+        // Wilder's smoothing for the remaining bars and collect DX values
+        var dxValues = new List<decimal>();
+        for (int i = start + period + 1; i < candles.Count; i++)
+        {
+            decimal high = candles[i].High, low = candles[i].Low;
+            decimal prevHigh = candles[i - 1].High, prevLow = candles[i - 1].Low, prevClose = candles[i - 1].Close;
+
+            decimal upMove   = high - prevHigh;
+            decimal downMove = prevLow - low;
+            decimal plusDm   = upMove > downMove && upMove > 0 ? upMove : 0m;
+            decimal minusDm  = downMove > upMove && downMove > 0 ? downMove : 0m;
+            decimal tr       = Math.Max(high - low, Math.Max(Math.Abs(high - prevClose), Math.Abs(low - prevClose)));
+
+            // Wilder's exponential smoothing: prev - prev/period + current
+            smoothedPlusDm  = smoothedPlusDm  - smoothedPlusDm  / period + plusDm;
+            smoothedMinusDm = smoothedMinusDm - smoothedMinusDm / period + minusDm;
+            smoothedTr      = smoothedTr      - smoothedTr      / period + tr;
+
+            if (smoothedTr <= 0m) continue;
+            decimal plusDi  = smoothedPlusDm  / smoothedTr * 100m;
+            decimal minusDi = smoothedMinusDm / smoothedTr * 100m;
+            decimal diSum   = plusDi + minusDi;
+            if (diSum <= 0m) continue;
+            dxValues.Add(Math.Abs(plusDi - minusDi) / diSum * 100m);
+        }
+
+        if (dxValues.Count == 0) return 0m;
+
+        // ADX = Wilder's smoothed average of DX values
+        decimal adx = dxValues.Take(period).Average();
+        for (int i = period; i < dxValues.Count; i++)
+            adx = (adx * (period - 1) + dxValues[i]) / period;
+
+        return Math.Min(100m, adx);
     }
 }

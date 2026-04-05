@@ -48,4 +48,18 @@ public record OrderFilledIntegrationEvent : IntegrationEvent
 
     /// <summary>UTC timestamp of the fill confirmation.</summary>
     public DateTime      FilledAt        { get; init; }
+
+    // ── EA telemetry (propagated from execution report for downstream quality logging) ──
+
+    /// <summary>Signed slippage in pips from the EA (positive = adverse).</summary>
+    public decimal?      SlippagePips    { get; init; }
+
+    /// <summary>Commission charged by the broker for this fill.</summary>
+    public decimal?      Commission      { get; init; }
+
+    /// <summary>Elapsed ms the order spent in the EA order queue before execution.</summary>
+    public int?          QueueDwellMs    { get; init; }
+
+    /// <summary>Broker return code from OrderSend result.</summary>
+    public int?          BrokerRetcode   { get; init; }
 }

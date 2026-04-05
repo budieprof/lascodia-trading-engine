@@ -12,21 +12,35 @@ namespace LascodiaTradingEngine.Application.MarketRegime.Queries.GetPagedRegimeS
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Paged query returning <see cref="MarketRegimeSnapshotDto"/> records, optionally
+/// filtered by symbol, timeframe, and detected regime.
+/// </summary>
 public class GetPagedRegimeSnapshotsQuery : PagerRequestWithFilterType<RegimeSnapshotQueryFilter, ResponseData<PagedData<MarketRegimeSnapshotDto>>>
 {
 }
 
 // ── Filter ────────────────────────────────────────────────────────────────────
 
+/// <summary>Optional filters for narrowing down market regime snapshot results.</summary>
 public class RegimeSnapshotQueryFilter
 {
+    /// <summary>Instrument symbol to filter by (e.g. "EURUSD"). Null returns all symbols.</summary>
     public string? Symbol    { get; set; }
+
+    /// <summary>Chart timeframe to filter by (e.g. "H1", "D1"). Null returns all timeframes.</summary>
     public string? Timeframe { get; set; }
+
+    /// <summary>Regime classification to filter by (e.g. "Trending", "Ranging"). Null returns all regimes.</summary>
     public string? Regime    { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Retrieves a paged list of market regime snapshots from the read replica,
+/// applying optional symbol, timeframe, and regime filters, ordered by most recent first.
+/// </summary>
 public class GetPagedRegimeSnapshotsQueryHandler
     : IRequestHandler<GetPagedRegimeSnapshotsQuery, ResponseData<PagedData<MarketRegimeSnapshotDto>>>
 {

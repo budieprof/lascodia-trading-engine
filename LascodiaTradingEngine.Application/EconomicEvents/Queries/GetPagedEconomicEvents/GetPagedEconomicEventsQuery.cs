@@ -11,20 +11,27 @@ namespace LascodiaTradingEngine.Application.EconomicEvents.Queries.GetPagedEcono
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Retrieves a paginated list of economic events with optional currency, impact, and date range filters.</summary>
 public class GetPagedEconomicEventsQuery : PagerRequestWithFilterType<EconomicEventQueryFilter, ResponseData<PagedData<EconomicEventDto>>>
 {
 }
 
+/// <summary>Filter criteria for the paged economic events query.</summary>
 public class EconomicEventQueryFilter
 {
+    /// <summary>Filter by affected currency (e.g., USD, EUR).</summary>
     public string?   Currency { get; set; }
+    /// <summary>Filter by impact level (High, Medium, Low, Holiday).</summary>
     public string?   Impact   { get; set; }
+    /// <summary>Inclusive start of the scheduled date range (UTC).</summary>
     public DateTime? From     { get; set; }
+    /// <summary>Inclusive end of the scheduled date range (UTC).</summary>
     public DateTime? To       { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Queries economic events ordered by scheduled date ascending with optional filters.</summary>
 public class GetPagedEconomicEventsQueryHandler
     : IRequestHandler<GetPagedEconomicEventsQuery, ResponseData<PagedData<EconomicEventDto>>>
 {

@@ -5,6 +5,7 @@ using LascodiaTradingEngine.Domain.Entities;
 
 namespace LascodiaTradingEngine.Application.Sentiment.Queries.DTOs;
 
+/// <summary>Data transfer object for a CFTC COT report with commercial, non-commercial, and retail positioning data.</summary>
 public class COTReportDto : IMapFrom<COTReport>
 {
     public long     Id                          { get; set; }
@@ -16,6 +17,7 @@ public class COTReportDto : IMapFrom<COTReport>
     public long     NonCommercialShort          { get; set; }
     public long     RetailLong                  { get; set; }
     public long     RetailShort                 { get; set; }
+    public long     TotalOpenInterest           { get; set; }
     public decimal  NetNonCommercialPositioning { get; set; }
     public decimal  NetPositioningChangeWeekly  { get; set; }
 

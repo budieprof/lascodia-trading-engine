@@ -8,6 +8,10 @@ namespace LascodiaTradingEngine.Application.RiskProfiles.Commands.CreateRiskProf
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Creates a new risk profile defining position limits, drawdown thresholds, and recovery parameters.
+/// If marked as default, the current default profile is unset first.
+/// </summary>
 public class CreateRiskProfileCommand : IRequest<ResponseData<long>>
 {
     public required string Name                         { get; set; }
@@ -68,6 +72,10 @@ public class CreateRiskProfileCommandValidator : AbstractValidator<CreateRiskPro
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Persists a new risk profile. If IsDefault is true, demotes the existing default profile first
+/// to ensure only one default profile exists at a time.
+/// </summary>
 public class CreateRiskProfileCommandHandler : IRequestHandler<CreateRiskProfileCommand, ResponseData<long>>
 {
     private readonly IWriteApplicationDbContext _context;

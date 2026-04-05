@@ -4,6 +4,10 @@ using LascodiaTradingEngine.Domain.Entities;
 
 namespace LascodiaTradingEngine.Infrastructure.Persistence.Configurations;
 
+/// <summary>
+/// EF Core entity configuration for <see cref="LivePrice"/>. Defines table mapping,
+/// column types, indexes, relationships, and the soft-delete query filter.
+/// </summary>
 public class LivePriceConfiguration : IEntityTypeConfiguration<LivePrice>
 {
     public void Configure(EntityTypeBuilder<LivePrice> builder)

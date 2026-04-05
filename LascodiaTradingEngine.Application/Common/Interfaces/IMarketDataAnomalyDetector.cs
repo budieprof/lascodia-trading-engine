@@ -21,6 +21,7 @@ public record CandleQualityResult(
 
 public interface IMarketDataAnomalyDetector
 {
+    /// <summary>Validates an incoming tick for anomalies (price spike, stale quote, inverted spread).</summary>
     Task<AnomalyCheckResult> ValidateTickAsync(
         string symbol,
         decimal bid,
@@ -29,6 +30,7 @@ public interface IMarketDataAnomalyDetector
         string instanceId,
         CancellationToken cancellationToken);
 
+    /// <summary>Validates candle OHLCV data for structural anomalies (e.g. high &lt; low, zero volume).</summary>
     CandleQualityResult ValidateCandle(
         decimal open, decimal high, decimal low, decimal close,
         long volume, DateTime timestamp, DateTime? previousClose);

@@ -5,6 +5,7 @@ using LascodiaTradingEngine.Domain.Entities;
 
 namespace LascodiaTradingEngine.Application.RiskProfiles.Queries.DTOs;
 
+/// <summary>Data transfer object for a risk profile including position limits, drawdown thresholds, and recovery parameters.</summary>
 public class RiskProfileDto : IMapFrom<RiskProfile>
 {
     public long    Id                           { get; set; }

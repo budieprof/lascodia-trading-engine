@@ -21,6 +21,9 @@ public record PortfolioRiskMetrics(
     public static PortfolioRiskMetrics Empty { get; } = new(0, 0, 0, 0, 0, 0);
 }
 
+/// <summary>
+/// Result of marginal VaR computation for a proposed new position.
+/// </summary>
 public record MarginalVaRResult(
     decimal MarginalVaR95,
     decimal PostTradeVaR95,
@@ -28,11 +31,13 @@ public record MarginalVaRResult(
 
 public interface IPortfolioRiskCalculator
 {
+    /// <summary>Computes VaR, CVaR, and Monte Carlo VaR for the account's current open positions.</summary>
     Task<PortfolioRiskMetrics> ComputeAsync(
         TradingAccount account,
         IReadOnlyList<Position> openPositions,
         CancellationToken cancellationToken);
 
+    /// <summary>Computes the marginal VaR impact of adding the proposed signal to the existing portfolio.</summary>
     Task<MarginalVaRResult> ComputeMarginalAsync(
         TradeSignal proposedSignal,
         TradingAccount account,

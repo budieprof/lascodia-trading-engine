@@ -1,13 +1,28 @@
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
+using Microsoft.EntityFrameworkCore;
 using MarketRegimeEnum = LascodiaTradingEngine.Domain.Enums.MarketRegime;
 
 namespace LascodiaTradingEngine.Application.MarketRegime.Services;
 
 /// <summary>
-/// Detects the current market regime for a given symbol/timeframe using
-/// ADX, ATR, and Bollinger Band Width calculated from the provided candle history.
+/// Hybrid market regime detector that combines a rule-based classifier (ADX/ATR/BBW)
+/// with a Hidden Markov Model (<see cref="HmmRegimeDetector"/>) via weighted voting.
+///
+/// <list type="bullet">
+///   <item><description>Rule-based logic uses hardcoded ADX, ATR, and Bollinger Band Width thresholds.</description></item>
+///   <item><description>HMM learns Gaussian emission distributions from the provided candle window.</description></item>
+///   <item><description>Final regime = weighted combination of both; configurable via EngineConfig keys.</description></item>
+///   <item><description>Transition smoothing prevents noisy regime flips.</description></item>
+/// </list>
+///
+/// EngineConfig keys:
+/// <list type="bullet">
+///   <item><description><c>RegimeDetector:RuleWeight</c> — weight for rule-based confidence (default 0.6).</description></item>
+///   <item><description><c>RegimeDetector:HmmWeight</c> — weight for HMM confidence (default 0.4).</description></item>
+///   <item><description><c>RegimeDetector:TransitionMinConfidence</c> — minimum confidence to accept a regime change (default 0.6).</description></item>
+/// </list>
 /// </summary>
 public class MarketRegimeDetector : IMarketRegimeDetector
 {
@@ -15,7 +30,52 @@ public class MarketRegimeDetector : IMarketRegimeDetector
     private const int AtrPeriod = 14;
     private const int BbPeriod  = 20;
 
-    public Task<MarketRegimeSnapshot> DetectAsync(
+    // ── Config key constants ──────────────────────────────────────────────────
+
+    private const string CK_RuleWeight             = "RegimeDetector:RuleWeight";
+    private const string CK_HmmWeight              = "RegimeDetector:HmmWeight";
+    private const string CK_TransitionMinConfidence = "RegimeDetector:TransitionMinConfidence";
+
+    // ── Default hybrid weights ────────────────────────────────────────────────
+
+    private const double DefaultRuleWeight             = 0.6;
+    private const double DefaultHmmWeight              = 0.4;
+    private const double DefaultTransitionMinConfidence = 0.6;
+
+    /// <summary>
+    /// When the rule-based and HMM detectors disagree on regime, the winning
+    /// confidence is dampened by this factor to reflect the uncertainty.
+    /// </summary>
+    private const double DisagreementDampeningFactor = 0.85;
+
+    /// <summary>Tracks the previous detection result for transition smoothing.</summary>
+    private MarketRegimeEnum? _previousRegime;
+
+    /// <summary>The HMM component used alongside the rule-based classifier.</summary>
+    private readonly HmmRegimeDetector _hmm = new();
+
+    /// <summary>
+    /// Optional read DB context for loading EngineConfig overrides.
+    /// When null (e.g. in unit tests), default weights are used.
+    /// </summary>
+    private readonly IReadApplicationDbContext? _readDbContext;
+
+    /// <summary>
+    /// Creates a hybrid detector without database access (uses default weights).
+    /// </summary>
+    public MarketRegimeDetector()
+    {
+    }
+
+    /// <summary>
+    /// Creates a hybrid detector that reads weight overrides from EngineConfig.
+    /// </summary>
+    public MarketRegimeDetector(IReadApplicationDbContext readDbContext)
+    {
+        _readDbContext = readDbContext;
+    }
+
+    public async Task<MarketRegimeSnapshot> DetectAsync(
         string symbol,
         Timeframe timeframe,
         IReadOnlyList<Candle> candles,
@@ -25,6 +85,101 @@ public class MarketRegimeDetector : IMarketRegimeDetector
             throw new InvalidOperationException(
                 $"Insufficient candle data for regime detection. Need at least {Math.Max(AdxPeriod + 1, BbPeriod)} candles, got {candles.Count}.");
 
+        // ── Load configurable weights from EngineConfig ───────────────────
+        double ruleWeight             = DefaultRuleWeight;
+        double hmmWeight              = DefaultHmmWeight;
+        double transitionMinConfidence = DefaultTransitionMinConfidence;
+
+        if (_readDbContext is DbContext dbCtx)
+        {
+            ruleWeight             = await GetConfigAsync<double>(dbCtx, CK_RuleWeight, DefaultRuleWeight, ct);
+            hmmWeight              = await GetConfigAsync<double>(dbCtx, CK_HmmWeight, DefaultHmmWeight, ct);
+            transitionMinConfidence = await GetConfigAsync<double>(dbCtx, CK_TransitionMinConfidence, DefaultTransitionMinConfidence, ct);
+        }
+
+        // Normalize weights so they sum to 1
+        double weightSum = ruleWeight + hmmWeight;
+        if (weightSum > 0)
+        {
+            ruleWeight /= weightSum;
+            hmmWeight  /= weightSum;
+        }
+
+        // ── 1. Run rule-based detection (all original logic preserved) ────
+        var (ruleRegime, ruleConfidence, adx, atr, bbw) = RunRuleBasedDetection(candles);
+
+        // ── 2. Run HMM detection ──────────────────────────────────────────
+        var (hmmRegime, hmmConfidence) = _hmm.Detect(candles, symbol, timeframe);
+
+        // ── 3. Combine via weighted voting ────────────────────────────────
+        MarketRegimeEnum finalRegime;
+        double finalConfidence;
+
+        if (ruleRegime == hmmRegime)
+        {
+            // Both agree — weighted average of confidences
+            finalRegime     = ruleRegime;
+            finalConfidence = ruleWeight * ruleConfidence + hmmWeight * hmmConfidence;
+        }
+        else
+        {
+            // Disagreement — pick the one with higher confidence, apply dampening
+            double ruleWeightedConf = ruleWeight * ruleConfidence;
+            double hmmWeightedConf  = hmmWeight * hmmConfidence;
+
+            if (ruleWeightedConf >= hmmWeightedConf)
+            {
+                finalRegime     = ruleRegime;
+                finalConfidence = ruleWeightedConf * DisagreementDampeningFactor;
+            }
+            else
+            {
+                finalRegime     = hmmRegime;
+                finalConfidence = hmmWeightedConf * DisagreementDampeningFactor;
+            }
+        }
+
+        // ── 4. Transition smoothing ───────────────────────────────────────
+        if (_previousRegime.HasValue && finalRegime != _previousRegime.Value)
+        {
+            if (finalConfidence < transitionMinConfidence)
+            {
+                // Confidence too low to justify the regime change — keep previous
+                finalRegime = _previousRegime.Value;
+            }
+        }
+
+        _previousRegime = finalRegime;
+
+        // Clamp confidence to [0, 1]
+        finalConfidence = Math.Clamp(finalConfidence, 0.0, 1.0);
+
+        var snapshot = new MarketRegimeSnapshot
+        {
+            Symbol             = symbol.ToUpperInvariant(),
+            Timeframe          = timeframe,
+            Regime             = finalRegime,
+            Confidence         = (decimal)Math.Round(finalConfidence, 4),
+            ADX                = (decimal)Math.Round(adx, 4),
+            ATR                = (decimal)Math.Round(atr, 6),
+            BollingerBandWidth = (decimal)Math.Round(bbw, 6),
+            DetectedAt         = DateTime.UtcNow
+        };
+
+        return snapshot;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  RULE-BASED DETECTION (original logic, fully preserved)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Executes the original rule-based regime classification using ADX, ATR,
+    /// and Bollinger Band Width. Returns the regime, confidence, and indicator values.
+    /// </summary>
+    private static (MarketRegimeEnum Regime, double Confidence, double Adx, double Atr, double Bbw)
+        RunRuleBasedDetection(IReadOnlyList<Candle> candles)
+    {
         double adx = CalculateAdx(candles);
         double atr = CalculateAtr(candles, AtrPeriod);
         double bbw = CalculateBollingerBandWidth(candles, BbPeriod);
@@ -84,20 +239,12 @@ public class MarketRegimeDetector : IMarketRegimeDetector
             confidence = 1.0 - Math.Min(1.0, adx / 50.0);
         }
 
-        var snapshot = new MarketRegimeSnapshot
-        {
-            Symbol             = symbol.ToUpperInvariant(),
-            Timeframe          = timeframe,
-            Regime             = regime,
-            Confidence         = (decimal)Math.Round(confidence, 4),
-            ADX                = (decimal)Math.Round(adx, 4),
-            ATR                = (decimal)Math.Round(atr, 6),
-            BollingerBandWidth = (decimal)Math.Round(bbw, 6),
-            DetectedAt         = DateTime.UtcNow
-        };
-
-        return Task.FromResult(snapshot);
+        return (regime, confidence, adx, atr, bbw);
     }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  INDICATOR CALCULATIONS (original, unchanged)
+    // ══════════════════════════════════════════════════════════════════════════
 
     // ── ADX (Average Directional Index) ───────────────────────────────────────
 
@@ -245,5 +392,30 @@ public class MarketRegimeDetector : IMarketRegimeDetector
         double lower = sma - 2.0 * stdDev;
 
         return sma > 0 ? (upper - lower) / sma : 0.0;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  ENGINE CONFIG HELPER
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Reads a typed value from <see cref="EngineConfig"/>. Returns
+    /// <paramref name="defaultValue"/> if the key is absent or the stored value
+    /// cannot be converted to <typeparamref name="T"/>.
+    /// </summary>
+    private static async Task<T> GetConfigAsync<T>(
+        DbContext ctx,
+        string key,
+        T defaultValue,
+        CancellationToken ct)
+    {
+        var entry = await ctx.Set<EngineConfig>()
+            .AsNoTracking()
+            .FirstOrDefaultAsync(c => c.Key == key, ct);
+
+        if (entry?.Value is null) return defaultValue;
+
+        try   { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
+        catch { return defaultValue; }
     }
 }

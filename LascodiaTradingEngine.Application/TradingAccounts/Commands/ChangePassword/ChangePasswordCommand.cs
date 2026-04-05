@@ -11,6 +11,10 @@ namespace LascodiaTradingEngine.Application.TradingAccounts.Commands.ChangePassw
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Changes the encrypted password for a trading account. Requires the current password
+/// for verification and enforces ownership via the EA ownership guard.
+/// </summary>
 public class ChangePasswordCommand : IRequest<ResponseData<string>>
 {
     [JsonIgnore] public long Id { get; set; }
@@ -37,6 +41,10 @@ public class ChangePasswordCommandValidator : AbstractValidator<ChangePasswordCo
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Validates the caller's ownership, verifies the current password, and re-encrypts
+/// with the new password using AES-256-GCM.
+/// </summary>
 public class ChangePasswordCommandHandler : IRequestHandler<ChangePasswordCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

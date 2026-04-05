@@ -11,20 +11,31 @@ namespace LascodiaTradingEngine.Application.Orders.Commands.UpdateOrder;
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Partially updates an existing order. Only non-null fields are applied.
+/// </summary>
 public class UpdateOrderCommand : IRequest<ResponseData<string>>
 {
+    /// <summary>Order identifier (populated from route).</summary>
     [JsonIgnore] public long Id { get; set; }
 
+    /// <summary>Updated currency pair symbol.</summary>
     public string? Symbol { get; set; }
+    /// <summary>Updated trade direction ("Buy" or "Sell").</summary>
     public string? OrderType { get; set; }
+    /// <summary>Updated lot size / quantity.</summary>
     public decimal? Quantity { get; set; }
+    /// <summary>Updated requested price.</summary>
     public decimal? Price { get; set; }
+    /// <summary>Updated order status as a string enum name.</summary>
     public string? Status { get; set; }
+    /// <summary>Updated free-text notes.</summary>
     public string? Notes { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>Validates <see cref="UpdateOrderCommand"/> ensuring the Id is present and optional fields have valid values.</summary>
 public class UpdateOrderCommandValidator : AbstractValidator<UpdateOrderCommand>
 {
     public UpdateOrderCommandValidator()
@@ -45,6 +56,7 @@ public class UpdateOrderCommandValidator : AbstractValidator<UpdateOrderCommand>
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Applies partial updates to an existing order entity. Returns not-found if the order does not exist or is soft-deleted.</summary>
 public class UpdateOrderCommandHandler : IRequestHandler<UpdateOrderCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

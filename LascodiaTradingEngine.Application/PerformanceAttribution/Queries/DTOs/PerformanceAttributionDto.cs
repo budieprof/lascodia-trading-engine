@@ -1,6 +1,9 @@
 namespace LascodiaTradingEngine.Application.PerformanceAttribution.Queries.DTOs;
 
-// No IMapFrom — manually constructed from StrategyPerformanceSnapshot
+/// <summary>
+/// Manually constructed DTO that attributes portfolio performance to individual strategies
+/// using the latest <see cref="Domain.Entities.StrategyPerformanceSnapshot"/> data.
+/// </summary>
 public class PerformanceAttributionDto
 {
     public long    StrategyId          { get; set; }

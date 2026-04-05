@@ -4,6 +4,10 @@ using LascodiaTradingEngine.Domain.Entities;
 
 namespace LascodiaTradingEngine.Infrastructure.Persistence.Configurations;
 
+/// <summary>
+/// EF Core entity configuration for <see cref="MLShadowRegimeBreakdown"/>. Defines table mapping,
+/// column types, indexes, relationships, and the soft-delete query filter.
+/// </summary>
 public class MLShadowRegimeBreakdownConfiguration : IEntityTypeConfiguration<MLShadowRegimeBreakdown>
 {
     public void Configure(EntityTypeBuilder<MLShadowRegimeBreakdown> builder)

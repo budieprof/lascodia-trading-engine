@@ -1,156 +1,387 @@
+using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Text.Json;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using LascodiaTradingEngine.Application.AuditTrail.Commands.LogDecision;
 using LascodiaTradingEngine.Application.Backtesting.Models;
 using LascodiaTradingEngine.Application.Backtesting.Services;
+using LascodiaTradingEngine.Application.Common.Diagnostics;
+using LascodiaTradingEngine.Application.Common.Events;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Optimization;
+using LascodiaTradingEngine.Application.Services;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
-
-// Auto-approval threshold: challenger must improve health score by at least this
-// margin AND exceed the absolute minimum to qualify for automatic promotion.
+using MarketRegimeEnum = LascodiaTradingEngine.Domain.Enums.MarketRegime;
 
 namespace LascodiaTradingEngine.Application.Workers;
 
 /// <summary>
-/// Background worker that drives the parameter optimisation pipeline by continuously
-/// polling the database for queued <see cref="OptimizationRun"/> records, performing an
-/// exhaustive grid search over each strategy's candidate parameter combinations, and
-/// persisting the best-found configuration.
+/// Background worker that drives the parameter optimisation pipeline. Polls for queued
+/// <see cref="OptimizationRun"/> records and performs Bayesian optimization (TPE) with
+/// purged K-fold cross-validation, multi-objective Pareto selection, parameter sensitivity
+/// analysis, bootstrap confidence intervals, transaction cost stress testing, and
+/// regime-conditional parameter storage.
 ///
-/// <para>
-/// <b>Algorithm — Exhaustive Grid Search:</b>
-/// For each queued run, <see cref="BuildParameterGrid"/> generates every discrete
-/// combination of the strategy's tunable parameters (e.g. fast/slow MA periods for
-/// <see cref="StrategyType.MovingAverageCrossover"/>, RSI period/oversold/overbought
-/// levels for <see cref="StrategyType.RSIReversion"/>, lookback/multiplier for
-/// <see cref="StrategyType.BreakoutScalper"/>). Each combination is backtested on the
-/// last 6 months of candle data against a fixed $10,000 initial balance. The combination
-/// that yields the highest <c>ProfitFactor</c> is selected as the candidate winner, and
-/// its composite <see cref="ComputeHealthScore"/> is compared to the strategy's current
-/// (baseline) score.
-/// </para>
+/// <b>Phase 1 (TPE exploration):</b> Tree-structured Parzen Estimator proposes candidates
+/// guided by a surrogate model. Each candidate evaluated via purged K-fold CV with embargo
+/// gaps. Latin Hypercube Sampling seeds the initial batch.
 ///
-/// <para>
-/// <b>Auto-approval gate:</b>
-/// If the best candidate's health score exceeds the baseline by at least
-/// <see cref="AutoApprovalImprovementThreshold"/> (10 pp) AND the absolute score reaches
-/// <see cref="AutoApprovalMinHealthScore"/> (0.55), the worker applies the new parameters
-/// directly to the live <see cref="Strategy"/> row without manual intervention. A paused
-/// strategy is re-activated. Otherwise, the run lands in <c>Completed</c> status and
-/// awaits an explicit <c>ApproveOptimizationCommand</c> from an operator.
-/// </para>
+/// <b>Phase 2 (Pareto selection + fine validation):</b> Multi-objective non-dominated
+/// sorting (Sharpe, drawdown, win rate) selects Pareto-optimal candidates. Survivors
+/// re-evaluated on full IS data.
 ///
-/// <para>
-/// <b>Post-approval validation chain:</b>
-/// After auto-approval, a fresh <see cref="BacktestRun"/> covering the last full year is
-/// queued so that BacktestWorker can re-validate the new parameters on a longer window,
-/// which in turn auto-queues a WalkForwardRun. This ensures every promoted parameter set
-/// passes the full validation pipeline before it influences live trading.
-/// </para>
+/// <b>Post-selection validation:</b> Parameter sensitivity analysis (±10% perturbation),
+/// OOS validation with bootstrap 95% CI, 2x transaction cost stress test, walk-forward
+/// stability on OOS-only data, temporal signal correlation check.
 ///
-/// <para>
-/// <b>Audit trail:</b> Every significant decision (completed, auto-approved, failed) is
-/// logged via <c>LogDecisionCommand</c> (MediatR) so a full audit trail is maintained in
-/// the <c>DecisionLog</c> table.
-/// </para>
+/// <b>Health score formula (5-factor):</b>
+/// <c>0.25*WinRate + 0.20*min(1,PF/2) + 0.20*max(0,1-DD/20) + 0.15*min(1,max(0,Sharpe)/2) + 0.20*min(1,Trades/50)</c>
 ///
-/// <para>
-/// <b>Polling model:</b> The worker wakes every <see cref="PollingInterval"/> seconds
-/// (30 s), processes one run per tick, and uses a per-cycle DI scope so EF contexts are
-/// properly disposed between runs.
-/// </para>
+/// <b>Auto-approval:</b> OOS improvement >= configured threshold AND absolute OOS score
+/// >= configured minimum AND walk-forward stable AND higher TF regime compatible AND
+/// winner params not too similar to another active strategy (correlation guard).
+///
+/// <b>Configuration (via EngineConfig, hot-reloadable):</b>
+/// <list type="bullet">
+///   <item><c>Optimization:SchedulePollSeconds</c> — auto-scheduling interval (default 7200)</item>
+///   <item><c>Optimization:CooldownDays</c> — min days between optimisations per strategy (default 14)</item>
+///   <item><c>Optimization:MaxQueuedPerCycle</c> — max auto-scheduled per scan (default 3)</item>
+///   <item><c>Optimization:AutoScheduleEnabled</c> — master switch for auto-scheduling (default true)</item>
+///   <item><c>Optimization:AutoApprovalImprovementThreshold</c> — min OOS improvement for auto-approval (default 0.10)</item>
+///   <item><c>Optimization:AutoApprovalMinHealthScore</c> — min absolute OOS score for auto-approval (default 0.55)</item>
+///   <item><c>Optimization:TopNCandidates</c> — survivors from coarse phase (default 5)</item>
+///   <item><c>Optimization:CoarsePhaseThreshold</c> — min candidates to use two-phase flow (default 10)</item>
+///   <item><c>Optimization:ScreeningTimeoutSeconds</c> — per-backtest timeout (default 30)</item>
+///   <item><c>Optimization:ScreeningSpreadPoints</c> — spread in broker points (default 20)</item>
+///   <item><c>Optimization:ScreeningCommissionPerLot</c> — round-trip commission (default 7.0)</item>
+///   <item><c>Optimization:ScreeningSlippagePips</c> — slippage in pips (default 1.0)</item>
+///   <item><c>Optimization:MaxOosDegradationPct</c> — max IS-to-OOS metric drop (default 0.60)</item>
+///   <item><c>Optimization:SuppressDuringDrawdownRecovery</c> — skip during recovery (default true)</item>
+///   <item><c>Optimization:SeasonalBlackoutEnabled</c> — skip during thin-liquidity periods (default true)</item>
+///   <item><c>Optimization:BlackoutPeriods</c> — comma-separated MM/DD-MM/DD ranges (default "12/20-01/05")</item>
+///   <item><c>Optimization:MaxRunTimeoutMinutes</c> — aggregate timeout for entire run (default 30)</item>
+///   <item><c>Optimization:MaxParallelBacktests</c> — max concurrent backtest evaluations (default 4)</item>
+///   <item><c>Optimization:MinCandidateTrades</c> — min trades for a candidate to qualify (default 10)</item>
+///   <item><c>Optimization:EmbargoRatio</c> — fraction of candles to skip at IS/OOS boundary (default 0.05)</item>
+///   <item><c>Optimization:CorrelationParamThreshold</c> — max param similarity to existing active strategy (default 0.15)</item>
+///   <item><c>Optimization:TpeBudget</c> — total TPE evaluation budget per run (default 50)</item>
+///   <item><c>Optimization:TpeInitialSamples</c> — initial Latin Hypercube samples before TPE surrogate kicks in (default 15)</item>
+///   <item><c>Optimization:PurgedKFolds</c> — K-fold count for IS candidate evaluation with embargo (default 5)</item>
+///   <item><c>Optimization:SensitivityPerturbPct</c> — perturbation % for parameter sensitivity check (default 0.10)</item>
+///   <item><c>Optimization:BootstrapIterations</c> — bootstrap resampling iterations for OOS CI (default 1000)</item>
+///   <item><c>Optimization:MinBootstrapCILower</c> — min 95% CI lower bound for auto-approval (default 0.40)</item>
+///   <item><c>Optimization:CostSensitivityEnabled</c> — enable 2x transaction cost stress test (default true)</item>
+///   <item><c>Optimization:AdaptiveBoundsEnabled</c> — narrow TPE bounds from historical approvals (default true)</item>
+///   <item><c>Optimization:TemporalOverlapThreshold</c> — max temporal signal overlap with other strategies (default 0.70)</item>
+///   <item><c>Optimization:DataScarcityThreshold</c> — candle count below which expanding-window protocol is used (default 200)</item>
+///   <item><c>Optimization:ScreeningInitialBalance</c> — initial balance for backtest/bootstrap/permutation tests (default 10000)</item>
+///   <item><c>Optimization:PortfolioCorrelationThreshold</c> — max daily PnL correlation with other active strategies (default 0.80)</item>
+///   <item><c>Optimization:MaxConsecutiveFailuresBeforeEscalation</c> — consecutive auto-approval failures before alert escalation (default 3)</item>
+///   <item><c>Optimization:CheckpointEveryN</c> — persist intermediate results every N evaluations for crash recovery (default 10)</item>
+///   <item><c>Optimization:GpEarlyStopPatience</c> — stagnant batches before early stop when using GP surrogate (default 4)</item>
+///   <item><c>Optimization:SensitivityDegradationTolerance</c> — max fractional score drop before a perturbation is flagged (default 0.20)</item>
+///   <item><c>Optimization:WalkForwardMinMaxRatio</c> — min(score)/max(score) threshold for walk-forward stability (default 0.50)</item>
+///   <item><c>Optimization:CostStressMultiplier</c> — multiplier applied to spread/commission/slippage in cost stress test (default 2.0)</item>
+///   <item><c>Optimization:MinOosCandlesForValidation</c> — minimum OOS candles for full validation (default 50)</item>
+///   <item><c>Optimization:MaxCvCoefficientOfVariation</c> — max CV across K-fold scores for consistency (default 0.50)</item>
+///   <item><c>Optimization:PermutationIterations</c> — Monte Carlo permutation test iterations (default 1000)</item>
+///   <item><c>Optimization:MaxRetryAttempts</c> — max retry attempts for transiently failed runs (default 2)</item>
+///   <item><c>Optimization:CandleLookbackMonths</c> — months of candle history to load (default 6; D1 strategies may need 12+)</item>
+///   <item><c>Optimization:RequireEADataAvailability</c> — defer runs when no active EA feeds the symbol (default true)</item>
+///   <item><c>Optimization:MaxConcurrentRuns</c> — max optimization runs executing simultaneously across all workers (default 3)</item>
+///   <item><c>Optimization:UseSymbolSpecificSpread</c> — use CurrencyPair.SpreadPoints instead of fixed config spread (default true)</item>
+///   <item><c>Optimization:RegimeBlendRatio</c> — fraction of non-regime candles blended into regime-filtered data (default 0.20)</item>
+///   <item><c>Optimization:CpcvNFolds</c> — number of temporal folds for CPCV (default 6)</item>
+///   <item><c>Optimization:CpcvTestFoldCount</c> — number of folds held out as OOS per CPCV combination (default 2)</item>
+///   <item><c>Optimization:CpcvMaxCombinations</c> — max C(N,K) combinations to evaluate (default 15)</item>
+///   <item><c>Optimization:CircuitBreakerThreshold</c> — consecutive backtest failures before aborting run (default 10)</item>
+///   <item><c>Optimization:SuccessiveHalvingRungs</c> — comma-separated fidelity levels for multi-rung screening, e.g. "0.25,0.50" or "0.125,0.25,0.50" (default "0.25,0.50")</item>
+///   <item><c>Backtest:Gate:MinWinRate</c> — auto-scheduling gate (default 0.60)</item>
+///   <item><c>Backtest:Gate:MinProfitFactor</c> — auto-scheduling gate (default 1.0)</item>
+///   <item><c>Backtest:Gate:MinTotalTrades</c> — auto-scheduling gate (default 10)</item>
+/// </list>
+/// <b>Authoritative config source:</b> <see cref="LoadConfigurationAsync"/> — this doc list may
+/// lag behind the code; always consult the loader method for the definitive parameter list.
 /// </summary>
-public class OptimizationWorker : BackgroundService
+public partial class OptimizationWorker : BackgroundService
 {
-    /// <summary>
-    /// Minimum absolute health-score improvement required for auto-approval.
-    /// The challenger's health score must exceed the baseline by at least this delta.
-    /// A value of 0.10 means the new parameters must score at least 10 percentage
-    /// points better than the current live configuration.
-    /// </summary>
-    private const decimal AutoApprovalImprovementThreshold = 0.10m;
+    // ── Inner types ─────────────────────────────────────────────────────────
+
+    /// <summary>All hot-reloadable configuration for a single optimisation cycle.</summary>
+    internal sealed record OptimizationConfig(
+        int SchedulePollSeconds,
+        int CooldownDays,
+        int MaxQueuedPerCycle,
+        bool AutoScheduleEnabled,
+        double MinWinRate,
+        double MinProfitFactor,
+        int MinTotalTrades,
+        decimal AutoApprovalImprovementThreshold,
+        decimal AutoApprovalMinHealthScore,
+        int TopNCandidates,
+        int CoarsePhaseThreshold,
+        int ScreeningTimeoutSeconds,
+        double ScreeningSpreadPoints,
+        double ScreeningCommissionPerLot,
+        double ScreeningSlippagePips,
+        double MaxOosDegradationPct,
+        bool SuppressDuringDrawdownRecovery,
+        bool SeasonalBlackoutEnabled,
+        string BlackoutPeriods,
+        int MaxRunTimeoutMinutes,
+        int MaxParallelBacktests,
+        int MinCandidateTrades,
+        double EmbargoRatio,
+        double CorrelationParamThreshold,
+        int TpeBudget,
+        int TpeInitialSamples,
+        int PurgedKFolds,
+        double SensitivityPerturbPct,
+        int BootstrapIterations,
+        decimal MinBootstrapCILower,
+        bool CostSensitivityEnabled,
+        bool AdaptiveBoundsEnabled,
+        double TemporalOverlapThreshold,
+        int DataScarcityThreshold,
+        decimal ScreeningInitialBalance,
+        double PortfolioCorrelationThreshold,
+        int MaxConsecutiveFailuresBeforeEscalation,
+        int CheckpointEveryN,
+        int GpEarlyStopPatience,
+        double SensitivityDegradationTolerance,
+        double WalkForwardMinMaxRatio,
+        double CostStressMultiplier,
+        int MinOosCandlesForValidation,
+        double MaxCvCoefficientOfVariation,
+        int PermutationIterations,
+        int MaxRetryAttempts,
+        int CandleLookbackMonths,
+        bool RequireEADataAvailability,
+        int MaxConcurrentRuns,
+        bool UseSymbolSpecificSpread,
+        double RegimeBlendRatio,
+        int CpcvNFolds,
+        int CpcvTestFoldCount,
+        int CpcvMaxCombinations,
+        int CircuitBreakerThreshold,
+        string SuccessiveHalvingRungs,
+        int MaxCrossRegimeEvals, string PresetName,
+        bool HyperbandEnabled, int HyperbandEta, int MaxRunsPerWeek);
 
     /// <summary>
-    /// Minimum absolute health score the best candidate must achieve before
-    /// auto-approval is considered, regardless of improvement magnitude.
-    /// This floor prevents automatically promoting a parameter set that is merely
-    /// "slightly less bad" than a terrible baseline — the result must still cross
-    /// an acceptable quality threshold (0.55 out of 1.0).
+    /// A scored parameter candidate from the screening phases.
+    /// Check <see cref="TradesTrimmed"/> before accessing <c>Result.Trades</c> —
+    /// trade lists are cleared from low-scoring candidates to reduce heap pressure.
     /// </summary>
-    private const decimal AutoApprovalMinHealthScore = 0.55m;
+    internal sealed record ScoredCandidate(
+        string ParamsJson,
+        decimal HealthScore,
+        BacktestResult Result,
+        double CvCoefficientOfVariation = 0.0)
+    {
+        /// <summary>True after trade lists have been cleared to reduce memory pressure.</summary>
+        public bool TradesTrimmed { get; set; }
+    }
 
-    // ── EngineConfig keys for auto-scheduling ─────────────────────────────
-    private const string CK_SchedulePollSecs   = "Optimization:SchedulePollSeconds";
-    private const string CK_CooldownDays       = "Optimization:CooldownDays";
-    private const string CK_MaxQueuedPerCycle  = "Optimization:MaxQueuedPerCycle";
-    private const string CK_AutoScheduleEnabled = "Optimization:AutoScheduleEnabled";
-    private const string CK_MinWinRate         = "Backtest:Gate:MinWinRate";
-    private const string CK_MinProfitFactor    = "Backtest:Gate:MinProfitFactor";
-    private const string CK_MinTotalTrades     = "Backtest:Gate:MinTotalTrades";
+    private sealed record OptimizationConfigSnapshot(
+        int Version,
+        OptimizationConfig Config);
+
+    private sealed record RunMetadataSnapshot(
+        int Version,
+        int DeterministicSeed,
+        string Surrogate,
+        string Symbol,
+        Timeframe Timeframe,
+        DateTime CandleFromUtc,
+        DateTime CandleToUtc,
+        int CandleCount,
+        int TrainCandles,
+        int TestCandles,
+        int EmbargoCandles,
+        bool ResumedFromCheckpoint,
+        string? CurrentRegime,
+        int WarmStartedObservations,
+        int Iterations = 0,
+        decimal? BaselineHealthScore = null,
+        decimal? OosHealthScore = null,
+        bool? AutoApproved = null);
+
+    /// <summary>Structured result from validating a single Pareto candidate through all gates.</summary>
+    internal sealed record CandidateValidationResult(
+        bool Passed,
+        ScoredCandidate Winner,
+        decimal OosHealthScore,
+        BacktestResult OosResult,
+        decimal CILower, decimal CIMedian, decimal CIUpper,
+        double PermPValue, double PermCorrectedAlpha, bool PermSignificant,
+        bool SensitivityOk, string SensitivityReport,
+        bool CostSensitiveOk, decimal PessimisticScore,
+        bool DegradationFailed,
+        decimal WfAvgScore, bool WfStable,
+        bool MtfCompatible,
+        bool CorrelationSafe,
+        bool TemporalCorrelationSafe, double TemporalMaxOverlap,
+        bool PortfolioCorrelationSafe, double PortfolioMaxCorrelation,
+        bool CvConsistent, double CvValue,
+        string ApprovalReportJson,
+        string FailureReason,
+        IReadOnlyList<(int Rank, string Params, string Reason, decimal Score)>? FailedCandidates = null);
+
+    /// <summary>Results from the data loading + baseline evaluation phase.</summary>
+    internal sealed record DataLoadResult(
+        Strategy Strategy,
+        List<Candle> AllCandles,
+        List<Candle> TrainCandles,
+        List<Candle> TestCandles,
+        int EmbargoSize,
+        BacktestOptions ScreeningOptions,
+        OptimizationGridBuilder.DataProtocol Protocol,
+        DateTime CandleLookbackStart,
+        MarketRegimeEnum? CurrentRegimeForBaseline,
+        CurrencyPair? PairInfo = null);
+
+    /// <summary>Results from the Bayesian search phase.</summary>
+    internal sealed record SearchResult(
+        List<ScoredCandidate> EvaluatedCandidates,
+        int TotalIterations,
+        string SurrogateKind,
+        int WarmStartedObservations,
+        bool ResumedFromCheckpoint);
+
+    /// <summary>Bundles DI services and tokens shared across optimization stages.</summary>
+    internal sealed record RunContext(
+        OptimizationRun Run,
+        Strategy Strategy,
+        OptimizationConfig Config,
+        DbContext Db,
+        DbContext WriteDb,
+        IWriteApplicationDbContext WriteCtx,
+        IMediator Mediator,
+        IAlertDispatcher AlertDispatcher,
+        IIntegrationEventService EventService,
+        CancellationToken Ct,
+        CancellationToken RunCt);
+
+    // ── Fields ──────────────────────────────────────────────────────────────
+
+    private static readonly TimeSpan PollingInterval = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan ExecutionLeaseDuration = TimeSpan.FromMinutes(10);
+    private const int ConfigSnapshotVersion = 1;
+    private const int RunMetadataVersion = 1;
 
     private readonly ILogger<OptimizationWorker> _logger;
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IBacktestEngine _backtestEngine;
+    private readonly TradingMetrics _metrics;
+    private readonly OptimizationGridBuilder _gridBuilder;
+    private readonly OptimizationValidator _validator;
 
-    private static readonly TimeSpan PollingInterval = TimeSpan.FromSeconds(30);
-
-    /// <summary>Tracks when the next auto-scheduling scan should run.</summary>
     private DateTime _nextScheduleScanUtc = DateTime.MinValue;
 
-    /// <summary>
-    /// Initialises the worker with its required dependencies.
-    /// </summary>
-    /// <param name="logger">Structured logger for diagnostic output.</param>
-    /// <param name="scopeFactory">Factory for creating per-cycle DI scopes.</param>
-    /// <param name="backtestEngine">Engine used to score each candidate parameter set.</param>
+    // ── Constructor ─────────────────────────────────────────────────────────
+
     public OptimizationWorker(
         ILogger<OptimizationWorker> logger,
         IServiceScopeFactory scopeFactory,
-        IBacktestEngine backtestEngine)
+        IBacktestEngine backtestEngine,
+        TradingMetrics metrics)
     {
         _logger         = logger;
         _scopeFactory   = scopeFactory;
         _backtestEngine = backtestEngine;
+        _metrics        = metrics;
+        _gridBuilder    = new OptimizationGridBuilder(logger);
+        _validator      = new OptimizationValidator(backtestEngine);
     }
 
-    /// <summary>
-    /// Entry point invoked by the hosted-service runtime. Runs a continuous polling
-    /// loop that delegates each tick to <see cref="ProcessNextQueuedRunAsync"/> and
-    /// waits <see cref="PollingInterval"/> between iterations.
-    /// </summary>
-    /// <param name="stoppingToken">
-    /// Signalled by the runtime on application shutdown, causing the loop to exit
-    /// gracefully once the current processing cycle completes.
-    /// </param>
+    // ── Main loop ───────────────────────────────────────────────────────────
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("OptimizationWorker starting (with auto-scheduling).");
+        _logger.LogInformation("OptimizationWorker starting");
+
+        // Crash recovery: reclaim any runs left in Running state from a prior crash.
+        // These runs lost their in-memory state, so re-queue them for a fresh attempt.
+        try
+        {
+            await using var recoveryScope = _scopeFactory.CreateAsyncScope();
+            var recoveryWriteCtx = recoveryScope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+            var recoveryDb       = recoveryWriteCtx.GetDbContext();
+            var nowUtc           = DateTime.UtcNow;
+
+            // Only re-queue runs whose strategy still exists (not deleted)
+            var activeStrategyIds = await recoveryDb.Set<Strategy>()
+                .Where(s => !s.IsDeleted)
+                .Select(s => s.Id)
+                .ToListAsync(stoppingToken);
+            var activeStrategySet = new HashSet<long>(activeStrategyIds);
+
+            int recovered = await recoveryDb.Set<OptimizationRun>()
+                .Where(r => r.Status == OptimizationRunStatus.Running && !r.IsDeleted
+                          && (r.ExecutionLeaseExpiresAt == null || r.ExecutionLeaseExpiresAt < nowUtc)
+                          && activeStrategySet.Contains(r.StrategyId))
+                .ExecuteUpdateAsync(s => s
+                    .SetProperty(r => r.Status, OptimizationRunStatus.Queued)
+                    .SetProperty(r => r.StartedAt, nowUtc)
+                    .SetProperty(r => r.DeferredUntilUtc, (DateTime?)null)
+                    .SetProperty(r => r.ExecutionLeaseExpiresAt, (DateTime?)null), stoppingToken);
+
+            // Mark orphaned runs (deleted strategy) as failed instead of re-queuing
+            int orphaned = await recoveryDb.Set<OptimizationRun>()
+                .Where(r => r.Status == OptimizationRunStatus.Running && !r.IsDeleted
+                          && (r.ExecutionLeaseExpiresAt == null || r.ExecutionLeaseExpiresAt < nowUtc)
+                          && !activeStrategySet.Contains(r.StrategyId))
+                .ExecuteUpdateAsync(s => s
+                    .SetProperty(r => r.Status, OptimizationRunStatus.Failed)
+                    .SetProperty(r => r.ErrorMessage, "Strategy deleted during optimization run")
+                    .SetProperty(r => r.CompletedAt, nowUtc), stoppingToken);
+
+            if (orphaned > 0)
+                _logger.LogWarning(
+                    "OptimizationWorker: marked {Count} orphaned Running run(s) as Failed (strategy deleted)",
+                    orphaned);
+
+            if (recovered > 0)
+            {
+                _metrics.OptimizationLeaseReclaims.Add(recovered);
+                _logger.LogWarning(
+                    "OptimizationWorker: recovered {Count} stale Running run(s) from prior crash — re-queued",
+                    recovered);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "OptimizationWorker: crash recovery check failed (non-fatal)");
+        }
 
         while (!stoppingToken.IsCancellationRequested)
         {
             try
             {
-                // ── Auto-scheduling: queue optimizations for underperforming strategies ──
+                await RequeueExpiredRunningRunsAsync(stoppingToken);
+                await RetryFailedRunsAsync(stoppingToken);
+                await MonitorFollowUpResultsAsync(stoppingToken);
+
                 if (DateTime.UtcNow >= _nextScheduleScanUtc)
                 {
                     await using var schedScope = _scopeFactory.CreateAsyncScope();
-                    var readDb  = schedScope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
-                    var writeDb = schedScope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
-                    var ctx     = readDb.GetDbContext();
+                    var readCtx  = schedScope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+                    var writeCtx = schedScope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+                    var db       = readCtx.GetDbContext();
 
-                    int schedulePollSecs = await GetConfigAsync<int>(ctx, CK_SchedulePollSecs, 7200, stoppingToken);
-                    _nextScheduleScanUtc = DateTime.UtcNow.AddSeconds(schedulePollSecs);
+                    var config = await LoadConfigurationAsync(db, stoppingToken);
+                    _nextScheduleScanUtc = DateTime.UtcNow.AddSeconds(config.SchedulePollSeconds);
 
-                    bool enabled = await GetConfigAsync<bool>(ctx, CK_AutoScheduleEnabled, true, stoppingToken);
-                    if (enabled)
+                    if (config.AutoScheduleEnabled)
                     {
-                        await ScheduleOptimizationsForUnderperformingStrategiesAsync(
-                            ctx, writeDb.GetDbContext(), stoppingToken);
+                        await AutoScheduleUnderperformersAsync(readCtx, writeCtx, config, stoppingToken);
                     }
                 }
 
@@ -162,645 +393,1791 @@ public class OptimizationWorker : BackgroundService
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Unexpected error in OptimizationWorker polling loop");
+                _logger.LogError(ex, "OptimizationWorker: unexpected error in polling loop");
+                _metrics.WorkerErrors.Add(1, new KeyValuePair<string, object?>("worker", "OptimizationWorker"));
             }
 
             await Task.Delay(PollingInterval, stoppingToken);
         }
 
-        _logger.LogInformation("OptimizationWorker stopped.");
+        _logger.LogInformation("OptimizationWorker stopped");
     }
 
+    // ── Core optimisation orchestrator ───────────────────────────────────────
+
     /// <summary>
-    /// Core processing method for a single polling tick. Dequeues the oldest
-    /// <see cref="OptimizationRunStatus.Queued"/> run, performs a grid-search backtest
-    /// over all candidate parameter sets, evaluates whether the best result qualifies
-    /// for auto-approval, and persists the outcome. Returns immediately when the queue
-    /// is empty.
+    /// Claims the next queued optimization run (atomically) and executes the full
+    /// two-phase grid search with OOS validation, walk-forward checks, and auto-approval.
+    /// Internal for unit test access (InternalsVisibleTo).
     /// </summary>
-    /// <remarks>
-    /// A fresh DI scope is created on every call so EF Core DbContext instances and
-    /// MediatR handlers are properly isolated and disposed after each run. This prevents
-    /// stale change-tracker state or memory growth across long-running optimisation jobs.
-    /// </remarks>
-    /// <param name="ct">Cancellation token propagated from <see cref="ExecuteAsync"/>.</param>
-    private async Task ProcessNextQueuedRunAsync(CancellationToken ct)
+    internal async Task ProcessNextQueuedRunAsync(CancellationToken ct)
     {
-        // Fresh scope per cycle to isolate scoped services (DbContexts, MediatR pipeline).
-        using var scope  = _scopeFactory.CreateScope();
-        var writeContext = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
-        var readContext  = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
-        var mediator     = scope.ServiceProvider.GetRequiredService<IMediator>();
+        await using var scope  = _scopeFactory.CreateAsyncScope();
+        var readCtx           = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+        var writeCtx          = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+        var mediator          = scope.ServiceProvider.GetRequiredService<IMediator>();
+        var alertDispatcher   = scope.ServiceProvider.GetRequiredService<IAlertDispatcher>();
+        var eventService      = scope.ServiceProvider.GetRequiredService<IIntegrationEventService>();
+        var db                = readCtx.GetDbContext();
+        var writeDb           = writeCtx.GetDbContext();
 
-        // Dequeue the oldest queued run (FIFO by StartedAt).
-        var run = await writeContext.GetDbContext()
-            .Set<OptimizationRun>()
-            .Where(x => x.Status == OptimizationRunStatus.Queued && !x.IsDeleted)
-            .OrderBy(x => x.StartedAt)
-            .FirstOrDefaultAsync(ct);
+        // ── Stage 0+1: Atomic claim with integrated concurrency limit ───
+        int maxConcurrentRuns;
+        {
+            var config0 = await LoadConfigurationAsync(db, ct);
+            maxConcurrentRuns = config0.MaxConcurrentRuns;
+        }
+        var claimedRunId = await OptimizationRunClaimer.ClaimNextRunAsync(
+            writeDb, maxConcurrentRuns, ExecutionLeaseDuration, ct);
 
-        // Nothing queued — return and wait for the next polling tick.
+        if (!claimedRunId.HasValue)
+        {
+            // Check for cold-start: no queued runs AND no active strategies
+            bool anyActive = await db.Set<Strategy>()
+                .AnyAsync(s => s.Status == StrategyStatus.Active && !s.IsDeleted, ct);
+            if (!anyActive)
+            {
+                _logger.LogInformation(
+                    "OptimizationWorker: no queued runs and no active strategies — system may be in cold start. " +
+                    "Ensure strategies are created and activated via StrategyGenerationWorker or manual configuration");
+            }
+            return;
+        }
+
+        var run = await writeDb.Set<OptimizationRun>()
+            .FirstOrDefaultAsync(x => x.Id == claimedRunId.Value, ct);
         if (run is null) return;
+
+        // Track how often previously-deferred runs are rechecked. High counts for a
+        // single run indicate a condition that won't self-resolve (e.g., dead EA symbol).
+        if (run.DeferredUntilUtc.HasValue)
+            _metrics.OptimizationDeferredRechecks.Add(1);
+
+        var sw = Stopwatch.StartNew();
+
+        // ── Stage 2: Load config + pre-flight checks ────────────────────
+        var config = await LoadRunScopedConfigurationAsync(run, db, writeCtx, ct);
+
+        // Config validation (warn on suspicious values before formal validation)
+        if (config.MaxConcurrentRuns <= 0) _logger.LogWarning("OptimizationWorker: MaxConcurrentRuns={V} must be positive", config.MaxConcurrentRuns);
+        if (config.BootstrapIterations < 100) _logger.LogWarning("OptimizationWorker: BootstrapIterations={V} is very low", config.BootstrapIterations);
+        if (config.PermutationIterations < 100) _logger.LogWarning("OptimizationWorker: PermutationIterations={V} is very low", config.PermutationIterations);
+        if (config.CooldownDays < 1) _logger.LogWarning("OptimizationWorker: CooldownDays={V} must be >= 1", config.CooldownDays);
+        if (config.MaxOosDegradationPct is <= 0 or > 1) _logger.LogWarning("OptimizationWorker: MaxOosDegradationPct={V} outside (0,1]", config.MaxOosDegradationPct);
+        if (config.TpeBudget < config.TpeInitialSamples) _logger.LogWarning("OptimizationWorker: TpeBudget ({B}) < TpeInitialSamples ({S}) — search will be purely random", config.TpeBudget, config.TpeInitialSamples);
+        if (config.ScreeningTimeoutSeconds <= 0) _logger.LogWarning("OptimizationWorker: ScreeningTimeoutSeconds={V} must be positive", config.ScreeningTimeoutSeconds);
+
+        _validator.SetInitialBalance(config.ScreeningInitialBalance);
+        _validator.EnableCache();
+        EnsureDeterministicSeed(run);
+        await HeartbeatRunAsync(run, writeCtx, ct);
+
+        var configIssues = OptimizationConfigValidator.Validate(
+            config.AutoApprovalImprovementThreshold, config.AutoApprovalMinHealthScore,
+            config.MinBootstrapCILower, config.EmbargoRatio, config.TpeBudget,
+            config.TpeInitialSamples, config.MaxParallelBacktests, config.ScreeningTimeoutSeconds,
+            config.CorrelationParamThreshold, config.SensitivityPerturbPct,
+            config.GpEarlyStopPatience, config.CooldownDays, config.CheckpointEveryN, _logger,
+            config.SensitivityDegradationTolerance, config.WalkForwardMinMaxRatio,
+            config.CostStressMultiplier,
+            config.CpcvNFolds, config.CpcvTestFoldCount,
+            config.MinOosCandlesForValidation, config.CircuitBreakerThreshold,
+            config.MinCandidateTrades, config.SuccessiveHalvingRungs);
+
+        if (configIssues.Count > 0)
+        {
+            var issueStr = string.Join("; ", configIssues);
+            _logger.LogError("OptimizationWorker: invalid configuration — {Issues}", issueStr);
+            run.FailureCategory = OptimizationFailureCategory.ConfigError;
+            OptimizationRunStateMachine.Transition(
+                run,
+                OptimizationRunStatus.Failed,
+                DateTime.UtcNow,
+                $"Invalid configuration: {issueStr}");
+            await writeCtx.SaveChangesAsync(ct);
+            return;
+        }
+
+        if (config.SeasonalBlackoutEnabled && IsInBlackoutPeriod(config.BlackoutPeriods))
+        {
+            _logger.LogInformation("OptimizationWorker: seasonal blackout active — deferring run {RunId}", run.Id);
+            _metrics.OptimizationRunsDeferred.Add(1, new KeyValuePair<string, object?>("reason", "seasonal_blackout"));
+            OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Queued, DateTime.UtcNow);
+            run.DeferredUntilUtc = DateTime.UtcNow.AddHours(6);
+            await writeCtx.SaveChangesAsync(ct);
+            return;
+        }
+
+        if (config.SuppressDuringDrawdownRecovery && await IsInDrawdownRecoveryAsync(db, ct))
+        {
+            _logger.LogInformation("OptimizationWorker: drawdown recovery active — deferring run {RunId}", run.Id);
+            _metrics.OptimizationRunsDeferred.Add(1, new KeyValuePair<string, object?>("reason", "drawdown_recovery"));
+            OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Queued, DateTime.UtcNow);
+            run.DeferredUntilUtc = DateTime.UtcNow.AddMinutes(30);
+            await writeCtx.SaveChangesAsync(ct);
+            return;
+        }
+
+        // Regime transition guard: if the regime for this strategy's symbol changed
+        // within the last N hours, parameters optimized during the transition may
+        // fit transitional noise rather than the new regime's characteristics.
+        {
+            var runStrategy = await db.Set<Strategy>()
+                .Where(s => s.Id == run.StrategyId && !s.IsDeleted)
+                .Select(s => new { s.Symbol, s.Timeframe })
+                .FirstOrDefaultAsync(ct);
+
+            if (runStrategy is not null)
+            {
+                int regimeStabilityHours = await OptimizationGridBuilder.GetConfigAsync(db, "Optimization:RegimeStabilityHours", 6, ct);
+                var recentRegimes = await db.Set<MarketRegimeSnapshot>()
+                    .Where(s => s.Symbol == runStrategy.Symbol
+                             && s.Timeframe == runStrategy.Timeframe
+                             && s.DetectedAt >= DateTime.UtcNow.AddHours(-regimeStabilityHours)
+                             && !s.IsDeleted)
+                    .Select(s => s.Regime)
+                    .Distinct()
+                    .CountAsync(ct);
+
+                if (recentRegimes > 1)
+                {
+                    _logger.LogInformation(
+                        "OptimizationWorker: regime transition detected for {Symbol}/{Tf} in last {Hours}h — deferring run {RunId}",
+                        runStrategy.Symbol, runStrategy.Timeframe, regimeStabilityHours, run.Id);
+                    _metrics.OptimizationRunsDeferred.Add(1, new KeyValuePair<string, object?>("reason", "regime_transition"));
+                    OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Queued, DateTime.UtcNow);
+                    run.DeferredUntilUtc = DateTime.UtcNow.AddHours(regimeStabilityHours);
+                    await writeCtx.SaveChangesAsync(ct);
+                    return;
+                }
+            }
+        }
+
+        // EA data availability guard: if the strategy's symbol has no active EA instances
+        // feeding data, we'd be optimizing against stale candles. Defer until data resumes.
+        if (config.RequireEADataAvailability)
+        {
+            var stratForEA = await db.Set<Strategy>()
+                .Where(s => s.Id == run.StrategyId && !s.IsDeleted)
+                .Select(s => s.Symbol)
+                .FirstOrDefaultAsync(ct);
+
+            if (stratForEA is not null)
+            {
+                bool hasActiveEA = await db.Set<EAInstance>()
+                    .AnyAsync(ea => ea.Status == EAInstanceStatus.Active
+                                 && !ea.IsDeleted
+                                 && ea.Symbols.Contains(stratForEA), ct);
+
+                if (!hasActiveEA)
+                {
+                    _logger.LogInformation(
+                        "OptimizationWorker: no active EA instance for {Symbol} — deferring run {RunId} (DATA_UNAVAILABLE)",
+                        stratForEA, run.Id);
+                    _metrics.OptimizationRunsDeferred.Add(1, new KeyValuePair<string, object?>("reason", "ea_data_unavailable"));
+                    OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Queued, DateTime.UtcNow);
+                    run.DeferredUntilUtc = DateTime.UtcNow.AddMinutes(15);
+                    await writeCtx.SaveChangesAsync(ct);
+                    return;
+                }
+            }
+        }
 
         _logger.LogInformation(
             "OptimizationWorker: processing run {RunId} for strategy {StrategyId}", run.Id, run.StrategyId);
 
-        // Immediately claim the run by setting it to Running so no concurrent worker
-        // instance picks up the same row.
-        run.Status = OptimizationRunStatus.Running;
-        await writeContext.SaveChangesAsync(ct);
+        // Aggregate timeout: cap the entire optimisation run to prevent indefinite blocking
+        using var runCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        runCts.CancelAfter(TimeSpan.FromMinutes(config.MaxRunTimeoutMinutes));
+        var runCt = runCts.Token;
 
         try
         {
-            // Load the strategy via the read-side context (CQRS separation).
-            var strategy = await readContext.GetDbContext()
-                .Set<Strategy>()
-                .FirstOrDefaultAsync(x => x.Id == run.StrategyId && !x.IsDeleted, ct);
+            var strategy = await db.Set<Strategy>()
+                .FirstOrDefaultAsync(x => x.Id == run.StrategyId && !x.IsDeleted, runCt);
 
             if (strategy is null)
                 throw new InvalidOperationException($"Strategy {run.StrategyId} not found.");
 
-            // Use the last 6 months of closed candles as the optimisation window.
-            // This keeps the search grounded in recent market conditions while providing
-            // enough data for statistically meaningful backtest results (typically thousands
-            // of H1 bars). A longer window risks optimising on stale regimes.
-            var toDate   = DateTime.UtcNow;
-            var fromDate = toDate.AddMonths(-6);
+            // ── Stages 3–4: Load candles, validate, split, build cost options, run baseline ──
+            var phase = PhaseTimer.Start(_logger, _metrics, run.Id, run.StrategyId, "DataLoad");
 
-            var candles = await readContext.GetDbContext()
-                .Set<Candle>()
-                .Where(x => x.Symbol    == strategy.Symbol
-                         && x.Timeframe == strategy.Timeframe
-                         && x.Timestamp >= fromDate
-                         && x.Timestamp <= toDate
-                         && x.IsClosed        // Only completed bars; open bar would bias indicators
-                         && !x.IsDeleted)
-                .OrderBy(x => x.Timestamp)
-                .ToListAsync(ct);
+            var dataLoad = await LoadAndValidateCandlesAsync(db, run, strategy, config, runCt);
 
-            if (candles.Count == 0)
-                throw new InvalidOperationException(
-                    $"No candles found for {strategy.Symbol}/{strategy.Timeframe} in the last 6 months.");
+            phase.Dispose();
 
-            // ── Establish baseline ────────────────────────────────────────────────
-            // Snapshot the strategy's current (live) parameters and backtest them on
-            // the same candle slice so the health-score improvement can be measured
-            // on an apples-to-apples basis.
-            run.BaselineParametersJson = strategy.ParametersJson;
-            var baselineResult         = await _backtestEngine.RunAsync(strategy, candles, 10_000m, ct);
-            run.BaselineHealthScore    = ComputeHealthScore(baselineResult.WinRate, baselineResult.ProfitFactor, baselineResult.MaxDrawdownPct);
+            var candles          = dataLoad.AllCandles;
+            var trainCandles     = dataLoad.TrainCandles;
+            var testCandles      = dataLoad.TestCandles;
+            int embargoSize      = dataLoad.EmbargoSize;
+            var screeningOptions = dataLoad.ScreeningOptions;
+            var protocol         = dataLoad.Protocol;
+            var candleLookbackStart = dataLoad.CandleLookbackStart;
+            var currentRegimeForBaseline = dataLoad.CurrentRegimeForBaseline;
+            var pairInfo = dataLoad.PairInfo;
 
-            // ── Grid search ───────────────────────────────────────────────────────
-            // BuildParameterGrid returns every discrete candidate combination for this
-            // strategy type. Each candidate is applied to a shallow Strategy clone so
-            // the live entity is never mutated during the search.
-            var parameterGrid = BuildParameterGrid(strategy.StrategyType);
+            // ── Stages 5–6: Bayesian search with purged K-fold ──────────
+            phase = PhaseTimer.Start(_logger, _metrics, run.Id, run.StrategyId, "Search");
+            var searchResult = await RunBayesianSearchAsync(
+                db, run, strategy, config, trainCandles, candles, screeningOptions,
+                protocol, embargoSize, currentRegimeForBaseline, writeCtx, ct, runCt);
 
-            string? bestParamsJson   = null;
-            decimal bestProfitFactor = -1m;  // Sentinel: profit factor cannot be negative in practice
-            int     iterations       = 0;
+            var allEvaluated = searchResult.EvaluatedCandidates;
+            int totalIters   = searchResult.TotalIterations;
 
-            foreach (var paramSet in parameterGrid)
+            if (allEvaluated.Count == 0)
+                throw new InvalidOperationException("All parameter candidates failed during TPE search.");
+
+            // ── Variables used downstream in RunMetadataSnapshot ──
+            var surrogateKind          = searchResult.SurrogateKind;
+            var warmStarted            = searchResult.WarmStartedObservations;
+            var resumedFromCheckpoint  = searchResult.ResumedFromCheckpoint;
+
+            phase.Dispose();
+
+            await HeartbeatRunAsync(run, writeCtx, ct);
+
+            // ── Stage 6b: Memory pressure mitigation ──────────────────
+            // Trim trade lists from non-top candidates to reduce heap pressure.
+            // The Pareto selector only needs BacktestResult metrics (Sharpe, DD, WR),
+            // not individual trades. Keep full trades only for the top N candidates
+            // that might proceed to OOS validation.
+            var evaluatedList = allEvaluated
+                .OrderByDescending(c => c.HealthScore)
+                .ToList();
+
+            int keepTradesCount = Math.Max(config.TopNCandidates * 2, 10);
+            for (int i = keepTradesCount; i < evaluatedList.Count; i++)
             {
-                // Clone the strategy and inject the candidate parameters as JSON so the
-                // backtest engine's evaluator picks them up via deserialization. The original
-                // strategy entity remains unchanged throughout the loop.
-                var candidate             = CloneStrategy(strategy);
-                candidate.ParametersJson  = JsonSerializer.Serialize(paramSet);
-
-                var result = await _backtestEngine.RunAsync(candidate, candles, 10_000m, ct);
-                iterations++;
-
-                // ProfitFactor is used as the primary ranking criterion because it directly
-                // captures gross profit vs gross loss, normalised for the number of trades.
-                // The health score (composite) is only computed and stored for the winner.
-                if (result.ProfitFactor > bestProfitFactor)
-                {
-                    bestProfitFactor    = result.ProfitFactor;
-                    bestParamsJson      = candidate.ParametersJson;
-                    run.BestHealthScore = ComputeHealthScore(result.WinRate, result.ProfitFactor, result.MaxDrawdownPct);
-                }
+                evaluatedList[i].Result.Trades?.Clear();
+                evaluatedList[i].TradesTrimmed = true;
             }
 
-            run.Iterations         = iterations;
-            // Fall back to the current parameters if no candidate outperformed the sentinel.
-            run.BestParametersJson = bestParamsJson ?? strategy.ParametersJson;
-            run.Status             = OptimizationRunStatus.Completed;
-            run.CompletedAt        = DateTime.UtcNow;
+            // ── Stage 7: Multi-objective Pareto selection ───────────────
+            var topCandidates = ParetoFrontSelector.RankByNonDominatedSorting(
+                evaluatedList,
+                config.TopNCandidates,
+                c => (double)c.Result.SharpeRatio,
+                c => -(double)c.Result.MaxDrawdownPct,
+                c => (double)c.Result.WinRate);
 
-            await writeContext.SaveChangesAsync(ct);
+            phase = PhaseTimer.Start(_logger, _metrics, run.Id, run.StrategyId, "Validation");
+
+            // Fine validation of Pareto winners on full IS data
+            var parallelOptions = new ParallelOptions
+            {
+                MaxDegreeOfParallelism = config.MaxParallelBacktests,
+                CancellationToken      = runCt,
+            };
+            var fineRanked = new List<ScoredCandidate>();
+            var _fineLock = new object();
+            await Parallel.ForEachAsync(topCandidates, parallelOptions, async (candidate, pCt) =>
+            {
+                try
+                {
+                    var result = await _validator.RunWithTimeoutAsync(
+                        strategy, candidate.ParamsJson, trainCandles, screeningOptions,
+                        config.ScreeningTimeoutSeconds, pCt);
+                    Interlocked.Increment(ref totalIters);
+                    lock (_fineLock) fineRanked.Add(new ScoredCandidate(
+                        candidate.ParamsJson,
+                        OptimizationHealthScorer.ComputeHealthScore(result),
+                        result,
+                        candidate.CvCoefficientOfVariation));
+                }
+                catch { Interlocked.Increment(ref totalIters); }
+            });
+
+            var rankedCandidates = fineRanked.Count == 0
+                ? topCandidates
+                : fineRanked.OrderByDescending(r => r.HealthScore).ToList();
+
+            // ── Stage 7b–11d: Post-selection validation with Pareto fallback ──
+            var vr = await ValidateParetoCandidatesAsync(
+                rankedCandidates, strategy, run, trainCandles, testCandles,
+                screeningOptions, protocol, config, db, totalIters, writeCtx, pairInfo, ct, runCt);
+            await HeartbeatRunAsync(run, writeCtx, ct);
+
+            var currentRegime = await db.Set<MarketRegimeSnapshot>()
+                .Where(s => s.Symbol == strategy.Symbol
+                         && s.Timeframe == strategy.Timeframe
+                         && !s.IsDeleted)
+                .OrderByDescending(s => s.DetectedAt)
+                .Select(s => (MarketRegimeEnum?)s.Regime)
+                .FirstOrDefaultAsync(runCt);
+
+            phase.Dispose();
+
+            // ── Stage 12: Persist results + benchmarking ────────────────
+            phase = PhaseTimer.Start(_logger, _metrics, run.Id, run.StrategyId, "Persist");
+            run.Iterations              = totalIters;
+            run.IntermediateResultsJson  = null; // Clear checkpoint data — run completed successfully
+            run.CheckpointVersion        = 0;
+            run.BestParametersJson = CanonicalParameterJson.Normalize(vr.Winner.ParamsJson);
+            run.BestHealthScore    = vr.OosHealthScore;
+            // Store per-objective metrics for EHVI warm-start in future runs
+            run.BestSharpeRatio    = vr.OosResult.SharpeRatio;
+            run.BestMaxDrawdownPct = vr.OosResult.MaxDrawdownPct;
+            run.BestWinRate        = vr.OosResult.WinRate;
+            run.ApprovalReportJson = OptimizationCheckpointStore.LimitJsonPayload(
+                vr.ApprovalReportJson,
+                OptimizationCheckpointStore.MaxApprovalReportChars,
+                "approval report",
+                _logger);
+            StampHeartbeat(run);
+            OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Completed, DateTime.UtcNow);
+            // NOTE: SaveChangesAsync calls below intentionally use the parent `ct` (not `runCt`)
+            // so that result persistence survives a run-level timeout. The run is already complete
+            // at this point — we must persist results even if the aggregate timeout fires.
+            run.RunMetadataJson = OptimizationCheckpointStore.LimitJsonPayload(JsonSerializer.Serialize(new RunMetadataSnapshot(
+                RunMetadataVersion,
+                run.DeterministicSeed,
+                surrogateKind,
+                strategy.Symbol,
+                strategy.Timeframe,
+                candles[0].Timestamp,
+                candles[^1].Timestamp,
+                candles.Count,
+                trainCandles.Count,
+                testCandles.Count,
+                embargoSize,
+                resumedFromCheckpoint,
+                currentRegime?.ToString(),
+                warmStarted,
+                totalIters,
+                run.BaselineHealthScore,
+                vr.OosHealthScore,
+                vr.Passed)),
+                OptimizationCheckpointStore.MaxMetadataChars,
+                "run metadata",
+                _logger);
+            await writeCtx.SaveChangesAsync(ct);
+
+            sw.Stop();
+            _metrics.OptimizationRunsProcessed.Add(1);
+            _metrics.OptimizationCycleDurationMs.Record(sw.Elapsed.TotalMilliseconds);
+            _metrics.OptimizationComputeSeconds.Record(sw.Elapsed.TotalSeconds,
+                new KeyValuePair<string, object?>("strategy_type", strategy.StrategyType.ToString()));
+
+            double candidatesPerSec = totalIters / Math.Max(1.0, sw.Elapsed.TotalSeconds);
 
             _logger.LogInformation(
-                "OptimizationWorker: run {RunId} completed — Iterations={Iter}, BestPF={PF:F2}",
-                run.Id, iterations, bestProfitFactor);
+                "OptimizationWorker: run {RunId} completed — Iter={Iter} ({CPS:F1}/s), IS={IS:F2}, OOS={OOS:F2}, " +
+                "CI=[{CIL:F2},{CIU:F2}], WF={WF:F2}, Sens={Sens}, CostOk={Cost}, Baseline={Base:F2} in {Ms:F0}ms",
+                run.Id, run.Iterations, candidatesPerSec, vr.Winner.HealthScore, vr.OosHealthScore,
+                vr.CILower, vr.CIUpper, vr.WfAvgScore, vr.SensitivityOk, vr.CostSensitiveOk,
+                run.BaselineHealthScore, sw.Elapsed.TotalMilliseconds);
 
-            // Audit log: record completion details for traceability.
             await mediator.Send(new LogDecisionCommand
             {
-                EntityType   = "OptimizationRun",
-                EntityId     = run.Id,
-                DecisionType = "OptimizationCompleted",
-                Outcome      = "Completed",
-                Reason       = $"Iterations={iterations}, BestProfitFactor={bestProfitFactor:F2}, BestHealthScore={run.BestHealthScore:F2}",
-                Source       = "OptimizationWorker"
+                EntityType = "OptimizationRun", EntityId = run.Id,
+                DecisionType = "OptimizationCompleted", Outcome = "Completed",
+                Reason = $"Iter={run.Iterations}, IS={vr.Winner.HealthScore:F2}, OOS={vr.OosHealthScore:F2}, " +
+                         $"CI95=[{vr.CILower:F2},{vr.CIUpper:F2}], WF_Avg={vr.WfAvgScore:F2}, WF_Stable={vr.WfStable}, " +
+                         $"MTF={vr.MtfCompatible}, ParamCorr={!vr.CorrelationSafe}, TemporalCorr={vr.TemporalMaxOverlap:P0}, " +
+                         $"PortfolioCorr={vr.PortfolioMaxCorrelation:P0}, " +
+                         $"Sensitivity={vr.SensitivityOk}, CostSensitive={vr.CostSensitiveOk} (pess={vr.PessimisticScore:F2}), " +
+                         $"PermTest p={vr.PermPValue:F3} α_corrected={vr.PermCorrectedAlpha:F4} sig={vr.PermSignificant} (N={totalIters}), " +
+                         $"Baseline={run.BaselineHealthScore:F2}, Throughput={candidatesPerSec:F1}/s",
+                Source = "OptimizationWorker"
+            }, runCt);
+
+            await eventService.SaveAndPublish(writeCtx, new OptimizationCompletedIntegrationEvent
+            {
+                OptimizationRunId = run.Id,
+                StrategyId        = run.StrategyId,
+                Symbol            = strategy.Symbol,
+                Timeframe         = strategy.Timeframe,
+                Iterations        = run.Iterations,
+                BaselineScore     = run.BaselineHealthScore ?? 0m,
+                BestOosScore      = vr.OosHealthScore,
+                CompletedAt       = run.CompletedAt ?? DateTime.UtcNow,
+            });
+
+            phase.Dispose();
+
+            // ── Stage 13: Auto-approval ──────────────────────────────────
+            phase = PhaseTimer.Start(_logger, _metrics, run.Id, run.StrategyId, "Approval");
+
+            var ctx = new RunContext(run, strategy, config, db, writeDb, writeCtx, mediator, alertDispatcher, eventService, ct, runCt);
+            await ApplyApprovalDecisionAsync(
+                ctx, vr, currentRegime, candleLookbackStart, screeningOptions);
+
+            phase.Dispose();
+        }
+        catch (DataQualityException dqEx)
+        {
+            // Data quality issues are recoverable — defer back to queue instead of failing.
+            // New candle data from EA instances may resolve the issue on the next attempt.
+            _logger.LogWarning(
+                "OptimizationWorker: run {RunId} deferred due to data quality issue — {Reason}",
+                run.Id, dqEx.Message);
+            _metrics.OptimizationRunsDeferred.Add(1, new KeyValuePair<string, object?>("reason", "data_quality"));
+            run.FailureCategory = OptimizationFailureCategory.DataQuality;
+            OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Queued, DateTime.UtcNow);
+            run.DeferredUntilUtc = DateTime.UtcNow.AddHours(1);
+            await writeCtx.SaveChangesAsync(ct);
+        }
+        catch (OperationCanceledException) when (runCts.IsCancellationRequested && !ct.IsCancellationRequested)
+        {
+            _logger.LogWarning("OptimizationWorker: run {RunId} exceeded aggregate timeout of {Minutes}min",
+                run.Id, config.MaxRunTimeoutMinutes);
+            run.FailureCategory = OptimizationFailureCategory.Timeout;
+            if (OptimizationRunStateMachine.CanTransition(run.Status, OptimizationRunStatus.Failed))
+            {
+                OptimizationRunStateMachine.Transition(
+                    run,
+                    OptimizationRunStatus.Failed,
+                    DateTime.UtcNow,
+                    $"Aggregate timeout exceeded ({config.MaxRunTimeoutMinutes} minutes)");
+            }
+            await writeCtx.SaveChangesAsync(ct);
+
+            _metrics.OptimizationRunsFailed.Add(1);
+
+            await mediator.Send(new LogDecisionCommand
+            {
+                EntityType = "OptimizationRun", EntityId = run.Id,
+                DecisionType = "OptimizationFailed", Outcome = "Timeout",
+                Reason = run.ErrorMessage ?? $"Aggregate timeout exceeded ({config.MaxRunTimeoutMinutes} minutes)",
+                Source = "OptimizationWorker"
             }, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Graceful shutdown: the parent stoppingToken was cancelled (app shutting down).
+            // Persist intermediate results and re-queue the run so crash recovery doesn't
+            // have to restart from scratch. The IntermediateResultsJson (if populated by
+            // periodic checkpointing) is preserved for the next attempt.
+            _logger.LogWarning(
+                "OptimizationWorker: run {RunId} interrupted by shutdown — re-queuing with intermediate results",
+                run.Id);
+            OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Queued, DateTime.UtcNow);
 
-            // ── Auto-approval gate ─────────────────────────────────────────────────
-            // Two conditions must BOTH be satisfied to skip manual review:
-            //   1. The improvement over baseline exceeds AutoApprovalImprovementThreshold
-            //      (ensures the gain is material, not noise).
-            //   2. The best score exceeds AutoApprovalMinHealthScore
-            //      (ensures the result is genuinely good, not just better than a bad baseline).
-            decimal bestScore   = run.BestHealthScore ?? 0m;
-            decimal improvement = bestScore - (run.BaselineHealthScore ?? 0m);
-            bool autoApprove    = improvement >= AutoApprovalImprovementThreshold
-                               && bestScore    >= AutoApprovalMinHealthScore;
-
-            if (autoApprove)
+            // Use a brief standalone timeout for the shutdown save — we can't use `ct`
+            // (already cancelled) and we don't want to block shutdown indefinitely.
+            using var shutdownCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            try
             {
-                // Apply best parameters directly to the live strategy entity.
-                // Re-query via the write context so EF tracks the change correctly
-                // (the strategy loaded earlier was via the read context).
-                var liveStrategy = await writeContext.GetDbContext()
-                    .Set<Strategy>()
-                    .FirstOrDefaultAsync(x => x.Id == run.StrategyId && !x.IsDeleted, ct);
-
-                if (liveStrategy is not null)
-                {
-                    liveStrategy.ParametersJson = run.BestParametersJson;
-                    // If the strategy was paused (e.g. due to a previous drawdown breach),
-                    // re-activate it now that better parameters have been found.
-                    if (liveStrategy.Status == StrategyStatus.Paused)
-                        liveStrategy.Status = StrategyStatus.Active;
-                }
-
-                run.Status     = OptimizationRunStatus.Approved;
-                run.ApprovedAt = DateTime.UtcNow;
-                await writeContext.SaveChangesAsync(ct);
-
+                await writeCtx.SaveChangesAsync(shutdownCts.Token);
                 _logger.LogInformation(
-                    "OptimizationWorker: run {RunId} AUTO-APPROVED — improvement={Imp:+0.00;-0.00}, BestScore={Score:F2}",
-                    run.Id, improvement, run.BestHealthScore);
-
-                // Audit log: record auto-approval so operators can review the decision trail.
-                await mediator.Send(new LogDecisionCommand
-                {
-                    EntityType   = "OptimizationRun",
-                    EntityId     = run.Id,
-                    DecisionType = "AutoApproval",
-                    Outcome      = "Approved",
-                    Reason       = $"HealthScore improvement={improvement:+0.00;-0.00} exceeded threshold ({AutoApprovalImprovementThreshold}) and minimum ({AutoApprovalMinHealthScore}); parameters applied automatically",
-                    Source       = "OptimizationWorker"
-                }, ct);
-
-                // ── Re-queue Backtest + WalkForward to validate new parameters ──────
-                // The optimisation window was only 6 months; queue a full 1-year backtest
-                // so BacktestWorker can evaluate the promoted parameters on a longer, more
-                // representative horizon. BacktestWorker will subsequently auto-queue a
-                // WalkForwardRun, completing the full validation chain.
-                var validationToDate   = DateTime.UtcNow;
-                var validationFromDate = validationToDate.AddYears(-1);
-
-                var validationBacktest = new BacktestRun
-                {
-                    StrategyId     = run.StrategyId,
-                    Symbol         = strategy.Symbol,
-                    Timeframe      = strategy.Timeframe,
-                    FromDate       = validationFromDate,
-                    ToDate         = validationToDate,
-                    InitialBalance = 10_000m,
-                    Status         = RunStatus.Queued,
-                    StartedAt      = DateTime.UtcNow
-                };
-
-                await writeContext.GetDbContext().Set<BacktestRun>().AddAsync(validationBacktest, ct);
-
-                _logger.LogInformation(
-                    "OptimizationWorker: queued validation BacktestRun for strategy {StrategyId} after auto-approval",
-                    run.StrategyId);
+                    "OptimizationWorker: run {RunId} successfully re-queued with checkpoint data", run.Id);
             }
-            else
+            catch (Exception saveEx)
             {
-                // Improvement is below the auto-approval thresholds — leave the run in
-                // Completed status for manual operator review via ApproveOptimizationCommand.
-                _logger.LogInformation(
-                    "OptimizationWorker: run {RunId} requires manual review — improvement={Imp:+0.00;-0.00} (threshold={Thr}), BestScore={Score:F2} (min={Min})",
-                    run.Id, improvement, AutoApprovalImprovementThreshold, run.BestHealthScore, AutoApprovalMinHealthScore);
+                _logger.LogError(saveEx,
+                    "OptimizationWorker: failed to re-queue run {RunId} during shutdown — " +
+                    "crash recovery will reclaim it on next startup", run.Id);
             }
-
-            await writeContext.SaveChangesAsync(ct);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "OptimizationWorker: run {RunId} failed", run.Id);
-            run.Status       = OptimizationRunStatus.Failed;
-            run.ErrorMessage = ex.Message;
-            run.CompletedAt  = DateTime.UtcNow;
-            await writeContext.SaveChangesAsync(ct);
+            run.FailureCategory = ex switch
+            {
+                InvalidOperationException when ex.Message.Contains("not found") => OptimizationFailureCategory.StrategyRemoved,
+                InvalidOperationException when ex.Message.Contains("candidates failed") => OptimizationFailureCategory.SearchExhausted,
+                _ => OptimizationFailureCategory.Transient,
+            };
+            if (OptimizationRunStateMachine.CanTransition(run.Status, OptimizationRunStatus.Failed))
+            {
+                OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Failed, DateTime.UtcNow, ex.Message);
+            }
+            else
+            {
+                _logger.LogWarning(
+                    "OptimizationWorker: preserving terminal run status {Status} for run {RunId} after downstream error",
+                    run.Status, run.Id);
+            }
+            await writeCtx.SaveChangesAsync(ct);
 
-            // Audit log: record failure so operators are aware and can investigate.
+            _metrics.OptimizationRunsFailed.Add(1);
+
             await mediator.Send(new LogDecisionCommand
             {
-                EntityType   = "OptimizationRun",
-                EntityId     = run.Id,
-                DecisionType = "OptimizationFailed",
-                Outcome      = "Failed",
-                Reason       = ex.Message,
-                Source       = "OptimizationWorker"
+                EntityType = "OptimizationRun", EntityId = run.Id,
+                DecisionType = "OptimizationFailed", Outcome = "Failed",
+                Reason = ex.Message, Source = "OptimizationWorker"
             }, ct);
         }
+        finally
+        {
+            _validator.ClearCache();
+        }
+    }
+
+    // ── Stage methods ───────────────────────────────────────────────────────
+
+    private async Task RequeueExpiredRunningRunsAsync(CancellationToken ct)
+    {
+        await using var recoveryScope = _scopeFactory.CreateAsyncScope();
+        var writeCtx = recoveryScope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+        var db = writeCtx.GetDbContext();
+
+        var (requeued, orphaned) = await OptimizationRunClaimer.RequeueExpiredRunsAsync(db, ct);
+
+        if (requeued > 0)
+            _metrics.OptimizationLeaseReclaims.Add(requeued);
+        if (orphaned > 0)
+            _logger.LogWarning(
+                "OptimizationWorker: marked {Count} expired run(s) as Failed — strategy deleted",
+                orphaned);
     }
 
     /// <summary>
-    /// Builds the exhaustive list of candidate parameter dictionaries for the given
-    /// strategy type. Each dictionary maps parameter names to their candidate values
-    /// and is later serialised to JSON and injected into a cloned <see cref="Strategy"/>
-    /// for backtesting.
+    /// Re-queues recently failed runs that haven't exhausted their retry budget.
+    /// Only retries runs that failed within the last hour (transient failures);
+    /// older failures are considered permanent. Runs that have exhausted their retry
+    /// budget are moved to <see cref="OptimizationRunStatus.Abandoned"/> (dead-letter queue)
+    /// and an alert is fired for operator visibility.
     /// </summary>
-    /// <remarks>
-    /// <b>Grid sizes by strategy type:</b>
-    /// <list type="bullet">
-    ///   <item>
-    ///     <term>MovingAverageCrossover</term>
-    ///     <description>
-    ///       3 fast periods × 3 slow periods = up to 9 combinations (invalid fast &gt;= slow
-    ///       pairs are filtered out), plus a fixed 50-bar trend filter (<c>MaPeriod</c>).
-    ///     </description>
-    ///   </item>
-    ///   <item>
-    ///     <term>RSIReversion</term>
-    ///     <description>
-    ///       3 RSI periods × 3 oversold levels × 3 overbought levels = 27 combinations.
-    ///       Oversold/overbought values are not validated against each other here; the
-    ///       evaluator enforces that oversold &lt; overbought at signal generation time.
-    ///     </description>
-    ///   </item>
-    ///   <item>
-    ///     <term>BreakoutScalper</term>
-    ///     <description>
-    ///       4 lookback windows × 3 ATR multipliers = 12 combinations.
-    ///     </description>
-    ///   </item>
-    ///   <item>
-    ///     <term>Default / unknown types</term>
-    ///     <description>
-    ///       A single empty dictionary is returned, which the evaluator interprets as
-    ///       "use built-in defaults". This avoids blocking optimisation for custom strategy
-    ///       types that have not yet had grid ranges defined.
-    ///     </description>
-    ///   </item>
-    /// </list>
-    /// </remarks>
-    /// <param name="strategyType">The type of strategy being optimised.</param>
-    /// <returns>
-    /// An ordered list of parameter dictionaries; each item represents one candidate
-    /// configuration to backtest.
-    /// </returns>
-    private static List<Dictionary<string, object>> BuildParameterGrid(StrategyType strategyType)
+    private async Task RetryFailedRunsAsync(CancellationToken ct)
     {
-        var grid = new List<Dictionary<string, object>>();
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        var readCtx  = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+        var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+        var db       = readCtx.GetDbContext();
+        var writeDb  = writeCtx.GetDbContext();
 
-        switch (strategyType)
+        // Single-key query instead of loading all ~52 config keys
+        int maxRetryAttempts = await OptimizationGridBuilder.GetConfigAsync(db, "Optimization:MaxRetryAttempts", 2, ct);
+        if (maxRetryAttempts <= 0) return;
+
+        var retryWindowStart = DateTime.UtcNow.AddHours(-1);
+        var nowUtc = DateTime.UtcNow;
+
+        // Re-queue retryable runs with exponential backoff: a run must wait
+        // 15 * 2^RetryCount minutes after failure before becoming eligible again
+        // (15m, 30m, 60m, ...). This prevents burning through the retry budget
+        // on transient issues that take minutes to resolve (e.g. DB failover,
+        // resource exhaustion).
+        int retried = await writeDb.Set<OptimizationRun>()
+            .Where(r => r.Status == OptimizationRunStatus.Failed
+                     && !r.IsDeleted
+                     && r.RetryCount < maxRetryAttempts
+                     && r.FailureCategory != OptimizationFailureCategory.ConfigError
+                     && r.FailureCategory != OptimizationFailureCategory.StrategyRemoved
+                     && r.CompletedAt != null && r.CompletedAt >= retryWindowStart
+                     && r.CompletedAt.Value.AddMinutes(15 << r.RetryCount) <= nowUtc)
+            .ExecuteUpdateAsync(s => s
+                .SetProperty(r => r.Status, OptimizationRunStatus.Queued)
+                .SetProperty(r => r.StartedAt, nowUtc)
+                .SetProperty(r => r.RetryCount, r => r.RetryCount + 1)
+                .SetProperty(r => r.CompletedAt, (DateTime?)null)
+                .SetProperty(r => r.ErrorMessage, (string?)null)
+                .SetProperty(r => r.DeferredUntilUtc, (DateTime?)null)
+                .SetProperty(r => r.ExecutionLeaseExpiresAt, (DateTime?)null), ct);
+
+        if (retried > 0)
         {
-            case StrategyType.MovingAverageCrossover:
-                // Enumerate all fast × slow period pairs and reject any where fast >= slow
-                // because a fast MA period equal to or exceeding the slow MA period produces
-                // no meaningful crossover signal.
-                foreach (var fast in new[] { 5, 9, 12 })
-                foreach (var slow in new[] { 20, 21, 26 })
-                {
-                    if (fast >= slow) continue;
-                    grid.Add(new Dictionary<string, object>
-                    {
-                        ["FastPeriod"] = fast,
-                        ["SlowPeriod"] = slow,
-                        ["MaPeriod"]   = 50   // Fixed trend-direction filter; not optimised
-                    });
-                }
-                break;
-
-            case StrategyType.RSIReversion:
-                // 3 × 3 × 3 = 27 combinations spanning common RSI period and threshold values.
-                // Wider oversold/overbought bands (25/75) are more selective; tighter bands
-                // (35/65) generate more signals but with lower edge per trade on average.
-                foreach (var period in new[] { 10, 14, 21 })
-                foreach (var oversold in new[] { 25, 30, 35 })
-                foreach (var overbought in new[] { 65, 70, 75 })
-                {
-                    grid.Add(new Dictionary<string, object>
-                    {
-                        ["Period"]     = period,
-                        ["Oversold"]   = oversold,
-                        ["Overbought"] = overbought
-                    });
-                }
-                break;
-
-            case StrategyType.BreakoutScalper:
-                // LookbackBars controls how far back the engine searches for swing highs/lows.
-                // BreakoutMultiplier scales the ATR-based buffer above/below the swing level
-                // that price must breach to confirm a genuine breakout vs. a noise excursion.
-                foreach (var lookback in new[] { 10, 15, 20, 30 })
-                foreach (var multiplier in new[] { 1.0, 1.5, 2.0 })
-                {
-                    grid.Add(new Dictionary<string, object>
-                    {
-                        ["LookbackBars"]        = lookback,
-                        ["BreakoutMultiplier"]  = multiplier
-                    });
-                }
-                break;
-
-            case StrategyType.MomentumTrend:
-                // AdxPeriod determines the lookback for trend strength measurement.
-                // AdxThreshold is the minimum ADX value to confirm a trending regime —
-                // lower values (18) catch trends earlier with more noise; higher values (30)
-                // require stronger confirmation but miss early entries.
-                foreach (var adxPeriod in new[] { 10, 14, 20 })
-                foreach (var adxThreshold in new[] { 18, 22, 25, 30 })
-                {
-                    grid.Add(new Dictionary<string, object>
-                    {
-                        ["AdxPeriod"]    = adxPeriod,
-                        ["AdxThreshold"] = adxThreshold
-                    });
-                }
-                break;
-
-            case StrategyType.MACDDivergence:
-                // Standard MACD uses (12, 26, 9) but faster settings can catch divergences
-                // earlier. DivergenceLookback controls how many bars to scan for price/MACD
-                // divergence patterns.
-                foreach (var fast in new[] { 8, 12, 16 })
-                foreach (var slow in new[] { 21, 26, 30 })
-                foreach (var signal in new[] { 7, 9, 12 })
-                {
-                    if (fast >= slow) continue;
-                    grid.Add(new Dictionary<string, object>
-                    {
-                        ["FastPeriod"]         = fast,
-                        ["SlowPeriod"]         = slow,
-                        ["SignalPeriod"]        = signal,
-                        ["DivergenceLookback"]  = 20
-                    });
-                }
-                break;
-
-            case StrategyType.SessionBreakout:
-                // Session breakout timing: range accumulation period → breakout window.
-                // ThresholdMultiplier scales ATR to determine how far price must breach
-                // the session range to qualify as a genuine breakout.
-                foreach (var rangeStart in new[] { 0, 2, 4 })
-                foreach (var rangeEnd in new[] { 6, 8 })
-                foreach (var thresholdMult in new[] { 0.3, 0.5, 0.8 })
-                {
-                    if (rangeStart >= rangeEnd) continue;
-                    grid.Add(new Dictionary<string, object>
-                    {
-                        ["RangeStartHourUtc"]   = rangeStart,
-                        ["RangeEndHourUtc"]     = rangeEnd,
-                        ["BreakoutStartHour"]   = rangeEnd,
-                        ["BreakoutEndHour"]     = rangeEnd + 8,
-                        ["ThresholdMultiplier"] = thresholdMult
-                    });
-                }
-                break;
-
-            default:
-                // For custom or unknown types, return a single default parameter set.
-                // The backtest engine will use the evaluator's hard-coded defaults,
-                // effectively making this a single-run "do-nothing" optimisation.
-                grid.Add(new Dictionary<string, object>());
-                break;
+            _logger.LogInformation(
+                "OptimizationWorker: re-queued {Count} failed run(s) for retry", retried);
         }
 
-        return grid;
+        // Dead-letter: move runs to Abandoned when either:
+        // (a) retry budget is spent (RetryCount >= max), OR
+        // (b) the run aged out of the retry window AND still has retries remaining.
+        // Case (b) prevents orphaned Failed runs that are too old for the transient retry
+        // window but haven't exhausted their budget — they'd otherwise sit in Failed forever
+        // with no alerting or operator visibility.
+        int abandoned = await writeDb.Set<OptimizationRun>()
+            .Where(r => r.Status == OptimizationRunStatus.Failed
+                     && !r.IsDeleted
+                     && (r.RetryCount >= maxRetryAttempts
+                         || (r.CompletedAt != null && r.CompletedAt < retryWindowStart)))
+            .ExecuteUpdateAsync(s => s
+                .SetProperty(r => r.Status, OptimizationRunStatus.Abandoned)
+                .SetProperty(r => r.ErrorMessage,
+                    r => (r.ErrorMessage ?? "") + $" [Abandoned after {r.RetryCount} retries]"), ct);
+
+        if (abandoned > 0)
+        {
+            _logger.LogWarning(
+                "OptimizationWorker: moved {Count} permanently failed run(s) to dead-letter (Abandoned) — " +
+                "retry budget exhausted, manual investigation required", abandoned);
+
+            // Fire alert for operator attention — deduplicate to avoid alert fatigue.
+            // If a dead-letter alert was already created within the last 24 hours, skip.
+            try
+            {
+                bool recentAlertExists = await db.Set<Alert>()
+                    .AnyAsync(a => a.Symbol == "OptimizationWorker:DeadLetter"
+                               && a.LastTriggeredAt != null
+                               && a.LastTriggeredAt >= DateTime.UtcNow.AddHours(-24)
+                               && !a.IsDeleted, ct);
+
+                if (!recentAlertExists)
+                {
+                    var alertDispatcher = scope.ServiceProvider.GetRequiredService<IAlertDispatcher>();
+                    var alert = new Alert
+                    {
+                        AlertType       = AlertType.DataQualityIssue,
+                        Symbol          = "OptimizationWorker:DeadLetter",
+                        Channel         = AlertChannel.Webhook,
+                        Destination     = string.Empty,
+                        Severity        = AlertSeverity.High,
+                        IsActive        = true,
+                        LastTriggeredAt = DateTime.UtcNow,
+                        ConditionJson   = JsonSerializer.Serialize(new
+                        {
+                            Type = "OptimizationDeadLetter",
+                            AbandonedCount = abandoned,
+                            MaxRetryAttempts = maxRetryAttempts,
+                            Message = $"{abandoned} optimization run(s) moved to dead-letter queue after exhausting {maxRetryAttempts} retry attempts. Manual investigation required."
+                        }),
+                    };
+                    writeDb.Set<Alert>().Add(alert);
+                    await writeCtx.SaveChangesAsync(ct);
+
+                    await alertDispatcher.DispatchBySeverityAsync(alert,
+                        $"{abandoned} optimization run(s) permanently failed after {maxRetryAttempts} retries — moved to dead-letter queue", ct);
+                }
+                else
+                {
+                    _logger.LogDebug(
+                        "OptimizationWorker: suppressed duplicate dead-letter alert ({Count} run(s)) — recent alert exists",
+                        abandoned);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "OptimizationWorker: dead-letter alert dispatch failed (non-fatal)");
+            }
+        }
     }
 
     /// <summary>
-    /// Computes a composite health score in the range [0, 1] from three independent
-    /// backtest metrics, weighted to reflect their relative importance in live trading.
+    /// Checks completed validation follow-ups (backtests + walk-forwards) for recently
+    /// approved optimization runs. If a follow-up shows poor results, fires an alert
+    /// for the operator to investigate and potentially roll back the approval.
     /// </summary>
-    /// <remarks>
-    /// <b>Weighting rationale:</b>
-    /// <list type="bullet">
-    ///   <item>
-    ///     <term>WinRate (40%)</term>
-    ///     <description>
-    ///       Highest weight — a consistently winning strategy is easier to operate
-    ///       psychologically and has lower sensitivity to individual trade sizing errors.
-    ///     </description>
-    ///   </item>
-    ///   <item>
-    ///     <term>ProfitFactor (30%)</term>
-    ///     <description>
-    ///       Normalised to [0, 1] by dividing by 2 and clamping at 1.
-    ///       A PF of 2.0 or above is considered excellent; higher values are capped to
-    ///       prevent a single outlier run dominating the score.
-    ///     </description>
-    ///   </item>
-    ///   <item>
-    ///     <term>MaxDrawdown penalty (30%)</term>
-    ///     <description>
-    ///       Scores 1.0 at 0% drawdown and 0.0 at 20% drawdown (linear). Drawdowns beyond
-    ///       20% are clamped to 0. This penalises high-risk configurations that would
-    ///       trigger the risk manager's drawdown circuit breaker in live trading.
-    ///     </description>
-    ///   </item>
-    /// </list>
-    /// </remarks>
-    /// <param name="winRate">Fraction of trades that were profitable, in [0, 1].</param>
-    /// <param name="profitFactor">Gross profit divided by gross loss (e.g. 1.5 = good).</param>
-    /// <param name="maxDrawdownPct">Maximum peak-to-trough equity decline as a percentage (e.g. 12.5 for 12.5%).</param>
-    /// <returns>Composite health score in [0, 1]; higher is better.</returns>
-    private static decimal ComputeHealthScore(decimal winRate, decimal profitFactor, decimal maxDrawdownPct)
+    private async Task MonitorFollowUpResultsAsync(CancellationToken ct)
     {
-        return 0.4m * winRate
-             + 0.3m * Math.Min(1m, profitFactor / 2m)          // Cap PF contribution at PF = 2.0
-             + 0.3m * Math.Max(0m, 1m - maxDrawdownPct / 20m); // Zero contribution at drawdown >= 20%
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        var readCtx  = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+        var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+        var db       = readCtx.GetDbContext();
+        var writeDb  = writeCtx.GetDbContext();
+
+        // Find approved runs with pending follow-ups where the follow-ups have completed
+        var pendingRuns = await db.Set<OptimizationRun>()
+            .Where(r => r.Status == OptimizationRunStatus.Approved
+                     && r.ValidationFollowUpStatus == ValidationFollowUpStatus.Pending
+                     && !r.IsDeleted)
+            .Take(10)
+            .ToListAsync(ct);
+
+        foreach (var run in pendingRuns)
+        {
+            var backtestRun = await db.Set<BacktestRun>()
+                .Where(b => b.SourceOptimizationRunId == run.Id && !b.IsDeleted)
+                .FirstOrDefaultAsync(ct);
+
+            var wfRun = await db.Set<WalkForwardRun>()
+                .Where(w => w.SourceOptimizationRunId == run.Id && !w.IsDeleted)
+                .FirstOrDefaultAsync(ct);
+
+            bool backtestDone = backtestRun is null || backtestRun.Status is RunStatus.Completed or RunStatus.Failed;
+            bool wfDone = wfRun is null || wfRun.Status is RunStatus.Completed or RunStatus.Failed;
+
+            if (!backtestDone || !wfDone) continue; // Still running
+
+            bool backtestFailed = backtestRun?.Status == RunStatus.Failed;
+            bool wfFailed = wfRun?.Status == RunStatus.Failed;
+
+            var liveRun = await writeDb.Set<OptimizationRun>()
+                .FirstOrDefaultAsync(r => r.Id == run.Id, ct);
+            if (liveRun is null) continue;
+
+            if (backtestFailed || wfFailed)
+            {
+                liveRun.ValidationFollowUpStatus = ValidationFollowUpStatus.Failed;
+                _metrics.OptimizationFollowUpFailures.Add(1);
+                _logger.LogWarning(
+                    "OptimizationWorker: follow-up validation FAILED for run {RunId} — " +
+                    "backtest={BtStatus}, walk-forward={WfStatus}. Manual investigation recommended.",
+                    run.Id, backtestRun?.Status, wfRun?.Status);
+            }
+            else
+            {
+                liveRun.ValidationFollowUpStatus = ValidationFollowUpStatus.Passed;
+                _logger.LogInformation(
+                    "OptimizationWorker: follow-up validation passed for run {RunId}", run.Id);
+            }
+
+            await writeCtx.SaveChangesAsync(ct);
+        }
     }
 
-    /// <summary>
-    /// Creates a shallow copy of a <see cref="Strategy"/> entity for use as a
-    /// candidate container during grid search. Only the fields relevant to backtest
-    /// execution are copied; EF navigation properties and tracked state are not included,
-    /// which avoids unintentional writes to the database when the clone is mutated.
-    /// </summary>
-    /// <param name="source">The live strategy whose identity and type metadata is copied.</param>
-    /// <returns>
-    /// A new, untracked <see cref="Strategy"/> instance with the same core properties
-    /// as <paramref name="source"/> but with <c>ParametersJson</c> ready to be overwritten
-    /// with candidate values.
-    /// </returns>
-    private static Strategy CloneStrategy(Strategy source) => new()
-    {
-        Id             = source.Id,
-        Name           = source.Name,
-        Description    = source.Description,
-        StrategyType   = source.StrategyType,
-        Symbol         = source.Symbol,
-        Timeframe      = source.Timeframe,
-        ParametersJson = source.ParametersJson,
-        Status         = source.Status,
-        RiskProfileId  = source.RiskProfileId,
-        CreatedAt      = source.CreatedAt,
-        IsDeleted      = source.IsDeleted
-    };
-
-    // ════════════════════════════════════════════════════════════════════════════
-    //  Auto-scheduling: queue optimizations for strategies that failed backtest gate
-    // ════════════════════════════════════════════════════════════════════════════
-
-    /// <summary>
-    /// Scans active strategies with completed backtests that don't meet the signal-generation
-    /// qualification gate (win rate, profit factor, etc.) and queues optimization runs to
-    /// improve their parameters. Strategies that already have a pending optimization or were
-    /// recently optimized are skipped.
-    ///
-    /// <para>
-    /// Configuration keys (read from <see cref="EngineConfig"/>):
-    /// <list type="bullet">
-    ///   <item><c>Optimization:AutoScheduleEnabled</c>  — master switch (default true)</item>
-    ///   <item><c>Optimization:SchedulePollSeconds</c>  — scan interval (default 7200 = 2 hours)</item>
-    ///   <item><c>Optimization:CooldownDays</c>         — min days between optimizations per strategy (default 14)</item>
-    ///   <item><c>Optimization:MaxQueuedPerCycle</c>    — max runs to queue per scan (default 3)</item>
-    /// </list>
-    /// </para>
-    /// </summary>
-    private async Task ScheduleOptimizationsForUnderperformingStrategiesAsync(
-        Microsoft.EntityFrameworkCore.DbContext readCtx,
-        Microsoft.EntityFrameworkCore.DbContext writeCtx,
+    private async Task<OptimizationConfig> LoadRunScopedConfigurationAsync(
+        OptimizationRun run,
+        DbContext db,
+        IWriteApplicationDbContext writeCtx,
         CancellationToken ct)
     {
-        int cooldownDays      = await GetConfigAsync<int>(readCtx, CK_CooldownDays, 14, ct);
-        int maxQueuedPerCycle = await GetConfigAsync<int>(readCtx, CK_MaxQueuedPerCycle, 3, ct);
-
-        // Load backtest qualification thresholds (same keys as StrategyWorker gate)
-        double minWinRate      = await GetConfigAsync<double>(readCtx, CK_MinWinRate, 0.60, ct);
-        double minProfitFactor = await GetConfigAsync<double>(readCtx, CK_MinProfitFactor, 1.0, ct);
-        int    minTotalTrades  = await GetConfigAsync<int>(readCtx, CK_MinTotalTrades, 10, ct);
-
-        // Load active strategies
-        var activeStrategies = await readCtx.Set<Strategy>()
-            .Where(s => s.Status == StrategyStatus.Active && !s.IsDeleted)
-            .AsNoTracking()
-            .Select(s => new { s.Id, s.Name, s.Symbol, s.Timeframe, s.ParametersJson })
-            .ToListAsync(ct);
-
-        if (activeStrategies.Count == 0) return;
-
-        // Skip strategies that already have a pending optimization
-        var pendingOptIds = await readCtx.Set<OptimizationRun>()
-            .Where(r => (r.Status == OptimizationRunStatus.Queued || r.Status == OptimizationRunStatus.Running)
-                        && !r.IsDeleted)
-            .Select(r => r.StrategyId)
-            .Distinct()
-            .ToListAsync(ct);
-        var pendingSet = new HashSet<long>(pendingOptIds);
-
-        // Skip strategies optimized recently (within cooldown)
-        var cooldownThreshold = DateTime.UtcNow.AddDays(-cooldownDays);
-        var recentOptIds = await readCtx.Set<OptimizationRun>()
-            .Where(r => (r.Status == OptimizationRunStatus.Completed || r.Status == OptimizationRunStatus.Approved)
-                        && !r.IsDeleted
-                        && r.CompletedAt >= cooldownThreshold)
-            .Select(r => r.StrategyId)
-            .Distinct()
-            .ToListAsync(ct);
-        var recentOptSet = new HashSet<long>(recentOptIds);
-
-        // Load the most recent completed backtest per strategy
-        var recentBacktests = await readCtx.Set<BacktestRun>()
-            .Where(r => r.Status == RunStatus.Completed && !r.IsDeleted && r.ResultJson != null)
-            .GroupBy(r => r.StrategyId)
-            .Select(g => new
-            {
-                StrategyId = g.Key,
-                ResultJson = g.OrderByDescending(r => r.CompletedAt).First().ResultJson
-            })
-            .ToListAsync(ct);
-        var backtestMap = recentBacktests.ToDictionary(r => r.StrategyId, r => r.ResultJson);
-
-        int queued = 0;
-
-        foreach (var strategy in activeStrategies)
+        bool hadExistingSnapshot = !string.IsNullOrWhiteSpace(run.ConfigSnapshotJson);
+        if (hadExistingSnapshot)
         {
-            if (queued >= maxQueuedPerCycle) break;
-            ct.ThrowIfCancellationRequested();
-
-            // Skip if already has a pending optimization
-            if (pendingSet.Contains(strategy.Id)) continue;
-
-            // Skip if recently optimized
-            if (recentOptSet.Contains(strategy.Id)) continue;
-
-            // Skip if no backtest exists yet (BacktestWorker will handle it first)
-            if (!backtestMap.TryGetValue(strategy.Id, out var resultJson) || string.IsNullOrWhiteSpace(resultJson))
-                continue;
-
-            // Parse backtest result and check if it FAILS the qualification gate
-            BacktestResult? result;
-            try { result = JsonSerializer.Deserialize<BacktestResult>(resultJson); }
-            catch { continue; }
-            if (result is null) continue;
-
-            bool meetsGate = result.TotalTrades >= minTotalTrades
-                && (double)result.WinRate >= minWinRate
-                && (double)result.ProfitFactor >= minProfitFactor;
-
-            // Only optimize strategies that FAIL the gate — already-qualified strategies don't need tuning
-            if (meetsGate) continue;
-
-            // Queue optimization run
-            var run = new OptimizationRun
+            try
             {
-                StrategyId             = strategy.Id,
-                TriggerType            = TriggerType.Scheduled,
-                Status                 = OptimizationRunStatus.Queued,
-                BaselineParametersJson = strategy.ParametersJson,
-                StartedAt              = DateTime.UtcNow,
-            };
-
-            writeCtx.Set<OptimizationRun>().Add(run);
-            queued++;
-
-            _logger.LogInformation(
-                "OptimizationWorker: auto-queued optimization for strategy {Id} ({Name}) " +
-                "{Symbol}/{Tf} — backtest WinRate={WR:P1} PF={PF:F2} (below gate thresholds).",
-                strategy.Id, strategy.Name, strategy.Symbol, strategy.Timeframe,
-                (double)result.WinRate, (double)result.ProfitFactor);
+                var snapshot = JsonSerializer.Deserialize<OptimizationConfigSnapshot>(run.ConfigSnapshotJson);
+                if (snapshot is not null && snapshot.Version == ConfigSnapshotVersion)
+                    return snapshot.Config;
+            }
+            catch
+            {
+                // Fall back to live config below if the stored snapshot is malformed.
+            }
         }
 
-        if (queued > 0)
+        var liveConfig = await LoadConfigurationAsync(db, ct);
+        // Config typo detection: warn about any EngineConfig keys starting with
+        // "Optimization:" or "Backtest:Gate:" that aren't in the known key set.
+        await DetectUnknownConfigKeysAsync(db, ct);
+        LogPresetOverrides(liveConfig);
+        var newSnapshotJson = JsonSerializer.Serialize(new OptimizationConfigSnapshot(ConfigSnapshotVersion, liveConfig));
+
+        // Config change audit trail: diff against the most recent prior run's snapshot.
+        // Skip if this is a checkpoint resume with a malformed snapshot — the config was
+        // already captured (and diffed) on the original run start; re-diffing on resume
+        // would produce duplicate audit log entries.
+        if (!hadExistingSnapshot)
         {
-            await writeCtx.SaveChangesAsync(ct);
+            try
+            {
+                var priorSnapshotJson = await db.Set<OptimizationRun>()
+                    .Where(r => r.Id != run.Id && r.ConfigSnapshotJson != null && !r.IsDeleted)
+                    .OrderByDescending(r => r.StartedAt)
+                    .Select(r => r.ConfigSnapshotJson)
+                    .FirstOrDefaultAsync(ct);
+
+                if (priorSnapshotJson is not null)
+                {
+                    var changes = DiffConfigSnapshots(priorSnapshotJson, newSnapshotJson);
+                    if (changes.Count > 0)
+                    {
+                        _logger.LogInformation(
+                            "OptimizationWorker: config changed since last run — {Count} parameter(s) modified: {Changes}",
+                            changes.Count, string.Join(", ", changes.Select(c => $"{c.Key}: {c.OldValue}→{c.NewValue}")));
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "OptimizationWorker: config diff failed (non-fatal)");
+            }
+        }
+
+        run.ConfigSnapshotJson = newSnapshotJson;
+        await writeCtx.SaveChangesAsync(ct);
+        return liveConfig;
+    }
+
+    /// <summary>
+    /// Returns preset-specific defaults for the ~15 most performance-sensitive config keys.
+    /// Three presets provide coherent starting points; individual keys still override.
+    /// </summary>
+    private static (int TpeBudget, int TpeInitialSamples, int PurgedKFolds, int BootstrapIters,
+        int PermutationIters, int MaxParallelBacktests, int CpcvNFolds, int MaxRunTimeoutMinutes,
+        int CpcvMaxCombinations, int TopNCandidates, int CheckpointEveryN) GetPresetDefaults(string preset)
+        => preset.ToLowerInvariant() switch
+        {
+            "conservative" => (30, 10, 3, 500, 500, 2, 4, 20, 10, 3, 5),
+            "aggressive"   => (100, 25, 7, 2000, 2000, 8, 8, 60, 25, 8, 15),
+            _              => (50, 15, 5, 1000, 1000, 4, 6, 30, 15, 5, 10), // "balanced" (default)
+        };
+
+    /// <summary>
+    /// Compares the loaded config against the preset defaults and logs any keys where
+    /// the operator explicitly overrode the preset value. This makes it visible at runtime
+    /// which keys are preset-driven and which are manually tuned.
+    /// </summary>
+    private void LogPresetOverrides(OptimizationConfig config)
+    {
+        var presetName = config.PresetName;
+        var p2 = GetPresetDefaults(presetName);
+        var overrides = new List<string>();
+        if (config.TpeBudget != p2.TpeBudget) overrides.Add($"TpeBudget={config.TpeBudget} (preset={p2.TpeBudget})");
+        if (config.TpeInitialSamples != p2.TpeInitialSamples) overrides.Add($"TpeInitialSamples={config.TpeInitialSamples} (preset={p2.TpeInitialSamples})");
+        if (config.PurgedKFolds != p2.PurgedKFolds) overrides.Add($"PurgedKFolds={config.PurgedKFolds} (preset={p2.PurgedKFolds})");
+        if (config.BootstrapIterations != p2.BootstrapIters) overrides.Add($"BootstrapIterations={config.BootstrapIterations} (preset={p2.BootstrapIters})");
+        if (config.PermutationIterations != p2.PermutationIters) overrides.Add($"PermutationIterations={config.PermutationIterations} (preset={p2.PermutationIters})");
+        if (config.MaxParallelBacktests != p2.MaxParallelBacktests) overrides.Add($"MaxParallelBacktests={config.MaxParallelBacktests} (preset={p2.MaxParallelBacktests})");
+        if (config.CpcvNFolds != p2.CpcvNFolds) overrides.Add($"CpcvNFolds={config.CpcvNFolds} (preset={p2.CpcvNFolds})");
+        if (config.MaxRunTimeoutMinutes != p2.MaxRunTimeoutMinutes) overrides.Add($"MaxRunTimeoutMinutes={config.MaxRunTimeoutMinutes} (preset={p2.MaxRunTimeoutMinutes})");
+        if (config.CpcvMaxCombinations != p2.CpcvMaxCombinations) overrides.Add($"CpcvMaxCombinations={config.CpcvMaxCombinations} (preset={p2.CpcvMaxCombinations})");
+        if (config.TopNCandidates != p2.TopNCandidates) overrides.Add($"TopNCandidates={config.TopNCandidates} (preset={p2.TopNCandidates})");
+        if (config.CheckpointEveryN != p2.CheckpointEveryN) overrides.Add($"CheckpointEveryN={config.CheckpointEveryN} (preset={p2.CheckpointEveryN})");
+
+        if (overrides.Count > 0)
+        {
             _logger.LogInformation(
-                "OptimizationWorker: auto-scheduled {Count} optimization run(s) for underperforming strategies.",
-                queued);
+                "OptimizationWorker: using preset '{Preset}' with {Count} override(s): {Overrides}",
+                presetName, overrides.Count, string.Join(", ", overrides));
         }
         else
         {
-            _logger.LogDebug(
-                "OptimizationWorker: no strategies need auto-optimization (all qualified or within {Cooldown}d cooldown).",
-                cooldownDays);
+            _logger.LogDebug("OptimizationWorker: using preset '{Preset}' with no overrides", presetName);
         }
     }
 
-    // ── Config helper ─────────────────────────────────────────────────────────
+    private static async Task<OptimizationConfig> LoadConfigurationAsync(DbContext db, CancellationToken ct)
+    {
+        // Single batch query for all config keys instead of ~50 individual queries
+        var allKeys = new[]
+        {
+            "Optimization:Preset",
+            "Optimization:SchedulePollSeconds", "Optimization:CooldownDays", "Optimization:MaxQueuedPerCycle",
+            "Optimization:AutoScheduleEnabled", "Backtest:Gate:MinWinRate", "Backtest:Gate:MinProfitFactor",
+            "Backtest:Gate:MinTotalTrades", "Optimization:AutoApprovalImprovementThreshold",
+            "Optimization:AutoApprovalMinHealthScore", "Optimization:TopNCandidates",
+            "Optimization:CoarsePhaseThreshold", "Optimization:ScreeningTimeoutSeconds",
+            "Optimization:ScreeningSpreadPoints", "Optimization:ScreeningCommissionPerLot",
+            "Optimization:ScreeningSlippagePips", "Optimization:MaxOosDegradationPct",
+            "Optimization:SuppressDuringDrawdownRecovery", "Optimization:SeasonalBlackoutEnabled",
+            "Optimization:BlackoutPeriods", "Optimization:MaxRunTimeoutMinutes",
+            "Optimization:MaxParallelBacktests", "Optimization:MinCandidateTrades",
+            "Optimization:EmbargoRatio", "Optimization:CorrelationParamThreshold",
+            "Optimization:TpeBudget", "Optimization:TpeInitialSamples", "Optimization:PurgedKFolds",
+            "Optimization:SensitivityPerturbPct", "Optimization:BootstrapIterations",
+            "Optimization:MinBootstrapCILower", "Optimization:CostSensitivityEnabled",
+            "Optimization:AdaptiveBoundsEnabled", "Optimization:TemporalOverlapThreshold",
+            "Optimization:DataScarcityThreshold", "Optimization:ScreeningInitialBalance",
+            "Optimization:PortfolioCorrelationThreshold", "Optimization:MaxConsecutiveFailuresBeforeEscalation",
+            "Optimization:CheckpointEveryN", "Optimization:GpEarlyStopPatience",
+            "Optimization:SensitivityDegradationTolerance", "Optimization:WalkForwardMinMaxRatio",
+            "Optimization:CostStressMultiplier", "Optimization:MinOosCandlesForValidation",
+            "Optimization:MaxCvCoefficientOfVariation", "Optimization:PermutationIterations",
+            "Optimization:RegimeStabilityHours",
+            "Optimization:MaxRetryAttempts", "Optimization:CandleLookbackMonths",
+            "Optimization:RequireEADataAvailability", "Optimization:MaxConcurrentRuns",
+            "Optimization:UseSymbolSpecificSpread", "Optimization:RegimeBlendRatio",
+            "Optimization:CpcvNFolds", "Optimization:CpcvTestFoldCount",
+            "Optimization:CpcvMaxCombinations", "Optimization:CircuitBreakerThreshold",
+            "Optimization:SuccessiveHalvingRungs", "Optimization:MaxCrossRegimeEvals",
+            "Optimization:HyperbandEnabled", "Optimization:HyperbandEta",
+        };
 
-    private static async Task<T> GetConfigAsync<T>(
-        Microsoft.EntityFrameworkCore.DbContext ctx,
-        string key,
-        T defaultValue,
+        var b = await OptimizationGridBuilder.GetConfigBatchAsync(db, allKeys, ct);
+
+        // Preset provides coherent defaults for the performance-sensitive keys.
+        // Individual key overrides still take precedence (GetConfigValue checks
+        // the batch first, falling back to the preset default).
+        var presetName = OptimizationGridBuilder.GetConfigValue(b, "Optimization:Preset", "balanced");
+        var p = GetPresetDefaults(presetName);
+
+        return new OptimizationConfig(
+            SchedulePollSeconds:              OptimizationGridBuilder.GetConfigValue(b, "Optimization:SchedulePollSeconds", 7200),
+            CooldownDays:                     OptimizationGridBuilder.GetConfigValue(b, "Optimization:CooldownDays", 14),
+            MaxQueuedPerCycle:                OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxQueuedPerCycle", 3),
+            AutoScheduleEnabled:              OptimizationGridBuilder.GetConfigValue(b, "Optimization:AutoScheduleEnabled", true),
+            MinWinRate:                       OptimizationGridBuilder.GetConfigValue(b, "Backtest:Gate:MinWinRate", 0.60),
+            MinProfitFactor:                  OptimizationGridBuilder.GetConfigValue(b, "Backtest:Gate:MinProfitFactor", 1.0),
+            MinTotalTrades:                   OptimizationGridBuilder.GetConfigValue(b, "Backtest:Gate:MinTotalTrades", 10),
+            AutoApprovalImprovementThreshold: OptimizationGridBuilder.GetConfigValue(b, "Optimization:AutoApprovalImprovementThreshold", 0.10m),
+            AutoApprovalMinHealthScore:       OptimizationGridBuilder.GetConfigValue(b, "Optimization:AutoApprovalMinHealthScore", 0.55m),
+            TopNCandidates:                   OptimizationGridBuilder.GetConfigValue(b, "Optimization:TopNCandidates", p.TopNCandidates),
+            CoarsePhaseThreshold:             OptimizationGridBuilder.GetConfigValue(b, "Optimization:CoarsePhaseThreshold", 10),
+            ScreeningTimeoutSeconds:          OptimizationGridBuilder.GetConfigValue(b, "Optimization:ScreeningTimeoutSeconds", 30),
+            ScreeningSpreadPoints:            OptimizationGridBuilder.GetConfigValue(b, "Optimization:ScreeningSpreadPoints", 20.0),
+            ScreeningCommissionPerLot:        OptimizationGridBuilder.GetConfigValue(b, "Optimization:ScreeningCommissionPerLot", 7.0),
+            ScreeningSlippagePips:            OptimizationGridBuilder.GetConfigValue(b, "Optimization:ScreeningSlippagePips", 1.0),
+            MaxOosDegradationPct:             OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxOosDegradationPct", 0.60),
+            SuppressDuringDrawdownRecovery:   OptimizationGridBuilder.GetConfigValue(b, "Optimization:SuppressDuringDrawdownRecovery", true),
+            SeasonalBlackoutEnabled:          OptimizationGridBuilder.GetConfigValue(b, "Optimization:SeasonalBlackoutEnabled", true),
+            BlackoutPeriods:                  OptimizationGridBuilder.GetConfigValue(b, "Optimization:BlackoutPeriods", "12/20-01/05"),
+            MaxRunTimeoutMinutes:             OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxRunTimeoutMinutes", p.MaxRunTimeoutMinutes),
+            MaxParallelBacktests:             OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxParallelBacktests", p.MaxParallelBacktests),
+            MinCandidateTrades:               OptimizationGridBuilder.GetConfigValue(b, "Optimization:MinCandidateTrades", 10),
+            EmbargoRatio:                     OptimizationGridBuilder.GetConfigValue(b, "Optimization:EmbargoRatio", 0.05),
+            CorrelationParamThreshold:        OptimizationGridBuilder.GetConfigValue(b, "Optimization:CorrelationParamThreshold", 0.15),
+            TpeBudget:                        OptimizationGridBuilder.GetConfigValue(b, "Optimization:TpeBudget", p.TpeBudget),
+            TpeInitialSamples:                OptimizationGridBuilder.GetConfigValue(b, "Optimization:TpeInitialSamples", p.TpeInitialSamples),
+            PurgedKFolds:                     OptimizationGridBuilder.GetConfigValue(b, "Optimization:PurgedKFolds", p.PurgedKFolds),
+            SensitivityPerturbPct:            OptimizationGridBuilder.GetConfigValue(b, "Optimization:SensitivityPerturbPct", 0.10),
+            BootstrapIterations:              OptimizationGridBuilder.GetConfigValue(b, "Optimization:BootstrapIterations", p.BootstrapIters),
+            MinBootstrapCILower:              OptimizationGridBuilder.GetConfigValue(b, "Optimization:MinBootstrapCILower", 0.40m),
+            CostSensitivityEnabled:           OptimizationGridBuilder.GetConfigValue(b, "Optimization:CostSensitivityEnabled", true),
+            AdaptiveBoundsEnabled:            OptimizationGridBuilder.GetConfigValue(b, "Optimization:AdaptiveBoundsEnabled", true),
+            TemporalOverlapThreshold:         OptimizationGridBuilder.GetConfigValue(b, "Optimization:TemporalOverlapThreshold", 0.70),
+            DataScarcityThreshold:            OptimizationGridBuilder.GetConfigValue(b, "Optimization:DataScarcityThreshold", 200),
+            ScreeningInitialBalance:          OptimizationGridBuilder.GetConfigValue(b, "Optimization:ScreeningInitialBalance", 10_000m),
+            PortfolioCorrelationThreshold:    OptimizationGridBuilder.GetConfigValue(b, "Optimization:PortfolioCorrelationThreshold", 0.80),
+            MaxConsecutiveFailuresBeforeEscalation: OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxConsecutiveFailuresBeforeEscalation", 3),
+            CheckpointEveryN:                 OptimizationGridBuilder.GetConfigValue(b, "Optimization:CheckpointEveryN", p.CheckpointEveryN),
+            GpEarlyStopPatience:              OptimizationGridBuilder.GetConfigValue(b, "Optimization:GpEarlyStopPatience", 4),
+            SensitivityDegradationTolerance:  OptimizationGridBuilder.GetConfigValue(b, "Optimization:SensitivityDegradationTolerance", 0.20),
+            WalkForwardMinMaxRatio:           OptimizationGridBuilder.GetConfigValue(b, "Optimization:WalkForwardMinMaxRatio", 0.50),
+            CostStressMultiplier:             OptimizationGridBuilder.GetConfigValue(b, "Optimization:CostStressMultiplier", 2.0),
+            MinOosCandlesForValidation:       OptimizationGridBuilder.GetConfigValue(b, "Optimization:MinOosCandlesForValidation", 50),
+            MaxCvCoefficientOfVariation:      OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxCvCoefficientOfVariation", 0.50),
+            PermutationIterations:            OptimizationGridBuilder.GetConfigValue(b, "Optimization:PermutationIterations", p.PermutationIters),
+            MaxRetryAttempts:                 OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxRetryAttempts", 2),
+            CandleLookbackMonths:            OptimizationGridBuilder.GetConfigValue(b, "Optimization:CandleLookbackMonths", 6),
+            RequireEADataAvailability:       OptimizationGridBuilder.GetConfigValue(b, "Optimization:RequireEADataAvailability", true),
+            MaxConcurrentRuns:               OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxConcurrentRuns", 3),
+            UseSymbolSpecificSpread:         OptimizationGridBuilder.GetConfigValue(b, "Optimization:UseSymbolSpecificSpread", true),
+            RegimeBlendRatio:                OptimizationGridBuilder.GetConfigValue(b, "Optimization:RegimeBlendRatio", 0.20),
+            CpcvNFolds:                      OptimizationGridBuilder.GetConfigValue(b, "Optimization:CpcvNFolds", p.CpcvNFolds),
+            CpcvTestFoldCount:               OptimizationGridBuilder.GetConfigValue(b, "Optimization:CpcvTestFoldCount", 2),
+            CpcvMaxCombinations:             OptimizationGridBuilder.GetConfigValue(b, "Optimization:CpcvMaxCombinations", p.CpcvMaxCombinations),
+            CircuitBreakerThreshold:         OptimizationGridBuilder.GetConfigValue(b, "Optimization:CircuitBreakerThreshold", 10),
+            SuccessiveHalvingRungs:          OptimizationGridBuilder.GetConfigValue(b, "Optimization:SuccessiveHalvingRungs", "0.25,0.50"),
+            MaxCrossRegimeEvals:             OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxCrossRegimeEvals", 4), PresetName: presetName,
+            HyperbandEnabled:               OptimizationGridBuilder.GetConfigValue(b, "Optimization:HyperbandEnabled", true),
+            HyperbandEta:                   OptimizationGridBuilder.GetConfigValue(b, "Optimization:HyperbandEta", 3),
+            MaxRunsPerWeek:                 OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxRunsPerWeek", 20));
+    }
+
+    // ── Auto-scheduling, escalation, and helpers are in OptimizationWorker.Scheduling.cs ──
+
+    // ── Config change audit ───────────────────────────────────────────────────
+
+    private sealed record ConfigChange(string Key, string OldValue, string NewValue);
+
+    /// <summary>
+    /// Diffs two JSON-serialised <see cref="OptimizationConfigSnapshot"/> payloads and
+    /// returns the list of fields whose values changed. Uses type-aware comparison
+    /// (numeric, boolean, string) to avoid false positives from serializer differences
+    /// (e.g. "0.5" vs "0.50", "true" vs "True").
+    /// </summary>
+    private static List<ConfigChange> DiffConfigSnapshots(string priorJson, string currentJson)
+    {
+        var changes = new List<ConfigChange>();
+        try
+        {
+            using var priorDoc   = JsonDocument.Parse(priorJson);
+            using var currentDoc = JsonDocument.Parse(currentJson);
+
+            if (!priorDoc.RootElement.TryGetProperty("Config", out var priorConfig)) return changes;
+            if (!currentDoc.RootElement.TryGetProperty("Config", out var currentConfig)) return changes;
+
+            foreach (var prop in currentConfig.EnumerateObject())
+            {
+                if (!priorConfig.TryGetProperty(prop.Name, out var priorVal))
+                {
+                    changes.Add(new ConfigChange(prop.Name, "(absent)", prop.Value.ToString()));
+                    continue;
+                }
+
+                // Type-aware comparison to avoid false positives from serializer differences
+                bool equal = (prop.Value.ValueKind, priorVal.ValueKind) switch
+                {
+                    (JsonValueKind.Number, JsonValueKind.Number) =>
+                        prop.Value.TryGetDouble(out double a) && priorVal.TryGetDouble(out double b) && a == b,
+                    (JsonValueKind.True or JsonValueKind.False, JsonValueKind.True or JsonValueKind.False) =>
+                        prop.Value.ValueKind == priorVal.ValueKind,
+                    _ => prop.Value.ToString() == priorVal.ToString()
+                };
+
+                if (!equal)
+                    changes.Add(new ConfigChange(prop.Name, priorVal.ToString(), prop.Value.ToString()));
+            }
+        }
+        catch { /* malformed JSON — return empty */ }
+        return changes;
+    }
+
+    // ── Stage: Approval Decision (Stage 13) ───────────────────────────────
+
+    /// <summary>
+    /// Applies the auto-approval decision: if all validation gates passed, updates the
+    /// live strategy parameters, saves regime-conditional params, runs cross-regime
+    /// evaluation, and queues validation follow-ups. Otherwise logs rejection and
+    /// escalates chronic failures.
+    /// </summary>
+    internal async Task ApplyApprovalDecisionAsync(
+        RunContext ctx, CandidateValidationResult vr,
+        MarketRegimeEnum? currentRegime, DateTime candleLookbackStart,
+        BacktestOptions screeningOptions)
+    {
+        var run = ctx.Run;
+        var strategy = ctx.Strategy;
+        var config = ctx.Config;
+        var db = ctx.Db;
+        var writeDb = ctx.WriteDb;
+        var writeCtx = ctx.WriteCtx;
+        var mediator = ctx.Mediator;
+        var alertDispatcher = ctx.AlertDispatcher;
+        var eventService = ctx.EventService;
+        var ct = ctx.Ct;
+        var runCt = ctx.RunCt;
+        var oosHealthScore = vr.OosHealthScore;
+        var oosResult = vr.OosResult;
+        var winner = vr.Winner;
+        decimal improvement = oosHealthScore - (run.BaselineHealthScore ?? 0m);
+
+        if (vr.Passed)
+        {
+            var liveStrategy = await writeDb.Set<Strategy>()
+                .FirstOrDefaultAsync(x => x.Id == run.StrategyId && !x.IsDeleted, runCt);
+
+            if (liveStrategy is not null)
+            {
+                // Gradual rollout: start at 25% traffic with automatic promotion/rollback
+                GradualRolloutManager.StartRollout(liveStrategy, run.BestParametersJson!, run.Id, initialPct: 25);
+                _logger.LogInformation(
+                    "OptimizationWorker: initiated gradual rollout for strategy {Id} at 25% traffic",
+                    liveStrategy.Id);
+
+                if (oosResult.TotalTrades > 0 && oosResult.Trades is not null && oosResult.Trades.Count >= 2)
+                {
+                    var oosSpanDays = (oosResult.Trades[^1].ExitTime - oosResult.Trades[0].EntryTime).TotalDays;
+                    if (oosSpanDays > 0)
+                    {
+                        double tradesPerDay = oosResult.TotalTrades / oosSpanDays;
+                        decimal avgLotSize  = oosResult.Trades.Average(t => t.LotSize);
+                        liveStrategy.EstimatedCapacityLots = avgLotSize * (decimal)Math.Max(1.0, tradesPerDay);
+                    }
+                }
+            }
+
+            OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Approved, DateTime.UtcNow);
+            await writeCtx.SaveChangesAsync(ct);
+
+            _metrics.OptimizationAutoApproved.Add(1);
+
+            _logger.LogInformation(
+                "OptimizationWorker: run {RunId} AUTO-APPROVED — improvement={Imp:+0.00;-0.00}, OOS={Score:F2}, CI_lower={CIL:F2}, WF_Avg={WF:F2}",
+                run.Id, improvement, vr.OosHealthScore, vr.CILower, vr.WfAvgScore);
+
+            await mediator.Send(new LogDecisionCommand
+            {
+                EntityType = "OptimizationRun", EntityId = run.Id,
+                DecisionType = "AutoApproval", Outcome = "Approved",
+                Reason = $"OOS={vr.OosHealthScore:F2}, CI95=[{vr.CILower:F2},{vr.CIUpper:F2}], " +
+                         $"WF={vr.WfAvgScore:F2}, Sens=pass, CostPess={vr.PessimisticScore:F2}; params applied",
+                Source = "OptimizationWorker"
+            }, runCt);
+
+            await eventService.SaveAndPublish(writeCtx, new OptimizationApprovedIntegrationEvent
+            {
+                OptimizationRunId = run.Id,
+                StrategyId        = run.StrategyId,
+                Symbol            = strategy.Symbol,
+                Timeframe         = strategy.Timeframe,
+                Improvement       = improvement,
+                OosScore          = vr.OosHealthScore,
+                ApprovedAt        = run.ApprovedAt ?? DateTime.UtcNow,
+            });
+
+            // Save regime-conditional parameters for the current regime
+            if (currentRegime.HasValue)
+                await SaveRegimeParamsAsync(writeDb, writeCtx, strategy, run, vr.Winner.ParamsJson,
+                    vr.OosHealthScore, vr.CILower, currentRegime.Value, runCt);
+
+            // Cross-regime evaluation with scoped timeout
+            using var crossRegimeCts = CancellationTokenSource.CreateLinkedTokenSource(runCt);
+            crossRegimeCts.CancelAfter(TimeSpan.FromMinutes(
+                Math.Max(2, config.MaxRunTimeoutMinutes / 4)));
+            var crossRegimeCt = crossRegimeCts.Token;
+
+            if (currentRegime.HasValue)
+            {
+                try
+                {
+                    var otherRegimes = await db.Set<MarketRegimeSnapshot>()
+                        .Where(s => s.Symbol == strategy.Symbol
+                                 && s.Timeframe == strategy.Timeframe
+                                 && s.Regime != currentRegime.Value
+                                 && s.DetectedAt >= candleLookbackStart
+                                 && !s.IsDeleted)
+                        .Select(s => s.Regime)
+                        .Distinct()
+                        .Take(config.MaxCrossRegimeEvals)
+                        .ToListAsync(crossRegimeCt);
+
+                    var regimeCandleSets = new List<(MarketRegimeEnum Regime, List<Candle> Candles)>();
+                    foreach (var otherRegime in otherRegimes)
+                    {
+                        try
+                        {
+                            var regimeSnaps = await db.Set<MarketRegimeSnapshot>()
+                                .Where(s => s.Symbol == strategy.Symbol
+                                         && s.Timeframe == strategy.Timeframe
+                                         && s.Regime == otherRegime && !s.IsDeleted)
+                                .OrderBy(s => s.DetectedAt)
+                                .Select(s => s.DetectedAt)
+                                .ToListAsync(crossRegimeCt);
+
+                            if (regimeSnaps.Count < 2) continue;
+                            var regimeCandles = await db.Set<Candle>()
+                                .Where(c => c.Symbol == strategy.Symbol
+                                         && c.Timeframe == strategy.Timeframe
+                                         && c.Timestamp >= regimeSnaps.First() && c.Timestamp <= regimeSnaps.Last()
+                                         && c.IsClosed && !c.IsDeleted)
+                                .OrderBy(c => c.Timestamp)
+                                .ToListAsync(crossRegimeCt);
+
+                            if (regimeCandles.Count >= 50)
+                                regimeCandleSets.Add((otherRegime, regimeCandles));
+                        }
+                        catch (OperationCanceledException) { break; }
+                        catch (Exception ex)
+                        {
+                            _logger.LogDebug(ex,
+                                "OptimizationWorker: cross-regime candle load for {Regime} failed (non-fatal)",
+                                otherRegime);
+                        }
+                    }
+
+                    var crossRegimeResults = new List<(MarketRegimeEnum Regime, decimal Score)>();
+                    var crossRegimeLock = new object();
+                    await Parallel.ForEachAsync(regimeCandleSets, new ParallelOptions
+                    {
+                        MaxDegreeOfParallelism = config.MaxParallelBacktests,
+                        CancellationToken = crossRegimeCt,
+                    }, async (entry, pCt) =>
+                    {
+                        try
+                        {
+                            var regimeResult = await _validator.RunWithTimeoutAsync(
+                                strategy, vr.Winner.ParamsJson, entry.Candles,
+                                screeningOptions, config.ScreeningTimeoutSeconds, pCt);
+                            decimal regimeScore = OptimizationHealthScorer.ComputeHealthScore(regimeResult);
+                            lock (crossRegimeLock) crossRegimeResults.Add((entry.Regime, regimeScore));
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogDebug(ex,
+                                "OptimizationWorker: cross-regime evaluation for {Regime} failed (non-fatal)",
+                                entry.Regime);
+                        }
+                    });
+
+                    foreach (var (regime, regimeScore) in crossRegimeResults)
+                    {
+                        if (regimeScore >= config.AutoApprovalMinHealthScore * 0.80m)
+                        {
+                            await SaveRegimeParamsAsync(writeDb, writeCtx, strategy, run, vr.Winner.ParamsJson,
+                                regimeScore, regimeScore * 0.85m, regime, ct);
+                            _logger.LogDebug(
+                                "OptimizationWorker: cross-regime save for {Symbol}/{Regime} — score={Score:F2}",
+                                strategy.Symbol, regime, regimeScore);
+                        }
+                    }
+                }
+                catch (OperationCanceledException) when (crossRegimeCts.IsCancellationRequested && !runCt.IsCancellationRequested)
+                {
+                    _logger.LogInformation(
+                        "OptimizationWorker: run {RunId} cross-regime evaluation timed out ({Limit}min) — " +
+                        "primary regime params already saved, continuing with follow-ups",
+                        run.Id, Math.Max(2, config.MaxRunTimeoutMinutes / 4));
+                }
+            }
+
+            bool followUpsAlreadyPresent = await EnsureValidationFollowUpsAsync(writeDb, run, strategy, config, runCt);
+            if (followUpsAlreadyPresent)
+                _metrics.OptimizationDuplicateFollowUpsPrevented.Add(1);
+
+            try
+            {
+                await writeCtx.SaveChangesAsync(ct);
+            }
+            catch (DbUpdateException ex) when (IsDuplicateFollowUpConstraintViolation(ex))
+            {
+                DetachPendingValidationFollowUps(writeDb, run.Id);
+                run.ValidationFollowUpsCreatedAt ??= DateTime.UtcNow;
+                run.ValidationFollowUpStatus ??= Domain.Enums.ValidationFollowUpStatus.Pending;
+                _metrics.OptimizationDuplicateFollowUpsPrevented.Add(1);
+                await writeCtx.SaveChangesAsync(ct);
+            }
+        }
+        else
+        {
+            _metrics.OptimizationAutoRejected.Add(1);
+
+            // Persist top 3 failed candidates info for debugging / dead-letter diagnostics
+            try
+            {
+                var failedCandidates = (vr.FailedCandidates ?? [])
+                    .Select(f => new { Rank = f.Rank, Params = f.Params, Reason = f.Reason, Score = f.Score })
+                    .ToArray();
+
+                // If no failed candidates were collected, fall back to the top result
+                if (failedCandidates.Length == 0)
+                {
+                    failedCandidates = [new
+                    {
+                        Rank = 1,
+                        Params = vr.Winner?.ParamsJson ?? "?",
+                        Reason = vr.FailureReason ?? "unknown",
+                        Score = vr.OosHealthScore,
+                    }];
+                }
+
+                var existingReport = run.ApprovalReportJson;
+                if (string.IsNullOrWhiteSpace(existingReport))
+                {
+                    run.ApprovalReportJson = JsonSerializer.Serialize(new
+                    {
+                        failedCandidates,
+                        topCandidateFailureReason = vr.FailureReason,
+                    });
+                }
+                else
+                {
+                    // Merge with existing report — append failure diagnostics
+                    var existing = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(existingReport)
+                        ?? new Dictionary<string, JsonElement>();
+                    existing["failedCandidates"] = JsonSerializer.SerializeToElement(failedCandidates);
+                    existing["topCandidateFailureReason"] = JsonSerializer.SerializeToElement(vr.FailureReason);
+                    existing["failedCandidateScore"] = JsonSerializer.SerializeToElement(vr.OosHealthScore);
+                    run.ApprovalReportJson = JsonSerializer.Serialize(existing);
+                }
+            }
+            catch { /* Non-critical */ }
+
+            _logger.LogInformation(
+                "OptimizationWorker: run {RunId} requires manual review — {Reason}",
+                run.Id, vr.FailureReason);
+
+            await mediator.Send(new LogDecisionCommand
+            {
+                EntityType = "OptimizationRun", EntityId = run.Id,
+                DecisionType = "AutoApproval", Outcome = "ManualReviewRequired",
+                Reason = vr.FailureReason,
+                Source = "OptimizationWorker"
+            }, runCt);
+
+            await EscalateChronicFailuresAsync(
+                db, writeDb, writeCtx, mediator, alertDispatcher, run.StrategyId,
+                strategy.Name, config.MaxConsecutiveFailuresBeforeEscalation,
+                config.CooldownDays, runCt);
+        }
+    }
+
+    // ── Stage: Load & Validate Candles (Stages 3–4) ──────────────────────────
+
+    /// <summary>
+    /// Loads regime-aware candles, validates data quality, splits into train/test with
+    /// embargo, builds transaction cost options, and runs the baseline backtest.
+    /// </summary>
+    internal async Task<DataLoadResult> LoadAndValidateCandlesAsync(
+        DbContext db, OptimizationRun run, Strategy strategy,
+        OptimizationConfig config, CancellationToken runCt)
+    {
+        // Auto-scale lookback by timeframe: higher timeframes need more months to
+        // accumulate enough candles. The configured CandleLookbackMonths acts as
+        // an explicit override — only apply auto-scaling when the default (6) is used.
+        int effectiveLookbackMonths = config.CandleLookbackMonths;
+        if (config.CandleLookbackMonths == 6) // Default — apply auto-scaling
+        {
+            effectiveLookbackMonths = strategy.Timeframe switch
+            {
+                Timeframe.D1  => 24,
+                Timeframe.H4  => 12,
+                Timeframe.H1  => 6,
+                Timeframe.M15 => 3,
+                Timeframe.M5  => 2,
+                Timeframe.M1  => 2,
+                _             => 6,
+            };
+        }
+        var candleLookbackStart = DateTime.UtcNow.AddMonths(-effectiveLookbackMonths);
+        var allCandles = await db.Set<Candle>()
+            .Where(x => x.Symbol == strategy.Symbol
+                     && x.Timeframe == strategy.Timeframe
+                     && x.Timestamp >= candleLookbackStart
+                     && x.Timestamp <= DateTime.UtcNow
+                     && x.IsClosed && !x.IsDeleted)
+            .OrderBy(x => x.Timestamp)
+            .ToListAsync(runCt);
+
+        if (allCandles.Count == 0)
+            throw new DataQualityException(
+                $"No candles found for {strategy.Symbol}/{strategy.Timeframe} in the last {config.CandleLookbackMonths} months.");
+
+        var candles = await GetRegimeAwareCandlesAsync(db, strategy.Symbol, strategy.Timeframe, allCandles, runCt, config.RegimeBlendRatio);
+
+        // Data quality validation (holiday-aware)
+        var holidayDates = await db.Set<EconomicEvent>()
+            .Where(e => e.Impact == EconomicImpact.Holiday
+                     && e.ScheduledAt >= DateTime.UtcNow.AddMonths(-1)
+                     && !e.IsDeleted)
+            .Select(e => e.ScheduledAt.Date)
+            .Distinct()
+            .ToListAsync(runCt);
+        var holidaySet = new HashSet<DateTime>(holidayDates);
+
+        var (dataValid, dataIssues) = OptimizationValidator.ValidateCandleQuality(
+            candles, strategy.Timeframe, holidayDates: holidaySet);
+        if (!dataValid)
+        {
+            _logger.LogWarning(
+                "OptimizationWorker: run {RunId} data quality check failed for {Symbol}/{Tf} — {Issues}",
+                run.Id, strategy.Symbol, strategy.Timeframe, dataIssues);
+            throw new DataQualityException(
+                $"Data quality validation failed for {strategy.Symbol}/{strategy.Timeframe}: {dataIssues}");
+        }
+
+        // Impute minor candle gaps (1-2 missing bars) to prevent data quality
+        // rejections for gaps that don't materially affect backtest results.
+        var (imputedCandles, imputedCount) = OptimizationValidator.ImputeMinorGaps(
+            candles, strategy.Timeframe, maxImputeBars: 2, holidayDates: holidaySet);
+        if (imputedCount > 0)
+        {
+            _logger.LogDebug(
+                "OptimizationWorker: imputed {Count} minor candle gap(s) for {Symbol}/{Tf}",
+                imputedCount, strategy.Symbol, strategy.Timeframe);
+            candles = imputedCandles;
+        }
+
+        // Data scarcity protocol + train/test split
+        var protocol   = OptimizationGridBuilder.GetDataProtocol(candles.Count, config.DataScarcityThreshold);
+        int splitIndex = (int)(candles.Count * protocol.TrainRatio);
+        int embargoSize = Math.Max(1, (int)(candles.Count * config.EmbargoRatio));
+        var trainCandles = candles.Take(splitIndex).ToList();
+        var testCandles  = candles.Skip(splitIndex + embargoSize).ToList();
+
+        if (trainCandles.Count < 50)
+            throw new DataQualityException(
+                $"Insufficient training candles ({trainCandles.Count}) for {strategy.Symbol}/{strategy.Timeframe}.");
+        if (testCandles.Count == 0)
+            throw new DataQualityException(
+                $"No OOS candles after embargo for {strategy.Symbol}/{strategy.Timeframe} " +
+                $"(total={candles.Count}, split={splitIndex}, embargo={embargoSize}).");
+
+        // Build transaction cost options from symbol metadata
+        var pairInfo = await db.Set<CurrencyPair>()
+            .FirstOrDefaultAsync(p => p.Symbol == strategy.Symbol && !p.IsDeleted, runCt);
+        var pointSize = pairInfo != null && pairInfo.DecimalPlaces > 0
+            ? 1.0m / (decimal)Math.Pow(10, pairInfo.DecimalPlaces)
+            : 0.00001m;
+
+        double effectiveSpreadPoints = config.ScreeningSpreadPoints;
+        if (config.UseSymbolSpecificSpread && pairInfo is not null && pairInfo.SpreadPoints > 0)
+        {
+            // Prefer 95th percentile spread from recent tick data when available.
+            // This captures realistic worst-case spreads (news spikes, low liquidity)
+            // rather than the average which underestimates real trading costs.
+            double? p95Spread = null;
+            var spreadCutoff = DateTime.UtcNow.AddDays(-7);
+            try
+            {
+                // Native PostgreSQL PERCENTILE_CONT: computes the 95th percentile
+                // server-side in a single pass without transferring rows to the app.
+                var p95Result = await db.Database.SqlQueryRaw<double>(
+                    @"SELECT COALESCE(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ""SpreadPoints""), 0)
+                      FROM ""TickRecords""
+                      WHERE ""Symbol"" = {0}
+                        AND ""IsDeleted"" = false
+                        AND ""SpreadPoints"" > 0
+                        AND ""TickTimestamp"" >= {1}
+                      HAVING COUNT(*) >= 100",
+                    strategy.Symbol, spreadCutoff)
+                    .FirstOrDefaultAsync(runCt);
+
+                if (p95Result > 0)
+                    p95Spread = p95Result;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "OptimizationWorker: native P95 spread query failed for {Symbol}, falling back to Skip/Take", strategy.Symbol);
+
+                // Fallback to EF Core Skip/Take for non-PostgreSQL databases
+                try
+                {
+                    var tickCount = await db.Set<TickRecord>()
+                        .Where(tr => tr.Symbol == strategy.Symbol && !tr.IsDeleted
+                                  && tr.SpreadPoints > 0
+                                  && tr.TickTimestamp >= spreadCutoff)
+                        .CountAsync(runCt);
+
+                    if (tickCount >= 100)
+                    {
+                        int skipCount = (int)(tickCount * 0.95);
+                        var p95Values = await db.Set<TickRecord>()
+                            .Where(tr => tr.Symbol == strategy.Symbol && !tr.IsDeleted
+                                      && tr.SpreadPoints > 0
+                                      && tr.TickTimestamp >= spreadCutoff)
+                            .OrderBy(tr => tr.SpreadPoints)
+                            .Skip(skipCount)
+                            .Take(1)
+                            .Select(tr => tr.SpreadPoints)
+                            .ToListAsync(runCt);
+
+                        if (p95Values.Count > 0)
+                            p95Spread = (double)p95Values[0];
+                    }
+                }
+                catch (Exception innerEx)
+                {
+                    _logger.LogDebug(innerEx, "OptimizationWorker: fallback P95 spread query also failed for {Symbol} (non-fatal)", strategy.Symbol);
+                }
+            }
+
+            if (p95Spread.HasValue && p95Spread.Value > 0)
+            {
+                effectiveSpreadPoints = Math.Max(config.ScreeningSpreadPoints, p95Spread.Value);
+                _logger.LogDebug(
+                    "OptimizationWorker: using P95 spread for {Symbol}: {Spread:F1} points (from {Window} recent ticks)",
+                    strategy.Symbol, effectiveSpreadPoints, "7d");
+            }
+            else
+            {
+                effectiveSpreadPoints = Math.Max(config.ScreeningSpreadPoints, pairInfo.SpreadPoints * 1.5);
+                _logger.LogDebug(
+                    "OptimizationWorker: using symbol-specific spread for {Symbol}: {Spread:F1} points (avg={Avg:F1}×1.5, no P95 data)",
+                    strategy.Symbol, effectiveSpreadPoints, pairInfo.SpreadPoints);
+            }
+        }
+
+        var screeningOptions = new BacktestOptions
+        {
+            SpreadPriceUnits   = pointSize * (decimal)effectiveSpreadPoints,
+            CommissionPerLot   = (decimal)config.ScreeningCommissionPerLot,
+            SlippagePriceUnits = pointSize * (decimal)config.ScreeningSlippagePips * 10,
+            ContractSize       = pairInfo?.ContractSize ?? 100_000m,
+        };
+
+        // P1: Wire dynamic spread function from SpreadProfile for realistic cost modeling
+        try
+        {
+            await using var spreadScope = _scopeFactory.CreateAsyncScope();
+            var spreadProfileProvider = spreadScope.ServiceProvider.GetService<ISpreadProfileProvider>();
+            if (spreadProfileProvider != null)
+            {
+                var profiles = await spreadProfileProvider.GetProfilesAsync(strategy.Symbol, runCt);
+                var spreadFunc = spreadProfileProvider.BuildSpreadFunction(strategy.Symbol, profiles);
+                if (spreadFunc != null)
+                    screeningOptions.SpreadFunction = spreadFunc;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "OptimizationWorker: spread profile load failed for {Symbol} (non-fatal)", strategy.Symbol);
+        }
+
+        // Baseline (regime-aware)
+        run.BaselineParametersJson = CanonicalParameterJson.Normalize(strategy.ParametersJson);
+        string baselineParamsJson  = CanonicalParameterJson.Normalize(strategy.ParametersJson);
+
+        var currentRegimeForBaseline = await db.Set<MarketRegimeSnapshot>()
+            .Where(s => s.Symbol == strategy.Symbol && s.Timeframe == strategy.Timeframe && !s.IsDeleted)
+            .OrderByDescending(s => s.DetectedAt)
+            .Select(s => (MarketRegimeEnum?)s.Regime)
+            .FirstOrDefaultAsync(runCt);
+
+        if (currentRegimeForBaseline.HasValue)
+        {
+            var regimeParams = await db.Set<StrategyRegimeParams>()
+                .Where(p => p.StrategyId == strategy.Id
+                         && p.Regime == currentRegimeForBaseline.Value
+                         && !p.IsDeleted)
+                .Select(p => p.ParametersJson)
+                .FirstOrDefaultAsync(runCt);
+            if (!string.IsNullOrWhiteSpace(regimeParams))
+            {
+                baselineParamsJson = CanonicalParameterJson.Normalize(regimeParams);
+                _logger.LogDebug(
+                    "OptimizationWorker: using regime-conditional params as baseline for {Symbol}/{Regime}",
+                    strategy.Symbol, currentRegimeForBaseline.Value);
+            }
+        }
+
+        var baselineResult = await _validator.RunWithTimeoutAsync(
+            strategy, baselineParamsJson, trainCandles, screeningOptions, config.ScreeningTimeoutSeconds, runCt);
+        run.BaselineHealthScore    = OptimizationHealthScorer.ComputeHealthScore(baselineResult);
+        run.BaselineParametersJson = baselineParamsJson;
+
+        return new DataLoadResult(strategy, candles, trainCandles, testCandles, embargoSize,
+            screeningOptions, protocol, candleLookbackStart, currentRegimeForBaseline, pairInfo);
+    }
+
+    // ── Regime-aware candle selection ────────────────────────────────────────
+
+    /// <summary>
+    /// Returns candles weighted toward the current regime, blended with a configurable
+    /// ratio of non-regime candles to prevent survivorship bias. Pure regime filtering
+    /// finds params that fit the current regime but has no evidence they'll survive a
+    /// transition. Blending ensures the optimizer sees some out-of-regime data too.
+    /// </summary>
+    /// <param name="blendRatio">
+    /// Fraction of non-regime candles to include (0.0 = pure regime, 1.0 = all candles).
+    /// Default 0.20 means 80% regime candles + 20% non-regime candles.
+    /// </param>
+    private async Task<List<Candle>> GetRegimeAwareCandlesAsync(
+        DbContext db, string symbol, Timeframe timeframe, List<Candle> allCandles,
+        CancellationToken ct, double blendRatio = 0.20)
+    {
+        if (allCandles.Count < 100) return allCandles;
+
+        var latestRegime = await db.Set<MarketRegimeSnapshot>()
+            .Where(s => s.Symbol == symbol && s.Timeframe == timeframe && !s.IsDeleted)
+            .OrderByDescending(s => s.DetectedAt)
+            .FirstOrDefaultAsync(ct);
+
+        if (latestRegime is null) return allCandles;
+
+        var regimeHistory = await db.Set<MarketRegimeSnapshot>()
+            .Where(s => s.Symbol == symbol && s.Timeframe == timeframe && !s.IsDeleted)
+            .OrderByDescending(s => s.DetectedAt)
+            .Take(50)
+            .ToListAsync(ct);
+
+        DateTime regimeStartedAt = latestRegime.DetectedAt;
+        foreach (var snap in regimeHistory)
+        {
+            if (snap.Regime != latestRegime.Regime)
+                break;
+            regimeStartedAt = snap.DetectedAt;
+        }
+
+        var regimeCandles = allCandles.Where(c => c.Timestamp >= regimeStartedAt).ToList();
+
+        if (regimeCandles.Count >= 100)
+        {
+            // Blend: include a portion of non-regime candles to prevent overfitting
+            // to the current regime. The non-regime candles are sampled evenly from
+            // the pre-regime period to maintain temporal diversity.
+            if (blendRatio > 0.0 && blendRatio < 1.0)
+            {
+                var nonRegimeCandles = allCandles.Where(c => c.Timestamp < regimeStartedAt).ToList();
+                int blendCount = (int)(regimeCandles.Count * blendRatio / (1.0 - blendRatio));
+                blendCount = Math.Min(blendCount, nonRegimeCandles.Count);
+
+                if (blendCount > 0)
+                {
+                    // Deterministic seeded sample from non-regime candles. Using a
+                    // Fisher-Yates partial shuffle seeded by the candle count gives
+                    // better temporal diversity than the previous fixed-stride approach
+                    // while remaining reproducible across runs with the same data.
+                    var indices = Enumerable.Range(0, nonRegimeCandles.Count).ToArray();
+                    var rng = new DeterministicRandom(nonRegimeCandles.Count ^ blendCount);
+                    for (int i = 0; i < Math.Min(blendCount, indices.Length); i++)
+                    {
+                        int j = i + rng.Next(indices.Length - i);
+                        (indices[i], indices[j]) = (indices[j], indices[i]);
+                    }
+                    var sampled = indices
+                        .Take(blendCount)
+                        .Order()
+                        .Select(i => nonRegimeCandles[i])
+                        .ToList();
+
+                    var blended = sampled.Concat(regimeCandles)
+                        .OrderBy(c => c.Timestamp)
+                        .ToList();
+
+                    _logger.LogDebug(
+                        "OptimizationWorker: using blended regime candles for {Symbol} ({Regime}, {RegimeCount} regime + {BlendCount} non-regime bars)",
+                        symbol, latestRegime.Regime, regimeCandles.Count, sampled.Count);
+                    return blended;
+                }
+            }
+
+            _logger.LogDebug(
+                "OptimizationWorker: using regime-filtered candles for {Symbol} ({Regime}, {Count} bars from {Start:d})",
+                symbol, latestRegime.Regime, regimeCandles.Count, regimeStartedAt);
+            return regimeCandles;
+        }
+
+        _logger.LogDebug(
+            "OptimizationWorker: regime segment too short ({Count} bars) for {Symbol} — using full candle window",
+            regimeCandles.Count, symbol);
+        return allCandles;
+    }
+
+    private OptimizationCheckpointStore.State RestoreCheckpoint(string? checkpointJson)
+        => OptimizationCheckpointStore.Restore(checkpointJson, _logger);
+
+    private static void EnsureDeterministicSeed(OptimizationRun run)
+    {
+        if (run.DeterministicSeed != 0)
+            return;
+
+        run.DeterministicSeed = HashCode.Combine(run.Id, run.StrategyId, run.StartedAt);
+    }
+
+    private static async Task HeartbeatRunAsync(
+        OptimizationRun run,
+        IWriteApplicationDbContext writeCtx,
         CancellationToken ct)
     {
-        var entry = await ctx.Set<EngineConfig>()
-            .AsNoTracking()
-            .FirstOrDefaultAsync(c => c.Key == key, ct);
+        StampHeartbeat(run);
+        await writeCtx.SaveChangesAsync(ct);
+    }
 
-        if (entry?.Value is null) return defaultValue;
+    private static void StampHeartbeat(OptimizationRun run)
+        => OptimizationRunClaimer.StampHeartbeat(run, ExecutionLeaseDuration);
 
-        try   { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
-        catch { return defaultValue; }
+    private static async Task<bool> EnsureValidationFollowUpsAsync(
+        DbContext writeDb,
+        OptimizationRun run,
+        Strategy strategy,
+        OptimizationConfig config,
+        CancellationToken ct)
+    {
+        if (run.ValidationFollowUpsCreatedAt.HasValue)
+            return false;
+
+        var fromDate = DateTime.UtcNow.AddYears(-1);
+        var toDate = DateTime.UtcNow;
+
+        bool hasBacktest = await writeDb.Set<BacktestRun>()
+            .AnyAsync(r => r.SourceOptimizationRunId == run.Id && !r.IsDeleted, ct);
+        if (!hasBacktest)
+        {
+            writeDb.Set<BacktestRun>().Add(new BacktestRun
+            {
+                StrategyId = run.StrategyId,
+                Symbol = strategy.Symbol,
+                Timeframe = strategy.Timeframe,
+                FromDate = fromDate,
+                ToDate = toDate,
+                InitialBalance = config.ScreeningInitialBalance,
+                Status = RunStatus.Queued,
+                SourceOptimizationRunId = run.Id
+            });
+        }
+
+        bool hasWalkForward = await writeDb.Set<WalkForwardRun>()
+            .AnyAsync(r => r.SourceOptimizationRunId == run.Id && !r.IsDeleted, ct);
+        if (!hasWalkForward)
+        {
+            writeDb.Set<WalkForwardRun>().Add(new WalkForwardRun
+            {
+                StrategyId = run.StrategyId,
+                Symbol = strategy.Symbol,
+                Timeframe = strategy.Timeframe,
+                FromDate = fromDate,
+                ToDate = toDate,
+                InSampleDays = 90,
+                OutOfSampleDays = 30,
+                InitialBalance = config.ScreeningInitialBalance,
+                ReOptimizePerFold = true,
+                Status = RunStatus.Queued,
+                StartedAt = DateTime.UtcNow,
+                SourceOptimizationRunId = run.Id
+            });
+        }
+
+        run.ValidationFollowUpsCreatedAt = DateTime.UtcNow;
+        run.ValidationFollowUpStatus = Domain.Enums.ValidationFollowUpStatus.Pending;
+        return hasBacktest || hasWalkForward;
+    }
+
+    private static bool IsDuplicateFollowUpConstraintViolation(DbUpdateException ex)
+    {
+        string message = ex.InnerException?.Message ?? ex.Message;
+        return message.Contains("IX_BacktestRun_SourceOptimizationRunId", StringComparison.OrdinalIgnoreCase)
+            || message.Contains("IX_WalkForwardRun_SourceOptimizationRunId", StringComparison.OrdinalIgnoreCase)
+            || message.Contains("duplicate key", StringComparison.OrdinalIgnoreCase)
+               && message.Contains("SourceOptimizationRunId", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static void DetachPendingValidationFollowUps(DbContext writeDb, long optimizationRunId)
+    {
+        foreach (var entry in writeDb.ChangeTracker.Entries<BacktestRun>()
+                     .Where(e => e.State == EntityState.Added && e.Entity.SourceOptimizationRunId == optimizationRunId)
+                     .ToList())
+        {
+            entry.State = EntityState.Detached;
+        }
+
+        foreach (var entry in writeDb.ChangeTracker.Entries<WalkForwardRun>()
+                     .Where(e => e.State == EntityState.Added && e.Entity.SourceOptimizationRunId == optimizationRunId)
+                     .ToList())
+        {
+            entry.State = EntityState.Detached;
+        }
+    }
+
+    /// <summary>Upserts regime-conditional parameters for the strategy.</summary>
+    private static async Task SaveRegimeParamsAsync(
+        DbContext writeDb, IWriteApplicationDbContext writeCtx, Strategy strategy,
+        OptimizationRun run, string paramsJson, decimal healthScore, decimal ciLower,
+        MarketRegimeEnum regime, CancellationToken ct)
+    {
+        var existing = await writeDb.Set<StrategyRegimeParams>()
+            .FirstOrDefaultAsync(p => p.StrategyId == strategy.Id && p.Regime == regime && !p.IsDeleted, ct);
+
+        if (existing is not null)
+        {
+            existing.ParametersJson    = CanonicalParameterJson.Normalize(paramsJson);
+            existing.HealthScore       = healthScore;
+            existing.HealthScoreCILower = ciLower;
+            existing.OptimizationRunId = run.Id;
+            existing.OptimizedAt       = DateTime.UtcNow;
+        }
+        else
+        {
+            writeDb.Set<StrategyRegimeParams>().Add(new StrategyRegimeParams
+            {
+                StrategyId         = strategy.Id,
+                Regime             = regime,
+                ParametersJson     = CanonicalParameterJson.Normalize(paramsJson),
+                HealthScore        = healthScore,
+                HealthScoreCILower = ciLower,
+                OptimizationRunId  = run.Id,
+                OptimizedAt        = DateTime.UtcNow,
+            });
+        }
+
+        await writeCtx.SaveChangesAsync(ct);
+    }
+
+    /// <summary>
+    /// Detects EngineConfig keys prefixed with "Optimization:" or "Backtest:Gate:" that
+    /// don't match any known configuration key. Almost always indicates an operator typo
+    /// causing an intended override to silently fall back to defaults.
+    /// </summary>
+    private async Task DetectUnknownConfigKeysAsync(DbContext db, CancellationToken ct)
+    {
+        try
+        {
+            var knownKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "Optimization:Preset",
+                "Optimization:SchedulePollSeconds", "Optimization:CooldownDays", "Optimization:MaxQueuedPerCycle",
+                "Optimization:AutoScheduleEnabled", "Backtest:Gate:MinWinRate", "Backtest:Gate:MinProfitFactor",
+                "Backtest:Gate:MinTotalTrades", "Optimization:AutoApprovalImprovementThreshold",
+                "Optimization:AutoApprovalMinHealthScore", "Optimization:TopNCandidates",
+                "Optimization:CoarsePhaseThreshold", "Optimization:ScreeningTimeoutSeconds",
+                "Optimization:ScreeningSpreadPoints", "Optimization:ScreeningCommissionPerLot",
+                "Optimization:ScreeningSlippagePips", "Optimization:MaxOosDegradationPct",
+                "Optimization:SuppressDuringDrawdownRecovery", "Optimization:SeasonalBlackoutEnabled",
+                "Optimization:BlackoutPeriods", "Optimization:MaxRunTimeoutMinutes",
+                "Optimization:MaxParallelBacktests", "Optimization:MinCandidateTrades",
+                "Optimization:EmbargoRatio", "Optimization:CorrelationParamThreshold",
+                "Optimization:TpeBudget", "Optimization:TpeInitialSamples", "Optimization:PurgedKFolds",
+                "Optimization:SensitivityPerturbPct", "Optimization:BootstrapIterations",
+                "Optimization:MinBootstrapCILower", "Optimization:CostSensitivityEnabled",
+                "Optimization:AdaptiveBoundsEnabled", "Optimization:TemporalOverlapThreshold",
+                "Optimization:DataScarcityThreshold", "Optimization:ScreeningInitialBalance",
+                "Optimization:PortfolioCorrelationThreshold", "Optimization:MaxConsecutiveFailuresBeforeEscalation",
+                "Optimization:CheckpointEveryN", "Optimization:GpEarlyStopPatience",
+                "Optimization:SensitivityDegradationTolerance", "Optimization:WalkForwardMinMaxRatio",
+                "Optimization:CostStressMultiplier", "Optimization:MinOosCandlesForValidation",
+                "Optimization:MaxCvCoefficientOfVariation", "Optimization:PermutationIterations",
+                "Optimization:RegimeStabilityHours",
+                "Optimization:MaxRetryAttempts", "Optimization:CandleLookbackMonths",
+                "Optimization:RequireEADataAvailability", "Optimization:MaxConcurrentRuns",
+                "Optimization:UseSymbolSpecificSpread", "Optimization:RegimeBlendRatio",
+                "Optimization:CpcvNFolds", "Optimization:CpcvTestFoldCount",
+                "Optimization:CpcvMaxCombinations", "Optimization:CircuitBreakerThreshold",
+                "Optimization:SuccessiveHalvingRungs", "Optimization:MaxCrossRegimeEvals",
+                "Optimization:HyperbandEnabled", "Optimization:HyperbandEta",
+            };
+
+            var dbKeys = await db.Set<EngineConfig>()
+                .Where(c => !c.IsDeleted
+                          && (c.Key.StartsWith("Optimization:") || c.Key.StartsWith("Backtest:Gate:")))
+                .Select(c => c.Key)
+                .ToListAsync(ct);
+
+            var unrecognized = dbKeys.Where(k => !knownKeys.Contains(k)).ToList();
+            if (unrecognized.Count > 0)
+            {
+                _logger.LogWarning(
+                    "OptimizationWorker: {Count} unrecognized config key(s) found — possible typos that will use defaults instead: {Keys}",
+                    unrecognized.Count, string.Join(", ", unrecognized));
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "OptimizationWorker: config typo detection failed (non-fatal)");
+        }
     }
 }

@@ -5,6 +5,7 @@ using LascodiaTradingEngine.Domain.Entities;
 
 namespace LascodiaTradingEngine.Application.StrategyEnsemble.Queries.DTOs;
 
+/// <summary>Data transfer object for a strategy's ensemble allocation including weight and rolling Sharpe ratio.</summary>
 public class StrategyAllocationDto : IMapFrom<StrategyAllocation>
 {
     public long     Id                 { get; set; }

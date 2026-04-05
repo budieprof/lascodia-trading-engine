@@ -49,6 +49,8 @@ public sealed class MLCovariateShiftWorker : BackgroundService
     private const string CK_TrainingDays          = "MLTraining:TrainingDataWindowDays";
     // Multivariate drift: mean squared z-score (expected = 1.0 under N(0,1))
     private const string CK_MultivariateThreshold = "MLCovariate:MultivariateThreshold";
+    // Per-feature PSI threshold for individual feature drift alerting
+    private const string CK_PerFeaturePsiThreshold = "MLCovariate:PerFeaturePsiThreshold";
 
     // ── PSI binning constants ─────────────────────────────────────────────────
     // 10 equal-width bins over [−3, +3] + 2 tail bins = 12 bins total.
@@ -99,10 +101,11 @@ public sealed class MLCovariateShiftWorker : BackgroundService
                 int    minCandles           = await GetConfigAsync<int>   (ctx, CK_MinCandles,            100,  stoppingToken);
                 int    trainingDays         = await GetConfigAsync<int>   (ctx, CK_TrainingDays,          365,  stoppingToken);
                 double multivariateThreshold = await GetConfigAsync<double>(ctx, CK_MultivariateThreshold, 1.5,  stoppingToken);
+                double perFeaturePsiThreshold = await GetConfigAsync<double>(ctx, CK_PerFeaturePsiThreshold, 0.25, stoppingToken);
 
                 await CheckAllModelsAsync(
                     ctx, writeCtx, windowDays, psiThreshold, minCandles, trainingDays,
-                    multivariateThreshold, stoppingToken);
+                    multivariateThreshold, perFeaturePsiThreshold, stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -137,6 +140,7 @@ public sealed class MLCovariateShiftWorker : BackgroundService
         int                                     minCandles,
         int                                     trainingDays,
         double                                  multivariateThreshold,
+        double                                  perFeaturePsiThreshold,
         CancellationToken                       ct)
     {
         var activeModels = await readCtx.Set<MLModel>()
@@ -153,7 +157,7 @@ public sealed class MLCovariateShiftWorker : BackgroundService
             ct.ThrowIfCancellationRequested();
             await CheckModelCovariateShiftAsync(
                 model, readCtx, writeCtx, windowDays, psiThreshold, minCandles, trainingDays,
-                multivariateThreshold, ct);
+                multivariateThreshold, perFeaturePsiThreshold, ct);
         }
     }
 
@@ -199,6 +203,7 @@ public sealed class MLCovariateShiftWorker : BackgroundService
         int                                     minCandles,
         int                                     trainingDays,
         double                                  multivariateThreshold,
+        double                                  perFeaturePsiThreshold,
         CancellationToken                       ct)
     {
         // ── 1. Deserialise snapshot to get training means/stds ────────────────
@@ -277,12 +282,14 @@ public sealed class MLCovariateShiftWorker : BackgroundService
         int    maxFeature      = 0;
         double weightedPsiSum  = 0;
         double importanceSum   = 0;
+        var    perFeaturePsiValues = new double[featureCount];
 
         for (int j = 0; j < featureCount; j++)
         {
             double psi        = ComputePsi(recentStd, j);
             double importance = hasImportance ? snap.FeatureImportance[j] : 1.0 / featureCount;
 
+            perFeaturePsiValues[j] = psi;
             weightedPsiSum += psi * importance;
             importanceSum  += importance;
 
@@ -298,6 +305,34 @@ public sealed class MLCovariateShiftWorker : BackgroundService
         string featureName = maxFeature < MLFeatureHelper.FeatureNames.Length
             ? MLFeatureHelper.FeatureNames[maxFeature]
             : $"feature[{maxFeature}]";
+
+        // ── 5d. Per-feature PSI breakdown: identify individually drifted features ──
+        var driftedFeatures = new List<(string Name, double Psi)>();
+        for (int j = 0; j < featureCount; j++)
+        {
+            if (perFeaturePsiValues[j] > perFeaturePsiThreshold)
+            {
+                string fname = j < MLFeatureHelper.FeatureNames.Length
+                    ? MLFeatureHelper.FeatureNames[j]
+                    : $"feature[{j}]";
+
+                driftedFeatures.Add((fname, perFeaturePsiValues[j]));
+
+                _logger.LogWarning(
+                    "Feature {Name} PSI={Psi:F4} exceeds per-feature threshold for {Symbol}/{Tf}",
+                    fname, perFeaturePsiValues[j], model.Symbol, model.Timeframe);
+            }
+        }
+
+        // Write drifted features to EngineConfig as a JSON array
+        if (driftedFeatures.Count > 0)
+        {
+            string driftedJson = System.Text.Json.JsonSerializer.Serialize(
+                driftedFeatures.Select(f => new { featureName = f.Name, psi = f.Psi }));
+
+            string configKey = $"MLCovariate:{model.Symbol}:{model.Timeframe}:DriftedFeatures";
+            await UpsertConfigAsync(writeCtx, configKey, driftedJson, ct);
+        }
 
         // ── 5c. Multivariate drift: mean of squared z-scores across all features ──
         // Under N(0, 1) training distribution the expected value is 1.0 per feature.
@@ -344,12 +379,13 @@ public sealed class MLCovariateShiftWorker : BackgroundService
         // ── 7. Queue retraining ───────────────────────────────────────────────
         var now = DateTime.UtcNow;
 
-        // Improvement #2: tag with covariate shift metadata
+        // Improvement #2: tag with covariate shift metadata (including per-feature drifted features)
         string covariateMetadata = System.Text.Json.JsonSerializer.Serialize(new
         {
             maxPsi,
-            psiFeature = featureName,
-            msz        = multivariateScore,
+            psiFeature      = featureName,
+            msz             = multivariateScore,
+            driftedFeatures = driftedFeatures.Select(f => new { featureName = f.Name, psi = f.Psi }).ToArray(),
         });
 
         var run = new MLTrainingRun
@@ -485,6 +521,36 @@ public sealed class MLCovariateShiftWorker : BackgroundService
     }
 
     // ── Config helper ─────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Upserts an <see cref="EngineConfig"/> entry. Updates the existing row if the key
+    /// already exists, otherwise inserts a new one.
+    /// </summary>
+    private static async Task UpsertConfigAsync(
+        Microsoft.EntityFrameworkCore.DbContext writeCtx,
+        string                                  key,
+        string                                  value,
+        CancellationToken                       ct)
+    {
+        int rows = await writeCtx.Set<EngineConfig>()
+            .Where(c => c.Key == key)
+            .ExecuteUpdateAsync(s => s
+                .SetProperty(c => c.Value, value)
+                .SetProperty(c => c.LastUpdatedAt, DateTime.UtcNow), ct);
+
+        if (rows == 0)
+        {
+            writeCtx.Set<EngineConfig>().Add(new EngineConfig
+            {
+                Key             = key,
+                Value           = value,
+                DataType        = Domain.Enums.ConfigDataType.Json,
+                Description     = "Per-feature PSI drift data written by MLCovariateShiftWorker.",
+                IsHotReloadable = true,
+                LastUpdatedAt   = DateTime.UtcNow,
+            });
+        }
+    }
 
     /// <summary>
     /// Reads a typed value from <see cref="EngineConfig"/> or returns <paramref name="defaultValue"/>

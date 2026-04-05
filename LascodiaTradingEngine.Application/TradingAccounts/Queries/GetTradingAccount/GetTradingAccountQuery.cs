@@ -9,13 +9,16 @@ namespace LascodiaTradingEngine.Application.TradingAccounts.Queries.GetTradingAc
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Retrieves a single trading account by its unique identifier.</summary>
 public class GetTradingAccountQuery : IRequest<ResponseData<TradingAccountDto>>
 {
+    /// <summary>The unique identifier of the trading account.</summary>
     public required long Id { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Fetches a single trading account by ID from the read-only context.</summary>
 public class GetTradingAccountQueryHandler : IRequestHandler<GetTradingAccountQuery, ResponseData<TradingAccountDto>>
 {
     private readonly IReadApplicationDbContext _context;

@@ -43,6 +43,7 @@ public class SubmitOrderCommand : IRequest<ResponseData<SubmitOrderResult>>
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>Validates that the order Id is a positive value.</summary>
 public class SubmitOrderCommandValidator : AbstractValidator<SubmitOrderCommand>
 {
     public SubmitOrderCommandValidator()
@@ -53,6 +54,10 @@ public class SubmitOrderCommandValidator : AbstractValidator<SubmitOrderCommand>
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Atomically transitions a Pending order to Submitted status using a WHERE guard to
+/// prevent race conditions. Enforces account ownership via <see cref="IEAOwnershipGuard"/>.
+/// </summary>
 public class SubmitOrderCommandHandler : IRequestHandler<SubmitOrderCommand, ResponseData<SubmitOrderResult>>
 {
     private readonly IWriteApplicationDbContext _context;

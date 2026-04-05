@@ -8,8 +8,10 @@ namespace LascodiaTradingEngine.Application.TradingAccounts.Commands.DeleteTradi
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>Soft-deletes a trading account. Active accounts cannot be deleted.</summary>
 public class DeleteTradingAccountCommand : IRequest<ResponseData<string>>
 {
+    /// <summary>The unique identifier of the trading account to delete.</summary>
     public long Id { get; set; }
 }
 
@@ -25,6 +27,7 @@ public class DeleteTradingAccountCommandValidator : AbstractValidator<DeleteTrad
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Marks the trading account as soft-deleted. Rejects deletion of the currently active account.</summary>
 public class DeleteTradingAccountCommandHandler : IRequestHandler<DeleteTradingAccountCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

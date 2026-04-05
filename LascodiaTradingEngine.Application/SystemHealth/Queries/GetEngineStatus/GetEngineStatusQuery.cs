@@ -8,6 +8,7 @@ namespace LascodiaTradingEngine.Application.SystemHealth.Queries.GetEngineStatus
 
 // ── DTO ───────────────────────────────────────────────────────────────────────
 
+/// <summary>Real-time snapshot of the trading engine's operational status.</summary>
 public class EngineStatusDto
 {
     public bool     IsRunning        { get; set; }
@@ -20,12 +21,17 @@ public class EngineStatusDto
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Queries the current engine status including active strategy count, open positions, pending orders, and paper mode.</summary>
 public class GetEngineStatusQuery : IRequest<ResponseData<EngineStatusDto>>
 {
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Counts active strategies, open positions, and pending orders from the read-only context,
+/// and reads the PaperMode engine config to build the status DTO.
+/// </summary>
 public class GetEngineStatusQueryHandler
     : IRequestHandler<GetEngineStatusQuery, ResponseData<EngineStatusDto>>
 {

@@ -10,14 +10,17 @@ namespace LascodiaTradingEngine.Application.StrategyEnsemble.Queries.GetPagedStr
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Retrieves a paginated list of strategy allocations ordered by weight descending.</summary>
 public class GetPagedStrategyAllocationsQuery : PagerRequestWithFilterType<StrategyAllocationQueryFilter, ResponseData<PagedData<StrategyAllocationDto>>>
 {
 }
 
 // ── Filter ────────────────────────────────────────────────────────────────────
 
+/// <summary>Filter criteria for the paged strategy allocations query.</summary>
 public class StrategyAllocationQueryFilter
 {
+    /// <summary>Filter by a specific strategy ID.</summary>
     public long? StrategyId { get; set; }
 }
 

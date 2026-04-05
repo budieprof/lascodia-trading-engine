@@ -4,6 +4,10 @@ using LascodiaTradingEngine.Domain.Entities;
 
 namespace LascodiaTradingEngine.Infrastructure.Persistence.Configurations;
 
+/// <summary>
+/// EF Core entity configuration for <see cref="MarketDataAnomaly"/>. Defines table mapping,
+/// column types, indexes, relationships, and the soft-delete query filter.
+/// </summary>
 public class MarketDataAnomalyConfiguration : IEntityTypeConfiguration<MarketDataAnomaly>
 {
     public void Configure(EntityTypeBuilder<MarketDataAnomaly> builder)

@@ -13,23 +13,44 @@ namespace LascodiaTradingEngine.Application.TradeSignals.Commands.CreateTradeSig
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Creates a new trade signal from a strategy evaluation, optionally enriched with ML model
+/// predictions. The signal is persisted in Pending status and a <see cref="TradeSignalCreatedIntegrationEvent"/>
+/// is published. When an ML model scored the signal, a <see cref="Domain.Entities.MLModelPredictionLog"/> is also created.
+/// </summary>
 public class CreateTradeSignalCommand : IRequest<ResponseData<long>>
 {
+    /// <summary>Strategy that generated this signal.</summary>
     public long          StrategyId           { get; set; }
+    /// <summary>Currency pair symbol (e.g. "EURUSD").</summary>
     public required string Symbol             { get; set; }
+    /// <summary>Trade direction: "Buy" or "Sell".</summary>
     public required string Direction          { get; set; }   // "Buy" | "Sell"
+    /// <summary>Suggested entry price from the strategy evaluator.</summary>
     public decimal       EntryPrice           { get; set; }
+    /// <summary>Suggested stop-loss price level.</summary>
     public decimal?      StopLoss             { get; set; }
+    /// <summary>Suggested take-profit price level.</summary>
     public decimal?      TakeProfit           { get; set; }
+    /// <summary>Recommended position size in lots.</summary>
     public decimal       SuggestedLotSize     { get; set; }
+    /// <summary>Strategy confidence score between 0.0 and 1.0.</summary>
     public decimal       Confidence           { get; set; }   // 0.0 – 1.0
+    /// <summary>ML model's predicted trade direction, if scored.</summary>
     public string?       MLPredictedDirection   { get; set; }
+    /// <summary>ML model's predicted price movement magnitude in pips.</summary>
     public decimal?      MLPredictedMagnitude   { get; set; }
+    /// <summary>ML model's confidence score for the prediction.</summary>
     public decimal?      MLConfidenceScore      { get; set; }
+    /// <summary>Identifier of the ML model that scored this signal.</summary>
     public long?         MLModelId              { get; set; }
+    /// <summary>Raw (uncalibrated) probability from the ML model.</summary>
     public decimal?      MLRawProbability       { get; set; }
+    /// <summary>Calibrated probability after Platt scaling or isotonic regression.</summary>
     public decimal?      MLCalibratedProbability { get; set; }
+    /// <summary>Final served calibrated probability after any runtime adjustments.</summary>
     public decimal?      MLServedCalibratedProbability { get; set; }
+    /// <summary>Decision threshold used to convert probability to a trade/no-trade decision.</summary>
     public decimal?      MLDecisionThresholdUsed { get; set; }
     /// <summary>
     /// Standard deviation of individual ensemble learner probabilities at scoring time.
@@ -53,6 +74,7 @@ public class CreateTradeSignalCommand : IRequest<ResponseData<long>>
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>Validates signal inputs including strategy Id, symbol, direction, entry price, lot size, and confidence range.</summary>
 public class CreateTradeSignalCommandValidator : AbstractValidator<CreateTradeSignalCommand>
 {
     public CreateTradeSignalCommandValidator()
@@ -81,6 +103,10 @@ public class CreateTradeSignalCommandValidator : AbstractValidator<CreateTradeSi
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Persists the trade signal in Pending status, publishes a <see cref="TradeSignalCreatedIntegrationEvent"/>,
+/// and creates an <see cref="Domain.Entities.MLModelPredictionLog"/> when ML scoring metadata is present.
+/// </summary>
 public class CreateTradeSignalCommandHandler : IRequestHandler<CreateTradeSignalCommand, ResponseData<long>>
 {
     private readonly IWriteApplicationDbContext _context;

@@ -6,6 +6,7 @@ using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.Sentiment.Queries.DTOs;
 
+/// <summary>Data transfer object for a market sentiment snapshot including score, confidence, and raw data.</summary>
 public class SentimentSnapshotDto : IMapFrom<SentimentSnapshot>
 {
     public long            Id             { get; set; }

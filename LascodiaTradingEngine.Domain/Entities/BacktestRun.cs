@@ -59,6 +59,19 @@ public class BacktestRun : Entity<long>
     /// <summary>UTC timestamp when processing finished (succeeded or failed). Null while running.</summary>
     public DateTime? CompletedAt   { get; set; }
 
+    /// <summary>
+    /// Processing priority (higher = processed first). Auto-generated candidates set this
+    /// based on screening quality (e.g. IS Sharpe rank) so the BacktestWorker processes
+    /// the most promising candidates first. Default 0 for manually queued runs.
+    /// </summary>
+    public int      Priority       { get; set; }
+
+    /// <summary>
+    /// Optional foreign key to the optimisation run that queued this validation backtest.
+    /// Enables idempotent follow-up scheduling after auto-approval.
+    /// </summary>
+    public long?    SourceOptimizationRunId { get; set; }
+
     /// <summary>Soft-delete flag. Filtered out by the global EF Core query filter.</summary>
     public bool     IsDeleted      { get; set; }
 

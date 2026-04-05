@@ -9,6 +9,10 @@ using LascodiaTradingEngine.Application.MarketRegime.Queries.GetPagedRegimeSnaps
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
+/// <summary>
+/// Queries market regime snapshots used by strategies to adapt to trending, ranging, or volatile conditions.
+/// Route: api/v1/lascodia-trading-engine/market-regime
+/// </summary>
 [Route("api/v1/lascodia-trading-engine/market-regime")]
 [ApiController]
 public class MarketRegimeController : AuthControllerBase<MarketRegimeController>

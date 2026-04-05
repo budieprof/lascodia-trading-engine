@@ -8,6 +8,9 @@ namespace LascodiaTradingEngine.Application.Common.Interfaces;
 /// </summary>
 public interface IStrategyCapacityEstimator
 {
+    /// <summary>
+    /// Estimates the maximum lot size the strategy can trade before market impact erodes expected alpha.
+    /// </summary>
     Task<StrategyCapacity> EstimateAsync(
         Strategy strategy,
         CancellationToken cancellationToken);

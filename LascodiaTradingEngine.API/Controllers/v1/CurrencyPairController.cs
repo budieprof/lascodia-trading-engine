@@ -12,6 +12,10 @@ using LascodiaTradingEngine.Application.CurrencyPairs.Queries.GetPagedCurrencyPa
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
+/// <summary>
+/// Manages currency pair (symbol) definitions including creation, updates, and deletion.
+/// Route: api/v1/lascodia-trading-engine/currency-pair
+/// </summary>
 [Route("api/v1/lascodia-trading-engine/currency-pair")]
 [ApiController]
 public class CurrencyPairController : AuthControllerBase<CurrencyPairController>

@@ -277,12 +277,9 @@ public sealed class StrategyFeedbackWorker : BackgroundService
             if (dd > maxDrawdown) maxDrawdown = dd;
         }
 
-        // Health score (same formula as StrategyHealthWorker for consistency):
-        // 0.4*WinRate + 0.3*min(1, PF/2) + 0.3*max(0, 1 - MaxDrawdown/20)
-        decimal healthScore =
-            0.4m * winRate
-            + 0.3m * Math.Min(1m, profitFactor / 2m)
-            + 0.3m * Math.Max(0m, 1m - maxDrawdown / 20m);
+        // Health score (5-factor, aligned with OptimizationWorker for consistency):
+        // 0.25*WinRate + 0.20*min(1, PF/2) + 0.20*max(0, 1 - DD/20) + 0.15*min(1, max(0, Sharpe)/2) + 0.20*min(1, Trades/50)
+        decimal healthScore = Optimization.OptimizationHealthScorer.ComputeHealthScore(winRate, profitFactor, maxDrawdown, sharpe, totalTrades);
 
         StrategyHealthStatus healthStatus = healthScore >= 0.6m ? StrategyHealthStatus.Healthy
             : healthScore >= 0.3m ? StrategyHealthStatus.Degrading

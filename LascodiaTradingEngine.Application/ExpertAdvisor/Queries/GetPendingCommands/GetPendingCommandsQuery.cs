@@ -10,14 +10,25 @@ namespace LascodiaTradingEngine.Application.ExpertAdvisor.Queries.GetPendingComm
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Retrieves all unacknowledged commands queued for a specific EA instance.
+/// The EA polls this endpoint to discover new work (modify SL/TP, close position, cancel order, etc.).
+/// </summary>
 public class GetPendingCommandsQuery : IRequest<ResponseData<List<EACommandDto>>>
 {
+    /// <summary>The EA instance to retrieve pending commands for.</summary>
     public required string EAInstanceId { get; set; }
+
+    /// <summary>Optional filter to only return commands created after this timestamp (for incremental polling).</summary>
     public DateTime? Since { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Handles pending command retrieval. Queries unacknowledged EACommand records for the target instance,
+/// optionally filtered by creation time, ordered oldest-first so the EA processes them in FIFO order.
+/// </summary>
 public class GetPendingCommandsQueryHandler : IRequestHandler<GetPendingCommandsQuery, ResponseData<List<EACommandDto>>>
 {
     private readonly IReadApplicationDbContext _context;

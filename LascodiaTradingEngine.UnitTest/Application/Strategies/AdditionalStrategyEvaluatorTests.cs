@@ -834,8 +834,8 @@ public class AdditionalStrategyEvaluatorTests : IDisposable
         var candles = new List<Candle>();
         var baseDate = new DateTime(2026, 1, 5, 0, 0, 0, DateTimeKind.Utc); // Monday
 
-        // Pre-history candles for ATR (14 bars before Asian session)
-        for (int i = -20; i < 0; i++)
+        // Pre-history candles satisfy the evaluator's 60+ candle warmup requirement.
+        for (int i = -53; i < 0; i++)
         {
             candles.Add(new Candle
             {
@@ -886,7 +886,7 @@ public class AdditionalStrategyEvaluatorTests : IDisposable
         var candles = new List<Candle>();
         var baseDate = new DateTime(2026, 1, 5, 0, 0, 0, DateTimeKind.Utc);
 
-        for (int i = -20; i < 0; i++)
+        for (int i = -53; i < 0; i++)
         {
             candles.Add(new Candle
             {

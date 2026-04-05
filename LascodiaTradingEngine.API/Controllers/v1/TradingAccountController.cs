@@ -17,6 +17,10 @@ using LascodiaTradingEngine.Application.TradingAccounts.Queries.GetPagedTradingA
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
+/// <summary>
+/// Manages trading account CRUD, activation, balance sync, password changes, and API key rotation.
+/// Route: api/v1/lascodia-trading-engine/trading-account
+/// </summary>
 [Route("api/v1/lascodia-trading-engine/trading-account")]
 [ApiController]
 public class TradingAccountController : AuthControllerBase<TradingAccountController>

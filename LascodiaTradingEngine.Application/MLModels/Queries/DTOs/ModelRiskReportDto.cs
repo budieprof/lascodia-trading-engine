@@ -1,5 +1,10 @@
 namespace LascodiaTradingEngine.Application.MLModels.Queries.DTOs;
 
+/// <summary>
+/// Comprehensive risk report for an ML model, aggregating training metrics, live performance,
+/// calibration, robustness, drift status, shadow evaluation results, and lifecycle event counts.
+/// Used for model governance, audit, and promotion decisions.
+/// </summary>
 public record ModelRiskReportDto(
     // Model identity
     long ModelId, string Symbol, string Timeframe, string ModelVersion, string LearnerArchitecture,

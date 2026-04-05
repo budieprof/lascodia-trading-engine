@@ -9,8 +9,10 @@ namespace LascodiaTradingEngine.Application.DeadLetters.Commands.ResolveDeadLett
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>Manually resolves a dead-lettered event without replaying it (e.g., after manual investigation).</summary>
 public class ResolveDeadLetterCommand : IRequest<ResponseData<bool>>
 {
+    /// <summary>The unique identifier of the dead letter event to resolve.</summary>
     public long Id { get; set; }
 }
 
@@ -26,6 +28,7 @@ public class ResolveDeadLetterCommandValidator : AbstractValidator<ResolveDeadLe
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Marks the dead letter event as resolved. Idempotent -- returns success if already resolved.</summary>
 public class ResolveDeadLetterCommandHandler
     : IRequestHandler<ResolveDeadLetterCommand, ResponseData<bool>>
 {

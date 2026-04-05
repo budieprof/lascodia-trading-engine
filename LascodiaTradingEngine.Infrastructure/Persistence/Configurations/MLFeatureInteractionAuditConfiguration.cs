@@ -4,6 +4,10 @@ using LascodiaTradingEngine.Domain.Entities;
 
 namespace LascodiaTradingEngine.Infrastructure.Persistence.Configurations;
 
+/// <summary>
+/// EF Core entity configuration for <see cref="MLFeatureInteractionAudit"/>. Defines table mapping,
+/// column types, indexes, relationships, and the soft-delete query filter.
+/// </summary>
 public class MLFeatureInteractionAuditConfiguration : IEntityTypeConfiguration<MLFeatureInteractionAudit>
 {
     public void Configure(EntityTypeBuilder<MLFeatureInteractionAudit> builder)

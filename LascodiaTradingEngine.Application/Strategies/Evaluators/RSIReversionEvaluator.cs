@@ -303,7 +303,7 @@ public class RSIReversionEvaluator : IStrategyEvaluator
         decimal currentRsi   = IndicatorCalculator.Rsi(candles, endIndex, period);
         decimal currentPrice = isBullish ? candles[endIndex].Low : candles[endIndex].High;
 
-        for (int i = endIndex - 2; i >= searchStart; i--)
+        for (int i = endIndex - 1; i >= searchStart; i--)
         {
             // Look for a prior swing point
             bool isSwing = isBullish

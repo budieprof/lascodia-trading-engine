@@ -14,8 +14,13 @@ namespace LascodiaTradingEngine.Application.DeadLetters.Commands.ReplayDeadLette
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Replays a dead-lettered integration event by deserializing its payload and re-publishing
+/// it onto the event bus. Marks the dead letter as resolved after successful replay.
+/// </summary>
 public class ReplayDeadLetterCommand : IRequest<ResponseData<bool>>
 {
+    /// <summary>The unique identifier of the dead letter event to replay.</summary>
     public long Id { get; set; }
 }
 
@@ -31,6 +36,10 @@ public class ReplayDeadLetterCommandValidator : AbstractValidator<ReplayDeadLett
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Resolves the integration event type by name, deserializes the JSON payload,
+/// publishes it to the event bus, and marks the dead letter as resolved.
+/// </summary>
 public class ReplayDeadLetterCommandHandler
     : IRequestHandler<ReplayDeadLetterCommand, ResponseData<bool>>
 {

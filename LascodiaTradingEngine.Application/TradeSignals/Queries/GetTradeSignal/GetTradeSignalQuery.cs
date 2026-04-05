@@ -9,13 +9,16 @@ namespace LascodiaTradingEngine.Application.TradeSignals.Queries.GetTradeSignal;
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Retrieves a single trade signal by its identifier, projected as a <see cref="TradeSignalDto"/>.</summary>
 public class GetTradeSignalQuery : IRequest<ResponseData<TradeSignalDto>>
 {
+    /// <summary>Trade signal identifier to look up.</summary>
     public required long Id { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Fetches a single trade signal from the read context and maps it to <see cref="TradeSignalDto"/>.</summary>
 public class GetTradeSignalQueryHandler : IRequestHandler<GetTradeSignalQuery, ResponseData<TradeSignalDto>>
 {
     private readonly IReadApplicationDbContext _context;

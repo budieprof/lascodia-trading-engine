@@ -208,12 +208,20 @@ public sealed class TrailingStopWorker : BackgroundService
             }
 
             // ── Persist the updated SL and trail reference price ──────────────
-            await writeCtx.Set<Position>()
+            int rowsUpdated = await writeCtx.Set<Position>()
                 .Where(p => p.Id == pos.Id)
                 .ExecuteUpdateAsync(s => s
                     .SetProperty(p => p.StopLoss,          newSl)
                     .SetProperty(p => p.TrailingStopLevel, current),
                     ct);
+
+            if (rowsUpdated == 0)
+            {
+                _logger.LogWarning(
+                    "TrailingStop: position {Id} ({Symbol}) SL update returned 0 rows — position may have been closed or deleted. Skipping EA command.",
+                    pos.Id, pos.Symbol);
+                continue;
+            }
 
             // ── Queue EACommand so the EA updates the SL on MT5 ─────────────
             if (!string.IsNullOrEmpty(pos.BrokerPositionId))

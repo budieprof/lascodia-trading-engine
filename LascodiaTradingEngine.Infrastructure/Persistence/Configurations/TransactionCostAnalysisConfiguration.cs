@@ -4,6 +4,10 @@ using LascodiaTradingEngine.Domain.Entities;
 
 namespace LascodiaTradingEngine.Infrastructure.Persistence.Configurations;
 
+/// <summary>
+/// EF Core entity configuration for <see cref="TransactionCostAnalysis"/>. Defines table mapping,
+/// column types, indexes, relationships, and the soft-delete query filter.
+/// </summary>
 public class TransactionCostAnalysisConfiguration : IEntityTypeConfiguration<TransactionCostAnalysis>
 {
     public void Configure(EntityTypeBuilder<TransactionCostAnalysis> builder)

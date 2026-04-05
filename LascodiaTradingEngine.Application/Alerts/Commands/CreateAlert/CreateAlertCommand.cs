@@ -8,17 +8,26 @@ namespace LascodiaTradingEngine.Application.Alerts.Commands.CreateAlert;
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Creates a new alert rule that triggers notifications when specified market conditions are met.
+/// </summary>
 public class CreateAlertCommand : IRequest<ResponseData<long>>
 {
+    /// <summary>The type of alert (e.g., PriceLevel, DrawdownBreached, SignalGenerated).</summary>
     public required string AlertType     { get; set; }
+    /// <summary>The trading symbol this alert monitors (e.g., EURUSD).</summary>
     public required string Symbol        { get; set; }
+    /// <summary>The delivery channel for the alert (Email, Webhook, or Telegram).</summary>
     public required string Channel       { get; set; }
+    /// <summary>The channel-specific destination (email address, webhook URL, or Telegram chat ID).</summary>
     public required string Destination   { get; set; }
+    /// <summary>JSON-encoded condition parameters that define when the alert triggers.</summary>
     public string ConditionJson          { get; set; } = "{}";
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>Validates <see cref="CreateAlertCommand"/> ensuring required fields and valid enum values.</summary>
 public class CreateAlertCommandValidator : AbstractValidator<CreateAlertCommand>
 {
     public CreateAlertCommandValidator()
@@ -44,6 +53,10 @@ public class CreateAlertCommandValidator : AbstractValidator<CreateAlertCommand>
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Persists a new <see cref="Domain.Entities.Alert"/> entity with the specified type, symbol, channel, and condition.
+/// Returns the newly created alert ID.
+/// </summary>
 public class CreateAlertCommandHandler : IRequestHandler<CreateAlertCommand, ResponseData<long>>
 {
     private readonly IWriteApplicationDbContext _context;

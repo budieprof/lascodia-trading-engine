@@ -9,12 +9,14 @@ namespace LascodiaTradingEngine.Application.TradingAccounts.Queries.GetActiveTra
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Retrieves the currently active trading account (only one can be active at a time).</summary>
 public class GetActiveTradingAccountQuery : IRequest<ResponseData<TradingAccountDto>>
 {
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Fetches the single active trading account from the read-only context.</summary>
 public class GetActiveTradingAccountQueryHandler : IRequestHandler<GetActiveTradingAccountQuery, ResponseData<TradingAccountDto>>
 {
     private readonly IReadApplicationDbContext _context;

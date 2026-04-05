@@ -11,22 +11,39 @@ namespace LascodiaTradingEngine.Application.MarketData.Queries.GetCandles;
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Retrieves a paginated list of candles filtered by symbol, timeframe, and optional date range.
+/// Timeframe filter is required. Results are ordered by timestamp descending (newest first).
+/// </summary>
 public class GetCandlesQuery : PagerRequestWithFilterType<CandleQueryFilter,ResponseData<PagedData<CandleDto>>>
 {
-    
+
 }
 
-
+/// <summary>
+/// Filter criteria for candle queries.
+/// </summary>
 public class CandleQueryFilter
 {
+    /// <summary>Instrument symbol to filter by (e.g. "EURUSD").</summary>
     public string? Symbol    { get; set; }
+
+    /// <summary>Bar timeframe to filter by (e.g. "H1", "D1"). Required.</summary>
     public string? Timeframe { get; set; }
+
+    /// <summary>Optional inclusive start date for the timestamp range.</summary>
     public DateTime? From { get; set; }
+
+    /// <summary>Optional inclusive end date for the timestamp range.</summary>
     public DateTime? To   { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Handles paginated candle retrieval. Requires a Timeframe filter (returns -11 if missing).
+/// Applies optional Symbol, From, and To filters, then paginates and maps to CandleDto.
+/// </summary>
 public class GetCandlesQueryHandler
     : IRequestHandler<GetCandlesQuery, ResponseData<PagedData<CandleDto>>>
 {

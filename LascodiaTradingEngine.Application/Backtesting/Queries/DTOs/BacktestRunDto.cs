@@ -6,6 +6,9 @@ using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.Backtesting.Queries.DTOs;
 
+/// <summary>
+/// Data transfer object for a backtest run, including configuration, status, and serialized results.
+/// </summary>
 public class BacktestRunDto : IMapFrom<BacktestRun>
 {
     public long      Id             { get; set; }

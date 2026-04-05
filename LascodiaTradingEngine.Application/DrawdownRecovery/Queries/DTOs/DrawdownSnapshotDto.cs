@@ -6,6 +6,7 @@ using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.DrawdownRecovery.Queries.DTOs;
 
+/// <summary>Data transfer object for a drawdown snapshot including equity levels, drawdown percentage, and recovery mode.</summary>
 public class DrawdownSnapshotDto : IMapFrom<DrawdownSnapshot>
 {
     public long         Id            { get; set; }

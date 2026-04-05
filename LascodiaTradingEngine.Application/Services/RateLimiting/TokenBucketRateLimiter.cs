@@ -6,10 +6,16 @@ using LascodiaTradingEngine.Application.Common.Interfaces;
 namespace LascodiaTradingEngine.Application.Services.RateLimiting;
 
 [RegisterService(ServiceLifetime.Singleton)]
+/// <summary>
+/// Sliding-window token bucket rate limiter. Tracks request counts per key within a
+/// configurable time window using a <see cref="ConcurrentDictionary{TKey,TValue}"/>.
+/// Registered as Singleton in DI.
+/// </summary>
 public class TokenBucketRateLimiter : IRateLimiter
 {
     private readonly ConcurrentDictionary<string, (int Count, DateTime WindowStart)> _buckets = new();
 
+    /// <inheritdoc />
     public Task<bool> TryAcquireAsync(string key, int maxRequests, TimeSpan window, CancellationToken ct)
     {
         var now = DateTime.UtcNow;
@@ -44,6 +50,7 @@ public class TokenBucketRateLimiter : IRateLimiter
         return Task.FromResult(allowed);
     }
 
+    /// <inheritdoc />
     public Task<int> GetRemainingAsync(string key, int maxRequests, TimeSpan window, CancellationToken ct)
     {
         if (!_buckets.TryGetValue(key, out var bucket))

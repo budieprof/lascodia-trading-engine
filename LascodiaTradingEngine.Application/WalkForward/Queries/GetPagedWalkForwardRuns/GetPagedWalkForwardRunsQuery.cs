@@ -11,12 +11,14 @@ namespace LascodiaTradingEngine.Application.WalkForward.Queries.GetPagedWalkForw
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Retrieves a paginated list of walk-forward runs with optional strategy and status filters.</summary>
 public class GetPagedWalkForwardRunsQuery : PagerRequestWithFilterType<WalkForwardRunQueryFilter, ResponseData<PagedData<WalkForwardRunDto>>>
 {
 }
 
 // ── Filter ────────────────────────────────────────────────────────────────────
 
+/// <summary>Filter criteria for the paged walk-forward runs query.</summary>
 public class WalkForwardRunQueryFilter
 {
     public long?   StrategyId { get; set; }

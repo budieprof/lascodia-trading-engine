@@ -45,6 +45,10 @@ public class GetPendingSignalsByAccountQuery : IRequest<ResponseData<List<Accoun
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Joins approved signals with their assigned orders and strategies to resolve the owning
+/// TradingAccount, enabling the bridge to fan out signals to the correct EA connections.
+/// </summary>
 public class GetPendingSignalsByAccountQueryHandler
     : IRequestHandler<GetPendingSignalsByAccountQuery, ResponseData<List<AccountSignalItem>>>
 {

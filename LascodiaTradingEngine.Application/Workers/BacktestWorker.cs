@@ -74,6 +74,7 @@ public class BacktestWorker : BackgroundService
     private const string CK_MaxQueuedPerCycle  = "Backtest:MaxQueuedPerCycle";
     private const string CK_MinCandles         = "Backtest:MinCandlesRequired";
     private const string CK_Enabled            = "Backtest:Enabled";
+    private const string CK_StaleRunMinutes    = "Backtest:StaleRunMinutes";
 
     /// <summary>Fast polling interval for processing queued runs (10 seconds).</summary>
     private static readonly TimeSpan ProcessingPollInterval = TimeSpan.FromSeconds(10);
@@ -116,6 +117,8 @@ public class BacktestWorker : BackgroundService
                         await ScheduleBacktestsForStaleStrategiesAsync(
                             ctx, writeContext.GetDbContext(), stoppingToken);
                     }
+
+                    await RecoverStaleRunsAsync(ctx, writeContext, stoppingToken);
                 }
 
                 // ── Process next queued run ─────────────────────────────────────────
@@ -259,12 +262,58 @@ public class BacktestWorker : BackgroundService
     }
 
     // ════════════════════════════════════════════════════════════════════════════
-    //  Run processing (unchanged logic, restructured for async scope)
+    //  Stale run recovery: detect runs stuck in Running or Queued too long
     // ════════════════════════════════════════════════════════════════════════════
 
     /// <summary>
-    /// Core processing method for a single polling tick. Looks up the oldest
-    /// <see cref="RunStatus.Queued"/> backtest run in FIFO order, executes it,
+    /// Detects backtest runs stuck in <see cref="RunStatus.Running"/> or
+    /// <see cref="RunStatus.Queued"/> beyond the configured threshold and marks them
+    /// as <see cref="RunStatus.Failed"/>. This handles process crashes that leave runs
+    /// orphaned mid-execution, and queued runs that were never picked up.
+    /// Runs on the same schedule as auto-scheduling (once per <c>Backtest:SchedulePollSeconds</c>).
+    /// </summary>
+    private async Task RecoverStaleRunsAsync(
+        Microsoft.EntityFrameworkCore.DbContext readCtx,
+        IWriteApplicationDbContext writeCtx,
+        CancellationToken ct)
+    {
+        int staleMinutes = await GetConfigAsync<int>(readCtx, CK_StaleRunMinutes, 120, ct);
+        var staleCutoff = DateTime.UtcNow.AddMinutes(-staleMinutes);
+
+        var writeDb = writeCtx.GetDbContext();
+
+        var staleRuns = await writeDb.Set<BacktestRun>()
+            .Where(r => !r.IsDeleted
+                && (r.Status == RunStatus.Running || r.Status == RunStatus.Queued)
+                && r.StartedAt < staleCutoff)
+            .ToListAsync(ct);
+
+        if (staleRuns.Count == 0) return;
+
+        foreach (var run in staleRuns)
+        {
+            var originalStatus = run.Status;
+            run.Status = RunStatus.Failed;
+            run.ErrorMessage = $"Recovered by staleness detection: stuck in {originalStatus} for >{staleMinutes} minutes";
+            run.CompletedAt = DateTime.UtcNow;
+
+            _logger.LogWarning(
+                "BacktestWorker: recovered stale run {RunId} (strategy {StrategyId}) — " +
+                "was {Status} since {StartedAt:u} (>{Minutes}min threshold)",
+                run.Id, run.StrategyId, run.Status, run.StartedAt, staleMinutes);
+        }
+
+        await writeCtx.SaveChangesAsync(ct);
+        _logger.LogInformation("BacktestWorker: recovered {Count} stale run(s)", staleRuns.Count);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
+    //  Run processing
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Core processing method for a single polling tick. Picks the highest-priority
+    /// <see cref="RunStatus.Queued"/> backtest run (falling back to FIFO), executes it,
     /// persists the result, auto-queues a <see cref="WalkForwardRun"/>, and publishes
     /// the completion event. Returns immediately (no-op) when the queue is empty.
     /// </summary>
@@ -279,7 +328,8 @@ public class BacktestWorker : BackgroundService
 
         var run = await db.Set<BacktestRun>()
             .Where(r => r.Status == RunStatus.Queued && !r.IsDeleted)
-            .OrderBy(r => r.StartedAt)
+            .OrderByDescending(r => r.Priority)
+            .ThenBy(r => r.StartedAt)
             .FirstOrDefaultAsync(ct);
 
         if (run == null) return;
@@ -287,7 +337,8 @@ public class BacktestWorker : BackgroundService
         _logger.LogInformation(
             "BacktestWorker: processing run {RunId} for strategy {StrategyId}", run.Id, run.StrategyId);
 
-        run.Status = RunStatus.Running;
+        run.Status    = RunStatus.Running;
+        run.StartedAt = DateTime.UtcNow;
         await writeContext.SaveChangesAsync(ct);
 
         try
@@ -326,25 +377,30 @@ public class BacktestWorker : BackgroundService
                 run.Id, result.TotalTrades, (double)result.WinRate);
 
             // ── Auto-queue a WalkForwardRun using the same window ─────────────────
-            var walkForwardRun = new WalkForwardRun
+            // Skip if this is an optimization follow-up — OptimizationWorker queues
+            // its own WalkForwardRun with SourceOptimizationRunId properly linked.
+            if (!run.SourceOptimizationRunId.HasValue)
             {
-                StrategyId        = run.StrategyId,
-                Symbol            = run.Symbol,
-                Timeframe         = run.Timeframe,
-                FromDate          = run.FromDate,
-                ToDate            = run.ToDate,
-                InSampleDays      = (int)((run.ToDate - run.FromDate).TotalDays * 0.7),
-                OutOfSampleDays   = (int)((run.ToDate - run.FromDate).TotalDays * 0.3),
-                InitialBalance    = run.InitialBalance,
-                Status            = RunStatus.Queued,
-                StartedAt         = DateTime.UtcNow
-            };
+                var walkForwardRun = new WalkForwardRun
+                {
+                    StrategyId        = run.StrategyId,
+                    Symbol            = run.Symbol,
+                    Timeframe         = run.Timeframe,
+                    FromDate          = run.FromDate,
+                    ToDate            = run.ToDate,
+                    InSampleDays      = (int)Math.Round((run.ToDate - run.FromDate).TotalDays * 0.7, MidpointRounding.AwayFromZero),
+                    OutOfSampleDays   = (int)Math.Round((run.ToDate - run.FromDate).TotalDays * 0.3, MidpointRounding.AwayFromZero),
+                    InitialBalance    = run.InitialBalance,
+                    Status            = RunStatus.Queued,
+                    StartedAt         = DateTime.UtcNow
+                };
 
-            await writeContext.GetDbContext().Set<WalkForwardRun>().AddAsync(walkForwardRun, ct);
+                await writeContext.GetDbContext().Set<WalkForwardRun>().AddAsync(walkForwardRun, ct);
 
-            _logger.LogInformation(
-                "BacktestWorker: auto-queued WalkForwardRun for strategy {StrategyId} following run {RunId}",
-                run.StrategyId, run.Id);
+                _logger.LogInformation(
+                    "BacktestWorker: auto-queued WalkForwardRun for strategy {StrategyId} following run {RunId}",
+                    run.StrategyId, run.Id);
+            }
         }
         catch (Exception ex)
         {
@@ -369,6 +425,14 @@ public class BacktestWorker : BackgroundService
                 InitialBalance = run.InitialBalance,
                 CompletedAt    = run.CompletedAt ?? DateTime.UtcNow
             });
+        }
+
+        // ── Update optimization follow-up status if this was a validation backtest ──
+        if (run.SourceOptimizationRunId.HasValue)
+        {
+            await Optimization.OptimizationFollowUpTracker.UpdateStatusAsync(
+                db, run.SourceOptimizationRunId.Value,
+                run.Status == RunStatus.Completed, writeContext, ct);
         }
     }
 

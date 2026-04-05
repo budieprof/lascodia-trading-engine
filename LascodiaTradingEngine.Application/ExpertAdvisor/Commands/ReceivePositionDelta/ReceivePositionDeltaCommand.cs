@@ -10,38 +10,89 @@ namespace LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ReceivePositi
 
 // ── DTOs ─────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Represents a single position change event detected by the EA (opened, closed, or modified).
+/// Only fields relevant to the action need to be populated; nulls are ignored during updates.
+/// </summary>
 public class PositionDeltaItem
 {
-    public string Action { get; set; } = string.Empty;  // "Opened", "Closed", "Modified"
+    /// <summary>Type of change: "Opened", "Closed", or "Modified".</summary>
+    public string Action { get; set; } = string.Empty;
+
+    /// <summary>Broker-assigned position ticket number.</summary>
     public long Ticket { get; set; }
+
+    /// <summary>Instrument symbol (required for Opened action).</summary>
     public string? Symbol { get; set; }
-    public string? Type { get; set; }       // "Buy" (Long) or "Sell" (Short)
+
+    /// <summary>Position direction: "Buy" (Long) or "Sell" (Short). Required for Opened action.</summary>
+    public string? Type { get; set; }
+
+    /// <summary>Current open volume in lots.</summary>
     public decimal? Volume { get; set; }
+
+    /// <summary>Average entry price.</summary>
     public decimal? PriceOpen { get; set; }
+
+    /// <summary>Current market price.</summary>
     public decimal? PriceCurrent { get; set; }
+
+    /// <summary>Stop loss level.</summary>
     public decimal? StopLoss { get; set; }
+
+    /// <summary>Take profit level.</summary>
     public decimal? TakeProfit { get; set; }
+
+    /// <summary>Current unrealised profit/loss.</summary>
     public decimal? Profit { get; set; }
+
+    /// <summary>Accumulated swap charges.</summary>
     public decimal? Swap { get; set; }
+
+    /// <summary>Broker commission.</summary>
     public decimal? Commission { get; set; }
+
+    /// <summary>EA magic number (used to identify which EA opened the position).</summary>
     public long? Magic { get; set; }
+
+    /// <summary>Order comment set by the EA or broker.</summary>
     public string? Comment { get; set; }
+
+    /// <summary>UTC time when the position was opened.</summary>
     public DateTime? OpenTime { get; set; }
+
+    /// <summary>UTC time when the position was closed (for Closed action only).</summary>
     public DateTime? CloseTime { get; set; }
 }
 
 // ── Command ──────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Receives incremental position change events (opened, closed, modified) from an EA instance.
+/// Uses a monotonic sequence number for idempotency -- duplicate or out-of-order batches are skipped.
+/// This is more efficient than full snapshots for real-time position tracking during active trading.
+/// </summary>
 public class ReceivePositionDeltaCommand : IRequest<ResponseData<int>>
 {
+    /// <summary>Unique identifier of the EA instance sending the deltas.</summary>
     public required string InstanceId { get; set; }
-    public long SequenceNumber { get; set; }  // Monotonic counter for ordering
+
+    /// <summary>Monotonic sequence number for idempotency. Batches with a sequence &lt;= the last processed value are skipped.</summary>
+    public long SequenceNumber { get; set; }
+
+    /// <summary>List of position change events in this batch.</summary>
     public List<PositionDeltaItem> Deltas { get; set; } = new();
+
+    /// <summary>UTC time when this batch was assembled by the EA.</summary>
     public DateTime Timestamp { get; set; }
 }
 
 // ── Validator ────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Validates InstanceId is non-empty, Deltas is non-empty, and each delta has a valid Action
+/// ("Opened", "Closed", or "Modified") and a positive Ticket.
+/// </summary>
 public class ReceivePositionDeltaCommandValidator : AbstractValidator<ReceivePositionDeltaCommand>
 {
     public ReceivePositionDeltaCommandValidator()
@@ -58,6 +109,12 @@ public class ReceivePositionDeltaCommandValidator : AbstractValidator<ReceivePos
 
 // ── Handler ──────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Handles incremental position delta processing. Checks idempotency via the EAInstance's
+/// LastProcessedDeltaSequence, then applies each delta: creates new Positions for "Opened",
+/// closes existing Positions for "Closed", and updates SL/TP/volume/price for "Modified".
+/// Updates the sequence watermark after successful processing.
+/// </summary>
 public class ReceivePositionDeltaCommandHandler : IRequestHandler<ReceivePositionDeltaCommand, ResponseData<int>>
 {
     private readonly IWriteApplicationDbContext _context;

@@ -1,5 +1,6 @@
 using FluentValidation;
 using MediatR;
+using Microsoft.EntityFrameworkCore;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 
@@ -7,6 +8,10 @@ namespace LascodiaTradingEngine.Application.Sentiment.Commands.IngestCOTReport;
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Ingests a CFTC Commitments of Traders (COT) report containing commercial, non-commercial,
+/// and retail positioning data for institutional sentiment analysis.
+/// </summary>
 public class IngestCOTReportCommand : IRequest<ResponseData<long>>
 {
     public required string Symbol              { get; set; }
@@ -15,6 +20,8 @@ public class IngestCOTReportCommand : IRequest<ResponseData<long>>
     public decimal         CommercialShort     { get; set; }
     public decimal         NonCommercialLong   { get; set; }
     public decimal         NonCommercialShort  { get; set; }
+    public decimal         RetailLong          { get; set; }
+    public decimal         RetailShort         { get; set; }
     public decimal         TotalOpenInterest   { get; set; }
 }
 
@@ -27,13 +34,33 @@ public class IngestCOTReportCommandValidator : AbstractValidator<IngestCOTReport
         RuleFor(x => x.Symbol)
             .NotEmpty().WithMessage("Symbol is required");
 
+        RuleFor(x => x.ReportDate)
+            .NotEmpty().WithMessage("ReportDate is required");
+
         RuleFor(x => x.TotalOpenInterest)
             .GreaterThanOrEqualTo(0).WithMessage("TotalOpenInterest must be >= 0");
+
+        RuleFor(x => x.CommercialLong)
+            .GreaterThanOrEqualTo(0).WithMessage("CommercialLong must be >= 0");
+
+        RuleFor(x => x.CommercialShort)
+            .GreaterThanOrEqualTo(0).WithMessage("CommercialShort must be >= 0");
+
+        RuleFor(x => x.NonCommercialLong)
+            .GreaterThanOrEqualTo(0).WithMessage("NonCommercialLong must be >= 0");
+
+        RuleFor(x => x.NonCommercialShort)
+            .GreaterThanOrEqualTo(0).WithMessage("NonCommercialShort must be >= 0");
     }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Persists a COT report with upsert semantics (Currency + ReportDate is unique).
+/// Computes net non-commercial positioning and the week-over-week change by querying
+/// the previous week's report for the same currency.
+/// </summary>
 public class IngestCOTReportCommandHandler : IRequestHandler<IngestCOTReportCommand, ResponseData<long>>
 {
     private readonly IWriteApplicationDbContext _context;
@@ -46,12 +73,46 @@ public class IngestCOTReportCommandHandler : IRequestHandler<IngestCOTReportComm
     public async Task<ResponseData<long>> Handle(
         IngestCOTReportCommand request, CancellationToken cancellationToken)
     {
-        // Extract the currency from the symbol (first 3 chars for base currency)
         string currency = request.Symbol.Length >= 3
             ? request.Symbol[..3].ToUpperInvariant()
             : request.Symbol.ToUpperInvariant();
 
         decimal netNonCommercial = request.NonCommercialLong - request.NonCommercialShort;
+
+        // Query the previous week's report for this currency to compute week-over-week delta.
+        var previousReport = await _context.GetDbContext()
+            .Set<Domain.Entities.COTReport>()
+            .Where(x => x.Currency == currency && x.ReportDate < request.ReportDate && !x.IsDeleted)
+            .OrderByDescending(x => x.ReportDate)
+            .Select(x => new { x.NetNonCommercialPositioning })
+            .FirstOrDefaultAsync(cancellationToken);
+
+        decimal weeklyChange = previousReport != null
+            ? netNonCommercial - previousReport.NetNonCommercialPositioning
+            : 0m;
+
+        // Upsert: update existing record for the same Currency + ReportDate, or insert new.
+        var existing = await _context.GetDbContext()
+            .Set<Domain.Entities.COTReport>()
+            .FirstOrDefaultAsync(
+                x => x.Currency == currency && x.ReportDate == request.ReportDate && !x.IsDeleted,
+                cancellationToken);
+
+        if (existing != null)
+        {
+            existing.CommercialLong              = (long)request.CommercialLong;
+            existing.CommercialShort             = (long)request.CommercialShort;
+            existing.NonCommercialLong           = (long)request.NonCommercialLong;
+            existing.NonCommercialShort          = (long)request.NonCommercialShort;
+            existing.RetailLong                  = (long)request.RetailLong;
+            existing.RetailShort                 = (long)request.RetailShort;
+            existing.TotalOpenInterest           = (long)request.TotalOpenInterest;
+            existing.NetNonCommercialPositioning = netNonCommercial;
+            existing.NetPositioningChangeWeekly  = weeklyChange;
+
+            await _context.SaveChangesAsync(cancellationToken);
+            return ResponseData<long>.Init(existing.Id, true, "Successful", "00");
+        }
 
         var entity = new Domain.Entities.COTReport
         {
@@ -61,10 +122,11 @@ public class IngestCOTReportCommandHandler : IRequestHandler<IngestCOTReportComm
             CommercialShort             = (long)request.CommercialShort,
             NonCommercialLong           = (long)request.NonCommercialLong,
             NonCommercialShort          = (long)request.NonCommercialShort,
-            RetailLong                  = 0,
-            RetailShort                 = 0,
+            RetailLong                  = (long)request.RetailLong,
+            RetailShort                 = (long)request.RetailShort,
+            TotalOpenInterest           = (long)request.TotalOpenInterest,
             NetNonCommercialPositioning = netNonCommercial,
-            NetPositioningChangeWeekly  = 0m
+            NetPositioningChangeWeekly  = weeklyChange
         };
 
         await _context.GetDbContext()

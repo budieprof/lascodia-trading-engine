@@ -10,19 +10,23 @@ namespace LascodiaTradingEngine.Application.Sentiment.Queries.GetPagedCOTReports
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Retrieves a paginated list of COT reports with optional symbol/currency filtering.</summary>
 public class GetPagedCOTReportsQuery : PagerRequestWithFilterType<COTReportQueryFilter, ResponseData<PagedData<COTReportDto>>>
 {
 }
 
 // ── Filter ────────────────────────────────────────────────────────────────────
 
+/// <summary>Filter criteria for the paged COT reports query.</summary>
 public class COTReportQueryFilter
 {
+    /// <summary>Filter by symbol; the first 3 characters are used as the currency key.</summary>
     public string? Symbol { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Queries COT reports ordered by report date descending with optional currency filter.</summary>
 public class GetPagedCOTReportsQueryHandler
     : IRequestHandler<GetPagedCOTReportsQuery, ResponseData<PagedData<COTReportDto>>>
 {

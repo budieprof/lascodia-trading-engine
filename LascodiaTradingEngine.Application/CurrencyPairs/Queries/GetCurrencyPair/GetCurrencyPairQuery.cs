@@ -9,13 +9,16 @@ namespace LascodiaTradingEngine.Application.CurrencyPairs.Queries.GetCurrencyPai
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Retrieves a single currency pair by its unique identifier.</summary>
 public class GetCurrencyPairQuery : IRequest<ResponseData<CurrencyPairDto>>
 {
+    /// <summary>The unique identifier of the currency pair.</summary>
     public long Id { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Fetches a single currency pair by ID from the read-only context.</summary>
 public class GetCurrencyPairQueryHandler : IRequestHandler<GetCurrencyPairQuery, ResponseData<CurrencyPairDto>>
 {
     private readonly IReadApplicationDbContext _context;

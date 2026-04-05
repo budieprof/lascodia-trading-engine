@@ -9,6 +9,10 @@ namespace LascodiaTradingEngine.Application.TradingAccounts.Commands.SyncAccount
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Synchronises a trading account's balance, equity, margin, and broker-reported fields
+/// with the latest data from the EA or broker. Called by the <c>AccountSyncWorker</c>.
+/// </summary>
 public class SyncAccountBalanceCommand : IRequest<ResponseData<string>>
 {
     public long       Id              { get; set; }
@@ -57,6 +61,7 @@ public class SyncAccountBalanceCommandValidator : AbstractValidator<SyncAccountB
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Updates balance, equity, margin, leverage, and broker-specific fields on the trading account.</summary>
 public class SyncAccountBalanceCommandHandler : IRequestHandler<SyncAccountBalanceCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

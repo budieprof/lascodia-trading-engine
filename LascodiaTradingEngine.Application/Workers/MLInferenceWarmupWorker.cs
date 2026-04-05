@@ -4,14 +4,17 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.Workers;
 
 /// <summary>
-/// On startup, pre-loads all active ML models and runs a dummy inference to warm the JIT
-/// and model deserialization cache. Eliminates first-tick cold-start latency (~200ms).
+/// On startup, pre-loads all active ML models and runs a real inference pass with
+/// actual candle data to fully warm the JIT, model deserialization cache, and feature
+/// engineering code paths. Eliminates first-tick cold-start latency (~200ms).
+/// Validates that each model can score successfully before live trading begins.
 /// Runs once on startup, then exits.
 /// </summary>
 public class MLInferenceWarmupWorker : BackgroundService
@@ -29,19 +32,22 @@ public class MLInferenceWarmupWorker : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        // Small delay to let other services initialize first
+        // Allow other services (DB connections, event bus) to initialize first
         await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
 
         _logger.LogInformation("MLInferenceWarmupWorker: warming up ML model cache");
         var sw = Stopwatch.StartNew();
 
+        int warmed = 0, failed = 0, skippedNoCandles = 0;
+
         try
         {
             using var scope = _scopeFactory.CreateScope();
-            var readCtx = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+            var readCtx  = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+            var mlScorer = scope.ServiceProvider.GetRequiredService<IMLSignalScorer>();
+            var readDb   = readCtx.GetDbContext();
 
-            // Load all active models
-            var activeModels = await readCtx.GetDbContext()
+            var activeModels = await readDb
                 .Set<MLModel>()
                 .Where(m => m.IsActive && !m.IsDeleted && m.ModelBytes != null)
                 .Select(m => new { m.Id, m.Symbol, m.Timeframe })
@@ -51,44 +57,86 @@ public class MLInferenceWarmupWorker : BackgroundService
                 "MLInferenceWarmupWorker: found {Count} active models to warm up",
                 activeModels.Count);
 
-            // For each active model, trigger a cache load by resolving the scorer
-            // The MLSignalScorer's snapshot cache is populated on first access per model
-            var mlScorer = scope.ServiceProvider.GetRequiredService<IMLSignalScorer>();
+            // Group by symbol/timeframe to share candle loads across models on the same pair
+            var groups = activeModels.GroupBy(m => (m.Symbol, m.Timeframe));
 
-            foreach (var model in activeModels)
+            foreach (var group in groups)
             {
                 if (stoppingToken.IsCancellationRequested) break;
 
-                try
-                {
-                    // Create a minimal dummy signal to trigger model loading
-                    var dummySignal = new TradeSignal
-                    {
-                        Symbol    = model.Symbol,
-                        Direction = TradeDirection.Buy,
-                        EntryPrice = 1.0m,
-                        SuggestedLotSize = 0.01m
-                    };
+                var (symbol, timeframe) = group.Key;
 
-                    // Score with empty candle list — the scorer will load and cache the model
-                    // snapshot even if scoring fails due to insufficient candles
-                    await mlScorer.ScoreAsync(dummySignal, Array.Empty<Candle>(), stoppingToken);
-                }
-                catch
+                // Load real candles for this symbol/timeframe (need LookbackWindow + 2)
+                int requiredCandles = MLFeatureHelper.LookbackWindow + 2;
+                var candles = await readDb
+                    .Set<Candle>()
+                    .Where(c => c.Symbol == symbol && c.Timeframe == timeframe
+                             && c.IsClosed && !c.IsDeleted)
+                    .OrderByDescending(c => c.Timestamp)
+                    .Take(requiredCandles)
+                    .ToListAsync(stoppingToken);
+
+                if (candles.Count < requiredCandles)
                 {
-                    // Expected: scoring may fail with empty candles, but the model is now cached
+                    skippedNoCandles += group.Count();
+                    _logger.LogDebug(
+                        "MLInferenceWarmupWorker: skipping {Symbol}/{Tf} — only {Count}/{Required} candles available",
+                        symbol, timeframe, candles.Count, requiredCandles);
+                    continue;
+                }
+
+                // Reverse to chronological order
+                candles.Reverse();
+
+                foreach (var model in group)
+                {
+                    if (stoppingToken.IsCancellationRequested) break;
+
+                    var modelSw = Stopwatch.StartNew();
+                    try
+                    {
+                        var dummySignal = new TradeSignal
+                        {
+                            Symbol           = model.Symbol,
+                            Direction        = TradeDirection.Buy,
+                            EntryPrice       = candles[^1].Close,
+                            SuggestedLotSize = 0.01m
+                        };
+
+                        // Score with real candle data to exercise the full code path:
+                        // model deserialization → feature engineering → inference → calibration
+                        await mlScorer.ScoreAsync(dummySignal, candles, stoppingToken);
+                        warmed++;
+
+                        _logger.LogDebug(
+                            "MLInferenceWarmupWorker: warmed model {Id} ({Symbol}/{Tf}) in {Ms}ms",
+                            model.Id, model.Symbol, model.Timeframe, modelSw.ElapsedMilliseconds);
+                    }
+                    catch (Exception ex)
+                    {
+                        failed++;
+                        _logger.LogWarning(ex,
+                            "MLInferenceWarmupWorker: warm-up scoring failed for model {Id} ({Symbol}/{Tf}). " +
+                            "Model may have stale snapshot or incompatible feature schema.",
+                            model.Id, model.Symbol, model.Timeframe);
+                    }
                 }
             }
-
-            sw.Stop();
-            _logger.LogInformation(
-                "MLInferenceWarmupWorker: warmed {Count} models in {Elapsed}ms",
-                activeModels.Count, sw.ElapsedMilliseconds);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "MLInferenceWarmupWorker: warm-up failed");
+            _logger.LogError(ex, "MLInferenceWarmupWorker: warm-up aborted due to critical error");
         }
+
+        sw.Stop();
+        _logger.LogInformation(
+            "MLInferenceWarmupWorker: completed in {Elapsed}ms — warmed={Warmed}, failed={Failed}, skipped={Skipped}",
+            sw.ElapsedMilliseconds, warmed, failed, skippedNoCandles);
+
+        if (failed > 0)
+            _logger.LogWarning(
+                "MLInferenceWarmupWorker: {Failed} models failed warm-up scoring — check model snapshots",
+                failed);
 
         // This worker runs once and exits — it does not loop
     }

@@ -9,13 +9,20 @@ namespace LascodiaTradingEngine.Application.MLEvaluation.Queries.GetMLShadowEval
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Retrieves a single ML shadow evaluation by its database ID. Returns -14 if not found.
+/// </summary>
 public class GetMLShadowEvaluationQuery : IRequest<ResponseData<MLShadowEvaluationDto>>
 {
+    /// <summary>Database ID of the shadow evaluation to retrieve.</summary>
     public required long Id { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Handles single shadow evaluation retrieval by ID, mapping the entity to MLShadowEvaluationDto.
+/// </summary>
 public class GetMLShadowEvaluationQueryHandler : IRequestHandler<GetMLShadowEvaluationQuery, ResponseData<MLShadowEvaluationDto>>
 {
     private readonly IReadApplicationDbContext _context;

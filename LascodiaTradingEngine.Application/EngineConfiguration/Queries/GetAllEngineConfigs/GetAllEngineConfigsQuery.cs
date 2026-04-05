@@ -9,12 +9,14 @@ namespace LascodiaTradingEngine.Application.EngineConfiguration.Queries.GetAllEn
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Retrieves all engine configuration entries ordered alphabetically by key.</summary>
 public class GetAllEngineConfigsQuery : IRequest<ResponseData<List<EngineConfigDto>>>
 {
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Fetches all active engine config entries from the read-only context, sorted by key.</summary>
 public class GetAllEngineConfigsQueryHandler : IRequestHandler<GetAllEngineConfigsQuery, ResponseData<List<EngineConfigDto>>>
 {
     private readonly IReadApplicationDbContext _context;

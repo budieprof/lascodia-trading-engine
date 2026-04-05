@@ -40,7 +40,7 @@ public sealed class WorkerGroupConfiguration
     /// ML training pipeline: MLTrainingWorker, MLShadowArbiterWorker, MLPredictionOutcomeWorker,
     /// MLModelActivatedEventHandler, MLModelRetirementWorker, MLTrainingRunHealthWorker,
     /// MLTrainingDataFreshnessWorker, MLTransferLearningWorker, MLModelDistillationWorker,
-    /// MLMamlMetaLearnerWorker, MLOnlineLearningWorker, MLPredictionLogPruningWorker.
+    /// MLAverageWeightInitWorker, MLOnlineLearningWorker, MLPredictionLogPruningWorker.
     /// </summary>
     public bool MLTraining      { get; set; }
 

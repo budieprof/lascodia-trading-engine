@@ -10,14 +10,25 @@ namespace LascodiaTradingEngine.Application.MarketData.Queries.GetLatestCandle;
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Retrieves the most recent candle for a given symbol and timeframe.
+/// Returns -14 if no candle exists for the specified combination.
+/// </summary>
 public class GetLatestCandleQuery : IRequest<ResponseData<CandleDto>>
 {
+    /// <summary>Instrument symbol (e.g. "EURUSD").</summary>
     public required string Symbol    { get; set; }
+
+    /// <summary>Bar timeframe (e.g. "H1", "D1").</summary>
     public required string Timeframe { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Handles latest candle retrieval by querying the Candle table for the most recent timestamp
+/// matching the given symbol and timeframe, then mapping to CandleDto.
+/// </summary>
 public class GetLatestCandleQueryHandler : IRequestHandler<GetLatestCandleQuery, ResponseData<CandleDto>>
 {
     private readonly IReadApplicationDbContext _context;

@@ -10,6 +10,10 @@ using LascodiaTradingEngine.Application.EconomicEvents.Queries.GetPagedEconomicE
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
+/// <summary>
+/// Manages economic calendar events used by the news filter to gate trading around high-impact releases.
+/// Route: api/v1/lascodia-trading-engine/economic-event
+/// </summary>
 [Route("api/v1/lascodia-trading-engine/economic-event")]
 [ApiController]
 public class EconomicEventController : AuthControllerBase<EconomicEventController>

@@ -8,6 +8,10 @@ namespace LascodiaTradingEngine.Application.EconomicEvents.Commands.CreateEconom
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Creates a scheduled economic event (e.g., NFP, CPI release) that the news filter uses
+/// to suspend trading around high-impact announcements.
+/// </summary>
 public class CreateEconomicEventCommand : IRequest<ResponseData<long>>
 {
     public required string Title       { get; set; }
@@ -43,6 +47,7 @@ public class CreateEconomicEventCommandValidator : AbstractValidator<CreateEcono
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Persists a new economic event with parsed impact level and event source.</summary>
 public class CreateEconomicEventCommandHandler : IRequestHandler<CreateEconomicEventCommand, ResponseData<long>>
 {
     private readonly IWriteApplicationDbContext _context;

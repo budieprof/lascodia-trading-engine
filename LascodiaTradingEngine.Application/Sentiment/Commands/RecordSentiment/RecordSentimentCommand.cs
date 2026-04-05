@@ -8,6 +8,10 @@ namespace LascodiaTradingEngine.Application.Sentiment.Commands.RecordSentiment;
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Records a market sentiment snapshot for a symbol, capturing bullish/bearish/neutral percentages
+/// and an overall sentiment score used by the sentiment filter in strategy evaluation.
+/// </summary>
 public class RecordSentimentCommand : IRequest<ResponseData<long>>
 {
     public required string Symbol         { get; set; }
@@ -16,6 +20,7 @@ public class RecordSentimentCommand : IRequest<ResponseData<long>>
     public decimal         BullishPct     { get; set; }
     public decimal         BearishPct     { get; set; }
     public decimal         NeutralPct     { get; set; }
+    public decimal?        Confidence     { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
@@ -37,6 +42,7 @@ public class RecordSentimentCommandValidator : AbstractValidator<RecordSentiment
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Persists a sentiment snapshot with the raw bullish/bearish/neutral breakdown stored as JSON.</summary>
 public class RecordSentimentCommandHandler : IRequestHandler<RecordSentimentCommand, ResponseData<long>>
 {
     private readonly IWriteApplicationDbContext _context;
@@ -54,7 +60,7 @@ public class RecordSentimentCommandHandler : IRequestHandler<RecordSentimentComm
             Currency       = request.Symbol,
             Source         = Enum.Parse<SentimentSource>(request.Source, ignoreCase: true),
             SentimentScore = request.SentimentScore,
-            Confidence     = request.BullishPct,
+            Confidence     = request.Confidence ?? request.BullishPct,
             RawDataJson    = System.Text.Json.JsonSerializer.Serialize(new
             {
                 request.BullishPct,

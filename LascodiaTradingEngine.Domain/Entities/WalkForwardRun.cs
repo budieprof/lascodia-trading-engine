@@ -48,6 +48,14 @@ public class WalkForwardRun : Entity<long>
     /// </summary>
     public int     OutOfSampleDays              { get; set; }
 
+    /// <summary>
+    /// When true, the walk-forward worker re-optimises strategy parameters on each
+    /// in-sample fold before evaluating the out-of-sample segment. This validates whether
+    /// the optimisation process itself consistently finds good parameters (true WFA),
+    /// rather than testing a single fixed parameter set across windows.
+    /// </summary>
+    public bool    ReOptimizePerFold              { get; set; }
+
     /// <summary>Current processing state: Queued → Running → Completed / Failed.</summary>
     public RunStatus  Status                       { get; set; } = RunStatus.Queued;
 
@@ -85,6 +93,12 @@ public class WalkForwardRun : Entity<long>
 
     /// <summary>UTC timestamp when walk-forward processing finished. Null while running.</summary>
     public DateTime? CompletedAt                { get; set; }
+
+    /// <summary>
+    /// Optional foreign key to the optimisation run that queued this walk-forward validation.
+    /// Enables idempotent follow-up scheduling after auto-approval.
+    /// </summary>
+    public long?    SourceOptimizationRunId     { get; set; }
 
     /// <summary>Soft-delete flag. Filtered out by the global EF Core query filter.</summary>
     public bool    IsDeleted                    { get; set; }

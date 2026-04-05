@@ -4,6 +4,10 @@ using Microsoft.EntityFrameworkCore.Metadata.Builders;
 
 namespace LascodiaTradingEngine.Infrastructure.Persistence.Configurations;
 
+/// <summary>
+/// EF Core entity configuration for <see cref="MLAdwinDriftLog"/>. Defines table mapping,
+/// column types, indexes, relationships, and the soft-delete query filter.
+/// </summary>
 public class MLAdwinDriftLogConfiguration : IEntityTypeConfiguration<MLAdwinDriftLog>
 {
     public void Configure(EntityTypeBuilder<MLAdwinDriftLog> builder)

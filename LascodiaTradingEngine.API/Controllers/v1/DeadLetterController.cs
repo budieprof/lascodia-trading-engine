@@ -10,6 +10,10 @@ using LascodiaTradingEngine.Application.DeadLetters.Queries.GetPagedDeadLetters;
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
+/// <summary>
+/// Manages dead-lettered integration events including listing, replay, and resolution.
+/// Route: api/v1/lascodia-trading-engine/dead-letter
+/// </summary>
 [Route("api/v1/lascodia-trading-engine/dead-letter")]
 [ApiController]
 public class DeadLetterController : AuthControllerBase<DeadLetterController>

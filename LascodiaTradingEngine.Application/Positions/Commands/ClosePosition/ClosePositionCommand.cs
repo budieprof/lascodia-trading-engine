@@ -10,15 +10,23 @@ namespace LascodiaTradingEngine.Application.Positions.Commands.ClosePosition;
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Closes (or partially closes) an open position at the specified price. Calculates
+/// realized P&amp;L using the actual contract size and queues an EA command if needed.
+/// </summary>
 public class ClosePositionCommand : IRequest<ResponseData<string>>
 {
+    /// <summary>Position identifier to close.</summary>
     public long    Id        { get; set; }
+    /// <summary>Exit price at which the position is closed.</summary>
     public decimal ClosePrice { get; set; }
+    /// <summary>Number of lots to close. Defaults to all open lots if null.</summary>
     public decimal? CloseLots { get; set; }  // defaults to all open lots
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>Validates that Id and ClosePrice are positive and optional CloseLots is positive when provided.</summary>
 public class ClosePositionCommandValidator : AbstractValidator<ClosePositionCommand>
 {
     public ClosePositionCommandValidator()
@@ -31,6 +39,11 @@ public class ClosePositionCommandValidator : AbstractValidator<ClosePositionComm
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Computes realized P&amp;L from the close price and contract size, updates position lots,
+/// transitions to Closed status when fully closed, and queues a <c>ClosePosition</c> EA command
+/// if the position has a broker ticket. Runs inside an explicit transaction for atomicity.
+/// </summary>
 public class ClosePositionCommandHandler : IRequestHandler<ClosePositionCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

@@ -9,29 +9,59 @@ namespace LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ReceiveCandle
 
 // ── DTO ──────────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// A single OHLCV candle within a batch submission. May represent a forming or closed bar.
+/// </summary>
 public class CandleBatchItem
 {
+    /// <summary>Instrument symbol (e.g. "EURUSD"). Normalised to upper-case during processing.</summary>
     public required string Symbol    { get; set; }
+
+    /// <summary>Bar timeframe (e.g. "M1", "H1", "D1"). Must parse to the Timeframe enum.</summary>
     public required string Timeframe { get; set; }
+
+    /// <summary>Opening price of the candle.</summary>
     public decimal  Open      { get; set; }
+
+    /// <summary>Highest price during the candle period.</summary>
     public decimal  High      { get; set; }
+
+    /// <summary>Lowest price during the candle period.</summary>
     public decimal  Low       { get; set; }
+
+    /// <summary>Closing (or current) price of the candle.</summary>
     public decimal  Close     { get; set; }
+
+    /// <summary>Tick volume for the candle period.</summary>
     public decimal  Volume    { get; set; }
+
+    /// <summary>Candle open time as reported by the EA.</summary>
     public DateTime Timestamp { get; set; }
+
+    /// <summary>True if the bar is complete; false if still forming.</summary>
     public bool     IsClosed  { get; set; }
 }
 
 // ── Command ──────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Receives a batch of OHLCV candles (potentially across multiple symbols and timeframes) from an EA instance.
+/// Each candle is upserted by its natural key (Symbol + Timeframe + Timestamp). Returns the count of processed candles.
+/// </summary>
 public class ReceiveCandleBatchCommand : IRequest<ResponseData<int>>
 {
+    /// <summary>Unique identifier of the EA instance sending the batch.</summary>
     public required string InstanceId { get; set; }
+
+    /// <summary>List of candles to upsert. Capped at 10,000 items per request.</summary>
     public List<CandleBatchItem> Candles { get; set; } = new();
 }
 
 // ── Validator ────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Validates InstanceId is non-empty, Candles is not null, and batch size does not exceed 10,000 items.
+/// </summary>
 public class ReceiveCandleBatchCommandValidator : AbstractValidator<ReceiveCandleBatchCommand>
 {
     public ReceiveCandleBatchCommandValidator()
@@ -47,6 +77,11 @@ public class ReceiveCandleBatchCommandValidator : AbstractValidator<ReceiveCandl
 
 // ── Handler ──────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Handles candle batch ingestion. Iterates each candle, parses the timeframe, and upserts by
+/// (Symbol, Timeframe, Timestamp). Invalid timeframes are silently skipped. All changes are
+/// flushed in a single SaveChangesAsync call for efficiency.
+/// </summary>
 public class ReceiveCandleBatchCommandHandler : IRequestHandler<ReceiveCandleBatchCommand, ResponseData<int>>
 {
     private readonly IWriteApplicationDbContext _context;

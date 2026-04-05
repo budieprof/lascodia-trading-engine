@@ -10,30 +10,67 @@ namespace LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ReceivePositi
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Receives a full snapshot of open positions from the broker via an EA instance.
+/// Upserts engine Position records by matching on BrokerPositionId + Symbol.
+/// Called during EA startup and periodically to reconcile broker state with the engine.
+/// </summary>
 public class ReceivePositionSnapshotCommand : IRequest<ResponseData<string>>
 {
+    /// <summary>Unique identifier of the EA instance providing the snapshot.</summary>
     public required string InstanceId { get; set; }
+
+    /// <summary>List of open positions as reported by the broker. Capped at 500 items.</summary>
     public List<PositionSnapshotItem> Positions { get; set; } = new();
 }
 
+/// <summary>
+/// Represents a single open position from the broker's perspective (MetaTrader 5 position data).
+/// </summary>
 public class PositionSnapshotItem
 {
+    /// <summary>Broker-assigned position ticket number.</summary>
     public long     Ticket          { get; set; }
+
+    /// <summary>Instrument symbol (e.g. "EURUSD").</summary>
     public required string Symbol   { get; set; }
-    public required string Direction { get; set; }  // "Long" | "Short"
+
+    /// <summary>Position direction: "Long" or "Short".</summary>
+    public required string Direction { get; set; }
+
+    /// <summary>Current open volume in lots.</summary>
     public decimal  Volume          { get; set; }
+
+    /// <summary>Average entry price of the position.</summary>
     public decimal  OpenPrice       { get; set; }
+
+    /// <summary>Current market price for the position's symbol.</summary>
     public decimal  CurrentPrice    { get; set; }
+
+    /// <summary>Stop loss level, if set.</summary>
     public decimal? StopLoss        { get; set; }
+
+    /// <summary>Take profit level, if set.</summary>
     public decimal? TakeProfit      { get; set; }
+
+    /// <summary>Current unrealised profit/loss in account currency.</summary>
     public decimal  Profit          { get; set; }
+
+    /// <summary>Accumulated swap charges.</summary>
     public decimal  Swap            { get; set; }
+
+    /// <summary>Broker commission charged for this position.</summary>
     public decimal  Commission      { get; set; }
+
+    /// <summary>UTC time when the position was opened.</summary>
     public DateTime OpenTime        { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Validates InstanceId is non-empty, Positions is not null, and batch size does not exceed 500 items.
+/// </summary>
 public class ReceivePositionSnapshotCommandValidator : AbstractValidator<ReceivePositionSnapshotCommand>
 {
     public ReceivePositionSnapshotCommandValidator()
@@ -49,6 +86,11 @@ public class ReceivePositionSnapshotCommandValidator : AbstractValidator<Receive
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Handles position snapshot processing. Verifies caller ownership, then for each position:
+/// updates the existing engine Position if matched by BrokerPositionId + Symbol, or creates a new
+/// Position record for unknown broker positions. Flushes all changes in a single save.
+/// </summary>
 public class ReceivePositionSnapshotCommandHandler : IRequestHandler<ReceivePositionSnapshotCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

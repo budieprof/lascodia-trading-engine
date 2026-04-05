@@ -4,6 +4,10 @@ using LascodiaTradingEngine.Domain.Entities;
 
 namespace LascodiaTradingEngine.Infrastructure.Persistence.Configurations;
 
+/// <summary>
+/// EF Core entity configuration for <see cref="MLTrainingRun"/>. Defines table mapping,
+/// column types, indexes, relationships, and the soft-delete query filter.
+/// </summary>
 public class MLTrainingRunConfiguration : IEntityTypeConfiguration<MLTrainingRun>
 {
     public void Configure(EntityTypeBuilder<MLTrainingRun> builder)

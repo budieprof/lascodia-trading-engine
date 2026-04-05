@@ -6,6 +6,7 @@ namespace LascodiaTradingEngine.Application.RateLimiting.Queries.GetApiQuotaStat
 
 // ── DTO (inline) ──────────────────────────────────────────────────────────────
 
+/// <summary>Current API rate-limit quota status for a specific broker key.</summary>
 public class ApiQuotaStatusDto
 {
     public string BrokerKey       { get; set; } = string.Empty;
@@ -16,14 +17,18 @@ public class ApiQuotaStatusDto
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Checks remaining API quota for a broker key within a one-minute sliding window.</summary>
 public class GetApiQuotaStatusQuery : IRequest<ResponseData<ApiQuotaStatusDto>>
 {
+    /// <summary>The broker-specific key to check quota for.</summary>
     public string BrokerKey             { get; set; } = string.Empty;
+    /// <summary>Maximum allowed requests per minute for this broker key.</summary>
     public int    MaxRequestsPerMinute  { get; set; } = 60;
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Queries the token bucket rate limiter for remaining capacity within the current minute window.</summary>
 public class GetApiQuotaStatusQueryHandler
     : IRequestHandler<GetApiQuotaStatusQuery, ResponseData<ApiQuotaStatusDto>>
 {

@@ -10,6 +10,10 @@ using LascodiaTradingEngine.Application.WalkForward.Queries.GetPagedWalkForwardR
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
+/// <summary>
+/// Manages walk-forward optimisation runs for out-of-sample strategy parameter validation.
+/// Route: api/v1/lascodia-trading-engine/walk-forward
+/// </summary>
 [Route("api/v1/lascodia-trading-engine/walk-forward")]
 [ApiController]
 public class WalkForwardController : AuthControllerBase<WalkForwardController>

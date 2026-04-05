@@ -9,12 +9,14 @@ namespace LascodiaTradingEngine.Application.StrategyEnsemble.Queries.GetStrategy
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Retrieves all strategy allocations ordered by weight descending, with strategy names resolved.</summary>
 public class GetStrategyAllocationsQuery : IRequest<ResponseData<List<StrategyAllocationDto>>>
 {
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Fetches all allocations and joins with strategy names for display.</summary>
 public class GetStrategyAllocationsQueryHandler
     : IRequestHandler<GetStrategyAllocationsQuery, ResponseData<List<StrategyAllocationDto>>>
 {

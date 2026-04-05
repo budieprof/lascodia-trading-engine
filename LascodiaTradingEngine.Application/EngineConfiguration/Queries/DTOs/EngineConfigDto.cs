@@ -6,6 +6,7 @@ using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.EngineConfiguration.Queries.DTOs;
 
+/// <summary>Data transfer object for an engine configuration key-value pair.</summary>
 public class EngineConfigDto : IMapFrom<EngineConfig>
 {
     public long           Id              { get; set; }

@@ -17,7 +17,7 @@ namespace LascodiaTradingEngine.Application.Workers;
 /// consecutive-miss cooldown active, rolling accuracy below floor — while technically
 /// remaining "active" because no single worker has authority to suppress it.
 ///
-/// <b>Algorithm:</b> Evaluate three independent degradation signals for each model:
+/// <b>Algorithm:</b> Evaluate four independent degradation signals for each model:
 /// <list type="number">
 ///   <item><b>Cooldown active</b> — <c>MLCooldown:{Symbol}:{Tf}:ExpiresAt</c> in
 ///         <see cref="EngineConfig"/> is a future timestamp.</item>
@@ -25,9 +25,12 @@ namespace LascodiaTradingEngine.Application.Workers;
 ///         is below <c>CriticalEwmaThreshold</c> (default 0.48).</item>
 ///   <item><b>Live accuracy degraded</b> — <see cref="MLModel.LiveDirectionAccuracy"/>
 ///         is non-null and below <c>LiveAccuracyFloor</c> (default 0.48).</item>
+///   <item><b>ADWIN drift detected</b> — <c>MLDrift:{Symbol}:{Tf}:AdwinDriftDetected</c>
+///         config key holds a future expiry timestamp, set by <see cref="MLAdwinDriftWorker"/>
+///         when a statistically significant accuracy shift is detected.</item>
 /// </list>
 ///
-/// When ≥ <c>SignalsRequired</c> (default 2) of these 3 signals are simultaneously
+/// When ≥ <c>SignalsRequired</c> (default 2) of these 4 signals are simultaneously
 /// active, set <c>MLModel.IsSuppressed = true</c> via <c>ExecuteUpdateAsync</c>
 /// and fire a <c>MLModelDecommissioned</c>-reason alert. The model remains suppressed
 /// until a new champion is promoted (handled by the shadow-arbiter workflow).
@@ -153,11 +156,11 @@ public sealed class MLModelRetirementWorker : BackgroundService
     }
 
     /// <summary>
-    /// Evaluates all three retirement signals for a single model and, if enough signals
+    /// Evaluates all four retirement signals for a single model and, if enough signals
     /// are simultaneously active, suppresses the model and fires a critical alert.
     /// </summary>
     /// <remarks>
-    /// <b>Three-signal retirement criteria:</b>
+    /// <b>Four-signal retirement criteria:</b>
     /// <list type="number">
     ///   <item>
     ///     <b>Cooldown active (Signal 1):</b> Reads the config key
@@ -176,6 +179,12 @@ public sealed class MLModelRetirementWorker : BackgroundService
     ///     <see cref="MLModel.LiveDirectionAccuracy"/> field (updated by
     ///     <c>MLPredictionOutcomeWorker</c>) is below <paramref name="liveAccuracyFloor"/>.
     ///     This is a simple rolling fraction, complementary to the EWMA.
+    ///   </item>
+    ///   <item>
+    ///     <b>ADWIN drift detected (Signal 4):</b> The <see cref="MLAdwinDriftWorker"/> has
+    ///     detected a statistically significant accuracy shift via adaptive windowing.
+    ///     The flag is stored as an expiring timestamp in
+    ///     <c>MLDrift:{Symbol}:{Timeframe}:AdwinDriftDetected</c> (48-hour TTL).
     ///   </item>
     /// </list>
     ///
@@ -239,7 +248,7 @@ public sealed class MLModelRetirementWorker : BackgroundService
         if (ewmaRow is not null && ewmaRow.EwmaAccuracy < ewmaThreshold)
             activeSignals.Add($"ewma_critical ({ewmaRow.EwmaAccuracy:P2} < {ewmaThreshold:P2})");
 
-        // ── Signal 3: Live direction accuracy below floor ─────────────────────
+        // ── Signal 3: Live direction accuracy below floor ──────────────��──────
         // MLModel.LiveDirectionAccuracy is a simple rolling fraction updated by
         // MLPredictionOutcomeWorker. Unlike EWMA it treats all predictions in the
         // window equally — it serves as a complementary, less reactive signal.
@@ -248,6 +257,25 @@ public sealed class MLModelRetirementWorker : BackgroundService
         {
             activeSignals.Add(
                 $"live_accuracy_degraded ({liveDirectionAccuracy.Value:P2} < {liveAccuracyFloor:P2})");
+        }
+
+        // ── Signal 4: ADWIN drift detected ────��──────────────────────────────
+        // MLAdwinDriftWorker writes a timestamped flag when it detects a statistically
+        // significant accuracy shift via adaptive windowing. The flag expires after
+        // 48 hours if ADWIN does not re-detect drift on the next run.
+        var adwinKey   = $"MLDrift:{symbol}:{timeframe}:AdwinDriftDetected";
+        var adwinEntry = await readCtx.Set<EngineConfig>()
+            .AsNoTracking()
+            .FirstOrDefaultAsync(c => c.Key == adwinKey, ct);
+
+        if (adwinEntry?.Value is not null &&
+            DateTime.TryParse(adwinEntry.Value,
+                System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.RoundtripKind,
+                out var adwinExpiry) &&
+            now < adwinExpiry)
+        {
+            activeSignals.Add($"adwin_drift_detected (expires {adwinExpiry:HH:mm} UTC)");
         }
 
         int signalCount = activeSignals.Count;

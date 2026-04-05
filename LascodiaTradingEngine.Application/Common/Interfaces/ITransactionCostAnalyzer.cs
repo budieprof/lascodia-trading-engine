@@ -7,6 +7,10 @@ namespace LascodiaTradingEngine.Application.Common.Interfaces;
 /// </summary>
 public interface ITransactionCostAnalyzer
 {
+    /// <summary>
+    /// Decomposes the execution cost of a filled order into spread, slippage, market impact,
+    /// and timing components using implementation-shortfall methodology.
+    /// </summary>
     Task<TransactionCostAnalysis> AnalyzeAsync(
         Order filledOrder,
         TradeSignal? originatingSignal,

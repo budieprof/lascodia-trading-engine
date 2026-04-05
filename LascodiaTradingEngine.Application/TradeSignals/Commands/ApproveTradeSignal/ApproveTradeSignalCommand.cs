@@ -9,13 +9,16 @@ namespace LascodiaTradingEngine.Application.TradeSignals.Commands.ApproveTradeSi
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>Approves a pending trade signal, making it eligible for order creation and EA execution.</summary>
 public class ApproveTradeSignalCommand : IRequest<ResponseData<string>>
 {
+    /// <summary>Trade signal identifier to approve.</summary>
     public long Id { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>Validates that the trade signal Id is a positive value.</summary>
 public class ApproveTradeSignalCommandValidator : AbstractValidator<ApproveTradeSignalCommand>
 {
     public ApproveTradeSignalCommandValidator()
@@ -26,6 +29,7 @@ public class ApproveTradeSignalCommandValidator : AbstractValidator<ApproveTrade
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Transitions the signal from Pending to Approved. Rejects if the signal is not in Pending status.</summary>
 public class ApproveTradeSignalCommandHandler : IRequestHandler<ApproveTradeSignalCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

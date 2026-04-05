@@ -9,13 +9,20 @@ namespace LascodiaTradingEngine.Application.MLModels.Queries.GetMLTrainingRun;
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Retrieves a single ML training run by its database ID. Returns -14 if not found.
+/// </summary>
 public class GetMLTrainingRunQuery : IRequest<ResponseData<MLTrainingRunDto>>
 {
+    /// <summary>Database ID of the training run to retrieve.</summary>
     public required long Id { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Handles single ML training run retrieval by ID, mapping the entity to MLTrainingRunDto.
+/// </summary>
 public class GetMLTrainingRunQueryHandler : IRequestHandler<GetMLTrainingRunQuery, ResponseData<MLTrainingRunDto>>
 {
     private readonly IReadApplicationDbContext _context;

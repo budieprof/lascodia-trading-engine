@@ -10,14 +10,25 @@ namespace LascodiaTradingEngine.Application.MarketRegime.Queries.GetLatestRegime
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Query that returns the most recent <see cref="MarketRegimeSnapshotDto"/> for a
+/// given symbol and timeframe combination.
+/// </summary>
 public class GetLatestRegimeQuery : IRequest<ResponseData<MarketRegimeSnapshotDto>>
 {
+    /// <summary>Instrument symbol to look up (e.g. "EURUSD").</summary>
     public required string Symbol    { get; set; }
+
+    /// <summary>Chart timeframe to look up (e.g. "H1", "D1").</summary>
     public required string Timeframe { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Fetches the single most recent market regime snapshot for the requested
+/// symbol/timeframe pair. Returns a not-found response if no snapshot exists.
+/// </summary>
 public class GetLatestRegimeQueryHandler : IRequestHandler<GetLatestRegimeQuery, ResponseData<MarketRegimeSnapshotDto>>
 {
     private readonly IReadApplicationDbContext _context;

@@ -13,6 +13,10 @@ namespace LascodiaTradingEngine.Application.RiskProfiles.Commands.UpdateRiskProf
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Updates all fields of an existing risk profile. Loosening risk limits (increasing max lot size,
+/// drawdown, risk-per-trade, or symbol exposure) requires four-eyes approval.
+/// </summary>
 public class UpdateRiskProfileCommand : IRequest<ResponseData<string>>
 {
     [JsonIgnore] public long Id { get; set; }
@@ -77,6 +81,10 @@ public class UpdateRiskProfileCommandValidator : AbstractValidator<UpdateRiskPro
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Applies risk profile updates with four-eyes approval gating when limits are loosened.
+/// Records a before/after audit trail via <see cref="LogDecisionCommand"/>.
+/// </summary>
 public class UpdateRiskProfileCommandHandler : IRequestHandler<UpdateRiskProfileCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

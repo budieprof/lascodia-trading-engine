@@ -4,6 +4,10 @@ using LascodiaTradingEngine.Domain.Entities;
 
 namespace LascodiaTradingEngine.Infrastructure.Persistence.Configurations;
 
+/// <summary>
+/// EF Core entity configuration for <see cref="CurrencyPair"/>. Defines table mapping,
+/// column types, indexes, relationships, and the soft-delete query filter.
+/// </summary>
 public class CurrencyPairConfiguration : IEntityTypeConfiguration<CurrencyPair>
 {
     public void Configure(EntityTypeBuilder<CurrencyPair> builder)

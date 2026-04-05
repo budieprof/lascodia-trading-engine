@@ -4,6 +4,10 @@ using LascodiaTradingEngine.Domain.Entities;
 
 namespace LascodiaTradingEngine.Infrastructure.Persistence.Configurations;
 
+/// <summary>
+/// EF Core entity configuration for <see cref="MarketRegimeSnapshot"/>. Defines table mapping,
+/// column types, indexes, relationships, and the soft-delete query filter.
+/// </summary>
 public class MarketRegimeSnapshotConfiguration : IEntityTypeConfiguration<MarketRegimeSnapshot>
 {
     public void Configure(EntityTypeBuilder<MarketRegimeSnapshot> builder)

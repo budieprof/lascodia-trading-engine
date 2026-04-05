@@ -48,6 +48,15 @@ public class OptimizationRun : Entity<long>
     /// </summary>
     public decimal? BestHealthScore       { get; set; }
 
+    /// <summary>Sharpe ratio of the best parameter set. Used for EHVI warm-start.</summary>
+    public decimal? BestSharpeRatio       { get; set; }
+
+    /// <summary>Max drawdown % of the best parameter set. Used for EHVI warm-start.</summary>
+    public decimal? BestMaxDrawdownPct    { get; set; }
+
+    /// <summary>Win rate of the best parameter set. Used for EHVI warm-start.</summary>
+    public decimal? BestWinRate           { get; set; }
+
     /// <summary>
     /// Snapshot of the strategy's parameter JSON at the time the run was queued.
     /// Used to compare baseline performance against the optimised result.
@@ -61,9 +70,80 @@ public class OptimizationRun : Entity<long>
     public decimal? BaselineHealthScore   { get; set; }
 
     /// <summary>
+    /// Immutable JSON snapshot of the optimization config used for this run. Captured at
+    /// run start so hot-reloaded EngineConfig changes do not alter an in-flight run.
+    /// </summary>
+    public string? ConfigSnapshotJson     { get; set; }
+
+    /// <summary>
+    /// Structured lineage metadata for the run: deterministic seed, candle window,
+    /// regime context, surrogate kind, and other diagnostics needed for reproducibility.
+    /// </summary>
+    public string? RunMetadataJson        { get; set; }
+
+    /// <summary>
+    /// JSON snapshot of the top-N evaluated candidates persisted periodically during the
+    /// TPE/GP search. Enables crash recovery — if the worker restarts mid-run, it can
+    /// resume from these intermediate results rather than re-evaluating from scratch.
+    /// </summary>
+    public string? IntermediateResultsJson { get; set; }
+
+    /// <summary>
+    /// Version of the serialized checkpoint payload stored in <see cref="IntermediateResultsJson"/>.
+    /// Used to safely reject incompatible checkpoint formats after code upgrades.
+    /// </summary>
+    public int     CheckpointVersion      { get; set; }
+
+    /// <summary>
+    /// Structured approval or manual-review report for the final selected candidate.
+    /// Stores pass/fail gates and key metrics in machine-readable form.
+    /// </summary>
+    public string? ApprovalReportJson     { get; set; }
+
+    /// <summary>
+    /// Deterministic seed used for all stochastic parts of the optimization run. Persisted
+    /// so resumed or audited runs are reproducible.
+    /// </summary>
+    public int     DeterministicSeed      { get; set; }
+
+    /// <summary>
     /// Error details if the run failed. Null on successful completion.
     /// </summary>
     public string? ErrorMessage           { get; set; }
+
+    /// <summary>
+    /// Categorises the failure reason for targeted retry strategies. Timeout failures
+    /// get extended timeouts on retry; data quality waits longer for new data;
+    /// config errors are never retried.
+    /// </summary>
+    public OptimizationFailureCategory? FailureCategory { get; set; }
+
+    /// <summary>
+    /// Number of times this run has been retried after transient failures (DB timeouts, OOM).
+    /// Incremented each time the worker re-queues a Failed run. Once this reaches the
+    /// configured max (<c>Optimization:MaxRetryAttempts</c>), the run stays Failed permanently.
+    /// </summary>
+    public int     RetryCount             { get; set; }
+
+    /// <summary>
+    /// UTC timestamp of the worker's latest heartbeat while holding this run.
+    /// Used to distinguish genuinely active runs from stale ones.
+    /// </summary>
+    public DateTime? LastHeartbeatAt      { get; set; }
+
+    /// <summary>
+    /// UTC lease expiration for the worker currently processing this run. If this passes
+    /// without a heartbeat update, the run may be safely reclaimed.
+    /// </summary>
+    public DateTime? ExecutionLeaseExpiresAt { get; set; }
+
+    /// <summary>
+    /// UTC timestamp before which this run should not be claimed by the worker. Set when
+    /// a run is deferred (seasonal blackout, drawdown recovery, regime transition, EA
+    /// unavailability, data quality). Prevents the worker from re-evaluating deferred runs
+    /// every polling cycle, reducing unnecessary DB churn.
+    /// </summary>
+    public DateTime? DeferredUntilUtc     { get; set; }
 
     /// <summary>UTC timestamp when this run was queued / the record was created.</summary>
     public DateTime StartedAt             { get; set; } = DateTime.UtcNow;
@@ -76,6 +156,18 @@ public class OptimizationRun : Entity<long>
     /// applied them to the strategy. Null until explicitly approved.
     /// </summary>
     public DateTime? ApprovedAt           { get; set; }
+
+    /// <summary>
+    /// UTC timestamp when the worker successfully ensured post-approval validation
+    /// follow-up runs (backtest + walk-forward) for this optimization.
+    /// </summary>
+    public DateTime? ValidationFollowUpsCreatedAt { get; set; }
+
+    /// <summary>
+    /// Aggregate outcome of the post-approval validation follow-ups (backtest + walk-forward).
+    /// Null until follow-ups are created; updated by the workers when they complete.
+    /// </summary>
+    public ValidationFollowUpStatus? ValidationFollowUpStatus { get; set; }
 
     /// <summary>Soft-delete flag. Filtered out by the global EF Core query filter.</summary>
     public bool    IsDeleted              { get; set; }

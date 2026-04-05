@@ -227,7 +227,7 @@ public class MLModel : Entity<long>
     /// <c>true</c> when this model stores a MAML meta-initialisation — a set of weights
     /// that can be rapidly fine-tuned to a new symbol in K inner-loop gradient steps.
     /// MAML initialisers are not used for direct inference; they are the starting point
-    /// for per-symbol fine-tuning runs triggered by <c>MLMamlMetaLearnerWorker</c>.
+    /// for per-symbol fine-tuning runs triggered by <c>MLAverageWeightInitWorker</c>.
     /// </summary>
     public bool    IsMamlInitializer       { get; set; }
 

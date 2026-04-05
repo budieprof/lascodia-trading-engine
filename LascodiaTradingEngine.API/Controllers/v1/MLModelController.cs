@@ -15,6 +15,10 @@ using LascodiaTradingEngine.Application.MLModels.Queries.GetPagedMLTrainingRuns;
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
+/// <summary>
+/// Manages ML model lifecycle: training triggers, activation, rollback, hyperparameter search, and queries.
+/// Route: api/v1/lascodia-trading-engine/ml-model
+/// </summary>
 [Route("api/v1/lascodia-trading-engine/ml-model")]
 [ApiController]
 public class MLModelController : AuthControllerBase<MLModelController>

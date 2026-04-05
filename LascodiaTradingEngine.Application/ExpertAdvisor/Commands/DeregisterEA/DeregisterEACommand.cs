@@ -10,13 +10,22 @@ namespace LascodiaTradingEngine.Application.ExpertAdvisor.Commands.DeregisterEA;
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Gracefully deregisters an EA instance by marking it as ShuttingDown.
+/// The engine will stop evaluating strategies for symbols owned by this instance
+/// and mark them as DATA_UNAVAILABLE if no other instance covers them.
+/// </summary>
 public class DeregisterEACommand : IRequest<ResponseData<string>>
 {
+    /// <summary>Unique identifier of the EA instance to deregister.</summary>
     public required string InstanceId { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Validates that the InstanceId is non-empty.
+/// </summary>
 public class DeregisterEACommandValidator : AbstractValidator<DeregisterEACommand>
 {
     public DeregisterEACommandValidator()
@@ -28,6 +37,11 @@ public class DeregisterEACommandValidator : AbstractValidator<DeregisterEAComman
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Handles EA deregistration. Verifies caller ownership, locates the active instance,
+/// sets its status to ShuttingDown, and records the deregistration timestamp.
+/// Returns -14 if the instance is not found or already shutting down.
+/// </summary>
 public class DeregisterEACommandHandler : IRequestHandler<DeregisterEACommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

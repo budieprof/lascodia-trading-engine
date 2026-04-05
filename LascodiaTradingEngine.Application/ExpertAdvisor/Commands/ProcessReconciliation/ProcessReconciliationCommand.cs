@@ -9,46 +9,103 @@ namespace LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ProcessReconc
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Compares the engine's open positions and pending orders against the broker's current state
+/// to detect discrepancies (orphaned engine records, unknown broker items, mismatches).
+/// This is a read-heavy diagnostic command that does not modify data.
+/// </summary>
 public class ProcessReconciliationCommand : IRequest<ResponseData<ReconciliationResult>>
 {
+    /// <summary>Unique identifier of the EA instance performing the reconciliation.</summary>
     public required string InstanceId { get; set; }
+
+    /// <summary>All currently open positions as reported by the broker.</summary>
     public List<BrokerPositionItem> BrokerPositions { get; set; } = new();
+
+    /// <summary>All currently pending orders as reported by the broker.</summary>
     public List<BrokerOrderItem> BrokerOrders { get; set; } = new();
 }
 
+/// <summary>
+/// A broker-side open position used for reconciliation comparison.
+/// </summary>
 public class BrokerPositionItem
 {
+    /// <summary>Broker-assigned position ticket number.</summary>
     public long     Ticket    { get; set; }
+
+    /// <summary>Instrument symbol.</summary>
     public required string Symbol   { get; set; }
+
+    /// <summary>Position direction: "Long" or "Short".</summary>
     public required string Direction { get; set; }
+
+    /// <summary>Open volume in lots.</summary>
     public decimal  Volume    { get; set; }
+
+    /// <summary>Average entry price.</summary>
     public decimal  OpenPrice { get; set; }
+
+    /// <summary>Stop loss level, if set.</summary>
     public decimal? StopLoss  { get; set; }
+
+    /// <summary>Take profit level, if set.</summary>
     public decimal? TakeProfit { get; set; }
 }
 
+/// <summary>
+/// A broker-side pending order used for reconciliation comparison.
+/// </summary>
 public class BrokerOrderItem
 {
+    /// <summary>Broker-assigned order ticket number.</summary>
     public long     Ticket    { get; set; }
+
+    /// <summary>Instrument symbol.</summary>
     public required string Symbol   { get; set; }
+
+    /// <summary>Order type: "Buy" or "Sell".</summary>
     public required string OrderType { get; set; }
+
+    /// <summary>Order volume in lots.</summary>
     public decimal  Volume    { get; set; }
+
+    /// <summary>Order trigger/limit price.</summary>
     public decimal  Price     { get; set; }
+
+    /// <summary>Stop loss level, if set.</summary>
     public decimal? StopLoss  { get; set; }
+
+    /// <summary>Take profit level, if set.</summary>
     public decimal? TakeProfit { get; set; }
 }
 
+/// <summary>
+/// Result of the reconciliation check, summarising discrepancies between engine and broker state.
+/// </summary>
 public class ReconciliationResult
 {
+    /// <summary>Number of engine positions with a BrokerPositionId not found on the broker (stale/closed on broker side).</summary>
     public int OrphanedEnginePositions { get; set; }
+
+    /// <summary>Number of broker positions not tracked in the engine (opened externally or missed by sync).</summary>
     public int UnknownBrokerPositions  { get; set; }
+
+    /// <summary>Number of positions present on both sides but with differing volume, SL, or TP.</summary>
     public int MismatchedPositions     { get; set; }
+
+    /// <summary>Number of engine orders with a BrokerOrderId not found on the broker.</summary>
     public int OrphanedEngineOrders    { get; set; }
+
+    /// <summary>Number of broker orders not tracked in the engine.</summary>
     public int UnknownBrokerOrders     { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Validates that the InstanceId is non-empty.
+/// </summary>
 public class ProcessReconciliationCommandValidator : AbstractValidator<ProcessReconciliationCommand>
 {
     public ProcessReconciliationCommandValidator()
@@ -60,6 +117,11 @@ public class ProcessReconciliationCommandValidator : AbstractValidator<ProcessRe
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Handles reconciliation by cross-referencing engine positions/orders against broker snapshots.
+/// Counts orphaned engine records (present in engine but not on broker), unknown broker records
+/// (present on broker but not in engine), and returns the discrepancy summary without modifying data.
+/// </summary>
 public class ProcessReconciliationCommandHandler : IRequestHandler<ProcessReconciliationCommand, ResponseData<ReconciliationResult>>
 {
     private readonly IWriteApplicationDbContext _context;

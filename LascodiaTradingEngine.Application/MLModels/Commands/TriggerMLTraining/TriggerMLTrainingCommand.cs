@@ -9,12 +9,25 @@ namespace LascodiaTradingEngine.Application.MLModels.Commands.TriggerMLTraining;
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Queues a new ML training run for a specific symbol and timeframe. Creates an MLTrainingRun
+/// record in Queued status, which the MLTrainingWorker picks up and executes asynchronously.
+/// </summary>
 public class TriggerMLTrainingCommand : IRequest<ResponseData<long>>
 {
+    /// <summary>Currency pair to train on (e.g. "EURUSD").</summary>
     public required string Symbol    { get; set; }
+
+    /// <summary>Chart timeframe for the training data (e.g. "H1", "D1").</summary>
     public required string Timeframe { get; set; }
+
+    /// <summary>Start date of the training data window.</summary>
     public DateTime        FromDate  { get; set; }
+
+    /// <summary>End date of the training data window.</summary>
     public DateTime        ToDate    { get; set; }
+
+    /// <summary>What triggered this training run (e.g. "Manual", "Scheduled", "Drift"). Defaults to "Manual".</summary>
     public string          TriggerType { get; set; } = "Manual";
     /// <summary>
     /// The trainer architecture to use for this run.
@@ -25,6 +38,9 @@ public class TriggerMLTrainingCommand : IRequest<ResponseData<long>>
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Validates that Symbol is non-empty (max 10 chars) and Timeframe is a valid enum value.
+/// </summary>
 public class TriggerMLTrainingCommandValidator : AbstractValidator<TriggerMLTrainingCommand>
 {
     public TriggerMLTrainingCommandValidator()
@@ -42,6 +58,11 @@ public class TriggerMLTrainingCommandValidator : AbstractValidator<TriggerMLTrai
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Handles ML training trigger by creating a new MLTrainingRun in Queued status.
+/// The MLTrainingWorker polls for queued runs and executes them asynchronously.
+/// Returns the new training run's database ID.
+/// </summary>
 public class TriggerMLTrainingCommandHandler : IRequestHandler<TriggerMLTrainingCommand, ResponseData<long>>
 {
     private readonly IWriteApplicationDbContext _context;

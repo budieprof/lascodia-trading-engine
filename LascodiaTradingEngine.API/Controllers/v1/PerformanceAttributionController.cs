@@ -8,6 +8,10 @@ using LascodiaTradingEngine.Application.PerformanceAttribution.Queries.GetAllAtt
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
+/// <summary>
+/// Provides performance attribution breakdowns per strategy and across the full portfolio.
+/// Route: api/v1/lascodia-trading-engine/performance
+/// </summary>
 [Route("api/v1/lascodia-trading-engine/performance")]
 [ApiController]
 public class PerformanceAttributionController : AuthControllerBase<PerformanceAttributionController>

@@ -18,6 +18,11 @@ using LascodiaTradingEngine.Application.Orders.Queries.GetPagedOrders;
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
+/// <summary>
+/// Manages the full order lifecycle: creation, modification, cancellation, submission,
+/// execution reports from EA instances, and signal-to-order conversion with Tier 2 risk checks.
+/// Route: api/v1/lascodia-trading-engine/order
+/// </summary>
 [Route("api/v1/lascodia-trading-engine/order")]
 [ApiController]
 public class OrderController : AuthControllerBase<OrderController>

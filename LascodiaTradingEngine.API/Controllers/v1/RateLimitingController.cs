@@ -6,6 +6,10 @@ using LascodiaTradingEngine.Application.RateLimiting.Queries.GetApiQuotaStatus;
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
+/// <summary>
+/// Exposes API rate-limit quota status for a given broker key.
+/// Route: api/v1/lascodia-trading-engine/rate-limit
+/// </summary>
 [Route("api/v1/lascodia-trading-engine/rate-limit")]
 [ApiController]
 public class RateLimitingController : AuthControllerBase<RateLimitingController>

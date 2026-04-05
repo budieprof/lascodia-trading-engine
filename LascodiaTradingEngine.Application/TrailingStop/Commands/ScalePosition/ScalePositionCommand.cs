@@ -9,6 +9,11 @@ namespace LascodiaTradingEngine.Application.TrailingStop.Commands.ScalePosition;
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Scales into or out of an existing position by adding or removing lots.
+/// Creates a <see cref="Domain.Entities.PositionScaleOrder"/> and adjusts the position's
+/// average entry price and open lots accordingly.
+/// </summary>
 public class ScalePositionCommand : IRequest<ResponseData<long>>
 {
     public long    PositionId { get; set; }
@@ -36,6 +41,10 @@ public class ScalePositionCommandValidator : AbstractValidator<ScalePositionComm
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Creates a scale order and adjusts the position. Scale-in recalculates the weighted average
+/// entry price; scale-out reduces open lots (minimum zero).
+/// </summary>
 public class ScalePositionCommandHandler : IRequestHandler<ScalePositionCommand, ResponseData<long>>
 {
     private readonly IWriteApplicationDbContext _context;

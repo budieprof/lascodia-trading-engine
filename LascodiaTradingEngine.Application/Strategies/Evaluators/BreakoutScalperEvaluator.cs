@@ -11,6 +11,11 @@ using LascodiaTradingEngine.Application.Common.Attributes;
 
 namespace LascodiaTradingEngine.Application.Strategies.Evaluators;
 
+/// <summary>
+/// Evaluates breakout scalping signals by detecting price breaks above/below a lookback-period
+/// high/low channel with optional ADX and RSI confirmation. Produces short-duration trade
+/// signals with ATR-based stop-loss and take-profit levels.
+/// </summary>
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyEvaluator))]
 public class BreakoutScalperEvaluator : IStrategyEvaluator
 {

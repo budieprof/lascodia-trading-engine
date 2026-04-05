@@ -11,12 +11,14 @@ namespace LascodiaTradingEngine.Application.ExecutionQuality.Queries.GetPagedExe
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Retrieves a paginated list of execution quality logs with optional filtering by symbol, session, strategy, and date range.</summary>
 public class GetPagedExecutionQualityLogsQuery : PagerRequestWithFilterType<ExecutionQualityLogQueryFilter, ResponseData<PagedData<ExecutionQualityLogDto>>>
 {
 }
 
 // ── Filter ────────────────────────────────────────────────────────────────────
 
+/// <summary>Filter criteria for the paged execution quality logs query.</summary>
 public class ExecutionQualityLogQueryFilter
 {
     public string?   Symbol     { get; set; }
@@ -28,6 +30,7 @@ public class ExecutionQualityLogQueryFilter
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Queries execution quality logs ordered by recording date descending with optional filters.</summary>
 public class GetPagedExecutionQualityLogsQueryHandler
     : IRequestHandler<GetPagedExecutionQualityLogsQuery, ResponseData<PagedData<ExecutionQualityLogDto>>>
 {

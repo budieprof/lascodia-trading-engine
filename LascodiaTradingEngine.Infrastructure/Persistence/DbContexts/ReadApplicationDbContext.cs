@@ -6,6 +6,11 @@ using LascodiaTradingEngine.Application.Common.Interfaces;
 
 namespace LascodiaTradingEngine.Infrastructure.Persistence.DbContexts;
 
+/// <summary>
+/// Read-only EF Core DbContext used exclusively by CQRS query handlers.
+/// Defaults to <see cref="QueryTrackingBehavior.NoTracking"/> for optimal read performance
+/// and connects to the read replica connection string (<c>ReadDbConnection</c>).
+/// </summary>
 public class ReadApplicationDbContext
     : ApplicationDbContext<ReadApplicationDbContext>, IReadApplicationDbContext
 {

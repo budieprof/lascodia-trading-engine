@@ -1,5 +1,6 @@
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
+using LascodiaTradingEngine.Domain.Enums;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -125,12 +126,13 @@ public sealed class MLKellyFractionWorker : BackgroundService
         foreach (var model in models)
         {
             string configKey = $"{KellyConfigKeyPrefix}{model.Symbol}:{model.Timeframe}:{model.Id}{KellyCapKeySuffix}";
+
+            // ── Load resolved prediction logs for the last 60 days ───────────
             var logs = await readDb.Set<MLModelPredictionLog>()
                 .AsNoTracking()
                 .Where(l => l.MLModelId == model.Id
                          && !l.IsDeleted
                          && l.DirectionCorrect != null
-                         && l.ActualMagnitudePips != null
                          && l.OutcomeRecordedAt != null
                          && l.OutcomeRecordedAt >= DateTime.UtcNow.AddDays(-60))
                 .OrderByDescending(l => l.OutcomeRecordedAt)
@@ -142,16 +144,82 @@ public sealed class MLKellyFractionWorker : BackgroundService
                 continue;
             }
 
-            var wins   = new List<double>(); // magnitudes of profitable predictions
-            var losses = new List<double>(); // magnitudes (absolute) of losing predictions
+            // ── Join predictions to actual position P&L via TradeSignal → Order → Position ──
+            var signalIds = logs
+                .Select(l => l.TradeSignalId)
+                .Distinct()
+                .ToList();
+
+            // Map: TradeSignalId → list of OrderIds
+            var signalOrderMap = await readDb.Set<Order>()
+                .AsNoTracking()
+                .Where(o => o.TradeSignalId != null && signalIds.Contains(o.TradeSignalId!.Value) && !o.IsDeleted)
+                .Select(o => new { o.TradeSignalId, o.Id })
+                .ToListAsync(ct);
+
+            var signalToOrderIds = signalOrderMap
+                .GroupBy(x => x.TradeSignalId!.Value)
+                .ToDictionary(g => g.Key, g => g.Select(x => x.Id).ToHashSet());
+
+            // Map: OrderId → closed Position P&L (net of swap + commission)
+            var allOrderIds = signalToOrderIds.Values.SelectMany(x => x).Distinct().ToList();
+
+            var orderPositionPnl = await readDb.Set<Position>()
+                .AsNoTracking()
+                .Where(p => p.Status == PositionStatus.Closed
+                         && p.OpenOrderId != null
+                         && allOrderIds.Contains(p.OpenOrderId!.Value)
+                         && !p.IsDeleted)
+                .Select(p => new { p.OpenOrderId, NetPnl = p.RealizedPnL + p.Swap - p.Commission })
+                .ToListAsync(ct);
+
+            var orderToPnl = orderPositionPnl
+                .Where(x => x.OpenOrderId.HasValue)
+                .GroupBy(x => x.OpenOrderId!.Value)
+                .ToDictionary(g => g.Key, g => g.Sum(x => x.NetPnl));
+
+            // ── Compute Kelly from actual P&L where available, fall back to magnitude ──
+            var wins   = new List<double>();
+            var losses = new List<double>();
+            int pnlBasedCount = 0;
 
             foreach (var log in logs)
             {
-                double magnitude = (double)Math.Abs(log.ActualMagnitudePips!.Value);
-                if (magnitude <= 0.0) continue;
+                double returnValue;
 
-                if (log.DirectionCorrect!.Value) wins.Add(magnitude);
-                else                             losses.Add(magnitude);
+                // Prefer actual position-level P&L (net of costs) when available
+                if (signalToOrderIds.TryGetValue(log.TradeSignalId, out var orderIds))
+                {
+                    decimal totalPnl = 0m;
+                    bool hasPnl = false;
+                    foreach (var oid in orderIds)
+                    {
+                        if (orderToPnl.TryGetValue(oid, out var pnl))
+                        {
+                            totalPnl += pnl;
+                            hasPnl = true;
+                        }
+                    }
+
+                    if (hasPnl)
+                    {
+                        returnValue = (double)Math.Abs(totalPnl);
+                        if (returnValue <= 0.0) continue;
+
+                        if (totalPnl > 0) wins.Add(returnValue);
+                        else               losses.Add(returnValue);
+                        pnlBasedCount++;
+                        continue;
+                    }
+                }
+
+                // Fallback: use ActualMagnitudePips when no position link exists
+                if (log.ActualMagnitudePips is null) continue;
+                returnValue = (double)Math.Abs(log.ActualMagnitudePips.Value);
+                if (returnValue <= 0.0) continue;
+
+                if (log.DirectionCorrect == true) wins.Add(returnValue);
+                else                               losses.Add(returnValue);
             }
 
             // Require at least one win and one loss to compute a meaningful b ratio.
@@ -162,27 +230,25 @@ public sealed class MLKellyFractionWorker : BackgroundService
             }
 
             // Kelly formula: f* = (p × b − q) / b
-            double p     = (double)wins.Count / (wins.Count + losses.Count); // win probability
-            double q     = 1 - p;                                             // loss probability
-            double b     = wins.Average() / (losses.Average() + 1e-8);       // win/loss ratio
-            double fStar = (p * b - q) / (b + 1e-8);                         // full Kelly fraction
+            double p     = (double)wins.Count / (wins.Count + losses.Count);
+            double q     = 1 - p;
+            double b     = wins.Average() / (losses.Average() + 1e-8);
+            double fStar = (p * b - q) / (b + 1e-8);
 
             // Half-Kelly: conservative sizing that halves variance while retaining
             // most of the geometric growth benefit. Capped at ±25% of account equity.
             double halfKelly = Math.Clamp(0.5 * fStar, -0.25, 0.25);
 
-            // Negative expected value flag: if f* < 0, the model loses money on average.
             bool negEv = fStar < 0;
             double deployedKellyCap = Math.Max(0.0, halfKelly);
 
-            // Persist Kelly computation as an audit log record.
             writeDb.Set<MLKellyFractionLog>().Add(new MLKellyFractionLog
             {
                 MLModelId     = model.Id,
                 Symbol        = model.Symbol,
                 Timeframe     = model.Timeframe.ToString(),
-                KellyFraction = Math.Clamp(fStar, -0.25, 0.25), // capped full Kelly
-                HalfKelly     = halfKelly,                        // recommended position fraction
+                KellyFraction = Math.Clamp(fStar, -0.25, 0.25),
+                HalfKelly     = halfKelly,
                 WinRate       = p,
                 WinLossRatio  = b,
                 NegativeEV    = negEv,
@@ -195,9 +261,6 @@ public sealed class MLKellyFractionWorker : BackgroundService
                 deployedKellyCap.ToString("F4", System.Globalization.CultureInfo.InvariantCulture),
                 ct);
 
-            // Suppress the model if it has negative EV to prevent live trading on a
-            // geometrically destructive model. The suppression is lifted on the next
-            // successful retrain which resets IsSuppressed = false.
             var tracked = await writeDb.Set<MLModel>().FindAsync(new object[] { model.Id }, ct);
             if (negEv)
             {
@@ -214,8 +277,9 @@ public sealed class MLKellyFractionWorker : BackgroundService
             }
 
             _logger.LogInformation(
-                "MLKellyFractionWorker: {S}/{T} f*={F:F4} halfKelly={H:F4} winRate={P:F3} b={B:F3} negEV={N}",
-                model.Symbol, model.Timeframe, fStar, halfKelly, p, b, negEv);
+                "MLKellyFractionWorker: {S}/{T} f*={F:F4} halfKelly={H:F4} winRate={P:F3} b={B:F3} negEV={N} pnlBased={PnlPct:P0}",
+                model.Symbol, model.Timeframe, fStar, halfKelly, p, b, negEv,
+                logs.Count > 0 ? (double)pnlBasedCount / logs.Count : 0.0);
         }
     }
 

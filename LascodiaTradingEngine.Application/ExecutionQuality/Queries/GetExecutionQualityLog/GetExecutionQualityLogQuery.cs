@@ -9,13 +9,16 @@ namespace LascodiaTradingEngine.Application.ExecutionQuality.Queries.GetExecutio
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Retrieves a single execution quality log entry by its unique identifier.</summary>
 public class GetExecutionQualityLogQuery : IRequest<ResponseData<ExecutionQualityLogDto>>
 {
+    /// <summary>The unique identifier of the execution quality log.</summary>
     public required long Id { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Fetches a single execution quality log by ID from the read-only context.</summary>
 public class GetExecutionQualityLogQueryHandler
     : IRequestHandler<GetExecutionQualityLogQuery, ResponseData<ExecutionQualityLogDto>>
 {

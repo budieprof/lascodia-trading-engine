@@ -11,12 +11,14 @@ namespace LascodiaTradingEngine.Application.StrategyFeedback.Queries.GetPagedOpt
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Retrieves a paginated list of optimization runs with optional strategy and status filters.</summary>
 public class GetPagedOptimizationRunsQuery : PagerRequestWithFilterType<OptimizationRunQueryFilter, ResponseData<PagedData<OptimizationRunDto>>>
 {
 }
 
 // ── Filter ────────────────────────────────────────────────────────────────────
 
+/// <summary>Filter criteria for the paged optimization runs query.</summary>
 public class OptimizationRunQueryFilter
 {
     public long?   StrategyId { get; set; }

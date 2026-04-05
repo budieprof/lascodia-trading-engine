@@ -9,6 +9,11 @@ namespace LascodiaTradingEngine.Application.StrategyEnsemble.Commands.RebalanceE
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Rebalances strategy ensemble weights across all active strategies based on their
+/// rolling Sharpe ratios. Strategies with positive Sharpe receive proportional weight;
+/// when no positive Sharpe exists, equal weight is applied.
+/// </summary>
 public class RebalanceEnsembleCommand : IRequest<ResponseData<string>>
 {
 }
@@ -22,6 +27,10 @@ public class RebalanceEnsembleCommandValidator : AbstractValidator<RebalanceEnse
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Loads all active strategies, fetches their latest Sharpe ratios from performance snapshots,
+/// normalises to weights, and upserts <see cref="Domain.Entities.StrategyAllocation"/> records.
+/// </summary>
 public class RebalanceEnsembleCommandHandler
     : IRequestHandler<RebalanceEnsembleCommand, ResponseData<string>>
 {

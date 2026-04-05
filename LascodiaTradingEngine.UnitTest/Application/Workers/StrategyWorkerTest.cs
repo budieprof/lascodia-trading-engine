@@ -204,7 +204,7 @@ public class StrategyWorkerTest : IDisposable
             Timestamp = DateTime.UtcNow.AddSeconds(-20) // 20s old, max is 10s
         };
 
-        await _worker.Handle(staleEvent);
+        await _worker.ProcessPriceUpdateAsync(staleEvent);
 
         // No strategy evaluation should occur
         _mockEvaluator.Verify(
@@ -217,7 +217,7 @@ public class StrategyWorkerTest : IDisposable
     {
         SetupDbSets(eaInstances: new List<EAInstance>()); // No EA instances
 
-        await _worker.Handle(CreatePriceEvent());
+        await _worker.ProcessPriceUpdateAsync(CreatePriceEvent());
 
         _mockEvaluator.Verify(
             e => e.EvaluateAsync(It.IsAny<Strategy>(), It.IsAny<IReadOnlyList<Candle>>(), It.IsAny<(decimal, decimal)>(), It.IsAny<CancellationToken>()),
@@ -237,7 +237,7 @@ public class StrategyWorkerTest : IDisposable
         };
         SetupDbSets(eaInstances: new List<EAInstance> { staleEA });
 
-        await _worker.Handle(CreatePriceEvent());
+        await _worker.ProcessPriceUpdateAsync(CreatePriceEvent());
 
         _mockEvaluator.Verify(
             e => e.EvaluateAsync(It.IsAny<Strategy>(), It.IsAny<IReadOnlyList<Candle>>(), It.IsAny<(decimal, decimal)>(), It.IsAny<CancellationToken>()),
@@ -249,7 +249,7 @@ public class StrategyWorkerTest : IDisposable
     {
         SetupDbSets(strategies: new List<Strategy>()); // No strategies
 
-        await _worker.Handle(CreatePriceEvent());
+        await _worker.ProcessPriceUpdateAsync(CreatePriceEvent());
 
         _mockEvaluator.Verify(
             e => e.EvaluateAsync(It.IsAny<Strategy>(), It.IsAny<IReadOnlyList<Candle>>(), It.IsAny<(decimal, decimal)>(), It.IsAny<CancellationToken>()),
@@ -279,7 +279,7 @@ public class StrategyWorkerTest : IDisposable
             .Setup(e => e.EvaluateAsync(It.IsAny<Strategy>(), It.IsAny<IReadOnlyList<Candle>>(), It.IsAny<(decimal, decimal)>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync((TradeSignal?)null);
 
-        await _worker.Handle(CreatePriceEvent());
+        await _worker.ProcessPriceUpdateAsync(CreatePriceEvent());
 
         // No signal creation command
         _mockMediator.Verify(
@@ -313,7 +313,7 @@ public class StrategyWorkerTest : IDisposable
             candles: candles,
             snapshots: new List<StrategyPerformanceSnapshot> { snapshot });
 
-        await _worker.Handle(CreatePriceEvent());
+        await _worker.ProcessPriceUpdateAsync(CreatePriceEvent());
 
         // Should skip evaluation for Critical strategy
         _mockEvaluator.Verify(
@@ -344,7 +344,7 @@ public class StrategyWorkerTest : IDisposable
             .ThrowsAsync(new InvalidOperationException("test error"));
 
         // Should not throw
-        await _worker.Handle(CreatePriceEvent());
+        await _worker.ProcessPriceUpdateAsync(CreatePriceEvent());
 
         // Verify it was attempted
         _mockEvaluator.Verify(
@@ -384,10 +384,10 @@ public class StrategyWorkerTest : IDisposable
             .Setup(e => e.EvaluateAsync(It.IsAny<Strategy>(), It.IsAny<IReadOnlyList<Candle>>(), It.IsAny<(decimal, decimal)>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(signal);
 
-        await _worker.Handle(CreatePriceEvent());
+        await _worker.ProcessPriceUpdateAsync(CreatePriceEvent());
 
         // Second call: cooldown should prevent evaluation
-        await _worker.Handle(CreatePriceEvent());
+        await _worker.ProcessPriceUpdateAsync(CreatePriceEvent());
 
         // Signal created only once (first call), second call skipped due to cooldown
         _mockMediator.Verify(

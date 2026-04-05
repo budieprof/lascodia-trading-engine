@@ -11,6 +11,10 @@ using LascodiaTradingEngine.Application.MLEvaluation.Queries.GetPagedMLShadowEva
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
+/// <summary>
+/// Manages ML model champion-challenger shadow evaluations and prediction outcome recording.
+/// Route: api/v1/lascodia-trading-engine/ml-evaluation
+/// </summary>
 [Route("api/v1/lascodia-trading-engine/ml-evaluation")]
 [ApiController]
 public class MLEvaluationController : AuthControllerBase<MLEvaluationController>

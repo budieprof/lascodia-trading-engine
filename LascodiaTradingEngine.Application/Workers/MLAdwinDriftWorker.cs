@@ -1,5 +1,6 @@
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
+using LascodiaTradingEngine.Domain.Enums;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -54,9 +55,11 @@ namespace LascodiaTradingEngine.Application.Workers;
 /// ADWIN complements the fixed-window detectors (<see cref="MLCusumDriftWorker"/>,
 /// <see cref="MLMultiScaleDriftWorker"/>) by removing the need to choose a window size.
 /// Its results are recorded in <c>MLAdwinDriftLog</c> for auditing and trend analysis.
-/// Unlike CUSUM and the structural-break worker, this worker does <em>not</em> automatically
-/// queue a retraining run — it only records the detection event, leaving the suppression
-/// and retraining decision to other workers and the MLShadowArbiterWorker.
+/// When drift is detected, the worker queues a retraining run with
+/// <c>DriftTriggerType = "AdwinDrift"</c> (deduplicated — skips if a run is already
+/// queued/running for the same symbol/timeframe). The ADWIN drift signal also feeds
+/// into <see cref="MLModelRetirementWorker"/> as a 4th retirement signal via the
+/// <c>MLDrift:{Symbol}:{Tf}:AdwinDriftDetected</c> config key.
 /// </para>
 ///
 /// <para>
@@ -248,17 +251,98 @@ public sealed class MLAdwinDriftWorker : BackgroundService
                 _logger.LogWarning(
                     "MLAdwinDriftWorker: {S}/{T} ADWIN drift detected — |{M1:F4} - {M2:F4}| > ε={E:F4}.",
                     model.Symbol, model.Timeframe, bestMean1, bestMean2, bestEpsilon);
+
+                // ── Set retirement signal flag ──────────────────────────────────
+                // Persists a flag that MLModelRetirementWorker reads as a 4th
+                // degradation signal. Expires after 48 hours if not refreshed.
+                var adwinFlagKey = $"MLDrift:{model.Symbol}:{model.Timeframe}:AdwinDriftDetected";
+                var expiresAt = DateTime.UtcNow.AddHours(48).ToString("O");
+                int updated = await writeDb.Set<EngineConfig>()
+                    .Where(c => c.Key == adwinFlagKey)
+                    .ExecuteUpdateAsync(s => s.SetProperty(c => c.Value, expiresAt), ct);
+                if (updated == 0)
+                {
+                    writeDb.Set<EngineConfig>().Add(new EngineConfig
+                    {
+                        Key      = adwinFlagKey,
+                        Value    = expiresAt,
+                        DataType = ConfigDataType.String,
+                    });
+                }
+
+                // ── Queue retraining run (deduplicated) ─────────────────────────
+                bool alreadyQueued = await readDb.Set<MLTrainingRun>()
+                    .AnyAsync(r => r.Symbol    == model.Symbol &&
+                                   r.Timeframe == model.Timeframe &&
+                                   (r.Status == RunStatus.Queued || r.Status == RunStatus.Running), ct);
+
+                if (!alreadyQueued)
+                {
+                    int trainingDays = await GetConfigAsync<int>(readDb, "MLTraining:TrainingDataWindowDays", 365, ct);
+                    var now = DateTime.UtcNow;
+                    writeDb.Set<MLTrainingRun>().Add(new MLTrainingRun
+                    {
+                        Symbol            = model.Symbol,
+                        Timeframe         = model.Timeframe,
+                        TriggerType       = TriggerType.AutoDegrading,
+                        Status            = RunStatus.Queued,
+                        FromDate          = now.AddDays(-trainingDays),
+                        ToDate            = now,
+                        StartedAt         = now,
+                        DriftTriggerType  = "AdwinDrift",
+                        DriftMetadataJson = System.Text.Json.JsonSerializer.Serialize(new
+                        {
+                            detector   = "ADWIN",
+                            window1Mean = bestMean1,
+                            window2Mean = bestMean2,
+                            epsilonCut  = bestEpsilon,
+                            splitPoint  = bestT,
+                            windowSize  = n,
+                        }),
+                        Priority = 1, // Drift-triggered = high priority
+                    });
+
+                    _logger.LogWarning(
+                        "MLAdwinDriftWorker: queued retraining for {S}/{T} (ADWIN drift, μ₁={M1:F4}, μ₂={M2:F4})",
+                        model.Symbol, model.Timeframe, bestMean1, bestMean2);
+                }
             }
             else
             {
                 _logger.LogInformation(
                     "MLAdwinDriftWorker: {S}/{T} no drift detected (n={N}).",
                     model.Symbol, model.Timeframe, n);
+
+                // Clear the retirement signal flag when no drift is detected
+                var adwinFlagKey = $"MLDrift:{model.Symbol}:{model.Timeframe}:AdwinDriftDetected";
+                await writeDb.Set<EngineConfig>()
+                    .Where(c => c.Key == adwinFlagKey)
+                    .ExecuteUpdateAsync(s => s.SetProperty(c => c.Value, (string?)null), ct);
             }
 
             // Save the log entry immediately per model so a failure on a later model
             // does not roll back successfully recorded results for earlier models.
             await writeDb.SaveChangesAsync(ct);
         }
+    }
+
+    /// <summary>
+    /// Reads a typed value from <see cref="EngineConfig"/> or returns <paramref name="defaultValue"/>
+    /// when the key is absent or its string value cannot be converted to <typeparamref name="T"/>.
+    /// </summary>
+    private static async Task<T> GetConfigAsync<T>(
+        Microsoft.EntityFrameworkCore.DbContext ctx,
+        string                                  key,
+        T                                       defaultValue,
+        CancellationToken                       ct)
+    {
+        var entry = await ctx.Set<EngineConfig>()
+            .AsNoTracking()
+            .FirstOrDefaultAsync(c => c.Key == key, ct);
+
+        if (entry?.Value is null) return defaultValue;
+
+        try   { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
+        catch { return defaultValue; }
     }
 }

@@ -7,6 +7,10 @@ using LascodiaTradingEngine.Application.PaperTrading.Queries.GetPaperTradingStat
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
+/// <summary>
+/// Toggles and queries paper trading mode for simulated order execution without live broker interaction.
+/// Route: api/v1/lascodia-trading-engine/paper-trading
+/// </summary>
 [Route("api/v1/lascodia-trading-engine/paper-trading")]
 [ApiController]
 public class PaperTradingController : AuthControllerBase<PaperTradingController>

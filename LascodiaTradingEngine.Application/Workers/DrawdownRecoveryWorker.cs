@@ -334,7 +334,13 @@ public sealed class DrawdownRecoveryWorker : BackgroundService
 
         List<long>? ids;
         try { ids = JsonSerializer.Deserialize<List<long>>(idsEntry.Value); }
-        catch { ids = null; } // Malformed JSON — treat as empty; log omitted to avoid confusion
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "DrawdownRecoveryWorker: failed to deserialize auto-paused strategy IDs — treating as empty. Raw value: {Value}",
+                idsEntry.Value?.Length > 200 ? idsEntry.Value[..200] + "…" : idsEntry.Value);
+            ids = null;
+        }
 
         if (ids is null || ids.Count == 0) return;
 

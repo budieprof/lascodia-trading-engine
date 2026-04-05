@@ -74,12 +74,19 @@ public class SignalOrderBridgeWorkerTest : IDisposable
         // Strategy evaluator options mock
         var mockEvalOptions = Options.Create(new StrategyEvaluatorOptions());
 
+        // Processed event tracker mock — default: always allow processing (first processor)
+        var mockProcessedEventTracker = new Mock<IProcessedEventTracker>();
+        mockProcessedEventTracker
+            .Setup(t => t.TryMarkAsProcessedAsync(It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true);
+
         mockProvider.Setup(p => p.GetService(typeof(IReadApplicationDbContext))).Returns(_mockReadContext.Object);
         mockProvider.Setup(p => p.GetService(typeof(IMediator))).Returns(_mockMediator.Object);
         mockProvider.Setup(p => p.GetService(typeof(ISignalValidator))).Returns(_mockSignalValidator.Object);
         mockProvider.Setup(p => p.GetService(typeof(IAlertDispatcher))).Returns(_mockAlertDispatcher.Object);
         mockProvider.Setup(p => p.GetService(typeof(INewsFilter))).Returns(mockNewsFilter.Object);
         mockProvider.Setup(p => p.GetService(typeof(IOptions<StrategyEvaluatorOptions>))).Returns(mockEvalOptions);
+        mockProvider.Setup(p => p.GetService(typeof(IProcessedEventTracker))).Returns(mockProcessedEventTracker.Object);
 
         mockScope.Setup(s => s.ServiceProvider).Returns(mockProvider.Object);
         _mockScopeFactory.Setup(f => f.CreateScope()).Returns(mockScope.Object);

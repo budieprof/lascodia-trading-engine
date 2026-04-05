@@ -13,6 +13,11 @@ namespace LascodiaTradingEngine.Application.TradingAccounts.Commands.RegisterTra
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Self-registration endpoint for traders. Creates a new trading account (or returns existing),
+/// generates encrypted credentials and API key, and returns a JWT token for immediate use.
+/// Supports multi-machine EA registration via idempotent upsert behavior.
+/// </summary>
 public class RegisterTraderCommand : IRequest<ResponseData<AuthTokenResult>>
 {
     public required string AccountId    { get; set; }
@@ -61,6 +66,11 @@ public class RegisterTraderCommandValidator : AbstractValidator<RegisterTraderCo
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// If the account already exists, returns existing credentials and a fresh JWT.
+/// Otherwise, creates the account with encrypted password and API key, activates it,
+/// and returns the JWT + plaintext API key + optional bridge endpoint for EA connectivity.
+/// </summary>
 public class RegisterTraderCommandHandler : IRequestHandler<RegisterTraderCommand, ResponseData<AuthTokenResult>>
 {
     private readonly IWriteApplicationDbContext _context;

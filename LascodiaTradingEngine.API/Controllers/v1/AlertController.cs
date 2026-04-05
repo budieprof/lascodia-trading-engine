@@ -12,6 +12,10 @@ using LascodiaTradingEngine.Application.Alerts.Queries.GetPagedAlerts;
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
+/// <summary>
+/// Manages trading alert lifecycle including creation, updates, and soft-deletion.
+/// Route: api/v1/lascodia-trading-engine/alert
+/// </summary>
 [Route("api/v1/lascodia-trading-engine/alert")]
 [ApiController]
 public class AlertController : AuthControllerBase<AlertController>

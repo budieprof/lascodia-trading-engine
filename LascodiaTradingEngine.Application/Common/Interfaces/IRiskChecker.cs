@@ -2,6 +2,10 @@ using LascodiaTradingEngine.Domain.Entities;
 
 namespace LascodiaTradingEngine.Application.Common.Interfaces;
 
+/// <summary>
+/// Result of a risk check. <see cref="Passed"/> is <c>true</c> if the trade is allowed;
+/// otherwise <see cref="BlockReason"/> describes why it was rejected.
+/// </summary>
 public record RiskCheckResult(bool Passed, string? BlockReason);
 
 /// <summary>

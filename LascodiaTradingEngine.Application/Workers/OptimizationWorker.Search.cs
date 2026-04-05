@@ -1,0 +1,841 @@
+using System.Collections.Concurrent;
+using System.Text.Json;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
+using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
+using LascodiaTradingEngine.Application.Backtesting.Models;
+using LascodiaTradingEngine.Application.Backtesting.Services;
+using LascodiaTradingEngine.Application.Common.Diagnostics;
+using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Optimization;
+using LascodiaTradingEngine.Domain.Entities;
+using LascodiaTradingEngine.Domain.Enums;
+using MarketRegimeEnum = LascodiaTradingEngine.Domain.Enums.MarketRegime;
+
+namespace LascodiaTradingEngine.Application.Workers;
+
+public partial class OptimizationWorker
+{
+    // ── Stage: Bayesian Search (Stages 5–6) ─────────────────────────────────
+
+    /// <summary>
+    /// Builds the parameter grid, configures the TPE/GP surrogate, warm-starts from
+    /// prior runs, runs successive halving + seed phase + surrogate-guided exploration,
+    /// and returns the evaluated candidates.
+    /// </summary>
+    internal async Task<SearchResult> RunBayesianSearchAsync(
+        DbContext db, OptimizationRun run, Strategy strategy, OptimizationConfig config,
+        List<Candle> trainCandles, List<Candle> candles, BacktestOptions screeningOptions,
+        OptimizationGridBuilder.DataProtocol protocol, int embargoSize,
+        MarketRegimeEnum? currentRegimeForBaseline,
+        IWriteApplicationDbContext writeCtx, CancellationToken ct, CancellationToken runCt)
+    {
+        _validator.SetInitialBalance(config.ScreeningInitialBalance);
+        var parameterGrid = await _gridBuilder.BuildParameterGridAsync(db, strategy.StrategyType, runCt);
+        var tpeBounds     = OptimizationGridBuilder.ExtractTpeBounds(parameterGrid);
+
+        // Adaptive bounds: narrow based on historically approved params
+        if (config.AdaptiveBoundsEnabled)
+        {
+            var historicalGood = await OptimizationGridBuilder.LoadHistoricalApprovedParamsAsync(db, strategy, runCt);
+            if (historicalGood.Count >= 3)
+                tpeBounds = OptimizationGridBuilder.NarrowBoundsFromHistory(tpeBounds, historicalGood);
+        }
+
+        // Parameter importance-guided bound tightening: compute which parameters
+        // changed most across prior approved runs, then concentrate sampling on those
+        // dimensions by narrowing their bounds proportionally. Low-importance params
+        // keep wide bounds for exploration.
+        if (config.AdaptiveBoundsEnabled)
+        {
+            var approvedRuns = await db.Set<OptimizationRun>()
+                .Where(r => r.StrategyId == strategy.Id
+                         && r.Status == OptimizationRunStatus.Approved
+                         && r.BestParametersJson != null
+                         && r.BaselineParametersJson != null
+                         && !r.IsDeleted)
+                .OrderByDescending(r => r.CompletedAt)
+                .Take(10)
+                .Select(r => new { r.BaselineParametersJson, r.BestParametersJson })
+                .ToListAsync(runCt);
+
+            if (approvedRuns.Count >= 3)
+            {
+                var allDeltas = approvedRuns
+                    .Select(r => ParameterImportanceTracker.ComputeParameterDeltas(r.BaselineParametersJson, r.BestParametersJson))
+                    .Where(d => d.Count > 0);
+                var importance = ParameterImportanceTracker.AggregateImportance(allDeltas);
+
+                if (importance.Count > 0)
+                {
+                    // For high-importance params (>0.5), narrow bounds by up to 20% extra
+                    // beyond what adaptive bounds already did. For low-importance params (<0.2),
+                    // widen bounds by 10% to encourage more exploration in those dimensions.
+                    foreach (var (param, imp) in importance)
+                    {
+                        if (!tpeBounds.TryGetValue(param, out var bounds)) continue;
+                        double range = bounds.Max - bounds.Min;
+                        if (range <= 0) continue;
+
+                        double center = (bounds.Max + bounds.Min) / 2.0;
+                        double adjustFactor = imp > 0.5 ? 1.0 - 0.20 * (imp - 0.5) / 0.5  // 0.80–1.00 for high importance
+                                            : imp < 0.2 ? 1.0 + 0.10 * (0.2 - imp) / 0.2  // 1.00–1.10 for low importance
+                                            : 1.0;
+
+                        double newHalfRange = range / 2.0 * adjustFactor;
+                        tpeBounds[param] = (
+                            Math.Max(bounds.Min, center - newHalfRange),
+                            Math.Min(bounds.Max, center + newHalfRange),
+                            bounds.IsInteger);
+                    }
+
+                    _logger.LogDebug(
+                        "OptimizationWorker: parameter importance applied for strategy {Id} — {Count} param(s) adjusted from {RunCount} prior approvals",
+                        strategy.Id, importance.Count, approvedRuns.Count);
+                }
+            }
+        }
+
+        // Exclude previously-promoted parameters (parameter memory)
+        var previousParams = await db.Set<OptimizationRun>()
+            .Where(r => r.StrategyId == strategy.Id
+                     && (r.Status == OptimizationRunStatus.Approved || r.Status == OptimizationRunStatus.Completed)
+                     && r.BestParametersJson != null && !r.IsDeleted)
+            .Select(r => r.BestParametersJson!)
+            .ToListAsync(runCt);
+        var previousParamSet = new HashSet<string>(previousParams, StringComparer.OrdinalIgnoreCase);
+
+        var freshCandidates = parameterGrid
+            .Where(p => !previousParamSet.Contains(JsonSerializer.Serialize(p)))
+            .ToList();
+
+        if (freshCandidates.Count == 0)
+        {
+            _logger.LogWarning(
+                "OptimizationWorker: parameter space exhausted for strategy {Id} — expanding with midpoints",
+                strategy.Id);
+            freshCandidates = OptimizationGridBuilder.ExpandGridWithMidpoints(parameterGrid, previousParamSet);
+        }
+
+        if (freshCandidates.Count == 0)
+        {
+            run.BestParametersJson = CanonicalParameterJson.Normalize(strategy.ParametersJson);
+            run.BestHealthScore    = run.BaselineHealthScore;
+            run.Iterations         = 0;
+
+            _logger.LogWarning(
+                "OptimizationWorker: parameter space exhausted for strategy {Id} — no fresh candidates after expansion",
+                strategy.Id);
+            _metrics.OptimizationParameterSpaceExhausted.Add(1);
+            return new SearchResult([], 0, "N/A", 0, false);
+        }
+
+        // ── Stage 6: Bayesian search with purged K-fold ────────────
+        // Load multi-objective acquisition config early so surrogate creation can branch on it.
+        bool useEhviEarly = await OptimizationGridBuilder.GetConfigAsync(
+            db, "Optimization:UseEhviAcquisition", false, runCt);
+
+        // Select surrogate: EHVI (3 independent GPs) when enabled, otherwise
+        // TPE for low-dimensional (< 6 params) or GP-UCB for higher.
+        bool useGp = tpeBounds.Count >= 6;
+        string surrogateKind = useEhviEarly ? "EHVI" : useGp ? "GP-UCB" : "TPE";
+        int searchSeed = run.DeterministicSeed;
+        var checkpoint = RestoreCheckpoint(run.IntermediateResultsJson);
+        TreeParzenEstimator? tpe = null;
+        GaussianProcessSurrogate? gp = null;
+
+        // When EHVI is active, it manages its own 3 GPs — skip TPE/GP creation.
+        if (!useEhviEarly)
+        {
+            if (useGp)
+            {
+                var keys   = tpeBounds.Keys.ToArray();
+                var lower  = keys.Select(k => tpeBounds[k].Min).ToArray();
+                var upper  = keys.Select(k => tpeBounds[k].Max).ToArray();
+                var isInt  = keys.Select(k => tpeBounds[k].IsInteger).ToArray();
+                gp = new GaussianProcessSurrogate(keys, lower, upper, isInt,
+                    beta: 2.0, seed: searchSeed);
+
+                _logger.LogDebug("OptimizationWorker: using GP-UCB surrogate ({Dims} dimensions)", tpeBounds.Count);
+            }
+            else
+            {
+                tpe = new TreeParzenEstimator(tpeBounds,
+                    seed: searchSeed);
+
+                _logger.LogDebug("OptimizationWorker: using TPE surrogate ({Dims} dimensions)", tpeBounds.Count);
+            }
+        }
+
+        // Multi-objective acquisition strategy: ParEGO (lightweight) or EHVI (3 independent
+        // GPs, more compute but better Pareto coverage). Both opt-in, both default off.
+        // When neither is enabled, the surrogate optimizes the fixed health score composite.
+        // Declared here (before checkpoint resume) so checkpoint observations can feed EHVI.
+        bool useParegoScalarization = await OptimizationGridBuilder.GetConfigAsync(
+            db, "Optimization:UseParegoScalarization", false, runCt);
+        bool useEhvi = useEhviEarly; // Already loaded above for surrogate selection
+        if (useEhvi) useParegoScalarization = false;
+        var paregoScalarizer = new ParegoScalarizer(searchSeed);
+        EhviAcquisition? ehvi = null;
+        if (useEhvi)
+        {
+            var ehviKeys  = tpeBounds.Keys.ToArray();
+            var ehviLower = ehviKeys.Select(k => tpeBounds[k].Min).ToArray();
+            var ehviUpper = ehviKeys.Select(k => tpeBounds[k].Max).ToArray();
+            var ehviIsInt = ehviKeys.Select(k => tpeBounds[k].IsInteger).ToArray();
+            ehvi = new EhviAcquisition(ehviKeys, ehviLower, ehviUpper, ehviIsInt, seed: searchSeed,
+                logger: _logger, metrics: _metrics);
+            _logger.LogInformation("OptimizationWorker: using EHVI multi-objective acquisition ({Dims} dimensions)", tpeBounds.Count);
+        }
+
+        // Checkpoint-aware resume: feed previously evaluated candidates back into the
+        // surrogate model so it doesn't re-explore already-evaluated parameter regions.
+        if (checkpoint.Observations.Count > 0)
+        {
+            int checkpointSeeded = 0;
+            foreach (var obs in checkpoint.Observations)
+            {
+                if (obs.ParamsJson is null || obs.HealthScore <= 0) continue;
+                try
+                {
+                    var dict = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(obs.ParamsJson);
+                    if (dict is null) continue;
+                    var dblDict = new Dictionary<string, double>();
+                    foreach (var (k, v) in dict)
+                        if (v.TryGetDouble(out double d) && tpeBounds.ContainsKey(k)) dblDict[k] = d;
+                    if (dblDict.Count != tpeBounds.Count) continue;
+
+                    bool seeded = false;
+                    if (ehvi is not null)
+                    {
+                        if (obs.Result is not null)
+                        {
+                            ehvi.AddObservation(dblDict, obs.Result);
+                            seeded = true;
+                        }
+                        // EHVI requires BacktestResult for 3-objective decomposition.
+                        // Checkpoint entries with stripped trade lists (Result=null) can't
+                        // be used — the health score alone doesn't tell EHVI the individual
+                        // Sharpe/DD/WR values. These entries are skipped silently.
+                    }
+                    else
+                    {
+                        if (tpe is not null) { tpe.AddObservation(dblDict, (double)obs.HealthScore); seeded = true; }
+                        if (gp is not null) { gp.AddObservation(dblDict, (double)obs.HealthScore); seeded = true; }
+                    }
+                    if (seeded) checkpointSeeded++;
+                }
+                catch { /* skip malformed checkpoint entries */ }
+            }
+
+            if (checkpointSeeded > 0)
+            {
+                _logger.LogInformation(
+                    "OptimizationWorker: resumed from checkpoint — seeded surrogate with {Count} prior evaluations",
+                    checkpointSeeded);
+                _metrics.OptimizationCheckpointRestored.Add(1);
+            }
+        }
+
+        // Warm-start: seed the surrogate with observations from recent completed/approved
+        // runs for this strategy. Observations are weighted by recency: scores from older
+        // runs are decayed toward the midpoint (0.5) to reduce their influence as market
+        // conditions change. Half-life of 30 days: 30d→50% decay, 60d→75%, 90d→87.5%.
+        var priorRuns = await db.Set<OptimizationRun>()
+            .Where(r => r.StrategyId == strategy.Id
+                     && (r.Status == OptimizationRunStatus.Completed || r.Status == OptimizationRunStatus.Approved)
+                     && r.BestParametersJson != null && r.BestHealthScore.HasValue
+                     && !r.IsDeleted)
+            .OrderByDescending(r => r.CompletedAt)
+            .Take(10)
+            .Select(r => new { r.BestParametersJson, r.BestHealthScore, r.BaselineParametersJson, r.BaselineHealthScore, r.CompletedAt, r.BestSharpeRatio, r.BestMaxDrawdownPct, r.BestWinRate, r.RunMetadataJson })
+            .ToListAsync(runCt);
+
+        int warmStarted = 0;
+        const double decayHalfLifeDays = 30.0;
+        const double decayMidpoint = 0.5;
+        var nowUtcForDecay = DateTime.UtcNow;
+
+        // Extract the current regime string for warm-start regime filtering
+        string? currentRegimeStr = currentRegimeForBaseline?.ToString();
+
+        foreach (var prior in priorRuns)
+        {
+            // Regime filter: skip warm-start candidates from a different market regime.
+            // The regime is stored in RunMetadataJson.CurrentRegime. If the prior run's
+            // regime differs from the current regime, its parameters are less relevant.
+            if (currentRegimeStr is not null && prior.RunMetadataJson is not null)
+            {
+                try
+                {
+                    using var metaDoc = JsonDocument.Parse(prior.RunMetadataJson);
+                    if (metaDoc.RootElement.TryGetProperty("CurrentRegime", out var regimeEl))
+                    {
+                        string? priorRegime = regimeEl.GetString();
+                        if (priorRegime is not null && priorRegime != currentRegimeStr)
+                        {
+                            _logger.LogDebug(
+                                "OptimizationWorker: skipping warm-start from prior run (regime mismatch: prior={Prior}, current={Current})",
+                                priorRegime, currentRegimeStr);
+                            continue;
+                        }
+                    }
+                }
+                catch { /* Non-critical — proceed with warm-start if metadata is malformed */ }
+            }
+
+            double ageDays = prior.CompletedAt.HasValue
+                ? (nowUtcForDecay - prior.CompletedAt.Value).TotalDays
+                : 90.0;
+            double decayFactor = Math.Pow(0.5, ageDays / decayHalfLifeDays);
+
+            // Seed both the best and baseline from each prior run (2 observations per run)
+            foreach (var (json, score) in new[] { (prior.BestParametersJson, prior.BestHealthScore), (prior.BaselineParametersJson, prior.BaselineHealthScore) })
+            {
+                if (json is null || !score.HasValue) continue;
+                try
+                {
+                    var dict = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(json);
+                    if (dict is null) continue;
+                    var dblDict = new Dictionary<string, double>();
+                    foreach (var (k, v) in dict)
+                        if (v.TryGetDouble(out double d) && tpeBounds.ContainsKey(k)) dblDict[k] = d;
+                    if (dblDict.Count != tpeBounds.Count) continue; // Skip if param shape changed
+
+                    // Temporal decay: blend score toward midpoint based on age
+                    double rawScore = (double)score.Value;
+                    double decayedScore = decayMidpoint + (rawScore - decayMidpoint) * decayFactor;
+
+                    if (ehvi is not null)
+                    {
+                        // EHVI warm-start: use per-objective fields when available (best params only,
+                        // not baseline — baseline doesn't have per-objective decomposition).
+                        if (json == prior.BestParametersJson
+                            && prior.BestSharpeRatio.HasValue && prior.BestMaxDrawdownPct.HasValue && prior.BestWinRate.HasValue)
+                        {
+                            ehvi.AddWarmStartObservation(dblDict,
+                                prior.BestSharpeRatio.Value, prior.BestMaxDrawdownPct.Value, prior.BestWinRate.Value,
+                                decayFactor);
+                            warmStarted++;
+                        }
+                        // Baseline params can't be warm-started into EHVI (no per-objective decomposition).
+                        // This is expected — EHVI gets fewer warm-start points than TPE/GP.
+                        continue;
+                    }
+                    if (tpe is not null) { tpe.AddObservation(dblDict, decayedScore); warmStarted++; }
+                    if (gp is not null) { gp.AddObservation(dblDict, decayedScore); warmStarted++; }
+                }
+                catch (Exception ex) { _logger.LogDebug(ex, "OptimizationWorker: skipping malformed prior run params during warm-start"); }
+            }
+        }
+
+        if (warmStarted > 0)
+        {
+            _logger.LogDebug("OptimizationWorker: warm-started surrogate with {Count} prior observations", warmStarted);
+        }
+        else if (priorRuns.Count > 0)
+        {
+            _logger.LogWarning(
+                "OptimizationWorker: warm-start yielded 0 observations despite {PriorCount} prior run(s) — " +
+                "likely parameter schema change (key count mismatch). Surrogate starting cold.",
+                priorRuns.Count);
+        }
+
+        var allEvaluated = new List<ScoredCandidate>();
+        var _evalLock = new object();
+        int totalIters     = 0;
+        int consecutiveFailures = 0;
+        int embargoPerFold = Math.Max(1, embargoSize / protocol.KFolds);
+
+        var parallelOptions = new ParallelOptions
+        {
+            MaxDegreeOfParallelism = config.MaxParallelBacktests,
+            CancellationToken      = runCt,
+        };
+
+        // Phase 0 (multi-fidelity screening): Hyperband or legacy successive halving.
+        // Hyperband runs multiple successive halving brackets simultaneously with different
+        // aggressiveness levels, eliminating the need to guess the right fidelity rungs.
+        // Falls back to the single-bracket SuccessiveHalvingRungs path when disabled.
+        if (freshCandidates.Count > config.TpeInitialSamples && trainCandles.Count >= 100)
+        {
+            decimal coarseBaseline = run.BaselineHealthScore ?? 0m;
+
+            if (config.HyperbandEnabled)
+            {
+                double minFidelity = HyperbandScheduler.ComputeMinFidelity(trainCandles.Count);
+                var brackets = HyperbandScheduler.ComputeBrackets(
+                    config.HyperbandEta, 1.0, minFidelity,
+                    budgetPerBracket: Math.Max(3, freshCandidates.Count / Math.Max(1, (int)Math.Log(1.0 / minFidelity, config.HyperbandEta) + 1)));
+
+                if (brackets.Count > 1)
+                {
+                    _logger.LogInformation(
+                        "OptimizationWorker: Hyperband screening with {Brackets} brackets, eta={Eta}, " +
+                        "min fidelity={MinF:P1}, budget={Budget} candidates",
+                        brackets.Count, config.HyperbandEta, minFidelity, freshCandidates.Count);
+
+                    // Serialize freshCandidates to JSON once for the candidate source
+                    var freshCandidateJsons = freshCandidates
+                        .Select(p => JsonSerializer.Serialize(p))
+                        .ToList();
+
+                    // Candidate source: distribute fresh candidates across brackets using
+                    // deterministic slicing. Each bracket gets a non-overlapping slice of
+                    // the grid. If a bracket needs more than its slice, overflow draws from
+                    // the full grid pool (may overlap other brackets' slices).
+                    var bracketCount = brackets.Count;
+                    List<string> CandidateSource(int requestedCount, int bracketIndex)
+                    {
+                        // Slice the grid: bracket 0 gets first 1/N, bracket 1 gets second 1/N, etc.
+                        int sliceStart = bracketIndex * freshCandidateJsons.Count / bracketCount;
+                        int sliceEnd = (bracketIndex + 1) * freshCandidateJsons.Count / bracketCount;
+                        var slice = freshCandidateJsons.GetRange(sliceStart, sliceEnd - sliceStart);
+
+                        if (slice.Count >= requestedCount)
+                            return slice.Take(requestedCount).ToList();
+
+                        // Not enough in the slice — add from the full pool (may overlap other brackets)
+                        var result = new List<string>(slice);
+                        var seen = new HashSet<string>(slice);
+                        foreach (var c in freshCandidateJsons)
+                        {
+                            if (result.Count >= requestedCount) break;
+                            if (seen.Add(c)) result.Add(c);
+                        }
+                        return result;
+                    }
+
+                    var hyperband = new HyperbandScheduler(_logger, _metrics);
+                    var hbResult = await hyperband.ExecuteAllBracketsAsync(
+                        brackets, CandidateSource, trainCandles, strategy, screeningOptions,
+                        _validator, coarseBaseline, config.MaxParallelBacktests,
+                        config.ScreeningTimeoutSeconds, config.CircuitBreakerThreshold,
+                        freshCandidates.Count, runCt);
+
+                    totalIters += hbResult.TotalEvaluations;
+
+                    if (hbResult.Survivors.Count > 0)
+                    {
+                        // Pool survivors from all brackets, dedup, take top N
+                        var pooled = HyperbandScheduler.PoolSurvivors(
+                            hbResult.Survivors, config.TpeInitialSamples * 2);
+
+                        // Feed full-fidelity Hyperband survivors directly into the evaluated list
+                        // (they've already been screened at the highest fidelity in their bracket)
+                        foreach (var s in pooled.Where(s => s.EvaluatedAtFidelity >= 0.99))
+                        {
+                            lock (_evalLock) allEvaluated.Add(new ScoredCandidate(
+                                s.ParamsJson, s.HealthScore, s.Result));
+                        }
+
+                        // Replace freshCandidates with pooled survivors for LHS seeding
+                        var survivorParamJsons = new HashSet<string>(pooled.Select(s => s.ParamsJson));
+                        freshCandidates = freshCandidates
+                            .Where(p => survivorParamJsons.Contains(JsonSerializer.Serialize(p)))
+                            .ToList();
+
+                        // If Hyperband pruned everything, fall back to original candidates
+                        if (freshCandidates.Count == 0)
+                            freshCandidates = parameterGrid
+                                .Where(p => !previousParamSet.Contains(JsonSerializer.Serialize(p)))
+                                .ToList();
+
+                        _logger.LogInformation(
+                            "OptimizationWorker: Hyperband completed — {Evals} evals across {Brackets} brackets " +
+                            "({Skipped} skipped), {Survivors} unique survivors",
+                            hbResult.TotalEvaluations, hbResult.BracketsExecuted,
+                            hbResult.BracketsSkipped, pooled.Count);
+                    }
+                    else
+                    {
+                        _logger.LogDebug(
+                            "OptimizationWorker: Hyperband produced no survivors — " +
+                            "proceeding with full candidate set for LHS seeding");
+                    }
+                }
+                else
+                {
+                    // Only 1 bracket computed (scarce data) — use legacy path
+                    _logger.LogDebug(
+                        "OptimizationWorker: Hyperband computed only 1 bracket (scarce data) — " +
+                        "falling back to legacy successive halving");
+                    await RunLegacySuccessiveHalvingAsync();
+                }
+            }
+            else
+            {
+                await RunLegacySuccessiveHalvingAsync();
+            }
+
+            async Task RunLegacySuccessiveHalvingAsync()
+            {
+                // Legacy single-bracket successive halving (SuccessiveHalvingRungs config)
+                var fidelityRungs = ParseFidelityRungs(config.SuccessiveHalvingRungs);
+                int rungIndex = 0;
+
+                foreach (var fidelity in fidelityRungs)
+                {
+                    rungIndex++;
+                    if (freshCandidates.Count <= config.TpeInitialSamples) break;
+
+                    int step = Math.Max(1, (int)Math.Round(1.0 / fidelity));
+                    var downsampledTrain = trainCandles.Where((_, i) => i % step == 0).ToList();
+                    if (downsampledTrain.Count < 30) break;
+
+                    int rungTimeout = Math.Max(5, (int)(config.ScreeningTimeoutSeconds * fidelity));
+                    var coarseScores = new List<(int Index, decimal Score)>();
+                    var coarseLock   = new object();
+
+                    await Parallel.ForEachAsync(
+                        Enumerable.Range(0, freshCandidates.Count),
+                        parallelOptions,
+                        async (idx, pCt) =>
+                        {
+                            var paramsJson = JsonSerializer.Serialize(freshCandidates[idx]);
+                            try
+                            {
+                                var result = await _validator.RunWithTimeoutAsync(
+                                    strategy, paramsJson, downsampledTrain, screeningOptions,
+                                    rungTimeout, pCt);
+                                lock (coarseLock) coarseScores.Add((idx, OptimizationHealthScorer.ComputeHealthScore(result)));
+                            }
+                            catch { lock (coarseLock) coarseScores.Add((idx, -1m)); }
+                        });
+
+                    double noiseTolerance = 0.90 + 0.05 * fidelity;
+                    var survivors = coarseScores
+                        .Where(c => c.Score >= coarseBaseline * (decimal)noiseTolerance)
+                        .OrderByDescending(c => c.Score)
+                        .ToList();
+
+                    if (survivors.Count > freshCandidates.Count / 2)
+                        survivors = survivors.Take(freshCandidates.Count / 2).ToList();
+
+                    if (survivors.Count > 0)
+                    {
+                        int pruned = freshCandidates.Count - survivors.Count;
+                        var survivorSet = new HashSet<int>(survivors.Select(s => s.Index));
+                        freshCandidates = freshCandidates.Where((_, i) => survivorSet.Contains(i)).ToList();
+
+                        _logger.LogDebug(
+                            "OptimizationWorker: successive halving rung {Rung}/{Total} (fidelity={Fidelity:P0}) " +
+                            "pruned {Pruned}/{Candidates} candidates",
+                            rungIndex, fidelityRungs.Length, fidelity, pruned, pruned + survivors.Count);
+                    }
+                    else
+                    {
+                        _logger.LogDebug(
+                            "OptimizationWorker: successive halving rung {Rung} produced no survivors — " +
+                            "stopping halving and proceeding with current {Count} candidates",
+                            rungIndex, freshCandidates.Count);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // (ParEGO/EHVI config and scalarizer initialized above, before checkpoint resume.)
+
+        // Phase 1: Seed surrogate with Latin Hypercube Sampling for better space coverage.
+        // The surrogate's SuggestCandidates falls back to LHS when no observations exist,
+        // giving superior initial coverage compared to random grid shuffling.
+        List<Dictionary<string, double>> lhsSuggestions;
+        if (tpe is not null)
+            lhsSuggestions = tpe.SuggestCandidates(config.TpeInitialSamples);
+        else
+            lhsSuggestions = gp!.SuggestCandidates(config.TpeInitialSamples);
+
+        var seedCandidates = lhsSuggestions
+            .Select(s => OptimizationGridBuilder.DoublesToParamSet(s, tpeBounds))
+            .Where(p => !previousParamSet.Contains(JsonSerializer.Serialize(p)))
+            .ToList();
+
+        // If LHS produced fewer fresh candidates than available grid points, backfill from grid
+        if (seedCandidates.Count < config.TpeInitialSamples && freshCandidates.Count > seedCandidates.Count)
+        {
+            var seedSet = new HashSet<string>(seedCandidates.Select(p => JsonSerializer.Serialize(p)));
+            var backfill = freshCandidates
+                .Where(p => !seedSet.Contains(JsonSerializer.Serialize(p)))
+                .Take(config.TpeInitialSamples - seedCandidates.Count);
+            seedCandidates.AddRange(backfill);
+        }
+
+        await Parallel.ForEachAsync(seedCandidates, parallelOptions, async (paramSet, pCt) =>
+        {
+            if (Volatile.Read(ref consecutiveFailures) >= config.CircuitBreakerThreshold) return;
+
+            var paramsJson = JsonSerializer.Serialize(paramSet);
+            try
+            {
+                var (score, result, _cvValue) = await _validator.TemporalChunkedEvaluateAsync(
+                    strategy, paramsJson, trainCandles, screeningOptions,
+                    config.ScreeningTimeoutSeconds, protocol.KFolds, embargoPerFold,
+                    config.MinCandidateTrades, pCt);
+                Interlocked.Increment(ref totalIters);
+                Interlocked.Exchange(ref consecutiveFailures, 0);
+                _metrics.OptimizationCandidatesScreened.Add(1);
+                lock (_evalLock) allEvaluated.Add(new ScoredCandidate(paramsJson, score, result, _cvValue));
+
+                var dblParams = OptimizationGridBuilder.ParamSetToDoubles(paramSet);
+                // Use ParEGO scalarization for surrogate input when enabled,
+                // otherwise fall back to health score. Seed phase uses initial
+                // uniform weights (1/3 each) — equivalent to equal-weighted Chebyshev.
+                double surrogateInput = useParegoScalarization
+                    ? paregoScalarizer.Scalarize(result)
+                    : (double)score;
+                if (ehvi is null)
+                {
+                    if (tpe is not null) lock (tpe) tpe.AddObservation(dblParams, surrogateInput);
+                    if (gp is not null) lock (gp) gp.AddObservation(dblParams, surrogateInput);
+                }
+                else
+                {
+                    lock (ehvi) ehvi.AddObservation(dblParams, result);
+                }
+            }
+            catch (OperationCanceledException) when (!pCt.IsCancellationRequested)
+            {
+                Interlocked.Increment(ref totalIters);
+                Interlocked.Increment(ref consecutiveFailures);
+            }
+            catch
+            {
+                Interlocked.Increment(ref totalIters);
+                Interlocked.Increment(ref consecutiveFailures);
+            }
+        });
+
+        if (consecutiveFailures >= config.CircuitBreakerThreshold)
+        {
+            _logger.LogWarning(
+                "OptimizationWorker: circuit breaker tripped after {Failures} consecutive backtest failures in seed phase — aborting search",
+                consecutiveFailures);
+            _metrics.OptimizationCircuitBreakerTrips.Add(1);
+            return new SearchResult(allEvaluated, totalIters, surrogateKind, warmStarted, checkpoint.Observations.Count > 0);
+        }
+
+        await HeartbeatRunAsync(run, writeCtx, ct);
+        // Adaptive TPE budget: reduce budget for strategies that historically converge
+        // quickly. Track the average early-stop savings ratio from prior runs.
+        int effectiveBudget = config.TpeBudget;
+        if (priorRuns.Count >= 3)
+        {
+            var priorIterations = await db.Set<OptimizationRun>()
+                .Where(r => r.StrategyId == strategy.Id
+                         && (r.Status == OptimizationRunStatus.Completed || r.Status == OptimizationRunStatus.Approved)
+                         && r.Iterations > 0
+                         && !r.IsDeleted)
+                .OrderByDescending(r => r.CompletedAt)
+                .Take(5)
+                .Select(r => r.Iterations)
+                .ToListAsync(runCt);
+
+            if (priorIterations.Count >= 3)
+            {
+                int avgPriorIters = (int)priorIterations.Average();
+                // If prior runs consistently converge with fewer iterations, shrink the budget
+                // but never below 60% of configured or the average + 20% headroom.
+                int adaptedBudget = Math.Max(
+                    (int)(config.TpeBudget * 0.60),
+                    (int)(avgPriorIters * 1.20));
+                if (adaptedBudget < effectiveBudget)
+                {
+                    _logger.LogDebug(
+                        "OptimizationWorker: adaptive TPE budget for strategy {Id}: {Adapted} (from {Original}, avg prior={Avg})",
+                        strategy.Id, adaptedBudget, config.TpeBudget, avgPriorIters);
+                    effectiveBudget = adaptedBudget;
+                }
+            }
+        }
+
+        // Phase 2: Surrogate-guided exploration rounds with early stopping.
+        // ParEGO: each batch uses a different random weight vector on the (Sharpe, -DD, WR)
+        // GP-UCB has exploration phases where scores intentionally dip as the
+        // acquisition function probes uncertain regions, so it needs more patience.
+        int remaining = effectiveBudget - totalIters;
+        decimal bestSeenScore = allEvaluated.Count == 0 ? 0m : allEvaluated.Max(c => c.HealthScore);
+        int stagnantBatches = 0;
+        int maxStagnantBatches = useGp ? config.GpEarlyStopPatience : 2;
+
+        while (remaining > 0 && !runCt.IsCancellationRequested)
+        {
+            // Circuit breaker: abort exploration if backtests are systematically failing
+            if (consecutiveFailures >= config.CircuitBreakerThreshold)
+            {
+                _logger.LogWarning(
+                    "OptimizationWorker: circuit breaker tripped after {Failures} consecutive backtest failures in exploration phase — aborting search ({Remaining} evals remaining)",
+                    consecutiveFailures, remaining);
+                _metrics.OptimizationCircuitBreakerTrips.Add(1);
+                break;
+            }
+
+            int batch = Math.Min(config.MaxParallelBacktests, remaining);
+
+            // ParEGO: rotate weight vector so this batch explores a different Pareto direction.
+            // Capture the weights before the parallel loop to avoid cross-thread volatile reads.
+            double[]? batchWeights = null;
+            if (useParegoScalarization)
+                batchWeights = paregoScalarizer.RotateWeights();
+
+            List<Dictionary<string, double>> suggestions;
+            if (ehvi is not null)
+                lock (ehvi) suggestions = ehvi.SuggestCandidates(batch);
+            else if (tpe is not null)
+                lock (tpe) suggestions = tpe.SuggestCandidates(batch);
+            else
+                lock (gp!) suggestions = gp!.SuggestCandidates(batch);
+
+            long batchBestScoreBits = 0L; // Atomic-friendly storage for decimal via double bits
+            await Parallel.ForEachAsync(suggestions, parallelOptions, async (suggestion, pCt) =>
+            {
+                if (Volatile.Read(ref consecutiveFailures) >= config.CircuitBreakerThreshold) return;
+
+                var paramSet  = OptimizationGridBuilder.DoublesToParamSet(suggestion, tpeBounds);
+                var paramsJson = JsonSerializer.Serialize(paramSet);
+                if (previousParamSet.Contains(paramsJson)) return;
+
+                try
+                {
+                    var (score, result, _cvVal) = await _validator.TemporalChunkedEvaluateAsync(
+                        strategy, paramsJson, trainCandles, screeningOptions,
+                        config.ScreeningTimeoutSeconds, protocol.KFolds, embargoPerFold,
+                        config.MinCandidateTrades, pCt);
+                    Interlocked.Increment(ref totalIters);
+                    Interlocked.Exchange(ref consecutiveFailures, 0);
+                    _metrics.OptimizationCandidatesScreened.Add(1);
+                    // Record the standard health score on the candidate (for downstream ranking)
+                    lock (_evalLock) allEvaluated.Add(new ScoredCandidate(paramsJson, score, result, _cvVal));
+                    // Feed observation to the active surrogate strategy:
+                    // EHVI: record on 3 independent GPs (handles its own Pareto tracking)
+                    // ParEGO: rotating Chebyshev scalar fed to single GP/TPE
+                    // Default: health score fed to single GP/TPE
+                    if (ehvi is not null)
+                    {
+                        lock (ehvi) ehvi.AddObservation(suggestion, result);
+                    }
+                    else
+                    {
+                        double surrogateScore = batchWeights is not null
+                            ? paregoScalarizer.Scalarize(result, batchWeights)
+                            : (double)score;
+                        if (tpe is not null) lock (tpe) tpe.AddObservation(suggestion, surrogateScore);
+                        if (gp is not null) lock (gp) gp.AddObservation(suggestion, surrogateScore);
+                    }
+
+                    // Thread-safe update of batch best using Interlocked on double bits
+                    long scoreBits = BitConverter.DoubleToInt64Bits((double)score);
+                    long current;
+                    do { current = Interlocked.Read(ref batchBestScoreBits); }
+                    while (scoreBits > current && Interlocked.CompareExchange(ref batchBestScoreBits, scoreBits, current) != current);
+                }
+                catch
+                {
+                    Interlocked.Increment(ref totalIters);
+                    Interlocked.Increment(ref consecutiveFailures);
+                }
+            });
+            decimal batchBestScore = (decimal)BitConverter.Int64BitsToDouble(Interlocked.Read(ref batchBestScoreBits));
+            remaining -= batch;
+
+            // Early stopping: if this batch didn't improve on the global best, increment stagnation counter
+            if (batchBestScore > bestSeenScore)
+            {
+                double batchImprovement = (double)(batchBestScore - bestSeenScore);
+                _metrics.OptimizationSurrogateImprovement.Record(batchImprovement);
+                // Surrogate accuracy telemetry: record that the surrogate-guided batch improved the global best
+                _metrics.OptimizationSurrogateImprovement.Record(1.0,
+                    new KeyValuePair<string, object?>("metric", "batch_improved_global_best"));
+                bestSeenScore = batchBestScore;
+                stagnantBatches = 0;
+            }
+            else
+            {
+                _metrics.OptimizationSurrogateImprovement.Record(0.0);
+                // Surrogate accuracy telemetry: surrogate-guided batch did not improve global best
+                _metrics.OptimizationSurrogateImprovement.Record(0.0,
+                    new KeyValuePair<string, object?>("metric", "batch_improved_global_best"));
+                stagnantBatches++;
+                if (stagnantBatches >= maxStagnantBatches)
+                {
+                    _metrics.OptimizationEarlyStopSavings.Add(remaining);
+                    _logger.LogDebug(
+                        "OptimizationWorker: early stopping after {Batches} stagnant batches ({Remaining} evals saved)",
+                        stagnantBatches, remaining);
+                    break;
+                }
+            }
+
+            // Incremental checkpoint: persist top candidates periodically so a crash
+            // doesn't lose all progress. Stored as JSON in IntermediateResultsJson.
+            if (config.CheckpointEveryN > 0 && totalIters % config.CheckpointEveryN == 0 && allEvaluated.Count > 0)
+            {
+                try
+                {
+                    List<ScoredCandidate> checkpointSnapshot;
+                    lock (_evalLock) checkpointSnapshot = allEvaluated.ToList();
+                    var topForCheckpoint = checkpointSnapshot
+                        .OrderByDescending(c => c.HealthScore)
+                        .Take(config.TopNCandidates)
+                        .Select(c => new { c.ParamsJson, c.HealthScore })
+                        .ToList();
+                    run.IntermediateResultsJson = JsonSerializer.Serialize(topForCheckpoint);
+                    run.Iterations = totalIters;
+                    await writeCtx.SaveChangesAsync(ct);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "OptimizationWorker: checkpoint save failed (non-fatal)");
+                }
+
+                // Incremental memory pressure mitigation: trim trade lists from
+                // low-scoring candidates at each checkpoint boundary.
+                int keepCount = Math.Max(config.TopNCandidates * 2, 10);
+                List<ScoredCandidate> trimSnapshot;
+                lock (_evalLock) trimSnapshot = allEvaluated.OrderByDescending(c => c.HealthScore).ToList();
+                for (int i = keepCount; i < trimSnapshot.Count; i++)
+                {
+                    if (!trimSnapshot[i].TradesTrimmed)
+                    {
+                        trimSnapshot[i].Result.Trades?.Clear();
+                        trimSnapshot[i].TradesTrimmed = true;
+                    }
+                }
+            }
+        }
+
+        // ── Surrogate quality diagnostics ─────────────────────────────────
+        // Log GP/TPE health so operators can detect when the surrogate is struggling
+        // (e.g., correlated observations causing ill-conditioned Cholesky, or gamma
+        // quantile producing degenerate good/bad splits).
+        if (gp is not null)
+        {
+            int clampCount = gp.LastCholeskyClampCount;
+            if (clampCount > 0)
+                _logger.LogWarning(
+                    "OptimizationWorker: GP surrogate had {ClampCount} Cholesky diagonal clamp(s) — " +
+                    "predictions may be unreliable due to correlated/duplicate observations",
+                    clampCount);
+            _metrics.OptimizationSurrogateClamps.Add(clampCount);
+        }
+        if (tpe is not null)
+        {
+            _logger.LogDebug(
+                "OptimizationWorker: TPE surrogate finished with {Observations} observations",
+                tpe.ObservationCount);
+        }
+        if (ehvi is not null)
+        {
+            _logger.LogDebug(
+                "OptimizationWorker: EHVI finished — Pareto front size={FrontSize}, HV={HV:F4}, observations={Obs}",
+                ehvi.ParetoFrontSize, ehvi.CurrentHypervolume, ehvi.ObservationCount);
+        }
+
+        return new SearchResult(
+            allEvaluated,
+            totalIters,
+            surrogateKind,
+            warmStarted,
+            checkpoint.Observations.Count > 0);
+    }
+}

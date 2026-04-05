@@ -3,8 +3,10 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using LascodiaTradingEngine.Application.Backtesting.Models;
 using LascodiaTradingEngine.Application.Backtesting.Services;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Optimization;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -262,30 +264,34 @@ public class WalkForwardWorker : BackgroundService
                 // a full OOS block.
                 if (oosEnd > allCandles.Count) break;
 
-                // Slice the in-sample candles (used only for metadata here — the strategy
-                // parameters are fixed, so there is no "training" step in the ML sense;
-                // the IS window confirms indicator warm-up data is available).
                 var inSampleCandles = allCandles
                     .Skip(inSampleStart)
                     .Take(run.InSampleDays)
-                    .ToList()
-                    .AsReadOnly();
+                    .ToList();
 
-                // Slice the out-of-sample candles — this is what the backtest engine
-                // actually evaluates. The strategy runs on data it was never "aware" of
-                // during the in-sample period.
                 var oosCandles = allCandles
                     .Skip(oosStart)
                     .Take(run.OutOfSampleDays)
-                    .ToList()
-                    .AsReadOnly();
+                    .ToList();
 
-                // Evaluate the strategy on the OOS window. The in-sample candles are
-                // sliced but not passed to RunAsync here because the current design fixes
-                // parameters before the walk-forward run starts. If parameter re-fitting
-                // per window is added in future, the IS candles would be passed to an
-                // optimisation step first.
-                var oosResult = await _backtestEngine.RunAsync(strategy, oosCandles, run.InitialBalance, ct);
+                // ── Per-fold re-optimization (true WFA) ─────────────────────
+                // When enabled, re-optimise strategy parameters on the IS candles using a
+                // mini TPE search before evaluating on the OOS segment. This validates
+                // whether the optimisation process itself consistently finds good params.
+                Strategy evalStrategy = strategy;
+                if (run.ReOptimizePerFold && inSampleCandles.Count >= 60)
+                {
+                    var foldOptimised = await ReOptimizeOnFoldAsync(strategy, inSampleCandles, run.InitialBalance, ct);
+                    if (foldOptimised is not null)
+                    {
+                        evalStrategy = foldOptimised;
+                        _logger.LogDebug(
+                            "WalkForwardWorker: run {RunId} window {Window} re-optimised params: {Params}",
+                            run.Id, windowIndex, evalStrategy.ParametersJson);
+                    }
+                }
+
+                var oosResult = await _backtestEngine.RunAsync(evalStrategy, oosCandles, run.InitialBalance, ct);
 
                 // Record full per-window metrics for the JSON breakdown stored in WindowResultsJson.
                 // OosHealthScore maps to SharpeRatio so the AverageOutOfSampleScore field
@@ -300,7 +306,8 @@ public class WalkForwardWorker : BackgroundService
                     OosHealthScore      = (double)oosResult.SharpeRatio,
                     OosTotalTrades      = oosResult.TotalTrades,
                     OosWinRate          = (double)oosResult.WinRate,
-                    OosProfitFactor     = (double)oosResult.ProfitFactor
+                    OosProfitFactor     = (double)oosResult.ProfitFactor,
+                    UsedParametersJson  = evalStrategy.ParametersJson
                 };
 
                 windowResults.Add(windowResult);
@@ -354,7 +361,139 @@ public class WalkForwardWorker : BackgroundService
         // Single SaveChanges call persists the final status, all metrics, and the
         // JSON breakdown in one database round-trip.
         await writeContext.SaveChangesAsync(ct);
+
+        // ── Update optimization follow-up status if this was a validation walk-forward ──
+        if (run.SourceOptimizationRunId.HasValue)
+        {
+            try
+            {
+                await Optimization.OptimizationFollowUpTracker.UpdateStatusAsync(
+                    db, run.SourceOptimizationRunId.Value,
+                    run.Status == RunStatus.Completed, writeContext, ct);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex,
+                    "WalkForwardWorker: failed to update optimization follow-up status for run {RunId} (non-fatal)",
+                    run.SourceOptimizationRunId.Value);
+            }
+        }
     }
+
+    // ── Per-fold re-optimization ───────────────────────────────────────────────
+
+    /// <summary>
+    /// Runs a mini TPE search on the in-sample candles to find the best parameters for
+    /// this fold. Returns a cloned strategy with optimised params, or null on failure.
+    /// Uses a small budget (20 evaluations) to keep walk-forward runs tractable.
+    /// </summary>
+    private async Task<Strategy?> ReOptimizeOnFoldAsync(
+        Strategy strategy, List<Candle> isCandles, decimal initialBalance, CancellationToken ct)
+    {
+        try
+        {
+            // Build parameter bounds from the strategy's current params as a baseline
+            var currentParams = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(strategy.ParametersJson);
+            if (currentParams is null || currentParams.Count == 0) return null;
+
+            var bounds = new Dictionary<string, (double Min, double Max, bool IsInteger)>();
+            foreach (var (key, val) in currentParams)
+            {
+                if (!val.TryGetDouble(out double baseVal)) continue;
+                bool isInt = val.ValueKind == JsonValueKind.Number && !val.ToString()!.Contains('.');
+                // Search ±50% around current value
+                double margin = Math.Max(Math.Abs(baseVal) * 0.5, 1.0);
+                bounds[key] = (baseVal - margin, baseVal + margin, isInt);
+            }
+
+            if (bounds.Count == 0) return null;
+
+            var tpe = new TreeParzenEstimator(bounds, gamma: 0.25, seed: isCandles.Count);
+
+            ScoredCandidate? best = null;
+            const int budget = 20;
+
+            // Seed with current params
+            var baseResult = await _backtestEngine.RunAsync(strategy, isCandles, initialBalance, ct);
+            double baseScore = (double)ComputeHealthScore(baseResult);
+            var baseDbl = currentParams.ToDictionary(
+                kv => kv.Key,
+                kv => kv.Value.TryGetDouble(out double d) ? d : 0.0);
+            tpe.AddObservation(baseDbl, baseScore);
+            best = new ScoredCandidate(strategy.ParametersJson, (decimal)baseScore, baseResult);
+
+            for (int i = 1; i < budget; i++)
+            {
+                ct.ThrowIfCancellationRequested();
+                var suggestions = tpe.SuggestCandidates(1, minObservationsForModel: 5);
+                if (suggestions.Count == 0) break;
+
+                var suggestion = suggestions[0];
+                var paramSet = suggestion.ToDictionary(
+                    kv => kv.Key,
+                    kv => bounds.TryGetValue(kv.Key, out var b) && b.IsInteger
+                        ? (object)(int)Math.Round(kv.Value) : (object)kv.Value);
+                var paramsJson = JsonSerializer.Serialize(paramSet);
+
+                var candidate = CloneStrategy(strategy);
+                candidate.ParametersJson = paramsJson;
+
+                try
+                {
+                    var result = await _backtestEngine.RunAsync(candidate, isCandles, initialBalance, ct);
+                    decimal score = ComputeHealthScore(result);
+                    tpe.AddObservation(suggestion, (double)score);
+
+                    if (best is null || score > best.HealthScore)
+                        best = new ScoredCandidate(paramsJson, score, result);
+                }
+                catch { /* skip failed candidate */ }
+            }
+
+            if (best is null) return null;
+
+            var optimised = CloneStrategy(strategy);
+            optimised.ParametersJson = best.ParamsJson;
+            return optimised;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "WalkForwardWorker: per-fold re-optimization failed — using fixed params");
+            return null;
+        }
+    }
+
+    private static Strategy CloneStrategy(Strategy source) => new()
+    {
+        Id                      = source.Id,
+        Name                    = source.Name,
+        Description             = source.Description,
+        StrategyType            = source.StrategyType,
+        Symbol                  = source.Symbol,
+        Timeframe               = source.Timeframe,
+        ParametersJson          = source.ParametersJson,
+        Status                  = source.Status,
+        RiskProfileId           = source.RiskProfileId,
+        CreatedAt               = source.CreatedAt,
+        LifecycleStage          = source.LifecycleStage,
+        LifecycleStageEnteredAt = source.LifecycleStageEnteredAt,
+        EstimatedCapacityLots   = source.EstimatedCapacityLots,
+        IsDeleted               = source.IsDeleted
+    };
+
+    /// <summary>
+    /// 5-factor health score aligned with OptimizationWorker.ComputeHealthScore.
+    /// </summary>
+    private static decimal ComputeHealthScore(BacktestResult r)
+    {
+        return 0.25m * r.WinRate
+             + 0.20m * Math.Min(1m, r.ProfitFactor / 2m)
+             + 0.20m * Math.Max(0m, 1m - r.MaxDrawdownPct / 20m)
+             + 0.15m * Math.Min(1m, Math.Max(0m, r.SharpeRatio) / 2m)
+             + 0.20m * Math.Min(1m, r.TotalTrades / 50m);
+    }
+
+    private sealed record ScoredCandidate(string ParamsJson, decimal HealthScore, BacktestResult Result);
 
     // ── Window result record ───────────────────────────────────────────────────
 
@@ -397,5 +536,12 @@ public class WalkForwardWorker : BackgroundService
 
         /// <summary>Gross OOS profit divided by gross OOS loss (profit factor).</summary>
         public double   OosProfitFactor     { get; init; }
+
+        /// <summary>
+        /// JSON of the parameters used for this window's OOS evaluation. When
+        /// <see cref="WalkForwardRun.ReOptimizePerFold"/> is true, this contains the
+        /// per-fold optimised parameters; otherwise it is the strategy's fixed params.
+        /// </summary>
+        public string?  UsedParametersJson  { get; init; }
     }
 }

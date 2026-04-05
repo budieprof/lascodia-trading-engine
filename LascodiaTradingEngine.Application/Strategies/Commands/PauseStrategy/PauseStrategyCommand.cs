@@ -9,13 +9,16 @@ namespace LascodiaTradingEngine.Application.Strategies.Commands.PauseStrategy;
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
+/// <summary>Pauses an active strategy, preventing it from generating new trade signals.</summary>
 public class PauseStrategyCommand : IRequest<ResponseData<string>>
 {
+    /// <summary>Strategy identifier to pause.</summary>
     public long Id { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
+/// <summary>Validates that the strategy Id is a positive value.</summary>
 public class PauseStrategyCommandValidator : AbstractValidator<PauseStrategyCommand>
 {
     public PauseStrategyCommandValidator()
@@ -26,6 +29,7 @@ public class PauseStrategyCommandValidator : AbstractValidator<PauseStrategyComm
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Sets the strategy status to Paused. Returns not-found if the strategy does not exist.</summary>
 public class PauseStrategyCommandHandler : IRequestHandler<PauseStrategyCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;

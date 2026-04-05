@@ -2,8 +2,13 @@ using Lascodia.Trading.Engine.EventBus.Events;
 
 namespace LascodiaTradingEngine.Application.Common.Events;
 
+/// <summary>
+/// Published by <c>StrategyWorker</c> when a new trade signal is created.
+/// The primary consumer is <c>SignalOrderBridgeWorker</c>, which performs Tier 1 validation.
+/// </summary>
 public record TradeSignalCreatedIntegrationEvent : IntegrationEvent
 {
+    /// <summary>Monotonic sequence number for ordering detection.</summary>
     public long    SequenceNumber { get; init; } = EventSequence.Next();
 
     /// <summary>
@@ -13,9 +18,18 @@ public record TradeSignalCreatedIntegrationEvent : IntegrationEvent
     /// </summary>
     public string  CorrelationId { get; init; } = Guid.NewGuid().ToString("N");
 
+    /// <summary>The new trade signal's database Id.</summary>
     public long    TradeSignalId { get; init; }
+
+    /// <summary>The strategy that generated the signal.</summary>
     public long    StrategyId    { get; init; }
+
+    /// <summary>Currency pair symbol.</summary>
     public string  Symbol        { get; init; } = string.Empty;
+
+    /// <summary>Trade direction ("Buy" or "Sell").</summary>
     public string  Direction     { get; init; } = string.Empty;
+
+    /// <summary>Suggested entry price.</summary>
     public decimal EntryPrice    { get; init; }
 }

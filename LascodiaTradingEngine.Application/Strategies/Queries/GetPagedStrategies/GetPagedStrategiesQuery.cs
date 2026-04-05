@@ -11,19 +11,25 @@ namespace LascodiaTradingEngine.Application.Strategies.Queries.GetPagedStrategie
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// <summary>Returns a paginated list of strategies with optional filtering by name/symbol search, status, and symbol.</summary>
 public class GetPagedStrategiesQuery : PagerRequestWithFilterType<StrategyQueryFilter, ResponseData<PagedData<StrategyDto>>>
 {
 }
 
+/// <summary>Filter criteria for the paged strategies query.</summary>
 public class StrategyQueryFilter
 {
+    /// <summary>Free-text search applied to Name and Symbol fields.</summary>
     public string? Search { get; set; }
+    /// <summary>Filter by <see cref="StrategyStatus"/> enum name.</summary>
     public string? Status { get; set; }
+    /// <summary>Filter by exact currency pair symbol.</summary>
     public string? Symbol { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
+/// <summary>Executes the paged strategies query with optional search, status, and symbol filters, ordered by name ascending.</summary>
 public class GetPagedStrategiesQueryHandler
     : IRequestHandler<GetPagedStrategiesQuery, ResponseData<PagedData<StrategyDto>>>
 {

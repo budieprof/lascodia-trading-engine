@@ -9,13 +9,24 @@ namespace LascodiaTradingEngine.Application.MLModels.Queries.GenerateModelRiskRe
 
 // ── Query ────────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Generates a comprehensive risk report for a specific ML model, aggregating training metrics,
+/// live performance, calibration data, robustness scores, drift status, shadow evaluation results,
+/// and lifecycle event counts into a single DTO.
+/// </summary>
 public class GenerateModelRiskReportQuery : IRequest<ResponseData<ModelRiskReportDto>>
 {
+    /// <summary>Database ID of the ML model to generate the risk report for.</summary>
     public long MLModelId { get; set; }
 }
 
 // ── Handler ──────────────────────────────────────────────────────────────────
 
+/// <summary>
+/// Handles model risk report generation. Loads the ML model, its latest training run,
+/// latest shadow evaluation, and lifecycle event count, then assembles them into a
+/// ModelRiskReportDto for governance and monitoring purposes.
+/// </summary>
 public class GenerateModelRiskReportQueryHandler : IRequestHandler<GenerateModelRiskReportQuery, ResponseData<ModelRiskReportDto>>
 {
     private readonly IReadApplicationDbContext _context;
