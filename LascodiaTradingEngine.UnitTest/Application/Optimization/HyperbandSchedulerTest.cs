@@ -1,5 +1,12 @@
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using Moq;
+using LascodiaTradingEngine.Application.Backtesting.Models;
+using LascodiaTradingEngine.Application.Backtesting.Services;
+using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Optimization;
 using LascodiaTradingEngine.Domain.Entities;
+using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.UnitTest.Application.Optimization;
 
@@ -233,6 +240,57 @@ public class HyperbandSchedulerTest
         }
     }
 
+    [Fact]
+    public async Task ExecuteAllBracketsAsync_PropagatesExternalCancellationDuringBracketEvaluation()
+    {
+        var metricsServices = new ServiceCollection().AddMetrics().BuildServiceProvider();
+        var scheduler = new HyperbandScheduler(
+            Mock.Of<ILogger>(),
+            new TradingMetrics(metricsServices.GetRequiredService<System.Diagnostics.Metrics.IMeterFactory>()));
+
+        using var cts = new CancellationTokenSource();
+        var validator = new OptimizationValidator(new SelfCancellingBacktestEngine(cts));
+        validator.SetInitialBalance(10_000m);
+
+        var brackets = new List<HyperbandScheduler.Bracket>
+        {
+            new HyperbandScheduler.Bracket(
+                Index: 0,
+                InitialCandidates: 3,
+                FidelityRungs: [1.0],
+                CandidatesPerRung: [3])
+        };
+
+        var strategy = new Strategy
+        {
+            Id = 1,
+            Symbol = "EURUSD",
+            Timeframe = Timeframe.H1,
+            StrategyType = StrategyType.BreakoutScalper,
+            ParametersJson = """{"Fast":10}"""
+        };
+
+        List<string> CandidateSource(int requestedCount, int _) =>
+            Enumerable.Range(1, requestedCount)
+                .Select(i => $"{{\"Fast\":{i}}}")
+                .ToList();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            scheduler.ExecuteAllBracketsAsync(
+                brackets,
+                CandidateSource,
+                CreateCandles(120),
+                strategy,
+                new BacktestOptions(),
+                validator,
+                baselineScore: 0.5m,
+                maxParallel: 1,
+                screeningTimeoutSeconds: 30,
+                circuitBreakerThreshold: 10,
+                globalBudgetRemaining: 3,
+                cts.Token));
+    }
+
     // ── Helpers ─────────────────────────────────────────────────────────────
 
     private static List<Candle> CreateCandles(int count) =>
@@ -248,4 +306,38 @@ public class HyperbandSchedulerTest
                 IsClosed = true,
             })
             .ToList();
+
+    private sealed class SelfCancellingBacktestEngine : IBacktestEngine
+    {
+        private readonly CancellationTokenSource _ownerCts;
+        private int _calls;
+
+        public SelfCancellingBacktestEngine(CancellationTokenSource ownerCts) => _ownerCts = ownerCts;
+
+        public async Task<BacktestResult> RunAsync(
+            Strategy strategy,
+            IReadOnlyList<Candle> candles,
+            decimal initialBalance,
+            CancellationToken ct,
+            BacktestOptions? options = null)
+        {
+            if (Interlocked.Increment(ref _calls) == 1)
+                _ownerCts.Cancel();
+
+            await Task.Yield();
+            ct.ThrowIfCancellationRequested();
+
+            return new BacktestResult
+            {
+                InitialBalance = initialBalance,
+                FinalBalance = initialBalance + 100m,
+                TotalTrades = 10,
+                WinRate = 0.60m,
+                ProfitFactor = 1.40m,
+                MaxDrawdownPct = 5m,
+                SharpeRatio = 1.1m,
+                Trades = []
+            };
+        }
+    }
 }

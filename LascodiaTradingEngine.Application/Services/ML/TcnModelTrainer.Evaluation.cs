@@ -11,7 +11,7 @@ public sealed partial class TcnModelTrainer
     /// <summary>
     /// Computes approximate Shapley values for the top-K most important channels.
     /// Uses exact enumeration of 2^K subsets (K ≤ 6 for tractability).
-    /// For each subset S, evaluates model accuracy with only channels in S active.
+    /// Non-top-K channels remain active; only top-K channels are toggled per subset.
     /// Shapley value = weighted average of marginal contributions across all subsets.
     /// </summary>
     internal static double[] ComputeShapleyValues(
@@ -244,8 +244,10 @@ public sealed partial class TcnModelTrainer
     /// <summary>Applies isotonic mapping from PAVA breakpoints via linear interpolation.</summary>
     private static double ApplyIsotonicMapping(double p, double[] breakpoints)
     {
-        if (breakpoints.Length < 2) return p;
+        if (breakpoints.Length < 4) return p;
         // breakpoints are interleaved [x0, y0, x1, y1, ...]
+        // Below-range: return first y value
+        if (p < breakpoints[0]) return breakpoints[1];
         for (int i = 0; i < breakpoints.Length - 2; i += 2)
         {
             double x0 = breakpoints[i], y0 = breakpoints[i + 1];
@@ -256,7 +258,7 @@ public sealed partial class TcnModelTrainer
                 return y0 + (y1 - y0) * (p - x0) / (x1 - x0);
             }
         }
-        // Extrapolate: return last y value
+        // Above-range: return last y value
         return breakpoints[breakpoints.Length - 1];
     }
 

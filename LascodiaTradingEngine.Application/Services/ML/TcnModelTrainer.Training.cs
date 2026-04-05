@@ -36,7 +36,8 @@ public sealed partial class TcnModelTrainer
     {
         double x = SampleGamma(rng, a);
         double y = SampleGamma(rng, b);
-        return x / (x + y);
+        double sum = x + y;
+        return sum > 1e-15 ? x / sum : 0.5; // guard against 0/0
     }
 
     private static double SampleGamma(Random rng, double shape)
@@ -56,7 +57,10 @@ public sealed partial class TcnModelTrainer
                 if (Math.Log(u) < 0.5 * x * x + d * (1.0 - v + Math.Log(v))) return d * v;
             }
         }
-        return SampleGamma(rng, shape + 1.0) * Math.Pow(rng.NextDouble(), 1.0 / shape);
+        double u2 = rng.NextDouble();
+        // Guard against u=0 which would produce 0^(1/shape) = 0, causing 0/0 in SampleBeta
+        if (u2 < 1e-15) u2 = 1e-15;
+        return SampleGamma(rng, shape + 1.0) * Math.Pow(u2, 1.0 / shape);
     }
 
     private static double SampleStdNormal(Random rng)

@@ -70,24 +70,28 @@ public sealed partial class TcnModelTrainer
         /// <returns>A reusable <see cref="TcnInferenceBuffer"/>.</returns>
         public TcnInferenceBuffer Rent(int seqT, int maxChannels, int filters)
         {
-            if (_pool.TryTake(out var buffer)
-                && buffer.SeqT >= seqT
-                && buffer.MaxChannels >= maxChannels
-                && buffer.PreActRow.Length >= Math.Max(maxChannels, filters))
+            if (_pool.TryTake(out var buffer))
             {
-                // Clear residual data from previous use.
-                for (int t = 0; t < buffer.SeqT; t++)
+                if (buffer.SeqT >= seqT
+                    && buffer.MaxChannels >= maxChannels
+                    && buffer.PreActRow.Length >= Math.Max(maxChannels, filters))
                 {
-                    Array.Clear(buffer.BufA[t]);
-                    Array.Clear(buffer.BufB[t]);
+                    // Clear residual data from previous use.
+                    for (int t = 0; t < buffer.SeqT; t++)
+                    {
+                        Array.Clear(buffer.BufA[t]);
+                        Array.Clear(buffer.BufB[t]);
+                    }
+
+                    Array.Clear(buffer.PreActRow);
+                    return buffer;
                 }
 
-                Array.Clear(buffer.PreActRow);
-                return buffer;
+                // Buffer was too small — return it to the pool so it's not leaked.
+                _pool.Add(buffer);
             }
 
-            // Buffer was too small or bag was empty — allocate a fresh one.
-            // If we popped a too-small buffer, let it be GC'd.
+            // Bag was empty or no suitably-sized buffer — allocate a fresh one.
             return new TcnInferenceBuffer(seqT, maxChannels, filters);
         }
 

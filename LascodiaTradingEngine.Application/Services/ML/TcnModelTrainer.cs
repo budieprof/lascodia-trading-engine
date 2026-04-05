@@ -342,14 +342,7 @@ public sealed partial class TcnModelTrainer : IMLModelTrainer
                     if (!compatible)
                         _logger.LogWarning("Warm-start architecture incompatible — weights may be partially restored");
 
-                    // Channel importance transfer (item 40)
-                    if (hp.TcnUseChannelImportanceTransfer &&
-                        warmStart.FeatureImportanceScores is { Length: > 0 } parentImp &&
-                        priorSnap.AttnQueryW?.Length == filters * filters)
-                    {
-                        _logger.LogInformation("Applying channel importance transfer from parent model");
-                        // Transfer will be applied after weight init in FitTcnModel
-                    }
+                    // Channel importance transfer (item 40) — applied in FitTcnModel after warm-start restore
                 }
             }
             catch (Exception ex) { _logger.LogDebug(ex, "Warm-start validation parse failed"); }
@@ -539,12 +532,15 @@ public sealed partial class TcnModelTrainer : IMLModelTrainer
         double monteCarloPermPValue = 1.0;
         if (hp.TcnMonteCarloPermutations > 0)
         {
+            // Use raw (uncalibrated) accuracy for fair comparison —
+            // the shuffled runs also use raw accuracy (plattA=1, plattB=0)
+            var rawMetrics = Evaluate(testSet, tcn, 1.0, 0.0, filters, useAttentionPool);
             monteCarloPermPValue = RunMonteCarloPermutationTest(
-                allStd, finalMetrics.Accuracy, hp, filters, numBlocks, dilations,
+                allStd, rawMetrics.Accuracy, hp, filters, numBlocks, dilations,
                 useLayerNorm, useAttentionPool, activation, attentionHeads,
                 hp.TcnMonteCarloPermutations, ct);
-            _logger.LogInformation("Monte Carlo permutation p-value={P:F4} ({N} permutations)",
-                monteCarloPermPValue, hp.TcnMonteCarloPermutations);
+            _logger.LogInformation("Monte Carlo permutation p-value={P:F4} ({N} permutations, raw acc={RawAcc:P1})",
+                monteCarloPermPValue, hp.TcnMonteCarloPermutations, rawMetrics.Accuracy);
         }
 
         // ── 10s. SHAP channel attribution (item 21) ─────────────────────────
@@ -605,6 +601,18 @@ public sealed partial class TcnModelTrainer : IMLModelTrainer
                 if (maskedCal.Count >= 10)
                     (abstentionWeights, abstentionBias, abstentionThreshold) =
                         FitTcnAbstentionModel(maskedCal, maskedCalProbs, pA, pB);
+
+                // Re-compute all 100/100 metrics on pruned model
+                (betaCalA, betaCalB, betaCalC) = FitBetaCalibration(maskedCal, maskedCalProbs);
+                vennAbersMultiP = maskedCal.Count >= 20 ? FitVennAbers(maskedCal, maskedCalProbs) : [];
+                (mce, eceBuy, eceSell) = ComputeCalibrationDecomposition(maskedTest, maskedTestProbs, pA, pB);
+                (calibrationLoss, refinementLoss) = ComputeLogLossDecomposition(maskedTest, maskedTestProbs, pA, pB);
+                isotonicBp = FitIsotonicCalibration(maskedCal, maskedCalProbs, pA, pB);
+                postIsotonicEce = ComputePostIsotonicEce(maskedTest, maskedTestProbs, pA, pB, isotonicBp);
+                predAutocorr = ComputePredictionAutocorrelation(maskedTest, maskedTestProbs, pA, pB);
+                confHistogramQuantiles = ComputeConfidenceHistogram(maskedTest, maskedTestProbs, pA, pB);
+                (relBinConf, relBinAcc, relBinCounts) = ComputeReliabilityDiagram(maskedTest, maskedTestProbs, pA, pB);
+                picpCoverage = ComputePicp(maskedTest, maskedTestProbs, pA, pB, conformalQHat);
             }
             else
             {
@@ -1017,6 +1025,15 @@ public sealed partial class TcnModelTrainer : IMLModelTrainer
                 }
             }
             catch (Exception ex) { _logger.LogWarning(ex, "Failed to load TCN warm-start; using cold start"); }
+        }
+
+        // ── Channel importance transfer (item 40) ───────────────────────────
+        if (hp.TcnUseChannelImportanceTransfer && useAttentionPool &&
+            warmStart?.FeatureImportanceScores is { Length: > 0 } parentImpScores &&
+            attnQueryW.Length == filters * filters)
+        {
+            TransferChannelImportance(attnQueryW, parentImpScores, filters);
+            _logger.LogInformation("Applied channel importance transfer from parent model");
         }
 
         // ── Adam state ───────────────────────────────────────────────────────

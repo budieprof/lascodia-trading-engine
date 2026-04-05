@@ -78,10 +78,9 @@ public sealed partial class TcnModelTrainer
         for (int si = 0; si < n; si++)
         {
             double p = Math.Clamp(TcnProb(samples[si], tcn, filters, useAttentionPool), 1e-7, 1 - 1e-7);
-            double y = samples[si].Direction > 0 ? 1.0 : 0.0;
-            // For binary classification, Fisher = p(1-p) for each parameter's contribution
-            // Simplified: use the squared gradient of the log-likelihood
-            double gradScale = (p - y) * (p - y);
+            // Fisher Information for binary cross-entropy: F = p(1-p)
+            // This is the expected squared gradient (variance of the score function)
+            double gradScale = p * (1.0 - p);
 
             // Distribute across all parameters proportionally
             // This is a simplified diagonal Fisher -- in practice we'd need per-param gradients

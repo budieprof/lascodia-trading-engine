@@ -892,6 +892,14 @@ public partial class OptimizationWorker : BackgroundService
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
+            if (ShouldPreservePersistedResult(completionPersisted, run.Status))
+            {
+                _logger.LogWarning(
+                    "OptimizationWorker: shutdown cancellation arrived after completion persistence for run {RunId} — keeping status {Status}",
+                    run.Id, run.Status);
+                return;
+            }
+
             // Graceful shutdown: the parent stoppingToken was cancelled (app shutting down).
             // Persist intermediate results and re-queue the run so crash recovery doesn't
             // have to restart from scratch. The IntermediateResultsJson (if populated by
@@ -1862,6 +1870,10 @@ public partial class OptimizationWorker : BackgroundService
                             decimal regimeScore = OptimizationHealthScorer.ComputeHealthScore(regimeResult);
                             lock (crossRegimeLock) crossRegimeResults.Add((entry.Regime, regimeScore));
                         }
+                        catch (OperationCanceledException) when (pCt.IsCancellationRequested)
+                        {
+                            throw;
+                        }
                         catch (Exception ex)
                         {
                             _logger.LogDebug(ex,
@@ -1888,6 +1900,10 @@ public partial class OptimizationWorker : BackgroundService
                         "OptimizationWorker: run {RunId} cross-regime evaluation timed out ({Limit}min) — " +
                         "primary regime params already saved, continuing with follow-ups",
                         run.Id, Math.Max(2, config.MaxRunTimeoutMinutes / 4));
+                }
+                catch (OperationCanceledException) when (runCt.IsCancellationRequested)
+                {
+                    throw;
                 }
                 catch (Exception ex)
                 {

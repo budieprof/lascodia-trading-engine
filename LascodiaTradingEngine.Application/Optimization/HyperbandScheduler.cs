@@ -339,6 +339,10 @@ internal sealed class HyperbandScheduler
                         scores.Add((idx, score, result));
                         Interlocked.Exchange(ref consecutiveFailures, 0);
                     }
+                    catch (OperationCanceledException) when (pCt.IsCancellationRequested)
+                    {
+                        throw;
+                    }
                     catch (OperationCanceledException) when (!pCt.IsCancellationRequested)
                     {
                         Interlocked.Increment(ref consecutiveFailures);

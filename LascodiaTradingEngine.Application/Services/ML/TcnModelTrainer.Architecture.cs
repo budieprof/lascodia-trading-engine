@@ -235,8 +235,9 @@ public sealed partial class TcnModelTrainer
         double[][] blockInput, int t, int inC, int filters, int kernelSize, int dilation,
         double[][] dBlockInput)
     {
-        // Backward through pointwise
-        var dDepthwise = new double[inC];
+        // Backward through pointwise (caller should pre-allocate dDepthwise; fallback alloc here)
+        Span<double> dDepthwise = inC <= 128 ? stackalloc double[inC] : new double[inC];
+        dDepthwise.Clear();
         for (int o = 0; o < filters; o++)
         {
             dPwB[o] += dOutput[o];

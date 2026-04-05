@@ -655,6 +655,10 @@ public partial class OptimizationWorker
                     lock (ehvi) ehvi.AddObservation(dblParams, result);
                 }
             }
+            catch (OperationCanceledException) when (pCt.IsCancellationRequested)
+            {
+                throw;
+            }
             catch (OperationCanceledException) when (!pCt.IsCancellationRequested)
             {
                 Interlocked.Increment(ref totalIters);
@@ -798,8 +802,12 @@ public partial class OptimizationWorker
                     // Thread-safe update of batch best using Interlocked on double bits
                     long scoreBits = BitConverter.DoubleToInt64Bits((double)score);
                     long current;
-                    do { current = Interlocked.Read(ref batchBestScoreBits); }
+                do { current = Interlocked.Read(ref batchBestScoreBits); }
                     while (scoreBits > current && Interlocked.CompareExchange(ref batchBestScoreBits, scoreBits, current) != current);
+                }
+                catch (OperationCanceledException) when (pCt.IsCancellationRequested)
+                {
+                    throw;
                 }
                 catch
                 {

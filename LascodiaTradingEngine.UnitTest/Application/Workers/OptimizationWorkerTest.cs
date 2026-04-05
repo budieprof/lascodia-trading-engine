@@ -13,6 +13,7 @@ using LascodiaTradingEngine.Application.AuditTrail.Commands.LogDecision;
 using LascodiaTradingEngine.Application.Backtesting.Models;
 using LascodiaTradingEngine.Application.Backtesting.Services;
 using LascodiaTradingEngine.Application.Common.Diagnostics;
+using LascodiaTradingEngine.Application.Common.Events;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Utilities;
 using LascodiaTradingEngine.Application.Optimization;
@@ -1808,11 +1809,173 @@ public class OptimizationWorkerTest
         Assert.Contains("Optimization follow-up validation failed", message, StringComparison.Ordinal);
     }
 
-    private static OptimizationWorker CreateWorker()
+    [Theory]
+    [InlineData(true, OptimizationRunStatus.Completed, true)]
+    [InlineData(true, OptimizationRunStatus.Approved, true)]
+    [InlineData(true, OptimizationRunStatus.Rejected, true)]
+    [InlineData(true, OptimizationRunStatus.Running, false)]
+    [InlineData(false, OptimizationRunStatus.Completed, false)]
+    public void ShouldPreservePersistedResult_OnlyAllowsPersistedTerminalStatuses(
+        bool completionPersisted,
+        OptimizationRunStatus status,
+        bool expected)
+    {
+        bool actual = OptimizationWorker.ShouldPreservePersistedResult(completionPersisted, status);
+
+        Assert.Equal(expected, actual);
+    }
+
+    [Fact]
+    public async Task ApplyApprovalDecisionAsync_PropagatesRunCancellation_DuringCrossRegimeEvaluation()
+    {
+        var nowUtc = DateTime.UtcNow;
+        var run = new OptimizationRun
+        {
+            Id = 407,
+            StrategyId = 15,
+            Status = OptimizationRunStatus.Completed,
+            CompletedAt = nowUtc,
+            BestParametersJson = """{"Fast":18,"Slow":44}"""
+        };
+        var strategy = new Strategy
+        {
+            Id = 15,
+            Name = "CrossRegimeCancel",
+            Symbol = "EURUSD",
+            Timeframe = Timeframe.H1,
+            ParametersJson = """{"Fast":10,"Slow":30}""",
+            StrategyType = StrategyType.BreakoutScalper,
+            Status = StrategyStatus.Active,
+            IsDeleted = false
+        };
+
+        var strategies = new List<Strategy> { strategy };
+        var backtests = new List<BacktestRun>();
+        var walks = new List<WalkForwardRun>();
+        var regimeParams = new List<StrategyRegimeParams>();
+        var snapshots = new List<MarketRegimeSnapshot>
+        {
+            new()
+            {
+                Id = 1,
+                Symbol = strategy.Symbol,
+                Timeframe = strategy.Timeframe,
+                Regime = MarketRegime.Ranging,
+                DetectedAt = nowUtc.AddDays(-12),
+                IsDeleted = false
+            },
+            new()
+            {
+                Id = 2,
+                Symbol = strategy.Symbol,
+                Timeframe = strategy.Timeframe,
+                Regime = MarketRegime.Trending,
+                DetectedAt = nowUtc.AddDays(-6),
+                IsDeleted = false
+            }
+        };
+        var candles = Enumerable.Range(0, 240)
+            .Select(i => new Candle
+            {
+                Symbol = strategy.Symbol,
+                Timeframe = strategy.Timeframe,
+                Timestamp = nowUtc.AddHours(-(240 - i)),
+                Open = 1.10m,
+                High = 1.11m,
+                Low = 1.09m,
+                Close = 1.10m,
+                IsClosed = true
+            })
+            .ToList();
+
+        var strategyDbSet = strategies.AsQueryable().BuildMockDbSet();
+        var backtestDbSet = backtests.AsQueryable().BuildMockDbSet();
+        backtestDbSet.Setup(d => d.Add(It.IsAny<BacktestRun>()))
+            .Callback<BacktestRun>(r => backtests.Add(r));
+        var walkDbSet = walks.AsQueryable().BuildMockDbSet();
+        walkDbSet.Setup(d => d.Add(It.IsAny<WalkForwardRun>()))
+            .Callback<WalkForwardRun>(r => walks.Add(r));
+        var regimeParamsDbSet = regimeParams.AsQueryable().BuildMockDbSet();
+        regimeParamsDbSet.Setup(d => d.Add(It.IsAny<StrategyRegimeParams>()))
+            .Callback<StrategyRegimeParams>(r => regimeParams.Add(r));
+        var snapshotDbSet = snapshots.AsQueryable().BuildMockDbSet();
+        var candleDbSet = candles.AsQueryable().BuildMockDbSet();
+
+        var db = new Mock<DbContext>();
+        db.Setup(c => c.Set<Strategy>()).Returns(strategyDbSet.Object);
+        db.Setup(c => c.Set<BacktestRun>()).Returns(backtestDbSet.Object);
+        db.Setup(c => c.Set<WalkForwardRun>()).Returns(walkDbSet.Object);
+        db.Setup(c => c.Set<StrategyRegimeParams>()).Returns(regimeParamsDbSet.Object);
+        db.Setup(c => c.Set<MarketRegimeSnapshot>()).Returns(snapshotDbSet.Object);
+        db.Setup(c => c.Set<Candle>()).Returns(candleDbSet.Object);
+
+        var writeCtx = new Mock<IWriteApplicationDbContext>();
+        writeCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
+        writeCtx.Setup(x => x.SaveChangesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(1);
+
+        var mediator = new Mock<IMediator>();
+        mediator.Setup(x => x.Send(It.IsAny<LogDecisionCommand>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(ResponseData<long>.Init(1, true, "ok", "00"));
+
+        using var runCts = new CancellationTokenSource();
+        var eventService = new Mock<IIntegrationEventService>();
+        eventService.Setup(x => x.SaveAndPublish(
+                It.IsAny<IDbContext>(),
+                It.IsAny<Lascodia.Trading.Engine.EventBus.Events.IntegrationEvent>()))
+            .Callback<IDbContext, Lascodia.Trading.Engine.EventBus.Events.IntegrationEvent>((_, evt) =>
+            {
+                if (evt is OptimizationApprovedIntegrationEvent)
+                    runCts.Cancel();
+            })
+            .Returns(Task.CompletedTask);
+
+        var worker = CreateWorker(new RecordingBacktestEngine());
+        var config = CreateOptimizationConfig(cooldownDays: 14, maxConsecutiveFailuresBeforeEscalation: 3);
+        var runContext = CreateRunContext(
+            run, strategy, config, baselineComparisonScore: 0.40m,
+            db.Object, db.Object, writeCtx.Object, mediator.Object,
+            Mock.Of<IAlertDispatcher>(), eventService.Object,
+            ct: CancellationToken.None,
+            runCt: runCts.Token);
+
+        var oosResult = new BacktestResult
+        {
+            TotalTrades = 24,
+            WinRate = 0.62m,
+            ProfitFactor = 1.70m,
+            MaxDrawdownPct = 4m,
+            SharpeRatio = 1.5m,
+            Trades = []
+        };
+        var validationResult = CreateCandidateValidationResult(
+            passed: true,
+            winnerParamsJson: """{"Fast":18,"Slow":44}""",
+            oosHealthScore: 0.74m,
+            oosResult: oosResult,
+            ciLower: 0.55m,
+            ciUpper: 0.82m,
+            wfAvgScore: 0.70m,
+            pessimisticScore: 0.68m,
+            failureReason: string.Empty);
+
+        var method = typeof(OptimizationWorker).GetMethod(
+            "ApplyApprovalDecisionAsync",
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
+
+        var task = (Task)method.Invoke(
+            worker,
+            [runContext, validationResult, MarketRegime.Trending, nowUtc.AddDays(-14), new BacktestOptions()])!;
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await task);
+    }
+
+    private static OptimizationWorker CreateWorker(
+        IBacktestEngine? backtestEngine = null,
+        IServiceScopeFactory? scopeFactory = null)
     {
         var logger = Mock.Of<ILogger<OptimizationWorker>>();
-        var scopeFactory = Mock.Of<IServiceScopeFactory>();
-        var backtestEngine = Mock.Of<IBacktestEngine>();
+        scopeFactory ??= Mock.Of<IServiceScopeFactory>();
+        backtestEngine ??= Mock.Of<IBacktestEngine>();
         var metricsServices = new ServiceCollection().AddMetrics().BuildServiceProvider();
         var meterFactory = metricsServices.GetRequiredService<System.Diagnostics.Metrics.IMeterFactory>();
         var metrics = new TradingMetrics(meterFactory);
@@ -1934,7 +2097,9 @@ public class OptimizationWorkerTest
         IWriteApplicationDbContext writeCtx,
         IMediator mediator,
         IAlertDispatcher alertDispatcher,
-        IIntegrationEventService eventService)
+        IIntegrationEventService eventService,
+        CancellationToken ct = default,
+        CancellationToken runCt = default)
     {
         var contextType = typeof(OptimizationWorker).GetNestedType("RunContext", BindingFlags.NonPublic)!;
         return contextType
@@ -1953,8 +2118,8 @@ public class OptimizationWorkerTest
                 mediator,
                 alertDispatcher,
                 eventService,
-                CancellationToken.None,
-                CancellationToken.None
+                ct,
+                runCt
             ]);
     }
 
