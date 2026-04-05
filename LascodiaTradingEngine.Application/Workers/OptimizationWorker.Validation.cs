@@ -115,9 +115,67 @@ public partial class OptimizationWorker
 
             if (!sensitivityOk)
             {
+                string failureReason = $"parameter sensitivity failure: {sensitivityReport}";
+                bool sensitivityMtfCompatible = !higherRegime.HasValue || IsRegimeCompatibleWithStrategy(strategy.StrategyType, higherRegime.Value);
+                double sensitivityCvValue = candidate.CvCoefficientOfVariation;
+                bool sensitivityCvConsistent = sensitivityCvValue <= config.MaxCvCoefficientOfVariation;
+
+                lastResult = new CandidateValidationResult(
+                    false,
+                    candidate,
+                    candidate.HealthScore,
+                    candidate.Result,
+                    candidate.HealthScore,
+                    candidate.HealthScore,
+                    candidate.HealthScore,
+                    1.0,
+                    0.05,
+                    false,
+                    false,
+                    sensitivityReport,
+                    true,
+                    candidate.HealthScore,
+                    false,
+                    candidate.HealthScore,
+                    true,
+                    sensitivityMtfCompatible,
+                    true,
+                    true,
+                    0,
+                    true,
+                    0,
+                    sensitivityCvConsistent,
+                    sensitivityCvValue,
+                    JsonSerializer.Serialize(new Dictionary<string, object?>
+                    {
+                        ["passed"] = false,
+                        ["sensitivityOk"] = false,
+                        ["failureReason"] = failureReason,
+                    }),
+                    failureReason);
+
+                _metrics.OptimizationGateRejections.Add(1, new KeyValuePair<string, object?>("gate", "sensitivity"));
+
+                if (gateTimings.Count > 0)
+                {
+                    _logger.LogDebug("OptimizationWorker: gate timings — {Timings}",
+                        string.Join(", ", gateTimings.Select(g => $"{g.Gate}={g.DurationMs:F0}ms")));
+
+                    foreach (var (gate, ms) in gateTimings)
+                        _metrics.OptimizationPhaseDurationMs.Record(ms, new KeyValuePair<string, object?>("gate", gate));
+                }
+
+                if (failedResults.Count < 3)
+                    failedResults.Add((candidateRank, candidate.ParamsJson, failureReason, candidate.HealthScore));
+
+                try { await HeartbeatRunAsync(run, writeCtx, ct); }
+                catch (Exception ex) { _logger.LogDebug(ex, "OptimizationWorker: heartbeat renewal failed during Pareto validation for run {RunId}", run.Id); }
+
                 _logger.LogDebug("OptimizationWorker: run {RunId} candidate #{Rank} sensitivity failed — trying next",
                     run.Id, candidateRank);
                 if (candidateRank < rankedCandidates.Count) continue;
+
+                return lastResult with { FailedCandidates = failedResults };
             }
             #endregion
 

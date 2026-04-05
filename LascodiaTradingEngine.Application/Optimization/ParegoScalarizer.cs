@@ -96,6 +96,18 @@ internal sealed class ParegoScalarizer
             _currentWeights);
 
     /// <summary>
+    /// Thread-safe overload for raw metric values with an explicit weight vector.
+    /// Useful when the caller captured the active weights before entering a parallel
+    /// section or needs to replay prior observations against a known scalarization.
+    /// </summary>
+    internal double Scalarize(decimal sharpeRatio, decimal maxDrawdownPct, decimal winRate, double[] weights)
+        => ScalarizeCore(
+            (double)sharpeRatio,
+            (double)maxDrawdownPct,
+            (double)winRate,
+            weights);
+
+    /// <summary>
     /// Thread-safe overload that accepts an explicit weight vector (captured before
     /// a <c>Parallel.ForEachAsync</c> block). Avoids reading the volatile field from
     /// multiple threads during parallel evaluation.

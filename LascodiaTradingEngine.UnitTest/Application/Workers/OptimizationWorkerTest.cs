@@ -954,6 +954,92 @@ public class OptimizationWorkerTest
     }
 
     [Fact]
+    public void ApplyImportanceGuidedBoundAdjustments_ReexpandsLowImportanceParamsWithinOriginalEnvelope()
+    {
+        var currentBounds = new Dictionary<string, (double Min, double Max, bool IsInteger)>
+        {
+            ["Fast"] = (2.0, 4.0, true),
+            ["Slow"] = (10.0, 30.0, true)
+        };
+        var outerBounds = new Dictionary<string, (double Min, double Max, bool IsInteger)>
+        {
+            ["Fast"] = (0.0, 10.0, true),
+            ["Slow"] = (0.0, 50.0, true)
+        };
+        var importance = new Dictionary<string, double>
+        {
+            ["Fast"] = 0.10,
+            ["Slow"] = 0.80
+        };
+
+        var adjusted = OptimizationWorker.ApplyImportanceGuidedBoundAdjustments(
+            currentBounds, outerBounds, importance);
+
+        Assert.True(adjusted["Fast"].Min < currentBounds["Fast"].Min);
+        Assert.True(adjusted["Fast"].Max > currentBounds["Fast"].Max);
+        Assert.True(adjusted["Slow"].Min > currentBounds["Slow"].Min);
+        Assert.True(adjusted["Slow"].Max < currentBounds["Slow"].Max);
+        Assert.InRange(adjusted["Fast"].Min, outerBounds["Fast"].Min, outerBounds["Fast"].Max);
+        Assert.InRange(adjusted["Fast"].Max, outerBounds["Fast"].Min, outerBounds["Fast"].Max);
+    }
+
+    [Fact]
+    public void GetCheckpointSurrogateObservationScore_UsesParegoScalarization_WhenEnabled()
+    {
+        var scalarizer = new ParegoScalarizer(123);
+        var result = new BacktestResult
+        {
+            SharpeRatio = 1.40m,
+            MaxDrawdownPct = 6.0m,
+            WinRate = 0.62m,
+            Trades = []
+        };
+
+        double paregoScore = OptimizationWorker.GetCheckpointSurrogateObservationScore(
+            useParegoScalarization: true,
+            paregoScalarizer: scalarizer,
+            result: result,
+            healthScore: 0.12m);
+
+        Assert.Equal(scalarizer.Scalarize(result), paregoScore, precision: 10);
+        Assert.NotEqual(0.12d, paregoScore);
+    }
+
+    [Fact]
+    public void TryGetWarmStartSurrogateObservationScore_RequiresObjectiveMetricsForParego()
+    {
+        var scalarizer = new ParegoScalarizer(321);
+
+        bool valid = OptimizationWorker.TryGetWarmStartSurrogateObservationScore(
+            useParegoScalarization: true,
+            paregoScalarizer: scalarizer,
+            healthScore: 0.80m,
+            sharpeRatio: 1.60m,
+            maxDrawdownPct: 5.0m,
+            winRate: 0.61m,
+            decayFactor: 0.5,
+            out double surrogateScore);
+
+        Assert.True(valid);
+        Assert.Equal(
+            scalarizer.Scalarize(1.60m, 5.0m, 0.61m) * 0.5,
+            surrogateScore,
+            precision: 10);
+
+        bool missingObjectives = OptimizationWorker.TryGetWarmStartSurrogateObservationScore(
+            useParegoScalarization: true,
+            paregoScalarizer: scalarizer,
+            healthScore: 0.80m,
+            sharpeRatio: null,
+            maxDrawdownPct: 5.0m,
+            winRate: 0.61m,
+            decayFactor: 0.5,
+            out _);
+
+        Assert.False(missingObjectives);
+    }
+
+    [Fact]
     public void OptimizationCheckpointStore_RestoresObservationOrderAndSeenParameters()
     {
         string json = OptimizationCheckpointStore.Serialize(
@@ -2389,6 +2475,75 @@ public class OptimizationWorkerTest
         var failedRun = optimizationRuns.Single(r => r.Id == 401);
         Assert.Equal(OptimizationRunStatus.Failed, failedRun.Status);
         Assert.Equal(0, failedRun.RetryCount);
+    }
+
+    [Fact]
+    public async Task RetryFailedRunsAsync_AbandonsSearchExhaustedRunWithoutRetry()
+    {
+        var nowUtc = DateTime.UtcNow;
+        var optimizationRuns = new List<OptimizationRun>
+        {
+            new()
+            {
+                Id = 451,
+                StrategyId = 88,
+                Status = OptimizationRunStatus.Failed,
+                RetryCount = 0,
+                FailureCategory = OptimizationFailureCategory.SearchExhausted,
+                ErrorMessage = "Search space exhausted",
+                CompletedAt = nowUtc.AddMinutes(-20),
+                StartedAt = nowUtc.AddHours(-1),
+                IsDeleted = false
+            }
+        };
+
+        var configs = new List<EngineConfig>
+        {
+            new()
+            {
+                Id = 1,
+                Key = "Optimization:MaxRetryAttempts",
+                Value = "2",
+                DataType = ConfigDataType.Int,
+                IsDeleted = false
+            }
+        };
+        var alerts = new List<Alert>();
+
+        var optRunDbSet = optimizationRuns.AsQueryable().BuildMockDbSet();
+        var configDbSet = configs.AsQueryable().BuildMockDbSet();
+        var alertDbSet = alerts.AsQueryable().BuildMockDbSet();
+        alertDbSet.Setup(d => d.Add(It.IsAny<Alert>()))
+            .Callback<Alert>(a => alerts.Add(a));
+
+        var db = new Mock<DbContext>();
+        db.Setup(c => c.Set<OptimizationRun>()).Returns(optRunDbSet.Object);
+        db.Setup(c => c.Set<EngineConfig>()).Returns(configDbSet.Object);
+        db.Setup(c => c.Set<Alert>()).Returns(alertDbSet.Object);
+
+        var readCtx = new Mock<IReadApplicationDbContext>();
+        readCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
+
+        var writeCtx = new Mock<IWriteApplicationDbContext>();
+        writeCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
+        writeCtx.Setup(x => x.SaveChangesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(1);
+
+        var services = new ServiceCollection()
+            .AddSingleton(readCtx.Object)
+            .AddSingleton(writeCtx.Object)
+            .BuildServiceProvider();
+
+        var worker = CreateWorker(scopeFactory: services.GetRequiredService<IServiceScopeFactory>());
+        var method = typeof(OptimizationWorker).GetMethod(
+            "RetryFailedRunsAsync",
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
+
+        await (Task)method.Invoke(worker, [CancellationToken.None])!;
+
+        var exhaustedRun = optimizationRuns.Single(r => r.Id == 451);
+        Assert.Equal(OptimizationRunStatus.Abandoned, exhaustedRun.Status);
+        Assert.Equal(0, exhaustedRun.RetryCount);
+        Assert.Contains("search exhausted", exhaustedRun.ErrorMessage!, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

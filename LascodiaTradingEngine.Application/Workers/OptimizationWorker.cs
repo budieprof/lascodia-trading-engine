@@ -1113,6 +1113,7 @@ public partial class OptimizationWorker : BackgroundService
                      && !r.IsDeleted
                      && r.RetryCount < maxRetryAttempts
                      && r.FailureCategory != OptimizationFailureCategory.ConfigError
+                     && r.FailureCategory != OptimizationFailureCategory.SearchExhausted
                      && r.FailureCategory != OptimizationFailureCategory.StrategyRemoved
                      && r.CompletedAt != null && r.CompletedAt >= retryWindowStart
                      && r.CompletedAt.Value.AddMinutes(15 << r.RetryCount) <= nowUtc)
@@ -1170,16 +1171,21 @@ public partial class OptimizationWorker : BackgroundService
         var abandonedRuns = await writeDb.Set<OptimizationRun>()
             .Where(r => r.Status == OptimizationRunStatus.Failed
                      && !r.IsDeleted
-                     && (r.RetryCount >= maxRetryAttempts
+                     && (r.FailureCategory == OptimizationFailureCategory.SearchExhausted
+                         || r.RetryCount >= maxRetryAttempts
                          || (r.CompletedAt != null && r.CompletedAt < retryWindowStart)))
             .ToListAsync(ct);
         int abandoned = abandonedRuns.Count;
 
         foreach (var run in abandonedRuns)
         {
-            string abandonmentMessage = string.IsNullOrWhiteSpace(run.ErrorMessage)
-                ? $"Retry budget exhausted — moved to dead-letter queue [Abandoned after {run.RetryCount} retries]"
-                : $"{run.ErrorMessage} [Abandoned after {run.RetryCount} retries]";
+            string abandonmentMessage = run.FailureCategory == OptimizationFailureCategory.SearchExhausted
+                ? string.IsNullOrWhiteSpace(run.ErrorMessage)
+                    ? "Search space exhausted — moved to dead-letter queue [Marked non-retryable]"
+                    : $"{run.ErrorMessage} [Marked non-retryable: search exhausted]"
+                : string.IsNullOrWhiteSpace(run.ErrorMessage)
+                    ? $"Retry budget exhausted — moved to dead-letter queue [Abandoned after {run.RetryCount} retries]"
+                    : $"{run.ErrorMessage} [Abandoned after {run.RetryCount} retries]";
             OptimizationRunStateMachine.Transition(
                 run,
                 OptimizationRunStatus.Abandoned,

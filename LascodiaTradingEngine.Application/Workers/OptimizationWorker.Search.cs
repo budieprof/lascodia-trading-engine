@@ -18,6 +18,83 @@ public partial class OptimizationWorker
 {
     // ── Stage: Bayesian Search (Stages 5–6) ─────────────────────────────────
 
+    internal static Dictionary<string, (double Min, double Max, bool IsInteger)> ApplyImportanceGuidedBoundAdjustments(
+        IReadOnlyDictionary<string, (double Min, double Max, bool IsInteger)> currentBounds,
+        IReadOnlyDictionary<string, (double Min, double Max, bool IsInteger)> outerBounds,
+        IReadOnlyDictionary<string, double> importance)
+    {
+        var adjusted = currentBounds.ToDictionary(kvp => kvp.Key, kvp => kvp.Value, StringComparer.OrdinalIgnoreCase);
+
+        foreach (var (param, imp) in importance)
+        {
+            if (!adjusted.TryGetValue(param, out var bounds)) continue;
+            if (!outerBounds.TryGetValue(param, out var outer)) continue;
+
+            double range = bounds.Max - bounds.Min;
+            if (range <= 0) continue;
+
+            double center = (bounds.Max + bounds.Min) / 2.0;
+            double adjustFactor = imp > 0.5 ? 1.0 - 0.20 * (imp - 0.5) / 0.5
+                                : imp < 0.2 ? 1.0 + 0.10 * (0.2 - imp) / 0.2
+                                : 1.0;
+
+            double newHalfRange = range / 2.0 * adjustFactor;
+            adjusted[param] = (
+                Math.Max(outer.Min, center - newHalfRange),
+                Math.Min(outer.Max, center + newHalfRange),
+                bounds.IsInteger);
+        }
+
+        return adjusted;
+    }
+
+    internal static double GetCheckpointSurrogateObservationScore(
+        bool useParegoScalarization,
+        ParegoScalarizer paregoScalarizer,
+        BacktestResult? result,
+        decimal healthScore)
+        => useParegoScalarization
+            ? result is not null
+                ? paregoScalarizer.Scalarize(result)
+                : (double)healthScore
+            : (double)healthScore;
+
+    internal static bool TryGetWarmStartSurrogateObservationScore(
+        bool useParegoScalarization,
+        ParegoScalarizer paregoScalarizer,
+        decimal? healthScore,
+        decimal? sharpeRatio,
+        decimal? maxDrawdownPct,
+        decimal? winRate,
+        double decayFactor,
+        out double surrogateScore)
+    {
+        if (useParegoScalarization)
+        {
+            if (!sharpeRatio.HasValue || !maxDrawdownPct.HasValue || !winRate.HasValue)
+            {
+                surrogateScore = 0;
+                return false;
+            }
+
+            surrogateScore = paregoScalarizer.Scalarize(
+                sharpeRatio.Value,
+                maxDrawdownPct.Value,
+                winRate.Value) * decayFactor;
+            return true;
+        }
+
+        if (!healthScore.HasValue)
+        {
+            surrogateScore = 0;
+            return false;
+        }
+
+        const double decayMidpoint = 0.5;
+        surrogateScore = decayMidpoint + ((double)healthScore.Value - decayMidpoint) * decayFactor;
+        return true;
+    }
+
     internal static List<Dictionary<string, double>> SuggestInitialCandidates(
         TreeParzenEstimator? tpe,
         GaussianProcessSurrogate? gp,
@@ -58,7 +135,11 @@ public partial class OptimizationWorker
     {
         _validator.SetInitialBalance(config.ScreeningInitialBalance);
         var parameterGrid = await _gridBuilder.BuildParameterGridAsync(db, strategy.StrategyType, runCt);
-        var tpeBounds     = OptimizationGridBuilder.ExtractTpeBounds(parameterGrid);
+        var originalTpeBounds = OptimizationGridBuilder.ExtractTpeBounds(parameterGrid);
+        var tpeBounds = originalTpeBounds.ToDictionary(
+            kvp => kvp.Key,
+            kvp => kvp.Value,
+            StringComparer.OrdinalIgnoreCase);
 
         // Adaptive bounds: narrow based on historically approved params
         if (config.AdaptiveBoundsEnabled)
@@ -94,26 +175,7 @@ public partial class OptimizationWorker
 
                 if (importance.Count > 0)
                 {
-                    // For high-importance params (>0.5), narrow bounds by up to 20% extra
-                    // beyond what adaptive bounds already did. For low-importance params (<0.2),
-                    // widen bounds by 10% to encourage more exploration in those dimensions.
-                    foreach (var (param, imp) in importance)
-                    {
-                        if (!tpeBounds.TryGetValue(param, out var bounds)) continue;
-                        double range = bounds.Max - bounds.Min;
-                        if (range <= 0) continue;
-
-                        double center = (bounds.Max + bounds.Min) / 2.0;
-                        double adjustFactor = imp > 0.5 ? 1.0 - 0.20 * (imp - 0.5) / 0.5  // 0.80–1.00 for high importance
-                                            : imp < 0.2 ? 1.0 + 0.10 * (0.2 - imp) / 0.2  // 1.00–1.10 for low importance
-                                            : 1.0;
-
-                        double newHalfRange = range / 2.0 * adjustFactor;
-                        tpeBounds[param] = (
-                            Math.Max(bounds.Min, center - newHalfRange),
-                            Math.Min(bounds.Max, center + newHalfRange),
-                            bounds.IsInteger);
-                    }
+                    tpeBounds = ApplyImportanceGuidedBoundAdjustments(tpeBounds, originalTpeBounds, importance);
 
                     _logger.LogDebug(
                         "OptimizationWorker: parameter importance applied for strategy {Id} — {Count} param(s) adjusted from {RunCount} prior approvals",
@@ -251,8 +313,13 @@ public partial class OptimizationWorker
                     }
                     else
                     {
-                        if (tpe is not null) { tpe.AddObservation(dblDict, (double)obs.HealthScore); seeded = true; }
-                        if (gp is not null) { gp.AddObservation(dblDict, (double)obs.HealthScore); seeded = true; }
+                        double surrogateScore = GetCheckpointSurrogateObservationScore(
+                            useParegoScalarization,
+                            paregoScalarizer,
+                            obs.Result,
+                            obs.HealthScore);
+                        if (tpe is not null) { tpe.AddObservation(dblDict, surrogateScore); seeded = true; }
+                        if (gp is not null) { gp.AddObservation(dblDict, surrogateScore); seeded = true; }
                     }
                     if (seeded) checkpointSeeded++;
                 }
@@ -284,7 +351,6 @@ public partial class OptimizationWorker
 
         int warmStarted = 0;
         const double decayHalfLifeDays = 30.0;
-        const double decayMidpoint = 0.5;
         var nowUtcForDecay = DateTime.UtcNow;
 
         // Extract the current regime string for warm-start regime filtering
@@ -333,10 +399,6 @@ public partial class OptimizationWorker
                         if (v.TryGetDouble(out double d) && tpeBounds.ContainsKey(k)) dblDict[k] = d;
                     if (dblDict.Count != tpeBounds.Count) continue; // Skip if param shape changed
 
-                    // Temporal decay: blend score toward midpoint based on age
-                    double rawScore = (double)score.Value;
-                    double decayedScore = decayMidpoint + (rawScore - decayMidpoint) * decayFactor;
-
                     if (ehvi is not null)
                     {
                         // EHVI warm-start: use per-objective fields when available (best params only,
@@ -353,8 +415,20 @@ public partial class OptimizationWorker
                         // This is expected — EHVI gets fewer warm-start points than TPE/GP.
                         continue;
                     }
-                    if (tpe is not null) { tpe.AddObservation(dblDict, decayedScore); warmStarted++; }
-                    if (gp is not null) { gp.AddObservation(dblDict, decayedScore); warmStarted++; }
+
+                    bool canWarmStart = TryGetWarmStartSurrogateObservationScore(
+                        useParegoScalarization,
+                        paregoScalarizer,
+                        score,
+                        json == prior.BestParametersJson ? prior.BestSharpeRatio : null,
+                        json == prior.BestParametersJson ? prior.BestMaxDrawdownPct : null,
+                        json == prior.BestParametersJson ? prior.BestWinRate : null,
+                        decayFactor,
+                        out double surrogateScore);
+                    if (!canWarmStart) continue;
+
+                    if (tpe is not null) { tpe.AddObservation(dblDict, surrogateScore); warmStarted++; }
+                    if (gp is not null) { gp.AddObservation(dblDict, surrogateScore); warmStarted++; }
                 }
                 catch (Exception ex) { _logger.LogDebug(ex, "OptimizationWorker: skipping malformed prior run params during warm-start"); }
             }
