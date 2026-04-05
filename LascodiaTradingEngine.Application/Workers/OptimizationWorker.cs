@@ -574,68 +574,60 @@ public partial class OptimizationWorker : BackgroundService
                 return;
             }
 
+            // Pre-flight: load strategy symbol/timeframe once for both regime transition
+            // and EA availability guards (avoids duplicate queries on the same row).
+            var preflightStrategy = await db.Set<Strategy>()
+                .Where(s => s.Id == run.StrategyId && !s.IsDeleted)
+                .Select(s => new { s.Symbol, s.Timeframe })
+                .FirstOrDefaultAsync(ct);
+
             // Regime transition guard: if the regime for this strategy's symbol changed
             // within the last N hours, parameters optimized during the transition may
             // fit transitional noise rather than the new regime's characteristics.
+            if (preflightStrategy is not null)
             {
-                var runStrategy = await db.Set<Strategy>()
-                    .Where(s => s.Id == run.StrategyId && !s.IsDeleted)
-                    .Select(s => new { s.Symbol, s.Timeframe })
-                    .FirstOrDefaultAsync(ct);
+                int regimeStabilityHours = config.RegimeStabilityHours;
+                var recentRegimes = await db.Set<MarketRegimeSnapshot>()
+                    .Where(s => s.Symbol == preflightStrategy.Symbol
+                             && s.Timeframe == preflightStrategy.Timeframe
+                             && s.DetectedAt >= DateTime.UtcNow.AddHours(-regimeStabilityHours)
+                             && !s.IsDeleted)
+                    .Select(s => s.Regime)
+                    .Distinct()
+                    .CountAsync(ct);
 
-                if (runStrategy is not null)
+                if (recentRegimes > 1)
                 {
-                    int regimeStabilityHours = config.RegimeStabilityHours;
-                    var recentRegimes = await db.Set<MarketRegimeSnapshot>()
-                        .Where(s => s.Symbol == runStrategy.Symbol
-                                 && s.Timeframe == runStrategy.Timeframe
-                                 && s.DetectedAt >= DateTime.UtcNow.AddHours(-regimeStabilityHours)
-                                 && !s.IsDeleted)
-                        .Select(s => s.Regime)
-                        .Distinct()
-                        .CountAsync(ct);
-
-                    if (recentRegimes > 1)
-                    {
-                        _logger.LogInformation(
-                            "OptimizationWorker: regime transition detected for {Symbol}/{Tf} in last {Hours}h — deferring run {RunId}",
-                            runStrategy.Symbol, runStrategy.Timeframe, regimeStabilityHours, run.Id);
-                        _metrics.OptimizationRunsDeferred.Add(1, new KeyValuePair<string, object?>("reason", "regime_transition"));
-                        OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Queued, DateTime.UtcNow);
-                        run.DeferredUntilUtc = DateTime.UtcNow.AddHours(regimeStabilityHours);
-                        await writeCtx.SaveChangesAsync(ct);
-                        return;
-                    }
+                    _logger.LogInformation(
+                        "OptimizationWorker: regime transition detected for {Symbol}/{Tf} in last {Hours}h — deferring run {RunId}",
+                        preflightStrategy.Symbol, preflightStrategy.Timeframe, regimeStabilityHours, run.Id);
+                    _metrics.OptimizationRunsDeferred.Add(1, new KeyValuePair<string, object?>("reason", "regime_transition"));
+                    OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Queued, DateTime.UtcNow);
+                    run.DeferredUntilUtc = DateTime.UtcNow.AddHours(regimeStabilityHours);
+                    await writeCtx.SaveChangesAsync(ct);
+                    return;
                 }
             }
 
             // EA data availability guard: if the strategy's symbol has no active EA instances
             // feeding data, we'd be optimizing against stale candles. Defer until data resumes.
-            if (config.RequireEADataAvailability)
+            if (config.RequireEADataAvailability && preflightStrategy is not null)
             {
-                var stratForEA = await db.Set<Strategy>()
-                    .Where(s => s.Id == run.StrategyId && !s.IsDeleted)
-                    .Select(s => s.Symbol)
-                    .FirstOrDefaultAsync(ct);
+                var maxHeartbeatAge = TimeSpan.FromSeconds(60);
+                bool hasActiveEA = await db.Set<EAInstance>()
+                    .ActiveAndFreshForSymbol(preflightStrategy.Symbol, maxHeartbeatAge)
+                    .AnyAsync(ct);
 
-                if (stratForEA is not null)
+                if (!hasActiveEA)
                 {
-                    var maxHeartbeatAge = TimeSpan.FromSeconds(60);
-                    bool hasActiveEA = await db.Set<EAInstance>()
-                        .ActiveAndFreshForSymbol(stratForEA, maxHeartbeatAge)
-                        .AnyAsync(ct);
-
-                    if (!hasActiveEA)
-                    {
-                        _logger.LogInformation(
-                            "OptimizationWorker: no active EA instance for {Symbol} — deferring run {RunId} (DATA_UNAVAILABLE)",
-                            stratForEA, run.Id);
-                        _metrics.OptimizationRunsDeferred.Add(1, new KeyValuePair<string, object?>("reason", "ea_data_unavailable"));
-                        OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Queued, DateTime.UtcNow);
-                        run.DeferredUntilUtc = DateTime.UtcNow.AddMinutes(15);
-                        await writeCtx.SaveChangesAsync(ct);
-                        return;
-                    }
+                    _logger.LogInformation(
+                        "OptimizationWorker: no active EA instance for {Symbol} — deferring run {RunId} (DATA_UNAVAILABLE)",
+                        preflightStrategy.Symbol, run.Id);
+                    _metrics.OptimizationRunsDeferred.Add(1, new KeyValuePair<string, object?>("reason", "ea_data_unavailable"));
+                    OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Queued, DateTime.UtcNow);
+                    run.DeferredUntilUtc = DateTime.UtcNow.AddMinutes(15);
+                    await writeCtx.SaveChangesAsync(ct);
+                    return;
                 }
             }
 
@@ -726,7 +718,7 @@ public partial class OptimizationWorker : BackgroundService
                 CancellationToken      = runCt,
             };
             var fineRanked = new List<ScoredCandidate>();
-            var _fineLock = new object();
+            var fineLock = new object();
             await Parallel.ForEachAsync(topCandidates, parallelOptions, async (candidate, pCt) =>
             {
                 try
@@ -735,7 +727,7 @@ public partial class OptimizationWorker : BackgroundService
                         strategy, candidate.ParamsJson, trainCandles, screeningOptions,
                         config.ScreeningTimeoutSeconds, pCt);
                     Interlocked.Increment(ref totalIters);
-                    lock (_fineLock) fineRanked.Add(new ScoredCandidate(
+                    lock (fineLock) fineRanked.Add(new ScoredCandidate(
                         candidate.ParamsJson,
                         OptimizationHealthScorer.ComputeHealthScore(result),
                         result,
