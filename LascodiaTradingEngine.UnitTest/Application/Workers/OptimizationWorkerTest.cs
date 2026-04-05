@@ -846,6 +846,108 @@ public class OptimizationWorkerTest
     }
 
     [Fact]
+    public async Task EnsureValidationFollowUpsAsync_PinsFollowUpWindowToApprovalTimestamp()
+    {
+        var config = CreateOptimizationConfig(
+            cooldownDays: 14,
+            maxConsecutiveFailuresBeforeEscalation: 3,
+            screeningInitialBalance: 25_000m);
+        var approvedAt = new DateTime(2026, 04, 01, 12, 0, 0, DateTimeKind.Utc);
+        var run = new OptimizationRun
+        {
+            Id = 78,
+            StrategyId = 5,
+            ApprovedAt = approvedAt,
+            CompletedAt = approvedAt.AddMinutes(-5),
+            ConfigSnapshotJson = JsonSerializer.Serialize(new { Version = 1, Config = config })
+        };
+        var strategy = new Strategy { Id = 5, Symbol = "EURUSD", Timeframe = Timeframe.H1 };
+
+        var backtests = new List<BacktestRun>();
+        var walks = new List<WalkForwardRun>();
+
+        var backtestDbSet = backtests.AsQueryable().BuildMockDbSet();
+        backtestDbSet.Setup(d => d.Add(It.IsAny<BacktestRun>()))
+            .Callback<BacktestRun>(r => backtests.Add(r));
+
+        var walkDbSet = walks.AsQueryable().BuildMockDbSet();
+        walkDbSet.Setup(d => d.Add(It.IsAny<WalkForwardRun>()))
+            .Callback<WalkForwardRun>(r => walks.Add(r));
+
+        var db = new Mock<DbContext>();
+        db.Setup(c => c.Set<BacktestRun>()).Returns(backtestDbSet.Object);
+        db.Setup(c => c.Set<WalkForwardRun>()).Returns(walkDbSet.Object);
+
+        var method = typeof(OptimizationWorker).GetMethod(
+            "EnsureValidationFollowUpsAsync",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        await (Task<bool>)method.Invoke(null, [db.Object, run, strategy, config, CancellationToken.None])!;
+
+        var backtest = Assert.Single(backtests);
+        var walkForward = Assert.Single(walks);
+
+        Assert.Equal(approvedAt.AddYears(-1), backtest.FromDate);
+        Assert.Equal(approvedAt, backtest.ToDate);
+        Assert.Equal(backtest.FromDate, walkForward.FromDate);
+        Assert.Equal(backtest.ToDate, walkForward.ToDate);
+    }
+
+    [Fact]
+    public async Task EnsureValidationFollowUpsAsync_ReusesExistingWindowWhenRepairingMissingRows()
+    {
+        var config = CreateOptimizationConfig(
+            cooldownDays: 14,
+            maxConsecutiveFailuresBeforeEscalation: 3,
+            screeningInitialBalance: 25_000m);
+        var expectedFrom = new DateTime(2025, 02, 01, 0, 0, 0, DateTimeKind.Utc);
+        var expectedTo = new DateTime(2026, 02, 01, 0, 0, 0, DateTimeKind.Utc);
+        var run = new OptimizationRun
+        {
+            Id = 79,
+            StrategyId = 5,
+            ApprovedAt = new DateTime(2026, 04, 01, 12, 0, 0, DateTimeKind.Utc),
+            ConfigSnapshotJson = JsonSerializer.Serialize(new { Version = 1, Config = config })
+        };
+        var strategy = new Strategy { Id = 5, Symbol = "EURUSD", Timeframe = Timeframe.H1 };
+
+        var backtests = new List<BacktestRun>
+        {
+            new()
+            {
+                Id = 1,
+                SourceOptimizationRunId = run.Id,
+                StrategyId = run.StrategyId,
+                FromDate = expectedFrom,
+                ToDate = expectedTo,
+                Status = RunStatus.Completed,
+                IsDeleted = false
+            }
+        };
+        var walks = new List<WalkForwardRun>();
+
+        var backtestDbSet = backtests.AsQueryable().BuildMockDbSet();
+        var walkDbSet = walks.AsQueryable().BuildMockDbSet();
+        walkDbSet.Setup(d => d.Add(It.IsAny<WalkForwardRun>()))
+            .Callback<WalkForwardRun>(r => walks.Add(r));
+
+        var db = new Mock<DbContext>();
+        db.Setup(c => c.Set<BacktestRun>()).Returns(backtestDbSet.Object);
+        db.Setup(c => c.Set<WalkForwardRun>()).Returns(walkDbSet.Object);
+
+        var method = typeof(OptimizationWorker).GetMethod(
+            "EnsureValidationFollowUpsAsync",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        bool hadAllRows = await (Task<bool>)method.Invoke(null, [db.Object, run, strategy, config, CancellationToken.None])!;
+
+        Assert.False(hadAllRows);
+        var walkForward = Assert.Single(walks);
+        Assert.Equal(expectedFrom, walkForward.FromDate);
+        Assert.Equal(expectedTo, walkForward.ToDate);
+    }
+
+    [Fact]
     public async Task MonitorFollowUpResultsAsync_RecreatesMissingFollowUps_WhenRowsAreAbsent()
     {
         var runs = new List<OptimizationRun>
@@ -2796,6 +2898,71 @@ public class OptimizationWorkerTest
     }
 
     [Fact]
+    public async Task RetryFailedRunsAsync_RequeuesOldTransientRunWhenRetryBudgetRemains()
+    {
+        var nowUtc = DateTime.UtcNow;
+        var optimizationRuns = new List<OptimizationRun>
+        {
+            new()
+            {
+                Id = 452,
+                StrategyId = 89,
+                Status = OptimizationRunStatus.Failed,
+                RetryCount = 0,
+                FailureCategory = OptimizationFailureCategory.Transient,
+                CompletedAt = nowUtc.AddHours(-6),
+                StartedAt = nowUtc.AddHours(-7),
+                IsDeleted = false
+            }
+        };
+
+        var configs = new List<EngineConfig>
+        {
+            new()
+            {
+                Id = 1,
+                Key = "Optimization:MaxRetryAttempts",
+                Value = "2",
+                DataType = ConfigDataType.Int,
+                IsDeleted = false
+            }
+        };
+        var alerts = new List<Alert>();
+
+        var optRunDbSet = optimizationRuns.AsQueryable().BuildMockDbSet();
+        var configDbSet = configs.AsQueryable().BuildMockDbSet();
+        var alertDbSet = alerts.AsQueryable().BuildMockDbSet();
+
+        var db = new Mock<DbContext>();
+        db.Setup(c => c.Set<OptimizationRun>()).Returns(optRunDbSet.Object);
+        db.Setup(c => c.Set<EngineConfig>()).Returns(configDbSet.Object);
+        db.Setup(c => c.Set<Alert>()).Returns(alertDbSet.Object);
+
+        var readCtx = new Mock<IReadApplicationDbContext>();
+        readCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
+
+        var writeCtx = new Mock<IWriteApplicationDbContext>();
+        writeCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
+        writeCtx.Setup(x => x.SaveChangesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(1);
+
+        var services = new ServiceCollection()
+            .AddSingleton(readCtx.Object)
+            .AddSingleton(writeCtx.Object)
+            .BuildServiceProvider();
+
+        var worker = CreateWorker(scopeFactory: services.GetRequiredService<IServiceScopeFactory>());
+        var method = typeof(OptimizationWorker).GetMethod(
+            "RetryFailedRunsAsync",
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
+
+        await (Task)method.Invoke(worker, [CancellationToken.None])!;
+
+        var retriedRun = optimizationRuns.Single(r => r.Id == 452);
+        Assert.Equal(OptimizationRunStatus.Queued, retriedRun.Status);
+        Assert.Equal(1, retriedRun.RetryCount);
+    }
+
+    [Fact]
     public void StateMachine_AllowsRetryPath_Failed_To_Queued()
     {
         Assert.True(OptimizationRunStateMachine.CanTransition(
@@ -4420,6 +4587,40 @@ public class OptimizationWorkerTest
         var status = Enum.Parse<OptimizationRunStatus>(statusStr);
         var result = OptimizationWorker.ShouldPreservePersistedResult(persisted, status);
         Assert.Equal(expected, result);
+    }
+
+    [Theory]
+    [InlineData(12, 120, 10, true)]
+    [InlineData(9, 120, 10, false)]
+    [InlineData(12, 90, 10, false)]
+    [InlineData(12, 120, 20, false)]
+    public void CoarseScreeningThreshold_UsesConfiguredThreshold(
+        int candidateCount,
+        int trainCandles,
+        int coarsePhaseThreshold,
+        bool expected)
+    {
+        bool actual = OptimizationWorker.ShouldRunCoarseScreening(
+            candidateCount,
+            trainCandles,
+            coarsePhaseThreshold);
+
+        Assert.Equal(expected, actual);
+    }
+
+    [Theory]
+    [InlineData(12, 10, true)]
+    [InlineData(9, 10, false)]
+    public void CoarseScreeningContinuation_UsesConfiguredThreshold(
+        int candidateCount,
+        int coarsePhaseThreshold,
+        bool expected)
+    {
+        bool actual = OptimizationWorker.ShouldContinueCoarseScreening(
+            candidateCount,
+            coarsePhaseThreshold);
+
+        Assert.Equal(expected, actual);
     }
 
     // #9: MarkRunFailedForRetry via state machine (validates Completed→Failed transition)

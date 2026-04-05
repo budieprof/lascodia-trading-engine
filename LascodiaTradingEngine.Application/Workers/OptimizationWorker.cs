@@ -1122,11 +1122,11 @@ public partial class OptimizationWorker : BackgroundService
     }
 
     /// <summary>
-    /// Re-queues recently failed runs that haven't exhausted their retry budget.
-    /// Only retries runs that failed within the last hour (transient failures);
-    /// older failures are considered permanent. Runs that have exhausted their retry
-    /// budget are moved to <see cref="OptimizationRunStatus.Abandoned"/> (dead-letter queue)
-    /// and an alert is fired for operator visibility.
+    /// Re-queues failed runs that haven't exhausted their retry budget.
+    /// Retry timing uses exponential backoff from <see cref="OptimizationRun.CompletedAt"/>,
+    /// but a long worker outage does not forfeit the remaining retry budget. Runs move to
+    /// <see cref="OptimizationRunStatus.Abandoned"/> only when retries are spent or the
+    /// failure is explicitly non-retryable.
     /// </summary>
     private async Task RetryFailedRunsAsync(CancellationToken ct)
     {
@@ -1141,7 +1141,6 @@ public partial class OptimizationWorker : BackgroundService
         if (maxRetryAttempts <= 0) return;
 
         var nowUtc = DateTime.UtcNow;
-        var retryWindowStart = nowUtc - GetRetryEligibilityWindow(maxRetryAttempts);
 
         // Re-queue retryable runs with exponential backoff: a run must wait
         // 15 * 2^RetryCount minutes after failure before becoming eligible again
@@ -1155,7 +1154,7 @@ public partial class OptimizationWorker : BackgroundService
                      && r.FailureCategory != OptimizationFailureCategory.ConfigError
                      && r.FailureCategory != OptimizationFailureCategory.SearchExhausted
                      && r.FailureCategory != OptimizationFailureCategory.StrategyRemoved
-                     && r.CompletedAt != null && r.CompletedAt >= retryWindowStart
+                     && r.CompletedAt != null
                      && r.CompletedAt.Value.AddMinutes(15 << r.RetryCount) <= nowUtc)
             .OrderBy(r => r.CompletedAt)
             .ToListAsync(ct);
@@ -1202,18 +1201,13 @@ public partial class OptimizationWorker : BackgroundService
                 "OptimizationWorker: re-queued {Count} failed run(s) for retry", retried);
         }
 
-        // Dead-letter: move runs to Abandoned when either:
-        // (a) retry budget is spent (RetryCount >= max), OR
-        // (b) the run aged out of the retry window AND still has retries remaining.
-        // Case (b) prevents orphaned Failed runs that are too old for the transient retry
-        // window but haven't exhausted their budget — they'd otherwise sit in Failed forever
-        // with no alerting or operator visibility.
+        // Dead-letter: move runs to Abandoned only when retries are spent or the
+        // failure category is explicitly non-retryable.
         var abandonedRuns = await writeDb.Set<OptimizationRun>()
             .Where(r => r.Status == OptimizationRunStatus.Failed
                      && !r.IsDeleted
                      && (r.FailureCategory == OptimizationFailureCategory.SearchExhausted
-                         || r.RetryCount >= maxRetryAttempts
-                         || (r.CompletedAt != null && r.CompletedAt < retryWindowStart)))
+                         || r.RetryCount >= maxRetryAttempts))
             .ToListAsync(ct);
         int abandoned = abandonedRuns.Count;
 
@@ -2771,15 +2765,16 @@ public partial class OptimizationWorker : BackgroundService
         OptimizationConfig config,
         CancellationToken ct)
     {
-        var fromDate = DateTime.UtcNow.AddYears(-1);
-        var toDate = DateTime.UtcNow;
+        var existingBacktest = await writeDb.Set<BacktestRun>()
+            .FirstOrDefaultAsync(r => r.SourceOptimizationRunId == run.Id && !r.IsDeleted, ct);
+        var existingWalkForward = await writeDb.Set<WalkForwardRun>()
+            .FirstOrDefaultAsync(r => r.SourceOptimizationRunId == run.Id && !r.IsDeleted, ct);
+        var (fromDate, toDate) = ResolveFollowUpWindowUtc(run, existingBacktest, existingWalkForward);
         string followUpParamsJson = CanonicalParameterJson.Normalize(run.BestParametersJson ?? strategy.ParametersJson);
         decimal followUpInitialBalance = TryGetRunScopedConfigSnapshot(run, out var runScopedConfig)
             ? runScopedConfig.ScreeningInitialBalance
             : config.ScreeningInitialBalance;
 
-        var existingBacktest = await writeDb.Set<BacktestRun>()
-            .FirstOrDefaultAsync(r => r.SourceOptimizationRunId == run.Id && !r.IsDeleted, ct);
         bool hasBacktest = existingBacktest is not null;
         if (existingBacktest is null)
         {
@@ -2796,13 +2791,12 @@ public partial class OptimizationWorker : BackgroundService
                 ParametersSnapshotJson = followUpParamsJson
             });
         }
-        else if (string.IsNullOrWhiteSpace(existingBacktest.ParametersSnapshotJson))
+        else
         {
-            existingBacktest.ParametersSnapshotJson = followUpParamsJson;
+            if (string.IsNullOrWhiteSpace(existingBacktest.ParametersSnapshotJson))
+                existingBacktest.ParametersSnapshotJson = followUpParamsJson;
         }
 
-        var existingWalkForward = await writeDb.Set<WalkForwardRun>()
-            .FirstOrDefaultAsync(r => r.SourceOptimizationRunId == run.Id && !r.IsDeleted, ct);
         bool hasWalkForward = existingWalkForward is not null;
         if (existingWalkForward is null)
         {
@@ -2835,6 +2829,35 @@ public partial class OptimizationWorker : BackgroundService
             run.ValidationFollowUpsCreatedAt = DateTime.UtcNow;
         run.ValidationFollowUpStatus = Domain.Enums.ValidationFollowUpStatus.Pending;
         return hadAllFollowUpsBeforeRepair;
+    }
+
+    private static (DateTime FromDate, DateTime ToDate) ResolveFollowUpWindowUtc(
+        OptimizationRun run,
+        BacktestRun? existingBacktest,
+        WalkForwardRun? existingWalkForward)
+    {
+        if (existingBacktest is not null)
+            return NormalizeFollowUpWindow(existingBacktest.FromDate, existingBacktest.ToDate, run);
+
+        if (existingWalkForward is not null)
+            return NormalizeFollowUpWindow(existingWalkForward.FromDate, existingWalkForward.ToDate, run);
+
+        var anchorUtc = run.ApprovedAt ?? run.CompletedAt ?? run.StartedAt;
+        return (anchorUtc.AddYears(-1), anchorUtc);
+    }
+
+    private static (DateTime FromDate, DateTime ToDate) NormalizeFollowUpWindow(
+        DateTime fromDate,
+        DateTime toDate,
+        OptimizationRun run)
+    {
+        if (toDate <= fromDate)
+        {
+            var anchorUtc = run.ApprovedAt ?? run.CompletedAt ?? run.StartedAt;
+            return (anchorUtc.AddYears(-1), anchorUtc);
+        }
+
+        return (fromDate, toDate);
     }
 
     private static bool IsDuplicateFollowUpConstraintViolation(DbUpdateException ex)

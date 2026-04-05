@@ -18,6 +18,13 @@ public partial class OptimizationWorker
 {
     // ── Stage: Bayesian Search (Stages 5–6) ─────────────────────────────────
 
+    internal static bool ShouldRunCoarseScreening(int candidateCount, int trainCandleCount, int coarsePhaseThreshold)
+        => candidateCount >= Math.Max(2, coarsePhaseThreshold)
+        && trainCandleCount >= 100;
+
+    internal static bool ShouldContinueCoarseScreening(int candidateCount, int coarsePhaseThreshold)
+        => candidateCount >= Math.Max(2, coarsePhaseThreshold);
+
     internal static Dictionary<string, (double Min, double Max, bool IsInteger)> ApplyImportanceGuidedBoundAdjustments(
         IReadOnlyDictionary<string, (double Min, double Max, bool IsInteger)> currentBounds,
         IReadOnlyDictionary<string, (double Min, double Max, bool IsInteger)> outerBounds,
@@ -477,7 +484,7 @@ public partial class OptimizationWorker
         // Hyperband runs multiple successive halving brackets simultaneously with different
         // aggressiveness levels, eliminating the need to guess the right fidelity rungs.
         // Falls back to the single-bracket SuccessiveHalvingRungs path when disabled.
-        if (freshCandidates.Count > config.TpeInitialSamples && trainCandles.Count >= 100)
+        if (ShouldRunCoarseScreening(freshCandidates.Count, trainCandles.Count, config.CoarsePhaseThreshold))
         {
             decimal coarseBaseline = run.BaselineHealthScore ?? 0m;
 
@@ -602,7 +609,7 @@ public partial class OptimizationWorker
                 foreach (var fidelity in fidelityRungs)
                 {
                     rungIndex++;
-                    if (freshCandidates.Count <= config.TpeInitialSamples) break;
+                    if (!ShouldContinueCoarseScreening(freshCandidates.Count, config.CoarsePhaseThreshold)) break;
 
                     int step = Math.Max(1, (int)Math.Round(1.0 / fidelity));
                     var downsampledTrain = trainCandles.Where((_, i) => i % step == 0).ToList();
