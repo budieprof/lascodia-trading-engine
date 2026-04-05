@@ -172,6 +172,14 @@ public static class DependencyInjection
                     + TimeSpan.FromMilliseconds(Random.Shared.Next(0, 500));
             }, (_, _, _, _) => Task.CompletedTask));
 
+        // FairEconomy JSON calendar API (mirrors ForexFactory data without Cloudflare)
+        services.AddHttpClient("FairEconomyCalendar", c =>
+        {
+            c.Timeout = TimeSpan.FromSeconds(15);
+            c.DefaultRequestHeaders.Add("User-Agent", "LascodiaTradingEngine/1.0");
+        })
+        .AddPolicyHandler(transientRetryPolicy);
+
         // ── Correlation Matrix (singleton: both hosted service and provider) ─────
         services.AddSingleton<CorrelationMatrixWorker>();
         services.AddSingleton<ICorrelationMatrixProvider>(sp => sp.GetRequiredService<CorrelationMatrixWorker>());
@@ -204,14 +212,19 @@ public static class DependencyInjection
         services.AddScoped<ICOTDataFeed, CftcCOTDataFeed>();
 
         // ── Economic Calendar Feeds (composite factory) ──────────────────────────
+        // FairEconomy JSON API is the primary source (mirrors ForexFactory without Cloudflare).
+        // Investing.com is kept as a secondary source for cross-validation.
+        // ForexFactory HTML scraper is retained but no longer in the composite — activate
+        // it only if needed (ForexFactory's Cloudflare JS challenge currently blocks it).
         services.AddSingleton<ForexFactoryFetchThrottle>();
         services.AddScoped<ForexFactoryCalendarFeed>();
+        services.AddScoped<FairEconomyCalendarFeed>();
         services.AddScoped<InvestingComCalendarFeed>();
         services.AddScoped<IEconomicCalendarFeed>(sp =>
             new CompositeCalendarFeed(
                 new IEconomicCalendarFeed[]
                 {
-                    sp.GetRequiredService<ForexFactoryCalendarFeed>(),
+                    sp.GetRequiredService<FairEconomyCalendarFeed>(),
                     sp.GetRequiredService<InvestingComCalendarFeed>()
                 },
                 sp.GetRequiredService<ILogger<CompositeCalendarFeed>>()));

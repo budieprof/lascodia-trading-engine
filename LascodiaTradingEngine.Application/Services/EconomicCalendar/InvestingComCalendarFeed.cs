@@ -58,7 +58,14 @@ public class InvestingComCalendarFeed : IEconomicCalendarFeed
             request.Headers.TryAddWithoutValidation("User-Agent", UserAgent);
 
             using var response = await client.SendAsync(request, ct).ConfigureAwait(false);
-            response.EnsureSuccessStatusCode();
+
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger.LogWarning(
+                    "InvestingComCalendarFeed: received HTTP {StatusCode} from Investing.com — feed may be blocked or rate-limited",
+                    (int)response.StatusCode);
+                return Array.Empty<EconomicCalendarEvent>();
+            }
 
             var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
             var allEvents = ParseCsv(body);
