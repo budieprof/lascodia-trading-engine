@@ -8,6 +8,7 @@ using Microsoft.Extensions.Logging;
 using Moq;
 using MockQueryable.Moq;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
+using LascodiaTradingEngine.Application.AuditTrail.Commands.LogDecision;
 using LascodiaTradingEngine.Application.Backtesting.Models;
 using LascodiaTradingEngine.Application.Backtesting.Services;
 using LascodiaTradingEngine.Application.Common.Diagnostics;
@@ -283,6 +284,87 @@ public class OptimizationWorkerTest
         Assert.DoesNotContain(
             optimizationRuns,
             r => r.Id != 1 && r.Id != 2 && r.Id != 3 && r.Status == OptimizationRunStatus.Queued);
+    }
+
+    [Fact]
+    public async Task AutoScheduleUnderperformersAsync_SchedulesGatePassingStrategy_WhenTrendShowsNonMonotonicDecline()
+    {
+        var strategies = new List<Strategy>
+        {
+            new()
+            {
+                Id = 43,
+                Name = "Slipping",
+                Status = StrategyStatus.Active,
+                StrategyType = StrategyType.BreakoutScalper,
+                Symbol = "EURUSD",
+                Timeframe = Timeframe.H1,
+                ParametersJson = """{"Fast":14}""",
+                IsDeleted = false
+            }
+        };
+
+        var optimizationRuns = new List<OptimizationRun>();
+        var backtestRuns = new List<BacktestRun>
+        {
+            new()
+            {
+                Id = 101,
+                StrategyId = 43,
+                Status = RunStatus.Completed,
+                CompletedAt = DateTime.UtcNow.AddDays(-1),
+                ResultJson = JsonSerializer.Serialize(new BacktestResult
+                {
+                    TotalTrades = 40,
+                    WinRate = 0.65m,
+                    ProfitFactor = 1.60m,
+                    MaxDrawdownPct = 7m,
+                    SharpeRatio = 1.1m
+                }),
+                IsDeleted = false
+            }
+        };
+
+        var snapshots = new List<StrategyPerformanceSnapshot>
+        {
+            new() { StrategyId = 43, EvaluatedAt = DateTime.UtcNow.AddHours(-1), HealthScore = 0.42m, IsDeleted = false },
+            new() { StrategyId = 43, EvaluatedAt = DateTime.UtcNow.AddHours(-2), HealthScore = 0.50m, IsDeleted = false },
+            new() { StrategyId = 43, EvaluatedAt = DateTime.UtcNow.AddHours(-3), HealthScore = 0.48m, IsDeleted = false },
+        };
+
+        var strategyDbSet = strategies.AsQueryable().BuildMockDbSet();
+        var optRunDbSet = optimizationRuns.AsQueryable().BuildMockDbSet();
+        optRunDbSet.Setup(d => d.Add(It.IsAny<OptimizationRun>()))
+            .Callback<OptimizationRun>(r => optimizationRuns.Add(r));
+        var backtestRunDbSet = backtestRuns.AsQueryable().BuildMockDbSet();
+        var snapshotDbSet = snapshots.AsQueryable().BuildMockDbSet();
+
+        var db = new Mock<DbContext>();
+        db.Setup(c => c.Set<Strategy>()).Returns(strategyDbSet.Object);
+        db.Setup(c => c.Set<OptimizationRun>()).Returns(optRunDbSet.Object);
+        db.Setup(c => c.Set<BacktestRun>()).Returns(backtestRunDbSet.Object);
+        db.Setup(c => c.Set<StrategyPerformanceSnapshot>()).Returns(snapshotDbSet.Object);
+
+        var readCtx = new Mock<IReadApplicationDbContext>();
+        readCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
+
+        var writeCtx = new Mock<IWriteApplicationDbContext>();
+        writeCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
+        writeCtx.Setup(x => x.SaveChangesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(1);
+
+        var worker = CreateWorker();
+        var config = CreateOptimizationConfig(cooldownDays: 14, maxConsecutiveFailuresBeforeEscalation: 3);
+
+        var method = typeof(OptimizationWorker).GetMethod(
+            "AutoScheduleUnderperformersAsync",
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
+
+        await (Task)method.Invoke(worker, [readCtx.Object, writeCtx.Object, config, CancellationToken.None])!;
+
+        var queuedRun = Assert.Single(optimizationRuns);
+        Assert.Equal(43, queuedRun.StrategyId);
+        Assert.Equal(OptimizationRunStatus.Queued, queuedRun.Status);
+        Assert.Equal(TriggerType.Scheduled, queuedRun.TriggerType);
     }
 
     [Fact]
@@ -914,6 +996,92 @@ public class OptimizationWorkerTest
         Assert.Null(run.ApprovedAt);
         Assert.Null(strategy.RolloutPct);
         Assert.Equal("""{"Fast":10,"Slow":30}""", strategy.ParametersJson);
+    }
+
+    [Fact]
+    public async Task ApplyApprovalDecisionAsync_RejectsRun_WhenStrategyDisappearsBeforeApproval()
+    {
+        var run = new OptimizationRun
+        {
+            Id = 405,
+            StrategyId = 13,
+            Status = OptimizationRunStatus.Completed,
+            CompletedAt = DateTime.UtcNow,
+            BestParametersJson = """{"Fast":18,"Slow":44}"""
+        };
+        var strategy = new Strategy
+        {
+            Id = 13,
+            Name = "Vanished",
+            Symbol = "EURUSD",
+            Timeframe = Timeframe.H1,
+            ParametersJson = """{"Fast":10,"Slow":30}""",
+            Status = StrategyStatus.Active,
+            IsDeleted = false
+        };
+
+        var strategies = new List<Strategy>();
+        var strategyDbSet = strategies.AsQueryable().BuildMockDbSet();
+
+        var db = new Mock<DbContext>();
+        db.Setup(c => c.Set<Strategy>()).Returns(strategyDbSet.Object);
+
+        var writeCtx = new Mock<IWriteApplicationDbContext>();
+        writeCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
+        writeCtx.Setup(x => x.SaveChangesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(1);
+
+        var mediator = new Mock<IMediator>();
+        var alertDispatcher = new Mock<IAlertDispatcher>();
+        var eventService = new Mock<IIntegrationEventService>();
+
+        var worker = CreateWorker();
+        var config = CreateOptimizationConfig(cooldownDays: 14, maxConsecutiveFailuresBeforeEscalation: 3);
+        var runContext = CreateRunContext(
+            run, strategy, config, baselineComparisonScore: 0.40m,
+            db.Object, db.Object, writeCtx.Object, mediator.Object,
+            alertDispatcher.Object, eventService.Object);
+
+        var oosResult = new BacktestResult
+        {
+            TotalTrades = 24,
+            WinRate = 0.62m,
+            ProfitFactor = 1.70m,
+            MaxDrawdownPct = 4m,
+            SharpeRatio = 1.5m,
+            Trades = []
+        };
+        var validationResult = CreateCandidateValidationResult(
+            passed: true,
+            winnerParamsJson: """{"Fast":18,"Slow":44}""",
+            oosHealthScore: 0.74m,
+            oosResult: oosResult,
+            ciLower: 0.55m,
+            ciUpper: 0.82m,
+            wfAvgScore: 0.70m,
+            pessimisticScore: 0.68m,
+            failureReason: string.Empty);
+
+        var method = typeof(OptimizationWorker).GetMethod(
+            "ApplyApprovalDecisionAsync",
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
+
+        await (Task)method.Invoke(worker,
+            [runContext, validationResult, null, DateTime.UtcNow.AddMonths(-2), new BacktestOptions()])!;
+
+        Assert.Equal(OptimizationRunStatus.Rejected, run.Status);
+        Assert.Equal(OptimizationFailureCategory.StrategyRemoved, run.FailureCategory);
+        Assert.Null(run.ApprovedAt);
+        Assert.Contains("StrategyRemoved", run.ApprovalReportJson, StringComparison.Ordinal);
+        writeCtx.Verify(x => x.SaveChangesAsync(It.IsAny<CancellationToken>()), Times.Once);
+        eventService.Verify(
+            x => x.SaveAndPublish(It.IsAny<IDbContext>(), It.IsAny<Lascodia.Trading.Engine.EventBus.Events.IntegrationEvent>()),
+            Times.Never);
+        mediator.Verify(
+            x => x.Send(
+                It.Is<LogDecisionCommand>(c => c.Outcome == "Rejected"
+                    && c.Reason!.Contains("Strategy removed", StringComparison.Ordinal)),
+                It.IsAny<CancellationToken>()),
+            Times.Once);
     }
 
     private static OptimizationWorker CreateWorker()

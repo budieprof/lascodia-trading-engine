@@ -221,13 +221,15 @@ public partial class OptimizationWorker
 
             if (meetsGate)
             {
-                // Gate met — check for deterioration trend using pre-fetched snapshots
+                // Gate met — check for deterioration trend using the same weighted
+                // regression shape as rollout evaluation so noisy downtrends still
+                // get scheduled before they become outright gate failures.
                 snapshotMap.TryGetValue(strategy.Id, out var recentSnapshots);
                 recentSnapshots ??= [];
 
-                bool deteriorating = recentSnapshots.Count >= 3
-                    && recentSnapshots[0] < recentSnapshots[1]
-                    && recentSnapshots[1] < recentSnapshots[2];
+                bool deteriorating = IsMeaningfullyDeteriorating(
+                    recentSnapshots,
+                    out decimal predictedDecline);
 
                 if (!deteriorating)
                 {
@@ -237,10 +239,8 @@ public partial class OptimizationWorker
                     continue;
                 }
 
-                // Priority 1: passes gate but deteriorating. Severity = magnitude of decline.
-                decimal decline = recentSnapshots[2] - recentSnapshots[0]; // positive = how much it dropped
                 candidates.Add((strategy.Id, strategy.Name, strategy.ParametersJson,
-                    Priority: 1, Severity: decline, result.WinRate, result.ProfitFactor));
+                    Priority: 1, Severity: predictedDecline, result.WinRate, result.ProfitFactor));
             }
             else
             {
@@ -426,6 +426,40 @@ public partial class OptimizationWorker
             .FirstOrDefaultAsync(ct);
 
         return latest != null && latest.RecoveryMode != RecoveryMode.Normal;
+    }
+
+    private static bool IsMeaningfullyDeteriorating(
+        IReadOnlyList<decimal> recentSnapshots,
+        out decimal predictedDecline)
+    {
+        predictedDecline = 0m;
+        if (recentSnapshots.Count < 3)
+            return false;
+
+        int n = recentSnapshots.Count;
+        double sumW = 0, sumWx = 0, sumWy = 0, sumWxx = 0, sumWxy = 0;
+        for (int i = 0; i < n; i++)
+        {
+            int x = n - 1 - i;
+            double y = (double)recentSnapshots[i];
+            double w = 1.0 + x;
+            sumW += w;
+            sumWx += w * x;
+            sumWy += w * y;
+            sumWxx += w * x * x;
+            sumWxy += w * x * y;
+        }
+
+        double denom = sumW * sumWxx - sumWx * sumWx;
+        if (denom == 0)
+            return false;
+
+        double slope = (sumW * sumWxy - sumWx * sumWy) / denom;
+        double avgScore = recentSnapshots.Average(s => (double)s);
+        double decline = Math.Abs(slope) * n;
+        predictedDecline = (decimal)decline;
+
+        return slope < 0 && decline > avgScore * 0.10;
     }
 
     /// <summary>

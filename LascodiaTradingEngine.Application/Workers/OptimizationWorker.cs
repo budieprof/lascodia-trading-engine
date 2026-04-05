@@ -1436,6 +1436,57 @@ public partial class OptimizationWorker : BackgroundService
             var liveStrategy = await writeDb.Set<Strategy>()
                 .FirstOrDefaultAsync(x => x.Id == run.StrategyId && !x.IsDeleted, runCt);
 
+            if (liveStrategy is null)
+            {
+                run.FailureCategory = OptimizationFailureCategory.StrategyRemoved;
+                OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Rejected, DateTime.UtcNow);
+
+                try
+                {
+                    var rejectionReport = string.IsNullOrWhiteSpace(run.ApprovalReportJson)
+                        ? new Dictionary<string, object?>()
+                        : JsonSerializer.Deserialize<Dictionary<string, object?>>(run.ApprovalReportJson) ?? [];
+                    rejectionReport["topCandidateFailureReason"] = "Strategy removed before approved parameters could be applied.";
+                    rejectionReport["approvalBlockedReason"] = "StrategyRemoved";
+                    run.ApprovalReportJson = JsonSerializer.Serialize(rejectionReport);
+                }
+                catch
+                {
+                    run.ApprovalReportJson = JsonSerializer.Serialize(new
+                    {
+                        topCandidateFailureReason = "Strategy removed before approved parameters could be applied.",
+                        approvalBlockedReason = "StrategyRemoved",
+                    });
+                }
+
+                await writeCtx.SaveChangesAsync(ct);
+
+                _logger.LogWarning(
+                    "OptimizationWorker: strategy {StrategyId} disappeared before approval for run {RunId} — rejecting auto-approval",
+                    run.StrategyId, run.Id);
+
+                try
+                {
+                    await mediator.Send(new LogDecisionCommand
+                    {
+                        EntityType = "OptimizationRun",
+                        EntityId = run.Id,
+                        DecisionType = "AutoApproval",
+                        Outcome = "Rejected",
+                        Reason = "Strategy removed before approved parameters could be applied",
+                        Source = "OptimizationWorker"
+                    }, ct);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex,
+                        "OptimizationWorker: approval rejection audit log failed for run {RunId} (non-fatal)",
+                        run.Id);
+                }
+
+                return;
+            }
+
             var originalRunStatus = run.Status;
             var originalApprovedAt = run.ApprovedAt;
             var originalCompletedAt = run.CompletedAt;
