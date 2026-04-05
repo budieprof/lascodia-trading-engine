@@ -16,6 +16,8 @@ namespace LascodiaTradingEngine.Application.Workers;
 
 public partial class OptimizationWorker
 {
+    private const int ChronicFailureAlertCooldownSeconds = 24 * 60 * 60;
+
     // ── Auto-scheduling ─────────────────────────────────────────────────────
 
     private async Task AutoScheduleUnderperformersAsync(
@@ -365,29 +367,46 @@ public partial class OptimizationWorker
             "OptimizationWorker: strategy {Id} ({Name}) has failed auto-approval {Count} consecutive times — escalating",
             strategyId, strategyName, consecutiveFailures);
 
-        // Create alert for manual attention
+        var nowUtc = DateTime.UtcNow;
+        string deduplicationKey = BuildChronicFailureAlertDedupKey(strategyId);
+        var existingAlert = await writeDb.Set<Alert>()
+            .FirstOrDefaultAsync(a => a.DeduplicationKey == deduplicationKey && !a.IsDeleted, ct);
+
+        if (existingAlert?.LastTriggeredAt is DateTime lastTriggeredAt
+            && lastTriggeredAt >= nowUtc.AddSeconds(-Math.Max(existingAlert.CooldownSeconds, ChronicFailureAlertCooldownSeconds)))
+        {
+            _logger.LogDebug(
+                "OptimizationWorker: suppressed duplicate chronic failure alert for strategy {Id} ({Name}) within cooldown window",
+                strategyId, strategyName);
+            return;
+        }
+
+        // Create or refresh alert for manual attention
         var alertMessage = $"Strategy '{strategyName}' (ID={strategyId}) has failed auto-approval " +
                            $"{consecutiveFailures} consecutive times. Manual parameter review recommended. " +
                            $"Cooldown extended to {baseCooldownDays * 2} days to reduce compute waste.";
-        var alert = new Alert
+        var alert = existingAlert ?? new Alert();
+        alert.AlertType = AlertType.DataQualityIssue; // Closest fit for system-level alerts
+        alert.Symbol = $"Strategy:{strategyId}";
+        alert.Channel = AlertChannel.Webhook;
+        alert.Destination = string.Empty; // Uses default webhook destination
+        alert.ConditionJson = JsonSerializer.Serialize(new
         {
-            AlertType     = AlertType.DataQualityIssue, // Closest fit for system-level alerts
-            Symbol        = $"Strategy:{strategyId}",
-            Channel       = AlertChannel.Webhook,
-            Destination   = string.Empty, // Uses default webhook destination
-            ConditionJson = JsonSerializer.Serialize(new
-            {
-                Type = "ChronicOptimizationFailure",
-                StrategyId = strategyId,
-                StrategyName = strategyName,
-                ConsecutiveFailures = consecutiveFailures,
-                Message = alertMessage,
-            }),
-            Severity        = AlertSeverity.High,
-            IsActive        = true,
-            LastTriggeredAt = DateTime.UtcNow,
-        };
-        writeDb.Set<Alert>().Add(alert);
+            Type = "ChronicOptimizationFailure",
+            StrategyId = strategyId,
+            StrategyName = strategyName,
+            ConsecutiveFailures = consecutiveFailures,
+            Message = alertMessage,
+        });
+        alert.Severity = AlertSeverity.High;
+        alert.IsActive = true;
+        alert.LastTriggeredAt = nowUtc;
+        alert.DeduplicationKey = deduplicationKey;
+        alert.CooldownSeconds = ChronicFailureAlertCooldownSeconds;
+
+        if (existingAlert is null)
+            writeDb.Set<Alert>().Add(alert);
+
         await writeCtx.SaveChangesAsync(ct);
 
         // Dispatch immediately rather than waiting for AlertWorker's next poll cycle
@@ -649,4 +668,7 @@ public partial class OptimizationWorker
             return true;
         }
     }
+
+    private static string BuildChronicFailureAlertDedupKey(long strategyId)
+        => $"Optimization:ChronicFailure:{strategyId}";
 }

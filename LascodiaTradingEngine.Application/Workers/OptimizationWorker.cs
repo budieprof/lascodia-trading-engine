@@ -1322,7 +1322,19 @@ public partial class OptimizationWorker : BackgroundService
                         writeDb, repairRun, strategy, repairConfig, ct);
                     if (!alreadyComplete)
                     {
-                        await writeCtx.SaveChangesAsync(ct);
+                        try
+                        {
+                            await writeCtx.SaveChangesAsync(ct);
+                        }
+                        catch (DbUpdateException ex) when (IsDuplicateFollowUpConstraintViolation(ex))
+                        {
+                            DetachPendingValidationFollowUps(writeDb, run.Id);
+                            repairRun.ValidationFollowUpsCreatedAt ??= DateTime.UtcNow;
+                            repairRun.ValidationFollowUpStatus ??= ValidationFollowUpStatus.Pending;
+                            await writeCtx.SaveChangesAsync(ct);
+                            _metrics.OptimizationDuplicateFollowUpsPrevented.Add(1);
+                        }
+
                         _logger.LogWarning(
                             "OptimizationWorker: repaired missing follow-up validation rows for approved run {RunId} — backtest={HasBacktest}, walk-forward={HasWalkForward}",
                             run.Id, backtestRun is not null, wfRun is not null);
@@ -1431,18 +1443,9 @@ public partial class OptimizationWorker : BackgroundService
         CancellationToken ct)
     {
         bool hadExistingSnapshot = !string.IsNullOrWhiteSpace(run.ConfigSnapshotJson);
-        if (hadExistingSnapshot)
+        if (TryGetRunScopedConfigSnapshot(run, out var snapshotConfig))
         {
-            try
-            {
-                var snapshot = JsonSerializer.Deserialize<OptimizationConfigSnapshot>(run.ConfigSnapshotJson);
-                if (snapshot is not null && snapshot.Version == ConfigSnapshotVersion)
-                    return snapshot.Config;
-            }
-            catch
-            {
-                // Fall back to live config below if the stored snapshot is malformed.
-            }
+            return snapshotConfig;
         }
 
         var liveConfig = await LoadConfigurationAsync(db, ct);
@@ -1486,6 +1489,30 @@ public partial class OptimizationWorker : BackgroundService
         run.ConfigSnapshotJson = newSnapshotJson;
         await writeCtx.SaveChangesAsync(ct);
         return liveConfig;
+    }
+
+    private static bool TryGetRunScopedConfigSnapshot(OptimizationRun run, out OptimizationConfig config)
+    {
+        config = null!;
+
+        if (string.IsNullOrWhiteSpace(run.ConfigSnapshotJson))
+            return false;
+
+        try
+        {
+            var snapshot = JsonSerializer.Deserialize<OptimizationConfigSnapshot>(run.ConfigSnapshotJson);
+            if (snapshot is not null && snapshot.Version == ConfigSnapshotVersion)
+            {
+                config = snapshot.Config;
+                return true;
+            }
+        }
+        catch (JsonException)
+        {
+            // Fall back to the runtime configuration if the stored snapshot is malformed.
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -2247,10 +2274,15 @@ public partial class OptimizationWorker : BackgroundService
                 $"No OOS candles after embargo for {strategy.Symbol}/{strategy.Timeframe} " +
                 $"(total={candles.Count}, split={splitIndex}, embargo={embargoSize}).");
 
+        if (pairInfo is null || pairInfo.DecimalPlaces <= 0 || pairInfo.ContractSize <= 0)
+        {
+            throw new DataQualityException(
+                $"Missing or invalid CurrencyPair metadata for {strategy.Symbol}. " +
+                "Optimization requires DecimalPlaces and ContractSize before cost-aware validation can run.");
+        }
+
         // Build transaction cost options from symbol metadata
-        var pointSize = pairInfo != null && pairInfo.DecimalPlaces > 0
-            ? 1.0m / (decimal)Math.Pow(10, pairInfo.DecimalPlaces)
-            : 0.00001m;
+        var pointSize = 1.0m / (decimal)Math.Pow(10, pairInfo.DecimalPlaces);
 
         double effectiveSpreadPoints = config.ScreeningSpreadPoints;
         if (config.UseSymbolSpecificSpread && pairInfo is not null && pairInfo.SpreadPoints > 0)
@@ -2335,7 +2367,7 @@ public partial class OptimizationWorker : BackgroundService
             SpreadPriceUnits   = pointSize * (decimal)effectiveSpreadPoints,
             CommissionPerLot   = (decimal)config.ScreeningCommissionPerLot,
             SlippagePriceUnits = pointSize * (decimal)config.ScreeningSlippagePips * 10,
-            ContractSize       = pairInfo?.ContractSize ?? 100_000m,
+            ContractSize       = pairInfo.ContractSize,
         };
 
         // P1: Wire dynamic spread function from SpreadProfile for realistic cost modeling
@@ -2682,6 +2714,9 @@ public partial class OptimizationWorker : BackgroundService
         var fromDate = DateTime.UtcNow.AddYears(-1);
         var toDate = DateTime.UtcNow;
         string followUpParamsJson = CanonicalParameterJson.Normalize(run.BestParametersJson ?? strategy.ParametersJson);
+        decimal followUpInitialBalance = TryGetRunScopedConfigSnapshot(run, out var runScopedConfig)
+            ? runScopedConfig.ScreeningInitialBalance
+            : config.ScreeningInitialBalance;
 
         var existingBacktest = await writeDb.Set<BacktestRun>()
             .FirstOrDefaultAsync(r => r.SourceOptimizationRunId == run.Id && !r.IsDeleted, ct);
@@ -2695,7 +2730,7 @@ public partial class OptimizationWorker : BackgroundService
                 Timeframe = strategy.Timeframe,
                 FromDate = fromDate,
                 ToDate = toDate,
-                InitialBalance = config.ScreeningInitialBalance,
+                InitialBalance = followUpInitialBalance,
                 Status = RunStatus.Queued,
                 SourceOptimizationRunId = run.Id,
                 ParametersSnapshotJson = followUpParamsJson
@@ -2720,7 +2755,7 @@ public partial class OptimizationWorker : BackgroundService
                 ToDate = toDate,
                 InSampleDays = 90,
                 OutOfSampleDays = 30,
-                InitialBalance = config.ScreeningInitialBalance,
+                InitialBalance = followUpInitialBalance,
                 ReOptimizePerFold = false,
                 Status = RunStatus.Queued,
                 StartedAt = DateTime.UtcNow,
