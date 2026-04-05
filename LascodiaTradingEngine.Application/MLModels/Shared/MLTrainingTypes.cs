@@ -924,6 +924,19 @@ public record TrainingHyperparams(
     /// in imbalanced datasets. Default true.
     /// </summary>
     bool UseClassWeights,
+    /// <summary>
+    /// Number of top features (by index order) to check for pairwise MI redundancy.
+    /// Higher values increase coverage but are O(topN²) in compute.
+    /// 0 = use trainer default (10). Typical 10–30.
+    /// </summary>
+    int MutualInfoRedundancyTopN = 0,
+    /// <summary>
+    /// When true and <c>AdaBoostMaxTreeDepth ≥ 2</c>, uses a jointly-optimal depth-2 tree
+    /// search that evaluates all (root, left-child, right-child) split combinations to minimise
+    /// total weighted classification error.  O(F²·m·log m) per round vs O(F·m·log m) for the
+    /// greedy default.  Recommended for F ≤ 30; disable for large feature sets.
+    /// </summary>
+    bool UseJointDepth2Search = false,
     /// <summary>Rec #398: Label smoothing epsilon for LabelSmoothModelTrainer. Null = 0.1.</summary>
     double? LabelSmoothEpsilon = null,
     /// <summary>Rec #399: Focal loss gamma for FocalLossModelTrainer. Null = 2.0.</summary>
@@ -1246,6 +1259,87 @@ public record TrainingHyperparams(
     /// </summary>
     int TcnAttentionHeads = 1,
     /// <summary>
+    /// When <c>true</c>, TCN blocks use gated activation: gate = σ(Conv_g) ⊙ tanh(Conv_f)
+    /// instead of plain ReLU/GELU. Doubles per-block parameters but improves gradient flow
+    /// and expressiveness for noisy financial data. Default false (plain activation).
+    /// </summary>
+    bool TcnUseGating = false,
+    /// <summary>
+    /// Block index at which the TCN backbone splits into separate direction and magnitude
+    /// branches. E.g. 2 means blocks 0–1 are shared, blocks 2+ are task-specific.
+    /// 0 = disabled (shared backbone for both heads, legacy). Typical: numBlocks − 1.
+    /// </summary>
+    int TcnLateSplitBlock = 0,
+    /// <summary>
+    /// Comma-separated kernel sizes per block (e.g. "3,3,5,5"). When empty, all blocks use
+    /// the default kernel size 3. Wider kernels in deeper blocks capture longer patterns.
+    /// </summary>
+    string TcnKernelSizes = "",
+    /// <summary>
+    /// When <c>true</c>, TCN conv layers use depthwise separable convolutions (depthwise + pointwise)
+    /// to reduce parameter count. Beneficial at higher filter counts (64+). Default false.
+    /// </summary>
+    bool TcnDepthwiseSeparable = false,
+    /// <summary>
+    /// Standard deviation of Gaussian noise added to gradients: g += N(0, σ/(1+t)^0.55).
+    /// Helps escape sharp minima. 0.0 = disabled. Typical 0.01–0.1.
+    /// </summary>
+    double TcnGradientNoiseStd = 0.0,
+    /// <summary>
+    /// Learning rate multiplier for attention projection weights (Q, K, V).
+    /// 1.0 = same as base LR (default). Typical 0.1–0.5 for fine-tuning.
+    /// </summary>
+    double TcnAttentionLrScale = 1.0,
+    /// <summary>
+    /// Learning rate multiplier for the classification and magnitude head weights.
+    /// 1.0 = same as base LR (default). Typical 1.0–3.0 for faster head convergence.
+    /// </summary>
+    double TcnHeadLrScale = 1.0,
+    /// <summary>
+    /// When <c>true</c>, two forward passes with different dropout masks produce a KL divergence
+    /// penalty term (R-Drop regularisation). Forces consistent predictions under different masks.
+    /// Default false.
+    /// </summary>
+    bool TcnUseRDrop = false,
+    /// <summary>
+    /// R-Drop KL divergence penalty coefficient. Only used when TcnUseRDrop is true.
+    /// 0.0 = disabled. Typical 0.1–1.0.
+    /// </summary>
+    double TcnRDropAlpha = 0.5,
+    /// <summary>
+    /// Number of epochs during which lower TCN blocks are frozen when warm-starting.
+    /// After these epochs, blocks are unfrozen one at a time from top to bottom.
+    /// 0 = disabled (all blocks trainable from epoch 0). Typical 5–15.
+    /// </summary>
+    int TcnProgressiveUnfreezeEpochs = 0,
+    /// <summary>
+    /// When <c>true</c> and a warm-start parent snapshot provides FeatureImportanceScores,
+    /// the attention query weights are biased toward channels the parent found important.
+    /// Default false.
+    /// </summary>
+    bool TcnUseChannelImportanceTransfer = false,
+    /// <summary>
+    /// When <c>true</c>, uses Combinatorial Purged Cross-Validation (CPCV) instead of
+    /// standard expanding-window walk-forward CV. Provides unbiased backtest-adjusted
+    /// Sharpe estimates. More expensive: O(C(n,k)) vs O(k). Default false.
+    /// </summary>
+    bool TcnUseCpcv = false,
+    /// <summary>
+    /// Number of Monte Carlo label-shuffled CV runs for permutation p-value computation.
+    /// 0 = disabled. Typical 100–500. Tests whether observed accuracy beats random labels.
+    /// </summary>
+    int TcnMonteCarloPermutations = 0,
+    /// <summary>
+    /// When <c>true</c>, later walk-forward folds are weighted higher in aggregate metrics
+    /// (recency-weighted) using exponential decay. Default false (equal fold weighting).
+    /// </summary>
+    bool TcnUseFoldWeighting = false,
+    /// <summary>
+    /// When <c>true</c>, validates that warm-start parent architecture config matches the
+    /// current config and logs structured warnings on mismatch. Default true.
+    /// </summary>
+    bool TcnValidateWarmStartCompat = true,
+    /// <summary>
     /// AdaBoost alpha shrinkage factor η applied to each stump weight: α_eff = η × α.
     /// Reduces variance (at the cost of requiring more rounds). 1.0 = no shrinkage (default).
     /// Typical 0.5–0.9. Only used by AdaBoostModelTrainer.
@@ -1310,7 +1404,230 @@ public record TrainingHyperparams(
     /// When the calibration set has between this value and 2x this value, leave-one-out
     /// cross-validation is used to guard against isotonic overfitting. Default 50.
     /// </summary>
-    int MinIsotonicCalibrationSamples = 50
+    int MinIsotonicCalibrationSamples = 50,
+    /// <summary>
+    /// Number of linear warmup epochs before cosine annealing begins for the FT-Transformer.
+    /// During warmup, LR ramps linearly from 0 to the base LR. Helps stability with
+    /// LayerNorm + multi-head attention. 0 = no warmup (legacy). Typical 5–10.
+    /// </summary>
+    int FtWarmupEpochs = 0,
+    /// <summary>
+    /// EV-optimal threshold sweep step size in basis points (hundredths of a percent).
+    /// 100 = 1% steps (legacy). 50 = 0.5% steps (finer). Typical 50–100.
+    /// Must be > 0. Default 50.
+    /// </summary>
+    int ThresholdSearchStepBps = 50,
+    /// <summary>
+    /// Dropout rate for attention weights and FFN hidden activations in the FT-Transformer.
+    /// 0.0 = no dropout. Default 0.10 (10%). Typical 0.05–0.20.
+    /// </summary>
+    double FtDropoutRate = 0.10,
+    /// <summary>
+    /// When <c>true</c>, adds a learnable per-head positional bias to attention scores
+    /// in the FT-Transformer. The bias is a [NumHeads][S×S] matrix added before softmax,
+    /// allowing the model to encode feature-ordering structure. False = no positional bias (default).
+    /// </summary>
+    bool FtUsePositionalEncoding = false,
+    /// <summary>
+    /// Row subsampling fraction for stochastic GBM (analogous to XGBoost subsample).
+    /// Each boosting round trains on this fraction of the training set.
+    /// 1.0 = no subsampling. Default 0.8. Typical 0.5–1.0.
+    /// </summary>
+    double GbmRowSubsampleRatio = 0.8,
+    /// <summary>
+    /// Minimum number of samples required in a leaf node (analogous to LightGBM min_data_in_leaf).
+    /// Prevents overfitting on noisy financial data by requiring sufficient evidence per leaf.
+    /// 0 = use default (4). Typical 10–30.
+    /// </summary>
+    int GbmMinSamplesLeaf = 0,
+    /// <summary>
+    /// Minimum loss reduction (gain) required to make a further partition on a leaf node
+    /// (analogous to XGBoost gamma / min_split_loss). Suppresses marginal splits.
+    /// 0.0 = any positive gain accepted (default). Typical 0.0–1.0.
+    /// </summary>
+    double GbmMinSplitGain = 0.0,
+    /// <summary>
+    /// When true, uses histogram-based split finding (256 bins) instead of exact scan.
+    /// O(n + 256·m) per tree vs O(n·m·log n). Faster on large datasets, slightly less precise.
+    /// </summary>
+    bool GbmUseHistogramSplits = false,
+    /// <summary>Number of histogram bins for split finding when GbmUseHistogramSplits=true. Default 256.</summary>
+    int GbmHistogramBins = 256,
+    /// <summary>
+    /// When true, uses leaf-wise (best-first) tree growth instead of level-wise (depth-first).
+    /// Produces deeper asymmetric trees that capture signal with fewer nodes. Default false.
+    /// </summary>
+    bool GbmUseLeafWiseGrowth = false,
+    /// <summary>Maximum number of leaves when using leaf-wise growth. 0 = 2^maxDepth (default).</summary>
+    int GbmMaxLeaves = 0,
+    /// <summary>
+    /// DART dropout rate — fraction of existing trees randomly dropped per boosting round.
+    /// Combats over-specialization of later trees. 0.0 = standard GBM (default). Typical 0.05–0.15.
+    /// </summary>
+    double GbmDartDropRate = 0.0,
+    /// <summary>
+    /// Per-depth decay factor for GbmMinSplitGain. Effective gain threshold at depth d =
+    /// GbmMinSplitGain × (1 − GbmMinSplitGainDecayPerDepth)^d. Allows broad root splits
+    /// while suppressing noisy leaf splits. 0.0 = uniform threshold (default).
+    /// </summary>
+    double GbmMinSplitGainDecayPerDepth = 0.0,
+    /// <summary>
+    /// When true, applies learning rate annealing: lr × (1 − round/numRounds).
+    /// Early trees make bold moves; late trees fine-tune. Default false.
+    /// </summary>
+    bool GbmShrinkageAnnealing = false,
+    /// <summary>
+    /// How often (in rounds) to check validation loss for early stopping.
+    /// 0 = auto (every 5 rounds, or every round if numRounds &lt; 30). Default 0.
+    /// </summary>
+    int GbmValCheckFrequency = 0,
+    /// <summary>
+    /// JSON-encoded interaction constraints — groups of feature indices that may co-occur in a path.
+    /// E.g. "[[0,1,2],[3,4]]" means features 0-2 can interact, 3-4 can interact, but not cross-group.
+    /// Empty = no constraints (default).
+    /// </summary>
+    string GbmInteractionConstraints = "",
+    /// <summary>
+    /// Hidden dimension for meta-label MLP. 0 = single-layer logistic (default). Typical 8–16.
+    /// </summary>
+    int GbmMetaLabelHiddenDim = 0,
+    /// <summary>
+    /// Estimated spread/slippage cost per trade (in magnitude units) to subtract during
+    /// EV-optimal threshold computation. 0.0 = no cost adjustment (default).
+    /// </summary>
+    double GbmEvThresholdSpreadCost = 0.0,
+    /// <summary>
+    /// When true, fits separate buy-abstention and sell-abstention thresholds
+    /// instead of a single symmetric threshold. Default false.
+    /// </summary>
+    bool GbmUseSeparateAbstention = false,
+    /// <summary>
+    /// When true, partitions training data by detected regime label and builds
+    /// separate tree blocks per regime. Default false.
+    /// </summary>
+    bool GbmRegimeConditioned = false,
+    /// <summary>
+    /// When true, computes sliding-window loss during training and auto-excludes
+    /// early data segments that hurt recent-window performance. Default false.
+    /// </summary>
+    bool GbmConceptDriftGate = false,
+    /// <summary>
+    /// When true, stratifies validation loss by regime label during early stopping,
+    /// preventing the best model from being one that compromises across regimes. Default false.
+    /// </summary>
+    bool GbmRegimeAwareEarlyStopping = false,
+    /// <summary>
+    /// Maximum parallelism for walk-forward CV folds. 0 = unlimited (default).
+    /// Prevents starving other workers on shared infrastructure.
+    /// </summary>
+    int GbmCvMaxParallelism = 0,
+    /// <summary>
+    /// When true, forces deterministic execution (sequential CV, fixed seeds).
+    /// Slower but fully reproducible. Default false.
+    /// </summary>
+    bool GbmDeterministic = false,
+    /// <summary>
+    /// Maximum number of warm-start trees to keep. 0 = keep all (default).
+    /// When set, prunes the tail of low-value prior trees before adding new rounds.
+    /// </summary>
+    int GbmMaxWarmStartTrees = 0,
+
+    // ── QRF-specific v4.1 hyperparams ─────────────────────────────────────────
+
+    /// <summary>
+    /// Number of rounds for Greedy Ensemble Selection in the QRF trainer.
+    /// 0 = use default (100). Higher values explore more tree combinations.
+    /// </summary>
+    int QrfGesRounds = 0,
+    /// <summary>
+    /// Early-stop patience for GES: stop if NLL hasn't improved for this many rounds.
+    /// 0 = disabled (run all QrfGesRounds). Default 0. Typical 10–20.
+    /// </summary>
+    int QrfGesEarlyStopPatience = 0,
+    /// <summary>
+    /// Number of shuffle repeats for permutation feature importance.
+    /// Averaged across repeats to reduce variance. 1 = single shuffle (default). Typical 3–5.
+    /// </summary>
+    int QrfPermutationRepeats = 1,
+    /// <summary>
+    /// When true, sweeps the abstention gate threshold on the calibration set
+    /// to maximize precision at ≥50 % recall, instead of using the default 0.5.
+    /// </summary>
+    bool QrfAbstentionSweepEnabled = false,
+    /// <summary>
+    /// Leaf probability shrinkage factor toward the global base rate.
+    /// leafP = shrinkage × globalBaseRate + (1 − shrinkage) × leafP.
+    /// Reduces variance from small leaves. 0.0 = disabled (default). Typical 0.05–0.20.
+    /// </summary>
+    double QrfLeafShrinkage = 0.0,
+    /// <summary>
+    /// When true, aborts training if Durbin-Watson statistic falls below
+    /// <see cref="DurbinWatsonThreshold"/>, indicating autocorrelated magnitude residuals.
+    /// False = log warning only (default).
+    /// </summary>
+    bool QrfDurbinWatsonGateEnabled = false,
+    /// <summary>
+    /// Hard PSI drift threshold for QRF. When &gt; 0 and the average PSI between
+    /// current training data and the parent model exceeds this value, warm-start
+    /// is rejected and a cold retrain is forced. 0.0 = disabled (default). Typical 0.25.
+    /// </summary>
+    double QrfPsiDriftHardThreshold = 0.0,
+    /// <summary>
+    /// When true, aborts training if the median feature stability CoV from
+    /// walk-forward CV exceeds <see cref="QrfMaxFeatureStabilityCov"/>.
+    /// </summary>
+    bool QrfFeatureStabilityGateEnabled = false,
+    /// <summary>
+    /// Maximum allowed median feature stability CoV (coefficient of variation
+    /// of importance across CV folds). Models relying on unstable features are
+    /// unreliable. 0.0 = disabled. Typical 1.0–2.0.
+    /// </summary>
+    double QrfMaxFeatureStabilityCov = 0.0,
+    /// <summary>
+    /// When true, uses magnitude-adjusted Kelly fraction: p − (1−p) × avgLoss/avgWin
+    /// instead of the simplified 2p−1 formula. Default false.
+    /// </summary>
+    bool QrfUseAdjustedKelly = false,
+    /// <summary>
+    /// Maximum serialized model size in megabytes. Training aborts if the estimated
+    /// snapshot would exceed this limit. 0 = unlimited (default). Typical 50–200.
+    /// </summary>
+    int QrfMaxModelSizeMb = 0,
+    /// <summary>
+    /// L2 regularisation coefficient for the quantile magnitude regressor.
+    /// 0.0 = no regularisation (default). Typical 0.001–0.01.
+    /// </summary>
+    double QrfQuantileL2 = 0.0,
+    /// <summary>
+    /// Early stopping patience (epochs) for the quantile magnitude regressor.
+    /// 0 = disabled (run all epochs). Default 0. Typical 10–20.
+    /// </summary>
+    int QrfQuantileEarlyStopPatience = 0,
+    // ── ROCKET-specific improvements ──────────────────────────────────────────
+    /// <summary>When true, uses MiniRocket ternary {-1, 0, 1} kernel weights instead of Gaussian.</summary>
+    bool RocketUseMiniWeights = false,
+    /// <summary>When true, generates channel-independent kernels per feature subgroup.</summary>
+    bool RocketMultivariate = false,
+    /// <summary>Number of linear warmup epochs before cosine annealing for ROCKET ridge training. 0 = disabled.</summary>
+    int RocketWarmupEpochs = 0,
+    /// <summary>Winsorize percentile (e.g. 0.01 = clip to p1/p99) before Z-score standardization. 0 = disabled.</summary>
+    double RocketWinsorizePercentile = 0.0,
+    /// <summary>Fraction of top kernels (by weight magnitude) to retain from warm-start parent. 0 = regenerate all.</summary>
+    double RocketKernelRetentionFraction = 0.0,
+    /// <summary>When true, uses sequential execution for walk-forward CV and permutation importance (deterministic).</summary>
+    bool RocketDeterministicParallel = false,
+    /// <summary>When true, applies L2 penalty to the bias term in ridge training.</summary>
+    bool RocketRegularizeBias = false,
+    /// <summary>Number of kernel subsets for MC kernel dropout epistemic uncertainty. 0 = disabled.</summary>
+    int RocketKernelDropoutSubsets = 0,
+    /// <summary>When true, uses combinatorial purged CV instead of walk-forward CV.</summary>
+    bool RocketUseCpcv = false,
+    /// <summary>When true, initializes feature pruning mask from parent model's importance scores.</summary>
+    bool RocketUseParentImportanceForPruning = false,
+    /// <summary>SMOTE target ratio — minority will be oversampled to this fraction of majority count. 1.0 = full parity.</summary>
+    double SmoteTargetRatio = 1.0,
+    /// <summary>When true, runs Edited Nearest Neighbors cleanup on SMOTE synthetics to remove noisy samples.</summary>
+    bool SmoteEnnEnabled = false
     );
 
 // ── Evaluation metrics ────────────────────────────────────────────────────────
@@ -1433,6 +1750,22 @@ public class ModelSnapshot
     public DateTime TrainedOn   { get; set; }
 
     /// <summary>
+    /// Value of <see cref="TrainSamples"/> at the time calibration parameters (Platt, isotonic,
+    /// temperature scaling, meta-label, abstention) were last fitted. Online updates via
+    /// Sherman-Morrison increment <see cref="TrainSamples"/> but leave calibration frozen.
+    /// Downstream workers can compare <c>TrainSamples - TrainSamplesAtLastCalibration</c>
+    /// to decide when recalibration is needed.
+    /// </summary>
+    public int TrainSamplesAtLastCalibration { get; set; }
+
+    /// <summary>
+    /// Exponential forgetting factor for online Sherman-Morrison updates.
+    /// 0.0 = no forgetting (default). Typical values: 0.001-0.01.
+    /// Applied as inverse Gram inflation: P <- P / (1 - lambda) before each rank-1 update.
+    /// </summary>
+    public double OnlineForgettingFactor { get; set; }
+
+    /// <summary>
     /// Permutation importance for each feature (index matches <see cref="Features"/>).
     /// Value = baseline accuracy − accuracy after shuffling that feature.
     /// Normalised to sum to 1.0. Empty when not yet computed.
@@ -1553,6 +1886,15 @@ public class ModelSnapshot
     /// </summary>
     public double Ece { get; set; }
 
+    // ── Reliability diagram bins (set post-Platt calibration) ────────���───────
+
+    /// <summary>Per-bin mean predicted confidence for the reliability diagram. Length = adaptive bin count.</summary>
+    public double[]? ReliabilityBinConfidence { get; set; }
+    /// <summary>Per-bin observed accuracy (fraction of positive class) for the reliability diagram.</summary>
+    public double[]? ReliabilityBinAccuracy { get; set; }
+    /// <summary>Per-bin sample count for the reliability diagram.</summary>
+    public int[]? ReliabilityBinCounts { get; set; }
+
     // ── Isotonic regression calibration (set by BaggedLogisticTrainer) ───────
 
     /// <summary>
@@ -1587,6 +1929,12 @@ public class ModelSnapshot
     /// </summary>
     public double ConformalQHat { get; set; } = 0.5;
 
+    /// <summary>Mondrian (per-class) conformal Q̂ for Buy class (y=1). Defaults to global Q̂.</summary>
+    public double ConformalQHatBuy { get; set; }
+
+    /// <summary>Mondrian (per-class) conformal Q̂ for Sell class (y=0). Defaults to global Q̂.</summary>
+    public double ConformalQHatSell { get; set; }
+
     // ── Meta-labeling secondary classifier ───────────────────────────────────
 
     /// <summary>
@@ -1605,6 +1953,13 @@ public class ModelSnapshot
     /// Default 0.5.
     /// </summary>
     public double MetaLabelThreshold { get; set; } = 0.5;
+
+    /// <summary>
+    /// Indices of the top-3 features (by permutation importance) used as auxiliary inputs
+    /// in the meta-label and abstention models. Stored so inference can reconstruct
+    /// the same meta-feature vector. Empty = legacy (uses indices 0, 1, 2).
+    /// </summary>
+    public int[] MetaLabelTopFeatureIndices { get; set; } = [];
 
     // ── Feature distribution baselines for PSI monitoring ────────────────────
 
@@ -2021,6 +2376,8 @@ public class ModelSnapshot
     /// </summary>
     public int SwaCheckpointCount { get; set; }
 
+    public int SmoteSeed { get; set; }
+
     // ── Rec #67: Echo State Network readout ──────────────────────────────────
 
     /// <summary>
@@ -2072,6 +2429,51 @@ public class ModelSnapshot
     /// Defaults to 0.1 for snapshots serialised before this field was added.
     /// </summary>
     public double GbmLearningRate { get; set; }
+
+    /// <summary>
+    /// Per-tree learning rates when shrinkage annealing is enabled. Length = number of trees.
+    /// Empty = uniform GbmLearningRate for all trees (default/legacy).
+    /// Inference: score = GbmBaseLogOdds + Σ GbmPerTreeLearningRates[t] × tree[t].Predict(x).
+    /// </summary>
+    public double[] GbmPerTreeLearningRates { get; set; } = [];
+
+    // ── GBM extended snapshot fields ────────────────────────────────────────
+
+    /// <summary>Venn-ABERS multi-probability calibration points [p_lower, p_upper] per calibration sample.</summary>
+    public double[][] VennAbersMultiP { get; set; } = [];
+
+    /// <summary>Coverage-accuracy tradeoff curve: [threshold, coverage, accuracy] triplets from abstention sweep.</summary>
+    public double[] AbstentionCoverageAccuracyCurve { get; set; } = [];
+
+    /// <summary>Separate buy-side abstention threshold (when GbmUseSeparateAbstention=true).</summary>
+    public double AbstentionThresholdBuy { get; set; } = 0.5;
+
+    /// <summary>Separate sell-side abstention threshold (when GbmUseSeparateAbstention=true).</summary>
+    public double AbstentionThresholdSell { get; set; } = 0.5;
+
+    /// <summary>Partial dependence data: per-feature marginal response curves for top features. [featureIdx][gridPoints].</summary>
+    public double[][] PartialDependenceData { get; set; } = [];
+
+    /// <summary>Calibration loss component of Murphy decomposition (reliability).</summary>
+    public double CalibrationLoss { get; set; }
+
+    /// <summary>Refinement loss component of Murphy decomposition (resolution).</summary>
+    public double RefinementLoss { get; set; }
+
+    /// <summary>Average prediction stability: mean distance-to-decision-boundary on test set.</summary>
+    public double PredictionStabilityScore { get; set; }
+
+    /// <summary>TreeSHAP baseline (expected output = mean prediction). Used for per-prediction attribution.</summary>
+    public double TreeShapBaseline { get; set; }
+
+    /// <summary>Gain-weighted feature importance from tree splits (total gain per feature, normalised).</summary>
+    public float[] GainWeightedImportance { get; set; } = [];
+
+    /// <summary>Empirical Jackknife+ coverage on calibration set at the target alpha.</summary>
+    public double JackknifeCoverage { get; set; }
+
+    /// <summary>Per-feature MI-redundancy drop recommendation: index of the feature to drop in each redundant pair.</summary>
+    public int[] RedundantFeatureDropIndices { get; set; } = [];
 
     // ── Rec #86: Mean Teacher EMA weights ────────────────────────────────────
 
@@ -2289,6 +2691,9 @@ public class ModelSnapshot
     /// <summary>Rec #389: TabNet per-step mean attention weights as JSON. Length = F.</summary>
     public string? TabNetAttentionJson { get; set; }
 
+    /// <summary>Rec #389: TabNet per-step attention mask weights (outer = step, inner = F). Used for warm-start transfer.</summary>
+    public double[][]? TabNetStepAttentionWeights { get; set; }
+
     /// <summary>Rec #390: FT-Transformer per-feature embedding weights (outer = feature, inner = dim).</summary>
     public double[][]? FtTransformerEmbedWeights { get; set; }
 
@@ -2352,8 +2757,14 @@ public class ModelSnapshot
     /// <summary>Rec #390: Number of stacked transformer blocks used during training.</summary>
     public int FtTransformerNumLayers { get; set; }
 
-    /// <summary>Rec #390: FT-Transformer additional layer weights (layers 1..N-1) serialised as JSON.</summary>
+    /// <summary>Rec #390: FT-Transformer additional layer weights (layers 1..N-1) serialised as JSON (legacy, kept for backward compat).</summary>
     public string? FtTransformerAdditionalLayersJson { get; set; }
+
+    /// <summary>Rec #390: FT-Transformer additional layer weights (layers 1..N-1) serialised as binary with CRC32 trailer.</summary>
+    public byte[]? FtTransformerAdditionalLayersBytes { get; set; }
+
+    /// <summary>Rec #390: FT-Transformer per-head positional bias for layer 0. Shape [NumHeads][S*S].</summary>
+    public double[][]? FtTransformerPosBias { get; set; }
 
     /// <summary>Rec #390: FT-Transformer learnable [CLS] token embedding. Length = EmbedDim.</summary>
     public double[]? FtTransformerClsToken { get; set; }
@@ -2662,6 +3073,56 @@ public class ModelSnapshot
     /// <summary>Conformal coverage target (1−α) used during training. Default 0.90.</summary>
     public double ConformalCoverage { get; set; } = 0.90;
 
+    // ── TCN extended metrics (100/100 improvements) ─────────────────────
+
+    /// <summary>Maximum Calibration Error (worst-bin |conf − acc|). Complements ECE with a worst-case view.</summary>
+    public double MaxCalibrationError { get; set; }
+
+    /// <summary>Class-wise ECE for Buy predictions (calibP ≥ 0.5).</summary>
+    public double ClasswiseEceBuy { get; set; }
+
+    /// <summary>Class-wise ECE for Sell predictions (calibP &lt; 0.5).</summary>
+    public double ClasswiseEceSell { get; set; }
+
+    /// <summary>Std dev of Platt A parameter across walk-forward folds. High variance = unstable raw scores.</summary>
+    public double RecalibrationStabilityA { get; set; }
+
+    /// <summary>Std dev of Platt B parameter across walk-forward folds.</summary>
+    public double RecalibrationStabilityB { get; set; }
+
+    /// <summary>ECE computed after full isotonic (PAVA) calibration. Measures residual calibration error post-PAVA.</summary>
+    public double PostIsotonicEce { get; set; }
+
+    /// <summary>Lag-1 autocorrelation of predicted probabilities on the test set. High values suggest lagged reactions.</summary>
+    public double PredictionAutocorrelation { get; set; }
+
+    /// <summary>Quantile summary of |calibP − 0.5| on the test set: [p10, p25, p50, p75, p90]. Measures confidence distribution.</summary>
+    public double[] ConfidenceHistogramQuantiles { get; set; } = [];
+
+    /// <summary>Accuracy decay rate per fold across walk-forward CV (linear regression slope). Negative = degrading.</summary>
+    public double AccuracyDecayRate { get; set; }
+
+    /// <summary>F1 decay rate per fold across walk-forward CV.</summary>
+    public double F1DecayRate { get; set; }
+
+    /// <summary>Monte Carlo permutation test p-value. Fraction of shuffled CVs that matched or exceeded observed accuracy.</summary>
+    public double MonteCarloPermPValue { get; set; } = 1.0;
+
+    /// <summary>Prediction Interval Coverage Probability — actual coverage of conformal intervals on test set.</summary>
+    public double PicpCoverage { get; set; }
+
+    /// <summary>Per-block max gradient norms recorded during training. Length = numBlocks. Monitors vanishing/exploding gradients.</summary>
+    public double[] PerBlockGradientNorms { get; set; } = [];
+
+    /// <summary>Approximate Shapley values per channel (top-k subsets). More accurate than permutation importance for interactions.</summary>
+    public double[] ShapleyChannelValues { get; set; } = [];
+
+    /// <summary>Beta calibration parameter c (3-param model). 0.0 = not fitted.</summary>
+    public double BetaCalC { get; set; }
+
+    /// <summary>EWC Fisher diagonal used during warm-start training. Stored for next-generation transfer.</summary>
+    public double[]? EwcFisherDiagonal { get; set; }
+
     // ── Per-learner activations (mixed activation ensemble) ──────────────
 
     /// <summary>
@@ -2703,6 +3164,38 @@ public class ModelSnapshot
     /// Per-feature standard deviations on the calibration set (post-standardisation).
     /// </summary>
     public double[] DriftDetectionFeatureStds { get; set; } = [];
+
+    // ── ROCKET improvements ──────────────────────────────────────────────
+
+    /// <summary>ROCKET magnitude regressor weights trained on ROCKET-space features. Length = 2 × numKernels.</summary>
+    public double[] RocketMagWeights { get; set; } = [];
+
+    /// <summary>ROCKET magnitude regressor bias (ROCKET-space).</summary>
+    public double RocketMagBias { get; set; }
+
+    /// <summary>Magnitude prediction R² (correlation between predicted and actual magnitudes on test set).</summary>
+    public double MagnitudeR2 { get; set; }
+
+    /// <summary>Fast weight-based feature attribution (no permutation). Length = featureCount.</summary>
+    public float[] FastFeatureAttribution { get; set; } = [];
+
+    /// <summary>Synergistic feature pairs detected via ROCKET kernel co-activation analysis.</summary>
+    public string[] SynergisticFeaturePairs { get; set; } = [];
+
+    /// <summary>Per-kernel accuracy contribution (accuracy drop when kernel zeroed). Length = numKernels.</summary>
+    public double[] PerKernelAccuracyContribution { get; set; } = [];
+
+    /// <summary>Epoch at which early stopping fired in the main ridge training. 0 = ran all epochs.</summary>
+    public int EarlyStoppingEpoch { get; set; }
+
+    /// <summary>Final validation loss at the time early stopping fired.</summary>
+    public double FinalValidationLoss { get; set; }
+
+    /// <summary>Venn-ABERS lower/upper probability bounds on calibration set. Interleaved [p_lo, p_hi, ...].</summary>
+    public double[] VennAbersCalBounds { get; set; } = [];
+
+    /// <summary>Kernel entropy per test sample (mean Shannon entropy of PPV activations). 0 = not computed.</summary>
+    public double MeanKernelEntropy { get; set; }
 
     // ── Magnitude regressor fold weights (prediction averaging) ──────────
 
