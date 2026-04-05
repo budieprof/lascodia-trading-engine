@@ -239,44 +239,36 @@ public class WalkForwardWorker : BackgroundService
                 throw new InvalidOperationException(
                     $"No closed candles found for {run.Symbol}/{run.Timeframe} between {run.FromDate:yyyy-MM-dd} and {run.ToDate:yyyy-MM-dd}.");
 
-            // Total bars required to fit at least one complete window.
-            int windowSize    = run.InSampleDays + run.OutOfSampleDays;
             var windowResults = new List<WindowResult>();
 
             int windowIndex = 0;
-            int offset      = 0;  // Start index of the current window's IS segment in allCandles
+            var windowStartUtc = run.FromDate;
 
             // ── Walk-forward loop ──────────────────────────────────────────────────
-            // Each iteration advances the window by OutOfSampleDays bars (anchored
-            // walk-forward). This means:
-            //   - The IS segment grows by one OOS period each iteration (anchored IS start)
-            //     — OR —
-            //   - The IS segment slides forward maintaining a fixed length (rolling IS).
-            // Here the implementation uses fixed-length IS/OOS slices via Skip/Take,
-            // so both segments maintain constant length and the window slides forward
-            // by OutOfSampleDays bars.
-            while (offset + windowSize <= allCandles.Count)
+            // The entity stores window sizes in calendar days, so the slices must be built
+            // from timestamps rather than raw candle counts. Each iteration advances by one
+            // OOS period, producing rolling day-based windows across the full date range.
+            while (windowStartUtc < run.ToDate)
             {
-                // ── Index arithmetic for this window ─────────────────────────────
-                int inSampleStart  = offset;
-                int inSampleEnd    = offset + run.InSampleDays;   // Exclusive upper bound
-                int oosStart       = inSampleEnd;                  // OOS starts immediately after IS
-                int oosEnd         = oosStart + run.OutOfSampleDays; // Exclusive upper bound
-
-                // Guard: ensure the OOS segment is fully contained in allCandles.
-                // This can fail on the last iteration if the remaining data is less than
-                // a full OOS block.
-                if (oosEnd > allCandles.Count) break;
+                DateTime inSampleStartUtc = windowStartUtc;
+                DateTime inSampleEndUtc = inSampleStartUtc.AddDays(run.InSampleDays);
+                DateTime oosStartUtc = inSampleEndUtc;
+                DateTime oosEndUtc = oosStartUtc.AddDays(run.OutOfSampleDays);
+                if (oosEndUtc > run.ToDate) break;
 
                 var inSampleCandles = allCandles
-                    .Skip(inSampleStart)
-                    .Take(run.InSampleDays)
+                    .Where(c => c.Timestamp >= inSampleStartUtc && c.Timestamp < inSampleEndUtc)
                     .ToList();
 
                 var oosCandles = allCandles
-                    .Skip(oosStart)
-                    .Take(run.OutOfSampleDays)
+                    .Where(c => c.Timestamp >= oosStartUtc && c.Timestamp < oosEndUtc)
                     .ToList();
+
+                if (inSampleCandles.Count == 0 || oosCandles.Count == 0)
+                {
+                    windowStartUtc = windowStartUtc.AddDays(run.OutOfSampleDays);
+                    continue;
+                }
 
                 // ── Per-fold re-optimization (true WFA) ─────────────────────
                 // When enabled, re-optimise strategy parameters on the IS candles using a
@@ -305,10 +297,10 @@ public class WalkForwardWorker : BackgroundService
                 var windowResult = new WindowResult
                 {
                     WindowIndex         = windowIndex,
-                    InSampleFrom        = allCandles[inSampleStart].Timestamp,
-                    InSampleTo          = allCandles[inSampleEnd - 1].Timestamp,   // Last inclusive bar
-                    OutOfSampleFrom     = allCandles[oosStart].Timestamp,
-                    OutOfSampleTo       = allCandles[oosEnd - 1].Timestamp,         // Last inclusive bar
+                    InSampleFrom        = inSampleCandles[0].Timestamp,
+                    InSampleTo          = inSampleCandles[^1].Timestamp,
+                    OutOfSampleFrom     = oosCandles[0].Timestamp,
+                    OutOfSampleTo       = oosCandles[^1].Timestamp,
                     OosHealthScore      = (double)oosResult.SharpeRatio,
                     OosTotalTrades      = oosResult.TotalTrades,
                     OosWinRate          = (double)oosResult.WinRate,
@@ -322,9 +314,8 @@ public class WalkForwardWorker : BackgroundService
                     "WalkForwardWorker: run {RunId} window {Window} OOS SharpeRatio={Sharpe:F4}",
                     run.Id, windowIndex, oosResult.SharpeRatio);
 
-                // Advance the window start by one OOS period so the next window's IS
-                // segment begins where this window's OOS segment started.
-                offset      += run.OutOfSampleDays;
+                // Advance by one OOS period to create the next rolling day-based window.
+                windowStartUtc = windowStartUtc.AddDays(run.OutOfSampleDays);
                 windowIndex++;
             }
 

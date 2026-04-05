@@ -254,9 +254,16 @@ internal sealed class OptimizationValidator
         var pessOptions = new BacktestOptions
         {
             SpreadPriceUnits   = baseOptions.SpreadPriceUnits * multiplier,
+            SpreadFunction     = baseOptions.SpreadFunction is null
+                ? null
+                : timestamp => baseOptions.SpreadFunction(timestamp) * multiplier,
             CommissionPerLot   = baseOptions.CommissionPerLot * multiplier,
             SlippagePriceUnits = baseOptions.SlippagePriceUnits * multiplier,
+            SwapPerLotPerDay   = baseOptions.SwapPerLotPerDay,
             ContractSize       = baseOptions.ContractSize,
+            GapSlippagePct     = baseOptions.GapSlippagePct,
+            FillRatio          = baseOptions.FillRatio,
+            PositionSizer      = baseOptions.PositionSizer,
         };
 
         try

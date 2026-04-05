@@ -457,7 +457,8 @@ public partial class OptimizationWorker
                         brackets, CandidateSource, trainCandles, strategy, screeningOptions,
                         _validator, coarseBaseline, config.MaxParallelBacktests,
                         config.ScreeningTimeoutSeconds, config.CircuitBreakerThreshold,
-                        freshCandidates.Count, runCt);
+                        freshCandidates.Count, protocol.KFolds, embargoPerFold,
+                        config.MinCandidateTrades, runCt);
 
                     totalIters += hbResult.TotalEvaluations;
 
@@ -474,7 +475,7 @@ public partial class OptimizationWorker
                             var paramsJson = CanonicalParameterJson.Normalize(s.ParamsJson);
                             seenParamSet.TryAdd(paramsJson, 0);
                             lock (_evalLock) allEvaluated.Add(new ScoredCandidate(
-                                paramsJson, s.HealthScore, s.Result));
+                                paramsJson, s.HealthScore, s.Result, s.CvCoefficientOfVariation));
                         }
 
                         // Replace freshCandidates with pooled survivors for LHS seeding

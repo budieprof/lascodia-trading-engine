@@ -3317,7 +3317,7 @@ public class OptimizationWorkerTest
             Symbol = "EURUSD",
             Timeframe = Timeframe.H1,
             FromDate = new DateTime(2026, 01, 01, 0, 0, 0, DateTimeKind.Utc),
-            ToDate = new DateTime(2026, 01, 05, 0, 0, 0, DateTimeKind.Utc),
+            ToDate = new DateTime(2026, 02, 20, 0, 0, 0, DateTimeKind.Utc),
             InSampleDays = 20,
             OutOfSampleDays = 10,
             InitialBalance = 10_000m,
@@ -3336,11 +3336,13 @@ public class OptimizationWorkerTest
             IsDeleted = false
         };
         var candles = Enumerable.Range(0, 60)
-            .Select(i => new Candle
+            .SelectMany(day => Enumerable.Range(0, 24).Select(hour => run.FromDate.AddDays(day).AddHours(hour)))
+            .Where(ts => ts < run.ToDate)
+            .Select(ts => new Candle
             {
                 Symbol = "EURUSD",
                 Timeframe = Timeframe.H1,
-                Timestamp = run.FromDate.AddHours(i),
+                Timestamp = ts,
                 Open = 1.10m,
                 High = 1.11m,
                 Low = 1.09m,
@@ -3386,8 +3388,82 @@ public class OptimizationWorkerTest
 
         await (Task)method.Invoke(worker, [CancellationToken.None])!;
 
-        Assert.Equal(4, engine.SeenParameterJson.Count);
+        Assert.Equal(3, engine.SeenParameterJson.Count);
         Assert.All(engine.SeenParameterJson, p => Assert.Equal("""{"mode":"approved"}""", p));
+        Assert.All(engine.SeenCandleCounts, count => Assert.Equal(240, count));
+    }
+
+    [Fact]
+    public async Task CostSensitivitySweepAsync_PreservesDynamicSpreadModel_AndExecutionSettings()
+    {
+        var engine = new OptionsCapturingBacktestEngine();
+        var validator = new OptimizationValidator(engine);
+        validator.SetInitialBalance(10_000m);
+
+        var strategy = new Strategy
+        {
+            Id = 18,
+            Symbol = "EURUSD",
+            Timeframe = Timeframe.H1,
+            ParametersJson = """{"mode":"winner"}"""
+        };
+
+        var candles = Enumerable.Range(0, 40)
+            .Select(i => new Candle
+            {
+                Symbol = "EURUSD",
+                Timeframe = Timeframe.H1,
+                Timestamp = new DateTime(2026, 03, 01, 0, 0, 0, DateTimeKind.Utc).AddHours(i),
+                Open = 1.10m,
+                High = 1.11m,
+                Low = 1.09m,
+                Close = 1.10m,
+                IsClosed = true
+            })
+            .ToList();
+
+        TradeSignal sizingSignal = new()
+        {
+            EntryPrice = 1.1000m,
+            StopLoss = 1.0950m,
+            SuggestedLotSize = 0.50m
+        };
+
+        var baseOptions = new BacktestOptions
+        {
+            SpreadPriceUnits = 0.0002m,
+            SpreadFunction = _ => 0.0003m,
+            CommissionPerLot = 7m,
+            SlippagePriceUnits = 0.0001m,
+            SwapPerLotPerDay = 1.5m,
+            ContractSize = 100_000m,
+            GapSlippagePct = 0.4m,
+            FillRatio = 0.85m,
+            PositionSizer = (_, _) => 0.25m
+        };
+
+        var (isRobust, pessimisticScore) = await validator.CostSensitivitySweepAsync(
+            strategy,
+            strategy.ParametersJson,
+            candles,
+            baseOptions,
+            approvalThreshold: 0.55m,
+            timeoutSecs: 5,
+            ct: CancellationToken.None,
+            costMultiplier: 2.0);
+
+        Assert.True(isRobust);
+        Assert.True(pessimisticScore > 0m);
+        Assert.NotNull(engine.LastOptions);
+        Assert.Equal(0.0004m, engine.LastOptions!.SpreadPriceUnits);
+        Assert.NotNull(engine.LastOptions.SpreadFunction);
+        Assert.Equal(0.0006m, engine.LastOptions.SpreadFunction!(candles[0].Timestamp));
+        Assert.Equal(14m, engine.LastOptions.CommissionPerLot);
+        Assert.Equal(0.0002m, engine.LastOptions.SlippagePriceUnits);
+        Assert.Equal(baseOptions.SwapPerLotPerDay, engine.LastOptions.SwapPerLotPerDay);
+        Assert.Equal(baseOptions.GapSlippagePct, engine.LastOptions.GapSlippagePct);
+        Assert.Equal(baseOptions.FillRatio, engine.LastOptions.FillRatio);
+        Assert.Equal(0.25m, engine.LastOptions.PositionSizer!(10_000m, sizingSignal));
     }
 
     [Fact]
@@ -3596,5 +3672,32 @@ public class OptimizationWorkerTest
             SharpeRatio = score * 2m,
             Trades = []
         };
+    }
+
+    private sealed class OptionsCapturingBacktestEngine : IBacktestEngine
+    {
+        public BacktestOptions? LastOptions { get; private set; }
+
+        public Task<BacktestResult> RunAsync(
+            Strategy strategy,
+            IReadOnlyList<Candle> candles,
+            decimal initialBalance,
+            CancellationToken ct,
+            BacktestOptions? options = null)
+        {
+            LastOptions = options;
+
+            return Task.FromResult(new BacktestResult
+            {
+                InitialBalance = initialBalance,
+                FinalBalance = initialBalance + 400m,
+                TotalTrades = 20,
+                WinRate = 0.60m,
+                ProfitFactor = 1.50m,
+                MaxDrawdownPct = 5m,
+                SharpeRatio = 1.2m,
+                Trades = []
+            });
+        }
     }
 }

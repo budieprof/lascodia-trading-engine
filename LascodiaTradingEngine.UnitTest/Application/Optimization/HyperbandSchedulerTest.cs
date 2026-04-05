@@ -177,6 +177,21 @@ public class HyperbandSchedulerTest
     }
 
     [Fact]
+    public void PoolSurvivors_PreservesCvFromHighestFidelityEntry()
+    {
+        var survivors = new List<HyperbandScheduler.ScoredCandidateWithFidelity>
+        {
+            new("""{"Fast":10}""", 0.60m, new(), 0.25, 0, 0.40),
+            new("""{"Fast":10}""", 0.65m, new(), 1.00, 1, 0.12),
+        };
+
+        var pooled = HyperbandScheduler.PoolSurvivors(survivors, maxCount: 10);
+
+        var fast10 = Assert.Single(pooled);
+        Assert.Equal(0.12, fast10.CvCoefficientOfVariation, 6);
+    }
+
+    [Fact]
     public void PoolSurvivors_RespectsMaxCount()
     {
         var survivors = Enumerable.Range(1, 20)
@@ -288,6 +303,9 @@ public class HyperbandSchedulerTest
                 screeningTimeoutSeconds: 30,
                 circuitBreakerThreshold: 10,
                 globalBudgetRemaining: 3,
+                kFolds: 3,
+                embargoPerFold: 1,
+                minTrades: 1,
                 cts.Token));
     }
 

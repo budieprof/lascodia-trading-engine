@@ -71,7 +71,8 @@ internal sealed class HyperbandScheduler
         decimal HealthScore,
         BacktestResult Result,
         double EvaluatedAtFidelity,
-        int SourceBracket);
+        int SourceBracket,
+        double CvCoefficientOfVariation = 0.0);
 
     // ── Bracket computation ────────────────────────────────────────────────
 
@@ -174,6 +175,9 @@ internal sealed class HyperbandScheduler
         int screeningTimeoutSeconds,
         int circuitBreakerThreshold,
         int globalBudgetRemaining,
+        int kFolds,
+        int embargoPerFold,
+        int minTrades,
         CancellationToken ct)
     {
         var allSurvivors = new List<ScoredCandidateWithFidelity>();
@@ -202,7 +206,8 @@ internal sealed class HyperbandScheduler
                 var (survivors, evals) = await ExecuteSingleBracketAsync(
                     bracket, candidateSource, trainCandles, strategy, screeningOptions,
                     validator, baselineScore, maxParallel, screeningTimeoutSeconds,
-                    circuitBreakerThreshold, globalBudgetRemaining, ct);
+                    circuitBreakerThreshold, globalBudgetRemaining, kFolds,
+                    embargoPerFold, minTrades, ct);
 
                 totalEvals += evals;
                 globalBudgetRemaining -= evals;
@@ -263,6 +268,9 @@ internal sealed class HyperbandScheduler
         int screeningTimeoutSeconds,
         int circuitBreakerThreshold,
         int bracketBudgetRemaining,
+        int kFolds,
+        int embargoPerFold,
+        int minTrades,
         CancellationToken ct)
     {
         // Source candidates for this bracket
@@ -313,7 +321,7 @@ internal sealed class HyperbandScheduler
             // Only successful evaluations are added to `scores`; failures increment the
             // circuit breaker counter but don't produce a scored entry. This keeps
             // totalEvals accurate for budget tracking (we only "spend" evals that ran).
-            var scores = new ConcurrentBag<(int Index, decimal Score, BacktestResult Result)>();
+            var scores = new ConcurrentBag<(int Index, decimal Score, BacktestResult Result, double CvCoefficientOfVariation)>();
             int consecutiveFailures = 0;
             int rungEvalsAttempted = 0;
 
@@ -332,11 +340,22 @@ internal sealed class HyperbandScheduler
                     Interlocked.Increment(ref rungEvalsAttempted);
                     try
                     {
-                        var result = await validator.RunWithTimeoutAsync(
-                            strategy, activeCandidates[idx], downsampledCandles,
-                            screeningOptions, rungTimeout, pCt);
-                        var score = OptimizationHealthScorer.ComputeHealthScore(result);
-                        scores.Add((idx, score, result));
+                        if (fidelity >= 0.99)
+                        {
+                            var (score, result, cvCoefficientOfVariation) = await validator.TemporalChunkedEvaluateAsync(
+                                strategy, activeCandidates[idx], downsampledCandles,
+                                screeningOptions, rungTimeout, kFolds,
+                                Math.Max(1, embargoPerFold), minTrades, pCt);
+                            scores.Add((idx, score, result, cvCoefficientOfVariation));
+                        }
+                        else
+                        {
+                            var result = await validator.RunWithTimeoutAsync(
+                                strategy, activeCandidates[idx], downsampledCandles,
+                                screeningOptions, rungTimeout, pCt);
+                            var score = OptimizationHealthScorer.ComputeHealthScore(result);
+                            scores.Add((idx, score, result, 0.0));
+                        }
                         Interlocked.Exchange(ref consecutiveFailures, 0);
                     }
                     catch (OperationCanceledException) when (pCt.IsCancellationRequested)
@@ -386,7 +405,7 @@ internal sealed class HyperbandScheduler
             lastRungScores = validScores
                 .Take(targetSurvivors)
                 .Select(s => new ScoredCandidateWithFidelity(
-                    activeCandidates[s.Index], s.Score, s.Result, fidelity, bracket.Index))
+                    activeCandidates[s.Index], s.Score, s.Result, fidelity, bracket.Index, s.CvCoefficientOfVariation))
                 .ToList();
 
             if (rung < bracket.FidelityRungs.Length - 1)

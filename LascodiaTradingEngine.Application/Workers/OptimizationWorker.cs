@@ -2402,12 +2402,9 @@ public partial class OptimizationWorker : BackgroundService
         OptimizationFailureCategory failureCategory,
         DateTime utcNow)
     {
-        run.Status = OptimizationRunStatus.Failed;
-        run.CompletedAt = utcNow;
-        run.ApprovedAt = null;
-        run.ErrorMessage = errorMessage;
         run.FailureCategory = failureCategory;
-        run.ExecutionLeaseExpiresAt = null;
+        OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Failed, utcNow, errorMessage);
+        run.ApprovedAt = null;
         run.DeferredUntilUtc = null;
     }
 

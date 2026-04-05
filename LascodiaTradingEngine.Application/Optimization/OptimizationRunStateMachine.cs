@@ -15,6 +15,7 @@ internal static class OptimizationRunStateMachine
         (OptimizationRunStatus.Running, OptimizationRunStatus.Queued) => true,
         (OptimizationRunStatus.Running, OptimizationRunStatus.Completed) => true,
         (OptimizationRunStatus.Running, OptimizationRunStatus.Failed) => true,
+        (OptimizationRunStatus.Completed, OptimizationRunStatus.Failed) => true, // approval persistence failure → retry
         (OptimizationRunStatus.Failed, OptimizationRunStatus.Queued) => true, // retry path
         (OptimizationRunStatus.Failed, OptimizationRunStatus.Abandoned) => true, // dead-letter after retries exhausted
         (OptimizationRunStatus.Completed, OptimizationRunStatus.Approved) => true,
