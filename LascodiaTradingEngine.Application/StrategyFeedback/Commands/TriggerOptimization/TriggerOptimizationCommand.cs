@@ -1,7 +1,9 @@
 using FluentValidation;
 using MediatR;
+using Microsoft.EntityFrameworkCore;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.StrategyFeedback.Commands.TriggerOptimization;
@@ -43,7 +45,24 @@ public class TriggerOptimizationCommandHandler : IRequestHandler<TriggerOptimiza
 
     public async Task<ResponseData<long>> Handle(TriggerOptimizationCommand request, CancellationToken cancellationToken)
     {
-        var entity = new Domain.Entities.OptimizationRun
+        var db = _context.GetDbContext();
+        var activeRun = await db.Set<OptimizationRun>()
+            .Where(r => r.StrategyId == request.StrategyId
+                     && !r.IsDeleted
+                     && (r.Status == OptimizationRunStatus.Queued || r.Status == OptimizationRunStatus.Running))
+            .OrderBy(r => r.StartedAt)
+            .FirstOrDefaultAsync(cancellationToken);
+
+        if (activeRun is not null)
+        {
+            return ResponseData<long>.Init(
+                activeRun.Id,
+                true,
+                "An optimization run is already queued or running for this strategy",
+                "00");
+        }
+
+        var entity = new OptimizationRun
         {
             StrategyId  = request.StrategyId,
             TriggerType = Enum.Parse<TriggerType>(request.TriggerType, ignoreCase: true),
@@ -51,12 +70,43 @@ public class TriggerOptimizationCommandHandler : IRequestHandler<TriggerOptimiza
             StartedAt   = DateTime.UtcNow
         };
 
-        await _context.GetDbContext()
-            .Set<Domain.Entities.OptimizationRun>()
+        await db.Set<OptimizationRun>()
             .AddAsync(entity, cancellationToken);
 
-        await _context.SaveChangesAsync(cancellationToken);
+        try
+        {
+            await _context.SaveChangesAsync(cancellationToken);
+        }
+        catch (DbUpdateException ex) when (IsActiveQueueConstraintViolation(ex))
+        {
+            activeRun = await db.Set<OptimizationRun>()
+                .Where(r => r.StrategyId == request.StrategyId
+                         && !r.IsDeleted
+                         && (r.Status == OptimizationRunStatus.Queued || r.Status == OptimizationRunStatus.Running))
+                .OrderBy(r => r.StartedAt)
+                .FirstOrDefaultAsync(cancellationToken);
+
+            if (activeRun is not null)
+            {
+                return ResponseData<long>.Init(
+                    activeRun.Id,
+                    true,
+                    "An optimization run is already queued or running for this strategy",
+                    "00");
+            }
+
+            throw;
+        }
 
         return ResponseData<long>.Init(entity.Id, true, "Optimization run queued successfully", "00");
+    }
+
+    private static bool IsActiveQueueConstraintViolation(DbUpdateException ex)
+    {
+        string message = ex.InnerException?.Message ?? ex.Message;
+        return message.Contains("IX_OptimizationRun_ActivePerStrategy", StringComparison.OrdinalIgnoreCase)
+            || message.Contains("duplicate key", StringComparison.OrdinalIgnoreCase)
+               && message.Contains("OptimizationRun", StringComparison.OrdinalIgnoreCase)
+               && message.Contains("StrategyId", StringComparison.OrdinalIgnoreCase);
     }
 }

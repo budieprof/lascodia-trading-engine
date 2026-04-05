@@ -256,7 +256,7 @@ public partial class OptimizationWorker
                     }
                     if (seeded) checkpointSeeded++;
                 }
-                catch { /* skip malformed checkpoint entries */ }
+                catch (Exception ex) { _logger.LogDebug(ex, "OptimizationWorker: skipping malformed checkpoint entry during surrogate seeding"); }
             }
 
             if (checkpointSeeded > 0)
@@ -312,7 +312,7 @@ public partial class OptimizationWorker
                         }
                     }
                 }
-                catch { /* Non-critical — proceed with warm-start if metadata is malformed */ }
+                catch (Exception ex) { _logger.LogDebug(ex, "OptimizationWorker: skipping warm-start entry with malformed RunMetadataJson"); }
             }
 
             double ageDays = prior.CompletedAt.HasValue
@@ -551,7 +551,11 @@ public partial class OptimizationWorker
                                     rungTimeout, pCt);
                                 lock (coarseLock) coarseScores.Add((idx, OptimizationHealthScorer.ComputeHealthScore(result)));
                             }
-                            catch { lock (coarseLock) coarseScores.Add((idx, -1m)); }
+                            catch (Exception ex)
+                            {
+                                _logger.LogDebug(ex, "OptimizationWorker: successive halving backtest failed for candidate {Idx}", idx);
+                                lock (coarseLock) coarseScores.Add((idx, -1m));
+                            }
                         });
 
                     double noiseTolerance = 0.90 + 0.05 * fidelity;

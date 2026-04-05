@@ -116,71 +116,95 @@ public partial class OptimizationWorker : BackgroundService
     // ── Inner types ─────────────────────────────────────────────────────────
 
     /// <summary>All hot-reloadable configuration for a single optimisation cycle.</summary>
-    internal sealed record OptimizationConfig(
-        int SchedulePollSeconds,
-        int CooldownDays,
-        int MaxQueuedPerCycle,
-        bool AutoScheduleEnabled,
-        double MinWinRate,
-        double MinProfitFactor,
-        int MinTotalTrades,
-        decimal AutoApprovalImprovementThreshold,
-        decimal AutoApprovalMinHealthScore,
-        int TopNCandidates,
-        int CoarsePhaseThreshold,
-        int ScreeningTimeoutSeconds,
-        double ScreeningSpreadPoints,
-        double ScreeningCommissionPerLot,
-        double ScreeningSlippagePips,
-        double MaxOosDegradationPct,
-        bool SuppressDuringDrawdownRecovery,
-        bool SeasonalBlackoutEnabled,
-        string BlackoutPeriods,
-        int MaxRunTimeoutMinutes,
-        int MaxParallelBacktests,
-        int MinCandidateTrades,
-        double EmbargoRatio,
-        double CorrelationParamThreshold,
-        int TpeBudget,
-        int TpeInitialSamples,
-        int PurgedKFolds,
-        double SensitivityPerturbPct,
-        int BootstrapIterations,
-        decimal MinBootstrapCILower,
-        bool CostSensitivityEnabled,
-        bool AdaptiveBoundsEnabled,
-        double TemporalOverlapThreshold,
-        int DataScarcityThreshold,
-        decimal ScreeningInitialBalance,
-        double PortfolioCorrelationThreshold,
-        int MaxConsecutiveFailuresBeforeEscalation,
-        int CheckpointEveryN,
-        int GpEarlyStopPatience,
-        double SensitivityDegradationTolerance,
-        double WalkForwardMinMaxRatio,
-        double CostStressMultiplier,
-        int MinOosCandlesForValidation,
-        double MaxCvCoefficientOfVariation,
-        int PermutationIterations,
-        int MaxRetryAttempts,
-        int CandleLookbackMonths,
-        bool CandleLookbackAutoScale,
-        bool RequireEADataAvailability,
-        int MaxConcurrentRuns,
-        bool UseSymbolSpecificSpread,
-        double RegimeBlendRatio,
-        int CpcvNFolds,
-        int CpcvTestFoldCount,
-        int CpcvMaxCombinations,
-        int CircuitBreakerThreshold,
-        string SuccessiveHalvingRungs,
-        int MaxCrossRegimeEvals, string PresetName,
-        bool HyperbandEnabled, int HyperbandEta, int MaxRunsPerWeek,
-        int RegimeStabilityHours,
-        bool UseEhviAcquisition,
-        bool UseParegoScalarization,
-        double MinEquityCurveR2,
-        double MaxTradeTimeConcentration);
+    internal sealed record OptimizationConfig
+    {
+        // Scheduling
+        public required int SchedulePollSeconds { get; init; }
+        public required int CooldownDays { get; init; }
+        public required int MaxQueuedPerCycle { get; init; }
+        public required bool AutoScheduleEnabled { get; init; }
+        public required int MaxRunsPerWeek { get; init; }
+
+        // Performance gates
+        public required double MinWinRate { get; init; }
+        public required double MinProfitFactor { get; init; }
+        public required int MinTotalTrades { get; init; }
+
+        // Approval thresholds
+        public required decimal AutoApprovalImprovementThreshold { get; init; }
+        public required decimal AutoApprovalMinHealthScore { get; init; }
+
+        // Search
+        public required int TopNCandidates { get; init; }
+        public required int CoarsePhaseThreshold { get; init; }
+        public required int TpeBudget { get; init; }
+        public required int TpeInitialSamples { get; init; }
+        public required int PurgedKFolds { get; init; }
+        public required bool AdaptiveBoundsEnabled { get; init; }
+        public required int GpEarlyStopPatience { get; init; }
+        public required string PresetName { get; init; }
+        public required bool HyperbandEnabled { get; init; }
+        public required int HyperbandEta { get; init; }
+        public required bool UseEhviAcquisition { get; init; }
+        public required bool UseParegoScalarization { get; init; }
+
+        // Screening / backtesting
+        public required int ScreeningTimeoutSeconds { get; init; }
+        public required double ScreeningSpreadPoints { get; init; }
+        public required double ScreeningCommissionPerLot { get; init; }
+        public required double ScreeningSlippagePips { get; init; }
+        public required decimal ScreeningInitialBalance { get; init; }
+        public required int MaxParallelBacktests { get; init; }
+        public required int MinCandidateTrades { get; init; }
+        public required int MaxRunTimeoutMinutes { get; init; }
+        public required int CircuitBreakerThreshold { get; init; }
+        public required string SuccessiveHalvingRungs { get; init; }
+
+        // Validation gates
+        public required double MaxOosDegradationPct { get; init; }
+        public required double EmbargoRatio { get; init; }
+        public required double CorrelationParamThreshold { get; init; }
+        public required double SensitivityPerturbPct { get; init; }
+        public required double SensitivityDegradationTolerance { get; init; }
+        public required int BootstrapIterations { get; init; }
+        public required decimal MinBootstrapCILower { get; init; }
+        public required bool CostSensitivityEnabled { get; init; }
+        public required double CostStressMultiplier { get; init; }
+        public required double TemporalOverlapThreshold { get; init; }
+        public required double PortfolioCorrelationThreshold { get; init; }
+        public required double WalkForwardMinMaxRatio { get; init; }
+        public required int MinOosCandlesForValidation { get; init; }
+        public required double MaxCvCoefficientOfVariation { get; init; }
+        public required int PermutationIterations { get; init; }
+        public required double MinEquityCurveR2 { get; init; }
+        public required double MaxTradeTimeConcentration { get; init; }
+
+        // CPCV
+        public required int CpcvNFolds { get; init; }
+        public required int CpcvTestFoldCount { get; init; }
+        public required int CpcvMaxCombinations { get; init; }
+
+        // Data loading
+        public required int DataScarcityThreshold { get; init; }
+        public required int CandleLookbackMonths { get; init; }
+        public required bool CandleLookbackAutoScale { get; init; }
+        public required bool UseSymbolSpecificSpread { get; init; }
+        public required double RegimeBlendRatio { get; init; }
+        public required int MaxCrossRegimeEvals { get; init; }
+        public required int RegimeStabilityHours { get; init; }
+
+        // Suppression / deferral
+        public required bool SuppressDuringDrawdownRecovery { get; init; }
+        public required bool SeasonalBlackoutEnabled { get; init; }
+        public required string BlackoutPeriods { get; init; }
+        public required bool RequireEADataAvailability { get; init; }
+
+        // Retry / escalation
+        public required int MaxRetryAttempts { get; init; }
+        public required int MaxConsecutiveFailuresBeforeEscalation { get; init; }
+        public required int CheckpointEveryN { get; init; }
+        public required int MaxConcurrentRuns { get; init; }
+    }
 
     /// <summary>
     /// A scored parameter candidate from the screening phases.
@@ -476,11 +500,16 @@ public partial class OptimizationWorker : BackgroundService
         var sw = Stopwatch.StartNew();
         OptimizationConfig? config = null;
         CancellationTokenSource? runCts = null;
+        CancellationTokenSource? leaseHeartbeatCts = null;
+        Task? leaseHeartbeatTask = null;
         var runCt = ct;
         bool completionPersisted = false;
 
         try
         {
+            leaseHeartbeatCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            leaseHeartbeatTask = MaintainExecutionLeaseAsync(run.Id, leaseHeartbeatCts.Token);
+
             // ── Stage 2: Load config + pre-flight checks ────────────────────
             config = await LoadRunScopedConfigurationAsync(run, db, writeCtx, ct);
 
@@ -508,7 +537,8 @@ public partial class OptimizationWorker : BackgroundService
                 config.CostStressMultiplier,
                 config.CpcvNFolds, config.CpcvTestFoldCount,
                 config.MinOosCandlesForValidation, config.CircuitBreakerThreshold,
-                config.MinCandidateTrades, config.SuccessiveHalvingRungs);
+                config.MinCandidateTrades, config.SuccessiveHalvingRungs,
+                config.RegimeBlendRatio, config.MinEquityCurveR2, config.MaxTradeTimeConcentration);
 
             if (configIssues.Count > 0)
             {
@@ -711,7 +741,11 @@ public partial class OptimizationWorker : BackgroundService
                         result,
                         candidate.CvCoefficientOfVariation));
                 }
-                catch { Interlocked.Increment(ref totalIters); }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "OptimizationWorker: fine-validation backtest failed for Pareto candidate");
+                    Interlocked.Increment(ref totalIters);
+                }
             });
 
             var rankedCandidates = fineRanked.Count == 0
@@ -965,6 +999,24 @@ public partial class OptimizationWorker : BackgroundService
         }
         finally
         {
+            if (leaseHeartbeatCts is not null)
+            {
+                leaseHeartbeatCts.Cancel();
+                if (leaseHeartbeatTask is not null)
+                {
+                    try
+                    {
+                        await leaseHeartbeatTask;
+                    }
+                    catch (OperationCanceledException) when (leaseHeartbeatCts.IsCancellationRequested)
+                    {
+                        // Normal shutdown for the background lease heartbeat.
+                    }
+                }
+
+                leaseHeartbeatCts.Dispose();
+            }
+
             runCts?.Dispose();
             _validator.ClearCache();
         }
@@ -1015,7 +1067,7 @@ public partial class OptimizationWorker : BackgroundService
         // (15m, 30m, 60m, ...). This prevents burning through the retry budget
         // on transient issues that take minutes to resolve (e.g. DB failover,
         // resource exhaustion).
-        int retried = await writeDb.Set<OptimizationRun>()
+        var retryableRuns = await writeDb.Set<OptimizationRun>()
             .Where(r => r.Status == OptimizationRunStatus.Failed
                      && !r.IsDeleted
                      && r.RetryCount < maxRetryAttempts
@@ -1023,15 +1075,44 @@ public partial class OptimizationWorker : BackgroundService
                      && r.FailureCategory != OptimizationFailureCategory.StrategyRemoved
                      && r.CompletedAt != null && r.CompletedAt >= retryWindowStart
                      && r.CompletedAt.Value.AddMinutes(15 << r.RetryCount) <= nowUtc)
-                .ExecuteUpdateAsync(s => s
-                    .SetProperty(r => r.Status, OptimizationRunStatus.Queued)
-                    .SetProperty(r => r.StartedAt, nowUtc)
-                    .SetProperty(r => r.RetryCount, r => r.RetryCount + 1)
-                    .SetProperty(r => r.CompletedAt, (DateTime?)null)
-                    .SetProperty(r => r.ErrorMessage, (string?)null)
-                    .SetProperty(r => r.FailureCategory, (OptimizationFailureCategory?)null)
-                    .SetProperty(r => r.DeferredUntilUtc, (DateTime?)null)
-                    .SetProperty(r => r.ExecutionLeaseExpiresAt, (DateTime?)null), ct);
+            .OrderBy(r => r.CompletedAt)
+            .ToListAsync(ct);
+
+        int retried = 0;
+        foreach (var run in retryableRuns)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            bool hasActiveRun = await writeDb.Set<OptimizationRun>()
+                .AnyAsync(r => r.Id != run.Id
+                            && r.StrategyId == run.StrategyId
+                            && !r.IsDeleted
+                            && (r.Status == OptimizationRunStatus.Queued || r.Status == OptimizationRunStatus.Running), ct);
+            if (hasActiveRun)
+            {
+                _logger.LogInformation(
+                    "OptimizationWorker: skipped retry for run {RunId} — strategy {StrategyId} already has an active optimization run",
+                    run.Id, run.StrategyId);
+                continue;
+            }
+
+            OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Queued, DateTime.UtcNow);
+            run.RetryCount++;
+            run.DeferredUntilUtc = null;
+
+            try
+            {
+                await writeCtx.SaveChangesAsync(ct);
+                retried++;
+            }
+            catch (DbUpdateException ex) when (IsActiveQueueConstraintViolation(ex))
+            {
+                await writeDb.Entry(run).ReloadAsync(ct);
+                _logger.LogInformation(
+                    "OptimizationWorker: skipped retry for run {RunId} — another worker queued or claimed the strategy first",
+                    run.Id);
+            }
+        }
 
         if (retried > 0)
         {
@@ -1045,15 +1126,28 @@ public partial class OptimizationWorker : BackgroundService
         // Case (b) prevents orphaned Failed runs that are too old for the transient retry
         // window but haven't exhausted their budget — they'd otherwise sit in Failed forever
         // with no alerting or operator visibility.
-        int abandoned = await writeDb.Set<OptimizationRun>()
+        var abandonedRuns = await writeDb.Set<OptimizationRun>()
             .Where(r => r.Status == OptimizationRunStatus.Failed
                      && !r.IsDeleted
                      && (r.RetryCount >= maxRetryAttempts
                          || (r.CompletedAt != null && r.CompletedAt < retryWindowStart)))
-            .ExecuteUpdateAsync(s => s
-                .SetProperty(r => r.Status, OptimizationRunStatus.Abandoned)
-                .SetProperty(r => r.ErrorMessage,
-                    r => (r.ErrorMessage ?? "") + $" [Abandoned after {r.RetryCount} retries]"), ct);
+            .ToListAsync(ct);
+        int abandoned = abandonedRuns.Count;
+
+        foreach (var run in abandonedRuns)
+        {
+            string abandonmentMessage = string.IsNullOrWhiteSpace(run.ErrorMessage)
+                ? $"Retry budget exhausted — moved to dead-letter queue [Abandoned after {run.RetryCount} retries]"
+                : $"{run.ErrorMessage} [Abandoned after {run.RetryCount} retries]";
+            OptimizationRunStateMachine.Transition(
+                run,
+                OptimizationRunStatus.Abandoned,
+                DateTime.UtcNow,
+                abandonmentMessage);
+        }
+
+        if (abandoned > 0)
+            await writeCtx.SaveChangesAsync(ct);
 
         if (abandoned > 0)
         {
@@ -1443,73 +1537,95 @@ public partial class OptimizationWorker : BackgroundService
         var presetName = OptimizationGridBuilder.GetConfigValue(b, "Optimization:Preset", "balanced");
         var p = GetPresetDefaults(presetName);
 
-        return new OptimizationConfig(
-            SchedulePollSeconds:              OptimizationGridBuilder.GetConfigValue(b, "Optimization:SchedulePollSeconds", 7200),
-            CooldownDays:                     OptimizationGridBuilder.GetConfigValue(b, "Optimization:CooldownDays", 14),
-            MaxQueuedPerCycle:                OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxQueuedPerCycle", 3),
-            AutoScheduleEnabled:              OptimizationGridBuilder.GetConfigValue(b, "Optimization:AutoScheduleEnabled", true),
-            MinWinRate:                       OptimizationGridBuilder.GetConfigValue(b, "Backtest:Gate:MinWinRate", 0.60),
-            MinProfitFactor:                  OptimizationGridBuilder.GetConfigValue(b, "Backtest:Gate:MinProfitFactor", 1.0),
-            MinTotalTrades:                   OptimizationGridBuilder.GetConfigValue(b, "Backtest:Gate:MinTotalTrades", 10),
-            AutoApprovalImprovementThreshold: OptimizationGridBuilder.GetConfigValue(b, "Optimization:AutoApprovalImprovementThreshold", 0.10m),
-            AutoApprovalMinHealthScore:       OptimizationGridBuilder.GetConfigValue(b, "Optimization:AutoApprovalMinHealthScore", 0.55m),
-            TopNCandidates:                   OptimizationGridBuilder.GetConfigValue(b, "Optimization:TopNCandidates", p.TopNCandidates),
-            CoarsePhaseThreshold:             OptimizationGridBuilder.GetConfigValue(b, "Optimization:CoarsePhaseThreshold", 10),
-            ScreeningTimeoutSeconds:          OptimizationGridBuilder.GetConfigValue(b, "Optimization:ScreeningTimeoutSeconds", 30),
-            ScreeningSpreadPoints:            OptimizationGridBuilder.GetConfigValue(b, "Optimization:ScreeningSpreadPoints", 20.0),
-            ScreeningCommissionPerLot:        OptimizationGridBuilder.GetConfigValue(b, "Optimization:ScreeningCommissionPerLot", 7.0),
-            ScreeningSlippagePips:            OptimizationGridBuilder.GetConfigValue(b, "Optimization:ScreeningSlippagePips", 1.0),
-            MaxOosDegradationPct:             OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxOosDegradationPct", 0.60),
-            SuppressDuringDrawdownRecovery:   OptimizationGridBuilder.GetConfigValue(b, "Optimization:SuppressDuringDrawdownRecovery", true),
-            SeasonalBlackoutEnabled:          OptimizationGridBuilder.GetConfigValue(b, "Optimization:SeasonalBlackoutEnabled", true),
-            BlackoutPeriods:                  OptimizationGridBuilder.GetConfigValue(b, "Optimization:BlackoutPeriods", "12/20-01/05"),
-            MaxRunTimeoutMinutes:             OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxRunTimeoutMinutes", p.MaxRunTimeoutMinutes),
-            MaxParallelBacktests:             OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxParallelBacktests", p.MaxParallelBacktests),
-            MinCandidateTrades:               OptimizationGridBuilder.GetConfigValue(b, "Optimization:MinCandidateTrades", 10),
-            EmbargoRatio:                     OptimizationGridBuilder.GetConfigValue(b, "Optimization:EmbargoRatio", 0.05),
-            CorrelationParamThreshold:        OptimizationGridBuilder.GetConfigValue(b, "Optimization:CorrelationParamThreshold", 0.15),
-            TpeBudget:                        OptimizationGridBuilder.GetConfigValue(b, "Optimization:TpeBudget", p.TpeBudget),
-            TpeInitialSamples:                OptimizationGridBuilder.GetConfigValue(b, "Optimization:TpeInitialSamples", p.TpeInitialSamples),
-            PurgedKFolds:                     OptimizationGridBuilder.GetConfigValue(b, "Optimization:PurgedKFolds", p.PurgedKFolds),
-            SensitivityPerturbPct:            OptimizationGridBuilder.GetConfigValue(b, "Optimization:SensitivityPerturbPct", 0.10),
-            BootstrapIterations:              OptimizationGridBuilder.GetConfigValue(b, "Optimization:BootstrapIterations", p.BootstrapIters),
-            MinBootstrapCILower:              OptimizationGridBuilder.GetConfigValue(b, "Optimization:MinBootstrapCILower", 0.40m),
-            CostSensitivityEnabled:           OptimizationGridBuilder.GetConfigValue(b, "Optimization:CostSensitivityEnabled", true),
-            AdaptiveBoundsEnabled:            OptimizationGridBuilder.GetConfigValue(b, "Optimization:AdaptiveBoundsEnabled", true),
-            TemporalOverlapThreshold:         OptimizationGridBuilder.GetConfigValue(b, "Optimization:TemporalOverlapThreshold", 0.70),
-            DataScarcityThreshold:            OptimizationGridBuilder.GetConfigValue(b, "Optimization:DataScarcityThreshold", 200),
-            ScreeningInitialBalance:          OptimizationGridBuilder.GetConfigValue(b, "Optimization:ScreeningInitialBalance", 10_000m),
-            PortfolioCorrelationThreshold:    OptimizationGridBuilder.GetConfigValue(b, "Optimization:PortfolioCorrelationThreshold", 0.80),
-            MaxConsecutiveFailuresBeforeEscalation: OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxConsecutiveFailuresBeforeEscalation", 3),
-            CheckpointEveryN:                 OptimizationGridBuilder.GetConfigValue(b, "Optimization:CheckpointEveryN", p.CheckpointEveryN),
-            GpEarlyStopPatience:              OptimizationGridBuilder.GetConfigValue(b, "Optimization:GpEarlyStopPatience", 4),
-            SensitivityDegradationTolerance:  OptimizationGridBuilder.GetConfigValue(b, "Optimization:SensitivityDegradationTolerance", 0.20),
-            WalkForwardMinMaxRatio:           OptimizationGridBuilder.GetConfigValue(b, "Optimization:WalkForwardMinMaxRatio", 0.50),
-            CostStressMultiplier:             OptimizationGridBuilder.GetConfigValue(b, "Optimization:CostStressMultiplier", 2.0),
-            MinOosCandlesForValidation:       OptimizationGridBuilder.GetConfigValue(b, "Optimization:MinOosCandlesForValidation", 50),
-            MaxCvCoefficientOfVariation:      OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxCvCoefficientOfVariation", 0.50),
-            PermutationIterations:            OptimizationGridBuilder.GetConfigValue(b, "Optimization:PermutationIterations", p.PermutationIters),
-            MaxRetryAttempts:                 OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxRetryAttempts", 2),
-            CandleLookbackMonths:            OptimizationGridBuilder.GetConfigValue(b, "Optimization:CandleLookbackMonths", 6),
-            CandleLookbackAutoScale:         OptimizationGridBuilder.GetConfigValue(b, "Optimization:CandleLookbackAutoScale", true),
-            RequireEADataAvailability:       OptimizationGridBuilder.GetConfigValue(b, "Optimization:RequireEADataAvailability", true),
-            MaxConcurrentRuns:               OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxConcurrentRuns", 3),
-            UseSymbolSpecificSpread:         OptimizationGridBuilder.GetConfigValue(b, "Optimization:UseSymbolSpecificSpread", true),
-            RegimeBlendRatio:                OptimizationGridBuilder.GetConfigValue(b, "Optimization:RegimeBlendRatio", 0.20),
-            CpcvNFolds:                      OptimizationGridBuilder.GetConfigValue(b, "Optimization:CpcvNFolds", p.CpcvNFolds),
-            CpcvTestFoldCount:               OptimizationGridBuilder.GetConfigValue(b, "Optimization:CpcvTestFoldCount", 2),
-            CpcvMaxCombinations:             OptimizationGridBuilder.GetConfigValue(b, "Optimization:CpcvMaxCombinations", p.CpcvMaxCombinations),
-            CircuitBreakerThreshold:         OptimizationGridBuilder.GetConfigValue(b, "Optimization:CircuitBreakerThreshold", 10),
-            SuccessiveHalvingRungs:          OptimizationGridBuilder.GetConfigValue(b, "Optimization:SuccessiveHalvingRungs", "0.25,0.50"),
-            MaxCrossRegimeEvals:             OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxCrossRegimeEvals", 4), PresetName: presetName,
-            HyperbandEnabled:               OptimizationGridBuilder.GetConfigValue(b, "Optimization:HyperbandEnabled", true),
-            HyperbandEta:                   OptimizationGridBuilder.GetConfigValue(b, "Optimization:HyperbandEta", 3),
-            MaxRunsPerWeek:                 OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxRunsPerWeek", 20),
-            RegimeStabilityHours:           OptimizationGridBuilder.GetConfigValue(b, "Optimization:RegimeStabilityHours", 6),
-            UseEhviAcquisition:             OptimizationGridBuilder.GetConfigValue(b, "Optimization:UseEhviAcquisition", false),
-            UseParegoScalarization:         OptimizationGridBuilder.GetConfigValue(b, "Optimization:UseParegoScalarization", false),
-            MinEquityCurveR2:               OptimizationGridBuilder.GetConfigValue(b, "Optimization:MinEquityCurveR2", 0.60),
-            MaxTradeTimeConcentration:      OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxTradeTimeConcentration", 0.60));
+        return new OptimizationConfig
+        {
+            // Scheduling
+            SchedulePollSeconds              = OptimizationGridBuilder.GetConfigValue(b, "Optimization:SchedulePollSeconds", 7200),
+            CooldownDays                     = OptimizationGridBuilder.GetConfigValue(b, "Optimization:CooldownDays", 14),
+            MaxQueuedPerCycle                = OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxQueuedPerCycle", 3),
+            AutoScheduleEnabled              = OptimizationGridBuilder.GetConfigValue(b, "Optimization:AutoScheduleEnabled", true),
+            MaxRunsPerWeek                   = OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxRunsPerWeek", 20),
+
+            // Performance gates
+            MinWinRate                       = OptimizationGridBuilder.GetConfigValue(b, "Backtest:Gate:MinWinRate", 0.60),
+            MinProfitFactor                  = OptimizationGridBuilder.GetConfigValue(b, "Backtest:Gate:MinProfitFactor", 1.0),
+            MinTotalTrades                   = OptimizationGridBuilder.GetConfigValue(b, "Backtest:Gate:MinTotalTrades", 10),
+
+            // Approval thresholds
+            AutoApprovalImprovementThreshold = OptimizationGridBuilder.GetConfigValue(b, "Optimization:AutoApprovalImprovementThreshold", 0.10m),
+            AutoApprovalMinHealthScore       = OptimizationGridBuilder.GetConfigValue(b, "Optimization:AutoApprovalMinHealthScore", 0.55m),
+
+            // Search
+            TopNCandidates                   = OptimizationGridBuilder.GetConfigValue(b, "Optimization:TopNCandidates", p.TopNCandidates),
+            CoarsePhaseThreshold             = OptimizationGridBuilder.GetConfigValue(b, "Optimization:CoarsePhaseThreshold", 10),
+            TpeBudget                        = OptimizationGridBuilder.GetConfigValue(b, "Optimization:TpeBudget", p.TpeBudget),
+            TpeInitialSamples                = OptimizationGridBuilder.GetConfigValue(b, "Optimization:TpeInitialSamples", p.TpeInitialSamples),
+            PurgedKFolds                     = OptimizationGridBuilder.GetConfigValue(b, "Optimization:PurgedKFolds", p.PurgedKFolds),
+            AdaptiveBoundsEnabled            = OptimizationGridBuilder.GetConfigValue(b, "Optimization:AdaptiveBoundsEnabled", true),
+            GpEarlyStopPatience              = OptimizationGridBuilder.GetConfigValue(b, "Optimization:GpEarlyStopPatience", 4),
+            PresetName                       = presetName,
+            HyperbandEnabled                 = OptimizationGridBuilder.GetConfigValue(b, "Optimization:HyperbandEnabled", true),
+            HyperbandEta                     = OptimizationGridBuilder.GetConfigValue(b, "Optimization:HyperbandEta", 3),
+            UseEhviAcquisition               = OptimizationGridBuilder.GetConfigValue(b, "Optimization:UseEhviAcquisition", false),
+            UseParegoScalarization           = OptimizationGridBuilder.GetConfigValue(b, "Optimization:UseParegoScalarization", false),
+
+            // Screening / backtesting
+            ScreeningTimeoutSeconds          = OptimizationGridBuilder.GetConfigValue(b, "Optimization:ScreeningTimeoutSeconds", 30),
+            ScreeningSpreadPoints            = OptimizationGridBuilder.GetConfigValue(b, "Optimization:ScreeningSpreadPoints", 20.0),
+            ScreeningCommissionPerLot        = OptimizationGridBuilder.GetConfigValue(b, "Optimization:ScreeningCommissionPerLot", 7.0),
+            ScreeningSlippagePips            = OptimizationGridBuilder.GetConfigValue(b, "Optimization:ScreeningSlippagePips", 1.0),
+            ScreeningInitialBalance          = OptimizationGridBuilder.GetConfigValue(b, "Optimization:ScreeningInitialBalance", 10_000m),
+            MaxParallelBacktests             = OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxParallelBacktests", p.MaxParallelBacktests),
+            MinCandidateTrades               = OptimizationGridBuilder.GetConfigValue(b, "Optimization:MinCandidateTrades", 10),
+            MaxRunTimeoutMinutes             = OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxRunTimeoutMinutes", p.MaxRunTimeoutMinutes),
+            CircuitBreakerThreshold          = OptimizationGridBuilder.GetConfigValue(b, "Optimization:CircuitBreakerThreshold", 10),
+            SuccessiveHalvingRungs           = OptimizationGridBuilder.GetConfigValue(b, "Optimization:SuccessiveHalvingRungs", "0.25,0.50"),
+
+            // Validation gates
+            MaxOosDegradationPct             = OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxOosDegradationPct", 0.60),
+            EmbargoRatio                     = OptimizationGridBuilder.GetConfigValue(b, "Optimization:EmbargoRatio", 0.05),
+            CorrelationParamThreshold        = OptimizationGridBuilder.GetConfigValue(b, "Optimization:CorrelationParamThreshold", 0.15),
+            SensitivityPerturbPct            = OptimizationGridBuilder.GetConfigValue(b, "Optimization:SensitivityPerturbPct", 0.10),
+            SensitivityDegradationTolerance  = OptimizationGridBuilder.GetConfigValue(b, "Optimization:SensitivityDegradationTolerance", 0.20),
+            BootstrapIterations              = OptimizationGridBuilder.GetConfigValue(b, "Optimization:BootstrapIterations", p.BootstrapIters),
+            MinBootstrapCILower              = OptimizationGridBuilder.GetConfigValue(b, "Optimization:MinBootstrapCILower", 0.40m),
+            CostSensitivityEnabled           = OptimizationGridBuilder.GetConfigValue(b, "Optimization:CostSensitivityEnabled", true),
+            CostStressMultiplier             = OptimizationGridBuilder.GetConfigValue(b, "Optimization:CostStressMultiplier", 2.0),
+            TemporalOverlapThreshold         = OptimizationGridBuilder.GetConfigValue(b, "Optimization:TemporalOverlapThreshold", 0.70),
+            PortfolioCorrelationThreshold    = OptimizationGridBuilder.GetConfigValue(b, "Optimization:PortfolioCorrelationThreshold", 0.80),
+            WalkForwardMinMaxRatio           = OptimizationGridBuilder.GetConfigValue(b, "Optimization:WalkForwardMinMaxRatio", 0.50),
+            MinOosCandlesForValidation       = OptimizationGridBuilder.GetConfigValue(b, "Optimization:MinOosCandlesForValidation", 50),
+            MaxCvCoefficientOfVariation      = OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxCvCoefficientOfVariation", 0.50),
+            PermutationIterations            = OptimizationGridBuilder.GetConfigValue(b, "Optimization:PermutationIterations", p.PermutationIters),
+            MinEquityCurveR2                 = OptimizationGridBuilder.GetConfigValue(b, "Optimization:MinEquityCurveR2", 0.60),
+            MaxTradeTimeConcentration        = OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxTradeTimeConcentration", 0.60),
+
+            // CPCV
+            CpcvNFolds                       = OptimizationGridBuilder.GetConfigValue(b, "Optimization:CpcvNFolds", p.CpcvNFolds),
+            CpcvTestFoldCount                = OptimizationGridBuilder.GetConfigValue(b, "Optimization:CpcvTestFoldCount", 2),
+            CpcvMaxCombinations              = OptimizationGridBuilder.GetConfigValue(b, "Optimization:CpcvMaxCombinations", p.CpcvMaxCombinations),
+
+            // Data loading
+            DataScarcityThreshold            = OptimizationGridBuilder.GetConfigValue(b, "Optimization:DataScarcityThreshold", 200),
+            CandleLookbackMonths             = OptimizationGridBuilder.GetConfigValue(b, "Optimization:CandleLookbackMonths", 6),
+            CandleLookbackAutoScale          = OptimizationGridBuilder.GetConfigValue(b, "Optimization:CandleLookbackAutoScale", true),
+            UseSymbolSpecificSpread          = OptimizationGridBuilder.GetConfigValue(b, "Optimization:UseSymbolSpecificSpread", true),
+            RegimeBlendRatio                 = OptimizationGridBuilder.GetConfigValue(b, "Optimization:RegimeBlendRatio", 0.20),
+            MaxCrossRegimeEvals              = OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxCrossRegimeEvals", 4),
+            RegimeStabilityHours             = OptimizationGridBuilder.GetConfigValue(b, "Optimization:RegimeStabilityHours", 6),
+
+            // Suppression / deferral
+            SuppressDuringDrawdownRecovery   = OptimizationGridBuilder.GetConfigValue(b, "Optimization:SuppressDuringDrawdownRecovery", true),
+            SeasonalBlackoutEnabled          = OptimizationGridBuilder.GetConfigValue(b, "Optimization:SeasonalBlackoutEnabled", true),
+            BlackoutPeriods                  = OptimizationGridBuilder.GetConfigValue(b, "Optimization:BlackoutPeriods", "12/20-01/05"),
+            RequireEADataAvailability        = OptimizationGridBuilder.GetConfigValue(b, "Optimization:RequireEADataAvailability", true),
+
+            // Retry / escalation
+            MaxRetryAttempts                 = OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxRetryAttempts", 2),
+            MaxConsecutiveFailuresBeforeEscalation = OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxConsecutiveFailuresBeforeEscalation", 3),
+            CheckpointEveryN                 = OptimizationGridBuilder.GetConfigValue(b, "Optimization:CheckpointEveryN", p.CheckpointEveryN),
+            MaxConcurrentRuns                = OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxConcurrentRuns", 3),
+        };
     }
 
     // ── Auto-scheduling, escalation, and helpers are in OptimizationWorker.Scheduling.cs ──
@@ -1557,7 +1673,7 @@ public partial class OptimizationWorker : BackgroundService
                     changes.Add(new ConfigChange(prop.Name, priorVal.ToString(), prop.Value.ToString()));
             }
         }
-        catch { /* malformed JSON — return empty */ }
+        catch (JsonException) { /* malformed snapshot JSON — return empty diff */ }
         return changes;
     }
 
@@ -1957,7 +2073,10 @@ public partial class OptimizationWorker : BackgroundService
                     run.ApprovalReportJson = JsonSerializer.Serialize(existing);
                 }
             }
-            catch { /* Non-critical */ }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "OptimizationWorker: failed to persist rejection diagnostics for run {RunId}", run.Id);
+            }
 
             await writeCtx.SaveChangesAsync(ct);
 
@@ -2255,6 +2374,7 @@ public partial class OptimizationWorker : BackgroundService
         CancellationToken ct, double blendRatio = 0.20)
     {
         if (allCandles.Count < 100) return allCandles;
+        if (blendRatio >= 1.0) return allCandles;
 
         var latestRegime = await db.Set<MarketRegimeSnapshot>()
             .Where(s => s.Symbol == symbol && s.Timeframe == timeframe && !s.IsDeleted)
@@ -2395,6 +2515,59 @@ public partial class OptimizationWorker : BackgroundService
 
     private static void StampHeartbeat(OptimizationRun run)
         => OptimizationRunClaimer.StampHeartbeat(run, ExecutionLeaseDuration);
+
+    internal static TimeSpan GetExecutionLeaseHeartbeatInterval()
+    {
+        long quarterLeaseTicks = ExecutionLeaseDuration.Ticks / 4;
+        long minIntervalTicks = TimeSpan.FromMinutes(1).Ticks;
+        long maxIntervalTicks = TimeSpan.FromMinutes(3).Ticks;
+        long boundedTicks = Math.Max(minIntervalTicks, Math.Min(maxIntervalTicks, quarterLeaseTicks));
+        return TimeSpan.FromTicks(boundedTicks);
+    }
+
+    private async Task MaintainExecutionLeaseAsync(long runId, CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(GetExecutionLeaseHeartbeatInterval());
+
+        try
+        {
+            while (await timer.WaitForNextTickAsync(ct))
+            {
+                try
+                {
+                    await using var scope = _scopeFactory.CreateAsyncScope();
+                    var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+                    var db = writeCtx.GetDbContext();
+                    var nowUtc = DateTime.UtcNow;
+
+                    int updated = await db.Set<OptimizationRun>()
+                        .Where(r => r.Id == runId
+                                 && !r.IsDeleted
+                                 && r.Status == OptimizationRunStatus.Running)
+                        .ExecuteUpdateAsync(s => s
+                            .SetProperty(r => r.LastHeartbeatAt, nowUtc)
+                            .SetProperty(r => r.ExecutionLeaseExpiresAt, nowUtc.Add(ExecutionLeaseDuration)), ct);
+
+                    if (updated == 0)
+                        break;
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex,
+                        "OptimizationWorker: background lease heartbeat failed for run {RunId} (non-fatal)",
+                        runId);
+                }
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Expected when the owning run completes or the worker shuts down.
+        }
+    }
 
     private static void MarkRunFailedForRetry(
         OptimizationRun run,

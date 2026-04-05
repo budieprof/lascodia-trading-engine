@@ -73,7 +73,7 @@ public partial class OptimizationWorker
                 if (parsed is not null && parsed.Count > 0)
                     otherActiveParsed.Add(parsed);
             }
-            catch { /* skip malformed */ }
+            catch (JsonException) { /* skip strategy with malformed ParametersJson */ }
         }
 
         CandidateValidationResult? lastResult = null;
@@ -128,43 +128,9 @@ public partial class OptimizationWorker
 
             #region Bootstrap CI Gate
             gateSw.Restart();
-            decimal ciLower, ciMedian, ciUpper;
-            int bootstrapTradeCount = oosResult.Trades?.Count ?? 0;
-            const int bootstrapMinTrades = 15; // Full empirical CI threshold
-            const int syntheticMaxTrades = 7;  // Pure synthetic CI threshold
-            if (bootstrapTradeCount >= bootstrapMinTrades)
-            {
-                (ciLower, ciMedian, ciUpper) = BootstrapAnalyzer.ComputeHealthScoreCI(
-                    oosResult.Trades!, config.ScreeningInitialBalance, config.BootstrapIterations, 0.95,
-                    run.Id.GetHashCode() ^ candidateRank);
-            }
-            else if (bootstrapTradeCount > syntheticMaxTrades)
-            {
-                // Blending zone (8-14 trades): interpolate between synthetic and empirical
-                // CI to avoid a hard cliff at the threshold boundary. The blend weight
-                // ramps linearly from 0% empirical at syntheticMaxTrades+1 to 100% at bootstrapMinTrades.
-                var (empLower, empMedian, empUpper) = BootstrapAnalyzer.ComputeHealthScoreCI(
-                    oosResult.Trades!, config.ScreeningInitialBalance, config.BootstrapIterations, 0.95,
-                    run.Id.GetHashCode() ^ candidateRank);
-
-                double samplePenalty = 0.50 + 0.13 * Math.Min(bootstrapTradeCount, 9) / 9.0;
-                decimal synLower = oosHealthScore * (decimal)samplePenalty;
-
-                decimal blendWeight = (decimal)(bootstrapTradeCount - syntheticMaxTrades)
-                                    / (bootstrapMinTrades - syntheticMaxTrades);
-                ciLower  = synLower + blendWeight * (empLower - synLower);
-                ciMedian = oosHealthScore + blendWeight * (empMedian - oosHealthScore);
-                ciUpper  = oosHealthScore + blendWeight * (empUpper - oosHealthScore);
-            }
-            else
-            {
-                // Pure synthetic CI for very low trade counts (0-7 trades).
-                // 0 trades → 50% of score, 7 trades → 60% of score.
-                double samplePenalty = 0.50 + 0.13 * Math.Min(bootstrapTradeCount, syntheticMaxTrades) / (double)syntheticMaxTrades;
-                ciLower = oosHealthScore * (decimal)samplePenalty;
-                ciMedian = oosHealthScore;
-                ciUpper = oosHealthScore;
-            }
+            var (ciLower, ciMedian, ciUpper) = ComputeBootstrapCI(
+                oosResult, oosHealthScore, config.ScreeningInitialBalance,
+                config.BootstrapIterations, run.Id.GetHashCode() ^ candidateRank);
             gateSw.Stop();
             _metrics.OptimizationGateDurationMs.Record(gateSw.Elapsed.TotalMilliseconds, new KeyValuePair<string, object?>("gate", "bootstrap_ci"));
             gateTimings.Add(("BootstrapCI", gateSw.Elapsed.TotalMilliseconds));
@@ -227,7 +193,7 @@ public partial class OptimizationWorker
                     if (oosRegime.HasValue && isRegime.HasValue && oosRegime.Value != isRegime.Value)
                         effectiveDegradation *= 1.5;
                 }
-                catch { /* Non-critical — use default threshold */ }
+                catch (Exception ex) { _logger.LogDebug(ex, "OptimizationWorker: regime-conditional degradation lookup failed — using default threshold"); }
 
                 double degradationRatio = (double)(oosHealthScore / candidate.HealthScore);
                 degradationFailed = degradationRatio < (1.0 - effectiveDegradation);
@@ -381,132 +347,20 @@ public partial class OptimizationWorker
             #endregion
 
             #region Threshold Adjustments + Kelly + Equity Curve + Time Concentration + Genesis Regression
-            // ── P2: Apply live haircuts to tighten approval thresholds ──
-            decimal effectiveMinScore = config.AutoApprovalMinHealthScore;
-            decimal effectiveImprovementThreshold = config.AutoApprovalImprovementThreshold;
-            try
-            {
-                await using var haircutScope = _scopeFactory.CreateAsyncScope();
-                var liveBenchmark = haircutScope.ServiceProvider.GetService<ILivePerformanceBenchmark>();
-                if (liveBenchmark != null)
-                {
-                    var haircuts = await liveBenchmark.GetCachedHaircutsAsync(ct);
-                    if (haircuts.SampleCount >= 5 || haircuts.SampleCount < 0)
-                    {
-                        // Tighten: if live Sharpe = 70% of backtest, divide threshold by 0.7
-                        effectiveMinScore = config.AutoApprovalMinHealthScore /
-                            (decimal)Math.Max(0.5, haircuts.SharpeHaircut);
-                        _logger.LogDebug("OptimizationWorker: haircut-adjusted approval threshold: {Original:F2} → {Adjusted:F2}",
-                            config.AutoApprovalMinHealthScore, effectiveMinScore);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "OptimizationWorker: haircut load failed (non-fatal)");
-            }
+            var adj = await ComputeThresholdAdjustmentsAsync(
+                strategy, oosResult, testCandles, screeningOptions, config, pairInfo, run.Id, ct, runCt);
+            decimal effectiveMinScore = adj.EffectiveMinScore;
+            decimal effectiveImprovementThreshold = adj.EffectiveImprovementThreshold;
+            bool kellySizingOk = adj.KellySizingOk;
+            double kellySharpe = adj.KellySharpe;
+            double fixedLotSharpe = adj.FixedLotSharpe;
+            var (_, acPF, acSh, acDD) = adj.AssetClassMultipliers; // (WR, PF, Sharpe, DD)
+            bool equityCurveOk = adj.EquityCurveOk;
+            bool timeConcentrationOk = adj.TimeConcentrationOk;
+            bool genesisRegressionOk = adj.GenesisRegressionOk;
 
-            // ── P5: Apply asset-class threshold multipliers ────────────
-            var assetClass = StrategyGenerationHelpers.ClassifyAsset(strategy.Symbol, pairInfo);
-            var (_, acPF, acSh, acDD) = StrategyGenerationHelpers.GetAssetClassThresholdMultipliers(assetClass);
-            effectiveMinScore *= (decimal)Math.Max(acSh, acPF);
-
-            // ── P7: Kelly position sizing sensitivity check ────────────
-            bool kellySizingOk = true;
-            double kellySharpe = 0, fixedLotSharpe = (double)oosResult.SharpeRatio;
-            if (oosResult.TotalTrades >= 10 && oosResult.WinRate > 0 && oosResult.AverageLoss > 0)
-            {
-                try
-                {
-                    decimal b = oosResult.AverageLoss > 0 ? oosResult.AverageWin / oosResult.AverageLoss : 1m;
-                    decimal kellyFull = (oosResult.WinRate * b - (1m - oosResult.WinRate)) / b;
-                    if (kellyFull > 0)
-                    {
-                        decimal halfKelly = Math.Clamp(kellyFull * 0.5m, 0.01m, 0.10m);
-                        var kellyOptions = new BacktestOptions
-                        {
-                            SpreadPriceUnits   = screeningOptions.SpreadPriceUnits,
-                            SpreadFunction     = screeningOptions.SpreadFunction,
-                            CommissionPerLot   = screeningOptions.CommissionPerLot,
-                            SlippagePriceUnits = screeningOptions.SlippagePriceUnits,
-                            SwapPerLotPerDay   = screeningOptions.SwapPerLotPerDay,
-                            ContractSize       = screeningOptions.ContractSize,
-                            GapSlippagePct     = screeningOptions.GapSlippagePct,
-                            FillRatio          = screeningOptions.FillRatio,
-                            PositionSizer      = (balance, signal) =>
-                            {
-                                decimal riskPerUnit = Math.Max(0.001m * signal.EntryPrice,
-                                    Math.Abs(signal.EntryPrice - (signal.StopLoss ?? signal.EntryPrice)));
-                                return Math.Clamp(balance * halfKelly / (screeningOptions.ContractSize * riskPerUnit), 0.01m, 10m);
-                            },
-                        };
-                        var kellyResult = await _backtestEngine.RunAsync(strategy, testCandles,
-                            config.ScreeningInitialBalance, runCt, kellyOptions);
-                        kellySharpe = (double)kellyResult.SharpeRatio;
-                        kellySizingOk = kellySharpe >= fixedLotSharpe * 0.80;
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogDebug(ex, "OptimizationWorker: Kelly sizing check failed (non-fatal)");
-                }
-            }
-
-            // ── Equity curve linearity check (R²) ─────────────────────
-            gateSw.Restart();
-            bool equityCurveOk = true;
-            if (oosResult.Trades is { Count: >= 5 })
-            {
-                double r2 = StrategyScreeningEngine.ComputeEquityCurveR2(oosResult.Trades, config.ScreeningInitialBalance);
-                double minR2 = config.MinEquityCurveR2;
-                if (r2 < minR2)
-                {
-                    equityCurveOk = false;
-                    _logger.LogDebug("OptimizationWorker: equity curve R²={R2:F3} below {Min:F2}", r2, minR2);
-                }
-            }
-            gateSw.Stop();
-            _metrics.OptimizationGateDurationMs.Record(gateSw.Elapsed.TotalMilliseconds, new KeyValuePair<string, object?>("gate", "equity_curve_r2"));
-
-            // ── Trade time concentration check ─────────────────────────
-            gateSw.Restart();
-            bool timeConcentrationOk = true;
-            if (oosResult.Trades is { Count: >= 10 })
-            {
-                double concentration = StrategyScreeningEngine.ComputeTradeTimeConcentration(oosResult.Trades);
-                double maxConcentration = config.MaxTradeTimeConcentration;
-                if (concentration > maxConcentration)
-                {
-                    timeConcentrationOk = false;
-                    _logger.LogDebug("OptimizationWorker: trade time concentration={Conc:P1} above {Max:P1}", concentration, maxConcentration);
-                }
-            }
-            gateSw.Stop();
-            _metrics.OptimizationGateDurationMs.Record(gateSw.Elapsed.TotalMilliseconds, new KeyValuePair<string, object?>("gate", "time_concentration"));
-
-            // ── Genesis quality regression check ──────────────────────
-            bool genesisRegressionOk = true;
-            try
-            {
-                var screeningJson = strategy.ScreeningMetricsJson;
-                if (!string.IsNullOrEmpty(screeningJson))
-                {
-                    var genesis = StrategyGeneration.ScreeningMetrics.FromJson(screeningJson);
-                    if (genesis != null && genesis.IsSharpeRatio > 0)
-                    {
-                        double genesisOosSharpe = genesis.OosSharpeRatio;
-                        if (genesisOosSharpe > 0 && (double)oosResult.SharpeRatio < genesisOosSharpe * 0.80)
-                        {
-                            genesisRegressionOk = false;
-                            _logger.LogDebug(
-                                "OptimizationWorker: genesis regression — OOS Sharpe {Current:F2} < 80% of original {Genesis:F2}",
-                                oosResult.SharpeRatio, genesisOosSharpe);
-                        }
-                    }
-                }
-            }
-            catch { /* Non-critical */ }
-
+            foreach (var (gate, ms) in adj.GateTimings)
+                _metrics.OptimizationGateDurationMs.Record(ms, new KeyValuePair<string, object?>("gate", gate));
             #endregion
 
             #region Approval Evaluation
@@ -598,7 +452,7 @@ public partial class OptimizationWorker
             // (CPCV + sensitivity + permutation test). Renew the lease to prevent
             // RequeueExpiredRunningRunsAsync from reclaiming this run mid-validation.
             try { await HeartbeatRunAsync(run, writeCtx, ct); }
-            catch { /* non-fatal — lease expiry is handled gracefully */ }
+            catch (Exception ex) { _logger.LogDebug(ex, "OptimizationWorker: heartbeat renewal failed during Pareto validation for run {RunId}", run.Id); }
 
             if (approval.Passed)
             {
@@ -644,5 +498,194 @@ public partial class OptimizationWorker
         for (int i = 0; i < k; i++)
             result = result * (n - i) / (i + 1);
         return result;
+    }
+
+    // ── Extracted validation helpers ──────────────────────────────────────
+
+    /// <summary>
+    /// Computes bootstrap confidence interval with blending zone for low trade counts.
+    /// Full empirical CI at 15+ trades, pure synthetic at 0-7, linear blend in between.
+    /// </summary>
+    internal static (decimal Lower, decimal Median, decimal Upper) ComputeBootstrapCI(
+        BacktestResult oosResult, decimal oosHealthScore, decimal initialBalance,
+        int bootstrapIterations, int seed)
+    {
+        int tradeCount = oosResult.Trades?.Count ?? 0;
+        const int empiricalMinTrades = 15;
+        const int syntheticMaxTrades = 7;
+
+        if (tradeCount >= empiricalMinTrades)
+        {
+            return BootstrapAnalyzer.ComputeHealthScoreCI(
+                oosResult.Trades!, initialBalance, bootstrapIterations, 0.95, seed);
+        }
+
+        if (tradeCount > syntheticMaxTrades)
+        {
+            // Blending zone (8-14 trades): interpolate between synthetic and empirical
+            var (empLower, empMedian, empUpper) = BootstrapAnalyzer.ComputeHealthScoreCI(
+                oosResult.Trades!, initialBalance, bootstrapIterations, 0.95, seed);
+
+            double samplePenalty = 0.50 + 0.13 * Math.Min(tradeCount, 9) / 9.0;
+            decimal synLower = oosHealthScore * (decimal)samplePenalty;
+
+            decimal blendWeight = (decimal)(tradeCount - syntheticMaxTrades)
+                                / (empiricalMinTrades - syntheticMaxTrades);
+            return (
+                synLower + blendWeight * (empLower - synLower),
+                oosHealthScore + blendWeight * (empMedian - oosHealthScore),
+                oosHealthScore + blendWeight * (empUpper - oosHealthScore));
+        }
+
+        // Pure synthetic CI for very low trade counts (0-7 trades)
+        double penalty = 0.50 + 0.13 * Math.Min(tradeCount, syntheticMaxTrades) / (double)syntheticMaxTrades;
+        return (oosHealthScore * (decimal)penalty, oosHealthScore, oosHealthScore);
+    }
+
+    /// <summary>Result from threshold adjustments and secondary validation gates.</summary>
+    internal sealed record ThresholdAdjustmentResult(
+        decimal EffectiveMinScore,
+        decimal EffectiveImprovementThreshold,
+        bool KellySizingOk, double KellySharpe, double FixedLotSharpe,
+        (double WinRate, double ProfitFactor, double Sharpe, double Drawdown) AssetClassMultipliers,
+        bool EquityCurveOk,
+        bool TimeConcentrationOk,
+        bool GenesisRegressionOk,
+        IReadOnlyList<(string Gate, double DurationMs)> GateTimings);
+
+    /// <summary>
+    /// Computes live haircuts, asset-class adjustments, Kelly sizing, equity curve R²,
+    /// time concentration, and genesis regression checks.
+    /// </summary>
+    private async Task<ThresholdAdjustmentResult> ComputeThresholdAdjustmentsAsync(
+        Strategy strategy, BacktestResult oosResult, List<Candle> testCandles,
+        BacktestOptions screeningOptions, OptimizationConfig config,
+        CurrencyPair? pairInfo, long runId,
+        CancellationToken ct, CancellationToken runCt)
+    {
+        var gateTimings = new List<(string Gate, double DurationMs)>();
+        decimal effectiveMinScore = config.AutoApprovalMinHealthScore;
+        decimal effectiveImprovementThreshold = config.AutoApprovalImprovementThreshold;
+
+        // Live performance haircuts
+        try
+        {
+            await using var haircutScope = _scopeFactory.CreateAsyncScope();
+            var liveBenchmark = haircutScope.ServiceProvider.GetService<ILivePerformanceBenchmark>();
+            if (liveBenchmark != null)
+            {
+                var haircuts = await liveBenchmark.GetCachedHaircutsAsync(ct);
+                if (haircuts.SampleCount >= 5 || haircuts.SampleCount < 0)
+                {
+                    effectiveMinScore = config.AutoApprovalMinHealthScore /
+                        (decimal)Math.Max(0.5, haircuts.SharpeHaircut);
+                    _logger.LogDebug("OptimizationWorker: haircut-adjusted approval threshold: {Original:F2} → {Adjusted:F2}",
+                        config.AutoApprovalMinHealthScore, effectiveMinScore);
+                }
+            }
+        }
+        catch (Exception ex) { _logger.LogDebug(ex, "OptimizationWorker: haircut load failed (non-fatal)"); }
+
+        // Asset-class threshold multipliers
+        var assetClass = StrategyGenerationHelpers.ClassifyAsset(strategy.Symbol, pairInfo);
+        var acMultipliers = StrategyGenerationHelpers.GetAssetClassThresholdMultipliers(assetClass);
+        effectiveMinScore *= (decimal)Math.Max(acMultipliers.Item3, acMultipliers.Item2);
+
+        // Kelly position sizing sensitivity
+        bool kellySizingOk = true;
+        double kellySharpe = 0, fixedLotSharpe = (double)oosResult.SharpeRatio;
+        if (oosResult.TotalTrades >= 10 && oosResult.WinRate > 0 && oosResult.AverageLoss > 0)
+        {
+            try
+            {
+                decimal b = oosResult.AverageLoss > 0 ? oosResult.AverageWin / oosResult.AverageLoss : 1m;
+                decimal kellyFull = (oosResult.WinRate * b - (1m - oosResult.WinRate)) / b;
+                if (kellyFull > 0)
+                {
+                    decimal halfKelly = Math.Clamp(kellyFull * 0.5m, 0.01m, 0.10m);
+                    var kellyOptions = new BacktestOptions
+                    {
+                        SpreadPriceUnits   = screeningOptions.SpreadPriceUnits,
+                        SpreadFunction     = screeningOptions.SpreadFunction,
+                        CommissionPerLot   = screeningOptions.CommissionPerLot,
+                        SlippagePriceUnits = screeningOptions.SlippagePriceUnits,
+                        SwapPerLotPerDay   = screeningOptions.SwapPerLotPerDay,
+                        ContractSize       = screeningOptions.ContractSize,
+                        GapSlippagePct     = screeningOptions.GapSlippagePct,
+                        FillRatio          = screeningOptions.FillRatio,
+                        PositionSizer      = (balance, signal) =>
+                        {
+                            decimal riskPerUnit = Math.Max(0.001m * signal.EntryPrice,
+                                Math.Abs(signal.EntryPrice - (signal.StopLoss ?? signal.EntryPrice)));
+                            return Math.Clamp(balance * halfKelly / (screeningOptions.ContractSize * riskPerUnit), 0.01m, 10m);
+                        },
+                    };
+                    var kellyResult = await _backtestEngine.RunAsync(strategy, testCandles,
+                        config.ScreeningInitialBalance, runCt, kellyOptions);
+                    kellySharpe = (double)kellyResult.SharpeRatio;
+                    kellySizingOk = kellySharpe >= fixedLotSharpe * 0.80;
+                }
+            }
+            catch (Exception ex) { _logger.LogDebug(ex, "OptimizationWorker: Kelly sizing check failed (non-fatal)"); }
+        }
+
+        // Equity curve R²
+        var gateSw = Stopwatch.StartNew();
+        bool equityCurveOk = true;
+        if (oosResult.Trades is { Count: >= 5 })
+        {
+            double r2 = StrategyScreeningEngine.ComputeEquityCurveR2(oosResult.Trades, config.ScreeningInitialBalance);
+            if (r2 < config.MinEquityCurveR2)
+            {
+                equityCurveOk = false;
+                _logger.LogDebug("OptimizationWorker: equity curve R²={R2:F3} below {Min:F2}", r2, config.MinEquityCurveR2);
+            }
+        }
+        gateSw.Stop();
+        gateTimings.Add(("equity_curve_r2", gateSw.Elapsed.TotalMilliseconds));
+
+        // Trade time concentration
+        gateSw.Restart();
+        bool timeConcentrationOk = true;
+        if (oosResult.Trades is { Count: >= 10 })
+        {
+            double concentration = StrategyScreeningEngine.ComputeTradeTimeConcentration(oosResult.Trades);
+            if (concentration > config.MaxTradeTimeConcentration)
+            {
+                timeConcentrationOk = false;
+                _logger.LogDebug("OptimizationWorker: trade time concentration={Conc:P1} above {Max:P1}", concentration, config.MaxTradeTimeConcentration);
+            }
+        }
+        gateSw.Stop();
+        gateTimings.Add(("time_concentration", gateSw.Elapsed.TotalMilliseconds));
+
+        // Genesis quality regression
+        bool genesisRegressionOk = true;
+        try
+        {
+            var screeningJson = strategy.ScreeningMetricsJson;
+            if (!string.IsNullOrEmpty(screeningJson))
+            {
+                var genesis = StrategyGeneration.ScreeningMetrics.FromJson(screeningJson);
+                if (genesis != null && genesis.IsSharpeRatio > 0)
+                {
+                    double genesisOosSharpe = genesis.OosSharpeRatio;
+                    if (genesisOosSharpe > 0 && (double)oosResult.SharpeRatio < genesisOosSharpe * 0.80)
+                    {
+                        genesisRegressionOk = false;
+                        _logger.LogDebug(
+                            "OptimizationWorker: genesis regression — OOS Sharpe {Current:F2} < 80% of original {Genesis:F2}",
+                            oosResult.SharpeRatio, genesisOosSharpe);
+                    }
+                }
+            }
+        }
+        catch (Exception ex) { _logger.LogDebug(ex, "OptimizationWorker: genesis regression check failed for run {RunId}", runId); }
+
+        return new ThresholdAdjustmentResult(
+            effectiveMinScore, effectiveImprovementThreshold,
+            kellySizingOk, kellySharpe, fixedLotSharpe,
+            acMultipliers, equityCurveOk, timeConcentrationOk, genesisRegressionOk,
+            gateTimings);
     }
 }

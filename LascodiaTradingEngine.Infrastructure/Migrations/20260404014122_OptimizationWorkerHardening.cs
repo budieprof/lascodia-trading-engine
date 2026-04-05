@@ -20,7 +20,7 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
             migrationBuilder.AddColumn<string>(
                 name: "ApprovalReportJson",
                 table: "OptimizationRun",
-                type: "nvarchar(max)",
+                type: "text",
                 nullable: true);
 
             migrationBuilder.AddColumn<int>(
@@ -33,7 +33,7 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
             migrationBuilder.AddColumn<string>(
                 name: "ConfigSnapshotJson",
                 table: "OptimizationRun",
-                type: "nvarchar(max)",
+                type: "text",
                 nullable: true);
 
             migrationBuilder.AddColumn<int>(
@@ -58,7 +58,7 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
             migrationBuilder.AddColumn<string>(
                 name: "RunMetadataJson",
                 table: "OptimizationRun",
-                type: "nvarchar(max)",
+                type: "text",
                 nullable: true);
 
             migrationBuilder.AddColumn<string>(

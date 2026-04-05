@@ -318,7 +318,7 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                         .HasColumnType("uuid");
 
                     b.Property<string>("ParametersSnapshotJson")
-                        .HasColumnType("nvarchar(max)");
+                        .HasColumnType("text");
 
                     b.Property<int>("Priority")
                         .HasColumnType("integer");
@@ -3321,7 +3321,7 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
 
                     b.Property<string>("ApprovalReportJson")
-                        .HasColumnType("nvarchar(max)");
+                        .HasColumnType("text");
 
                     b.Property<DateTime?>("ApprovedAt")
                         .HasColumnType("timestamp with time zone");
@@ -3356,7 +3356,7 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                         .HasColumnType("timestamp with time zone");
 
                     b.Property<string>("ConfigSnapshotJson")
-                        .HasColumnType("nvarchar(max)");
+                        .HasColumnType("text");
 
                     b.Property<DateTime?>("DeferredUntilUtc")
                         .HasColumnType("timestamp with time zone");
@@ -3374,7 +3374,7 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                         .HasColumnType("integer");
 
                     b.Property<string>("IntermediateResultsJson")
-                        .HasColumnType("nvarchar(max)");
+                        .HasColumnType("text");
 
                     b.Property<bool>("IsDeleted")
                         .HasColumnType("boolean");
@@ -3392,7 +3392,7 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                         .HasColumnType("integer");
 
                     b.Property<string>("RunMetadataJson")
-                        .HasColumnType("nvarchar(max)");
+                        .HasColumnType("text");
 
                     b.Property<DateTime>("StartedAt")
                         .HasColumnType("timestamp with time zone");
@@ -5318,7 +5318,7 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                         .HasColumnType("uuid");
 
                     b.Property<string>("ParametersSnapshotJson")
-                        .HasColumnType("nvarchar(max)");
+                        .HasColumnType("text");
 
                     b.Property<bool>("ReOptimizePerFold")
                         .HasColumnType("boolean");

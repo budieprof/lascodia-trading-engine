@@ -13,13 +13,13 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
             migrationBuilder.AddColumn<string>(
                 name: "ParametersSnapshotJson",
                 table: "WalkForwardRun",
-                type: "nvarchar(max)",
+                type: "text",
                 nullable: true);
 
             migrationBuilder.AddColumn<string>(
                 name: "ParametersSnapshotJson",
                 table: "BacktestRun",
-                type: "nvarchar(max)",
+                type: "text",
                 nullable: true);
         }
 

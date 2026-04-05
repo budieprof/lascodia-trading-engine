@@ -21,10 +21,10 @@ public class OptimizationRunConfiguration : IEntityTypeConfiguration<Optimizatio
         builder.Property(x => x.BestHealthScore).HasPrecision(5, 4);
         builder.Property(x => x.BaselineHealthScore).HasPrecision(5, 4);
 
-        builder.Property(x => x.ConfigSnapshotJson).HasColumnType("nvarchar(max)");
-        builder.Property(x => x.RunMetadataJson).HasColumnType("nvarchar(max)");
-        builder.Property(x => x.IntermediateResultsJson).HasColumnType("nvarchar(max)");
-        builder.Property(x => x.ApprovalReportJson).HasColumnType("nvarchar(max)");
+        builder.Property(x => x.ConfigSnapshotJson).HasColumnType("text");
+        builder.Property(x => x.RunMetadataJson).HasColumnType("text");
+        builder.Property(x => x.IntermediateResultsJson).HasColumnType("text");
+        builder.Property(x => x.ApprovalReportJson).HasColumnType("text");
         builder.Property(x => x.ValidationFollowUpStatus).HasConversion<string>().HasMaxLength(20);
 
         builder.HasQueryFilter(x => !x.IsDeleted);

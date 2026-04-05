@@ -21,7 +21,7 @@ public class WalkForwardRunConfiguration : IEntityTypeConfiguration<WalkForwardR
         builder.Property(x => x.InitialBalance).HasPrecision(18, 2);
         builder.Property(x => x.AverageOutOfSampleScore).HasPrecision(18, 6);
         builder.Property(x => x.ScoreConsistency).HasPrecision(18, 6);
-        builder.Property(x => x.ParametersSnapshotJson).HasColumnType("nvarchar(max)");
+        builder.Property(x => x.ParametersSnapshotJson).HasColumnType("text");
 
         builder.HasQueryFilter(x => !x.IsDeleted);
 

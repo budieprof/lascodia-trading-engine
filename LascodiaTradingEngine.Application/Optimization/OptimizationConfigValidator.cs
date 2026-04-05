@@ -35,7 +35,10 @@ internal static class OptimizationConfigValidator
         int minOosCandlesForValidation = 50,
         int circuitBreakerThreshold = 10,
         int minCandidateTrades = 10,
-        string successiveHalvingRungs = "0.25,0.50")
+        string successiveHalvingRungs = "0.25,0.50",
+        double regimeBlendRatio = 0.20,
+        double minEquityCurveR2 = 0.60,
+        double maxTradeTimeConcentration = 0.60)
     {
         var issues = new List<string>();
 
@@ -75,6 +78,15 @@ internal static class OptimizationConfigValidator
 
         if (costStressMultiplier < 1.0)
             issues.Add($"CostStressMultiplier ({costStressMultiplier}) < 1.0 — must be at least 1x");
+
+        if (regimeBlendRatio < 0 || regimeBlendRatio > 1)
+            issues.Add($"RegimeBlendRatio ({regimeBlendRatio}) outside [0, 1]");
+
+        if (minEquityCurveR2 < 0 || minEquityCurveR2 > 1)
+            issues.Add($"MinEquityCurveR2 ({minEquityCurveR2}) outside [0, 1]");
+
+        if (maxTradeTimeConcentration < 0 || maxTradeTimeConcentration > 1)
+            issues.Add($"MaxTradeTimeConcentration ({maxTradeTimeConcentration}) outside [0, 1]");
 
         if (gpEarlyStopPatience < 1)
             issues.Add($"GpEarlyStopPatience ({gpEarlyStopPatience}) < 1");

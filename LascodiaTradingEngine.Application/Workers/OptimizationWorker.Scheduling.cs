@@ -214,7 +214,7 @@ public partial class OptimizationWorker
 
             BacktestResult? result;
             try { result = JsonSerializer.Deserialize<BacktestResult>(resultJson); }
-            catch { continue; }
+            catch (JsonException) { continue; }
             if (result is null) continue;
 
             bool meetsGate = result.TotalTrades >= config.MinTotalTrades
@@ -489,18 +489,20 @@ public partial class OptimizationWorker
             a = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(paramsJsonA);
             b = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(paramsJsonB);
         }
-        catch { return false; }
+        catch (JsonException) { return false; }
 
         if (a is null || b is null || a.Count == 0) return false;
         if (a.Count != b.Count) return false;
         if (!a.Keys.All(k => b.ContainsKey(k))) return false;
 
         int matched = 0, compared = 0;
+        bool sawNonNumeric = false;
         foreach (var (key, valA) in a)
         {
             var valB = b[key];
-            if (!valA.TryGetDouble(out double dA) || !valB.TryGetDouble(out double dB))
+            if (!TryGetNumericValue(valA, out double dA) || !TryGetNumericValue(valB, out double dB))
             {
+                sawNonNumeric = true;
                 if (valA.ToString() != valB.ToString()) return false;
                 continue;
             }
@@ -510,7 +512,7 @@ public partial class OptimizationWorker
             if (Math.Abs(dA - dB) / denom <= threshold) matched++;
         }
 
-        return compared > 0 && matched == compared;
+        return compared > 0 ? matched == compared : sawNonNumeric;
     }
 
     /// <summary>
@@ -526,7 +528,7 @@ public partial class OptimizationWorker
 
         Dictionary<string, JsonElement>? a;
         try { a = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(candidateJson); }
-        catch { return false; }
+        catch (JsonException) { return false; }
         if (a is null || a.Count == 0) return false;
 
         foreach (var b in otherParsed)
@@ -536,11 +538,13 @@ public partial class OptimizationWorker
 
             int matched = 0, compared = 0;
             bool mismatch = false;
+            bool sawNonNumeric = false;
             foreach (var (key, valA) in a)
             {
                 var valB = b[key];
-                if (!valA.TryGetDouble(out double dA) || !valB.TryGetDouble(out double dB))
+                if (!TryGetNumericValue(valA, out double dA) || !TryGetNumericValue(valB, out double dB))
                 {
+                    sawNonNumeric = true;
                     if (valA.ToString() != valB.ToString()) { mismatch = true; break; }
                     continue;
                 }
@@ -550,10 +554,19 @@ public partial class OptimizationWorker
                 if (Math.Abs(dA - dB) / denom <= threshold) matched++;
             }
 
-            if (!mismatch && compared > 0 && matched == compared)
+            if (!mismatch && (compared > 0 ? matched == compared : sawNonNumeric))
                 return true;
         }
 
+        return false;
+    }
+
+    private static bool TryGetNumericValue(JsonElement value, out double numericValue)
+    {
+        if (value.ValueKind == JsonValueKind.Number)
+            return value.TryGetDouble(out numericValue);
+
+        numericValue = default;
         return false;
     }
 

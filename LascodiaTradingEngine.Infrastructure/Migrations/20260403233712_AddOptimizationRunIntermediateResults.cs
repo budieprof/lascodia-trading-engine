@@ -28,7 +28,7 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
             migrationBuilder.AddColumn<string>(
                 name: "IntermediateResultsJson",
                 table: "OptimizationRun",
-                type: "nvarchar(max)",
+                type: "text",
                 nullable: true);
 
             migrationBuilder.AddColumn<int>(
