@@ -80,17 +80,33 @@ public partial class OptimizationWorker
         var failedResults = new List<(int Rank, string Params, string Reason, decimal Score)>();
         int candidateRank = 0;
 
+        // Per-gate timeout budget: allocate a fraction of the remaining aggregate time to
+        // each candidate's validation pass. This prevents a single expensive gate (CPCV with
+        // many combinations, sensitivity with high parallelism) from starving downstream
+        // gates. Budget = remaining_time / (candidates * 2), floored at 60s.
+        int gateTimeoutSeconds = Math.Max(60, config.MaxRunTimeoutMinutes * 60 / Math.Max(1, rankedCandidates.Count * 2));
+
         foreach (var candidate in rankedCandidates)
         {
             candidateRank++;
             var gateTimings = new List<(string Gate, double DurationMs)>();
+
+            // Create a per-candidate gate budget CTS linked to the run-level timeout.
+            // Each candidate gets gateTimeoutSeconds; if exceeded, remaining gates for
+            // this candidate are skipped and the next Pareto candidate is tried.
+            using var gateBudgetCts = CancellationTokenSource.CreateLinkedTokenSource(runCt);
+            gateBudgetCts.CancelAfter(TimeSpan.FromSeconds(gateTimeoutSeconds));
+            var gateCt = gateBudgetCts.Token;
+
+            try
+            {
 
             #region Sensitivity Analysis Gate
             var gateSw = Stopwatch.StartNew();
             var (sensitivityOk, sensitivityReport) = await _validator.SensitivityCheckAsync(
                 strategy, candidate.ParamsJson, trainCandles, screeningOptions,
                 config.ScreeningTimeoutSeconds, candidate.HealthScore,
-                config.SensitivityPerturbPct, runCt,
+                config.SensitivityPerturbPct, gateCt,
                 config.SensitivityDegradationTolerance, config.MaxParallelBacktests,
                 parameterBounds);
             gateSw.Stop();
@@ -113,7 +129,7 @@ public partial class OptimizationWorker
             if (hasSufficientOosData)
             {
                 oosResult = await _validator.RunWithTimeoutAsync(
-                    strategy, candidate.ParamsJson, testCandles, screeningOptions, config.ScreeningTimeoutSeconds, runCt);
+                    strategy, candidate.ParamsJson, testCandles, screeningOptions, config.ScreeningTimeoutSeconds, gateCt);
                 oosHealthScore = OptimizationHealthScorer.ComputeHealthScore(oosResult);
             }
             else
@@ -159,7 +175,7 @@ public partial class OptimizationWorker
             {
                 (costSensitiveOk, pessimisticScore) = await _validator.CostSensitivitySweepAsync(
                     strategy, candidate.ParamsJson, testCandles, screeningOptions,
-                    config.AutoApprovalMinHealthScore, config.ScreeningTimeoutSeconds, runCt,
+                    config.AutoApprovalMinHealthScore, config.ScreeningTimeoutSeconds, gateCt,
                     config.CostStressMultiplier);
             }
             gateSw.Stop();
@@ -206,7 +222,7 @@ public partial class OptimizationWorker
             #region Walk-Forward Stability Gate
             gateSw.Restart();
             var (wfAvgScore, wfStable) = await _validator.WalkForwardValidateAsync(
-                strategy, candidate.ParamsJson, testCandles, screeningOptions, config.ScreeningTimeoutSeconds, runCt,
+                strategy, candidate.ParamsJson, testCandles, screeningOptions, config.ScreeningTimeoutSeconds, gateCt,
                 config.WalkForwardMinMaxRatio, baselineParamsJson);
             gateSw.Stop();
             _metrics.OptimizationGateDurationMs.Record(gateSw.Elapsed.TotalMilliseconds, new KeyValuePair<string, object?>("gate", "walk_forward"));
@@ -234,7 +250,7 @@ public partial class OptimizationWorker
                 var recentCandles = testCandles.TakeLast(Math.Min(200, testCandles.Count)).ToList();
                 (temporalCorrelationSafe, temporalMaxOverlap) = await _validator.TemporalSignalCorrelationCheckAsync(
                     strategy, candidate.ParamsJson, recentCandles, screeningOptions,
-                    config.ScreeningTimeoutSeconds, db, config.TemporalOverlapThreshold, strategy.Timeframe, runCt);
+                    config.ScreeningTimeoutSeconds, db, config.TemporalOverlapThreshold, strategy.Timeframe, gateCt);
             }
             gateSw.Stop();
             _metrics.OptimizationGateDurationMs.Record(gateSw.Elapsed.TotalMilliseconds, new KeyValuePair<string, object?>("gate", "temporal_correlation"));
@@ -245,7 +261,7 @@ public partial class OptimizationWorker
             if (testCandles.Count >= config.MinOosCandlesForValidation)
             {
                 (portfolioCorrelationSafe, portfolioMaxCorrelation) = await _validator.PortfolioCorrelationCheckAsync(
-                    strategy, oosResult, db, config.PortfolioCorrelationThreshold, runCt);
+                    strategy, oosResult, db, config.PortfolioCorrelationThreshold, gateCt);
             }
             gateSw.Stop();
             _metrics.OptimizationGateDurationMs.Record(gateSw.Elapsed.TotalMilliseconds, new KeyValuePair<string, object?>("gate", "portfolio_correlation"));
@@ -290,7 +306,7 @@ public partial class OptimizationWorker
                         embargoCandles: cpcvEmbargo,
                         minTrades: config.MinCandidateTrades, maxCombinations: config.CpcvMaxCombinations,
                         seed: run.Id.GetHashCode() ^ candidateRank,
-                        ct: runCt, maxParallelism: config.MaxParallelBacktests);
+                        ct: gateCt, maxParallelism: config.MaxParallelBacktests);
                     cpcvMean = mean;
                     cpcvCv = cv;
                     cpcvScores = scores;
@@ -483,6 +499,20 @@ public partial class OptimizationWorker
 
             _logger.LogDebug("OptimizationWorker: run {RunId} candidate #{Rank} failed gate — trying next Pareto candidate",
                 run.Id, candidateRank);
+
+            }
+            catch (OperationCanceledException) when (gateBudgetCts.IsCancellationRequested && !runCt.IsCancellationRequested)
+            {
+                // Per-candidate gate budget expired — skip remaining gates for this candidate
+                // and try the next Pareto candidate. This prevents a single expensive gate
+                // (e.g., CPCV with many combinations) from blocking the entire validation phase.
+                _logger.LogInformation(
+                    "OptimizationWorker: run {RunId} candidate #{Rank} gate budget expired ({Budget}s) — trying next candidate",
+                    run.Id, candidateRank, gateTimeoutSeconds);
+                _metrics.OptimizationGateRejections.Add(1, new KeyValuePair<string, object?>("gate", "gate_budget_timeout"));
+                if (failedResults.Count < 3)
+                    failedResults.Add((candidateRank, candidate.ParamsJson, $"gate budget timeout ({gateTimeoutSeconds}s)", 0m));
+            }
         }
 
         // Should never reach here (rankedCandidates is non-empty), but satisfy the compiler

@@ -313,6 +313,7 @@ public partial class OptimizationWorker : BackgroundService
 
     // ── Fields ──────────────────────────────────────────────────────────────
 
+    private static readonly ActivitySource s_activitySource = new("LascodiaTradingEngine.Optimization");
     private static readonly TimeSpan PollingInterval = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan ExecutionLeaseDuration = TimeSpan.FromMinutes(10);
     private const int ConfigSnapshotVersion = 1;
@@ -505,6 +506,10 @@ public partial class OptimizationWorker : BackgroundService
         var runCt = ct;
         bool completionPersisted = false;
 
+        using var runActivity = s_activitySource.StartActivity("optimization.run");
+        runActivity?.SetTag("run.id", run.Id);
+        runActivity?.SetTag("strategy.id", run.StrategyId);
+
         try
         {
             leaseHeartbeatCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -645,230 +650,10 @@ public partial class OptimizationWorker : BackgroundService
             if (strategy is null)
                 throw new InvalidOperationException($"Strategy {run.StrategyId} not found.");
 
-            // ── Stages 3–4: Load candles, validate, split, build cost options, run baseline ──
-            var phase = PhaseTimer.Start(_logger, _metrics, run.Id, run.StrategyId, "DataLoad");
-
-            var dataLoad = await LoadAndValidateCandlesAsync(db, run, strategy, config, runCt);
-
-            phase.Dispose();
-
-            var candles          = dataLoad.AllCandles;
-            var trainCandles     = dataLoad.TrainCandles;
-            var testCandles      = dataLoad.TestCandles;
-            int embargoSize      = dataLoad.EmbargoSize;
-            var screeningOptions = dataLoad.ScreeningOptions;
-            var protocol         = dataLoad.Protocol;
-            var candleLookbackStart = dataLoad.CandleLookbackStart;
-            var currentRegimeForBaseline = dataLoad.CurrentRegimeForBaseline;
-            var baselineComparisonScore = dataLoad.BaselineComparisonScore;
-            var baselineParamsJson = dataLoad.BaselineParametersJson;
-            var pairInfo = dataLoad.PairInfo;
-
-            // ── Stages 5–6: Bayesian search with purged K-fold ──────────
-            phase = PhaseTimer.Start(_logger, _metrics, run.Id, run.StrategyId, "Search");
-            var searchResult = await RunBayesianSearchAsync(
-                db, run, strategy, config, trainCandles, candles, screeningOptions,
-                protocol, embargoSize, currentRegimeForBaseline, writeCtx, ct, runCt);
-
-            var allEvaluated = searchResult.EvaluatedCandidates;
-            int totalIters   = searchResult.TotalIterations;
-
-            if (allEvaluated.Count == 0)
-                throw new InvalidOperationException("All parameter candidates failed during TPE search.");
-
-            // ── Variables used downstream in RunMetadataSnapshot ──
-            var surrogateKind          = searchResult.SurrogateKind;
-            var warmStarted            = searchResult.WarmStartedObservations;
-            var resumedFromCheckpoint  = searchResult.ResumedFromCheckpoint;
-
-            phase.Dispose();
-
-            await HeartbeatRunAsync(run, writeCtx, ct);
-
-            // ── Stage 6b: Memory pressure mitigation ──────────────────
-            // Trim trade lists from non-top candidates to reduce heap pressure.
-            // The Pareto selector only needs BacktestResult metrics (Sharpe, DD, WR),
-            // not individual trades. Keep full trades only for the top N candidates
-            // that might proceed to OOS validation.
-            var evaluatedList = allEvaluated
-                .OrderByDescending(c => c.HealthScore)
-                .ToList();
-
-            int keepTradesCount = Math.Max(config.TopNCandidates * 2, 10);
-            for (int i = keepTradesCount; i < evaluatedList.Count; i++)
-            {
-                evaluatedList[i].Result.Trades?.Clear();
-                evaluatedList[i].TradesTrimmed = true;
-            }
-
-            // ── Stage 7: Multi-objective Pareto selection ───────────────
-            var topCandidates = ParetoFrontSelector.RankByNonDominatedSorting(
-                evaluatedList,
-                config.TopNCandidates,
-                c => (double)c.Result.SharpeRatio,
-                c => -(double)c.Result.MaxDrawdownPct,
-                c => (double)c.Result.WinRate);
-
-            phase = PhaseTimer.Start(_logger, _metrics, run.Id, run.StrategyId, "Validation");
-
-            // Fine validation of Pareto winners on full IS data
-            var parallelOptions = new ParallelOptions
-            {
-                MaxDegreeOfParallelism = config.MaxParallelBacktests,
-                CancellationToken      = runCt,
-            };
-            var fineRanked = new List<ScoredCandidate>();
-            var fineLock = new object();
-            await Parallel.ForEachAsync(topCandidates, parallelOptions, async (candidate, pCt) =>
-            {
-                try
-                {
-                    var result = await _validator.RunWithTimeoutAsync(
-                        strategy, candidate.ParamsJson, trainCandles, screeningOptions,
-                        config.ScreeningTimeoutSeconds, pCt);
-                    Interlocked.Increment(ref totalIters);
-                    lock (fineLock) fineRanked.Add(new ScoredCandidate(
-                        candidate.ParamsJson,
-                        OptimizationHealthScorer.ComputeHealthScore(result),
-                        result,
-                        candidate.CvCoefficientOfVariation));
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogDebug(ex, "OptimizationWorker: fine-validation backtest failed for Pareto candidate");
-                    Interlocked.Increment(ref totalIters);
-                }
-            });
-
-            var rankedCandidates = fineRanked.Count == 0
-                ? topCandidates
-                : fineRanked.OrderByDescending(r => r.HealthScore).ToList();
-
-            // ── Stage 7b–11d: Post-selection validation with Pareto fallback ──
-            var vr = await ValidateParetoCandidatesAsync(
-                rankedCandidates, strategy, run, trainCandles, testCandles,
-                screeningOptions, protocol, config, db, totalIters, baselineComparisonScore,
-                baselineParamsJson, writeCtx, pairInfo, ct, runCt);
-            await HeartbeatRunAsync(run, writeCtx, ct);
-
-            var currentRegime = await db.Set<MarketRegimeSnapshot>()
-                .Where(s => s.Symbol == strategy.Symbol
-                         && s.Timeframe == strategy.Timeframe
-                         && !s.IsDeleted)
-                .OrderByDescending(s => s.DetectedAt)
-                .Select(s => (MarketRegimeEnum?)s.Regime)
-                .FirstOrDefaultAsync(runCt);
-
-            phase.Dispose();
-
-            // ── Stage 12: Persist results + benchmarking ────────────────
-            phase = PhaseTimer.Start(_logger, _metrics, run.Id, run.StrategyId, "Persist");
-            run.Iterations              = totalIters;
-            run.IntermediateResultsJson  = null; // Clear checkpoint data — run completed successfully
-            run.CheckpointVersion        = 0;
-            run.BestParametersJson = CanonicalParameterJson.Normalize(vr.Winner.ParamsJson);
-            run.BestHealthScore    = vr.OosHealthScore;
-            // Store per-objective metrics for EHVI warm-start in future runs
-            run.BestSharpeRatio    = vr.OosResult.SharpeRatio;
-            run.BestMaxDrawdownPct = vr.OosResult.MaxDrawdownPct;
-            run.BestWinRate        = vr.OosResult.WinRate;
-            run.ApprovalReportJson = OptimizationCheckpointStore.LimitJsonPayload(
-                vr.ApprovalReportJson,
-                OptimizationCheckpointStore.MaxApprovalReportChars,
-                "approval report",
-                _logger);
-            StampHeartbeat(run);
-            OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Completed, DateTime.UtcNow);
-            // NOTE: SaveChangesAsync calls below intentionally use the parent `ct` (not `runCt`)
-            // so that result persistence survives a run-level timeout. The run is already complete
-            // at this point — we must persist results even if the aggregate timeout fires.
-            run.RunMetadataJson = OptimizationCheckpointStore.LimitJsonPayload(JsonSerializer.Serialize(new RunMetadataSnapshot(
-                RunMetadataVersion,
-                run.DeterministicSeed,
-                surrogateKind,
-                strategy.Symbol,
-                strategy.Timeframe,
-                candles[0].Timestamp,
-                candles[^1].Timestamp,
-                candles.Count,
-                trainCandles.Count,
-                testCandles.Count,
-                embargoSize,
-                resumedFromCheckpoint,
-                currentRegime?.ToString(),
-                warmStarted,
-                totalIters,
-                run.BaselineHealthScore,
-                baselineComparisonScore,
-                vr.OosHealthScore,
-                vr.Passed)),
-                OptimizationCheckpointStore.MaxMetadataChars,
-                "run metadata",
-                _logger);
-            await writeCtx.SaveChangesAsync(ct);
-            completionPersisted = true;
-
-            sw.Stop();
-            _metrics.OptimizationRunsProcessed.Add(1);
-            _metrics.OptimizationCycleDurationMs.Record(sw.Elapsed.TotalMilliseconds);
-            _metrics.OptimizationComputeSeconds.Record(sw.Elapsed.TotalSeconds,
-                new KeyValuePair<string, object?>("strategy_type", strategy.StrategyType.ToString()));
-
-            double candidatesPerSec = totalIters / Math.Max(1.0, sw.Elapsed.TotalSeconds);
-
-            _logger.LogInformation(
-                "OptimizationWorker: run {RunId} completed — Iter={Iter} ({CPS:F1}/s), IS={IS:F2}, OOS={OOS:F2}, " +
-                "CI=[{CIL:F2},{CIU:F2}], WF={WF:F2}, Sens={Sens}, CostOk={Cost}, Baseline={Base:F2} in {Ms:F0}ms",
-                run.Id, run.Iterations, candidatesPerSec, vr.Winner.HealthScore, vr.OosHealthScore,
-                vr.CILower, vr.CIUpper, vr.WfAvgScore, vr.SensitivityOk, vr.CostSensitiveOk,
-                run.BaselineHealthScore, sw.Elapsed.TotalMilliseconds);
-
-            await mediator.Send(new LogDecisionCommand
-            {
-                EntityType = "OptimizationRun", EntityId = run.Id,
-                DecisionType = "OptimizationCompleted", Outcome = "Completed",
-                Reason = $"Iter={run.Iterations}, IS={vr.Winner.HealthScore:F2}, OOS={vr.OosHealthScore:F2}, " +
-                         $"CI95=[{vr.CILower:F2},{vr.CIUpper:F2}], WF_Avg={vr.WfAvgScore:F2}, WF_Stable={vr.WfStable}, " +
-                         $"MTF={vr.MtfCompatible}, ParamCorr={!vr.CorrelationSafe}, TemporalCorr={vr.TemporalMaxOverlap:P0}, " +
-                         $"PortfolioCorr={vr.PortfolioMaxCorrelation:P0}, " +
-                         $"Sensitivity={vr.SensitivityOk}, CostSensitive={vr.CostSensitiveOk} (pess={vr.PessimisticScore:F2}), " +
-                         $"PermTest p={vr.PermPValue:F3} α_corrected={vr.PermCorrectedAlpha:F4} sig={vr.PermSignificant} (N={totalIters}), " +
-                         $"Baseline={run.BaselineHealthScore:F2}, Throughput={candidatesPerSec:F1}/s",
-                Source = "OptimizationWorker"
-            }, ct);
-
-            try
-            {
-                await eventService.SaveAndPublish(writeCtx, new OptimizationCompletedIntegrationEvent
-                {
-                    OptimizationRunId = run.Id,
-                    StrategyId        = run.StrategyId,
-                    Symbol            = strategy.Symbol,
-                    Timeframe         = strategy.Timeframe,
-                    Iterations        = run.Iterations,
-                    BaselineScore     = run.BaselineHealthScore ?? 0m,
-                    BestOosScore      = vr.OosHealthScore,
-                    CompletedAt       = run.CompletedAt ?? DateTime.UtcNow,
-                });
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex,
-                    "OptimizationWorker: failed to persist completion event for run {RunId} after results were already saved — preserving status {Status} and continuing",
-                    run.Id, run.Status);
-                _metrics.WorkerErrors.Add(1, new KeyValuePair<string, object?>("worker", "OptimizationWorker"));
-            }
-
-            phase.Dispose();
-
-            // ── Stage 13: Auto-approval ──────────────────────────────────
-            phase = PhaseTimer.Start(_logger, _metrics, run.Id, run.StrategyId, "Approval");
-
-            var ctx = new RunContext(run, strategy, config, baselineComparisonScore, db, writeDb, writeCtx, mediator, alertDispatcher, eventService, ct, runCt);
-            await ApplyApprovalDecisionAsync(
-                ctx, vr, currentRegime, candleLookbackStart, screeningOptions);
-
-            phase.Dispose();
+            // ── Stages 3–13: Full optimization pipeline ──
+            completionPersisted = await RunOptimizationPipelineAsync(
+                run, strategy, config, db, writeDb, writeCtx, mediator,
+                alertDispatcher, eventService, sw, ct, runCt);
         }
         catch (DataQualityException dqEx)
         {
@@ -1012,6 +797,270 @@ public partial class OptimizationWorker : BackgroundService
             runCts?.Dispose();
             _validator.ClearCache();
         }
+    }
+
+    // ── Pipeline body (stages 3–13) ────────────────────────────────────────
+
+    /// <summary>
+    /// Executes stages 3–13 of the optimization pipeline: data loading, Bayesian search,
+    /// Pareto selection, validation gates, result persistence, and auto-approval.
+    /// Extracted from <see cref="ProcessNextQueuedRunAsync"/> to keep the orchestrator
+    /// focused on claiming, error handling, and lifecycle management.
+    /// </summary>
+    /// <returns><c>true</c> if completion was successfully persisted to the database.</returns>
+    private async Task<bool> RunOptimizationPipelineAsync(
+        OptimizationRun run, Strategy strategy, OptimizationConfig config,
+        DbContext db, DbContext writeDb, IWriteApplicationDbContext writeCtx,
+        IMediator mediator, IAlertDispatcher alertDispatcher,
+        IIntegrationEventService eventService, Stopwatch sw,
+        CancellationToken ct, CancellationToken runCt)
+    {
+        // ── Stages 3–4: Load candles, validate, split, build cost options, run baseline ──
+        using var dataLoadActivity = s_activitySource.StartActivity("optimization.data_load");
+        var phase = PhaseTimer.Start(_logger, _metrics, run.Id, run.StrategyId, "DataLoad");
+
+        var dataLoad = await LoadAndValidateCandlesAsync(db, run, strategy, config, runCt);
+
+        phase.Dispose();
+        dataLoadActivity?.SetTag("candle.count", dataLoad.AllCandles.Count);
+        dataLoadActivity?.SetTag("train.count", dataLoad.TrainCandles.Count);
+        dataLoadActivity?.SetTag("test.count", dataLoad.TestCandles.Count);
+
+        var candles          = dataLoad.AllCandles;
+        var trainCandles     = dataLoad.TrainCandles;
+        var testCandles      = dataLoad.TestCandles;
+        int embargoSize      = dataLoad.EmbargoSize;
+        var screeningOptions = dataLoad.ScreeningOptions;
+        var protocol         = dataLoad.Protocol;
+        var candleLookbackStart = dataLoad.CandleLookbackStart;
+        var currentRegimeForBaseline = dataLoad.CurrentRegimeForBaseline;
+        var baselineComparisonScore = dataLoad.BaselineComparisonScore;
+        var baselineParamsJson = dataLoad.BaselineParametersJson;
+        var pairInfo = dataLoad.PairInfo;
+
+        // ── Stages 5–6: Bayesian search with purged K-fold ──────────
+        using var searchActivity = s_activitySource.StartActivity("optimization.search");
+        phase = PhaseTimer.Start(_logger, _metrics, run.Id, run.StrategyId, "Search");
+        var searchResult = await RunBayesianSearchAsync(
+            db, run, strategy, config, trainCandles, candles, screeningOptions,
+            protocol, embargoSize, currentRegimeForBaseline, writeCtx, ct, runCt);
+
+        var allEvaluated = searchResult.EvaluatedCandidates;
+        int totalIters   = searchResult.TotalIterations;
+
+        if (allEvaluated.Count == 0)
+            throw new InvalidOperationException("All parameter candidates failed during TPE search.");
+
+        // ── Variables used downstream in RunMetadataSnapshot ──
+        var surrogateKind          = searchResult.SurrogateKind;
+        var warmStarted            = searchResult.WarmStartedObservations;
+        var resumedFromCheckpoint  = searchResult.ResumedFromCheckpoint;
+
+        phase.Dispose();
+        searchActivity?.SetTag("surrogate", surrogateKind);
+        searchActivity?.SetTag("iterations", totalIters);
+        searchActivity?.SetTag("candidates.evaluated", allEvaluated.Count);
+
+        await HeartbeatRunAsync(run, writeCtx, ct);
+
+        // ── Stage 6b: Memory pressure mitigation ──────────────────
+        // Trim trade lists from non-top candidates to reduce heap pressure.
+        // The Pareto selector only needs BacktestResult metrics (Sharpe, DD, WR),
+        // not individual trades. Keep full trades only for the top N candidates
+        // that might proceed to OOS validation.
+        var evaluatedList = allEvaluated
+            .OrderByDescending(c => c.HealthScore)
+            .ToList();
+
+        int keepTradesCount = Math.Max(config.TopNCandidates * 2, 10);
+        for (int i = keepTradesCount; i < evaluatedList.Count; i++)
+        {
+            evaluatedList[i].Result.Trades?.Clear();
+            evaluatedList[i].TradesTrimmed = true;
+        }
+
+        // LOH pressure relief: after trimming trade lists, many large objects
+        // (BacktestResult with trade arrays) become collectible. A targeted Gen2
+        // collect here prevents these from accumulating across the remaining
+        // validation phases, especially for runs with 100+ evaluated candidates.
+        GC.Collect(2, GCCollectionMode.Optimized, blocking: false);
+
+        // ── Stage 7: Multi-objective Pareto selection ───────────────
+        var topCandidates = ParetoFrontSelector.RankByNonDominatedSorting(
+            evaluatedList,
+            config.TopNCandidates,
+            c => (double)c.Result.SharpeRatio,
+            c => -(double)c.Result.MaxDrawdownPct,
+            c => (double)c.Result.WinRate);
+
+        using var validationActivity = s_activitySource.StartActivity("optimization.validation");
+        phase = PhaseTimer.Start(_logger, _metrics, run.Id, run.StrategyId, "Validation");
+
+        // Fine validation of Pareto winners on full IS data
+        var parallelOptions = new ParallelOptions
+        {
+            MaxDegreeOfParallelism = config.MaxParallelBacktests,
+            CancellationToken      = runCt,
+        };
+        var fineRanked = new List<ScoredCandidate>();
+        var fineLock = new object();
+        await Parallel.ForEachAsync(topCandidates, parallelOptions, async (candidate, pCt) =>
+        {
+            try
+            {
+                var result = await _validator.RunWithTimeoutAsync(
+                    strategy, candidate.ParamsJson, trainCandles, screeningOptions,
+                    config.ScreeningTimeoutSeconds, pCt);
+                Interlocked.Increment(ref totalIters);
+                lock (fineLock) fineRanked.Add(new ScoredCandidate(
+                    candidate.ParamsJson,
+                    OptimizationHealthScorer.ComputeHealthScore(result),
+                    result,
+                    candidate.CvCoefficientOfVariation));
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "OptimizationWorker: fine-validation backtest failed for Pareto candidate");
+                Interlocked.Increment(ref totalIters);
+            }
+        });
+
+        var rankedCandidates = fineRanked.Count == 0
+            ? topCandidates
+            : fineRanked.OrderByDescending(r => r.HealthScore).ToList();
+
+        // ── Stage 7b–11d: Post-selection validation with Pareto fallback ──
+        var vr = await ValidateParetoCandidatesAsync(
+            rankedCandidates, strategy, run, trainCandles, testCandles,
+            screeningOptions, protocol, config, db, totalIters, baselineComparisonScore,
+            baselineParamsJson, writeCtx, pairInfo, ct, runCt);
+        await HeartbeatRunAsync(run, writeCtx, ct);
+
+        var currentRegime = await db.Set<MarketRegimeSnapshot>()
+            .Where(s => s.Symbol == strategy.Symbol
+                     && s.Timeframe == strategy.Timeframe
+                     && !s.IsDeleted)
+            .OrderByDescending(s => s.DetectedAt)
+            .Select(s => (MarketRegimeEnum?)s.Regime)
+            .FirstOrDefaultAsync(runCt);
+
+        phase.Dispose();
+        validationActivity?.SetTag("approval.passed", vr.Passed);
+        validationActivity?.SetTag("oos.score", (double)vr.OosHealthScore);
+
+        // ── Stage 12: Persist results + benchmarking ────────────────
+        using var persistActivity = s_activitySource.StartActivity("optimization.persist");
+        phase = PhaseTimer.Start(_logger, _metrics, run.Id, run.StrategyId, "Persist");
+        run.Iterations              = totalIters;
+        run.IntermediateResultsJson  = null; // Clear checkpoint data — run completed successfully
+        run.CheckpointVersion        = 0;
+        run.BestParametersJson = CanonicalParameterJson.Normalize(vr.Winner.ParamsJson);
+        run.BestHealthScore    = vr.OosHealthScore;
+        // Store per-objective metrics for EHVI warm-start in future runs
+        run.BestSharpeRatio    = vr.OosResult.SharpeRatio;
+        run.BestMaxDrawdownPct = vr.OosResult.MaxDrawdownPct;
+        run.BestWinRate        = vr.OosResult.WinRate;
+        run.ApprovalReportJson = OptimizationCheckpointStore.LimitJsonPayload(
+            vr.ApprovalReportJson,
+            OptimizationCheckpointStore.MaxApprovalReportChars,
+            "approval report",
+            _logger);
+        StampHeartbeat(run);
+        OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Completed, DateTime.UtcNow);
+        // NOTE: SaveChangesAsync calls below intentionally use the parent `ct` (not `runCt`)
+        // so that result persistence survives a run-level timeout. The run is already complete
+        // at this point — we must persist results even if the aggregate timeout fires.
+        run.RunMetadataJson = OptimizationCheckpointStore.LimitJsonPayload(JsonSerializer.Serialize(new RunMetadataSnapshot(
+            RunMetadataVersion,
+            run.DeterministicSeed,
+            surrogateKind,
+            strategy.Symbol,
+            strategy.Timeframe,
+            candles[0].Timestamp,
+            candles[^1].Timestamp,
+            candles.Count,
+            trainCandles.Count,
+            testCandles.Count,
+            embargoSize,
+            resumedFromCheckpoint,
+            currentRegime?.ToString(),
+            warmStarted,
+            totalIters,
+            run.BaselineHealthScore,
+            baselineComparisonScore,
+            vr.OosHealthScore,
+            vr.Passed)),
+            OptimizationCheckpointStore.MaxMetadataChars,
+            "run metadata",
+            _logger);
+        await writeCtx.SaveChangesAsync(ct);
+        bool completionPersisted = true;
+
+        sw.Stop();
+        _metrics.OptimizationRunsProcessed.Add(1);
+        _metrics.OptimizationCycleDurationMs.Record(sw.Elapsed.TotalMilliseconds);
+        _metrics.OptimizationComputeSeconds.Record(sw.Elapsed.TotalSeconds,
+            new KeyValuePair<string, object?>("strategy_type", strategy.StrategyType.ToString()));
+
+        double candidatesPerSec = totalIters / Math.Max(1.0, sw.Elapsed.TotalSeconds);
+
+        _logger.LogInformation(
+            "OptimizationWorker: run {RunId} completed — Iter={Iter} ({CPS:F1}/s), IS={IS:F2}, OOS={OOS:F2}, " +
+            "CI=[{CIL:F2},{CIU:F2}], WF={WF:F2}, Sens={Sens}, CostOk={Cost}, Baseline={Base:F2} in {Ms:F0}ms",
+            run.Id, run.Iterations, candidatesPerSec, vr.Winner.HealthScore, vr.OosHealthScore,
+            vr.CILower, vr.CIUpper, vr.WfAvgScore, vr.SensitivityOk, vr.CostSensitiveOk,
+            run.BaselineHealthScore, sw.Elapsed.TotalMilliseconds);
+
+        await mediator.Send(new LogDecisionCommand
+        {
+            EntityType = "OptimizationRun", EntityId = run.Id,
+            DecisionType = "OptimizationCompleted", Outcome = "Completed",
+            Reason = $"Iter={run.Iterations}, IS={vr.Winner.HealthScore:F2}, OOS={vr.OosHealthScore:F2}, " +
+                     $"CI95=[{vr.CILower:F2},{vr.CIUpper:F2}], WF_Avg={vr.WfAvgScore:F2}, WF_Stable={vr.WfStable}, " +
+                     $"MTF={vr.MtfCompatible}, ParamCorr={!vr.CorrelationSafe}, TemporalCorr={vr.TemporalMaxOverlap:P0}, " +
+                     $"PortfolioCorr={vr.PortfolioMaxCorrelation:P0}, " +
+                     $"Sensitivity={vr.SensitivityOk}, CostSensitive={vr.CostSensitiveOk} (pess={vr.PessimisticScore:F2}), " +
+                     $"PermTest p={vr.PermPValue:F3} α_corrected={vr.PermCorrectedAlpha:F4} sig={vr.PermSignificant} (N={totalIters}), " +
+                     $"Baseline={run.BaselineHealthScore:F2}, Throughput={candidatesPerSec:F1}/s",
+            Source = "OptimizationWorker"
+        }, ct);
+
+        try
+        {
+            await eventService.SaveAndPublish(writeCtx, new OptimizationCompletedIntegrationEvent
+            {
+                OptimizationRunId = run.Id,
+                StrategyId        = run.StrategyId,
+                Symbol            = strategy.Symbol,
+                Timeframe         = strategy.Timeframe,
+                Iterations        = run.Iterations,
+                BaselineScore     = run.BaselineHealthScore ?? 0m,
+                BestOosScore      = vr.OosHealthScore,
+                CompletedAt       = run.CompletedAt ?? DateTime.UtcNow,
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "OptimizationWorker: failed to persist completion event for run {RunId} after results were already saved — preserving status {Status} and continuing",
+                run.Id, run.Status);
+            _metrics.WorkerErrors.Add(1, new KeyValuePair<string, object?>("worker", "OptimizationWorker"));
+        }
+
+        phase.Dispose();
+
+        // ── Stage 13: Auto-approval ──────────────────────────────────
+        using var approvalActivity = s_activitySource.StartActivity("optimization.approval");
+        phase = PhaseTimer.Start(_logger, _metrics, run.Id, run.StrategyId, "Approval");
+
+        var ctx = new RunContext(run, strategy, config, baselineComparisonScore, db, writeDb, writeCtx, mediator, alertDispatcher, eventService, ct, runCt);
+        await ApplyApprovalDecisionAsync(
+            ctx, vr, currentRegime, candleLookbackStart, screeningOptions);
+
+        phase.Dispose();
+        approvalActivity?.SetTag("approval.decision", run.Status.ToString());
+
+        return completionPersisted;
     }
 
     // ── Stage methods ───────────────────────────────────────────────────────
