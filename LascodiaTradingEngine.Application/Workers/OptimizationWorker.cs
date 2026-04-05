@@ -93,6 +93,7 @@ namespace LascodiaTradingEngine.Application.Workers;
 ///   <item><c>Optimization:PermutationIterations</c> — Monte Carlo permutation test iterations (default 1000)</item>
 ///   <item><c>Optimization:MaxRetryAttempts</c> — max retry attempts for transiently failed runs (default 2)</item>
 ///   <item><c>Optimization:CandleLookbackMonths</c> — months of candle history to load (default 6; D1 strategies may need 12+)</item>
+///   <item><c>Optimization:CandleLookbackAutoScale</c> — auto-scale lookback by timeframe (D1=24mo, H4=12mo, H1=6mo, M15=3mo, M5/M1=2mo); when false, CandleLookbackMonths is used as-is (default true)</item>
 ///   <item><c>Optimization:RequireEADataAvailability</c> — defer runs when no active EA feeds the symbol (default true)</item>
 ///   <item><c>Optimization:MaxConcurrentRuns</c> — max optimization runs executing simultaneously across all workers (default 3)</item>
 ///   <item><c>Optimization:UseSymbolSpecificSpread</c> — use CurrencyPair.SpreadPoints instead of fixed config spread (default true)</item>
@@ -162,6 +163,7 @@ public partial class OptimizationWorker : BackgroundService
         int PermutationIterations,
         int MaxRetryAttempts,
         int CandleLookbackMonths,
+        bool CandleLookbackAutoScale,
         bool RequireEADataAvailability,
         int MaxConcurrentRuns,
         bool UseSymbolSpecificSpread,
@@ -210,6 +212,7 @@ public partial class OptimizationWorker : BackgroundService
         int WarmStartedObservations,
         int Iterations = 0,
         decimal? BaselineHealthScore = null,
+        decimal? BaselineComparisonScore = null,
         decimal? OosHealthScore = null,
         bool? AutoApproved = null);
 
@@ -245,6 +248,7 @@ public partial class OptimizationWorker : BackgroundService
         OptimizationGridBuilder.DataProtocol Protocol,
         DateTime CandleLookbackStart,
         MarketRegimeEnum? CurrentRegimeForBaseline,
+        decimal BaselineComparisonScore,
         CurrencyPair? PairInfo = null);
 
     /// <summary>Results from the Bayesian search phase.</summary>
@@ -260,6 +264,7 @@ public partial class OptimizationWorker : BackgroundService
         OptimizationRun Run,
         Strategy Strategy,
         OptimizationConfig Config,
+        decimal BaselineComparisonScore,
         DbContext Db,
         DbContext WriteDb,
         IWriteApplicationDbContext WriteCtx,
@@ -614,6 +619,7 @@ public partial class OptimizationWorker : BackgroundService
             var protocol         = dataLoad.Protocol;
             var candleLookbackStart = dataLoad.CandleLookbackStart;
             var currentRegimeForBaseline = dataLoad.CurrentRegimeForBaseline;
+            var baselineComparisonScore = dataLoad.BaselineComparisonScore;
             var pairInfo = dataLoad.PairInfo;
 
             // ── Stages 5–6: Bayesian search with purged K-fold ──────────
@@ -695,7 +701,7 @@ public partial class OptimizationWorker : BackgroundService
             // ── Stage 7b–11d: Post-selection validation with Pareto fallback ──
             var vr = await ValidateParetoCandidatesAsync(
                 rankedCandidates, strategy, run, trainCandles, testCandles,
-                screeningOptions, protocol, config, db, totalIters, writeCtx, pairInfo, ct, runCt);
+                screeningOptions, protocol, config, db, totalIters, baselineComparisonScore, writeCtx, pairInfo, ct, runCt);
             await HeartbeatRunAsync(run, writeCtx, ct);
 
             var currentRegime = await db.Set<MarketRegimeSnapshot>()
@@ -746,6 +752,7 @@ public partial class OptimizationWorker : BackgroundService
                 warmStarted,
                 totalIters,
                 run.BaselineHealthScore,
+                baselineComparisonScore,
                 vr.OosHealthScore,
                 vr.Passed)),
                 OptimizationCheckpointStore.MaxMetadataChars,
@@ -799,7 +806,7 @@ public partial class OptimizationWorker : BackgroundService
             // ── Stage 13: Auto-approval ──────────────────────────────────
             phase = PhaseTimer.Start(_logger, _metrics, run.Id, run.StrategyId, "Approval");
 
-            var ctx = new RunContext(run, strategy, config, db, writeDb, writeCtx, mediator, alertDispatcher, eventService, ct, runCt);
+            var ctx = new RunContext(run, strategy, config, baselineComparisonScore, db, writeDb, writeCtx, mediator, alertDispatcher, eventService, ct, runCt);
             await ApplyApprovalDecisionAsync(
                 ctx, vr, currentRegime, candleLookbackStart, screeningOptions);
 
@@ -943,8 +950,8 @@ public partial class OptimizationWorker : BackgroundService
         int maxRetryAttempts = await OptimizationGridBuilder.GetConfigAsync(db, "Optimization:MaxRetryAttempts", 2, ct);
         if (maxRetryAttempts <= 0) return;
 
-        var retryWindowStart = DateTime.UtcNow.AddHours(-1);
         var nowUtc = DateTime.UtcNow;
+        var retryWindowStart = nowUtc - GetRetryEligibilityWindow(maxRetryAttempts);
 
         // Re-queue retryable runs with exponential backoff: a run must wait
         // 15 * 2^RetryCount minutes after failure before becoming eligible again
@@ -1046,6 +1053,13 @@ public partial class OptimizationWorker : BackgroundService
         }
     }
 
+    private static TimeSpan GetRetryEligibilityWindow(int maxRetryAttempts)
+    {
+        int normalizedAttempts = Math.Max(1, maxRetryAttempts);
+        int maxEligibleBackoffMinutes = 15 << (normalizedAttempts - 1);
+        return TimeSpan.FromMinutes(maxEligibleBackoffMinutes + 15);
+    }
+
     /// <summary>
     /// Checks completed validation follow-ups (backtests + walk-forwards) for recently
     /// approved optimization runs. If a follow-up shows poor results, fires an alert
@@ -1077,13 +1091,21 @@ public partial class OptimizationWorker : BackgroundService
                 .Where(w => w.SourceOptimizationRunId == run.Id && !w.IsDeleted)
                 .FirstOrDefaultAsync(ct);
 
-            bool backtestDone = backtestRun is null || backtestRun.Status is RunStatus.Completed or RunStatus.Failed;
-            bool wfDone = wfRun is null || wfRun.Status is RunStatus.Completed or RunStatus.Failed;
+            if (backtestRun is null || wfRun is null)
+            {
+                _logger.LogWarning(
+                    "OptimizationWorker: follow-up validation rows missing for approved run {RunId} — backtest={HasBacktest}, walk-forward={HasWalkForward}",
+                    run.Id, backtestRun is not null, wfRun is not null);
+                continue;
+            }
+
+            bool backtestDone = backtestRun.Status is RunStatus.Completed or RunStatus.Failed;
+            bool wfDone = wfRun.Status is RunStatus.Completed or RunStatus.Failed;
 
             if (!backtestDone || !wfDone) continue; // Still running
 
-            bool backtestFailed = backtestRun?.Status == RunStatus.Failed;
-            bool wfFailed = wfRun?.Status == RunStatus.Failed;
+            bool backtestFailed = backtestRun.Status == RunStatus.Failed;
+            bool wfFailed = wfRun.Status == RunStatus.Failed;
 
             var liveRun = await writeDb.Set<OptimizationRun>()
                 .FirstOrDefaultAsync(r => r.Id == run.Id, ct);
@@ -1096,7 +1118,7 @@ public partial class OptimizationWorker : BackgroundService
                 _logger.LogWarning(
                     "OptimizationWorker: follow-up validation FAILED for run {RunId} — " +
                     "backtest={BtStatus}, walk-forward={WfStatus}. Manual investigation recommended.",
-                    run.Id, backtestRun?.Status, wfRun?.Status);
+                    run.Id, backtestRun.Status, wfRun.Status);
             }
             else
             {
@@ -1249,13 +1271,14 @@ public partial class OptimizationWorker : BackgroundService
             "Optimization:CostStressMultiplier", "Optimization:MinOosCandlesForValidation",
             "Optimization:MaxCvCoefficientOfVariation", "Optimization:PermutationIterations",
             "Optimization:RegimeStabilityHours",
-            "Optimization:MaxRetryAttempts", "Optimization:CandleLookbackMonths",
+            "Optimization:MaxRetryAttempts", "Optimization:CandleLookbackMonths", "Optimization:CandleLookbackAutoScale",
             "Optimization:RequireEADataAvailability", "Optimization:MaxConcurrentRuns",
             "Optimization:UseSymbolSpecificSpread", "Optimization:RegimeBlendRatio",
             "Optimization:CpcvNFolds", "Optimization:CpcvTestFoldCount",
             "Optimization:CpcvMaxCombinations", "Optimization:CircuitBreakerThreshold",
             "Optimization:SuccessiveHalvingRungs", "Optimization:MaxCrossRegimeEvals",
             "Optimization:HyperbandEnabled", "Optimization:HyperbandEta",
+            "Optimization:MaxRunsPerWeek",
         };
 
         var b = await OptimizationGridBuilder.GetConfigBatchAsync(db, allKeys, ct);
@@ -1314,6 +1337,7 @@ public partial class OptimizationWorker : BackgroundService
             PermutationIterations:            OptimizationGridBuilder.GetConfigValue(b, "Optimization:PermutationIterations", p.PermutationIters),
             MaxRetryAttempts:                 OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxRetryAttempts", 2),
             CandleLookbackMonths:            OptimizationGridBuilder.GetConfigValue(b, "Optimization:CandleLookbackMonths", 6),
+            CandleLookbackAutoScale:         OptimizationGridBuilder.GetConfigValue(b, "Optimization:CandleLookbackAutoScale", true),
             RequireEADataAvailability:       OptimizationGridBuilder.GetConfigValue(b, "Optimization:RequireEADataAvailability", true),
             MaxConcurrentRuns:               OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxConcurrentRuns", 3),
             UseSymbolSpecificSpread:         OptimizationGridBuilder.GetConfigValue(b, "Optimization:UseSymbolSpecificSpread", true),
@@ -1405,12 +1429,46 @@ public partial class OptimizationWorker : BackgroundService
         var oosHealthScore = vr.OosHealthScore;
         var oosResult = vr.OosResult;
         var winner = vr.Winner;
-        decimal improvement = oosHealthScore - (run.BaselineHealthScore ?? 0m);
+        decimal improvement = oosHealthScore - ctx.BaselineComparisonScore;
 
         if (vr.Passed)
         {
             var liveStrategy = await writeDb.Set<Strategy>()
                 .FirstOrDefaultAsync(x => x.Id == run.StrategyId && !x.IsDeleted, runCt);
+
+            var originalRunStatus = run.Status;
+            var originalApprovedAt = run.ApprovedAt;
+            var originalCompletedAt = run.CompletedAt;
+            var originalErrorMessage = run.ErrorMessage;
+            var originalValidationFollowUpsCreatedAt = run.ValidationFollowUpsCreatedAt;
+            var originalValidationFollowUpStatus = run.ValidationFollowUpStatus;
+
+            string? originalRollbackParametersJson = liveStrategy?.RollbackParametersJson;
+            string? originalStrategyParametersJson = liveStrategy?.ParametersJson;
+            int? originalRolloutPct = liveStrategy?.RolloutPct;
+            DateTime? originalRolloutStartedAt = liveStrategy?.RolloutStartedAt;
+            long? originalRolloutOptimizationRunId = liveStrategy?.RolloutOptimizationRunId;
+            decimal? originalEstimatedCapacityLots = liveStrategy?.EstimatedCapacityLots;
+
+            void RestorePreApprovalState()
+            {
+                run.Status = originalRunStatus;
+                run.ApprovedAt = originalApprovedAt;
+                run.CompletedAt = originalCompletedAt;
+                run.ErrorMessage = originalErrorMessage;
+                run.ValidationFollowUpsCreatedAt = originalValidationFollowUpsCreatedAt;
+                run.ValidationFollowUpStatus = originalValidationFollowUpStatus;
+
+                if (liveStrategy is null)
+                    return;
+
+                liveStrategy.RollbackParametersJson = originalRollbackParametersJson;
+                liveStrategy.ParametersJson = originalStrategyParametersJson ?? liveStrategy.ParametersJson;
+                liveStrategy.RolloutPct = originalRolloutPct;
+                liveStrategy.RolloutStartedAt = originalRolloutStartedAt;
+                liveStrategy.RolloutOptimizationRunId = originalRolloutOptimizationRunId;
+                liveStrategy.EstimatedCapacityLots = originalEstimatedCapacityLots;
+            }
 
             if (liveStrategy is not null)
             {
@@ -1432,25 +1490,18 @@ public partial class OptimizationWorker : BackgroundService
                 }
             }
 
-            OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Approved, DateTime.UtcNow);
-            await writeCtx.SaveChangesAsync(ct);
+            bool followUpsAlreadyPresent = await EnsureValidationFollowUpsAsync(writeDb, run, strategy, config, runCt);
+            if (followUpsAlreadyPresent)
+                _metrics.OptimizationDuplicateFollowUpsPrevented.Add(1);
 
-            _metrics.OptimizationAutoApproved.Add(1);
-
-            _logger.LogInformation(
-                "OptimizationWorker: run {RunId} AUTO-APPROVED — improvement={Imp:+0.00;-0.00}, OOS={Score:F2}, CI_lower={CIL:F2}, WF_Avg={WF:F2}",
-                run.Id, improvement, vr.OosHealthScore, vr.CILower, vr.WfAvgScore);
-
-            await mediator.Send(new LogDecisionCommand
+            if (currentRegime.HasValue)
             {
-                EntityType = "OptimizationRun", EntityId = run.Id,
-                DecisionType = "AutoApproval", Outcome = "Approved",
-                Reason = $"OOS={vr.OosHealthScore:F2}, CI95=[{vr.CILower:F2},{vr.CIUpper:F2}], " +
-                         $"WF={vr.WfAvgScore:F2}, Sens=pass, CostPess={vr.PessimisticScore:F2}; params applied",
-                Source = "OptimizationWorker"
-            }, runCt);
+                await SaveRegimeParamsAsync(writeDb, writeCtx, strategy, run, vr.Winner.ParamsJson,
+                    vr.OosHealthScore, vr.CILower, currentRegime.Value, runCt, persistChanges: false);
+            }
 
-            await eventService.SaveAndPublish(writeCtx, new OptimizationApprovedIntegrationEvent
+            OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Approved, DateTime.UtcNow);
+            var approvedEvent = new OptimizationApprovedIntegrationEvent
             {
                 OptimizationRunId = run.Id,
                 StrategyId        = run.StrategyId,
@@ -1459,12 +1510,63 @@ public partial class OptimizationWorker : BackgroundService
                 Improvement       = improvement,
                 OosScore          = vr.OosHealthScore,
                 ApprovedAt        = run.ApprovedAt ?? DateTime.UtcNow,
-            });
+            };
 
-            // Save regime-conditional parameters for the current regime
-            if (currentRegime.HasValue)
-                await SaveRegimeParamsAsync(writeDb, writeCtx, strategy, run, vr.Winner.ParamsJson,
-                    vr.OosHealthScore, vr.CILower, currentRegime.Value, runCt);
+            try
+            {
+                await eventService.SaveAndPublish(writeCtx, approvedEvent);
+            }
+            catch (DbUpdateException ex) when (IsDuplicateFollowUpConstraintViolation(ex))
+            {
+                DetachPendingValidationFollowUps(writeDb, run.Id);
+                run.ValidationFollowUpsCreatedAt ??= DateTime.UtcNow;
+                run.ValidationFollowUpStatus ??= Domain.Enums.ValidationFollowUpStatus.Pending;
+                _metrics.OptimizationDuplicateFollowUpsPrevented.Add(1);
+                try
+                {
+                    await eventService.SaveAndPublish(writeCtx, approvedEvent);
+                }
+                catch (Exception retryEx)
+                {
+                    RestorePreApprovalState();
+                    _logger.LogError(retryEx,
+                        "OptimizationWorker: failed to persist approval for run {RunId} after duplicate follow-up retry — leaving run in Completed state",
+                        run.Id);
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                RestorePreApprovalState();
+                _logger.LogError(ex,
+                    "OptimizationWorker: failed to persist approval for run {RunId} — leaving run in Completed state",
+                    run.Id);
+                return;
+            }
+
+            _metrics.OptimizationAutoApproved.Add(1);
+
+            _logger.LogInformation(
+                "OptimizationWorker: run {RunId} AUTO-APPROVED — improvement={Imp:+0.00;-0.00}, OOS={Score:F2}, CI_lower={CIL:F2}, WF_Avg={WF:F2}",
+                run.Id, improvement, vr.OosHealthScore, vr.CILower, vr.WfAvgScore);
+
+            try
+            {
+                await mediator.Send(new LogDecisionCommand
+                {
+                    EntityType = "OptimizationRun", EntityId = run.Id,
+                    DecisionType = "AutoApproval", Outcome = "Approved",
+                    Reason = $"OOS={vr.OosHealthScore:F2}, CI95=[{vr.CILower:F2},{vr.CIUpper:F2}], " +
+                             $"WF={vr.WfAvgScore:F2}, Sens=pass, CostPess={vr.PessimisticScore:F2}; params applied",
+                    Source = "OptimizationWorker"
+                }, runCt);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "OptimizationWorker: approval audit log failed for run {RunId} (non-fatal)",
+                    run.Id);
+            }
 
             // Cross-regime evaluation with scoped timeout
             using var crossRegimeCts = CancellationTokenSource.CreateLinkedTokenSource(runCt);
@@ -1476,15 +1578,30 @@ public partial class OptimizationWorker : BackgroundService
             {
                 try
                 {
-                    var otherRegimes = await db.Set<MarketRegimeSnapshot>()
+                    var lookbackEndUtc = DateTime.UtcNow;
+                    var snapshotHistory = await db.Set<MarketRegimeSnapshot>()
                         .Where(s => s.Symbol == strategy.Symbol
                                  && s.Timeframe == strategy.Timeframe
-                                 && s.Regime != currentRegime.Value
-                                 && s.DetectedAt >= candleLookbackStart
+                                 && s.DetectedAt <= lookbackEndUtc
                                  && !s.IsDeleted)
+                        .OrderBy(s => s.DetectedAt)
+                        .ToListAsync(crossRegimeCt);
+
+                    var otherRegimes = snapshotHistory
+                        .Where(s => s.DetectedAt >= candleLookbackStart && s.Regime != currentRegime.Value)
                         .Select(s => s.Regime)
                         .Distinct()
                         .Take(config.MaxCrossRegimeEvals)
+                        .ToList();
+
+                    var lookbackCandles = await db.Set<Candle>()
+                        .Where(c => c.Symbol == strategy.Symbol
+                                 && c.Timeframe == strategy.Timeframe
+                                 && c.Timestamp >= candleLookbackStart
+                                 && c.Timestamp <= lookbackEndUtc
+                                 && c.IsClosed
+                                 && !c.IsDeleted)
+                        .OrderBy(c => c.Timestamp)
                         .ToListAsync(crossRegimeCt);
 
                     var regimeCandleSets = new List<(MarketRegimeEnum Regime, List<Candle> Candles)>();
@@ -1492,22 +1609,14 @@ public partial class OptimizationWorker : BackgroundService
                     {
                         try
                         {
-                            var regimeSnaps = await db.Set<MarketRegimeSnapshot>()
-                                .Where(s => s.Symbol == strategy.Symbol
-                                         && s.Timeframe == strategy.Timeframe
-                                         && s.Regime == otherRegime && !s.IsDeleted)
-                                .OrderBy(s => s.DetectedAt)
-                                .Select(s => s.DetectedAt)
-                                .ToListAsync(crossRegimeCt);
+                            var regimeIntervals = BuildRegimeIntervals(
+                                snapshotHistory,
+                                otherRegime,
+                                candleLookbackStart,
+                                lookbackEndUtc);
 
-                            if (regimeSnaps.Count < 2) continue;
-                            var regimeCandles = await db.Set<Candle>()
-                                .Where(c => c.Symbol == strategy.Symbol
-                                         && c.Timeframe == strategy.Timeframe
-                                         && c.Timestamp >= regimeSnaps.First() && c.Timestamp <= regimeSnaps.Last()
-                                         && c.IsClosed && !c.IsDeleted)
-                                .OrderBy(c => c.Timestamp)
-                                .ToListAsync(crossRegimeCt);
+                            if (regimeIntervals.Count == 0) continue;
+                            var regimeCandles = FilterCandlesByIntervals(lookbackCandles, regimeIntervals);
 
                             if (regimeCandles.Count >= 50)
                                 regimeCandleSets.Add((otherRegime, regimeCandles));
@@ -1564,24 +1673,14 @@ public partial class OptimizationWorker : BackgroundService
                         "primary regime params already saved, continuing with follow-ups",
                         run.Id, Math.Max(2, config.MaxRunTimeoutMinutes / 4));
                 }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex,
+                        "OptimizationWorker: cross-regime persistence failed for approved run {RunId} (non-fatal)",
+                        run.Id);
+                }
             }
 
-            bool followUpsAlreadyPresent = await EnsureValidationFollowUpsAsync(writeDb, run, strategy, config, runCt);
-            if (followUpsAlreadyPresent)
-                _metrics.OptimizationDuplicateFollowUpsPrevented.Add(1);
-
-            try
-            {
-                await writeCtx.SaveChangesAsync(ct);
-            }
-            catch (DbUpdateException ex) when (IsDuplicateFollowUpConstraintViolation(ex))
-            {
-                DetachPendingValidationFollowUps(writeDb, run.Id);
-                run.ValidationFollowUpsCreatedAt ??= DateTime.UtcNow;
-                run.ValidationFollowUpStatus ??= Domain.Enums.ValidationFollowUpStatus.Pending;
-                _metrics.OptimizationDuplicateFollowUpsPrevented.Add(1);
-                await writeCtx.SaveChangesAsync(ct);
-            }
         }
         else
         {
@@ -1658,10 +1757,11 @@ public partial class OptimizationWorker : BackgroundService
         OptimizationConfig config, CancellationToken runCt)
     {
         // Auto-scale lookback by timeframe: higher timeframes need more months to
-        // accumulate enough candles. The configured CandleLookbackMonths acts as
-        // an explicit override — only apply auto-scaling when the default (6) is used.
+        // accumulate enough candles. When CandleLookbackAutoScale is true, the
+        // configured CandleLookbackMonths is treated as a base and overridden per
+        // timeframe. When false, the configured value is used as-is.
         int effectiveLookbackMonths = config.CandleLookbackMonths;
-        if (config.CandleLookbackMonths == 6) // Default — apply auto-scaling
+        if (config.CandleLookbackAutoScale)
         {
             effectiveLookbackMonths = strategy.Timeframe switch
             {
@@ -1700,6 +1800,18 @@ public partial class OptimizationWorker : BackgroundService
             .ToListAsync(runCt);
         var holidaySet = new HashSet<DateTime>(holidayDates);
 
+        // Impute minor candle gaps (1-2 missing bars) before hard validation so
+        // harmless feed blemishes do not defer an otherwise healthy optimization run.
+        var (imputedCandles, imputedCount) = OptimizationValidator.ImputeMinorGaps(
+            candles, strategy.Timeframe, maxImputeBars: 2, holidayDates: holidaySet);
+        if (imputedCount > 0)
+        {
+            _logger.LogDebug(
+                "OptimizationWorker: imputed {Count} minor candle gap(s) for {Symbol}/{Tf}",
+                imputedCount, strategy.Symbol, strategy.Timeframe);
+            candles = imputedCandles;
+        }
+
         var (dataValid, dataIssues) = OptimizationValidator.ValidateCandleQuality(
             candles, strategy.Timeframe, holidayDates: holidaySet);
         if (!dataValid)
@@ -1709,18 +1821,6 @@ public partial class OptimizationWorker : BackgroundService
                 run.Id, strategy.Symbol, strategy.Timeframe, dataIssues);
             throw new DataQualityException(
                 $"Data quality validation failed for {strategy.Symbol}/{strategy.Timeframe}: {dataIssues}");
-        }
-
-        // Impute minor candle gaps (1-2 missing bars) to prevent data quality
-        // rejections for gaps that don't materially affect backtest results.
-        var (imputedCandles, imputedCount) = OptimizationValidator.ImputeMinorGaps(
-            candles, strategy.Timeframe, maxImputeBars: 2, holidayDates: holidaySet);
-        if (imputedCount > 0)
-        {
-            _logger.LogDebug(
-                "OptimizationWorker: imputed {Count} minor candle gap(s) for {Symbol}/{Tf}",
-                imputedCount, strategy.Symbol, strategy.Timeframe);
-            candles = imputedCandles;
         }
 
         // Data scarcity protocol + train/test split
@@ -1880,9 +1980,20 @@ public partial class OptimizationWorker : BackgroundService
             strategy, baselineParamsJson, trainCandles, screeningOptions, config.ScreeningTimeoutSeconds, runCt);
         run.BaselineHealthScore    = OptimizationHealthScorer.ComputeHealthScore(baselineResult);
         run.BaselineParametersJson = baselineParamsJson;
+        decimal baselineComparisonScore;
+        if (testCandles.Count >= config.MinOosCandlesForValidation)
+        {
+            var baselineOosResult = await _validator.RunWithTimeoutAsync(
+                strategy, baselineParamsJson, testCandles, screeningOptions, config.ScreeningTimeoutSeconds, runCt);
+            baselineComparisonScore = OptimizationHealthScorer.ComputeHealthScore(baselineOosResult);
+        }
+        else
+        {
+            baselineComparisonScore = (run.BaselineHealthScore.Value - protocol.ScorePenalty) * 0.85m;
+        }
 
         return new DataLoadResult(strategy, candles, trainCandles, testCandles, embargoSize,
-            screeningOptions, protocol, candleLookbackStart, currentRegimeForBaseline, pairInfo);
+            screeningOptions, protocol, candleLookbackStart, currentRegimeForBaseline, baselineComparisonScore, pairInfo);
     }
 
     // ── Regime-aware candle selection ────────────────────────────────────────
@@ -1910,18 +2021,30 @@ public partial class OptimizationWorker : BackgroundService
 
         if (latestRegime is null) return allCandles;
 
-        var regimeHistory = await db.Set<MarketRegimeSnapshot>()
-            .Where(s => s.Symbol == symbol && s.Timeframe == timeframe && !s.IsDeleted)
-            .OrderByDescending(s => s.DetectedAt)
-            .Take(50)
-            .ToListAsync(ct);
-
         DateTime regimeStartedAt = latestRegime.DetectedAt;
-        foreach (var snap in regimeHistory)
+        var previousDifferentAt = await db.Set<MarketRegimeSnapshot>()
+            .Where(s => s.Symbol == symbol
+                     && s.Timeframe == timeframe
+                     && !s.IsDeleted
+                     && s.DetectedAt < latestRegime.DetectedAt
+                     && s.Regime != latestRegime.Regime)
+            .OrderByDescending(s => s.DetectedAt)
+            .Select(s => (DateTime?)s.DetectedAt)
+            .FirstOrDefaultAsync(ct);
+
+        var earliestCurrentInStreak = await db.Set<MarketRegimeSnapshot>()
+            .Where(s => s.Symbol == symbol
+                     && s.Timeframe == timeframe
+                     && !s.IsDeleted
+                     && s.Regime == latestRegime.Regime
+                     && (!previousDifferentAt.HasValue || s.DetectedAt > previousDifferentAt.Value))
+            .OrderBy(s => s.DetectedAt)
+            .Select(s => (DateTime?)s.DetectedAt)
+            .FirstOrDefaultAsync(ct);
+
+        if (earliestCurrentInStreak.HasValue)
         {
-            if (snap.Regime != latestRegime.Regime)
-                break;
-            regimeStartedAt = snap.DetectedAt;
+            regimeStartedAt = earliestCurrentInStreak.Value;
         }
 
         var regimeCandles = allCandles.Where(c => c.Timestamp >= regimeStartedAt).ToList();
@@ -2088,7 +2211,7 @@ public partial class OptimizationWorker : BackgroundService
     private static async Task SaveRegimeParamsAsync(
         DbContext writeDb, IWriteApplicationDbContext writeCtx, Strategy strategy,
         OptimizationRun run, string paramsJson, decimal healthScore, decimal ciLower,
-        MarketRegimeEnum regime, CancellationToken ct)
+        MarketRegimeEnum regime, CancellationToken ct, bool persistChanges = true)
     {
         var existing = await writeDb.Set<StrategyRegimeParams>()
             .FirstOrDefaultAsync(p => p.StrategyId == strategy.Id && p.Regime == regime && !p.IsDeleted, ct);
@@ -2115,7 +2238,64 @@ public partial class OptimizationWorker : BackgroundService
             });
         }
 
-        await writeCtx.SaveChangesAsync(ct);
+        if (persistChanges)
+            await writeCtx.SaveChangesAsync(ct);
+    }
+
+    private static List<(DateTime StartUtc, DateTime EndUtc)> BuildRegimeIntervals(
+        IReadOnlyList<MarketRegimeSnapshot> snapshots,
+        MarketRegimeEnum regime,
+        DateTime rangeStartUtc,
+        DateTime rangeEndUtc)
+    {
+        var intervals = new List<(DateTime StartUtc, DateTime EndUtc)>();
+        if (snapshots.Count == 0 || rangeStartUtc >= rangeEndUtc)
+            return intervals;
+
+        for (int i = 0; i < snapshots.Count; i++)
+        {
+            var snapshot = snapshots[i];
+            if (snapshot.Regime != regime)
+                continue;
+
+            var startUtc = snapshot.DetectedAt > rangeStartUtc ? snapshot.DetectedAt : rangeStartUtc;
+            var endUtc = i + 1 < snapshots.Count
+                ? snapshots[i + 1].DetectedAt
+                : rangeEndUtc;
+            if (endUtc > rangeEndUtc)
+                endUtc = rangeEndUtc;
+
+            if (startUtc < endUtc)
+                intervals.Add((startUtc, endUtc));
+        }
+
+        return intervals;
+    }
+
+    private static List<Candle> FilterCandlesByIntervals(
+        IReadOnlyList<Candle> candles,
+        IReadOnlyList<(DateTime StartUtc, DateTime EndUtc)> intervals)
+    {
+        if (candles.Count == 0 || intervals.Count == 0)
+            return [];
+
+        var filtered = new List<Candle>();
+        int intervalIndex = 0;
+
+        foreach (var candle in candles)
+        {
+            while (intervalIndex < intervals.Count && candle.Timestamp >= intervals[intervalIndex].EndUtc)
+                intervalIndex++;
+
+            if (intervalIndex >= intervals.Count)
+                break;
+
+            var interval = intervals[intervalIndex];
+            if (candle.Timestamp >= interval.StartUtc && candle.Timestamp < interval.EndUtc)
+                filtered.Add(candle);
+        }
+
+        return filtered;
     }
 
     /// <summary>
@@ -2152,13 +2332,14 @@ public partial class OptimizationWorker : BackgroundService
                 "Optimization:CostStressMultiplier", "Optimization:MinOosCandlesForValidation",
                 "Optimization:MaxCvCoefficientOfVariation", "Optimization:PermutationIterations",
                 "Optimization:RegimeStabilityHours",
-                "Optimization:MaxRetryAttempts", "Optimization:CandleLookbackMonths",
+                "Optimization:MaxRetryAttempts", "Optimization:CandleLookbackMonths", "Optimization:CandleLookbackAutoScale",
                 "Optimization:RequireEADataAvailability", "Optimization:MaxConcurrentRuns",
                 "Optimization:UseSymbolSpecificSpread", "Optimization:RegimeBlendRatio",
                 "Optimization:CpcvNFolds", "Optimization:CpcvTestFoldCount",
                 "Optimization:CpcvMaxCombinations", "Optimization:CircuitBreakerThreshold",
                 "Optimization:SuccessiveHalvingRungs", "Optimization:MaxCrossRegimeEvals",
                 "Optimization:HyperbandEnabled", "Optimization:HyperbandEta",
+                "Optimization:MaxRunsPerWeek",
             };
 
             var dbKeys = await db.Set<EngineConfig>()

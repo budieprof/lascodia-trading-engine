@@ -100,6 +100,8 @@ public sealed class TradingMetrics
     public Counter<long>     OptimizationRunsDeferred   { get; }
     public Counter<long>     OptimizationFollowUpFailures { get; }
     public Histogram<double> OptimizationSurrogateImprovement { get; }
+    public Counter<long>     OptimizationSurrogateBatchHits { get; }
+    public Counter<long>     OptimizationSurrogateBatchMisses { get; }
     public Counter<long>     OptimizationEarlyStopSavings { get; }
     public Counter<long>     OptimizationParameterSpaceExhausted { get; }
     public Counter<long>     OptimizationCircuitBreakerTrips { get; }
@@ -270,6 +272,8 @@ public sealed class TradingMetrics
         OptimizationRunsDeferred = _meter.CreateCounter<long>("trading.optimization.runs_deferred", "runs", "Optimization runs deferred back to queue (tagged by reason)");
         OptimizationFollowUpFailures = _meter.CreateCounter<long>("trading.optimization.followup_failures", "runs", "Validation follow-up backtests/walk-forwards that failed for an approved optimization");
         OptimizationSurrogateImprovement = _meter.CreateHistogram<double>("trading.optimization.surrogate_improvement", "score", "Per-batch best score improvement over previous best during surrogate search");
+        OptimizationSurrogateBatchHits = _meter.CreateCounter<long>("trading.optimization.surrogate_batch_hits", "batches", "Surrogate-guided batches that improved the global best score");
+        OptimizationSurrogateBatchMisses = _meter.CreateCounter<long>("trading.optimization.surrogate_batch_misses", "batches", "Surrogate-guided batches that did not improve the global best score");
         OptimizationEarlyStopSavings = _meter.CreateCounter<long>("trading.optimization.early_stop_savings", "evaluations", "Evaluations saved by early stopping in surrogate search");
         OptimizationParameterSpaceExhausted = _meter.CreateCounter<long>("trading.optimization.parameter_space_exhausted", "runs", "Optimization runs that found no fresh parameter candidates after grid expansion");
         OptimizationCircuitBreakerTrips = _meter.CreateCounter<long>("trading.optimization.circuit_breaker_trips", "trips", "Times the backtest circuit breaker tripped due to consecutive failures");

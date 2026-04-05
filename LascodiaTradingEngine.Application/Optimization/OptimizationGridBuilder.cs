@@ -321,7 +321,7 @@ internal sealed class OptimizationGridBuilder
         }
 
         return candidates
-            .Where(c => !previousParamSet.Contains(JsonSerializer.Serialize(c)))
+            .Where(c => !previousParamSet.Contains(CanonicalParameterJson.Serialize(c)))
             .Take(50)
             .ToList();
     }

@@ -34,7 +34,7 @@ public partial class OptimizationWorker
         BacktestOptions screeningOptions,
         OptimizationGridBuilder.DataProtocol protocol,
         OptimizationConfig config, DbContext db,
-        int totalIters, IWriteApplicationDbContext writeCtx,
+        int totalIters, decimal baselineComparisonScore, IWriteApplicationDbContext writeCtx,
         CurrencyPair? pairInfo,
         CancellationToken ct, CancellationToken runCt)
     {
@@ -505,7 +505,7 @@ public partial class OptimizationWorker
 
             #region Approval Evaluation
             // ── Check if this candidate passes all gates ────────────
-            decimal candidateImprovement = oosHealthScore - (run.BaselineHealthScore ?? 0m);
+            decimal candidateImprovement = oosHealthScore - baselineComparisonScore;
             var approval = OptimizationApprovalPolicy.Evaluate(new OptimizationApprovalPolicy.Input(
                 candidateImprovement,
                 oosHealthScore,

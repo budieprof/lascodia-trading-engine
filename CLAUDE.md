@@ -31,7 +31,9 @@ dotnet ef migrations add <MigrationName> --project LascodiaTradingEngine.Infrast
 
 ## Architecture
 
-This is an **enterprise-grade algorithmic trading engine** built with **Clean Architecture + CQRS** targeting **.NET 10**. It supports ML-driven strategy evaluation, multi-broker failover, real-time market data, backtesting, walk-forward optimization, and comprehensive risk management — all orchestrated via background workers and an event-driven bus.
+This is an **enterprise-grade autonomous algorithmic trading engine** built with **Clean Architecture + CQRS** targeting **.NET 10**. It supports autonomous strategy discovery and screening, ML-driven signal scoring (12 learner architectures), Bayesian parameter optimization, real-time market data via MQL5 EA, backtesting, walk-forward analysis, 5-layer defense-in-depth risk management, and regime-aware adaptation — all orchestrated via 135 background workers and an event-driven bus.
+
+**Key architectural decisions are documented in [docs/adr/](docs/adr/README.md)** (12 ADRs covering EA integration, risk model, ML selection, optimization rollout, etc.).
 
 ### Layer Dependency Flow
 
@@ -50,20 +52,23 @@ API → SharedAPI (submodule)
 
 Entities inherit `Entity<long>` from `SharedDomain`. All entities use a soft-delete `IsDeleted` flag.
 
-**Entities (26):**
+**Entities (76):**
 | Group | Entities |
 |---|---|
-| Core Trading | `Order`, `Position`, `PositionScaleOrder`, `TradeSignal` |
-| Strategies | `Strategy`, `StrategyAllocation`, `StrategyPerformanceSnapshot` |
-| Accounts | `TradingAccount`, `CurrencyPair` |
-| Market Data | `Candle`, `LivePrice`, `MarketRegimeSnapshot`, `SentimentSnapshot` |
-| Risk & Alerts | `Alert`, `RiskProfile`, `DrawdownSnapshot`, `ExecutionQualityLog` |
-| ML Models | `MLModel`, `MLTrainingRun`, `MLModelPredictionLog`, `MLShadowEvaluation` |
+| Core Trading | `Order`, `Position`, `PositionScaleOrder`, `TradeSignal`, `SignalAccountAttempt`, `SignalAllocation` |
+| Strategies | `Strategy`, `StrategyAllocation`, `StrategyPerformanceSnapshot`, `StrategyRegimeParams`, `StrategyVariant`, `StrategyCapacity` |
+| Accounts | `TradingAccount`, `CurrencyPair`, `AccountPerformanceAttribution` |
+| Market Data | `Candle`, `LivePrice`, `MarketRegimeSnapshot`, `SentimentSnapshot`, `TickRecord`, `OrderBookSnapshot`, `SpreadProfile`, `MarketDataAnomaly` |
+| Risk & Alerts | `Alert`, `RiskProfile`, `DrawdownSnapshot`, `ExecutionQualityLog`, `TransactionCostAnalysis`, `StressTestScenario`, `StressTestResult` |
+| ML Models | `MLModel`, `MLTrainingRun`, `MLModelPredictionLog`, `MLShadowEvaluation`, `MLModelLifecycleLog` |
+| ML Monitoring | `MLModelRegimeAccuracy`, `MLModelSessionAccuracy`, `MLModelVolatilityAccuracy`, `MLModelHourlyAccuracy`, `MLModelEwmaAccuracy`, `MLModelHorizonAccuracy`, `MLShadowRegimeBreakdown` |
+| ML Advanced | `MLAdwinDriftLog`, `MLCausalFeatureAudit`, `MLConformalCalibration`, `MLConformalBreakerLog`, `MLCorrelatedFailureLog`, `MLErgodicityLog`, `MLFeatureConsensusSnapshot`, `MLFeatureInteractionAudit`, `MLFeatureStalenessLog`, `MLHawkesKernelParams`, `MLKellyFractionLog`, `MLMrmrFeatureRanking`, `MLPeltChangePointLog`, `MLStackingMetaModel`, `MLTemperatureScalingLog`, `MLVaeEncoder`, `MLCpcEncoder` |
 | Backtesting | `BacktestRun`, `OptimizationRun`, `WalkForwardRun` |
 | Expert Advisor | `EAInstance`, `EACommand` |
-| Other | `EconomicEvent`, `COTReport`, `EngineConfig`, `DecisionLog` |
+| Governance | `ApprovalRequest`, `ProcessedIdempotencyKey`, `EngineConfigAuditLog` |
+| Infrastructure | `EconomicEvent`, `COTReport`, `EngineConfig`, `DecisionLog`, `DeadLetterEvent`, `FeatureVector`, `TradeRationale`, `WorkerHealthSnapshot` |
 
-**Enums (32):** `OrderType`, `OrderStatus`, `TradeDirection`, `TradeSignalStatus`, `StrategyType`, `StrategyStatus`, `PositionDirection`, `PositionStatus`, `ExecutionType`, `Timeframe`, `TradingSession`, `TrailingStopType`, `AlertType`, `AlertChannel`, `MLModelStatus`, `ModelRole`, `ShadowEvaluationStatus`, `PromotionDecision`, `OptimizationRunStatus`, `RunStatus`, `MarketRegime`, `EconomicImpact`, `EconomicEventSource`, `SentimentSource`, `ScaleType`, `ScaleOrderStatus`, `ConfigDataType`, `RecoveryMode`, `StrategyHealthStatus`, `TriggerType`, `EACommandType`, `EAInstanceStatus`
+**Enums (50):** `OrderType`, `OrderStatus`, `TradeDirection`, `TradeSignalStatus`, `StrategyType`, `StrategyStatus`, `PositionDirection`, `PositionStatus`, `ExecutionType`, `Timeframe`, `TradingSession`, `TrailingStopType`, `AlertType`, `AlertChannel`, `AlertSeverity`, `MLModelStatus`, `ModelRole`, `ShadowEvaluationStatus`, `PromotionDecision`, `OptimizationRunStatus`, `OptimizationFailureCategory`, `ValidationFollowUpStatus`, `RunStatus`, `MarketRegime`, `EconomicImpact`, `EconomicEventSource`, `SentimentSource`, `ScaleType`, `ScaleOrderStatus`, `ConfigDataType`, `RecoveryMode`, `StrategyHealthStatus`, `StrategyLifecycleStage`, `TriggerType`, `EACommandType`, `EAInstanceStatus`, `LearnerArchitecture`, `ElmActivation`, `TcnActivation`, `AccountType`, `MarginMode`, `TimeInForce`, `ExecutionAlgorithmType`, `ApprovalOperationType`, `ApprovalStatus`, `StressScenarioType`, `MarketDataAnomalyType`, `DegradationMode`, `TradeExitReason`
 
 ---
 
@@ -98,7 +103,7 @@ Orders/
 - List queries accept `PagerRequest` and return `ResponseData<Pager<TDto>>`.
 - Publish integration events via `IEventBus` after successful writes.
 
-#### Features (34)
+#### Features (40+)
 
 | Feature | Commands | Queries |
 |---|---|---|
@@ -131,65 +136,107 @@ Orders/
 | WalkForward | RunWalkForward | GetWalkForwardRun, GetPagedRuns |
 | ExpertAdvisor | RegisterEA, DeregisterEA, ProcessHeartbeat, ReceiveSymbolSpecs, RefreshSymbolSpecs, ReceiveTradingSessions, ReceiveTickBatch, ReceiveCandle, ReceiveCandleBackfill, ReceivePositionSnapshot, ReceiveOrderSnapshot, ReceiveDealSnapshot, ProcessReconciliation, AcknowledgeCommand | GetPendingCommands, GetActiveInstances |
 
-#### Common Interfaces (`Common/Interfaces/`)
+#### Common Interfaces (`Common/Interfaces/`) — 53 interfaces
 
 | Interface | Purpose |
 |---|---|
 | `IWriteApplicationDbContext` | EF write DbContext (commands) |
 | `IReadApplicationDbContext` | EF read DbContext (queries) |
 | `IAlertDispatcher` | Alert dispatch coordination |
-| `IBrokerFailover` | Broker failover logic |
-| `IBrokerOrderExecutor` | Order execution at broker |
-| `IEconomicCalendarFeed` | Economic calendar data source |
 | `ILivePriceCache` | Live price caching |
-| `IMLModelTrainer` | ML model training |
+| `IMLModelTrainer` | ML model training (keyed by `LearnerArchitecture`) |
 | `IMLSignalScorer` | ML signal scoring |
+| `IBatchMLSignalScorer` | Batch ML scoring for multiple signals |
+| `ITrainerSelector` | UCB1 bandit architecture auto-selection |
 | `IMarketRegimeDetector` | Market regime classification |
 | `IMultiTimeframeFilter` | Multi-timeframe signal filtering |
 | `INewsFilter` | News-based trading filter |
-| `IPortfolioCorrelationChecker` | Correlation checks |
+| `IPortfolioCorrelationChecker` | Portfolio correlation checks |
+| `IPortfolioRiskCalculator` | Portfolio VaR and risk calculations |
 | `IRateLimiter` | API rate limiting |
-| `IRiskChecker` | Risk validation |
+| `IRiskChecker` | Tier 2 account-level risk validation |
+| `ISignalValidator` | Tier 1 signal-level validation |
 | `ISessionFilter` | Trading session filtering |
 | `IStrategyEvaluator` | Strategy evaluation interface |
+| `IFeatureStore` | ML feature storage and retrieval |
+| `ISignalConflictResolver` | Cross-strategy signal dedup and conflict resolution |
+| `IDistributedLock` | Distributed locking (promotions, evaluations) |
+| `IEconomicCalendarFeed` | Economic calendar data source |
+| `IHawkesSignalFilter` | Hawkes process signal clustering detection |
+| `ISignalAllocationEngine` | Signal allocation across accounts |
+| `ISmartOrderRouter` | Smart order routing (TWAP, VWAP) |
+| `IStrategyCapacityEstimator` | Strategy capacity estimation |
+| `IStressTestEngine` | Stress test scenario execution |
+| `ITransactionCostAnalyzer` | Transaction cost analysis |
+| `IApprovalWorkflow` | Four-eyes approval workflow |
+| `IDeadLetterSink` | Dead letter event storage |
+| `IGapRiskModel` | Weekend/holiday gap risk model |
+| `ICorrelationRiskAnalyzer` | Cross-asset correlation analysis |
+| `IWorkerHealthMonitor` | Background worker health tracking |
+| + 20 more (ML pre-trainers, explainers, providers) |
 
-#### Integration Events (`Common/Events/`)
+#### Integration Events (`Common/Events/`) — 20 events
 
-- `OrderFilledIntegrationEvent`
-- `PositionClosedIntegrationEvent`
-- `StrategyActivatedIntegrationEvent`
-- `TradeSignalCreatedIntegrationEvent`
-- `MLModelActivatedIntegrationEvent`
-- `BacktestCompletedIntegrationEvent`
-- `EAInstanceRegisteredIntegrationEvent`
+- `PriceUpdatedIntegrationEvent` — tick data received from EA (drives StrategyWorker)
+- `TradeSignalCreatedIntegrationEvent` — new signal generated (drives SignalOrderBridgeWorker)
+- `OrderFilledIntegrationEvent` — order filled by broker
+- `OrderCreatedIntegrationEvent` — order created in engine
+- `PositionOpenedIntegrationEvent` — new position opened
+- `PositionClosedIntegrationEvent` — position closed (drives PredictionOutcomeWorker)
+- `StrategyActivatedIntegrationEvent` — strategy activated
+- `StrategyCandidateCreatedIntegrationEvent` — auto-generated strategy candidate
+- `StrategyAutoPromotedIntegrationEvent` — elite candidate fast-tracked
+- `StrategyGenerationCycleCompletedIntegrationEvent` — generation cycle summary
+- `MLModelActivatedIntegrationEvent` — ML model promoted to active
+- `BacktestCompletedIntegrationEvent` — backtest finished (seeds WalkForwardRun)
+- `OptimizationCompletedIntegrationEvent` — optimization run completed
+- `OptimizationApprovedIntegrationEvent` — optimization auto-approved
+- `EAInstanceRegisteredIntegrationEvent` — EA instance registered
+- `EmergencyFlattenIntegrationEvent` — emergency position flatten
+- `VaRBreachIntegrationEvent` — portfolio VaR limit breached
+- `StressTestCompletedIntegrationEvent` — stress test scenario completed
+- `MarketDataAnomalyIntegrationEvent` — data quality anomaly detected
 
-#### Services (`Services/`)
+#### Services (`Services/`) — 51 top-level + 25 ML services
 
 | Service Group | Implementations |
 |---|---|
 | Alert Channels | `AlertDispatcher`, `WebhookAlertSender`, `EmailAlertSender`, `TelegramAlertSender` |
-| Broker Adapters | `OandaBrokerAdapter`, `OandaOrderExecutor`, `BrokerFailoverService` (disabled — EA is sole adapter) |
-| Security | `FieldEncryption` (AES-256-GCM), `TradingAccountTokenGenerator` (JWT) |
-| Cache | `InMemoryLivePriceCache`, `InDatabaseLivePriceCache` |
-| Economic Calendar | `StubEconomicCalendarFeed` |
-| Filters | `NewsFilter`, `MultiTimeframeFilter`, `SessionFilter`, `PortfolioCorrelationChecker` |
-| ML | `BaggedLogisticTrainer`, `MLSignalScorer`, `MarketRegimeDetector` |
-| Rate Limiting | `TokenBucketRateLimiter` |
+| Signal Processing | `SignalConflictResolver`, `SignalAllocationEngine`, `RegimeCoherenceChecker` |
+| Risk & Portfolio | `PortfolioRiskCalculator`, `CorrelationRiskAnalyzer`, `GapRiskModel`, `StressTestEngine`, `TransactionCostAnalyzer`, `PortfolioOptimizer` |
+| Execution | `SmartOrderRouter`, `TwapExecutionAlgorithm`, `VwapExecutionAlgorithm`, `PartialFillRedistributor` |
+| Market Data | `MarketRegimeDetector`, `RegimeClassificationVerifier`, `MarketDataAnomalyDetector`, `SpreadProfileProvider`, `NewsProximityProvider` |
+| ML Scoring | `MLSignalScorer`, `BatchMLSignalScorer`, `LatencyAwareMLSignalScorer`, `MLModelResolver`, `MLConfigService`, `ParallelShadowScorer` |
+| ML Training (12 architectures) | `BaggedLogisticTrainer`, `ElmModelTrainer`, `GbmModelTrainer`, `TcnModelTrainer`, `AdaBoostModelTrainer`, `RocketModelTrainer`, `TabNetModelTrainer`, `FtTransformerModelTrainer`, `SmoteModelTrainer`, `QuantileRfModelTrainer`, `SvgpModelTrainer`, `DannModelTrainer` |
+| ML Support | `TrainerSelector` (UCB1 bandit), `EnsembleCommitteeBlender`, `OnnxInferenceEngine`, `OodDetector`, `HawkesSignalFilter`, `CounterfactualExplainer` |
+| ML Pre-trainers | `SelfSupervisedPretrainer`, `VaePretrainer`, `CpcPretrainer` |
+| Feature Store | `DatabaseFeatureStore` |
+| Monitoring | `LivePerformanceBenchmark`, `PortfolioEquityCurveProvider`, `WorkerHealthMonitor`, `EngineMonitoringService`, `StrategyCapacityEstimator` |
+| Infrastructure | `DeadLetterSink`, `IdempotencyGuard`, `DataRetentionManager`, `DegradationModeManager`, `ApprovalWorkflowService` |
 | Strategy Evaluators | `BreakoutScalperEvaluator`, `MovingAverageCrossoverEvaluator`, `RSIReversionEvaluator` |
 
-#### Background Workers (`Workers/`)
+#### Background Workers (`Workers/`) — 135 workers
 
 All workers run as hosted services registered in DI.
 
-| Category | Workers |
-|---|---|
-| Core Trading | `StrategyWorker`, `SignalOrderBridgeWorker`, `OrderExecutionWorker`, `PositionWorker`, `TrailingStopWorker` |
-| Market & Data | `MarketDataWorker`, `RegimeDetectionWorker`, `SentimentWorker`, `COTDataWorker`, `EconomicCalendarWorker` |
-| Risk & Monitoring | `RiskMonitorWorker`, `DrawdownMonitorWorker`, `DrawdownRecoveryWorker`, `ExecutionQualityCircuitBreakerWorker` |
-| ML Workflow | `MLTrainingWorker`, `MLDriftMonitorWorker`, `MLCovariateShiftWorker`, `MLPredictionOutcomeWorker`, `MLShadowArbiterWorker`, `PredictionOutcomeWorker` |
-| Backtesting & Optimization | `BacktestWorker`, `OptimizationWorker`, `WalkForwardWorker` |
-| Other | `AccountSyncWorker`, `AlertWorker`, `StrategyFeedbackWorker`, `StrategyHealthWorker` |
-| Event Handlers | `OrderFilledEventHandler`, `PositionClosedEventHandler`, `MLModelActivatedEventHandler` |
+| Category | Workers | Count |
+|---|---|---|
+| Core Trading | `StrategyWorker` (event-driven, bounded channel), `SignalOrderBridgeWorker` (event-driven), `PositionWorker`, `TrailingStopWorker` | 4 |
+| Market & Data | `RegimeDetectionWorker`, `EconomicCalendarWorker`, `CandleAggregationWorker`, `CorrelationMatrixWorker`, `SpreadProfileWorker` | 5 |
+| Risk & Monitoring | `RiskMonitorWorker`, `DrawdownMonitorWorker`, `DrawdownRecoveryWorker`, `ExecutionQualityCircuitBreakerWorker`, `PortfolioRiskWorker`, `StressTestWorker`, `DailyPnlMonitorWorker` | 7 |
+| Strategy Lifecycle | `StrategyGenerationWorker`, `StrategyHealthWorker`, `StrategyFeedbackWorker`, `StrategyCapacityWorker`, `StrategyPromotionWorker` | 5 |
+| Backtesting & Optimization | `BacktestWorker`, `OptimizationWorker` (4 partial files), `WalkForwardWorker` | 3 |
+| ML Training | `MLTrainingWorker`, `MLTrainingRunHealthWorker`, `MLTrainingDataFreshnessWorker` | 3 |
+| ML Drift Detection (7) | `MLDriftMonitorWorker`, `MLDriftAgreementWorker`, `MLAdwinDriftWorker`, `MLCusumDriftWorker`, `MLMultiScaleDriftWorker`, `MLStructuralBreakWorker`, `MLPeltChangePointWorker` | 7 |
+| ML Feature Monitoring (10) | `MLCovariateShiftWorker`, `MLFeatureDataFreshnessWorker`, `MLFeatureStalenessWorker`, `MLFeatureConsensusWorker`, `MLFeatureInteractionWorker`, `MLFeatureImportanceTrendWorker`, `MLFeaturePsiWorker`, `MLFeatureRankShiftWorker`, `MLMrmrFeatureWorker`, `MLCausalFeatureWorker` | 10 |
+| ML Calibration (9) | `MLCalibrationMonitorWorker`, `MLThresholdCalibrationWorker`, `MLTemperatureScalingWorker`, `MLOnlinePlattWorker`, `MLIsotonicRecalibrationWorker`, `MLProductionCalibrationWorker`, `MLRecalibrationWorker`, `MLConformalCalibrationWorker`, `MLConformalRecalibrationWorker` | 9 |
+| ML Accuracy (8) | `MLRegimeAccuracyWorker`, `MLSessionAccuracyWorker`, `MLVolatilityAccuracyWorker`, `MLTimeOfDayAccuracyWorker`, `MLEwmaAccuracyWorker`, `MLHorizonAccuracyWorker`, `MLRollingAccuracyWorker`, `MLHourlyAccuracyWorker` | 8 |
+| ML Prediction (5) | `MLPredictionOutcomeWorker`, `MLPredictionPnlWorker`, `MLPredictionSharpnessWorker`, `MLPredictionSkewWorker`, `MLPredictionLogPruningWorker` | 5 |
+| ML Signal Management (7) | `MLSignalSuppressionWorker`, `MLSignalCooldownWorker`, `MLSignalFunnelWorker`, `MLSignalCoverageAuditWorker`, `MLSuppressionRollbackWorker`, `MLCorrelatedSignalConflictWorker`, `MLCorrelatedFailureWorker` | 7 |
+| ML Model Lifecycle (9) | `MLShadowArbiterWorker`, `MLModelWarmupWorker`, `MLModelRetirementWorker`, `MLModelDistillationWorker`, `MLModelSoupWorker`, `MLInferenceWarmupWorker`, `MLArchitectureRotationWorker`, `MLTransferLearningWorker`, `MLModelActivatedEventHandler` | 9 |
+| ML Advanced (15+) | `MLStackingMetaLearnerWorker`, `MLSharpeEnsembleWorker`, `MLEnsembleDiversityRecoveryWorker`, `MLAdaptiveThresholdWorker`, `MLCalibratedEdgeWorker`, `MLKellyFractionWorker`, `MLPositionSizeAdvisorWorker`, `MLRewardToRiskWorker`, `MLResourceGuardWorker`, `MLDegradationModeWorker`, `MLDeadLetterWorker`, `MLOnlineLearningWorker`, `MLMetricsExportWorker`, `MLRegimeHotSwapWorker`, `MLRegimeTransitionGuardWorker`, `MLDataQualityWorker`, `MLDirectionStreakWorker`, `MLErgodicityWorker`, `MLHawkesProcessWorker`, `MLPsiAutoRetrainWorker`, `MLConformalBreakerWorker` | 21+ |
+| Infrastructure | `DataRetentionWorker`, `WorkerHealthWorker`, `DeadLetterCleanupWorker`, `StaleOrderRecoveryWorker`, `EAHealthMonitorWorker`, `ReconciliationWorker`, `IntegrationEventRetryWorker`, `TransactionCostWorker`, `PerformanceAttributionWorker`, `EACommandPushWorker`, `TcpBridgeWorker`, `PartialFillResubmissionWorker`, `FeatureStoreBackfillWorker` | 13+ |
+| Event Handlers | `OrderFilledEventHandler`, `PositionClosedEventHandler`, `MLModelActivatedEventHandler`, `VaRRecalculationEventHandler` | 4 |
 
 ---
 
@@ -208,7 +255,7 @@ EF Core with **separate read/write contexts** and a dedicated **event log contex
 
 #### Entity Configurations (`Persistence/Configurations/`)
 
-38 configuration files — one per entity, using EF Core Fluent API. All configurations apply the global `IsDeleted` soft-delete query filter.
+76+ configuration files — one per entity, using EF Core Fluent API. All configurations apply the global `IsDeleted` soft-delete query filter.
 
 #### Migrations (`Migrations/`)
 
@@ -233,7 +280,7 @@ Most controllers inherit `AuthControllerBase<T>` from the shared library. All en
 
 #### Controllers (`Controllers/v1/`) — 31 controllers
 
-`OrderController`, `PositionController`, `StrategyController`, `StrategyEnsembleController`, `StrategyFeedbackController`, `TradeSignalController`, `TradingAccountController`, **`TradingAccountAuthController`** (`[AllowAnonymous]`), `CurrencyPairController`, `RiskProfileController`, `AlertController`, `AuditTrailController`, `MarketDataController`, `MarketRegimeController`, `SentimentController`, `EconomicEventController`, `MLModelController`, `MLEvaluationController`, `BacktestController`, `WalkForwardController`, `DrawdownRecoveryController`, `TrailingStopController`, `ExecutionQualityController`, `PaperTradingController`, `PerformanceAttributionController`, `RateLimitingController`, `SystemHealthController`, `EngineConfigurationController`, **`ExpertAdvisorController`**
+`OrderController`, `PositionController`, `StrategyController`, `StrategyEnsembleController`, `StrategyFeedbackController`, `TradeSignalController`, `TradingAccountController`, **`TradingAccountAuthController`** (`[AllowAnonymous]`), **`AuthTokenController`**, `CurrencyPairController`, `RiskProfileController`, `AlertController`, `AuditTrailController`, `MarketDataController`, `MarketRegimeController`, `SentimentController`, `EconomicEventController`, `MLModelController`, `MLEvaluationController`, `BacktestController`, `WalkForwardController`, `DrawdownRecoveryController`, `TrailingStopController`, `ExecutionQualityController`, `PaperTradingController`, `PerformanceAttributionController`, `RateLimitingController`, `SystemHealthController`, `EngineConfigurationController`, `DeadLetterController`, **`ExpertAdvisorController`**
 
 #### Authentication Endpoints (TradingAccountAuthController)
 
@@ -268,15 +315,20 @@ Most controllers inherit `AuthControllerBase<T>` from the shared library. All en
 
 ### Unit Tests (`LascodiaTradingEngine.UnitTest`)
 
-**Stack:** xUnit + Moq + MockQueryable
+**Stack:** xUnit + Moq + MockQueryable  
+**Total:** 107 test files across 34 test directories
 
-**Test classes:**
-- `Application/Orders/CreateOrderCommandTest.cs`
-- `Application/Strategies/CreateStrategyCommandTest.cs`
-- `Application/RiskProfiles/CreateRiskProfileCommandTest.cs`
-- `Application/CurrencyPairs/CreateCurrencyPairCommandTest.cs`
-- `Application/MarketData/IngestCandleCommandTest.cs`
-- `Application/MLModels/MLTrainingEngineTests.cs`
+**Key test areas:**
+- `Application/Workers/OptimizationWorkerTest.cs` — 122 tests covering optimization pipeline
+- `Application/Workers/StrategyGenerationWorkerTest.cs` + `StrategyGenerationTests.cs` — generation/screening tests
+- `Application/Workers/MLTrainingWorkerTest.cs` — ML training pipeline tests
+- `Application/Workers/MLDriftMonitorWorkerTest.cs`, `MLAdwinDriftWorkerTest.cs`, `MLCusumDriftWorkerTest.cs` — drift detection tests
+- `Application/Workers/MLShadowArbiterWorkerTest.cs` — shadow evaluation tests
+- `Application/Services/BaggedLogisticTrainerTests.cs`, `ElmTrainerHelpersTests.cs` — ML trainer tests
+- `Application/MLModels/QualityGateEvaluatorTest.cs` — quality gate pure-function tests
+- `Application/Backtesting/BacktestEngineTest.cs` — backtest engine tests
+- `Application/Optimization/OptimizationImprovementsTest.cs` — optimization config validation
+- `Application/Orders/`, `Application/Strategies/`, `Application/RiskProfiles/`, `Application/CurrencyPairs/`, `Application/MarketData/` — CQRS handler tests
 
 ---
 
@@ -324,22 +376,27 @@ These types are discovered and registered **automatically by reflection** — yo
 | Interface | Implementation | Lifetime |
 |---|---|---|
 | `ILivePriceCache` | `InDatabaseLivePriceCache` | Singleton |
-| `IBrokerDataFeed` | `OandaBrokerAdapter` | Singleton |
-| `IBrokerOrderExecutor` | `OandaOrderExecutor` | Scoped |
 | `IRiskChecker` | `RiskChecker` | Scoped |
 | `IBacktestEngine` | `BacktestEngine` | Singleton |
 | `IAlertChannelSender` | `WebhookAlertSender`, `EmailAlertSender`, `TelegramAlertSender` | Scoped (all 3 registered) |
 | `IAlertDispatcher` | `AlertDispatcher` | Singleton (holds dedup state; resolves scoped senders via `IServiceScopeFactory`) |
-| `IMLModelTrainer` | `BaggedLogisticTrainer` | Scoped |
+| `IMLModelTrainer` | `BaggedLogisticTrainer` (default, keyed `BaggedLogistic`) | Scoped |
+| `IMLModelTrainer` (keyed) | `ElmModelTrainer`, `GbmModelTrainer`, `TcnModelTrainer`, `AdaBoostModelTrainer`, `RocketModelTrainer`, `TabNetModelTrainer`, `FtTransformerModelTrainer`, `SmoteModelTrainer`, `QuantileRfModelTrainer`, `SvgpModelTrainer`, `DannModelTrainer` | Scoped (keyed by `LearnerArchitecture` enum) |
 | `IMLSignalScorer` | `MLSignalScorer` | Scoped |
+| `ITrainerSelector` | `TrainerSelector` | Scoped |
 | `IMultiTimeframeFilter` | `MultiTimeframeFilter` | Scoped |
 | `INewsFilter` | `NewsFilter` | Scoped |
 | `IPortfolioCorrelationChecker` | `PortfolioCorrelationChecker` | Scoped |
+| `IPortfolioRiskCalculator` | `PortfolioRiskCalculator` | Scoped |
 | `ISessionFilter` | `SessionFilter` | Singleton |
 | `IMarketRegimeDetector` | `MarketRegimeDetector` | Scoped |
-| `IBrokerFailover` | `BrokerFailoverService` | Singleton |
-| `IEconomicCalendarFeed` | `StubEconomicCalendarFeed` | Scoped |
+| `ISignalConflictResolver` | `SignalConflictResolver` | Singleton |
+| `IDistributedLock` | (implementation varies) | Singleton |
+| `IEconomicCalendarFeed` | `FairEconomyCalendarFeed` | Scoped |
 | `IRateLimiter` | `TokenBucketRateLimiter` | Singleton |
+| `IHawkesSignalFilter` | `HawkesSignalFilter` | Scoped |
+| `IStressTestEngine` | `StressTestEngine` | Scoped |
+| `ITransactionCostAnalyzer` | `TransactionCostAnalyzer` | Scoped |
 
 ### Explicitly Registered Services (Infrastructure DI)
 
@@ -490,6 +547,56 @@ The engine should track EA heartbeats. If no heartbeat from an instance for 60 s
 
 ---
 
+## Autonomous Strategy Lifecycle
+
+The engine implements a fully autonomous closed-loop strategy lifecycle:
+
+```
+StrategyGenerationWorker → BacktestWorker → WalkForwardWorker → StrategyHealthWorker
+       ↑                                                              ↓
+       └──── OptimizationWorker ←──── StrategyFeedbackWorker ←───────┘
+```
+
+### Strategy Generation (`StrategyGeneration/`)
+
+`StrategyGenerationWorker` autonomously discovers new strategy candidates daily. Key components:
+- `StrategyScreeningEngine` — 12-gate screening pipeline (IS/OOS backtests, degradation, R², walk-forward, Monte Carlo sign-flip, Monte Carlo shuffle, marginal Sharpe, Kelly sizing, equity curve, time concentration)
+- `StrategyGenerationHelpers` — asset classification, ATR computation, spread filtering, regime-threshold scaling
+- `IRegimeStrategyMapper` — maps market regimes to suitable strategy types
+- `IStrategyParameterTemplateProvider` — provides parameter templates with dynamic refresh from promoted strategies
+- `FeedbackDecayMonitor` — monitors and adjusts half-life for recency-weighted survival rates
+- Anti-bloat: MaxCandidatesPerCycle, MaxActivePerSymbol, correlation group caps, regime budget diversity, weekly velocity cap
+- Strategic reserve: counter-regime candidates for regime rotation readiness
+- Portfolio drawdown filter: greedy removal of correlated candidates post-screening
+
+### Optimization Pipeline (`Optimization/`)
+
+`OptimizationWorker` refines strategy parameters using Bayesian optimization. Key components:
+- `OptimizationSearchEngine` — TPE / GP-UCB / EHVI surrogate selection based on dimensionality
+- `OptimizationGridBuilder` — parameter grid generation with adaptive bounds from historical approvals
+- `OptimizationValidator` — purged K-fold, sensitivity, cost stress, walk-forward, temporal/portfolio correlation
+- `OptimizationHealthScorer` — 5-factor health score (WR, PF, DD, Sharpe, trade count)
+- `OptimizationApprovalPolicy` — composite + multi-objective + safety gate evaluation (14 total gates)
+- `OptimizationRunStateMachine` — validated state transitions (Queued→Running→Completed→Approved/Rejected/Abandoned)
+- `OptimizationRunClaimer` — atomic claiming via `FOR UPDATE SKIP LOCKED`
+- `GradualRolloutManager` — 25%→50%→75%→100% traffic rollout with automatic rollback
+- `HyperbandScheduler` — multi-bracket successive halving for efficient candidate screening
+- Checkpointing, crash recovery, self-tuning retry, chronic failure escalation
+
+### ML Training Pipeline
+
+`MLTrainingWorker` trains and promotes ML models. Key components:
+- **12 learner architectures:** BaggedLogistic, ELM, GBM, TCN, AdaBoost, ROCKET, TabNet, FT-Transformer, SMOTE, QuantileRF, SVGP, DANN
+- **`TrainerSelector`** — UCB1 bandit auto-selection with regime affinity, cross-symbol cold start, graduated sample-count gates
+- **`QualityGateEvaluator`** — 9-gate quality check (accuracy, EV, Brier, Sharpe, F1, walk-forward CV, ECE, BSS, OOB regression)
+- **`MLShadowArbiterWorker`** — SPRT + z-test shadow evaluation before promotion (tournament groups)
+- **82 ML monitoring workers** covering: drift detection (7), feature monitoring (10), calibration (9), accuracy tracking (8), prediction analysis (5), signal management (7), model lifecycle (9), advanced (21+)
+- Self-tuning retry: analyzes failure patterns, blends hyperparams toward profitable models
+- Profitability-based promotion gate: composite score must exceed champion
+- Regime-specific sub-models: per-regime parameter conditioning
+
+---
+
 ## Key Patterns & Rules
 
 - **Soft delete**: All entities have `IsDeleted`; EF global query filters exclude deleted rows automatically.
@@ -498,8 +605,14 @@ The engine should track EA heartbeats. If no heartbeat from an instance for 60 s
 - **CQRS separation**: Commands use `IWriteApplicationDbContext`; queries use `IReadApplicationDbContext`. Never inject both into a single handler.
 - **Worker pattern**: All background workers implement `BackgroundService` and are registered as hosted services in Application DI.
 - **Strategy evaluators**: Implement `IStrategyEvaluator`; registered and resolved by strategy type enum.
-- **ML workflow**: Train → Shadow evaluation → Promotion decision → Activate (event triggers downstream workers).
+- **ML workflow**: Train → Quality gates (9 checks) → Shadow evaluation (SPRT) → Promotion decision → Activate (event triggers downstream workers). 82 monitoring workers continuously track drift, calibration, accuracy, and feature health.
+- **ML architecture selection**: `TrainerSelector` uses UCB1 bandit algorithm with regime affinity to auto-select from 12 architectures. Sample-count gates prevent complex architectures on small datasets.
 - **Broker adapters**: Built-in adapters (`IBrokerOrderExecutor` + `IBrokerDataFeed`) are **disabled** when EA is active. The EA replaces them entirely. Set `WorkerGroups.BrokerAdapters = false`.
+- **Autonomous strategy lifecycle**: StrategyGenerationWorker discovers → BacktestWorker validates → WalkForwardWorker confirms → StrategyHealthWorker monitors → StrategyFeedbackWorker detects degradation → OptimizationWorker refines → cycle repeats.
+- **Defense-in-depth risk**: 5 independent layers (SignalValidator → RiskChecker → StrategyHealthWorker → DrawdownRecoveryWorker → ExecutionQualityCircuitBreaker) + EA-side safety (per-symbol + global circuit breakers).
+- **Regime awareness**: Cross-cutting concern permeating all subsystems — strategy evaluation, generation, optimization, ML training, and signal filtering all adapt to detected market regime.
+- **Gradual rollout**: Optimized parameters deploy at 25%→50%→75%→100% traffic with automatic rollback on degradation (see ADR-0007).
+- **Hot-reloadable config**: 200+ parameters stored in `EngineConfig` table, loaded via batch queries, with run-scoped snapshots for reproducibility (see ADR-0012).
 - **EA as broker adapter**: All market data comes from EA instances via REST API. The engine has zero direct broker connectivity when EA mode is enabled.
 - **Trading account-centric**: The `Broker` entity has been removed. All broker info (name, server) lives on `TradingAccount`. Login is via AccountId + BrokerServer.
 - **Trader authentication**: `POST /auth/register` (self-registration + auto-login) and `POST /auth/login` (EA: passwordless, Web: password required). JWT tokens are scoped to a single TradingAccount.

@@ -1,11 +1,13 @@
 using System.Reflection;
 using System.Runtime.Serialization;
 using System.Text.Json;
+using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Moq;
 using MockQueryable.Moq;
+using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using LascodiaTradingEngine.Application.Backtesting.Models;
 using LascodiaTradingEngine.Application.Backtesting.Services;
 using LascodiaTradingEngine.Application.Common.Diagnostics;
@@ -139,6 +141,67 @@ public class OptimizationWorkerTest
 
         Assert.Equal(101, filtered.Count);
         Assert.Equal(new DateTime(2026, 03, 22, 22, 0, 0, DateTimeKind.Utc), filtered[0].Timestamp);
+    }
+
+    [Fact]
+    public async Task GetRegimeAwareCandlesAsync_DoesNotTruncateLongRegimeStreaks()
+    {
+        var regimeStart = new DateTime(2026, 01, 04, 08, 0, 0, DateTimeKind.Utc);
+        var allCandlesStart = regimeStart.AddHours(-80);
+
+        var regimeSnapshots = new List<MarketRegimeSnapshot>
+        {
+            new()
+            {
+                Id = 1,
+                Symbol = "EURUSD",
+                Timeframe = Timeframe.H1,
+                Regime = MarketRegime.Ranging,
+                DetectedAt = regimeStart.AddHours(-1),
+                IsDeleted = false
+            }
+        };
+
+        regimeSnapshots.AddRange(Enumerable.Range(0, 120).Select(i => new MarketRegimeSnapshot
+        {
+            Id = i + 2,
+            Symbol = "EURUSD",
+            Timeframe = Timeframe.H1,
+            Regime = MarketRegime.Trending,
+            DetectedAt = regimeStart.AddHours(i),
+            IsDeleted = false
+        }));
+
+        var snapshotDbSet = regimeSnapshots.AsQueryable().BuildMockDbSet();
+        var db = new Mock<DbContext>();
+        db.Setup(c => c.Set<MarketRegimeSnapshot>()).Returns(snapshotDbSet.Object);
+
+        var allCandles = Enumerable.Range(0, 200)
+            .Select(i => new Candle
+            {
+                Timestamp = allCandlesStart.AddHours(i),
+                Open = 1.1m,
+                High = 1.2m,
+                Low = 1.0m,
+                Close = 1.1m,
+                IsClosed = true
+            })
+            .ToList();
+
+        var worker = CreateWorker();
+        var method = typeof(OptimizationWorker).GetMethod(
+            "GetRegimeAwareCandlesAsync",
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
+
+        var task = (Task<List<Candle>>)method.Invoke(
+            worker,
+            [db.Object, "EURUSD", Timeframe.H1, allCandles, CancellationToken.None, 0.0])!;
+
+        var filtered = await task;
+
+        Assert.Equal(120, filtered.Count);
+        Assert.Equal(regimeStart, filtered[0].Timestamp);
+        Assert.Equal(regimeStart.AddHours(119), filtered[^1].Timestamp);
     }
 
     [Fact]
@@ -369,6 +432,58 @@ public class OptimizationWorkerTest
     }
 
     [Fact]
+    public async Task MonitorFollowUpResultsAsync_DoesNotPassRun_WhenFollowUpsAreMissing()
+    {
+        var runs = new List<OptimizationRun>
+        {
+            new()
+            {
+                Id = 88,
+                StrategyId = 5,
+                Status = OptimizationRunStatus.Approved,
+                ValidationFollowUpStatus = ValidationFollowUpStatus.Pending,
+                IsDeleted = false
+            }
+        };
+
+        var runDbSet = runs.AsQueryable().BuildMockDbSet();
+        var backtestDbSet = new List<BacktestRun>().AsQueryable().BuildMockDbSet();
+        var walkDbSet = new List<WalkForwardRun>().AsQueryable().BuildMockDbSet();
+
+        var db = new Mock<DbContext>();
+        db.Setup(c => c.Set<OptimizationRun>()).Returns(runDbSet.Object);
+        db.Setup(c => c.Set<BacktestRun>()).Returns(backtestDbSet.Object);
+        db.Setup(c => c.Set<WalkForwardRun>()).Returns(walkDbSet.Object);
+
+        var readCtx = new Mock<IReadApplicationDbContext>();
+        readCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
+
+        var writeCtx = new Mock<IWriteApplicationDbContext>();
+        writeCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
+        writeCtx.Setup(x => x.SaveChangesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(1);
+
+        var services = new ServiceCollection()
+            .AddSingleton(readCtx.Object)
+            .AddSingleton(writeCtx.Object)
+            .BuildServiceProvider();
+
+        var worker = new OptimizationWorker(
+            Mock.Of<ILogger<OptimizationWorker>>(),
+            services.GetRequiredService<IServiceScopeFactory>(),
+            Mock.Of<IBacktestEngine>(),
+            (TradingMetrics)FormatterServices.GetUninitializedObject(typeof(TradingMetrics)));
+
+        var method = typeof(OptimizationWorker).GetMethod(
+            "MonitorFollowUpResultsAsync",
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
+
+        await (Task)method.Invoke(worker, [CancellationToken.None])!;
+
+        Assert.Equal(ValidationFollowUpStatus.Pending, runs[0].ValidationFollowUpStatus);
+        writeCtx.Verify(x => x.SaveChangesAsync(It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
     public void OptimizationCheckpointStore_RestoresObservationOrderAndSeenParameters()
     {
         string json = OptimizationCheckpointStore.Serialize(
@@ -404,6 +519,201 @@ public class OptimizationWorkerTest
         Assert.Equal("""{"Fast":12,"Slow":34}""", restored.Observations[1].ParamsJson);
         Assert.Contains("""{"Fast":12,"Slow":34}""", restored.SeenParameterJson);
         Assert.Contains("""{"Fast":9,"Slow":21}""", restored.SeenParameterJson);
+    }
+
+    [Fact]
+    public void CrossRegimeHelpers_FilterOnlyTrueRegimeIntervals()
+    {
+        var snapshots = new List<MarketRegimeSnapshot>
+        {
+            new() { DetectedAt = new DateTime(2026, 03, 01, 0, 0, 0, DateTimeKind.Utc), Regime = MarketRegime.Trending },
+            new() { DetectedAt = new DateTime(2026, 03, 02, 0, 0, 0, DateTimeKind.Utc), Regime = MarketRegime.Ranging },
+            new() { DetectedAt = new DateTime(2026, 03, 03, 0, 0, 0, DateTimeKind.Utc), Regime = MarketRegime.Trending },
+            new() { DetectedAt = new DateTime(2026, 03, 04, 0, 0, 0, DateTimeKind.Utc), Regime = MarketRegime.HighVolatility },
+        };
+
+        var candles = Enumerable.Range(0, 96)
+            .Select(i => new Candle
+            {
+                Timestamp = new DateTime(2026, 03, 01, 0, 0, 0, DateTimeKind.Utc).AddHours(i),
+                Open = 1.1m,
+                High = 1.2m,
+                Low = 1.0m,
+                Close = 1.1m,
+                IsClosed = true
+            })
+            .ToList();
+
+        var intervalMethod = typeof(OptimizationWorker).GetMethod(
+            "BuildRegimeIntervals",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var filterMethod = typeof(OptimizationWorker).GetMethod(
+            "FilterCandlesByIntervals",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        var intervals = intervalMethod.Invoke(null, [snapshots, MarketRegime.Trending, snapshots[0].DetectedAt, new DateTime(2026, 03, 05, 0, 0, 0, DateTimeKind.Utc)])!;
+        var filtered = (List<Candle>)filterMethod.Invoke(null, [candles, intervals])!;
+
+        Assert.Equal(48, filtered.Count);
+        Assert.Equal(new DateTime(2026, 03, 01, 0, 0, 0, DateTimeKind.Utc), filtered.First().Timestamp);
+        Assert.Equal(new DateTime(2026, 03, 03, 23, 0, 0, DateTimeKind.Utc), filtered.Last().Timestamp);
+        Assert.DoesNotContain(filtered, c => c.Timestamp >= new DateTime(2026, 03, 02, 0, 0, 0, DateTimeKind.Utc)
+            && c.Timestamp < new DateTime(2026, 03, 03, 0, 0, 0, DateTimeKind.Utc));
+    }
+
+    [Fact]
+    public async Task LoadAndValidateCandlesAsync_UsesOosBaselineScoreForApprovalComparison()
+    {
+        var nowUtc = DateTime.UtcNow;
+        var candles = Enumerable.Range(0, 600)
+            .Select(i => new Candle
+            {
+                Symbol = "EURUSD",
+                Timeframe = Timeframe.H1,
+                Timestamp = nowUtc.AddHours(-(600 - i)),
+                Open = 1.1000m + i * 0.0001m,
+                High = 1.1005m + i * 0.0001m,
+                Low = 1.0995m + i * 0.0001m,
+                Close = 1.1000m + i * 0.0001m,
+                IsClosed = true
+            })
+            .ToList();
+
+        var candleDbSet = candles.AsQueryable().BuildMockDbSet();
+        var eventDbSet = new List<EconomicEvent>().AsQueryable().BuildMockDbSet();
+        var regimeDbSet = new List<MarketRegimeSnapshot>().AsQueryable().BuildMockDbSet();
+        var pairDbSet = new List<CurrencyPair>().AsQueryable().BuildMockDbSet();
+        var regimeParamsDbSet = new List<StrategyRegimeParams>().AsQueryable().BuildMockDbSet();
+
+        var db = new Mock<DbContext>();
+        db.Setup(c => c.Set<Candle>()).Returns(candleDbSet.Object);
+        db.Setup(c => c.Set<EconomicEvent>()).Returns(eventDbSet.Object);
+        db.Setup(c => c.Set<MarketRegimeSnapshot>()).Returns(regimeDbSet.Object);
+        db.Setup(c => c.Set<CurrencyPair>()).Returns(pairDbSet.Object);
+        db.Setup(c => c.Set<StrategyRegimeParams>()).Returns(regimeParamsDbSet.Object);
+
+        var services = new ServiceCollection().BuildServiceProvider();
+        var worker = new OptimizationWorker(
+            Mock.Of<ILogger<OptimizationWorker>>(),
+            services.GetRequiredService<IServiceScopeFactory>(),
+            new BaselineSplitBacktestEngine(),
+            (TradingMetrics)FormatterServices.GetUninitializedObject(typeof(TradingMetrics)));
+
+        var strategy = new Strategy
+        {
+            Id = 9,
+            Name = "Baseline",
+            StrategyType = StrategyType.BreakoutScalper,
+            Symbol = "EURUSD",
+            Timeframe = Timeframe.H1,
+            ParametersJson = """{"Fast":12,"Slow":34}"""
+        };
+        var run = new OptimizationRun { Id = 501, StrategyId = strategy.Id, StartedAt = nowUtc };
+        var config = CreateOptimizationConfig(cooldownDays: 14, maxConsecutiveFailuresBeforeEscalation: 3);
+
+        var method = typeof(OptimizationWorker).GetMethod(
+            "LoadAndValidateCandlesAsync",
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
+
+        var task = (Task)method.Invoke(worker, [db.Object, run, strategy, config, CancellationToken.None])!;
+        await task;
+
+        var result = task.GetType().GetProperty("Result")!.GetValue(task)!;
+        var baselineComparisonScore = (decimal)result.GetType().GetProperty("BaselineComparisonScore")!.GetValue(result)!;
+
+        Assert.NotNull(run.BaselineHealthScore);
+        Assert.NotEqual(run.BaselineHealthScore!.Value, baselineComparisonScore);
+        Assert.True(baselineComparisonScore > run.BaselineHealthScore.Value,
+            "Expected OOS baseline score to come from the shorter OOS split, not the in-sample baseline result.");
+    }
+
+    [Fact]
+    public async Task LoadAndValidateCandlesAsync_ImputesMinorGapsBeforeValidation()
+    {
+        var nowUtc = DateTime.UtcNow;
+        var missingIndices = new HashSet<int> { 15, 30, 45, 60, 75, 90, 105, 120, 135, 150 };
+        var candles = Enumerable.Range(0, 170)
+            .Where(i => !missingIndices.Contains(i))
+            .Select(i => new Candle
+            {
+                Symbol = "EURUSD",
+                Timeframe = Timeframe.H1,
+                Timestamp = nowUtc.AddHours(-(170 - i)),
+                Open = 1.1000m + i * 0.0001m,
+                High = 1.1005m + i * 0.0001m,
+                Low = 1.0995m + i * 0.0001m,
+                Close = 1.1000m + i * 0.0001m,
+                IsClosed = true
+            })
+            .ToList();
+
+        var candleDbSet = candles.AsQueryable().BuildMockDbSet();
+        var eventDbSet = new List<EconomicEvent>().AsQueryable().BuildMockDbSet();
+        var regimeDbSet = new List<MarketRegimeSnapshot>().AsQueryable().BuildMockDbSet();
+        var pairDbSet = new List<CurrencyPair>().AsQueryable().BuildMockDbSet();
+        var regimeParamsDbSet = new List<StrategyRegimeParams>().AsQueryable().BuildMockDbSet();
+
+        var db = new Mock<DbContext>();
+        db.Setup(c => c.Set<Candle>()).Returns(candleDbSet.Object);
+        db.Setup(c => c.Set<EconomicEvent>()).Returns(eventDbSet.Object);
+        db.Setup(c => c.Set<MarketRegimeSnapshot>()).Returns(regimeDbSet.Object);
+        db.Setup(c => c.Set<CurrencyPair>()).Returns(pairDbSet.Object);
+        db.Setup(c => c.Set<StrategyRegimeParams>()).Returns(regimeParamsDbSet.Object);
+
+        var services = new ServiceCollection().BuildServiceProvider();
+        var worker = new OptimizationWorker(
+            Mock.Of<ILogger<OptimizationWorker>>(),
+            services.GetRequiredService<IServiceScopeFactory>(),
+            new BaselineSplitBacktestEngine(),
+            (TradingMetrics)FormatterServices.GetUninitializedObject(typeof(TradingMetrics)));
+
+        var strategy = new Strategy
+        {
+            Id = 13,
+            Name = "GapHealing",
+            StrategyType = StrategyType.BreakoutScalper,
+            Symbol = "EURUSD",
+            Timeframe = Timeframe.H1,
+            ParametersJson = """{"Fast":12,"Slow":34}"""
+        };
+        var run = new OptimizationRun { Id = 777, StrategyId = strategy.Id, StartedAt = nowUtc };
+        var config = CreateOptimizationConfig(cooldownDays: 14, maxConsecutiveFailuresBeforeEscalation: 3);
+
+        var method = typeof(OptimizationWorker).GetMethod(
+            "LoadAndValidateCandlesAsync",
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
+
+        var task = (Task)method.Invoke(worker, [db.Object, run, strategy, config, CancellationToken.None])!;
+        await task;
+
+        var result = task.GetType().GetProperty("Result")!.GetValue(task)!;
+        var allCandles = (IReadOnlyList<Candle>)result.GetType().GetProperty("AllCandles")!.GetValue(result)!;
+
+        Assert.True(allCandles.Count > candles.Count);
+        Assert.NotNull(run.BaselineHealthScore);
+    }
+
+    [Fact]
+    public void SuggestInitialCandidates_UsesEhviWhenConfigured()
+    {
+        string[] paramNames = ["Fast", "Slow"];
+        double[] lower = [5, 20];
+        double[] upper = [20, 50];
+        bool[] isInteger = [true, true];
+        var ehvi = new EhviAcquisition(paramNames, lower, upper, isInteger, seed: 123);
+
+        var suggestions = OptimizationWorker.SuggestInitialCandidates(
+            tpe: null,
+            gp: null,
+            ehvi: ehvi,
+            count: 3);
+
+        Assert.Equal(3, suggestions.Count);
+        Assert.All(suggestions, suggestion =>
+        {
+            Assert.Contains("Fast", suggestion.Keys);
+            Assert.Contains("Slow", suggestion.Keys);
+        });
     }
 
     [Fact]
@@ -514,6 +824,98 @@ public class OptimizationWorkerTest
         Assert.Contains("Illegal OptimizationRun status transition", ex.Message, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task ApplyApprovalDecisionAsync_LeavesRunCompleted_WhenApprovalPersistenceFails()
+    {
+        var run = new OptimizationRun
+        {
+            Id = 404,
+            StrategyId = 12,
+            Status = OptimizationRunStatus.Completed,
+            CompletedAt = DateTime.UtcNow,
+            BestParametersJson = """{"Fast":14,"Slow":40}"""
+        };
+        var strategy = new Strategy
+        {
+            Id = 12,
+            Name = "ApprovalFailure",
+            Symbol = "EURUSD",
+            Timeframe = Timeframe.H1,
+            ParametersJson = """{"Fast":10,"Slow":30}""",
+            Status = StrategyStatus.Active,
+            IsDeleted = false
+        };
+
+        var strategies = new List<Strategy> { strategy };
+        var backtests = new List<BacktestRun>();
+        var walks = new List<WalkForwardRun>();
+        var regimeParams = new List<StrategyRegimeParams>();
+
+        var strategyDbSet = strategies.AsQueryable().BuildMockDbSet();
+        var backtestDbSet = backtests.AsQueryable().BuildMockDbSet();
+        backtestDbSet.Setup(d => d.Add(It.IsAny<BacktestRun>()))
+            .Callback<BacktestRun>(r => backtests.Add(r));
+        var walkDbSet = walks.AsQueryable().BuildMockDbSet();
+        walkDbSet.Setup(d => d.Add(It.IsAny<WalkForwardRun>()))
+            .Callback<WalkForwardRun>(r => walks.Add(r));
+        var regimeParamsDbSet = regimeParams.AsQueryable().BuildMockDbSet();
+
+        var db = new Mock<DbContext>();
+        db.Setup(c => c.Set<Strategy>()).Returns(strategyDbSet.Object);
+        db.Setup(c => c.Set<BacktestRun>()).Returns(backtestDbSet.Object);
+        db.Setup(c => c.Set<WalkForwardRun>()).Returns(walkDbSet.Object);
+        db.Setup(c => c.Set<StrategyRegimeParams>()).Returns(regimeParamsDbSet.Object);
+
+        var writeCtx = new Mock<IWriteApplicationDbContext>();
+        writeCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
+        writeCtx.Setup(x => x.SaveChangesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(1);
+
+        var mediator = new Mock<IMediator>();
+        var alertDispatcher = new Mock<IAlertDispatcher>();
+        var eventService = new Mock<IIntegrationEventService>();
+        eventService.Setup(x => x.SaveAndPublish(It.IsAny<IDbContext>(), It.IsAny<Lascodia.Trading.Engine.EventBus.Events.IntegrationEvent>()))
+            .ThrowsAsync(new InvalidOperationException("approval event persistence failed"));
+
+        var worker = CreateWorker();
+        var config = CreateOptimizationConfig(cooldownDays: 14, maxConsecutiveFailuresBeforeEscalation: 3);
+        var runContext = CreateRunContext(
+            run, strategy, config, baselineComparisonScore: 0.40m,
+            db.Object, db.Object, writeCtx.Object, mediator.Object,
+            alertDispatcher.Object, eventService.Object);
+
+        var oosResult = new BacktestResult
+        {
+            TotalTrades = 24,
+            WinRate = 0.62m,
+            ProfitFactor = 1.70m,
+            MaxDrawdownPct = 4m,
+            SharpeRatio = 1.5m,
+            Trades = []
+        };
+        var validationResult = CreateCandidateValidationResult(
+            passed: true,
+            winnerParamsJson: """{"Fast":14,"Slow":40}""",
+            oosHealthScore: 0.74m,
+            oosResult: oosResult,
+            ciLower: 0.55m,
+            ciUpper: 0.82m,
+            wfAvgScore: 0.70m,
+            pessimisticScore: 0.68m,
+            failureReason: string.Empty);
+
+        var method = typeof(OptimizationWorker).GetMethod(
+            "ApplyApprovalDecisionAsync",
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
+
+        await (Task)method.Invoke(worker,
+            [runContext, validationResult, null, DateTime.UtcNow.AddMonths(-2), new BacktestOptions()])!;
+
+        Assert.Equal(OptimizationRunStatus.Completed, run.Status);
+        Assert.Null(run.ApprovedAt);
+        Assert.Null(strategy.RolloutPct);
+        Assert.Equal("""{"Fast":10,"Slow":30}""", strategy.ParametersJson);
+    }
+
     private static OptimizationWorker CreateWorker()
     {
         var logger = Mock.Of<ILogger<OptimizationWorker>>();
@@ -597,6 +999,7 @@ public class OptimizationWorkerTest
             ["PermutationIterations"] = 1000,
             ["MaxRetryAttempts"] = 3,
             ["CandleLookbackMonths"] = 12,
+            ["CandleLookbackAutoScale"] = true,
             ["RequireEADataAvailability"] = false,
             ["MaxConcurrentRuns"] = 2,
             ["UseSymbolSpecificSpread"] = true,
@@ -615,6 +1018,103 @@ public class OptimizationWorkerTest
 
         var args = ctor
             .GetParameters()
+            .Select(parameter => values[parameter.Name!])
+            .ToArray();
+
+        return ctor.Invoke(args);
+    }
+
+    private static object CreateRunContext(
+        OptimizationRun run,
+        Strategy strategy,
+        object config,
+        decimal baselineComparisonScore,
+        DbContext db,
+        DbContext writeDb,
+        IWriteApplicationDbContext writeCtx,
+        IMediator mediator,
+        IAlertDispatcher alertDispatcher,
+        IIntegrationEventService eventService)
+    {
+        var contextType = typeof(OptimizationWorker).GetNestedType("RunContext", BindingFlags.NonPublic)!;
+        return contextType
+            .GetConstructors(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)
+            .OrderByDescending(ctor => ctor.GetParameters().Length)
+            .First()
+            .Invoke(
+            [
+                run,
+                strategy,
+                config,
+                baselineComparisonScore,
+                db,
+                writeDb,
+                writeCtx,
+                mediator,
+                alertDispatcher,
+                eventService,
+                CancellationToken.None,
+                CancellationToken.None
+            ]);
+    }
+
+    private static object CreateCandidateValidationResult(
+        bool passed,
+        string winnerParamsJson,
+        decimal oosHealthScore,
+        BacktestResult oosResult,
+        decimal ciLower,
+        decimal ciUpper,
+        decimal wfAvgScore,
+        decimal pessimisticScore,
+        string failureReason)
+    {
+        var scoredCandidateType = typeof(OptimizationWorker).GetNestedType("ScoredCandidate", BindingFlags.NonPublic)!;
+        var scoredCandidate = scoredCandidateType
+            .GetConstructors(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)
+            .OrderByDescending(ctor => ctor.GetParameters().Length)
+            .First()
+            .Invoke([winnerParamsJson, oosHealthScore, oosResult, 0.10]);
+
+        var resultType = typeof(OptimizationWorker).GetNestedType("CandidateValidationResult", BindingFlags.NonPublic)!;
+        var ctor = resultType
+            .GetConstructors(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)
+            .OrderByDescending(candidate => candidate.GetParameters().Length)
+            .First();
+
+        var values = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["Passed"] = passed,
+            ["Winner"] = scoredCandidate,
+            ["OosHealthScore"] = oosHealthScore,
+            ["OosResult"] = oosResult,
+            ["CILower"] = ciLower,
+            ["CIMedian"] = oosHealthScore,
+            ["CIUpper"] = ciUpper,
+            ["PermPValue"] = 0.01,
+            ["PermCorrectedAlpha"] = 0.05,
+            ["PermSignificant"] = true,
+            ["SensitivityOk"] = true,
+            ["SensitivityReport"] = "ok",
+            ["CostSensitiveOk"] = true,
+            ["PessimisticScore"] = pessimisticScore,
+            ["DegradationFailed"] = false,
+            ["WfAvgScore"] = wfAvgScore,
+            ["WfStable"] = true,
+            ["MtfCompatible"] = true,
+            ["CorrelationSafe"] = true,
+            ["TemporalCorrelationSafe"] = true,
+            ["TemporalMaxOverlap"] = 0.0,
+            ["PortfolioCorrelationSafe"] = true,
+            ["PortfolioMaxCorrelation"] = 0.0,
+            ["CvConsistent"] = true,
+            ["CvValue"] = 0.10,
+            ["ApprovalReportJson"] = "{}",
+            ["FailureReason"] = failureReason,
+            ["FailedCandidates"] = null
+        };
+
+        var args = ctor.GetParameters()
             .Select(parameter => values[parameter.Name!])
             .ToArray();
 
@@ -647,6 +1147,30 @@ public class OptimizationWorkerTest
         }
     }
 
+    private sealed class BaselineSplitBacktestEngine : IBacktestEngine
+    {
+        public Task<BacktestResult> RunAsync(
+            Strategy strategy,
+            IReadOnlyList<Candle> candles,
+            decimal initialBalance,
+            CancellationToken ct,
+            BacktestOptions? options = null)
+        {
+            bool isTrainLike = candles.Count >= 300;
+            return Task.FromResult(new BacktestResult
+            {
+                InitialBalance = initialBalance,
+                FinalBalance = initialBalance + (isTrainLike ? 200m : 800m),
+                TotalTrades = isTrainLike ? 40 : 25,
+                WinRate = isTrainLike ? 0.45m : 0.62m,
+                ProfitFactor = isTrainLike ? 1.05m : 1.70m,
+                MaxDrawdownPct = isTrainLike ? 12m : 4m,
+                SharpeRatio = isTrainLike ? 0.4m : 1.6m,
+                Trades = []
+            });
+        }
+    }
+
     // ── #9: Retry / dead-letter lifecycle tests ────────────────────────────
 
     [Fact]
@@ -658,6 +1182,20 @@ public class OptimizationWorkerTest
         Assert.Equal(30, 15 << 1);
         Assert.Equal(60, 15 << 2);
         Assert.Equal(120, 15 << 3);
+    }
+
+    [Fact]
+    public void RetryEligibilityWindow_ScalesWithConfiguredRetryAttempts()
+    {
+        var method = typeof(OptimizationWorker).GetMethod(
+            "GetRetryEligibilityWindow",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        var twoAttempts = (TimeSpan)method.Invoke(null, [2])!;
+        var threeAttempts = (TimeSpan)method.Invoke(null, [3])!;
+
+        Assert.Equal(TimeSpan.FromMinutes(45), twoAttempts);
+        Assert.Equal(TimeSpan.FromMinutes(75), threeAttempts);
     }
 
     [Fact]
@@ -836,6 +1374,25 @@ public class OptimizationWorkerTest
         Assert.True(importance["A"] > importance["B"]);
         // Normalized to [0, 1] — max should be 1.0
         Assert.Equal(1.0, importance.Values.Max(), precision: 4);
+    }
+
+    [Fact]
+    public void ExpandGridWithMidpoints_UsesCanonicalParameterIdentity()
+    {
+        var grid = new List<Dictionary<string, object>>
+        {
+            new() { ["Slow"] = 34, ["Fast"] = 12 },
+            new() { ["Slow"] = 40, ["Fast"] = 20 }
+        };
+
+        var previous = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            """{"Fast":12,"Slow":34}"""
+        };
+
+        var expanded = OptimizationGridBuilder.ExpandGridWithMidpoints(grid, previous);
+
+        Assert.DoesNotContain(expanded, p => CanonicalParameterJson.Serialize(p) == """{"Fast":12,"Slow":34}""");
     }
 
     [Fact]
@@ -1067,6 +1624,36 @@ public class OptimizationWorkerTest
         Assert.True(restored.Observations.Count > 0);
         Assert.True(restored.Observations.Count < 1500,
             $"Expected trimming to reduce observation count below original 1500, got {restored.Observations.Count}");
+    }
+
+    [Fact]
+    public async Task LoadConfigurationAsync_LoadsMaxRunsPerWeekOverride()
+    {
+        var configs = new List<EngineConfig>
+        {
+            new()
+            {
+                Key = "Optimization:MaxRunsPerWeek",
+                Value = "7",
+                IsDeleted = false
+            }
+        };
+
+        var configDbSet = configs.AsQueryable().BuildMockDbSet();
+        var db = new Mock<DbContext>();
+        db.Setup(c => c.Set<EngineConfig>()).Returns(configDbSet.Object);
+
+        var method = typeof(OptimizationWorker).GetMethod(
+            "LoadConfigurationAsync",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        var task = (Task)method.Invoke(null, [db.Object, CancellationToken.None])!;
+        await task;
+
+        var result = task.GetType().GetProperty("Result")!.GetValue(task)!;
+        var maxRunsPerWeek = (int)result.GetType().GetProperty("MaxRunsPerWeek")!.GetValue(result)!;
+
+        Assert.Equal(7, maxRunsPerWeek);
     }
 
     // ── Health Score Tests ────────────────────────────────────────────────

@@ -18,6 +18,24 @@ public partial class OptimizationWorker
 {
     // ── Stage: Bayesian Search (Stages 5–6) ─────────────────────────────────
 
+    internal static List<Dictionary<string, double>> SuggestInitialCandidates(
+        TreeParzenEstimator? tpe,
+        GaussianProcessSurrogate? gp,
+        EhviAcquisition? ehvi,
+        int count)
+    {
+        if (ehvi is not null)
+            return ehvi.SuggestCandidates(count);
+
+        if (tpe is not null)
+            return tpe.SuggestCandidates(count);
+
+        if (gp is not null)
+            return gp.SuggestCandidates(count);
+
+        throw new InvalidOperationException("OptimizationWorker: no surrogate available for initial candidate suggestions.");
+    }
+
     /// <summary>
     /// Builds the parameter grid, configures the TPE/GP surrogate, warm-starts from
     /// prior runs, runs successive halving + seed phase + surrogate-guided exploration,
@@ -103,10 +121,12 @@ public partial class OptimizationWorker
                      && r.BestParametersJson != null && !r.IsDeleted)
             .Select(r => r.BestParametersJson!)
             .ToListAsync(runCt);
-        var previousParamSet = new HashSet<string>(previousParams, StringComparer.OrdinalIgnoreCase);
+        var previousParamSet = new HashSet<string>(
+            previousParams.Select(CanonicalParameterJson.Normalize),
+            StringComparer.OrdinalIgnoreCase);
 
         var freshCandidates = parameterGrid
-            .Where(p => !previousParamSet.Contains(JsonSerializer.Serialize(p)))
+            .Where(p => !previousParamSet.Contains(CanonicalParameterJson.Serialize(p)))
             .ToList();
 
         if (freshCandidates.Count == 0)
@@ -147,6 +167,10 @@ public partial class OptimizationWorker
         // When EHVI is active, it manages its own 3 GPs — skip TPE/GP creation.
         if (!useEhviEarly)
         {
+            ulong? restoredRandomState = checkpoint.SurrogateKind == surrogateKind && checkpoint.SurrogateRandomState != 0
+                ? checkpoint.SurrogateRandomState
+                : null;
+
             if (useGp)
             {
                 var keys   = tpeBounds.Keys.ToArray();
@@ -154,14 +178,15 @@ public partial class OptimizationWorker
                 var upper  = keys.Select(k => tpeBounds[k].Max).ToArray();
                 var isInt  = keys.Select(k => tpeBounds[k].IsInteger).ToArray();
                 gp = new GaussianProcessSurrogate(keys, lower, upper, isInt,
-                    beta: 2.0, seed: searchSeed);
+                    beta: 2.0, seed: searchSeed, randomState: restoredRandomState);
 
                 _logger.LogDebug("OptimizationWorker: using GP-UCB surrogate ({Dims} dimensions)", tpeBounds.Count);
             }
             else
             {
                 tpe = new TreeParzenEstimator(tpeBounds,
-                    seed: searchSeed);
+                    seed: searchSeed,
+                    randomState: restoredRandomState);
 
                 _logger.LogDebug("OptimizationWorker: using TPE surrogate ({Dims} dimensions)", tpeBounds.Count);
             }
@@ -341,9 +366,24 @@ public partial class OptimizationWorker
                 priorRuns.Count);
         }
 
-        var allEvaluated = new List<ScoredCandidate>();
+        var allEvaluated = checkpoint.Observations
+            .OrderBy(o => o.Sequence)
+            .Select(o => new ScoredCandidate(
+                o.ParamsJson,
+                o.HealthScore,
+                OptimizationCheckpointStore.ToCheckpointResult(o.Result),
+                o.CvCoefficientOfVariation))
+            .ToList();
         var _evalLock = new object();
-        int totalIters     = 0;
+        var seenParamSet = new ConcurrentDictionary<string, byte>(
+            checkpoint.SeenParameterJson
+                .Concat(checkpoint.Observations.Select(o => o.ParamsJson))
+                .Select(CanonicalParameterJson.Normalize)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(p => p, _ => (byte)0, StringComparer.OrdinalIgnoreCase),
+            StringComparer.OrdinalIgnoreCase);
+
+        int totalIters     = Math.Max(checkpoint.Iterations, allEvaluated.Count);
         int consecutiveFailures = 0;
         int embargoPerFold = Math.Max(1, embargoSize / protocol.KFolds);
 
@@ -377,7 +417,7 @@ public partial class OptimizationWorker
 
                     // Serialize freshCandidates to JSON once for the candidate source
                     var freshCandidateJsons = freshCandidates
-                        .Select(p => JsonSerializer.Serialize(p))
+                        .Select(CanonicalParameterJson.Serialize)
                         .ToList();
 
                     // Candidate source: distribute fresh candidates across brackets using
@@ -425,20 +465,24 @@ public partial class OptimizationWorker
                         // (they've already been screened at the highest fidelity in their bracket)
                         foreach (var s in pooled.Where(s => s.EvaluatedAtFidelity >= 0.99))
                         {
+                            var paramsJson = CanonicalParameterJson.Normalize(s.ParamsJson);
+                            seenParamSet.TryAdd(paramsJson, 0);
                             lock (_evalLock) allEvaluated.Add(new ScoredCandidate(
-                                s.ParamsJson, s.HealthScore, s.Result));
+                                paramsJson, s.HealthScore, s.Result));
                         }
 
                         // Replace freshCandidates with pooled survivors for LHS seeding
-                        var survivorParamJsons = new HashSet<string>(pooled.Select(s => s.ParamsJson));
+                        var survivorParamJsons = new HashSet<string>(
+                            pooled.Select(s => CanonicalParameterJson.Normalize(s.ParamsJson)),
+                            StringComparer.OrdinalIgnoreCase);
                         freshCandidates = freshCandidates
-                            .Where(p => survivorParamJsons.Contains(JsonSerializer.Serialize(p)))
+                            .Where(p => survivorParamJsons.Contains(CanonicalParameterJson.Serialize(p)))
                             .ToList();
 
                         // If Hyperband pruned everything, fall back to original candidates
                         if (freshCandidates.Count == 0)
                             freshCandidates = parameterGrid
-                                .Where(p => !previousParamSet.Contains(JsonSerializer.Serialize(p)))
+                                .Where(p => !previousParamSet.Contains(CanonicalParameterJson.Serialize(p)))
                                 .ToList();
 
                         _logger.LogInformation(
@@ -492,7 +536,7 @@ public partial class OptimizationWorker
                         parallelOptions,
                         async (idx, pCt) =>
                         {
-                            var paramsJson = JsonSerializer.Serialize(freshCandidates[idx]);
+                            var paramsJson = CanonicalParameterJson.Serialize(freshCandidates[idx]);
                             try
                             {
                                 var result = await _validator.RunWithTimeoutAsync(
@@ -540,23 +584,29 @@ public partial class OptimizationWorker
         // Phase 1: Seed surrogate with Latin Hypercube Sampling for better space coverage.
         // The surrogate's SuggestCandidates falls back to LHS when no observations exist,
         // giving superior initial coverage compared to random grid shuffling.
-        List<Dictionary<string, double>> lhsSuggestions;
-        if (tpe is not null)
-            lhsSuggestions = tpe.SuggestCandidates(config.TpeInitialSamples);
-        else
-            lhsSuggestions = gp!.SuggestCandidates(config.TpeInitialSamples);
+        var lhsSuggestions = SuggestInitialCandidates(tpe, gp, ehvi, config.TpeInitialSamples);
 
         var seedCandidates = lhsSuggestions
             .Select(s => OptimizationGridBuilder.DoublesToParamSet(s, tpeBounds))
-            .Where(p => !previousParamSet.Contains(JsonSerializer.Serialize(p)))
+            .Where(p =>
+            {
+                var paramsJson = CanonicalParameterJson.Serialize(p);
+                return !previousParamSet.Contains(paramsJson) && !seenParamSet.ContainsKey(paramsJson);
+            })
             .ToList();
 
         // If LHS produced fewer fresh candidates than available grid points, backfill from grid
         if (seedCandidates.Count < config.TpeInitialSamples && freshCandidates.Count > seedCandidates.Count)
         {
-            var seedSet = new HashSet<string>(seedCandidates.Select(p => JsonSerializer.Serialize(p)));
+            var seedSet = new HashSet<string>(
+                seedCandidates.Select(CanonicalParameterJson.Serialize),
+                StringComparer.OrdinalIgnoreCase);
             var backfill = freshCandidates
-                .Where(p => !seedSet.Contains(JsonSerializer.Serialize(p)))
+                .Where(p =>
+                {
+                    var paramsJson = CanonicalParameterJson.Serialize(p);
+                    return !seedSet.Contains(paramsJson) && !seenParamSet.ContainsKey(paramsJson);
+                })
                 .Take(config.TpeInitialSamples - seedCandidates.Count);
             seedCandidates.AddRange(backfill);
         }
@@ -565,7 +615,10 @@ public partial class OptimizationWorker
         {
             if (Volatile.Read(ref consecutiveFailures) >= config.CircuitBreakerThreshold) return;
 
-            var paramsJson = JsonSerializer.Serialize(paramSet);
+            var paramsJson = CanonicalParameterJson.Serialize(paramSet);
+            if (previousParamSet.Contains(paramsJson) || !seenParamSet.TryAdd(paramsJson, 0))
+                return;
+
             try
             {
                 var (score, result, _cvValue) = await _validator.TemporalChunkedEvaluateAsync(
@@ -653,9 +706,11 @@ public partial class OptimizationWorker
         // ParEGO: each batch uses a different random weight vector on the (Sharpe, -DD, WR)
         // GP-UCB has exploration phases where scores intentionally dip as the
         // acquisition function probes uncertain regions, so it needs more patience.
-        int remaining = effectiveBudget - totalIters;
+        int remaining = Math.Max(0, effectiveBudget - totalIters);
         decimal bestSeenScore = allEvaluated.Count == 0 ? 0m : allEvaluated.Max(c => c.HealthScore);
-        int stagnantBatches = 0;
+        int stagnantBatches = checkpoint.SurrogateKind == surrogateKind
+            ? checkpoint.StagnantBatches
+            : 0;
         int maxStagnantBatches = useGp ? config.GpEarlyStopPatience : 2;
 
         while (remaining > 0 && !runCt.IsCancellationRequested)
@@ -687,13 +742,15 @@ public partial class OptimizationWorker
                 lock (gp!) suggestions = gp!.SuggestCandidates(batch);
 
             long batchBestScoreBits = 0L; // Atomic-friendly storage for decimal via double bits
+            int batchSpent = 0;
             await Parallel.ForEachAsync(suggestions, parallelOptions, async (suggestion, pCt) =>
             {
                 if (Volatile.Read(ref consecutiveFailures) >= config.CircuitBreakerThreshold) return;
 
-                var paramSet  = OptimizationGridBuilder.DoublesToParamSet(suggestion, tpeBounds);
-                var paramsJson = JsonSerializer.Serialize(paramSet);
-                if (previousParamSet.Contains(paramsJson)) return;
+                var paramSet   = OptimizationGridBuilder.DoublesToParamSet(suggestion, tpeBounds);
+                var paramsJson = CanonicalParameterJson.Serialize(paramSet);
+                if (previousParamSet.Contains(paramsJson) || !seenParamSet.TryAdd(paramsJson, 0)) return;
+                Interlocked.Increment(ref batchSpent);
 
                 try
                 {
@@ -735,26 +792,30 @@ public partial class OptimizationWorker
                     Interlocked.Increment(ref consecutiveFailures);
                 }
             });
+            int spentThisBatch = Volatile.Read(ref batchSpent);
+            if (spentThisBatch == 0)
+            {
+                _logger.LogInformation(
+                    "OptimizationWorker: surrogate batch produced no fresh candidates after deduplication — stopping exploration early");
+                break;
+            }
+
             decimal batchBestScore = (decimal)BitConverter.Int64BitsToDouble(Interlocked.Read(ref batchBestScoreBits));
-            remaining -= batch;
+            remaining -= spentThisBatch;
 
             // Early stopping: if this batch didn't improve on the global best, increment stagnation counter
             if (batchBestScore > bestSeenScore)
             {
                 double batchImprovement = (double)(batchBestScore - bestSeenScore);
                 _metrics.OptimizationSurrogateImprovement.Record(batchImprovement);
-                // Surrogate accuracy telemetry: record that the surrogate-guided batch improved the global best
-                _metrics.OptimizationSurrogateImprovement.Record(1.0,
-                    new KeyValuePair<string, object?>("metric", "batch_improved_global_best"));
+                _metrics.OptimizationSurrogateBatchHits.Add(1);
                 bestSeenScore = batchBestScore;
                 stagnantBatches = 0;
             }
             else
             {
                 _metrics.OptimizationSurrogateImprovement.Record(0.0);
-                // Surrogate accuracy telemetry: surrogate-guided batch did not improve global best
-                _metrics.OptimizationSurrogateImprovement.Record(0.0,
-                    new KeyValuePair<string, object?>("metric", "batch_improved_global_best"));
+                _metrics.OptimizationSurrogateBatchMisses.Add(1);
                 stagnantBatches++;
                 if (stagnantBatches >= maxStagnantBatches)
                 {
@@ -774,12 +835,26 @@ public partial class OptimizationWorker
                 {
                     List<ScoredCandidate> checkpointSnapshot;
                     lock (_evalLock) checkpointSnapshot = allEvaluated.ToList();
-                    var topForCheckpoint = checkpointSnapshot
-                        .OrderByDescending(c => c.HealthScore)
-                        .Take(config.TopNCandidates)
-                        .Select(c => new { c.ParamsJson, c.HealthScore })
+                    ulong surrogateRandomState = ehvi is not null
+                        ? 0UL
+                        : tpe?.RandomState ?? gp?.RandomState ?? 0UL;
+                    var observations = checkpointSnapshot
+                        .Select((c, index) => new OptimizationCheckpointStore.Observation(
+                            Sequence: index + 1,
+                            ParamsJson: c.ParamsJson,
+                            HealthScore: c.HealthScore,
+                            CvCoefficientOfVariation: c.CvCoefficientOfVariation,
+                            Result: c.Result))
                         .ToList();
-                    run.IntermediateResultsJson = JsonSerializer.Serialize(topForCheckpoint);
+                    run.IntermediateResultsJson = OptimizationCheckpointStore.Serialize(
+                        totalIters,
+                        stagnantBatches,
+                        surrogateKind,
+                        surrogateRandomState,
+                        observations,
+                        seenParamSet.Keys,
+                        _logger);
+                    run.CheckpointVersion = OptimizationCheckpointStore.PayloadVersion;
                     run.Iterations = totalIters;
                     await writeCtx.SaveChangesAsync(ct);
                 }
