@@ -27,7 +27,7 @@ internal static class OptimizationFollowUpTracker
     internal static async Task UpdateStatusAsync(
         DbContext writeDb,
         long optimizationRunId,
-        bool succeeded,
+        bool followUpPassed,
         IWriteApplicationDbContext writeContext,
         CancellationToken ct)
     {
@@ -38,7 +38,7 @@ internal static class OptimizationFollowUpTracker
             || optRun.ValidationFollowUpStatus == ValidationFollowUpStatus.Failed)
             return; // Already failed — don't overwrite
 
-        if (!succeeded)
+        if (!followUpPassed)
         {
             optRun.ValidationFollowUpStatus = ValidationFollowUpStatus.Failed;
             await writeContext.SaveChangesAsync(ct);
@@ -52,6 +52,7 @@ internal static class OptimizationFollowUpTracker
             .GroupBy(_ => 1)
             .Select(g => new
             {
+                Total = g.Count(),
                 Pending = g.Count(r => r.Status != RunStatus.Completed && r.Status != RunStatus.Failed),
                 Failed  = g.Count(r => r.Status == RunStatus.Failed),
             })
@@ -62,13 +63,19 @@ internal static class OptimizationFollowUpTracker
             .GroupBy(_ => 1)
             .Select(g => new
             {
+                Total = g.Count(),
                 Pending = g.Count(r => r.Status != RunStatus.Completed && r.Status != RunStatus.Failed),
                 Failed  = g.Count(r => r.Status == RunStatus.Failed),
             })
             .FirstOrDefaultAsync(ct);
 
+        bool hasBacktestRow = (btStats?.Total ?? 0) > 0;
+        bool hasWalkForwardRow = (wfStats?.Total ?? 0) > 0;
         int totalPending = (btStats?.Pending ?? 0) + (wfStats?.Pending ?? 0);
         int totalFailed  = (btStats?.Failed ?? 0) + (wfStats?.Failed ?? 0);
+
+        if (!hasBacktestRow || !hasWalkForwardRow)
+            return;
 
         if (totalPending == 0)
         {

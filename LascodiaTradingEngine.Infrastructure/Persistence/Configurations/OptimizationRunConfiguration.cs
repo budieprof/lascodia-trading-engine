@@ -29,7 +29,10 @@ public class OptimizationRunConfiguration : IEntityTypeConfiguration<Optimizatio
 
         builder.HasQueryFilter(x => !x.IsDeleted);
 
-        builder.HasIndex(x => x.StrategyId);
+        builder.HasIndex(x => x.StrategyId)
+            .HasDatabaseName("IX_OptimizationRun_ActivePerStrategy")
+            .HasFilter("\"Status\" IN ('Queued','Running') AND \"IsDeleted\" = false")
+            .IsUnique();
         builder.HasIndex(x => new { x.StrategyId, x.Status });
         builder.HasIndex(x => new { x.Status, x.ExecutionLeaseExpiresAt });
         builder.HasIndex(x => new { x.Status, x.DeferredUntilUtc });

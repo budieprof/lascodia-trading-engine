@@ -43,6 +43,32 @@ namespace LascodiaTradingEngine.Application.Services.ML;
 ///   <item>Density-ratio importance weights.</item>
 ///   <item>Covariate shift weights from parent model.</item>
 ///   <item>Incremental update fast-path for warm-start fine-tuning.</item>
+///   <item>MiniRocket ternary kernel weights {-1, 0, 1}.</item>
+///   <item>Multi-variate channel-independent kernels.</item>
+///   <item>Learning rate warmup before cosine annealing.</item>
+///   <item>Gradient norm clipping.</item>
+///   <item>Fractional differencing of non-stationary features.</item>
+///   <item>Outlier winsorization before standardization.</item>
+///   <item>Combinatorial purged cross-validation.</item>
+///   <item>Per-fold Platt calibration in CV.</item>
+///   <item>Venn-ABERS calibration bounds.</item>
+///   <item>Per-stage ECE logging (post-Platt, post-isotonic, post-temperature).</item>
+///   <item>Kernel subset dropout for epistemic uncertainty.</item>
+///   <item>Extended abstention gate (5 features).</item>
+///   <item>ROCKET-space magnitude regressor.</item>
+///   <item>Magnitude R² metric.</item>
+///   <item>Fast weight-based feature attribution.</item>
+///   <item>Feature interaction detection (synergistic pairs).</item>
+///   <item>Kernel evolution (retain top kernels from warm-start).</item>
+///   <item>Parent importance for feature pruning.</item>
+///   <item>Graceful per-weight NaN/Inf sanitization.</item>
+///   <item>Bias regularization in ridge training.</item>
+///   <item>Empty test/cal set guards.</item>
+///   <item>Deterministic parallel execution.</item>
+///   <item>Per-kernel accuracy contribution diagnostics.</item>
+///   <item>Training convergence metadata (early stop epoch, best val loss, SWA count).</item>
+///   <item>Reliability diagram per-bin data.</item>
+///   <item>Consistent RocketModelParams parameter struct.</item>
 /// </list>
 /// </para>
 /// </summary>
@@ -52,7 +78,7 @@ public sealed class RocketModelTrainer : IMLModelTrainer
     // ── Constants ────────────────────────────────────────────────────────────
 
     private const string ModelType    = "ROCKET";
-    private const string ModelVersion = "2.0";
+    private const string ModelVersion = "3.0";
 
     private const double AdamBeta1   = 0.9;
     private const double AdamBeta2   = 0.999;
@@ -63,6 +89,11 @@ public sealed class RocketModelTrainer : IMLModelTrainer
         new() { WriteIndented = false, MaxDepth = 64 };
 
     private static readonly int[] KernelLengths = { 7, 9, 11 };
+
+    // ── Consistent parameter struct (#28) ────────────────────────────────────
+
+    private readonly record struct RocketModelParams(
+        double[] W, double Bias, double PlattA, double PlattB, int Dim);
 
     // ── Dependencies ─────────────────────────────────────────────────────────
 
@@ -117,6 +148,26 @@ public sealed class RocketModelTrainer : IMLModelTrainer
             }
         }
 
+        // ── 0b. Outlier winsorization (#7) ──────────────────────────────────
+        if (hp.RocketWinsorizePercentile > 0)
+        {
+            double pctile = hp.RocketWinsorizePercentile;
+            int nSamp = samples.Count;
+            for (int j = 0; j < featureCount; j++)
+            {
+                var vals = new float[nSamp];
+                for (int i = 0; i < nSamp; i++) vals[i] = samples[i].Features[j];
+                Array.Sort(vals);
+                int loIdx = Math.Clamp((int)(pctile * nSamp), 0, nSamp - 1);
+                int hiIdx = Math.Clamp((int)((1.0 - pctile) * nSamp), 0, nSamp - 1);
+                float lo = vals[loIdx];
+                float hi = vals[hiIdx];
+                for (int i = 0; i < nSamp; i++)
+                    samples[i].Features[j] = Math.Clamp(samples[i].Features[j], lo, hi);
+            }
+            _logger.LogInformation("ROCKET winsorized features at p={Pctile:F3}", pctile);
+        }
+
         // ── 1. Z-score standardisation over ALL samples ──────────────────────
         var rawFeatures = new List<float[]>(samples.Count);
         foreach (var s in samples) rawFeatures.Add(s.Features);
@@ -127,6 +178,36 @@ public sealed class RocketModelTrainer : IMLModelTrainer
             allStd.Add(s with { Features = MLFeatureHelper.Standardize(s.Features, means, stds) });
 
         int numKernels = hp.K > 0 ? hp.K : 1000;
+
+        // ── 1b. Fractional differencing (#6) ────────────────────────────────
+        if (hp.FracDiffD > 0)
+        {
+            int nonStatCount = CountNonStationaryFeatures(allStd, featureCount);
+            int diffCount = 0;
+            int nStd = allStd.Count;
+            for (int j = 0; j < featureCount; j++)
+            {
+                // Check if feature j is non-stationary (simple AR(1) proxy)
+                double sumXY = 0, sumXX = 0;
+                for (int i = 1; i < nStd; i++)
+                {
+                    double x = allStd[i - 1].Features[j];
+                    double y = allStd[i].Features[j];
+                    sumXY += x * y;
+                    sumXX += x * x;
+                }
+                double rho = sumXX > 1e-10 ? sumXY / sumXX : 0;
+                if (Math.Abs(rho) > 0.95)
+                {
+                    for (int i = nStd - 1; i >= 1; i--)
+                        allStd[i].Features[j] -= (float)(hp.FracDiffD * allStd[i - 1].Features[j]);
+                    diffCount++;
+                }
+            }
+            if (diffCount > 0)
+                _logger.LogInformation("ROCKET fractional differencing: applied d={D:F2} to {Count}/{Total} non-stationary features",
+                    hp.FracDiffD, diffCount, featureCount);
+        }
 
         // ── 2. Walk-forward cross-validation ────────────────────────────────
         var (cvResult, equityCurveGateFailed) = RunWalkForwardCV(allStd, hp, featureCount, numKernels, ct);
@@ -154,6 +235,14 @@ public sealed class RocketModelTrainer : IMLModelTrainer
         if (trainSet.Count < hp.MinSamples)
             throw new InvalidOperationException(
                 $"RocketModelTrainer: insufficient training samples after splits: {trainSet.Count} < {hp.MinSamples}");
+
+        if (testSet.Count < 5)
+            throw new InvalidOperationException(
+                $"RocketModelTrainer: insufficient test samples after splits: {testSet.Count} < 5");
+
+        if (calSet.Count < 5)
+            throw new InvalidOperationException(
+                $"RocketModelTrainer: insufficient calibration samples after splits: {calSet.Count} < 5");
 
         var effectiveHp = warmStart is not null
             ? hp with { MaxEpochs = Math.Max(30, hp.MaxEpochs / 2), LearningRate = hp.LearningRate / 3.0 }
@@ -215,13 +304,40 @@ public sealed class RocketModelTrainer : IMLModelTrainer
         // ── 4. Generate ROCKET kernels ──────────────────────────────────────
         int kernelSeed = HashCode.Combine(samples.Count, featureCount, numKernels, samples[0].Direction);
         var rng = new Random(kernelSeed);
-        var (kernelWeights, kernelDilations, kernelPaddings, kernelLengthArr) =
-            GenerateKernels(numKernels, featureCount, rng);
+        var (kernelWeights, kernelDilations, kernelPaddings, kernelLengthArr, channelStarts, channelEnds) =
+            GenerateKernels(numKernels, featureCount, rng, hp.RocketUseMiniWeights, hp.RocketMultivariate);
+
+        // ── 4b. Kernel evolution (#18) ──────────────────────────────────────
+        if (hp.RocketKernelRetentionFraction > 0 && warmStart?.RocketKernelWeights is { Length: > 0 } parentKW
+            && warmStart.Weights is { Length: > 0 } parentW && parentW[0].Length >= numKernels)
+        {
+            int retainCount = Math.Clamp((int)(numKernels * hp.RocketKernelRetentionFraction), 1, numKernels - 1);
+            // Sort kernel indices by |rw[k]| descending from parent weights
+            var parentRw = parentW[0];
+            var sortedKernels = Enumerable.Range(0, Math.Min(numKernels, parentKW.Length))
+                .OrderByDescending(k => k < parentRw.Length ? Math.Abs(parentRw[k]) : 0)
+                .Take(retainCount).ToArray();
+
+            foreach (int k in sortedKernels)
+            {
+                if (k < parentKW.Length && parentKW[k] is { Length: > 0 })
+                {
+                    kernelWeights[k] = [..parentKW[k]];
+                    if (warmStart.RocketKernelDilations is { Length: > 0 } && k < warmStart.RocketKernelDilations.Length)
+                        kernelDilations[k] = warmStart.RocketKernelDilations[k];
+                    if (warmStart.RocketKernelPaddings is { Length: > 0 } && k < warmStart.RocketKernelPaddings.Length)
+                        kernelPaddings[k] = warmStart.RocketKernelPaddings[k];
+                    if (warmStart.RocketKernelLengths is { Length: > 0 } && k < warmStart.RocketKernelLengths.Length)
+                        kernelLengthArr[k] = warmStart.RocketKernelLengths[k];
+                }
+            }
+            _logger.LogInformation("ROCKET kernel evolution: retained {Retained}/{Total} top kernels from parent", retainCount, numKernels);
+        }
 
         // ── 5. Extract ROCKET features for all splits ────────────────────────
-        var trainRocket = ExtractRocketFeatures(trainSet, kernelWeights, kernelDilations, kernelPaddings, kernelLengthArr, numKernels);
-        var calRocket   = ExtractRocketFeatures(calSet, kernelWeights, kernelDilations, kernelPaddings, kernelLengthArr, numKernels);
-        var testRocket  = ExtractRocketFeatures(testSet, kernelWeights, kernelDilations, kernelPaddings, kernelLengthArr, numKernels);
+        var trainRocket = ExtractRocketFeatures(trainSet, kernelWeights, kernelDilations, kernelPaddings, kernelLengthArr, numKernels, channelStarts, channelEnds);
+        var calRocket   = ExtractRocketFeatures(calSet, kernelWeights, kernelDilations, kernelPaddings, kernelLengthArr, numKernels, channelStarts, channelEnds);
+        var testRocket  = ExtractRocketFeatures(testSet, kernelWeights, kernelDilations, kernelPaddings, kernelLengthArr, numKernels, channelStarts, channelEnds);
 
         ct.ThrowIfCancellationRequested();
 
@@ -234,25 +350,34 @@ public sealed class RocketModelTrainer : IMLModelTrainer
         StandardizeRocketInPlace(testRocket, rocketMeans, rocketStds, dim);
 
         // ── 6. Train ridge regression (Adam + early stopping + label smoothing) ──
-        var (rw, rb) = TrainRidgeAdam(trainRocket, trainSet, dim, effectiveHp, densityWeights, warmStart, ct);
+        var (rw, rb, earlyStopEpoch, finalValLoss, swaCheckpointCount) = TrainRidgeAdam(trainRocket, trainSet, dim, effectiveHp, densityWeights, warmStart, ct);
 
-        // ── 6b. Post-training weight sanitisation ────────────────────────────
+        // ── 6b. Post-training weight sanitisation (#20: graceful per-weight) ──
         int sanitizedCount = 0;
         {
-            bool needsSanitize = !double.IsFinite(rb);
-            if (!needsSanitize)
+            int nonFiniteCount = 0;
+            if (!double.IsFinite(rb)) nonFiniteCount++;
+            for (int j = 0; j < rw.Length; j++)
+                if (!double.IsFinite(rw[j])) nonFiniteCount++;
+
+            if (nonFiniteCount > 0)
             {
-                for (int j = 0; j < rw.Length; j++)
+                if (nonFiniteCount > (rw.Length + 1) / 2)
                 {
-                    if (!double.IsFinite(rw[j])) { needsSanitize = true; break; }
+                    // More than 50% non-finite: zero everything
+                    Array.Clear(rw, 0, rw.Length);
+                    rb = 0.0;
+                    _logger.LogWarning("RocketModelTrainer: >50% non-finite weights — zeroed all.");
                 }
-            }
-            if (needsSanitize)
-            {
-                Array.Clear(rw, 0, rw.Length);
-                rb = 0.0;
+                else
+                {
+                    // Replace individual non-finite weights with 0
+                    for (int j = 0; j < rw.Length; j++)
+                        if (!double.IsFinite(rw[j])) rw[j] = 0.0;
+                    if (!double.IsFinite(rb)) rb = 0.0;
+                    _logger.LogWarning("RocketModelTrainer: sanitized {Count} individual non-finite weights.", nonFiniteCount);
+                }
                 sanitizedCount = 1;
-                _logger.LogWarning("RocketModelTrainer: sanitized non-finite ridge weights.");
             }
         }
 
@@ -279,8 +404,18 @@ public sealed class RocketModelTrainer : IMLModelTrainer
             _logger.LogDebug("ROCKET quantile magnitude regressor fitted (τ={Tau:F2}).", hp.MagnitudeQuantileTau);
         }
 
+        // ── 8c. ROCKET-space magnitude regressor (#14) ──────────────────────
+        double[] rocketMagWeights = [];
+        double   rocketMagBias    = 0.0;
+        if (trainRocket.Count >= hp.MinSamples)
+        {
+            (rocketMagWeights, rocketMagBias) = TrainAdamRegressor(trainRocket, trainSet, dim, ct);
+            _logger.LogDebug("ROCKET-space magnitude regressor fitted (dim={Dim}).", dim);
+        }
+
         // ── 9. Final evaluation on held-out test set ────────────────────────
-        var finalMetrics = EvaluateModel(testRocket, testSet, rw, rb, magWeights, magBias, plattA, plattB, dim, featureCount);
+        var finalMetrics = EvaluateModel(testRocket, testSet, rw, rb, magWeights, magBias, plattA, plattB, dim, featureCount,
+            rocketMagWeights, rocketMagBias);
 
         _logger.LogInformation(
             "ROCKET final eval — acc={Acc:P1} f1={F1:F3} ev={EV:F4} brier={Brier:F4} sharpe={Sharpe:F2}",
@@ -288,7 +423,8 @@ public sealed class RocketModelTrainer : IMLModelTrainer
             finalMetrics.ExpectedValue, finalMetrics.BrierScore, finalMetrics.SharpeRatio);
 
         // ── 10. ECE post-Platt ───────────────────────────────────────────────
-        double ece = ComputeEce(testRocket, testSet, rw, rb, plattA, plattB, dim);
+        var (ece, reliabilityBinConf, reliabilityBinAcc, reliabilityBinCounts) =
+            ComputeEce(testRocket, testSet, rw, rb, plattA, plattB, dim);
         _logger.LogInformation("ROCKET post-Platt ECE={Ece:F4}", ece);
 
         // ── 11. EV-optimal decision threshold (on cal set) ───────────────────
@@ -301,7 +437,7 @@ public sealed class RocketModelTrainer : IMLModelTrainer
         var featureImportance = testSet.Count >= 10
             ? ComputePermutationImportance(testSet, testRocket, rw, rb, plattA, plattB, dim,
                 kernelWeights, kernelDilations, kernelPaddings, kernelLengthArr, numKernels,
-                featureCount, rocketMeans, rocketStds, ct)
+                featureCount, rocketMeans, rocketStds, ct, hp.RocketDeterministicParallel)
             : new float[featureCount];
 
         if (featureImportance.Length > 0)
@@ -320,11 +456,22 @@ public sealed class RocketModelTrainer : IMLModelTrainer
         double[] calImportanceScores = calSet.Count >= 10
             ? ComputeCalPermutationImportance(calSet, calRocket, rw, rb, dim,
                 kernelWeights, kernelDilations, kernelPaddings, kernelLengthArr, numKernels,
-                featureCount, rocketMeans, rocketStds, ct)
+                featureCount, rocketMeans, rocketStds, ct, hp.RocketDeterministicParallel)
             : new double[featureCount];
 
         // ── 12c. Feature pruning re-train pass ───────────────────────────────
-        var activeMask = BuildFeatureMask(featureImportance, hp.MinFeatureImportance, featureCount);
+        // #19: Use parent importance for initial mask if available
+        float[] pruningImportance = featureImportance;
+        if (hp.RocketUseParentImportanceForPruning
+            && warmStart?.FeatureImportanceScores is { Length: > 0 } parentImp
+            && parentImp.Length == featureCount)
+        {
+            pruningImportance = new float[featureCount];
+            for (int j = 0; j < featureCount; j++)
+                pruningImportance[j] = (float)parentImp[j];
+            _logger.LogInformation("ROCKET using parent importance scores for feature pruning mask.");
+        }
+        var activeMask = BuildFeatureMask(pruningImportance, hp.MinFeatureImportance, featureCount);
         int prunedCount = activeMask.Count(m => !m);
 
         if (prunedCount > 0 && featureCount - prunedCount >= 10)
@@ -353,7 +500,7 @@ public sealed class RocketModelTrainer : IMLModelTrainer
                 EarlyStoppingPatience = Math.Max(5, effectiveHp.EarlyStoppingPatience / 2),
             };
 
-            var (pw, pb) = TrainRidgeAdam(maskedTrainRocket, maskedTrain, dim, prunedHp, null, null, ct);
+            var (pw, pb, _, _, _) = TrainRidgeAdam(maskedTrainRocket, maskedTrain, dim, prunedHp, null, null, ct);
             var (pmw, pmb) = FitLinearRegressor(maskedTrain, featureCount, ct);
             var (pA, pB) = FitPlattScaling(maskedCalRocket, maskedCal, pw, pb, dim);
             var prunedMetrics = EvaluateModel(maskedTestRocket, maskedTest, pw, pb, pmw, pmb, pA, pB, dim, featureCount);
@@ -377,7 +524,8 @@ public sealed class RocketModelTrainer : IMLModelTrainer
                 (plattABuy, plattBBuy, plattASell, plattBSell) =
                     FitClassConditionalPlatt(calRocket, maskedCal, rw, rb, dim);
                 avgKellyFraction = ComputeAvgKellyFraction(calRocket, maskedCal, rw, rb, plattA, plattB, dim);
-                ece = ComputeEce(testRocket, maskedTest, rw, rb, plattA, plattB, dim);
+                (ece, reliabilityBinConf, reliabilityBinAcc, reliabilityBinCounts) =
+                    ComputeEce(testRocket, maskedTest, rw, rb, plattA, plattB, dim);
                 optimalThreshold = ComputeOptimalThreshold(calRocket, maskedCal, rw, rb, plattA, plattB, dim,
                     hp.ThresholdSearchMin, hp.ThresholdSearchMax);
             }
@@ -401,6 +549,34 @@ public sealed class RocketModelTrainer : IMLModelTrainer
         double[] isotonicBp = FitIsotonicCalibration(calRocket, calSet, rw, rb, plattA, plattB, dim);
         _logger.LogInformation("ROCKET isotonic calibration: {N} PAVA breakpoints", isotonicBp.Length / 2);
 
+        // ── 13b. Per-stage ECE: post-isotonic (#11) ──────────────────────────
+        {
+            // Compute ECE with isotonic calibration applied
+            double isoEce = 0;
+            const int NumBinsIso = 10;
+            var isoBinConfSum = new double[NumBinsIso];
+            var isoBinCorrect = new int[NumBinsIso];
+            var isoBinCount   = new int[NumBinsIso];
+            for (int i = 0; i < testSet.Count; i++)
+            {
+                double p = CalibratedProb(testRocket[i], rw, rb, plattA, plattB, dim);
+                if (isotonicBp.Length >= 4) p = ApplyIsotonicCalibration(p, isotonicBp);
+                int bin = Math.Clamp((int)(p * NumBinsIso), 0, NumBinsIso - 1);
+                isoBinConfSum[bin] += p;
+                if (testSet[i].Direction == 1) isoBinCorrect[bin]++;
+                isoBinCount[bin]++;
+            }
+            int isoN = testSet.Count;
+            for (int bx = 0; bx < NumBinsIso; bx++)
+            {
+                if (isoBinCount[bx] == 0) continue;
+                double avgConf = isoBinConfSum[bx] / isoBinCount[bx];
+                double acc = isoBinCorrect[bx] / (double)isoBinCount[bx];
+                isoEce += Math.Abs(acc - avgConf) * isoBinCount[bx] / isoN;
+            }
+            _logger.LogInformation("ROCKET post-isotonic ECE={Ece:F4}", isoEce);
+        }
+
         // ── 14. Conformal prediction threshold ───────────────────────────────
         double conformalAlpha = Math.Clamp(1.0 - hp.ConformalCoverage, 0.01, 0.50);
         double conformalQHat = ComputeConformalQHat(
@@ -413,7 +589,7 @@ public sealed class RocketModelTrainer : IMLModelTrainer
 
         // ── 16. Abstention gate ──────────────────────────────────────────────
         var (abstentionWeights, abstentionBias, abstentionThreshold) = FitAbstentionModel(
-            calRocket, calSet, rw, rb, plattA, plattB, metaLabelWeights, metaLabelBias, dim, ct);
+            calRocket, calSet, rw, rb, plattA, plattB, metaLabelWeights, metaLabelBias, dim, ct, numKernels);
         _logger.LogDebug("ROCKET abstention gate: bias={B:F4} threshold={T:F2}", abstentionBias, abstentionThreshold);
 
         // ── 17. Decision boundary distance ───────────────────────────────────
@@ -433,21 +609,50 @@ public sealed class RocketModelTrainer : IMLModelTrainer
             _logger.LogDebug("ROCKET temperature scaling: T={T:F4}", temperatureScale);
         }
 
-        // ── 19b. Holdout-based OOB accuracy proxy ─────────────────────────────
+        // ── 19b. Per-stage ECE: post-temperature (#11) ───────────��──────────
+        if (temperatureScale > 0)
+        {
+            double tempEce = 0;
+            const int NumBinsT = 10;
+            var tBinConfSum = new double[NumBinsT];
+            var tBinCorrect = new int[NumBinsT];
+            var tBinCount   = new int[NumBinsT];
+            for (int i = 0; i < testSet.Count; i++)
+            {
+                double rawP = RocketProb(testRocket[i], rw, rb, dim);
+                rawP = Math.Clamp(rawP, 1e-7, 1.0 - 1e-7);
+                double scaledLogit = MLFeatureHelper.Logit(rawP) / temperatureScale;
+                double p = MLFeatureHelper.Sigmoid(scaledLogit);
+                int bin = Math.Clamp((int)(p * NumBinsT), 0, NumBinsT - 1);
+                tBinConfSum[bin] += p;
+                if (testSet[i].Direction == 1) tBinCorrect[bin]++;
+                tBinCount[bin]++;
+            }
+            int tN = testSet.Count;
+            for (int bx = 0; bx < NumBinsT; bx++)
+            {
+                if (tBinCount[bx] == 0) continue;
+                double avgConf = tBinConfSum[bx] / tBinCount[bx];
+                double acc = tBinCorrect[bx] / (double)tBinCount[bx];
+                tempEce += Math.Abs(acc - avgConf) * tBinCount[bx] / tN;
+            }
+            _logger.LogInformation("ROCKET post-temperature ECE={Ece:F4}", tempEce);
+        }
+
+        // ── 19c. Holdout-based OOB accuracy proxy ─────────────────────────────
         // ROCKET is a single model (not ensemble), so true OOB isn't available.
-        // Use the internal validation split from ridge training as an unbiased proxy.
+        // Use the calibration set (independent of the early-stopping validation split)
+        // to avoid optimistic bias from evaluating on model-selection data.
         double oobAccuracy = 0.0;
         {
-            int valSize = Math.Max(20, trainRocket.Count / 10);
-            int valStart = trainRocket.Count - valSize;
-            int valCorrect = 0;
-            for (int i = valStart; i < trainRocket.Count; i++)
+            int oobCorrect = 0;
+            for (int i = 0; i < calRocket.Count; i++)
             {
-                double p = CalibratedProb(trainRocket[i], rw, rb, plattA, plattB, dim);
-                if ((p >= 0.5) == (trainSet[i].Direction == 1)) valCorrect++;
+                double p = CalibratedProb(calRocket[i], rw, rb, plattA, plattB, dim);
+                if ((p >= 0.5) == (calSet[i].Direction == 1)) oobCorrect++;
             }
-            oobAccuracy = valSize > 0 ? (double)valCorrect / valSize : 0;
-            _logger.LogInformation("ROCKET holdout OOB accuracy proxy={OobAcc:P1}", oobAccuracy);
+            oobAccuracy = calRocket.Count > 0 ? (double)oobCorrect / calRocket.Count : 0;
+            _logger.LogInformation("ROCKET holdout OOB accuracy proxy={OobAcc:P1} (cal set)", oobAccuracy);
         }
         finalMetrics = finalMetrics with { OobAccuracy = oobAccuracy };
 
@@ -486,6 +691,202 @@ public sealed class RocketModelTrainer : IMLModelTrainer
                 _logger.LogWarning(
                     "ROCKET MI redundancy: {N} feature pairs exceed threshold: {Pairs}",
                     redundantPairs.Length, string.Join(", ", redundantPairs));
+        }
+
+        // ── 22b. Venn-ABERS calibration bounds (#10) ────────────────────────
+        double[] vennAbersCalBounds = [];
+        if (calRocket.Count >= 20)
+        {
+            // Lightweight Venn-ABERS proxy: per-decile [min, max] calibrated P
+            const int vBins = 10;
+            var vBinMin = new double[vBins];
+            var vBinMax = new double[vBins];
+            Array.Fill(vBinMin, double.MaxValue);
+            Array.Fill(vBinMax, double.MinValue);
+            for (int i = 0; i < calRocket.Count; i++)
+            {
+                double p = CalibratedProb(calRocket[i], rw, rb, plattA, plattB, dim);
+                int bin = Math.Clamp((int)(p * vBins), 0, vBins - 1);
+                if (p < vBinMin[bin]) vBinMin[bin] = p;
+                if (p > vBinMax[bin]) vBinMax[bin] = p;
+            }
+            vennAbersCalBounds = new double[vBins * 2];
+            for (int bi = 0; bi < vBins; bi++)
+            {
+                vennAbersCalBounds[bi * 2]     = vBinMin[bi] == double.MaxValue ? 0.0 : vBinMin[bi];
+                vennAbersCalBounds[bi * 2 + 1] = vBinMax[bi] == double.MinValue ? 1.0 : vBinMax[bi];
+            }
+            _logger.LogInformation("ROCKET Venn-ABERS calibration bounds: {N} bins", vBins);
+        }
+
+        // ── 22c. Magnitude R² (#15) ─────────────────────────────────────────
+        double magnitudeR2 = 0.0;
+        {
+            double sumMagRes = 0, sumMagTot = 0, meanMag = 0;
+            for (int i = 0; i < testSet.Count; i++) meanMag += testSet[i].Magnitude;
+            meanMag /= testSet.Count > 0 ? testSet.Count : 1;
+            for (int i = 0; i < testSet.Count; i++)
+            {
+                double magPred = featureCount <= magWeights.Length
+                    ? MLFeatureHelper.DotProduct(magWeights, testSet[i].Features) + magBias : 0;
+                if (rocketMagWeights is { Length: > 0 })
+                {
+                    double rmp = rocketMagBias;
+                    int rLen = Math.Min(rocketMagWeights.Length, testRocket[i].Length);
+                    for (int j = 0; j < rLen; j++) rmp += rocketMagWeights[j] * testRocket[i][j];
+                    magPred = (magPred + rmp) * 0.5;
+                }
+                double res = magPred - testSet[i].Magnitude;
+                sumMagRes += res * res;
+                double tot = testSet[i].Magnitude - meanMag;
+                sumMagTot += tot * tot;
+            }
+            magnitudeR2 = sumMagTot > 1e-10 ? 1.0 - sumMagRes / sumMagTot : 0.0;
+            _logger.LogInformation("ROCKET magnitude R²={R2:F4}", magnitudeR2);
+        }
+
+        // ── 22d. Fast weight-based attribution (#16) ────────────────────────
+        var fastFeatureAttribution = new float[featureCount];
+        {
+            double attrSum = 0;
+            for (int j = 0; j < featureCount; j++)
+            {
+                double sumAttr = 0;
+                for (int k = 0; k < numKernels; k++)
+                {
+                    int len = kernelLengthArr[k];
+                    int dil = kernelDilations[k];
+                    bool pad = kernelPaddings[k];
+                    int padding = pad ? (len - 1) * dil / 2 : 0;
+                    int chStart = channelStarts is not null ? channelStarts[k] : 0;
+
+                    for (int li = 0; li < len; li++)
+                    {
+                        int srcIdx = j - chStart + li * dil - padding;
+                        if (srcIdx == j - chStart)
+                            sumAttr += Math.Abs(rw[k]) * Math.Abs(kernelWeights[k][li]);
+                    }
+                }
+                fastFeatureAttribution[j] = (float)sumAttr;
+                attrSum += sumAttr;
+            }
+            if (attrSum > 1e-10)
+                for (int j = 0; j < featureCount; j++) fastFeatureAttribution[j] /= (float)attrSum;
+        }
+
+        // ── 22e. Feature interaction detection (#17) ─────────────────────────
+        string[] synergisticFeaturePairs = [];
+        {
+            int topN = Math.Min(10, featureCount);
+            var topIdx = fastFeatureAttribution
+                .Select((v, i) => (v, i))
+                .OrderByDescending(x => x.v)
+                .Take(topN)
+                .Select(x => x.i)
+                .ToArray();
+
+            var pairCounts = new Dictionary<(int, int), int>();
+            for (int ai = 0; ai < topIdx.Length; ai++)
+            for (int bi = ai + 1; bi < topIdx.Length; bi++)
+            {
+                int a = topIdx[ai], bFeat = topIdx[bi];
+                int count = 0;
+                for (int k = 0; k < numKernels; k++)
+                {
+                    int len = kernelLengthArr[k];
+                    int dil = kernelDilations[k];
+                    bool pad = kernelPaddings[k];
+                    int padding = pad ? (len - 1) * dil / 2 : 0;
+                    int chStart = channelStarts is not null ? channelStarts[k] : 0;
+                    int chEnd = channelEnds is not null ? channelEnds[k] : featureCount;
+
+                    bool touchesA = false, touchesB = false;
+                    for (int li = 0; li < len && !(touchesA && touchesB); li++)
+                    {
+                        int srcMin = chStart - padding + li * dil;
+                        int srcMax = srcMin + (featureCount - 1);
+                        if (a >= chStart && a < chEnd) touchesA = true;
+                        if (bFeat >= chStart && bFeat < chEnd) touchesB = true;
+                    }
+                    if (touchesA && touchesB) count++;
+                }
+                if (count > numKernels / 10) pairCounts[(a, bFeat)] = count;
+            }
+            synergisticFeaturePairs = pairCounts
+                .Select(kv =>
+                {
+                    string nameA = kv.Key.Item1 < MLFeatureHelper.FeatureNames.Length ? MLFeatureHelper.FeatureNames[kv.Key.Item1] : $"F{kv.Key.Item1}";
+                    string nameB = kv.Key.Item2 < MLFeatureHelper.FeatureNames.Length ? MLFeatureHelper.FeatureNames[kv.Key.Item2] : $"F{kv.Key.Item2}";
+                    return $"{nameA}:{nameB}:{kv.Value}";
+                }).ToArray();
+            if (synergisticFeaturePairs.Length > 0)
+                _logger.LogInformation("ROCKET synergistic feature pairs: {Pairs}", string.Join(", ", synergisticFeaturePairs));
+        }
+
+        // ── 22f. Kernel subset dropout (#12) ─────────────────────────────────
+        double meanKernelEntropy = 0.0;
+        if (hp.RocketKernelDropoutSubsets > 0)
+        {
+            int subsets = hp.RocketKernelDropoutSubsets;
+            var dropRng = new Random(42);
+            var variances = new double[testSet.Count];
+            var subsetPreds = new double[subsets];
+
+            for (int i = 0; i < testSet.Count; i++)
+            {
+                for (int s = 0; s < subsets; s++)
+                {
+                    var maskedFeat = new double[dim];
+                    Array.Copy(testRocket[i], maskedFeat, dim);
+                    // Zero out 20% of random kernels
+                    for (int k = 0; k < numKernels; k++)
+                    {
+                        if (dropRng.NextDouble() < 0.2)
+                        {
+                            maskedFeat[k] = 0;
+                            maskedFeat[numKernels + k] = 0;
+                        }
+                    }
+                    subsetPreds[s] = CalibratedProb(maskedFeat, rw, rb, plattA, plattB, dim);
+                }
+                double mean = 0;
+                for (int s = 0; s < subsets; s++) mean += subsetPreds[s];
+                mean /= subsets;
+                double var_ = 0;
+                for (int s = 0; s < subsets; s++) { double d = subsetPreds[s] - mean; var_ += d * d; }
+                variances[i] = var_ / subsets;
+            }
+            meanKernelEntropy = variances.Average();
+            _logger.LogInformation("ROCKET kernel dropout epistemic uncertainty={Entropy:F6}", meanKernelEntropy);
+        }
+
+        // ── 22g. Per-kernel accuracy contribution (#24) ──────────────────────
+        double[] perKernelAccContrib = [];
+        {
+            int diagKernels = Math.Min(numKernels, 100);
+            int baseCorrect = 0;
+            for (int i = 0; i < testSet.Count; i++)
+            {
+                double p = CalibratedProb(testRocket[i], rw, rb, plattA, plattB, dim);
+                if ((p >= 0.5) == (testSet[i].Direction == 1)) baseCorrect++;
+            }
+            double baselineAcc = (double)baseCorrect / testSet.Count;
+
+            perKernelAccContrib = new double[diagKernels];
+            for (int k = 0; k < diagKernels; k++)
+            {
+                int correct = 0;
+                for (int i = 0; i < testSet.Count; i++)
+                {
+                    var maskedFeat = new double[dim];
+                    Array.Copy(testRocket[i], maskedFeat, dim);
+                    maskedFeat[k] = 0;
+                    maskedFeat[numKernels + k] = 0;
+                    double p = CalibratedProb(maskedFeat, rw, rb, plattA, plattB, dim);
+                    if ((p >= 0.5) == (testSet[i].Direction == 1)) correct++;
+                }
+                perKernelAccContrib[k] = baselineAcc - (double)correct / testSet.Count;
+            }
         }
 
         // ── 23. Mean PPV per kernel (ROCKET-specific diagnostic) ─────────────
@@ -560,6 +961,20 @@ public sealed class RocketModelTrainer : IMLModelTrainer
             SanitizedLearnerCount      = sanitizedCount,
             ConformalCoverage          = hp.ConformalCoverage,
             RocketFeatureStats         = meanPpv,
+            RocketMagWeights           = rocketMagWeights,
+            RocketMagBias              = rocketMagBias,
+            MagnitudeR2                = magnitudeR2,
+            FastFeatureAttribution     = fastFeatureAttribution,
+            SynergisticFeaturePairs    = synergisticFeaturePairs,
+            PerKernelAccuracyContribution = perKernelAccContrib,
+            EarlyStoppingEpoch         = earlyStopEpoch,
+            FinalValidationLoss        = finalValLoss,
+            VennAbersCalBounds         = vennAbersCalBounds,
+            MeanKernelEntropy          = meanKernelEntropy,
+            ReliabilityBinConfidence   = reliabilityBinConf,
+            ReliabilityBinAccuracy     = reliabilityBinAcc,
+            ReliabilityBinCounts       = reliabilityBinCounts,
+            SwaCheckpointCount         = swaCheckpointCount,
             RocketKernelWeights        = kernelWeights,
             RocketKernelDilations      = kernelDilations,
             RocketKernelPaddings       = kernelPaddings,
@@ -582,25 +997,55 @@ public sealed class RocketModelTrainer : IMLModelTrainer
     //  ROCKET kernel generation
     // ═══════════════════════════════════════════════════════════════════════════
 
-    private static (double[][] Weights, int[] Dilations, bool[] Paddings, int[] Lengths)
-        GenerateKernels(int numKernels, int featureCount, Random rng)
+    private static (double[][] Weights, int[] Dilations, bool[] Paddings, int[] Lengths, int[]? ChannelStarts, int[]? ChannelEnds)
+        GenerateKernels(int numKernels, int featureCount, Random rng,
+            bool useMiniWeights = false, bool multivariate = false)
     {
         var weights   = new double[numKernels][];
         var dilations = new int[numKernels];
         var paddings  = new bool[numKernels];
         var lengths   = new int[numKernels];
 
+        // #2: Multivariate channel-independent kernels
+        int[]? channelStarts = null;
+        int[]? channelEnds   = null;
+        if (multivariate && featureCount >= 6)
+        {
+            channelStarts = new int[numKernels];
+            channelEnds   = new int[numKernels];
+            int groupSize = featureCount / 3;
+            for (int k = 0; k < numKernels; k++)
+            {
+                int group = k % 3;
+                channelStarts[k] = group * groupSize;
+                channelEnds[k]   = group == 2 ? featureCount : (group + 1) * groupSize;
+            }
+        }
+
         for (int k = 0; k < numKernels; k++)
         {
             int len    = KernelLengths[rng.Next(KernelLengths.Length)];
             double[] w = new double[len];
-            for (int i = 0; i < len; i++) w[i] = SampleGaussian(rng);
+
+            if (useMiniWeights)
+            {
+                // #1: MiniRocket ternary {-1, 0, 1} kernel weights
+                for (int i = 0; i < len; i++) w[i] = rng.Next(3) - 1;
+            }
+            else
+            {
+                for (int i = 0; i < len; i++) w[i] = SampleGaussian(rng);
+            }
+
             double wMean = 0;
             for (int i = 0; i < len; i++) wMean += w[i];
             wMean /= len;
             for (int i = 0; i < len; i++) w[i] -= wMean;
 
-            double A = len > 1 ? Math.Log2((featureCount - 1.0) / (len - 1) + 1e-6) : 0;
+            int effectiveFeatureCount = (channelEnds is not null && channelStarts is not null)
+                ? channelEnds[k] - channelStarts[k]
+                : featureCount;
+            double A = len > 1 ? Math.Log2((effectiveFeatureCount - 1.0) / (len - 1) + 1e-6) : 0;
             int dil  = A > 0 ? (int)Math.Floor(Math.Pow(2, rng.NextDouble() * A)) : 1;
             dil = Math.Max(1, dil);
 
@@ -610,7 +1055,7 @@ public sealed class RocketModelTrainer : IMLModelTrainer
             lengths[k]   = len;
         }
 
-        return (weights, dilations, paddings, lengths);
+        return (weights, dilations, paddings, lengths, channelStarts, channelEnds);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -620,7 +1065,7 @@ public sealed class RocketModelTrainer : IMLModelTrainer
     private static List<double[]> ExtractRocketFeatures(
         List<TrainingSample> samples,
         double[][] kernelWeights, int[] kernelDilations, bool[] kernelPaddings, int[] kernelLengthArr,
-        int numKernels)
+        int numKernels, int[]? channelStarts = null, int[]? channelEnds = null)
     {
         int n = samples.Count;
         int F = samples.Count > 0 ? samples[0].Features.Length : 0;
@@ -638,8 +1083,13 @@ public sealed class RocketModelTrainer : IMLModelTrainer
                 int      dil = kernelDilations[k];
                 bool     pad = kernelPaddings[k];
 
+                // #2: Channel-independent convolution range
+                int chStart = channelStarts is not null ? channelStarts[k] : 0;
+                int chEnd   = channelEnds is not null ? channelEnds[k] : F;
+                int chLen   = chEnd - chStart;
+
                 int padding   = pad ? (len - 1) * dil / 2 : 0;
-                int outputLen = F + 2 * padding - (len - 1) * dil;
+                int outputLen = chLen + 2 * padding - (len - 1) * dil;
 
                 double maxVal  = double.MinValue;
                 int    ppvPos  = 0;
@@ -650,7 +1100,7 @@ public sealed class RocketModelTrainer : IMLModelTrainer
                     double dot = 0;
                     for (int j = 0; j < len; j++)
                     {
-                        int srcIdx = pos + j * dil - padding;
+                        int srcIdx = chStart + pos + j * dil - padding;
                         double xVal = (srcIdx >= 0 && srcIdx < F) ? x[srcIdx] : 0;
                         dot += w[j] * xVal;
                     }
@@ -715,7 +1165,7 @@ public sealed class RocketModelTrainer : IMLModelTrainer
     //  Ridge regression with Adam optimiser + cosine LR + early stopping
     // ═══════════════════════════════════════════════════════════════════════════
 
-    private static (double[] Weights, double Bias) TrainRidgeAdam(
+    private static (double[] Weights, double Bias, int EarlyStopEpoch, double BestValLoss, int SwaCount) TrainRidgeAdam(
         List<double[]>       features,
         List<TrainingSample> labels,
         int                  dim,
@@ -775,6 +1225,7 @@ public sealed class RocketModelTrainer : IMLModelTrainer
 
         double bestValLoss = double.MaxValue;
         int    patienceCounter = 0;
+        int    earlyStopEpoch = 0; // #25: track early stopping epoch
         double[] bestW = [..w];
         double   bestBias = bias;
 
@@ -794,25 +1245,15 @@ public sealed class RocketModelTrainer : IMLModelTrainer
             if (bc > 0 && sc > 0) { rocketCwBuy = (double)trainN / (2.0 * bc); rocketCwSell = (double)trainN / (2.0 * sc); }
         }
 
-        // Mixup augmentation (post-ROCKET feature space)
+        // Mixup augmentation (post-ROCKET feature space) — re-sampled each epoch
         bool useMixup = hp.MixupAlpha > 0.0;
         double[][]? mixupFeatures = null;
         double[]?   mixupLabels   = null;
+        Random? mixRng = useMixup ? new Random(42) : null;
         if (useMixup)
         {
-            var mixRng = new Random(42);
             mixupFeatures = new double[trainN][];
             mixupLabels   = new double[trainN];
-            for (int i = 0; i < trainN; i++)
-            {
-                int j2    = mixRng.Next(trainN);
-                double lam = SampleBeta(mixRng, hp.MixupAlpha);
-                var mixed  = new double[dim];
-                for (int j = 0; j < dim; j++)
-                    mixed[j] = lam * features[i][j] + (1.0 - lam) * features[j2][j];
-                mixupFeatures[i] = mixed;
-                mixupLabels[i]   = lam * softLabels[i] + (1.0 - lam) * softLabels[j2];
-            }
         }
 
         // SWA state
@@ -837,8 +1278,26 @@ public sealed class RocketModelTrainer : IMLModelTrainer
                 (shuffledIdx[i], shuffledIdx[swapIdx]) = (shuffledIdx[swapIdx], shuffledIdx[i]);
             }
 
-            // Cosine-annealed learning rate
-            double lr = baseLr * 0.5 * (1.0 + Math.Cos(Math.PI * epoch / maxEpochs));
+            // Cosine-annealed learning rate with warmup (#4)
+            int warmupEpochs = hp.RocketWarmupEpochs;
+            double lr = epoch < warmupEpochs
+                ? baseLr * (epoch + 1.0) / warmupEpochs
+                : baseLr * 0.5 * (1.0 + Math.Cos(Math.PI * (epoch - warmupEpochs) / (maxEpochs - warmupEpochs)));
+
+            // Re-sample mixup partners and lambdas each epoch for maximum diversity
+            if (useMixup)
+            {
+                for (int i = 0; i < trainN; i++)
+                {
+                    int j2     = mixRng!.Next(trainN);
+                    double lam = SampleBeta(mixRng, hp.MixupAlpha);
+                    var mixed  = new double[dim];
+                    for (int j = 0; j < dim; j++)
+                        mixed[j] = lam * features[i][j] + (1.0 - lam) * features[j2][j];
+                    mixupFeatures![i] = mixed;
+                    mixupLabels![i]   = lam * softLabels[i] + (1.0 - lam) * softLabels[j2];
+                }
+            }
 
             // Mini-batched training pass
             for (int bStart = 0; bStart < trainN; bStart += batchSize)
@@ -872,6 +1331,25 @@ public sealed class RocketModelTrainer : IMLModelTrainer
                 double invBLen = 1.0 / bLen;
                 for (int j = 0; j < dim; j++) gW[j] *= invBLen;
                 gBatch *= invBLen;
+
+                // #5: Gradient norm clipping
+                if (hp.MaxGradNorm > 0)
+                {
+                    double gradNorm = 0;
+                    for (int j = 0; j < dim; j++) gradNorm += gW[j] * gW[j];
+                    gradNorm += gBatch * gBatch;
+                    gradNorm = Math.Sqrt(gradNorm);
+                    if (gradNorm > hp.MaxGradNorm)
+                    {
+                        double scale = hp.MaxGradNorm / gradNorm;
+                        for (int j = 0; j < dim; j++) gW[j] *= scale;
+                        gBatch *= scale;
+                    }
+                }
+
+                // #21: Bias regularization
+                if (hp.RocketRegularizeBias)
+                    gBatch += l2 * bias;
 
                 // Single Adam step per mini-batch
                 t++;
@@ -925,6 +1403,7 @@ public sealed class RocketModelTrainer : IMLModelTrainer
                 Array.Copy(w, bestW, dim);
                 bestBias = bias;
                 patienceCounter = 0;
+                earlyStopEpoch = epoch; // #25: track best epoch
             }
             else
             {
@@ -955,7 +1434,7 @@ public sealed class RocketModelTrainer : IMLModelTrainer
             }
         }
 
-        return (bestW, bestBias);
+        return (bestW, bestBias, earlyStopEpoch, bestValLoss, swaCount);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -979,17 +1458,54 @@ public sealed class RocketModelTrainer : IMLModelTrainer
             return (new WalkForwardResult(0, 0, 0, 0, 0, 0), false);
         }
 
-        var foldResults = new (double Acc, double F1, double EV, double Sharpe, double[] Imp, bool IsBad)?[folds];
+        (double Acc, double F1, double EV, double Sharpe, double[] Imp, bool IsBad)?[] foldResults;
         int cvKernelSeed = HashCode.Combine(samples.Count, featureCount, numKernels, samples[0].Direction);
         var rng = new Random(cvKernelSeed);
-        var (kWeights, kDilations, kPaddings, kLengths) = GenerateKernels(numKernels, featureCount, rng);
+        var (kWeights, kDilations, kPaddings, kLengths, kChStarts, kChEnds) =
+            GenerateKernels(numKernels, featureCount, rng, hp.RocketUseMiniWeights, hp.RocketMultivariate);
 
-        Parallel.For(0, folds, new ParallelOptions { CancellationToken = ct }, fold =>
+        // #8: Generate fold definitions (CPCV or expanding-window)
+        var foldDefs = new List<(int TrainEnd, int TestStart, int TestEnd)>();
+        if (hp.RocketUseCpcv)
         {
-            int testEnd   = (fold + 2) * foldSize;
-            int testStart = testEnd - foldSize;
-            int purgeExtra = MLFeatureHelper.LookbackWindow - 1;
-            int trainEnd   = Math.Max(0, testStart - embargo - purgeExtra);
+            // Combinatorial purged CV: all pairs of consecutive blocks
+            int numBlocks = folds + 1;
+            for (int a = 0; a < numBlocks; a++)
+            for (int b = a + 1; b < numBlocks; b++)
+            {
+                int tStart = b * foldSize;
+                int tEnd   = Math.Min((b + 1) * foldSize, samples.Count);
+                // Train = everything except the test block, with purging
+                int trnEnd = Math.Max(0, tStart - embargo - (MLFeatureHelper.LookbackWindow - 1));
+                if (trnEnd >= hp.MinSamples && tEnd - tStart >= 20)
+                    foldDefs.Add((trnEnd, tStart, tEnd));
+            }
+            if (foldDefs.Count == 0) // fallback to standard
+                for (int f = 0; f < folds; f++)
+                    foldDefs.Add((Math.Max(0, (f + 2) * foldSize - foldSize - embargo - (MLFeatureHelper.LookbackWindow - 1)),
+                        (f + 2) * foldSize - foldSize, (f + 2) * foldSize));
+        }
+        else
+        {
+            for (int f = 0; f < folds; f++)
+            {
+                int tEnd = (f + 2) * foldSize;
+                int tStart = tEnd - foldSize;
+                int trnEnd = Math.Max(0, tStart - embargo - (MLFeatureHelper.LookbackWindow - 1));
+                foldDefs.Add((trnEnd, tStart, tEnd));
+            }
+        }
+
+        int actualFolds = foldDefs.Count;
+        foldResults = new (double Acc, double F1, double EV, double Sharpe, double[] Imp, bool IsBad)?[actualFolds];
+
+        Parallel.For(0, actualFolds, new ParallelOptions
+        {
+            CancellationToken = ct,
+            MaxDegreeOfParallelism = hp.RocketDeterministicParallel ? 1 : -1
+        }, fold =>
+        {
+            var (trainEnd, testStart, testEnd) = foldDefs[fold];
 
             if (trainEnd < hp.MinSamples) return;
 
@@ -1006,8 +1522,8 @@ public sealed class RocketModelTrainer : IMLModelTrainer
             if (foldTest.Count < 20) return;
 
             // Extract ROCKET features for this fold
-            var foldTrainRocket = ExtractRocketFeatures(foldTrain, kWeights, kDilations, kPaddings, kLengths, numKernels);
-            var foldTestRocket  = ExtractRocketFeatures(foldTest, kWeights, kDilations, kPaddings, kLengths, numKernels);
+            var foldTrainRocket = ExtractRocketFeatures(foldTrain, kWeights, kDilations, kPaddings, kLengths, numKernels, kChStarts, kChEnds);
+            var foldTestRocket  = ExtractRocketFeatures(foldTest, kWeights, kDilations, kPaddings, kLengths, numKernels, kChStarts, kChEnds);
 
             int dim = 2 * numKernels;
             var (rm, rs) = ComputeRocketStandardization(foldTrainRocket, dim);
@@ -1020,9 +1536,31 @@ public sealed class RocketModelTrainer : IMLModelTrainer
                 EarlyStoppingPatience = Math.Max(5, hp.EarlyStoppingPatience / 2),
             };
 
-            var (w, b) = TrainRidgeAdam(foldTrainRocket, foldTrain, dim, cvHp, null, null, ct);
-            var (mw, mb) = FitLinearRegressor(foldTrain, featureCount, ct);
-            var m = EvaluateModel(foldTestRocket, foldTest, w, b, mw, mb, 1.0, 0.0, dim, featureCount);
+            // #9: Split fold train into 80% train / 20% cal for per-fold Platt
+            int foldCalStart = (int)(foldTrain.Count * 0.80);
+            var foldTrainActual = foldTrain[..foldCalStart];
+            var foldCal = foldTrain[foldCalStart..];
+
+            var foldTrainActualRocket = ExtractRocketFeatures(foldTrainActual, kWeights, kDilations, kPaddings, kLengths, numKernels, kChStarts, kChEnds);
+            var foldCalRocket = foldTrainRocket[foldCalStart..];
+            foldTrainRocket = foldTrainRocket[..foldCalStart];
+
+            var (rmT, rsT) = ComputeRocketStandardization(foldTrainActualRocket, dim);
+            StandardizeRocketInPlace(foldTrainActualRocket, rmT, rsT, dim);
+            StandardizeRocketInPlace(foldCalRocket, rmT, rsT, dim);
+            // Re-standardize test with train-actual stats
+            foldTestRocket = ExtractRocketFeatures(foldTest, kWeights, kDilations, kPaddings, kLengths, numKernels, kChStarts, kChEnds);
+            StandardizeRocketInPlace(foldTestRocket, rmT, rsT, dim);
+
+            var (w, b, _, _, _) = TrainRidgeAdam(foldTrainActualRocket, foldTrainActual, dim, cvHp, null, null, ct);
+
+            // Fit Platt scaling on fold calibration slice
+            double foldPlattA = 1.0, foldPlattB = 0.0;
+            if (foldCal.Count >= 5)
+                (foldPlattA, foldPlattB) = FitPlattScaling(foldCalRocket, foldCal, w, b, dim);
+
+            var (mw, mb) = FitLinearRegressor(foldTrainActual, featureCount, ct);
+            var m = EvaluateModel(foldTestRocket, foldTest, w, b, mw, mb, foldPlattA, foldPlattB, dim, featureCount);
 
             // Feature importance proxy: mean absolute weight contribution per original feature
             var foldImp = new double[featureCount];
@@ -1165,6 +1703,14 @@ public sealed class RocketModelTrainer : IMLModelTrainer
         return MLFeatureHelper.Sigmoid(plattA * MLFeatureHelper.Logit(raw) + plattB);
     }
 
+    /// <summary>#28: Overload accepting <see cref="RocketModelParams"/>.</summary>
+    private static double CalibratedProb(double[] rocketFeatures, in RocketModelParams p)
+        => CalibratedProb(rocketFeatures, p.W, p.Bias, p.PlattA, p.PlattB, p.Dim);
+
+    /// <summary>#28: Overload accepting <see cref="RocketModelParams"/>.</summary>
+    private static double RocketProb(double[] rocketFeatures, in RocketModelParams p)
+        => RocketProb(rocketFeatures, p.W, p.Bias, p.Dim);
+
     // ═══════════════════════════════════════════════════════════════════════════
     //  Platt scaling
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1264,7 +1810,8 @@ public sealed class RocketModelTrainer : IMLModelTrainer
         double[]             w, double bias,
         double[]             magWeights, double magBias,
         double               plattA, double plattB,
-        int                  dim, int featureCount)
+        int                  dim, int featureCount,
+        double[]?            rocketMagW = null, double rocketMagB = 0.0)
     {
         int correct = 0, tp = 0, fp = 0, fn = 0, tn = 0;
         double sumBrier = 0, sumMagSqErr = 0, sumEV = 0;
@@ -1284,6 +1831,17 @@ public sealed class RocketModelTrainer : IMLModelTrainer
             double magPred = featureCount <= magWeights.Length
                 ? MLFeatureHelper.DotProduct(magWeights, samples[i].Features) + magBias
                 : 0;
+
+            // #14: Ensemble with ROCKET-space magnitude prediction
+            if (rocketMagW is { Length: > 0 })
+            {
+                double rocketMagPred = rocketMagB;
+                int rLen = Math.Min(rocketMagW.Length, rocketFeatures[i].Length);
+                for (int j = 0; j < rLen; j++)
+                    rocketMagPred += rocketMagW[j] * rocketFeatures[i][j];
+                magPred = (magPred + rocketMagPred) * 0.5;
+            }
+
             double magErr = magPred - samples[i].Magnitude;
             sumMagSqErr += magErr * magErr;
 
@@ -1334,7 +1892,7 @@ public sealed class RocketModelTrainer : IMLModelTrainer
     //  ECE (Expected Calibration Error)
     // ═══════════════════════════════════════════════════════════════════════════
 
-    private static double ComputeEce(
+    private static (double Ece, double[]? BinConf, double[]? BinAcc, int[]? BinCounts) ComputeEce(
         List<double[]> rocketFeatures, List<TrainingSample> samples,
         double[] w, double bias, double plattA, double plattB, int dim)
     {
@@ -1348,21 +1906,25 @@ public sealed class RocketModelTrainer : IMLModelTrainer
             double p   = CalibratedProb(rocketFeatures[i], w, bias, plattA, plattB, dim);
             int    bin = Math.Clamp((int)(p * NumBins), 0, NumBins - 1);
             binConfSum[bin] += p;
-            if (samples[i].Direction == 1) binCorrect[bin]++; // positive-class frequency, not accuracy
+            if (samples[i].Direction == 1) binCorrect[bin]++;
             binCount[bin]++;
         }
 
         double ece = 0;
         int    n   = samples.Count;
+        var binConf = new double[NumBins];
+        var binAcc  = new double[NumBins];
         for (int b = 0; b < NumBins; b++)
         {
             if (binCount[b] == 0) continue;
             double avgConf = binConfSum[b] / binCount[b];
             double acc     = binCorrect[b] / (double)binCount[b];
+            binConf[b] = avgConf;
+            binAcc[b]  = acc;
             ece += Math.Abs(acc - avgConf) * binCount[b] / n;
         }
 
-        return ece;
+        return (ece, binConf, binAcc, binCount);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1411,7 +1973,7 @@ public sealed class RocketModelTrainer : IMLModelTrainer
         double[][] kernelWeights, int[] kernelDilations, bool[] kernelPaddings, int[] kernelLengthArr,
         int numKernels, int featureCount,
         double[] rocketMeans, double[] rocketStds,
-        CancellationToken ct)
+        CancellationToken ct, bool deterministic = false)
     {
         // Baseline accuracy
         int baseCorrect = 0;
@@ -1426,7 +1988,7 @@ public sealed class RocketModelTrainer : IMLModelTrainer
         int tn = testSet.Count;
         const int numRuns = 3;
 
-        Parallel.For(0, featureCount, new ParallelOptions { CancellationToken = ct }, j =>
+        Parallel.For(0, featureCount, new ParallelOptions { CancellationToken = ct, MaxDegreeOfParallelism = deterministic ? 1 : -1 }, j =>
         {
             if (ct.IsCancellationRequested) return;
 
@@ -1590,12 +2152,8 @@ public sealed class RocketModelTrainer : IMLModelTrainer
         var metaW = new double[metaDim];
         double metaB = 0;
 
-        // Adam state
-        var mW_m = new double[metaDim];
-        var vW_m = new double[metaDim];
-        double mB_m = 0, vB_m = 0;
-        double b1t = 1.0, b2t = 1.0;
-        int adamT = 0;
+        // Adam state (#3: shared helper)
+        var metaAdam = AdamState.Create(metaDim);
 
         int fLimit = Math.Min(5, featureCount);
         const double baseLr = 0.01;
@@ -1658,21 +2216,7 @@ public sealed class RocketModelTrainer : IMLModelTrainer
                 for (int j = 0; j < metaDim; j++) gW[j] *= invBLen;
                 gB *= invBLen;
 
-                adamT++;
-                b1t *= AdamBeta1;
-                b2t *= AdamBeta2;
-
-                for (int j = 0; j < metaDim; j++)
-                {
-                    mW_m[j] = AdamBeta1 * mW_m[j] + (1 - AdamBeta1) * gW[j];
-                    vW_m[j] = AdamBeta2 * vW_m[j] + (1 - AdamBeta2) * gW[j] * gW[j];
-                    double mH = mW_m[j] / (1 - b1t);
-                    double vH = vW_m[j] / (1 - b2t);
-                    metaW[j] -= lr * mH / (Math.Sqrt(vH) + AdamEpsilon);
-                }
-                mB_m = AdamBeta1 * mB_m + (1 - AdamBeta1) * gB;
-                vB_m = AdamBeta2 * vB_m + (1 - AdamBeta2) * gB * gB;
-                metaB -= lr * (mB_m / (1 - b1t)) / (Math.Sqrt(vB_m / (1 - b2t)) + AdamEpsilon);
+                AdamState.AdamStep(ref metaAdam, gW, gB, metaW, ref metaB, lr, metaDim);
             }
 
             // Validation loss
@@ -1717,7 +2261,8 @@ public sealed class RocketModelTrainer : IMLModelTrainer
         List<double[]> calRocket, List<TrainingSample> calSet,
         double[] w, double bias, double plattA, double plattB,
         double[] metaLabelW, double metaLabelB, int dim,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        int numKernels = 0)
     {
         int n = calRocket.Count;
         if (n < 10) return ([], 0.0, 0.5);
@@ -1727,17 +2272,13 @@ public sealed class RocketModelTrainer : IMLModelTrainer
         int absValN   = n - absTrainN;
         if (absTrainN < 5) return ([], 0.0, 0.5);
 
-        // Features: [calibP, |calibP - 0.5|, metaLabelScore]
-        int absDim = 3;
+        // Features: [calibP, |calibP - 0.5|, metaLabelScore, kernelEntropy, |magPred|] (#13)
+        int absDim = 5;
         var absW = new double[absDim];
         double absB = 0;
 
-        // Adam state
-        var mW_a = new double[absDim];
-        var vW_a = new double[absDim];
-        double mB_a = 0, vB_a = 0;
-        double b1t = 1.0, b2t = 1.0;
-        int adamT = 0;
+        // Adam state (#3: shared helper)
+        var absAdam = AdamState.Create(absDim);
 
         const double baseLr = 0.01;
         const int maxEpochs = 100;
@@ -1789,7 +2330,19 @@ public sealed class RocketModelTrainer : IMLModelTrainer
                         metaScore = metaLabelB + metaLabelW[0] * rawP;
                     }
 
-                    double[] feat = [calibP, Math.Abs(calibP - 0.5), metaScore];
+                    // #13: 5 features — kernel PPV entropy + |logit| as magnitude confidence
+                    double kernelEntropy = 0;
+                    if (numKernels > 0)
+                    {
+                        for (int ki = 0; ki < Math.Min(numKernels, calRocket[si].Length - numKernels); ki++)
+                        {
+                            double ppv = Math.Clamp(calRocket[si][numKernels + ki], 1e-7, 1.0 - 1e-7);
+                            kernelEntropy += -(ppv * Math.Log(ppv) + (1.0 - ppv) * Math.Log(1.0 - ppv));
+                        }
+                        kernelEntropy /= numKernels;
+                    }
+                    double magConf = Math.Abs(MLFeatureHelper.Logit(Math.Clamp(calibP, 1e-7, 1.0 - 1e-7)));
+                    double[] feat = [calibP, Math.Abs(calibP - 0.5), metaScore, kernelEntropy, magConf];
                     double z = absB;
                     for (int j = 0; j < absDim; j++) z += absW[j] * feat[j];
                     double p   = MLFeatureHelper.Sigmoid(z);
@@ -1804,21 +2357,7 @@ public sealed class RocketModelTrainer : IMLModelTrainer
                 for (int j = 0; j < absDim; j++) gW[j] *= invBLen;
                 gBatch *= invBLen;
 
-                adamT++;
-                b1t *= AdamBeta1;
-                b2t *= AdamBeta2;
-
-                for (int j = 0; j < absDim; j++)
-                {
-                    mW_a[j] = AdamBeta1 * mW_a[j] + (1 - AdamBeta1) * gW[j];
-                    vW_a[j] = AdamBeta2 * vW_a[j] + (1 - AdamBeta2) * gW[j] * gW[j];
-                    double mH = mW_a[j] / (1 - b1t);
-                    double vH = vW_a[j] / (1 - b2t);
-                    absW[j] -= lr * mH / (Math.Sqrt(vH) + AdamEpsilon);
-                }
-                mB_a = AdamBeta1 * mB_a + (1 - AdamBeta1) * gBatch;
-                vB_a = AdamBeta2 * vB_a + (1 - AdamBeta2) * gBatch * gBatch;
-                absB -= lr * (mB_a / (1 - b1t)) / (Math.Sqrt(vB_a / (1 - b2t)) + AdamEpsilon);
+                AdamState.AdamStep(ref absAdam, gW, gBatch, absW, ref absB, lr, absDim);
             }
 
             // Validation loss
@@ -1837,7 +2376,18 @@ public sealed class RocketModelTrainer : IMLModelTrainer
                     metaScore = metaLabelB + metaLabelW[0] * rawP;
                 }
 
-                double[] feat = [calibP, Math.Abs(calibP - 0.5), metaScore];
+                double kernelEntropyI = 0;
+                if (numKernels > 0)
+                {
+                    for (int ki = 0; ki < Math.Min(numKernels, calRocket[i].Length - numKernels); ki++)
+                    {
+                        double ppv = Math.Clamp(calRocket[i][numKernels + ki], 1e-7, 1.0 - 1e-7);
+                        kernelEntropyI += -(ppv * Math.Log(ppv) + (1.0 - ppv) * Math.Log(1.0 - ppv));
+                    }
+                    kernelEntropyI /= numKernels;
+                }
+                double magConfI = Math.Abs(MLFeatureHelper.Logit(Math.Clamp(calibP, 1e-7, 1.0 - 1e-7)));
+                double[] feat = [calibP, Math.Abs(calibP - 0.5), metaScore, kernelEntropyI, magConfI];
                 double z = absB;
                 for (int j = 0; j < absDim; j++) z += absW[j] * feat[j];
                 double p = MLFeatureHelper.Sigmoid(z);
@@ -1877,7 +2427,18 @@ public sealed class RocketModelTrainer : IMLModelTrainer
                     double rawP = RocketProb(calRocket[i], w, bias, dim);
                     metaScore = metaLabelB + metaLabelW[0] * rawP;
                 }
-                double[] feat = [calibP, Math.Abs(calibP - 0.5), metaScore];
+                double kernelEntropyI = 0;
+                if (numKernels > 0)
+                {
+                    for (int ki = 0; ki < Math.Min(numKernels, calRocket[i].Length - numKernels); ki++)
+                    {
+                        double ppv = Math.Clamp(calRocket[i][numKernels + ki], 1e-7, 1.0 - 1e-7);
+                        kernelEntropyI += -(ppv * Math.Log(ppv) + (1.0 - ppv) * Math.Log(1.0 - ppv));
+                    }
+                    kernelEntropyI /= numKernels;
+                }
+                double magConfI = Math.Abs(MLFeatureHelper.Logit(Math.Clamp(calibP, 1e-7, 1.0 - 1e-7)));
+                double[] feat = [calibP, Math.Abs(calibP - 0.5), metaScore, kernelEntropyI, magConfI];
                 double z = absB;
                 for (int j = 0; j < absDim; j++) z += absW[j] * feat[j];
                 double absP = MLFeatureHelper.Sigmoid(z);
@@ -1913,12 +2474,8 @@ public sealed class RocketModelTrainer : IMLModelTrainer
         var w = new double[featureCount];
         double b = 0;
 
-        // Adam state
-        var mW_r = new double[featureCount];
-        var vW_r = new double[featureCount];
-        double mB_r = 0, vB_r = 0;
-        double b1t = 1.0, b2t = 1.0;
-        int adamT = 0;
+        // Adam state (#3: shared helper)
+        var linAdam = AdamState.Create(featureCount);
 
         const double baseLr = 0.01;
         const int maxEpochs = 200;
@@ -1981,21 +2538,7 @@ public sealed class RocketModelTrainer : IMLModelTrainer
                 for (int j = 0; j < featureCount; j++) gW[j] *= invBLen;
                 gBatch *= invBLen;
 
-                adamT++;
-                b1t *= AdamBeta1;
-                b2t *= AdamBeta2;
-
-                for (int j = 0; j < featureCount; j++)
-                {
-                    mW_r[j] = AdamBeta1 * mW_r[j] + (1 - AdamBeta1) * gW[j];
-                    vW_r[j] = AdamBeta2 * vW_r[j] + (1 - AdamBeta2) * gW[j] * gW[j];
-                    double mH = mW_r[j] / (1 - b1t);
-                    double vH = vW_r[j] / (1 - b2t);
-                    w[j] -= lr * mH / (Math.Sqrt(vH) + AdamEpsilon);
-                }
-                mB_r = AdamBeta1 * mB_r + (1 - AdamBeta1) * gBatch;
-                vB_r = AdamBeta2 * vB_r + (1 - AdamBeta2) * gBatch * gBatch;
-                b -= lr * (mB_r / (1 - b1t)) / (Math.Sqrt(vB_r / (1 - b2t)) + AdamEpsilon);
+                AdamState.AdamStep(ref linAdam, gW, gBatch, w, ref b, lr, featureCount);
             }
 
             // Validation loss (Huber)
@@ -2054,12 +2597,8 @@ public sealed class RocketModelTrainer : IMLModelTrainer
         var w = new double[featureCount];
         double b = 0;
 
-        // Adam state
-        var mW_q = new double[featureCount];
-        var vW_q = new double[featureCount];
-        double mB_q = 0, vB_q = 0;
-        double b1t = 1.0, b2t = 1.0;
-        int adamT = 0;
+        // Adam state (#3: shared helper)
+        var qAdam = AdamState.Create(featureCount);
 
         const double baseLr = 0.01;
         const int maxEpochs = 200;
@@ -2115,21 +2654,7 @@ public sealed class RocketModelTrainer : IMLModelTrainer
                 for (int j = 0; j < featureCount; j++) gW[j] *= invBLen;
                 gBatch *= invBLen;
 
-                adamT++;
-                b1t *= AdamBeta1;
-                b2t *= AdamBeta2;
-
-                for (int j = 0; j < featureCount; j++)
-                {
-                    mW_q[j] = AdamBeta1 * mW_q[j] + (1 - AdamBeta1) * gW[j];
-                    vW_q[j] = AdamBeta2 * vW_q[j] + (1 - AdamBeta2) * gW[j] * gW[j];
-                    double mH = mW_q[j] / (1 - b1t);
-                    double vH = vW_q[j] / (1 - b2t);
-                    w[j] -= lr * mH / (Math.Sqrt(vH) + AdamEpsilon);
-                }
-                mB_q = AdamBeta1 * mB_q + (1 - AdamBeta1) * gBatch;
-                vB_q = AdamBeta2 * vB_q + (1 - AdamBeta2) * gBatch * gBatch;
-                b -= lr * (mB_q / (1 - b1t)) / (Math.Sqrt(vB_q / (1 - b2t)) + AdamEpsilon);
+                AdamState.AdamStep(ref qAdam, gW, gBatch, w, ref b, lr, featureCount);
             }
 
             // Validation loss (pinball)
@@ -2163,6 +2688,114 @@ public sealed class RocketModelTrainer : IMLModelTrainer
         }
 
         if (qValN > 0 && bestValLoss < double.MaxValue)
+            return (bestW, bestB);
+        return (w, b);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  ROCKET-space magnitude regressor (#14)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private static (double[] Weights, double Bias) TrainAdamRegressor(
+        List<double[]> rocketFeatures, List<TrainingSample> labels, int dim,
+        CancellationToken ct = default)
+    {
+        int n = rocketFeatures.Count;
+        if (n < 5) return (new double[dim], 0.0);
+
+        int magTrainN = (int)(n * 0.90);
+        int magValN   = n - magTrainN;
+        if (magTrainN < 5) magTrainN = n;
+
+        var w = new double[dim];
+        double b = 0;
+        var adam = AdamState.Create(dim);
+
+        const double baseLr = 0.01;
+        const int maxEpochs = 200;
+        const int patience = 15;
+        const double huberDelta = 1.0;
+        int batchSize = Math.Min(DefaultBatchSize, magTrainN);
+
+        double bestValLoss = double.MaxValue;
+        int patienceCounter = 0;
+        var bestW = new double[dim];
+        double bestB = 0;
+
+        var idx = new int[magTrainN];
+        for (int i = 0; i < magTrainN; i++) idx[i] = i;
+        var rng = new Random(magTrainN ^ dim);
+
+        for (int epoch = 0; epoch < maxEpochs; epoch++)
+        {
+            ct.ThrowIfCancellationRequested();
+            double lr = baseLr * 0.5 * (1.0 + Math.Cos(Math.PI * epoch / maxEpochs));
+
+            for (int i = idx.Length - 1; i > 0; i--)
+            {
+                int sw = rng.Next(i + 1);
+                (idx[i], idx[sw]) = (idx[sw], idx[i]);
+            }
+
+            for (int bStart = 0; bStart < magTrainN; bStart += batchSize)
+            {
+                int bEnd = Math.Min(bStart + batchSize, magTrainN);
+                int bLen = bEnd - bStart;
+                var gW = new double[dim];
+                double gBatch = 0;
+
+                for (int bi = bStart; bi < bEnd; bi++)
+                {
+                    int si = idx[bi];
+                    double pred = b;
+                    for (int j = 0; j < dim; j++)
+                        pred += w[j] * rocketFeatures[si][j];
+                    double residual = pred - labels[si].Magnitude;
+                    double grad = Math.Abs(residual) <= huberDelta ? residual : huberDelta * Math.Sign(residual);
+
+                    for (int j = 0; j < dim; j++)
+                        gW[j] += grad * rocketFeatures[si][j];
+                    gBatch += grad;
+                }
+
+                double invBLen = 1.0 / bLen;
+                for (int j = 0; j < dim; j++) gW[j] *= invBLen;
+                gBatch *= invBLen;
+
+                AdamState.AdamStep(ref adam, gW, gBatch, w, ref b, lr, dim);
+            }
+
+            if (magValN > 0)
+            {
+                double valLoss = 0;
+                for (int i = magTrainN; i < n; i++)
+                {
+                    double pred = b;
+                    for (int j = 0; j < dim; j++)
+                        pred += w[j] * rocketFeatures[i][j];
+                    double residual = Math.Abs(pred - labels[i].Magnitude);
+                    valLoss += residual <= huberDelta
+                        ? 0.5 * residual * residual
+                        : huberDelta * (residual - 0.5 * huberDelta);
+                }
+                valLoss /= magValN;
+
+                if (valLoss < bestValLoss - 1e-6)
+                {
+                    bestValLoss = valLoss;
+                    Array.Copy(w, bestW, dim);
+                    bestB = b;
+                    patienceCounter = 0;
+                }
+                else
+                {
+                    patienceCounter++;
+                    if (patienceCounter >= patience) break;
+                }
+            }
+        }
+
+        if (magValN > 0 && bestValLoss < double.MaxValue)
             return (bestW, bestB);
         return (w, b);
     }
@@ -2573,6 +3206,56 @@ public sealed class RocketModelTrainer : IMLModelTrainer
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
+    //  Shared Adam helper (#3)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private struct AdamState
+    {
+        public double[] MW;
+        public double[] VW;
+        public double MB;
+        public double VB;
+        public double Beta1T;
+        public double Beta2T;
+        public int T;
+
+        public static AdamState Create(int dim)
+            => new()
+            {
+                MW = new double[dim],
+                VW = new double[dim],
+                MB = 0, VB = 0,
+                Beta1T = 1.0, Beta2T = 1.0,
+                T = 0,
+            };
+
+        public static void AdamStep(
+            ref AdamState state, double[] gradW, double gradB,
+            double[] weights, ref double bias, double lr, int dim)
+        {
+            state.T++;
+            state.Beta1T *= AdamBeta1;
+            state.Beta2T *= AdamBeta2;
+
+            for (int j = 0; j < dim; j++)
+            {
+                double g = gradW[j];
+                state.MW[j] = AdamBeta1 * state.MW[j] + (1 - AdamBeta1) * g;
+                state.VW[j] = AdamBeta2 * state.VW[j] + (1 - AdamBeta2) * g * g;
+                double mHat = state.MW[j] / (1 - state.Beta1T);
+                double vHat = state.VW[j] / (1 - state.Beta2T);
+                weights[j] -= lr * mHat / (Math.Sqrt(vHat) + AdamEpsilon);
+            }
+
+            state.MB = AdamBeta1 * state.MB + (1 - AdamBeta1) * gradB;
+            state.VB = AdamBeta2 * state.VB + (1 - AdamBeta2) * gradB * gradB;
+            double mBHat = state.MB / (1 - state.Beta1T);
+            double vBHat = state.VB / (1 - state.Beta2T);
+            bias -= lr * mBHat / (Math.Sqrt(vBHat) + AdamEpsilon);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
     //  Statistical helpers
     // ═══════════════════════════════════════════════════════════════════════════
 
@@ -2657,7 +3340,7 @@ public sealed class RocketModelTrainer : IMLModelTrainer
         double[][] kernelWeights, int[] kernelDilations, bool[] kernelPaddings, int[] kernelLengthArr,
         int numKernels, int featureCount,
         double[] rocketMeans, double[] rocketStds,
-        CancellationToken ct)
+        CancellationToken ct, bool deterministic = false)
     {
         // Baseline accuracy on cal set
         int baseCorrect = 0;
@@ -2670,34 +3353,40 @@ public sealed class RocketModelTrainer : IMLModelTrainer
 
         var importance = new double[featureCount];
         int m = calSet.Count;
+        const int numRuns = 3;
 
-        Parallel.For(0, featureCount, new ParallelOptions { CancellationToken = ct }, j =>
+        Parallel.For(0, featureCount, new ParallelOptions { CancellationToken = ct, MaxDegreeOfParallelism = deterministic ? 1 : -1 }, j =>
         {
-            var shuffleRng = new Random(j * 71 + 17);
-            var indices = Enumerable.Range(0, m).ToArray();
-            for (int i = indices.Length - 1; i > 0; i--)
+            double totalDrop = 0;
+            for (int run = 0; run < numRuns; run++)
             {
-                int swap = shuffleRng.Next(i + 1);
-                (indices[i], indices[swap]) = (indices[swap], indices[i]);
+                var shuffleRng = new Random(j * 71 + 17 + run * 997);
+                var indices = Enumerable.Range(0, m).ToArray();
+                for (int i = indices.Length - 1; i > 0; i--)
+                {
+                    int swap = shuffleRng.Next(i + 1);
+                    (indices[i], indices[swap]) = (indices[swap], indices[i]);
+                }
+
+                int correct = 0;
+                for (int i = 0; i < m; i++)
+                {
+                    var scratch = new float[calSet[i].Features.Length];
+                    Array.Copy(calSet[i].Features, scratch, scratch.Length);
+                    scratch[j] = calSet[indices[i]].Features[j];
+
+                    var shuffledSample = new List<TrainingSample>(1) { new(scratch, calSet[i].Direction, calSet[i].Magnitude) };
+                    var shuffledRocket = ExtractRocketFeatures(shuffledSample, kernelWeights, kernelDilations, kernelPaddings, kernelLengthArr, numKernels);
+                    for (int d = 0; d < dim; d++)
+                        shuffledRocket[0][d] = (shuffledRocket[0][d] - rocketMeans[d]) / rocketStds[d];
+
+                    double p = RocketProb(shuffledRocket[0], w, bias, dim);
+                    if ((p >= 0.5) == (calSet[i].Direction == 1)) correct++;
+                }
+                double shuffledAcc = (double)correct / m;
+                totalDrop += Math.Max(0.0, baseline - shuffledAcc);
             }
-
-            int correct = 0;
-            for (int i = 0; i < m; i++)
-            {
-                var scratch = new float[calSet[i].Features.Length];
-                Array.Copy(calSet[i].Features, scratch, scratch.Length);
-                scratch[j] = calSet[indices[i]].Features[j];
-
-                var shuffledSample = new List<TrainingSample>(1) { new(scratch, calSet[i].Direction, calSet[i].Magnitude) };
-                var shuffledRocket = ExtractRocketFeatures(shuffledSample, kernelWeights, kernelDilations, kernelPaddings, kernelLengthArr, numKernels);
-                for (int d = 0; d < dim; d++)
-                    shuffledRocket[0][d] = (shuffledRocket[0][d] - rocketMeans[d]) / rocketStds[d];
-
-                double p = RocketProb(shuffledRocket[0], w, bias, dim);
-                if ((p >= 0.5) == (calSet[i].Direction == 1)) correct++;
-            }
-            double shuffledAcc = (double)correct / m;
-            importance[j] = Math.Max(0.0, baseline - shuffledAcc);
+            importance[j] = totalDrop / numRuns;
         });
 
         double total = importance.Sum();

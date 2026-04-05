@@ -46,7 +46,7 @@ internal sealed class OptimizationValidator
     internal async Task<(decimal AvgScore, bool IsStable)> WalkForwardValidateAsync(
         Strategy strategy, string paramsJson, List<Candle> oosCandles,
         BacktestOptions options, int timeoutSecs, CancellationToken ct,
-        double minMaxRatio = 0.50)
+        double minMaxRatio = 0.50, string? baselineParamsJson = null)
     {
         // Timeframe-aware minimum: M1 needs more candles per window to be meaningful
         int minCandlesPerWindow = GetMinCandlesPerWindow(strategy.Timeframe);
@@ -59,6 +59,9 @@ internal sealed class OptimizationValidator
         // params, then the chosen params are tested on the OOS portion. This ensures
         // the winner params are locally competitive, not just globally best.
         const double foldIsSplit = 0.60;
+        string effectiveBaselineParamsJson = string.IsNullOrWhiteSpace(baselineParamsJson)
+            ? strategy.ParametersJson
+            : baselineParamsJson;
 
         var scores = new List<decimal>();
         for (int i = 0; i < windowCount; i++)
@@ -91,11 +94,11 @@ internal sealed class OptimizationValidator
                 decimal winnerIsScore = OptimizationHealthScorer.ComputeHealthScore(winnerIsResult);
 
                 // Also test baseline (current strategy params) on fold IS
-                var baselineIsResult = await RunWithTimeoutAsync(strategy, strategy.ParametersJson, foldIs, options, timeoutSecs, ct);
+                var baselineIsResult = await RunWithTimeoutAsync(strategy, effectiveBaselineParamsJson, foldIs, options, timeoutSecs, ct);
                 decimal baselineIsScore = OptimizationHealthScorer.ComputeHealthScore(baselineIsResult);
 
                 // Pick whichever performs better on this fold's IS, then test OOS
-                string selectedParams = winnerIsScore >= baselineIsScore ? paramsJson : strategy.ParametersJson;
+                string selectedParams = winnerIsScore >= baselineIsScore ? paramsJson : effectiveBaselineParamsJson;
                 var oosResult = await RunWithTimeoutAsync(strategy, selectedParams, foldOos, options, timeoutSecs, ct);
                 scores.Add(OptimizationHealthScorer.ComputeHealthScore(oosResult));
             }
@@ -127,7 +130,8 @@ internal sealed class OptimizationValidator
         Strategy strategy, string winnerParamsJson, List<Candle> candles,
         BacktestOptions options, int timeoutSecs, decimal baseScore,
         double perturbPct, CancellationToken ct,
-        double degradationTolerance = 0.20, int maxParallel = 4)
+        double degradationTolerance = 0.20, int maxParallel = 4,
+        IReadOnlyDictionary<string, (double Min, double Max, bool IsInteger)>? parameterBounds = null)
     {
         Dictionary<string, JsonElement>? baseParams;
         try { baseParams = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(winnerParamsJson); }
@@ -143,20 +147,12 @@ internal sealed class OptimizationValidator
         foreach (var (key, val) in baseParams)
         {
             if (!val.TryGetDouble(out double baseVal)) continue;
+            var bounds = ResolveBounds(parameterBounds, key);
+            bool isInteger = bounds?.IsInteger ?? IsIntegerJsonNumber(val, baseVal);
 
             foreach (double dir in new[] { -perturbPct, perturbPct })
             {
-                double newVal;
-                if (Math.Abs(baseVal) < 1e-10)
-                {
-                    // Additive perturbation: shift by perturbPct of a reasonable scale.
-                    // Use 1.0 as default scale if no range context available.
-                    newVal = baseVal + dir;
-                }
-                else
-                {
-                    newVal = baseVal * (1.0 + dir);
-                }
+                double newVal = PerturbNumericValue(baseVal, dir, bounds, isInteger);
 
                 var perturbed = new Dictionary<string, object>();
                 foreach (var kv in baseParams)
@@ -178,7 +174,7 @@ internal sealed class OptimizationValidator
         var numericKeys = baseParams
             .Where(kv => kv.Value.TryGetDouble(out _))
             .Select(kv => kv.Key)
-            .ToList();
+            .ToHashSet(StringComparer.Ordinal);
 
         if (numericKeys.Count >= 2)
         {
@@ -200,17 +196,10 @@ internal sealed class OptimizationValidator
                         continue;
                     }
 
-                    double newVal;
-                    if (Math.Abs(baseVal) < 1e-10)
-                    {
-                        double additive = (rng.NextDouble() * 2.0 - 1.0) * perturbPct;
-                        newVal = baseVal + additive;
-                    }
-                    else
-                    {
-                        double factor = 1.0 + (rng.NextDouble() * 2.0 - 1.0) * perturbPct;
-                        newVal = baseVal * factor;
-                    }
+                    var bounds = ResolveBounds(parameterBounds, key);
+                    bool isInteger = bounds?.IsInteger ?? IsIntegerJsonNumber(val, baseVal);
+                    double signedPerturbation = (rng.NextDouble() * 2.0 - 1.0) * perturbPct;
+                    double newVal = PerturbNumericValue(baseVal, signedPerturbation, bounds, isInteger);
 
                     perturbed[key] = newVal;
                     label.Add($"{key}={baseVal:F4}→{newVal:F4}");
@@ -244,6 +233,11 @@ internal sealed class OptimizationValidator
         });
 
         return (issues.IsEmpty, issues.IsEmpty ? $"all perturbations within {degradationTolerance:P0} tolerance" : string.Join("; ", issues));
+
+        static (double Min, double Max, bool IsInteger)? ResolveBounds(
+            IReadOnlyDictionary<string, (double Min, double Max, bool IsInteger)>? bounds,
+            string key)
+            => bounds is not null && bounds.TryGetValue(key, out var value) ? value : null;
     }
 
     /// <summary>
@@ -471,7 +465,9 @@ internal sealed class OptimizationValidator
             selectedCombinations = indices.Take(maxCombinations).Select(i => allCombinations[i]).ToList();
         }
 
-        // Pre-build all fold splits (CPU-only, no IO) so the parallel phase is pure evaluation
+        // Pre-build all fold splits (CPU-only, no IO) so the parallel phase is pure evaluation.
+        // The purged train side is retained because it acts as a local support check
+        // before the corresponding OOS score is admitted to the CPCV distribution.
         var foldSplits = new List<(List<Candle> Train, List<Candle> Test)>();
         foreach (var testFoldIndices in selectedCombinations)
         {
@@ -522,6 +518,10 @@ internal sealed class OptimizationValidator
         {
             try
             {
+                var trainResult = await RunWithTimeoutAsync(strategy, paramsJson, split.Train, options, timeoutSecs, pCt);
+                if (trainResult.TotalTrades < minTrades)
+                    return;
+
                 var testResult = await RunWithTimeoutAsync(strategy, paramsJson, split.Test, options, timeoutSecs, pCt);
                 if (testResult.TotalTrades >= minTrades)
                     scores.Add(OptimizationHealthScorer.ComputeHealthScore(testResult));
@@ -956,4 +956,40 @@ internal sealed class OptimizationValidator
         EstimatedCapacityLots   = source.EstimatedCapacityLots,
         IsDeleted               = source.IsDeleted
     };
+
+    private static bool IsIntegerJsonNumber(JsonElement value, double numericValue)
+    {
+        if (value.ValueKind != JsonValueKind.Number)
+            return false;
+
+        return value.TryGetInt64(out _)
+            || Math.Abs(numericValue - Math.Round(numericValue)) < 1e-9;
+    }
+
+    private static double PerturbNumericValue(
+        double baseVal,
+        double signedPerturbation,
+        (double Min, double Max, bool IsInteger)? bounds,
+        bool isInteger)
+    {
+        double scale = bounds.HasValue
+            ? Math.Max(1e-9, bounds.Value.Max - bounds.Value.Min)
+            : Math.Max(Math.Abs(baseVal), 1.0);
+
+        double newVal = Math.Abs(baseVal) < 1e-10
+            ? baseVal + scale * signedPerturbation
+            : baseVal * (1.0 + signedPerturbation);
+
+        if (bounds.HasValue)
+            newVal = Math.Clamp(newVal, bounds.Value.Min, bounds.Value.Max);
+
+        if (isInteger)
+        {
+            newVal = Math.Round(newVal);
+            if (bounds.HasValue)
+                newVal = Math.Clamp(newVal, Math.Ceiling(bounds.Value.Min), Math.Floor(bounds.Value.Max));
+        }
+
+        return newVal;
+    }
 }

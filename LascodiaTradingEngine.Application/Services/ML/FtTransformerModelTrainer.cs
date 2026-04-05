@@ -47,7 +47,7 @@ namespace LascodiaTradingEngine.Application.Services.ML;
 /// Registered with key "fttransformer".
 /// </summary>
 [RegisterKeyedService(typeof(IMLModelTrainer), LearnerArchitecture.FtTransformer)]
-public sealed class FtTransformerModelTrainer : IMLModelTrainer
+public sealed partial class FtTransformerModelTrainer : IMLModelTrainer
 {
     // ── Constants ────────────────────────────────────────────────────────────
 
@@ -98,6 +98,7 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
         ct.ThrowIfCancellationRequested();
 
         int F = samples[0].Features.Length;
+        double sharpeAnnual = hp.SharpeAnnualisationFactor > 0.0 ? hp.SharpeAnnualisationFactor : 252.0;
 
         if (samples.Count < hp.MinSamples)
             throw new InvalidOperationException(
@@ -151,7 +152,7 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
 
         // ── 2. Walk-forward cross-validation ─────────────────────────────────
         var (cvResult, equityCurveGateFailed) = RunWalkForwardCV(
-            allStd, hp, F, embedDim, numHeads, ffnDim, numLayers, ct);
+            allStd, hp, F, embedDim, numHeads, ffnDim, numLayers, sharpeAnnual, ct);
         _logger.LogInformation(
             "FT-Transformer walk-forward CV — folds={Folds} avgAcc={Acc:P1} stdAcc={Std:P1} avgF1={F1:F3} avgEV={EV:F4} avgSharpe={Sharpe:F2}",
             cvResult.FoldCount, cvResult.AvgAccuracy, cvResult.StdAccuracy,
@@ -210,7 +211,7 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
 
         // ── 7. Final evaluation on held-out test set ──────────────────────────
         var testBuf = new InferenceBuffers(F, embedDim, numHeads, ffnDim);
-        var finalMetrics = EvaluateModel(testSet, model, magWeights, magBias, plattA, plattB, F, testBuf);
+        var finalMetrics = EvaluateModel(testSet, model, magWeights, magBias, plattA, plattB, F, testBuf, sharpeAnnual);
 
         _logger.LogInformation(
             "FT-Transformer final eval — acc={Acc:P1} f1={F1:F3} ev={EV:F4} brier={Brier:F4} sharpe={Sharpe:F2}",
@@ -218,11 +219,14 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
             finalMetrics.ExpectedValue, finalMetrics.BrierScore, finalMetrics.SharpeRatio);
 
         // ── 8. ECE post-Platt ────────────────────────────────────────────────
-        double ece = ComputeEce(testSet, model, plattA, plattB, F, testBuf);
+        var (ece, eceBinConf, eceBinAcc, eceBinCount) = ComputeEce(testSet, model, plattA, plattB, F, testBuf);
         _logger.LogInformation("Post-Platt ECE={Ece:F4}", ece);
 
         // ── 9. EV-optimal decision threshold (tuned on cal set) ──────────────
-        double optimalThreshold = ComputeOptimalThreshold(calSet, model, plattA, plattB, F, calBuf);
+        int thrMinBps  = hp.ThresholdSearchMin  * 100;  // e.g. 30 → 3000
+        int thrMaxBps  = hp.ThresholdSearchMax  * 100;  // e.g. 75 → 7500
+        int thrStepBps = hp.ThresholdSearchStepBps > 0 ? hp.ThresholdSearchStepBps : 50;
+        double optimalThreshold = ComputeOptimalThreshold(calSet, model, plattA, plattB, F, calBuf, thrMinBps, thrMaxBps, thrStepBps);
         _logger.LogInformation("EV-optimal threshold={Thr:F2} (default 0.50)", optimalThreshold);
 
         // ── 10. Permutation feature importance ───────────────────────────────
@@ -268,7 +272,7 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
             var (pmw, pmb) = FitLinearRegressor(maskedTrain, activeF, prunedHp, ct);
             var prunedBuf = new InferenceBuffers(activeF, embedDim, numHeads, ffnDim);
             var (pA, pB) = FitPlattScaling(maskedCal, prunedModel, activeF, prunedBuf);
-            var prunedMetrics = EvaluateModel(maskedTest, prunedModel, pmw, pmb, pA, pB, activeF, prunedBuf);
+            var prunedMetrics = EvaluateModel(maskedTest, prunedModel, pmw, pmb, pA, pB, activeF, prunedBuf, sharpeAnnual);
 
             if (prunedMetrics.Accuracy >= finalMetrics.Accuracy - 0.005)
             {
@@ -284,8 +288,8 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
                 testSet      = maskedTest;   // downstream BSS uses masked features
                 calSet       = maskedCal;    // downstream conformal/temperature use masked features
                 calBuf       = prunedBuf;    // inference buffers sized for activeF
-                ece          = ComputeEce(maskedTest, model, pA, pB, F, prunedBuf);
-                optimalThreshold = ComputeOptimalThreshold(maskedCal, model, pA, pB, F, prunedBuf);
+                (ece, eceBinConf, eceBinAcc, eceBinCount) = ComputeEce(maskedTest, model, pA, pB, F, prunedBuf);
+                optimalThreshold = ComputeOptimalThreshold(maskedCal, model, pA, pB, F, prunedBuf, thrMinBps, thrMaxBps, thrStepBps);
                 (plattABuy, plattBBuy, plattASell, plattBSell) =
                     FitClassConditionalPlatt(maskedCal, model, F, prunedBuf);
                 avgKellyFraction = ComputeAvgKellyFraction(maskedCal, model, pA, pB, F, prunedBuf);
@@ -337,6 +341,12 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
 
         // ── 16. Post-training NaN/Inf weight sanitisation ────────────────────
         int sanitizedCount = SanitiseWeights(model);
+        if (model.UsePositionalBias)
+            for (int l = 0; l < model.NumLayers; l++)
+                if (model.Layers[l].PosBias is not null)
+                    for (int h = 0; h < model.NumHeads; h++)
+                        if (HasNonFiniteArray(model.Layers[l].PosBias![h]))
+                            { Array.Clear(model.Layers[l].PosBias[h]); sanitizedCount++; }
         if (sanitizedCount > 0)
             _logger.LogWarning("Post-training sanitisation: {N} weight arrays had non-finite values.", sanitizedCount);
 
@@ -372,6 +382,9 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
             PrunedFeatureCount          = prunedCount,
             OptimalThreshold            = optimalThreshold,
             Ece                         = ece,
+            ReliabilityBinConfidence    = eceBinConf,
+            ReliabilityBinAccuracy      = eceBinAcc,
+            ReliabilityBinCounts        = eceBinCount,
             ConformalQHat               = conformalQHat,
             BrierSkillScore             = brierSkillScore,
             TemperatureScale            = temperatureScale,
@@ -408,7 +421,14 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
                         Wff1 = model.Layers[l].Wff1, Bff1 = model.Layers[l].Bff1,
                         Wff2 = model.Layers[l].Wff2, Bff2 = model.Layers[l].Bff2,
                         Gamma2 = model.Layers[l].Gamma2, Beta2 = model.Layers[l].Beta2,
+                        PosBias = model.Layers[l].PosBias,
                     }).ToList(), JsonOpts)
+                : null,
+            FtTransformerAdditionalLayersBytes = model.NumLayers > 1
+                ? SerializeAdditionalLayersBinary(model)
+                : null,
+            FtTransformerPosBias = model.UsePositionalBias && model.Layers[0].PosBias is not null
+                ? model.Layers[0].PosBias.Select(h => (double[])h.Clone()).ToArray()
                 : null,
             FtTransformerClsToken       = model.ClsToken,
             FtTransformerGammaFinal     = model.GammaFinal,
@@ -431,163 +451,7 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
         return new TrainingResult(finalMetrics, cvResult, modelBytes);
     }
 
-    // ── Transformer model state ──────────────────────────────────────────────
-
-    /// <summary>Per-block weights for one transformer layer.</summary>
-    private sealed class TransformerLayer
-    {
-        public double[][] Wq;     // [EmbedDim][EmbedDim]
-        public double[][] Wk;     // [EmbedDim][EmbedDim]
-        public double[][] Wv;     // [EmbedDim][EmbedDim]
-        public double[][] Wo;     // [EmbedDim][EmbedDim]
-        public double[] Gamma1;   // [EmbedDim]
-        public double[] Beta1;    // [EmbedDim]
-        public double[][] Wff1;   // [EmbedDim][FfnDim]
-        public double[]   Bff1;   // [FfnDim]
-        public double[][] Wff2;   // [FfnDim][EmbedDim]
-        public double[]   Bff2;   // [EmbedDim]
-        public double[] Gamma2;   // [EmbedDim]
-        public double[] Beta2;    // [EmbedDim]
-
-        public TransformerLayer(int embedDim, int ffnDim)
-        {
-            Wq   = new double[embedDim][];
-            Wk   = new double[embedDim][];
-            Wv   = new double[embedDim][];
-            Wo   = new double[embedDim][];
-            Gamma1 = new double[embedDim];
-            Beta1  = new double[embedDim];
-            Wff1 = new double[embedDim][];
-            Bff1 = new double[ffnDim];
-            Wff2 = new double[ffnDim][];
-            Bff2 = new double[embedDim];
-            Gamma2 = new double[embedDim];
-            Beta2  = new double[embedDim];
-        }
-    }
-
-    /// <summary>Bundles all trained transformer parameters across all layers.</summary>
-    private sealed class TransformerModel
-    {
-        // Per-feature embedding
-        public double[][] We;     // [F][EmbedDim]
-        public double[][] Be;     // [F][EmbedDim]
-
-        // Learnable [CLS] token embedding
-        public double[] ClsToken; // [EmbedDim]
-
-        // Stacked transformer layers
-        public TransformerLayer[] Layers;
-
-        // Final LayerNorm (pre-norm architecture requires LN on the output)
-        public double[] GammaFinal; // [EmbedDim]
-        public double[] BetaFinal;  // [EmbedDim]
-
-        // Classifier head
-        public double[]   WOut;   // [EmbedDim]
-        public double     BOut;   // scalar
-
-        // Architecture dims
-        public int F;          // number of features (excludes [CLS])
-        public int SeqLen;     // F + 1 ([CLS] + features)
-        public int EmbedDim;
-        public int NumHeads;
-        public int HeadDim;
-        public int FfnDim;
-        public int NumLayers;
-
-        // Convenience accessors for layer 0 (backward compatibility with snapshot serialisation)
-        public double[][] Wq   { get => Layers[0].Wq;   set => Layers[0].Wq   = value; }
-        public double[][] Wk   { get => Layers[0].Wk;   set => Layers[0].Wk   = value; }
-        public double[][] Wv   { get => Layers[0].Wv;   set => Layers[0].Wv   = value; }
-        public double[][] Wo   { get => Layers[0].Wo;   set => Layers[0].Wo   = value; }
-        public double[]   Gamma1 { get => Layers[0].Gamma1; set => Layers[0].Gamma1 = value; }
-        public double[]   Beta1  { get => Layers[0].Beta1;  set => Layers[0].Beta1  = value; }
-        public double[][] Wff1 { get => Layers[0].Wff1; set => Layers[0].Wff1 = value; }
-        public double[]   Bff1 { get => Layers[0].Bff1; set => Layers[0].Bff1 = value; }
-        public double[][] Wff2 { get => Layers[0].Wff2; set => Layers[0].Wff2 = value; }
-        public double[]   Bff2 { get => Layers[0].Bff2; set => Layers[0].Bff2 = value; }
-        public double[]   Gamma2 { get => Layers[0].Gamma2; set => Layers[0].Gamma2 = value; }
-        public double[]   Beta2  { get => Layers[0].Beta2;  set => Layers[0].Beta2  = value; }
-
-        public TransformerModel(int f, int embedDim, int numHeads, int ffnDim, int numLayers = 1)
-        {
-            F         = f;
-            SeqLen    = f + 1; // [CLS] + F feature tokens
-            EmbedDim  = embedDim;
-            NumHeads  = numHeads;
-            HeadDim   = embedDim / numHeads;
-            FfnDim    = ffnDim;
-            NumLayers = numLayers;
-
-            We = new double[f][];
-            Be = new double[f][];
-            ClsToken = new double[embedDim];
-
-            Layers = new TransformerLayer[numLayers];
-            for (int l = 0; l < numLayers; l++)
-                Layers[l] = new TransformerLayer(embedDim, ffnDim);
-
-            GammaFinal = new double[embedDim];
-            BetaFinal  = new double[embedDim];
-
-            WOut = new double[embedDim];
-            BOut = 0.0;
-        }
-    }
-
-    // ── Reusable inference buffers ──────────────────────────────────────────
-
-    /// <summary>
-    /// Pre-allocated buffers for forward pass to eliminate GC pressure during
-    /// repeated inference (Platt fitting, ECE, permutation importance, etc.).
-    /// Supports multi-layer transformers by sharing Q/K/V/AttnOut/Res/Ffn buffers across layers.
-    /// </summary>
-    private sealed class InferenceBuffers
-    {
-        public readonly double[][] E;      // [S][EmbedDim] - embeddings / inter-layer input (S = F+1 with [CLS])
-        public readonly double[][] Q;      // [S][EmbedDim] - queries
-        public readonly double[][] K;      // [S][EmbedDim] - keys
-        public readonly double[][] V;      // [S][EmbedDim] - values
-        public readonly double[][] AttnOut;// [S][EmbedDim] - attention output
-        public readonly double[][] Scores; // [NumHeads][S*S] - attention scores per head
-        public readonly double[][] AttnW;  // [NumHeads][S*S] - attention weights per head
-        public readonly double[][] LnIn;   // [S][EmbedDim] - pre-norm LN output
-        public readonly double[][] Res1;   // [S][EmbedDim] - after attention + residual
-        public readonly double[][] LnIn2;  // [S][EmbedDim] - pre-norm LN2 output
-        public readonly double[][] FfnH;   // [S][FfnDim]   - FFN hidden
-        public readonly double[][] FfnOut; // [S][EmbedDim] - FFN output
-        public readonly double[][] Res2;   // [S][EmbedDim] - after FFN + residual
-        public readonly double[]   FinalLn;// [EmbedDim]    - final LN output for [CLS]
-
-        /// <param name="f">Number of features (SeqLen = f+1 with [CLS] token).</param>
-        public InferenceBuffers(int f, int embedDim, int numHeads, int ffnDim)
-        {
-            int s = f + 1; // [CLS] + F feature tokens
-            E      = Alloc2D(s, embedDim);
-            Q      = Alloc2D(s, embedDim);
-            K      = Alloc2D(s, embedDim);
-            V      = Alloc2D(s, embedDim);
-            AttnOut= Alloc2D(s, embedDim);
-            Scores = Alloc2D(numHeads, s * s);
-            AttnW  = Alloc2D(numHeads, s * s);
-            LnIn   = Alloc2D(s, embedDim);
-            Res1   = Alloc2D(s, embedDim);
-            LnIn2  = Alloc2D(s, embedDim);
-            FfnH   = Alloc2D(s, ffnDim);
-            FfnOut = Alloc2D(s, embedDim);
-            Res2   = Alloc2D(s, embedDim);
-            FinalLn= new double[embedDim];
-        }
-
-        private static double[][] Alloc2D(int rows, int cols)
-        {
-            var arr = new double[rows][];
-            for (int i = 0; i < rows; i++) arr[i] = new double[cols];
-            return arr;
-        }
-
-    }
+    // ── Transformer model types are in FtTransformerModelTrainer.Types.cs ───
 
     // ── Walk-forward cross-validation ─────────────────────────────────────────
 
@@ -599,6 +463,7 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
         int                  numHeads,
         int                  ffnDim,
         int                  numLayers,
+        double               sharpeAnnualisation,
         CancellationToken    ct)
     {
         int folds   = hp.WalkForwardFolds;
@@ -611,14 +476,10 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
             return (new WalkForwardResult(0, 0, 0, 0, 0, 0), false);
         }
 
-        var accList    = new List<double>(folds);
-        var f1List     = new List<double>(folds);
-        var evList     = new List<double>(folds);
-        var sharpeList = new List<double>(folds);
-        var foldImportances = new List<double[]>(folds);
-        int badFolds = 0;
+        var foldResults = new (double Acc, double F1, double EV, double Sharpe, double[] FoldImp, bool IsBad)?[folds];
+        int parallelism = Math.Min(folds, Math.Max(1, Environment.ProcessorCount / 2));
 
-        for (int fold = 0; fold < folds && !ct.IsCancellationRequested; fold++)
+        Parallel.For(0, folds, new ParallelOptions { MaxDegreeOfParallelism = parallelism, CancellationToken = ct }, fold =>
         {
             int testEnd   = (fold + 2) * foldSize;
             int testStart = testEnd - foldSize;
@@ -626,10 +487,7 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
             int trainEnd   = Math.Max(0, testStart - embargo - purgeExtra);
 
             if (trainEnd < hp.MinSamples)
-            {
-                _logger.LogDebug("Fold {Fold} skipped — insufficient training data ({N})", fold, trainEnd);
-                continue;
-            }
+                return; // skip fold
 
             var foldTrain = samples[..trainEnd].ToList();
 
@@ -642,7 +500,7 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
             }
 
             var foldTest = samples[testStart..Math.Min(testEnd, samples.Count)];
-            if (foldTest.Count < 20) continue;
+            if (foldTest.Count < 20) return;
 
             var cvHp = hp with
             {
@@ -650,9 +508,21 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
                 EarlyStoppingPatience = Math.Max(5,  hp.EarlyStoppingPatience / 2),
             };
 
-            var cvModel = FitTransformer(foldTrain, cvHp, featureCount, embedDim, numHeads, ffnDim, numLayers, null, ct);
+            // Per-fold Platt calibration: reserve last 10% of fold train for Platt fitting
+            int plattSize = Math.Max(10, foldTrain.Count / 10);
+            var foldTrainOnly = foldTrain.Count > plattSize + hp.MinSamples
+                ? foldTrain[..^plattSize]
+                : foldTrain;
+            var foldPlattSet = foldTrain.Count > plattSize + hp.MinSamples
+                ? foldTrain[^plattSize..]
+                : foldTrain[^Math.Min(plattSize, foldTrain.Count)..];
+
+            var cvModel = FitTransformer(foldTrainOnly, cvHp, featureCount, embedDim, numHeads, ffnDim, numLayers, null, ct);
             var cvBuf = new InferenceBuffers(featureCount, embedDim, numHeads, ffnDim);
-            var m = EvaluateModel(foldTest, cvModel, new double[featureCount], 0.0, 1.0, 0.0, featureCount, cvBuf);
+
+            // Fit per-fold Platt scaling
+            var (foldPlattA, foldPlattB) = FitPlattScaling(foldPlattSet, cvModel, featureCount, cvBuf);
+            var m = EvaluateModel(foldTest, cvModel, new double[featureCount], 0.0, foldPlattA, foldPlattB, featureCount, cvBuf, sharpeAnnualisation);
 
             // Compute per-feature mean |embedding weight| for stability scoring
             var foldImp = new double[featureCount];
@@ -676,7 +546,7 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
                                            foldTest[pi].Direction > 0 ? 1 : -1);
                 }
 
-                var (foldMaxDD, foldCurveSharpe) = ComputeEquityCurveStats(foldPredictions);
+                var (foldMaxDD, foldCurveSharpe) = ComputeEquityCurveStats(foldPredictions, sharpeAnnualisation);
 
                 if (hp.MaxFoldDrawdown < 1.0 && foldMaxDD > hp.MaxFoldDrawdown)
                     isBadFold = true;
@@ -684,17 +554,32 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
                     isBadFold = true;
             }
 
-            if (isBadFold) badFolds++;
+            foldResults[fold] = (m.Accuracy, m.F1, m.ExpectedValue, m.SharpeRatio, foldImp, isBadFold);
+        });
 
-            accList.Add(m.Accuracy);
-            f1List.Add(m.F1);
-            evList.Add(m.ExpectedValue);
-            sharpeList.Add(m.SharpeRatio);
-            foldImportances.Add(foldImp);
+        // Collect results
+        var accList    = new List<double>(folds);
+        var f1List     = new List<double>(folds);
+        var evList     = new List<double>(folds);
+        var sharpeList = new List<double>(folds);
+        var foldImportances = new List<double[]>(folds);
+        int badFolds = 0;
+        foreach (var fr in foldResults)
+        {
+            if (fr is null) continue;
+            accList.Add(fr.Value.Acc);
+            f1List.Add(fr.Value.F1);
+            evList.Add(fr.Value.EV);
+            sharpeList.Add(fr.Value.Sharpe);
+            foldImportances.Add(fr.Value.FoldImp);
+            if (fr.Value.IsBad) badFolds++;
         }
 
         if (accList.Count == 0)
-            return (new WalkForwardResult(0, 0, 0, 0, 0, 0), false);
+        {
+            _logger.LogWarning("Walk-forward CV: all folds skipped — failing equity-curve gate.");
+            return (new WalkForwardResult(0, 0, 0, 0, 0, 0), true);
+        }
 
         // Check equity-curve gate
         double badFoldThreshold = hp.MaxBadFoldFraction > 0.0 && hp.MaxBadFoldFraction < 1.0
@@ -775,6 +660,18 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
         }
 
         var model = new TransformerModel(featureCount, embedDim, numHeads, ffnDim, numLayers);
+        model.UsePositionalBias = hp.FtUsePositionalEncoding;
+        if (model.UsePositionalBias)
+        {
+            int S = featureCount + 1;
+            for (int l = 0; l < numLayers; l++)
+            {
+                model.Layers[l].PosBias = new double[numHeads][];
+                for (int h = 0; h < numHeads; h++)
+                    model.Layers[l].PosBias[h] = new double[S * S];
+            }
+        }
+
         int seed = HashCode.Combine(train.Count, featureCount, embedDim, train[0].Direction);
         var rng = new Random(seed);
 
@@ -787,7 +684,7 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
 
         if (hasFullWarmStart)
         {
-            LoadWarmStartWeights(model, warmStart!, featureCount, embedDim, ffnDim, rng);
+            LoadWarmStartWeights(model, warmStart!, featureCount, embedDim, ffnDim, rng, _logger);
             _logger.LogDebug("FT-Transformer warm-start: loaded weights from parent model (generation={Gen}).",
                 warmStart!.GenerationNumber);
         }
@@ -809,7 +706,7 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
         double labelSmoothing = hp.LabelSmoothing;
         double posLabel = 1.0 - labelSmoothing;
         double negLabel = labelSmoothing;
-        double dropoutRate = DefaultDropoutRate;
+        double dropoutRate = hp.FtDropoutRate > 0.0 ? hp.FtDropoutRate : DefaultDropoutRate;
 
         double bestValLoss = double.MaxValue;
         int patience = 0;
@@ -817,7 +714,7 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
         const int MaxNanReversions = 3;
         double lrScale = 1.0;
 
-        var bestModel = CloneModel(model);
+        var bestModel = CloneModelWithPosBias(model);
         double l2 = hp.L2Lambda;
 
         // Shuffled index array for epoch-level randomisation
@@ -826,20 +723,55 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
 
         // ── Gradient accumulator ────────────────────────────────────────────
         var grad = new TransformerGrad(featureCount, embedDim, ffnDim, numLayers);
+        if (model.UsePositionalBias)
+        {
+            int S = featureCount + 1;
+            for (int l = 0; l < numLayers; l++)
+            {
+                grad.LayerGrads[l].dPosBias = new double[numHeads][];
+                for (int h = 0; h < numHeads; h++)
+                    grad.LayerGrads[l].dPosBias[h] = new double[S * S];
+            }
+        }
 
         // ── Adam state ──────────────────────────────────────────────────────
         var adam = new AdamState(featureCount, embedDim, ffnDim, numLayers);
+        if (model.UsePositionalBias)
+        {
+            int S = featureCount + 1;
+            for (int l = 0; l < numLayers; l++)
+            {
+                adam.LayerStates[l].mPosBias = new double[numHeads][];
+                adam.LayerStates[l].vPosBias = new double[numHeads][];
+                for (int h = 0; h < numHeads; h++)
+                {
+                    adam.LayerStates[l].mPosBias[h] = new double[S * S];
+                    adam.LayerStates[l].vPosBias[h] = new double[S * S];
+                }
+            }
+        }
 
         // ── Forward/backward pass buffers ───────────────────────────────────
         var fwdBuf = new ForwardBuffers(featureCount, embedDim, numHeads, ffnDim, numLayers);
         var valBuf = new InferenceBuffers(featureCount, embedDim, numHeads, ffnDim);
 
+        int warmupEpochs = hp.FtWarmupEpochs;
+
         for (int epoch = 0; epoch < hp.MaxEpochs && !ct.IsCancellationRequested; epoch++)
             {
                 ct.ThrowIfCancellationRequested();
 
-                double alpha = hp.LearningRate * lrScale * 0.5 *
-                    (1.0 + Math.Cos(Math.PI * epoch / hp.MaxEpochs));
+                // Linear warmup then cosine annealing
+                double alpha;
+                if (warmupEpochs > 0 && epoch < warmupEpochs)
+                    alpha = hp.LearningRate * lrScale * ((epoch + 1.0) / warmupEpochs);
+                else
+                {
+                    int cosineEpoch = epoch - warmupEpochs;
+                    int cosineTotal = Math.Max(1, hp.MaxEpochs - warmupEpochs);
+                    alpha = hp.LearningRate * lrScale * 0.5 *
+                        (1.0 + Math.Cos(Math.PI * cosineEpoch / cosineTotal));
+                }
 
                 // Fisher-Yates shuffle of training indices each epoch
                 for (int i = indices.Length - 1; i > 0; i--)
@@ -873,7 +805,7 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
                         if (!double.IsFinite(p)) continue;
 
                         double err = p - y;
-                        BackwardPass(err, model, featureCount, fwdBuf, xRaw, grad, l2);
+                        BackwardPass(err, model, featureCount, fwdBuf, xRaw, grad, dropoutRate);
                     }
 
                     // Average gradients
@@ -888,12 +820,37 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
                     double bc2    = 1.0 - adam.Beta2t;
                     double alphAt = alpha * Math.Sqrt(bc2) / bc1;
 
-                    ApplyAdamUpdates(model, grad, adam, alphAt, featureCount, embedDim, ffnDim);
+                    double effectiveWd = l2;
+                    if (warmupEpochs > 0 && epoch < warmupEpochs)
+                        effectiveWd = l2 * ((epoch + 1.0) / warmupEpochs);
+
+                    ApplyAdamUpdates(model, grad, adam, alphAt, featureCount, embedDim, ffnDim, effectiveWd);
+
+                    // PosBias AdamW update (conditionally allocated, outside ApplyAdamUpdates)
+                    if (model.UsePositionalBias)
+                    {
+                        for (int l = 0; l < model.NumLayers; l++)
+                        {
+                            var L  = model.Layers[l];
+                            var lg = grad.LayerGrads[l];
+                            var la = adam.LayerStates[l];
+                            if (L.PosBias is not null && lg.dPosBias is not null && la.mPosBias is not null)
+                                AdamWUpdate2D(L.PosBias, lg.dPosBias, la.mPosBias, la.vPosBias!,
+                                    alphAt, model.NumHeads, model.SeqLen * model.SeqLen, effectiveWd);
+                        }
+                    }
 
                     // ── NaN/Inf guard with backoff ────────────────────────────
-                    if (!double.IsFinite(model.BOut) || HasNonFinite(model))
+                    bool hasNan = !double.IsFinite(model.BOut) || HasNonFinite(model);
+                    if (!hasNan && model.UsePositionalBias)
+                        for (int l = 0; l < model.NumLayers && !hasNan; l++)
+                            if (model.Layers[l].PosBias is not null)
+                                for (int h = 0; h < model.NumHeads && !hasNan; h++)
+                                    if (HasNonFiniteArray(model.Layers[l].PosBias![h])) hasNan = true;
+                    if (hasNan)
                     {
                         CopyModel(bestModel, model);
+                        CopyPosBias(bestModel, model);
                         nanReversions++;
                         _logger.LogWarning(
                             "NaN at epoch {Epoch}, batch {Batch} — reverting to checkpoint (reversion {N}/{Max}).",
@@ -911,7 +868,14 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
                     }
 
                     if (hp.MaxWeightMagnitude > 0.0)
+                    {
                         ClipWeights(model, hp.MaxWeightMagnitude);
+                        if (model.UsePositionalBias)
+                            for (int l = 0; l < model.NumLayers; l++)
+                                if (model.Layers[l].PosBias is not null)
+                                    for (int h = 0; h < model.NumHeads; h++)
+                                        ClipArray(model.Layers[l].PosBias![h], hp.MaxWeightMagnitude);
+                    }
                 }
 
                 // ── Early stopping ───────────────────────────────────────────
@@ -920,6 +884,7 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
                 {
                     bestValLoss = valLoss;
                     CopyModel(model, bestModel);
+                    CopyPosBias(model, bestModel);
                     patience = 0;
                 }
                 else if (++patience >= hp.EarlyStoppingPatience)
@@ -933,6 +898,7 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
             EndTraining:
 
         CopyModel(bestModel, model);
+        CopyPosBias(bestModel, model);
         return model;
     }
 
@@ -956,6 +922,13 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
 
         for (int l = 0; l < model.NumLayers; l++)
             InitialiseLayerWeights(model.Layers[l], embedDim, ffnDim, rng);
+
+        if (model.UsePositionalBias)
+            for (int l = 0; l < model.NumLayers; l++)
+                if (model.Layers[l].PosBias is not null)
+                    for (int h = 0; h < model.NumHeads; h++)
+                        for (int i = 0; i < model.Layers[l].PosBias![h].Length; i++)
+                            model.Layers[l].PosBias[h][i] = SampleGaussian(rng, 0.02);
 
         // Final LayerNorm (pre-norm output)
         Array.Fill(model.GammaFinal, 1.0);
@@ -1006,7 +979,8 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
     }
 
     private static void LoadWarmStartWeights(
-        TransformerModel model, ModelSnapshot ws, int F, int embedDim, int ffnDim, Random rng)
+        TransformerModel model, ModelSnapshot ws, int F, int embedDim, int ffnDim, Random rng,
+        ILogger? logger = null)
     {
         // Embeddings
         for (int f = 0; f < F; f++)
@@ -1049,39 +1023,51 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
         LoadVector(L0.Gamma2, ws.FtTransformerGamma2, embedDim, 1.0);
         LoadVector(L0.Beta2,  ws.FtTransformerBeta2,  embedDim, 0.0);
 
-        // Layers 1..N-1 from additional layers JSON (if available)
-        if (model.NumLayers > 1 && ws.FtTransformerAdditionalLayersJson is { Length: > 0 })
+        // Layers 1..N-1: try binary first, fall back to JSON
+        if (model.NumLayers > 1)
         {
-            try
+            List<SerializedLayerWeights>? additionalLayers = null;
+            if (ws.FtTransformerAdditionalLayersBytes is { Length: > 4 })
             {
-                var additionalLayers = JsonSerializer.Deserialize<List<SerializedLayerWeights>>(
-                    ws.FtTransformerAdditionalLayersJson, JsonOpts);
-                if (additionalLayers is not null)
+                try { additionalLayers = DeserializeAdditionalLayers(ws.FtTransformerAdditionalLayersBytes, embedDim, ffnDim); }
+                catch { /* fall through to JSON */ }
+            }
+            if (additionalLayers is null && ws.FtTransformerAdditionalLayersJson is { Length: > 0 })
+            {
+                try
                 {
-                    for (int l = 0; l < Math.Min(additionalLayers.Count, model.NumLayers - 1); l++)
-                    {
-                        var sl = additionalLayers[l];
-                        var tl = model.Layers[l + 1];
-                        LoadMatrix(tl.Wq, sl.Wq, embedDim, embedDim, rng, xavierAttn);
-                        LoadMatrix(tl.Wk, sl.Wk, embedDim, embedDim, rng, xavierAttn);
-                        LoadMatrix(tl.Wv, sl.Wv, embedDim, embedDim, rng, xavierAttn);
-                        LoadMatrix(tl.Wo, sl.Wo, embedDim, embedDim, rng, xavierAttn);
-                        LoadVector(tl.Gamma1, sl.Gamma1, embedDim, 1.0);
-                        LoadVector(tl.Beta1,  sl.Beta1,  embedDim, 0.0);
-                        LoadMatrix(tl.Wff1, sl.Wff1, embedDim, ffnDim, rng, xavierFfn1);
-                        LoadVector(tl.Bff1, sl.Bff1, ffnDim, 0.0);
-                        LoadMatrix(tl.Wff2, sl.Wff2, ffnDim, embedDim, rng, xavierFfn2);
-                        LoadVector(tl.Bff2, sl.Bff2, embedDim, 0.0);
-                        LoadVector(tl.Gamma2, sl.Gamma2, embedDim, 1.0);
-                        LoadVector(tl.Beta2,  sl.Beta2,  embedDim, 0.0);
-                    }
+                    additionalLayers = JsonSerializer.Deserialize<List<SerializedLayerWeights>>(
+                        ws.FtTransformerAdditionalLayersJson, JsonOpts);
+                }
+                catch (JsonException ex)
+                {
+                    logger?.LogDebug(ex, "Failed to deserialise additional layer weights from warm-start — layers 1..N will use fresh init.");
                 }
             }
-            catch { /* If deserialization fails, layers 1..N already have fresh init */ }
+            if (additionalLayers is not null)
+            {
+                for (int l = 0; l < Math.Min(additionalLayers.Count, model.NumLayers - 1); l++)
+                {
+                    var sl = additionalLayers[l];
+                    var tl = model.Layers[l + 1];
+                    LoadMatrix(tl.Wq, sl.Wq, embedDim, embedDim, rng, xavierAttn);
+                    LoadMatrix(tl.Wk, sl.Wk, embedDim, embedDim, rng, xavierAttn);
+                    LoadMatrix(tl.Wv, sl.Wv, embedDim, embedDim, rng, xavierAttn);
+                    LoadMatrix(tl.Wo, sl.Wo, embedDim, embedDim, rng, xavierAttn);
+                    LoadVector(tl.Gamma1, sl.Gamma1, embedDim, 1.0);
+                    LoadVector(tl.Beta1,  sl.Beta1,  embedDim, 0.0);
+                    LoadMatrix(tl.Wff1, sl.Wff1, embedDim, ffnDim, rng, xavierFfn1);
+                    LoadVector(tl.Bff1, sl.Bff1, ffnDim, 0.0);
+                    LoadMatrix(tl.Wff2, sl.Wff2, ffnDim, embedDim, rng, xavierFfn2);
+                    LoadVector(tl.Bff2, sl.Bff2, embedDim, 0.0);
+                    LoadVector(tl.Gamma2, sl.Gamma2, embedDim, 1.0);
+                    LoadVector(tl.Beta2,  sl.Beta2,  embedDim, 0.0);
+                }
+            }
         }
 
         // Any remaining layers beyond what warm-start covers get fresh init
-        int warmLayers = 1 + (ws.FtTransformerAdditionalLayersJson is { Length: > 0 } ? ws.FtTransformerNumLayers - 1 : 0);
+        int warmLayers = 1 + (ws.FtTransformerAdditionalLayersBytes is { Length: > 0 } || ws.FtTransformerAdditionalLayersJson is { Length: > 0 } ? ws.FtTransformerNumLayers - 1 : 0);
         for (int l = Math.Max(1, warmLayers); l < model.NumLayers; l++)
             InitialiseLayerWeights(model.Layers[l], embedDim, ffnDim, rng);
 
@@ -1109,22 +1095,7 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
         }
     }
 
-    /// <summary>Serialised per-layer weights for additional layers (1..N-1).</summary>
-    private sealed class SerializedLayerWeights
-    {
-        public double[][]? Wq { get; set; }
-        public double[][]? Wk { get; set; }
-        public double[][]? Wv { get; set; }
-        public double[][]? Wo { get; set; }
-        public double[]? Gamma1 { get; set; }
-        public double[]? Beta1 { get; set; }
-        public double[][]? Wff1 { get; set; }
-        public double[]? Bff1 { get; set; }
-        public double[][]? Wff2 { get; set; }
-        public double[]? Bff2 { get; set; }
-        public double[]? Gamma2 { get; set; }
-        public double[]? Beta2 { get; set; }
-    }
+    // SerializedLayerWeights → FtTransformerModelTrainer.Types.cs
 
     private static void LoadMatrix(double[][] dst, double[][]? src, int rows, int cols, Random rng, double std)
     {
@@ -1210,126 +1181,7 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
         };
     }
 
-    // ── Forward pass buffers for training (includes dropout masks) ─────────
-
-    /// <summary>Per-layer cached intermediates for backprop during training.</summary>
-    private sealed class LayerForwardCache
-    {
-        public readonly double[][] Input;      // [S][EmbedDim] - input to this layer (snapshot)
-        public readonly double[][] LnIn;       // [S][EmbedDim] - LN1 output (pre-norm before attention)
-        public readonly double[][] Q;          // [S][EmbedDim]
-        public readonly double[][] K;          // [S][EmbedDim]
-        public readonly double[][] V;          // [S][EmbedDim]
-        public readonly double[][] AttnOut;    // [S][EmbedDim]
-        public readonly double[][][] HeadScores; // [NumHeads][S][S]
-        public readonly double[][][] HeadAttnW;  // [NumHeads][S][S]
-        public readonly double[][] Res1;       // [S][EmbedDim]
-        public readonly double[][] LnIn2;      // [S][EmbedDim] - LN2 output (pre-norm before FFN)
-        public readonly double[][] FfnH;       // [S][FfnDim]
-        public readonly double[][] FfnHPreAct; // [S][FfnDim]
-        public readonly double[][] FfnOut;     // [S][EmbedDim]
-        public readonly double[][] Res2;       // [S][EmbedDim]
-
-        public readonly double[] Ln1Mean;      // [S]
-        public readonly double[] Ln1InvStd;    // [S]
-        public readonly double[][] Ln1Norm;    // [S][EmbedDim]
-        public readonly double[] Ln2Mean;      // [S]
-        public readonly double[] Ln2InvStd;    // [S]
-        public readonly double[][] Ln2Norm;    // [S][EmbedDim]
-
-        public readonly bool[][] AttnDropMask; // [NumHeads][S*S]
-        public readonly bool[][] FfnDropMask;  // [S][FfnDim]
-
-        // Final LN cache (only used for last layer, position 0)
-        public double FinalLnMean;
-        public double FinalLnInvStd;
-        public readonly double[] FinalLnNorm;  // [EmbedDim]
-        public readonly double[] FinalLnOut;   // [EmbedDim]
-
-        public LayerForwardCache(int s, int embedDim, int numHeads, int ffnDim)
-        {
-            Input    = Alloc2D(s, embedDim);
-            LnIn     = Alloc2D(s, embedDim);
-            Q        = Alloc2D(s, embedDim);
-            K        = Alloc2D(s, embedDim);
-            V        = Alloc2D(s, embedDim);
-            AttnOut  = Alloc2D(s, embedDim);
-            HeadScores = new double[numHeads][][];
-            HeadAttnW  = new double[numHeads][][];
-            for (int h = 0; h < numHeads; h++)
-            {
-                HeadScores[h] = Alloc2D(s, s);
-                HeadAttnW[h]  = Alloc2D(s, s);
-            }
-            Res1       = Alloc2D(s, embedDim);
-            LnIn2      = Alloc2D(s, embedDim);
-            FfnH       = Alloc2D(s, ffnDim);
-            FfnHPreAct = Alloc2D(s, ffnDim);
-            FfnOut     = Alloc2D(s, embedDim);
-            Res2       = Alloc2D(s, embedDim);
-
-            Ln1Mean   = new double[s];
-            Ln1InvStd = new double[s];
-            Ln1Norm   = Alloc2D(s, embedDim);
-            Ln2Mean   = new double[s];
-            Ln2InvStd = new double[s];
-            Ln2Norm   = Alloc2D(s, embedDim);
-
-            AttnDropMask = new bool[numHeads][];
-            for (int h = 0; h < numHeads; h++)
-                AttnDropMask[h] = new bool[s * s];
-            FfnDropMask = new bool[s][];
-            for (int i = 0; i < s; i++)
-                FfnDropMask[i] = new bool[ffnDim];
-
-            FinalLnNorm = new double[embedDim];
-            FinalLnOut  = new double[embedDim];
-        }
-
-        private static double[][] Alloc2D(int rows, int cols)
-        {
-            var arr = new double[rows][];
-            for (int i = 0; i < rows; i++) arr[i] = new double[cols];
-            return arr;
-        }
-    }
-
-    private sealed class ForwardBuffers
-    {
-        public readonly double[][] E;        // [S][EmbedDim] — embedding / inter-layer carrier (S = F+1)
-        public readonly double[]   FinalLn;  // [EmbedDim] — final LN output for [CLS]
-        public readonly LayerForwardCache[] LayerCaches;
-
-        public readonly int F;
-        public readonly int S;        // SeqLen = F + 1
-        public readonly int EmbedDim;
-        public readonly int NumHeads;
-        public readonly int HeadDim;
-        public readonly int FfnDim;
-        public readonly int NumLayers;
-
-        public ForwardBuffers(int f, int embedDim, int numHeads, int ffnDim, int numLayers = 1)
-        {
-            F = f; S = f + 1; EmbedDim = embedDim; NumHeads = numHeads;
-            HeadDim = embedDim / numHeads; FfnDim = ffnDim;
-            NumLayers = numLayers;
-
-            E      = Alloc2D(f + 1, embedDim);
-            FinalLn = new double[embedDim];
-
-            LayerCaches = new LayerForwardCache[numLayers];
-            for (int l = 0; l < numLayers; l++)
-                LayerCaches[l] = new LayerForwardCache(f + 1, embedDim, numHeads, ffnDim);
-        }
-
-        private static double[][] Alloc2D(int rows, int cols)
-        {
-            var arr = new double[rows][];
-            for (int i = 0; i < rows; i++) arr[i] = new double[cols];
-            return arr;
-        }
-
-    }
+    // LayerForwardCache, ForwardBuffers → FtTransformerModelTrainer.Types.cs
 
     // ── Forward pass (inference, no dropout, pre-norm with [CLS]) ────────────
 
@@ -1401,6 +1253,8 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
                     for (int d = 0; d < Dh; d++)
                         dot += buf.Q[r][hOff + d] * buf.K[c][hOff + d];
                     buf.Scores[h][r * S + c] = dot / sqrtDh;
+                    if (L.PosBias is not null && h < L.PosBias.Length)
+                        buf.Scores[h][r * S + c] += L.PosBias[h][r * S + c];
                 }
 
             for (int r = 0; r < S; r++)
@@ -1528,6 +1382,8 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
                         for (int d = 0; d < Dh; d++)
                             dot += lc.Q[r][hOff + d] * lc.K[c][hOff + d];
                         lc.HeadScores[h][r][c] = dot / sqrtDh;
+                        if (L.PosBias is not null && h < L.PosBias.Length)
+                            lc.HeadScores[h][r][c] += L.PosBias[h][r * S + c];
                     }
 
                 for (int r = 0; r < S; r++)
@@ -1546,7 +1402,11 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
                         lc.HeadAttnW[h][r][c] /= sum;
                 }
 
-                // Issue #1 fix: Attention dropout zeroes weights WITHOUT rescaling
+                // Cache pre-dropout softmax for backward pass
+                for (int r = 0; r < S; r++)
+                    Array.Copy(lc.HeadAttnW[h][r], lc.PreDropAttnW[h][r], S);
+
+                // Attention dropout with inverted scaling (consistent with FFN dropout)
                 if (dropoutRate > 0.0)
                 {
                     for (int r = 0; r < S; r++)
@@ -1554,7 +1414,7 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
                         {
                             bool keep = rng.NextDouble() >= dropoutRate;
                             lc.AttnDropMask[h][r * S + c] = keep;
-                            lc.HeadAttnW[h][r][c] = keep ? lc.HeadAttnW[h][r][c] : 0.0;
+                            lc.HeadAttnW[h][r][c] = keep ? lc.HeadAttnW[h][r][c] * dropScale : 0.0;
                         }
                 }
                 else
@@ -1647,11 +1507,13 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
 
     private static void BackwardPass(
         double err, TransformerModel model, int F,
-        ForwardBuffers buf, float[] xRaw, TransformerGrad grad, double l2)
+        ForwardBuffers buf, float[] xRaw, TransformerGrad grad,
+        double dropoutRate = 0.0)
     {
         int D  = model.EmbedDim;
         int H  = model.NumHeads;
         int Dh = model.HeadDim;
+        double dropScale = dropoutRate > 0.0 ? 1.0 / (1.0 - dropoutRate) : 1.0;
         int Ff = model.FfnDim;
         int S  = F + 1;
 
@@ -1660,7 +1522,7 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
         // ── Classifier head ─────────────────────────────────────────────
         grad.dBOut += err;
         for (int d = 0; d < D; d++)
-            grad.dWOut[d] += err * lastCache.FinalLnOut[d] + l2 * model.WOut[d];
+            grad.dWOut[d] += err * lastCache.FinalLnOut[d];
 
         // dFinalLn[d] = err * WOut[d]
         var dFinalLn = grad.Scratch1;
@@ -1675,7 +1537,7 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
 
         // dInput: gradient flowing into the last layer's output
         // Only [CLS] position (0) receives gradient from the classifier head
-        var dInput = grad.Scratch2D_SxD;
+        var dInput = grad.dInput;
         for (int i = 0; i < S; i++)
             Array.Clear(dInput[i], 0, D);
         Array.Copy(dClsFromFinalLn, dInput[0], D);
@@ -1691,13 +1553,10 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
             // dInput flows into both FFN_out and Res1 (residual)
 
             // FFN backward
-            var dRes1 = grad.Scratch2D_SxD3;
-            for (int i = 0; i < S; i++)
-                for (int d = 0; d < D; d++)
-                    dRes1[i][d] = dInput[i][d]; // residual path from Res2
+            var dRes1 = grad.dRes1;
 
             // FFN backward: weight gradients and dLnIn2 in a single pass
-            var dLnIn2 = grad.Scratch2D_SxD2;
+            var dLnIn2 = grad.dLnIn2;
             for (int i = 0; i < S; i++)
             {
                 Array.Clear(dLnIn2[i], 0, D);
@@ -1726,7 +1585,7 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
             }
 
             // LN2 backward: dLnIn2 → dRes1 (accumulate, not replace)
-            var dRes1FromLn2 = grad.Scratch2D_SxD4;
+            var dRes1FromLn2 = grad.dRes1FromLn2;
             for (int i = 0; i < S; i++)
                 LayerNormBackward(dLnIn2[i], lc.Ln2Norm[i], L.Gamma2,
                     lc.Ln2InvStd[i], D, dRes1FromLn2[i],
@@ -1739,13 +1598,13 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
 
             // Res1 = Wo @ AttnOut + Input, so dInput flows to both
             // dE = gradient flowing to this layer's input (from residual of Res1)
-            var dE = grad.Scratch2D_SxD5;
+            var dE = grad.dE;
             for (int i = 0; i < S; i++)
                 for (int d = 0; d < D; d++)
                     dE[i][d] = dRes1[i][d]; // residual path
 
             // Wo backward: dRes1 → dAttnOut
-            var dAttnOut = grad.Scratch2D_SxD6;
+            var dAttnOut = grad.dAttnOut;
             for (int i = 0; i < S; i++)
                 for (int d = 0; d < D; d++)
                 {
@@ -1759,9 +1618,9 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
                 }
 
             // Multi-head attention backward
-            var dQ = grad.Scratch2D_SxD7;
-            var dK = grad.Scratch2D_SxD8;
-            var dV = grad.Scratch2D_SxD9;
+            var dQ = grad.dQ;
+            var dK = grad.dK;
+            var dV = grad.dV;
             for (int i = 0; i < S; i++)
             {
                 Array.Clear(dQ[i], 0, D);
@@ -1783,19 +1642,25 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
                             daw += dAttnOut[r][hOff + d] * lc.V[c][hOff + d];
                             dV[c][hOff + d] += dAttnOut[r][hOff + d] * lc.HeadAttnW[h][r][c];
                         }
+                        // Dropout backward: mask + inverted scaling
                         if (!lc.AttnDropMask[h][r * S + c])
                             daw = 0.0;
-                        grad.SoftmaxTemp[c] = daw;
+                        else if (dropScale != 1.0)
+                            daw *= dropScale;
+                        grad.dAttnWeightPerCol[c] = daw;
                     }
 
+                    // Softmax backward uses PRE-dropout probabilities
                     double dotSum = 0;
                     for (int c = 0; c < S; c++)
-                        dotSum += lc.HeadAttnW[h][r][c] * grad.SoftmaxTemp[c];
+                        dotSum += lc.PreDropAttnW[h][r][c] * grad.dAttnWeightPerCol[c];
 
                     for (int c = 0; c < S; c++)
                     {
-                        double dScore = lc.HeadAttnW[h][r][c] * (grad.SoftmaxTemp[c] - dotSum);
-                        dScore /= sqrtDh;
+                        double rawDScore = lc.PreDropAttnW[h][r][c] * (grad.dAttnWeightPerCol[c] - dotSum);
+                        if (lg.dPosBias is not null && h < lg.dPosBias.Length)
+                            lg.dPosBias[h][r * S + c] += rawDScore;
+                        double dScore = rawDScore / sqrtDh;
                         for (int d = 0; d < Dh; d++)
                         {
                             dQ[r][hOff + d] += dScore * lc.K[c][hOff + d];
@@ -1806,7 +1671,7 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
             }
 
             // Q, K, V projection backward → gradient w.r.t. LN1 output
-            var dLnIn = grad.Scratch2D_SxD10;
+            var dLnIn = grad.dLnIn;
             for (int i = 0; i < S; i++)
                 Array.Clear(dLnIn[i], 0, D);
 
@@ -1830,7 +1695,7 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
             }
 
             // LN1 backward: dLnIn → gradient w.r.t. layer input
-            var dInputFromLn1 = grad.Scratch2D_SxD11;
+            var dInputFromLn1 = grad.dInputFromLn1;
             for (int i = 0; i < S; i++)
                 LayerNormBackward(dLnIn[i], lc.Ln1Norm[i], L.Gamma1,
                     lc.Ln1InvStd[i], D, dInputFromLn1[i],
@@ -1840,25 +1705,6 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
             for (int i = 0; i < S; i++)
                 for (int d = 0; d < D; d++)
                     dE[i][d] += dInputFromLn1[i][d];
-
-            // L2 regularisation for shared projection matrices (once per layer, not per position)
-            if (l2 > 0.0)
-            {
-                for (int d1 = 0; d1 < D; d1++)
-                    for (int d2 = 0; d2 < D; d2++)
-                    {
-                        lg.dWq[d1][d2] += l2 * L.Wq[d1][d2];
-                        lg.dWk[d1][d2] += l2 * L.Wk[d1][d2];
-                        lg.dWv[d1][d2] += l2 * L.Wv[d1][d2];
-                        lg.dWo[d1][d2] += l2 * L.Wo[d1][d2];
-                    }
-                for (int d = 0; d < D; d++)
-                    for (int h = 0; h < Ff; h++)
-                        lg.dWff1[d][h] += l2 * L.Wff1[d][h];
-                for (int h = 0; h < Ff; h++)
-                    for (int d = 0; d < D; d++)
-                        lg.dWff2[h][d] += l2 * L.Wff2[h][d];
-            }
 
             // dE is now the gradient flowing into this layer's input.
             // Copy it to dInput for the previous layer (or embedding backward).
@@ -1874,369 +1720,17 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
         for (int f = 0; f < F; f++)
             for (int d = 0; d < D; d++)
             {
-                grad.dWe[f][d] += dInput[f + 1][d] * xRaw[f] + l2 * model.We[f][d];
-                grad.dBe[f][d] += dInput[f + 1][d] + l2 * model.Be[f][d];
+                grad.dWe[f][d] += dInput[f + 1][d] * xRaw[f];
+                grad.dBe[f][d] += dInput[f + 1][d];
             }
     }
 
-    // ── Per-layer gradient accumulator ────────────────────────────────────────
+    // LayerGrad → FtTransformerModelTrainer.Types.cs
 
-    private sealed class LayerGrad
-    {
-        public double[][] dWq, dWk, dWv, dWo;
-        public double[] dGamma1, dBeta1, dGamma2, dBeta2;
-        public double[][] dWff1;
-        public double[] dBff1;
-        public double[][] dWff2;
-        public double[] dBff2;
+    // TransformerGrad → FtTransformerModelTrainer.Types.cs
 
-        public LayerGrad(int D, int Ff)
-        {
-            dWq = Alloc2D(D, D); dWk = Alloc2D(D, D);
-            dWv = Alloc2D(D, D); dWo = Alloc2D(D, D);
-            dGamma1 = new double[D]; dBeta1 = new double[D];
-            dGamma2 = new double[D]; dBeta2 = new double[D];
-            dWff1 = Alloc2D(D, Ff); dBff1 = new double[Ff];
-            dWff2 = Alloc2D(Ff, D); dBff2 = new double[D];
-        }
+    // LayerAdamState, AdamState → FtTransformerModelTrainer.Types.cs
 
-        public void Zero()
-        {
-            Zero2D(dWq); Zero2D(dWk); Zero2D(dWv); Zero2D(dWo);
-            Array.Clear(dGamma1); Array.Clear(dBeta1);
-            Array.Clear(dGamma2); Array.Clear(dBeta2);
-            Zero2D(dWff1); Array.Clear(dBff1);
-            Zero2D(dWff2); Array.Clear(dBff2);
-        }
-
-        private static double[][] Alloc2D(int r, int c)
-        {
-            var a = new double[r][]; for (int i = 0; i < r; i++) a[i] = new double[c]; return a;
-        }
-        private static void Zero2D(double[][] a) { for (int i = 0; i < a.Length; i++) Array.Clear(a[i]); }
-    }
-
-    private sealed class TransformerGrad
-    {
-        public double[][] dWe, dBe;
-        public double[] dClsToken;
-        public LayerGrad[] LayerGrads;
-        public double[] dWOut;
-        public double dBOut;
-        public double[] dGammaFinal, dBetaFinal;
-
-        // Scratch buffers for backward pass (shared across layers, sized S = F+1)
-        public double[] Scratch1;     // [D]
-        public double[] ScratchD;     // [D]
-        public double[][] Scratch2D_SxD, Scratch2D_SxD2, Scratch2D_SxD3;
-        public double[][] Scratch2D_SxD4, Scratch2D_SxD5, Scratch2D_SxD6;
-        public double[][] Scratch2D_SxD7, Scratch2D_SxD8, Scratch2D_SxD9;
-        public double[][] Scratch2D_SxD10, Scratch2D_SxD11;
-        public double[] SoftmaxTemp;
-
-        public TransformerGrad(int F, int D, int Ff, int numLayers)
-        {
-            int S = F + 1;
-            dWe = Alloc2D(F, D); dBe = Alloc2D(F, D);
-            dClsToken = new double[D];
-            dWOut = new double[D];
-            dGammaFinal = new double[D];
-            dBetaFinal = new double[D];
-
-            LayerGrads = new LayerGrad[numLayers];
-            for (int l = 0; l < numLayers; l++)
-                LayerGrads[l] = new LayerGrad(D, Ff);
-
-            Scratch1 = new double[D];
-            ScratchD = new double[D];
-            Scratch2D_SxD   = Alloc2D(S, D); Scratch2D_SxD2  = Alloc2D(S, D);
-            Scratch2D_SxD3  = Alloc2D(S, D); Scratch2D_SxD4  = Alloc2D(S, D);
-            Scratch2D_SxD5  = Alloc2D(S, D); Scratch2D_SxD6  = Alloc2D(S, D);
-            Scratch2D_SxD7  = Alloc2D(S, D); Scratch2D_SxD8  = Alloc2D(S, D);
-            Scratch2D_SxD9  = Alloc2D(S, D); Scratch2D_SxD10 = Alloc2D(S, D);
-            Scratch2D_SxD11 = Alloc2D(S, D);
-            SoftmaxTemp = new double[S];
-        }
-
-        public void Zero()
-        {
-            Zero2D(dWe); Zero2D(dBe);
-            Array.Clear(dClsToken);
-            foreach (var lg in LayerGrads) lg.Zero();
-            Array.Clear(dWOut);
-            dBOut = 0;
-            Array.Clear(dGammaFinal);
-            Array.Clear(dBetaFinal);
-        }
-
-        public void Scale(double s)
-        {
-            Scale2D(dWe, s); Scale2D(dBe, s);
-            Scale1D(dClsToken, s);
-            foreach (var lg in LayerGrads)
-            {
-                Scale2D(lg.dWq, s); Scale2D(lg.dWk, s); Scale2D(lg.dWv, s); Scale2D(lg.dWo, s);
-                Scale1D(lg.dGamma1, s); Scale1D(lg.dBeta1, s);
-                Scale1D(lg.dGamma2, s); Scale1D(lg.dBeta2, s);
-                Scale2D(lg.dWff1, s); Scale1D(lg.dBff1, s);
-                Scale2D(lg.dWff2, s); Scale1D(lg.dBff2, s);
-            }
-            Scale1D(dWOut, s);
-            dBOut *= s;
-            Scale1D(dGammaFinal, s);
-            Scale1D(dBetaFinal, s);
-        }
-
-        public void ClipNorm(double maxNorm)
-        {
-            double normSq = dBOut * dBOut;
-            normSq += NormSq2D(dWe) + NormSq2D(dBe);
-            normSq += NormSq1D(dClsToken);
-            foreach (var lg in LayerGrads)
-            {
-                normSq += NormSq2D(lg.dWq) + NormSq2D(lg.dWk) + NormSq2D(lg.dWv) + NormSq2D(lg.dWo);
-                normSq += NormSq1D(lg.dGamma1) + NormSq1D(lg.dBeta1);
-                normSq += NormSq1D(lg.dGamma2) + NormSq1D(lg.dBeta2);
-                normSq += NormSq2D(lg.dWff1) + NormSq1D(lg.dBff1);
-                normSq += NormSq2D(lg.dWff2) + NormSq1D(lg.dBff2);
-            }
-            normSq += NormSq1D(dWOut);
-            normSq += NormSq1D(dGammaFinal) + NormSq1D(dBetaFinal);
-
-            double norm = Math.Sqrt(normSq);
-            if (norm > maxNorm)
-                Scale(maxNorm / norm);
-        }
-
-        private static double[][] Alloc2D(int r, int c)
-        {
-            var a = new double[r][]; for (int i = 0; i < r; i++) a[i] = new double[c]; return a;
-        }
-        private static void Zero2D(double[][] a) { for (int i = 0; i < a.Length; i++) Array.Clear(a[i]); }
-        private static void Scale2D(double[][] a, double s) { for (int i = 0; i < a.Length; i++) for (int j = 0; j < a[i].Length; j++) a[i][j] *= s; }
-        private static void Scale1D(double[] a, double s) { for (int i = 0; i < a.Length; i++) a[i] *= s; }
-        private static double NormSq2D(double[][] a) { double s = 0; for (int i = 0; i < a.Length; i++) for (int j = 0; j < a[i].Length; j++) s += a[i][j] * a[i][j]; return s; }
-        private static double NormSq1D(double[] a) { double s = 0; for (int i = 0; i < a.Length; i++) s += a[i] * a[i]; return s; }
-    }
-
-    // ── Per-layer Adam state ────────────────────────────────────────────────
-
-    private sealed class LayerAdamState
-    {
-        public double[][] mWq, vWq, mWk, vWk, mWv, vWv, mWo, vWo;
-        public double[] mGamma1, vGamma1, mBeta1, vBeta1;
-        public double[] mGamma2, vGamma2, mBeta2, vBeta2;
-        public double[][] mWff1, vWff1;
-        public double[] mBff1, vBff1;
-        public double[][] mWff2, vWff2;
-        public double[] mBff2, vBff2;
-
-        public LayerAdamState(int D, int Ff)
-        {
-            mWq = Z2D(D, D); vWq = Z2D(D, D); mWk = Z2D(D, D); vWk = Z2D(D, D);
-            mWv = Z2D(D, D); vWv = Z2D(D, D); mWo = Z2D(D, D); vWo = Z2D(D, D);
-            mGamma1 = new double[D]; vGamma1 = new double[D];
-            mBeta1  = new double[D]; vBeta1  = new double[D];
-            mGamma2 = new double[D]; vGamma2 = new double[D];
-            mBeta2  = new double[D]; vBeta2  = new double[D];
-            mWff1 = Z2D(D, Ff); vWff1 = Z2D(D, Ff);
-            mBff1 = new double[Ff]; vBff1 = new double[Ff];
-            mWff2 = Z2D(Ff, D); vWff2 = Z2D(Ff, D);
-            mBff2 = new double[D]; vBff2 = new double[D];
-        }
-
-        private static double[][] Z2D(int r, int c)
-        {
-            var a = new double[r][]; for (int i = 0; i < r; i++) a[i] = new double[c]; return a;
-        }
-    }
-
-    private sealed class AdamState
-    {
-        public double[][] mWe, vWe, mBe, vBe;
-        public double[] mClsToken, vClsToken;
-        public LayerAdamState[] LayerStates;
-        public double[] mGammaFinal, vGammaFinal, mBetaFinal, vBetaFinal;
-        public double[] mWOut, vWOut;
-        public double mBOut, vBOut;
-        public int Step;
-        public double Beta1t = 1.0, Beta2t = 1.0;
-
-        public AdamState(int F, int D, int Ff, int numLayers)
-        {
-            mWe = Z2D(F, D); vWe = Z2D(F, D); mBe = Z2D(F, D); vBe = Z2D(F, D);
-            mClsToken = new double[D]; vClsToken = new double[D];
-            LayerStates = new LayerAdamState[numLayers];
-            for (int l = 0; l < numLayers; l++)
-                LayerStates[l] = new LayerAdamState(D, Ff);
-            mGammaFinal = new double[D]; vGammaFinal = new double[D];
-            mBetaFinal  = new double[D]; vBetaFinal  = new double[D];
-            mWOut = new double[D]; vWOut = new double[D];
-        }
-
-        private static double[][] Z2D(int r, int c)
-        {
-            var a = new double[r][]; for (int i = 0; i < r; i++) a[i] = new double[c]; return a;
-        }
-
-    }
-
-    private static void ApplyAdamUpdates(
-        TransformerModel model, TransformerGrad grad, AdamState adam, double alphAt,
-        int F, int D, int Ff)
-    {
-        AdamUpdate2D(model.We, grad.dWe, adam.mWe, adam.vWe, alphAt, F, D);
-        AdamUpdate2D(model.Be, grad.dBe, adam.mBe, adam.vBe, alphAt, F, D);
-        AdamUpdate1D(model.ClsToken, grad.dClsToken, adam.mClsToken, adam.vClsToken, alphAt, D);
-
-        for (int l = 0; l < model.NumLayers; l++)
-        {
-            var L  = model.Layers[l];
-            var lg = grad.LayerGrads[l];
-            var la = adam.LayerStates[l];
-
-            AdamUpdate2D(L.Wq, lg.dWq, la.mWq, la.vWq, alphAt, D, D);
-            AdamUpdate2D(L.Wk, lg.dWk, la.mWk, la.vWk, alphAt, D, D);
-            AdamUpdate2D(L.Wv, lg.dWv, la.mWv, la.vWv, alphAt, D, D);
-            AdamUpdate2D(L.Wo, lg.dWo, la.mWo, la.vWo, alphAt, D, D);
-            AdamUpdate1D(L.Gamma1, lg.dGamma1, la.mGamma1, la.vGamma1, alphAt, D);
-            AdamUpdate1D(L.Beta1,  lg.dBeta1,  la.mBeta1,  la.vBeta1,  alphAt, D);
-            AdamUpdate2D(L.Wff1, lg.dWff1, la.mWff1, la.vWff1, alphAt, D, Ff);
-            AdamUpdate1D(L.Bff1, lg.dBff1, la.mBff1, la.vBff1, alphAt, Ff);
-            AdamUpdate2D(L.Wff2, lg.dWff2, la.mWff2, la.vWff2, alphAt, Ff, D);
-            AdamUpdate1D(L.Bff2, lg.dBff2, la.mBff2, la.vBff2, alphAt, D);
-            AdamUpdate1D(L.Gamma2, lg.dGamma2, la.mGamma2, la.vGamma2, alphAt, D);
-            AdamUpdate1D(L.Beta2,  lg.dBeta2,  la.mBeta2,  la.vBeta2,  alphAt, D);
-        }
-
-        AdamUpdate1D(model.GammaFinal, grad.dGammaFinal, adam.mGammaFinal, adam.vGammaFinal, alphAt, D);
-        AdamUpdate1D(model.BetaFinal,  grad.dBetaFinal,  adam.mBetaFinal,  adam.vBetaFinal,  alphAt, D);
-        AdamUpdate1D(model.WOut, grad.dWOut, adam.mWOut, adam.vWOut, alphAt, D);
-
-        adam.mBOut = AdamBeta1 * adam.mBOut + (1.0 - AdamBeta1) * grad.dBOut;
-        adam.vBOut = AdamBeta2 * adam.vBOut + (1.0 - AdamBeta2) * grad.dBOut * grad.dBOut;
-        model.BOut -= alphAt * adam.mBOut / (Math.Sqrt(adam.vBOut) + AdamEpsilon);
-    }
-
-    private static void AdamUpdate2D(double[][] w, double[][] g, double[][] m, double[][] v, double lr, int r, int c)
-    {
-        for (int i = 0; i < r; i++)
-            for (int j = 0; j < c; j++)
-            {
-                m[i][j] = AdamBeta1 * m[i][j] + (1.0 - AdamBeta1) * g[i][j];
-                v[i][j] = AdamBeta2 * v[i][j] + (1.0 - AdamBeta2) * g[i][j] * g[i][j];
-                w[i][j] -= lr * m[i][j] / (Math.Sqrt(v[i][j]) + AdamEpsilon);
-            }
-    }
-
-    private static void AdamUpdate1D(double[] w, double[] g, double[] m, double[] v, double lr, int n)
-    {
-        for (int i = 0; i < n; i++)
-        {
-            m[i] = AdamBeta1 * m[i] + (1.0 - AdamBeta1) * g[i];
-            v[i] = AdamBeta2 * v[i] + (1.0 - AdamBeta2) * g[i] * g[i];
-            w[i] -= lr * m[i] / (Math.Sqrt(v[i]) + AdamEpsilon);
-        }
-    }
-
-    // ── LayerNorm ─────────────────────────────────────────────────────────────
-
-    private static void LayerNormForward(double[] x, double[] gamma, double[] beta, double[] y, int D)
-    {
-        double mean = 0;
-        for (int d = 0; d < D; d++) mean += x[d];
-        mean /= D;
-
-        double variance = 0;
-        for (int d = 0; d < D; d++) { double diff = x[d] - mean; variance += diff * diff; }
-        double invStd = 1.0 / Math.Sqrt(variance / D + 1e-8);
-
-        for (int d = 0; d < D; d++)
-            y[d] = gamma[d] * (x[d] - mean) * invStd + beta[d];
-    }
-
-    private static void LayerNormForwardCached(
-        double[] x, double[] gamma, double[] beta, double[] y,
-        int D, ref double outMean, ref double outInvStd, double[] outNorm)
-    {
-        double mean = 0;
-        for (int d = 0; d < D; d++) mean += x[d];
-        mean /= D;
-
-        double variance = 0;
-        for (int d = 0; d < D; d++) { double diff = x[d] - mean; variance += diff * diff; }
-        double invStd = 1.0 / Math.Sqrt(variance / D + 1e-8);
-
-        outMean   = mean;
-        outInvStd = invStd;
-
-        for (int d = 0; d < D; d++)
-        {
-            outNorm[d] = (x[d] - mean) * invStd;
-            y[d] = gamma[d] * outNorm[d] + beta[d];
-        }
-    }
-
-    private static void LayerNormBackward(
-        double[] dOut, double[] norm, double[] gamma, double invStd,
-        int D, double[] dx, double[] dGamma, double[] dBeta)
-    {
-        // dGamma, dBeta accumulate across positions
-        for (int d = 0; d < D; d++)
-        {
-            dGamma[d] += dOut[d] * norm[d];
-            dBeta[d]  += dOut[d];
-        }
-
-        // dx = invStd * (gamma * dOut - mean(gamma * dOut) - norm * mean(gamma * dOut * norm))
-        double s1 = 0, s2 = 0;
-        for (int d = 0; d < D; d++)
-        {
-            double gd = gamma[d] * dOut[d];
-            s1 += gd;
-            s2 += gd * norm[d];
-        }
-        s1 /= D;
-        s2 /= D;
-
-        for (int d = 0; d < D; d++)
-            dx[d] = invStd * (gamma[d] * dOut[d] - s1 - norm[d] * s2);
-    }
-
-    // ── Activation functions ──────────────────────────────────────────────────
-
-    private static double GELU(double x)
-    {
-        // Approximate GELU: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-        const double sqrt2OverPi = 0.7978845608028654;
-        double inner = sqrt2OverPi * (x + 0.044715 * x * x * x);
-        return 0.5 * x * (1.0 + Math.Tanh(inner));
-    }
-
-    private static double GELUGrad(double x)
-    {
-        const double sqrt2OverPi = 0.7978845608028654;
-        double x3 = x * x * x;
-        double inner = sqrt2OverPi * (x + 0.044715 * x3);
-        double tanh = Math.Tanh(inner);
-        double sech2 = 1.0 - tanh * tanh;
-        double dInner = sqrt2OverPi * (1.0 + 3.0 * 0.044715 * x * x);
-        return 0.5 * (1.0 + tanh) + 0.5 * x * sech2 * dInner;
-    }
-
-    // ── Matrix multiply helper ──────────────────────────────────────────────
-
-    private static void MatMul(double[][] A, double[][] B, double[][] C, int M, int K, int N)
-    {
-        for (int i = 0; i < M; i++)
-            for (int j = 0; j < N; j++)
-            {
-                double s = 0;
-                for (int k = 0; k < K; k++)
-                    s += A[i][k] * B[k][j];
-                C[i][j] = s;
-            }
-    }
 
     // ── Magnitude regressor (mini-batch Adam) ────────────────────────────────
 
@@ -2542,7 +2036,7 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
     // ── Equity curve stats ───────────────────────────────────────────────────
 
     private static (double MaxDrawdown, double Sharpe) ComputeEquityCurveStats(
-        (int Predicted, int Actual)[] predictions)
+        (int Predicted, int Actual)[] predictions, double sharpeAnnualisation = 252.0)
     {
         if (predictions.Length == 0) return (0, 0);
 
@@ -2563,7 +2057,7 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
             if (dd > maxDD) maxDD = dd;
         }
 
-        return (maxDD, ComputeSharpe(returns, returns.Length));
+        return (maxDD, ComputeSharpe(returns, returns.Length, sharpeAnnualisation));
     }
 
     // ── Feature pruning helpers ──────────────────────────────────────────────
@@ -2603,7 +2097,8 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
     private static EvalMetrics EvaluateModel(
         List<TrainingSample> testSet, TransformerModel model,
         double[] magWeights, double magBias,
-        double plattA, double plattB, int featureCount, InferenceBuffers buf)
+        double plattA, double plattB, int featureCount, InferenceBuffers buf,
+        double sharpeAnnualisation = 252.0)
     {
         if (testSet.Count == 0)
             return new EvalMetrics(0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0);
@@ -2652,7 +2147,7 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
                 Accuracy: accuracy, Precision: precision, Recall: recall, F1: f1,
                 MagnitudeRmse: Math.Sqrt(sumMagSqErr / n), ExpectedValue: sumEV / n,
                 BrierScore: sumBrier / n, WeightedAccuracy: accuracy,
-                SharpeRatio: ComputeSharpe(returns, retCount),
+                SharpeRatio: ComputeSharpe(returns, retCount, sharpeAnnualisation),
                 TP: tp, FP: fp, FN: fn, TN: tn);
         }
         finally { ArrayPool<double>.Shared.Return(returns); }
@@ -2660,13 +2155,13 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
 
     // ── ECE ──────────────────────────────────────────────────────────────────
 
-    private static double ComputeEce(
+    private static (double Ece, double[]? BinConf, double[]? BinAcc, int[]? BinCount) ComputeEce(
         List<TrainingSample> testSet, TransformerModel model,
         double plattA, double plattB, int featureCount, InferenceBuffers buf)
     {
-        if (testSet.Count < 20) return 0.5;
+        if (testSet.Count < 20) return (0.5, null, null, null);
 
-        const int NumBins = 10;
+        int NumBins = Math.Max(5, Math.Min(20, (int)Math.Sqrt(testSet.Count)));
         var binConfSum = new double[NumBins];
         var binCorrect = new int[NumBins];
         var binCount   = new int[NumBins];
@@ -2683,21 +2178,29 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
         }
 
         double ece = 0;
+        var outBinConf = new double[NumBins];
+        var outBinAcc  = new double[NumBins];
         for (int b = 0; b < NumBins; b++)
         {
             if (binCount[b] == 0) continue;
-            ece += Math.Abs(binCorrect[b] / (double)binCount[b] - binConfSum[b] / binCount[b]) * binCount[b] / testSet.Count;
+            double avgConf = binConfSum[b] / binCount[b];
+            double avgAcc  = binCorrect[b] / (double)binCount[b];
+            outBinConf[b] = avgConf;
+            outBinAcc[b]  = avgAcc;
+            ece += Math.Abs(avgAcc - avgConf) * binCount[b] / testSet.Count;
         }
-        return ece;
+        return (ece, outBinConf, outBinAcc, binCount);
     }
 
     // ── EV-optimal threshold ─────────────────────────────────────────────────
 
     private static double ComputeOptimalThreshold(
         List<TrainingSample> dataSet, TransformerModel model,
-        double plattA, double plattB, int featureCount, InferenceBuffers buf)
+        double plattA, double plattB, int featureCount, InferenceBuffers buf,
+        int searchMinBps = 3000, int searchMaxBps = 7500, int stepBps = 50)
     {
         if (dataSet.Count < 30) return 0.5;
+        if (stepBps <= 0) stepBps = 50;
 
         var probs = new double[dataSet.Count];
         for (int i = 0; i < dataSet.Count; i++)
@@ -2708,9 +2211,9 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
         }
 
         double bestEV = double.MinValue, bestThr = 0.5;
-        for (int t = 30; t <= 75; t++)
+        for (int t = searchMinBps; t <= searchMaxBps; t += stepBps)
         {
-            double thr = t / 100.0, sumEV = 0;
+            double thr = t / 10000.0, sumEV = 0;
             for (int i = 0; i < dataSet.Count; i++)
             {
                 bool correct = (probs[i] >= thr) == (dataSet[i].Direction == 1);
@@ -2844,190 +2347,157 @@ public sealed class FtTransformerModelTrainer : IMLModelTrainer
         return count > 0 ? loss / count : double.MaxValue;
     }
 
-    // ── Weight sanitisation ──────────────────────────────────────────────────
+    // ── Positional bias helpers ──────────────────────────────────────────────
 
-    private static int SanitiseWeights(TransformerModel model)
+    private static void CopyPosBias(TransformerModel src, TransformerModel dst)
     {
-        int count = 0;
-        count += SanitiseMatrix(model.We, model.F);
-        count += SanitiseMatrix(model.Be, model.F);
-        count += SanitiseArray(model.ClsToken);
-        for (int l = 0; l < model.NumLayers; l++)
+        if (!src.UsePositionalBias) return;
+        for (int l = 0; l < src.NumLayers; l++)
+            if (src.Layers[l].PosBias is not null && dst.Layers[l].PosBias is not null)
+                for (int h = 0; h < src.NumHeads; h++)
+                    Array.Copy(src.Layers[l].PosBias![h], dst.Layers[l].PosBias![h],
+                        src.Layers[l].PosBias[h].Length);
+    }
+
+    private static TransformerModel CloneModelWithPosBias(TransformerModel src)
+    {
+        var dst = CloneModel(src);
+        if (src.UsePositionalBias)
         {
-            var L = model.Layers[l];
-            count += SanitiseMatrix(L.Wq, model.EmbedDim);
-            count += SanitiseMatrix(L.Wk, model.EmbedDim);
-            count += SanitiseMatrix(L.Wv, model.EmbedDim);
-            count += SanitiseMatrix(L.Wo, model.EmbedDim);
-            count += SanitiseArray(L.Gamma1);
-            count += SanitiseArray(L.Beta1);
-            count += SanitiseMatrix(L.Wff1, model.EmbedDim);
-            count += SanitiseArray(L.Bff1);
-            count += SanitiseMatrix(L.Wff2, model.FfnDim);
-            count += SanitiseArray(L.Bff2);
-            count += SanitiseArray(L.Gamma2);
-            count += SanitiseArray(L.Beta2);
+            dst.UsePositionalBias = true;
+            for (int l = 0; l < src.NumLayers; l++)
+                if (src.Layers[l].PosBias is not null)
+                {
+                    dst.Layers[l].PosBias = new double[src.NumHeads][];
+                    for (int h = 0; h < src.NumHeads; h++)
+                    {
+                        dst.Layers[l].PosBias[h] = new double[src.Layers[l].PosBias![h].Length];
+                        Array.Copy(src.Layers[l].PosBias[h], dst.Layers[l].PosBias[h],
+                            src.Layers[l].PosBias[h].Length);
+                    }
+                }
         }
-        count += SanitiseArray(model.GammaFinal);
-        count += SanitiseArray(model.BetaFinal);
-        count += SanitiseArray(model.WOut);
-        if (!double.IsFinite(model.BOut)) { model.BOut = 0.0; count++; }
-        return count;
-    }
-
-    private static int SanitiseMatrix(double[][] m, int rows)
-    {
-        int count = 0;
-        for (int r = 0; r < rows; r++)
-            if (HasNonFiniteArray(m[r])) { Array.Clear(m[r]); count++; }
-        return count;
-    }
-
-    private static int SanitiseArray(double[] a)
-    {
-        if (HasNonFiniteArray(a)) { Array.Clear(a); return 1; }
-        return 0;
-    }
-
-    // ── Model cloning ────────────────────────────────────────────────────────
-
-    private static TransformerModel CloneModel(TransformerModel src)
-    {
-        var dst = new TransformerModel(src.F, src.EmbedDim, src.NumHeads, src.FfnDim, src.NumLayers);
-        CopyModel(src, dst);
         return dst;
     }
 
-    private static void CopyModel(TransformerModel src, TransformerModel dst)
-    {
-        int D  = src.EmbedDim;
-        int Ff = src.FfnDim;
+    // ── Binary serialisation for additional layers (improvement 6+7) ─────────
 
-        for (int f = 0; f < src.F; f++) { dst.We[f] = [..src.We[f]]; dst.Be[f] = [..src.Be[f]]; }
-        dst.ClsToken = [..src.ClsToken];
-        for (int l = 0; l < src.NumLayers; l++)
+    private static byte[] SerializeAdditionalLayersBinary(TransformerModel model)
+    {
+        using var ms = new MemoryStream();
+        using var bw = new BinaryWriter(ms);
+
+        int numAdditional = model.NumLayers - 1;
+        int S = model.SeqLen;
+        bool hasPosBias = model.UsePositionalBias;
+
+        bw.Write(numAdditional);
+        bw.Write(model.NumHeads);
+        bw.Write(hasPosBias ? S * S : 0);
+
+        for (int l = 1; l < model.NumLayers; l++)
         {
-            var sL = src.Layers[l];
-            var dL = dst.Layers[l];
-            for (int d = 0; d < D; d++) { dL.Wq[d] = [..sL.Wq[d]]; dL.Wk[d] = [..sL.Wk[d]]; dL.Wv[d] = [..sL.Wv[d]]; dL.Wo[d] = [..sL.Wo[d]]; }
-            dL.Gamma1 = [..sL.Gamma1]; dL.Beta1 = [..sL.Beta1];
-            for (int d = 0; d < D; d++) dL.Wff1[d] = [..sL.Wff1[d]];
-            dL.Bff1 = [..sL.Bff1];
-            for (int d = 0; d < Ff; d++) dL.Wff2[d] = [..sL.Wff2[d]];
-            dL.Bff2 = [..sL.Bff2];
-            dL.Gamma2 = [..sL.Gamma2]; dL.Beta2 = [..sL.Beta2];
+            var layer = model.Layers[l];
+            WriteBinaryMatrix(bw, layer.Wq, model.EmbedDim, model.EmbedDim);
+            WriteBinaryMatrix(bw, layer.Wk, model.EmbedDim, model.EmbedDim);
+            WriteBinaryMatrix(bw, layer.Wv, model.EmbedDim, model.EmbedDim);
+            WriteBinaryMatrix(bw, layer.Wo, model.EmbedDim, model.EmbedDim);
+            WriteBinaryVector(bw, layer.Gamma1);
+            WriteBinaryVector(bw, layer.Beta1);
+            WriteBinaryMatrix(bw, layer.Wff1, model.EmbedDim, model.FfnDim);
+            WriteBinaryVector(bw, layer.Bff1);
+            WriteBinaryMatrix(bw, layer.Wff2, model.FfnDim, model.EmbedDim);
+            WriteBinaryVector(bw, layer.Bff2);
+            WriteBinaryVector(bw, layer.Gamma2);
+            WriteBinaryVector(bw, layer.Beta2);
+            if (hasPosBias && layer.PosBias is not null)
+                WriteBinaryMatrix(bw, layer.PosBias, model.NumHeads, S * S);
         }
-        dst.GammaFinal = [..src.GammaFinal];
-        dst.BetaFinal  = [..src.BetaFinal];
-        dst.WOut = [..src.WOut];
-        dst.BOut = src.BOut;
+
+        bw.Flush();
+        byte[] payload = ms.ToArray();
+
+        // Append CRC32 trailer
+        uint crc = ComputeCrc32(payload);
+        var result = new byte[payload.Length + 4];
+        Buffer.BlockCopy(payload, 0, result, 0, payload.Length);
+        BitConverter.TryWriteBytes(result.AsSpan(payload.Length), crc);
+        return result;
     }
 
-    private static void ClipWeights(TransformerModel model, double maxMag)
+    private static List<SerializedLayerWeights> DeserializeAdditionalLayers(byte[] data, int D, int Ff)
     {
-        ClipMatrix(model.We, model.F, maxMag);
-        ClipMatrix(model.Be, model.F, maxMag);
-        ClipArray(model.ClsToken, maxMag);
-        for (int l = 0; l < model.NumLayers; l++)
+        if (data.Length < 4) throw new InvalidOperationException("Binary blob too short");
+        int payloadLen = data.Length - 4;
+        uint storedCrc = BitConverter.ToUInt32(data, payloadLen);
+        uint computedCrc = ComputeCrc32(data[..payloadLen]);
+        if (storedCrc != computedCrc)
+            throw new InvalidOperationException("CRC32 mismatch");
+
+        var result = new List<SerializedLayerWeights>();
+        using var ms = new MemoryStream(data, 0, payloadLen);
+        using var br = new BinaryReader(ms);
+        int numLayers = br.ReadInt32();
+        int numHeads = br.ReadInt32();
+        int seqSq = br.ReadInt32();
+        for (int l = 0; l < numLayers; l++)
         {
-            var L = model.Layers[l];
-            ClipMatrix(L.Wq, model.EmbedDim, maxMag);
-            ClipMatrix(L.Wk, model.EmbedDim, maxMag);
-            ClipMatrix(L.Wv, model.EmbedDim, maxMag);
-            ClipMatrix(L.Wo, model.EmbedDim, maxMag);
-            ClipArray(L.Gamma1, maxMag); ClipArray(L.Beta1, maxMag);
-            ClipMatrix(L.Wff1, model.EmbedDim, maxMag);
-            ClipArray(L.Bff1, maxMag);
-            ClipMatrix(L.Wff2, model.FfnDim, maxMag);
-            ClipArray(L.Bff2, maxMag);
-            ClipArray(L.Gamma2, maxMag); ClipArray(L.Beta2, maxMag);
+            var lw = new SerializedLayerWeights
+            {
+                Wq = ReadBinaryMatrix(br, D, D), Wk = ReadBinaryMatrix(br, D, D),
+                Wv = ReadBinaryMatrix(br, D, D), Wo = ReadBinaryMatrix(br, D, D),
+                Gamma1 = ReadBinaryVector(br, D), Beta1 = ReadBinaryVector(br, D),
+                Wff1 = ReadBinaryMatrix(br, D, Ff), Bff1 = ReadBinaryVector(br, Ff),
+                Wff2 = ReadBinaryMatrix(br, Ff, D), Bff2 = ReadBinaryVector(br, D),
+                Gamma2 = ReadBinaryVector(br, D), Beta2 = ReadBinaryVector(br, D),
+            };
+            if (seqSq > 0 && numHeads > 0)
+                lw.PosBias = ReadBinaryMatrix(br, numHeads, seqSq);
+            result.Add(lw);
         }
-        ClipArray(model.GammaFinal, maxMag);
-        ClipArray(model.BetaFinal, maxMag);
-        ClipArray(model.WOut, maxMag);
-        model.BOut = Math.Clamp(model.BOut, -maxMag, maxMag);
+        return result;
     }
 
-    private static void ClipMatrix(double[][] m, int rows, double maxMag)
+    private static void WriteBinaryMatrix(BinaryWriter bw, double[][] m, int rows, int cols)
     {
         for (int r = 0; r < rows; r++)
-            for (int c = 0; c < m[r].Length; c++)
-                m[r][c] = Math.Clamp(m[r][c], -maxMag, maxMag);
+            for (int c = 0; c < cols; c++)
+                bw.Write(m[r][c]);
     }
 
-    private static void ClipArray(double[] a, double maxMag)
+    private static void WriteBinaryVector(BinaryWriter bw, double[] v)
     {
-        for (int i = 0; i < a.Length; i++)
-            a[i] = Math.Clamp(a[i], -maxMag, maxMag);
+        for (int i = 0; i < v.Length; i++)
+            bw.Write(v[i]);
     }
 
-    private static bool HasNonFinite(TransformerModel model)
+    private static double[][] ReadBinaryMatrix(BinaryReader br, int rows, int cols)
     {
-        if (!double.IsFinite(model.BOut)) return true;
-        if (HasNonFiniteArray(model.WOut)) return true;
-        if (HasNonFiniteArray(model.ClsToken)) return true;
-        if (HasNonFiniteArray(model.GammaFinal)) return true;
-        if (HasNonFiniteArray(model.BetaFinal)) return true;
-        for (int f = 0; f < model.F; f++)
-            if (HasNonFiniteArray(model.We[f]) || HasNonFiniteArray(model.Be[f])) return true;
-        for (int l = 0; l < model.NumLayers; l++)
+        var m = new double[rows][];
+        for (int r = 0; r < rows; r++)
         {
-            var L = model.Layers[l];
-            for (int d = 0; d < model.EmbedDim; d++)
-                if (HasNonFiniteArray(L.Wq[d]) || HasNonFiniteArray(L.Wk[d]) ||
-                    HasNonFiniteArray(L.Wv[d]) || HasNonFiniteArray(L.Wo[d])) return true;
-            if (HasNonFiniteArray(L.Gamma1) || HasNonFiniteArray(L.Beta1)) return true;
-            if (HasNonFiniteArray(L.Gamma2) || HasNonFiniteArray(L.Beta2)) return true;
-            for (int d = 0; d < model.EmbedDim; d++)
-                if (HasNonFiniteArray(L.Wff1[d])) return true;
-            if (HasNonFiniteArray(L.Bff1)) return true;
-            for (int d = 0; d < model.FfnDim; d++)
-                if (HasNonFiniteArray(L.Wff2[d])) return true;
-            if (HasNonFiniteArray(L.Bff2)) return true;
+            m[r] = new double[cols];
+            for (int c = 0; c < cols; c++) m[r][c] = br.ReadDouble();
         }
-        return false;
+        return m;
     }
 
-    private static bool HasNonFiniteArray(double[] arr)
+    private static double[] ReadBinaryVector(BinaryReader br, int len)
     {
-        for (int i = 0; i < arr.Length; i++) if (!double.IsFinite(arr[i])) return true;
-        return false;
+        var v = new double[len];
+        for (int i = 0; i < len; i++) v[i] = br.ReadDouble();
+        return v;
     }
 
-    private static double ComputeSharpe(double[] returns, int count)
+    private static uint ComputeCrc32(byte[] data)
     {
-        if (count < 2) return 0.0;
-        double sum = 0;
-        for (int i = 0; i < count; i++) sum += returns[i];
-        double mean = sum / count;
-        double varSum = 0;
-        for (int i = 0; i < count; i++) { double d = returns[i] - mean; varSum += d * d; }
-        double std = Math.Sqrt(varSum / (count - 1));
-        return std > 1e-10 ? mean / std * Math.Sqrt(252) : 0.0;
-    }
-
-    private static double StdDev(IEnumerable<double> values, double mean)
-    {
-        double sum = 0; int count = 0;
-        foreach (double v in values) { sum += (v - mean) * (v - mean); count++; }
-        return count > 1 ? Math.Sqrt(sum / (count - 1)) : 0.0;
-    }
-
-    private static double ComputeSharpeTrend(List<double> sharpePerFold)
-    {
-        if (sharpePerFold.Count < 3) return 0.0;
-        int n = sharpePerFold.Count;
-        double xMean = (n - 1) / 2.0;
-        double yMean = 0; foreach (var s in sharpePerFold) yMean += s; yMean /= n;
-        double num = 0, den = 0;
-        for (int i = 0; i < n; i++) { double dx = i - xMean; num += dx * (sharpePerFold[i] - yMean); den += dx * dx; }
-        return den > 1e-15 ? num / den : 0.0;
-    }
-
-    private static double SampleGaussian(Random rng, double std)
-    {
-        double u1 = 1.0 - rng.NextDouble();
-        double u2 = rng.NextDouble();
-        return std * Math.Sqrt(-2.0 * Math.Log(u1)) * Math.Cos(2.0 * Math.PI * u2);
+        uint crc = 0xFFFFFFFF;
+        for (int i = 0; i < data.Length; i++)
+        {
+            crc ^= data[i];
+            for (int bit = 0; bit < 8; bit++)
+                crc = (crc >> 1) ^ (0xEDB88320 & ~((crc & 1) - 1));
+        }
+        return ~crc;
     }
 }

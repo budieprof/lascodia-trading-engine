@@ -467,6 +467,7 @@ public sealed class MLSignalScorer : IMLSignalScorer
         !string.IsNullOrEmpty(snap.GbmTreesJson) ||
         !string.IsNullOrEmpty(snap.TabNetAttentionJson) ||
         !string.IsNullOrEmpty(snap.FtTransformerAdditionalLayersJson) ||
+        snap.FtTransformerAdditionalLayersBytes is { Length: > 0 } ||
         !string.IsNullOrEmpty(snap.RotationForestJson);
 
     private async Task<ModelSnapshot?> GetOrDeserializeSnapshotAsync(MLModel model)

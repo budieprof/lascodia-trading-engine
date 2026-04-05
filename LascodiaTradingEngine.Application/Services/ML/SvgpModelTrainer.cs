@@ -8,6 +8,7 @@ using TorchSharp;
 using TorchSharp.Modules;
 using static TorchSharp.torch;
 using static TorchSharp.torch.nn;
+using static LascodiaTradingEngine.Application.Services.ML.MLTrainerHelpers;
 
 namespace LascodiaTradingEngine.Application.Services.ML;
 
@@ -254,6 +255,8 @@ public sealed class SvgpModelTrainer : IMLModelTrainer
         // Warm-start: import inducing points from prior snapshot when geometry matches.
         // New format: double[M][F] (each sub-array is one inducing point).
         // Legacy format: double[1][M*F] (single flat array) — handle both for backward compat.
+        bool warmStartZImported = false;
+        double warmStartZDisplacement = 0.0;
         if (warmStart?.SvgpInducingPoints is { Length: > 0 } priorIp)
         {
             bool isNewFormat = priorIp.Length == M && priorIp[0].Length == F;
@@ -264,7 +267,12 @@ public sealed class SvgpModelTrainer : IMLModelTrainer
                 _logger.LogInformation("SVGP warm-start: importing {M} inducing points from prior snapshot.", M);
                 for (int m = 0; m < M; m++)
                     Array.Copy(priorIp[m], inducingPts[m], F);
+
+                // Snapshot pre-refinement positions to measure displacement
+                var preRefine = inducingPts.Select(p => p.ToArray()).ToArray();
                 inducingPts = KMeansRefine(trainSet, inducingPts, F, iters: 5);
+                warmStartZDisplacement = MeanInducingDisplacement(preRefine, inducingPts, M, F);
+                warmStartZImported = true;
             }
             else if (isLegacyFlat)
             {
@@ -272,7 +280,11 @@ public sealed class SvgpModelTrainer : IMLModelTrainer
                 for (int m = 0; m < M; m++)
                     for (int fi = 0; fi < F; fi++)
                         inducingPts[m][fi] = priorIp[0][m * F + fi];
+
+                var preRefine = inducingPts.Select(p => p.ToArray()).ToArray();
                 inducingPts = KMeansRefine(trainSet, inducingPts, F, iters: 5);
+                warmStartZDisplacement = MeanInducingDisplacement(preRefine, inducingPts, M, F);
+                warmStartZImported = true;
             }
         }
 
@@ -293,18 +305,36 @@ public sealed class SvgpModelTrainer : IMLModelTrainer
         // Initialise ARD length scales from per-feature std of training data
         double[] initArdLs = ComputeArdLsFromData(trainSet, F);
 
-        // Warm-start variational params if snapshot matches
-        double[]? warmM     = warmStart?.SvgpVariationalMean?.Length == M
+        // Warm-start variational params if snapshot matches — but invalidate
+        // if K-means refinement shifted the inducing geometry too far.
+        const double MaxWarmStartDisplacement = 1.0; // in standardized feature space
+        bool varParamsValid = warmStartZImported && warmStartZDisplacement <= MaxWarmStartDisplacement;
+        if (warmStartZImported && !varParamsValid)
+            _logger.LogWarning(
+                "SVGP warm-start: inducing point displacement {Disp:F3} > {Max:F1} — discarding variational params, using fresh initialization.",
+                warmStartZDisplacement, MaxWarmStartDisplacement);
+        else if (warmStartZImported)
+            _logger.LogInformation(
+                "SVGP warm-start: inducing point displacement {Disp:F3} — variational params retained.",
+                warmStartZDisplacement);
+
+        double[]? warmM     = varParamsValid && warmStart?.SvgpVariationalMean?.Length == M
             ? warmStart.SvgpVariationalMean : null;
-        double[]? warmLogS  = warmStart?.SvgpVariationalLogSDiag?.Length == M
+        double[]? warmLogS  = varParamsValid && warmStart?.SvgpVariationalLogSDiag?.Length == M
             ? warmStart.SvgpVariationalLogSDiag : null;
-        double[]? warmLogLs = warmStart?.SvgpArdLengthScales?.Length == F
+        double[]? warmLogLs = warmStartZImported && warmStart?.SvgpArdLengthScales?.Length == F
             ? warmStart.SvgpArdLengthScales.Select(v => Math.Log(v)).ToArray() : null;
-        // Warm-start full-rank L_S off-diagonal if geometry matches
-        double[]? warmLSOffDiag = warmLogS != null
+        // Warm-start full-rank L_S off-diagonal if geometry matches and displacement is acceptable
+        double[]? warmLSOffDiag = varParamsValid && warmLogS != null
             && warmStart?.SvgpVariationalLSOffDiag?.Length == M * M
             && warmStart.SvgpVariationalLSOffDiag.All(double.IsFinite)
             ? warmStart.SvgpVariationalLSOffDiag : null;
+        // Warm-start kernel hyperparams (signal variance, noise) — these are global
+        // scale parameters independent of inducing geometry, so always import when available.
+        double? warmLogSf = warmStartZImported && warmStart!.SvgpSignalVariance > 1e-12
+            ? 0.5 * Math.Log(warmStart.SvgpSignalVariance) : null;   // log(σ_f) = ½ log(σ_f²)
+        double? warmLogNoi = warmStartZImported && warmStart!.SvgpNoiseVariance > 1e-12
+            ? Math.Log(warmStart.SvgpNoiseVariance) : null;           // log(σ_n)
 
         int miniBatch = hp.SvgpMiniBatchSize is > 0
             ? hp.SvgpMiniBatchSize.Value : DefaultMiniBatchSize;
@@ -314,6 +344,7 @@ public sealed class SvgpModelTrainer : IMLModelTrainer
             trainSet, inducingPts, combinedWeights,
             M, F, initArdLs,
             warmM, warmLogS, warmLogLs, warmLSOffDiag,
+            warmLogSf, warmLogNoi,
             ElboEpochs, ElboPatience, device, ct,
             miniBatchSize: miniBatch);
 
@@ -376,9 +407,9 @@ public sealed class SvgpModelTrainer : IMLModelTrainer
         float[] finalCalProbs  = ApplyFullCalibration(calMeans,  plattA, plattB, isotonicBp, tempScale);
         float[] finalTestProbs = ApplyFullCalibration(testMeans, plattA, plattB, isotonicBp, tempScale);
 
-        // ── 10. ECE and Brier Skill Score (Platt-calibrated test set) ─────────
-        double ece = ComputeEce(calibTestProbs, testSet);
-        double bss = ComputeBss(calibTestProbs, testSet);
+        // ── 10. ECE and Brier Skill Score (fully-calibrated test set) ─────────
+        double ece = ComputeEce(finalTestProbs, testSet);
+        double bss = ComputeBss(finalTestProbs, testSet);
         _logger.LogInformation("SVGP ECE={Ece:F4} BSS={Bss:F4}", ece, bss);
 
         // ── 11. EV-optimal threshold and Kelly fraction ───────────────────────
@@ -388,7 +419,15 @@ public sealed class SvgpModelTrainer : IMLModelTrainer
         _logger.LogInformation(
             "SVGP threshold={Thr:F2} Kelly={Kelly:F4}", optimalThreshold, avgKellyFraction);
 
-        // ── 12. Final evaluation on test set ─────────────────────────────────
+        // ── 12. Magnitude regressors (before final eval so RMSE is correct) ──
+        var (magWeights, magBias) = FitMagnitudeRegressor(trainSet, F);
+
+        double[] magQ90Weights = [];
+        double   magQ90Bias    = 0.0;
+        if (hp.MagnitudeQuantileTau > 0.0 && trainSet.Count >= hp.MinSamples)
+            (magQ90Weights, magQ90Bias) = FitQuantileRegressor(trainSet, F, hp.MagnitudeQuantileTau);
+
+        // ── 13. Final evaluation on test set ─────────────────────────────────
         var finalMetrics = ComputeFullMetrics(finalTestProbs, testSet, optimalThreshold, sharpeAnnFactor);
         _logger.LogInformation(
             "SVGP test — acc={Acc:P1} f1={F1:F3} ev={EV:F4} sharpe={Sharpe:F2} ELBO={Elbo:F2}",
@@ -397,7 +436,7 @@ public sealed class SvgpModelTrainer : IMLModelTrainer
 
         ct.ThrowIfCancellationRequested();
 
-        // ── 13. Permutation feature importance (test + cal, parallel) ─────────
+        // ── 14. Permutation feature importance (test + cal, parallel) ─────────
         float[] featureImportance = testSet.Count >= 10
             ? ComputePermutationImportance(testSet, inducingPts, alphaData, F, M, ardLs, sf2Val, plattA, plattB, ct)
             : new float[F];
@@ -417,16 +456,6 @@ public sealed class SvgpModelTrainer : IMLModelTrainer
         float[] calImportanceScores = calSet.Count >= 10
             ? ComputePermutationImportance(calSet, inducingPts, alphaData, F, M, ardLs, sf2Val, plattA, plattB, ct)
             : new float[F];
-
-        ct.ThrowIfCancellationRequested();
-
-        // ── 14. Magnitude regressors ──────────────────────────────────────────
-        var (magWeights, magBias) = FitMagnitudeRegressor(trainSet, F);
-
-        double[] magQ90Weights = [];
-        double   magQ90Bias    = 0.0;
-        if (hp.MagnitudeQuantileTau > 0.0 && trainSet.Count >= hp.MinSamples)
-            (magQ90Weights, magQ90Bias) = FitQuantileRegressor(trainSet, F, hp.MagnitudeQuantileTau);
 
         // ── 15. Feature quantile breakpoints (PSI monitoring) ─────────────────
         double[][] featureQuantileBreakpoints = ComputeQuantileBreakpoints(trainSet, F);
@@ -630,6 +659,8 @@ public sealed class SvgpModelTrainer : IMLModelTrainer
         double[]?            warmLogSDiag,
         double[]?            warmArdLogLs,
         double[]?            warmLSOffDiag,
+        double?              warmLogSf,
+        double?              warmLogNoi,
         int epochs, int patience, Device device,
         CancellationToken ct,
         int miniBatchSize = DefaultMiniBatchSize)
@@ -672,13 +703,15 @@ public sealed class SvgpModelTrainer : IMLModelTrainer
             : new float[M * M];
         using var l_s_lower = new Parameter(tensor(initLSLower, new long[] { M, M }, ScalarType.Float32).to(device));
         using var log_ls    = new Parameter(tensor(initLogLs,   new long[] { F },    ScalarType.Float32).to(device));
-        using var log_sf    = new Parameter(tensor(new float[] { 0.0f },             ScalarType.Float32).to(device));
-        using var log_noi   = new Parameter(tensor(new float[] { (float)Math.Log(DefaultNoise) }, ScalarType.Float32).to(device));
+        using var log_sf    = new Parameter(tensor(new float[] { warmLogSf.HasValue ? (float)warmLogSf.Value : 0.0f }, ScalarType.Float32).to(device));
+        using var log_noi   = new Parameter(tensor(new float[] { warmLogNoi.HasValue ? (float)warmLogNoi.Value : (float)Math.Log(DefaultNoise) }, ScalarType.Float32).to(device));
 
-        // ── TorchSharp Adam (all ops stay on GPU) ─────────────────────────────
+        // ── TorchSharp Adam + cosine annealing LR schedule ──────────────────
         using var optimizer = torch.optim.Adam(
             new Parameter[] { z_var, m_var, l_s_diag, l_s_lower, log_ls, log_sf, log_noi },
             AdamLr, AdamBeta1, AdamBeta2, AdamEpsilon);
+        var scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max: epochs, eta_min: AdamLr * 0.01);
 
         double   bestElbo    = double.NegativeInfinity;
         float[]  bestZ       = zFlat.ToArray();
@@ -686,8 +719,8 @@ public sealed class SvgpModelTrainer : IMLModelTrainer
         float[]  bestLogDiag = initLogDiag.ToArray();
         float[]  bestLower   = new float[M * M];
         float[]  bestLogLs   = initLogLs.ToArray();
-        float    bestLogSf   = 0.0f;
-        float    bestLogNoi  = (float)Math.Log(DefaultNoise);
+        float    bestLogSf   = warmLogSf.HasValue ? (float)warmLogSf.Value : 0.0f;
+        float    bestLogNoi  = warmLogNoi.HasValue ? (float)warmLogNoi.Value : (float)Math.Log(DefaultNoise);
         int      noImprove   = 0;
 
         for (int epoch = 0; epoch < epochs; epoch++)
@@ -743,8 +776,8 @@ public sealed class SvgpModelTrainer : IMLModelTrainer
             var K_mm     = K_mm_raw + (nvar + Jitter)
                            * torch.eye((long)M, dtype: ScalarType.Float32, device: device);
 
-            // ── Cholesky L_mm [M, M] ─────────────────────────────────────────
-            var L_mm = torch.linalg.cholesky(K_mm);
+            // ── Cholesky L_mm [M, M] (progressive jitter retry on failure) ────
+            var L_mm = CholeskyWithRetry(K_mm, M, device, _logger);
 
             // ── Full-rank S = L_S L_S^T ───────────────────────────────────────
             // L_S is lower-triangular with positive diagonal.
@@ -793,7 +826,11 @@ public sealed class SvgpModelTrainer : IMLModelTrainer
             // ── Backward + Adam step (entirely on GPU) ────────────────────────
             optimizer.zero_grad();
             (-elbo).backward();
+            torch.nn.utils.clip_grad_norm_(
+                new Parameter[] { z_var, m_var, l_s_diag, l_s_lower, log_ls, log_sf, log_noi },
+                10.0);
             optimizer.step();
+            scheduler.step();
 
             // ── Early stopping ────────────────────────────────────────────────
             double elboVal = elbo.item<float>();
@@ -933,10 +970,10 @@ public sealed class SvgpModelTrainer : IMLModelTrainer
             using var diff_mm  = Z.unsqueeze(1) - Z.unsqueeze(0);
             using var K_mm_raw = sf2Val * (-0.5f * (diff_mm / ls_t.unsqueeze(0).unsqueeze(0))
                                  .pow(2f).sum(2L)).exp();
-            using var K_mm     = K_mm_raw + (noiseV + Jitter)
-                                 * torch.eye((long)M, dtype: ScalarType.Float32, device: device);
+            using var K_mm_base = K_mm_raw + (noiseV + Jitter)
+                                  * torch.eye((long)M, dtype: ScalarType.Float32, device: device);
 
-            using var L_mm      = torch.linalg.cholesky(K_mm);
+            using var L_mm = CholeskyWithRetry(K_mm_base, M, device);
             using var alpha_hat = torch.linalg.solve_triangular(
                                       L_mm, m_var.unsqueeze(1), upper: false).squeeze(1);
 
@@ -963,10 +1000,10 @@ public sealed class SvgpModelTrainer : IMLModelTrainer
             }
             else
             {
-                // Legacy diagonal fallback
+                // Legacy diagonal fallback: S = diag(s²) where s = diag(L_S)
                 using var s_diag = log_sd.clamp(SDiagLogMin, SDiagLogMax).exp();
                 q_var = (K_xx_d - V.pow(2f).sum(0L)
-                       + (s_diag.unsqueeze(1) * U.pow(2f)).sum(0L))
+                       + (s_diag.pow(2f).unsqueeze(1) * U.pow(2f)).sum(0L))
                        .clamp(min: 1e-6f);
             }
 
@@ -1053,6 +1090,7 @@ public sealed class SvgpModelTrainer : IMLModelTrainer
             var foldState = OptimizeSvgpElbo(
                 foldTrain, Z, foldImportanceW, foldM, F, foldArdLs,
                 null, null, null, null,
+                null, null,
                 CvElboEpochs, CvElboPatience, device, ct,
                 miniBatchSize: Math.Min(foldTrain.Count, DefaultMiniBatchSize));
 
@@ -1257,357 +1295,6 @@ public sealed class SvgpModelTrainer : IMLModelTrainer
         return probs;
     }
 
-    // ═════════════════════════════════════════════════════════════════════════
-    // CALIBRATION STACK
-    // ═════════════════════════════════════════════════════════════════════════
-
-    private static (double A, double B) FitPlatt(float[] rawProbs, List<TrainingSample> samples)
-    {
-        if (samples.Count < 5) return (1.0, 0.0);
-
-        double[] logits = new double[samples.Count];
-        for (int i = 0; i < samples.Count; i++)
-            logits[i] = Logit(Math.Clamp(rawProbs[i], 1e-7, 1.0 - 1e-7));
-
-        double a = 1.0, b = 0.0, bestA = 1.0, bestB = 0.0, bestLoss = double.MaxValue;
-        double mA = 0, mB = 0, vA = 0, vB = 0;
-        const double lr = 0.01, l2 = 1e-4;
-        const int maxEpochs = 300, patience = 30;
-        int noImprove = 0;
-
-        for (int epoch = 0; epoch < maxEpochs; epoch++)
-        {
-            double gradA = 0, gradB = 0, loss = 0;
-            for (int i = 0; i < samples.Count; i++)
-            {
-                double p   = Sigmoid(a * logits[i] + b);
-                double y   = samples[i].Direction > 0 ? 1.0 : 0.0;
-                double err = p - y;
-                gradA += err * logits[i];
-                gradB += err;
-                loss  -= y * Math.Log(Math.Max(p, 1e-10))
-                       + (1 - y) * Math.Log(Math.Max(1 - p, 1e-10));
-            }
-            int t = epoch + 1;
-            gradA = gradA / samples.Count + 2.0 * l2 * a;
-            gradB = gradB / samples.Count + 2.0 * l2 * b;
-            loss  = loss / samples.Count + l2 * (a * a + b * b);
-
-            mA = AdamBeta1 * mA + (1 - AdamBeta1) * gradA;
-            mB = AdamBeta1 * mB + (1 - AdamBeta1) * gradB;
-            vA = AdamBeta2 * vA + (1 - AdamBeta2) * gradA * gradA;
-            vB = AdamBeta2 * vB + (1 - AdamBeta2) * gradB * gradB;
-            a -= lr * (mA / (1 - Math.Pow(AdamBeta1, t))) / (Math.Sqrt(vA / (1 - Math.Pow(AdamBeta2, t))) + AdamEpsilon);
-            b -= lr * (mB / (1 - Math.Pow(AdamBeta1, t))) / (Math.Sqrt(vB / (1 - Math.Pow(AdamBeta2, t))) + AdamEpsilon);
-
-            if (loss < bestLoss - 1e-7) { bestLoss = loss; bestA = a; bestB = b; noImprove = 0; }
-            else if (++noImprove >= patience) break;
-        }
-        return (bestA, bestB);
-    }
-
-    private static (double ABuy, double BBuy, double ASell, double BSell) FitClassConditionalPlatt(
-        float[] rawProbs, List<TrainingSample> calSet)
-    {
-        const double lr     = 0.01;
-        const int    epochs = 200;
-
-        var buySamples  = new List<(double Logit, double Y)>();
-        var sellSamples = new List<(double Logit, double Y)>();
-
-        for (int i = 0; i < calSet.Count; i++)
-        {
-            double rawP  = Math.Clamp(rawProbs[i], 1e-7, 1.0 - 1e-7);
-            double logit = Logit(rawP);
-            double y     = calSet[i].Direction > 0 ? 1.0 : 0.0;
-            if (rawP >= 0.5) buySamples.Add((logit, y));
-            else             sellSamples.Add((logit, y));
-        }
-
-        static (double A, double B) FitSgd(List<(double Logit, double Y)> pairs)
-        {
-            if (pairs.Count < 5) return (1.0, 0.0); // identity on logit scale
-            double a = 1.0, b = 0.0;
-            for (int ep = 0; ep < epochs; ep++)
-            {
-                double dA = 0, dB = 0;
-                foreach (var (logit, y) in pairs)
-                {
-                    double p   = Sigmoid(a * logit + b);
-                    double err = p - y;
-                    dA += err * logit;
-                    dB += err;
-                }
-                int n = pairs.Count;
-                a -= lr * dA / n;
-                b -= lr * dB / n;
-            }
-            return (a, b);
-        }
-
-        var (aBuy,  bBuy)  = FitSgd(buySamples);
-        var (aSell, bSell) = FitSgd(sellSamples);
-        return (aBuy, bBuy, aSell, bSell);
-    }
-
-    private static float[] CalibratePlatt(float[] rawProbs, double plattA, double plattB)
-    {
-        var result = new float[rawProbs.Length];
-        for (int i = 0; i < rawProbs.Length; i++)
-        {
-            double logit = Logit(Math.Clamp(rawProbs[i], 1e-7, 1.0 - 1e-7));
-            result[i] = (float)Sigmoid(plattA * logit + plattB);
-        }
-        return result;
-    }
-
-    private static double[] FitIsotonicCalibration(float[] calibProbs, List<TrainingSample> calSet)
-    {
-        if (calSet.Count < 10) return [];
-
-        int cn = calSet.Count;
-        var pairs = new (double P, double Y)[cn];
-        for (int i = 0; i < cn; i++)
-            pairs[i] = (Math.Clamp(calibProbs[i], 1e-7, 1.0 - 1e-7), calSet[i].Direction > 0 ? 1.0 : 0.0);
-        Array.Sort(pairs, (a, b) => a.P.CompareTo(b.P));
-
-        var stack = new List<(double SumY, double SumP, int Count)>(cn);
-        foreach (var (P, Y) in pairs)
-        {
-            stack.Add((Y, P, 1));
-            while (stack.Count >= 2)
-            {
-                var last = stack[^1]; var prev = stack[^2];
-                if (prev.SumY / prev.Count > last.SumY / last.Count)
-                {
-                    stack.RemoveAt(stack.Count - 1);
-                    stack[^1] = (prev.SumY + last.SumY, prev.SumP + last.SumP, prev.Count + last.Count);
-                }
-                else break;
-            }
-        }
-
-        var bp = new double[stack.Count * 2];
-        for (int i = 0; i < stack.Count; i++)
-        {
-            bp[i * 2]     = stack[i].SumP / stack[i].Count;
-            bp[i * 2 + 1] = stack[i].SumY / stack[i].Count;
-        }
-        return bp;
-    }
-
-    private static double ApplyIsotonicCalibration(double p, double[] breakpoints)
-    {
-        if (breakpoints.Length < 4) return p;
-        int nPoints = breakpoints.Length / 2;
-        if (p <= breakpoints[0])                 return breakpoints[1];
-        if (p >= breakpoints[(nPoints - 1) * 2]) return breakpoints[(nPoints - 1) * 2 + 1];
-        int lo = 0, hi = nPoints - 2;
-        while (lo < hi)
-        {
-            int mid = (lo + hi) / 2;
-            if (breakpoints[(mid + 1) * 2] <= p) lo = mid + 1;
-            else hi = mid;
-        }
-        double x0 = breakpoints[lo * 2],       y0 = breakpoints[lo * 2 + 1];
-        double x1 = breakpoints[(lo + 1) * 2], y1 = breakpoints[(lo + 1) * 2 + 1];
-        return Math.Abs(x1 - x0) < 1e-15 ? (y0 + y1) / 2.0 : y0 + (p - x0) * (y1 - y0) / (x1 - x0);
-    }
-
-    private static float[] ApplyIsotonicArray(float[] probs, double[] breakpoints)
-    {
-        if (breakpoints.Length < 4) return probs;
-        var result = new float[probs.Length];
-        for (int i = 0; i < probs.Length; i++)
-            result[i] = (float)ApplyIsotonicCalibration(probs[i], breakpoints);
-        return result;
-    }
-
-    private static double FitTemperatureScaling(float[] isoCalProbs, List<TrainingSample> calSet)
-    {
-        if (calSet.Count < 10) return 1.0;
-        var logits = new double[calSet.Count];
-        for (int i = 0; i < calSet.Count; i++)
-            logits[i] = Logit(Math.Clamp(isoCalProbs[i], 1e-7, 1.0 - 1e-7));
-
-        double Nll(double T)
-        {
-            double loss = 0;
-            for (int i = 0; i < calSet.Count; i++)
-            {
-                double p = Sigmoid(logits[i] / T);
-                double y = calSet[i].Direction > 0 ? 1.0 : 0.0;
-                loss -= y * Math.Log(Math.Max(p, 1e-10)) + (1.0 - y) * Math.Log(Math.Max(1.0 - p, 1e-10));
-            }
-            return loss / calSet.Count;
-        }
-
-        double bestT = 1.0, bestNll = Nll(1.0);
-        for (int i = 1; i <= 100; i++)
-        {
-            double T   = 0.1 + i * 0.099;
-            double nll = Nll(T);
-            if (nll < bestNll) { bestNll = nll; bestT = T; }
-        }
-        return Math.Round(bestT, 4);
-    }
-
-    private static float[] ApplyFullCalibration(
-        float[] rawProbs, double plattA, double plattB,
-        double[] isotonicBp, double tempScale)
-    {
-        var result = new float[rawProbs.Length];
-        for (int i = 0; i < rawProbs.Length; i++)
-        {
-            double p = Sigmoid(plattA * Logit(Math.Clamp(rawProbs[i], 1e-7, 1.0 - 1e-7)) + plattB);
-            if (isotonicBp.Length >= 4)
-                p = ApplyIsotonicCalibration(p, isotonicBp);
-            if (Math.Abs(tempScale - 1.0) > 1e-6 && tempScale > 0.0)
-                p = Sigmoid(Logit(Math.Clamp(p, 1e-7, 1.0 - 1e-7)) / tempScale);
-            result[i] = (float)Math.Clamp(p, 1e-7, 1.0 - 1e-7);
-        }
-        return result;
-    }
-
-    // ═════════════════════════════════════════════════════════════════════════
-    // EVALUATION METRICS
-    // ═════════════════════════════════════════════════════════════════════════
-
-    private static double ComputeAvgKellyFraction(float[] calibProbs, List<TrainingSample> calSet)
-    {
-        if (calSet.Count == 0) return 0.0;
-        double sum = 0.0;
-        for (int i = 0; i < calSet.Count; i++)
-            sum += Math.Max(0.0, 2.0 * calibProbs[i] - 1.0);
-        return sum / calSet.Count * 0.5;
-    }
-
-    private static double ComputeEce(float[] calibProbs, List<TrainingSample> samples, int bins = 10)
-    {
-        if (samples.Count == 0) return 0;
-        int[] cnt = new int[bins];
-        double[] sumAcc = new double[bins], sumConf = new double[bins];
-        for (int i = 0; i < samples.Count; i++)
-        {
-            double p = calibProbs[i];
-            int    b = Math.Clamp((int)(p * bins), 0, bins - 1);
-            cnt[b]++;
-            sumAcc[b]  += samples[i].Direction > 0 ? 1.0 : 0.0; // positive-class frequency, not accuracy
-            sumConf[b] += p;
-        }
-        double ece = 0;
-        for (int b = 0; b < bins; b++)
-        {
-            if (cnt[b] == 0) continue;
-            ece += Math.Abs(sumAcc[b] / cnt[b] - sumConf[b] / cnt[b]) * cnt[b];
-        }
-        return ece / samples.Count;
-    }
-
-    private static double ComputeBss(float[] calibProbs, List<TrainingSample> samples)
-    {
-        if (samples.Count == 0) return 0;
-        int pos = samples.Count(s => s.Direction > 0);
-        double naiveP = (double)pos / samples.Count;
-        double brierModel = 0, brierNaive = 0;
-        for (int i = 0; i < samples.Count; i++)
-        {
-            double p = calibProbs[i], y = samples[i].Direction > 0 ? 1.0 : 0.0;
-            brierModel += (p - y) * (p - y);
-            brierNaive += (naiveP - y) * (naiveP - y);
-        }
-        return brierNaive > 1e-10 ? 1.0 - brierModel / brierNaive : 0.0;
-    }
-
-    private static double ComputeOptimalThreshold(
-        float[] calibProbs, List<TrainingSample> samples, int minPct, int maxPct)
-    {
-        if (samples.Count == 0) return 0.5;
-        double bestEV = double.NegativeInfinity, bestThr = 0.5;
-        for (int tPct = minPct; tPct <= maxPct; tPct += 2)
-        {
-            double thr = tPct / 100.0;
-            double evWin = 0, evLoss = 0;
-            int traded = 0;
-            for (int i = 0; i < samples.Count; i++)
-            {
-                double p = calibProbs[i];
-                if (p < thr && p > 1.0 - thr) continue;
-                traded++;
-                double mag = Math.Max(0.001, Math.Abs(samples[i].Magnitude));
-                if ((p >= 0.5 ? 1 : 0) == samples[i].Direction) evWin += mag;
-                else evLoss += mag;
-            }
-            if (traded == 0) continue;
-            double ev = (evWin - evLoss) / traded;
-            if (ev > bestEV) { bestEV = ev; bestThr = thr; }
-        }
-        return bestThr;
-    }
-
-    private static EvalMetrics ComputeFullMetrics(
-        float[] calibProbs, List<TrainingSample> samples, double threshold, double sharpeAnnFactor)
-    {
-        if (samples.Count == 0)
-            return new EvalMetrics(0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0);
-
-        int correct = 0, tp = 0, fp = 0, fn = 0, tn = 0;
-        double brierSum = 0, evWin = 0, evLoss = 0, magSse = 0;
-        var returns = new double[samples.Count];
-
-        for (int i = 0; i < samples.Count; i++)
-        {
-            double p      = calibProbs[i];
-            double y      = samples[i].Direction > 0 ? 1.0 : 0.0;
-            int    pred   = p >= threshold ? 1 : 0;
-            double absMag = Math.Max(0.001, Math.Abs(samples[i].Magnitude));
-
-            if (pred == samples[i].Direction) correct++;
-            if (pred == 1 && samples[i].Direction == 1) tp++;
-            if (pred == 1 && samples[i].Direction == 0) fp++;
-            if (pred == 0 && samples[i].Direction == 1) fn++;
-            if (pred == 0 && samples[i].Direction == 0) tn++;
-
-            brierSum += (p - y) * (p - y);
-            if (pred == samples[i].Direction) evWin += absMag; else evLoss += absMag;
-            magSse  += samples[i].Magnitude * samples[i].Magnitude;
-            returns[i] = (pred == 1 ? 1 : -1) * (samples[i].Direction > 0 ? 1 : -1) * absMag;
-        }
-
-        int ne = samples.Count;
-        double acc  = (double)correct / ne;
-        double prec = (tp + fp) > 0 ? (double)tp / (tp + fp) : 0;
-        double rec  = (tp + fn) > 0 ? (double)tp / (tp + fn) : 0;
-        double f1   = (prec + rec) > 0 ? 2 * prec * rec / (prec + rec) : 0;
-        double ev   = (evWin - evLoss) / ne;
-        double sharpe = ComputeSharpe(returns, sharpeAnnFactor);
-        return new EvalMetrics(acc, prec, rec, f1, Math.Sqrt(magSse / ne), ev, brierSum / ne, acc, sharpe, tp, fp, fn, tn);
-    }
-
-    private static double ComputeSharpe(double[] returns, double annFactor)
-    {
-        if (returns.Length < 2) return 0;
-        double mean = returns.Average();
-        double std  = Math.Sqrt(returns.Average(r => (r - mean) * (r - mean)));
-        return std > 1e-10 ? mean / std * Math.Sqrt(annFactor) : 0;
-    }
-
-    private static double ComputeMaxDrawdown(float[] probs, List<TrainingSample> samples)
-    {
-        double peak = 0, equity = 0, maxDD = 0;
-        for (int i = 0; i < samples.Count; i++)
-        {
-            double ret = (probs[i] >= 0.5 ? 1 : -1)
-                       * (samples[i].Direction > 0 ? 1 : -1)
-                       * Math.Max(0.001, Math.Abs(samples[i].Magnitude));
-            equity += ret;
-            if (equity > peak) peak = equity;
-            if (peak > 0) { double dd = (peak - equity) / peak; if (dd > maxDD) maxDD = dd; }
-        }
-        return maxDD;
-    }
-
-    // ═════════════════════════════════════════════════════════════════════════
     // PERMUTATION FEATURE IMPORTANCE
     // ═════════════════════════════════════════════════════════════════════════
 
@@ -1652,139 +1339,17 @@ public sealed class SvgpModelTrainer : IMLModelTrainer
                 double p   = Sigmoid(plattA * Logit(Math.Clamp(Sigmoid(raw), 1e-7, 1.0 - 1e-7)) + plattB);
                 if ((p >= 0.5 ? 1 : 0) == evalSet[i].Direction) correct++;
             }
-            importance[fi] = (float)(baselineAcc - (double)correct / evalSet.Count);
+            importance[fi] = (float)Math.Max(0.0, baselineAcc - (double)correct / evalSet.Count);
         });
+
+        // Normalize to sum=1 for consistency with peer trainers
+        float total = importance.Sum();
+        if (total > 1e-6f)
+            for (int fi = 0; fi < F; fi++) importance[fi] /= total;
 
         return importance;
     }
 
-    // ═════════════════════════════════════════════════════════════════════════
-    // META-LABEL MODEL & ABSTENTION GATE  (dynamic MetaDim = 2 + min(F,5))
-    // ═════════════════════════════════════════════════════════════════════════
-
-    /// <summary>
-    /// Fits a logistic meta-label classifier predicting whether the model's prediction is correct.
-    /// Features: [calibP, gpStd (true posterior uncertainty), feat[0..min(F,5)-1]].
-    /// MetaDim is dynamic: 2 + min(F, 5).
-    /// </summary>
-    private static (double[] Weights, double Bias) FitMetaLabelModel(
-        float[] calibProbs, float[] gpVars, List<TrainingSample> calSet, int F, int metaDim)
-    {
-        const int    Epochs = 50;
-        const double Lr     = 0.01;
-        const double L2     = 0.001;
-
-        if (calSet.Count < 10) return (new double[metaDim], 0.0);
-
-        var    mw = new double[metaDim];
-        double mb = 0.0;
-
-        for (int epoch = 0; epoch < Epochs; epoch++)
-        {
-            var    dW = new double[metaDim];
-            double dB = 0;
-
-            for (int i = 0; i < calSet.Count; i++)
-            {
-                var    s      = calSet[i];
-                double calibP = Math.Clamp(calibProbs[i], 1e-7, 1.0 - 1e-7);
-                double gpStd  = Math.Sqrt(Math.Max(gpVars[i], 0.0));   // GP posterior std (true uncertainty)
-
-                var feat = new double[metaDim];
-                feat[0] = calibP;
-                feat[1] = gpStd;
-                int topF = Math.Min(F, metaDim - 2);
-                for (int j = 0; j < topF; j++) feat[2 + j] = s.Features[j];
-
-                double z    = mb;
-                for (int j = 0; j < metaDim; j++) z += mw[j] * feat[j];
-                double pred = Sigmoid(z);
-                double lbl  = (calibP >= 0.5) == (s.Direction == 1) ? 1.0 : 0.0;
-                double err  = pred - lbl;
-
-                for (int j = 0; j < metaDim; j++) dW[j] += err * feat[j];
-                dB += err;
-            }
-
-            int n = calSet.Count;
-            for (int j = 0; j < metaDim; j++)
-                mw[j] -= Lr * (dW[j] / n + L2 * mw[j]);
-            mb -= Lr * dB / n;
-        }
-
-        return (mw, mb);
-    }
-
-    /// <summary>
-    /// Fits a 3-feature logistic abstention gate: [calibP, gpStd, metaScore].
-    /// Returns (weights[3], bias, threshold=0.5).
-    /// </summary>
-    private static (double[] Weights, double Bias, double Threshold) FitAbstentionModel(
-        float[]              calibProbs,
-        float[]              gpVars,
-        List<TrainingSample> calSet,
-        double[]             metaLabelWeights,
-        double               metaLabelBias,
-        int                  F,
-        int                  metaDim)
-    {
-        const int    Dim    = 3;
-        const int    Epochs = 50;
-        const double Lr     = 0.01;
-        const double L2     = 0.001;
-
-        if (calSet.Count < 10)
-            return (new double[Dim], 0.0, 0.5);
-
-        var    aw = new double[Dim];
-        double ab = 0.0;
-
-        var dW = new double[Dim];
-        var mf = new double[metaDim];
-        var af = new double[Dim];
-
-        for (int epoch = 0; epoch < Epochs; epoch++)
-        {
-            double dB = 0;
-            Array.Clear(dW, 0, Dim);
-
-            for (int i = 0; i < calSet.Count; i++)
-            {
-                var    s      = calSet[i];
-                double calibP = Math.Clamp(calibProbs[i], 1e-7, 1.0 - 1e-7);
-                double gpStd  = Math.Sqrt(Math.Max(gpVars[i], 0.0));
-
-                // Meta-label score
-                mf[0] = calibP; mf[1] = gpStd;
-                int topF = Math.Min(F, metaDim - 2);
-                for (int j = 0; j < topF; j++) mf[2 + j] = s.Features[j];
-                double mz = metaLabelBias;
-                for (int j = 0; j < metaDim && j < metaLabelWeights.Length; j++)
-                    mz += metaLabelWeights[j] * mf[j];
-                double metaScore = Sigmoid(mz);
-
-                af[0] = calibP; af[1] = gpStd; af[2] = metaScore;
-                double lbl = (calibP >= 0.5) == (s.Direction == 1) ? 1.0 : 0.0;
-
-                double z    = ab;
-                for (int j = 0; j < Dim; j++) z += aw[j] * af[j];
-                double pred = Sigmoid(z);
-                double err  = pred - lbl;
-
-                for (int j = 0; j < Dim; j++) dW[j] += err * af[j];
-                dB += err;
-            }
-
-            int n = calSet.Count;
-            for (int j = 0; j < Dim; j++)
-                aw[j] -= Lr * (dW[j] / n + L2 * aw[j]);
-            ab -= Lr * dB / n;
-        }
-
-        return (aw, ab, 0.5);
-    }
-
-    // ═════════════════════════════════════════════════════════════════════════
     // DECISION BOUNDARY STATS  (ARD gradient norm)
     // ═════════════════════════════════════════════════════════════════════════
 
@@ -1826,357 +1391,26 @@ public sealed class SvgpModelTrainer : IMLModelTrainer
         return (mean, Math.Sqrt(variance));
     }
 
-    // ═════════════════════════════════════════════════════════════════════════
-    // MAGNITUDE REGRESSORS
-    // ═════════════════════════════════════════════════════════════════════════
-
-    private static (double[] Weights, double Bias) FitMagnitudeRegressor(
-        List<TrainingSample> trainSet, int F)
-    {
-        if (trainSet.Count < F + 2) return (new double[F], 0.0);
-
-        bool   canEarlyStop = trainSet.Count >= 30;
-        int    valSize      = canEarlyStop ? Math.Max(5, trainSet.Count / 10) : 0;
-        var    valSet       = canEarlyStop ? trainSet[^valSize..] : trainSet;
-        var    train        = canEarlyStop ? trainSet[..^valSize] : trainSet;
-
-        if (train.Count == 0) return (new double[F], 0.0);
-
-        double[] w = new double[F], mW = new double[F], vW = new double[F];
-        double   b = 0.0, mB = 0, vB = 0, beta1t = 1.0, beta2t = 1.0;
-        int      t = 0;
-        double bestValLoss = double.MaxValue;
-        var    bestW       = new double[F];
-        double bestB       = 0.0;
-        int    patience    = 0;
-
-        const int    MaxEpochs = 150;
-        const double BaseLr    = 0.001;
-        const double L2        = 0.01;
-        const int    Patience  = 20;
-
-        for (int epoch = 0; epoch < MaxEpochs; epoch++)
-        {
-            double alpha = BaseLr * 0.5 * (1.0 + Math.Cos(Math.PI * epoch / MaxEpochs));
-            foreach (var s in train)
-            {
-                t++;
-                beta1t *= AdamBeta1; beta2t *= AdamBeta2;
-                double pred = b;
-                for (int j = 0; j < F; j++) pred += w[j] * s.Features[j];
-                double err = pred - s.Magnitude;
-                if (!double.IsFinite(err)) continue;
-                double hGrad = Math.Abs(err) <= 1.0 ? err : Math.Sign(err);
-                double bc1   = 1.0 - beta1t, bc2 = 1.0 - beta2t;
-                double alpAt = alpha * Math.Sqrt(bc2) / bc1;
-                mB  = AdamBeta1 * mB  + (1.0 - AdamBeta1) * hGrad;
-                vB  = AdamBeta2 * vB  + (1.0 - AdamBeta2) * hGrad * hGrad;
-                b  -= alpAt * mB / (Math.Sqrt(vB) + AdamEpsilon);
-                for (int j = 0; j < F; j++)
-                {
-                    double g = hGrad * s.Features[j] + L2 * w[j];
-                    mW[j]  = AdamBeta1 * mW[j] + (1.0 - AdamBeta1) * g;
-                    vW[j]  = AdamBeta2 * vW[j] + (1.0 - AdamBeta2) * g * g;
-                    w[j]  -= alpAt * mW[j] / (Math.Sqrt(vW[j]) + AdamEpsilon);
-                }
-            }
-            if (!canEarlyStop) continue;
-            double valLoss = 0.0; int valN = 0;
-            foreach (var s in valSet)
-            {
-                double pred = b;
-                for (int j = 0; j < F; j++) pred += w[j] * s.Features[j];
-                double err = pred - s.Magnitude;
-                if (!double.IsFinite(err)) continue;
-                valLoss += Math.Abs(err) <= 1.0 ? 0.5 * err * err : Math.Abs(err) - 0.5;
-                valN++;
-            }
-            if (valN > 0) valLoss /= valN; else valLoss = double.MaxValue;
-            if (valLoss < bestValLoss - 1e-6) { bestValLoss = valLoss; Array.Copy(w, bestW, F); bestB = b; patience = 0; }
-            else if (++patience >= Patience) break;
-        }
-        if (canEarlyStop) { Array.Copy(bestW, w, F); b = bestB; }
-        return (w, b);
-    }
-
-    private static (double[] Weights, double Bias) FitQuantileRegressor(
-        List<TrainingSample> trainSet, int F, double tau)
-    {
-        var    w = new double[F];
-        double b = 0.0;
-        const double lr = 0.005, l2 = 1e-4;
-        const int    MaxEpochs = 100;
-        for (int epoch = 0; epoch < MaxEpochs; epoch++)
-        {
-            foreach (var s in trainSet)
-            {
-                double pred = b;
-                for (int j = 0; j < F; j++) pred += w[j] * s.Features[j];
-                double r = s.Magnitude - pred;
-                double g = r >= 0 ? -tau : (1.0 - tau);
-                b -= lr * g;
-                for (int j = 0; j < F; j++)
-                    w[j] -= lr * (g * s.Features[j] + l2 * w[j]);
-            }
-        }
-        return (w, b);
-    }
-
-    // ═════════════════════════════════════════════════════════════════════════
-    // IMPORTANCE WEIGHTS
-    // ═════════════════════════════════════════════════════════════════════════
-
-    private static double[] ComputeDensityRatioWeights(
-        List<TrainingSample> trainSet, int F, int windowDays)
-    {
-        int n = trainSet.Count;
-        if (n < 50) { var u = new double[n]; Array.Fill(u, 1.0 / n); return u; }
-
-        int recentCount = Math.Max(10, Math.Min(n / 5, windowDays * 24));
-        recentCount = Math.Min(recentCount, n - 10);
-        int histCount = n - recentCount;
-
-        var    dw = new double[F];
-        double db = 0.0;
-        const double lr = 0.01, l2 = 0.01;
-
-        for (int epoch = 0; epoch < 30; epoch++)
-        {
-            for (int i = 0; i < n; i++)
-            {
-                double y   = i >= histCount ? 1.0 : 0.0;
-                double z   = db;
-                for (int j = 0; j < F; j++) z += dw[j] * trainSet[i].Features[j];
-                double p   = Sigmoid(z);
-                double err = p - y;
-                for (int j = 0; j < F; j++)
-                    dw[j] -= lr * (err * trainSet[i].Features[j] + l2 * dw[j]);
-                db -= lr * err;
-            }
-        }
-
-        var    weights = new double[n];
-        double sum     = 0.0;
-        for (int i = 0; i < n; i++)
-        {
-            double z = db;
-            for (int j = 0; j < F; j++) z += dw[j] * trainSet[i].Features[j];
-            double p     = Sigmoid(z);
-            double ratio = Math.Clamp(p / Math.Max(1.0 - p, 1e-6), 0.01, 10.0);
-            weights[i] = ratio;
-            sum        += ratio;
-        }
-        for (int i = 0; i < n; i++) weights[i] /= sum;
-        return weights;
-    }
-
-    private static double[] ComputeCovariateShiftWeights(
-        List<TrainingSample> samples, double[][] parentQbp, int F)
-    {
-        int n = samples.Count;
-        var weights = new double[n];
-        for (int i = 0; i < n; i++)
-        {
-            float[] feat = samples[i].Features;
-            int outsideCount = 0, checkedCount = 0;
-            for (int j = 0; j < F; j++)
-            {
-                if (j >= parentQbp.Length) continue;
-                var bp = parentQbp[j];
-                if (bp.Length < 2) continue;
-                double q10 = bp[0], q90 = bp[^1];
-                if ((double)feat[j] < q10 || (double)feat[j] > q90) outsideCount++;
-                checkedCount++;
-            }
-            weights[i] = 1.0 + (checkedCount > 0 ? (double)outsideCount / checkedCount : 0.0);
-        }
-        double mean = weights.Average();
-        if (mean > 1e-10) for (int i = 0; i < n; i++) weights[i] /= mean;
-        return weights;
-    }
-
-    private static double[] BlendImportanceWeights(double[] w1, double[] w2, int n)
-    {
-        var    blended = new double[n];
-        double sum     = 0.0;
-        for (int i = 0; i < n; i++) { blended[i] = w1[i] * w2[i]; sum += blended[i]; }
-        if (sum > 1e-15) for (int i = 0; i < n; i++) blended[i] /= sum;
-        else             Array.Fill(blended, 1.0 / n);
-        return blended;
-    }
-
-    private static double[] UniformWeights(int n)
-    {
-        var w = new double[n];
-        Array.Fill(w, 1.0 / Math.Max(1, n));
-        return w;
-    }
-
-    // ═════════════════════════════════════════════════════════════════════════
-    // MONITORING DIAGNOSTICS
-    // ═════════════════════════════════════════════════════════════════════════
-
-    private static double[][] ComputeQuantileBreakpoints(List<TrainingSample> trainSet, int F)
-    {
-        if (trainSet.Count < 10) return [];
-        var bp = new double[F][];
-        for (int j = 0; j < F; j++)
-        {
-            var sorted = trainSet.Select(s => (double)s.Features[j]).OrderBy(v => v).ToArray();
-            int n = sorted.Length;
-            bp[j] = new double[9];
-            for (int q = 1; q <= 9; q++)
-            {
-                int idx = Math.Clamp((int)Math.Round((double)q / 10.0 * n), 0, n - 1);
-                bp[j][q - 1] = sorted[idx];
-            }
-        }
-        return bp;
-    }
-
-    private static double ComputeDurbinWatson(
-        List<TrainingSample> trainSet, double[] magW, double magBias, int F)
-    {
-        if (trainSet.Count < 3) return 2.0;
-        var residuals = new double[trainSet.Count];
-        for (int i = 0; i < trainSet.Count; i++)
-        {
-            double pred = magBias;
-            for (int j = 0; j < F && j < magW.Length; j++) pred += magW[j] * trainSet[i].Features[j];
-            residuals[i] = trainSet[i].Magnitude - pred;
-        }
-        double numerator = 0.0, denominator = 0.0;
-        for (int i = 1; i < residuals.Length; i++) { double d = residuals[i] - residuals[i - 1]; numerator += d * d; }
-        for (int i = 0; i < residuals.Length; i++) denominator += residuals[i] * residuals[i];
-        return denominator > 1e-15 ? numerator / denominator : 2.0;
-    }
-
-    private static string[] ComputeRedundantFeaturePairs(
-        List<TrainingSample> trainSet, int F, double threshold)
-    {
-        if (trainSet.Count < 20 || F < 2) return [];
-
-        const int nBins      = 10;
-        double    threshNats = threshold * Math.Log(2.0);
-        int       n          = trainSet.Count;
-
-        var bins = new int[n, F];
-        for (int j = 0; j < F; j++)
-        {
-            var vals  = trainSet.Select(s => (double)s.Features[j]).OrderBy(v => v).ToArray();
-            var edges = new double[nBins - 1];
-            for (int b = 1; b < nBins; b++)
-            {
-                int idx = Math.Clamp((int)Math.Round((double)b / nBins * n), 0, n - 1);
-                edges[b - 1] = vals[idx];
-            }
-            for (int i = 0; i < n; i++)
-            {
-                double v = trainSet[i].Features[j];
-                int    b = 0;
-                for (int eb = 0; eb < edges.Length; eb++) if (v > edges[eb]) b = eb + 1;
-                bins[i, j] = b;
-            }
-        }
-
-        var result = new List<string>();
-        for (int j1 = 0; j1 < F; j1++)
-        for (int j2 = j1 + 1; j2 < F; j2++)
-        {
-            var    joint = new double[nBins, nBins];
-            var    margX = new double[nBins];
-            var    margY = new double[nBins];
-            for (int i = 0; i < n; i++)
-            {
-                int b1 = bins[i, j1], b2 = bins[i, j2];
-                joint[b1, b2] += 1.0; margX[b1] += 1.0; margY[b2] += 1.0;
-            }
-            double mi = 0.0;
-            for (int b1 = 0; b1 < nBins; b1++)
-            for (int b2 = 0; b2 < nBins; b2++)
-            {
-                double pXY = joint[b1, b2] / n;
-                if (pXY < 1e-10) continue;
-                double pX = margX[b1] / n, pY = margY[b2] / n;
-                if (pX < 1e-10 || pY < 1e-10) continue;
-                mi += pXY * Math.Log(pXY / (pX * pY));
-            }
-            if (mi > threshNats) result.Add($"F{j1}-F{j2}");
-        }
-        return result.ToArray();
-    }
-
-    // ═════════════════════════════════════════════════════════════════════════
-    // K-MEANS++ HELPERS
-    // ═════════════════════════════════════════════════════════════════════════
-
-    private static double[][] KMeansInit(List<TrainingSample> samples, int k, int F, Random rng)
-    {
-        var centres = new double[k][];
-        centres[0] = Array.ConvertAll(samples[rng.Next(samples.Count)].Features, x => (double)x);
-        for (int ci = 1; ci < k; ci++)
-        {
-            double[] dists = samples.Select(s =>
-            {
-                double best = double.MaxValue;
-                for (int j = 0; j < ci; j++)
-                {
-                    double d = 0;
-                    for (int fi = 0; fi < F; fi++) { double diff = s.Features[fi] - centres[j][fi]; d += diff * diff; }
-                    if (d < best) best = d;
-                }
-                return best;
-            }).ToArray();
-            double total = dists.Sum(), pick = rng.NextDouble() * total, cum = 0;
-            for (int i = 0; i < samples.Count; i++)
-            {
-                cum += dists[i];
-                if (cum >= pick) { centres[ci] = Array.ConvertAll(samples[i].Features, x => (double)x); break; }
-            }
-            centres[ci] ??= Array.ConvertAll(samples[rng.Next(samples.Count)].Features, x => (double)x);
-        }
-        return centres;
-    }
-
-    private static double[][] KMeansRefine(List<TrainingSample> samples, double[][] centres, int F, int iters)
-    {
-        int k = centres.Length;
-        for (int it = 0; it < iters; it++)
-        {
-            int[] assign = new int[samples.Count];
-            for (int i = 0; i < samples.Count; i++)
-            {
-                double best = double.MaxValue; int bestC = 0;
-                for (int c = 0; c < k; c++)
-                {
-                    double d = 0;
-                    for (int fi = 0; fi < F; fi++) { double diff = samples[i].Features[fi] - centres[c][fi]; d += diff * diff; }
-                    if (d < best) { best = d; bestC = c; }
-                }
-                assign[i] = bestC;
-            }
-            double[][] newC = Enumerable.Range(0, k).Select(_ => new double[F]).ToArray();
-            int[]      cnt  = new int[k];
-            for (int i = 0; i < samples.Count; i++)
-            {
-                for (int fi = 0; fi < F; fi++) newC[assign[i]][fi] += samples[i].Features[fi];
-                cnt[assign[i]]++;
-            }
-            for (int c = 0; c < k; c++)
-                if (cnt[c] > 0) for (int fi = 0; fi < F; fi++) newC[c][fi] /= cnt[c];
-                else            newC[c] = centres[c];
-            centres = newC;
-        }
-        return centres;
-    }
-
-    // ═════════════════════════════════════════════════════════════════════════
     // MATH HELPERS
     // ═════════════════════════════════════════════════════════════════════════
 
-    private static double Sigmoid(double x)      => 1.0 / (1.0 + Math.Exp(-Math.Clamp(x, -500, 500)));
-    private static double SigmoidClamp(double x) => Math.Clamp(Sigmoid(x), 1e-7, 1.0 - 1e-7);
-    private static double Logit(double p)         => Math.Log(p / (1.0 - p));
+
+    /// <summary>Mean per-point L2 displacement between two inducing sets in standardized space.</summary>
+    private static double MeanInducingDisplacement(double[][] before, double[][] after, int M, int F)
+    {
+        double sum = 0;
+        for (int m = 0; m < M; m++)
+        {
+            double sq = 0;
+            for (int fi = 0; fi < F; fi++)
+            {
+                double d = after[m][fi] - before[m][fi];
+                sq += d * d;
+            }
+            sum += Math.Sqrt(sq);
+        }
+        return sum / M;
+    }
 
     private static Tensor ToFeatureTensor(IReadOnlyList<TrainingSample> samples, Device device)
     {
@@ -2184,5 +1418,38 @@ public sealed class SvgpModelTrainer : IMLModelTrainer
         var flat = new float[N * F];
         for (int i = 0; i < N; i++) samples[i].Features.CopyTo(flat, i * F);
         return tensor(flat, new long[] { N, F }, ScalarType.Float32).to(device);
+    }
+
+    /// <summary>
+    /// Attempts Cholesky decomposition with progressive jitter: 1e-5 → 1e-4 → 1e-3 → 1e-2.
+    /// Logs a warning at each escalation level.
+    /// </summary>
+    private static Tensor CholeskyWithRetry(Tensor K, int M, Device device, ILogger? logger = null)
+    {
+        float[] jitters = [1e-5f, 1e-4f, 1e-3f, 1e-2f];
+        for (int attempt = 0; attempt < jitters.Length; attempt++)
+        {
+            try
+            {
+                if (attempt == 0)
+                    return torch.linalg.cholesky(K);
+
+                using var K_jit = K + jitters[attempt] * torch.eye((long)M, dtype: ScalarType.Float32, device: device);
+                var L = torch.linalg.cholesky(K_jit);
+                logger?.LogWarning(
+                    "SVGP Cholesky succeeded at jitter level {Jitter:E1} (attempt {Attempt}/{Max}).",
+                    jitters[attempt], attempt + 1, jitters.Length);
+                return L;
+            }
+            catch when (attempt < jitters.Length - 1)
+            {
+                logger?.LogWarning(
+                    "SVGP Cholesky failed at jitter {Jitter:E1} — escalating.",
+                    jitters[attempt]);
+            }
+        }
+        // Final attempt — let it throw if it still fails.
+        using var K_final = K + jitters[^1] * torch.eye((long)M, dtype: ScalarType.Float32, device: device);
+        return torch.linalg.cholesky(K_final);
     }
 }

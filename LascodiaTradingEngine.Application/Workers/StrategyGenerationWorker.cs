@@ -1,7 +1,10 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Security.Cryptography;
+using System.Text;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -313,6 +316,7 @@ public class StrategyGenerationWorker : BackgroundService
         public int ConsecutiveFailures { get; private set; }
         public DateTime CircuitBreakerUntilUtc { get; private set; } = DateTime.MinValue;
         public int RetriesThisWindow { get; private set; }
+        public DateTime RetryWindowDateUtc { get; private set; } = DateTime.MinValue;
         public bool IsLoaded { get; private set; }
         private bool _wasInWindow;
 
@@ -321,11 +325,18 @@ public class StrategyGenerationWorker : BackgroundService
         public bool RetriesExhausted => RetriesThisWindow >= MaxRetriesPerWindow;
 
         /// <summary>Load persisted state from DB on first poll.</summary>
-        public void LoadFromPersisted(DateTime lastRunDate, int consecutiveFailures, DateTime circuitBreakerUntil)
+        public void LoadFromPersisted(
+            DateTime lastRunDate,
+            int consecutiveFailures,
+            DateTime circuitBreakerUntil,
+            int retriesThisWindow,
+            DateTime retryWindowDate)
         {
             if (lastRunDate != DateTime.MinValue) LastRunDateUtc = lastRunDate;
             ConsecutiveFailures = consecutiveFailures;
             CircuitBreakerUntilUtc = circuitBreakerUntil;
+            RetryWindowDateUtc = retryWindowDate.Date;
+            RetriesThisWindow = RetryWindowDateUtc == DateTime.UtcNow.Date ? retriesThisWindow : 0;
             IsLoaded = true;
         }
 
@@ -335,13 +346,19 @@ public class StrategyGenerationWorker : BackgroundService
             LastRunDateUtc = DateTime.UtcNow.Date;
             ConsecutiveFailures = 0;
             RetriesThisWindow = 0;
+            RetryWindowDateUtc = DateTime.MinValue;
+            _wasInWindow = false;
         }
 
         /// <summary>Transition: generation cycle failed. Returns true if circuit breaker tripped.</summary>
         public bool OnFailure(int maxFailures, int backoffDays)
         {
+            if (RetryWindowDateUtc != DateTime.UtcNow.Date)
+                RetriesThisWindow = 0;
+
             ConsecutiveFailures++;
             RetriesThisWindow++;
+            RetryWindowDateUtc = DateTime.UtcNow.Date;
 
             if (ConsecutiveFailures >= maxFailures)
             {
@@ -356,12 +373,17 @@ public class StrategyGenerationWorker : BackgroundService
         {
             LastRunDateUtc = DateTime.UtcNow.Date;
             RetriesThisWindow = 0;
+            RetryWindowDateUtc = DateTime.MinValue;
+            _wasInWindow = false;
         }
 
         /// <summary>Transition: circuit breaker active — skip today.</summary>
         public void OnCircuitBreakerSkip()
         {
             LastRunDateUtc = DateTime.UtcNow.Date;
+            RetriesThisWindow = 0;
+            RetryWindowDateUtc = DateTime.MinValue;
+            _wasInWindow = false;
         }
 
         /// <summary>Signal that we are inside the schedule window (enables edge-triggered reset on exit).</summary>
@@ -370,8 +392,9 @@ public class StrategyGenerationWorker : BackgroundService
         /// <summary>Transition: schedule window passed — reset retry counter once on window exit.</summary>
         public void OnWindowPassed()
         {
-            if (!_wasInWindow) return;
+            if (!_wasInWindow && RetryWindowDateUtc == DateTime.MinValue) return;
             RetriesThisWindow = 0;
+            RetryWindowDateUtc = DateTime.MinValue;
             _wasInWindow = false;
         }
     }
@@ -424,94 +447,104 @@ public class StrategyGenerationWorker : BackgroundService
 
         while (!stoppingToken.IsCancellationRequested)
         {
-            try
-            {
-                using var scope = _scopeFactory.CreateScope();
-                var ctx = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
-                var db = ctx.GetDbContext();
-
-                bool enabled = await GetConfigAsync<bool>(db, "StrategyGeneration:Enabled", true, stoppingToken);
-                if (!enabled) { await Task.Delay(PollInterval, stoppingToken); continue; }
-
-                int scheduleHour = await GetConfigAsync(db, "StrategyGeneration:ScheduleHourUtc", 2, stoppingToken);
-
-                // One-time load of persisted state on startup
-                if (!_scheduling.IsLoaded)
-                {
-                    var persistedDate = await GetConfigAsync(db, "StrategyGeneration:LastRunDateUtc", "", stoppingToken);
-                    DateTime.TryParse(persistedDate, out var parsedDate);
-                    var cbUntil = await GetConfigAsync(db, "StrategyGeneration:CircuitBreakerUntilUtc", "", stoppingToken);
-                    DateTime.TryParse(cbUntil, out var parsedCb);
-                    int failures = await GetConfigAsync(db, "StrategyGeneration:ConsecutiveFailures", 0, stoppingToken);
-                    _scheduling.LoadFromPersisted(parsedDate.Date, failures, parsedCb);
-                }
-
-                // Not in schedule window or already ran today
-                if (DateTime.UtcNow.Hour != scheduleHour || _scheduling.HasRunToday)
-                {
-                    if (DateTime.UtcNow.Hour != scheduleHour)
-                        _scheduling.OnWindowPassed();
-                    await Task.Delay(PollInterval, stoppingToken);
-                    continue;
-                }
-
-                _scheduling.MarkInWindow();
-
-                // Circuit breaker active
-                if (_scheduling.IsCircuitBreakerActive)
-                {
-                    _logger.LogWarning("StrategyGenerationWorker: circuit breaker active until {Until:u}",
-                        _scheduling.CircuitBreakerUntilUtc);
-                    _metrics.StrategyGenCircuitBreakerTripped.Add(1);
-                    _scheduling.OnCircuitBreakerSkip();
-                    await Task.Delay(PollInterval, stoppingToken);
-                    continue;
-                }
-
-                await RunGenerationCycleAsync(stoppingToken);
-                _scheduling.OnSuccess();
-                await PersistCircuitBreakerStateAsync(stoppingToken);
-            }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-            {
-                break;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "StrategyGenerationWorker: error during generation cycle");
-                _metrics.WorkerErrors.Add(1, new KeyValuePair<string, object?>("worker", "StrategyGenerationWorker"));
-
-                int maxFailures = 3, backoffDays = 2;
-                try
-                {
-                    using var cfgScope = _scopeFactory.CreateScope();
-                    var cfgCtx = cfgScope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
-                    maxFailures = await GetConfigAsync(cfgCtx.GetDbContext(), "StrategyGeneration:CircuitBreakerMaxFailures", 3, stoppingToken);
-                    backoffDays = await GetConfigAsync(cfgCtx.GetDbContext(), "StrategyGeneration:CircuitBreakerBackoffDays", 2, stoppingToken);
-                }
-                catch { /* Use defaults */ }
-
-                bool tripped = _scheduling.OnFailure(maxFailures, backoffDays);
-                if (tripped)
-                {
-                    _logger.LogError("StrategyGenerationWorker: {Failures} failures — circuit breaker until {Until:u}",
-                        _scheduling.ConsecutiveFailures, _scheduling.CircuitBreakerUntilUtc);
-                    _metrics.StrategyGenCircuitBreakerTripped.Add(1);
-                }
-
-                if (_scheduling.RetriesExhausted)
-                {
-                    _scheduling.OnRetriesExhausted();
-                    _logger.LogWarning("StrategyGenerationWorker: exhausted retries within schedule window — skipping to next day");
-                }
-
-                await PersistCircuitBreakerStateAsync(stoppingToken);
-            }
-
+            await ExecutePollAsync(stoppingToken);
             await Task.Delay(PollInterval, stoppingToken);
         }
 
         _logger.LogInformation("StrategyGenerationWorker stopped");
+    }
+
+    internal async Task ExecutePollAsync(CancellationToken stoppingToken)
+    {
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var ctx = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+            var db = ctx.GetDbContext();
+
+            bool enabled = await GetConfigAsync<bool>(db, "StrategyGeneration:Enabled", true, stoppingToken);
+            if (!enabled) return;
+
+            int scheduleHour = await GetConfigAsync(db, "StrategyGeneration:ScheduleHourUtc", 2, stoppingToken);
+
+            // One-time load of persisted state on startup.
+            if (!_scheduling.IsLoaded)
+            {
+                var persistedDate = await GetConfigAsync(db, "StrategyGeneration:LastRunDateUtc", "", stoppingToken);
+                DateTime.TryParse(persistedDate, out var parsedDate);
+                var cbUntil = await GetConfigAsync(db, "StrategyGeneration:CircuitBreakerUntilUtc", "", stoppingToken);
+                DateTime.TryParse(cbUntil, out var parsedCb);
+                int failures = await GetConfigAsync(db, "StrategyGeneration:ConsecutiveFailures", 0, stoppingToken);
+                int retriesThisWindow = await GetConfigAsync(db, "StrategyGeneration:RetriesThisWindow", 0, stoppingToken);
+                var retryWindowDate = await GetConfigAsync(db, "StrategyGeneration:RetryWindowDateUtc", "", stoppingToken);
+                DateTime.TryParse(retryWindowDate, out var parsedRetryWindow);
+                _scheduling.LoadFromPersisted(
+                    parsedDate.Date,
+                    failures,
+                    parsedCb,
+                    retriesThisWindow,
+                    parsedRetryWindow.Date);
+            }
+
+            // Not in schedule window or already ran today.
+            if (DateTime.UtcNow.Hour != scheduleHour || _scheduling.HasRunToday)
+            {
+                if (DateTime.UtcNow.Hour != scheduleHour)
+                    _scheduling.OnWindowPassed();
+                return;
+            }
+
+            _scheduling.MarkInWindow();
+
+            if (_scheduling.IsCircuitBreakerActive)
+            {
+                _logger.LogWarning("StrategyGenerationWorker: circuit breaker active until {Until:u}",
+                    _scheduling.CircuitBreakerUntilUtc);
+                _metrics.StrategyGenCircuitBreakerTripped.Add(1);
+                _scheduling.OnCircuitBreakerSkip();
+                await PersistSchedulingStateAsync(stoppingToken);
+                return;
+            }
+
+            await RunGenerationCycleAsync(stoppingToken);
+            _scheduling.OnSuccess();
+            await PersistSchedulingStateAsync(stoppingToken);
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "StrategyGenerationWorker: error during generation cycle");
+            _metrics.WorkerErrors.Add(1, new KeyValuePair<string, object?>("worker", "StrategyGenerationWorker"));
+
+            int maxFailures = 3, backoffDays = 2;
+            try
+            {
+                using var cfgScope = _scopeFactory.CreateScope();
+                var cfgCtx = cfgScope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+                maxFailures = await GetConfigAsync(cfgCtx.GetDbContext(), "StrategyGeneration:CircuitBreakerMaxFailures", 3, stoppingToken);
+                backoffDays = await GetConfigAsync(cfgCtx.GetDbContext(), "StrategyGeneration:CircuitBreakerBackoffDays", 2, stoppingToken);
+            }
+            catch { /* Use defaults */ }
+
+            bool tripped = _scheduling.OnFailure(maxFailures, backoffDays);
+            if (tripped)
+            {
+                _logger.LogError("StrategyGenerationWorker: {Failures} failures — circuit breaker until {Until:u}",
+                    _scheduling.ConsecutiveFailures, _scheduling.CircuitBreakerUntilUtc);
+                _metrics.StrategyGenCircuitBreakerTripped.Add(1);
+            }
+
+            if (_scheduling.RetriesExhausted)
+            {
+                _scheduling.OnRetriesExhausted();
+                _logger.LogWarning("StrategyGenerationWorker: exhausted retries within schedule window — skipping to next day");
+            }
+
+            await PersistSchedulingStateAsync(stoppingToken);
+        }
     }
 
     // ── Core generation cycle ──────────────────────────────────────────────
@@ -924,6 +957,7 @@ public class StrategyGenerationWorker : BackgroundService
         int candidatesCreated = 0;
         var pendingCandidates = new List<ScreeningOutcome>();
         var candleCache = new CandleLruCache(config.MaxCandleCacheSize);
+        string checkpointFingerprint = ComputeCheckpointFingerprint(s);
 
         // ── Checkpoint restore ──
         var completedSymbolSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -932,11 +966,17 @@ public class StrategyGenerationWorker : BackgroundService
             var cpJson = await db.Set<EngineConfig>().AsNoTracking()
                 .Where(c => c.Key == GenerationCheckpointStore.ConfigKey)
                 .Select(c => c.Value).FirstOrDefaultAsync(ct);
-            var checkpoint = GenerationCheckpointStore.Restore(cpJson, DateTime.UtcNow, _logger);
+            var checkpoint = GenerationCheckpointStore.Restore(cpJson, DateTime.UtcNow, checkpointFingerprint, _logger);
             if (checkpoint != null)
             {
                 completedSymbolSet = GenerationCheckpointStore.CompletedSymbolSet(checkpoint);
                 candidatesCreated = checkpoint.CandidatesCreated;
+                pendingCandidates = checkpoint.PendingCandidates
+                    .Select(c => c.ToOutcome())
+                    .Where(c => c.Passed)
+                    .ToList();
+                foreach (var pending in pendingCandidates)
+                    s.ExistingSet.Add((pending.Strategy.StrategyType, pending.Strategy.Symbol, pending.Strategy.Timeframe));
                 foreach (var (k, v) in checkpoint.CandidatesPerCurrency)
                     candidatesPerCurrency[k] = v;
                 foreach (var (k, v) in checkpoint.RegimeCandidatesCreated)
@@ -946,8 +986,8 @@ public class StrategyGenerationWorker : BackgroundService
                     if (int.TryParse(k, out var idx))
                         s.CorrelationGroupCounts[idx] = v;
                 _logger.LogInformation(
-                    "StrategyGenerationWorker: resuming from checkpoint — {Completed} symbols done, {Candidates} candidates",
-                    completedSymbolSet.Count, candidatesCreated);
+                    "StrategyGenerationWorker: resuming from checkpoint — {Completed} symbols done, {Candidates} candidates, {Pending} pending persists",
+                    completedSymbolSet.Count, candidatesCreated, pendingCandidates.Count);
             }
         }
         catch (Exception ex)
@@ -1148,8 +1188,12 @@ public class StrategyGenerationWorker : BackgroundService
                 var cpState = new GenerationCheckpointStore.State
                 {
                     CycleDateUtc = DateTime.UtcNow.Date,
+                    Fingerprint = checkpointFingerprint,
                     CompletedSymbols = completedSymbolSet.ToList(),
                     CandidatesCreated = candidatesCreated,
+                    PendingCandidates = pendingCandidates
+                        .Select(GenerationCheckpointStore.PendingCandidateState.FromOutcome)
+                        .ToList(),
                     CandidatesPerCurrency = new Dictionary<string, int>(candidatesPerCurrency),
                     RegimeCandidatesCreated = regimeCandidatesCreated.ToDictionary(kv => kv.Key.ToString(), kv => kv.Value),
                     CorrelationGroupCounts = s.CorrelationGroupCounts.ToDictionary(kv => kv.Key.ToString(), kv => kv.Value),
@@ -1474,10 +1518,10 @@ public class StrategyGenerationWorker : BackgroundService
                 var thresholds = new ScreeningThresholds(reserveWR, reservePF, reserveSh, reserveDD, adjMinTrades);
                 var reserveTasks = new List<Func<Task<ScreeningOutcome?>>>();
 
-                // Lazily compute train/test split — only allocate if at least one task passes filtering
                 double trainRatio = GetTrainSplitRatio(candles.Count);
                 int splitIdx = (int)(candles.Count * trainRatio);
-                List<Candle>? trainC = null, testC = null;
+                var trainC = candles.Take(splitIdx).ToList();
+                var testC = candles.Skip(splitIdx).ToList();
 
                 foreach (var counterType in counterTypes)
                 {
@@ -1543,9 +1587,6 @@ public class StrategyGenerationWorker : BackgroundService
 
                 if (reserveTasks.Count > 0)
                 {
-                    // Allocate train/test split only when tasks exist
-                    trainC = candles.Take(splitIdx).ToList();
-                    testC = candles.Skip(splitIdx).ToList();
                     var results = await Task.WhenAll(reserveTasks.Select(f => f()));
                     foreach (var result in results.Where(r => r != null && r.Passed))
                     {
@@ -1604,9 +1645,10 @@ public class StrategyGenerationWorker : BackgroundService
             .ToListAsync(ct);
         var queuedSet = new HashSet<long>(existingQueuedStrategyIds);
 
-        // #3: Atomic save — strategies + backtest runs in a single SaveChangesAsync
+        // #3: Atomic save — prefer DB transaction; compensate persisted drafts if transactions are unavailable
         try
         {
+            await using var tx = await TryBeginTransactionAsync(writeDb, ct);
             foreach (var c in confirmed)
                 writeDb.Set<Strategy>().Add(c.Strategy);
             await writeCtx.SaveChangesAsync(ct); // Need IDs first
@@ -1630,10 +1672,14 @@ public class StrategyGenerationWorker : BackgroundService
                 });
             }
             await writeCtx.SaveChangesAsync(ct);
+            if (tx != null)
+                await tx.CommitAsync(ct);
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "StrategyGenerationWorker: batch save failed — falling back to individual saves");
+            foreach (var c in confirmed)
+                await TryCompensateUnsafelyPersistedStrategyAsync(writeDb, writeCtx, c.Strategy, ct);
             foreach (var entry in writeDb.ChangeTracker.Entries().ToList())
                 entry.State = EntityState.Detached;
 
@@ -1652,6 +1698,7 @@ public class StrategyGenerationWorker : BackgroundService
             {
                 try
                 {
+                    await using var tx = await TryBeginTransactionAsync(writeDb, ct);
                     writeDb.Set<Strategy>().Add(c.Strategy);
                     await writeCtx.SaveChangesAsync(ct);
                     int priority = (int)((double)c.TrainResult.SharpeRatio * 100);
@@ -1663,11 +1710,14 @@ public class StrategyGenerationWorker : BackgroundService
                         InitialBalance = 10_000m, Status = RunStatus.Queued, Priority = priority,
                     });
                     await writeCtx.SaveChangesAsync(ct);
+                    if (tx != null)
+                        await tx.CommitAsync(ct);
                     saved.Add(c);
                 }
                 catch (Exception innerEx)
                 {
                     _logger.LogWarning(innerEx, "StrategyGenerationWorker: save failed for {Name}", c.Strategy.Name);
+                    await TryCompensateUnsafelyPersistedStrategyAsync(writeDb, writeCtx, c.Strategy, ct);
                     failedCandidateKeys.Add($"{c.Strategy.StrategyType}|{c.Strategy.Symbol}|{c.Strategy.Timeframe}|{c.Strategy.ParametersJson}");
                     foreach (var entry in writeDb.ChangeTracker.Entries()
                         .Where(e => e.State != EntityState.Unchanged).ToList())
@@ -1759,6 +1809,33 @@ public class StrategyGenerationWorker : BackgroundService
         return confirmed.Count;
     }
 
+    private static async Task<IDbContextTransaction?> TryBeginTransactionAsync(DbContext writeDb, CancellationToken ct)
+    {
+        try { return await writeDb.Database.BeginTransactionAsync(ct); }
+        catch { return null; }
+    }
+
+    private static async Task TryCompensateUnsafelyPersistedStrategyAsync(
+        DbContext writeDb, IWriteApplicationDbContext writeCtx, Strategy strategy, CancellationToken ct)
+    {
+        if (strategy.Id <= 0) return;
+
+        try
+        {
+            var persisted = await writeDb.Set<Strategy>().FindAsync([strategy.Id], ct);
+            if (persisted == null) return;
+
+            writeDb.Set<Strategy>().Remove(persisted);
+            await writeCtx.SaveChangesAsync(ct);
+        }
+        catch
+        {
+            foreach (var entry in writeDb.ChangeTracker.Entries()
+                .Where(e => e.State != EntityState.Unchanged).ToList())
+                entry.State = EntityState.Detached;
+        }
+    }
+
     // ── Stage 8: Pruning ────────────────────────────────────────────────────
 
     private async Task<int> PruneStaleStrategiesAsync(
@@ -1824,20 +1901,41 @@ public class StrategyGenerationWorker : BackgroundService
 
     /// <summary>Serialisable feedback summary persisted to EngineConfig for cross-cycle caching.</summary>
     private sealed record FeedbackSummaryEntry(string StrategyType, string Regime, double SurvivalRate);
-    private sealed record FeedbackSummaryCache(int StrategyCount, DateTime ComputedAtUtc, List<FeedbackSummaryEntry> Entries);
+    private sealed record FeedbackStrategySnapshot(
+        StrategyType StrategyType,
+        string? Description,
+        string? ScreeningMetricsJson,
+        string? ParametersJson,
+        StrategyLifecycleStage LifecycleStage,
+        bool IsDeleted,
+        DateTime CreatedAt);
+    private sealed record FeedbackSummaryCache(string SignatureFingerprint, int StrategyCount, DateTime ComputedAtUtc, List<FeedbackSummaryEntry> Entries);
 
     private static async Task<(Dictionary<(StrategyType, MarketRegimeEnum), double> TypeRates, Dictionary<string, double> TemplateRates)>
         LoadPerformanceFeedbackAsync(DbContext db, IWriteApplicationDbContext writeCtx, double halfLifeDays, CancellationToken ct)
     {
         var feedbackCutoff = DateTime.UtcNow.AddDays(-180);
 
-        // Cheap count query to detect if the underlying data has changed since the last cached summary
-        var currentCount = await db.Set<Strategy>()
+        var allAutoStrategies = await db.Set<Strategy>()
             .IncludingSoftDeleted()
             .Where(s => s.Name.StartsWith("Auto-") && s.CreatedAt >= feedbackCutoff)
-            .CountAsync(ct);
+            .Select(s => new FeedbackStrategySnapshot(
+                s.StrategyType,
+                s.Description,
+                s.ScreeningMetricsJson,
+                s.ParametersJson,
+                s.LifecycleStage,
+                s.IsDeleted,
+                s.CreatedAt))
+            .ToListAsync(ct);
 
-        // Try to use cached summary if strategy count hasn't changed (type rates only)
+        if (allAutoStrategies.Count == 0)
+            return (new Dictionary<(StrategyType, MarketRegimeEnum), double>(), new Dictionary<string, double>(StringComparer.Ordinal));
+
+        int strategyCount = allAutoStrategies.Count;
+        string currentFingerprint = ComputeFeedbackFingerprint(allAutoStrategies);
+
+        // Try to use cached summary if the underlying evidence fingerprint hasn't changed.
         var cachedJson = await db.Set<EngineConfig>()
             .AsNoTracking()
             .Where(c => c.Key == "StrategyGeneration:FeedbackSummary")
@@ -1849,12 +1947,13 @@ public class StrategyGenerationWorker : BackgroundService
             try
             {
                 var cached = System.Text.Json.JsonSerializer.Deserialize<FeedbackSummaryCache>(cachedJson);
-                if (cached != null && cached.StrategyCount == currentCount
+                if (cached != null
+                    && cached.StrategyCount == strategyCount
+                    && string.Equals(cached.SignatureFingerprint, currentFingerprint, StringComparison.Ordinal)
                     && (DateTime.UtcNow - cached.ComputedAtUtc).TotalHours < 24)
                 {
                     var cachedTypeRates = DeserializeFeedbackRates(cached.Entries);
-                    // Template rates are always computed fresh (they change more frequently)
-                    var (_, freshTemplateRates) = await ComputeFeedbackRatesAsync(db, feedbackCutoff, halfLifeDays, ct);
+                    var freshTemplateRates = ComputeTemplateFeedbackRates(allAutoStrategies, halfLifeDays);
                     return (cachedTypeRates, freshTemplateRates);
                 }
             }
@@ -1862,7 +1961,7 @@ public class StrategyGenerationWorker : BackgroundService
         }
 
         // Full recomputation
-        var (rates, templateRates) = await ComputeFeedbackRatesAsync(db, feedbackCutoff, halfLifeDays, ct);
+        var (rates, templateRates) = ComputeFeedbackRates(allAutoStrategies, halfLifeDays);
 
         // Persist the computed type-rate summary for next cycle (best-effort, via write context)
         // Template rates are not cached — they change more frequently
@@ -1870,7 +1969,7 @@ public class StrategyGenerationWorker : BackgroundService
         {
             var writeDb = writeCtx.GetDbContext();
             var summary = new FeedbackSummaryCache(
-                currentCount, DateTime.UtcNow,
+                currentFingerprint, strategyCount, DateTime.UtcNow,
                 rates.Select(kv => new FeedbackSummaryEntry(
                     kv.Key.Item1.ToString(), kv.Key.Item2.ToString(), kv.Value)).ToList());
             var summaryJson = System.Text.Json.JsonSerializer.Serialize(summary);
@@ -1884,22 +1983,55 @@ public class StrategyGenerationWorker : BackgroundService
         return (rates, templateRates);
     }
 
+    private static string ComputeFeedbackFingerprint(IReadOnlyList<FeedbackStrategySnapshot> strategies)
+    {
+        var parts = strategies
+            .OrderBy(s => s.StrategyType)
+            .ThenBy(s => s.LifecycleStage)
+            .ThenBy(s => s.IsDeleted)
+            .ThenBy(s => s.CreatedAt)
+            .ThenBy(s => s.Description, StringComparer.Ordinal)
+            .ThenBy(s => s.ScreeningMetricsJson, StringComparer.Ordinal)
+            .Select(s => string.Join("|",
+                s.StrategyType,
+                s.LifecycleStage,
+                s.IsDeleted ? "1" : "0",
+                s.CreatedAt.ToUniversalTime().Ticks,
+                s.Description ?? string.Empty,
+                s.ScreeningMetricsJson ?? string.Empty));
+
+        using var sha = SHA256.Create();
+        byte[] bytes = Encoding.UTF8.GetBytes(string.Join("\n", parts));
+        return Convert.ToHexString(sha.ComputeHash(bytes));
+    }
+
     private static async Task<(Dictionary<(StrategyType, MarketRegimeEnum), double> TypeRates, Dictionary<string, double> TemplateRates)>
         ComputeFeedbackRatesAsync(DbContext db, DateTime feedbackCutoff, double halfLifeDays, CancellationToken ct)
     {
-        var rates = new Dictionary<(StrategyType, MarketRegimeEnum), double>();
-        var templateRates = new Dictionary<string, double>(StringComparer.Ordinal);
-
         var allAutoStrategies = await db.Set<Strategy>()
             .IncludingSoftDeleted()
             .Where(s => s.Name.StartsWith("Auto-") && s.CreatedAt >= feedbackCutoff)
-            .Select(s => new { s.StrategyType, s.Description, s.ScreeningMetricsJson, s.ParametersJson, s.LifecycleStage, s.IsDeleted, s.CreatedAt })
+            .Select(s => new FeedbackStrategySnapshot(
+                s.StrategyType,
+                s.Description,
+                s.ScreeningMetricsJson,
+                s.ParametersJson,
+                s.LifecycleStage,
+                s.IsDeleted,
+                s.CreatedAt))
             .ToListAsync(ct);
 
-        if (allAutoStrategies.Count == 0) return (rates, templateRates);
+        return ComputeFeedbackRates(allAutoStrategies, halfLifeDays);
+    }
 
-        // Template-level survival tracking
-        var templateGroups = new Dictionary<string, List<(bool Survived, DateTime CreatedAt)>>(StringComparer.Ordinal);
+    private static (Dictionary<(StrategyType, MarketRegimeEnum), double> TypeRates, Dictionary<string, double> TemplateRates)
+        ComputeFeedbackRates(IReadOnlyList<FeedbackStrategySnapshot> allAutoStrategies, double halfLifeDays)
+    {
+        var rates = new Dictionary<(StrategyType, MarketRegimeEnum), double>();
+        var templateRates = ComputeTemplateFeedbackRates(allAutoStrategies, halfLifeDays);
+
+        if (allAutoStrategies.Count == 0)
+            return (rates, templateRates);
 
         foreach (var group in allAutoStrategies.GroupBy(s => s.StrategyType))
         {
@@ -1924,17 +2056,6 @@ public class StrategyGenerationWorker : BackgroundService
 
                 bool survived = !strategy.IsDeleted && strategy.LifecycleStage >= StrategyLifecycleStage.BacktestQualified;
                 list.Add((survived, strategy.CreatedAt));
-
-                // Track per-template survival
-                if (!string.IsNullOrWhiteSpace(strategy.ParametersJson))
-                {
-                    if (!templateGroups.TryGetValue(strategy.ParametersJson, out var tList))
-                    {
-                        tList = [];
-                        templateGroups[strategy.ParametersJson] = tList;
-                    }
-                    tList.Add((survived, strategy.CreatedAt));
-                }
             }
 
             foreach (var (regime, strategies) in byRegime)
@@ -1944,14 +2065,38 @@ public class StrategyGenerationWorker : BackgroundService
             }
         }
 
-        // Compute template survival rates where there are >= 2 samples
+        return (rates, templateRates);
+    }
+
+    private static Dictionary<string, double> ComputeTemplateFeedbackRates(
+        IReadOnlyList<FeedbackStrategySnapshot> allAutoStrategies,
+        double halfLifeDays)
+    {
+        var templateGroups = new Dictionary<string, List<(bool Survived, DateTime CreatedAt)>>(StringComparer.Ordinal);
+
+        foreach (var strategy in allAutoStrategies)
+        {
+            if (string.IsNullOrWhiteSpace(strategy.ParametersJson))
+                continue;
+
+            if (!templateGroups.TryGetValue(strategy.ParametersJson, out var tList))
+            {
+                tList = [];
+                templateGroups[strategy.ParametersJson] = tList;
+            }
+
+            bool survived = !strategy.IsDeleted && strategy.LifecycleStage >= StrategyLifecycleStage.BacktestQualified;
+            tList.Add((survived, strategy.CreatedAt));
+        }
+
+        var templateRates = new Dictionary<string, double>(StringComparer.Ordinal);
         foreach (var (paramsJson, samples) in templateGroups)
         {
             if (samples.Count >= 2)
                 templateRates[paramsJson] = ComputeRecencyWeightedSurvivalRate(samples, halfLifeDays);
         }
 
-        return (rates, templateRates);
+        return templateRates;
     }
 
     private static Dictionary<(StrategyType, MarketRegimeEnum), double> DeserializeFeedbackRates(
@@ -2332,7 +2477,7 @@ public class StrategyGenerationWorker : BackgroundService
         await writeCtx.SaveChangesAsync(ct);
     }
 
-    private async Task PersistCircuitBreakerStateAsync(CancellationToken ct)
+    private async Task PersistSchedulingStateAsync(CancellationToken ct)
     {
         try
         {
@@ -2342,16 +2487,24 @@ public class StrategyGenerationWorker : BackgroundService
             var writeDb  = writeCtx.GetDbContext();
             var readDb   = readCtx.GetDbContext();
 
+            await UpsertConfigAsync(readDb, writeDb, "StrategyGeneration:LastRunDateUtc",
+                _scheduling.LastRunDateUtc == DateTime.MinValue ? string.Empty : _scheduling.LastRunDateUtc.ToString("O"),
+                "Last date the StrategyGenerationWorker ran (auto-managed)", ct);
             await UpsertConfigAsync(readDb, writeDb, "StrategyGeneration:CircuitBreakerUntilUtc",
                 _scheduling.CircuitBreakerUntilUtc.ToString("O"), "Circuit breaker expiry (auto-managed)", ct);
             await UpsertConfigAsync(readDb, writeDb, "StrategyGeneration:ConsecutiveFailures",
                 _scheduling.ConsecutiveFailures.ToString(), "Consecutive cycle failures (auto-managed)", ct);
+            await UpsertConfigAsync(readDb, writeDb, "StrategyGeneration:RetriesThisWindow",
+                _scheduling.RetriesThisWindow.ToString(), "Retries consumed within the active schedule window (auto-managed)", ct);
+            await UpsertConfigAsync(readDb, writeDb, "StrategyGeneration:RetryWindowDateUtc",
+                _scheduling.RetryWindowDateUtc == DateTime.MinValue ? string.Empty : _scheduling.RetryWindowDateUtc.ToString("O"),
+                "Date for the active retry window (auto-managed)", ct);
 
             await writeCtx.SaveChangesAsync(ct);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "StrategyGenerationWorker: failed to persist circuit breaker state");
+            _logger.LogWarning(ex, "StrategyGenerationWorker: failed to persist scheduling state");
         }
     }
 
@@ -2386,6 +2539,44 @@ public class StrategyGenerationWorker : BackgroundService
         if (entry?.Value is null) return defaultValue;
         try { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
         catch { return defaultValue; }
+    }
+
+    private string ComputeCheckpointFingerprint(ScreeningContext s)
+    {
+        var parts = new List<string>();
+
+        parts.AddRange(s.RawConfigs
+            .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+            .Select(kv => $"cfg|{kv.Key}|{kv.Value}"));
+
+        parts.AddRange(s.ActivePairs
+            .OrderBy(sym => sym, StringComparer.OrdinalIgnoreCase)
+            .Select(sym => $"pair|{sym}"));
+
+        parts.AddRange(s.RegimeBySymbol
+            .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+            .Select(kv =>
+            {
+                double confidence = s.RegimeConfidenceBySymbol.GetValueOrDefault(kv.Key);
+                DateTime detectedAt = s.RegimeDetectedAtBySymbol.GetValueOrDefault(kv.Key);
+                return $"regime|{kv.Key}|{kv.Value}|{confidence:F6}|{detectedAt.ToUniversalTime():O}";
+            }));
+
+        parts.AddRange(s.RegimeBySymbolTf
+            .OrderBy(kv => kv.Key.Item1, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(kv => kv.Key.Item2)
+            .Select(kv => $"regime_tf|{kv.Key.Item1}|{kv.Key.Item2}|{kv.Value}"));
+
+        foreach (var strategyType in Enum.GetValues<StrategyType>().OrderBy(t => t))
+        {
+            var templates = _templateProvider.GetTemplates(strategyType) ?? [];
+            for (int i = 0; i < templates.Count; i++)
+                parts.Add($"template|{strategyType}|{i}|{templates[i]}");
+        }
+
+        using var sha = SHA256.Create();
+        byte[] bytes = Encoding.UTF8.GetBytes(string.Join("\n", parts));
+        return Convert.ToHexString(sha.ComputeHash(bytes));
     }
 
     // ── Dynamic template refresh ────────────────────────────────────────

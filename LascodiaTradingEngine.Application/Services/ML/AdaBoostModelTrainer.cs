@@ -50,10 +50,7 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
     private const string ModelType    = "AdaBoost";
     private const string ModelVersion = "2.0";
 
-    private const double AdamBeta1   = 0.9;
-    private const double AdamBeta2   = 0.999;
-    private const double AdamEpsilon = 1e-8;
-    private const double Eps         = 1e-10;
+    private const double Eps = 1e-10;
 
     private static readonly JsonSerializerOptions JsonOptions =
         new() { WriteIndented = false, MaxDepth = 64 };
@@ -353,6 +350,7 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         double shrinkage   = hp.AdaBoostAlphaShrinkage > 0.0 ? hp.AdaBoostAlphaShrinkage : 1.0;
         bool   sammeR      = hp.UseSammeR;
         int    treeDepth   = hp.AdaBoostMaxTreeDepth >= 2 ? 2 : 1;
+        bool   jointDepth2 = treeDepth == 2 && hp.UseJointDepth2Search;
 
         for (int round = 0; round < effectiveK && !ct.IsCancellationRequested; round++)
         {
@@ -374,11 +372,14 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
             if (sammeR)
             {
                 // SAMME.R: leaf values are ½·logit(p_leaf); alpha = 1.0 (absorbed into leaf).
-                // Weight update: w_i ← w_i · exp(−y_i · h^R(x_i)), using hard ±1 labels since
-                // the exponential loss gradient already handles the continuous probability space.
+                // Soft-label weight update: w_i ← w_i · exp(−ỹ_i · h^R(x_i)), where ỹ_i uses
+                // adaptive label smoothing when enabled — consistent with the SAMME path so
+                // ambiguous samples are not over-penalised regardless of boosting variant.
                 tree  = treeDepth == 2
-                    ? BuildDepth2Tree(bestFi, bestThresh, trainSet, labels,
-                                      boostWeights, F, sortKeys, sortIndices, true)
+                    ? (jointDepth2
+                        ? BuildJointDepth2Tree(trainSet, labels, boostWeights, F, sortKeys, sortIndices, true, null)
+                        : BuildDepth2Tree(bestFi, bestThresh, trainSet, labels,
+                                          boostWeights, F, sortKeys, sortIndices, true))
                     : BuildSammeRStump(bestFi, bestThresh, trainSet, labels, boostWeights, m);
                 alpha = 1.0;
                 alphas.Add(alpha);
@@ -388,7 +389,7 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
                 for (int i = 0; i < m; i++)
                 {
                     double hR = PredictStump(tree, trainSet[i].Features);
-                    boostWeights[i] *= Math.Exp(-labels[i] * hR);
+                    boostWeights[i] *= Math.Exp(-softLabels[i] * hR);
                     wSum += boostWeights[i];
                 }
                 if (wSum > 0) for (int i = 0; i < m; i++) boostWeights[i] /= wSum;
@@ -399,8 +400,10 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
                 double err = Math.Max(Eps, Math.Min(1 - Eps, bestErr));
                 alpha = shrinkage * 0.5 * Math.Log((1 - err) / err);
                 tree  = treeDepth == 2
-                    ? BuildDepth2Tree(bestFi, bestThresh, trainSet, labels,
-                                      boostWeights, F, sortKeys, sortIndices, false)
+                    ? (jointDepth2
+                        ? BuildJointDepth2Tree(trainSet, labels, boostWeights, F, sortKeys, sortIndices, false, null)
+                        : BuildDepth2Tree(bestFi, bestThresh, trainSet, labels,
+                                          boostWeights, F, sortKeys, sortIndices, false))
                     : BuildStump(bestFi, bestThresh, bestParity);
                 alphas.Add(alpha);
                 stumps.Add(tree);
@@ -483,6 +486,15 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         // ── 12. Magnitude linear regressor (Adam + Huber loss) ────────────────
         var (magWeights, magBias) = FitLinearRegressor(trainSet, F, hp);
 
+        // ── 12-pre. Quantile magnitude regressor (moved before pruning so pruning can re-fit) ──
+        double[] magQ90Weights = [];
+        double   magQ90Bias    = 0.0;
+        if (hp.MagnitudeQuantileTau > 0.0 && trainSet.Count >= 10)
+        {
+            (magQ90Weights, magQ90Bias) = FitQuantileRegressor(trainSet, F, hp.MagnitudeQuantileTau);
+            _logger.LogDebug("Quantile regressor fitted (τ={Tau}).", hp.MagnitudeQuantileTau);
+        }
+
         // ── 12b. Durbin-Watson on magnitude residuals ─────────────────────────
         double durbinWatson = ComputeDurbinWatson(trainSet, magWeights, magBias, F);
         _logger.LogDebug(
@@ -532,199 +544,40 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
 
         if (prunedCount > 0 && F - prunedCount >= 10)
         {
-            _logger.LogInformation(
-                "Feature pruning: masking {Pruned}/{Total} low-importance features; re-training.",
-                prunedCount, F);
+            var pruneResult = TrainPrunedModel(
+                trainSet, calSet, testSet, activeMask, stumps, alphas,
+                warmStumps, warmAlphas, replayWarmStartWeights, densityWeights,
+                magWeights, magBias, plattA, plattB, plattABuy, plattBBuy, plattASell, plattBSell,
+                isotonicBp, hp, F, effectiveK, shrinkage, sammeR, treeDepth, prunedCount, ct);
 
-            var maskedTrain = ApplyMask(trainSet, activeMask);
-            var maskedCal   = ApplyMask(calSet,   activeMask);
-            var maskedTest  = ApplyMask(testSet,  activeMask);
-
-            // ── Warm-start pruned retrain from filtered existing stumps ──────────
-            // Instead of training from scratch (effectiveK rounds), we initialise the
-            // pruned ensemble from the current model's stumps whose root-split feature
-            // is still active, then add only K/3 residual rounds.  This halves typical
-            // training time for the pruning pass while allowing new rounds to correct
-            // the few residual errors the pruned feature set cannot address.
-            var filteredPStumps = new List<GbmTree>(stumps.Count);
-            var filteredPAlphas = new List<double>(stumps.Count);
-            for (int i = 0; i < Math.Min(stumps.Count, alphas.Count); i++)
-            {
-                int sf = stumps[i].Nodes?[0].SplitFeature ?? -1;
-                if (sf >= 0 && sf < activeMask.Length && activeMask[sf])
-                {
-                    filteredPStumps.Add(stumps[i]);
-                    filteredPAlphas.Add(alphas[i]);
-                }
-            }
-            int pResidualRounds = filteredPStumps.Count > 0
-                ? Math.Max(5, effectiveK / 3)
-                : effectiveK;   // cold start if no stumps survived the mask
-
-            int      pM      = maskedTrain.Count;
-            var      pLabels = new int[pM];
-            for (int i = 0; i < pM; i++) pLabels[i] = maskedTrain[i].Direction > 0 ? 1 : -1;
-
-            // Compute soft labels from maskedTrain directly — avoids the silent index-alignment
-            // assumption that ApplyMask preserves sample order/count without subsampling.
-            var pSoftLabels = new double[pM];
-            if (hp.UseAdaptiveLabelSmoothing)
-            {
-                double pMaxMag = 0.0;
-                foreach (var s in maskedTrain) { double mag = Math.Abs((double)s.Magnitude); if (mag > pMaxMag) pMaxMag = mag; }
-                for (int i = 0; i < pM; i++)
-                {
-                    double eps_i = pMaxMag > 1e-9
-                        ? Math.Clamp(1.0 - Math.Abs((double)maskedTrain[i].Magnitude) / pMaxMag, 0.0, 0.20)
-                        : 0.0;
-                    pSoftLabels[i] = pLabels[i] * (1.0 - eps_i);
-                }
-            }
-            else
-            {
-                for (int i = 0; i < pM; i++) pSoftLabels[i] = pLabels[i];
-            }
-
-            // densityWeights is indexed over trainSet samples. ApplyMask preserves sample count
-            // and order (it only zeroes feature values), so maskedTrain.Count == trainSet.Count
-            // and the index alignment is guaranteed. Guard against future changes that might
-            // subsample: if lengths diverge, pass null so blending is skipped rather than silently
-            // partially applied.
-            double[]? pDensityWeights = densityWeights is null || densityWeights.Length >= maskedTrain.Count
-                ? densityWeights
-                : null;
-            if (densityWeights is not null && densityWeights.Length < maskedTrain.Count)
-                _logger.LogWarning(
-                    "AdaBoost pruned retrain: densityWeights length ({DW}) < maskedTrain count ({MT}); " +
-                    "density blending skipped to avoid partial index misalignment.",
-                    densityWeights.Length, maskedTrain.Count);
-
-            double[] pWeights = InitialiseBoostWeights(maskedTrain, hp.TemporalDecayLambda, pDensityWeights);
-
-            // Replay warm-start weight updates on the masked feature set so new rounds
-            // focus on the parent's failures (mirrors the full-feature warm-start path).
-            // Only replay stumps whose root split feature is retained in the active mask so
-            // degenerate warm-start stumps on zeroed features don't corrupt weights.
-            if (replayWarmStartWeights)
-            {
-                var filteredStumps = new List<GbmTree>(warmStumps.Count);
-                var filteredAlphas = new List<double>(warmStumps.Count);
-                foreach (var (ws, wa) in warmStumps.Zip(warmAlphas))
-                {
-                    int sf = ws.Nodes?[0].SplitFeature ?? -1;
-                    if (sf >= 0 && sf < activeMask.Length && activeMask[sf])
-                    { filteredStumps.Add(ws); filteredAlphas.Add(wa); }
-                }
-                if (filteredStumps.Count > 0)
-                    AdjustWarmStartWeights(pWeights, pLabels, maskedTrain, filteredStumps, filteredAlphas);
-            }
-
-            // Initialise from filtered parent stumps; new rounds extend from this base
-            var pStumps = new List<GbmTree>(filteredPStumps);
-            var pAlphas = new List<double>(filteredPAlphas);
-            var pSortK   = new double[pM];
-            var pSortIdx = new int[pM];
-
-            for (int round = 0; round < pResidualRounds && !ct.IsCancellationRequested; round++)
-            {
-                var (bFi, bThresh, bParity, bErr) =
-                    FindBestStump(maskedTrain, pLabels, pWeights, F, pSortK, pSortIdx, activeMask);
-
-                if (!double.IsFinite(bErr) || bErr >= 0.5 - Eps) break;
-
-                GbmTree pTree;
-                double  pAlpha;
-
-                if (sammeR)
-                {
-                    pTree  = treeDepth == 2
-                        ? BuildDepth2Tree(bFi, bThresh, maskedTrain, pLabels,
-                                          pWeights, F, pSortK, pSortIdx, true, activeMask)
-                        : BuildSammeRStump(bFi, bThresh, maskedTrain, pLabels, pWeights, pM);
-                    pAlpha = 1.0;
-                    pAlphas.Add(pAlpha);
-                    pStumps.Add(pTree);
-                    double wSum = 0;
-                    for (int i = 0; i < pM; i++)
-                    {
-                        double hR = PredictStump(pTree, maskedTrain[i].Features);
-                        pWeights[i] *= Math.Exp(-pLabels[i] * hR);
-                        wSum += pWeights[i];
-                    }
-                    if (wSum > 0) for (int i = 0; i < pM; i++) pWeights[i] /= wSum;
-                }
-                else
-                {
-                    double cErr = Math.Max(Eps, Math.Min(1 - Eps, bErr));
-                    pAlpha = shrinkage * 0.5 * Math.Log((1 - cErr) / cErr);
-                    pTree  = treeDepth == 2
-                        ? BuildDepth2Tree(bFi, bThresh, maskedTrain, pLabels,
-                                          pWeights, F, pSortK, pSortIdx, false, activeMask)
-                        : BuildStump(bFi, bThresh, bParity);
-                    pAlphas.Add(pAlpha);
-                    pStumps.Add(pTree);
-                    double wSum = 0;
-                    for (int i = 0; i < pM; i++)
-                    {
-                        double pred = PredictStump(pTree, maskedTrain[i].Features);
-                        pWeights[i] *= Math.Exp(-pAlpha * pSoftLabels[i] * pred);
-                        wSum += pWeights[i];
-                    }
-                    if (wSum > 0) for (int i = 0; i < pM; i++) pWeights[i] /= wSum;
-                }
-            }
-
-            // Sanitise pruned-retrain alphas
-            for (int k = 0; k < pStumps.Count; k++)
-                if (!double.IsFinite(pAlphas[k]) || pStumps[k].Nodes is not { Count: > 0 })
-                    pAlphas[k] = 0.0;
-
-            // Calibrate the pruned model
-            var (pPlattA, pPlattB)  = FitPlattScaling(maskedCal, pStumps, pAlphas);
-            var (pPlattABuy, pPlattBBuy, pPlattASell, pPlattBSell) =
-                FitClassConditionalPlatt(maskedCal, pStumps, pAlphas);
-            double[] pIsotonicBp    = FitIsotonicCalibration(maskedCal, pStumps, pAlphas, pPlattA, pPlattB,
-                                                              pPlattABuy, pPlattBBuy, pPlattASell, pPlattBSell);
-            var pMetrics            = EvaluateModel(maskedTest, pStumps, pAlphas,
-                                                    magWeights, magBias, pPlattA, pPlattB, pIsotonicBp,
-                                                    pPlattABuy, pPlattBBuy, pPlattASell, pPlattBSell);
-
-            // Accept pruned model only if accuracy doesn't degrade by more than 1 %
-            var baseMetrics = EvaluateModel(testSet, stumps, alphas,
-                                            magWeights, magBias, plattA, plattB, isotonicBp,
-                                            plattABuy, plattBBuy, plattASell, plattBSell);
-            if (pMetrics.Accuracy >= baseMetrics.Accuracy - 0.01)
+            if (pruneResult is not null)
             {
                 _logger.LogInformation(
                     "Pruned model accepted: acc={Acc:P1} (was {Was:P1}), {P} features removed.",
-                    pMetrics.Accuracy, baseMetrics.Accuracy, prunedCount);
-                stumps     = pStumps;
-                alphas     = pAlphas;
-                plattA     = pPlattA;
-                plattB     = pPlattB;
-                plattABuy  = pPlattABuy;   plattBBuy  = pPlattBBuy;
-                plattASell = pPlattASell;   plattBSell = pPlattBSell;
-                isotonicBp = pIsotonicBp;
-                calSet     = maskedCal;    // downstream conformalQHat/evalMetrics use masked features
-                testSet    = maskedTest;   // downstream brierSkillScore uses masked features
-                avgKellyFraction = ComputeAvgKellyFraction(maskedCal, pStumps, pAlphas, pPlattA, pPlattB);
-                ece = ComputeEce(maskedTest, pStumps, pAlphas, pPlattA, pPlattB, pIsotonicBp,
-                                  plattABuy: pPlattABuy, plattBBuy: pPlattBBuy,
-                                  plattASell: pPlattASell, plattBSell: pPlattBSell);
-                optimalThreshold = ComputeOptimalThreshold(
-                    maskedCal, pStumps, pAlphas, pPlattA, pPlattB, pIsotonicBp,
-                    hp.ThresholdSearchMin, hp.ThresholdSearchMax,
-                    pPlattABuy, pPlattBBuy, pPlattASell, pPlattBSell);
-                if (hp.FitTemperatureScale && maskedCal.Count >= 10)
-                    temperatureScale = FitTemperatureScaling(maskedCal, pStumps, pAlphas);
-                // conformalQHat and brierSkillScore are recomputed below at their declaration sites
-                // using the now-updated stumps/alphas/platt variables.
+                    pruneResult.Value.Metrics.Accuracy, pruneResult.Value.BaseAccuracy, prunedCount);
+                stumps       = pruneResult.Value.Stumps;
+                alphas       = pruneResult.Value.Alphas;
+                plattA       = pruneResult.Value.PlattA;
+                plattB       = pruneResult.Value.PlattB;
+                plattABuy    = pruneResult.Value.PlattABuy;    plattBBuy  = pruneResult.Value.PlattBBuy;
+                plattASell   = pruneResult.Value.PlattASell;   plattBSell = pruneResult.Value.PlattBSell;
+                isotonicBp   = pruneResult.Value.IsotonicBp;
+                calSet       = pruneResult.Value.MaskedCal;
+                testSet      = pruneResult.Value.MaskedTest;
+                magWeights   = pruneResult.Value.MagWeights;
+                magBias      = pruneResult.Value.MagBias;
+                magQ90Weights = pruneResult.Value.MagQ90Weights;
+                magQ90Bias   = pruneResult.Value.MagQ90Bias;
+                durbinWatson = pruneResult.Value.DurbinWatson;
+                avgKellyFraction = pruneResult.Value.AvgKellyFraction;
+                ece              = pruneResult.Value.Ece;
+                optimalThreshold = pruneResult.Value.OptimalThreshold;
+                temperatureScale = pruneResult.Value.TemperatureScale;
             }
             else
             {
                 _logger.LogInformation(
-                    "Pruned model rejected (acc={Acc:P1} < {Was:P1} − 1 %); keeping original.",
-                    pMetrics.Accuracy, baseMetrics.Accuracy);
+                    "Pruned model rejected; keeping original.");
                 prunedCount = 0;
                 Array.Fill(activeMask, true);
             }
@@ -778,14 +631,8 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
                                metaLabelWeights, metaLabelBias, sumAlphaFinal, F);
         _logger.LogDebug("Abstention gate fitted (threshold={Thr:F2}).", abstentionThreshold);
 
-        // ── 18d. Quantile magnitude regressor (pinball loss, τ = MagnitudeQuantileTau) ──
-        double[] magQ90Weights = [];
-        double   magQ90Bias    = 0.0;
-        if (hp.MagnitudeQuantileTau > 0.0 && trainSet.Count >= 10)
-        {
-            (magQ90Weights, magQ90Bias) = FitQuantileRegressor(trainSet, F, hp.MagnitudeQuantileTau);
-            _logger.LogDebug("Quantile regressor fitted (τ={Tau}).", hp.MagnitudeQuantileTau);
-        }
+        // ── 18d. Quantile magnitude regressor — already fitted in step 12-pre;
+        //    re-fitted on masked features in step 13b if pruning was accepted.
 
         // ── 18e. Decision boundary stats ──────────────────────────────────────
         var (decisionBoundaryMean, decisionBoundaryStd) =
@@ -794,7 +641,8 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
             "Decision boundary: mean={Mean:F4}, std={Std:F4}", decisionBoundaryMean, decisionBoundaryStd);
 
         // ── 18f. MI redundancy check ───────────────────────────────────────────
-        var redundantFeaturePairs = ComputeRedundantFeaturePairs(trainSet, F, hp.MutualInfoRedundancyThreshold);
+        int miTopN = hp.MutualInfoRedundancyTopN > 0 ? hp.MutualInfoRedundancyTopN : 10;
+        var redundantFeaturePairs = ComputeRedundantFeaturePairs(trainSet, F, hp.MutualInfoRedundancyThreshold, miTopN);
         if (redundantFeaturePairs.Length > 0)
         {
             _logger.LogWarning(
@@ -996,9 +844,10 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
             var      foldKeys    = new double[foldM];
             var      foldIndices = new int[foldM];
 
-            double cvShrinkage = hp.AdaBoostAlphaShrinkage > 0.0 ? hp.AdaBoostAlphaShrinkage : 1.0;
-            bool   cvSammeR    = hp.UseSammeR;
-            int    cvDepth     = hp.AdaBoostMaxTreeDepth >= 2 ? 2 : 1;
+            double cvShrinkage  = hp.AdaBoostAlphaShrinkage > 0.0 ? hp.AdaBoostAlphaShrinkage : 1.0;
+            bool   cvSammeR     = hp.UseSammeR;
+            int    cvDepth      = hp.AdaBoostMaxTreeDepth >= 2 ? 2 : 1;
+            bool   cvJointD2    = cvDepth == 2 && hp.UseJointDepth2Search;
 
             for (int r = 0; r < cvK && !ct.IsCancellationRequested; r++)
             {
@@ -1013,7 +862,9 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
                 if (cvSammeR)
                 {
                     cvTree = cvDepth == 2
-                        ? BuildDepth2Tree(fi, thresh, foldTrain, foldLb, foldW, F, foldKeys, foldIndices, true)
+                        ? (cvJointD2
+                            ? BuildJointDepth2Tree(foldTrain, foldLb, foldW, F, foldKeys, foldIndices, true, null)
+                            : BuildDepth2Tree(fi, thresh, foldTrain, foldLb, foldW, F, foldKeys, foldIndices, true))
                         : BuildSammeRStump(fi, thresh, foldTrain, foldLb, foldW, foldM);
                     alpha = 1.0;
                     foldAlphas.Add(alpha);
@@ -1022,7 +873,7 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
                     for (int i = 0; i < foldM; i++)
                     {
                         double hR = PredictStump(cvTree, foldTrain[i].Features);
-                        foldW[i] *= Math.Exp(-foldLb[i] * hR);
+                        foldW[i] *= Math.Exp(-foldSoftLabels[i] * hR);
                         wSum += foldW[i];
                     }
                     if (wSum > 0) for (int i = 0; i < foldM; i++) foldW[i] /= wSum;
@@ -1032,7 +883,9 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
                     double cErr = Math.Max(Eps, Math.Min(1 - Eps, err));
                     alpha  = cvShrinkage * 0.5 * Math.Log((1 - cErr) / cErr);
                     cvTree = cvDepth == 2
-                        ? BuildDepth2Tree(fi, thresh, foldTrain, foldLb, foldW, F, foldKeys, foldIndices, false)
+                        ? (cvJointD2
+                            ? BuildJointDepth2Tree(foldTrain, foldLb, foldW, F, foldKeys, foldIndices, false, null)
+                            : BuildDepth2Tree(fi, thresh, foldTrain, foldLb, foldW, F, foldKeys, foldIndices, false))
                         : BuildStump(fi, thresh, parity);
                     foldAlphas.Add(alpha);
                     foldStumps.Add(cvTree);
@@ -2117,9 +1970,10 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
     // ── Temperature scaling ────────────────────────────────────────────────────
 
     /// <summary>
-    /// Fits a single temperature scalar T on the calibration set via grid search over
-    /// [0.1, 3.0] in 30 steps, selecting T that minimises binary cross-entropy.
-    /// calibP = σ(logit(rawP) / T). Returns 1.0 (no-op) when the cal set is too small.
+    /// Fits a single temperature scalar T on the calibration set via SGD, minimising
+    /// binary cross-entropy: calibP = σ(logit(rawP) / T).
+    /// Initialised at T=1.0 (no-op); uses the same early-stopping pattern as Platt scaling.
+    /// Returns 1.0 when the cal set is too small.
     /// </summary>
     private static double FitTemperatureScaling(
         List<TrainingSample> calSet,
@@ -2139,22 +1993,40 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
             labels[i]    = calSet[i].Direction > 0 ? 1.0 : 0.0;
         }
 
-        double bestT    = 1.0;
-        double bestLoss = double.MaxValue;
+        // SGD on log(T) so T stays positive without clamping; T = exp(logT).
+        double logT     = 0.0;  // T=1.0 initially
+        const double lr = 0.01;
+        double prevLoss = double.MaxValue;
+        int    noImpro  = 0;
 
-        for (int step = 0; step <= 30; step++)
+        for (int epoch = 0; epoch < 300; epoch++)
         {
-            double T    = 0.1 + step * (3.0 - 0.1) / 30.0;
-            double loss = 0.0;
+            double T    = Math.Exp(logT);
+            double invT = 1.0 / Math.Max(T, 1e-8);
+            double dLogT = 0.0, loss = 0.0;
+
             for (int i = 0; i < n; i++)
             {
-                double calibP = MLFeatureHelper.Sigmoid(logits[i] / T);
+                double z      = logits[i] * invT;
+                double calibP = MLFeatureHelper.Sigmoid(z);
                 double y      = labels[i];
-                loss += -(y * Math.Log(calibP + Eps) + (1 - y) * Math.Log(1 - calibP + Eps));
+                loss -= y * Math.Log(calibP + Eps) + (1 - y) * Math.Log(1 - calibP + Eps);
+                // ∂L/∂logT = ∂L/∂z · ∂z/∂logT = (calibP − y) · (−logits[i] · invT)
+                // because z = logits[i]/T = logits[i]·exp(−logT), so ∂z/∂logT = −z
+                dLogT += (calibP - y) * (-z);
             }
-            if (loss / n < bestLoss) { bestLoss = loss / n; bestT = T; }
+            logT -= lr * dLogT / n;
+
+            // Clamp T to [0.05, 5.0] to prevent degenerate solutions
+            logT = Math.Clamp(logT, Math.Log(0.05), Math.Log(5.0));
+
+            double curLoss = loss / n;
+            if (prevLoss - curLoss < 1e-7) { if (++noImpro >= 10) break; }
+            else                           noImpro = 0;
+            prevLoss = curLoss;
         }
-        return bestT;
+
+        return Math.Exp(logT);
     }
 
     // ── Durbin-Watson autocorrelation test ─────────────────────────────────────
@@ -2227,18 +2099,18 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
 
         using var wP  = new Parameter(zeros(F, 1));
         using var bP  = new Parameter(zeros(1));
-        // weight_decay provides L2 regularisation; avoids the gradient-addition
-        // instability of the previous per-sample approach.
         using var opt = optim.Adam(new Parameter[] { wP, bP }, lr: 0.01, weight_decay: 0.01);
+
+        // Hoist constant tensors out of the training loop to avoid per-epoch allocation
+        using var xTConst = torch.tensor(xArr, device: CPU).reshape(n, F);
+        using var yTConst = torch.tensor(yArr, device: CPU).reshape(n, 1);
 
         for (int epoch = 0; epoch < 40; epoch++)
         {
             opt.zero_grad();
-            using var xT    = torch.tensor(xArr, device: CPU).reshape(n, F);
-            using var yT    = torch.tensor(yArr, device: CPU).reshape(n, 1);
-            using var logit = torch.mm(xT, wP) + bP;
+            using var logit = torch.mm(xTConst, wP) + bP;
             using var prob  = torch.sigmoid(logit);
-            using var loss  = functional.binary_cross_entropy(prob, yT);
+            using var loss  = functional.binary_cross_entropy(prob, yTConst);
             loss.backward();
             opt.step();
         }
@@ -2247,8 +2119,7 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         float[] scoreArr;
         using (no_grad())
         {
-            using var xT    = torch.tensor(xArr, device: CPU).reshape(n, F);
-            using var logit = torch.mm(xT, wP) + bP;
+            using var logit = torch.mm(xTConst, wP) + bP;
             using var prob  = torch.sigmoid(logit).squeeze(1);
             scoreArr = prob.cpu().data<float>().ToArray();
         }
@@ -2547,14 +2418,15 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         using var bP  = new Parameter(zeros(1));
         using var opt = optim.Adam(new Parameter[] { wP, bP }, lr: 0.01, weight_decay: 0.001);
 
+        using var xTConst = torch.tensor(xArr, device: CPU).reshape(n, MetaDim);
+        using var yTConst = torch.tensor(yArr, device: CPU).reshape(n, 1);
+
         for (int epoch = 0; epoch < 40; epoch++)
         {
             opt.zero_grad();
-            using var xT    = torch.tensor(xArr, device: CPU).reshape(n, MetaDim);
-            using var yT    = torch.tensor(yArr, device: CPU).reshape(n, 1);
-            using var logit = torch.mm(xT, wP) + bP;
+            using var logit = torch.mm(xTConst, wP) + bP;
             using var prob  = torch.sigmoid(logit);
-            using var loss  = functional.binary_cross_entropy(prob, yT);
+            using var loss  = functional.binary_cross_entropy(prob, yTConst);
             loss.backward();
             opt.step();
         }
@@ -2630,14 +2502,15 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         using var bP  = new Parameter(zeros(1));
         using var opt = optim.Adam(new Parameter[] { wP, bP }, lr: 0.01, weight_decay: 0.001);
 
+        using var xTConst = torch.tensor(xArr, device: CPU).reshape(n, Dim);
+        using var yTConst = torch.tensor(yArr, device: CPU).reshape(n, 1);
+
         for (int epoch = 0; epoch < 60; epoch++)
         {
             opt.zero_grad();
-            using var xT    = torch.tensor(xArr, device: CPU).reshape(n, Dim);
-            using var yT    = torch.tensor(yArr, device: CPU).reshape(n, 1);
-            using var logit = torch.mm(xT, wP) + bP;
+            using var logit = torch.mm(xTConst, wP) + bP;
             using var prob  = torch.sigmoid(logit);
-            using var loss  = functional.binary_cross_entropy(prob, yT);
+            using var loss  = functional.binary_cross_entropy(prob, yTConst);
             loss.backward();
             opt.step();
         }
@@ -2760,14 +2633,14 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
     private static string[] ComputeRedundantFeaturePairs(
         List<TrainingSample> trainSet,
         int                  F,
-        double               threshold)
+        double               threshold,
+        int                  topN = 10)
     {
         if (threshold <= 0.0 || trainSet.Count < 20) return [];
 
-        const int TopN   = 10;
         const int NumBin = 10;
 
-        int        checkCount = Math.Min(TopN, F);
+        int        checkCount = Math.Min(Math.Max(2, topN), F);
         var        result     = new List<string>();
         double     maxMi      = threshold * Math.Log(2);
 
@@ -3002,14 +2875,15 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         using var bP  = new Parameter(zeros(1));
         using var opt = optim.Adam(new Parameter[] { wP, bP }, lr: 0.005, weight_decay: 0.01);
 
+        using var xTConst = torch.tensor(xArr, device: CPU).reshape(n, F);
+        using var yTConst = torch.tensor(yArr, device: CPU).reshape(n, 1);
+
         for (int epoch = 0; epoch < 60; epoch++)
         {
             opt.zero_grad();
-            using var xT    = torch.tensor(xArr, device: CPU).reshape(n, F);
-            using var yT    = torch.tensor(yArr, device: CPU).reshape(n, 1);
-            using var logit = torch.mm(xT, wP) + bP;
+            using var logit = torch.mm(xTConst, wP) + bP;
             using var prob  = torch.sigmoid(logit);
-            using var loss  = functional.binary_cross_entropy(prob, yT);
+            using var loss  = functional.binary_cross_entropy(prob, yTConst);
             loss.backward();
             opt.step();
         }
@@ -3018,8 +2892,7 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         float[] scoreArr;
         using (no_grad())
         {
-            using var xT    = torch.tensor(xArr, device: CPU).reshape(n, F);
-            using var logit = torch.mm(xT, wP) + bP;
+            using var logit = torch.mm(xTConst, wP) + bP;
             using var prob  = torch.sigmoid(logit).squeeze(1);
             scoreArr = prob.cpu().data<float>().ToArray();
         }
@@ -3040,7 +2913,136 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         return (pos > 0 && neg > 0) ? (double)aucNum / (pos * neg) : 0.5;
     }
 
-    // ── Depth-2 tree builder ──────────────────────────────────────────────────
+    // ── Jointly-optimal depth-2 tree builder ─────────────────────────────────
+
+    /// <summary>
+    /// Builds a depth-2 classification tree by jointly optimising root and child splits.
+    /// For every candidate root split (feature × threshold), partitions the data, finds the
+    /// best child split in each partition via <see cref="FindBestStumpInSubset"/>, and scores
+    /// the full tree by total weighted classification error across all 4 leaves.
+    /// Selects the (root, left-child, right-child) triple that minimises total error.
+    /// Complexity: O(F² · m · log m) per call — use only when F is moderate (≤ 30).
+    /// Falls back to the greedy <see cref="BuildDepth2Tree"/> when no valid root split exists.
+    /// </summary>
+    private static GbmTree BuildJointDepth2Tree(
+        List<TrainingSample> train,
+        int[]                labels,
+        double[]             weights,
+        int                  F,
+        double[]             sortKeys,
+        int[]                sortIndices,
+        bool                 sammeR,
+        bool[]?              activeMask)
+    {
+        int m = train.Count;
+
+        // Gather all candidate root splits: for each feature, sweep sorted values
+        var rootCandidates = new List<(int Fi, double Thresh)>();
+        for (int fi = 0; fi < F; fi++)
+        {
+            if (activeMask is not null && fi < activeMask.Length && !activeMask[fi]) continue;
+            for (int i = 0; i < m; i++)
+            {
+                sortKeys[i]    = train[i].Features[fi];
+                sortIndices[i] = i;
+            }
+            Array.Sort(sortKeys, sortIndices, 0, m);
+            for (int ti = 0; ti < m - 1; ti++)
+            {
+                if (sortKeys[ti + 1] <= sortKeys[ti] + 1e-12) continue;
+                rootCandidates.Add((fi, (sortKeys[ti] + sortKeys[ti + 1]) * 0.5));
+            }
+        }
+
+        if (rootCandidates.Count == 0)
+        {
+            // No valid split — return a trivial stump
+            double posW = 0, totW = 0;
+            for (int i = 0; i < m; i++) { totW += weights[i]; if (labels[i] > 0) posW += weights[i]; }
+            double p = totW > 1e-15 ? Math.Clamp(posW / totW, Eps, 1.0 - Eps) : 0.5;
+            double lv = sammeR ? 0.5 * MLFeatureHelper.Logit(p) : (p >= 0.5 ? 1.0 : -1.0);
+            return BuildStump(0, 0, 1, lv, lv);
+        }
+
+        // Temporary buffers for child-split search (avoid allocating inside the loop)
+        var tmpKeys = new double[m];
+        var tmpIdx  = new int[m];
+
+        double bestTotalErr = double.MaxValue;
+        int    bestRootFi   = 0;
+        double bestRootThr  = 0;
+        int    bestLFi = 0; double bestLThr = 0; int bestLPar = 1; double bestLProbL = 0.5; double bestLProbR = 0.5;
+        int    bestRFi = 0; double bestRThr = 0; int bestRPar = 1; double bestRProbL = 0.5; double bestRProbR = 0.5;
+
+        // Re-usable partition lists
+        var leftIdx  = new List<int>(m);
+        var rightIdx = new List<int>(m);
+
+        foreach (var (rootFi, rootThr) in rootCandidates)
+        {
+            // Partition samples by root split
+            leftIdx.Clear();
+            rightIdx.Clear();
+            for (int i = 0; i < m; i++)
+            {
+                if (rootFi < train[i].Features.Length && train[i].Features[rootFi] <= rootThr)
+                    leftIdx.Add(i);
+                else
+                    rightIdx.Add(i);
+            }
+            if (leftIdx.Count == 0 || rightIdx.Count == 0) continue;
+
+            // Find best child splits
+            var (lFi, lThr, lPar, lErr, lPL, lPR) =
+                FindBestStumpInSubset(train, labels, weights, F, leftIdx, activeMask, tmpKeys, tmpIdx);
+            var (rFi, rThr, rPar, rErr, rPL, rPR) =
+                FindBestStumpInSubset(train, labels, weights, F, rightIdx, activeMask, tmpKeys, tmpIdx);
+
+            // Total tree error = left-child error + right-child error (both already weighted)
+            double totalErr = lErr + rErr;
+            if (totalErr < bestTotalErr)
+            {
+                bestTotalErr = totalErr;
+                bestRootFi   = rootFi;
+                bestRootThr  = rootThr;
+                bestLFi = lFi; bestLThr = lThr; bestLPar = lPar; bestLProbL = lPL; bestLProbR = lPR;
+                bestRFi = rFi; bestRThr = rThr; bestRPar = rPar; bestRProbL = rPL; bestRProbR = rPR;
+            }
+        }
+
+        // Leaf values
+        double llv, lrv, rlv, rrv;
+        if (sammeR)
+        {
+            llv = 0.5 * MLFeatureHelper.Logit(bestLProbL);
+            lrv = 0.5 * MLFeatureHelper.Logit(bestLProbR);
+            rlv = 0.5 * MLFeatureHelper.Logit(bestRProbL);
+            rrv = 0.5 * MLFeatureHelper.Logit(bestRProbR);
+        }
+        else
+        {
+            llv = bestLPar > 0 ?  1.0 : -1.0;
+            lrv = bestLPar > 0 ? -1.0 :  1.0;
+            rlv = bestRPar > 0 ?  1.0 : -1.0;
+            rrv = bestRPar > 0 ? -1.0 :  1.0;
+        }
+
+        return new GbmTree
+        {
+            Nodes =
+            [
+                new GbmNode { IsLeaf = false, SplitFeature = bestRootFi, SplitThreshold = bestRootThr, LeftChild = 1, RightChild = 2 },
+                new GbmNode { IsLeaf = false, SplitFeature = bestLFi,    SplitThreshold = bestLThr,    LeftChild = 3, RightChild = 4 },
+                new GbmNode { IsLeaf = false, SplitFeature = bestRFi,    SplitThreshold = bestRThr,    LeftChild = 5, RightChild = 6 },
+                new GbmNode { IsLeaf = true,  LeafValue = llv },
+                new GbmNode { IsLeaf = true,  LeafValue = lrv },
+                new GbmNode { IsLeaf = true,  LeafValue = rlv },
+                new GbmNode { IsLeaf = true,  LeafValue = rrv },
+            ]
+        };
+    }
+
+    // ── Depth-2 tree builder (greedy) ────────────────────────────────────────
 
     /// <summary>
     /// Greedily builds a depth-2 classification tree.
@@ -3117,5 +3119,267 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
                 new GbmNode { IsLeaf = true,  LeafValue = rrv },
             ]
         };
+    }
+
+    // ── Pruned-model result ───────────────────────────────────────────────────
+
+    private readonly record struct PrunedModelResult(
+        List<GbmTree>        Stumps,
+        List<double>         Alphas,
+        double               PlattA,
+        double               PlattB,
+        double               PlattABuy,
+        double               PlattBBuy,
+        double               PlattASell,
+        double               PlattBSell,
+        double[]             IsotonicBp,
+        List<TrainingSample> MaskedCal,
+        List<TrainingSample> MaskedTest,
+        double[]             MagWeights,
+        double               MagBias,
+        double[]             MagQ90Weights,
+        double               MagQ90Bias,
+        double               DurbinWatson,
+        double               AvgKellyFraction,
+        double               Ece,
+        double               OptimalThreshold,
+        double               TemperatureScale,
+        EvalMetrics          Metrics,
+        double               BaseAccuracy);
+
+    // ── Pruned-model training helper ──────────────────────────────────────────
+
+    /// <summary>
+    /// Trains a pruned AdaBoost ensemble on masked features, calibrates it, and compares
+    /// against the unpruned baseline. Returns <c>null</c> if the pruned model degrades
+    /// accuracy by more than 1 %, otherwise returns a <see cref="PrunedModelResult"/>
+    /// containing all updated artefacts.
+    /// </summary>
+    private PrunedModelResult? TrainPrunedModel(
+        List<TrainingSample> trainSet,
+        List<TrainingSample> calSet,
+        List<TrainingSample> testSet,
+        bool[]               activeMask,
+        List<GbmTree>        stumps,
+        List<double>         alphas,
+        List<GbmTree>        warmStumps,
+        List<double>         warmAlphas,
+        bool                 replayWarmStartWeights,
+        double[]?            densityWeights,
+        double[]             magWeights,
+        double               magBias,
+        double               plattA,
+        double               plattB,
+        double               plattABuy,
+        double               plattBBuy,
+        double               plattASell,
+        double               plattBSell,
+        double[]             isotonicBp,
+        TrainingHyperparams  hp,
+        int                  F,
+        int                  effectiveK,
+        double               shrinkage,
+        bool                 sammeR,
+        int                  treeDepth,
+        int                  prunedCount,
+        CancellationToken    ct)
+    {
+        _logger.LogInformation(
+            "Feature pruning: masking {Pruned}/{Total} low-importance features; re-training.",
+            prunedCount, F);
+
+        var maskedTrain = ApplyMask(trainSet, activeMask);
+        var maskedCal   = ApplyMask(calSet,   activeMask);
+        var maskedTest  = ApplyMask(testSet,  activeMask);
+
+        // ── Warm-start pruned retrain from filtered existing stumps ──────────
+        var filteredPStumps = new List<GbmTree>(stumps.Count);
+        var filteredPAlphas = new List<double>(stumps.Count);
+        for (int i = 0; i < Math.Min(stumps.Count, alphas.Count); i++)
+        {
+            int sf = stumps[i].Nodes?[0].SplitFeature ?? -1;
+            if (sf >= 0 && sf < activeMask.Length && activeMask[sf])
+            {
+                filteredPStumps.Add(stumps[i]);
+                filteredPAlphas.Add(alphas[i]);
+            }
+        }
+        int pResidualRounds = filteredPStumps.Count > 0
+            ? Math.Max(5, effectiveK / 3)
+            : effectiveK;
+
+        int pM      = maskedTrain.Count;
+        var pLabels = new int[pM];
+        for (int i = 0; i < pM; i++) pLabels[i] = maskedTrain[i].Direction > 0 ? 1 : -1;
+
+        var pSoftLabels = new double[pM];
+        if (hp.UseAdaptiveLabelSmoothing)
+        {
+            double pMaxMag = 0.0;
+            foreach (var s in maskedTrain) { double mag = Math.Abs((double)s.Magnitude); if (mag > pMaxMag) pMaxMag = mag; }
+            for (int i = 0; i < pM; i++)
+            {
+                double eps_i = pMaxMag > 1e-9
+                    ? Math.Clamp(1.0 - Math.Abs((double)maskedTrain[i].Magnitude) / pMaxMag, 0.0, 0.20)
+                    : 0.0;
+                pSoftLabels[i] = pLabels[i] * (1.0 - eps_i);
+            }
+        }
+        else
+        {
+            for (int i = 0; i < pM; i++) pSoftLabels[i] = pLabels[i];
+        }
+
+        double[]? pDensityWeights = densityWeights is null || densityWeights.Length >= maskedTrain.Count
+            ? densityWeights
+            : null;
+        if (densityWeights is not null && densityWeights.Length < maskedTrain.Count)
+            _logger.LogWarning(
+                "AdaBoost pruned retrain: densityWeights length ({DW}) < maskedTrain count ({MT}); " +
+                "density blending skipped to avoid partial index misalignment.",
+                densityWeights.Length, maskedTrain.Count);
+
+        double[] pWeights = InitialiseBoostWeights(maskedTrain, hp.TemporalDecayLambda, pDensityWeights);
+
+        if (replayWarmStartWeights)
+        {
+            var filteredStumps = new List<GbmTree>(warmStumps.Count);
+            var filteredAlphas = new List<double>(warmStumps.Count);
+            foreach (var (ws, wa) in warmStumps.Zip(warmAlphas))
+            {
+                int sf = ws.Nodes?[0].SplitFeature ?? -1;
+                if (sf >= 0 && sf < activeMask.Length && activeMask[sf])
+                { filteredStumps.Add(ws); filteredAlphas.Add(wa); }
+            }
+            if (filteredStumps.Count > 0)
+                AdjustWarmStartWeights(pWeights, pLabels, maskedTrain, filteredStumps, filteredAlphas);
+        }
+
+        bool pJointD2 = treeDepth == 2 && hp.UseJointDepth2Search;
+        var pStumps  = new List<GbmTree>(filteredPStumps);
+        var pAlphas  = new List<double>(filteredPAlphas);
+        var pSortK   = new double[pM];
+        var pSortIdx = new int[pM];
+
+        for (int round = 0; round < pResidualRounds && !ct.IsCancellationRequested; round++)
+        {
+            var (bFi, bThresh, bParity, bErr) =
+                FindBestStump(maskedTrain, pLabels, pWeights, F, pSortK, pSortIdx, activeMask);
+
+            if (!double.IsFinite(bErr) || bErr >= 0.5 - Eps) break;
+
+            GbmTree pTree;
+            double  pAlpha;
+
+            if (sammeR)
+            {
+                pTree  = treeDepth == 2
+                    ? (pJointD2
+                        ? BuildJointDepth2Tree(maskedTrain, pLabels, pWeights, F, pSortK, pSortIdx, true, activeMask)
+                        : BuildDepth2Tree(bFi, bThresh, maskedTrain, pLabels,
+                                          pWeights, F, pSortK, pSortIdx, true, activeMask))
+                    : BuildSammeRStump(bFi, bThresh, maskedTrain, pLabels, pWeights, pM);
+                pAlpha = 1.0;
+                pAlphas.Add(pAlpha);
+                pStumps.Add(pTree);
+                double wSum = 0;
+                for (int i = 0; i < pM; i++)
+                {
+                    double hR = PredictStump(pTree, maskedTrain[i].Features);
+                    pWeights[i] *= Math.Exp(-pSoftLabels[i] * hR);
+                    wSum += pWeights[i];
+                }
+                if (wSum > 0) for (int i = 0; i < pM; i++) pWeights[i] /= wSum;
+            }
+            else
+            {
+                double cErr = Math.Max(Eps, Math.Min(1 - Eps, bErr));
+                pAlpha = shrinkage * 0.5 * Math.Log((1 - cErr) / cErr);
+                pTree  = treeDepth == 2
+                    ? (pJointD2
+                        ? BuildJointDepth2Tree(maskedTrain, pLabels, pWeights, F, pSortK, pSortIdx, false, activeMask)
+                        : BuildDepth2Tree(bFi, bThresh, maskedTrain, pLabels,
+                                          pWeights, F, pSortK, pSortIdx, false, activeMask))
+                    : BuildStump(bFi, bThresh, bParity);
+                pAlphas.Add(pAlpha);
+                pStumps.Add(pTree);
+                double wSum = 0;
+                for (int i = 0; i < pM; i++)
+                {
+                    double pred = PredictStump(pTree, maskedTrain[i].Features);
+                    pWeights[i] *= Math.Exp(-pAlpha * pSoftLabels[i] * pred);
+                    wSum += pWeights[i];
+                }
+                if (wSum > 0) for (int i = 0; i < pM; i++) pWeights[i] /= wSum;
+            }
+        }
+
+        // Sanitise pruned-retrain alphas
+        for (int k = 0; k < pStumps.Count; k++)
+            if (!double.IsFinite(pAlphas[k]) || pStumps[k].Nodes is not { Count: > 0 })
+                pAlphas[k] = 0.0;
+
+        // Calibrate the pruned model
+        var (pPlattA, pPlattB)  = FitPlattScaling(maskedCal, pStumps, pAlphas);
+        var (pPlattABuy, pPlattBBuy, pPlattASell, pPlattBSell) =
+            FitClassConditionalPlatt(maskedCal, pStumps, pAlphas);
+        double[] pIsotonicBp = FitIsotonicCalibration(maskedCal, pStumps, pAlphas, pPlattA, pPlattB,
+                                                       pPlattABuy, pPlattBBuy, pPlattASell, pPlattBSell);
+
+        // Re-fit magnitude regressors on masked features
+        var (pMagWeights, pMagBias) = FitLinearRegressor(maskedTrain, F, hp);
+        double pDurbinWatson = ComputeDurbinWatson(maskedTrain, pMagWeights, pMagBias, F);
+        double[] pMagQ90Weights = [];
+        double   pMagQ90Bias    = 0.0;
+        if (hp.MagnitudeQuantileTau > 0.0 && maskedTrain.Count >= 10)
+            (pMagQ90Weights, pMagQ90Bias) = FitQuantileRegressor(maskedTrain, F, hp.MagnitudeQuantileTau);
+
+        var pMetrics = EvaluateModel(maskedTest, pStumps, pAlphas,
+                                      pMagWeights, pMagBias, pPlattA, pPlattB, pIsotonicBp,
+                                      pPlattABuy, pPlattBBuy, pPlattASell, pPlattBSell);
+
+        // Accept pruned model only if accuracy doesn't degrade by more than 1 %
+        var baseMetrics = EvaluateModel(testSet, stumps, alphas,
+                                        magWeights, magBias, plattA, plattB, isotonicBp,
+                                        plattABuy, plattBBuy, plattASell, plattBSell);
+
+        if (pMetrics.Accuracy < baseMetrics.Accuracy - 0.01)
+            return null;
+
+        double pAvgKelly = ComputeAvgKellyFraction(maskedCal, pStumps, pAlphas, pPlattA, pPlattB);
+        double pEce = ComputeEce(maskedTest, pStumps, pAlphas, pPlattA, pPlattB, pIsotonicBp,
+                                  plattABuy: pPlattABuy, plattBBuy: pPlattBBuy,
+                                  plattASell: pPlattASell, plattBSell: pPlattBSell);
+        double pOptThreshold = ComputeOptimalThreshold(
+            maskedCal, pStumps, pAlphas, pPlattA, pPlattB, pIsotonicBp,
+            hp.ThresholdSearchMin, hp.ThresholdSearchMax,
+            pPlattABuy, pPlattBBuy, pPlattASell, pPlattBSell);
+        double pTempScale = hp.FitTemperatureScale && maskedCal.Count >= 10
+            ? FitTemperatureScaling(maskedCal, pStumps, pAlphas)
+            : 0.0;
+
+        return new PrunedModelResult(
+            Stumps:           pStumps,
+            Alphas:           pAlphas,
+            PlattA:           pPlattA,
+            PlattB:           pPlattB,
+            PlattABuy:        pPlattABuy,
+            PlattBBuy:        pPlattBBuy,
+            PlattASell:       pPlattASell,
+            PlattBSell:       pPlattBSell,
+            IsotonicBp:       pIsotonicBp,
+            MaskedCal:        maskedCal,
+            MaskedTest:       maskedTest,
+            MagWeights:       pMagWeights,
+            MagBias:          pMagBias,
+            MagQ90Weights:    pMagQ90Weights,
+            MagQ90Bias:       pMagQ90Bias,
+            DurbinWatson:     pDurbinWatson,
+            AvgKellyFraction: pAvgKelly,
+            Ece:              pEce,
+            OptimalThreshold: pOptThreshold,
+            TemperatureScale: pTempScale,
+            Metrics:          pMetrics,
+            BaseAccuracy:     baseMetrics.Accuracy);
     }
 }

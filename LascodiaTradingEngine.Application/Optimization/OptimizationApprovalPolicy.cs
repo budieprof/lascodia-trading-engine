@@ -44,7 +44,9 @@ internal static class OptimizationApprovalPolicy
         bool TimeConcentrationOk,
         double AssetClassSharpeMultiplier = 1.0,
         double AssetClassPfMultiplier = 1.0,
-        bool GenesisRegressionOk = true);
+        double AssetClassDrawdownMultiplier = 1.0,
+        bool GenesisRegressionOk = true,
+        bool HasSufficientOutOfSampleData = true);
 
     internal sealed record Result(
         bool Passed,
@@ -63,7 +65,7 @@ internal static class OptimizationApprovalPolicy
         if (!compositeGateOk && input.TotalTrades >= input.MinCandidateTrades)
         {
             bool strongSharpe  = (double)input.SharpeRatio >= 1.0 * input.AssetClassSharpeMultiplier;
-            bool lowDrawdown   = (double)input.MaxDrawdownPct <= 10.0 / input.AssetClassSharpeMultiplier;
+            bool lowDrawdown   = (double)input.MaxDrawdownPct <= 10.0 / input.AssetClassDrawdownMultiplier;
             bool decentWinRate = (double)input.WinRate >= 0.45;
             bool decentPF      = (double)input.ProfitFactor >= 1.2 * input.AssetClassPfMultiplier;
 
@@ -75,6 +77,7 @@ internal static class OptimizationApprovalPolicy
         }
 
         bool safetyGatesOk = input.CILower >= input.MinBootstrapCILower
+            && input.HasSufficientOutOfSampleData
             && !input.DegradationFailed
             && input.WfStable
             && input.MtfCompatible
@@ -93,7 +96,8 @@ internal static class OptimizationApprovalPolicy
         bool passed = (compositeGateOk || multiObjectiveGateOk) && safetyGatesOk;
 
         string failureReason = passed ? string.Empty :
-            input.DegradationFailed ? "excessive IS-to-OOS degradation"
+            !input.HasSufficientOutOfSampleData ? "insufficient out-of-sample data for approval-grade validation"
+            : input.DegradationFailed ? "excessive IS-to-OOS degradation"
             : !input.WfStable ? "walk-forward instability"
             : !input.MtfCompatible ? "higher TF regime incompatible"
             : !input.CorrelationSafe ? "winner params too similar to existing active strategy"
@@ -119,6 +123,7 @@ internal static class OptimizationApprovalPolicy
             ["safetyGatesOk"] = safetyGatesOk,
             ["candidateImprovement"] = input.CandidateImprovement,
             ["oosHealthScore"] = input.OosHealthScore,
+            ["hasSufficientOutOfSampleData"] = input.HasSufficientOutOfSampleData,
             ["ciLower"] = input.CILower,
             ["wfStable"] = input.WfStable,
             ["mtfCompatible"] = input.MtfCompatible,

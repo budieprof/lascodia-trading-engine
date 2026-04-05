@@ -44,12 +44,14 @@ internal static class OptimizationRunStateMachine
                 run.CompletedAt = null;
                 run.ApprovedAt = null;
                 run.ErrorMessage = null;
+                run.FailureCategory = null;
                 run.ExecutionLeaseExpiresAt = null;
                 break;
 
             case OptimizationRunStatus.Completed:
                 run.CompletedAt = utcNow;
                 run.ErrorMessage = null;
+                run.FailureCategory = null;
                 run.ExecutionLeaseExpiresAt = null;
                 break;
 
@@ -64,6 +66,7 @@ internal static class OptimizationRunStateMachine
                 if (!run.CompletedAt.HasValue)
                     run.CompletedAt = utcNow;
                 run.ErrorMessage = null;
+                run.FailureCategory = null;
                 run.ExecutionLeaseExpiresAt = null;
                 break;
 
@@ -71,6 +74,7 @@ internal static class OptimizationRunStateMachine
                 if (!run.CompletedAt.HasValue)
                     run.CompletedAt = utcNow;
                 run.ErrorMessage = null;
+                run.FailureCategory = null;
                 run.ExecutionLeaseExpiresAt = null;
                 break;
 

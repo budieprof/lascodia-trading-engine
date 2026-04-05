@@ -20,6 +20,8 @@ namespace LascodiaTradingEngine.Application.Optimization;
 /// </remarks>
 internal static class OptimizationRunClaimer
 {
+    private const string ClaimAdvisoryLockKey = "OptimizationRunClaimer:ClaimNextRun";
+
     /// <summary>
     /// Atomically claims the next queued optimization run by setting its status to Running,
     /// applying an execution lease, and enforcing the concurrency limit — all in a single
@@ -44,21 +46,26 @@ internal static class OptimizationRunClaimer
             : "";
 
         var claimSql = $@"
+            WITH claim_guard AS (
+                SELECT pg_try_advisory_xact_lock(hashtext('{ClaimAdvisoryLockKey}')) AS acquired
+            ),
+            candidate AS (
+                SELECT ""Id"" FROM {tableName}
+                WHERE ""Status"" = {{3}} AND ""IsDeleted"" = false
+                  AND (""DeferredUntilUtc"" IS NULL OR ""DeferredUntilUtc"" <= {{1}})
+                  AND EXISTS (SELECT 1 FROM claim_guard WHERE acquired)
+                  {concurrencyGuard}
+                ORDER BY ""StartedAt""
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            )
             UPDATE {tableName}
             SET ""Status"" = {{0}},
                 ""StartedAt"" = {{1}},
                 ""LastHeartbeatAt"" = {{1}},
                 ""ExecutionLeaseExpiresAt"" = {{2}},
                 ""DeferredUntilUtc"" = NULL
-            WHERE ""Id"" = (
-                SELECT ""Id"" FROM {tableName}
-                WHERE ""Status"" = {{3}} AND ""IsDeleted"" = false
-                AND (""DeferredUntilUtc"" IS NULL OR ""DeferredUntilUtc"" <= {{1}})
-                {concurrencyGuard}
-                ORDER BY ""StartedAt""
-                LIMIT 1
-                FOR UPDATE SKIP LOCKED
-            )
+            WHERE ""Id"" = (SELECT ""Id"" FROM candidate)
             RETURNING ""Id""";
 
         var claimParams = maxConcurrentRuns > 0

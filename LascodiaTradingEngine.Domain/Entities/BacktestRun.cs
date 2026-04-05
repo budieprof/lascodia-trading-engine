@@ -72,6 +72,13 @@ public class BacktestRun : Entity<long>
     /// </summary>
     public long?    SourceOptimizationRunId { get; set; }
 
+    /// <summary>
+    /// Optional parameter snapshot pinned to this run at queue time.
+    /// Optimization follow-up backtests use this instead of whatever parameters the
+    /// strategy may hold later after rollouts, rollbacks, or manual edits.
+    /// </summary>
+    public string?  ParametersSnapshotJson { get; set; }
+
     /// <summary>Soft-delete flag. Filtered out by the global EF Core query filter.</summary>
     public bool     IsDeleted      { get; set; }
 

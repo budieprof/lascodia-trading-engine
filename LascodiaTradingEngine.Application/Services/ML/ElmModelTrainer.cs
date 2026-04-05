@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text.Json;
 using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
@@ -37,7 +38,7 @@ namespace LascodiaTradingEngine.Application.Services.ML;
 /// </para>
 /// </summary>
 [RegisterKeyedService(typeof(IMLModelTrainer), LearnerArchitecture.Elm)]
-public sealed class ElmModelTrainer : IMLModelTrainer
+public sealed partial class ElmModelTrainer : IMLModelTrainer
 {
     // ── Constants ────────────────────────────────────────────────────────────
 
@@ -79,6 +80,9 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         CancellationToken    ct)
     {
         ct.ThrowIfCancellationRequested();
+
+        var pipelineStopwatch = Stopwatch.StartNew();
+        var stageStopwatch = Stopwatch.StartNew();
 
         int featureCount = ValidateTrainingSamples(samples);
         int hiddenSize   = hp.ElmHiddenSize is > 0 ? hp.ElmHiddenSize.Value : DefaultHiddenSize;
@@ -176,6 +180,8 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             "ELM walk-forward CV — folds={Folds} avgAcc={Acc:P1} stdAcc={Std:P1} avgF1={F1:F3} avgEV={EV:F4} avgSharpe={Sharpe:F2}",
             cvResult.FoldCount, cvResult.AvgAccuracy, cvResult.StdAccuracy,
             cvResult.AvgF1, cvResult.AvgEV, cvResult.AvgSharpe);
+        _logger.LogDebug("ELM stage timing: walk-forward CV = {Ms}ms", stageStopwatch.ElapsedMilliseconds);
+        stageStopwatch.Restart();
 
         if (equityCurveGateFailed)
             return new TrainingResult(new EvalMetrics(0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0), cvResult, []);
@@ -274,6 +280,8 @@ public sealed class ElmModelTrainer : IMLModelTrainer
 
         // ── 4b. Post-training NaN/Inf weight sanitisation ──────────────────
         int sanitizedCount = SanitizeLearnerOutputs(weights, biases, "ELM");
+        _logger.LogDebug("ELM stage timing: ensemble fitting + sanitisation = {Ms}ms", stageStopwatch.ElapsedMilliseconds);
+        stageStopwatch.Restart();
 
         ct.ThrowIfCancellationRequested();
 
@@ -363,7 +371,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         {
             (magWeights, magBias, magAugWeights, magAugBias) = FitElmMagnitudeRegressor(
                 trainSet, featureCount, hiddenSize, inputWeights, inputBiases, featureSubsets, learnerActivations,
-                hp.ElmMagRegressorLr, hp.ElmMagRegressorMaxEpochs, hp.ElmMagRegressorPatience, ct);
+                hp.ElmMagRegressorLr, hp.ElmMagRegressorMaxEpochs, hp.ElmMagRegressorPatience, embargo, ct);
         }
 
         // ── 6b. Quantile magnitude regressor ─────────────────────────────────
@@ -373,7 +381,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         {
             (magQ90Weights, magQ90Bias) = FitQuantileRegressor(
                 trainSet, featureCount, hp.MagnitudeQuantileTau, hiddenSize,
-                inputWeights, inputBiases, featureSubsets, learnerActivations, ct);
+                inputWeights, inputBiases, featureSubsets, learnerActivations, embargo, ct);
             _logger.LogDebug("ELM quantile magnitude regressor fitted (τ={Tau:F2}).", hp.MagnitudeQuantileTau);
         }
 
@@ -444,6 +452,9 @@ public sealed class ElmModelTrainer : IMLModelTrainer
         var effectiveTrainSet     = trainSet;
         int effectiveFeatureCount = featureCount;
 
+        _logger.LogDebug("ELM stage timing: calibration + importance = {Ms}ms", stageStopwatch.ElapsedMilliseconds);
+        stageStopwatch.Restart();
+
         // ── 11. Feature pruning re-train pass ───────────────────────────────
         var activeMask = ElmBootstrapHelper.BuildFeatureMask(featureImportance, hp.MinFeatureImportance, featureCount);
 
@@ -474,28 +485,36 @@ public sealed class ElmModelTrainer : IMLModelTrainer
 
         int prunedCount = activeMask.Count(m => !m);
 
-        if (prunedCount > 0 && featureCount - prunedCount >= 10)
+        const int maxPruningIterations = 3;
+        for (int pruneIter = 0; pruneIter < maxPruningIterations; pruneIter++)
         {
+            if (prunedCount <= 0 || featureCount - prunedCount < 10)
+                break;
+
             int activeFeatureCount = featureCount - prunedCount;
             _logger.LogInformation(
-                "ELM feature pruning: masking {Pruned}/{Total} low-importance features (active={Active})",
-                prunedCount, featureCount, activeFeatureCount);
+                "ELM feature pruning iter {Iter}: masking {Pruned}/{Total} low-importance features (active={Active})",
+                pruneIter + 1, prunedCount, featureCount, activeFeatureCount);
 
             var maskedTrain = ElmBootstrapHelper.ApplyZeroMask(trainSet, activeMask);
             var maskedCal   = ElmBootstrapHelper.ApplyZeroMask(calSet, activeMask);
             var maskedTest  = ElmBootstrapHelper.ApplyZeroMask(testSet, activeMask);
 
-            double currentAcceptanceThreshold = ElmCalibrationHelper.ComputeOptimalThreshold(
-                maskedCal, weights, biases, inputWeights, inputBiases, plattA, plattB, featureCount, hiddenSize, featureSubsets,
-                hp.ThresholdSearchMin, hp.ThresholdSearchMax,
-                (f, w, b, iw, ib, pA, pB, fc, hs, fs, lw) => PrimaryCalibProb(f));
+            // Run the full calibration pipeline on the unpruned model so the
+            // acceptance comparison is apples-to-apples (both sides have isotonic).
+            var fullCalib = FitCalibrationPipeline(
+                maskedCal, weights, biases, inputWeights, inputBiases,
+                featureCount, hiddenSize, featureSubsets, learnerHiddenSizes, learnerActivations, hp, ct);
+            var fullCalibProb = BuildCalibratedProbFunc(
+                weights, biases, inputWeights, inputBiases, featureCount, hiddenSize, featureSubsets,
+                learnerHiddenSizes, learnerActivations, fullCalib, hp.AgeDecayLambda);
             var currentAcceptanceMetrics = ElmEvaluationHelper.EvaluateEnsemble(
                 maskedCal, weights, biases, inputWeights, inputBiases,
-                magWeights, magBias, plattA, plattB, featureCount, hiddenSize, featureSubsets,
+                magWeights, magBias, fullCalib.PlattA, fullCalib.PlattB, featureCount, hiddenSize, featureSubsets,
                 magAugWeights, magAugBias, sharpeAnnFactor,
-                (f, w, b, iw, ib, pA, pB, fc, hs, fs, lw) => PrimaryCalibProb(f),
+                (f, w, b, iw, ib, pA, pB, fc, hs, fs, lw) => fullCalibProb(f),
                 (f, aw, ab, fc, hs, eiw, eib, fs) => PredictMagnitudeAug(f, aw, ab, fc, hs, eiw, eib, fs, learnerActivations),
-                currentAcceptanceThreshold);
+                fullCalib.OptimalThreshold);
 
             var prunedHp = hp with
             {
@@ -538,105 +557,28 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             {
                 (pmw, pmb, pmaw, pmab) = FitElmMagnitudeRegressor(
                     maskedTrain, featureCount, hiddenSize, piw, pib, psub, pla,
-                    hp.ElmMagRegressorLr, hp.ElmMagRegressorMaxEpochs, hp.ElmMagRegressorPatience, ct);
+                    hp.ElmMagRegressorLr, hp.ElmMagRegressorMaxEpochs, hp.ElmMagRegressorPatience, embargo, ct);
             }
 
-            var (pLearnerCalAccuracies, pLearnerAccWeights) = ComputeLearnerCalibrationStats(
+            var pCalib = FitCalibrationPipeline(
                 maskedCal, pw, pb, piw, pib,
-                featureCount, psub, phs, pla);
+                featureCount, hiddenSize, psub, phs, pla, hp, ct);
 
-            // Fit stacking meta-learner on the pruned model before computing comparison
-            // metrics. The full model already uses stacking in EnsembleRawProb/CalibProb;
-            // omitting it here made the pruned vs full comparison apples-to-oranges and
-            // systematically penalised the pruned model by ~1–3 % accuracy.
-            var (pSw, pSb) = FitStackingMetaLearner(
-                maskedCal, pw, pb, piw, pib, featureCount, hiddenSize, psub, phs, pla, ct);
-
-            // Use CV Platt so the acceptance comparison uses the same calibration
-            // method as the full model (FitPlattScalingCV at step 5), making it
-            // apples-to-apples.
-            var (pA, pB) = ElmCalibrationHelper.FitPlattScalingCV(
-                maskedCal, pw, pb, piw, pib, featureCount, hiddenSize, psub,
-                (f, w, b, iw, ib, fc, hs, fs, lw) => EnsembleRawProb(
-                    f, w, b, iw, ib, fc, hs, fs, lw ?? pLearnerAccWeights, phs, pla, pSw, pSb));
-            var pTrainedAtUtc = DateTime.UtcNow;
-            double pTemp = 0.0;
-            if (hp.FitTemperatureScale && maskedCal.Count >= 10)
-            {
-                pTemp = ElmCalibrationHelper.FitTemperatureScaling(
-                    maskedCal, pw, pb, piw, pib, featureCount, hiddenSize, psub,
-                    (f, w, b, iw, ib, fc, hs, fs, lw) => EnsembleRawProb(
-                        f, w, b, iw, ib, fc, hs, fs, lw ?? pLearnerAccWeights, phs, pla, pSw, pSb));
-            }
-            var (pABuy, pBBuy, pASell, pBSell) = ElmCalibrationHelper.FitClassConditionalPlatt(
-                maskedCal, pw, pb, piw, pib, featureCount, hiddenSize, psub,
-                pA, pB, pTemp,
-                (f, w, b, iw, ib, fc, hs, fs, lw) => EnsembleRawProb(
-                    f, w, b, iw, ib, fc, hs, fs, lw ?? pLearnerAccWeights, phs, pla, pSw, pSb));
-
-            double PPreIsotonicCalibProb(float[] features) => ApplyProductionCalibration(
-                EnsembleRawProb(features, pw, pb, piw, pib, featureCount, hiddenSize, psub, pLearnerAccWeights, phs, pla, pSw, pSb),
-                pA, pB, pTemp, pABuy, pBBuy, pASell, pBSell);
-
-            double[] pIso = ElmCalibrationHelper.FitIsotonicCalibration(
-                maskedCal, pw, pb, piw, pib, pA, pB, featureCount, hiddenSize, psub,
-                (f, w, b, iw, ib, pAp, pBp, fc, hs, fs, lw) => PPreIsotonicCalibProb(f));
-
-            if (hp.FitTemperatureScale && maskedCal.Count >= 10)
-            {
-                double refitPTemp = ElmCalibrationHelper.FitTemperatureScaling(
-                    maskedCal, pw, pb, piw, pib, featureCount, hiddenSize, psub,
-                    (f, w, b, iw, ib, fc, hs, fs, lw) => EnsembleRawProb(
-                        f, w, b, iw, ib, fc, hs, fs, lw ?? pLearnerAccWeights, phs, pla, pSw, pSb),
-                    pA, pB, pABuy, pBBuy, pASell, pBSell, pIso, hp.AgeDecayLambda, pTrainedAtUtc);
-
-                if (Math.Abs(refitPTemp - pTemp) > 1e-6)
-                {
-                    pTemp = refitPTemp;
-                    (pABuy, pBBuy, pASell, pBSell) = ElmCalibrationHelper.FitClassConditionalPlatt(
-                        maskedCal, pw, pb, piw, pib, featureCount, hiddenSize, psub,
-                        pA, pB, pTemp,
-                        (f, w, b, iw, ib, fc, hs, fs, lw) => EnsembleRawProb(
-                            f, w, b, iw, ib, fc, hs, fs, lw ?? pLearnerAccWeights, phs, pla, pSw, pSb));
-                    pIso = ElmCalibrationHelper.FitIsotonicCalibration(
-                        maskedCal, pw, pb, piw, pib, pA, pB, featureCount, hiddenSize, psub,
-                        (f, w, b, iw, ib, pAp, pBp, fc, hs, fs, lw) => PPreIsotonicCalibProb(f));
-                }
-            }
-
-            double PPrimaryCalibProb(float[] features)
-            {
-                double calib = PPreIsotonicCalibProb(features);
-                calib = pIso.Length >= 4 ? ElmCalibrationHelper.ApplyIsotonicCalibration(calib, pIso) : calib;
-
-                double safeAgeDecayLambda = ClampNonNegativeFinite(hp.AgeDecayLambda);
-                if (safeAgeDecayLambda > 0.0)
-                {
-                    double daysSinceTrain = (DateTime.UtcNow - pTrainedAtUtc).TotalDays;
-                    double decayFactor = Math.Exp(-safeAgeDecayLambda * Math.Max(0.0, daysSinceTrain));
-                    calib = 0.5 + (calib - 0.5) * decayFactor;
-                }
-
-                return calib;
-            }
-
-            double pOptimalThreshold = ElmCalibrationHelper.ComputeOptimalThreshold(
-                maskedCal, pw, pb, piw, pib, pA, pB, featureCount, hiddenSize, psub,
-                hp.ThresholdSearchMin, hp.ThresholdSearchMax,
-                (f, w, b, iw, ib, pAp, pBp, fc, hs, fs, lw) => PPrimaryCalibProb(f));
+            var pCalibProb = BuildCalibratedProbFunc(
+                pw, pb, piw, pib, featureCount, hiddenSize, psub, phs, pla, pCalib, hp.AgeDecayLambda);
 
             var prunedMetrics = ElmEvaluationHelper.EvaluateEnsemble(
-                maskedCal, pw, pb, piw, pib, pmw, pmb, pA, pB, featureCount, hiddenSize, psub,
-                pmaw, pmab, sharpeAnnFactor,
-                (f, w, b, iw, ib, pAp, pBp, fc, hs, fs, lw) => PPrimaryCalibProb(f),
+                maskedCal, pw, pb, piw, pib, pmw, pmb, pCalib.PlattA, pCalib.PlattB,
+                featureCount, hiddenSize, psub, pmaw, pmab, sharpeAnnFactor,
+                (f, w, b, iw, ib, pAp, pBp, fc, hs, fs, lw) => pCalibProb(f),
                 (f, aw, ab, fc, hs, eiw, eib, fs) => PredictMagnitudeAug(f, aw, ab, fc, hs, eiw, eib, fs, pla),
-                pOptimalThreshold);
+                pCalib.OptimalThreshold);
 
             if (prunedMetrics.Accuracy >= currentAcceptanceMetrics.Accuracy - 0.005)
             {
                 _logger.LogInformation(
-                    "ELM pruned model accepted: acc={Acc:P1} (was {Old:P1}), reduced features {Full}→{Active}",
-                    prunedMetrics.Accuracy, currentAcceptanceMetrics.Accuracy, featureCount, activeFeatureCount);
+                    "ELM pruned model accepted (iter {Iter}): acc={Acc:P1} (was {Old:P1}), reduced features {Full}→{Active}",
+                    pruneIter + 1, prunedMetrics.Accuracy, currentAcceptanceMetrics.Accuracy, featureCount, activeFeatureCount);
                 weights = pw; biases = pb;
                 inputWeights = piw; inputBiases = pib;
                 featureSubsets = psub;
@@ -644,40 +586,40 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                 learnerActivations = pla;
                 inverseGramsFlat = pInvGramFlat;
                 inverseGramDims = pInvGramDims;
-                learnerCalAccuracies = pLearnerCalAccuracies;
-                learnerAccWeights = pLearnerAccWeights;
+                learnerCalAccuracies = pCalib.LearnerCalAccuracies;
+                learnerAccWeights = pCalib.LearnerAccWeights;
                 magWeights = pmw; magBias = pmb;
                 magAugWeights = pmaw; magAugBias = pmab;
                 magAugWeightsFolds = pMagAugWeightsFolds;
                 magAugBiasFolds    = pMagAugBiasFolds;
                 sanitizedCount = pSanitizedCount;
-                plattA = pA; plattB = pB;
-                temperatureScale = pTemp;
+                plattA = pCalib.PlattA; plattB = pCalib.PlattB;
+                temperatureScale = pCalib.TemperatureScale;
                 finalMetrics = prunedMetrics;
 
-                // Reuse the stacking weights already fitted on the pruned model (pSw, pSb)
-                // — same inputs would produce identical results.
-                (stackingWeights, stackingBias) = (pSw, pSb);
+                (stackingWeights, stackingBias) = (pCalib.StackingWeights, pCalib.StackingBias);
+                (plattABuy, plattBBuy, plattASell, plattBSell) =
+                    (pCalib.PlattABuy, pCalib.PlattBBuy, pCalib.PlattASell, pCalib.PlattBSell);
 
-                (plattABuy, plattBBuy, plattASell, plattBSell) = (pABuy, pBBuy, pASell, pBSell);
                 avgKellyFraction = ElmCalibrationHelper.ComputeAvgKellyFraction(
                     maskedCal, pw, pb, piw, pib, plattA, plattB, featureCount, hiddenSize, psub,
-                    (f, w2, b2, iw2, ib2, pAp, pBp, fc, hs, fs, lw) => PPrimaryCalibProb(f));
+                    (f, w2, b2, iw2, ib2, pAp, pBp, fc, hs, fs, lw) => pCalibProb(f));
                 ece = ElmEvaluationHelper.ComputeEce(maskedTest, pw, pb, piw, pib, plattA, plattB, featureCount, hiddenSize, psub,
-                    (f, w2, b2, iw2, ib2, pAp, pBp, fc, hs, fs, lw) => PPrimaryCalibProb(f));
-                optimalThreshold = pOptimalThreshold;
+                    (f, w2, b2, iw2, ib2, pAp, pBp, fc, hs, fs, lw) => pCalibProb(f));
+                optimalThreshold = pCalib.OptimalThreshold;
 
                 featureImportance = maskedTest.Count >= 10
                     ? ElmEvaluationHelper.ComputePermutationImportance(
-                        maskedTest, pw, pb, piw, pib, pA, pB, featureCount, hiddenSize, psub,
-                        (f, w2, b2, iw2, ib2, pAp, pBp, fc, hs, fs, lw) => PPrimaryCalibProb(f), ct, pOptimalThreshold)
+                        maskedTest, pw, pb, piw, pib, pCalib.PlattA, pCalib.PlattB, featureCount, hiddenSize, psub,
+                        (f, w2, b2, iw2, ib2, pAp, pBp, fc, hs, fs, lw) => pCalibProb(f), ct, pCalib.OptimalThreshold)
                     : new float[featureCount];
                 featureImportance = ElmEvaluationHelper.NormalisePositiveImportance(featureImportance, featureCount);
                 calImportanceScores = maskedCal.Count >= 10
                     ? ElmEvaluationHelper.ComputeCalPermutationImportance(
                         maskedCal, pw, pb, piw, pib, featureCount, hiddenSize, psub,
                         (f, w2, b2, iw2, ib2, fc, hs, fs, lw) => EnsembleRawProb(
-                            f, w2, b2, iw2, ib2, fc, hs, fs, lw ?? pLearnerAccWeights, phs, pla, pSw, pSb), ct)
+                            f, w2, b2, iw2, ib2, fc, hs, fs, lw ?? pCalib.LearnerAccWeights,
+                            phs, pla, pCalib.StackingWeights, pCalib.StackingBias), ct)
                     : new double[featureCount];
 
                 // Advance the effective views so that steps 12-22 use the pruned model's
@@ -686,112 +628,81 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                 effectiveTestSet      = maskedTest;
                 effectiveTrainSet     = maskedTrain;
                 effectiveFeatureCount = featureCount;
+
+                // Recompute feature importance for next iteration
+                activeMask = ElmBootstrapHelper.BuildFeatureMask(featureImportance, hp.MinFeatureImportance, featureCount);
+                if (hp.MutualInfoRedundancyThreshold > 0.0)
+                {
+                    var miRedundantIndices = ElmEvaluationHelper.ComputeRedundantFeaturePairIndices(
+                        effectiveTrainSet, featureCount, hp.MutualInfoRedundancyThreshold);
+                    foreach (var (fi, fj) in miRedundantIndices)
+                    {
+                        if (fi >= featureCount || fj >= featureCount) continue;
+                        if (!activeMask[fi] || !activeMask[fj]) continue;
+                        float impI = fi < featureImportance.Length ? featureImportance[fi] : 0;
+                        float impJ = fj < featureImportance.Length ? featureImportance[fj] : 0;
+                        activeMask[impI <= impJ ? fi : fj] = false;
+                    }
+                }
+                prunedCount = activeMask.Count(m => !m);
+
+                if (prunedCount == 0 || featureCount - prunedCount < 10)
+                    break; // No more features to prune
             }
             else
             {
                 _logger.LogInformation(
-                    "ELM pruned model rejected (acc drop {Drop:P1}) — keeping full model",
-                    finalMetrics.Accuracy - prunedMetrics.Accuracy);
+                    "ELM pruned model rejected (iter {Iter}, acc drop {Drop:P1}) — keeping current model",
+                    pruneIter + 1, finalMetrics.Accuracy - prunedMetrics.Accuracy);
                 prunedCount = 0;
                 activeMask = new bool[featureCount];
                 Array.Fill(activeMask, true);
+                break;
             }
         }
-        else if (prunedCount == 0)
+        // After loop: ensure activeMask is valid
+        if (prunedCount == 0)
         {
             activeMask = new bool[featureCount];
             Array.Fill(activeMask, true);
         }
 
-        var trainedAtUtc = DateTime.UtcNow;
+        _logger.LogDebug("ELM stage timing: feature pruning = {Ms}ms", stageStopwatch.ElapsedMilliseconds);
+        stageStopwatch.Restart();
 
-        double PrimaryEffectiveCalibProb(float[] features) => ApplyProductionCalibration(
-            EnsembleRawProb(features, weights, biases, inputWeights, inputBiases,
-                effectiveFeatureCount, hiddenSize, featureSubsets, learnerAccWeights,
-                learnerHiddenSizes, learnerActivations, stackingWeights, stackingBias),
-            plattA, plattB, temperatureScale, plattABuy, plattBBuy, plattASell, plattBSell);
+        // ── 12. Final calibration (isotonic + temperature refit + threshold) ──
+        // Pass the existing upstream calibration (Platt, stacking, etc.) as prior
+        // so only the isotonic tail runs. For the pruning-accepted case, those
+        // variables were already overwritten from pCalib above.
+        var priorCalib = new CalibrationResult(
+            learnerCalAccuracies, learnerAccWeights,
+            stackingWeights ?? [], stackingBias,
+            plattA, plattB, temperatureScale,
+            plattABuy, plattBBuy, plattASell, plattBSell,
+            [], optimalThreshold, DateTime.UtcNow);
 
-        // ── 12. Isotonic calibration (PAVA) ──────────────────────────────────
-        double[] isotonicBp = ElmCalibrationHelper.FitIsotonicCalibration(
+        var finalCalib = FitCalibrationPipeline(
             effectiveCalSet, weights, biases, inputWeights, inputBiases,
-            plattA, plattB, effectiveFeatureCount, hiddenSize, featureSubsets,
-            (f, w, b, iw, ib, pA, pB, fc, hs, fs, lw) => PrimaryEffectiveCalibProb(f));
+            effectiveFeatureCount, hiddenSize, featureSubsets,
+            learnerHiddenSizes, learnerActivations, hp, ct, prior: priorCalib);
+
+        var trainedAtUtc = finalCalib.TrainedAtUtc;
+        temperatureScale = finalCalib.TemperatureScale;
+        plattABuy  = finalCalib.PlattABuy;  plattBBuy  = finalCalib.PlattBBuy;
+        plattASell = finalCalib.PlattASell; plattBSell = finalCalib.PlattBSell;
+        var isotonicBp = finalCalib.IsotonicBreakpoints;
         _logger.LogInformation("ELM isotonic calibration: {N} PAVA breakpoints", isotonicBp.Length / 2);
 
-        if (hp.FitTemperatureScale && effectiveCalSet.Count >= 10)
-        {
-            double finalTemperatureScale = ElmCalibrationHelper.FitTemperatureScaling(
-                effectiveCalSet,
-                weights,
-                biases,
-                inputWeights,
-                inputBiases,
-                effectiveFeatureCount,
-                hiddenSize,
-                featureSubsets,
-                (f, w, b, iw, ib, fc, hs, fs, lw) => EnsembleRawProb(
-                    f, w, b, iw, ib, fc, hs, fs, lw ?? learnerAccWeights,
-                    learnerHiddenSizes, learnerActivations, stackingWeights, stackingBias),
-                plattA,
-                plattB,
-                plattABuy,
-                plattBBuy,
-                plattASell,
-                plattBSell,
-                isotonicBp,
-                hp.AgeDecayLambda,
-                trainedAtUtc);
-
-            if (Math.Abs(finalTemperatureScale - temperatureScale) > 1e-6)
-            {
-                temperatureScale = finalTemperatureScale;
-                (plattABuy, plattBBuy, plattASell, plattBSell) = ElmCalibrationHelper.FitClassConditionalPlatt(
-                    effectiveCalSet, weights, biases, inputWeights, inputBiases, effectiveFeatureCount, hiddenSize, featureSubsets,
-                    plattA, plattB, temperatureScale,
-                    (f, w, b, iw, ib, fc, hs, fs, lw) => EnsembleRawProb(
-                        f, w, b, iw, ib, fc, hs, fs, lw ?? learnerAccWeights,
-                        learnerHiddenSizes, learnerActivations, stackingWeights, stackingBias));
-
-                double RefitPrimaryCalibProb(float[] features) => ApplyProductionCalibration(
-                    EnsembleRawProb(features, weights, biases, inputWeights, inputBiases,
-                        effectiveFeatureCount, hiddenSize, featureSubsets, learnerAccWeights,
-                        learnerHiddenSizes, learnerActivations, stackingWeights, stackingBias),
-                    plattA, plattB, temperatureScale, plattABuy, plattBBuy, plattASell, plattBSell);
-
-                isotonicBp = ElmCalibrationHelper.FitIsotonicCalibration(
-                    effectiveCalSet, weights, biases, inputWeights, inputBiases,
-                    plattA, plattB, effectiveFeatureCount, hiddenSize, featureSubsets,
-                    (f, w, b, iw, ib, pA, pB, fc, hs, fs, lw) => RefitPrimaryCalibProb(f));
-            }
-        }
-
-        double FinalEffectiveCalibProb(float[] features)
-        {
-            double calib = PrimaryEffectiveCalibProb(features);
-            calib = isotonicBp.Length >= 4
-                ? ElmCalibrationHelper.ApplyIsotonicCalibration(calib, isotonicBp)
-                : calib;
-
-            double safeAgeDecayLambda = ClampNonNegativeFinite(hp.AgeDecayLambda);
-            if (safeAgeDecayLambda > 0.0)
-            {
-                double daysSinceTrain = (DateTime.UtcNow - trainedAtUtc).TotalDays;
-                double decayFactor = Math.Exp(-safeAgeDecayLambda * Math.Max(0.0, daysSinceTrain));
-                calib = 0.5 + (calib - 0.5) * decayFactor;
-            }
-
-            return calib;
-        }
+        var FinalEffectiveCalibProb = BuildCalibratedProbFunc(
+            weights, biases, inputWeights, inputBiases,
+            effectiveFeatureCount, hiddenSize, featureSubsets,
+            learnerHiddenSizes, learnerActivations, finalCalib, hp.AgeDecayLambda);
 
         ece = ElmEvaluationHelper.ComputeEce(
             effectiveTestSet, weights, biases, inputWeights, inputBiases,
             plattA, plattB, effectiveFeatureCount, hiddenSize, featureSubsets,
             (f, w, b, iw, ib, pA, pB, fc, hs, fs, lw) => FinalEffectiveCalibProb(f));
-        optimalThreshold = ElmCalibrationHelper.ComputeOptimalThreshold(
-            effectiveCalSet, weights, biases, inputWeights, inputBiases,
-            plattA, plattB, effectiveFeatureCount, hiddenSize, featureSubsets,
-            hp.ThresholdSearchMin, hp.ThresholdSearchMax,
-            (f, w, b, iw, ib, pA, pB, fc, hs, fs, lw) => FinalEffectiveCalibProb(f));
+        optimalThreshold = finalCalib.OptimalThreshold;
         finalMetrics = ElmEvaluationHelper.EvaluateEnsemble(
             effectiveTestSet, weights, biases, inputWeights, inputBiases,
             magWeights, magBias, plattA, plattB, effectiveFeatureCount, hiddenSize, featureSubsets,
@@ -804,14 +715,55 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             "ELM final eval — acc={Acc:P1} f1={F1:F3} ev={EV:F4} brier={Brier:F4} sharpe={Sharpe:F2} thr={Thr:F2}",
             finalMetrics.Accuracy, finalMetrics.F1,
             finalMetrics.ExpectedValue, finalMetrics.BrierScore, finalMetrics.SharpeRatio, optimalThreshold);
+        _logger.LogDebug("ELM stage timing: final calibration = {Ms}ms", stageStopwatch.ElapsedMilliseconds);
+        stageStopwatch.Restart();
 
         // ── 13. Conformal prediction threshold ───────────────────────────────
+        // Conformal uses pre-isotonic calibration (Platt + temp + class-conditional)
+        double PreIsoEffectiveCalibProb(float[] features) => ApplyProductionCalibration(
+            EnsembleRawProb(features, weights, biases, inputWeights, inputBiases,
+                effectiveFeatureCount, hiddenSize, featureSubsets, finalCalib.LearnerAccWeights,
+                learnerHiddenSizes, learnerActivations, finalCalib.StackingWeights, finalCalib.StackingBias),
+            plattA, plattB, temperatureScale, plattABuy, plattBBuy, plattASell, plattBSell);
+
         double conformalAlpha = Math.Clamp(1.0 - hp.ConformalCoverage, 0.01, 0.50);
         double conformalQHat = ElmCalibrationHelper.ComputeConformalQHat(
             effectiveCalSet, weights, biases, inputWeights, inputBiases,
             plattA, plattB, isotonicBp, effectiveFeatureCount, hiddenSize, featureSubsets, conformalAlpha,
-            (f, w, b, iw, ib, pA, pB, fc, hs, fs, lw) => PrimaryEffectiveCalibProb(f));
+            (f, w, b, iw, ib, pA, pB, fc, hs, fs, lw) => PreIsoEffectiveCalibProb(f));
         _logger.LogInformation("ELM conformal qHat={QHat:F4} ({Cov:P0} coverage)", conformalQHat, hp.ConformalCoverage);
+
+        // ── 13b. Mondrian (per-class) conformal prediction ───────────────────
+        double conformalQHatBuy = conformalQHat, conformalQHatSell = conformalQHat;
+        {
+            var buyResiduals = new List<double>();
+            var sellResiduals = new List<double>();
+            foreach (var s in effectiveCalSet)
+            {
+                double calibP = PreIsoEffectiveCalibProb(s.Features);
+                double y = ToBinaryLabel(s.Direction);
+                double residual = Math.Abs(y - calibP);
+                if (s.Direction > 0)
+                    buyResiduals.Add(residual);
+                else
+                    sellResiduals.Add(residual);
+            }
+            if (buyResiduals.Count >= 5)
+            {
+                buyResiduals.Sort();
+                int idx = Math.Min((int)Math.Ceiling((1.0 - conformalAlpha) * (buyResiduals.Count + 1)) - 1, buyResiduals.Count - 1);
+                conformalQHatBuy = buyResiduals[Math.Max(0, idx)];
+            }
+            if (sellResiduals.Count >= 5)
+            {
+                sellResiduals.Sort();
+                int idx = Math.Min((int)Math.Ceiling((1.0 - conformalAlpha) * (sellResiduals.Count + 1)) - 1, sellResiduals.Count - 1);
+                conformalQHatSell = sellResiduals[Math.Max(0, idx)];
+            }
+            _logger.LogInformation(
+                "ELM Mondrian conformal: qHatBuy={QBuy:F4} qHatSell={QSell:F4}",
+                conformalQHatBuy, conformalQHatSell);
+        }
 
         ct.ThrowIfCancellationRequested();
 
@@ -821,7 +773,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             effectiveFeatureCount, hiddenSize, featureSubsets, learnerHiddenSizes, learnerActivations,
             optimalThreshold, FinalEffectiveCalibProb,
             stackingWeights, stackingBias,
-            hp.ElmSubModelLr, hp.ElmSubModelMaxEpochs, hp.ElmSubModelPatience, ct);
+            hp.ElmSubModelLr, hp.ElmSubModelMaxEpochs, hp.ElmSubModelPatience, embargo, ct);
         _logger.LogDebug("ELM meta-label: bias={B:F4}", metaLabelBias);
 
         // ── 15. Abstention gate ──────────────────────────────────────────────
@@ -831,7 +783,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             effectiveFeatureCount, hiddenSize, featureSubsets, learnerHiddenSizes, learnerActivations,
             optimalThreshold, FinalEffectiveCalibProb,
             stackingWeights, stackingBias,
-            hp.ElmSubModelLr, hp.ElmSubModelMaxEpochs, hp.ElmSubModelPatience, ct);
+            hp.ElmSubModelLr, hp.ElmSubModelMaxEpochs, hp.ElmSubModelPatience, embargo, ct);
         _logger.LogDebug("ELM abstention gate: bias={B:F4} threshold={T:F2}", abstentionBias, abstentionThreshold);
 
         // ── 16. Decision boundary distance ───────────────────────────────────
@@ -1020,6 +972,8 @@ public sealed class ElmModelTrainer : IMLModelTrainer
                     redundantPairs.Length, string.Join(", ", redundantPairs));
         }
 
+        _logger.LogDebug("ELM stage timing: post-training metrics = {Ms}ms", stageStopwatch.ElapsedMilliseconds);
+
         // ── 23. Serialise model snapshot ────────────────────────────────────
         var snapshot = new ModelSnapshot
         {
@@ -1040,6 +994,7 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             PlattB                     = plattB,
             Metrics                    = finalMetrics,
             TrainSamples               = trainSet.Count,
+            TrainSamplesAtLastCalibration = trainSet.Count,
             TestSamples                = testSet.Count,
             CalSamples                 = calSet.Count,
             EmbargoSamples             = embargo,
@@ -1053,6 +1008,8 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             Ece                        = ece,
             IsotonicBreakpoints        = isotonicBp,
             ConformalQHat              = conformalQHat,
+            ConformalQHatBuy           = conformalQHatBuy,
+            ConformalQHatSell          = conformalQHatSell,
             FracDiffD                  = hp.FracDiffD,
             MetaLabelWeights           = metaLabelWeights,
             MetaLabelBias              = metaLabelBias,
@@ -1114,2541 +1071,8 @@ public sealed class ElmModelTrainer : IMLModelTrainer
             "ElmModelTrainer complete: K={K}, hidden={H}, accuracy={Acc:P1}, Brier={B:F4}, BSS={BSS:F4}",
             K, hiddenSize, finalMetrics.Accuracy, finalMetrics.BrierScore, brierSkillScore);
 
+        _logger.LogInformation("ELM total training time: {Ms}ms", pipelineStopwatch.ElapsedMilliseconds);
+
         return new TrainingResult(finalMetrics, cvResult, modelBytes);
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  Walk-forward cross-validation
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    private (WalkForwardResult Result, bool EquityCurveGateFailed) RunWalkForwardCV(
-        List<TrainingSample> samples,
-        TrainingHyperparams  hp,
-        int                  featureCount,
-        int                  hiddenSize,
-        CancellationToken    ct,
-        double               sharpeAnnualisationFactor = DefaultSharpeAnnualisationFactor)
-    {
-        int folds   = hp.WalkForwardFolds;
-        int embargo = hp.EmbargoBarCount;
-        int K       = Math.Max(1, hp.K);
-
-        int foldSize = samples.Count / (folds + 1);
-        if (foldSize < 50)
-        {
-            _logger.LogWarning("ELM walk-forward fold size too small ({Size}), skipping CV", foldSize);
-            return (new WalkForwardResult(0, 0, 0, 0, 0, 0), false);
-        }
-
-        var foldResults = new (double Acc, double F1, double EV, double Sharpe, double[] Imp, bool IsBad)?[folds];
-
-        int cvInnerParallelism = Math.Max(1, Environment.ProcessorCount / Math.Max(1, folds));
-        Parallel.For(0, folds, new ParallelOptions
-        {
-            CancellationToken = ct,
-            MaxDegreeOfParallelism = Math.Max(1, Math.Min(folds, Environment.ProcessorCount))
-        }, fold =>
-        {
-            ct.ThrowIfCancellationRequested();
-
-            int testEnd   = (fold + 2) * foldSize;
-            int testStart = testEnd - foldSize;
-            int purgeExtra = MLFeatureHelper.LookbackWindow - 1;
-            int trainEnd   = Math.Max(0, testStart - embargo - purgeExtra);
-
-            if (trainEnd < hp.MinSamples)
-            {
-                _logger.LogDebug("ELM CV fold {Fold} skipped — insufficient training data ({N})", fold, trainEnd);
-                return;
-            }
-
-            var fullFoldTrain = samples[..trainEnd].ToList();
-
-            if (hp.PurgeHorizonBars > 0)
-            {
-                int purgeFrom = Math.Max(0, testStart - hp.PurgeHorizonBars);
-                if (purgeFrom < fullFoldTrain.Count)
-                    fullFoldTrain = fullFoldTrain[..purgeFrom];
-            }
-
-            var foldTest = samples[testStart..Math.Min(testEnd, samples.Count)];
-            if (foldTest.Count < 20) return;
-
-            // Carve a mini-cal set from the tail of the fold-train window BEFORE fitting
-            // the ensemble, so base learners never see the cal samples via bootstrap.
-            int cvCalSize = fullFoldTrain.Count / 7; // ~14 % of fold-train as mini cal
-            List<TrainingSample> foldTrain;
-            List<TrainingSample>? cvCalSet = null;
-            if (cvCalSize >= 20)
-            {
-                int calStart = fullFoldTrain.Count - cvCalSize;
-                int cvGap = Math.Max(embargo, hp.PurgeHorizonBars) + purgeExtra;
-                int foldTrainEnd = Math.Max(0, calStart - cvGap);
-                if (foldTrainEnd >= hp.MinSamples)
-                {
-                    cvCalSet  = fullFoldTrain[calStart..];
-                    foldTrain = fullFoldTrain[..foldTrainEnd];
-                }
-                else
-                {
-                    foldTrain = fullFoldTrain;
-                }
-            }
-            else
-            {
-                foldTrain = fullFoldTrain;
-            }
-
-            if (foldTrain.Count < hp.MinSamples) return;
-
-            var cvLabelSmoothing = hp.LabelSmoothing;
-            var (w, b, iw, ib, subs, lhs, cvla, _, _) = FitBaggedElm(
-                foldTrain, hp, featureCount, hiddenSize, Math.Max(1, K / 2),
-                cvLabelSmoothing, null, null, ct,
-                maxInnerParallelism: cvInnerParallelism);
-            var (mw, mb, maw, mab) = FitElmMagnitudeRegressor(
-                foldTrain, featureCount, hiddenSize, iw, ib, subs, cvla,
-                hp.ElmMagRegressorLr, hp.ElmMagRegressorMaxEpochs, hp.ElmMagRegressorPatience);
-
-            // Fit a lightweight Platt calibration on the held-out mini-cal set so
-            // that CV fold evaluation uses calibrated probabilities, matching the full
-            // training pipeline. Using raw probabilities (plattA=1, plattB=0) overstates
-            // Brier/EV metrics on folds where the ensemble is poorly calibrated.
-            double cvPlattA = 1.0, cvPlattB = 0.0;
-            double cvTemp = 0.0;
-            double cvPlattABuy = 0.0, cvPlattBBuy = 0.0, cvPlattASell = 0.0, cvPlattBSell = 0.0;
-            double[]? cvLearnerAccWeights = null;
-            if (cvCalSet is not null)
-            {
-                (_, cvLearnerAccWeights) = ComputeLearnerCalibrationStats(
-                    cvCalSet, w, b, iw, ib, featureCount, subs, lhs, cvla);
-                (cvPlattA, cvPlattB) = ElmCalibrationHelper.FitPlattScalingCV(
-                    cvCalSet, w, b, iw, ib, featureCount, hiddenSize, subs,
-                    (f, ww, bb, iww, ibb, fc, hs, fs, lw) => EnsembleRawProb(
-                        f, ww, bb, iww, ibb, fc, hs, fs, lw ?? cvLearnerAccWeights, lhs, cvla));
-                if (hp.FitTemperatureScale && cvCalSet.Count >= 10)
-                {
-                    cvTemp = ElmCalibrationHelper.FitTemperatureScaling(
-                        cvCalSet, w, b, iw, ib, featureCount, hiddenSize, subs,
-                        (f, ww, bb, iww, ibb, fc, hs, fs, lw) => EnsembleRawProb(
-                            f, ww, bb, iww, ibb, fc, hs, fs, lw ?? cvLearnerAccWeights, lhs, cvla));
-                }
-                (cvPlattABuy, cvPlattBBuy, cvPlattASell, cvPlattBSell) = ElmCalibrationHelper.FitClassConditionalPlatt(
-                    cvCalSet, w, b, iw, ib, featureCount, hiddenSize, subs,
-                    cvPlattA, cvPlattB, cvTemp,
-                    (f, ww, bb, iww, ibb, fc, hs, fs, lw) => EnsembleRawProb(
-                        f, ww, bb, iww, ibb, fc, hs, fs, lw ?? cvLearnerAccWeights, lhs, cvla));
-            }
-
-            double CvPrimaryCalibProb(float[] features) => ApplyProductionCalibration(
-                EnsembleRawProb(features, w, b, iw, ib, featureCount, hiddenSize, subs, cvLearnerAccWeights, lhs, cvla),
-                cvPlattA, cvPlattB, cvTemp, cvPlattABuy, cvPlattBBuy, cvPlattASell, cvPlattBSell);
-
-            var m = ElmEvaluationHelper.EvaluateEnsemble(foldTest, w, b, iw, ib, mw, mb, cvPlattA, cvPlattB, featureCount, hiddenSize, subs,
-                maw, mab, sharpeAnnualisationFactor,
-                (f, ww, bb, iww, ibb, pA, pB, fc, hs, fs, lw) => CvPrimaryCalibProb(f),
-                (f, aw, ab, fc, hs, eiw, eib, fs) => PredictMagnitudeAug(f, aw, ab, fc, hs, eiw, eib, fs, cvla));
-
-            var foldImp = new double[featureCount];
-            for (int ki = 0; ki < w.Length; ki++)
-            {
-                int[] sub = subs is not null && ki < subs.Length ? subs[ki]
-                    : Enumerable.Range(0, featureCount).ToArray();
-                int subLen = sub.Length;
-                for (int h = 0; h < Math.Min(w[ki].Length, lhs[ki]); h++)
-                {
-                    double outMag = Math.Abs(w[ki][h]);
-                    int rowOff = h * subLen;
-                    for (int si = 0; si < subLen; si++)
-                    {
-                        int fi = sub[si];
-                        if (fi < featureCount && rowOff + si < iw[ki].Length)
-                            foldImp[fi] += outMag * Math.Abs(iw[ki][rowOff + si]);
-                    }
-                }
-            }
-            double kCount = w.Length;
-            for (int j = 0; j < featureCount; j++) foldImp[j] /= kCount;
-
-            var foldPredictions = new (int Predicted, int Actual)[foldTest.Count];
-            for (int pi = 0; pi < foldTest.Count; pi++)
-            {
-                double calibP = CvPrimaryCalibProb(foldTest[pi].Features);
-                foldPredictions[pi] = (calibP >= 0.5 ? 1 : -1,
-                                       foldTest[pi].Direction > 0 ? 1 : -1);
-            }
-
-            var (foldMaxDD, foldCurveSharpe) = ElmMathHelper.ComputeEquityCurveStats(foldPredictions, sharpeAnnualisationFactor);
-
-            bool isBadFold = false;
-            if (hp.MaxFoldDrawdown < 1.0 && foldMaxDD > hp.MaxFoldDrawdown)
-                isBadFold = true;
-            if (hp.MinFoldCurveSharpe > -99.0 && foldCurveSharpe < hp.MinFoldCurveSharpe)
-                isBadFold = true;
-
-            foldResults[fold] = (m.Accuracy, m.F1, m.ExpectedValue, m.SharpeRatio, foldImp, isBadFold);
-        });
-
-        var accList    = new List<double>(folds);
-        var f1List     = new List<double>(folds);
-        var evList     = new List<double>(folds);
-        var sharpeList = new List<double>(folds);
-        var foldImps   = new List<double[]>(folds);
-        int badFolds   = 0;
-
-        foreach (var r in foldResults)
-        {
-            if (r is null) continue;
-            accList.Add(r.Value.Acc);
-            f1List.Add(r.Value.F1);
-            evList.Add(r.Value.EV);
-            sharpeList.Add(r.Value.Sharpe);
-            foldImps.Add(r.Value.Imp);
-            if (r.Value.IsBad) badFolds++;
-        }
-
-        if (accList.Count == 0)
-            return (new WalkForwardResult(0, 0, 0, 0, 0, 0), false);
-
-        double badFoldThreshold = hp.MaxBadFoldFraction > 0.0 && hp.MaxBadFoldFraction < 1.0
-            ? hp.MaxBadFoldFraction : 0.5;
-        bool equityCurveGateFailed = badFolds > (int)(accList.Count * badFoldThreshold);
-        if (equityCurveGateFailed)
-            _logger.LogWarning(
-                "ELM equity-curve gate: {BadFolds}/{TotalFolds} folds failed. Model rejected.",
-                badFolds, accList.Count);
-
-        double avgAcc      = accList.Average();
-        double stdAcc      = ElmMathHelper.StdDev(accList, avgAcc);
-        double sharpeTrend = ElmMathHelper.ComputeSharpeTrend(sharpeList);
-
-        if (hp.MinSharpeTrendSlope > -99.0 && sharpeTrend < hp.MinSharpeTrendSlope)
-        {
-            _logger.LogWarning(
-                "ELM Sharpe trend gate: slope={Slope:F3} < threshold {Thr:F3}. Model rejected.",
-                sharpeTrend, hp.MinSharpeTrendSlope);
-            equityCurveGateFailed = true;
-        }
-
-        double[]? featureStabilityScores = null;
-        if (foldImps.Count >= 2)
-        {
-            featureStabilityScores = new double[featureCount];
-            int foldCount = foldImps.Count;
-            for (int j = 0; j < featureCount; j++)
-            {
-                double sumImp = 0.0;
-                for (int fi = 0; fi < foldCount; fi++) sumImp += foldImps[fi][j];
-                double meanImp = sumImp / foldCount;
-                double varImp  = 0.0;
-                for (int fi = 0; fi < foldCount; fi++)
-                {
-                    double d = foldImps[fi][j] - meanImp;
-                    varImp += d * d;
-                }
-                double stdImp = foldCount > 1 ? Math.Sqrt(varImp / (foldCount - 1)) : 0.0;
-                featureStabilityScores[j] = meanImp > 1e-10 ? stdImp / meanImp : 0.0;
-            }
-        }
-
-        return (new WalkForwardResult(
-            AvgAccuracy:            avgAcc,
-            StdAccuracy:            stdAcc,
-            AvgF1:                  f1List.Average(),
-            AvgEV:                  evList.Average(),
-            AvgSharpe:              sharpeList.Average(),
-            FoldCount:              accList.Count,
-            SharpeTrend:            sharpeTrend,
-            FeatureStabilityScores: featureStabilityScores), equityCurveGateFailed);
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  Ridge lambda auto-selection
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    private static double SelectRidgeLambda(
-        List<TrainingSample> trainSet,
-        int featureCount, int hiddenSize, double labelSmoothing,
-        TrainingHyperparams hp, CancellationToken ct)
-    {
-        double[] candidates = [1e-6, 3e-6, 1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1, 3e-1];
-        double bestLambda = 1e-3;
-        double bestAvgAcc = -1;
-
-        int embargo = hp.EmbargoBarCount;
-        int purgeExtra = MLFeatureHelper.LookbackWindow - 1;
-        const int cvFolds = 5;
-        int foldSize = trainSet.Count / (cvFolds + 1);
-        if (foldSize < 10) return bestLambda;
-
-        // Use multiple random projections so the selected lambda generalises
-        // across diverse hidden layers, not just a single lucky projection.
-        // When mixed activations are enabled, rotate activations across probes
-        // to match FitBaggedElm's per-learner activation diversity.
-        int nProbes   = Math.Max(1, Math.Min(Math.Max(1, hp.K), 3));
-        int subsetLen = featureCount;
-        double scale  = Math.Sqrt(2.0 / (subsetLen + hiddenSize));
-
-        var availableActivations = new[] { ElmActivation.Sigmoid, ElmActivation.Tanh, ElmActivation.Relu };
-        var probeWIn = new double[nProbes][];
-        var probeBIn = new double[nProbes][];
-        var probeActivations = new ElmActivation[nProbes];
-        for (int pi = 0; pi < nProbes; pi++)
-        {
-            var probeRng = new Random(ElmMathHelper.HashSeed(hp.ElmOuterSeed, pi, 777));
-            probeWIn[pi] = new double[hiddenSize * subsetLen];
-            probeBIn[pi] = new double[hiddenSize];
-            for (int i = 0; i < probeWIn[pi].Length; i++) probeWIn[pi][i] = ElmMathHelper.SampleGaussian(probeRng) * scale;
-            for (int h = 0; h < hiddenSize; h++) probeBIn[pi][h] = ElmMathHelper.SampleGaussian(probeRng) * scale;
-            probeActivations[pi] = hp.ElmMixActivations
-                ? availableActivations[pi % availableActivations.Length]
-                : hp.ElmActivation;
-        }
-
-        int solveSize = hiddenSize + 1;
-        double posLabel = 1.0 - labelSmoothing;
-        double negLabel = labelSmoothing;
-
-        foreach (double lambda in candidates)
-        {
-            ct.ThrowIfCancellationRequested();
-            double totalAccSum = 0;
-            int    totalValid  = 0;
-
-            for (int pi = 0; pi < nProbes; pi++)
-            {
-                double[] wIn = probeWIn[pi];
-                double[] bIn = probeBIn[pi];
-                ElmActivation probeAct = probeActivations[pi];
-
-                for (int fold = 0; fold < cvFolds; fold++)
-                {
-                    int valEnd = (fold + 2) * foldSize;
-                    int valStart = valEnd - foldSize;
-                    int trainEndIdx = Math.Max(0, valStart - embargo - purgeExtra);
-                    if (trainEndIdx < 20) continue;
-                    int actualValEnd = Math.Min(valEnd, trainSet.Count);
-                    int actualValStart = Math.Min(valStart, actualValEnd);
-                    if (actualValEnd - actualValStart < 5) continue;
-
-                    double[,] HtH = new double[solveSize, solveSize];
-                    double[] HtY = new double[solveSize];
-                    double[] hRow = new double[solveSize];
-
-                    for (int t = 0; t < trainEndIdx; t++)
-                    {
-                        var features = trainSet[t].Features;
-                        for (int h = 0; h < hiddenSize; h++)
-                        {
-                            double z = bIn[h];
-                            int rowOff = h * subsetLen;
-                            for (int si = 0; si < subsetLen; si++)
-                                if (si < features.Length) z += wIn[rowOff + si] * features[si];
-                            hRow[h] = ElmMathHelper.Activate(z, probeAct);
-                        }
-                        hRow[hiddenSize] = 1.0;
-                        double yt = trainSet[t].Direction > 0 ? posLabel : negLabel;
-                        for (int ri = 0; ri < solveSize; ri++)
-                        {
-                            HtY[ri] += hRow[ri] * yt;
-                            for (int j = ri; j < solveSize; j++)
-                                HtH[ri, j] += hRow[ri] * hRow[j];
-                        }
-                    }
-
-                    for (int ri = 0; ri < solveSize; ri++)
-                    {
-                        if (ri < hiddenSize) HtH[ri, ri] += lambda;
-                        for (int j = ri + 1; j < solveSize; j++)
-                            HtH[j, ri] = HtH[ri, j];
-                    }
-
-                    double[] wSolve = new double[solveSize];
-                    if (!ElmMathHelper.CholeskySolve(HtH, HtY, wSolve, solveSize))
-                        continue;
-
-                    int correct = 0, valCount = 0;
-                    for (int vi = actualValStart; vi < actualValEnd; vi++)
-                    {
-                        var s = trainSet[vi];
-                        double score = wSolve[hiddenSize];
-                        for (int h = 0; h < hiddenSize; h++)
-                        {
-                            double z = bIn[h];
-                            int rowOff = h * subsetLen;
-                            for (int si = 0; si < subsetLen; si++)
-                                if (si < s.Features.Length) z += wIn[rowOff + si] * s.Features[si];
-                            score += wSolve[h] * ElmMathHelper.Activate(z, probeAct);
-                        }
-                        int pred = MLFeatureHelper.Sigmoid(score) >= 0.5 ? 1 : 0;
-                        if (pred == ToBinaryLabel(s.Direction)) correct++;
-                        valCount++;
-                    }
-
-                    if (valCount > 0)
-                    {
-                        totalAccSum += (double)correct / valCount;
-                        totalValid++;
-                    }
-                }
-            }
-
-            if (totalValid == 0) continue;
-            double avgAcc = totalAccSum / totalValid;
-            if (avgAcc > bestAvgAcc) { bestAvgAcc = avgAcc; bestLambda = lambda; }
-        }
-        return bestLambda;
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  Bagged ELM ensemble fitting
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    private (double[][] Weights, double[] Biases,
-             double[][] InputWeights, double[][] InputBiases,
-             int[][]? FeatureSubsets, int[] LearnerHiddenSizes,
-             ElmActivation[] LearnerActivations,
-             double[][] InverseGramsFlat, int[] InverseGramDims) FitBaggedElm(
-        List<TrainingSample> train,
-        TrainingHyperparams  hp,
-        int                  featureCount,
-        int                  hiddenSize,
-        int                  K,
-        double               labelSmoothing,
-        ModelSnapshot?       warmStart,
-        double[]?            densityWeights,
-        CancellationToken    ct,
-        bool[]?              activeFeatureMask = null,
-        int                  maxInnerParallelism = 0)
-    {
-        var weights      = new double[K][];
-        var biases       = new double[K];
-        var inputWeights = new double[K][];
-        var inputBiases  = new double[K][];
-        var cgDidNotConverge = new bool[K];
-        var learnerHiddenSizes = new int[K];
-        var learnerActivations = new ElmActivation[K];
-        var inverseGramsFlat = new double[K][];
-        var inverseGramDims  = new int[K];
-
-        bool useSubsampling = hp.FeatureSampleRatio > 0.0 && hp.FeatureSampleRatio < 1.0;
-        var featureSubsets   = useSubsampling ? new int[K][] : null;
-
-        int outerSeed = hp.ElmOuterSeed;
-
-        var temporalWeights = ElmBootstrapHelper.ComputeTemporalWeights(train.Count, hp.TemporalDecayLambda);
-
-        if (densityWeights is { Length: > 0 } && densityWeights.Length == temporalWeights.Length)
-        {
-            var blended = new double[temporalWeights.Length];
-            double sum = 0.0;
-            for (int i = 0; i < temporalWeights.Length; i++)
-            {
-                blended[i] = temporalWeights[i] * densityWeights[i];
-                sum += blended[i];
-            }
-            if (sum > 1e-15)
-                for (int i = 0; i < blended.Length; i++) blended[i] /= sum;
-            temporalWeights = blended;
-        }
-
-        // ── Class imbalance handling: class weights (preferred) or SMOTE (legacy) ──
-        bool useClassWeights = hp.ElmUseClassWeights;
-        double classWeightBuy = 1.0, classWeightSell = 1.0;
-        bool smoteEnabled = false;
-        List<TrainingSample>? smoteMinoritySamples = null;
-        int smoteSyntheticNeeded = 0;
-        int smoteKNeighbors = 5;
-
-        {
-            int buyCount = 0, sellCount = 0;
-            foreach (var s in train)
-            {
-                if (s.Direction > 0) buyCount++;
-                else sellCount++;
-            }
-
-            if (useClassWeights && buyCount > 0 && sellCount > 0)
-            {
-                // Inverse-frequency class weights: minority class gets higher weight
-                double total = buyCount + sellCount;
-                classWeightBuy = total / (2.0 * buyCount);
-                classWeightSell = total / (2.0 * sellCount);
-                _logger.LogDebug(
-                    "ELM class weights: buy={Buy:F3} sell={Sell:F3} (buy={BuyN} sell={SellN})",
-                    classWeightBuy, classWeightSell, buyCount, sellCount);
-            }
-            else if (hp.ElmUseSmote && !useClassWeights)
-            {
-                // Legacy SMOTE path — only used when ElmUseClassWeights is explicitly disabled
-                int majCount = Math.Max(buyCount, sellCount);
-                int minCount = Math.Min(buyCount, sellCount);
-                double minRatio = majCount > 0 ? (double)minCount / majCount : 1.0;
-
-                smoteKNeighbors = hp.SmoteKNeighbors is > 0 ? hp.SmoteKNeighbors.Value : 5;
-                int minSmoteFloor = smoteKNeighbors + 1;
-                double extremeImbalanceFloor = 0.05;
-                if (minCount >= minSmoteFloor && minRatio >= extremeImbalanceFloor && minRatio < hp.ElmSmoteMinorityRatioThreshold)
-                {
-                    smoteEnabled = true;
-                    var buyList = new List<TrainingSample>();
-                    var sellList = new List<TrainingSample>();
-                    foreach (var s in train)
-                    {
-                        if (s.Direction > 0) buyList.Add(s);
-                        else sellList.Add(s);
-                    }
-                    smoteMinoritySamples = buyList.Count < sellList.Count ? buyList : sellList;
-                    smoteSyntheticNeeded = majCount - minCount;
-                }
-                else if (minCount < minSmoteFloor || minRatio < extremeImbalanceFloor)
-                {
-                    _logger.LogWarning(
-                        "ELM SMOTE skipped: minority count {MinCount} or ratio {Ratio:P1} too low for reliable interpolation (need ≥{Floor} samples and ≥{FloorRatio:P0} ratio).",
-                        minCount, minRatio, minSmoteFloor, extremeImbalanceFloor);
-                }
-            }
-        }
-
-        double ridgeLambda = Math.Max(1e-6, hp.L2Lambda > 0 ? hp.L2Lambda : 1e-3);
-        double maxWeightMag = hp.MaxWeightMagnitude > 0 ? hp.MaxWeightMagnitude : 10.0;
-        double dropRate = Math.Clamp(hp.ElmDropoutRate, 0.0, 0.5);
-        double dropScale = dropRate > 0.0 ? 1.0 / (1.0 - dropRate) : 1.0;
-        double smoteSampleWeight = Math.Clamp(hp.ElmSmoteSampleWeight, 0.01, 1.0);
-        ElmActivation activation = hp.ElmActivation;
-
-        bool useBiasedFeatureSampling =
-            warmStart is not null &&
-            warmStart.FeatureImportanceScores.Length == featureCount &&
-            hp.FeatureSampleRatio > 0.0;
-
-        int effectiveParallelism = maxInnerParallelism > 0
-            ? maxInnerParallelism
-            : Math.Max(1, Environment.ProcessorCount);
-        Parallel.For(0, K, new ParallelOptions
-        {
-            CancellationToken = ct,
-            MaxDegreeOfParallelism = effectiveParallelism
-        }, k =>
-        {
-            ct.ThrowIfCancellationRequested();
-
-            // ── Per-learner hidden size variation ──────────────────────────
-            int learnerHidden = hiddenSize;
-            if (hp.ElmHiddenSizeVariation > 0.0)
-            {
-                var hiddenRng = new Random(ElmMathHelper.HashSeed(outerSeed, k, 99));
-                double variation = hp.ElmHiddenSizeVariation;
-                double factor = 1.0 + (hiddenRng.NextDouble() * 2.0 - 1.0) * variation;
-                learnerHidden = Math.Max(8, (int)(hiddenSize * factor));
-            }
-            // Safe in Parallel.For: each iteration writes to its own index k — no contention.
-            learnerHiddenSizes[k] = learnerHidden;
-
-            // ── Per-learner activation (mixed activation ensemble) ─────────
-            ElmActivation learnerAct;
-            if (hp.ElmMixActivations)
-            {
-                var availableActivations = new[] { ElmActivation.Sigmoid, ElmActivation.Tanh, ElmActivation.Relu };
-                learnerAct = availableActivations[k % availableActivations.Length];
-            }
-            else
-            {
-                learnerAct = activation;
-            }
-            learnerActivations[k] = learnerAct;
-
-            int learnerSeed = ElmMathHelper.HashSeed(outerSeed, k, 42);
-            int featureSeed = ElmMathHelper.HashSeed(outerSeed, k, 13);
-            var rng = new Random(learnerSeed);
-
-            // ── Feature subset ──────────────────────────────────────────────
-            int[] eligibleIndices = activeFeatureMask is not null
-                ? Enumerable.Range(0, featureCount).Where(i => activeFeatureMask[i]).ToArray()
-                : Enumerable.Range(0, featureCount).ToArray();
-
-            int[] subset;
-            if (useSubsampling)
-            {
-                if (activeFeatureMask is not null)
-                {
-                    subset = useBiasedFeatureSampling
-                        ? ElmBootstrapHelper.GenerateBiasedFeatureSubsetFromPool(eligibleIndices, hp.FeatureSampleRatio,
-                            warmStart!.FeatureImportanceScores, seed: featureSeed)
-                        : ElmBootstrapHelper.GenerateFeatureSubsetFromPool(eligibleIndices, hp.FeatureSampleRatio, seed: featureSeed);
-                }
-                else
-                {
-                    subset = useBiasedFeatureSampling
-                        ? ElmBootstrapHelper.GenerateBiasedFeatureSubset(featureCount, hp.FeatureSampleRatio,
-                            warmStart!.FeatureImportanceScores, seed: featureSeed)
-                        : ElmBootstrapHelper.GenerateFeatureSubset(featureCount, hp.FeatureSampleRatio, seed: featureSeed);
-                }
-            }
-            else
-            {
-                subset = eligibleIndices;
-            }
-            if (featureSubsets is not null) featureSubsets[k] = subset;
-
-            int subsetLen = subset.Length;
-
-            // ── Xavier-init random input weights ───
-            double scale = Math.Sqrt(2.0 / (subsetLen + learnerHidden));
-            double[] wIn = new double[learnerHidden * subsetLen];
-            double[] bIn = new double[learnerHidden];
-
-            if (warmStart is not null &&
-                WarmStartMatchesLearnerSubset(warmStart, k, subset, featureCount, learnerHidden * subsetLen))
-            {
-                var warmInputWeights = warmStart.ElmInputWeights![k];
-                var warmInputBiases = warmStart.ElmInputBiases is not null && k < warmStart.ElmInputBiases.Length
-                    ? warmStart.ElmInputBiases[k]
-                    : null;
-                bool warmStartFinite = HasFiniteValues(warmInputWeights) &&
-                    (warmInputBiases is null || HasFiniteValues(warmInputBiases));
-                if (warmStartFinite)
-                {
-                    Array.Copy(warmInputWeights, wIn, wIn.Length);
-                    if (warmInputBiases is not null)
-                        Array.Copy(warmInputBiases, bIn, Math.Min(warmInputBiases.Length, bIn.Length));
-                }
-                else
-                {
-                    _logger.LogWarning(
-                        "ELM learner {K}: warm-start input weights/biases contained non-finite values. Falling back to random init.",
-                        k);
-                    for (int i = 0; i < wIn.Length; i++) wIn[i] = ElmMathHelper.SampleGaussian(rng) * scale;
-                    for (int h = 0; h < learnerHidden; h++) bIn[h] = ElmMathHelper.SampleGaussian(rng) * scale;
-                }
-            }
-            else
-            {
-                if (warmStart?.ElmInputWeights is not null && k < warmStart.ElmInputWeights.Length)
-                    _logger.LogWarning(
-                        "ELM learner {K}: warm-start mismatch for subset/dimension (expected length {Expected}, got {Actual}). Falling back to random init.",
-                        k, learnerHidden * subsetLen, warmStart.ElmInputWeights[k]?.Length ?? 0);
-
-                for (int i = 0; i < wIn.Length; i++) wIn[i] = ElmMathHelper.SampleGaussian(rng) * scale;
-                for (int h = 0; h < learnerHidden; h++) bIn[h] = ElmMathHelper.SampleGaussian(rng) * scale;
-            }
-
-            inputWeights[k] = wIn;
-            inputBiases[k]  = bIn;
-
-            // ── Stratified biased bootstrap ──
-            int bootstrapSeed = ElmMathHelper.HashSeed(outerSeed, k, 7);
-            var bootstrap = ElmBootstrapHelper.StratifiedBiasedBootstrap(train, temporalWeights, train.Count, seed: bootstrapSeed);
-
-            // ── Per-learner SMOTE with sample weighting ──
-            // Track which samples are synthetic to apply differential weighting
-            bool[]? isSynthetic = null;
-            if (smoteEnabled && smoteMinoritySamples is not null)
-            {
-                int smoteSeed = ElmMathHelper.HashSeed(outerSeed, k, 9999);
-                var syntheticPairs = ElmBootstrapHelper.GenerateSmoteSamples(smoteMinoritySamples, smoteSyntheticNeeded, smoteKNeighbors, smoteSeed);
-                int originalCount = bootstrap.Count;
-                isSynthetic = new bool[originalCount + syntheticPairs.Count];
-                foreach (var (sample, _) in syntheticPairs)
-                    bootstrap.Add(sample);
-                for (int i = originalCount; i < bootstrap.Count; i++) isSynthetic[i] = true;
-            }
-            int N = bootstrap.Count;
-
-            // ── Compute H^TH and H^TY ──
-            double posLabel = 1.0 - labelSmoothing;
-            double negLabel = labelSmoothing;
-
-            int solveSize = learnerHidden + 1;
-            double[,] HtH = new double[solveSize, solveSize];
-            double[] HtY  = new double[solveSize];
-
-            var dropMask = new bool[learnerHidden];
-            double[] hRow = new double[solveSize];
-
-            for (int t = 0; t < N; t++)
-            {
-                // Per-sample dropout mask
-                if (dropRate > 0.0)
-                    for (int h = 0; h < learnerHidden; h++)
-                        dropMask[h] = rng.NextDouble() >= dropRate;
-
-                var features = bootstrap[t].Features;
-                for (int h = 0; h < learnerHidden; h++)
-                {
-                    if (dropRate > 0.0 && !dropMask[h]) { hRow[h] = 0.0; continue; }
-
-                    double z = bIn[h];
-                    int rowOff = h * subsetLen;
-                    // SIMD-accelerated dot product
-                    z += ElmMathHelper.DotProductSimd(wIn, rowOff, features, subset, subsetLen);
-                    double act = ElmMathHelper.Activate(z, learnerAct);
-                    hRow[h] = (double.IsFinite(act) ? act : 0.5) * (dropRate > 0.0 ? dropScale : 1.0);
-                }
-                hRow[learnerHidden] = 1.0;
-                double yt = bootstrap[t].Direction > 0 ? posLabel : negLabel;
-
-                // Apply sample weighting: class weights (inverse-frequency) and/or SMOTE down-weighting
-                double sampleW = 1.0;
-                if (useClassWeights)
-                    sampleW *= bootstrap[t].Direction > 0 ? classWeightBuy : classWeightSell;
-                if (isSynthetic is not null && t < isSynthetic.Length && isSynthetic[t])
-                    sampleW *= smoteSampleWeight;
-
-                for (int i = 0; i < solveSize; i++)
-                {
-                    HtY[i] += hRow[i] * yt * sampleW;
-                    for (int j = i; j < solveSize; j++)
-                        HtH[i, j] += hRow[i] * hRow[j] * sampleW;
-                }
-            }
-
-            // ── Degenerate activation detection ──
-            {
-                int saturatedUnits = 0;
-                for (int h = 0; h < learnerHidden; h++)
-                {
-                    double diagH = HtH[h, h];
-                    double saturationThreshold = 1e-6 * N;
-                    if (diagH < saturationThreshold || diagH > N - saturationThreshold)
-                        saturatedUnits++;
-                }
-                if (saturatedUnits > learnerHidden / 2)
-                    _logger.LogWarning(
-                        "ELM learner {K}: {Sat}/{H} hidden units are saturated. " +
-                        "Consider reducing input weight scale, increasing ridge lambda, or trying a different activation.",
-                        k, saturatedUnits, learnerHidden);
-            }
-
-            // Symmetric fill + ridge
-            for (int i = 0; i < solveSize; i++)
-            {
-                if (i < learnerHidden) HtH[i, i] += ridgeLambda;
-                for (int j = i + 1; j < solveSize; j++)
-                    HtH[j, i] = HtH[i, j];
-            }
-
-            var inverseGram = new double[solveSize, solveSize];
-            if (ElmMathHelper.TryInvertSpd(HtH, inverseGram, solveSize))
-            {
-                var flat = new double[solveSize * solveSize];
-                for (int i = 0; i < solveSize; i++)
-                    for (int j = 0; j < solveSize; j++)
-                        flat[i * solveSize + j] = inverseGram[i, j];
-                inverseGramsFlat[k] = flat;
-                inverseGramDims[k]  = solveSize;
-            }
-            else
-            {
-                _logger.LogWarning(
-                    "ELM learner {K}: failed to invert hidden Gram matrix; online updates disabled for this learner",
-                    k);
-            }
-
-            // ── Cholesky solve ──
-            double[] wSolve = new double[solveSize];
-            bool choleskyOk = ElmMathHelper.CholeskySolve(HtH, HtY, wSolve, solveSize);
-
-            if (!choleskyOk)
-                cgDidNotConverge[k] = true;
-
-            double[] wOut = new double[learnerHidden];
-            Array.Copy(wSolve, wOut, learnerHidden);
-            double outBias = wSolve[learnerHidden];
-
-            bool solveIsFinite = double.IsFinite(outBias);
-            if (solveIsFinite)
-                for (int i = 0; i < learnerHidden; i++)
-                    if (!double.IsFinite(wSolve[i])) { solveIsFinite = false; break; }
-
-            if (!solveIsFinite)
-            {
-                Array.Clear(wOut, 0, learnerHidden);
-                outBias = 0.0;
-            }
-            else
-            {
-                for (int i = 0; i < learnerHidden; i++)
-                    wOut[i] = Math.Clamp(wOut[i], -maxWeightMag, maxWeightMag);
-            }
-
-            weights[k] = wOut;
-            biases[k]  = Math.Clamp(outBias, -maxWeightMag, maxWeightMag);
-        });
-
-        int cgFailCount = cgDidNotConverge.Count(f => f);
-        if (cgFailCount > 0)
-            _logger.LogWarning(
-                "ELM Cholesky solver failed for {N}/{K} learners — consider increasing ridge lambda.",
-                cgFailCount, K);
-
-        return (weights, biases, inputWeights, inputBiases, featureSubsets, learnerHiddenSizes, learnerActivations, inverseGramsFlat, inverseGramDims);
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  ELM inference helpers (with SIMD + configurable activation)
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    private static double ElmLearnerProb(
-        float[] features, double[] wOut, double bias,
-        double[] wIn, double[] bIn,
-        int featureCount, int hiddenSize, int[]? subset,
-        ElmActivation activation)
-    {
-        int subsetLen = subset?.Length ?? featureCount;
-        double score = bias;
-        for (int h = 0; h < hiddenSize; h++)
-        {
-            double z = h < bIn.Length ? bIn[h] : 0.0;
-            int rowOff = h * subsetLen;
-            if (subset is not null)
-                z += ElmMathHelper.DotProductSimd(wIn, rowOff, features, subset, subsetLen);
-            else
-            {
-                int len = Math.Min(subsetLen, features.Length);
-                z += ElmMathHelper.DotProductSimdContiguous(wIn, rowOff, features, len);
-            }
-            double hAct = ElmMathHelper.Activate(z, activation);
-            if (h < wOut.Length) score += wOut[h] * hAct;
-        }
-        return MLFeatureHelper.Sigmoid(score);
-    }
-
-    private static double EnsembleRawProb(
-        float[] features, double[][] weights, double[] biases,
-        double[][] inputWeights, double[][] inputBiases,
-        int featureCount, int hiddenSize, int[][]? featureSubsets,
-        double[]? learnerWeights,
-        int[] learnerHiddenSizes, ElmActivation[] learnerActivations,
-        double[]? stackingWeights = null, double stackingBias = 0.0)
-    {
-        int K = Math.Min(
-            weights.Length,
-            Math.Min(biases.Length, Math.Min(inputWeights.Length, inputBiases.Length)));
-        if (K <= 0)
-            return 0.5;
-
-        // Stacking meta-learner: logistic regression over per-learner probabilities.
-        // When active, this replaces both uniform and accuracy-weighted averaging,
-        // learning optimal per-learner combination weights.
-        if (stackingWeights is not null && stackingWeights.Length == K)
-        {
-            double z = stackingBias;
-            for (int k = 0; k < K; k++)
-            {
-                if (weights[k] is not { Length: > 0 } ||
-                    inputWeights[k] is not { Length: > 0 } ||
-                    inputBiases[k] is null)
-                {
-                    continue;
-                }
-
-                double pk = ClampProbabilityOrNeutral(ElmLearnerProb(
-                    features, weights[k], biases[k], inputWeights[k], inputBiases[k],
-                    featureCount,
-                    ResolveLearnerHiddenSize(learnerHiddenSizes, k, hiddenSize, inputBiases[k]),
-                    ResolveLearnerSubset(featureSubsets, k),
-                    ResolveLearnerActivation(learnerActivations, k)));
-                double stackingWeight = double.IsFinite(stackingWeights[k]) ? stackingWeights[k] : 0.0;
-                z += stackingWeight * pk;
-            }
-            return ClampProbabilityOrNeutral(MLFeatureHelper.Sigmoid(z));
-        }
-
-        if (learnerWeights is not null && learnerWeights.Length == K)
-        {
-            double sum = 0;
-            double sumWeights = 0.0;
-            for (int k = 0; k < K; k++)
-            {
-                double learnerWeight = double.IsFinite(learnerWeights[k]) && learnerWeights[k] > 0.0
-                    ? learnerWeights[k]
-                    : 0.0;
-                if (learnerWeight <= 0.0)
-                    continue;
-                if (weights[k] is not { Length: > 0 } ||
-                    inputWeights[k] is not { Length: > 0 } ||
-                    inputBiases[k] is null)
-                {
-                    continue;
-                }
-
-                sum += learnerWeight * ClampProbabilityOrNeutral(ElmLearnerProb(
-                    features, weights[k], biases[k], inputWeights[k], inputBiases[k],
-                    featureCount,
-                    ResolveLearnerHiddenSize(learnerHiddenSizes, k, hiddenSize, inputBiases[k]),
-                    ResolveLearnerSubset(featureSubsets, k),
-                    ResolveLearnerActivation(learnerActivations, k)));
-                sumWeights += learnerWeight;
-            }
-            if (sumWeights > 1e-15)
-                return ClampProbabilityOrNeutral(sum / sumWeights);
-        }
-
-        double uniSum = 0;
-        int uniCount = 0;
-        for (int k = 0; k < K; k++)
-        {
-            if (weights[k] is not { Length: > 0 } ||
-                inputWeights[k] is not { Length: > 0 } ||
-                inputBiases[k] is null)
-            {
-                continue;
-            }
-
-            uniSum += ClampProbabilityOrNeutral(ElmLearnerProb(
-                features, weights[k], biases[k], inputWeights[k], inputBiases[k],
-                featureCount,
-                ResolveLearnerHiddenSize(learnerHiddenSizes, k, hiddenSize, inputBiases[k]),
-                ResolveLearnerSubset(featureSubsets, k),
-                ResolveLearnerActivation(learnerActivations, k)));
-            uniCount++;
-        }
-        return uniCount > 0 ? uniSum / uniCount : 0.5;
-    }
-
-    private static double EnsembleCalibProb(
-        float[] features, double[][] weights, double[] biases,
-        double[][] inputWeights, double[][] inputBiases,
-        double plattA, double plattB,
-        int featureCount, int hiddenSize, int[][]? featureSubsets,
-        double[]? learnerWeights,
-        int[] learnerHiddenSizes, ElmActivation[] learnerActivations,
-        double[]? stackingWeights = null, double stackingBias = 0.0)
-    {
-        if (weights.Length <= 0)
-            return 0.5;
-
-        double raw = EnsembleRawProb(features, weights, biases, inputWeights, inputBiases,
-            featureCount, hiddenSize, featureSubsets, learnerWeights, learnerHiddenSizes, learnerActivations,
-            stackingWeights, stackingBias);
-        double logit = MLFeatureHelper.Logit(ClampProbabilityForLogit(raw));
-        return MLFeatureHelper.Sigmoid(plattA * logit + plattB);
-    }
-
-    private static double ApplyProductionCalibration(
-        double rawProb,
-        double plattA,
-        double plattB,
-        double temperatureScale,
-        double plattABuy,
-        double plattBBuy,
-        double plattASell,
-        double plattBSell)
-    {
-        double rawLogit = MLFeatureHelper.Logit(ClampProbabilityForLogit(rawProb));
-        double globalCalibP = ElmCalibrationHelper.ApplyGlobalCalibration(rawProb, plattA, plattB, temperatureScale);
-
-        if (globalCalibP >= 0.5 && plattABuy != 0.0)
-            return MLFeatureHelper.Sigmoid(plattABuy * rawLogit + plattBBuy);
-        if (globalCalibP < 0.5 && plattASell != 0.0)
-            return MLFeatureHelper.Sigmoid(plattASell * rawLogit + plattBSell);
-
-        return globalCalibP;
-    }
-
-    private (double[] Accuracies, double[]? AccuracyWeights) ComputeLearnerCalibrationStats(
-        List<TrainingSample> calSet,
-        double[][] weights, double[] biases,
-        double[][] inputWeights, double[][] inputBiases,
-        int featureCount, int[][]? featureSubsets,
-        int[] learnerHiddenSizes, ElmActivation[] learnerActivations)
-    {
-        int K = Math.Min(
-            weights.Length,
-            Math.Min(biases.Length, Math.Min(inputWeights.Length, inputBiases.Length)));
-        var accuracies = new double[K];
-        if (K <= 0 || calSet.Count == 0) return (accuracies, null);
-
-        for (int k = 0; k < K; k++)
-        {
-            if (weights[k] is not { Length: > 0 } ||
-                inputWeights[k] is not { Length: > 0 } ||
-                inputBiases[k] is null)
-            {
-                continue;
-            }
-
-            int correct = 0;
-            foreach (var s in calSet)
-            {
-                double prob = ClampProbabilityOrNeutral(ElmLearnerProb(
-                    s.Features, weights[k], biases[k], inputWeights[k], inputBiases[k],
-                    featureCount,
-                    ResolveLearnerHiddenSize(learnerHiddenSizes, k, inputBiases[k].Length, inputBiases[k]),
-                    ResolveLearnerSubset(featureSubsets, k),
-                    ResolveLearnerActivation(learnerActivations, k)));
-                if ((prob >= 0.5 ? 1 : 0) == ToBinaryLabel(s.Direction)) correct++;
-            }
-            accuracies[k] = (double)correct / calSet.Count;
-        }
-
-        _logger.LogDebug("ELM per-learner cal accuracies: [{Accs}]",
-            string.Join(", ", accuracies.Select(a => $"{a:P0}")));
-
-        var accuracyWeights = new double[K];
-        const double tempScale = 5.0;
-        double maxShifted = accuracies.Max() - 0.5;
-        double expSum = 0.0;
-        for (int k = 0; k < K; k++)
-        {
-            double shifted = accuracies[k] - 0.5;
-            accuracyWeights[k] = Math.Exp(tempScale * (shifted - maxShifted));
-            expSum += accuracyWeights[k];
-        }
-
-        if (expSum <= 1e-15) return (accuracies, null);
-        for (int k = 0; k < K; k++) accuracyWeights[k] /= expSum;
-        return (accuracies, accuracyWeights);
-    }
-
-    private static double ComputeEnsembleStd(
-        float[] features, double[][] weights, double[] biases,
-        double[][] inputWeights, double[][] inputBiases,
-        int featureCount, int[][]? featureSubsets,
-        int[] learnerHiddenSizes, ElmActivation[] learnerActivations,
-        double[]? learnerWeights = null,
-        double[]? stackingWeights = null, double stackingBias = 0.0)
-    {
-        int maxK = Math.Min(
-            weights.Length,
-            Math.Min(biases.Length, Math.Min(inputWeights.Length, inputBiases.Length)));
-        if (maxK <= 1) return 0.0;
-
-        var probs = new double[maxK];
-        var validIndices = new int[maxK];
-        int validCount = 0;
-        for (int k = 0; k < maxK; k++)
-        {
-            if (weights[k] is not { Length: > 0 } ||
-                inputWeights[k] is not { Length: > 0 } ||
-                inputBiases[k] is null)
-            {
-                continue;
-            }
-
-            probs[validCount++] = ClampProbabilityOrNeutral(ElmLearnerProb(
-                features, weights[k], biases[k], inputWeights[k], inputBiases[k],
-                featureCount,
-                ResolveLearnerHiddenSize(learnerHiddenSizes, k, inputBiases[k].Length, inputBiases[k]),
-                ResolveLearnerSubset(featureSubsets, k),
-                ResolveLearnerActivation(learnerActivations, k)));
-            validIndices[validCount - 1] = k;
-        }
-
-        if (validCount <= 1)
-            return 0.0;
-
-        double avg;
-        if (stackingWeights is { Length: > 0 } sw)
-        {
-            double z = stackingBias;
-            for (int k = 0; k < validCount; k++)
-            {
-                int originalIndex = validIndices[k];
-                double stackingWeight = originalIndex < sw.Length && double.IsFinite(sw[originalIndex])
-                    ? sw[originalIndex]
-                    : 0.0;
-                z += stackingWeight * probs[k];
-            }
-            avg = ClampProbabilityOrNeutral(MLFeatureHelper.Sigmoid(z));
-        }
-        else if (learnerWeights is { Length: > 0 } lw)
-        {
-            double sumP = 0.0;
-            double sumW = 0.0;
-            for (int k = 0; k < validCount; k++)
-            {
-                int originalIndex = validIndices[k];
-                double learnerWeight = originalIndex < lw.Length && double.IsFinite(lw[originalIndex]) && lw[originalIndex] > 0.0
-                    ? lw[originalIndex]
-                    : 0.0;
-                sumP += learnerWeight * probs[k];
-                sumW += learnerWeight;
-            }
-            avg = ClampProbabilityOrNeutral(sumW > 1e-15 ? sumP / sumW : probs[..validCount].Average());
-        }
-        else
-        {
-            avg = probs[..validCount].Average();
-        }
-
-        double variance = 0.0;
-        for (int k = 0; k < validCount; k++)
-        {
-            double d = probs[k] - avg;
-            variance += d * d;
-        }
-
-        return double.IsFinite(variance) ? Math.Sqrt(variance / (validCount - 1)) : 0.0;
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  Magnitude regressors
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    private static double PredictMagnitudeAug(
-        float[] features, double[] augWeights, double augBias,
-        int featureCount, int hiddenSize,
-        double[][] elmInputWeights, double[][] elmInputBiases, int[][]? featureSubsets,
-        ElmActivation[] learnerActivations)
-    {
-        int K = Math.Min(elmInputWeights.Length, elmInputBiases.Length);
-        int[] defaultSubset = Enumerable.Range(0, featureCount).ToArray();
-        double pred = augBias;
-
-        for (int j = 0; j < Math.Min(Math.Min(featureCount, features.Length), augWeights.Length); j++)
-            pred += augWeights[j] * features[j];
-
-        for (int h = 0; h < hiddenSize; h++)
-        {
-            if (featureCount + h >= augWeights.Length) break;
-            double hSum = 0;
-            int hCount = 0;
-            for (int ki = 0; ki < K; ki++)
-            {
-                if (elmInputWeights[ki] is not { Length: > 0 } ||
-                    elmInputBiases[ki] is not { Length: > 0 })
-                {
-                    continue;
-                }
-
-                var bIn = elmInputBiases[ki];
-                if (h >= bIn.Length) continue; // learner has fewer hidden units
-
-                var wIn = elmInputWeights[ki];
-                int[] sub = featureSubsets is not null && ki < featureSubsets.Length && featureSubsets[ki] is { Length: > 0 }
-                    ? featureSubsets[ki]
-                    : defaultSubset;
-                int subLen = sub.Length;
-                double z = bIn[h];
-                int rowOff = h * subLen;
-                z += ElmMathHelper.DotProductSimd(wIn, rowOff, features, sub, subLen);
-                ElmActivation learnerAct = learnerActivations.Length > 0
-                    ? ResolveLearnerActivation(learnerActivations, ki)
-                    : ElmActivation.Sigmoid;
-                hSum += ElmMathHelper.Activate(z, learnerAct);
-                hCount++;
-            }
-            pred += augWeights[featureCount + h] * (hCount > 0 ? hSum / hCount : 0.0);
-        }
-
-        return pred;
-    }
-
-    private static (double[] EquivWeights, double EquivBias,
-                    double[] AugWeights, double AugBias) FitElmMagnitudeRegressor(
-        List<TrainingSample> train, int featureCount, int hiddenSize,
-        double[][] elmInputWeights, double[][] elmInputBiases, int[][]? featureSubsets,
-        ElmActivation[] learnerActivations,
-        double configLr = 0.0, int configMaxEpochs = 0, int configPatience = 0,
-        CancellationToken ct = default)
-    {
-        if (train.Count < 10) return (new double[featureCount], 0.0,
-                                      new double[featureCount + hiddenSize], 0.0);
-
-        int K = elmInputWeights.Length;
-        int augDim = featureCount + hiddenSize;
-        int valSize = Math.Max(10, train.Count / 10);
-        if (train.Count <= valSize)
-            valSize = Math.Max(1, train.Count / 5);
-        if (train.Count - valSize < 1)
-            return (new double[featureCount], 0.0,
-                new double[featureCount + hiddenSize], 0.0);
-        var trainSubset = train[..^valSize];
-
-        double[] w = new double[augDim];
-        double   b = 0.0;
-        double   magBaseLr = configLr > 0.0 ? configLr : 0.001;
-        const double magL2Lambda = 1e-4;
-        const double beta1 = 0.9, beta2 = 0.999, eps = 1e-8;
-        double   bestLoss = double.MaxValue;
-        double[] bestW = new double[augDim];
-        double   bestB = 0.0;
-        int      patience = 0;
-        int      magMaxEpochs = configMaxEpochs > 0 ? configMaxEpochs : 200;
-        int      magMaxPatience = configPatience > 0 ? configPatience : 15;
-
-        double[] adamMW = new double[augDim], adamVW = new double[augDim];
-        double   adamMB = 0, adamVB = 0;
-
-        var augFeatures = BuildAugmentedFeatures(train, featureCount, hiddenSize, K, elmInputWeights, elmInputBiases, featureSubsets, learnerActivations);
-
-        const int magBatchSize = 256;
-        int trainSubCount = trainSubset.Count;
-        bool magUseBatch = trainSubCount > magBatchSize * 2;
-        var magBatchRng = magUseBatch ? new Random(trainSubCount + 19) : null;
-        int[] magBatchOrder = magUseBatch ? Enumerable.Range(0, trainSubCount).ToArray() : [];
-        int magGlobalStep = 0;
-
-        double[] magGradW = new double[augDim]; // Pre-allocated to reduce GC pressure
-        for (int epoch = 0; epoch < magMaxEpochs; epoch++)
-        {
-            ct.ThrowIfCancellationRequested();
-            double lr = ElmMathHelper.CosineAnnealLr(magBaseLr, epoch, magMaxEpochs);
-            if (magUseBatch) ElmMathHelper.ShuffleArray(magBatchOrder, magBatchRng!);
-
-            int batchCount = magUseBatch ? (trainSubCount + magBatchSize - 1) / magBatchSize : 1;
-            for (int bi = 0; bi < batchCount; bi++)
-            {
-                int bStart = magUseBatch ? bi * magBatchSize : 0;
-                int bEnd = magUseBatch ? Math.Min(bStart + magBatchSize, trainSubCount) : trainSubCount;
-                int bLen = bEnd - bStart;
-
-                double gradB = 0;
-                Array.Clear(magGradW, 0, augDim);
-                double[] gradW = magGradW;
-
-                for (int bIdx = bStart; bIdx < bEnd; bIdx++)
-                {
-                    int i = magUseBatch ? magBatchOrder[bIdx] : bIdx;
-                    double pred = b;
-                    for (int j = 0; j < augDim; j++)
-                        pred += w[j] * augFeatures[i][j];
-                    double err = pred - trainSubset[i].Magnitude;
-                    double clipped = Math.Abs(err) > 1.35 ? 1.35 * Math.Sign(err) : err;
-                    gradB += clipped;
-                    for (int j = 0; j < augDim; j++)
-                        gradW[j] += clipped * augFeatures[i][j];
-                }
-
-                double gB = gradB / bLen + 2.0 * magL2Lambda * b;
-                magGlobalStep++;
-                adamMB = beta1 * adamMB + (1 - beta1) * gB;
-                adamVB = beta2 * adamVB + (1 - beta2) * gB * gB;
-                b -= lr * (adamMB / (1 - Math.Pow(beta1, magGlobalStep))) / (Math.Sqrt(adamVB / (1 - Math.Pow(beta2, magGlobalStep))) + eps);
-
-                for (int j = 0; j < augDim; j++)
-                {
-                    double gW = gradW[j] / bLen + 2.0 * magL2Lambda * w[j];
-                    adamMW[j] = beta1 * adamMW[j] + (1 - beta1) * gW;
-                    adamVW[j] = beta2 * adamVW[j] + (1 - beta2) * gW * gW;
-                    w[j] -= lr * (adamMW[j] / (1 - Math.Pow(beta1, magGlobalStep))) / (Math.Sqrt(adamVW[j] / (1 - Math.Pow(beta2, magGlobalStep))) + eps);
-                }
-            }
-
-            double valLoss = 0;
-            for (int i = trainSubCount; i < train.Count; i++)
-            {
-                double pred = b;
-                for (int j = 0; j < augDim; j++)
-                    pred += w[j] * augFeatures[i][j];
-                double e = pred - train[i].Magnitude;
-                valLoss += e * e;
-            }
-            valLoss /= valSize;
-
-            if (valLoss < bestLoss - 1e-6)
-            {
-                bestLoss = valLoss;
-                Array.Copy(w, bestW, augDim);
-                bestB = b;
-                patience = 0;
-            }
-            else if (++patience >= magMaxPatience) break;
-        }
-
-        double[] equivW = ProjectAugWeightsToFeatureSpace(bestW, featureCount, hiddenSize, K, train, elmInputWeights, elmInputBiases, featureSubsets, learnerActivations);
-        return (equivW, bestB, bestW, bestB);
-    }
-
-    /// <summary>
-    /// Walk-forward CV for the magnitude regressor: trains on expanding windows with embargo.
-    /// Stores per-fold weights for prediction averaging at inference time (avoids the lossy
-    /// weight-averaging approach which can cancel useful asymmetric patterns).
-    /// Returns the mean-averaged weights for backward-compatible single-model inference,
-    /// plus per-fold weight arrays for prediction-averaged inference.
-    /// </summary>
-    private static (double[] EquivWeights, double EquivBias,
-                    double[] AugWeights, double AugBias,
-                    double[][]? FoldAugWeights, double[]? FoldAugBiases) FitElmMagnitudeRegressorCV(
-        List<TrainingSample> train, int featureCount, int hiddenSize,
-        double[][] elmInputWeights, double[][] elmInputBiases, int[][]? featureSubsets,
-        ElmActivation[] learnerActivations,
-        double configLr, int configMaxEpochs, int configPatience,
-        int cvFolds, int embargo,
-        CancellationToken ct = default)
-    {
-        int foldSize = train.Count / (cvFolds + 1);
-        if (foldSize < 20)
-        {
-            var single = FitElmMagnitudeRegressor(train, featureCount, hiddenSize,
-                elmInputWeights, elmInputBiases, featureSubsets, learnerActivations,
-                configLr, configMaxEpochs, configPatience, ct);
-            return (single.EquivWeights, single.EquivBias, single.AugWeights, single.AugBias, null, null);
-        }
-
-        int augDim = featureCount + hiddenSize;
-        int purgeExtra = MLFeatureHelper.LookbackWindow - 1;
-        var allFoldWeights = new List<double[]>();
-        var allFoldBiases = new List<double>();
-
-        for (int fold = 0; fold < cvFolds; fold++)
-        {
-            ct.ThrowIfCancellationRequested();
-            int testEnd   = (fold + 2) * foldSize;
-            int testStart = testEnd - foldSize;
-            int trainEnd  = Math.Max(0, testStart - embargo - purgeExtra);
-            if (trainEnd < 20) continue;
-
-            var foldTrain = train[..trainEnd];
-            var (_, _, foldAugW, foldAugB) = FitElmMagnitudeRegressor(
-                foldTrain, featureCount, hiddenSize, elmInputWeights, elmInputBiases, featureSubsets,
-                learnerActivations, configLr, configMaxEpochs, configPatience, ct);
-
-            allFoldWeights.Add(foldAugW);
-            allFoldBiases.Add(foldAugB);
-        }
-
-        if (allFoldWeights.Count == 0)
-        {
-            var single = FitElmMagnitudeRegressor(train, featureCount, hiddenSize,
-                elmInputWeights, elmInputBiases, featureSubsets, learnerActivations,
-                configLr, configMaxEpochs, configPatience, ct);
-            return (single.EquivWeights, single.EquivBias, single.AugWeights, single.AugBias, null, null);
-        }
-
-        // Compute mean-averaged weights as fallback / backward-compatible single model
-        int validFolds = allFoldWeights.Count;
-        double[] avgAugW = new double[augDim];
-        double avgAugB = 0.0;
-        for (int fi = 0; fi < validFolds; fi++)
-        {
-            for (int j = 0; j < augDim && j < allFoldWeights[fi].Length; j++)
-                avgAugW[j] += allFoldWeights[fi][j];
-            avgAugB += allFoldBiases[fi];
-        }
-        for (int j = 0; j < augDim; j++) avgAugW[j] /= validFolds;
-        avgAugB /= validFolds;
-
-        int K = elmInputWeights.Length;
-        double[] equivW = ProjectAugWeightsToFeatureSpace(avgAugW, featureCount, hiddenSize, K, train, elmInputWeights, elmInputBiases, featureSubsets, learnerActivations);
-        return (equivW, avgAugB, avgAugW, avgAugB, allFoldWeights.ToArray(), allFoldBiases.ToArray());
-    }
-
-    private static (double[] Weights, double Bias) FitQuantileRegressor(
-        List<TrainingSample> train, int featureCount, double tau,
-        int hiddenSize, double[][] elmInputWeights, double[][] elmInputBiases,
-        int[][]? featureSubsets, ElmActivation[] learnerActivations,
-        CancellationToken ct = default)
-    {
-        if (train.Count < 10) return (new double[featureCount], 0.0);
-
-        int K = elmInputWeights.Length;
-        int augDim = featureCount + hiddenSize;
-        int valSize = Math.Max(10, train.Count / 10);
-        if (train.Count <= valSize)
-            valSize = Math.Max(1, train.Count / 5);
-        if (train.Count - valSize < 1)
-            return (new double[featureCount], 0.0);
-        var trainSubset = train[..^valSize];
-        int trainSubCount = trainSubset.Count;
-
-        var augFeatures = BuildAugmentedFeatures(train, featureCount, hiddenSize, K, elmInputWeights, elmInputBiases, featureSubsets, learnerActivations);
-
-        double[] w = new double[augDim];
-        double   b = 0.0;
-        const double qBaseLr = 0.001;
-        const double qL2Lambda = 1e-4;
-        const double beta1 = 0.9, beta2 = 0.999, eps = 1e-8;
-        const int qMaxEpochs = 200;
-        const int qMaxPatience = 15;
-
-        double bestLoss = double.MaxValue;
-        double[] bestW  = new double[augDim];
-        double   bestB  = 0.0;
-        int patience = 0;
-
-        double[] adamMW = new double[augDim], adamVW = new double[augDim];
-        double   adamMB = 0, adamVB = 0;
-        int globalStep = 0;
-
-        const int qBatchSize = 256;
-        bool useBatch = trainSubCount > qBatchSize * 2;
-        var batchRng = useBatch ? new Random(trainSubCount + 31) : null;
-        int[] batchOrder = useBatch ? Enumerable.Range(0, trainSubCount).ToArray() : [];
-
-        double[] qGradW = new double[augDim]; // Pre-allocated to reduce GC pressure
-        for (int epoch = 0; epoch < qMaxEpochs; epoch++)
-        {
-            ct.ThrowIfCancellationRequested();
-            double lr = ElmMathHelper.CosineAnnealLr(qBaseLr, epoch, qMaxEpochs);
-            if (useBatch) ElmMathHelper.ShuffleArray(batchOrder, batchRng!);
-
-            int batchCount = useBatch ? (trainSubCount + qBatchSize - 1) / qBatchSize : 1;
-            for (int bi = 0; bi < batchCount; bi++)
-            {
-                int bStart = useBatch ? bi * qBatchSize : 0;
-                int bEnd = useBatch ? Math.Min(bStart + qBatchSize, trainSubCount) : trainSubCount;
-                int bLen = bEnd - bStart;
-
-                double gradB = 0;
-                Array.Clear(qGradW, 0, augDim);
-                double[] gradW = qGradW;
-
-                for (int bIdx = bStart; bIdx < bEnd; bIdx++)
-                {
-                    int idx = useBatch ? batchOrder[bIdx] : bIdx;
-                    double pred = b;
-                    for (int j = 0; j < augDim; j++)
-                        pred += w[j] * augFeatures[idx][j];
-                    double err = trainSubset[idx].Magnitude - pred;
-                    double sign = err >= 0 ? -tau : (1.0 - tau);
-                    gradB += sign;
-                    for (int j = 0; j < augDim; j++)
-                        gradW[j] += sign * augFeatures[idx][j];
-                }
-
-                double gB = gradB / bLen + 2.0 * qL2Lambda * b;
-                globalStep++;
-                adamMB = beta1 * adamMB + (1 - beta1) * gB;
-                adamVB = beta2 * adamVB + (1 - beta2) * gB * gB;
-                b -= lr * (adamMB / (1 - Math.Pow(beta1, globalStep))) / (Math.Sqrt(adamVB / (1 - Math.Pow(beta2, globalStep))) + eps);
-
-                for (int j = 0; j < augDim; j++)
-                {
-                    double gW = gradW[j] / bLen + 2.0 * qL2Lambda * w[j];
-                    adamMW[j] = beta1 * adamMW[j] + (1 - beta1) * gW;
-                    adamVW[j] = beta2 * adamVW[j] + (1 - beta2) * gW * gW;
-                    w[j] -= lr * (adamMW[j] / (1 - Math.Pow(beta1, globalStep))) / (Math.Sqrt(adamVW[j] / (1 - Math.Pow(beta2, globalStep))) + eps);
-                }
-            }
-
-            double valLoss = 0;
-            for (int i = trainSubCount; i < train.Count; i++)
-            {
-                double pred = b;
-                for (int j = 0; j < augDim; j++)
-                    pred += w[j] * augFeatures[i][j];
-                double e = train[i].Magnitude - pred;
-                valLoss += e >= 0 ? tau * e : (tau - 1.0) * e;
-            }
-            valLoss /= valSize;
-
-            if (valLoss < bestLoss - 1e-6)
-            {
-                bestLoss = valLoss;
-                Array.Copy(w, bestW, augDim);
-                bestB = b;
-                patience = 0;
-            }
-            else if (++patience >= qMaxPatience) break;
-        }
-
-        double[] equivW = ProjectAugWeightsToFeatureSpace(bestW, featureCount, hiddenSize, K, train, elmInputWeights, elmInputBiases, featureSubsets, learnerActivations);
-        return (equivW, bestB);
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  Shared magnitude helpers
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    private static double[][] BuildAugmentedFeatures(
-        List<TrainingSample> samples, int featureCount, int hiddenSize, int K,
-        double[][] elmInputWeights, double[][] elmInputBiases, int[][]? featureSubsets,
-        ElmActivation[] learnerActivations)
-    {
-        K = Math.Min(K, Math.Min(elmInputWeights.Length, elmInputBiases.Length));
-        int augDim = featureCount + hiddenSize;
-
-        // Pre-compute default subset once — avoids per-sample per-learner allocation
-        int[] defaultSubset = Enumerable.Range(0, featureCount).ToArray();
-
-        // Pre-compute per-learner effective hidden size (clamped to augDim slots)
-        int[] learnerH = new int[K];
-        for (int ki = 0; ki < K; ki++)
-            learnerH[ki] = elmInputBiases[ki] is { Length: > 0 } && elmInputWeights[ki] is { Length: > 0 }
-                ? Math.Min(hiddenSize, elmInputBiases[ki].Length)
-                : 0;
-
-        var augFeatures = new double[samples.Count][];
-        for (int i = 0; i < samples.Count; i++)
-        {
-            augFeatures[i] = new double[augDim];
-            var f = samples[i].Features;
-            for (int j = 0; j < Math.Min(featureCount, f.Length); j++)
-                augFeatures[i][j] = f[j];
-
-            var hSum   = new double[hiddenSize];
-            var hCount = new int[hiddenSize];
-            for (int ki = 0; ki < K; ki++)
-            {
-                if (elmInputWeights[ki] is not { Length: > 0 } ||
-                    elmInputBiases[ki] is not { Length: > 0 })
-                {
-                    continue;
-                }
-
-                var wIn = elmInputWeights[ki];
-                var bIn = elmInputBiases[ki];
-                int[] sub = featureSubsets is not null && ki < featureSubsets.Length && featureSubsets[ki] is { Length: > 0 }
-                    ? featureSubsets[ki]
-                    : defaultSubset;
-                int subLen = sub.Length;
-                int effH = learnerH[ki];
-
-                for (int h = 0; h < effH; h++)
-                {
-                    double z = bIn[h];
-                    int rowOff = h * subLen;
-                    z += ElmMathHelper.DotProductSimd(wIn, rowOff, f, sub, subLen);
-                    ElmActivation learnerAct = learnerActivations.Length > 0
-                        ? ResolveLearnerActivation(learnerActivations, ki)
-                        : ElmActivation.Sigmoid;
-                    hSum[h] += ElmMathHelper.Activate(z, learnerAct);
-                    hCount[h]++;
-                }
-            }
-            for (int h = 0; h < hiddenSize; h++)
-                augFeatures[i][featureCount + h] = hCount[h] > 0 ? hSum[h] / hCount[h] : 0.0;
-        }
-        return augFeatures;
-    }
-
-    private static double[] ProjectAugWeightsToFeatureSpace(
-        double[] augWeights, int featureCount, int hiddenSize, int K,
-        List<TrainingSample> train,
-        double[][] elmInputWeights, double[][] elmInputBiases, int[][]? featureSubsets,
-        ElmActivation[] learnerActivations)
-    {
-        K = Math.Min(K, Math.Min(elmInputWeights.Length, elmInputBiases.Length));
-        double[] equivW = new double[featureCount];
-        if (augWeights.Length > 0)
-            Array.Copy(augWeights, equivW, Math.Min(featureCount, augWeights.Length));
-
-        if (train.Count == 0 || hiddenSize <= 0)
-            return equivW;
-
-        int[] defaultSubset = Enumerable.Range(0, featureCount).ToArray();
-
-        double[] meanActivationDeriv = new double[hiddenSize];
-        int[] derivContributors = new int[hiddenSize];
-        for (int ki = 0; ki < K; ki++)
-        {
-            if (elmInputWeights[ki] is not { Length: > 0 } ||
-                elmInputBiases[ki] is not { Length: > 0 })
-            {
-                continue;
-            }
-
-            var wIn = elmInputWeights[ki];
-            var bIn = elmInputBiases[ki];
-            int effH = Math.Min(hiddenSize, bIn.Length);
-            int[] sub = featureSubsets is not null && ki < featureSubsets.Length && featureSubsets[ki] is { Length: > 0 }
-                ? featureSubsets[ki]
-                : defaultSubset;
-            int subLen = sub.Length;
-
-            for (int h = 0; h < effH; h++)
-            {
-                double derivSum = 0;
-                int rowOff = h * subLen;
-                for (int i = 0; i < train.Count; i++)
-                {
-                    double z = bIn[h];
-                    var f = train[i].Features;
-                    z += ElmMathHelper.DotProductSimd(wIn, rowOff, f, sub, subLen);
-                    ElmActivation learnerAct = learnerActivations.Length > 0
-                        ? ResolveLearnerActivation(learnerActivations, ki)
-                        : ElmActivation.Sigmoid;
-                    derivSum += ActivationDerivative(z, learnerAct);
-                }
-                meanActivationDeriv[h] += derivSum / train.Count;
-                derivContributors[h]++;
-            }
-        }
-        for (int h = 0; h < hiddenSize; h++)
-            if (derivContributors[h] > 0) meanActivationDeriv[h] /= derivContributors[h];
-
-        for (int h = 0; h < hiddenSize; h++)
-        {
-            if (featureCount + h >= augWeights.Length)
-                break;
-
-            double hiddenW = augWeights[featureCount + h];
-            if (Math.Abs(hiddenW) < 1e-10) continue;
-
-            double deriv = meanActivationDeriv[h];
-            int contributors = derivContributors[h];
-            if (contributors == 0) continue;
-
-            for (int ki = 0; ki < K; ki++)
-            {
-                if (elmInputWeights[ki] is not { Length: > 0 } ||
-                    elmInputBiases[ki] is not { Length: > 0 })
-                {
-                    continue;
-                }
-
-                var bIn = elmInputBiases[ki];
-                if (h >= bIn.Length) continue; // learner has fewer hidden units
-
-                var wIn = elmInputWeights[ki];
-                int[] sub = featureSubsets is not null && ki < featureSubsets.Length && featureSubsets[ki] is { Length: > 0 }
-                    ? featureSubsets[ki]
-                    : defaultSubset;
-                int subLen = sub.Length;
-                int rowOff = h * subLen;
-
-                for (int si = 0; si < subLen; si++)
-                {
-                    int fi = sub[si];
-                    if (fi >= 0 && fi < featureCount && rowOff + si < wIn.Length)
-                        equivW[fi] += hiddenW * deriv * wIn[rowOff + si] / contributors;
-                }
-            }
-        }
-
-        return equivW;
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  Activation derivative (for Taylor projection in magnitude regressor)
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    private static double ActivationDerivative(double z, ElmActivation activation)
-    {
-        switch (activation)
-        {
-            case ElmActivation.Tanh:
-                var t = Math.Tanh(z);
-                return 1.0 - t * t;
-            case ElmActivation.Relu:
-                return z > 0.0 ? 1.0 : 0.0;
-            default: // Sigmoid
-                var s = MLFeatureHelper.Sigmoid(z);
-                return s * (1.0 - s);
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  Meta-label & abstention (kept inline — they use ensemble inference)
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    private (double[] Weights, double Bias) FitMetaLabelModel(
-        List<TrainingSample> calSet,
-        double[][] weights, double[] biases,
-        double[][] inputWeights, double[][] inputBiases,
-        int featureCount, int hiddenSize, int[][]? featureSubsets,
-        int[] learnerHiddenSizes, ElmActivation[] learnerActivations,
-        double decisionThreshold,
-        Func<float[], double>? calibratedProb = null,
-        double[]? stackingWeights = null, double stackingBias = 0.0,
-        double configLr = 0.0, int configMaxEpochs = 0, int configPatience = 0,
-        CancellationToken ct = default)
-    {
-        if (calSet.Count < 10) return ([], 0.0);
-
-        int metaDim = 2 + Math.Min(5, featureCount);
-        double[] mw = new double[metaDim];
-        double[] bestMw = new double[metaDim];
-        double   mb = 0.0, bestMb = 0.0;
-        double metaBaseLr = configLr > 0.0 ? configLr : 0.01;
-        const double l2Lambda = 1e-4;
-        const double beta1 = 0.9, beta2 = 0.999, eps = 1e-8;
-        double   bestLoss = double.MaxValue;
-        int      patience = 0;
-        int maxPatience = configPatience > 0 ? configPatience : 25;
-
-        double[] adamMW = new double[metaDim], adamVW = new double[metaDim];
-        double   adamMB = 0, adamVB = 0;
-
-        var metaXs = new double[calSet.Count][];
-        var targets = new double[calSet.Count];
-        for (int i = 0; i < calSet.Count; i++)
-        {
-            var s = calSet[i];
-            double calibP = ClampProbabilityOrNeutral(calibratedProb is not null
-                ? calibratedProb(s.Features)
-                : EnsembleCalibProb(
-                    s.Features, weights, biases, inputWeights, inputBiases,
-                    1.0, 0.0, featureCount, hiddenSize, featureSubsets, null, learnerHiddenSizes, learnerActivations, stackingWeights, stackingBias));
-
-            double ensStd = ClampNonNegativeFinite(ComputeEnsembleStd(
-                s.Features, weights, biases, inputWeights, inputBiases,
-                featureCount, featureSubsets, learnerHiddenSizes, learnerActivations,
-                stackingWeights: stackingWeights, stackingBias: stackingBias));
-
-            metaXs[i] = BuildMetaLabelFeatureVector(calibP, ensStd, s.Features, featureCount);
-
-            targets[i] = (calibP >= decisionThreshold ? 1 : 0) == ToBinaryLabel(s.Direction) ? 1.0 : 0.0;
-        }
-
-        int metaMaxEpochs = configMaxEpochs > 0 ? configMaxEpochs : 200;
-        int metaTrainCount = Math.Max(1, (int)(calSet.Count * 0.8));
-        int metaValStart = metaTrainCount;
-        int metaValCount = calSet.Count - metaTrainCount;
-        const int metaBatchSize = 256;
-        bool metaUseBatch = metaTrainCount > metaBatchSize * 2;
-        var metaBatchRng = metaUseBatch ? new Random(calSet.Count + 7) : null;
-        int[] metaBatchOrder = metaUseBatch ? Enumerable.Range(0, metaTrainCount).ToArray() : [];
-        int metaGlobalStep = 0;
-
-        double[] metaGradW = new double[metaDim]; // Pre-allocated to reduce GC pressure
-        for (int epoch = 0; epoch < metaMaxEpochs; epoch++)
-        {
-            ct.ThrowIfCancellationRequested();
-            double lr = ElmMathHelper.CosineAnnealLr(metaBaseLr, epoch, metaMaxEpochs);
-            if (metaUseBatch) ElmMathHelper.ShuffleArray(metaBatchOrder, metaBatchRng!);
-
-            int batchCount = metaUseBatch ? (metaTrainCount + metaBatchSize - 1) / metaBatchSize : 1;
-            for (int bi = 0; bi < batchCount; bi++)
-            {
-                int bStart = metaUseBatch ? bi * metaBatchSize : 0;
-                int bEnd = metaUseBatch ? Math.Min(bStart + metaBatchSize, metaTrainCount) : metaTrainCount;
-                int bLen = bEnd - bStart;
-
-                double gradB = 0;
-                Array.Clear(metaGradW, 0, metaDim);
-                double[] gradW = metaGradW;
-
-                for (int bIdx = bStart; bIdx < bEnd; bIdx++)
-                {
-                    int i = metaUseBatch ? metaBatchOrder[bIdx] : bIdx;
-                    double z = mb;
-                    for (int j = 0; j < metaDim; j++) z += mw[j] * metaXs[i][j];
-                    double p = MLFeatureHelper.Sigmoid(z);
-
-                    double err = p - targets[i];
-                    gradB += err;
-                    for (int j = 0; j < metaDim; j++) gradW[j] += err * metaXs[i][j];
-                }
-
-                double gB = gradB / bLen + 2.0 * l2Lambda * mb;
-                metaGlobalStep++;
-                adamMB = beta1 * adamMB + (1 - beta1) * gB;
-                adamVB = beta2 * adamVB + (1 - beta2) * gB * gB;
-                mb -= lr * (adamMB / (1 - Math.Pow(beta1, metaGlobalStep))) / (Math.Sqrt(adamVB / (1 - Math.Pow(beta2, metaGlobalStep))) + eps);
-
-                for (int j = 0; j < metaDim; j++)
-                {
-                    double gW = gradW[j] / bLen + 2.0 * l2Lambda * mw[j];
-                    adamMW[j] = beta1 * adamMW[j] + (1 - beta1) * gW;
-                    adamVW[j] = beta2 * adamVW[j] + (1 - beta2) * gW * gW;
-                    mw[j] -= lr * (adamMW[j] / (1 - Math.Pow(beta1, metaGlobalStep))) / (Math.Sqrt(adamVW[j] / (1 - Math.Pow(beta2, metaGlobalStep))) + eps);
-                }
-            }
-
-            double loss = 0;
-            int evalCount = metaValCount > 0 ? metaValCount : calSet.Count;
-            int evalStart = metaValCount > 0 ? metaValStart : 0;
-            for (int i = evalStart; i < evalStart + evalCount; i++)
-            {
-                double z = mb;
-                for (int j = 0; j < metaDim; j++) z += mw[j] * metaXs[i][j];
-                double p = MLFeatureHelper.Sigmoid(z);
-                loss -= targets[i] * Math.Log(Math.Max(p, 1e-10)) + (1 - targets[i]) * Math.Log(Math.Max(1 - p, 1e-10));
-            }
-            loss /= evalCount;
-            double l2Penalty = mb * mb;
-            for (int j = 0; j < metaDim; j++) l2Penalty += mw[j] * mw[j];
-            loss += l2Lambda * l2Penalty;
-
-            if (loss < bestLoss - 1e-7)
-            {
-                bestLoss = loss; bestMb = mb;
-                Array.Copy(mw, bestMw, metaDim);
-                patience = 0;
-            }
-            else if (++patience >= maxPatience) break;
-        }
-
-        return (bestMw, bestMb);
-    }
-
-    private (double[] Weights, double Bias, double Threshold) FitAbstentionModel(
-        List<TrainingSample> calSet,
-        double[][] weights, double[] biases,
-        double[][] inputWeights, double[][] inputBiases,
-        double plattA, double plattB,
-        double[] metaLabelWeights, double metaLabelBias,
-        int featureCount, int hiddenSize, int[][]? featureSubsets,
-        int[] learnerHiddenSizes, ElmActivation[] learnerActivations,
-        double decisionThreshold,
-        Func<float[], double>? calibratedProb = null,
-        double[]? stackingWeights = null, double stackingBias = 0.0,
-        double configLr = 0.0, int configMaxEpochs = 0, int configPatience = 0,
-        CancellationToken ct = default)
-    {
-        if (calSet.Count < 10) return ([], 0.0, 0.5);
-
-        int dim = 3;
-        double[] aw = new double[dim];
-        double[] bestAw = new double[dim];
-        double   ab = 0.0, bestAb = 0.0;
-        double absBaseLr = configLr > 0.0 ? configLr : 0.01;
-        const double l2Lambda = 1e-4;
-        const double beta1 = 0.9, beta2 = 0.999, eps = 1e-8;
-        double   bestLoss = double.MaxValue;
-        int      patience = 0;
-        int maxPatience = configPatience > 0 ? configPatience : 25;
-
-        double[] adamMW = new double[dim], adamVW = new double[dim];
-        double   adamMB = 0, adamVB = 0;
-
-        var absXs = new double[calSet.Count][];
-        var absTargets = new double[calSet.Count];
-        for (int i = 0; i < calSet.Count; i++)
-        {
-            var s = calSet[i];
-            double calibP = ClampProbabilityOrNeutral(calibratedProb is not null
-                ? calibratedProb(s.Features)
-                : EnsembleCalibProb(
-                    s.Features, weights, biases, inputWeights, inputBiases,
-                    plattA, plattB, featureCount, hiddenSize, featureSubsets, null, learnerHiddenSizes, learnerActivations, stackingWeights, stackingBias));
-
-            double ensStd = ClampNonNegativeFinite(ComputeEnsembleStd(
-                s.Features, weights, biases, inputWeights, inputBiases,
-                featureCount, featureSubsets, learnerHiddenSizes, learnerActivations,
-                stackingWeights: stackingWeights, stackingBias: stackingBias));
-
-            double mlScore = ComputeMetaLabelScore(calibP, ensStd, s.Features, featureCount, metaLabelWeights, metaLabelBias);
-
-            absXs[i] = [calibP, ensStd, mlScore];
-            absTargets[i] = (calibP >= decisionThreshold ? 1 : 0) == ToBinaryLabel(s.Direction) ? 1.0 : 0.0;
-        }
-
-        int absMaxEpochs = configMaxEpochs > 0 ? configMaxEpochs : 200;
-        int absTrainCount = Math.Max(1, (int)(calSet.Count * 0.8));
-        int absValStart = absTrainCount;
-        int absValCount = calSet.Count - absTrainCount;
-        const int absBatchSize = 256;
-        bool absUseBatch = absTrainCount > absBatchSize * 2;
-        var absBatchRng = absUseBatch ? new Random(calSet.Count + 13) : null;
-        int[] absBatchOrder = absUseBatch ? Enumerable.Range(0, absTrainCount).ToArray() : [];
-        int absGlobalStep = 0;
-
-        double[] absGradW = new double[dim]; // Pre-allocated to reduce GC pressure
-        for (int epoch = 0; epoch < absMaxEpochs; epoch++)
-        {
-            ct.ThrowIfCancellationRequested();
-            double lr = ElmMathHelper.CosineAnnealLr(absBaseLr, epoch, absMaxEpochs);
-            if (absUseBatch) ElmMathHelper.ShuffleArray(absBatchOrder, absBatchRng!);
-
-            int batchCount = absUseBatch ? (absTrainCount + absBatchSize - 1) / absBatchSize : 1;
-            for (int bi = 0; bi < batchCount; bi++)
-            {
-                int bStart = absUseBatch ? bi * absBatchSize : 0;
-                int bEnd = absUseBatch ? Math.Min(bStart + absBatchSize, absTrainCount) : absTrainCount;
-                int bLen = bEnd - bStart;
-
-                double gradB = 0;
-                Array.Clear(absGradW, 0, dim);
-                double[] gradW = absGradW;
-
-                for (int bIdx = bStart; bIdx < bEnd; bIdx++)
-                {
-                    int i = absUseBatch ? absBatchOrder[bIdx] : bIdx;
-                    double z = ab;
-                    for (int j = 0; j < dim; j++) z += aw[j] * absXs[i][j];
-                    double p = MLFeatureHelper.Sigmoid(z);
-
-                    double err = p - absTargets[i];
-                    gradB += err;
-                    for (int j = 0; j < dim; j++) gradW[j] += err * absXs[i][j];
-                }
-
-                double gB = gradB / bLen + 2.0 * l2Lambda * ab;
-                absGlobalStep++;
-                adamMB = beta1 * adamMB + (1 - beta1) * gB;
-                adamVB = beta2 * adamVB + (1 - beta2) * gB * gB;
-                ab -= lr * (adamMB / (1 - Math.Pow(beta1, absGlobalStep))) / (Math.Sqrt(adamVB / (1 - Math.Pow(beta2, absGlobalStep))) + eps);
-
-                for (int j = 0; j < dim; j++)
-                {
-                    double gW = gradW[j] / bLen + 2.0 * l2Lambda * aw[j];
-                    adamMW[j] = beta1 * adamMW[j] + (1 - beta1) * gW;
-                    adamVW[j] = beta2 * adamVW[j] + (1 - beta2) * gW * gW;
-                    aw[j] -= lr * (adamMW[j] / (1 - Math.Pow(beta1, absGlobalStep))) / (Math.Sqrt(adamVW[j] / (1 - Math.Pow(beta2, absGlobalStep))) + eps);
-                }
-            }
-
-            double loss = 0;
-            int absEvalCount = absValCount > 0 ? absValCount : calSet.Count;
-            int absEvalStart = absValCount > 0 ? absValStart : 0;
-            for (int i = absEvalStart; i < absEvalStart + absEvalCount; i++)
-            {
-                double z = ab;
-                for (int j = 0; j < dim; j++) z += aw[j] * absXs[i][j];
-                double p = MLFeatureHelper.Sigmoid(z);
-                loss -= absTargets[i] * Math.Log(Math.Max(p, 1e-10)) + (1 - absTargets[i]) * Math.Log(Math.Max(1 - p, 1e-10));
-            }
-            loss /= absEvalCount;
-            double l2Penalty = ab * ab;
-            for (int j = 0; j < dim; j++) l2Penalty += aw[j] * aw[j];
-            loss += l2Lambda * l2Penalty;
-
-            if (loss < bestLoss - 1e-7)
-            {
-                bestLoss = loss; bestAb = ab;
-                Array.Copy(aw, bestAw, dim);
-                patience = 0;
-            }
-            else if (++patience >= maxPatience) break;
-        }
-
-        aw = bestAw;
-        ab = bestAb;
-
-        double bestThr = 0.5;
-        double bestAcc = 0;
-        for (int pct = 30; pct <= 70; pct++)
-        {
-            double threshold = pct / 100.0;
-            int c = 0, t = 0;
-            foreach (var s in calSet)
-            {
-                double calibP = ClampProbabilityOrNeutral(calibratedProb is not null
-                    ? calibratedProb(s.Features)
-                    : EnsembleCalibProb(
-                        s.Features, weights, biases, inputWeights, inputBiases,
-                        plattA, plattB, featureCount, hiddenSize, featureSubsets, null, learnerHiddenSizes, learnerActivations, stackingWeights, stackingBias));
-                double ensStd = ClampNonNegativeFinite(ComputeEnsembleStd(
-                    s.Features, weights, biases, inputWeights, inputBiases,
-                    featureCount, featureSubsets, learnerHiddenSizes, learnerActivations,
-                    stackingWeights: stackingWeights, stackingBias: stackingBias));
-
-                double mlScore = ComputeMetaLabelScore(calibP, ensStd, s.Features, featureCount, metaLabelWeights, metaLabelBias);
-
-                double absZ = ab + aw[0] * calibP + aw[1] * ensStd + aw[2] * mlScore;
-                if (MLFeatureHelper.Sigmoid(absZ) < threshold) continue;
-                t++;
-                if ((calibP >= decisionThreshold ? 1 : 0) == ToBinaryLabel(s.Direction)) c++;
-            }
-            if (t < 5) continue;
-            double acc = (double)c / t;
-            if (acc > bestAcc && t >= calSet.Count / 4)
-            {
-                bestAcc = acc;
-                bestThr = threshold;
-            }
-        }
-
-        return (aw, ab, bestThr);
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  Stacking meta-learner
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    /// <summary>
-    /// Trains a logistic meta-learner that maps per-base-learner probabilities [p_0,..,p_{K-1}]
-    /// to a final probability via σ(Σ w_k·p_k + b). Fitted on the calibration set which base
-    /// learners never saw. When the meta-learner is active, it replaces simple/weighted averaging,
-    /// learning optimal per-learner combination weights.
-    /// </summary>
-    private (double[] Weights, double Bias) FitStackingMetaLearner(
-        List<TrainingSample> calSet,
-        double[][] weights, double[] biases,
-        double[][] inputWeights, double[][] inputBiases,
-        int featureCount, int hiddenSize, int[][]? featureSubsets,
-        int[] learnerHiddenSizes, ElmActivation[] learnerActivations,
-        CancellationToken ct = default)
-    {
-        int K = Math.Min(
-            weights.Length,
-            Math.Min(biases.Length, Math.Min(inputWeights.Length, inputBiases.Length)));
-        if (calSet.Count < 20 || K < 2) return ([], 0.0);
-
-        int n = calSet.Count;
-        var calLp = new double[n][];
-        var calLabels = new double[n];
-        for (int i = 0; i < n; i++)
-        {
-            calLp[i] = new double[K];
-            for (int k = 0; k < K; k++)
-            {
-                if (weights[k] is not { Length: > 0 } ||
-                    inputWeights[k] is not { Length: > 0 } ||
-                    inputBiases[k] is null)
-                {
-                    continue;
-                }
-
-                calLp[i][k] = ClampProbabilityOrNeutral(ElmLearnerProb(
-                    calSet[i].Features, weights[k], biases[k], inputWeights[k], inputBiases[k],
-                    featureCount,
-                    ResolveLearnerHiddenSize(learnerHiddenSizes, k, hiddenSize, inputBiases[k]),
-                    ResolveLearnerSubset(featureSubsets, k),
-                    ResolveLearnerActivation(learnerActivations, k)));
-            }
-            calLabels[i] = calSet[i].Direction > 0 ? 1.0 : 0.0;
-        }
-
-        // 80/20 train/val split for early stopping (consistent with FitMetaLabelModel)
-        int trainCount = Math.Max(1, (int)(n * 0.8));
-        int valStart   = trainCount;
-        int valCount   = n - trainCount;
-
-        var mw = new double[K];
-        for (int k = 0; k < K; k++) mw[k] = 1.0 / K; // uniform init
-        double mb = 0.0;
-
-        var bestMw = new double[K];
-        Array.Copy(mw, bestMw, K);
-        double bestMb   = 0.0;
-        double bestLoss = double.MaxValue;
-        int    patience = 0;
-
-        const double lr = 0.01;
-        const double l2Lambda = 1e-4;
-        const int maxEpochs = 300;
-        const int maxPatience = 30;
-
-        var dW = new double[K]; // pre-allocated
-        for (int epoch = 0; epoch < maxEpochs; epoch++)
-        {
-            ct.ThrowIfCancellationRequested();
-            Array.Clear(dW, 0, K);
-            double dB = 0;
-
-            for (int i = 0; i < trainCount; i++)
-            {
-                var lp = calLp[i];
-                double z = mb;
-                for (int k = 0; k < K; k++) z += mw[k] * lp[k];
-                double p = MLFeatureHelper.Sigmoid(z);
-                double err = p - calLabels[i];
-                for (int k = 0; k < K; k++) dW[k] += err * lp[k];
-                dB += err;
-            }
-
-            for (int k = 0; k < K; k++) mw[k] -= lr * (dW[k] / trainCount + 2.0 * l2Lambda * mw[k]);
-            mb -= lr * (dB / trainCount + 2.0 * l2Lambda * mb);
-
-            // Validation loss for early stopping
-            int evalCount = valCount > 0 ? valCount : n;
-            int evalStart = valCount > 0 ? valStart : 0;
-            double loss = 0;
-            for (int i = evalStart; i < evalStart + evalCount; i++)
-            {
-                var lp = calLp[i];
-                double z = mb;
-                for (int k = 0; k < K; k++) z += mw[k] * lp[k];
-                double p = MLFeatureHelper.Sigmoid(z);
-                loss -= calLabels[i] * Math.Log(Math.Max(p, 1e-10))
-                      + (1 - calLabels[i]) * Math.Log(Math.Max(1 - p, 1e-10));
-            }
-            loss /= evalCount;
-
-            if (loss < bestLoss - 1e-7)
-            {
-                bestLoss = loss;
-                bestMb = mb;
-                Array.Copy(mw, bestMw, K);
-                patience = 0;
-            }
-            else if (++patience >= maxPatience) break;
-        }
-
-        _logger.LogDebug(
-            "ELM stacking meta-learner: bias={B:F4} weights=[{W}]",
-            bestMb, string.Join(",", bestMw.Select(w => w.ToString("F3"))));
-
-        return (bestMw, bestMb);
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  Warm-start pruning remap
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    private static ModelSnapshot? RemapWarmStartForPruning(
-        ModelSnapshot? warmStart, bool[] activeMask, int featureCount, int hiddenSize)
-    {
-        if (warmStart?.ElmInputWeights is null) return null;
-
-        int wsK = warmStart.ElmInputWeights.Length;
-        var remappedInputWeights = new double[wsK][];
-        var remappedInputBiases  = new double[wsK][];
-        var remappedSubsets      = new int[wsK][];
-
-        for (int ki = 0; ki < wsK; ki++)
-        {
-            var oldWIn = warmStart.ElmInputWeights[ki] ?? Array.Empty<double>();
-            var oldBIn = warmStart.ElmInputBiases is not null && ki < warmStart.ElmInputBiases.Length
-                ? warmStart.ElmInputBiases[ki] : new double[hiddenSize];
-            oldBIn ??= Array.Empty<double>();
-
-            int[] oldSub = warmStart.FeatureSubsetIndices is not null && ki < warmStart.FeatureSubsetIndices.Length
-                ? warmStart.FeatureSubsetIndices[ki] is { Length: > 0 } warmSubset
-                    ? warmSubset
-                    : Enumerable.Range(0, featureCount).ToArray()
-                : Enumerable.Range(0, featureCount).ToArray();
-            int oldSubLen = oldSub.Length;
-            int oldHidden = oldBIn.Length > 0
-                ? oldBIn.Length
-                : oldSubLen > 0
-                    ? Math.Max(0, oldWIn.Length / oldSubLen)
-                    : hiddenSize;
-
-            var newSubList = new List<int>();
-            var oldSubPositions = new List<int>();
-            for (int si = 0; si < oldSubLen; si++)
-            {
-                int oldFi = oldSub[si];
-                if (oldFi >= 0 && oldFi < featureCount && oldFi < activeMask.Length && activeMask[oldFi])
-                {
-                    newSubList.Add(oldFi);
-                    oldSubPositions.Add(si);
-                }
-            }
-
-            int newSubLen = newSubList.Count;
-            if (newSubLen == 0)
-            {
-                remappedInputWeights[ki] = [];
-                remappedInputBiases[ki]  = [];
-                remappedSubsets[ki]      = [];
-                continue;
-            }
-
-            var newWIn = new double[oldHidden * newSubLen];
-            for (int h = 0; h < oldHidden; h++)
-            {
-                int oldRowOff = h * oldSubLen;
-                int newRowOff = h * newSubLen;
-                for (int nsi = 0; nsi < newSubLen; nsi++)
-                {
-                    int oldPos = oldSubPositions[nsi];
-                    if (oldRowOff + oldPos < oldWIn.Length)
-                        newWIn[newRowOff + nsi] = oldWIn[oldRowOff + oldPos];
-                }
-            }
-
-            remappedInputWeights[ki] = newWIn;
-            remappedInputBiases[ki]  = (double[])oldBIn.Clone();
-            remappedSubsets[ki]      = newSubList.ToArray();
-        }
-
-        return new ModelSnapshot
-        {
-            ElmInputWeights      = remappedInputWeights,
-            ElmInputBiases       = remappedInputBiases,
-            FeatureSubsetIndices = remappedSubsets,
-            FeatureImportanceScores = warmStart.FeatureImportanceScores,
-            GenerationNumber       = warmStart.GenerationNumber,
-        };
-    }
-
-    // ── Online incremental update (Sherman-Morrison) ────────────────────────
-
-    /// <summary>
-    /// Incrementally updates an already-trained ELM model with a single new
-    /// training sample using the Sherman-Morrison rank-1 formula.
-    /// Cost: O(H²) per sample per learner — sub-millisecond for typical H=64.
-    /// <para>
-    /// The inverse Gram matrix is stored on <see cref="ModelSnapshot.ElmInverseGram"/>
-    /// and updated in-place. If not available (older model), the update is skipped.
-    /// </para>
-    /// </summary>
-    /// <param name="snapshot">
-    /// The current model snapshot. <c>ElmInverseGram</c>, <c>Weights</c>, <c>Biases</c>
-    /// are updated in-place.
-    /// </param>
-    /// <param name="sample">The new labelled training sample.</param>
-    /// <returns><c>true</c> if the update was applied; <c>false</c> if skipped.</returns>
-    public bool UpdateOnline(ModelSnapshot snapshot, TrainingSample sample)
-    {
-        if (snapshot.ElmInverseGram is null || snapshot.ElmInverseGram.Length == 0)
-        {
-            _logger.LogDebug("ELM online update skipped — no inverse Gram matrix in snapshot");
-            return false;
-        }
-
-        if (sample.Direction is not (1 or 0 or -1))
-        {
-            _logger.LogDebug(
-                "ELM online update skipped — sample direction {Direction} is invalid",
-                sample.Direction);
-            return false;
-        }
-
-        if (sample.Features.Length == 0 || !HasFiniteValues(sample.Features))
-        {
-            _logger.LogDebug("ELM online update skipped — sample features are empty or non-finite");
-            return false;
-        }
-
-        if (snapshot.FracDiffD > 0.0)
-        {
-            _logger.LogDebug(
-                "ELM online update skipped — FracDiffD={D:F2} requires historical context not available to single-sample updates",
-                snapshot.FracDiffD);
-            return false;
-        }
-
-        if (snapshot.Weights is null || snapshot.Biases is null || snapshot.ElmInputWeights is null)
-            return false;
-
-        int K = Math.Min(snapshot.Weights.Length, snapshot.Biases.Length);
-        double smoothing = double.IsFinite(snapshot.AdaptiveLabelSmoothing)
-            ? Math.Clamp(snapshot.AdaptiveLabelSmoothing, 0.0, 0.49)
-            : 0.0;
-        double target = sample.Direction > 0 ? 1.0 - smoothing : smoothing;
-
-        // Standardise using the snapshot's stored means/stds
-        var stdFeatures = snapshot.Means is not null && snapshot.Stds is not null
-            ? MLFeatureHelper.Standardize(sample.Features, snapshot.Means, snapshot.Stds)
-            : sample.Features;
-        var maskedFeatures = (float[])stdFeatures.Clone();
-        if (snapshot.ActiveFeatureMask is { Length: > 0 } featureMask)
-        {
-            for (int i = 0; i < maskedFeatures.Length && i < featureMask.Length; i++)
-                if (!featureMask[i]) maskedFeatures[i] = 0f;
-        }
-        if (!HasFiniteValues(maskedFeatures))
-        {
-            _logger.LogDebug("ELM online update skipped — standardised features became non-finite");
-            return false;
-        }
-
-        int updatedLearners = 0;
-        for (int k = 0; k < K; k++)
-        {
-            if (k >= snapshot.ElmInverseGram.Length || snapshot.ElmInverseGram[k] is null)
-                continue;
-            if (k >= snapshot.ElmInputWeights.Length || snapshot.Weights[k] is null || snapshot.Weights[k].Length == 0)
-                continue;
-            if (snapshot.ElmInputBiases is null || k >= snapshot.ElmInputBiases.Length)
-                continue;
-            if (snapshot.ElmInputBiases[k] is null)
-                continue;
-
-            var inputW = snapshot.ElmInputWeights[k];
-            var inputB = snapshot.ElmInputBiases[k];
-            int H      = snapshot.Weights[k].Length;
-            int gramDim = snapshot.ElmInverseGramDim is not null && k < snapshot.ElmInverseGramDim.Length
-                ? snapshot.ElmInverseGramDim[k] : H;
-            if (gramDim <= 0 || snapshot.ElmInverseGram[k].Length != gramDim * gramDim || (gramDim != H && gramDim != H + 1))
-                continue;
-
-            // Resolve feature subset for this learner
-            float[] features = maskedFeatures;
-            if (snapshot.FeatureSubsetIndices is not null && k < snapshot.FeatureSubsetIndices.Length)
-            {
-                var subset = snapshot.FeatureSubsetIndices[k];
-                if (subset is { Length: > 0 })
-                {
-                    features = new float[subset.Length];
-                    for (int i = 0; i < subset.Length; i++)
-                        features[i] = subset[i] >= 0 && subset[i] < maskedFeatures.Length
-                            ? maskedFeatures[subset[i]]
-                            : 0f;
-                }
-            }
-
-            // Compute hidden activation: h = activation(W_in × features + b_in)
-            int inputDim = features.Length;
-            var hidden   = new double[H];
-            ElmActivation learnerAct = ResolveLearnerActivation(snapshot.LearnerActivations, k);
-            for (int h = 0; h < H; h++)
-            {
-                double z = h < inputB.Length ? inputB[h] : 0.0;
-                int rowOff = h * inputDim;
-                for (int f = 0; f < inputDim && rowOff + f < inputW.Length; f++)
-                    z += inputW[rowOff + f] * features[f];
-                hidden[h] = ElmMathHelper.Activate(z, learnerAct);
-            }
-
-            if (gramDim == H + 1)
-            {
-                var augmentedFeatures = new double[gramDim];
-                var coefficients = new double[gramDim];
-                Array.Copy(hidden, augmentedFeatures, H);
-                augmentedFeatures[H] = 1.0;
-                Array.Copy(snapshot.Weights[k], coefficients, H);
-                coefficients[H] = snapshot.Biases[k];
-
-                if (!ElmMathHelper.ShermanMorrisonUpdate(
-                        snapshot.ElmInverseGram[k],
-                        gramDim,
-                        coefficients,
-                        augmentedFeatures,
-                        target))
-                {
-                    continue;
-                }
-
-                Array.Copy(coefficients, snapshot.Weights[k], H);
-                snapshot.Biases[k] = coefficients[H];
-                updatedLearners++;
-                continue;
-            }
-
-            var legacyCoefficients = new double[H];
-            Array.Copy(snapshot.Weights[k], legacyCoefficients, H);
-            double legacyPrediction = snapshot.Biases[k];
-            for (int i = 0; i < H; i++)
-                legacyPrediction += legacyCoefficients[i] * hidden[i];
-            if (!ElmMathHelper.ShermanMorrisonUpdate(
-                    snapshot.ElmInverseGram[k],
-                    gramDim,
-                    legacyCoefficients,
-                    hidden,
-                    target))
-            {
-                continue;
-            }
-
-            Array.Copy(legacyCoefficients, snapshot.Weights[k], H);
-            double legacyBiasLr = snapshot.TrainSamples > 0 ? 1.0 / snapshot.TrainSamples : 0.001;
-            snapshot.Biases[k] += legacyBiasLr * (target - legacyPrediction);
-            updatedLearners++;
-        }
-
-        if (updatedLearners == 0)
-        {
-            _logger.LogDebug("ELM online update skipped — no learner had a usable inverse Gram matrix");
-            return false;
-        }
-
-        snapshot.TrainSamples++;
-
-        _logger.LogDebug("ELM online update applied: {K} learners updated with 1 sample", updatedLearners);
-        return true;
-    }
-
-    private int SanitizeLearnerOutputs(double[][] weights, double[] biases, string label)
-    {
-        int learnerCount = Math.Min(weights.Length, biases.Length);
-        int sanitizedCount = 0;
-
-        for (int k = 0; k < learnerCount; k++)
-        {
-            weights[k] ??= [];
-
-            bool needsSanitize = !double.IsFinite(biases[k]);
-            if (!needsSanitize)
-            {
-                for (int j = 0; j < weights[k].Length; j++)
-                {
-                    if (!double.IsFinite(weights[k][j]))
-                    {
-                        needsSanitize = true;
-                        break;
-                    }
-                }
-            }
-
-            if (!needsSanitize)
-                continue;
-
-            if (weights[k].Length > 0)
-                Array.Clear(weights[k], 0, weights[k].Length);
-            biases[k] = 0.0;
-            sanitizedCount++;
-            _logger.LogWarning("{Label}: sanitized learner {K}: non-finite weights replaced with zeros.", label, k);
-        }
-
-        if (sanitizedCount > 0)
-            _logger.LogWarning(
-                "{Label} post-training sanitization: {N}/{K} learners had non-finite weights.",
-                label, sanitizedCount, learnerCount);
-
-        return sanitizedCount;
-    }
-
-    private static int ValidateTrainingSamples(IReadOnlyList<TrainingSample> samples)
-    {
-        if (samples.Count == 0)
-            throw new InvalidOperationException("ElmModelTrainer: no training samples provided.");
-
-        int featureCount = samples[0].Features.Length;
-        if (featureCount <= 0)
-            throw new InvalidOperationException("ElmModelTrainer: training samples must contain at least one feature.");
-
-        for (int i = 0; i < samples.Count; i++)
-        {
-            if (samples[i].Direction is not (1 or 0 or -1))
-                throw new InvalidOperationException(
-                    $"ElmModelTrainer: sample {i} has invalid direction {samples[i].Direction}; expected 1 for Buy and 0/-1 for non-Buy.");
-
-            if (!float.IsFinite(samples[i].Magnitude))
-                throw new InvalidOperationException($"ElmModelTrainer: sample {i} has non-finite magnitude.");
-
-            if (samples[i].Features.Length != featureCount)
-                throw new InvalidOperationException(
-                    $"ElmModelTrainer: inconsistent feature count — sample 0 has {featureCount} features, sample {i} has {samples[i].Features.Length}.");
-
-            for (int j = 0; j < samples[i].Features.Length; j++)
-            {
-                if (!float.IsFinite(samples[i].Features[j]))
-                    throw new InvalidOperationException(
-                        $"ElmModelTrainer: sample {i} feature {j} is non-finite.");
-            }
-        }
-
-        return featureCount;
-    }
-
-    private static string[] BuildSnapshotFeatureNames(int featureCount)
-    {
-        if (featureCount <= 0)
-            return [];
-
-        var names = new string[featureCount];
-        for (int i = 0; i < featureCount; i++)
-            names[i] = i < MLFeatureHelper.FeatureNames.Length
-                ? MLFeatureHelper.FeatureNames[i]
-                : $"F{i}";
-        return names;
-    }
-
-    private static double ClampProbabilityForLogit(double probability)
-    {
-        if (!double.IsFinite(probability))
-            return 0.5;
-
-        return Math.Clamp(probability, 1e-7, 1.0 - 1e-7);
-    }
-
-    private static double ClampProbabilityOrNeutral(double probability)
-    {
-        if (!double.IsFinite(probability))
-            return 0.5;
-
-        return Math.Clamp(probability, 0.0, 1.0);
-    }
-
-    private static double ClampNonNegativeFinite(double value)
-    {
-        if (!double.IsFinite(value) || value < 0.0)
-            return 0.0;
-
-        return value;
-    }
-
-    private static double SanitizeFiniteOrDefault(double value, double fallback) =>
-        double.IsFinite(value) ? value : fallback;
-
-    private static double[] BuildMetaLabelFeatureVector(
-        double calibP,
-        double ensStd,
-        float[] features,
-        int featureCount)
-    {
-        int featureTerms = Math.Min(Math.Min(5, Math.Max(0, featureCount)), features.Length);
-        var metaFeatures = new double[2 + Math.Min(5, Math.Max(0, featureCount))];
-        metaFeatures[0] = ClampProbabilityOrNeutral(calibP);
-        metaFeatures[1] = ClampNonNegativeFinite(ensStd);
-
-        for (int j = 0; j < featureTerms; j++)
-            metaFeatures[j + 2] = SanitizeFiniteOrDefault(features[j], 0.0);
-
-        return metaFeatures;
-    }
-
-    private static double ComputeMetaLabelScore(
-        double calibP,
-        double ensStd,
-        float[] features,
-        int featureCount,
-        double[] metaLabelWeights,
-        double metaLabelBias)
-    {
-        if (metaLabelWeights.Length == 0)
-            return 0.5;
-
-        double[] metaFeatures = BuildMetaLabelFeatureVector(calibP, ensStd, features, featureCount);
-        double metaZ = SanitizeFiniteOrDefault(metaLabelBias, 0.0);
-        for (int j = 0; j < Math.Min(metaLabelWeights.Length, metaFeatures.Length); j++)
-            metaZ += SanitizeFiniteOrDefault(metaLabelWeights[j], 0.0) * metaFeatures[j];
-
-        return ClampProbabilityOrNeutral(MLFeatureHelper.Sigmoid(metaZ));
-    }
-
-    private static ElmActivation ResolveLearnerActivation(ElmActivation[] learnerActivations, int learnerIndex)
-    {
-        if (learnerActivations.Length == 0)
-            return ElmActivation.Sigmoid;
-
-        return learnerIndex < learnerActivations.Length
-            ? learnerActivations[learnerIndex]
-            : learnerActivations[0];
-    }
-
-    private static ElmActivation ResolveLearnerActivation(int[]? learnerActivations, int learnerIndex)
-    {
-        if (learnerActivations is null || learnerActivations.Length == 0)
-            return ElmActivation.Sigmoid;
-
-        int activation = learnerIndex < learnerActivations.Length
-            ? learnerActivations[learnerIndex]
-            : learnerActivations[0];
-        return (ElmActivation)activation;
-    }
-
-    private static int[]? ResolveLearnerSubset(int[][]? featureSubsets, int learnerIndex)
-    {
-        if (featureSubsets is null || learnerIndex < 0 || learnerIndex >= featureSubsets.Length)
-            return null;
-
-        return featureSubsets[learnerIndex];
-    }
-
-    private static int ResolveLearnerHiddenSize(
-        int[] learnerHiddenSizes,
-        int learnerIndex,
-        int defaultHiddenSize,
-        double[] learnerBiases)
-    {
-        int hiddenSize = learnerIndex >= 0 && learnerIndex < learnerHiddenSizes.Length
-            ? learnerHiddenSizes[learnerIndex]
-            : defaultHiddenSize;
-
-        if (hiddenSize < 0)
-            hiddenSize = 0;
-
-        return Math.Min(hiddenSize, learnerBiases.Length);
-    }
-
-    private static bool WarmStartMatchesLearnerSubset(
-        ModelSnapshot warmStart,
-        int learnerIndex,
-        int[] currentSubset,
-        int featureCount,
-        int expectedInputWeightLength)
-    {
-        if (warmStart.ElmInputWeights is not { Length: > 0 } inputWeights ||
-            learnerIndex >= inputWeights.Length ||
-            inputWeights[learnerIndex] is not { Length: > 0 } learnerWeights ||
-            learnerWeights.Length != expectedInputWeightLength)
-        {
-            return false;
-        }
-
-        if (warmStart.FeatureSubsetIndices is { Length: > 0 } subsets &&
-            learnerIndex < subsets.Length &&
-            subsets[learnerIndex] is { Length: > 0 } warmSubset)
-        {
-            return warmSubset.Length == currentSubset.Length &&
-                   warmSubset.SequenceEqual(currentSubset);
-        }
-
-        if (currentSubset.Length != featureCount)
-            return false;
-
-        for (int i = 0; i < currentSubset.Length; i++)
-            if (currentSubset[i] != i) return false;
-
-        return true;
-    }
-
-    private static bool HasFiniteValues(double[] values)
-    {
-        for (int i = 0; i < values.Length; i++)
-            if (!double.IsFinite(values[i]))
-                return false;
-
-        return true;
-    }
-
-    private static bool HasFiniteValues(float[] values)
-    {
-        for (int i = 0; i < values.Length; i++)
-            if (!float.IsFinite(values[i]))
-                return false;
-
-        return true;
     }
 }

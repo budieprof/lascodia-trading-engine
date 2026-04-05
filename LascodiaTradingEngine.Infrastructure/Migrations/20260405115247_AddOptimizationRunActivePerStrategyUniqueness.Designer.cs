@@ -3,6 +3,7 @@ using System;
 using LascodiaTradingEngine.Infrastructure.Persistence.DbContexts;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 
@@ -11,9 +12,11 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace LascodiaTradingEngine.Infrastructure.Migrations
 {
     [DbContext(typeof(WriteApplicationDbContext))]
-    partial class WriteApplicationDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260405115247_AddOptimizationRunActivePerStrategyUniqueness")]
+    partial class AddOptimizationRunActivePerStrategyUniqueness
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -316,9 +319,6 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
 
                     b.Property<Guid>("OutboxId")
                         .HasColumnType("uuid");
-
-                    b.Property<string>("ParametersSnapshotJson")
-                        .HasColumnType("nvarchar(max)");
 
                     b.Property<int>("Priority")
                         .HasColumnType("integer");
@@ -5316,9 +5316,6 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
 
                     b.Property<Guid>("OutboxId")
                         .HasColumnType("uuid");
-
-                    b.Property<string>("ParametersSnapshotJson")
-                        .HasColumnType("nvarchar(max)");
 
                     b.Property<bool>("ReOptimizePerFold")
                         .HasColumnType("boolean");

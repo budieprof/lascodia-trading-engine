@@ -229,5 +229,6 @@ public sealed class MLConformalCalibrationWorker : BackgroundService
         !string.IsNullOrEmpty(snap.GbmTreesJson) ||
         !string.IsNullOrEmpty(snap.TabNetAttentionJson) ||
         !string.IsNullOrEmpty(snap.FtTransformerAdditionalLayersJson) ||
+        snap.FtTransformerAdditionalLayersBytes is { Length: > 0 } ||
         !string.IsNullOrEmpty(snap.RotationForestJson);
 }

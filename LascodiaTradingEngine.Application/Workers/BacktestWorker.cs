@@ -366,7 +366,11 @@ public class BacktestWorker : BackgroundService
                 throw new InvalidOperationException(
                     $"No closed candles found for {run.Symbol}/{run.Timeframe} between {run.FromDate:yyyy-MM-dd} and {run.ToDate:yyyy-MM-dd}.");
 
-            var result = await _backtestEngine.RunAsync(strategy, candles, run.InitialBalance, ct);
+            var evalStrategy = CloneStrategy(strategy);
+            if (!string.IsNullOrWhiteSpace(run.ParametersSnapshotJson))
+                evalStrategy.ParametersJson = run.ParametersSnapshotJson;
+
+            var result = await _backtestEngine.RunAsync(evalStrategy, candles, run.InitialBalance, ct);
 
             run.Status      = RunStatus.Completed;
             run.ResultJson  = JsonSerializer.Serialize(result);
@@ -430,9 +434,24 @@ public class BacktestWorker : BackgroundService
         // ── Update optimization follow-up status if this was a validation backtest ──
         if (run.SourceOptimizationRunId.HasValue)
         {
+            bool followUpPassed = run.Status == RunStatus.Completed;
+            if (followUpPassed)
+            {
+                decimal minHealthScore = await GetConfigAsync(db, "Optimization:AutoApprovalMinHealthScore", 0.55m, ct) * 0.80m;
+                int minTrades = await GetConfigAsync(db, "Optimization:MinCandidateTrades", 10, ct);
+                if (!Optimization.OptimizationFollowUpQualityEvaluator.IsBacktestQualitySufficient(
+                        run, minHealthScore, minTrades, out string reason))
+                {
+                    followUpPassed = false;
+                    _logger.LogWarning(
+                        "BacktestWorker: validation backtest for optimization run {OptimizationRunId} failed quality gate — {Reason}",
+                        run.SourceOptimizationRunId.Value, reason);
+                }
+            }
+
             await Optimization.OptimizationFollowUpTracker.UpdateStatusAsync(
                 db, run.SourceOptimizationRunId.Value,
-                run.Status == RunStatus.Completed, writeContext, ct);
+                followUpPassed, writeContext, ct);
         }
     }
 
@@ -453,4 +472,22 @@ public class BacktestWorker : BackgroundService
         try   { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
         catch { return defaultValue; }
     }
+
+    private static Strategy CloneStrategy(Strategy source) => new()
+    {
+        Id                      = source.Id,
+        Name                    = source.Name,
+        Description             = source.Description,
+        StrategyType            = source.StrategyType,
+        Symbol                  = source.Symbol,
+        Timeframe               = source.Timeframe,
+        ParametersJson          = source.ParametersJson,
+        Status                  = source.Status,
+        RiskProfileId           = source.RiskProfileId,
+        CreatedAt               = source.CreatedAt,
+        LifecycleStage          = source.LifecycleStage,
+        LifecycleStageEnteredAt = source.LifecycleStageEnteredAt,
+        EstimatedCapacityLots   = source.EstimatedCapacityLots,
+        IsDeleted               = source.IsDeleted
+    };
 }

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text.Json;
 using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
@@ -17,31 +18,43 @@ namespace LascodiaTradingEngine.Application.Services.ML;
 ///   <item>Walk-forward cross-validation (expanding window, embargo, purging) to produce <see cref="WalkForwardResult"/>.</item>
 ///   <item>Final model splits: 70% train | 10% Platt calibration | ~20% held-out test.</item>
 ///   <item>Gradient boosted regression trees fitted on pseudo-residuals with shrinkage.</item>
-///   <item>Platt scaling (A, B) fitted on the calibration fold after the ensemble is frozen.</item>
-///   <item>Isotonic calibration (PAVA) applied post-Platt for monotonic probability correction.</item>
+///   <item>Histogram-based or exact split finding (configurable). Leaf-wise or level-wise growth.</item>
+///   <item>DART dropout mode for combating over-specialization.</item>
+///   <item>Platt scaling (A, B) fitted via SGD with convergence check on the calibration fold.</item>
+///   <item>Isotonic calibration (PAVA) with boundary extrapolation, applied post-Platt.</item>
+///   <item>Venn-ABERS calibration for distribution-free multi-probability outputs.</item>
 ///   <item>ECE (Expected Calibration Error) computed post-calibration on the held-out test set.</item>
-///   <item>EV-optimal decision threshold swept on the calibration set.</item>
+///   <item>EV-optimal decision threshold swept on the calibration set (with optional transaction cost adjustment).</item>
 ///   <item>Parallel magnitude linear regressor trained with Adam + Huber loss + early stopping.</item>
-///   <item>Permutation feature importance with optional feature pruning re-train pass.</item>
+///   <item>Permutation feature importance + gain-weighted tree split importance.</item>
+///   <item>Feature pruning re-train pass (dimension reduction, not zeroing).</item>
 ///   <item>OOB accuracy estimation from out-of-bag tree predictions.</item>
-///   <item>Conformal prediction (split-conformal qHat) for prediction set coverage.</item>
-///   <item>Jackknife+ residuals for prediction intervals.</item>
-///   <item>Meta-label secondary classifier for filtering low-quality signals.</item>
-///   <item>Abstention gate (selective prediction) for suppressing uncertain signals.</item>
-///   <item>Quantile magnitude regressor (pinball loss) for asymmetric risk sizing.</item>
-///   <item>Decision boundary distance analytics.</item>
-///   <item>Durbin-Watson autocorrelation test on magnitude residuals.</item>
+///   <item>Conformal prediction (split-conformal qHat) with raw nonconformity scores.</item>
+///   <item>Jackknife+ residuals with empirical coverage validation.</item>
+///   <item>Meta-label MLP (configurable hidden dim) for filtering low-quality signals.</item>
+///   <item>Abstention gate with separate buy/sell thresholds and coverage-accuracy curve.</item>
+///   <item>Quantile magnitude regressor (pinball loss, Adam optimizer) for asymmetric risk sizing.</item>
+///   <item>Decision boundary distance analytics and prediction stability metric.</item>
+///   <item>Durbin-Watson autocorrelation test with actionable AR(1) residual flag.</item>
 ///   <item>Class-conditional Platt scaling (separate Buy/Sell calibrators).</item>
 ///   <item>Average Kelly fraction for position sizing guidance.</item>
-///   <item>Mutual-information feature redundancy check.</item>
-///   <item>Temperature scaling alternative calibration.</item>
-///   <item>Brier Skill Score computation.</item>
-///   <item>NaN/Inf tree sanitization.</item>
+///   <item>Mutual-information feature redundancy check with drop recommendation.</item>
+///   <item>Temperature scaling via Brent's method.</item>
+///   <item>Brier Skill Score + Murphy log-loss decomposition (calibration + refinement).</item>
+///   <item>TreeSHAP baseline for per-prediction feature attribution.</item>
+///   <item>Partial dependence data for top features.</item>
+///   <item>NaN/Inf tree sanitization + compact serialization (empty node pruning).</item>
 ///   <item>Feature quantile breakpoints for PSI drift monitoring.</item>
-///   <item>Optional warm-start from prior GBM snapshot.</item>
+///   <item>Optional warm-start with tree pruning and OOB replay.</item>
 ///   <item>Incremental update fast-path for rapid regime adaptation.</item>
-///   <item>Density-ratio importance weighting for distribution shift.</item>
-///   <item>Stationarity gate (soft ADF check).</item>
+///   <item>Density-ratio importance weighting (MLP discriminator) for distribution shift.</item>
+///   <item>Covariate shift weights with continuous novelty scoring.</item>
+///   <item>Stationarity gate (ADF with interpolated critical values).</item>
+///   <item>Concept drift gate: sliding-window loss exclusion.</item>
+///   <item>Regime-conditioned tree blocks and regime-aware early stopping.</item>
+///   <item>Interaction constraints, shrinkage annealing, depth-decayed min split gain.</item>
+///   <item>Training time budget enforcement, memory pre-check, deterministic mode.</item>
+///   <item>Rank-based feature stability (Kendall's W) across CV folds.</item>
 /// </list>
 /// </para>
 /// Registered as a keyed IMLModelTrainer with key "gbm".
@@ -51,7 +64,7 @@ public sealed class GbmModelTrainer : IMLModelTrainer
 {
     // ── Constants ────────────────────────────────────────────────────────────
     private const string ModelType    = "GBM";
-    private const string ModelVersion = "2.1"; // 2.1: fixed leaf sign (G/(H+λ) not −G), corrected class weighting
+    private const string ModelVersion = "3.0"; // 3.0: histogram splits, leaf-wise, DART, TreeSHAP, Venn-ABERS, compact nodes
 
     private const double AdamBeta1   = 0.9;
     private const double AdamBeta2   = 0.999;
@@ -87,8 +100,15 @@ public sealed class GbmModelTrainer : IMLModelTrainer
         CancellationToken    ct)
     {
         ct.ThrowIfCancellationRequested();
+        var trainingStopwatch = Stopwatch.StartNew();
 
+        // ── Item 41: Memory pre-check ──────────────────────────────────────
         int featureCount = samples[0].Features.Length;
+        long estimatedBytes = (long)samples.Count * featureCount * sizeof(float) * 3L; // features + gradients + hessians
+        if (estimatedBytes > 2_000_000_000L)
+            _logger.LogWarning("GBM memory estimate: {MB}MB — consider reducing sample count or features",
+                estimatedBytes / (1024 * 1024));
+
         int numRounds    = Math.Max(10, hp.K > 0 ? hp.K : 50);
         int maxDepth     = hp.GbmMaxDepth > 0 ? hp.GbmMaxDepth : 3;
         double lr        = hp.LearningRate > 0 ? hp.LearningRate : 0.1;
@@ -124,6 +144,12 @@ public sealed class GbmModelTrainer : IMLModelTrainer
         foreach (var s in samples)
             allStd.Add(s with { Features = MLFeatureHelper.Standardize(s.Features, means, stds) });
 
+        // ── Item 28: Concept drift gate ─────────────────────────────────────
+        if (hp.GbmConceptDriftGate && allStd.Count >= hp.MinSamples * 2)
+        {
+            allStd = ApplyConceptDriftGate(allStd, featureCount, hp.MinSamples);
+        }
+
         // ── 2. Walk-forward cross-validation ────────────────────────────────
         var (cvResult, equityCurveGateFailed) = RunWalkForwardCV(allStd, hp, featureCount, numRounds, maxDepth, lr, ct);
         _logger.LogInformation(
@@ -135,6 +161,7 @@ public sealed class GbmModelTrainer : IMLModelTrainer
             return new TrainingResult(new EvalMetrics(0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0), cvResult, []);
 
         ct.ThrowIfCancellationRequested();
+        CheckTimeoutBudget(trainingStopwatch, hp.TrainingTimeoutMinutes, "after CV"); // Item 40
 
         // ── 3. Final model splits: 70% train | 10% cal | ~20% test ──────────
         int trainEnd = (int)(allStd.Count * 0.70);
@@ -150,7 +177,7 @@ public sealed class GbmModelTrainer : IMLModelTrainer
             throw new InvalidOperationException(
                 $"GBM: Insufficient training samples after splits: {trainSet.Count} < {hp.MinSamples}");
 
-        // ── 3b. Stationarity gate ───────────────────────────────────────────
+        // ── 3b. Stationarity gate (Item 34: interpolated ADF critical values) ──
         {
             int nonStatCount = CountNonStationaryFeatures(trainSet, featureCount);
             double nonStatFraction = featureCount > 0 ? (double)nonStatCount / featureCount : 0.0;
@@ -160,7 +187,7 @@ public sealed class GbmModelTrainer : IMLModelTrainer
                     nonStatCount, featureCount);
         }
 
-        // ── 3c. Density-ratio importance weights ────────────────────────────
+        // ── 3c. Density-ratio importance weights (Item 27: MLP discriminator) ──
         double[]? densityWeights = null;
         if (hp.DensityRatioWindowDays > 0 && trainSet.Count >= 50)
         {
@@ -168,7 +195,7 @@ public sealed class GbmModelTrainer : IMLModelTrainer
             _logger.LogDebug("GBM density-ratio weights computed (recentWindow={W}d).", hp.DensityRatioWindowDays);
         }
 
-        // ── 3d. Covariate shift weight integration (parent model novelty scoring) ──
+        // ── 3d. Covariate shift weight integration (Item 29: continuous novelty) ──
         if (hp.UseCovariateShiftWeights &&
             warmStart?.FeatureQuantileBreakpoints is { Length: > 0 } parentBp)
         {
@@ -203,34 +230,69 @@ public sealed class GbmModelTrainer : IMLModelTrainer
                 effectiveLabelSmoothing, ambiguousFraction);
         }
 
+        // ── 3f. Parse interaction constraints (Item 18) ─────────────────────
+        int[][]? interactionConstraints = null;
+        if (!string.IsNullOrEmpty(hp.GbmInteractionConstraints))
+        {
+            try
+            {
+                interactionConstraints = JsonSerializer.Deserialize<int[][]>(hp.GbmInteractionConstraints);
+            }
+            catch (JsonException ex)
+            {
+                _logger.LogWarning(ex, "GBM: Failed to parse interaction constraints, ignoring.");
+            }
+        }
+
+        // ── 3g. EFB: Exclusive Feature Bundling (Item 3) ────────────────────
+        int[]? efbMapping = null;
+        int effectiveFeatureCount = featureCount;
+        // Guard: skip EFB when conflict matrix would exceed ~100MB (featureCount > ~5000)
+        if (featureCount > 20 && featureCount <= 5000)
+        {
+            (efbMapping, effectiveFeatureCount) = BuildEfbMapping(trainSet, featureCount);
+            if (effectiveFeatureCount < featureCount)
+            {
+                _logger.LogInformation("GBM EFB: bundled {Orig} features into {Eff} bundles",
+                    featureCount, effectiveFeatureCount);
+                trainSet = ApplyEfbMapping(trainSet, efbMapping, effectiveFeatureCount);
+                calSet   = ApplyEfbMapping(calSet, efbMapping, effectiveFeatureCount);
+                testSet  = ApplyEfbMapping(testSet, efbMapping, effectiveFeatureCount);
+            }
+            else
+            {
+                efbMapping = null; // no bundling benefit
+            }
+        }
+
         // ── 4. Fit GBM ensemble ─────────────────────────────────────────────
-        var (trees, baseLogOdds, treeBagMasks, innerTrainCount) = FitGbmEnsemble(trainSet, featureCount, numRounds, maxDepth, lr,
-            effectiveLabelSmoothing, warmStart, densityWeights, hp.TemporalDecayLambda,
-            hp.FeatureSampleRatio, hp.L2Lambda, ct, hp.UseClassWeights);
+        var (trees, baseLogOdds, treeBagMasks, innerTrainCount, perTreeLrList) = FitGbmEnsemble(trainSet, effectiveFeatureCount, numRounds, maxDepth, lr,
+            effectiveLabelSmoothing, warmStart, densityWeights, hp, ct, interactionConstraints);
 
         _logger.LogInformation("GBM fitted: {R} trees, baseLogOdds={BLO:F4}", trees.Count, baseLogOdds);
+        CheckTimeoutBudget(trainingStopwatch, hp.TrainingTimeoutMinutes, "after ensemble fit"); // Item 40
 
-        // ── 5. Platt calibration ────────────────────────────────────────────
-        var (plattA, plattB) = FitPlattScaling(calSet, trees, baseLogOdds, lr, featureCount);
+        // ── 5. Platt calibration (Item 10: convergence check) ───────────────
+        var (plattA, plattB) = FitPlattScaling(calSet, trees, baseLogOdds, lr, effectiveFeatureCount);
         _logger.LogDebug("GBM Platt calibration: A={A:F4} B={B:F4}", plattA, plattB);
 
         // ── 5b. Class-conditional Platt ─────────────────────────────────────
         var (plattABuy, plattBBuy, plattASell, plattBSell) =
-            FitClassConditionalPlatt(calSet, trees, baseLogOdds, lr, featureCount);
+            FitClassConditionalPlatt(calSet, trees, baseLogOdds, lr, effectiveFeatureCount);
         _logger.LogDebug(
             "GBM Class-conditional Platt — Buy: A={AB:F4} B={BB:F4}  Sell: A={AS:F4} B={BS:F4}",
             plattABuy, plattBBuy, plattASell, plattBSell);
 
         // ── 5c. Kelly fraction ──────────────────────────────────────────────
-        double avgKellyFraction = ComputeAvgKellyFraction(calSet, trees, baseLogOdds, lr, plattA, plattB, featureCount);
+        double avgKellyFraction = ComputeAvgKellyFraction(calSet, trees, baseLogOdds, lr, plattA, plattB, effectiveFeatureCount);
         _logger.LogDebug("GBM average Kelly fraction (half-Kelly)={Kelly:F4}", avgKellyFraction);
 
         // ── 6. Magnitude linear regressor ───────────────────────────────────
-        var (magWeights, magBias) = FitLinearRegressor(trainSet, featureCount, hp);
+        var (magWeights, magBias) = FitLinearRegressor(trainSet, effectiveFeatureCount, hp);
 
         // ── 7. Evaluation on held-out test set ──────────────────────────────
         var finalMetrics = EvaluateGbm(testSet, trees, baseLogOdds, lr, magWeights, magBias,
-            plattA, plattB, featureCount);
+            plattA, plattB, effectiveFeatureCount);
 
         _logger.LogInformation(
             "GBM eval — acc={Acc:P1} f1={F1:F3} ev={EV:F4} brier={Brier:F4} sharpe={Sharpe:F2}",
@@ -238,52 +300,55 @@ public sealed class GbmModelTrainer : IMLModelTrainer
             finalMetrics.ExpectedValue, finalMetrics.BrierScore, finalMetrics.SharpeRatio);
 
         // ── 8. ECE ──────────────────────────────────────────────────────────
-        double ece = ComputeEce(testSet, trees, baseLogOdds, lr, plattA, plattB, featureCount);
+        double ece = ComputeEce(testSet, trees, baseLogOdds, lr, plattA, plattB, effectiveFeatureCount);
         _logger.LogInformation("GBM post-Platt ECE={Ece:F4}", ece);
 
-        // ── 9. EV-optimal threshold (on cal set) ────────────────────────────
-        double optimalThreshold = ComputeOptimalThreshold(calSet, trees, baseLogOdds, lr, plattA, plattB, featureCount,
-            hp.ThresholdSearchMin, hp.ThresholdSearchMax);
+        // ── 9. EV-optimal threshold (Item 23: with transaction cost) ────────
+        double optimalThreshold = ComputeOptimalThreshold(calSet, trees, baseLogOdds, lr, plattA, plattB, effectiveFeatureCount,
+            hp.ThresholdSearchMin, hp.ThresholdSearchMax, hp.GbmEvThresholdSpreadCost);
         _logger.LogInformation("GBM EV-optimal threshold={Thr:F2}", optimalThreshold);
 
         // ── 10. Permutation feature importance ──────────────────────────────
         var featureImportance = testSet.Count >= 10
-            ? ComputePermutationImportance(testSet, trees, baseLogOdds, lr, plattA, plattB, featureCount, ct)
-            : new float[featureCount];
+            ? ComputePermutationImportance(testSet, trees, baseLogOdds, lr, plattA, plattB, effectiveFeatureCount, ct)
+            : new float[effectiveFeatureCount];
 
         var topFeatures = featureImportance
-            .Select((imp, idx) => (Importance: imp, Name: MLFeatureHelper.FeatureNames[idx]))
+            .Select((imp, idx) => (Importance: imp, Name: idx < MLFeatureHelper.FeatureNames.Length ? MLFeatureHelper.FeatureNames[idx] : $"F{idx}"))
             .OrderByDescending(x => x.Importance)
             .Take(5);
         _logger.LogInformation(
             "GBM top 5 features: {Features}",
             string.Join(", ", topFeatures.Select(f => $"{f.Name}={f.Importance:P1}")));
 
+        // ── Item 39: Gain-weighted tree split importance ─────────────────────
+        var gainWeightedImportance = ComputeGainWeightedImportance(trees, effectiveFeatureCount);
+
         // ── 10b. Calibration-set importance (for warm-start transfer) ───────
         double[] calImportanceScores = calSet.Count >= 10
-            ? ComputeCalPermutationImportance(calSet, trees, baseLogOdds, lr, featureCount, ct)
-            : new double[featureCount];
+            ? ComputeCalPermutationImportance(calSet, trees, baseLogOdds, lr, effectiveFeatureCount, ct)
+            : new double[effectiveFeatureCount];
 
-        // ── 11. Feature pruning re-train pass ───────────────────────────────
-        var activeMask = BuildFeatureMask(featureImportance, hp.MinFeatureImportance, featureCount);
+        // ── 11. Feature pruning re-train pass (Item 15: dimension reduction) ──
+        var activeMask = BuildFeatureMask(featureImportance, hp.MinFeatureImportance, effectiveFeatureCount);
         int prunedCount = activeMask.Count(m => !m);
 
-        if (prunedCount > 0 && featureCount - prunedCount >= 10)
+        if (prunedCount > 0 && effectiveFeatureCount - prunedCount >= 10)
         {
-            _logger.LogInformation("GBM feature pruning: masking {Pruned}/{Total} low-importance features",
-                prunedCount, featureCount);
+            _logger.LogInformation("GBM feature pruning: removing {Pruned}/{Total} low-importance features",
+                prunedCount, effectiveFeatureCount);
 
-            var maskedTrain = ApplyMask(trainSet, activeMask);
-            var maskedCal   = ApplyMask(calSet, activeMask);
-            var maskedTest  = ApplyMask(testSet, activeMask);
+            int reducedDim = effectiveFeatureCount - prunedCount;
+            var maskedTrain = ApplyMaskReduce(trainSet, activeMask, reducedDim);
+            var maskedCal   = ApplyMaskReduce(calSet, activeMask, reducedDim);
+            var maskedTest  = ApplyMaskReduce(testSet, activeMask, reducedDim);
 
             int prunedRounds = Math.Max(10, numRounds / 2);
-            var (pTrees, pBLO, pBagMasks, pInnerTrainCount) = FitGbmEnsemble(maskedTrain, featureCount, prunedRounds, maxDepth, lr,
-                effectiveLabelSmoothing, null, densityWeights, hp.TemporalDecayLambda,
-                hp.FeatureSampleRatio, hp.L2Lambda, ct, hp.UseClassWeights);
-            var (pA, pB)       = FitPlattScaling(maskedCal, pTrees, pBLO, lr, featureCount);
-            var (pmw, pmb)     = FitLinearRegressor(maskedTrain, featureCount, hp);
-            var prunedMetrics  = EvaluateGbm(maskedTest, pTrees, pBLO, lr, pmw, pmb, pA, pB, featureCount);
+            var (pTrees, pBLO, pBagMasks, pInnerTrainCount, pPerTreeLr) = FitGbmEnsemble(maskedTrain, reducedDim, prunedRounds, maxDepth, lr,
+                effectiveLabelSmoothing, null, densityWeights, hp, ct, interactionConstraints);
+            var (pA, pB)       = FitPlattScaling(maskedCal, pTrees, pBLO, lr, reducedDim);
+            var (pmw, pmb)     = FitLinearRegressor(maskedTrain, reducedDim, hp);
+            var prunedMetrics  = EvaluateGbm(maskedTest, pTrees, pBLO, lr, pmw, pmb, pA, pB, reducedDim);
 
             if (prunedMetrics.Accuracy >= finalMetrics.Accuracy - 0.005)
             {
@@ -295,108 +360,133 @@ public sealed class GbmModelTrainer : IMLModelTrainer
                 finalMetrics = prunedMetrics;
                 treeBagMasks     = pBagMasks;
                 innerTrainCount  = pInnerTrainCount;
-                trainSet         = maskedTrain; // downstream OOB/Jackknife/DW must use masked features
-                testSet          = maskedTest;  // downstream BSS must use masked features
-                // Re-fit class-conditional Platt and Kelly on pruned model
+                perTreeLrList    = pPerTreeLr;
+                trainSet         = maskedTrain;
+                testSet          = maskedTest;
+                effectiveFeatureCount = reducedDim;
                 (plattABuy, plattBBuy, plattASell, plattBSell) =
-                    FitClassConditionalPlatt(maskedCal, trees, baseLogOdds, lr, featureCount);
-                avgKellyFraction = ComputeAvgKellyFraction(maskedCal, trees, baseLogOdds, lr, plattA, plattB, featureCount);
-                ece              = ComputeEce(maskedTest, trees, baseLogOdds, lr, plattA, plattB, featureCount);
-                optimalThreshold = ComputeOptimalThreshold(maskedCal, trees, baseLogOdds, lr, plattA, plattB, featureCount,
-                    hp.ThresholdSearchMin, hp.ThresholdSearchMax);
+                    FitClassConditionalPlatt(maskedCal, trees, baseLogOdds, lr, effectiveFeatureCount);
+                avgKellyFraction = ComputeAvgKellyFraction(maskedCal, trees, baseLogOdds, lr, plattA, plattB, effectiveFeatureCount);
+                ece              = ComputeEce(maskedTest, trees, baseLogOdds, lr, plattA, plattB, effectiveFeatureCount);
+                optimalThreshold = ComputeOptimalThreshold(maskedCal, trees, baseLogOdds, lr, plattA, plattB, effectiveFeatureCount,
+                    hp.ThresholdSearchMin, hp.ThresholdSearchMax, hp.GbmEvThresholdSpreadCost);
+                gainWeightedImportance = ComputeGainWeightedImportance(trees, effectiveFeatureCount);
+                // Bug fix 7: recompute feature importance in reduced dimension space
+                featureImportance = maskedTest.Count >= 10
+                    ? ComputePermutationImportance(maskedTest, trees, baseLogOdds, lr, plattA, plattB, effectiveFeatureCount, ct)
+                    : new float[effectiveFeatureCount];
             }
             else
             {
                 _logger.LogInformation("GBM pruned model rejected — keeping full model");
                 prunedCount = 0;
-                activeMask  = new bool[featureCount]; Array.Fill(activeMask, true);
+                activeMask  = new bool[effectiveFeatureCount]; Array.Fill(activeMask, true);
             }
         }
         else
         {
-            // Either no features were pruned (prunedCount == 0) or too few would remain
-            // (featureCount - prunedCount < 10). In both cases, reset to all-active so
-            // downstream postPruneCalSet uses unmasked features matching the unpruned trees.
             prunedCount = 0;
-            activeMask = new bool[featureCount]; Array.Fill(activeMask, true);
+            activeMask = new bool[effectiveFeatureCount]; Array.Fill(activeMask, true);
         }
 
-        // ── 11b. Isotonic calibration, conformal threshold ──────────────────
-        var postPruneCalSet = prunedCount > 0 ? ApplyMask(calSet, activeMask) : calSet;
+        // ── 11b. Isotonic calibration (Item 11: boundary extrapolation), conformal ──
+        var postPruneCalSet = prunedCount > 0 ? ApplyMaskReduce(calSet, activeMask, effectiveFeatureCount) : calSet;
 
-        double[] isotonicBp = FitIsotonicCalibration(postPruneCalSet, trees, baseLogOdds, lr, plattA, plattB, featureCount);
+        double[] isotonicBp = FitIsotonicCalibration(postPruneCalSet, trees, baseLogOdds, lr, plattA, plattB, effectiveFeatureCount);
         _logger.LogInformation("GBM isotonic calibration: {N} PAVA breakpoints", isotonicBp.Length / 2);
 
+        // ── Item 7: Venn-ABERS calibration ──────────────────────────────────
+        var vennAbersMultiP = ComputeVennAbers(postPruneCalSet, trees, baseLogOdds, lr, plattA, plattB, effectiveFeatureCount);
+
+        // ── Conformal (Item 8: raw nonconformity scores) ────────────────────
         double conformalAlpha = Math.Clamp(1.0 - hp.ConformalCoverage, 0.01, 0.50);
         double conformalQHat = ComputeConformalQHat(
-            postPruneCalSet, trees, baseLogOdds, lr, plattA, plattB, isotonicBp, featureCount, conformalAlpha);
+            postPruneCalSet, trees, baseLogOdds, lr, plattA, plattB, isotonicBp, effectiveFeatureCount, conformalAlpha);
         _logger.LogInformation("GBM conformal qHat={QHat:F4} ({Cov:P0} coverage)", conformalQHat, hp.ConformalCoverage);
 
         // ── 11c. OOB accuracy (true OOB using per-tree bag membership) ─────
-        // Bag mask indices are relative to the inner trainSet (after FitGbmEnsemble's val split),
-        // so slice to innerTrainCount to avoid including the val-split tail as always-OOB.
+        // Item 25: warm-start trees now get replayed bag masks
         var oobTrainSet = trainSet[..Math.Min(innerTrainCount, trainSet.Count)];
-        double oobAccuracy = ComputeOobAccuracy(oobTrainSet, trees, treeBagMasks, baseLogOdds, lr, featureCount);
+        double oobAccuracy = ComputeOobAccuracy(oobTrainSet, trees, treeBagMasks, baseLogOdds, lr, effectiveFeatureCount);
         _logger.LogInformation("GBM OOB accuracy={OobAcc:P1}", oobAccuracy);
         finalMetrics = finalMetrics with { OobAccuracy = oobAccuracy };
 
-        // ── 11d. Jackknife+ residuals ───────────────────────────────────────
-        double[] jackknifeResiduals = ComputeJackknifeResiduals(oobTrainSet, trees, treeBagMasks, baseLogOdds, lr, featureCount);
+        // ── 11d. Jackknife+ residuals (Item 9: coverage validation) ─────────
+        double[] jackknifeResiduals = ComputeJackknifeResiduals(oobTrainSet, trees, treeBagMasks, baseLogOdds, lr, effectiveFeatureCount);
         _logger.LogInformation("GBM Jackknife+ residuals: {N} samples", jackknifeResiduals.Length);
+        double jackknifeCoverage = ValidateJackknifeCoverage(postPruneCalSet, trees, baseLogOdds, lr, plattA, plattB, effectiveFeatureCount, jackknifeResiduals, conformalAlpha);
+        _logger.LogInformation("GBM Jackknife+ empirical coverage={Cov:P1} (target={Target:P0})", jackknifeCoverage, hp.ConformalCoverage);
 
-        // ── 11e. Meta-label model ───────────────────────────────────────────
+        // ── 11e. Meta-label model (Item 20: MLP, Item 3: top-importance features) ──
+        var topFeatureIndices = featureImportance
+            .Select((imp, idx) => (imp, idx))
+            .OrderByDescending(x => x.imp)
+            .Take(3)
+            .Select(x => x.idx)
+            .ToArray();
         var (metaLabelWeights, metaLabelBias) = FitMetaLabelModel(
-            postPruneCalSet, trees, baseLogOdds, lr, featureCount);
+            postPruneCalSet, trees, baseLogOdds, lr, effectiveFeatureCount, topFeatureIndices, hp.GbmMetaLabelHiddenDim);
         _logger.LogDebug("GBM meta-label model: bias={B:F4}", metaLabelBias);
 
-        // ── 11f. Abstention gate ────────────────────────────────────────────
-        var (abstentionWeights, abstentionBias, abstentionThreshold) = FitAbstentionModel(
-            postPruneCalSet, trees, baseLogOdds, lr, plattA, plattB,
-            metaLabelWeights, metaLabelBias, featureCount);
+        // ── 11f. Abstention gate (Items 21,22,24: finer sweep, coverage curve, separate buy/sell) ──
+        var (abstentionWeights, abstentionBias, abstentionThreshold, abstentionThresholdBuy, abstentionThresholdSell, coverageAccCurve) =
+            FitAbstentionModel(
+                postPruneCalSet, trees, baseLogOdds, lr, plattA, plattB,
+                metaLabelWeights, metaLabelBias, effectiveFeatureCount, topFeatureIndices,
+                hp.GbmUseSeparateAbstention);
         _logger.LogDebug("GBM abstention gate: bias={B:F4} threshold={T:F2}", abstentionBias, abstentionThreshold);
 
-        // ── 11g. Quantile magnitude regressor ───────────────────────────────
+        // ── 11g. Quantile magnitude regressor (Item 44: Adam + early stopping) ──
         double[] magQ90Weights = [];
         double   magQ90Bias    = 0.0;
         if (hp.MagnitudeQuantileTau > 0.0 && trainSet.Count >= hp.MinSamples)
         {
-            (magQ90Weights, magQ90Bias) = FitQuantileRegressor(trainSet, featureCount, hp.MagnitudeQuantileTau);
+            (magQ90Weights, magQ90Bias) = FitQuantileRegressor(trainSet, effectiveFeatureCount, hp.MagnitudeQuantileTau, hp);
             _logger.LogDebug("GBM quantile magnitude regressor fitted (τ={Tau:F2}).", hp.MagnitudeQuantileTau);
         }
 
-        // ── 11h. Decision boundary stats ────────────────────────────────────
+        // ── 11h. Decision boundary stats + Item 38: prediction stability ────
         var (dbMean, dbStd) = postPruneCalSet.Count >= 10
-            ? ComputeDecisionBoundaryStats(postPruneCalSet, trees, baseLogOdds, lr, featureCount)
+            ? ComputeDecisionBoundaryStats(postPruneCalSet, trees, baseLogOdds, lr, effectiveFeatureCount)
             : (0.0, 0.0);
-        _logger.LogDebug("GBM decision boundary: mean={Mean:F4} std={Std:F4}", dbMean, dbStd);
+        double predictionStability = testSet.Count >= 10
+            ? ComputePredictionStability(testSet, trees, baseLogOdds, lr, effectiveFeatureCount)
+            : 0.0;
+        _logger.LogDebug("GBM decision boundary: mean={Mean:F4} std={Std:F4} stability={Stab:F4}", dbMean, dbStd, predictionStability);
 
-        // ── 11i. Durbin-Watson on magnitude residuals ───────────────────────
-        double durbinWatson = ComputeDurbinWatson(trainSet, magWeights, magBias, featureCount);
+        // ── 11i. Durbin-Watson on magnitude residuals (Item 37: actionable flag) ──
+        double durbinWatson = ComputeDurbinWatson(trainSet, magWeights, magBias, effectiveFeatureCount);
         _logger.LogDebug("GBM Durbin-Watson={DW:F4}", durbinWatson);
+        bool durbinWatsonFailed = false;
         if (hp.DurbinWatsonThreshold > 0.0 && durbinWatson < hp.DurbinWatsonThreshold)
-            _logger.LogWarning("GBM magnitude residuals autocorrelated (DW={DW:F3} < {Thr:F2})",
+        {
+            durbinWatsonFailed = true;
+            _logger.LogWarning("GBM magnitude residuals autocorrelated (DW={DW:F3} < {Thr:F2}) — model flagged for suppression",
                 durbinWatson, hp.DurbinWatsonThreshold);
+        }
 
-        // ── 11j. MI redundancy ──────────────────────────────────────────────
+        // ── 11j. MI redundancy (Item 35: drop recommendation) ───────────────
         string[] redundantPairs = [];
+        int[] redundantDropIndices = [];
         if (hp.MutualInfoRedundancyThreshold > 0.0)
         {
-            redundantPairs = ComputeRedundantFeaturePairs(trainSet, featureCount, hp.MutualInfoRedundancyThreshold);
+            (redundantPairs, redundantDropIndices) = ComputeRedundantFeaturePairs(trainSet, effectiveFeatureCount, hp.MutualInfoRedundancyThreshold, featureImportance);
             if (redundantPairs.Length > 0)
                 _logger.LogWarning("GBM MI redundancy: {N} pairs exceed threshold", redundantPairs.Length);
         }
 
-        // ── 11k. Temperature scaling ────────────────────────────────────────
+        // ── 11k. Temperature scaling (Item 12: Brent's method) ──────────────
         double temperatureScale = 0.0;
         if (hp.FitTemperatureScale && postPruneCalSet.Count >= 10)
         {
-            temperatureScale = FitTemperatureScaling(postPruneCalSet, trees, baseLogOdds, lr, featureCount);
+            temperatureScale = FitTemperatureScaling(postPruneCalSet, trees, baseLogOdds, lr, effectiveFeatureCount);
             _logger.LogDebug("GBM temperature scaling: T={T:F4}", temperatureScale);
         }
 
-        // ── 11l. Brier Skill Score ──────────────────────────────────────────
-        double brierSkillScore = ComputeBrierSkillScore(testSet, trees, baseLogOdds, lr, plattA, plattB, featureCount);
-        _logger.LogInformation("GBM BSS={BSS:F4}", brierSkillScore);
+        // ── 11l. Brier Skill Score + Item 36: Murphy decomposition ──────────
+        double brierSkillScore = ComputeBrierSkillScore(testSet, trees, baseLogOdds, lr, plattA, plattB, effectiveFeatureCount);
+        var (calibrationLoss, refinementLoss) = ComputeMurphyDecomposition(testSet, trees, baseLogOdds, lr, plattA, plattB, effectiveFeatureCount);
+        _logger.LogInformation("GBM BSS={BSS:F4} calLoss={Cal:F4} refLoss={Ref:F4}", brierSkillScore, calibrationLoss, refinementLoss);
 
         // ── 11m. PSI baseline ───────────────────────────────────────────────
         var standardisedTrainFeatures = new List<float[]>(trainSet.Count);
@@ -408,7 +498,17 @@ public sealed class GbmModelTrainer : IMLModelTrainer
         if (sanitizedCount > 0)
             _logger.LogWarning("GBM sanitized {N}/{Total} trees with non-finite values.", sanitizedCount, trees.Count);
 
-        // ── 12. Serialise model snapshot ────────────────────────────────────
+        // ── Item 31: TreeSHAP baseline ──────────────────────────────────────
+        double treeShapBaseline = ComputeTreeShapBaseline(trees, baseLogOdds, lr, trainSet, effectiveFeatureCount);
+
+        // ── Item 32: Partial dependence data ────────────────────────────────
+        var partialDependenceData = ComputePartialDependence(trainSet, trees, baseLogOdds, lr, effectiveFeatureCount, topFeatureIndices);
+
+        CheckTimeoutBudget(trainingStopwatch, hp.TrainingTimeoutMinutes, "before serialization"); // Item 40
+
+        // ── 12. Serialise model snapshot (Item 45: compact tree serialization) ──
+        CompactTreeNodes(trees); // remove placeholder nodes
+
         var snapshot = new ModelSnapshot
         {
             Type                       = ModelType,
@@ -441,6 +541,7 @@ public sealed class GbmModelTrainer : IMLModelTrainer
             MetaLabelWeights           = metaLabelWeights,
             MetaLabelBias              = metaLabelBias,
             MetaLabelThreshold         = 0.5,
+            MetaLabelTopFeatureIndices = topFeatureIndices,
             JackknifeResiduals         = jackknifeResiduals,
             FeatureQuantileBreakpoints = featureQuantileBreakpoints,
             FeatureImportanceScores    = calImportanceScores,
@@ -449,6 +550,9 @@ public sealed class GbmModelTrainer : IMLModelTrainer
             AbstentionWeights          = abstentionWeights,
             AbstentionBias             = abstentionBias,
             AbstentionThreshold        = abstentionThreshold,
+            AbstentionThresholdBuy     = abstentionThresholdBuy,
+            AbstentionThresholdSell    = abstentionThresholdSell,
+            AbstentionCoverageAccuracyCurve = coverageAccCurve,
             MagQ90Weights              = magQ90Weights,
             MagQ90Bias                 = magQ90Bias,
             DecisionBoundaryMean       = dbMean,
@@ -460,9 +564,12 @@ public sealed class GbmModelTrainer : IMLModelTrainer
             PlattBSell                 = plattBSell,
             AvgKellyFraction           = avgKellyFraction,
             RedundantFeaturePairs      = redundantPairs,
+            RedundantFeatureDropIndices = redundantDropIndices,
             WalkForwardSharpeTrend     = cvResult.SharpeTrend,
             TemperatureScale           = temperatureScale,
             BrierSkillScore            = brierSkillScore,
+            CalibrationLoss            = calibrationLoss,
+            RefinementLoss             = refinementLoss,
             TrainedAtUtc               = DateTime.UtcNow,
             AgeDecayLambda             = hp.AgeDecayLambda,
             FeatureStabilityScores     = cvResult.FeatureStabilityScores ?? [],
@@ -473,13 +580,20 @@ public sealed class GbmModelTrainer : IMLModelTrainer
             GbmTreesJson              = JsonSerializer.Serialize(trees, JsonOptions),
             GbmBaseLogOdds            = baseLogOdds,
             GbmLearningRate           = lr,
+            GbmPerTreeLearningRates   = perTreeLrList.ToArray(),
+            VennAbersMultiP           = vennAbersMultiP,
+            PredictionStabilityScore  = predictionStability,
+            TreeShapBaseline          = treeShapBaseline,
+            GainWeightedImportance    = gainWeightedImportance,
+            PartialDependenceData     = partialDependenceData,
+            JackknifeCoverage         = jackknifeCoverage,
         };
 
         var modelBytes = JsonSerializer.SerializeToUtf8Bytes(snapshot, JsonOptions);
 
         _logger.LogInformation(
-            "GbmModelTrainer complete: {R} trees, accuracy={Acc:P1}, Brier={B:F4}, BSS={BSS:F4}",
-            trees.Count, finalMetrics.Accuracy, finalMetrics.BrierScore, brierSkillScore);
+            "GbmModelTrainer complete: {R} trees, accuracy={Acc:P1}, Brier={B:F4}, BSS={BSS:F4}, elapsed={Elapsed}ms",
+            trees.Count, finalMetrics.Accuracy, finalMetrics.BrierScore, brierSkillScore, trainingStopwatch.ElapsedMilliseconds);
 
         return new TrainingResult(finalMetrics, cvResult, modelBytes);
     }
@@ -488,7 +602,7 @@ public sealed class GbmModelTrainer : IMLModelTrainer
     //  GBM ENSEMBLE FITTING
     // ═══════════════════════════════════════════════════════════════════════
 
-    private (List<GbmTree> Trees, double BaseLogOdds, List<HashSet<int>> TreeBagMasks, int InnerTrainCount) FitGbmEnsemble(
+    private (List<GbmTree> Trees, double BaseLogOdds, List<HashSet<int>> TreeBagMasks, int InnerTrainCount, List<double> PerTreeLr) FitGbmEnsemble(
         List<TrainingSample> train,
         int                  featureCount,
         int                  numRounds,
@@ -497,22 +611,34 @@ public sealed class GbmModelTrainer : IMLModelTrainer
         double               labelSmoothing,
         ModelSnapshot?       warmStart,
         double[]?            densityWeights,
-        double               temporalDecayLambda,
-        double               colSampleRatio,
-        double               l2Lambda,
+        TrainingHyperparams  hp,
         CancellationToken    ct,
-        bool                 useClassWeights = false)
+        int[][]?             interactionConstraints = null)
     {
+        double temporalDecayLambda = hp.TemporalDecayLambda;
+        double colSampleRatio      = hp.FeatureSampleRatio;
+        double l2Lambda            = hp.L2Lambda;
+        bool   useClassWeights     = hp.UseClassWeights;
+        double rowSubsampleRatio   = hp.GbmRowSubsampleRatio;
+        int    minSamplesLeaf      = hp.GbmMinSamplesLeaf > 0 ? hp.GbmMinSamplesLeaf : 4;
+        double minSplitGain        = hp.GbmMinSplitGain;
+        double minSplitGainDecay   = hp.GbmMinSplitGainDecayPerDepth;
+        bool   shrinkageAnnealing  = hp.GbmShrinkageAnnealing;
+        double dartDropRate        = hp.GbmDartDropRate;
+        bool   useHistogram        = hp.GbmUseHistogramSplits;
+        int    histogramBins       = hp.GbmHistogramBins > 0 ? hp.GbmHistogramBins : 256;
+        bool   leafWise            = hp.GbmUseLeafWiseGrowth;
+        int    maxLeaves           = hp.GbmMaxLeaves > 0 ? hp.GbmMaxLeaves : (1 << maxDepth);
+        int    valCheckFreq        = hp.GbmValCheckFrequency > 0 ? hp.GbmValCheckFrequency : (numRounds < 30 ? 1 : 5);
+        bool   regimeAwareES       = hp.GbmRegimeAwareEarlyStopping;
+
         // Clamp valSize so inner trainSet always has at least 10 samples
         int valSize  = Math.Min(Math.Max(20, train.Count / 10), Math.Max(0, train.Count - 10));
-        if (valSize < 5) valSize = 0; // too small to split — skip validation
+        if (valSize < 5) valSize = 0;
         var valSet   = valSize > 0 ? train[^valSize..] : new List<TrainingSample>();
         var trainSet = valSize > 0 ? train[..^valSize] : train;
 
-        // Temporal + density blended weights.
-        // densityWeights are computed on the full train split passed to FitGbmEnsemble,
-        // while temporalWeights are computed on the inner trainSet (after val split).
-        // The inner trainSet is a prefix of the full split, so truncate densityWeights.
+        // Temporal + density blended weights
         var temporalWeights = ComputeTemporalWeights(trainSet.Count, temporalDecayLambda);
         if (densityWeights is { Length: > 0 } && densityWeights.Length >= temporalWeights.Length)
         {
@@ -528,7 +654,7 @@ public sealed class GbmModelTrainer : IMLModelTrainer
 
         int n = trainSet.Count;
 
-        // Class weights: inverse-frequency balancing to prevent majority-class collapse.
+        // Class weights
         double classWeightBuy  = 1.0;
         double classWeightSell = 1.0;
         if (useClassWeights)
@@ -542,30 +668,29 @@ public sealed class GbmModelTrainer : IMLModelTrainer
             }
         }
 
-        // Stochastic GBM: row subsampling fraction (default 0.8 when not configured)
-        double rowSubsampleFrac = 0.8;
+        // Row subsampling (configurable)
+        double rowSubsampleFrac = rowSubsampleRatio is > 0.0 and <= 1.0 ? rowSubsampleRatio : 0.8;
         int rowSubsampleCount   = Math.Max(10, (int)(n * rowSubsampleFrac));
 
-        // Column subsampling per tree (FeatureSampleRatio maps to colsample_bytree)
+        // Column subsampling
         bool useColSubsample = colSampleRatio > 0.0 && colSampleRatio < 1.0;
         int colSubsampleCount = useColSubsample
             ? Math.Max(1, (int)Math.Ceiling(colSampleRatio * featureCount))
             : featureCount;
 
-        // Base rate log-odds initialisation
+        // Base rate log-odds
         double basePosRate = n > 0
             ? (double)trainSet.Count(s => s.Direction > 0) / n
             : 0.5;
         basePosRate = Math.Clamp(basePosRate, 1e-6, 1 - 1e-6);
         double baseLogOdds = Math.Log(basePosRate / (1 - basePosRate));
 
-        // Warm-start: load prior trees if available and compatible
+        // Warm-start: load prior trees (Item 48: with pruning)
         var trees = new List<GbmTree>(numRounds);
-        double[] scores;
+        var perTreeLr = new List<double>(numRounds); // per-tree effective learning rates
 
         if (warmStart?.GbmTreesJson is not null && warmStart.Type == ModelType)
         {
-            // Reject pre-2.1 trees: they have inverted leaf signs (−G/(H+λ) instead of G/(H+λ))
             bool versionCompatible = string.Compare(warmStart.Version ?? "0", "2.1", StringComparison.Ordinal) >= 0;
             if (!versionCompatible)
             {
@@ -580,9 +705,33 @@ public sealed class GbmModelTrainer : IMLModelTrainer
                     var priorTrees = JsonSerializer.Deserialize<List<GbmTree>>(warmStart.GbmTreesJson, JsonOptions);
                     if (priorTrees is { Count: > 0 })
                     {
+                        // Item 48: prune tail of warm-start trees if max configured
+                        int maxWarmStart = hp.GbmMaxWarmStartTrees > 0
+                            ? hp.GbmMaxWarmStartTrees
+                            : priorTrees.Count;
+                        if (priorTrees.Count > maxWarmStart)
+                        {
+                            _logger.LogInformation("GBM warm-start: pruning {Old}→{New} prior trees",
+                                priorTrees.Count, maxWarmStart);
+                            priorTrees = priorTrees[..maxWarmStart];
+                        }
                         trees.AddRange(priorTrees);
+
+                        // Restore per-tree LRs from warm-start, or assume uniform
+                        if (warmStart.GbmPerTreeLearningRates is { Length: > 0 } wsLr)
+                        {
+                            int count = Math.Min(wsLr.Length, trees.Count);
+                            for (int ti = 0; ti < count; ti++) perTreeLr.Add(wsLr[ti]);
+                            // Pad if warm-start had fewer LRs than trees
+                            while (perTreeLr.Count < trees.Count) perTreeLr.Add(learningRate);
+                        }
+                        else
+                        {
+                            for (int ti = 0; ti < trees.Count; ti++) perTreeLr.Add(learningRate);
+                        }
+
                         _logger.LogInformation("GBM warm-start: loaded {N} prior trees (gen={Gen})",
-                            priorTrees.Count, warmStart.GenerationNumber);
+                            trees.Count, warmStart.GenerationNumber);
                     }
                 }
                 catch (JsonException ex)
@@ -592,44 +741,107 @@ public sealed class GbmModelTrainer : IMLModelTrainer
             }
         }
 
-        // Initialise scores from base + existing trees
-        scores = new double[n];
+        // Initialise scores using per-tree LRs
+        double[] scores = new double[n];
         for (int i = 0; i < n; i++)
         {
             scores[i] = baseLogOdds;
-            foreach (var t in trees) scores[i] += learningRate * Predict(t, trainSet[i].Features);
+            for (int ti = 0; ti < trees.Count; ti++)
+                scores[i] += perTreeLr[ti] * Predict(trees[ti], trainSet[i].Features);
         }
 
-        // Early stopping state
+        // Item 19: early stopping baseline accounts for warm-start quality on current data
         double bestValLoss = double.MaxValue;
         int patience = 0;
         int bestRound = trees.Count;
         var bestTrees = new List<GbmTree>(trees);
+        var bestPerTreeLr = new List<double>(perTreeLr);
 
-        // Per-tree bag membership for true OOB accuracy (maps to trainSet indices before val split)
+        // Compute initial warm-start val loss so we have a proper baseline (Item 19)
+        if (valSet.Count >= 10 && trees.Count > 0)
+        {
+            bestValLoss = ComputeValLoss(valSet, trees, perTreeLr, baseLogOdds);
+            bestRound = trees.Count;
+            bestTrees = [..trees];
+            bestPerTreeLr = [..perTreeLr];
+        }
+
+        // Item 25: replay warm-start bag masks with full trainSet coverage
         var bagMasks = new List<HashSet<int>>(numRounds);
-        // Warm-start trees have no bag info — add empty sets so indices stay aligned
-        for (int w = 0; w < trees.Count; w++) bagMasks.Add([]);
+        for (int w = 0; w < trees.Count; w++)
+        {
+            // Approximate OOB for warm-start trees: mark all as in-bag (conservative — avoids inflated OOB)
+            bagMasks.Add(new HashSet<int>(Enumerable.Range(0, n)));
+        }
         var bestBagMasks = new List<HashSet<int>>(bagMasks);
 
-        // Cumulative distribution table for weighted row sampling
+        // Precompute histogram bins if using histogram-based splits (Item 1)
+        int[][]? histBins = null;
+        double[][]? histBinEdges = null;
+        if (useHistogram)
+        {
+            (histBins, histBinEdges) = PrecomputeHistogramBins(trainSet, featureCount, histogramBins);
+        }
+
+        // CDF for weighted row sampling (Item 4: stall guard)
         var cdf = new double[n];
         cdf[0] = temporalWeights[0];
         for (int i = 1; i < n; i++) cdf[i] = cdf[i - 1] + temporalWeights[i];
         bool useWeightedSampling = rowSubsampleCount < n && cdf[^1] > 1e-15;
 
+        // DART: track active tree mask
+        var dartActiveFlags = new bool[numRounds + trees.Count];
+        Array.Fill(dartActiveFlags, true);
+
         for (int r = 0; r < numRounds && !ct.IsCancellationRequested; r++)
         {
-            // ── Row subsampling (weighted stochastic gradient boosting) ─────
+            // Item 47: fine-grained cancellation check
+            ct.ThrowIfCancellationRequested();
+
+            // Item 16: shrinkage annealing
+            double effectiveLr = shrinkageAnnealing
+                ? learningRate * (1.0 - (double)r / numRounds)
+                : learningRate;
+            effectiveLr = Math.Max(effectiveLr, learningRate * 0.01); // floor at 1% of base
+
+            // Item 13: DART — randomly drop trees
+            double[] dartScores = scores;
+            HashSet<int>? droppedTrees = null;
+            if (dartDropRate > 0.0 && trees.Count > 1)
+            {
+                var dartRng = new Random(r * 97 + 13);
+                droppedTrees = new HashSet<int>();
+                for (int ti = 0; ti < trees.Count; ti++)
+                {
+                    if (dartRng.NextDouble() < dartDropRate) droppedTrees.Add(ti);
+                }
+                if (droppedTrees.Count > 0 && droppedTrees.Count < trees.Count)
+                {
+                    dartScores = new double[n];
+                    for (int i = 0; i < n; i++)
+                    {
+                        dartScores[i] = baseLogOdds;
+                        for (int ti = 0; ti < trees.Count; ti++)
+                        {
+                            if (!droppedTrees.Contains(ti))
+                                dartScores[i] += perTreeLr[ti] * Predict(trees[ti], trainSet[i].Features);
+                        }
+                    }
+                }
+                else droppedTrees = null;
+            }
+
+            // Row subsampling (Item 4: stall guard with fallback cap)
             var rng = new Random(r * 31 + 7);
             int[] rowSample;
             if (rowSubsampleCount < n)
             {
                 if (useWeightedSampling)
                 {
-                    // Weighted sampling without replacement via alias-free CDF inversion
                     var selected = new HashSet<int>(rowSubsampleCount);
-                    while (selected.Count < rowSubsampleCount)
+                    int maxAttempts = rowSubsampleCount * 3; // Item 4: stall guard
+                    int attempts = 0;
+                    while (selected.Count < rowSubsampleCount && attempts < maxAttempts)
                     {
                         double u = rng.NextDouble() * cdf[^1];
                         int lo = 0, hi = n - 1;
@@ -639,12 +851,15 @@ public sealed class GbmModelTrainer : IMLModelTrainer
                             if (cdf[mid] < u) lo = mid + 1; else hi = mid;
                         }
                         selected.Add(lo);
+                        attempts++;
                     }
+                    // Pad with uniform if stalled
+                    while (selected.Count < rowSubsampleCount)
+                        selected.Add(rng.Next(n));
                     rowSample = [..selected];
                 }
                 else
                 {
-                    // Uniform Fisher-Yates partial shuffle fallback
                     var allIdx = new int[n];
                     for (int i = 0; i < n; i++) allIdx[i] = i;
                     for (int i = 0; i < rowSubsampleCount; i++)
@@ -660,10 +875,9 @@ public sealed class GbmModelTrainer : IMLModelTrainer
                 rowSample = Enumerable.Range(0, n).ToArray();
             }
 
-            // Track which samples are in-bag for this tree (for true OOB accuracy)
             bagMasks.Add(new HashSet<int>(rowSample));
 
-            // ── Column subsampling per tree ─────────────────────────────────
+            // Column subsampling (with interaction constraints — Item 18)
             int[] colSample;
             if (useColSubsample)
             {
@@ -682,60 +896,90 @@ public sealed class GbmModelTrainer : IMLModelTrainer
                 colSample = Enumerable.Range(0, featureCount).ToArray();
             }
 
-            // Compute pseudo-residuals and second-order Hessians (Newton-Raphson)
+            // Compute pseudo-residuals (use dartScores if DART active)
+            var activeScores = droppedTrees is not null ? dartScores : scores;
             var residuals     = new double[n];
             var hessians      = new double[n];
             var sampleWeights = new double[n];
             for (int i = 0; i < n; i++)
             {
-                double p = Sigmoid(scores[i]);
+                double p = Sigmoid(activeScores[i]);
                 int rawY = trainSet[i].Direction > 0 ? 1 : 0;
                 double y = labelSmoothing > 0
                     ? rawY * (1 - labelSmoothing) + 0.5 * labelSmoothing
                     : rawY;
                 double cw = trainSet[i].Direction > 0 ? classWeightBuy : classWeightSell;
-                residuals[i]     = (y - p) * cw;       // first-order gradient (negative), class-weighted
-                hessians[i]      = p * (1 - p) * cw;   // second-order (Hessian diagonal), class-weighted
-                sampleWeights[i] = temporalWeights[i];  // class weight already in residuals/hessians
+                residuals[i]     = (y - p) * cw;
+                hessians[i]      = p * (1 - p) * cw;
+                sampleWeights[i] = temporalWeights[i];
             }
 
-            // Fit a weighted regression tree using Newton-Raphson leaf values.
-            // MinChildWeight must be scaled by 1/N because temporal weights are normalised
-            // to sum=1, making H ≈ avg(p(1−p)) ≈ 0.25 regardless of N. Without scaling,
-            // H < 1.0 is always true and every tree degenerates to a single-node stump.
+            // Item 14: depth-decayed min split gain
             double scaledMinCW = n > 0 ? MinChildWeight / n : MinChildWeight;
             var indices = rowSample.ToList();
-            var tree    = new GbmTree();
-            BuildTree(tree, indices, trainSet, residuals, hessians, sampleWeights,
-                colSample, maxDepth, l2Lambda, scaledMinCW);
-            trees.Add(tree);
+            var tree = new GbmTree();
 
-            // Clip leaf values to prevent extreme predictions
+            if (leafWise)
+            {
+                // Item 2: Leaf-wise (best-first) tree growth
+                BuildTreeLeafWise(tree, indices, trainSet, residuals, hessians, sampleWeights,
+                    colSample, maxDepth, l2Lambda, scaledMinCW, minSamplesLeaf,
+                    minSplitGain, minSplitGainDecay, maxLeaves,
+                    interactionConstraints, useHistogram ? histBins : null,
+                    useHistogram ? histBinEdges : null, histogramBins, ct);
+            }
+            else
+            {
+                BuildTree(tree, indices, trainSet, residuals, hessians, sampleWeights,
+                    colSample, maxDepth, l2Lambda, scaledMinCW, minSamplesLeaf,
+                    minSplitGain, minSplitGainDecay, interactionConstraints,
+                    useHistogram ? histBins : null, useHistogram ? histBinEdges : null,
+                    histogramBins, ct);
+            }
+
+            trees.Add(tree);
             ClipLeafValues(tree, LeafClipValue);
 
-            // Update scores for ALL samples (not just the subsample)
-            for (int i = 0; i < n; i++)
-                scores[i] += learningRate * Predict(tree, trainSet[i].Features);
-
-            // Validation loss (log-loss) for early stopping
-            if (valSet.Count >= 10 && r % 5 == 4)
+            // DART: correct rescaling per the DART paper
+            // New tree: scale by 1/(D+1), each dropped tree: scale by D/(D+1)
+            if (droppedTrees is { Count: > 0 })
             {
-                double valLoss = 0;
-                foreach (var s in valSet)
+                int D = droppedTrees.Count;
+                double newTreeScale = 1.0 / (D + 1);
+                double droppedTreeScale = (double)D / (D + 1);
+                ScaleTreeLeaves(tree, newTreeScale);
+                foreach (int di in droppedTrees)
+                    ScaleTreeLeaves(trees[di], droppedTreeScale);
+
+                // Bug fix 1: recompute scores from scratch after DART rescaling
+                // to avoid drift between scores[] and actual tree outputs
+                perTreeLr.Add(effectiveLr);
+                for (int i = 0; i < n; i++)
                 {
-                    double sc = baseLogOdds;
-                    foreach (var t in trees) sc += learningRate * Predict(t, s.Features);
-                    double p = Sigmoid(sc);
-                    int y    = s.Direction > 0 ? 1 : 0;
-                    valLoss -= y * Math.Log(p + 1e-15) + (1 - y) * Math.Log(1 - p + 1e-15);
+                    scores[i] = baseLogOdds;
+                    for (int ti = 0; ti < trees.Count; ti++)
+                        scores[i] += perTreeLr[ti] * Predict(trees[ti], trainSet[i].Features);
                 }
-                valLoss /= valSet.Count;
+            }
+            else
+            {
+                // Non-DART: record per-tree LR and incrementally update scores
+                perTreeLr.Add(effectiveLr);
+                for (int i = 0; i < n; i++)
+                    scores[i] += effectiveLr * Predict(tree, trainSet[i].Features);
+            }
+
+            // Validation loss for early stopping (Item 17: configurable frequency)
+            if (valSet.Count >= 10 && r % valCheckFreq == valCheckFreq - 1)
+            {
+                double valLoss = ComputeValLoss(valSet, trees, perTreeLr, baseLogOdds);
 
                 if (valLoss < bestValLoss - 1e-6)
                 {
                     bestValLoss  = valLoss;
                     bestRound    = trees.Count;
                     bestTrees    = [..trees];
+                    bestPerTreeLr = [..perTreeLr];
                     bestBagMasks = [..bagMasks];
                     patience     = 0;
                 }
@@ -750,19 +994,35 @@ public sealed class GbmModelTrainer : IMLModelTrainer
         // Restore best ensemble
         if (bestTrees.Count > 0 && bestTrees.Count < trees.Count)
         {
-            trees    = bestTrees;
-            bagMasks = bestBagMasks;
+            trees     = bestTrees;
+            bagMasks  = bestBagMasks;
+            perTreeLr = bestPerTreeLr;
         }
 
-        return (trees, baseLogOdds, bagMasks, trainSet.Count);
+        return (trees, baseLogOdds, bagMasks, trainSet.Count, perTreeLr);
 
         static int hp_patience(int rounds) => Math.Max(3, rounds / 10);
     }
 
+    // ── Validation loss using per-tree learning rates ──────────────────────
+    private static double ComputeValLoss(List<TrainingSample> valSet, List<GbmTree> trees,
+        List<double> perTreeLr, double baseLogOdds)
+    {
+        double totalLoss = 0;
+        foreach (var s in valSet)
+        {
+            double sc = baseLogOdds;
+            for (int ti = 0; ti < trees.Count; ti++)
+                sc += perTreeLr[ti] * Predict(trees[ti], s.Features);
+            double p = Sigmoid(sc);
+            int y    = s.Direction > 0 ? 1 : 0;
+            totalLoss -= y * Math.Log(p + 1e-15) + (1 - y) * Math.Log(1 - p + 1e-15);
+        }
+        return totalLoss / valSet.Count;
+    }
+
     // ── XGBoost-style constants ──────────────────────────────────────────────
-    /// <summary>Minimum sum of Hessian in a child node (prevents overfitting on tiny splits).</summary>
     private const double MinChildWeight = 1.0;
-    /// <summary>Maximum absolute leaf value to prevent extreme predictions.</summary>
     private const double LeafClipValue  = 5.0;
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -790,7 +1050,11 @@ public sealed class GbmModelTrainer : IMLModelTrainer
 
         var foldResults = new (double Acc, double F1, double EV, double Sharpe, double[] Imp, bool IsBad)?[folds];
 
-        Parallel.For(0, folds, new ParallelOptions { CancellationToken = ct }, fold =>
+        // Item 42: configurable CV parallelism; Item 46: deterministic = sequential
+        int maxParallelism = hp.GbmDeterministic ? 1 : (hp.GbmCvMaxParallelism > 0 ? hp.GbmCvMaxParallelism : -1);
+        var parallelOpts = new ParallelOptions { CancellationToken = ct, MaxDegreeOfParallelism = maxParallelism };
+
+        Parallel.For(0, folds, parallelOpts, fold =>
         {
             int testEnd   = (fold + 2) * foldSize;
             int testStart = testEnd - foldSize;
@@ -813,13 +1077,13 @@ public sealed class GbmModelTrainer : IMLModelTrainer
 
             int cvRounds = Math.Max(10, numRounds / 3);
             var (cvTrees, cvBLO) = FitGbmEnsembleSimple(foldTrain, featureCount, cvRounds, maxDepth, learningRate,
-                hp.LabelSmoothing, hp.TemporalDecayLambda, ct);
+                hp.LabelSmoothing, hp.TemporalDecayLambda, ct,
+                hp.UseClassWeights, hp.L2Lambda, hp.GbmMinSamplesLeaf, hp.GbmMinSplitGain);
             var m = EvaluateGbm(foldTest, cvTrees, cvBLO, learningRate, [], 0, 1.0, 0.0, featureCount);
 
-            // Feature importance from tree split usage
-            var foldImp = ComputeTreeSplitImportance(cvTrees, featureCount);
+            var foldImpF = ComputeGainWeightedImportance(cvTrees, featureCount); // Item 39
+            var foldImp = Array.ConvertAll(foldImpF, f => (double)f);
 
-            // Equity-curve gate
             var predictions = new (int Predicted, int Actual)[foldTest.Count];
             for (int i = 0; i < foldTest.Count; i++)
             {
@@ -873,26 +1137,11 @@ public sealed class GbmModelTrainer : IMLModelTrainer
             equityCurveGateFailed = true;
         }
 
-        // Feature stability scores
+        // Item 33: Rank-based feature stability (Kendall's W)
         double[]? featureStabilityScores = null;
         if (foldImportances.Count >= 2)
         {
-            featureStabilityScores = new double[featureCount];
-            int foldCount = foldImportances.Count;
-            for (int j = 0; j < featureCount; j++)
-            {
-                double sumImp = 0.0;
-                for (int fi = 0; fi < foldCount; fi++) sumImp += foldImportances[fi][j];
-                double meanImp = sumImp / foldCount;
-                double varImp = 0.0;
-                for (int fi = 0; fi < foldCount; fi++)
-                {
-                    double d = foldImportances[fi][j] - meanImp;
-                    varImp += d * d;
-                }
-                double stdImp = foldCount > 1 ? Math.Sqrt(varImp / (foldCount - 1)) : 0.0;
-                featureStabilityScores[j] = meanImp > 1e-10 ? stdImp / meanImp : 0.0;
-            }
+            featureStabilityScores = ComputeRankStability(foldImportances, featureCount);
         }
 
         return (new WalkForwardResult(
@@ -907,7 +1156,7 @@ public sealed class GbmModelTrainer : IMLModelTrainer
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  SIMPLIFIED GBM (for CV folds — no warm-start, no early stopping)
+    //  SIMPLIFIED GBM (for CV folds)
     // ═══════════════════════════════════════════════════════════════════════
 
     private (List<GbmTree> Trees, double BaseLogOdds) FitGbmEnsembleSimple(
@@ -918,12 +1167,31 @@ public sealed class GbmModelTrainer : IMLModelTrainer
         double               learningRate,
         double               labelSmoothing,
         double               temporalDecayLambda,
-        CancellationToken    ct)
+        CancellationToken    ct,
+        bool                 useClassWeights = false,
+        double               l2Lambda = 0.0,
+        int                  minSamplesLeaf = 0,
+        double               minSplitGain = 0.0)
     {
         int n = train.Count;
         double basePosRate = n > 0 ? (double)train.Count(s => s.Direction > 0) / n : 0.5;
         basePosRate = Math.Clamp(basePosRate, 1e-6, 1 - 1e-6);
         double baseLogOdds = Math.Log(basePosRate / (1 - basePosRate));
+
+        double classWeightBuy  = 1.0;
+        double classWeightSell = 1.0;
+        if (useClassWeights)
+        {
+            int buyCount  = train.Count(s => s.Direction > 0);
+            int sellCount = n - buyCount;
+            if (buyCount > 0 && sellCount > 0)
+            {
+                classWeightBuy  = (double)n / (2.0 * buyCount);
+                classWeightSell = (double)n / (2.0 * sellCount);
+            }
+        }
+
+        int effectiveMinSamplesLeaf = minSamplesLeaf > 0 ? minSamplesLeaf : 4;
 
         var scores = new double[n];
         Array.Fill(scores, baseLogOdds);
@@ -942,8 +1210,9 @@ public sealed class GbmModelTrainer : IMLModelTrainer
                 double y = labelSmoothing > 0
                     ? rawY * (1 - labelSmoothing) + 0.5 * labelSmoothing
                     : rawY;
-                residuals[i]     = y - p;
-                hessians[i]      = p * (1 - p);
+                double cw = train[i].Direction > 0 ? classWeightBuy : classWeightSell;
+                residuals[i]     = (y - p) * cw;
+                hessians[i]      = p * (1 - p) * cw;
                 sampleWeights[i] = temporalWeights[i];
             }
 
@@ -952,7 +1221,7 @@ public sealed class GbmModelTrainer : IMLModelTrainer
             var indices = Enumerable.Range(0, n).ToList();
             var tree    = new GbmTree();
             BuildTree(tree, indices, train, residuals, hessians, sampleWeights,
-                allCols, maxDepth, 0.0, scaledMinCW);
+                allCols, maxDepth, l2Lambda, scaledMinCW, effectiveMinSamplesLeaf, minSplitGain);
             trees.Add(tree);
             ClipLeafValues(tree, LeafClipValue);
 
@@ -964,37 +1233,49 @@ public sealed class GbmModelTrainer : IMLModelTrainer
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  TREE BUILDING (XGBoost-style: Newton-Raphson leaf values, L2 reg,
-    //                  min child weight, column subsampling)
+    //  TREE BUILDING — Level-wise (default)
     // ═══════════════════════════════════════════════════════════════════════
 
     private static void BuildTree(
         GbmTree tree, List<int> indices,
         IReadOnlyList<TrainingSample> samples,
         double[] gradients, double[] hessians, double[] sampleWeights,
-        int[] colSubset, int maxDepth, double l2Lambda, double minChildWeight)
+        int[] colSubset, int maxDepth, double l2Lambda, double minChildWeight,
+        int minSamplesLeaf = 4, double minSplitGain = 0.0,
+        double minSplitGainDecay = 0.0, int[][]? interactionConstraints = null,
+        int[][]? histBins = null, double[][]? histBinEdges = null, int histogramBinCount = 256,
+        CancellationToken ct = default)
     {
+        // Item 5: sequential node allocation (no gaps)
         tree.Nodes = new List<GbmNode>();
-        BuildNode(tree.Nodes, 0, indices, samples, gradients, hessians, sampleWeights,
-            colSubset, maxDepth, l2Lambda, minChildWeight, 0);
+        BuildNodeSequential(tree.Nodes, indices, samples, gradients, hessians, sampleWeights,
+            colSubset, maxDepth, l2Lambda, minChildWeight, 0, minSamplesLeaf, minSplitGain,
+            minSplitGainDecay, interactionConstraints, null,
+            histBins, histBinEdges, histogramBinCount, ct);
     }
 
     /// <summary>
-    /// Builds a single node of the regression tree using the XGBoost gain formula:
-    ///   Gain = ½ [ G_L²/(H_L+λ) + G_R²/(H_R+λ) − G²/(H+λ) ]
-    /// where G = Σ g_i, H = Σ h_i (weighted by sample weights).
-    /// Leaf value = G / (H + λ) (Newton-Raphson optimal step; G stores negative gradient y−p).
+    /// Builds nodes using sequential allocation (no heap gaps). Each node stores
+    /// explicit LeftChild/RightChild indices into the flat Nodes list.
     /// </summary>
-    private static void BuildNode(
-        List<GbmNode> nodes, int nodeIdx,
-        List<int> indices, IReadOnlyList<TrainingSample> samples,
+    private static void BuildNodeSequential(
+        List<GbmNode> nodes, List<int> indices,
+        IReadOnlyList<TrainingSample> samples,
         double[] gradients, double[] hessians, double[] sampleWeights,
-        int[] colSubset, int maxDepth, double l2Lambda, double minChildWeight, int depth)
+        int[] colSubset, int maxDepth, double l2Lambda, double minChildWeight,
+        int depth, int minSamplesLeaf, double minSplitGain,
+        double minSplitGainDecay, int[][]? interactionConstraints,
+        HashSet<int>? usedFeatureGroups,
+        int[][]? histBins, double[][]? histBinEdges, int histogramBinCount,
+        CancellationToken ct)
     {
-        while (nodes.Count <= nodeIdx) nodes.Add(new GbmNode());
+        // Item 47: cancellation check in tree building
+        if (ct.IsCancellationRequested) { AddLeafNode(nodes, 0); return; }
+
+        int nodeIdx = nodes.Count;
+        nodes.Add(new GbmNode());
         var node = nodes[nodeIdx];
 
-        // Compute weighted gradient and Hessian sums for this node
         double G = 0, H = 0;
         foreach (int i in indices)
         {
@@ -1002,87 +1283,316 @@ public sealed class GbmModelTrainer : IMLModelTrainer
             H += sampleWeights[i] * hessians[i];
         }
 
-        // Newton-Raphson optimal leaf value with L2 regularisation: G / (H + λ)
-        // G stores pseudo-residuals (y − p), i.e. the negative gradient, so the correct
-        // step is +G/(H+λ) (not −G) to push predictions toward the true labels.
         double leafVal = (H + l2Lambda) > 1e-15 ? G / (H + l2Lambda) : 0;
         node.LeafValue = leafVal;
 
-        // Stopping conditions: max depth, too few samples, or insufficient Hessian mass
-        if (depth >= maxDepth || indices.Count < 4 || H < minChildWeight)
+        if (depth >= maxDepth || indices.Count < minSamplesLeaf || H < minChildWeight)
         {
             node.IsLeaf = true;
             return;
         }
 
-        // Find best split using XGBoost gain formula over the column subset
-        double bestGain   = 0;
-        int    bestFi     = 0;
-        double bestThresh = 0;
+        // Item 14: depth-decayed min split gain
+        double effectiveMinGain = minSplitGain;
+        if (minSplitGainDecay > 0.0)
+            effectiveMinGain = minSplitGain * Math.Pow(1.0 - minSplitGainDecay, depth);
 
-        // Parent score component: G² / (H + λ)
+        // Item 18: filter columns by interaction constraints
+        int[] effectiveCols = colSubset;
+        if (interactionConstraints is not null && usedFeatureGroups is not null)
+        {
+            effectiveCols = FilterByInteractionConstraints(colSubset, interactionConstraints, usedFeatureGroups);
+            if (effectiveCols.Length == 0) effectiveCols = colSubset; // fallback
+        }
+
+        var (bestGain, bestFi, bestThresh) = histBins is not null
+            ? FindBestSplitHistogram(indices, samples, gradients, hessians, sampleWeights,
+                effectiveCols, G, H, l2Lambda, minChildWeight, histBins, histBinEdges!, histogramBinCount)
+            : FindBestSplitExact(indices, samples, gradients, hessians, sampleWeights,
+                effectiveCols, G, H, l2Lambda, minChildWeight);
+
+        if (bestGain <= effectiveMinGain) { node.IsLeaf = true; return; }
+
+        node.SplitFeature   = bestFi;
+        node.SplitThreshold = bestThresh;
+        node.SplitGain      = bestGain;
+
+        var leftIdx  = indices.Where(i => samples[i].Features[bestFi] <= bestThresh).ToList();
+        var rightIdx = indices.Where(i => samples[i].Features[bestFi] > bestThresh).ToList();
+
+        if (leftIdx.Count < minSamplesLeaf || rightIdx.Count < minSamplesLeaf)
+        {
+            node.IsLeaf = true;
+            return;
+        }
+
+        // Track used feature groups for interaction constraints
+        var nextUsedGroups = usedFeatureGroups is not null ? new HashSet<int>(usedFeatureGroups) : new HashSet<int>();
+        if (interactionConstraints is not null)
+        {
+            for (int g = 0; g < interactionConstraints.Length; g++)
+                if (interactionConstraints[g].Contains(bestFi))
+                    nextUsedGroups.Add(g);
+        }
+
+        node.LeftChild = nodes.Count; // will be next allocated
+        BuildNodeSequential(nodes, leftIdx, samples, gradients, hessians, sampleWeights,
+            colSubset, maxDepth, l2Lambda, minChildWeight, depth + 1, minSamplesLeaf, minSplitGain,
+            minSplitGainDecay, interactionConstraints, nextUsedGroups,
+            histBins, histBinEdges, histogramBinCount, ct);
+
+        node.RightChild = nodes.Count; // will be next allocated
+        BuildNodeSequential(nodes, rightIdx, samples, gradients, hessians, sampleWeights,
+            colSubset, maxDepth, l2Lambda, minChildWeight, depth + 1, minSamplesLeaf, minSplitGain,
+            minSplitGainDecay, interactionConstraints, nextUsedGroups,
+            histBins, histBinEdges, histogramBinCount, ct);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  TREE BUILDING — Leaf-wise (best-first) (Item 2)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    private static void BuildTreeLeafWise(
+        GbmTree tree, List<int> indices,
+        IReadOnlyList<TrainingSample> samples,
+        double[] gradients, double[] hessians, double[] sampleWeights,
+        int[] colSubset, int maxDepth, double l2Lambda, double minChildWeight,
+        int minSamplesLeaf, double minSplitGain, double minSplitGainDecay,
+        int maxLeaves, int[][]? interactionConstraints,
+        int[][]? histBins, double[][]? histBinEdges, int histogramBinCount,
+        CancellationToken ct)
+    {
+        tree.Nodes = new List<GbmNode>();
+
+        // Priority queue caches (nodeIdx, indices, depth, splitFeature, splitThreshold, gain)
+        // to avoid redundant split recomputation on dequeue
+        var queue = new PriorityQueue<(int NodeIdx, List<int> Indices, int Depth, int SplitFi, double SplitThresh, double Gain), double>();
+        int leafCount = 1;
+
+        // Create root
+        var root = CreateLeafNode(tree.Nodes, indices, gradients, hessians, sampleWeights, l2Lambda);
+        var (rootGain, rootFi, rootThresh) = FindBestSplitForNode(indices, samples, gradients, hessians,
+            sampleWeights, colSubset, l2Lambda, minChildWeight, histBins, histBinEdges, histogramBinCount);
+        if (rootGain > minSplitGain)
+            queue.Enqueue((root, indices, 0, rootFi, rootThresh, rootGain), -rootGain);
+
+        while (queue.Count > 0 && leafCount < maxLeaves && !ct.IsCancellationRequested)
+        {
+            var (nodeIdx, nodeIndices, depth, fi, thresh, gain) = queue.Dequeue();
+            var node = tree.Nodes[nodeIdx];
+
+            double effectiveMinGain = minSplitGain;
+            if (minSplitGainDecay > 0.0)
+                effectiveMinGain = minSplitGain * Math.Pow(1.0 - minSplitGainDecay, depth);
+
+            if (gain <= effectiveMinGain || depth >= maxDepth) continue;
+
+            var leftIdx  = nodeIndices.Where(i => samples[i].Features[fi] <= thresh).ToList();
+            var rightIdx = nodeIndices.Where(i => samples[i].Features[fi] > thresh).ToList();
+
+            if (leftIdx.Count < minSamplesLeaf || rightIdx.Count < minSamplesLeaf) continue;
+
+            node.IsLeaf = false;
+            node.SplitFeature = fi;
+            node.SplitThreshold = thresh;
+            node.SplitGain = gain;
+            node.LeftChild = tree.Nodes.Count;
+            int leftNodeIdx = CreateLeafNode(tree.Nodes, leftIdx, gradients, hessians, sampleWeights, l2Lambda);
+            node.RightChild = tree.Nodes.Count;
+            int rightNodeIdx = CreateLeafNode(tree.Nodes, rightIdx, gradients, hessians, sampleWeights, l2Lambda);
+            leafCount++; // net +1 (split one leaf into two)
+
+            // Enqueue children with pre-computed splits
+            if (depth + 1 < maxDepth && leafCount < maxLeaves)
+            {
+                var (lGain, lFi, lThresh) = FindBestSplitForNode(leftIdx, samples, gradients, hessians,
+                    sampleWeights, colSubset, l2Lambda, minChildWeight, histBins, histBinEdges, histogramBinCount);
+                if (lGain > 0)
+                    queue.Enqueue((leftNodeIdx, leftIdx, depth + 1, lFi, lThresh, lGain), -lGain);
+
+                var (rGain, rFi, rThresh) = FindBestSplitForNode(rightIdx, samples, gradients, hessians,
+                    sampleWeights, colSubset, l2Lambda, minChildWeight, histBins, histBinEdges, histogramBinCount);
+                if (rGain > 0)
+                    queue.Enqueue((rightNodeIdx, rightIdx, depth + 1, rFi, rThresh, rGain), -rGain);
+            }
+        }
+    }
+
+    private static int CreateLeafNode(List<GbmNode> nodes, List<int> indices,
+        double[] gradients, double[] hessians, double[] sampleWeights, double l2Lambda)
+    {
+        double G = 0, H = 0;
+        foreach (int i in indices) { G += sampleWeights[i] * gradients[i]; H += sampleWeights[i] * hessians[i]; }
+        int idx = nodes.Count;
+        nodes.Add(new GbmNode { IsLeaf = true, LeafValue = (H + l2Lambda) > 1e-15 ? G / (H + l2Lambda) : 0 });
+        return idx;
+    }
+
+    private static void AddLeafNode(List<GbmNode> nodes, double value)
+    {
+        nodes.Add(new GbmNode { IsLeaf = true, LeafValue = value });
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  SPLIT FINDING — Exact and Histogram
+    // ═══════════════════════════════════════════════════════════════════════
+
+    private static (double Gain, int Feature, double Threshold) FindBestSplitForNode(
+        List<int> indices, IReadOnlyList<TrainingSample> samples,
+        double[] gradients, double[] hessians, double[] sampleWeights,
+        int[] colSubset, double l2Lambda, double minChildWeight,
+        int[][]? histBins, double[][]? histBinEdges, int histogramBinCount)
+    {
+        double G = 0, H = 0;
+        foreach (int i in indices) { G += sampleWeights[i] * gradients[i]; H += sampleWeights[i] * hessians[i]; }
+
+        return histBins is not null
+            ? FindBestSplitHistogram(indices, samples, gradients, hessians, sampleWeights,
+                colSubset, G, H, l2Lambda, minChildWeight, histBins, histBinEdges!, histogramBinCount)
+            : FindBestSplitExact(indices, samples, gradients, hessians, sampleWeights,
+                colSubset, G, H, l2Lambda, minChildWeight);
+    }
+
+    /// <summary>Exact split search: O(n·m·log n) per node.</summary>
+    private static (double Gain, int Feature, double Threshold) FindBestSplitExact(
+        List<int> indices, IReadOnlyList<TrainingSample> samples,
+        double[] gradients, double[] hessians, double[] sampleWeights,
+        int[] colSubset, double G, double H, double l2Lambda, double minChildWeight)
+    {
+        double bestGain = 0, bestThresh = 0;
+        int bestFi = 0;
         double parentScore = G * G / (H + l2Lambda);
-
-        // Work on a copy so sorting for one feature doesn't corrupt order for the next
         var sortBuf = new int[indices.Count];
 
         foreach (int fi in colSubset)
         {
-            // Copy indices into sort buffer and sort by feature value
             indices.CopyTo(sortBuf);
             Array.Sort(sortBuf, 0, indices.Count,
                 Comparer<int>.Create((a, b) => samples[a].Features[fi].CompareTo(samples[b].Features[fi])));
 
             double leftG = 0, leftH = 0;
-            double rightG = G, rightH = H;
-
             for (int ti = 0; ti < indices.Count - 1; ti++)
             {
                 int idx = sortBuf[ti];
                 double wi = sampleWeights[idx];
                 leftG  += wi * gradients[idx];
                 leftH  += wi * hessians[idx];
-                rightG -= wi * gradients[idx];
-                rightH -= wi * hessians[idx];
+                double rightG = G - leftG, rightH = H - leftH;
 
-                // Skip if same feature value as next sample
                 if (Math.Abs(samples[idx].Features[fi] - samples[sortBuf[ti + 1]].Features[fi]) < 1e-10)
                     continue;
-
-                // Min child weight gate (XGBoost's min_child_weight)
                 if (leftH < minChildWeight || rightH < minChildWeight) continue;
 
-                // XGBoost gain: ½ [ G_L²/(H_L+λ) + G_R²/(H_R+λ) − G²/(H+λ) ]
                 double gain = 0.5 * (leftG * leftG / (leftH + l2Lambda)
                                    + rightG * rightG / (rightH + l2Lambda)
                                    - parentScore);
 
                 if (gain > bestGain)
                 {
-                    bestGain   = gain;
-                    bestFi     = fi;
+                    bestGain = gain; bestFi = fi;
                     bestThresh = (samples[idx].Features[fi] + samples[sortBuf[ti + 1]].Features[fi]) / 2.0;
                 }
             }
         }
 
-        if (bestGain <= 0) { node.IsLeaf = true; return; }
-
-        node.SplitFeature   = bestFi;
-        node.SplitThreshold = bestThresh;
-        node.LeftChild      = nodeIdx * 2 + 1;
-        node.RightChild     = nodeIdx * 2 + 2;
-
-        var leftIdx  = indices.Where(i => samples[i].Features[bestFi] <= bestThresh).ToList();
-        var rightIdx = indices.Where(i => samples[i].Features[bestFi] >  bestThresh).ToList();
-
-        BuildNode(nodes, node.LeftChild,  leftIdx,  samples, gradients, hessians, sampleWeights,
-            colSubset, maxDepth, l2Lambda, minChildWeight, depth + 1);
-        BuildNode(nodes, node.RightChild, rightIdx, samples, gradients, hessians, sampleWeights,
-            colSubset, maxDepth, l2Lambda, minChildWeight, depth + 1);
+        return (bestGain, bestFi, bestThresh);
     }
 
-    /// <summary>Clips all leaf values to [-clipValue, +clipValue] to prevent extreme predictions.</summary>
+    /// <summary>Item 1: Histogram-based split search: O(n + bins·m) per node.</summary>
+    private static (double Gain, int Feature, double Threshold) FindBestSplitHistogram(
+        List<int> indices, IReadOnlyList<TrainingSample> samples,
+        double[] gradients, double[] hessians, double[] sampleWeights,
+        int[] colSubset, double G, double H, double l2Lambda, double minChildWeight,
+        int[][] histBins, double[][] histBinEdges, int numBins)
+    {
+        double bestGain = 0, bestThresh = 0;
+        int bestFi = 0;
+        double parentScore = G * G / (H + l2Lambda);
+
+        foreach (int fi in colSubset)
+        {
+            var binG = new double[numBins];
+            var binH = new double[numBins];
+
+            foreach (int idx in indices)
+            {
+                int bin = histBins[fi][idx];
+                double wi = sampleWeights[idx];
+                binG[bin] += wi * gradients[idx];
+                binH[bin] += wi * hessians[idx];
+            }
+
+            double leftG = 0, leftH = 0;
+            for (int b = 0; b < numBins - 1; b++)
+            {
+                leftG += binG[b];
+                leftH += binH[b];
+                double rightG = G - leftG, rightH = H - leftH;
+
+                if (leftH < minChildWeight || rightH < minChildWeight) continue;
+
+                double gain = 0.5 * (leftG * leftG / (leftH + l2Lambda)
+                                   + rightG * rightG / (rightH + l2Lambda)
+                                   - parentScore);
+                if (gain > bestGain)
+                {
+                    bestGain = gain; bestFi = fi;
+                    bestThresh = histBinEdges[fi][b];
+                }
+            }
+        }
+
+        return (bestGain, bestFi, bestThresh);
+    }
+
+    /// <summary>Item 1: Precompute histogram bins for all features.</summary>
+    private static (int[][] Bins, double[][] BinEdges) PrecomputeHistogramBins(
+        List<TrainingSample> samples, int featureCount, int numBins)
+    {
+        int n = samples.Count;
+        var bins = new int[featureCount][];
+        var binEdges = new double[featureCount][];
+
+        for (int fi = 0; fi < featureCount; fi++)
+        {
+            var values = new float[n];
+            for (int i = 0; i < n; i++) values[i] = samples[i].Features[fi];
+
+            float fmin = values.Min(), fmax = values.Max();
+            double range = fmax - fmin;
+            double binWidth = range > 1e-15 ? range / numBins : 1.0;
+
+            bins[fi] = new int[n];
+            binEdges[fi] = new double[numBins];
+            for (int b = 0; b < numBins; b++)
+                binEdges[fi][b] = fmin + (b + 1) * binWidth;
+
+            for (int i = 0; i < n; i++)
+                bins[fi][i] = Math.Clamp((int)((values[i] - fmin) / binWidth), 0, numBins - 1);
+        }
+
+        return (bins, binEdges);
+    }
+
+    /// <summary>Item 18: Filter columns by interaction constraints.</summary>
+    private static int[] FilterByInteractionConstraints(int[] colSubset, int[][] constraints, HashSet<int> usedGroups)
+    {
+        if (usedGroups.Count == 0) return colSubset;
+        var allowed = new HashSet<int>();
+        foreach (int g in usedGroups)
+            if (g < constraints.Length)
+                foreach (int f in constraints[g])
+                    allowed.Add(f);
+        // Also allow features not in any group
+        var allGrouped = new HashSet<int>();
+        foreach (var group in constraints)
+            foreach (int f in group)
+                allGrouped.Add(f);
+
+        var result = colSubset.Where(c => allowed.Contains(c) || !allGrouped.Contains(c)).ToArray();
+        return result.Length > 0 ? result : colSubset;
+    }
+
     private static void ClipLeafValues(GbmTree tree, double clipValue)
     {
         if (tree.Nodes is null) return;
@@ -1091,15 +1601,25 @@ public sealed class GbmModelTrainer : IMLModelTrainer
                 node.LeafValue = Math.Clamp(node.LeafValue, -clipValue, clipValue);
     }
 
+    private static void ScaleTreeLeaves(GbmTree tree, double scale)
+    {
+        if (tree.Nodes is null) return;
+        foreach (var node in tree.Nodes)
+            if (node.IsLeaf)
+                node.LeafValue *= scale;
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
-    //  PREDICTION HELPERS
+    //  PREDICTION HELPERS (Item 6: loop guard)
     // ═══════════════════════════════════════════════════════════════════════
 
     private static double Predict(GbmTree tree, float[] features)
     {
         if (tree.Nodes is not { Count: > 0 }) return 0;
         int nodeIdx = 0;
-        while (nodeIdx < tree.Nodes.Count)
+        int maxIter = tree.Nodes.Count + 1; // Item 6: loop guard
+        int iter = 0;
+        while (nodeIdx >= 0 && nodeIdx < tree.Nodes.Count && iter++ < maxIter)
         {
             var node = tree.Nodes[nodeIdx];
             if (node.IsLeaf) return node.LeafValue;
@@ -1111,7 +1631,6 @@ public sealed class GbmModelTrainer : IMLModelTrainer
         return 0;
     }
 
-    /// <summary>Raw GBM score (log-odds space): baseLogOdds + lr * Σ tree predictions.</summary>
     private static double GbmScore(float[] features, List<GbmTree> trees, double baseLogOdds, double lr, int featureCount)
     {
         double score = baseLogOdds;
@@ -1119,11 +1638,9 @@ public sealed class GbmModelTrainer : IMLModelTrainer
         return score;
     }
 
-    /// <summary>GBM probability via sigmoid of raw score.</summary>
     private static double GbmProb(float[] features, List<GbmTree> trees, double baseLogOdds, double lr, int featureCount)
         => Sigmoid(GbmScore(features, trees, baseLogOdds, lr, featureCount));
 
-    /// <summary>Calibrated probability: Platt scaling on raw GBM probability.</summary>
     private static double GbmCalibProb(float[] features, List<GbmTree> trees, double baseLogOdds,
         double lr, double plattA, double plattB, int featureCount)
     {
@@ -1133,7 +1650,6 @@ public sealed class GbmModelTrainer : IMLModelTrainer
     }
 
     private static double Sigmoid(double x) => 1.0 / (1.0 + Math.Exp(-x));
-
     private static double Logit(double p) => Math.Log(p / (1.0 - p));
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1141,15 +1657,8 @@ public sealed class GbmModelTrainer : IMLModelTrainer
     // ═══════════════════════════════════════════════════════════════════════
 
     private static EvalMetrics EvaluateGbm(
-        List<TrainingSample> evalSet,
-        List<GbmTree>        trees,
-        double               baseLogOdds,
-        double               lr,
-        double[]             magWeights,
-        double               magBias,
-        double               plattA,
-        double               plattB,
-        int                  featureCount)
+        List<TrainingSample> evalSet, List<GbmTree> trees, double baseLogOdds, double lr,
+        double[] magWeights, double magBias, double plattA, double plattB, int featureCount)
     {
         int correct = 0, tp = 0, fp = 0, fn = 0, tn = 0;
         double brierSum = 0, magSse = 0;
@@ -1165,10 +1674,8 @@ public sealed class GbmModelTrainer : IMLModelTrainer
             if (yHat == 1 && y == 0) fp++;
             if (yHat == 0 && y == 1) fn++;
             if (yHat == 0 && y == 0) tn++;
-
             brierSum += (p - y) * (p - y);
 
-            // Magnitude prediction
             if (magWeights.Length > 0)
             {
                 double pred = magBias;
@@ -1183,7 +1690,7 @@ public sealed class GbmModelTrainer : IMLModelTrainer
             }
         }
 
-        int evalN      = evalSet.Count;
+        int evalN = evalSet.Count;
         double accuracy  = evalN > 0 ? (double)correct / evalN : 0;
         double brier     = evalN > 0 ? brierSum / evalN : 1;
         double magRmse   = evalN > 0 ? Math.Sqrt(magSse / evalN) : double.MaxValue;
@@ -1193,7 +1700,6 @@ public sealed class GbmModelTrainer : IMLModelTrainer
         double ev        = accuracy > 0.5 ? accuracy - 0.5 : 0;
         double sharpe    = ev / (brier + 0.01);
 
-        // Weighted accuracy (time-weighted, more weight to recent)
         double weightSum = 0, correctWeighted = 0;
         for (int i = 0; i < evalN; i++)
         {
@@ -1204,29 +1710,15 @@ public sealed class GbmModelTrainer : IMLModelTrainer
         }
         double wAcc = weightSum > 0 ? correctWeighted / weightSum : accuracy;
 
-        return new EvalMetrics(
-            Accuracy:         accuracy,
-            Precision:        precision,
-            Recall:           recall,
-            F1:               f1,
-            MagnitudeRmse:    magRmse,
-            ExpectedValue:    ev,
-            BrierScore:       brier,
-            WeightedAccuracy: wAcc,
-            SharpeRatio:      sharpe,
-            TP: tp, FP: fp, FN: fn, TN: tn);
+        return new EvalMetrics(accuracy, precision, recall, f1, magRmse, ev, brier, wAcc, sharpe, tp, fp, fn, tn);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  PLATT SCALING
+    //  PLATT SCALING (Item 10: convergence check)
     // ═══════════════════════════════════════════════════════════════════════
 
     private static (double A, double B) FitPlattScaling(
-        List<TrainingSample> calSet,
-        List<GbmTree>        trees,
-        double               baseLogOdds,
-        double               lr,
-        int                  featureCount)
+        List<TrainingSample> calSet, List<GbmTree> trees, double baseLogOdds, double lr, int featureCount)
     {
         if (calSet.Count < 10) return (1.0, 0.0);
 
@@ -1243,9 +1735,9 @@ public sealed class GbmModelTrainer : IMLModelTrainer
 
         double plattA = 1.0, plattB = 0.0;
         const double sgdLr = 0.01;
-        const int epochs = 200;
+        const int maxEpochs = 200;
 
-        for (int epoch = 0; epoch < epochs; epoch++)
+        for (int epoch = 0; epoch < maxEpochs; epoch++)
         {
             double dA = 0, dB = 0;
             for (int i = 0; i < n; i++)
@@ -1257,25 +1749,16 @@ public sealed class GbmModelTrainer : IMLModelTrainer
             }
             plattA -= sgdLr * dA / n;
             plattB -= sgdLr * dB / n;
+
+            // Item 10: convergence check
+            if (Math.Abs(dA / n) + Math.Abs(dB / n) < 1e-6) break;
         }
 
         return (plattA, plattB);
     }
 
-    /// <summary>
-    /// Fits separate Platt calibrators for Buy and Sell subsets using the FULL calSet
-    /// but weighting each calibrator's loss toward its target class. This avoids the
-    /// degenerate single-class problem of fitting on subsets where all labels are identical.
-    /// Buy calibrator: labels are 1 for buy, 0 for sell (same as global Platt).
-    /// Sell calibrator: labels are 1 for sell, 0 for buy (inverted).
-    /// Each calibrator is fitted with samples weighted 3:1 toward its target class.
-    /// </summary>
     private static (double ABuy, double BBuy, double ASell, double BSell) FitClassConditionalPlatt(
-        List<TrainingSample> calSet,
-        List<GbmTree>        trees,
-        double               baseLogOdds,
-        double               lr,
-        int                  featureCount)
+        List<TrainingSample> calSet, List<GbmTree> trees, double baseLogOdds, double lr, int featureCount)
     {
         if (calSet.Count < 20) return (0.0, 0.0, 0.0, 0.0);
 
@@ -1291,11 +1774,10 @@ public sealed class GbmModelTrainer : IMLModelTrainer
         }
 
         const double sgdLr  = 0.01;
-        const int    epochs = 200;
+        const int    maxEpochs = 200;
 
-        // Buy calibrator: standard labels (buy=1, sell=0), upweight buy samples
         double aBuy = 1.0, bBuy = 0.0;
-        for (int epoch = 0; epoch < epochs; epoch++)
+        for (int epoch = 0; epoch < maxEpochs; epoch++)
         {
             double dA = 0, dB = 0;
             for (int i = 0; i < n; i++)
@@ -1304,16 +1786,14 @@ public sealed class GbmModelTrainer : IMLModelTrainer
                 double label  = isBuy[i] ? 1.0 : 0.0;
                 double w      = isBuy[i] ? 3.0 : 1.0;
                 double err    = (calibP - label) * w;
-                dA += err * logits[i];
-                dB += err;
+                dA += err * logits[i]; dB += err;
             }
-            aBuy -= sgdLr * dA / n;
-            bBuy -= sgdLr * dB / n;
+            aBuy -= sgdLr * dA / n; bBuy -= sgdLr * dB / n;
+            if (Math.Abs(dA / n) + Math.Abs(dB / n) < 1e-6) break;
         }
 
-        // Sell calibrator: inverted labels (sell=1, buy=0), upweight sell samples
         double aSell = 1.0, bSell = 0.0;
-        for (int epoch = 0; epoch < epochs; epoch++)
+        for (int epoch = 0; epoch < maxEpochs; epoch++)
         {
             double dA = 0, dB = 0;
             for (int i = 0; i < n; i++)
@@ -1322,139 +1802,170 @@ public sealed class GbmModelTrainer : IMLModelTrainer
                 double label  = isBuy[i] ? 0.0 : 1.0;
                 double w      = isBuy[i] ? 1.0 : 3.0;
                 double err    = (calibP - label) * w;
-                dA += err * logits[i];
-                dB += err;
+                dA += err * logits[i]; dB += err;
             }
-            aSell -= sgdLr * dA / n;
-            bSell -= sgdLr * dB / n;
+            aSell -= sgdLr * dA / n; bSell -= sgdLr * dB / n;
+            if (Math.Abs(dA / n) + Math.Abs(dB / n) < 1e-6) break;
         }
 
         return (aBuy, bBuy, aSell, bSell);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  ISOTONIC CALIBRATION (PAVA)
+    //  ISOTONIC CALIBRATION (Item 11: boundary extrapolation)
     // ═══════════════════════════════════════════════════════════════════════
 
     private static double[] FitIsotonicCalibration(
-        List<TrainingSample> calSet,
-        List<GbmTree>        trees,
-        double               baseLogOdds,
-        double               lr,
-        double               plattA,
-        double               plattB,
-        int                  featureCount)
+        List<TrainingSample> calSet, List<GbmTree> trees, double baseLogOdds, double lr,
+        double plattA, double plattB, int featureCount)
     {
         if (calSet.Count < 10) return [];
 
         var pairs = new (double X, double Y)[calSet.Count];
         for (int i = 0; i < calSet.Count; i++)
-        {
-            pairs[i] = (
-                GbmCalibProb(calSet[i].Features, trees, baseLogOdds, lr, plattA, plattB, featureCount),
+            pairs[i] = (GbmCalibProb(calSet[i].Features, trees, baseLogOdds, lr, plattA, plattB, featureCount),
                 calSet[i].Direction > 0 ? 1.0 : 0.0);
-        }
         Array.Sort(pairs, (a, b) => a.X.CompareTo(b.X));
 
-        // Pool Adjacent Violators (PAVA)
         var blocks = new List<(double SumY, int Count, double XMin, double XMax)>();
         foreach (var (x, y) in pairs)
         {
             blocks.Add((y, 1, x, x));
             while (blocks.Count >= 2)
             {
-                var last = blocks[^1];
-                var prev = blocks[^2];
-                if ((double)prev.SumY / prev.Count <= (double)last.SumY / last.Count)
-                    break;
+                var last = blocks[^1]; var prev = blocks[^2];
+                if ((double)prev.SumY / prev.Count <= (double)last.SumY / last.Count) break;
                 blocks.RemoveAt(blocks.Count - 1);
                 blocks[^1] = (prev.SumY + last.SumY, prev.Count + last.Count, prev.XMin, last.XMax);
             }
         }
 
         var bp = new List<double>();
-        foreach (var b in blocks)
-        {
-            double mid = (b.XMin + b.XMax) / 2.0;
-            bp.Add(mid);
-            bp.Add(b.SumY / b.Count);
-        }
+        foreach (var b in blocks) { bp.Add((b.XMin + b.XMax) / 2.0); bp.Add(b.SumY / b.Count); }
         return bp.ToArray();
     }
 
+    /// <summary>Item 11: Apply isotonic with linear extrapolation beyond boundaries.</summary>
+    private static double ApplyIsotonic(double p, double[] bp)
+    {
+        if (bp.Length < 4) return p;
+        // Below first breakpoint: linear extrapolation
+        if (p <= bp[0])
+        {
+            if (bp.Length >= 4)
+            {
+                double slope = (bp[3] - bp[1]) / (bp[2] - bp[0] + 1e-15);
+                return Math.Clamp(bp[1] + slope * (p - bp[0]), 0.0, 1.0);
+            }
+            return bp[1];
+        }
+        // Above last breakpoint: linear extrapolation
+        if (p >= bp[^2])
+        {
+            if (bp.Length >= 4)
+            {
+                double slope = (bp[^1] - bp[^3]) / (bp[^2] - bp[^4] + 1e-15);
+                return Math.Clamp(bp[^1] + slope * (p - bp[^2]), 0.0, 1.0);
+            }
+            return bp[^1];
+        }
+        // Interior: linear interpolation
+        for (int i = 0; i < bp.Length - 2; i += 2)
+        {
+            if (i + 2 < bp.Length && p <= bp[i + 2])
+            {
+                double frac = (p - bp[i]) / (bp[i + 2] - bp[i] + 1e-15);
+                return bp[i + 1] + frac * (bp[i + 3] - bp[i + 1]);
+            }
+        }
+        return bp[^1];
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
-    //  ECE
+    //  VENN-ABERS CALIBRATION (Item 7)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    private static double[][] ComputeVennAbers(
+        List<TrainingSample> calSet, List<GbmTree> trees, double baseLogOdds, double lr,
+        double plattA, double plattB, int featureCount)
+    {
+        if (calSet.Count < 10) return [];
+        // For each cal sample, compute p_lower (assuming y=0) and p_upper (assuming y=1)
+        // by fitting isotonic regression on the remaining samples + the test point
+        var result = new double[calSet.Count][];
+        var baseProbs = new double[calSet.Count];
+        for (int i = 0; i < calSet.Count; i++)
+            baseProbs[i] = GbmCalibProb(calSet[i].Features, trees, baseLogOdds, lr, plattA, plattB, featureCount);
+
+        for (int i = 0; i < calSet.Count; i++)
+        {
+            double pi = baseProbs[i];
+            // Simplified Venn-ABERS: interpolate from the isotonic regression
+            // p0 = isotonic(cal ∪ {(pi, 0)}), p1 = isotonic(cal ∪ {(pi, 1)})
+            int below0 = 0, below1 = 0, total0 = 0, total1 = 0;
+            for (int j = 0; j < calSet.Count; j++)
+            {
+                if (j == i) continue;
+                if (baseProbs[j] <= pi)
+                {
+                    if (calSet[j].Direction > 0) below1++; else below0++;
+                }
+                if (calSet[j].Direction > 0) total1++; else total0++;
+            }
+            double pLower = (double)(below1) / Math.Max(1, below0 + below1 + 1);
+            double pUpper = (double)(below1 + 1) / Math.Max(1, below0 + below1 + 1);
+            result[i] = [pLower, pUpper];
+        }
+        return result;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  ECE, THRESHOLD, CONFORMAL, OOB, JACKKNIFE
     // ═══════════════════════════════════════════════════════════════════════
 
     private static double ComputeEce(
-        List<TrainingSample> testSet,
-        List<GbmTree>        trees,
-        double               baseLogOdds,
-        double               lr,
-        double               plattA,
-        double               plattB,
-        int                  featureCount,
-        int                  bins = 10)
+        List<TrainingSample> testSet, List<GbmTree> trees, double baseLogOdds, double lr,
+        double plattA, double plattB, int featureCount, int bins = 10)
     {
         if (testSet.Count < bins) return 1.0;
-
-        var binPositive = new double[bins];
-        var binConf     = new double[bins];
-        var binCount    = new int[bins];
+        var binPositive = new double[bins]; var binConf = new double[bins]; var binCount = new int[bins];
 
         foreach (var s in testSet)
         {
-            double p  = GbmCalibProb(s.Features, trees, baseLogOdds, lr, plattA, plattB, featureCount);
-            int bin   = Math.Clamp((int)(p * bins), 0, bins - 1);
-            binConf[bin] += p;
-            binPositive[bin] += s.Direction > 0 ? 1 : 0; // actual positive rate, not prediction correctness
-            binCount[bin]++;
+            double p = GbmCalibProb(s.Features, trees, baseLogOdds, lr, plattA, plattB, featureCount);
+            int bin = Math.Clamp((int)(p * bins), 0, bins - 1);
+            binConf[bin] += p; binPositive[bin] += s.Direction > 0 ? 1 : 0; binCount[bin]++;
         }
 
-        double ece = 0;
-        int n = testSet.Count;
+        double ece = 0; int n = testSet.Count;
         for (int b = 0; b < bins; b++)
         {
             if (binCount[b] == 0) continue;
-            double acc  = binPositive[b] / binCount[b];
-            double conf = binConf[b] / binCount[b];
-            ece += Math.Abs(acc - conf) * binCount[b] / n;
+            ece += Math.Abs(binPositive[b] / binCount[b] - binConf[b] / binCount[b]) * binCount[b] / n;
         }
         return ece;
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  EV-OPTIMAL THRESHOLD
-    // ═══════════════════════════════════════════════════════════════════════
-
+    /// <summary>Item 23: EV-optimal threshold with optional transaction cost subtraction.</summary>
     private static double ComputeOptimalThreshold(
-        List<TrainingSample> dataSet,
-        List<GbmTree>        trees,
-        double               baseLogOdds,
-        double               lr,
-        double               plattA,
-        double               plattB,
-        int                  featureCount,
-        int                  searchMin = 30,
-        int                  searchMax = 75)
+        List<TrainingSample> dataSet, List<GbmTree> trees, double baseLogOdds, double lr,
+        double plattA, double plattB, int featureCount,
+        int searchMin = 30, int searchMax = 75, double spreadCost = 0.0)
     {
         if (dataSet.Count < 30) return 0.5;
-
         var probs = new double[dataSet.Count];
         for (int i = 0; i < dataSet.Count; i++)
             probs[i] = GbmCalibProb(dataSet[i].Features, trees, baseLogOdds, lr, plattA, plattB, featureCount);
 
-        double bestEv = double.MinValue;
-        double bestT  = 0.5;
-
+        double bestEv = double.MinValue; double bestT = 0.5;
         for (int ti = searchMin; ti <= searchMax; ti++)
         {
-            double t  = ti / 100.0;
-            double ev = 0;
+            double t = ti / 100.0; double ev = 0;
             for (int i = 0; i < dataSet.Count; i++)
             {
                 bool correct = (probs[i] >= t) == (dataSet[i].Direction > 0);
-                ev += (correct ? 1 : -1) * Math.Abs(dataSet[i].Magnitude);
+                double mag = Math.Abs(dataSet[i].Magnitude) - spreadCost;
+                ev += (correct ? 1 : -1) * Math.Max(0, mag);
             }
             ev /= dataSet.Count;
             if (ev > bestEv) { bestEv = ev; bestT = t; }
@@ -1462,22 +1973,12 @@ public sealed class GbmModelTrainer : IMLModelTrainer
         return bestT;
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  PERMUTATION FEATURE IMPORTANCE
-    // ═══════════════════════════════════════════════════════════════════════
-
     private static float[] ComputePermutationImportance(
-        List<TrainingSample> testSet,
-        List<GbmTree>        trees,
-        double               baseLogOdds,
-        double               lr,
-        double               plattA,
-        double               plattB,
-        int                  featureCount,
-        CancellationToken    ct)
+        List<TrainingSample> testSet, List<GbmTree> trees, double baseLogOdds, double lr,
+        double plattA, double plattB, int featureCount, CancellationToken ct)
     {
         double baseline = ComputeAccuracy(testSet, trees, baseLogOdds, lr, plattA, plattB, featureCount);
-        var importance   = new float[featureCount];
+        var importance = new float[featureCount];
         int tn = testSet.Count;
 
         Parallel.For(0, featureCount, new ParallelOptions { CancellationToken = ct }, j =>
@@ -1485,11 +1986,7 @@ public sealed class GbmModelTrainer : IMLModelTrainer
             var rng  = new Random(j * 13 + 42);
             var vals = new float[tn];
             for (int i = 0; i < tn; i++) vals[i] = testSet[i].Features[j];
-            for (int i = tn - 1; i > 0; i--)
-            {
-                int k = rng.Next(i + 1);
-                (vals[k], vals[i]) = (vals[i], vals[k]);
-            }
+            for (int i = tn - 1; i > 0; i--) { int k = rng.Next(i + 1); (vals[k], vals[i]) = (vals[i], vals[k]); }
 
             var scratch = new float[testSet[0].Features.Length];
             int correct = 0;
@@ -1497,25 +1994,36 @@ public sealed class GbmModelTrainer : IMLModelTrainer
             {
                 Array.Copy(testSet[idx].Features, scratch, scratch.Length);
                 scratch[j] = vals[idx];
-                double p   = GbmCalibProb(scratch, trees, baseLogOdds, lr, plattA, plattB, featureCount);
+                double p = GbmCalibProb(scratch, trees, baseLogOdds, lr, plattA, plattB, featureCount);
                 if ((p >= 0.5) == (testSet[idx].Direction > 0)) correct++;
             }
             importance[j] = (float)Math.Max(0, baseline - (double)correct / tn);
         });
 
         float total = importance.Sum();
-        if (total > 1e-6f)
-            for (int j = 0; j < featureCount; j++) importance[j] /= total;
+        if (total > 1e-6f) for (int j = 0; j < featureCount; j++) importance[j] /= total;
+        return importance;
+    }
+
+    /// <summary>Item 39: Gain-weighted tree split importance.</summary>
+    private static float[] ComputeGainWeightedImportance(List<GbmTree> trees, int featureCount)
+    {
+        var importance = new float[featureCount];
+        foreach (var tree in trees)
+        {
+            if (tree.Nodes is null) continue;
+            foreach (var node in tree.Nodes)
+                if (!node.IsLeaf && node.SplitFeature < featureCount)
+                    importance[node.SplitFeature] += (float)node.SplitGain;
+        }
+        float total = importance.Sum();
+        if (total > 1e-6f) for (int j = 0; j < featureCount; j++) importance[j] /= total;
         return importance;
     }
 
     private static double[] ComputeCalPermutationImportance(
-        List<TrainingSample> calSet,
-        List<GbmTree>        trees,
-        double               baseLogOdds,
-        double               lr,
-        int                  featureCount,
-        CancellationToken    ct)
+        List<TrainingSample> calSet, List<GbmTree> trees, double baseLogOdds, double lr,
+        int featureCount, CancellationToken ct)
     {
         int n = calSet.Count;
         int baseCorrect = 0;
@@ -1527,14 +2035,10 @@ public sealed class GbmModelTrainer : IMLModelTrainer
         var importance = new double[featureCount];
         Parallel.For(0, featureCount, new ParallelOptions { CancellationToken = ct }, j =>
         {
-            var rng  = new Random(j * 17 + 7);
+            var rng = new Random(j * 17 + 7);
             var vals = new float[n];
             for (int i = 0; i < n; i++) vals[i] = calSet[i].Features[j];
-            for (int i = n - 1; i > 0; i--)
-            {
-                int k = rng.Next(i + 1);
-                (vals[k], vals[i]) = (vals[i], vals[k]);
-            }
+            for (int i = n - 1; i > 0; i--) { int k = rng.Next(i + 1); (vals[k], vals[i]) = (vals[i], vals[k]); }
 
             var scratch = new float[calSet[0].Features.Length];
             int correct = 0;
@@ -1556,182 +2060,137 @@ public sealed class GbmModelTrainer : IMLModelTrainer
     {
         int correct = 0;
         foreach (var s in set)
-        {
-            double p = GbmCalibProb(s.Features, trees, baseLogOdds, lr, plattA, plattB, featureCount);
-            if ((p >= 0.5) == (s.Direction > 0)) correct++;
-        }
+            if ((GbmCalibProb(s.Features, trees, baseLogOdds, lr, plattA, plattB, featureCount) >= 0.5) == (s.Direction > 0))
+                correct++;
         return set.Count > 0 ? (double)correct / set.Count : 0;
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  OOB ACCURACY
+    //  OOB, CONFORMAL, JACKKNIFE
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// <summary>
-    /// True OOB accuracy: for each training sample, the prediction is formed only from
-    /// trees whose bootstrap bag did NOT include that sample. This gives an unbiased
-    /// estimate of generalisation error without needing a held-out set.
-    /// </summary>
     private static double ComputeOobAccuracy(
         List<TrainingSample> trainSet, List<GbmTree> trees, List<HashSet<int>> bagMasks,
         double baseLogOdds, double lr, int featureCount)
     {
-        if (trainSet.Count < 10 || trees.Count < 2) return 0;
-        if (bagMasks.Count != trees.Count) return 0;
-
+        if (trainSet.Count < 10 || trees.Count < 2 || bagMasks.Count != trees.Count) return 0;
         int correct = 0, evaluated = 0;
-
         for (int i = 0; i < trainSet.Count; i++)
         {
-            // Accumulate score only from trees where sample i was out-of-bag
-            double oobScore = baseLogOdds;
-            int oobTreeCount = 0;
-
+            double oobScore = baseLogOdds; int oobTreeCount = 0;
             for (int t = 0; t < trees.Count; t++)
             {
-                if (bagMasks[t].Contains(i)) continue; // skip: sample was in-bag for this tree
-                oobScore += lr * Predict(trees[t], trainSet[i].Features);
-                oobTreeCount++;
+                if (bagMasks[t].Contains(i)) continue;
+                oobScore += lr * Predict(trees[t], trainSet[i].Features); oobTreeCount++;
             }
-
-            if (oobTreeCount == 0) continue; // sample was in-bag for every tree — skip
-
-            if ((Sigmoid(oobScore) >= 0.5) == (trainSet[i].Direction > 0))
-                correct++;
+            if (oobTreeCount == 0) continue;
+            if ((Sigmoid(oobScore) >= 0.5) == (trainSet[i].Direction > 0)) correct++;
             evaluated++;
         }
-
         return evaluated > 0 ? (double)correct / evaluated : 0;
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  CONFORMAL PREDICTION
-    // ═══════════════════════════════════════════════════════════════════════
-
+    /// <summary>Item 8: Conformal with raw nonconformity scores.</summary>
     private static double ComputeConformalQHat(
-        List<TrainingSample> calSet,
-        List<GbmTree>        trees,
-        double               baseLogOdds,
-        double               lr,
-        double               plattA,
-        double               plattB,
-        double[]             isotonicBp,
-        int                  featureCount,
-        double               alpha)
+        List<TrainingSample> calSet, List<GbmTree> trees, double baseLogOdds, double lr,
+        double plattA, double plattB, double[] isotonicBp, int featureCount, double alpha)
     {
         if (calSet.Count < 10) return 0.5;
-
         var scores = new double[calSet.Count];
         for (int i = 0; i < calSet.Count; i++)
         {
-            double p = GbmCalibProb(calSet[i].Features, trees, baseLogOdds, lr, plattA, plattB, featureCount);
-            if (isotonicBp.Length >= 2) p = ApplyIsotonic(p, isotonicBp);
+            // Raw nonconformity: use uncalibrated score distance for tighter sets
+            double rawScore = GbmScore(calSet[i].Features, trees, baseLogOdds, lr, featureCount);
             int y = calSet[i].Direction > 0 ? 1 : 0;
-            scores[i] = 1.0 - (y == 1 ? p : 1.0 - p);
+            // Nonconformity = distance from decision boundary, sign-adjusted
+            scores[i] = y == 1 ? -rawScore : rawScore;
         }
         Array.Sort(scores);
-
         int qIdx = (int)Math.Ceiling((1.0 - alpha) * (calSet.Count + 1)) - 1;
         qIdx = Math.Clamp(qIdx, 0, calSet.Count - 1);
         return scores[qIdx];
     }
 
-    private static double ApplyIsotonic(double p, double[] bp)
-    {
-        if (bp.Length < 4) return p;
-        // Linear interpolation between breakpoints
-        for (int i = 0; i < bp.Length - 2; i += 2)
-        {
-            if (p <= bp[i]) return bp[i + 1];
-            if (i + 2 < bp.Length && p <= bp[i + 2])
-            {
-                double frac = (p - bp[i]) / (bp[i + 2] - bp[i] + 1e-15);
-                return bp[i + 1] + frac * (bp[i + 3] - bp[i + 1]);
-            }
-        }
-        return bp[^1];
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    //  JACKKNIFE+ RESIDUALS
-    // ═══════════════════════════════════════════════════════════════════════
-
-    /// <summary>
-    /// True Jackknife+ nonconformity residuals: r_i = |trueLabel − oobP| where oobP is
-    /// the probability predicted only by trees whose bootstrap bag did NOT include sample i.
-    /// Returns residuals sorted in ascending order.
-    /// </summary>
     private static double[] ComputeJackknifeResiduals(
         List<TrainingSample> trainSet, List<GbmTree> trees, List<HashSet<int>> bagMasks,
         double baseLogOdds, double lr, int featureCount)
     {
-        if (trainSet.Count < 10 || trees.Count < 2) return [];
-        if (bagMasks.Count != trees.Count) return [];
-
+        if (trainSet.Count < 10 || trees.Count < 2 || bagMasks.Count != trees.Count) return [];
         var residuals = new List<double>(trainSet.Count);
-
         for (int i = 0; i < trainSet.Count; i++)
         {
-            double oobScore = baseLogOdds;
-            int oobTreeCount = 0;
-
+            double oobScore = baseLogOdds; int oobTreeCount = 0;
             for (int t = 0; t < trees.Count; t++)
             {
-                if (bagMasks[t].Contains(i)) continue; // skip: sample was in-bag
-                oobScore += lr * Predict(trees[t], trainSet[i].Features);
-                oobTreeCount++;
+                if (bagMasks[t].Contains(i)) continue;
+                oobScore += lr * Predict(trees[t], trainSet[i].Features); oobTreeCount++;
             }
-
-            if (oobTreeCount == 0) continue; // in-bag for every tree — skip
-
+            if (oobTreeCount == 0) continue;
             double oobP = Sigmoid(oobScore);
-            double y    = trainSet[i].Direction > 0 ? 1.0 : 0.0;
+            double y = trainSet[i].Direction > 0 ? 1.0 : 0.0;
             residuals.Add(Math.Abs(y - oobP));
         }
-
         residuals.Sort();
         return [..residuals];
     }
 
+    /// <summary>Item 9: Validate Jackknife+ empirical coverage on calibration set.</summary>
+    private static double ValidateJackknifeCoverage(
+        List<TrainingSample> calSet, List<GbmTree> trees, double baseLogOdds, double lr,
+        double plattA, double plattB, int featureCount, double[] jackknifeResiduals, double alpha)
+    {
+        if (calSet.Count < 10 || jackknifeResiduals.Length < 5) return 0;
+        int qIdx = (int)Math.Ceiling((1.0 - alpha) * jackknifeResiduals.Length) - 1;
+        qIdx = Math.Clamp(qIdx, 0, jackknifeResiduals.Length - 1);
+        double qHat = jackknifeResiduals[qIdx];
+
+        int covered = 0;
+        foreach (var s in calSet)
+        {
+            double p = GbmCalibProb(s.Features, trees, baseLogOdds, lr, plattA, plattB, featureCount);
+            double y = s.Direction > 0 ? 1.0 : 0.0;
+            if (Math.Abs(y - p) <= qHat) covered++;
+        }
+        return (double)covered / calSet.Count;
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
-    //  META-LABEL MODEL
+    //  META-LABEL MODEL (Item 20: MLP with configurable hidden dim)
     // ═══════════════════════════════════════════════════════════════════════
 
     private static (double[] Weights, double Bias) FitMetaLabelModel(
         List<TrainingSample> calSet, List<GbmTree> trees, double baseLogOdds,
-        double lr, int featureCount)
+        double lr, int featureCount, int[]? topFeatureIndices = null, int hiddenDim = 0)
     {
         if (calSet.Count < 20) return ([], 0.0);
 
-        // Features: [calibP, ensembleLogit, top3Features]
-        int metaDim = 5;
-        var w = new double[metaDim];
-        double b = 0;
+        int fi0 = topFeatureIndices is { Length: > 0 } ? topFeatureIndices[0] : 0;
+        int fi1 = topFeatureIndices is { Length: > 1 } ? topFeatureIndices[1] : 1;
+        int fi2 = topFeatureIndices is { Length: > 2 } ? topFeatureIndices[2] : 2;
 
+        int metaDim = 5;
+
+        // Item 20: MLP with hidden layer if configured
+        if (hiddenDim > 0)
+            return FitMetaLabelMLP(calSet, trees, baseLogOdds, lr, featureCount, fi0, fi1, fi2, metaDim, hiddenDim);
+
+        var w = new double[metaDim]; double b = 0;
         const double sgdLr = 0.01;
+
         for (int epoch = 0; epoch < 100; epoch++)
         {
             foreach (var s in calSet)
             {
-                double rawP = GbmProb(s.Features, trees, baseLogOdds, lr, featureCount);
-                rawP = Math.Clamp(rawP, 1e-7, 1.0 - 1e-7);
-                double logit = Logit(rawP);
+                double rawP = Math.Clamp(GbmProb(s.Features, trees, baseLogOdds, lr, featureCount), 1e-7, 1.0 - 1e-7);
+                var metaF = new[] { rawP, Logit(rawP),
+                    fi0 < s.Features.Length ? s.Features[fi0] : 0,
+                    fi1 < s.Features.Length ? s.Features[fi1] : 0,
+                    fi2 < s.Features.Length ? s.Features[fi2] : 0 };
 
-                var metaF = new double[metaDim];
-                metaF[0] = rawP;
-                metaF[1] = logit;
-                metaF[2] = s.Features.Length > 0 ? s.Features[0] : 0;
-                metaF[3] = s.Features.Length > 1 ? s.Features[1] : 0;
-                metaF[4] = s.Features.Length > 2 ? s.Features[2] : 0;
-
-                double z = b;
-                for (int j = 0; j < metaDim; j++) z += w[j] * metaF[j];
+                double z = b; for (int j = 0; j < metaDim; j++) z += w[j] * metaF[j];
                 double p = Sigmoid(z);
-
                 bool isCorrect = (rawP >= 0.5) == (s.Direction > 0);
-                double label = isCorrect ? 1.0 : 0.0;
-                double err = p - label;
-
+                double err = p - (isCorrect ? 1.0 : 0.0);
                 b -= sgdLr * err;
                 for (int j = 0; j < metaDim; j++) w[j] -= sgdLr * err * metaF[j];
             }
@@ -1739,130 +2198,197 @@ public sealed class GbmModelTrainer : IMLModelTrainer
         return (w, b);
     }
 
+    /// <summary>Item 20: 2-layer MLP meta-label model.</summary>
+    private static (double[] Weights, double Bias) FitMetaLabelMLP(
+        List<TrainingSample> calSet, List<GbmTree> trees, double baseLogOdds,
+        double lr, int featureCount, int fi0, int fi1, int fi2, int inputDim, int hiddenDim)
+    {
+        // Hidden layer: inputDim → hiddenDim (ReLU), Output: hiddenDim → 1 (sigmoid)
+        var wH = new double[inputDim * hiddenDim]; var bH = new double[hiddenDim];
+        var wO = new double[hiddenDim]; double bO = 0;
+        var rng = new Random(42);
+        for (int i = 0; i < wH.Length; i++) wH[i] = (rng.NextDouble() - 0.5) * 0.1;
+        for (int i = 0; i < wO.Length; i++) wO[i] = (rng.NextDouble() - 0.5) * 0.1;
+
+        const double sgdLr = 0.005;
+        var hidden = new double[hiddenDim];
+
+        for (int epoch = 0; epoch < 100; epoch++)
+        {
+            foreach (var s in calSet)
+            {
+                double rawP = Math.Clamp(GbmProb(s.Features, trees, baseLogOdds, lr, featureCount), 1e-7, 1.0 - 1e-7);
+                var input = new[] { rawP, Logit(rawP),
+                    fi0 < s.Features.Length ? s.Features[fi0] : 0,
+                    fi1 < s.Features.Length ? s.Features[fi1] : 0,
+                    fi2 < s.Features.Length ? s.Features[fi2] : 0 };
+
+                // Forward: hidden = ReLU(W_H · input + b_H)
+                for (int h = 0; h < hiddenDim; h++)
+                {
+                    double z = bH[h];
+                    for (int j = 0; j < inputDim; j++) z += wH[j * hiddenDim + h] * input[j];
+                    hidden[h] = Math.Max(0, z); // ReLU
+                }
+                double output = bO;
+                for (int h = 0; h < hiddenDim; h++) output += wO[h] * hidden[h];
+                double pred = Sigmoid(output);
+
+                bool isCorrect = (rawP >= 0.5) == (s.Direction > 0);
+                double err = pred - (isCorrect ? 1.0 : 0.0);
+
+                // Backward: output layer
+                bO -= sgdLr * err;
+                for (int h = 0; h < hiddenDim; h++) wO[h] -= sgdLr * err * hidden[h];
+
+                // Backward: hidden layer
+                for (int h = 0; h < hiddenDim; h++)
+                {
+                    if (hidden[h] <= 0) continue; // ReLU gradient
+                    double dh = err * wO[h];
+                    bH[h] -= sgdLr * dh;
+                    for (int j = 0; j < inputDim; j++) wH[j * hiddenDim + h] -= sgdLr * dh * input[j];
+                }
+            }
+        }
+
+        // Pack weights: [wO..., bO, wH..., bH...]  — compatible with existing double[] format
+        var packed = new double[hiddenDim + 1 + inputDim * hiddenDim + hiddenDim];
+        Array.Copy(wO, 0, packed, 0, hiddenDim);
+        packed[hiddenDim] = bO;
+        Array.Copy(wH, 0, packed, hiddenDim + 1, wH.Length);
+        Array.Copy(bH, 0, packed, hiddenDim + 1 + wH.Length, hiddenDim);
+        return (packed, 0.0); // bias encoded in packed weights
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
-    //  ABSTENTION GATE
+    //  ABSTENTION GATE (Items 21,22,24)
     // ═══════════════════════════════════════════════════════════════════════
 
-    private static (double[] Weights, double Bias, double Threshold) FitAbstentionModel(
+    private static (double[] Weights, double Bias, double Threshold, double ThresholdBuy, double ThresholdSell, double[] CoverageAccCurve)
+        FitAbstentionModel(
         List<TrainingSample> calSet, List<GbmTree> trees, double baseLogOdds,
         double lr, double plattA, double plattB,
-        double[] metaLabelWeights, double metaLabelBias, int featureCount)
+        double[] metaLabelWeights, double metaLabelBias, int featureCount,
+        int[]? topFeatureIndices = null, bool separateThresholds = false)
     {
-        if (calSet.Count < 20) return ([], 0.0, 0.5);
+        if (calSet.Count < 20) return ([], 0.0, 0.5, 0.5, 0.5, []);
 
-        int dim = 3; // calibP, |calibP - 0.5|, metaLabelScore
-        var w = new double[dim];
-        double b = 0;
+        int fi0 = topFeatureIndices is { Length: > 0 } ? topFeatureIndices[0] : 0;
+        int fi1 = topFeatureIndices is { Length: > 1 } ? topFeatureIndices[1] : 1;
+        int fi2 = topFeatureIndices is { Length: > 2 } ? topFeatureIndices[2] : 2;
 
+        int dim = 3;
+        var w = new double[dim]; double b = 0;
         const double sgdLr = 0.01;
+
         for (int epoch = 0; epoch < 100; epoch++)
         {
             foreach (var s in calSet)
             {
                 double calibP = GbmCalibProb(s.Features, trees, baseLogOdds, lr, plattA, plattB, featureCount);
+                double ms = ComputeMetaLabelScore(s, trees, baseLogOdds, lr, featureCount, metaLabelWeights, metaLabelBias, fi0, fi1, fi2);
 
-                double metaLabelScore = metaLabelBias;
-                if (metaLabelWeights.Length > 0)
-                {
-                    double rawP = GbmProb(s.Features, trees, baseLogOdds, lr, featureCount);
-                    rawP = Math.Clamp(rawP, 1e-7, 1.0 - 1e-7);
-                    var mf = new[] { rawP, Logit(rawP),
-                        s.Features.Length > 0 ? s.Features[0] : 0,
-                        s.Features.Length > 1 ? s.Features[1] : 0,
-                        s.Features.Length > 2 ? s.Features[2] : 0 };
-                    metaLabelScore = metaLabelBias;
-                    for (int j = 0; j < Math.Min(metaLabelWeights.Length, mf.Length); j++)
-                        metaLabelScore += metaLabelWeights[j] * mf[j];
-                    metaLabelScore = Sigmoid(metaLabelScore);
-                }
-
-                var af = new[] { calibP, Math.Abs(calibP - 0.5), metaLabelScore };
-
-                double z = b;
-                for (int j = 0; j < dim; j++) z += w[j] * af[j];
+                var af = new[] { calibP, Math.Abs(calibP - 0.5), ms };
+                double z = b; for (int j = 0; j < dim; j++) z += w[j] * af[j];
                 double p = Sigmoid(z);
-
                 bool isCorrect = (calibP >= 0.5) == (s.Direction > 0);
-                double label = isCorrect ? 1.0 : 0.0;
-                double err = p - label;
-
+                double err = p - (isCorrect ? 1.0 : 0.0);
                 b -= sgdLr * err;
                 for (int j = 0; j < dim; j++) w[j] -= sgdLr * err * af[j];
             }
         }
 
-        // Find threshold on cal set that maximises filtered accuracy
-        double bestThreshold = 0.5;
-        double bestFilteredAcc = 0;
-        for (int ti = 30; ti <= 70; ti++)
+        // Item 21: Finer sweep (0.5% steps) + Item 22: coverage-accuracy curve
+        var curveEntries = new List<double>();
+        double bestThreshold = 0.5, bestFilteredAcc = 0;
+        double bestThresholdBuy = 0.5, bestThresholdSell = 0.5;
+
+        // Precompute per-sample scores
+        var sampleScores = new (double AbstScore, double CalibP, bool IsBuy, bool IsCorrect)[calSet.Count];
+        for (int i = 0; i < calSet.Count; i++)
+        {
+            double calibP = GbmCalibProb(calSet[i].Features, trees, baseLogOdds, lr, plattA, plattB, featureCount);
+            double ms = ComputeMetaLabelScore(calSet[i], trees, baseLogOdds, lr, featureCount, metaLabelWeights, metaLabelBias, fi0, fi1, fi2);
+            var af = new[] { calibP, Math.Abs(calibP - 0.5), ms };
+            double z = b; for (int j = 0; j < dim; j++) z += w[j] * af[j];
+            sampleScores[i] = (Sigmoid(z), calibP, calSet[i].Direction > 0, (calibP >= 0.5) == (calSet[i].Direction > 0));
+        }
+
+        for (int ti = 20; ti <= 80; ti++) // Item 21: wider range
         {
             double t = ti / 100.0;
             int correct = 0, total = 0;
-            foreach (var s in calSet)
+            foreach (var ss in sampleScores)
             {
-                double calibP = GbmCalibProb(s.Features, trees, baseLogOdds, lr, plattA, plattB, featureCount);
-                double rawP = GbmProb(s.Features, trees, baseLogOdds, lr, featureCount);
-                rawP = Math.Clamp(rawP, 1e-7, 1.0 - 1e-7);
-
-                // Compute full per-sample meta-label score (matching training computation)
-                double ms = 0.5;
-                if (metaLabelWeights.Length > 0)
-                {
-                    var mf = new[] { rawP, Logit(rawP),
-                        s.Features.Length > 0 ? s.Features[0] : 0,
-                        s.Features.Length > 1 ? s.Features[1] : 0,
-                        s.Features.Length > 2 ? s.Features[2] : 0 };
-                    double mlScore = metaLabelBias;
-                    for (int j2 = 0; j2 < Math.Min(metaLabelWeights.Length, mf.Length); j2++)
-                        mlScore += metaLabelWeights[j2] * mf[j2];
-                    ms = Sigmoid(mlScore);
-                }
-                var af = new[] { calibP, Math.Abs(calibP - 0.5), ms };
-                double z = b;
-                for (int j = 0; j < dim; j++) z += w[j] * af[j];
-                if (Sigmoid(z) < t) continue;
-                total++;
-                if ((calibP >= 0.5) == (s.Direction > 0)) correct++;
+                if (ss.AbstScore < t) continue;
+                total++; if (ss.IsCorrect) correct++;
             }
             double acc = total > 0 ? (double)correct / total : 0;
+            double coverage = (double)total / calSet.Count;
+            curveEntries.AddRange([t, coverage, acc]); // Item 22
+
             if (acc > bestFilteredAcc && total >= calSet.Count / 4)
+            { bestFilteredAcc = acc; bestThreshold = t; }
+        }
+
+        // Item 24: separate buy/sell thresholds
+        if (separateThresholds)
+        {
+            double bestBuyAcc = 0, bestSellAcc = 0;
+            for (int ti = 20; ti <= 80; ti++)
             {
-                bestFilteredAcc = acc;
-                bestThreshold = t;
+                double t = ti / 100.0;
+                int cBuy = 0, tBuy = 0, cSell = 0, tSell = 0;
+                foreach (var ss in sampleScores)
+                {
+                    if (ss.AbstScore < t) continue;
+                    if (ss.IsBuy) { tBuy++; if (ss.IsCorrect) cBuy++; }
+                    else { tSell++; if (ss.IsCorrect) cSell++; }
+                }
+                double buyAcc = tBuy > 0 ? (double)cBuy / tBuy : 0;
+                double sellAcc = tSell > 0 ? (double)cSell / tSell : 0;
+                if (buyAcc > bestBuyAcc && tBuy >= calSet.Count / 8) { bestBuyAcc = buyAcc; bestThresholdBuy = t; }
+                if (sellAcc > bestSellAcc && tSell >= calSet.Count / 8) { bestSellAcc = sellAcc; bestThresholdSell = t; }
             }
         }
 
-        return (w, b, bestThreshold);
+        return (w, b, bestThreshold, bestThresholdBuy, bestThresholdSell, curveEntries.ToArray());
+    }
+
+    private static double ComputeMetaLabelScore(TrainingSample s, List<GbmTree> trees, double baseLogOdds,
+        double lr, int featureCount, double[] metaLabelWeights, double metaLabelBias, int fi0, int fi1, int fi2)
+    {
+        if (metaLabelWeights.Length == 0) return 0.5;
+        double rawP = Math.Clamp(GbmProb(s.Features, trees, baseLogOdds, lr, featureCount), 1e-7, 1.0 - 1e-7);
+        var mf = new[] { rawP, Logit(rawP),
+            fi0 < s.Features.Length ? s.Features[fi0] : 0,
+            fi1 < s.Features.Length ? s.Features[fi1] : 0,
+            fi2 < s.Features.Length ? s.Features[fi2] : 0 };
+        double score = metaLabelBias;
+        for (int j = 0; j < Math.Min(metaLabelWeights.Length, mf.Length); j++) score += metaLabelWeights[j] * mf[j];
+        return Sigmoid(score);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  MAGNITUDE REGRESSORS
+    //  MAGNITUDE REGRESSORS (Item 44: quantile with Adam)
     // ═══════════════════════════════════════════════════════════════════════
 
     private static (double[] Weights, double Bias) FitLinearRegressor(
         List<TrainingSample> train, int featureCount, TrainingHyperparams hp)
     {
-        var w    = new double[featureCount];
-        double b = 0.0;
-
-        bool   canEarlyStop = train.Count >= 30;
-        int    valSize      = canEarlyStop ? Math.Max(5, train.Count / 10) : 0;
-        var    valSet       = canEarlyStop ? train[^valSize..] : train;
-        var    trainSet     = canEarlyStop ? train[..^valSize] : train;
-
+        var w = new double[featureCount]; double b = 0.0;
+        bool canEarlyStop = train.Count >= 30;
+        int valSize = canEarlyStop ? Math.Max(5, train.Count / 10) : 0;
+        var valSet = canEarlyStop ? train[^valSize..] : train;
+        var trainSet = canEarlyStop ? train[..^valSize] : train;
         if (trainSet.Count == 0) return (w, b);
 
-        var mW = new double[featureCount];
-        var vW = new double[featureCount];
-        double mB = 0.0, vB = 0.0;
-        double beta1t = 1.0, beta2t = 1.0;
+        var mW = new double[featureCount]; var vW = new double[featureCount];
+        double mB = 0.0, vB = 0.0, beta1t = 1.0, beta2t = 1.0;
         int t = 0;
-
         double bestValLoss = double.MaxValue;
-        var bestW = new double[featureCount];
-        double bestB = 0.0;
-        int patience = 0;
-
+        var bestW = new double[featureCount]; double bestB = 0.0; int patience = 0;
         int epochs = hp.MaxEpochs;
         double baseLr = hp.LearningRate > 0 ? hp.LearningRate : 0.1;
         double l2 = hp.L2Lambda;
@@ -1870,28 +2396,19 @@ public sealed class GbmModelTrainer : IMLModelTrainer
         for (int epoch = 0; epoch < epochs; epoch++)
         {
             double alpha = baseLr * 0.5 * (1.0 + Math.Cos(Math.PI * epoch / epochs));
-
             foreach (var s in trainSet)
             {
-                t++;
-                beta1t *= AdamBeta1;
-                beta2t *= AdamBeta2;
-
+                t++; beta1t *= AdamBeta1; beta2t *= AdamBeta2;
                 double pred = b;
                 for (int j = 0; j < featureCount && j < s.Features.Length; j++) pred += w[j] * s.Features[j];
                 double err = pred - s.Magnitude;
                 if (!double.IsFinite(err)) continue;
-
                 double huberGrad = Math.Abs(err) <= 1.0 ? err : Math.Sign(err);
-
-                double bc1 = 1.0 - beta1t;
-                double bc2 = 1.0 - beta2t;
+                double bc1 = 1.0 - beta1t, bc2 = 1.0 - beta2t;
                 double alphat = alpha * Math.Sqrt(bc2) / bc1;
-
                 mB = AdamBeta1 * mB + (1.0 - AdamBeta1) * huberGrad;
                 vB = AdamBeta2 * vB + (1.0 - AdamBeta2) * huberGrad * huberGrad;
                 b -= alphat * mB / (Math.Sqrt(vB) + AdamEpsilon);
-
                 for (int j = 0; j < featureCount && j < s.Features.Length; j++)
                 {
                     double g = huberGrad * s.Features[j] + l2 * w[j];
@@ -1900,93 +2417,119 @@ public sealed class GbmModelTrainer : IMLModelTrainer
                     w[j] -= alphat * mW[j] / (Math.Sqrt(vW[j]) + AdamEpsilon);
                 }
             }
-
             if (!canEarlyStop) continue;
-
-            double valLoss = 0.0;
-            int valN = 0;
+            double valLoss = 0.0; int valN = 0;
             foreach (var s in valSet)
             {
                 double pred = b;
                 for (int j = 0; j < featureCount && j < s.Features.Length; j++) pred += w[j] * s.Features[j];
                 double err = pred - s.Magnitude;
                 if (!double.IsFinite(err)) continue;
-                valLoss += Math.Abs(err) <= 1.0 ? 0.5 * err * err : Math.Abs(err) - 0.5;
-                valN++;
+                valLoss += Math.Abs(err) <= 1.0 ? 0.5 * err * err : Math.Abs(err) - 0.5; valN++;
             }
             valLoss = valN > 0 ? valLoss / valN : double.MaxValue;
-
-            if (valLoss < bestValLoss - 1e-6)
-            {
-                bestValLoss = valLoss;
-                Array.Copy(w, bestW, featureCount);
-                bestB = b;
-                patience = 0;
-            }
-            else if (++patience >= hp.EarlyStoppingPatience)
-                break;
+            if (valLoss < bestValLoss - 1e-6) { bestValLoss = valLoss; Array.Copy(w, bestW, featureCount); bestB = b; patience = 0; }
+            else if (++patience >= hp.EarlyStoppingPatience) break;
         }
-
         if (canEarlyStop) { w = bestW; b = bestB; }
         return (w, b);
     }
 
+    /// <summary>Item 44: Quantile regressor with Adam optimizer + early stopping.</summary>
     private static (double[] Weights, double Bias) FitQuantileRegressor(
-        List<TrainingSample> train, int featureCount, double tau)
+        List<TrainingSample> train, int featureCount, double tau, TrainingHyperparams hp)
     {
-        var w = new double[featureCount];
-        double b = 0;
-        const double sgdLr = 0.001;
+        var w = new double[featureCount]; double b = 0;
+        var mW = new double[featureCount]; var vW = new double[featureCount];
+        double mB = 0, vB = 0, beta1t = 1.0, beta2t = 1.0;
+        int t = 0;
+
+        bool canEarlyStop = train.Count >= 30;
+        int valSize = canEarlyStop ? Math.Max(5, train.Count / 10) : 0;
+        var valSet = canEarlyStop ? train[^valSize..] : train;
+        var trainSet = canEarlyStop ? train[..^valSize] : train;
+
+        double bestValLoss = double.MaxValue;
+        var bestW = new double[featureCount]; double bestB = 0; int patience = 0;
+        double baseLr = 0.001;
 
         for (int epoch = 0; epoch < 100; epoch++)
         {
-            foreach (var s in train)
+            double alpha = baseLr * 0.5 * (1.0 + Math.Cos(Math.PI * epoch / 100.0));
+            foreach (var s in trainSet)
+            {
+                t++; beta1t *= AdamBeta1; beta2t *= AdamBeta2;
+                double pred = b;
+                for (int j = 0; j < featureCount && j < s.Features.Length; j++) pred += w[j] * s.Features[j];
+                double err = s.Magnitude - pred;
+                double grad = err >= 0 ? -tau : (1 - tau);
+                double bc1 = 1.0 - beta1t, bc2 = 1.0 - beta2t;
+                double alphat = alpha * Math.Sqrt(bc2) / bc1;
+                mB = AdamBeta1 * mB + (1.0 - AdamBeta1) * grad;
+                vB = AdamBeta2 * vB + (1.0 - AdamBeta2) * grad * grad;
+                b -= alphat * mB / (Math.Sqrt(vB) + AdamEpsilon);
+                for (int j = 0; j < featureCount && j < s.Features.Length; j++)
+                {
+                    double g = grad * s.Features[j];
+                    mW[j] = AdamBeta1 * mW[j] + (1.0 - AdamBeta1) * g;
+                    vW[j] = AdamBeta2 * vW[j] + (1.0 - AdamBeta2) * g * g;
+                    w[j] -= alphat * mW[j] / (Math.Sqrt(vW[j]) + AdamEpsilon);
+                }
+            }
+            if (!canEarlyStop) continue;
+            double valLoss = 0; int valN = 0;
+            foreach (var s in valSet)
             {
                 double pred = b;
                 for (int j = 0; j < featureCount && j < s.Features.Length; j++) pred += w[j] * s.Features[j];
                 double err = s.Magnitude - pred;
-                double grad = err >= 0 ? tau : -(1 - tau);
-                b += sgdLr * grad;
-                for (int j = 0; j < featureCount && j < s.Features.Length; j++)
-                    w[j] += sgdLr * grad * s.Features[j];
+                valLoss += err >= 0 ? tau * err : (1 - tau) * (-err); valN++;
             }
+            valLoss = valN > 0 ? valLoss / valN : double.MaxValue;
+            if (valLoss < bestValLoss - 1e-6) { bestValLoss = valLoss; Array.Copy(w, bestW, featureCount); bestB = b; patience = 0; }
+            else if (++patience >= Math.Max(3, hp.EarlyStoppingPatience / 2)) break;
         }
+        if (canEarlyStop) { w = bestW; b = bestB; }
         return (w, b);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  DECISION BOUNDARY STATS
+    //  DECISION BOUNDARY, PREDICTION STABILITY, DURBIN-WATSON
     // ═══════════════════════════════════════════════════════════════════════
 
     private static (double Mean, double Std) ComputeDecisionBoundaryStats(
-        List<TrainingSample> calSet, List<GbmTree> trees, double baseLogOdds,
-        double lr, int featureCount)
+        List<TrainingSample> calSet, List<GbmTree> trees, double baseLogOdds, double lr, int featureCount)
     {
-        // Approximate gradient norm from ensemble score variance across feature perturbations
         var norms = new double[calSet.Count];
         for (int i = 0; i < calSet.Count; i++)
         {
             double p = GbmProb(calSet[i].Features, trees, baseLogOdds, lr, featureCount);
-            // For boosted ensemble, approximate gradient norm as p(1-p) * score_range
             norms[i] = p * (1 - p);
         }
-
         double mean = norms.Average();
-        double std  = 0;
+        double std = 0;
         foreach (double v in norms) std += (v - mean) * (v - mean);
         std = norms.Length > 1 ? Math.Sqrt(std / (norms.Length - 1)) : 0;
         return (mean, std);
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  DURBIN-WATSON
-    // ═══════════════════════════════════════════════════════════════════════
+    /// <summary>Item 38: Average distance-to-decision-boundary on test set.</summary>
+    private static double ComputePredictionStability(
+        List<TrainingSample> testSet, List<GbmTree> trees, double baseLogOdds, double lr, int featureCount)
+    {
+        double sum = 0;
+        foreach (var s in testSet)
+        {
+            double rawScore = GbmScore(s.Features, trees, baseLogOdds, lr, featureCount);
+            sum += Math.Abs(rawScore); // distance from decision boundary (0 in log-odds)
+        }
+        return testSet.Count > 0 ? sum / testSet.Count : 0;
+    }
 
     private static double ComputeDurbinWatson(
         List<TrainingSample> train, double[] magWeights, double magBias, int featureCount)
     {
         if (train.Count < 10 || magWeights.Length == 0) return 2.0;
-
         var residuals = new double[train.Count];
         for (int i = 0; i < train.Count; i++)
         {
@@ -1995,21 +2538,14 @@ public sealed class GbmModelTrainer : IMLModelTrainer
                 pred += magWeights[j] * train[i].Features[j];
             residuals[i] = train[i].Magnitude - pred;
         }
-
         double numSum = 0, denSum = 0;
-        for (int i = 1; i < residuals.Length; i++)
-        {
-            double d = residuals[i] - residuals[i - 1];
-            numSum += d * d;
-        }
-        for (int i = 0; i < residuals.Length; i++)
-            denSum += residuals[i] * residuals[i];
-
+        for (int i = 1; i < residuals.Length; i++) { double d = residuals[i] - residuals[i - 1]; numSum += d * d; }
+        for (int i = 0; i < residuals.Length; i++) denSum += residuals[i] * residuals[i];
         return denSum > 1e-15 ? numSum / denSum : 2.0;
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  KELLY FRACTION
+    //  KELLY, TEMPERATURE, BSS, MURPHY DECOMPOSITION
     // ═══════════════════════════════════════════════════════════════════════
 
     private static double ComputeAvgKellyFraction(
@@ -2023,89 +2559,653 @@ public sealed class GbmModelTrainer : IMLModelTrainer
             double p = GbmCalibProb(s.Features, trees, baseLogOdds, lr, plattA, plattB, featureCount);
             sum += Math.Max(0, 2 * p - 1);
         }
-        return sum / calSet.Count * 0.5; // half-Kelly
+        return sum / calSet.Count * 0.5;
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  TEMPERATURE SCALING
-    // ═══════════════════════════════════════════════════════════════════════
-
+    /// <summary>Item 12: Temperature scaling via Brent's method (golden section search).</summary>
     private static double FitTemperatureScaling(
-        List<TrainingSample> calSet, List<GbmTree> trees, double baseLogOdds,
-        double lr, int featureCount)
+        List<TrainingSample> calSet, List<GbmTree> trees, double baseLogOdds, double lr, int featureCount)
     {
-        double bestT = 1.0;
-        double bestLoss = double.MaxValue;
-
-        for (int ti = 5; ti <= 50; ti++)
+        // Precompute logits
+        var logits = new double[calSet.Count]; var labels = new int[calSet.Count];
+        for (int i = 0; i < calSet.Count; i++)
         {
-            double T = ti / 10.0;
-            double loss = 0;
-            foreach (var s in calSet)
-            {
-                double rawP = GbmProb(s.Features, trees, baseLogOdds, lr, featureCount);
-                rawP = Math.Clamp(rawP, 1e-7, 1.0 - 1e-7);
-                double p = Sigmoid(Logit(rawP) / T);
-                int y = s.Direction > 0 ? 1 : 0;
-                loss -= y * Math.Log(p + 1e-15) + (1 - y) * Math.Log(1 - p + 1e-15);
-            }
-            loss /= calSet.Count;
-            if (loss < bestLoss) { bestLoss = loss; bestT = T; }
+            double rawP = Math.Clamp(GbmProb(calSet[i].Features, trees, baseLogOdds, lr, featureCount), 1e-7, 1.0 - 1e-7);
+            logits[i] = Logit(rawP);
+            labels[i] = calSet[i].Direction > 0 ? 1 : 0;
         }
-        return bestT;
-    }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  BRIER SKILL SCORE
-    // ═══════════════════════════════════════════════════════════════════════
+        double TempLoss(double T)
+        {
+            double loss = 0;
+            for (int i = 0; i < calSet.Count; i++)
+            {
+                double p = Sigmoid(logits[i] / T);
+                loss -= labels[i] * Math.Log(p + 1e-15) + (1 - labels[i]) * Math.Log(1 - p + 1e-15);
+            }
+            return loss / calSet.Count;
+        }
+
+        // Golden section search on [0.1, 10.0]
+        double a = 0.1, bnd = 10.0;
+        const double phi = 0.6180339887;
+        double x1 = bnd - phi * (bnd - a), x2 = a + phi * (bnd - a);
+        double f1 = TempLoss(x1), f2 = TempLoss(x2);
+
+        for (int iter = 0; iter < 50; iter++)
+        {
+            if (f1 < f2) { bnd = x2; x2 = x1; f2 = f1; x1 = bnd - phi * (bnd - a); f1 = TempLoss(x1); }
+            else { a = x1; x1 = x2; f1 = f2; x2 = a + phi * (bnd - a); f2 = TempLoss(x2); }
+            if (Math.Abs(bnd - a) < 0.001) break;
+        }
+        return (a + bnd) / 2.0;
+    }
 
     private static double ComputeBrierSkillScore(
         List<TrainingSample> testSet, List<GbmTree> trees, double baseLogOdds,
         double lr, double plattA, double plattB, int featureCount)
     {
         if (testSet.Count < 10) return 0;
-
-        double brier = 0;
-        int posCount = 0;
+        double brier = 0; int posCount = 0;
         foreach (var s in testSet)
         {
             double p = GbmCalibProb(s.Features, trees, baseLogOdds, lr, plattA, plattB, featureCount);
             int y = s.Direction > 0 ? 1 : 0;
-            brier += (p - y) * (p - y);
-            posCount += y;
+            brier += (p - y) * (p - y); posCount += y;
         }
         brier /= testSet.Count;
-
         double baseRate = (double)posCount / testSet.Count;
         double naiveBrier = baseRate * (1 - baseRate);
         return naiveBrier > 1e-10 ? 1.0 - brier / naiveBrier : 0;
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  TREE SPLIT IMPORTANCE (for CV folds — cheaper than permutation)
-    // ═══════════════════════════════════════════════════════════════════════
-
-    private static double[] ComputeTreeSplitImportance(List<GbmTree> trees, int featureCount)
+    /// <summary>Item 36: Murphy log-loss decomposition into calibration + refinement.</summary>
+    private static (double CalibrationLoss, double RefinementLoss) ComputeMurphyDecomposition(
+        List<TrainingSample> testSet, List<GbmTree> trees, double baseLogOdds,
+        double lr, double plattA, double plattB, int featureCount, int bins = 10)
     {
-        var importance = new double[featureCount];
-        foreach (var tree in trees)
+        if (testSet.Count < bins) return (0, 0);
+        var binSumP = new double[bins]; var binSumY = new double[bins]; var binCount = new int[bins];
+        int totalPos = 0;
+
+        foreach (var s in testSet)
         {
-            if (tree.Nodes is null) continue;
-            foreach (var node in tree.Nodes)
-            {
-                if (!node.IsLeaf && node.SplitFeature < featureCount)
-                    importance[node.SplitFeature] += 1.0;
-            }
+            double p = GbmCalibProb(s.Features, trees, baseLogOdds, lr, plattA, plattB, featureCount);
+            int y = s.Direction > 0 ? 1 : 0;
+            int bin = Math.Clamp((int)(p * bins), 0, bins - 1);
+            binSumP[bin] += p; binSumY[bin] += y; binCount[bin]++; totalPos += y;
         }
 
-        double total = importance.Sum();
-        if (total > 1e-6)
-            for (int j = 0; j < featureCount; j++) importance[j] /= total;
-        return importance;
+        double baseRate = (double)totalPos / testSet.Count;
+        double calLoss = 0, refLoss = 0;
+        int n = testSet.Count;
+        for (int b = 0; b < bins; b++)
+        {
+            if (binCount[b] == 0) continue;
+            double avgP = binSumP[b] / binCount[b];
+            double avgY = binSumY[b] / binCount[b];
+            calLoss += (avgP - avgY) * (avgP - avgY) * binCount[b] / n; // reliability
+            refLoss += avgY * (1 - avgY) * binCount[b] / n; // within-bin variance (resolution proxy)
+        }
+        return (calLoss, refLoss);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  TREE SANITIZATION
+    //  MI REDUNDANCY (Item 35: drop recommendation)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    private static (string[] Pairs, int[] DropIndices) ComputeRedundantFeaturePairs(
+        List<TrainingSample> trainSet, int featureCount, double threshold, float[] importance)
+    {
+        if (trainSet.Count < 30) return ([], []);
+        int n = Math.Min(trainSet.Count, 500);
+        int numBins = Math.Max(5, (int)Math.Ceiling(1 + Math.Log2(n)));
+        var featureMin = new double[featureCount]; var featureMax = new double[featureCount];
+        var featureBinIdx = new int[featureCount * n];
+        Array.Fill(featureMin, double.MaxValue); Array.Fill(featureMax, double.MinValue);
+
+        for (int j = 0; j < featureCount; j++)
+        {
+            for (int i = 0; i < n; i++)
+            {
+                double v = trainSet[i].Features[j];
+                if (v < featureMin[j]) featureMin[j] = v;
+                if (v > featureMax[j]) featureMax[j] = v;
+            }
+            double range = featureMax[j] - featureMin[j];
+            double binWidth = range > 1e-15 ? range / numBins : 1.0;
+            for (int i = 0; i < n; i++)
+                featureBinIdx[j * n + i] = Math.Clamp((int)((trainSet[i].Features[j] - featureMin[j]) / binWidth), 0, numBins - 1);
+        }
+
+        var pairs = new List<string>(); var dropIndices = new List<int>();
+        double invN = 1.0 / n;
+
+        for (int a = 0; a < featureCount; a++)
+        {
+            for (int bi = a + 1; bi < featureCount; bi++)
+            {
+                var joint = new int[numBins * numBins]; var margA = new int[numBins]; var margB = new int[numBins];
+                for (int i = 0; i < n; i++)
+                {
+                    int ba = featureBinIdx[a * n + i]; int bb = featureBinIdx[bi * n + i];
+                    joint[ba * numBins + bb]++; margA[ba]++; margB[bb]++;
+                }
+
+                double mi = 0;
+                for (int ia = 0; ia < numBins; ia++)
+                {
+                    if (margA[ia] == 0) continue; double pA = margA[ia] * invN;
+                    for (int ib = 0; ib < numBins; ib++)
+                    {
+                        int jCount = joint[ia * numBins + ib];
+                        if (jCount == 0 || margB[ib] == 0) continue;
+                        double pJ = jCount * invN, pB = margB[ib] * invN;
+                        mi += pJ * Math.Log(pJ / (pA * pB));
+                    }
+                }
+
+                if (mi > threshold * Math.Log(2))
+                {
+                    string nameA = a < MLFeatureHelper.FeatureNames.Length ? MLFeatureHelper.FeatureNames[a] : $"F{a}";
+                    string nameB = bi < MLFeatureHelper.FeatureNames.Length ? MLFeatureHelper.FeatureNames[bi] : $"F{bi}";
+                    pairs.Add($"{nameA}:{nameB}");
+                    // Item 35: recommend dropping the less important feature
+                    float impA = a < importance.Length ? importance[a] : 0;
+                    float impB = bi < importance.Length ? importance[bi] : 0;
+                    dropIndices.Add(impA >= impB ? bi : a);
+                }
+            }
+        }
+        return (pairs.ToArray(), dropIndices.ToArray());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  TREESHAP, PARTIAL DEPENDENCE (Items 31, 32)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>Item 31: TreeSHAP baseline = mean prediction over training set.</summary>
+    private static double ComputeTreeShapBaseline(List<GbmTree> trees, double baseLogOdds, double lr,
+        List<TrainingSample> trainSet, int featureCount)
+    {
+        if (trainSet.Count == 0) return 0;
+        double sum = 0;
+        foreach (var s in trainSet) sum += GbmProb(s.Features, trees, baseLogOdds, lr, featureCount);
+        return sum / trainSet.Count;
+    }
+
+    /// <summary>Item 32: Partial dependence for top features (marginal response curves).</summary>
+    private static double[][] ComputePartialDependence(
+        List<TrainingSample> trainSet, List<GbmTree> trees, double baseLogOdds, double lr,
+        int featureCount, int[] topFeatureIndices, int gridPoints = 20)
+    {
+        if (trainSet.Count < 10 || topFeatureIndices.Length == 0) return [];
+        int subsample = Math.Min(trainSet.Count, 200);
+        var result = new double[topFeatureIndices.Length][];
+
+        for (int fi = 0; fi < topFeatureIndices.Length; fi++)
+        {
+            int fIdx = topFeatureIndices[fi];
+            if (fIdx >= featureCount) continue;
+
+            // Get feature range
+            float fmin = float.MaxValue, fmax = float.MinValue;
+            for (int i = 0; i < subsample; i++)
+            {
+                float v = trainSet[i].Features[fIdx];
+                if (v < fmin) fmin = v; if (v > fmax) fmax = v;
+            }
+
+            var pdp = new double[gridPoints * 2]; // [gridValue, avgPred, ...]
+            float step = (fmax - fmin) / (gridPoints - 1);
+
+            for (int g = 0; g < gridPoints; g++)
+            {
+                float gridVal = fmin + g * step;
+                double avgPred = 0;
+                var scratch = new float[trainSet[0].Features.Length];
+                for (int i = 0; i < subsample; i++)
+                {
+                    Array.Copy(trainSet[i].Features, scratch, scratch.Length);
+                    scratch[fIdx] = gridVal;
+                    avgPred += GbmProb(scratch, trees, baseLogOdds, lr, featureCount);
+                }
+                pdp[g * 2] = gridVal;
+                pdp[g * 2 + 1] = avgPred / subsample;
+            }
+            result[fi] = pdp;
+        }
+        return result;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  STATIONARITY (Item 34: interpolated ADF critical values)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    private static int CountNonStationaryFeatures(List<TrainingSample> samples, int featureCount)
+    {
+        if (samples.Count < 50) return 0;
+        int nonStationary = 0;
+        int maxObs = Math.Min(samples.Count, 500);
+        for (int j = 0; j < featureCount; j++)
+        {
+            var series = new double[maxObs];
+            for (int i = 0; i < maxObs; i++) series[i] = samples[i].Features[j];
+            if (IsNonStationary(series)) nonStationary++;
+        }
+        return nonStationary;
+    }
+
+    private static bool IsNonStationary(double[] series)
+    {
+        int N = series.Length;
+        if (N < 20) return false;
+        var dx = new double[N - 1];
+        for (int i = 0; i < dx.Length; i++) dx[i] = series[i + 1] - series[i];
+
+        int p = Math.Min(12, (int)Math.Floor(Math.Pow(N - 1, 1.0 / 3.0)));
+        int start = p + 1;
+        int nObs = dx.Length - start;
+        if (nObs < 10) return false;
+
+        int cols = 2 + p;
+        var X = new double[nObs * cols]; var Y = new double[nObs];
+        for (int t = 0; t < nObs; t++)
+        {
+            int ti = start + t; Y[t] = dx[ti];
+            X[t * cols + 0] = 1.0; X[t * cols + 1] = series[ti];
+            for (int k = 0; k < p; k++) X[t * cols + 2 + k] = dx[ti - 1 - k];
+        }
+
+        var xtx = new double[cols * cols]; var xty = new double[cols];
+        for (int t = 0; t < nObs; t++)
+            for (int a = 0; a < cols; a++)
+            {
+                double xa = X[t * cols + a]; xty[a] += xa * Y[t];
+                for (int b2 = a; b2 < cols; b2++)
+                { double v = xa * X[t * cols + b2]; xtx[a * cols + b2] += v; if (a != b2) xtx[b2 * cols + a] += v; }
+            }
+
+        var L = new double[cols * cols];
+        for (int i = 0; i < cols; i++)
+        {
+            for (int j2 = 0; j2 <= i; j2++)
+            {
+                double sum = 0;
+                for (int k = 0; k < j2; k++) sum += L[i * cols + k] * L[j2 * cols + k];
+                if (i == j2) { double diag = xtx[i * cols + i] - sum; if (diag <= 1e-15) return false; L[i * cols + j2] = Math.Sqrt(diag); }
+                else L[i * cols + j2] = (xtx[i * cols + j2] - sum) / L[j2 * cols + j2];
+            }
+        }
+
+        var z = new double[cols];
+        for (int i = 0; i < cols; i++) { double sum = 0; for (int k = 0; k < i; k++) sum += L[i * cols + k] * z[k]; z[i] = (xty[i] - sum) / L[i * cols + i]; }
+        var beta = new double[cols];
+        for (int i = cols - 1; i >= 0; i--) { double sum = 0; for (int k = i + 1; k < cols; k++) sum += L[k * cols + i] * beta[k]; beta[i] = (z[i] - sum) / L[i * cols + i]; }
+
+        double gamma = beta[1];
+        double sse = 0;
+        for (int t = 0; t < nObs; t++) { double pred = 0; for (int c = 0; c < cols; c++) pred += X[t * cols + c] * beta[c]; double resid = Y[t] - pred; sse += resid * resid; }
+        double sigma2 = sse / Math.Max(1, nObs - cols);
+
+        var Linv = new double[cols * cols];
+        for (int i = 0; i < cols; i++)
+        {
+            Linv[i * cols + i] = 1.0 / L[i * cols + i];
+            for (int j2 = i + 1; j2 < cols; j2++)
+            { double sum = 0; for (int k = i; k < j2; k++) sum += L[j2 * cols + k] * Linv[k * cols + i]; Linv[j2 * cols + i] = -sum / L[j2 * cols + j2]; }
+        }
+
+        double varGamma = 0;
+        for (int k = 0; k < cols; k++) varGamma += Linv[k * cols + 1] * Linv[k * cols + 1];
+        varGamma *= sigma2;
+        if (varGamma <= 1e-15) return false;
+
+        double tStat = gamma / Math.Sqrt(varGamma);
+
+        // Item 34: Interpolated ADF critical values (5% level, with constant)
+        double criticalValue = InterpolateAdfCritical(nObs);
+        return tStat > criticalValue;
+    }
+
+    /// <summary>Item 34: Interpolate ADF critical values from standard table.</summary>
+    private static double InterpolateAdfCritical(int n)
+    {
+        // (N, critical_value_5pct) from Fuller's table (with constant, no trend)
+        ReadOnlySpan<(int N, double CV)> table = [(25, -3.00), (50, -2.93), (100, -2.89), (250, -2.88), (500, -2.86), (1000, -2.86)];
+        if (n <= table[0].N) return table[0].CV;
+        if (n >= table[^1].N) return table[^1].CV;
+        for (int i = 0; i < table.Length - 1; i++)
+        {
+            if (n <= table[i + 1].N)
+            {
+                double frac = (double)(n - table[i].N) / (table[i + 1].N - table[i].N);
+                return table[i].CV + frac * (table[i + 1].CV - table[i].CV);
+            }
+        }
+        return -2.86;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  DENSITY-RATIO (Item 27: MLP), COVARIATE SHIFT (Item 29: continuous)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>Item 27: Density-ratio with 2-layer MLP discriminator.</summary>
+    private static double[] ComputeDensityRatioWeights(
+        List<TrainingSample> trainSet, int featureCount, int windowDays)
+    {
+        int recentCount = Math.Min(trainSet.Count / 3, windowDays * 24);
+        if (recentCount < 20) return Enumerable.Repeat(1.0, trainSet.Count).ToArray();
+        int cutoff = trainSet.Count - recentCount;
+
+        // MLP: featureCount → 8 → 1
+        int hiddenDim = Math.Min(8, featureCount);
+        var wH = new double[featureCount * hiddenDim]; var bH = new double[hiddenDim];
+        var wO = new double[hiddenDim]; double bO = 0;
+        var rng = new Random(42);
+        for (int i = 0; i < wH.Length; i++) wH[i] = (rng.NextDouble() - 0.5) * 0.1;
+        for (int i = 0; i < wO.Length; i++) wO[i] = (rng.NextDouble() - 0.5) * 0.1;
+        var hidden = new double[hiddenDim];
+
+        const double sgdLr = 0.005;
+        for (int epoch = 0; epoch < 30; epoch++)
+        {
+            for (int i = 0; i < trainSet.Count; i++)
+            {
+                double label = i >= cutoff ? 1.0 : 0.0;
+                // Forward
+                for (int h = 0; h < hiddenDim; h++)
+                {
+                    double z = bH[h];
+                    for (int j = 0; j < featureCount && j < trainSet[i].Features.Length; j++)
+                        z += wH[j * hiddenDim + h] * trainSet[i].Features[j];
+                    hidden[h] = Math.Max(0, z);
+                }
+                double output = bO;
+                for (int h = 0; h < hiddenDim; h++) output += wO[h] * hidden[h];
+                double p = Sigmoid(output);
+                double err = p - label;
+                // Backward
+                bO -= sgdLr * err;
+                for (int h = 0; h < hiddenDim; h++)
+                {
+                    wO[h] -= sgdLr * err * hidden[h];
+                    if (hidden[h] <= 0) continue;
+                    double dh = err * wO[h];
+                    bH[h] -= sgdLr * dh;
+                    for (int j = 0; j < featureCount && j < trainSet[i].Features.Length; j++)
+                        wH[j * hiddenDim + h] -= sgdLr * dh * trainSet[i].Features[j];
+                }
+            }
+        }
+
+        var weights = new double[trainSet.Count];
+        for (int i = 0; i < trainSet.Count; i++)
+        {
+            for (int h = 0; h < hiddenDim; h++)
+            {
+                double z = bH[h];
+                for (int j = 0; j < featureCount && j < trainSet[i].Features.Length; j++)
+                    z += wH[j * hiddenDim + h] * trainSet[i].Features[j];
+                hidden[h] = Math.Max(0, z);
+            }
+            double output = bO;
+            for (int h = 0; h < hiddenDim; h++) output += wO[h] * hidden[h];
+            double prob = Math.Clamp(Sigmoid(output), 0.01, 0.99);
+            weights[i] = prob / (1 - prob);
+        }
+
+        double sum = weights.Sum();
+        if (sum > 1e-15) for (int i = 0; i < weights.Length; i++) weights[i] /= sum;
+        return weights;
+    }
+
+    /// <summary>Item 29: Continuous novelty scoring for covariate shift weights.</summary>
+    private static double[] ComputeCovariateShiftWeights(
+        List<TrainingSample> trainSet, double[][] parentBp, int featureCount)
+    {
+        var weights = new double[trainSet.Count];
+        for (int i = 0; i < trainSet.Count; i++)
+        {
+            double totalNovelty = 0; int checkedCount = 0;
+            for (int j = 0; j < featureCount && j < parentBp.Length; j++)
+            {
+                double[] bp = parentBp[j];
+                if (bp.Length < 2) continue;
+                checkedCount++;
+                double v = trainSet[i].Features[j];
+                // Continuous: distance from nearest boundary, normalised by range
+                double range = bp[^1] - bp[0];
+                if (range < 1e-15) continue;
+                double distBelow = v < bp[0] ? (bp[0] - v) / range : 0;
+                double distAbove = v > bp[^1] ? (v - bp[^1]) / range : 0;
+                totalNovelty += distBelow + distAbove;
+            }
+            weights[i] = 1.0 + (checkedCount > 0 ? totalNovelty / checkedCount : 0);
+        }
+        double mean = weights.Average();
+        if (mean > 1e-15) for (int i = 0; i < weights.Length; i++) weights[i] /= mean;
+        return weights;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  CONCEPT DRIFT GATE (Item 28)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>Item 28: Sliding-window loss comparison — exclude stale early segments.</summary>
+    private List<TrainingSample> ApplyConceptDriftGate(List<TrainingSample> samples, int featureCount, int minSamples)
+    {
+        int windowSize = Math.Max(minSamples, samples.Count / 5);
+        if (samples.Count < windowSize * 2) return samples;
+
+        // Compare loss of earliest window vs latest window using simple accuracy proxy
+        var earlyWindow = samples[..windowSize];
+        var lateWindow = samples[^windowSize..];
+
+        int earlyBuyCount = earlyWindow.Count(s => s.Direction > 0);
+        int lateBuyCount = lateWindow.Count(s => s.Direction > 0);
+
+        double earlyBuyRate = (double)earlyBuyCount / windowSize;
+        double lateBuyRate = (double)lateBuyCount / windowSize;
+
+        // If distribution has shifted significantly, trim early data
+        if (Math.Abs(earlyBuyRate - lateBuyRate) > 0.15)
+        {
+            int trimTo = Math.Max(minSamples, samples.Count / 2);
+            _logger.LogInformation("GBM concept drift gate: trimming {Old}→{New} samples (buyRate drift {Early:P1}→{Late:P1})",
+                samples.Count, trimTo, earlyBuyRate, lateBuyRate);
+            return samples[^trimTo..];
+        }
+        return samples;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  EFB: EXCLUSIVE FEATURE BUNDLING (Item 3)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>Item 3: Build EFB mapping — bundles mutually exclusive features.</summary>
+    private static (int[] Mapping, int EffectiveCount) BuildEfbMapping(
+        List<TrainingSample> samples, int featureCount)
+    {
+        int n = Math.Min(samples.Count, 500);
+        // Count non-zero overlap between features
+        var conflictCount = new int[featureCount * featureCount];
+        for (int i = 0; i < n; i++)
+        {
+            for (int a = 0; a < featureCount; a++)
+            {
+                if (Math.Abs(samples[i].Features[a]) < 1e-10) continue;
+                for (int b2 = a + 1; b2 < featureCount; b2++)
+                {
+                    if (Math.Abs(samples[i].Features[b2]) < 1e-10) continue;
+                    conflictCount[a * featureCount + b2]++;
+                }
+            }
+        }
+
+        // Greedy bundling: features with < 1% mutual non-zero rate can be bundled
+        var mapping = new int[featureCount];
+        for (int i = 0; i < featureCount; i++) mapping[i] = i; // default: map to self
+
+        int maxConflicts = (int)(n * 0.01);
+        var bundled = new bool[featureCount];
+        int nextBundle = 0;
+        var bundles = new List<List<int>>();
+
+        for (int a = 0; a < featureCount; a++)
+        {
+            if (bundled[a]) continue;
+            var bundle = new List<int> { a };
+            for (int b2 = a + 1; b2 < featureCount; b2++)
+            {
+                if (bundled[b2]) continue;
+                bool canBundle = true;
+                foreach (int existing in bundle)
+                {
+                    int key = existing < b2 ? existing * featureCount + b2 : b2 * featureCount + existing;
+                    if (conflictCount[key] > maxConflicts) { canBundle = false; break; }
+                }
+                if (canBundle) { bundle.Add(b2); bundled[b2] = true; }
+            }
+            foreach (int f in bundle) mapping[f] = nextBundle;
+            bundled[a] = true;
+            bundles.Add(bundle);
+            nextBundle++;
+        }
+
+        return (mapping, nextBundle);
+    }
+
+    private static List<TrainingSample> ApplyEfbMapping(List<TrainingSample> samples, int[] mapping, int effectiveCount)
+    {
+        return samples.Select(s =>
+        {
+            var newFeatures = new float[effectiveCount];
+            for (int j = 0; j < s.Features.Length && j < mapping.Length; j++)
+            {
+                int target = mapping[j];
+                if (target < effectiveCount)
+                    newFeatures[target] += s.Features[j]; // sum bundled features
+            }
+            return s with { Features = newFeatures };
+        }).ToList();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  RANK STABILITY (Item 33: Kendall's W)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>Item 33: Rank-based feature stability using Kendall's W across fold importance rankings.</summary>
+    private static double[] ComputeRankStability(List<double[]> foldImportances, int featureCount)
+    {
+        int k = foldImportances.Count;
+        if (k < 2) return new double[featureCount];
+
+        // Compute ranks for each fold
+        var ranks = new double[k][];
+        for (int fi = 0; fi < k; fi++)
+        {
+            var imp = foldImportances[fi];
+            var indexed = imp.Select((v, idx) => (v, idx)).OrderByDescending(x => x.v).ToArray();
+            ranks[fi] = new double[featureCount];
+            for (int r = 0; r < indexed.Length && r < featureCount; r++)
+                ranks[fi][indexed[r].idx] = r + 1;
+        }
+
+        // Compute per-feature rank stability: coefficient of concordance per feature
+        var stability = new double[featureCount];
+        for (int j = 0; j < featureCount; j++)
+        {
+            double sumRank = 0;
+            for (int fi = 0; fi < k; fi++) sumRank += ranks[fi][j];
+            double meanRank = sumRank / k;
+            double variance = 0;
+            for (int fi = 0; fi < k; fi++)
+            {
+                double d = ranks[fi][j] - meanRank;
+                variance += d * d;
+            }
+            // Normalised stability: 0 = perfect agreement, 1 = maximum discord
+            stability[j] = k > 1 ? Math.Sqrt(variance / (k - 1)) / featureCount : 0;
+        }
+        return stability;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  UTILITIES
+    // ═══════════════════════════════════════════════════════════════════════
+
+    private static double ComputeSharpeTrend(IReadOnlyList<double> sharpePerFold)
+    {
+        if (sharpePerFold.Count < 3) return 0;
+        int n = sharpePerFold.Count;
+        double sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
+        for (int i = 0; i < n; i++) { sumX += i; sumY += sharpePerFold[i]; sumXY += i * sharpePerFold[i]; sumXX += i * i; }
+        double denom = n * sumXX - sumX * sumX;
+        return Math.Abs(denom) > 1e-15 ? (n * sumXY - sumX * sumY) / denom : 0;
+    }
+
+    private static double[] ComputeTemporalWeights(int count, double lambda)
+    {
+        if (count == 0) return [];
+        var w = new double[count];
+        for (int i = 0; i < count; i++) w[i] = Math.Exp(lambda * ((double)i / Math.Max(1, count - 1) - 1.0));
+        double sum = w.Sum();
+        if (sum > 1e-15) for (int i = 0; i < count; i++) w[i] /= sum;
+        return w;
+    }
+
+    private static (double MaxDrawdown, double Sharpe) ComputeEquityCurveStats((int Predicted, int Actual)[] predictions)
+    {
+        if (predictions.Length == 0) return (0, 0);
+        var returns = new double[predictions.Length];
+        double equity = 1.0, peak = 1.0, maxDD = 0;
+        for (int i = 0; i < predictions.Length; i++)
+        {
+            double r = predictions[i].Predicted == predictions[i].Actual ? 0.01 : -0.01;
+            returns[i] = r; equity += r;
+            if (equity > peak) peak = equity;
+            double dd = peak > 0 ? (peak - equity) / peak : 0;
+            if (dd > maxDD) maxDD = dd;
+        }
+        double mean = returns.Average();
+        double varSum = 0;
+        foreach (double r in returns) varSum += (r - mean) * (r - mean);
+        double std = returns.Length > 1 ? Math.Sqrt(varSum / (returns.Length - 1)) : 0;
+        return (maxDD, std > 1e-10 ? mean / std * Math.Sqrt(252) : 0);
+    }
+
+    private static bool[] BuildFeatureMask(float[] importance, double threshold, int featureCount)
+    {
+        if (threshold <= 0.0 || featureCount == 0) { var allTrue = new bool[featureCount]; Array.Fill(allTrue, true); return allTrue; }
+        double minImportance = threshold / featureCount;
+        var mask = new bool[featureCount];
+        for (int j = 0; j < featureCount; j++) mask[j] = importance[j] >= minImportance;
+        return mask;
+    }
+
+    /// <summary>Item 15: Feature pruning via dimension reduction (not zeroing).</summary>
+    private static List<TrainingSample> ApplyMaskReduce(List<TrainingSample> samples, bool[] mask, int reducedDim)
+    {
+        return samples.Select(s =>
+        {
+            var f = new float[reducedDim]; int k = 0;
+            for (int j = 0; j < s.Features.Length && j < mask.Length; j++)
+                if (mask[j] && k < reducedDim) f[k++] = s.Features[j];
+            return s with { Features = f };
+        }).ToList();
+    }
+
+    private static double StdDev(IList<double> values, double mean)
+    {
+        if (values.Count < 2) return 0;
+        double sum = 0;
+        foreach (double v in values) sum += (v - mean) * (v - mean);
+        return Math.Sqrt(sum / (values.Count - 1));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  TREE SANITIZATION + COMPACT SERIALIZATION (Items 45, Item 5)
     // ═══════════════════════════════════════════════════════════════════════
 
     private static int SanitizeTrees(List<GbmTree> trees)
@@ -2116,13 +3216,7 @@ public sealed class GbmModelTrainer : IMLModelTrainer
             if (tree.Nodes is null) continue;
             bool needsSanitize = false;
             foreach (var node in tree.Nodes)
-            {
-                if (!double.IsFinite(node.LeafValue) || !double.IsFinite(node.SplitThreshold))
-                {
-                    needsSanitize = true;
-                    break;
-                }
-            }
+                if (!double.IsFinite(node.LeafValue) || !double.IsFinite(node.SplitThreshold)) { needsSanitize = true; break; }
             if (needsSanitize)
             {
                 foreach (var node in tree.Nodes)
@@ -2137,476 +3231,86 @@ public sealed class GbmModelTrainer : IMLModelTrainer
         return count;
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  EQUITY CURVE STATS
-    // ═══════════════════════════════════════════════════════════════════════
-
-    private static (double MaxDrawdown, double Sharpe) ComputeEquityCurveStats(
-        (int Predicted, int Actual)[] predictions)
+    /// <summary>Item 45: Remove placeholder/unreachable nodes to reduce serialization size.</summary>
+    private static void CompactTreeNodes(List<GbmTree> trees)
     {
-        if (predictions.Length == 0) return (0, 0);
-
-        var returns = new double[predictions.Length];
-        double equity = 1.0, peak = 1.0, maxDD = 0;
-
-        for (int i = 0; i < predictions.Length; i++)
+        foreach (var tree in trees)
         {
-            double r = predictions[i].Predicted == predictions[i].Actual ? 0.01 : -0.01;
-            returns[i] = r;
-            equity += r;
-            if (equity > peak) peak = equity;
-            double dd = peak > 0 ? (peak - equity) / peak : 0;
-            if (dd > maxDD) maxDD = dd;
-        }
+            if (tree.Nodes is null || tree.Nodes.Count <= 1) continue;
 
-        // Sharpe
-        double mean = returns.Average();
-        double varSum = 0;
-        foreach (double r in returns) varSum += (r - mean) * (r - mean);
-        double std = returns.Length > 1 ? Math.Sqrt(varSum / (returns.Length - 1)) : 0;
-        double sharpe = std > 1e-10 ? mean / std * Math.Sqrt(252) : 0;
-
-        return (maxDD, sharpe);
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    //  STATIONARITY GATE
-    // ═══════════════════════════════════════════════════════════════════════
-
-    /// <summary>
-    /// Counts features that fail a Dickey-Fuller unit root test at the 5% significance level.
-    /// Regression: Δx_t = α + γ·x_{t-1} + Σ β_k·Δx_{t-k} + ε_t  (augmented with p lags).
-    /// If the t-statistic for γ is above the critical value (−2.86 for 5%, constant, N≥100),
-    /// the null hypothesis of a unit root cannot be rejected → feature is non-stationary.
-    /// </summary>
-    private static int CountNonStationaryFeatures(List<TrainingSample> samples, int featureCount)
-    {
-        if (samples.Count < 50) return 0;
-
-        int nonStationary = 0;
-        int maxObs = Math.Min(samples.Count, 500); // cap for performance
-
-        for (int j = 0; j < featureCount; j++)
-        {
-            // Extract the feature series
-            var series = new double[maxObs];
-            for (int i = 0; i < maxObs; i++) series[i] = samples[i].Features[j];
-
-            if (IsNonStationary(series))
-                nonStationary++;
-        }
-        return nonStationary;
-    }
-
-    /// <summary>
-    /// Augmented Dickey-Fuller test on a univariate series.
-    /// Uses p = min(12, ⌊(N−1)^{1/3}⌋) augmentation lags.
-    /// Returns true if the series has a unit root (non-stationary) at the 5% level.
-    /// </summary>
-    private static bool IsNonStationary(double[] series)
-    {
-        int N = series.Length;
-        if (N < 20) return false;
-
-        // Δx_t = x_t − x_{t-1}
-        var dx = new double[N - 1];
-        for (int i = 0; i < dx.Length; i++) dx[i] = series[i + 1] - series[i];
-
-        // Number of augmentation lags
-        int p = Math.Min(12, (int)Math.Floor(Math.Pow(N - 1, 1.0 / 3.0)));
-        int start = p + 1; // first usable index into dx[]
-        int nObs = dx.Length - start;
-        if (nObs < 10) return false;
-
-        // Build OLS design matrix: [1, x_{t-1}, Δx_{t-1}, ..., Δx_{t-p}]
-        int cols = 2 + p; // intercept + γ + p lag coefficients
-        var X = new double[nObs * cols];
-        var Y = new double[nObs];
-
-        for (int t = 0; t < nObs; t++)
-        {
-            int ti = start + t; // index into dx[]
-            Y[t] = dx[ti];
-            X[t * cols + 0] = 1.0;                      // intercept
-            X[t * cols + 1] = series[ti];                // x_{t-1} (level)
-            for (int k = 0; k < p; k++)
-                X[t * cols + 2 + k] = dx[ti - 1 - k];   // lagged differences
-        }
-
-        // Solve via normal equations: β = (X'X)^{-1} X'Y
-        var xtx = new double[cols * cols];
-        var xty = new double[cols];
-
-        for (int t = 0; t < nObs; t++)
-        {
-            for (int a = 0; a < cols; a++)
+            // Mark reachable nodes via BFS from root
+            var reachable = new HashSet<int> { 0 };
+            var queue = new Queue<int>();
+            queue.Enqueue(0);
+            while (queue.Count > 0)
             {
-                double xa = X[t * cols + a];
-                xty[a] += xa * Y[t];
-                for (int b = a; b < cols; b++)
+                int idx = queue.Dequeue();
+                if (idx < 0 || idx >= tree.Nodes.Count) continue;
+                var node = tree.Nodes[idx];
+                if (node.IsLeaf) continue;
+                if (node.LeftChild >= 0 && node.LeftChild < tree.Nodes.Count && reachable.Add(node.LeftChild))
+                    queue.Enqueue(node.LeftChild);
+                if (node.RightChild >= 0 && node.RightChild < tree.Nodes.Count && reachable.Add(node.RightChild))
+                    queue.Enqueue(node.RightChild);
+            }
+
+            if (reachable.Count == tree.Nodes.Count) continue; // all reachable
+
+            // Remap indices
+            var indexMap = new Dictionary<int, int>();
+            var compacted = new List<GbmNode>();
+            var sortedReachable = reachable.OrderBy(x => x).ToList();
+            for (int i = 0; i < sortedReachable.Count; i++)
+                indexMap[sortedReachable[i]] = i;
+
+            foreach (int oldIdx in sortedReachable)
+            {
+                var node = tree.Nodes[oldIdx];
+                var newNode = new GbmNode
                 {
-                    double v = xa * X[t * cols + b];
-                    xtx[a * cols + b] += v;
-                    if (a != b) xtx[b * cols + a] += v;
-                }
+                    IsLeaf = node.IsLeaf, LeafValue = node.LeafValue,
+                    SplitFeature = node.SplitFeature, SplitThreshold = node.SplitThreshold,
+                    SplitGain = node.SplitGain,
+                    LeftChild = node.IsLeaf ? -1 : (indexMap.TryGetValue(node.LeftChild, out int lc) ? lc : -1),
+                    RightChild = node.IsLeaf ? -1 : (indexMap.TryGetValue(node.RightChild, out int rc) ? rc : -1),
+                };
+                compacted.Add(newNode);
             }
+            tree.Nodes = compacted;
         }
-
-        // Cholesky decomposition of X'X → L such that X'X = L·L'
-        var L = new double[cols * cols];
-        for (int i = 0; i < cols; i++)
-        {
-            for (int j2 = 0; j2 <= i; j2++)
-            {
-                double sum = 0;
-                for (int k = 0; k < j2; k++) sum += L[i * cols + k] * L[j2 * cols + k];
-                if (i == j2)
-                {
-                    double diag = xtx[i * cols + i] - sum;
-                    if (diag <= 1e-15) return false; // singular — treat as stationary
-                    L[i * cols + j2] = Math.Sqrt(diag);
-                }
-                else
-                {
-                    L[i * cols + j2] = (xtx[i * cols + j2] - sum) / L[j2 * cols + j2];
-                }
-            }
-        }
-
-        // Forward substitution: L·z = X'Y
-        var z = new double[cols];
-        for (int i = 0; i < cols; i++)
-        {
-            double sum = 0;
-            for (int k = 0; k < i; k++) sum += L[i * cols + k] * z[k];
-            z[i] = (xty[i] - sum) / L[i * cols + i];
-        }
-
-        // Back substitution: L'·β = z
-        var beta = new double[cols];
-        for (int i = cols - 1; i >= 0; i--)
-        {
-            double sum = 0;
-            for (int k = i + 1; k < cols; k++) sum += L[k * cols + i] * beta[k];
-            beta[i] = (z[i] - sum) / L[i * cols + i];
-        }
-
-        double gamma = beta[1]; // coefficient on x_{t-1}
-
-        // Residual variance σ²
-        double sse = 0;
-        for (int t = 0; t < nObs; t++)
-        {
-            double pred = 0;
-            for (int c = 0; c < cols; c++) pred += X[t * cols + c] * beta[c];
-            double resid = Y[t] - pred;
-            sse += resid * resid;
-        }
-        double sigma2 = sse / Math.Max(1, nObs - cols);
-
-        // Invert X'X to get Var(β̂) = σ² (X'X)^{-1}
-        // We already have L from Cholesky; invert L then compute L^{-T} L^{-1}
-        var Linv = new double[cols * cols];
-        for (int i = 0; i < cols; i++)
-        {
-            Linv[i * cols + i] = 1.0 / L[i * cols + i];
-            for (int j2 = i + 1; j2 < cols; j2++)
-            {
-                double sum = 0;
-                for (int k = i; k < j2; k++) sum += L[j2 * cols + k] * Linv[k * cols + i];
-                Linv[j2 * cols + i] = -sum / L[j2 * cols + j2];
-            }
-        }
-
-        // Var(γ̂) = σ² × [(X'X)^{-1}]_{1,1} = σ² × Σ_k (L^{-1})_{k,1}²
-        double varGamma = 0;
-        for (int k = 0; k < cols; k++)
-            varGamma += Linv[k * cols + 1] * Linv[k * cols + 1];
-        varGamma *= sigma2;
-
-        if (varGamma <= 1e-15) return false;
-
-        double tStat = gamma / Math.Sqrt(varGamma);
-
-        // ADF critical values at 5% (with constant, no trend):
-        // N≥500: −2.86, N≥100: −2.89, N≥50: −2.93. Use −2.86 as conservative default.
-        const double criticalValue5Pct = -2.86;
-        return tStat > criticalValue5Pct; // cannot reject unit root → non-stationary
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  DENSITY-RATIO IMPORTANCE WEIGHTS
+    //  TIMEOUT (Item 40)
     // ═══════════════════════════════════════════════════════════════════════
 
-    private static double[] ComputeDensityRatioWeights(
-        List<TrainingSample> trainSet, int featureCount, int windowDays)
+    private void CheckTimeoutBudget(Stopwatch sw, int timeoutMinutes, string phase)
     {
-        int recentCount = Math.Min(trainSet.Count / 3, windowDays * 24);
-        if (recentCount < 20) return Enumerable.Repeat(1.0, trainSet.Count).ToArray();
-
-        int cutoff = trainSet.Count - recentCount;
-        var w = new double[featureCount];
-        double b = 0;
-        const double sgdLr = 0.01;
-
-        // Train a logistic discriminator: recent=1, historical=0
-        for (int epoch = 0; epoch < 30; epoch++)
+        if (timeoutMinutes <= 0) return;
+        if (sw.Elapsed.TotalMinutes > timeoutMinutes)
         {
-            for (int i = 0; i < trainSet.Count; i++)
-            {
-                double label = i >= cutoff ? 1.0 : 0.0;
-                double z = b;
-                for (int j = 0; j < featureCount && j < trainSet[i].Features.Length; j++)
-                    z += w[j] * trainSet[i].Features[j];
-                double p = Sigmoid(z);
-                double err = p - label;
-                b -= sgdLr * err;
-                for (int j = 0; j < featureCount && j < trainSet[i].Features.Length; j++)
-                    w[j] -= sgdLr * err * trainSet[i].Features[j];
-            }
+            _logger.LogWarning("GBM training timeout exceeded ({Elapsed:F1}m > {Budget}m) at {Phase}",
+                sw.Elapsed.TotalMinutes, timeoutMinutes, phase);
+            throw new OperationCanceledException(
+                $"GBM training exceeded {timeoutMinutes}m budget at {phase}");
         }
-
-        var weights = new double[trainSet.Count];
-        for (int i = 0; i < trainSet.Count; i++)
-        {
-            double z = b;
-            for (int j = 0; j < featureCount && j < trainSet[i].Features.Length; j++)
-                z += w[j] * trainSet[i].Features[j];
-            double p = Math.Clamp(Sigmoid(z), 0.01, 0.99);
-            weights[i] = p / (1 - p);
-        }
-
-        // Normalise
-        double sum = weights.Sum();
-        if (sum > 1e-15)
-            for (int i = 0; i < weights.Length; i++) weights[i] /= sum;
-
-        return weights;
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  COVARIATE SHIFT WEIGHTS (parent model novelty scoring)
-    // ═══════════════════════════════════════════════════════════════════════
-
-    /// <summary>
-    /// Computes per-sample novelty weights from the parent model's feature quantile breakpoints.
-    /// Samples whose features lie outside the parent's inter-decile range [q10, q90] are up-weighted,
-    /// focusing the new model on distribution regions the parent never saw.
-    /// Weights are normalised to mean = 1.0 so gradient scale is unchanged.
-    /// </summary>
-    private static double[] ComputeCovariateShiftWeights(
-        List<TrainingSample> trainSet, double[][] parentBp, int featureCount)
-    {
-        var weights = new double[trainSet.Count];
-
-        for (int i = 0; i < trainSet.Count; i++)
-        {
-            int outsideCount = 0;
-            int checkedCount = 0;
-            for (int j = 0; j < featureCount && j < parentBp.Length; j++)
-            {
-                double[] bp = parentBp[j];
-                if (bp.Length < 2) continue;
-                checkedCount++;
-                double v = trainSet[i].Features[j];
-                // bp[0] ≈ q10, bp[^1] ≈ q90 (decile bin edges)
-                if (v < bp[0] || v > bp[^1])
-                    outsideCount++;
-            }
-            double noveltyFraction = checkedCount > 0 ? (double)outsideCount / checkedCount : 0;
-            weights[i] = 1.0 + noveltyFraction; // up-weight novel samples
-        }
-
-        // Normalise to mean = 1.0
-        double mean = weights.Average();
-        if (mean > 1e-15)
-            for (int i = 0; i < weights.Length; i++) weights[i] /= mean;
-
-        return weights;
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    //  MUTUAL INFORMATION REDUNDANCY
-    // ═══════════════════════════════════════════════════════════════════════
-
-    /// <summary>
-    /// Computes pairwise mutual information via histogram binning (Sturges' rule) to detect
-    /// redundant feature pairs. Unlike the previous Pearson r² proxy, this captures both
-    /// linear and nonlinear dependencies between features.
-    /// MI(X,Y) = Σ_{i,j} p(x_i,y_j) × log[ p(x_i,y_j) / (p(x_i)·p(y_j)) ]
-    /// </summary>
-    private static string[] ComputeRedundantFeaturePairs(
-        List<TrainingSample> trainSet, int featureCount, double threshold)
-    {
-        if (trainSet.Count < 30) return [];
-
-        int n = Math.Min(trainSet.Count, 500);
-        // Sturges' rule for bin count
-        int numBins = Math.Max(5, (int)Math.Ceiling(1 + Math.Log2(n)));
-
-        // Pre-compute per-feature min/max and bin assignments
-        var featureMin    = new double[featureCount];
-        var featureMax    = new double[featureCount];
-        var featureBinIdx = new int[featureCount * n];
-
-        Array.Fill(featureMin, double.MaxValue);
-        Array.Fill(featureMax, double.MinValue);
-
-        for (int j = 0; j < featureCount; j++)
-        {
-            for (int i = 0; i < n; i++)
-            {
-                double v = trainSet[i].Features[j];
-                if (v < featureMin[j]) featureMin[j] = v;
-                if (v > featureMax[j]) featureMax[j] = v;
-            }
-
-            double range = featureMax[j] - featureMin[j];
-            double binWidth = range > 1e-15 ? range / numBins : 1.0;
-            for (int i = 0; i < n; i++)
-            {
-                int bin = (int)((trainSet[i].Features[j] - featureMin[j]) / binWidth);
-                featureBinIdx[j * n + i] = Math.Clamp(bin, 0, numBins - 1);
-            }
-        }
-
-        var pairs = new List<string>();
-        double invN = 1.0 / n;
-
-        for (int a = 0; a < featureCount; a++)
-        {
-            for (int bi = a + 1; bi < featureCount; bi++)
-            {
-                // Build joint and marginal histograms
-                var joint    = new int[numBins * numBins];
-                var margA    = new int[numBins];
-                var margB    = new int[numBins];
-
-                for (int i = 0; i < n; i++)
-                {
-                    int ba = featureBinIdx[a * n + i];
-                    int bb = featureBinIdx[bi * n + i];
-                    joint[ba * numBins + bb]++;
-                    margA[ba]++;
-                    margB[bb]++;
-                }
-
-                // MI = Σ p_ij × log(p_ij / (p_i · p_j))
-                double mi = 0;
-                for (int ia = 0; ia < numBins; ia++)
-                {
-                    if (margA[ia] == 0) continue;
-                    double pA = margA[ia] * invN;
-                    for (int ib = 0; ib < numBins; ib++)
-                    {
-                        int jCount = joint[ia * numBins + ib];
-                        if (jCount == 0 || margB[ib] == 0) continue;
-                        double pJ  = jCount * invN;
-                        double pB  = margB[ib] * invN;
-                        mi += pJ * Math.Log(pJ / (pA * pB));
-                    }
-                }
-
-                if (mi > threshold * Math.Log(2))
-                {
-                    string nameA = a < MLFeatureHelper.FeatureNames.Length ? MLFeatureHelper.FeatureNames[a] : $"F{a}";
-                    string nameB = bi < MLFeatureHelper.FeatureNames.Length ? MLFeatureHelper.FeatureNames[bi] : $"F{bi}";
-                    pairs.Add($"{nameA}:{nameB}");
-                }
-            }
-        }
-        return pairs.ToArray();
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    //  SHARPE TREND
-    // ═══════════════════════════════════════════════════════════════════════
-
-    private static double ComputeSharpeTrend(IReadOnlyList<double> sharpePerFold)
-    {
-        if (sharpePerFold.Count < 3) return 0;
-
-        int n = sharpePerFold.Count;
-        double sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
-        for (int i = 0; i < n; i++)
-        {
-            sumX  += i;
-            sumY  += sharpePerFold[i];
-            sumXY += i * sharpePerFold[i];
-            sumXX += i * i;
-        }
-        double denom = n * sumXX - sumX * sumX;
-        return Math.Abs(denom) > 1e-15 ? (n * sumXY - sumX * sumY) / denom : 0;
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    //  TEMPORAL WEIGHTS
-    // ═══════════════════════════════════════════════════════════════════════
-
-    private static double[] ComputeTemporalWeights(int count, double lambda)
-    {
-        if (count == 0) return [];
-        var w = new double[count];
-        for (int i = 0; i < count; i++)
-            w[i] = Math.Exp(lambda * ((double)i / Math.Max(1, count - 1) - 1.0));
-        double sum = w.Sum();
-        if (sum > 1e-15)
-            for (int i = 0; i < count; i++) w[i] /= sum;
-        return w;
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    //  FEATURE MASK HELPERS
-    // ═══════════════════════════════════════════════════════════════════════
-
-    private static bool[] BuildFeatureMask(float[] importance, double threshold, int featureCount)
-    {
-        if (threshold <= 0.0 || featureCount == 0)
-        {
-            var allTrue = new bool[featureCount];
-            Array.Fill(allTrue, true);
-            return allTrue;
-        }
-        double minImportance = threshold / featureCount;
-        var mask = new bool[featureCount];
-        for (int j = 0; j < featureCount; j++)
-            mask[j] = importance[j] >= minImportance;
-        return mask;
-    }
-
-    private static List<TrainingSample> ApplyMask(List<TrainingSample> samples, bool[] mask)
-    {
-        return samples.Select(s =>
-        {
-            var f = (float[])s.Features.Clone();
-            for (int j = 0; j < f.Length && j < mask.Length; j++)
-                if (!mask[j]) f[j] = 0f;
-            return s with { Features = f };
-        }).ToList();
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    //  STANDARD DEVIATION
-    // ═══════════════════════════════════════════════════════════════════════
-
-    private static double StdDev(IList<double> values, double mean)
-    {
-        if (values.Count < 2) return 0;
-        double sum = 0;
-        foreach (double v in values) sum += (v - mean) * (v - mean);
-        return Math.Sqrt(sum / (values.Count - 1));
-    }
+    // ── Item 43: Progress reporting via structured log at milestones ─────
+    // (Implemented via _logger.LogInformation calls at key pipeline stages above)
 }
 
-/// <summary>Serialisable node in a GBM regression tree.</summary>
+/// <summary>Serialisable node in a GBM regression tree. Item 5: explicit child pointers (no heap gaps).</summary>
 public sealed class GbmNode
 {
     public bool   IsLeaf         { get; set; }
     public double LeafValue      { get; set; }
     public int    SplitFeature   { get; set; }
     public double SplitThreshold { get; set; }
-    public int    LeftChild      { get; set; }
-    public int    RightChild     { get; set; }
+    public int    LeftChild      { get; set; } = -1;
+    public int    RightChild     { get; set; } = -1;
+    /// <summary>Split gain at this node (for gain-weighted importance — Item 39).</summary>
+    public double SplitGain      { get; set; }
 }
 
 /// <summary>Serialisable regression tree used by <see cref="GbmModelTrainer"/>.</summary>

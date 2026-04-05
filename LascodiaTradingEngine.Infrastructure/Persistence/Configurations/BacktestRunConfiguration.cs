@@ -19,6 +19,7 @@ public class BacktestRunConfiguration : IEntityTypeConfiguration<BacktestRun>
         builder.Property(x => x.Timeframe).HasConversion<string>().IsRequired().HasMaxLength(10);
         builder.Property(x => x.Status).HasConversion<string>().IsRequired().HasMaxLength(20);
         builder.Property(x => x.InitialBalance).HasPrecision(18, 2);
+        builder.Property(x => x.ParametersSnapshotJson).HasColumnType("nvarchar(max)");
 
         builder.HasQueryFilter(x => !x.IsDeleted);
 

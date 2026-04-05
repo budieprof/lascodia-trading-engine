@@ -47,14 +47,18 @@ public sealed class GbmInferenceEngine : IModelInferenceEngine
             ? snapshot.GbmLearningRate
             : DefaultLearningRate;
 
+        bool hasPerTreeLr = snapshot.GbmPerTreeLearningRates is { Length: > 0 }
+                            && snapshot.GbmPerTreeLearningRates.Length == trees.Count;
+
         double score = snapshot.GbmBaseLogOdds;
         var treeProbs = new double[trees.Count];
 
         for (int t = 0; t < trees.Count; t++)
         {
+            double treeLr = hasPerTreeLr ? snapshot.GbmPerTreeLearningRates[t] : lr;
             double leafVal = Predict(trees[t], features);
-            score += lr * leafVal;
-            treeProbs[t] = MLFeatureHelper.Sigmoid(snapshot.GbmBaseLogOdds + lr * leafVal);
+            score += treeLr * leafVal;
+            treeProbs[t] = MLFeatureHelper.Sigmoid(snapshot.GbmBaseLogOdds + treeLr * leafVal);
         }
 
         double rawProb = MLFeatureHelper.Sigmoid(score);

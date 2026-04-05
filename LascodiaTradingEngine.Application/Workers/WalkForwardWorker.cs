@@ -213,6 +213,10 @@ public class WalkForwardWorker : BackgroundService
         run.Status = RunStatus.Running;
         await writeContext.SaveChangesAsync(ct);
 
+        var baseStrategyForRun = CloneStrategy(strategy);
+        if (!string.IsNullOrWhiteSpace(run.ParametersSnapshotJson))
+            baseStrategyForRun.ParametersJson = run.ParametersSnapshotJson;
+
         try
         {
             // Load all closed candles spanning the full date window in chronological order.
@@ -278,10 +282,12 @@ public class WalkForwardWorker : BackgroundService
                 // When enabled, re-optimise strategy parameters on the IS candles using a
                 // mini TPE search before evaluating on the OOS segment. This validates
                 // whether the optimisation process itself consistently finds good params.
-                Strategy evalStrategy = strategy;
-                if (run.ReOptimizePerFold && inSampleCandles.Count >= 60)
+                Strategy evalStrategy = baseStrategyForRun;
+                if (run.ReOptimizePerFold
+                    && string.IsNullOrWhiteSpace(run.ParametersSnapshotJson)
+                    && inSampleCandles.Count >= 60)
                 {
-                    var foldOptimised = await ReOptimizeOnFoldAsync(strategy, inSampleCandles, run.InitialBalance, ct);
+                    var foldOptimised = await ReOptimizeOnFoldAsync(baseStrategyForRun, inSampleCandles, run.InitialBalance, ct);
                     if (foldOptimised is not null)
                     {
                         evalStrategy = foldOptimised;
@@ -367,9 +373,23 @@ public class WalkForwardWorker : BackgroundService
         {
             try
             {
+                bool followUpPassed = run.Status == RunStatus.Completed;
+                if (followUpPassed)
+                {
+                    decimal maxCv = await GetConfigAsync(db, "Optimization:MaxCvCoefficientOfVariation", 0.50m, ct);
+                    if (!Optimization.OptimizationFollowUpQualityEvaluator.IsWalkForwardQualitySufficient(
+                            run, maxCv, out string reason))
+                    {
+                        followUpPassed = false;
+                        _logger.LogWarning(
+                            "WalkForwardWorker: validation walk-forward for optimization run {OptimizationRunId} failed quality gate — {Reason}",
+                            run.SourceOptimizationRunId.Value, reason);
+                    }
+                }
+
                 await Optimization.OptimizationFollowUpTracker.UpdateStatusAsync(
                     db, run.SourceOptimizationRunId.Value,
-                    run.Status == RunStatus.Completed, writeContext, ct);
+                    followUpPassed, writeContext, ct);
             }
             catch (Exception ex)
             {
@@ -491,6 +511,22 @@ public class WalkForwardWorker : BackgroundService
              + 0.20m * Math.Max(0m, 1m - r.MaxDrawdownPct / 20m)
              + 0.15m * Math.Min(1m, Math.Max(0m, r.SharpeRatio) / 2m)
              + 0.20m * Math.Min(1m, r.TotalTrades / 50m);
+    }
+
+    private static async Task<T> GetConfigAsync<T>(
+        DbContext ctx,
+        string key,
+        T defaultValue,
+        CancellationToken ct)
+    {
+        var entry = await ctx.Set<EngineConfig>()
+            .AsNoTracking()
+            .FirstOrDefaultAsync(c => c.Key == key, ct);
+
+        if (entry?.Value is null) return defaultValue;
+
+        try { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
+        catch { return defaultValue; }
     }
 
     private sealed record ScoredCandidate(string ParamsJson, decimal HealthScore, BacktestResult Result);

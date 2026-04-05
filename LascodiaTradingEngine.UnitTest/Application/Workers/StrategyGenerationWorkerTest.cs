@@ -235,6 +235,11 @@ public class StrategyGenerationWorkerTest : IDisposable
             Config("StrategyGeneration:MaxTradeTimeConcentration", "0.60"),
             Config("StrategyGeneration:CircuitBreakerMaxFailures", "3"),
             Config("StrategyGeneration:CircuitBreakerBackoffDays", "2"),
+            Config("StrategyGeneration:ConsecutiveFailures", "0"),
+            Config("StrategyGeneration:RetriesThisWindow", "0"),
+            Config("StrategyGeneration:RetryWindowDateUtc", ""),
+            Config("StrategyGeneration:CircuitBreakerUntilUtc", ""),
+            Config("StrategyGeneration:LastRunDateUtc", ""),
             Config("StrategyGeneration:MaxCandleCacheSize", "500000"),
             Config("StrategyGeneration:MaxCorrelatedCandidates", "4"),
             Config("StrategyGeneration:AdaptiveThresholdsEnabled", "false"),
@@ -1794,6 +1799,69 @@ public class StrategyGenerationWorkerTest : IDisposable
         Assert.Empty(_addedStrategies);
     }
 
+    [Fact]
+    public async Task ExecutePollAsync_VelocityCapSkip_PersistsLastRunDate()
+    {
+        var configs = DefaultConfigs(
+            ("StrategyGeneration:ScheduleHourUtc", DateTime.UtcNow.Hour.ToString()),
+            ("StrategyGeneration:MaxCandidatesPerWeek", "1"),
+            ("StrategyGeneration:StrategicReserveQuota", "0"));
+
+        var recentStrategies = new List<Strategy>
+        {
+            new()
+            {
+                Id = 77,
+                Name = "Auto-Recent",
+                StrategyType = StrategyType.MovingAverageCrossover,
+                Symbol = "EURUSD",
+                Timeframe = Timeframe.H1,
+                Status = StrategyStatus.Paused,
+                LifecycleStage = StrategyLifecycleStage.Draft,
+                CreatedAt = DateTime.UtcNow.AddDays(-1),
+                IsDeleted = false,
+            }
+        };
+
+        SetupDbContexts(configs, new(), recentStrategies, new(), new(), new(), new());
+
+        await _worker.ExecutePollAsync(CancellationToken.None);
+
+        var lastRun = configs.Single(c => c.Key == "StrategyGeneration:LastRunDateUtc").Value;
+        Assert.True(DateTime.TryParse(lastRun, out var parsed));
+        Assert.Equal(DateTime.UtcNow.Date, parsed.Date);
+    }
+
+    [Fact]
+    public async Task ExecutePollAsync_Failure_PersistsRetryWindowState()
+    {
+        var configs = DefaultConfigs(
+            ("StrategyGeneration:ScheduleHourUtc", DateTime.UtcNow.Hour.ToString()),
+            ("StrategyGeneration:CircuitBreakerMaxFailures", "5"),
+            ("StrategyGeneration:StrategicReserveQuota", "0"));
+        var pairs = new List<CurrencyPair> { MakePair() };
+        var regimes = new List<MarketRegimeSnapshot> { MakeRegime() };
+        var candles = GenerateCandles("EURUSD", Timeframe.H1, 200);
+
+        SetupDbContexts(configs, pairs, new(), candles, regimes, new(), new());
+        SetupDefaultRegimeMapper();
+
+        _mockTemplateProvider
+            .Setup(t => t.GetTemplates(It.IsAny<StrategyType>()))
+            .Throws(new InvalidOperationException("template provider boom"));
+
+        await _worker.ExecutePollAsync(CancellationToken.None);
+
+        Assert.Equal("1", configs.Single(c => c.Key == "StrategyGeneration:ConsecutiveFailures").Value);
+        Assert.Equal("1", configs.Single(c => c.Key == "StrategyGeneration:RetriesThisWindow").Value);
+
+        var retryWindowDate = configs.Single(c => c.Key == "StrategyGeneration:RetryWindowDateUtc").Value;
+        Assert.True(DateTime.TryParse(retryWindowDate, out var parsed));
+        Assert.Equal(DateTime.UtcNow.Date, parsed.Date);
+
+        Assert.Equal(string.Empty, configs.Single(c => c.Key == "StrategyGeneration:LastRunDateUtc").Value);
+    }
+
     // ── Data-driven regime mapper tests ──────────────────────────────────
 
     [Fact]
@@ -1956,6 +2024,65 @@ public class StrategyGenerationWorkerTest : IDisposable
         // We can't easily assert cache hit vs miss without inspecting EngineConfig writes,
         // but we verify the full pipeline including feedback loading works end-to-end
         Assert.NotEmpty(_addedStrategies);
+    }
+
+    [Fact]
+    public async Task Cycle_StaleCheckpointFingerprint_DoesNotResumePendingCandidates()
+    {
+        var pending = new ScreeningOutcome
+        {
+            Strategy = new Strategy
+            {
+                Name = "Auto-Checkpoint-MovingAverageCrossover-EURUSD-H1",
+                Description = "Auto-generated for Trending regime",
+                StrategyType = StrategyType.MovingAverageCrossover,
+                Symbol = "EURUSD",
+                Timeframe = Timeframe.H1,
+                ParametersJson = """{"FastPeriod":9,"SlowPeriod":21}""",
+                CreatedAt = DateTime.UtcNow,
+                Status = StrategyStatus.Paused,
+                LifecycleStage = StrategyLifecycleStage.Draft,
+                ScreeningMetricsJson = new ScreeningMetrics
+                {
+                    Regime = "Trending",
+                    GenerationSource = "Primary",
+                    IsWinRate = 0.62,
+                    OosWinRate = 0.58,
+                }.ToJson(),
+            },
+            TrainResult = MakePassingResult(),
+            OosResult = MakePassingResult(10),
+            Regime = MarketRegimeEnum.Trending,
+            Metrics = new ScreeningMetrics
+            {
+                Regime = "Trending",
+                GenerationSource = "Primary",
+                IsWinRate = 0.62,
+                OosWinRate = 0.58,
+            },
+        };
+
+        var checkpoint = new GenerationCheckpointStore.State
+        {
+            CycleDateUtc = DateTime.UtcNow.Date,
+            Fingerprint = "stale-fingerprint",
+            CandidatesCreated = 1,
+            PendingCandidates = [GenerationCheckpointStore.PendingCandidateState.FromOutcome(pending)],
+        };
+
+        var configs = DefaultConfigs(
+            ("StrategyGeneration:StrategicReserveQuota", "0"),
+            (GenerationCheckpointStore.ConfigKey, GenerationCheckpointStore.Serialize(checkpoint)));
+        var pairs = new List<CurrencyPair> { MakePair() };
+        var regimes = new List<MarketRegimeSnapshot> { MakeRegime() };
+
+        SetupDbContexts(configs, pairs, new(), new(), regimes, new(), new());
+        SetupDefaultRegimeMapper();
+        SetupDefaultTemplateProvider();
+
+        await _worker.RunGenerationCycleAsync(CancellationToken.None);
+
+        Assert.Empty(_addedStrategies);
     }
 
     // ── Fix 18: Walk-forward config mismatch warning ────────────────────

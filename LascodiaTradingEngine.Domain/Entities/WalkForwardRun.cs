@@ -100,6 +100,13 @@ public class WalkForwardRun : Entity<long>
     /// </summary>
     public long?    SourceOptimizationRunId     { get; set; }
 
+    /// <summary>
+    /// Optional parameter snapshot pinned to this run at queue time.
+    /// Optimization follow-up walk-forward runs use this instead of the mutable live
+    /// strategy parameters so they validate the approved candidate itself.
+    /// </summary>
+    public string?  ParametersSnapshotJson      { get; set; }
+
     /// <summary>Soft-delete flag. Filtered out by the global EF Core query filter.</summary>
     public bool    IsDeleted                    { get; set; }
 

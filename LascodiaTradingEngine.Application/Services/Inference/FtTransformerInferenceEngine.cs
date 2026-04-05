@@ -65,34 +65,43 @@ public sealed class FtTransformerInferenceEngine : IModelInferenceEngine
             snapshot.FtTransformerGamma1, snapshot.FtTransformerBeta1,
             snapshot.FtTransformerGamma2, snapshot.FtTransformerBeta2,
             snapshot.FtTransformerWff1, snapshot.FtTransformerBff1,
-            snapshot.FtTransformerWff2, snapshot.FtTransformerBff2);
+            snapshot.FtTransformerWff2, snapshot.FtTransformerBff2,
+            snapshot.FtTransformerPosBias);
 
-        // 4. Process additional layers from serialised JSON
-        if (numLayers > 1 && !string.IsNullOrEmpty(snapshot.FtTransformerAdditionalLayersJson))
+        // 4. Process additional layers (prefer binary, fall back to JSON)
+        if (numLayers > 1)
         {
-            try
-            {
-                var additionalLayers = JsonSerializer.Deserialize<SerializedLayerWeights[]>(
-                    snapshot.FtTransformerAdditionalLayersJson, JsonOptions);
+            List<SerializedLayerWeights>? additionalLayers = null;
 
-                if (additionalLayers is not null)
-                {
-                    for (int l = 0; l < additionalLayers.Length; l++)
-                    {
-                        var layer = additionalLayers[l];
-                        ProcessLayer(E, S, D, H, Dh, Ff,
-                            layer.Wq, layer.Wk, layer.Wv, layer.Wo,
-                            layer.Gamma1, layer.Beta1,
-                            layer.Gamma2, layer.Beta2,
-                            layer.Wff1, layer.Bff1,
-                            layer.Wff2, layer.Bff2);
-                    }
-                }
-            }
-            catch
+            if (snapshot.FtTransformerAdditionalLayersBytes is { Length: > 4 } blob)
             {
-                // If additional layers fail to deserialise, continue with layer 0 only
+                try { additionalLayers = DeserializeAdditionalLayers(blob, D, Ff); }
+                catch { /* fall through to JSON */ }
             }
+
+            if (additionalLayers is null && !string.IsNullOrEmpty(snapshot.FtTransformerAdditionalLayersJson))
+            {
+                try
+                {
+                    var arr = JsonSerializer.Deserialize<SerializedLayerWeights[]>(
+                        snapshot.FtTransformerAdditionalLayersJson, JsonOptions);
+                    if (arr is not null) additionalLayers = new List<SerializedLayerWeights>(arr);
+                }
+                catch { /* continue with layer 0 only */ }
+            }
+
+            if (additionalLayers is not null)
+                for (int l = 0; l < additionalLayers.Count; l++)
+                {
+                    var layer = additionalLayers[l];
+                    ProcessLayer(E, S, D, H, Dh, Ff,
+                        layer.Wq, layer.Wk, layer.Wv, layer.Wo,
+                        layer.Gamma1, layer.Beta1,
+                        layer.Gamma2, layer.Beta2,
+                        layer.Wff1, layer.Bff1,
+                        layer.Wff2, layer.Bff2,
+                        layer.PosBias);
+                }
         }
 
         // 5. Final LayerNorm on [CLS] position
@@ -116,7 +125,8 @@ public sealed class FtTransformerInferenceEngine : IModelInferenceEngine
         double[]? gamma1, double[]? beta1,
         double[]? gamma2, double[]? beta2,
         double[][]? Wff1, double[]? Bff1,
-        double[][]? Wff2, double[]? Bff2)
+        double[][]? Wff2, double[]? Bff2,
+        double[][]? posBias = null)
     {
         if (Wq is null || Wk is null || Wv is null || Wo is null) return;
 
@@ -136,6 +146,7 @@ public sealed class FtTransformerInferenceEngine : IModelInferenceEngine
         for (int h = 0; h < H; h++)
         {
             int hOff = h * Dh;
+            bool hasBias = posBias is not null && h < posBias.Length && posBias[h] is { Length: > 0 };
 
             // Scores
             var scores = new double[S * S];
@@ -145,7 +156,10 @@ public sealed class FtTransformerInferenceEngine : IModelInferenceEngine
                     double dot = 0;
                     for (int d = 0; d < Dh; d++)
                         dot += Q[r][hOff + d] * K[c][hOff + d];
-                    scores[r * S + c] = dot / sqrtDh;
+                    int idx = r * S + c;
+                    scores[idx] = dot / sqrtDh;
+                    if (hasBias && idx < posBias![h].Length)
+                        scores[idx] += posBias[h][idx];
                 }
 
             // Softmax per row
@@ -284,5 +298,82 @@ public sealed class FtTransformerInferenceEngine : IModelInferenceEngine
         public double[]?   Bff1   { get; set; }
         public double[][]? Wff2   { get; set; }
         public double[]?   Bff2   { get; set; }
+        public double[][]? PosBias { get; set; }
+    }
+
+    // ── Binary layer deserialisation (matches FtTransformerModelTrainer serialiser) ──
+
+    private static List<SerializedLayerWeights> DeserializeAdditionalLayers(byte[] data, int D, int Ff)
+    {
+        // Verify CRC32 trailer
+        if (data.Length < 4) throw new InvalidOperationException("Binary blob too short for CRC trailer.");
+        int payloadLen = data.Length - 4;
+        uint storedCrc = BitConverter.ToUInt32(data, payloadLen);
+        uint computedCrc = ComputeCrc32(data.AsSpan(0, payloadLen));
+        if (storedCrc != computedCrc)
+            throw new InvalidOperationException($"CRC32 mismatch: stored={storedCrc:X8} computed={computedCrc:X8}");
+
+        var result = new List<SerializedLayerWeights>();
+        using var ms = new MemoryStream(data, 0, payloadLen);
+        using var br = new BinaryReader(ms);
+
+        int numLayers = br.ReadInt32();
+        int numHeads  = br.ReadInt32();
+        int seqSq     = br.ReadInt32(); // S*S for PosBias (0 if no positional bias)
+
+        for (int l = 0; l < numLayers; l++)
+        {
+            var lw = new SerializedLayerWeights
+            {
+                Wq     = ReadMatrix(br, D, D),
+                Wk     = ReadMatrix(br, D, D),
+                Wv     = ReadMatrix(br, D, D),
+                Wo     = ReadMatrix(br, D, D),
+                Gamma1 = ReadVector(br, D),
+                Beta1  = ReadVector(br, D),
+                Wff1   = ReadMatrix(br, D, Ff),
+                Bff1   = ReadVector(br, Ff),
+                Wff2   = ReadMatrix(br, Ff, D),
+                Bff2   = ReadVector(br, D),
+                Gamma2 = ReadVector(br, D),
+                Beta2  = ReadVector(br, D),
+            };
+            if (seqSq > 0 && numHeads > 0)
+                lw.PosBias = ReadMatrix(br, numHeads, seqSq);
+            result.Add(lw);
+        }
+        return result;
+    }
+
+    private static double[][] ReadMatrix(BinaryReader br, int rows, int cols)
+    {
+        var m = new double[rows][];
+        for (int r = 0; r < rows; r++)
+        {
+            m[r] = new double[cols];
+            for (int c = 0; c < cols; c++)
+                m[r][c] = br.ReadDouble();
+        }
+        return m;
+    }
+
+    private static double[] ReadVector(BinaryReader br, int len)
+    {
+        var v = new double[len];
+        for (int i = 0; i < len; i++)
+            v[i] = br.ReadDouble();
+        return v;
+    }
+
+    private static uint ComputeCrc32(ReadOnlySpan<byte> data)
+    {
+        uint crc = 0xFFFFFFFF;
+        foreach (byte b in data)
+        {
+            crc ^= b;
+            for (int i = 0; i < 8; i++)
+                crc = (crc >> 1) ^ (0xEDB88320 & ~((crc & 1) - 1));
+        }
+        return ~crc;
     }
 }

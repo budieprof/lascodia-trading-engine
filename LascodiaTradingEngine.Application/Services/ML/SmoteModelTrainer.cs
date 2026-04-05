@@ -117,6 +117,10 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         double[][]? MlpHB,
         int         HidDim);
 
+    internal readonly record struct EnsembleTrainResult(
+        double[][] Weights, double[] Biases, int[][]? FeatureSubsets, int PolyStart,
+        bool[][] OobMasks, double[][]? MlpHW, double[][]? MlpHB, int SwaCount);
+
     // ── EnsembleState forwarding helpers ────────────────────────────────────
     private static double EnsembleProb(float[] x, in EnsembleState es)
         => EnsembleProb(x, es.Weights, es.Biases, es.F, es.FeatureSubsets, es.Meta, es.MlpHW, es.MlpHB, es.HidDim);
@@ -151,21 +155,21 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
     private static double ComputeConformalQHat(List<TrainingSample> s, in EnsembleState es, double pA, double pB, double[] isoBp, double alpha)
         => ComputeConformalQHat(s, es.Weights, es.Biases, pA, pB, isoBp, es.F, es.FeatureSubsets, es.Meta, es.MlpHW, es.MlpHB, es.HidDim, alpha);
 
-    private static double[] ComputeJackknifeResiduals(List<TrainingSample> s, in EnsembleState es)
-        => ComputeJackknifeResiduals(s, es.Weights, es.Biases, es.F, es.FeatureSubsets, es.MlpHW, es.MlpHB, es.HidDim);
+    private static double[] ComputeJackknifeResiduals(List<TrainingSample> s, in EnsembleState es, bool[][] oobMasks)
+        => ComputeJackknifeResiduals(s, es.Weights, es.Biases, es.F, es.FeatureSubsets, oobMasks, es.MlpHW, es.MlpHB, es.HidDim);
 
-    private static (double[] Weights, double Bias) FitMetaLabelModel(List<TrainingSample> s, in EnsembleState es, double[]? importanceScores = null)
+    private static (double[] Weights, double Bias, int[] TopFeatureIndices) FitMetaLabelModel(List<TrainingSample> s, in EnsembleState es, double[]? importanceScores = null)
         => FitMetaLabelModel(s, es.Weights, es.Biases, es.F, es.FeatureSubsets, es.MlpHW, es.MlpHB, es.HidDim, importanceScores);
 
     private static (double[] Weights, double Bias, double Threshold) FitAbstentionModel(
-        List<TrainingSample> s, in EnsembleState es, double pA, double pB, double[] metaLabelW, double metaLabelB)
-        => FitAbstentionModel(s, es.Weights, es.Biases, pA, pB, metaLabelW, metaLabelB, es.F, es.FeatureSubsets, es.MlpHW, es.MlpHB, es.HidDim);
+        List<TrainingSample> s, in EnsembleState es, double pA, double pB, double[] metaLabelW, double metaLabelB, int[] metaLabelTopFeatures)
+        => FitAbstentionModel(s, es.Weights, es.Biases, pA, pB, metaLabelW, metaLabelB, metaLabelTopFeatures, es.F, es.FeatureSubsets, es.MlpHW, es.MlpHB, es.HidDim);
 
     private static double FitTemperatureScaling(List<TrainingSample> s, in EnsembleState es)
         => FitTemperatureScaling(s, es.Weights, es.Biases, es.F, es.FeatureSubsets, es.Meta, es.MlpHW, es.MlpHB, es.HidDim);
 
-    private static double ComputeEnsembleDiversity(in EnsembleState es)
-        => ComputeEnsembleDiversity(es.Weights, es.F);
+    private static double ComputeEnsembleDiversity(List<TrainingSample> calSet, in EnsembleState es)
+        => ComputeEnsembleDiversity(calSet, es.Weights, es.Biases, es.F, es.FeatureSubsets, es.MlpHW, es.MlpHB, es.HidDim);
 
     private static (double Mean, double Std) ComputeDecisionBoundaryStats(List<TrainingSample> s, in EnsembleState es)
         => ComputeDecisionBoundaryStats(s, es.Weights, es.Biases, es.F, es.FeatureSubsets, es.MlpHW, es.MlpHB, es.HidDim);
@@ -242,6 +246,30 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         if (samples.Count < hp.MinSamples)
             throw new InvalidOperationException(
                 $"SmoteModelTrainer requires at least {hp.MinSamples} samples; got {samples.Count}.");
+
+        if (warmStart is not null)
+        {
+            bool mismatch = false;
+            if (warmStart.Version != ModelVersion)
+            {
+                _logger.LogWarning("Warm-start version mismatch: snapshot={SnapVer} current={CurVer} — falling back to cold start.",
+                    warmStart.Version, ModelVersion);
+                mismatch = true;
+            }
+            if (warmStart.MlpHiddenDim != hp.MlpHiddenDim)
+            {
+                _logger.LogWarning("Warm-start MLP dim mismatch: snapshot={SnapDim} hp={HpDim} — falling back to cold start.",
+                    warmStart.MlpHiddenDim, hp.MlpHiddenDim);
+                mismatch = true;
+            }
+            if (warmStart.BaseLearnersK > 0 && warmStart.BaseLearnersK != (hp.K > 0 ? hp.K : 50))
+            {
+                _logger.LogWarning("Warm-start K mismatch: snapshot={SnapK} hp={HpK} — falling back to cold start.",
+                    warmStart.BaseLearnersK, hp.K > 0 ? hp.K : 50);
+                mismatch = true;
+            }
+            if (mismatch) warmStart = null;
+        }
 
         int F = samples[0].Features.Length;
         int K = hp.K > 0 ? hp.K : 50;
@@ -378,7 +406,7 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         }
 
         // ── 5. SMOTE oversampling on train fold ───────────────────────────────
-        var (balancedTrain, syntheticCount) = ApplySmote(trainSet, hp, F, ct);
+        var (balancedTrain, syntheticCount, smoteSeed) = ApplySmote(trainSet, hp, F, ct);
         if (_logger.IsEnabled(LogLevel.Information))
             _logger.LogInformation(
                 "SMOTE: trainN={Train} → balancedN={Balanced} (+{Synth} synthetic)",
@@ -391,9 +419,12 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
             : hp;
 
         // ── 6. Fit ensemble ───────────────────────────────────────────────────
-        var (weights, biases, featureSubsets, polyStart, oobMasks, ensMlpHW, ensMlpHB, swaCount) =
-            FitEnsemble(balancedTrain, effectiveHp, F, K, labelSmoothing, warmStart, densityWeights, ct,
+        var ensResult = FitEnsemble(balancedTrain, effectiveHp, F, K, labelSmoothing, warmStart, densityWeights, ct,
                 originalCount: trainSet.Count);
+        var weights = ensResult.Weights; var biases = ensResult.Biases;
+        var featureSubsets = ensResult.FeatureSubsets; var polyStart = ensResult.PolyStart;
+        var oobMasks = ensResult.OobMasks; var ensMlpHW = ensResult.MlpHW;
+        var ensMlpHB = ensResult.MlpHB; var swaCount = ensResult.SwaCount;
 
         // ── 7. Post-training NaN/Inf sanitization ─────────────────────────────
         int sanitizedCount = 0;
@@ -553,8 +584,11 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
                 EarlyStoppingPatience = Math.Max(5,  effectiveHp.EarlyStoppingPatience / 2),
             };
 
-            var (pw, pb, _, _, _, pMlpHW, pMlpHB, _) = FitEnsemble(
-                maskedTrain, prunedHp, reducedF, K, labelSmoothing, null, densityWeights, ct);
+            var pEnsResult = FitEnsemble(
+                maskedTrain, prunedHp, reducedF, K, labelSmoothing, null, densityWeights, ct,
+                originalCount: trainSet.Count);
+            var pw = pEnsResult.Weights; var pb = pEnsResult.Biases;
+            var pOobMasks = pEnsResult.OobMasks; var pMlpHW = pEnsResult.MlpHW; var pMlpHB = pEnsResult.MlpHB;
             var pMeta       = maskedCal.Count >= MinCalSamples
                 ? FitMetaLearner(maskedCal, pw, pb, reducedF, null, pMlpHW, pMlpHB, prunedHp.MlpHiddenDim)
                 : MetaLearner.None;
@@ -590,6 +624,9 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
                     ? FitClassConditionalPlatt(maskedCal, pEns) : (1.0, 0.0, 1.0, 0.0);
                 avgKellyFraction = maskedCal.Count >= MinEvalSamples
                     ? ComputeAvgKellyFraction(maskedCal, pEns, pA, pB) : 0.0;
+                // Recompute OOB accuracy for the pruned model
+                oobAccuracy = ComputeOobAccuracy(maskedTrain, pEns, pOobMasks);
+                oobMasks = pOobMasks;
                 // Reassign balancedTrain and F so downstream Jackknife/DW/OOB/PSI use masked features
                 balancedTrain = maskedTrain;
                 F = reducedF;
@@ -630,18 +667,18 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         double conformalQHat = ComputeConformalQHat(postPruneCalSet, ens, plattA, plattB, isotonicBp, conformalAlpha);
         _logger.LogDebug("Conformal qHat={QHat:F4} ({Cov:P0} coverage)", conformalQHat, hp.ConformalCoverage);
 
-        // ── H10: Jackknife+ residuals ─────────────────────────────────────────
-        double[] jackknifeResiduals = ComputeJackknifeResiduals(balancedTrain, ens);
+        // ── H10: Jackknife+ residuals (OOB-approximated) ─────────────────────
+        double[] jackknifeResiduals = ComputeJackknifeResiduals(balancedTrain, ens, oobMasks);
         _logger.LogDebug("Jackknife+ residuals: {N} samples", jackknifeResiduals.Length);
 
         // ── H11: Meta-label secondary classifier ─────────────────────────────
-        var (metaLabelWeights, metaLabelBias) = FitMetaLabelModel(
+        var (metaLabelWeights, metaLabelBias, metaLabelTopFeatures) = FitMetaLabelModel(
             postPruneCalSet, ens, importanceScores: calImportanceScores);
         _logger.LogDebug("Meta-label model: bias={B:F4}", metaLabelBias);
 
         // ── H12: Abstention gate ──────────────────────────────────────────────
         var (abstentionWeights, abstentionBias, abstentionThreshold) = FitAbstentionModel(
-            postPruneCalSet, ens, plattA, plattB, metaLabelWeights, metaLabelBias);
+            postPruneCalSet, ens, plattA, plattB, metaLabelWeights, metaLabelBias, metaLabelTopFeatures);
         _logger.LogDebug("Abstention gate: bias={B:F4} threshold={T:F2}", abstentionBias, abstentionThreshold);
 
         // ── M11: Temperature scaling ──────────────────────────────────────────
@@ -653,7 +690,7 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         }
 
         // ── M10: Ensemble diversity ───────────────────────────────────────────
-        double ensembleDiversity = ComputeEnsembleDiversity(ens);
+        double ensembleDiversity = ComputeEnsembleDiversity(postPruneCalSet, ens);
         _logger.LogDebug("Ensemble diversity (avg ρ)={Div:F4}", ensembleDiversity);
         if (hp.MaxEnsembleDiversity < 1.0 && ensembleDiversity > hp.MaxEnsembleDiversity)
             _logger.LogWarning(
@@ -738,9 +775,10 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
             OobAccuracy                = oobAccuracy,
             ConformalQHat              = conformalQHat,
             JackknifeResiduals         = jackknifeResiduals,
-            MetaLabelWeights           = metaLabelWeights,
-            MetaLabelBias              = metaLabelBias,
-            MetaLabelThreshold         = 0.5,
+            MetaLabelWeights              = metaLabelWeights,
+            MetaLabelBias                 = metaLabelBias,
+            MetaLabelThreshold            = 0.5,
+            MetaLabelTopFeatureIndices    = metaLabelTopFeatures,
             AbstentionWeights          = abstentionWeights,
             AbstentionBias             = abstentionBias,
             AbstentionThreshold        = abstentionThreshold,
@@ -771,6 +809,7 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
             MlpHiddenWeights           = ensMlpHW,
             MlpHiddenBiases            = ensMlpHB,
             SwaCheckpointCount         = swaCount,
+            SmoteSeed                  = smoteSeed,
         };
 
         byte[] modelBytes = JsonSerializer.SerializeToUtf8Bytes(snapshot, JsonOpts);
@@ -833,13 +872,26 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
             };
 
             int foldOrigCount = foldTrain.Count;
-            var (balancedFold, _) = ApplySmote(foldTrain, hp, F, ct);
-            var (w, b, subs, _, _, cvMlpHW, cvMlpHB, _) = FitEnsemble(
+            var (balancedFold, _, _) = ApplySmote(foldTrain, hp, F, ct);
+            var cvEnsResult = FitEnsemble(
                 balancedFold, cvHp, F, cvHp.K, hp.LabelSmoothing, null, null, ct,
                 forceSequential: false, originalCount: foldOrigCount);
+            var w = cvEnsResult.Weights; var b = cvEnsResult.Biases;
+            var subs = cvEnsResult.FeatureSubsets; var cvMlpHW = cvEnsResult.MlpHW; var cvMlpHB = cvEnsResult.MlpHB;
             var (mw, mb) = FitLinearRegressor(balancedFold, F, cvHp);
-            var m = EvaluateEnsemble(foldTest, w, b, mw, mb, 1.0, 0.0, F, subs, MetaLearner.None, 0.0,
-                cvMlpHW, cvMlpHB, cvHp.MlpHiddenDim);
+
+            // Per-fold calibration: split test into mini-cal (30%) and mini-eval (70%)
+            int miniCalEnd = Math.Max(1, foldTest.Count * 3 / 10);
+            var foldMiniCal = foldTest[..miniCalEnd];
+            var foldMiniEval = foldTest[miniCalEnd..];
+            var foldEns = new EnsembleState(w, b, F, subs, MetaLearner.None, cvMlpHW, cvMlpHB, cvHp.MlpHiddenDim);
+            var (foldPlattA, foldPlattB) = foldMiniCal.Count >= 5
+                ? FitPlattScaling(foldMiniCal, foldEns) : (1.0, 0.0);
+            var m = foldMiniEval.Count >= 10
+                ? EvaluateEnsemble(foldMiniEval, w, b, mw, mb, foldPlattA, foldPlattB, F, subs, MetaLearner.None, 0.0,
+                    cvMlpHW, cvMlpHB, cvHp.MlpHiddenDim)
+                : EvaluateEnsemble(foldTest, w, b, mw, mb, 1.0, 0.0, F, subs, MetaLearner.None, 0.0,
+                    cvMlpHW, cvMlpHB, cvHp.MlpHiddenDim);
 
             // H14: Per-feature mean |weight| for stability scoring
             var foldImp = new double[F];
@@ -860,7 +912,9 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
             {
                 double rawP = EnsembleProb(foldTest[pi].Features, w, b, F, subs, MetaLearner.None,
                     cvMlpHW, cvMlpHB, cvHp.MlpHiddenDim);
-                preds[pi] = (rawP >= 0.5 ? 1 : -1, foldTest[pi].Direction > 0 ? 1 : -1);
+                double logitP = Math.Log(Math.Max(rawP, 1e-9) / Math.Max(1 - rawP, 1e-9));
+                double calibP = Sigmoid(foldPlattA * logitP + foldPlattB);
+                preds[pi] = (calibP >= 0.5 ? 1 : -1, foldTest[pi].Direction > 0 ? 1 : -1);
             }
             var (foldMaxDD, foldCurveSharpe) = ComputeEquityCurveStats(preds);
 
@@ -885,6 +939,18 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
             evList.Add(r.Value.EV); sharpeList.Add(r.Value.Sharpe);
             foldImportances.Add(r.Value.Imp);
             if (r.Value.IsBad) badFolds++;
+        }
+
+        if (_logger.IsEnabled(LogLevel.Information))
+        {
+            for (int fi = 0; fi < foldResults.Length; fi++)
+            {
+                if (foldResults[fi] is null) continue;
+                var fr = foldResults[fi]!.Value;
+                _logger.LogInformation(
+                    "CV fold {Fold}: acc={Acc:P1} f1={F1:F3} sharpe={Sh:F2} bad={Bad}",
+                    fi + 1, fr.Acc, fr.F1, fr.Sharpe, fr.IsBad);
+            }
         }
 
         if (accList.Count == 0)
@@ -955,7 +1021,7 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
     // KNN searches use an O(n × K) insertion-sorted buffer (K is small, typically 5)
     // and are parallelised across minority samples.
 
-    private static (List<TrainingSample> Balanced, int SyntheticCount) ApplySmote(
+    private static (List<TrainingSample> Balanced, int SyntheticCount, int SmoteSeed) ApplySmote(
         List<TrainingSample> trainSet,
         TrainingHyperparams  hp,
         int                  F,
@@ -966,15 +1032,17 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         double ratio = neg.Count > 0 ? (double)pos.Count / neg.Count : 1.0;
 
         if ((ratio >= 0.8 && ratio <= 1.2) || pos.Count == 0 || neg.Count == 0)
-            return (new List<TrainingSample>(trainSet), 0);
+            return (new List<TrainingSample>(trainSet), 0, 0);
 
         var minority = ratio < 1.0 ? pos : neg;
         var majority = ratio >= 1.0 ? pos : neg;
-        int deficit  = majority.Count - minority.Count;
+        double targetRatio = hp.SmoteTargetRatio is > 0.0 and <= 1.0 ? hp.SmoteTargetRatio : 1.0;
+        int targetMinorityCount = (int)(majority.Count * targetRatio);
+        int deficit = Math.Max(0, targetMinorityCount - minority.Count);
         int kSmote   = Math.Max(1, Math.Min(hp.SmoteKNeighbors ?? 5, minority.Count - 1));
 
         if (minority.Count < 2 || deficit <= 0)
-            return (new List<TrainingSample>(trainSet), 0);
+            return (new List<TrainingSample>(trainSet), 0, 0);
 
         // ── Step 1: classify minority samples using all-sample KNN (parallel) ──
         // For each minority[i], count how many of its K nearest (in trainSet) are majority.
@@ -1054,11 +1122,25 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         var rng       = new Random(smoteSeed);
         var synthetic = new List<TrainingSample>(deficit);
 
+        // ADASYN-weighted seed selection: harder samples (more majority neighbors) get more synthetics
+        var borderlineCdf = new double[borderline.Count];
+        double cdfSum = 0;
+        for (int bi = 0; bi < borderline.Count; bi++)
+        {
+            cdfSum += Math.Max(1, majorityNeighborCounts[borderline[bi]]);
+            borderlineCdf[bi] = cdfSum;
+        }
+
         for (int s = 0; s < deficit; s++)
         {
             if (ct.IsCancellationRequested) break;
 
-            int        seedIdx    = borderline[rng.Next(borderline.Count)];
+            // ADASYN: sample proportionally to majority neighbor count
+            double target = rng.NextDouble() * cdfSum;
+            int bi2 = Array.BinarySearch(borderlineCdf, target);
+            if (bi2 < 0) bi2 = ~bi2;
+            bi2 = Math.Min(bi2, borderline.Count - 1);
+            int seedIdx = borderline[bi2];
             var        seedSample = minority[seedIdx];
             var        neighbors  = knnLists[seedIdx];
             if (neighbors.Length == 0) continue;
@@ -1073,16 +1155,57 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
             synthetic.Add(new TrainingSample(synth, seedSample.Direction, seedSample.Magnitude));
         }
 
+        // SMOTE-ENN: remove synthetics whose 3-NN majority disagrees with their label
+        if (synthetic.Count > 0 && hp.SmoteEnnEnabled)
+        {
+            var allSamples = new List<TrainingSample>(trainSet.Count + synthetic.Count);
+            allSamples.AddRange(trainSet);
+            allSamples.AddRange(synthetic);
+            int kEnn = 3;
+            var toRemove = new HashSet<int>();
+            Parallel.For(0, synthetic.Count, popts, si =>
+            {
+                int idx = trainSet.Count + si;
+                var sample = allSamples[idx];
+                var buf = new (double D, int Dir)[kEnn];
+                for (int ki = 0; ki < kEnn; ki++) buf[ki] = (double.MaxValue, 0);
+                double thresh = double.MaxValue;
+                for (int j = 0; j < allSamples.Count; j++)
+                {
+                    if (j == idx) continue;
+                    double d = EuclideanDistSq(sample.Features, allSamples[j].Features);
+                    if (d >= thresh) continue;
+                    buf[kEnn - 1] = (d, allSamples[j].Direction);
+                    int ins = kEnn - 1;
+                    while (ins > 0 && buf[ins].D < buf[ins - 1].D)
+                    {
+                        (buf[ins], buf[ins - 1]) = (buf[ins - 1], buf[ins]);
+                        ins--;
+                    }
+                    thresh = buf[kEnn - 1].D;
+                }
+                int disagree = 0;
+                for (int ki = 0; ki < kEnn; ki++)
+                    if (buf[ki].D < double.MaxValue && (buf[ki].Dir > 0) != (sample.Direction > 0))
+                        disagree++;
+                if (disagree > kEnn / 2)
+                    lock (toRemove) toRemove.Add(si);
+            });
+            if (toRemove.Count > 0)
+            {
+                synthetic = [.. synthetic.Where((_, i) => !toRemove.Contains(i))];
+            }
+        }
+
         var balanced = new List<TrainingSample>(trainSet.Count + synthetic.Count);
         balanced.AddRange(trainSet);
         balanced.AddRange(synthetic);
-        return (balanced, synthetic.Count);
+        return (balanced, synthetic.Count, smoteSeed);
     }
 
     // ── Ensemble fit ──────────────────────────────────────────────────────────
 
-    private (double[][] Weights, double[] Biases, int[][]? FeatureSubsets, int PolyStart,
-             bool[][] OobMasks, double[][]? MlpHW, double[][]? MlpHB, int SwaCount) FitEnsemble(
+    private EnsembleTrainResult FitEnsemble(
         List<TrainingSample> trainSet,
         TrainingHyperparams  hp,
         int                  F,
@@ -1140,6 +1263,10 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         var posIdx = Enumerable.Range(0, origN).Where(i => trainSet[i].Direction > 0).ToArray();
         var negIdx = Enumerable.Range(0, origN).Where(i => trainSet[i].Direction <= 0).ToArray();
 
+        if (posIdx.Length == 0 || negIdx.Length == 0)
+            _logger.LogWarning("StratifiedBootstrap: {Class} class is empty among original samples — bootstrap will use uniform sampling.",
+                posIdx.Length == 0 ? "positive" : "negative");
+
         // Result arrays
         var weights      = new double[K][];
         var biases       = new double[K];
@@ -1149,18 +1276,20 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         double[][]? mlpHB = useMlp ? new double[K][] : null;
         var swaCountPerLearner = new int[K];
 
-        // Determine if learners are independent (can run in parallel)
+        // Determine if learners are independent (can run in parallel).
+        // Only NCL and DiversityLambda require sequential execution (they read prior learners' weights).
+        // NoiseCorrectionThreshold only uses the current sample's p and yRaw — safe to parallelize.
         bool learnersIndependent =
             hp.NclLambda             <= 0.0 &&
-            hp.DiversityLambda       <= 0.0 &&
-            hp.NoiseCorrectionThreshold <= 0.0;
+            hp.DiversityLambda       <= 0.0;
         bool runParallel = !forceSequential && learnersIndependent;
 
         // Split off a small validation set for adaptive LR decay (M1)
-        // valSet indices are excluded from OOB to avoid feedback between LR decay and early stopping
-        int valSize  = Math.Max(20, n / 10);
-        int valStart = n - valSize;
-        var valSet   = trainSet[valStart..];
+        // Must come from ORIGINAL samples only (not synthetics) so LR decay tracks real data.
+        // valSet indices are excluded from OOB to avoid feedback between LR decay and early stopping.
+        int valSize  = Math.Max(20, origN / 10);
+        int valStart = origN - valSize; // index within original samples
+        var valSet   = trainSet[valStart..origN]; // only original samples, excludes synthetics
         var fitSet   = trainSet[..valStart];
 
         // ── Per-learner training closure ──────────────────────────────────────
@@ -1236,12 +1365,20 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
                 b = warmStart is not null && k < warmStart.Biases?.Length ? warmStart.Biases[k] : 0.0;
             }
 
-            // Bootstrap over original samples; synthetics always included in training
-            int[] bootstrap = StratifiedBootstrap(posIdx, negIdx, origN, temporalWeights, rng);
-            var   inBag     = new HashSet<int>(bootstrap);
+            // Bootstrap over original samples + append all synthetic indices so SMOTE data is used
+            int[] origBootstrap = StratifiedBootstrap(posIdx, negIdx, origN, temporalWeights, rng);
+            int syntheticStart = origN;
+            int syntheticEnd   = n;
+            int syntheticN     = syntheticEnd - syntheticStart;
+            var bootstrap      = new int[origBootstrap.Length + syntheticN];
+            Array.Copy(origBootstrap, bootstrap, origBootstrap.Length);
+            for (int si = 0; si < syntheticN; si++)
+                bootstrap[origBootstrap.Length + si] = syntheticStart + si;
+            var   inBag     = new HashSet<int>(origBootstrap);
             // OOB mask: original samples not in bag and not in valSet are OOB;
             // synthetics (index >= origN) and valSet samples (index >= valStart) are never OOB
             oobMasks[k] = [.. Enumerable.Range(0, n).Select(i => i < origN && i < valStart && !inBag.Contains(i))];
+            bool hasOobSamples = oobMasks[k].Any(x => x);
 
             // Adam state — M19: ArrayPool for Adam moment arrays
             int hWSize = useMlp ? hW!.Length : 0;
@@ -1330,7 +1467,19 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
                             // L8: Augment features for poly learners
                             if (isPoly) xFull = BuildPolyAugmentedFeatures(xFull, top5Indices, F);
 
-                            // L7: Mixup
+                            // L6: AtrLabelSensitivity — soft labels (compute before Mixup so both samples get labels)
+                            double yRaw;
+                            if (hp.AtrLabelSensitivity > 0.0)
+                            {
+                                double signedMag = trainSet[idx].Magnitude * (trainSet[idx].Direction > 0 ? 1.0 : -1.0);
+                                yRaw = Sigmoid(signedMag / hp.AtrLabelSensitivity);
+                            }
+                            else
+                            {
+                                yRaw = trainSet[idx].Direction > 0 ? 1.0 : 0.0;
+                            }
+
+                            // L7: Mixup — interpolate both features AND labels (Zhang et al., 2018)
                             if (hp.MixupAlpha > 0.0 && rng.NextDouble() < 0.5)
                             {
                                 int partnerIdx = bootstrap[rng.Next(bootstrap.Length)];
@@ -1341,18 +1490,14 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
                                 for (int j = 0; j < xFull.Length; j++)
                                     xMixed[j] = (float)(lam * xFull[j] + (1 - lam) * xPartner[j]);
                                 xFull = xMixed;
-                            }
 
-                            // L6: AtrLabelSensitivity — soft labels
-                            double yRaw;
-                            if (hp.AtrLabelSensitivity > 0.0)
-                            {
-                                double signedMag = trainSet[idx].Magnitude * (trainSet[idx].Direction > 0 ? 1.0 : -1.0);
-                                yRaw = Sigmoid(signedMag / hp.AtrLabelSensitivity);
-                            }
-                            else
-                            {
-                                yRaw = trainSet[idx].Direction > 0 ? 1.0 : 0.0;
+                                // Interpolate label: yRaw_mix = λ·yRaw_primary + (1-λ)·yRaw_partner
+                                double yRawPartner = hp.AtrLabelSensitivity > 0.0
+                                    ? Sigmoid(trainSet[partnerIdx].Magnitude
+                                        * (trainSet[partnerIdx].Direction > 0 ? 1.0 : -1.0)
+                                        / hp.AtrLabelSensitivity)
+                                    : (trainSet[partnerIdx].Direction > 0 ? 1.0 : 0.0);
+                                yRaw = lam * yRaw + (1 - lam) * yRawPartner;
                             }
 
                             double y = labelSmoothing > 0
@@ -1403,49 +1548,8 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
                             double p   = Sigmoid(logit);
                             double err = p - y;
 
-                            // L4: FpCostWeight asymmetric BCE gradient
-                            if (hp.FpCostWeight > 0.0 && Math.Abs(hp.FpCostWeight - 0.5) > 1e-6)
-                            {
-                                double yBin = yRaw > 0.5 ? 1.0 : 0.0;
-                                double fpW  = yBin > 0.5 ? hp.FpCostWeight : (1.0 - hp.FpCostWeight);
-                                err *= fpW / 0.5; // normalise so default 0.5 → no change
-                            }
-
-                            // L3: SCE — add reverse cross-entropy gradient
-                            if (hp.UseSymmetricCE && hp.SymmetricCeAlpha > 0.0)
-                            {
-                                double rceGrad = (-Math.Log(Math.Max(y, 1e-7)) + Math.Log(Math.Max(1 - y, 1e-7)))
-                                    * p * (1 - p);
-                                err += hp.SymmetricCeAlpha * rceGrad;
-                            }
-
-                            // L1: NCL — gradient penalty using prior learners' avg prediction
-                            if (hp.NclLambda > 0.0 && k > 0)
-                            {
-                                double avgP = ComputeAvgPriorLearners(xFull, weights, biases, k, F, fsubs,
-                                    mlpHW, mlpHB, hiddenDim);
-                                err += hp.NclLambda * p * (1 - p) * (2 * p - avgP);
-                            }
-
-                            // L2: DiversityLambda — push away from ensemble mean
-                            if (hp.DiversityLambda > 0.0 && k > 0)
-                            {
-                                double avgP = ComputeAvgPriorLearners(xFull, weights, biases, k, F, fsubs,
-                                    mlpHW, mlpHB, hiddenDim);
-                                err += -hp.DiversityLambda * 2.0 * (p - avgP) * p * (1 - p);
-                            }
-
-                            // L5: Noise correction — downweight likely mislabelled samples
-                            if (hp.NoiseCorrectionThreshold > 0.0)
-                            {
-                                double yBin = yRaw > 0.5 ? 1.0 : 0.0;
-                                double noiseW = 1.0;
-                                if (yBin == 1.0 && p < hp.NoiseCorrectionThreshold)
-                                    noiseW = p;
-                                else if (yBin == 0.0 && (1 - p) < hp.NoiseCorrectionThreshold)
-                                    noiseW = 1 - p;
-                                err *= noiseW;
-                            }
+                            err = ApplyLossModifiers(err, p, y, yRaw, hp, xFull, weights, biases, k, F,
+                                fsubs, mlpHW, mlpHB, hiddenDim);
 
                             // Accumulate bias gradient
                             gb += err;
@@ -1458,14 +1562,14 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
                                     Array.Clear(dL1Buf!, 0, hiddenDim);
                                     for (int hj = 0; hj < hiddenDim; hj++)
                                     {
-                                        gw[hj] += err * hL2ActBuf![hj] + l2 * w[hj];
+                                        gw[hj] += err * hL2ActBuf![hj];
                                         double reluGate2 = hL2PreBuf![hj] > 0 ? 1.0 : 0.0;
                                         double dOut = err * w[hj] * reluGate2;
                                         ghB![hiddenDim + hj] += dOut;
                                         for (int ji = 0; ji < hiddenDim; ji++)
                                         {
                                             int wIdx = l2WOff + hj * hiddenDim + ji;
-                                            ghW![wIdx] += dOut * hL1ActBuf![ji] + l2 * hW![wIdx];
+                                            ghW![wIdx] += dOut * hL1ActBuf![ji];
                                             dL1Buf![ji] += dOut * hW![wIdx];
                                         }
                                     }
@@ -1475,26 +1579,26 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
                                         double dAct1     = dL1Buf![hj] * reluGate1;
                                         ghB![hj] += dAct1;
                                         for (int ji2 = 0; ji2 < fk; ji2++)
-                                            ghW![hj * fk + ji2] += dAct1 * xFull[subset[ji2]] + l2 * hW![hj * fk + ji2];
+                                            ghW![hj * fk + ji2] += dAct1 * xFull[subset[ji2]];
                                     }
                                 }
                                 else
                                 {
                                     for (int hj = 0; hj < hiddenDim; hj++)
                                     {
-                                        gw[hj] += err * hL1ActBuf![hj] + l2 * w[hj];
+                                        gw[hj] += err * hL1ActBuf![hj];
                                         double reluGate = hL1PreBuf![hj] > 0 ? 1.0 : 0.0;
                                         double dH = err * w[hj] * reluGate;
                                         ghB![hj] += dH;
                                         for (int ji2 = 0; ji2 < fk; ji2++)
-                                            ghW![hj * fk + ji2] += dH * xFull[subset[ji2]] + l2 * hW![hj * fk + ji2];
+                                            ghW![hj * fk + ji2] += dH * xFull[subset[ji2]];
                                     }
                                 }
                             }
                             else
                             {
                                 for (int ji = 0; ji < fk; ji++)
-                                    gw[ji] += err * xFull[subset[ji]] + l2 * w[ji];
+                                    gw[ji] += err * xFull[subset[ji]];
                             }
                         } // end per-sample accumulation
 
@@ -1549,6 +1653,9 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
                             v1[ji] = AdamBeta2 * v1[ji] + (1 - AdamBeta2) * gw[ji] * gw[ji];
                             w[ji] -= lr * (m1[ji] / (1 - beta1t)) / (Math.Sqrt(v1[ji] / (1 - beta2t)) + AdamEpsilon);
 
+                            // AdamW: decoupled weight decay
+                            if (l2 > 0) w[ji] *= (1.0 - lr * l2);
+
                             // L1 proximal soft-thresholding
                             if (l1 > 0)
                                 w[ji] = Math.Sign(w[ji]) * Math.Max(0, Math.Abs(w[ji]) - l1 * lr);
@@ -1566,6 +1673,7 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
                                 hm1[i] = AdamBeta1 * hm1[i] + (1 - AdamBeta1) * ghW![i];
                                 hv1[i] = AdamBeta2 * hv1[i] + (1 - AdamBeta2) * ghW![i] * ghW![i];
                                 hW![i] -= lr * (hm1[i] / (1 - beta1t)) / (Math.Sqrt(hv1[i] / (1 - beta2t)) + AdamEpsilon);
+                                if (l2 > 0) hW![i] *= (1.0 - lr * l2);
                                 if (hp.MaxWeightMagnitude > 0)
                                     hW![i] = Math.Clamp(hW![i], -hp.MaxWeightMagnitude, hp.MaxWeightMagnitude);
                             }
@@ -1609,7 +1717,7 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
                     }
 
                     // Per-learner early stopping via OOB cross-entropy loss
-                    if (patience > 0 && oobMasks[k].Any(x => x))
+                    if (patience > 0 && hasOobSamples)
                     {
                         double oobLoss = ComputeOobLoss(fitSet, oobMasks[k], w, b, subset, fk,
                             labelSmoothing, hW, hB, hiddenDim);
@@ -1645,7 +1753,7 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
                     if (useMlp && swaHW is not null) { Array.Copy(swaHW, hW!, hW!.Length); Array.Copy(swaHB!, hB!, hB!.Length); }
 
                     // If early stopping tracked a best loss, verify SWA didn't degrade
-                    if (patience > 0 && bestLoss < double.MaxValue && oobMasks[k].Any(x => x))
+                    if (patience > 0 && bestLoss < double.MaxValue && hasOobSamples)
                     {
                         double swaLoss = ComputeOobLoss(fitSet, oobMasks[k], w, b, subset, fk,
                             labelSmoothing, hW, hB, hiddenDim);
@@ -1714,10 +1822,26 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         // M13: MaxLearnerCorrelation enforcement — re-init highly correlated pairs
         if (hp.MaxLearnerCorrelation is > 0.0 and < 1.0)
         {
+            // For MLP learners, use prediction-based correlation on valSet
+            double[][]? predCache = null;
+            if (useMlp && valSet.Count > 0)
+            {
+                predCache = new double[K][];
+                for (int ki = 0; ki < K; ki++)
+                {
+                    predCache[ki] = new double[valSet.Count];
+                    for (int vi = 0; vi < valSet.Count; vi++)
+                        predCache[ki][vi] = SingleLearnerProb(valSet[vi].Features, weights[ki], biases[ki],
+                            fsubs?[ki], F, mlpHW?[ki], mlpHB?[ki], hiddenDim);
+                }
+            }
+
             for (int i = 0; i < K - 1; i++)
             for (int j = i + 1; j < K; j++)
             {
-                double rho = PearsonCorrelation(weights[i], weights[j], F);
+                double rho = predCache is not null
+                    ? PearsonCorrelation(predCache[i], predCache[j], valSet.Count)
+                    : PearsonCorrelation(weights[i], weights[j], F);
                 if (rho > hp.MaxLearnerCorrelation)
                 {
                     // Zero out the later learner — effectively prunes it from the ensemble
@@ -1731,7 +1855,60 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         }
 
         int totalSwaCount = swaCountPerLearner.Length > 0 ? swaCountPerLearner.Max() : 0;
-        return (weights, biases, fsubs, polyStart, oobMasks, mlpHW, mlpHB, totalSwaCount);
+        return new EnsembleTrainResult(weights, biases, fsubs, polyStart, oobMasks, mlpHW, mlpHB, totalSwaCount);
+    }
+
+    private static double ApplyLossModifiers(
+        double err, double p, double y, double yRaw,
+        TrainingHyperparams hp,
+        float[] xFull, double[][] weights, double[] biases, int k, int F,
+        int[][]? featureSubsets, double[][]? mlpHW, double[][]? mlpHB, int hiddenDim)
+    {
+        // L4: FpCostWeight asymmetric BCE gradient
+        if (hp.FpCostWeight > 0.0 && Math.Abs(hp.FpCostWeight - 0.5) > 1e-6)
+        {
+            double yBin = yRaw > 0.5 ? 1.0 : 0.0;
+            double fpW  = yBin > 0.5 ? hp.FpCostWeight : (1.0 - hp.FpCostWeight);
+            err *= fpW / 0.5;
+        }
+
+        // L3: SCE — add reverse cross-entropy gradient
+        if (hp.UseSymmetricCE && hp.SymmetricCeAlpha > 0.0)
+        {
+            double rceGrad = (-Math.Log(Math.Max(y, 1e-7)) + Math.Log(Math.Max(1 - y, 1e-7)))
+                * p * (1 - p);
+            err += hp.SymmetricCeAlpha * rceGrad;
+        }
+
+        // L1: NCL — gradient penalty using prior learners' avg prediction
+        if (hp.NclLambda > 0.0 && k > 0)
+        {
+            double avgP = ComputeAvgPriorLearners(xFull, weights, biases, k, F, featureSubsets,
+                mlpHW, mlpHB, hiddenDim);
+            err += hp.NclLambda * p * (1 - p) * (2 * p - avgP);
+        }
+
+        // L2: DiversityLambda — push away from ensemble mean
+        if (hp.DiversityLambda > 0.0 && k > 0)
+        {
+            double avgP = ComputeAvgPriorLearners(xFull, weights, biases, k, F, featureSubsets,
+                mlpHW, mlpHB, hiddenDim);
+            err += -hp.DiversityLambda * 2.0 * (p - avgP) * p * (1 - p);
+        }
+
+        // L5: Noise correction — downweight likely mislabelled samples
+        if (hp.NoiseCorrectionThreshold > 0.0)
+        {
+            double yBin = yRaw > 0.5 ? 1.0 : 0.0;
+            double noiseW = 1.0;
+            if (yBin == 1.0 && p < hp.NoiseCorrectionThreshold)
+                noiseW = p;
+            else if (yBin == 0.0 && (1 - p) < hp.NoiseCorrectionThreshold)
+                noiseW = 1 - p;
+            err *= noiseW;
+        }
+
+        return err;
     }
 
     // ── Magnitude regressors ──────────────────────────────────────────────────
@@ -1750,16 +1927,29 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         var    bestW = new double[F];
         double bestB = 0;
 
+        var indices = Enumerable.Range(0, trainSet.Count).ToArray();
+        var shuffleRng = new Random(42);
+
         for (int ep = 0; ep < epochs; ep++)
         {
-            foreach (var s in trainSet)
+            for (int si = indices.Length - 1; si > 0; si--)
             {
+                int sj = shuffleRng.Next(si + 1);
+                (indices[si], indices[sj]) = (indices[sj], indices[si]);
+            }
+
+            for (int ii = 0; ii < indices.Length; ii++)
+            {
+                var s = trainSet[indices[ii]];
                 double pred = b;
                 for (int j = 0; j < F; j++) pred += w[j] * s.Features[j];
                 double err = Math.Clamp(pred - s.Magnitude, -10.0, 10.0);
                 b -= lr * err;
                 for (int j = 0; j < F; j++)
-                    w[j] -= lr * (err * s.Features[j] + l2 * w[j]);
+                {
+                    w[j] -= lr * err * s.Features[j];
+                    w[j] *= (1.0 - lr * l2); // decoupled weight decay
+                }
             }
 
             // NaN/Inf guard — rollback to last good state
@@ -1787,17 +1977,30 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         var    bestW = new double[F];
         double bestB = 0;
 
+        var indices = Enumerable.Range(0, trainSet.Count).ToArray();
+        var shuffleRng = new Random(42);
+
         for (int ep = 0; ep < epochs; ep++)
         {
-            foreach (var s in trainSet)
+            for (int si = indices.Length - 1; si > 0; si--)
             {
+                int sj = shuffleRng.Next(si + 1);
+                (indices[si], indices[sj]) = (indices[sj], indices[si]);
+            }
+
+            for (int ii = 0; ii < indices.Length; ii++)
+            {
+                var s = trainSet[indices[ii]];
                 double pred = b;
                 for (int j = 0; j < F; j++) pred += w[j] * s.Features[j];
                 double residual = s.Magnitude - pred;
                 double dLdpred = residual >= 0 ? -tau : (1.0 - tau);
                 b -= lr * dLdpred;
                 for (int j = 0; j < F; j++)
-                    w[j] -= lr * (dLdpred * s.Features[j] + l2 * w[j]);
+                {
+                    w[j] -= lr * dLdpred * s.Features[j];
+                    w[j] *= (1.0 - lr * l2); // decoupled weight decay
+                }
             }
 
             bool bad = !double.IsFinite(b);
@@ -2055,7 +2258,7 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
 
     // ── H11: Meta-label secondary classifier ─────────────────────────────────
 
-    private static (double[] Weights, double Bias) FitMetaLabelModel(
+    private static (double[] Weights, double Bias, int[] TopFeatureIndices) FitMetaLabelModel(
         List<TrainingSample> calSet,
         double[][]           weights,
         double[]             biases,
@@ -2066,7 +2269,8 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         int                  hidDim           = 0,
         double[]?            importanceScores = null)
     {
-        if (calSet.Count < MinCalSamples) return ([], 0.0);
+        int[] defaultTop3 = [0, Math.Min(1, Math.Max(0, F - 1)), Math.Min(2, Math.Max(0, F - 1))];
+        if (calSet.Count < MinCalSamples) return ([], 0.0, defaultTop3);
 
         // Determine top-3 feature indices by cal-set importance; fall back to [0,1,2]
         int[] top3 = importanceScores is { Length: > 0 }
@@ -2075,8 +2279,7 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
                             .Take(3)]
             : [0, Math.Min(1, F - 1), Math.Min(2, F - 1)];
 
-        // Input features: [ensembleLogit, ensembleStd, top3[0], top3[1], top3[2]]
-        const int MetaInputDim = 5;
+        const int MetaInputDim = 7;
         var mw = new double[MetaInputDim];
         double mb = 0;
         const double lr = 0.01;
@@ -2090,15 +2293,25 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
             {
                 var (avgP, stdP) = EnsembleProbAndStd(s.Features, weights, biases, F, featureSubsets, mlpHW, mlpHB, hidDim);
                 double logit = Math.Log(Math.Max(avgP, 1e-9) / Math.Max(1 - avgP, 1e-9));
+                double distFromBoundary = Math.Abs(avgP - 0.5);
+                double maxP = double.MinValue, minP = double.MaxValue;
+                for (int k2 = 0; k2 < weights.Length; k2++)
+                {
+                    double pk = SingleLearnerProb(s.Features, weights[k2], biases[k2],
+                        featureSubsets?[k2], F, mlpHW?[k2], mlpHB?[k2], hidDim);
+                    if (pk > maxP) maxP = pk;
+                    if (pk < minP) minP = pk;
+                }
+                double maxDisagreement = maxP - minP;
                 double[] x = [logit, stdP,
                                top3[0] < s.Features.Length ? s.Features[top3[0]] : 0.0f,
                                top3[1] < s.Features.Length ? s.Features[top3[1]] : 0.0f,
-                               top3[2] < s.Features.Length ? s.Features[top3[2]] : 0.0f];
+                               top3[2] < s.Features.Length ? s.Features[top3[2]] : 0.0f,
+                               distFromBoundary, maxDisagreement];
 
                 double metaLogit = mb;
                 for (int j = 0; j < MetaInputDim; j++) metaLogit += mw[j] * x[j];
                 double p   = Sigmoid(metaLogit);
-                // Label: 1 if correct prediction, 0 otherwise
                 int yHat = avgP >= 0.5 ? 1 : 0;
                 int yTrue = s.Direction > 0 ? 1 : 0;
                 double y = yHat == yTrue ? 1.0 : 0.0;
@@ -2108,10 +2321,39 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
             }
             double inv = 1.0 / calSet.Count;
             mb -= lr * db * inv;
-            for (int j = 0; j < MetaInputDim; j++) mw[j] -= lr * dw[j] * inv;
+            for (int j = 0; j < MetaInputDim; j++) mw[j] -= lr * (dw[j] * inv + 0.001 * mw[j]);
         }
 
-        return (mw, mb);
+        return (mw, mb, top3);
+    }
+
+    private static double ComputeMetaLabelScore(
+        float[] features, double avgP, double stdP,
+        double[][] weights, double[] biases, int F, int[][]? featureSubsets,
+        double[][]? mlpHW, double[][]? mlpHB, int hidDim,
+        double[] metaLabelWeights, double metaLabelBias, int[] topFeatures)
+    {
+        if (metaLabelWeights.Length == 0) return 0.5;
+        double rawLogit = Math.Log(Math.Max(avgP, 1e-9) / Math.Max(1 - avgP, 1e-9));
+        double distFromBoundary = Math.Abs(avgP - 0.5);
+        double maxP = double.MinValue, minP = double.MaxValue;
+        for (int k2 = 0; k2 < weights.Length; k2++)
+        {
+            double pk = SingleLearnerProb(features, weights[k2], biases[k2],
+                featureSubsets?[k2], F, mlpHW?[k2], mlpHB?[k2], hidDim);
+            if (pk > maxP) maxP = pk;
+            if (pk < minP) minP = pk;
+        }
+        double maxDisagreement = maxP - minP;
+        double metaLogit = metaLabelBias;
+        double[] mx = [rawLogit, stdP,
+            topFeatures.Length > 0 && topFeatures[0] < features.Length ? features[topFeatures[0]] : 0,
+            topFeatures.Length > 1 && topFeatures[1] < features.Length ? features[topFeatures[1]] : 0,
+            topFeatures.Length > 2 && topFeatures[2] < features.Length ? features[topFeatures[2]] : 0,
+            distFromBoundary, maxDisagreement];
+        for (int j = 0; j < Math.Min(metaLabelWeights.Length, mx.Length); j++)
+            metaLogit += metaLabelWeights[j] * mx[j];
+        return Sigmoid(metaLogit);
     }
 
     // ── H12: Abstention gate ──────────────────────────────────────────────────
@@ -2124,6 +2366,7 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         double               plattB,
         double[]             metaLabelWeights,
         double               metaLabelBias,
+        int[]                metaLabelTopFeatures,
         int                  F,
         int[][]?             featureSubsets,
         double[][]?          mlpHW  = null,
@@ -2148,20 +2391,14 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
                 double rawLogit = Math.Log(Math.Max(avgP, 1e-9) / Math.Max(1 - avgP, 1e-9));
                 double calibP   = Sigmoid(plattA * rawLogit + plattB);
 
-                // Meta-label score
-                double metaLogit = metaLabelBias;
-                double[] mx = [rawLogit, stdP, s.Features.Length > 0 ? s.Features[0] : 0,
-                                s.Features.Length > 1 ? s.Features[1] : 0,
-                                s.Features.Length > 2 ? s.Features[2] : 0];
-                for (int j = 0; j < Math.Min(metaLabelWeights.Length, mx.Length); j++)
-                    metaLogit += metaLabelWeights[j] * mx[j];
-                double metaScore = Sigmoid(metaLogit);
+                double metaScore = ComputeMetaLabelScore(s.Features, avgP, stdP,
+                    weights, biases, F, featureSubsets, mlpHW, mlpHB, hidDim,
+                    metaLabelWeights, metaLabelBias, metaLabelTopFeatures);
 
                 double[] x = [calibP, stdP, metaScore];
                 double absLogit = ab;
                 for (int j = 0; j < 3; j++) absLogit += aw[j] * x[j];
                 double p = Sigmoid(absLogit);
-                // Label: 1 if this signal would be correctly traded (using calibP vs actual)
                 double y = (calibP >= 0.5 ? 1 : 0) == (s.Direction > 0 ? 1 : 0) ? 1.0 : 0.0;
                 double err = p - y;
                 db += err;
@@ -2169,28 +2406,41 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
             }
             double inv = 1.0 / calSet.Count;
             ab -= lr * db * inv;
-            for (int j = 0; j < 3; j++) aw[j] -= lr * dw[j] * inv;
+            for (int j = 0; j < 3; j++) aw[j] -= lr * (dw[j] * inv + 0.001 * aw[j]);
         }
 
-        // Threshold = median score on cal set
-        var scores = calSet.Select(s =>
+        // Cost-sensitive threshold: maximize net profit on cal set
+        var sampleScores = new (double Score, bool Correct, double Magnitude)[calSet.Count];
+        for (int si = 0; si < calSet.Count; si++)
         {
+            var s = calSet[si];
             var (avgP, stdP) = EnsembleProbAndStd(s.Features, weights, biases, F, featureSubsets, mlpHW, mlpHB, hidDim);
             double rawLogit = Math.Log(Math.Max(avgP, 1e-9) / Math.Max(1 - avgP, 1e-9));
-            double calibP   = Sigmoid(plattA * rawLogit + plattB);
-            double metaLogit = metaLabelBias;
-            double[] mx = [rawLogit, stdP, s.Features.Length > 0 ? s.Features[0] : 0,
-                           s.Features.Length > 1 ? s.Features[1] : 0,
-                           s.Features.Length > 2 ? s.Features[2] : 0];
-            for (int j = 0; j < Math.Min(metaLabelWeights.Length, mx.Length); j++)
-                metaLogit += metaLabelWeights[j] * mx[j];
-            double[] x = [calibP, stdP, Sigmoid(metaLogit)];
+            double calibP = Sigmoid(plattA * rawLogit + plattB);
+            double metaScore = ComputeMetaLabelScore(s.Features, avgP, stdP,
+                weights, biases, F, featureSubsets, mlpHW, mlpHB, hidDim,
+                metaLabelWeights, metaLabelBias, metaLabelTopFeatures);
+            double[] x = [calibP, stdP, metaScore];
             double absLogit = ab;
             for (int j = 0; j < 3; j++) absLogit += aw[j] * x[j];
-            return Sigmoid(absLogit);
-        }).OrderBy(v => v).ToArray();
+            double score = Sigmoid(absLogit);
+            bool correct = (calibP >= 0.5 ? 1 : 0) == (s.Direction > 0 ? 1 : 0);
+            sampleScores[si] = (score, correct, Math.Abs(s.Magnitude));
+        }
 
-        double threshold = scores.Length > 0 ? scores[scores.Length / 2] : 0.5;
+        double bestProfit = double.MinValue;
+        double threshold = 0.5;
+        for (double t = 0.1; t <= 0.9; t += 0.02)
+        {
+            double profit = 0;
+            foreach (var (score, correct, mag) in sampleScores)
+            {
+                if (score >= t)
+                    profit += correct ? mag : -mag;
+            }
+            if (profit > bestProfit) { bestProfit = profit; threshold = t; }
+        }
+
         return (aw, ab, threshold);
     }
 
@@ -2234,7 +2484,12 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         return scores[idx];
     }
 
-    // ── H10: Jackknife+ residuals ─────────────────────────────────────────────
+    // ── H10: Jackknife+ residuals (OOB-approximated) ───────────────────────────
+    //
+    // True Jackknife+ requires N leave-one-out retrains. We approximate by using
+    // OOB predictions: for each sample, average only learners where the sample was
+    // out-of-bag. This gives an honest (not seen during training) prediction per
+    // sample, closely approximating leave-one-out without the N× retraining cost.
 
     private static double[] ComputeJackknifeResiduals(
         List<TrainingSample> trainSet,
@@ -2242,6 +2497,7 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         double[]             biases,
         int                  F,
         int[][]?             featureSubsets,
+        bool[][]             oobMasks,
         double[][]?          mlpHW  = null,
         double[][]?          mlpHB  = null,
         int                  hidDim = 0)
@@ -2253,8 +2509,21 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         {
             var s = trainSet[i];
             double yTrue = s.Direction > 0 ? 1.0 : 0.0;
-            double rawP  = EnsembleProb(s.Features, weights, biases, F, featureSubsets,
-                MetaLearner.None, mlpHW, mlpHB, hidDim);
+
+            // Average predictions only from learners where this sample is OOB
+            double sumP = 0;
+            int oobCount = 0;
+            for (int k = 0; k < K; k++)
+            {
+                if (i < oobMasks[k].Length && oobMasks[k][i])
+                {
+                    sumP += SingleLearnerProb(s.Features, weights[k], biases[k],
+                        featureSubsets?[k], F, mlpHW?[k], mlpHB?[k], hidDim);
+                    oobCount++;
+                }
+            }
+            if (oobCount == 0) continue; // skip samples seen by all learners
+            double rawP = sumP / oobCount;
             res.Add(Math.Abs(yTrue - rawP));
         }
 
@@ -2298,15 +2567,21 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
 
         for (double t = lo; t <= hi + 1e-9; t += ThresholdSearchStep)
         {
-            int correct = 0;
+            // Only count samples where the model would trade (calibP >= t for buy, calibP <= 1-t for sell)
+            int wins = 0, trades = 0;
             foreach (var s in calSet)
             {
                 double rawP   = EnsembleProb(s.Features, weights, biases, F, featureSubsets, meta, mlpHW, mlpHB, hidDim);
                 double logit  = Math.Log(Math.Max(rawP, 1e-9) / Math.Max(1 - rawP, 1e-9));
                 double calibP = Sigmoid(plattA * logit + plattB);
-                if ((calibP >= t ? 1 : 0) == (s.Direction > 0 ? 1 : 0)) correct++;
+                bool wouldTrade = calibP >= t || calibP <= (1.0 - t);
+                if (!wouldTrade) continue;
+                trades++;
+                int yHat = calibP >= 0.5 ? 1 : 0;
+                if (yHat == (s.Direction > 0 ? 1 : 0)) wins++;
             }
-            double ev = calSet.Count > 0 ? (double)correct / calSet.Count : 0.0;
+            // EV = win_rate - (1 - win_rate) = 2 * win_rate - 1, scaled by trade frequency
+            double ev = trades > 0 ? ((double)wins / trades * 2.0 - 1.0) * trades / calSet.Count : 0.0;
             if (ev > bestEV) { bestEV = ev; best = t; }
         }
 
@@ -2591,23 +2866,60 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
     }
 
     // ── M10: Ensemble diversity ───────────────────────────────────────────────
+    //
+    // For MLP learners, weight-space correlation is misleading (two learners can
+    // have different output weights but identical predictions due to hidden-layer
+    // reparameterisation). Use prediction-based Pearson correlation instead:
+    // compute each learner's predictions on the cal set and correlate those vectors.
+    // For linear learners (hidDim == 0) without a cal set, fall back to weight correlation.
 
-    private static double ComputeEnsembleDiversity(double[][] weights, int F)
+    private static double ComputeEnsembleDiversity(
+        List<TrainingSample> calSet,
+        double[][]           weights,
+        double[]             biases,
+        int                  F,
+        int[][]?             featureSubsets,
+        double[][]?          mlpHW  = null,
+        double[][]?          mlpHB  = null,
+        int                  hidDim = 0)
     {
         int K = weights.Length;
         if (K < 2) return 0.0;
 
-        double sumRho = 0;
-        int    pairs  = 0;
+        // Use prediction-based correlation when we have cal samples
+        if (calSet.Count > 0)
+        {
+            int N = calSet.Count;
+            var preds = new double[K][];
+            for (int k = 0; k < K; k++)
+            {
+                preds[k] = new double[N];
+                for (int i = 0; i < N; i++)
+                    preds[k][i] = SingleLearnerProb(calSet[i].Features, weights[k], biases[k],
+                        featureSubsets?[k], F, mlpHW?[k], mlpHB?[k], hidDim);
+            }
 
+            double sumRho = 0;
+            int    pairs  = 0;
+            for (int i = 0; i < K - 1; i++)
+            for (int j = i + 1; j < K; j++)
+            {
+                sumRho += Math.Abs(PearsonCorrelation(preds[i], preds[j], N));
+                pairs++;
+            }
+            return pairs > 0 ? sumRho / pairs : 0.0;
+        }
+
+        // Fallback: weight-space correlation (meaningful only for linear learners)
+        double sumRhoW = 0;
+        int    pairsW  = 0;
         for (int i = 0; i < K - 1; i++)
         for (int j = i + 1; j < K; j++)
         {
-            sumRho += Math.Abs(PearsonCorrelation(weights[i], weights[j], F));
-            pairs++;
+            sumRhoW += Math.Abs(PearsonCorrelation(weights[i], weights[j], F));
+            pairsW++;
         }
-
-        return pairs > 0 ? sumRho / pairs : 0.0;
+        return pairsW > 0 ? sumRhoW / pairsW : 0.0;
     }
 
     // ── M18: Decision boundary stats ─────────────────────────────────────────
@@ -2630,14 +2942,15 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         for (int i = 0; i < calSet.Count; i++)
         {
             var x = calSet[i].Features;
+            // Use a defensive copy to avoid mutating the shared feature array
+            var xPerturbed = (float[])x.Clone();
             double p0 = EnsembleProb(x, weights, biases, F, featureSubsets, MetaLearner.None, mlpHW, mlpHB, hidDim);
             double gradSq = 0;
             for (int j = 0; j < Math.Min(F, x.Length); j++)
             {
-                float orig = x[j];
-                x[j] = (float)(orig + eps);
-                double pPlus = EnsembleProb(x, weights, biases, F, featureSubsets, MetaLearner.None, mlpHW, mlpHB, hidDim);
-                x[j] = orig;
+                xPerturbed[j] = (float)(x[j] + eps);
+                double pPlus = EnsembleProb(xPerturbed, weights, biases, F, featureSubsets, MetaLearner.None, mlpHW, mlpHB, hidDim);
+                xPerturbed[j] = x[j]; // restore for next feature
                 double dP = (pPlus - p0) / eps;
                 gradSq += dP * dP;
             }
@@ -2775,11 +3088,8 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         double baseline = EvalAccuracy(testSet, weights, biases, plattA, plattB, F, featureSubsets, meta, mlpHW, mlpHB, hidDim);
         var imp = new float[F];
 
-        for (int j = 0; j < F; j++)
+        Parallel.For(0, F, new ParallelOptions { CancellationToken = ct }, j =>
         {
-            if (ct.IsCancellationRequested) break;
-
-            // Per-feature deterministic seed — avoids ordering dependency between features
             var rng = new Random(77 * (j + 1));
             var origVals = testSet.Select(s => s.Features[j]).ToArray();
             for (int i = origVals.Length - 1; i > 0; i--)
@@ -2787,16 +3097,14 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
                 int swap = rng.Next(i + 1);
                 (origVals[i], origVals[swap]) = (origVals[swap], origVals[i]);
             }
-
             var permuted = testSet.Select((s, idx) =>
             {
                 var f2 = (float[])s.Features.Clone(); f2[j] = origVals[idx];
                 return s with { Features = f2 };
             }).ToList();
-
             double permAcc = EvalAccuracy(permuted, weights, biases, plattA, plattB, F, featureSubsets, meta, mlpHW, mlpHB, hidDim);
             imp[j] = (float)Math.Max(0, baseline - permAcc);
-        }
+        });
 
         float sum = imp.Sum();
         if (sum > 0) for (int j = 0; j < F; j++) imp[j] /= sum;
@@ -2822,10 +3130,8 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         double baseline = EvalAccuracy(calSet, weights, biases, plattA, plattB, F, featureSubsets, meta, mlpHW, mlpHB, hidDim);
         var imp = new double[F];
 
-        for (int j = 0; j < F; j++)
+        Parallel.For(0, F, new ParallelOptions { CancellationToken = ct }, j =>
         {
-            if (ct.IsCancellationRequested) break;
-
             var rng = new Random(13 * (j + 1));
             var origVals = calSet.Select(s => s.Features[j]).ToArray();
             for (int i = origVals.Length - 1; i > 0; i--)
@@ -2833,16 +3139,14 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
                 int swap = rng.Next(i + 1);
                 (origVals[i], origVals[swap]) = (origVals[swap], origVals[i]);
             }
-
             var permuted = calSet.Select((s, idx) =>
             {
                 var f2 = (float[])s.Features.Clone(); f2[j] = origVals[idx];
                 return s with { Features = f2 };
             }).ToList();
-
             double permAcc = EvalAccuracy(permuted, weights, biases, plattA, plattB, F, featureSubsets, meta, mlpHW, mlpHB, hidDim);
             imp[j] = Math.Max(0, baseline - permAcc);
-        }
+        });
 
         return imp;
     }
@@ -2881,7 +3185,7 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
             }
             double inv = 1.0 / n;
             db -= lr * gdb * inv;
-            for (int j = 0; j < F; j++) dw[j] -= lr * gdw[j] * inv;
+            for (int j = 0; j < F; j++) dw[j] -= lr * (gdw[j] * inv + 0.001 * dw[j]);
         }
 
         for (int i = 0; i < n; i++)
@@ -3249,6 +3553,52 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
 
     // ── Stratified temporally-weighted bootstrap ──────────────────────────────
 
+    private readonly struct AliasTable
+    {
+        private readonly double[] _prob;
+        private readonly int[] _alias;
+        private readonly int _n;
+
+        public AliasTable(int[] indices, double[] weights)
+        {
+            _n = indices.Length;
+            _prob = new double[_n];
+            _alias = new int[_n];
+            if (_n == 0) return;
+
+            double sum = 0;
+            foreach (int i in indices) sum += weights[i];
+            if (sum <= 0) { Array.Fill(_prob, 1.0); return; }
+
+            double avg = sum / _n;
+            var small = new Stack<int>(_n);
+            var large = new Stack<int>(_n);
+            var scaled = new double[_n];
+            for (int i = 0; i < _n; i++)
+            {
+                scaled[i] = weights[indices[i]] / avg;
+                if (scaled[i] < 1.0) small.Push(i); else large.Push(i);
+            }
+            while (small.Count > 0 && large.Count > 0)
+            {
+                int s = small.Pop(), l = large.Pop();
+                _prob[s] = scaled[s];
+                _alias[s] = l;
+                scaled[l] -= (1.0 - scaled[s]);
+                if (scaled[l] < 1.0) small.Push(l); else large.Push(l);
+            }
+            while (large.Count > 0) _prob[large.Pop()] = 1.0;
+            while (small.Count > 0) _prob[small.Pop()] = 1.0;
+        }
+
+        public int Sample(int[] indices, Random rng)
+        {
+            if (_n == 0) return 0;
+            int i = rng.Next(_n);
+            return rng.NextDouble() < _prob[i] ? indices[i] : indices[_alias[i]];
+        }
+    }
+
     private static int[] StratifiedBootstrap(
         int[]    posIdx,
         int[]    negIdx,
@@ -3259,32 +3609,14 @@ public sealed class SmoteModelTrainer : IMLModelTrainer
         int halfN     = n / 2;
         var bootstrap = new int[n];
 
+        var posAlias = new AliasTable(posIdx, temporalWeights);
+        var negAlias = new AliasTable(negIdx, temporalWeights);
+
         for (int i = 0; i < halfN; i++)
-            bootstrap[i] = posIdx.Length > 0
-                ? WeightedSample(posIdx, temporalWeights, rng)
-                : rng.Next(n);
-
+            bootstrap[i] = posIdx.Length > 0 ? posAlias.Sample(posIdx, rng) : rng.Next(n);
         for (int i = halfN; i < n; i++)
-            bootstrap[i] = negIdx.Length > 0
-                ? WeightedSample(negIdx, temporalWeights, rng)
-                : rng.Next(n);
-
+            bootstrap[i] = negIdx.Length > 0 ? negAlias.Sample(negIdx, rng) : rng.Next(n);
         return bootstrap;
-    }
-
-    private static int WeightedSample(int[] indices, double[] weights, Random rng)
-    {
-        double sum = 0;
-        foreach (int i in indices) sum += weights[i];
-        if (sum <= 0) return indices[rng.Next(indices.Length)];
-
-        double target = rng.NextDouble() * sum, cum = 0;
-        foreach (int i in indices)
-        {
-            cum += weights[i];
-            if (cum >= target) return i;
-        }
-        return indices[^1];
     }
 
     // ── Warm-start weight initialisation ──────────────────────────────────────

@@ -102,7 +102,11 @@ internal static class OptimizationCheckpointStore
                 stagnantBatches,
                 surrogateKind,
                 surrogateRandomState,
-                state.Observations.Take(Math.Min(25, state.Observations.Count)).ToList(),
+                state.Observations
+                    .OrderByDescending(o => o.Sequence)
+                    .Take(Math.Min(25, state.Observations.Count))
+                    .OrderBy(o => o.Sequence)
+                    .ToList(),
                 []));
     }
 

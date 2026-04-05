@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text.Json;
 using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
@@ -69,14 +70,66 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
     // ── Constants ────────────────────────────────────────────────────────────
 
     private const string ModelType    = "quantilerf";
-    private const string ModelVersion = "4.0";
+    private const string ModelVersion = "4.1";
 
-    private const int    MaxDepth    = 6;
-    private const int    MinLeaf     = 3;
-    private const double Eps         = 1e-10;
+    // Tree defaults
+    private const int    DefaultMaxDepth = 6;
+    private const int    DefaultMinLeaf  = 3;
+    private const double Eps             = 1e-10;
+
+    // Adam optimizer
     private const double AdamBeta1   = 0.9;
     private const double AdamBeta2   = 0.999;
     private const double AdamEpsilon = 1e-8;
+
+    // Split ratios for train / calibration / test
+    private const double TrainSplitRatio  = 0.70;
+    private const double CalEndSplitRatio = 0.80;
+
+    // Platt scaling SGD
+    private const double PlattLearningRate     = 0.01;
+    private const int    PlattMaxEpochs        = 200;
+    private const double PlattConvergenceDelta = 1e-7;
+
+    // Stationarity gate
+    private const double StationarityRhoThreshold   = 0.97;
+    private const double NonStationaryFractionWarn   = 0.30;
+
+    // Class imbalance warning bounds
+    private const double ImbalanceLowerBound = 0.35;
+    private const double ImbalanceUpperBound = 0.65;
+
+    // Density-ratio discriminator
+    private const double DensityRatioLr     = 0.01;
+    private const int    DensityRatioEpochs = 30;
+
+    // Feature pruning re-train acceptance tolerance
+    private const double PruningAccuracyTolerance = 0.005;
+
+    // Calibration-fold minimum sample counts
+    private const int MinCalSamples      = 10;
+    private const int MinCalSamplesPlatt = 20;
+
+    // Isotonic min block size for regularisation
+    private const int IsotonicMinBlockSize = 3;
+
+    // Default GES rounds
+    private const int DefaultGesRounds = 100;
+
+    // Permutation importance
+    private const int DefaultPermutationRepeats = 1;
+
+    // Target-leakage warning threshold (single feature > 40 % of total importance)
+    private const double LeakageImportanceWarnFraction = 0.40;
+
+    // MI redundancy defaults
+    private const int MaxMiDefaultSamples = 500;
+
+    // Diversity computation
+    private const int MaxDiversitySamples = 200;
+
+    // Minimum class count for stratified bootstrap
+    private const int MinStratifiedClassCount = 5;
 
     private static readonly JsonSerializerOptions JsonOptions =
         new() { WriteIndented = false, MaxDepth = 512 };
@@ -88,17 +141,159 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
     public QuantileRfModelTrainer(ILogger<QuantileRfModelTrainer> logger)
         => _logger = logger;
 
+    // ── Training diagnostics ─────────────────────────────────────────────────
+
+    /// <summary>
+    /// Structured training diagnostics emitted alongside the model for programmatic
+    /// consumption (monitoring dashboards, auto-tuning, offline analysis).
+    /// </summary>
+    private sealed record TrainingDiagnostics(
+        TimeSpan TreeBuildTime,
+        TimeSpan CalibrationTime,
+        TimeSpan EvaluationTime,
+        TimeSpan FeatureImportanceTime,
+        TimeSpan TotalTime,
+        int      GatesPassed,
+        int      GatesFailed,
+        string[] FailedGateNames,
+        double   PeakEstimatedMemoryMb,
+        int      TreesBeforePruning,
+        int      TreesAfterPruning,
+        int      FeaturesBeforePruning,
+        int      FeaturesAfterPruning);
+
+    // ── Training context (inter-phase state) ────────────────────────────────
+
+    /// <summary>
+    /// Mutable state container passed between training phase methods.
+    /// Avoids 40+ parameter signatures while keeping the phase extraction clean.
+    /// Fields are mutable because the feature-pruning step conditionally reassigns
+    /// trainSet, calSet, testSet, allTrees, and all calibration parameters.
+    /// </summary>
+    private sealed class TrainingContext
+    {
+        // ── Inputs ───────────────────────────────────────────────────────────
+        public required List<TrainingSample> OriginalSamples { get; init; }
+        public required TrainingHyperparams  Hp              { get; init; }
+        public ModelSnapshot?                WarmStart       { get; init; }
+        public long?                         ParentModelId   { get; init; }
+        public CancellationToken             Ct              { get; init; }
+
+        // ── Derived from inputs ──────────────────────────────────────────────
+        public int    F                 { get; set; }
+        public int    TreeCount         { get; set; }
+        public int    SqrtF             { get; set; }
+        public Random Rng               { get; set; } = new();
+        public int    EffectiveMaxDepth { get; set; }
+        public int    EffectiveMinLeaf  { get; set; }
+
+        // ── Diagnostics ──────────────────────────────────────────────────────
+        public Stopwatch      TotalStopwatch { get; } = Stopwatch.StartNew();
+        public List<string>   FailedGates    { get; } = [];
+        public int            GatesPassed    { get; set; }
+
+        // ── Standardization ──────────────────────────────────────────────────
+        public float[] Means { get; set; } = [];
+        public float[] Stds  { get; set; } = [];
+        public List<TrainingSample> AllStd { get; set; } = [];
+
+        // ── CV ───────────────────────────────────────────────────────────────
+        public WalkForwardResult CvResult { get; set; } = new(0, 0, 0, 0, 0, 0);
+
+        // ── Data splits ──────────────────────────────────────────────────────
+        public List<TrainingSample> TrainSet { get; set; } = [];
+        public List<TrainingSample> CalSet   { get; set; } = [];
+        public List<TrainingSample> TestSet  { get; set; } = [];
+
+        // ── Density/covariate weights ────────────────────────────────────────
+        public double[]? DensityWeights { get; set; }
+        public double[]? CumDensity     { get; set; }
+
+        // ── Warm-start ───────────────────────────────────────────────────────
+        public List<List<TreeNode>> WarmTrees          { get; set; } = [];
+        public int                  EffectiveTreeCount { get; set; }
+        public int                  GenerationNum      { get; set; } = 1;
+        public float[]?             ParentImportanceScores { get; set; }
+
+        // ── Forest ───────────────────────────────────────────────────────────
+        public List<List<TreeNode>> AllTrees  { get; set; } = [];
+        public List<List<TreeNode>> NewTrees  { get; set; } = [];
+        public List<HashSet<int>>   OobMasks  { get; set; } = [];
+        public float[]              FeatureImportance { get; set; } = [];
+        public double               OobAccuracy       { get; set; }
+        public int                  SanitizedCount    { get; set; }
+
+        // ── Calibration ──────────────────────────────────────────────────────
+        public double   PlattA      { get; set; } = 1.0;
+        public double   PlattB      { get; set; }
+        public double   PlattABuy   { get; set; }
+        public double   PlattBBuy   { get; set; }
+        public double   PlattASell  { get; set; }
+        public double   PlattBSell  { get; set; }
+        public double[] IsotonicBp  { get; set; } = [];
+        public double   Ece         { get; set; }
+        public double   OptimalThreshold { get; set; } = 0.5;
+        public double   AvgKellyFraction { get; set; }
+        public double   TemperatureScale { get; set; }
+
+        // ── Magnitude regressors ─────────────────────────────────────────────
+        public double[] MagWeights    { get; set; } = [];
+        public double   MagBias       { get; set; }
+        public double[] MlpW1         { get; set; } = [];
+        public double[] MlpB1         { get; set; } = [];
+        public double[] MlpW2         { get; set; } = [];
+        public double   MlpB2         { get; set; }
+        public double[] MagQ90Weights { get; set; } = [];
+        public double   MagQ90Bias    { get; set; }
+
+        // ── Feature analysis ─────────────────────────────────────────────────
+        public double[] CalImportanceScores { get; set; } = [];
+        public bool[]   ActiveMask          { get; set; } = [];
+        public int      PrunedCount         { get; set; }
+        public double   DurbinWatson        { get; set; } = 2.0;
+        public string[] RedundantPairs      { get; set; } = [];
+        public double   ConformalQHat       { get; set; }
+        public double[][] FeatureQuantileBp { get; set; } = [];
+        public double   BrierSkillScore     { get; set; }
+
+        // ── Evaluation ───────────────────────────────────────────────────────
+        public EvalMetrics EvalMetrics { get; set; } = new(0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0);
+
+        // ── Ensemble ─────────────────────────────────────────────────────────
+        public double[] GesWeights           { get; set; } = [];
+        public double[] MetaWeights          { get; set; } = [];
+        public double   MetaBias             { get; set; }
+        public double   EnsembleDiversity    { get; set; }
+        public double[] TreeCalAccuracies    { get; set; } = [];
+        public double[] JackknifeResiduals   { get; set; } = [];
+        public double[] MetaLabelWeights     { get; set; } = [];
+        public double   MetaLabelBias        { get; set; }
+        public double[] AbstentionWeights    { get; set; } = [];
+        public double   AbstentionBias       { get; set; }
+        public double   AbstentionThreshold  { get; set; } = 0.5;
+        public int      OobPrunedCount       { get; set; }
+        public double   CalCiStdA            { get; set; }
+        public double   CalCiStdB            { get; set; }
+        public string[] FeatureInteractions  { get; set; } = [];
+    }
+
     // ── Internal flat tree node ───────────────────────────────────────────────
 
+    /// <summary>
+    /// Compact decision tree node. <c>SplitFeat = -1</c> denotes a leaf.
+    /// <c>LeafDirection</c> holds the fraction of positive (Buy) samples at the leaf.
+    /// <c>LeafPosCount</c> / <c>LeafTotalCount</c> are the raw counts used for
+    /// probability computation and warm-start repopulation.
+    /// </summary>
     private sealed class TreeNode
     {
-        public int    SplitFeat     { get; set; } = -1;   // -1 = leaf
+        public int    SplitFeat     { get; set; } = -1;
         public double SplitThresh   { get; set; }
         public int    LeftChild     { get; set; } = -1;
         public int    RightChild    { get; set; } = -1;
-        public double LeafDirection { get; set; }          // mean(Direction > 0) at leaf
-        public int    LeafPosCount  { get; set; }          // positive (Buy) samples at this leaf
-        public int    LeafTotalCount { get; set; }         // total samples at this leaf
+        public double LeafDirection { get; set; }
+        public int    LeafPosCount  { get; set; }
+        public int    LeafTotalCount { get; set; }
     }
 
     // ── IMLModelTrainer ───────────────────────────────────────────────────────
@@ -113,7 +308,9 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
         return await Task.Run(() => Train(samples, hp, warmStart, parentModelId, ct), ct);
     }
 
-    // ── Core training logic ───────────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════════
+    // CORE TRAINING — thin orchestrator calling named phase methods
+    // ══════════════════════════════════════════════════════════════════════════
 
     private TrainingResult Train(
         List<TrainingSample> samples,
@@ -145,37 +342,89 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
             throw new InvalidOperationException(
                 $"QuantileRfModelTrainer needs at least {hp.MinSamples} samples; got {samples.Count}.");
 
-        int F                 = samples[0].Features.Length;
-        int treeCount         = hp.QrfTrees ?? 50;
-        int sqrtF             = Math.Max(1, (int)Math.Round(Math.Sqrt(F)));
-        var rng               = hp.QrfSeed != 0 ? new Random(hp.QrfSeed) : new Random();
-        int effectiveMaxDepth = hp.QrfMaxDepth > 0 ? hp.QrfMaxDepth : MaxDepth;
-        int effectiveMinLeaf  = hp.QrfMinLeaf  > 0 ? hp.QrfMinLeaf  : MinLeaf;
+        // ── Build context and run phases ──────────────────────────────────────
+        var ctx = new TrainingContext
+        {
+            OriginalSamples = samples,
+            Hp              = hp,
+            WarmStart       = warmStart,
+            ParentModelId   = parentModelId,
+            Ct              = ct,
+            F               = samples[0].Features.Length,
+            TreeCount       = hp.QrfTrees ?? 50,
+            SqrtF           = Math.Max(1, (int)Math.Round(Math.Sqrt(samples[0].Features.Length))),
+            Rng             = hp.QrfSeed != 0 ? new Random(hp.QrfSeed) : new Random(),
+            EffectiveMaxDepth = hp.QrfMaxDepth > 0 ? hp.QrfMaxDepth : DefaultMaxDepth,
+            EffectiveMinLeaf  = hp.QrfMinLeaf  > 0 ? hp.QrfMinLeaf  : DefaultMinLeaf,
+            EffectiveTreeCount = hp.QrfTrees ?? 50,
+        };
 
         _logger.LogInformation(
             "QuantileRfModelTrainer starting: N={N} F={F} sqrtF={SF} T={T}",
-            samples.Count, F, sqrtF, treeCount);
+            samples.Count, ctx.F, ctx.SqrtF, ctx.TreeCount);
+
+        if (RunPreTrainingGates(ctx) is { } earlyExit1)  return earlyExit1;
+        if (PrepareTrainingData(ctx) is { } earlyExit2)  return earlyExit2;
+        BuildAndPruneForest(ctx);
+        CalibrateModel(ctx);
+        if (EvaluateAndRefine(ctx) is { } earlyExit3)    return earlyExit3;
+        FitEnsembleMethods(ctx);
+        return SerializeSnapshot(ctx);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // PHASE 1: Pre-training gates (standardization, CV, stability/equity gates)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    private TrainingResult? RunPreTrainingGates(TrainingContext ctx)
+    {
+        var hp = ctx.Hp;
+        int F  = ctx.F;
 
         // ── 2. Z-score standardisation — statistics from the training fold only ─
         // Splitting must be established before computing means/stds so that the
         // scale of the calibration and test sets cannot leak into the normalisation
         // parameters used at inference time.
-        int trainEndRaw = (int)(samples.Count * 0.70);
+        int trainEndRaw = (int)(ctx.OriginalSamples.Count * TrainSplitRatio);
         var trainRawFeatures = new List<float[]>(trainEndRaw);
-        for (int i = 0; i < trainEndRaw; i++) trainRawFeatures.Add(samples[i].Features);
+        for (int i = 0; i < trainEndRaw; i++) trainRawFeatures.Add(ctx.OriginalSamples[i].Features);
         var (means, stds) = MLFeatureHelper.ComputeStandardization(trainRawFeatures);
+        ctx.Means = means;
+        ctx.Stds  = stds;
 
-        var allStd = new List<TrainingSample>(samples.Count);
-        foreach (var s in samples)
+        var allStd = new List<TrainingSample>(ctx.OriginalSamples.Count);
+        foreach (var s in ctx.OriginalSamples)
             allStd.Add(s with { Features = MLFeatureHelper.Standardize(s.Features, means, stds) });
+        ctx.AllStd = allStd;
 
         // ── 3. Walk-forward cross-validation ─────────────────────────────────
-        var (cvResult, equityCurveGateFailed) = RunWalkForwardCV(allStd, hp, F, sqrtF, treeCount, ct,
-                                                                   effectiveMaxDepth, effectiveMinLeaf);
+        var (cvResult, equityCurveGateFailed) = RunWalkForwardCV(allStd, hp, F, ctx.SqrtF, ctx.TreeCount, ctx.Ct,
+                                                                   ctx.EffectiveMaxDepth, ctx.EffectiveMinLeaf);
+        ctx.CvResult = cvResult;
         _logger.LogInformation(
             "Walk-forward CV — folds={Folds} avgAcc={Acc:P1} stdAcc={Std:P1} avgF1={F1:F3} avgEV={EV:F4} avgSharpe={Sharpe:F2} sharpeTrend={Trend:F3}",
             cvResult.FoldCount, cvResult.AvgAccuracy, cvResult.StdAccuracy,
             cvResult.AvgF1, cvResult.AvgEV, cvResult.AvgSharpe, cvResult.SharpeTrend);
+
+        // ── 3b. Feature stability gate (#26) ──────────────────────────────────
+        if (hp.QrfFeatureStabilityGateEnabled && hp.QrfMaxFeatureStabilityCov > 0.0
+            && cvResult.FeatureStabilityScores is { Length: > 0 })
+        {
+            var sorted = cvResult.FeatureStabilityScores.OrderBy(x => x).ToArray();
+            double medianCov = sorted[sorted.Length / 2];
+            if (medianCov > hp.QrfMaxFeatureStabilityCov)
+            {
+                _logger.LogWarning(
+                    "QuantileRF feature stability gate: median CoV={CoV:F3} > threshold={Thr:F3}. " +
+                    "Model relies on unstable features — aborting.",
+                    medianCov, hp.QrfMaxFeatureStabilityCov);
+                ctx.FailedGates.Add("FeatureStability");
+                return new TrainingResult(
+                    new EvalMetrics(0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0),
+                    cvResult, []);
+            }
+            ctx.GatesPassed++;
+        }
 
         // ── 4. Equity-curve gate ──────────────────────────────────────────────
         if (equityCurveGateFailed)
@@ -186,34 +435,46 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
                 cvResult, []);
         }
 
-        ct.ThrowIfCancellationRequested();
+        ctx.Ct.ThrowIfCancellationRequested();
+        return null;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // PHASE 2: Prepare training data (splits, stationarity, density, warm-start)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    private TrainingResult? PrepareTrainingData(TrainingContext ctx)
+    {
+        var hp     = ctx.Hp;
+        int F      = ctx.F;
+        var allStd = ctx.AllStd;
 
         // ── 5. Final splits: 70 % train | 10 % cal | ~20 % test + embargo ─────
-        int trainEnd  = (int)(allStd.Count * 0.70);
-        int calEnd    = (int)(allStd.Count * 0.80);
+        int trainEnd  = (int)(allStd.Count * TrainSplitRatio);
+        int calEnd    = (int)(allStd.Count * CalEndSplitRatio);
         int embargo   = hp.EmbargoBarCount;
 
         int trainLimit = Math.Max(0, trainEnd - embargo);
         int calStart   = Math.Min(trainEnd + embargo, calEnd);
         int testStart  = Math.Min(calEnd   + embargo, allStd.Count);
 
-        var trainSet = allStd[..trainLimit];
-        var calSet   = calStart < calEnd       ? allStd[calStart..calEnd] : [];
-        var testSet  = testStart < allStd.Count ? allStd[testStart..]    : [];
+        ctx.TrainSet = allStd[..trainLimit];
+        ctx.CalSet   = calStart < calEnd       ? allStd[calStart..calEnd] : [];
+        ctx.TestSet  = testStart < allStd.Count ? allStd[testStart..]    : [];
 
-        if (trainSet.Count < hp.MinSamples)
+        if (ctx.TrainSet.Count < hp.MinSamples)
             throw new InvalidOperationException(
-                $"Insufficient training samples after splits: {trainSet.Count} < {hp.MinSamples}");
+                $"Insufficient training samples after splits: {ctx.TrainSet.Count} < {hp.MinSamples}");
 
         // ── 5b. Stationarity gate ─────────────────────────────────────────────
         {
-            int    nonStat  = CountNonStationaryFeatures(trainSet, F);
+            int    nonStat  = CountNonStationaryFeatures(ctx.TrainSet, F);
             double fraction = F > 0 ? (double)nonStat / F : 0;
-            if (fraction > 0.30 && hp.FracDiffD == 0.0)
+            if (fraction > NonStationaryFractionWarn && hp.FracDiffD == 0.0)
             {
                 _logger.LogWarning(
-                    "Stationarity gate: {N}/{T} features have unit root (|ρ₁| > 0.97). " +
-                    "Consider enabling FracDiffD.", nonStat, F);
+                    "Stationarity gate: {N}/{T} features have unit root (|ρ₁| > {Thr:F2}). " +
+                    "Consider enabling FracDiffD.", nonStat, F, StationarityRhoThreshold);
                 if (hp.QrfStationarityGateEnabled)
                 {
                     _logger.LogWarning(
@@ -221,7 +482,7 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
                         "({NonStat}/{Total} non-stationary features, FracDiffD=0).", nonStat, F);
                     return new TrainingResult(
                         new EvalMetrics(0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0),
-                        cvResult, []);
+                        ctx.CvResult, []);
                 }
             }
         }
@@ -229,9 +490,9 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
         // ── 5c. Class-imbalance warning ────────────────────────────────────────
         {
             int posCount = 0;
-            foreach (var s in trainSet) if (s.Direction > 0) posCount++;
-            double buyRatio = (double)posCount / trainSet.Count;
-            if (buyRatio < 0.35 || buyRatio > 0.65)
+            foreach (var s in ctx.TrainSet) if (s.Direction > 0) posCount++;
+            double buyRatio = (double)posCount / ctx.TrainSet.Count;
+            if (buyRatio < ImbalanceLowerBound || buyRatio > ImbalanceUpperBound)
                 _logger.LogWarning(
                     "QuantileRF class imbalance: Buy={Buy:P1}, Sell={Sell:P1}. " +
                     "Density-weighted bootstrap will partially compensate.",
@@ -240,17 +501,17 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
 
         // ── 6. Density-ratio importance weights ───────────────────────────────
         double[]? densityWeights = null;
-        if (hp.DensityRatioWindowDays > 0 && trainSet.Count >= 50)
+        if (hp.DensityRatioWindowDays > 0 && ctx.TrainSet.Count >= 50)
         {
-            densityWeights = ComputeDensityRatioWeights(trainSet, F, hp.DensityRatioWindowDays);
+            densityWeights = ComputeDensityRatioWeights(ctx.TrainSet, F, hp.DensityRatioWindowDays);
             _logger.LogDebug("QuantileRF density-ratio weights computed (recentWindow={W}d).", hp.DensityRatioWindowDays);
         }
 
         // ── 6b. Covariate shift weights from parent model ─────────────────────
         if (hp.UseCovariateShiftWeights &&
-            warmStart?.FeatureQuantileBreakpoints is { Length: > 0 } parentBp)
+            ctx.WarmStart?.FeatureQuantileBreakpoints is { Length: > 0 } parentBp)
         {
-            var csWeights = ComputeCovariateShiftWeights(trainSet, parentBp, F);
+            var csWeights = ComputeCovariateShiftWeights(ctx.TrainSet, parentBp, F);
             if (densityWeights is not null)
             {
                 for (int i = 0; i < densityWeights.Length && i < csWeights.Length; i++)
@@ -265,8 +526,9 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
                 densityWeights = csWeights;
             }
             _logger.LogDebug("QuantileRF covariate shift weights applied from parent model (gen={Gen}).",
-                warmStart.GenerationNumber);
+                ctx.WarmStart.GenerationNumber);
         }
+        ctx.DensityWeights = densityWeights;
 
         // Pre-compute cumulative density weights for O(log N) bootstrap sampling
         double[]? cumDensity = null;
@@ -277,39 +539,84 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
             for (int i = 1; i < densityWeights.Length; i++)
                 cumDensity[i] = cumDensity[i - 1] + densityWeights[i];
         }
+        ctx.CumDensity = cumDensity;
 
         // ── 7. Warm-start: load existing forest from parent snapshot ──────────
-        int effectiveTreeCount = treeCount;
-        int generationNum      = 1;
-        var warmTrees          = new List<List<TreeNode>>();
+        var warmTrees = new List<List<TreeNode>>();
 
-        if (warmStart?.Type == ModelType && warmStart.GbmTreesJson is { Length: > 0 })
+        if (ctx.WarmStart?.Type == ModelType && ctx.WarmStart.GbmTreesJson is { Length: > 0 })
         {
+            // #17: Snapshot version migration check
+            if (!string.IsNullOrEmpty(ctx.WarmStart.Version) && ctx.WarmStart.Version != ModelVersion)
+                _logger.LogWarning(
+                    "QuantileRF warm-start version mismatch: snapshot={SnapVer}, trainer={TrainerVer}. " +
+                    "New v4.1 fields will use defaults.",
+                    ctx.WarmStart.Version, ModelVersion);
+
             try
             {
-                var loadedGbm = JsonSerializer.Deserialize<List<GbmTree>>(warmStart.GbmTreesJson, JsonOptions);
+                var loadedGbm = JsonSerializer.Deserialize<List<GbmTree>>(ctx.WarmStart.GbmTreesJson, JsonOptions);
                 if (loadedGbm is { Count: > 0 })
                 {
-                    foreach (var gbmTree in loadedGbm)
+                    // #18: Parallel repopulation of warm-start trees
+                    var loadedNodes = new List<TreeNode>?[loadedGbm.Count];
+                    Parallel.For(0, loadedGbm.Count, i =>
                     {
-                        var nodes = ConvertGbmToTreeNodes(gbmTree);
-                        if (nodes.Count == 0) continue;
-                        RepopulateLeafCounts(nodes, 0, trainSet);
-                        warmTrees.Add(nodes);
-                    }
-                    effectiveTreeCount = Math.Max(10, treeCount / 3);
-                    generationNum      = warmStart.GenerationNumber + 1;
+                        var nodes = ConvertGbmToTreeNodes(loadedGbm[i]);
+                        if (nodes.Count > 0)
+                        {
+                            RepopulateLeafCounts(nodes, 0, ctx.TrainSet);
+                            loadedNodes[i] = nodes;
+                        }
+                    });
+                    foreach (var nodes in loadedNodes)
+                        if (nodes is { Count: > 0 }) warmTrees.Add(nodes);
+
+                    ctx.EffectiveTreeCount = Math.Max(10, ctx.TreeCount / 3);
+                    ctx.GenerationNum      = ctx.WarmStart.GenerationNumber + 1;
                     _logger.LogInformation(
                         "QuantileRF warm-start: loaded {N} trees (gen={Gen}); adding up to {New} new trees.",
-                        warmTrees.Count, warmStart.GenerationNumber, effectiveTreeCount);
+                        warmTrees.Count, ctx.WarmStart.GenerationNumber, ctx.EffectiveTreeCount);
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogWarning("QuantileRF warm-start deserialization failed ({Msg}); starting cold.", ex.Message);
+                // #16: Log full exception (including stack trace) for debugging
+                _logger.LogWarning(ex, "QuantileRF warm-start deserialization failed; starting cold.");
                 warmTrees = [];
             }
         }
+        ctx.WarmTrees = warmTrees;
+
+        // Warm-start biased feature importance for candidate selection (#12)
+        // FeatureImportanceScores is double[]; convert to float[] once for BuildTree
+        if (ctx.WarmStart?.FeatureImportanceScores is { Length: > 0 } piScores)
+        {
+            var parentImportanceScores = new float[piScores.Length];
+            for (int i = 0; i < piScores.Length; i++)
+                parentImportanceScores[i] = (float)piScores[i];
+            ctx.ParentImportanceScores = parentImportanceScores;
+        }
+
+        return null;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // PHASE 3: Build and prune forest
+    // ══════════════════════════════════════════════════════════════════════════
+
+    private void BuildAndPruneForest(TrainingContext ctx)
+    {
+        var hp     = ctx.Hp;
+        int F      = ctx.F;
+        int sqrtF  = ctx.SqrtF;
+        var rng    = ctx.Rng;
+        int effectiveTreeCount = ctx.EffectiveTreeCount;
+        int effectiveMaxDepth  = ctx.EffectiveMaxDepth;
+        int effectiveMinLeaf   = ctx.EffectiveMinLeaf;
+        var trainSet           = ctx.TrainSet;
+        var cumDensity         = ctx.CumDensity;
+        var densityWeights     = ctx.DensityWeights;
 
         // ── 8. Build new trees (stratified density-weighted bootstrap, OOB tracking) ──
         int trainCount     = trainSet.Count;
@@ -326,7 +633,7 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
             if (trainSet[i].Direction > 0) posTrainIdx.Add(i);
             else                           negTrainIdx.Add(i);
         }
-        bool useStratified = posTrainIdx.Count >= 5 && negTrainIdx.Count >= 5;
+        bool useStratified = posTrainIdx.Count >= MinStratifiedClassCount && negTrainIdx.Count >= MinStratifiedClassCount;
 
         // Build per-class cumulative density arrays when density weights are available
         double[]? posCumDensity = null, negCumDensity = null;
@@ -354,15 +661,7 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
             else { for (int i = 0; i < negW.Length; i++) negCumDensity[i] = (i + 1.0) / negW.Length; }
         }
 
-        // Warm-start biased feature importance for candidate selection (#12)
-        // FeatureImportanceScores is double[]; convert to float[] once for BuildTree
-        float[]? parentImportanceScores = null;
-        if (warmStart?.FeatureImportanceScores is { Length: > 0 } piScores)
-        {
-            parentImportanceScores = new float[piScores.Length];
-            for (int i = 0; i < piScores.Length; i++)
-                parentImportanceScores[i] = (float)piScores[i];
-        }
+        var parentImportanceScores = ctx.ParentImportanceScores;
 
         // Pre-generate per-tree seeds from the master RNG (sequential) so that tree
         // construction is fully deterministic given hp.QrfSeed regardless of thread scheduling.
@@ -375,7 +674,7 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
         var impAccumArr  = new double[effectiveTreeCount][];
         var impSplitsArr = new int[effectiveTreeCount];
 
-        Parallel.For(0, effectiveTreeCount, new ParallelOptions { CancellationToken = ct }, tIdx =>
+        Parallel.For(0, effectiveTreeCount, new ParallelOptions { CancellationToken = ctx.Ct }, tIdx =>
         {
             var localRng       = new Random(treeSeeds[tIdx]);
             var localImpAccum  = new double[F];
@@ -455,8 +754,8 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
         }
 
         // Combine warm-start + new trees for inference
-        var allTrees = new List<List<TreeNode>>(warmTrees.Count + newTrees.Count);
-        allTrees.AddRange(warmTrees);
+        var allTrees = new List<List<TreeNode>>(ctx.WarmTrees.Count + newTrees.Count);
+        allTrees.AddRange(ctx.WarmTrees);
         allTrees.AddRange(newTrees);
 
         // ── 9. NaN/Inf node sanitization ─────────────────────────────────────
@@ -475,6 +774,23 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
         if (sanitizedCount > 0)
             _logger.LogWarning("QuantileRF: sanitized {N} degenerate nodes/trees.", sanitizedCount);
 
+        // ── 9b. Leaf shrinkage (#11) ──────────────────────────────────────────
+        if (hp.QrfLeafShrinkage > 0.0)
+        {
+            // Compute global base rate from training set
+            int globalPos = 0;
+            foreach (var s in trainSet) if (s.Direction > 0) globalPos++;
+            double globalBaseRate = (double)globalPos / trainSet.Count;
+            double shrink = Math.Clamp(hp.QrfLeafShrinkage, 0.0, 1.0);
+
+            foreach (var tree in allTrees)
+                foreach (var node in tree)
+                    if (node.SplitFeat < 0) // leaf
+                        node.LeafDirection = shrink * globalBaseRate + (1.0 - shrink) * node.LeafDirection;
+
+            _logger.LogDebug("Leaf shrinkage applied: factor={S:F3}, baseRate={BR:F3}", shrink, globalBaseRate);
+        }
+
         // ── 10. OOB accuracy (RF-native, bias-free generalisation estimate) ────
         double oobAccuracy = ComputeOobAccuracy(trainSet, newTrees, oobMasks);
         _logger.LogInformation("QuantileRF OOB accuracy={OobAcc:P1}", oobAccuracy);
@@ -490,9 +806,32 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
                 featureImportance[fi] = totalImp > Eps ? (float)(impAccum[fi] / totalImp) : 0f;
         }
 
+        // Write results to context
+        ctx.AllTrees          = allTrees;
+        ctx.NewTrees          = newTrees;
+        ctx.OobMasks          = oobMasks;
+        ctx.OobAccuracy       = oobAccuracy;
+        ctx.FeatureImportance = featureImportance;
+        ctx.SanitizedCount    = sanitizedCount;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // PHASE 4: Calibrate model (Platt, isotonic, ECE, threshold, Kelly, temp)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    private void CalibrateModel(TrainingContext ctx)
+    {
+        var hp       = ctx.Hp;
+        var calSet   = ctx.CalSet;
+        var testSet  = ctx.TestSet;
+        var allTrees = ctx.AllTrees;
+        var trainSet = ctx.TrainSet;
+
         // ── 12. Platt scaling on calibration fold ─────────────────────────────
         var (plattA, plattB) = FitPlattScaling(calSet, allTrees, trainSet);
         _logger.LogDebug("Platt calibration: A={A:F4} B={B:F4}", plattA, plattB);
+        ctx.PlattA = plattA;
+        ctx.PlattB = plattB;
 
         // ── 13. Class-conditional Platt (separate Buy/Sell calibrators) ────────
         var (plattABuy, plattBBuy, plattASell, plattBSell) =
@@ -500,24 +839,34 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
         _logger.LogDebug(
             "Class-conditional Platt — Buy: A={AB:F4} B={BB:F4}  Sell: A={AS:F4} B={BS:F4}",
             plattABuy, plattBBuy, plattASell, plattBSell);
+        ctx.PlattABuy  = plattABuy;
+        ctx.PlattBBuy  = plattBBuy;
+        ctx.PlattASell = plattASell;
+        ctx.PlattBSell = plattBSell;
 
         // ── 14. Isotonic calibration (PAVA) ────────────────────────────────────
         double[] isotonicBp = FitIsotonicCalibration(calSet, allTrees, trainSet, plattA, plattB);
         _logger.LogInformation("Isotonic calibration: {N} PAVA breakpoints", isotonicBp.Length / 2);
+        ctx.IsotonicBp = isotonicBp;
 
         // ── 15. ECE on held-out test set ──────────────────────────────────────
         double ece = ComputeEce(testSet, allTrees, trainSet, plattA, plattB, isotonicBp);
         _logger.LogInformation("Post-Platt ECE={Ece:F4}", ece);
+        ctx.Ece = ece;
 
         // ── 16. EV-optimal threshold (on cal set — no test-set leakage) ────────
         double optimalThreshold = ComputeOptimalThreshold(
             calSet, allTrees, trainSet, plattA, plattB, isotonicBp,
-            hp.ThresholdSearchMin, hp.ThresholdSearchMax);
-        _logger.LogInformation("EV-optimal threshold={Thr:F2}", optimalThreshold);
+            hp.ThresholdSearchMin, hp.ThresholdSearchMax,
+            stepBps: hp.ThresholdSearchStepBps);
+        _logger.LogInformation("EV-optimal threshold={Thr:F3} (step={Bps}bps)", optimalThreshold, hp.ThresholdSearchStepBps);
+        ctx.OptimalThreshold = optimalThreshold;
 
-        // ── 17. Kelly fraction (half-Kelly, on cal set) ────────────────────────
-        double avgKellyFraction = ComputeAvgKellyFraction(calSet, allTrees, trainSet, plattA, plattB, isotonicBp);
+        // ── 17. Kelly fraction (half-Kelly or magnitude-adjusted, on cal set) ──
+        double avgKellyFraction = ComputeAvgKellyFraction(calSet, allTrees, trainSet, plattA, plattB, isotonicBp,
+            useAdjusted: hp.QrfUseAdjustedKelly);
         _logger.LogDebug("Average Kelly fraction (half-Kelly)={Kelly:F4}", avgKellyFraction);
+        ctx.AvgKellyFraction = avgKellyFraction;
 
         // ── 18. Temperature scaling (optional alternative calibration) ─────────
         double temperatureScale = 0.0;
@@ -526,9 +875,27 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
             temperatureScale = FitTemperatureScaling(calSet, allTrees, trainSet);
             _logger.LogDebug("Temperature scaling: T={T:F4}", temperatureScale);
         }
+        ctx.TemperatureScale = temperatureScale;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // PHASE 5: Evaluate and refine (magnitude, importance, pruning, DW, MI, conformal, PSI)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    private TrainingResult? EvaluateAndRefine(TrainingContext ctx)
+    {
+        var hp       = ctx.Hp;
+        int F        = ctx.F;
+        var trainSet = ctx.TrainSet;
+        var calSet   = ctx.CalSet;
+        var testSet  = ctx.TestSet;
+        var allTrees = ctx.AllTrees;
+        var newTrees = ctx.NewTrees;
 
         // ── 19. Magnitude regressor (linear, or 2-layer MLP when QrfMagHiddenDim > 0) ──
-        var (magWeights, magBias) = FitLinearRegressor(trainSet, F, hp, ct);
+        var (magWeights, magBias) = FitLinearRegressor(trainSet, F, hp, ctx.Ct);
+        ctx.MagWeights = magWeights;
+        ctx.MagBias    = magBias;
 
         // ── 19b. MLP magnitude regressor — trained in addition to the linear one ─
         // The linear weights are retained for EvaluateModel RMSE consistency; the MLP
@@ -537,25 +904,35 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
         double   mlpB2 = 0.0;
         if (hp.QrfMagHiddenDim > 0 && trainSet.Count >= hp.MinSamples)
         {
-            (mlpW1, mlpB1, mlpW2, mlpB2) = FitMlpMagnitudeRegressor(trainSet, F, hp.QrfMagHiddenDim, hp, ct);
+            (mlpW1, mlpB1, mlpW2, mlpB2) = FitMlpMagnitudeRegressor(trainSet, F, hp.QrfMagHiddenDim, hp, ctx.Ct);
             _logger.LogInformation(
                 "QRF MLP magnitude regressor fitted (H={H}, params={P}).",
                 hp.QrfMagHiddenDim, F * hp.QrfMagHiddenDim + 2 * hp.QrfMagHiddenDim + 1);
         }
+        ctx.MlpW1 = mlpW1;
+        ctx.MlpB1 = mlpB1;
+        ctx.MlpW2 = mlpW2;
+        ctx.MlpB2 = mlpB2;
 
         // ── 20. Quantile magnitude regressor (pinball loss, optional) ──────────
         double[] magQ90Weights = [];
         double   magQ90Bias    = 0.0;
         if (hp.MagnitudeQuantileTau > 0.0 && trainSet.Count >= hp.MinSamples)
         {
-            (magQ90Weights, magQ90Bias) = FitQuantileRegressor(trainSet, F, hp.MagnitudeQuantileTau);
+            (magQ90Weights, magQ90Bias) = FitQuantileRegressor(trainSet, F, hp.MagnitudeQuantileTau,
+                l2: hp.QrfQuantileL2, earlyStopPatience: hp.QrfQuantileEarlyStopPatience);
             _logger.LogDebug("Quantile magnitude regressor fitted (τ={Tau:F2}).", hp.MagnitudeQuantileTau);
         }
+        ctx.MagQ90Weights = magQ90Weights;
+        ctx.MagQ90Bias    = magQ90Bias;
 
         // ── 21. Permutation feature importance on test set ────────────────────
+        var featureImportance = ctx.FeatureImportance;
         if (testSet.Count >= 10)
             featureImportance = ComputePermutationImportance(
-                testSet, allTrees, trainSet, plattA, plattB, isotonicBp, F, hp.QrfSeed);
+                testSet, allTrees, trainSet, ctx.PlattA, ctx.PlattB, ctx.IsotonicBp, F, hp.QrfSeed,
+                repeats: Math.Max(1, hp.QrfPermutationRepeats));
+        ctx.FeatureImportance = featureImportance;
 
         if (_logger.IsEnabled(LogLevel.Information))
         {
@@ -570,9 +947,24 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
                 string.Join(", ", topFeatures.Select(f => $"{f.Name}={f.Importance:P1}")));
         }
 
+        // ── 21b. Target leakage check (#13) ───────────────────────────────────
+        {
+            float maxImp = featureImportance.Length > 0 ? featureImportance.Max() : 0;
+            if (maxImp > LeakageImportanceWarnFraction)
+            {
+                int leakIdx = Array.IndexOf(featureImportance, maxImp);
+                string leakName = leakIdx < MLFeatureHelper.FeatureNames.Length
+                    ? MLFeatureHelper.FeatureNames[leakIdx] : $"F{leakIdx}";
+                _logger.LogWarning(
+                    "QuantileRF target leakage warning: feature '{Name}' has {Imp:P0} of total importance " +
+                    "(threshold={Thr:P0}). Verify this feature does not contain forward-looking information.",
+                    leakName, maxImp, LeakageImportanceWarnFraction);
+            }
+        }
+
         // ── 22. Calibration-set permutation importance (for warm-start transfer)
-        double[] calImportanceScores = calSet.Count >= 10
-            ? ComputeCalPermutationImportance(calSet, allTrees, trainSet, F, ct)
+        ctx.CalImportanceScores = calSet.Count >= 10
+            ? ComputeCalPermutationImportance(calSet, allTrees, trainSet, F, ctx.Ct)
             : new double[F];
 
         // ── 23. Feature pruning re-train pass ─────────────────────────────────
@@ -594,37 +986,49 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
             // Using treeCount/2 or the advancing master rng made the acceptance gate
             // inconsistent (smaller/differently-seeded forest vs. the full one).
             var pruneRng  = hp.QrfSeed != 0 ? new Random(hp.QrfSeed + 1999) : new Random();
-            var pTrees    = BuildForestOnly(maskedTrain, treeCount, F, sqrtF, cumDensity, pruneRng, ct,
-                                            importanceScores: null, maxDepth: effectiveMaxDepth, minLeaf: effectiveMinLeaf);
+            var pTrees    = BuildForestOnly(maskedTrain, ctx.TreeCount, F, ctx.SqrtF, ctx.CumDensity, pruneRng, ctx.Ct,
+                                            importanceScores: null, maxDepth: ctx.EffectiveMaxDepth, minLeaf: ctx.EffectiveMinLeaf);
             var (pA, pB)  = FitPlattScaling(maskedCal, pTrees, maskedTrain);
             double[] pBp  = FitIsotonicCalibration(maskedCal, pTrees, maskedTrain, pA, pB);
             var pMetrics  = EvaluateModel(maskedTest, pTrees, maskedTrain, magWeights, magBias, pA, pB, pBp);
 
-            // Accept the pruned model only when its held-out test accuracy is within 0.5 % of
-            // the full model — a single, consistent gate with no test-set leakage from OOB.
-            double fullTestAcc = EvaluateModel(
-                testSet, allTrees, trainSet, magWeights, magBias, plattA, plattB, isotonicBp).Accuracy;
+            // #9: Multi-metric pruning gate — check accuracy, Brier, and EV
+            var fullMetrics = EvaluateModel(
+                testSet, allTrees, trainSet, magWeights, magBias, ctx.PlattA, ctx.PlattB, ctx.IsotonicBp);
+            bool pruneAccepted = pMetrics.Accuracy >= fullMetrics.Accuracy - PruningAccuracyTolerance
+                              && pMetrics.BrierScore <= fullMetrics.BrierScore + PruningAccuracyTolerance
+                              && pMetrics.ExpectedValue >= fullMetrics.ExpectedValue - PruningAccuracyTolerance;
 
-            if (pMetrics.Accuracy >= fullTestAcc - 0.005)
+            if (pruneAccepted)
             {
                 _logger.LogInformation(
                     "QuantileRF pruned model accepted: acc={Acc:P1}, BSS={B:F4}",
                     pMetrics.Accuracy, pMetrics.BrierScore);
-                allTrees    = pTrees;
-                trainSet    = maskedTrain;
-                calSet      = maskedCal;
-                testSet     = maskedTest;
-                plattA      = pA;  plattB = pB;
-                isotonicBp  = pBp;
+                ctx.AllTrees = pTrees;
+                ctx.TrainSet = maskedTrain;
+                ctx.CalSet   = maskedCal;
+                ctx.TestSet  = maskedTest;
+                ctx.PlattA   = pA;  ctx.PlattB = pB;
+                ctx.IsotonicBp = pBp;
                 // Recompute calibration-dependent values
-                (plattABuy, plattBBuy, plattASell, plattBSell) =
-                    FitClassConditionalPlatt(calSet, allTrees, trainSet);
-                if (hp.FitTemperatureScale && calSet.Count >= 10)
-                    temperatureScale = FitTemperatureScaling(calSet, allTrees, trainSet);
-                ece              = ComputeEce(testSet, allTrees, trainSet, plattA, plattB, isotonicBp);
-                optimalThreshold = ComputeOptimalThreshold(calSet, allTrees, trainSet, plattA, plattB, isotonicBp,
-                    hp.ThresholdSearchMin, hp.ThresholdSearchMax);
-                avgKellyFraction = ComputeAvgKellyFraction(calSet, allTrees, trainSet, plattA, plattB, isotonicBp);
+                var (pABuy, pBBuy, pASell, pBSell) =
+                    FitClassConditionalPlatt(ctx.CalSet, ctx.AllTrees, ctx.TrainSet);
+                ctx.PlattABuy  = pABuy;
+                ctx.PlattBBuy  = pBBuy;
+                ctx.PlattASell = pASell;
+                ctx.PlattBSell = pBSell;
+                if (hp.FitTemperatureScale && ctx.CalSet.Count >= 10)
+                    ctx.TemperatureScale = FitTemperatureScaling(ctx.CalSet, ctx.AllTrees, ctx.TrainSet);
+                ctx.Ece              = ComputeEce(ctx.TestSet, ctx.AllTrees, ctx.TrainSet, ctx.PlattA, ctx.PlattB, ctx.IsotonicBp);
+                ctx.OptimalThreshold = ComputeOptimalThreshold(ctx.CalSet, ctx.AllTrees, ctx.TrainSet, ctx.PlattA, ctx.PlattB, ctx.IsotonicBp,
+                    hp.ThresholdSearchMin, hp.ThresholdSearchMax, stepBps: hp.ThresholdSearchStepBps);
+                ctx.AvgKellyFraction = ComputeAvgKellyFraction(ctx.CalSet, ctx.AllTrees, ctx.TrainSet, ctx.PlattA, ctx.PlattB, ctx.IsotonicBp,
+                    useAdjusted: hp.QrfUseAdjustedKelly);
+                // Update local references for subsequent steps
+                allTrees = ctx.AllTrees;
+                trainSet = ctx.TrainSet;
+                calSet   = ctx.CalSet;
+                testSet  = ctx.TestSet;
             }
             else
             {
@@ -639,14 +1043,28 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
             activeMask = new bool[F];
             Array.Fill(activeMask, true);
         }
+        ctx.ActiveMask  = activeMask;
+        ctx.PrunedCount = prunedCount;
 
         // ── 24. Durbin-Watson autocorrelation test on magnitude residuals ──────
         double durbinWatson = ComputeDurbinWatson(trainSet, magWeights, magBias, F);
         _logger.LogDebug("Durbin-Watson={DW:F4}", durbinWatson);
+        ctx.DurbinWatson = durbinWatson;
         if (hp.DurbinWatsonThreshold > 0.0 && durbinWatson < hp.DurbinWatsonThreshold)
+        {
             _logger.LogWarning(
                 "QuantileRF magnitude residuals autocorrelated (DW={DW:F3} < {Thr:F2}).",
                 durbinWatson, hp.DurbinWatsonThreshold);
+            // #37: Optional hard gate on DW
+            if (hp.QrfDurbinWatsonGateEnabled)
+            {
+                _logger.LogWarning("QuantileRF DW gate enabled — aborting training.");
+                ctx.FailedGates.Add("DurbinWatson");
+                return new TrainingResult(
+                    new EvalMetrics(0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0),
+                    ctx.CvResult, []);
+            }
+        }
 
         // ── 25. Mutual-information feature redundancy check ───────────────────
         string[] redundantPairs = [];
@@ -657,24 +1075,26 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
                 _logger.LogWarning(
                     "QuantileRF MI redundancy: {N} feature pairs exceed threshold.", redundantPairs.Length);
         }
+        ctx.RedundantPairs = redundantPairs;
 
         // ── 26. Split-conformal q̂ ─────────────────────────────────────────────
         double conformalAlpha = Math.Clamp(1.0 - hp.ConformalCoverage, 0.01, 0.50);
         double conformalQHat  = ComputeConformalQHat(
-            calSet, allTrees, trainSet, plattA, plattB, isotonicBp, conformalAlpha);
+            calSet, allTrees, trainSet, ctx.PlattA, ctx.PlattB, ctx.IsotonicBp, conformalAlpha);
         _logger.LogInformation("Conformal qHat={QHat:F4} ({Cov:P0} coverage)", conformalQHat, hp.ConformalCoverage);
+        ctx.ConformalQHat = conformalQHat;
 
         // ── 27. Feature quantile breakpoints for PSI ──────────────────────────
         var trainFeatureList = new List<float[]>(trainSet.Count);
         foreach (var s in trainSet) trainFeatureList.Add(s.Features);
-        var featureQuantileBp = MLFeatureHelper.ComputeFeatureQuantileBreakpoints(trainFeatureList);
+        ctx.FeatureQuantileBp = MLFeatureHelper.ComputeFeatureQuantileBreakpoints(trainFeatureList);
 
         // ── 27b. PSI-based feature drift gate ─────────────────────────────────
         // Bins current training samples into the parent model's quantile intervals and
         // computes PSI per feature. Emits a warning when the distribution has shifted
         // significantly (PSI > QrfPsiDriftWarnThreshold). This detects regime changes
         // that would invalidate warm-start weight transfer before training is accepted.
-        if (warmStart?.FeatureQuantileBreakpoints is { Length: > 0 } parentBpForPsi)
+        if (ctx.WarmStart?.FeatureQuantileBreakpoints is { Length: > 0 } parentBpForPsi)
         {
             double avgPsi = ComputeAvgPsi(trainSet, parentBpForPsi, F);
             _logger.LogInformation("QRF PSI vs parent model: avgPSI={PSI:F4} (0.10=monitor, 0.25=significant)", avgPsi);
@@ -684,16 +1104,44 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
                     "Feature distribution has drifted significantly from parent model — " +
                     "consider triggering a cold retrain instead of warm-starting.",
                     avgPsi, hp.QrfPsiDriftWarnThreshold);
+
+            // #39: Hard PSI gate — force cold retrain by discarding warm-start trees
+            if (hp.QrfPsiDriftHardThreshold > 0.0 && avgPsi > hp.QrfPsiDriftHardThreshold)
+            {
+                _logger.LogWarning(
+                    "QRF PSI hard gate: avgPSI={PSI:F4} > hard threshold={Thr:F4}. " +
+                    "Discarding warm-start trees and forcing cold retrain.",
+                    avgPsi, hp.QrfPsiDriftHardThreshold);
+                ctx.AllTrees = [.. ctx.NewTrees];
+                allTrees = ctx.AllTrees;
+                ctx.FailedGates.Add("PsiDriftHard");
+            }
         }
 
         // ── 28. Full evaluation on held-out test set ───────────────────────────
         var evalMetrics = EvaluateModel(
-            testSet, allTrees, trainSet, magWeights, magBias, plattA, plattB, isotonicBp);
-        evalMetrics = evalMetrics with { OobAccuracy = oobAccuracy };
+            testSet, allTrees, trainSet, magWeights, magBias, ctx.PlattA, ctx.PlattB, ctx.IsotonicBp);
+        ctx.EvalMetrics = evalMetrics with { OobAccuracy = ctx.OobAccuracy };
 
         // ── 29. Brier Skill Score ──────────────────────────────────────────────
-        double brierSkillScore = ComputeBrierSkillScore(testSet, allTrees, trainSet, plattA, plattB, isotonicBp);
-        _logger.LogInformation("Brier Skill Score (BSS)={BSS:F4}", brierSkillScore);
+        ctx.BrierSkillScore = ComputeBrierSkillScore(testSet, allTrees, trainSet, ctx.PlattA, ctx.PlattB, ctx.IsotonicBp);
+        _logger.LogInformation("Brier Skill Score (BSS)={BSS:F4}", ctx.BrierSkillScore);
+
+        return null;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // PHASE 6: Fit ensemble methods (OOB pruning, GES, stacking, diversity, etc.)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    private void FitEnsembleMethods(TrainingContext ctx)
+    {
+        var hp       = ctx.Hp;
+        var trainSet = ctx.TrainSet;
+        var calSet   = ctx.CalSet;
+        var allTrees = ctx.AllTrees;
+        var newTrees = ctx.NewTrees;
+        var oobMasks = ctx.OobMasks;
 
         // ── 30. OOB-contribution tree pruning (#4) — must run BEFORE GES/meta-learner
         //        so their weight arrays match the final tree count.
@@ -702,23 +1150,35 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
         {
             oobPrunedCount = PruneByOobContribution(trainSet, newTrees, oobMasks);
             // Rebuild allTrees with pruned newTrees
-            allTrees = [.. warmTrees, .. newTrees];
+            allTrees = [.. ctx.WarmTrees, .. newTrees];
+            ctx.AllTrees = allTrees;
             if (oobPrunedCount > 0)
                 _logger.LogInformation(
                     "OOB pruning: removed {N}/{K} new trees whose removal improved OOB accuracy.",
                     oobPrunedCount, oobPrunedCount + newTrees.Count);
         }
+        ctx.OobPrunedCount = oobPrunedCount;
 
         // ── 31. Greedy Ensemble Selection (#3) ────────────────────────────────
-        double[] gesWeights = hp.EnableGreedyEnsembleSelection && calSet.Count >= 20
-            ? RunGreedyTreeSelection(calSet, allTrees, trainSet)
+        int gesRounds = hp.QrfGesRounds > 0 ? hp.QrfGesRounds : DefaultGesRounds;
+        double[] gesWeights = hp.EnableGreedyEnsembleSelection && calSet.Count >= MinCalSamplesPlatt
+            ? RunGreedyTreeSelection(calSet, allTrees, trainSet,
+                rounds: gesRounds, earlyStopPatience: hp.QrfGesEarlyStopPatience)
             : [];
         if (gesWeights.Length > 0)
-            _logger.LogDebug("GES: {N} trees selected with non-zero weight.", gesWeights.Count(w => w > 0));
+        {
+            int gesSelected = gesWeights.Count(w => w > 0);
+            // #38: Log which trees were selected most frequently
+            _logger.LogInformation("GES: {N}/{T} trees selected with non-zero weight (rounds={R}).",
+                gesSelected, allTrees.Count, gesRounds);
+        }
+        ctx.GesWeights = gesWeights;
 
         // ── 32. Stacking meta-learner on per-tree probs (#2) ──────────────────
         var (metaWeights, metaBias) = FitMetaLearner(calSet, allTrees, trainSet);
         _logger.LogDebug("Meta-learner: {T} tree weights, bias={B:F4}", metaWeights.Length, metaBias);
+        ctx.MetaWeights = metaWeights;
+        ctx.MetaBias    = metaBias;
 
         // ── 33. Ensemble (tree) diversity metric (#5) ─────────────────────────
         double ensembleDiversity = ComputeTreeDiversity(allTrees, trainSet);
@@ -728,109 +1188,169 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
                 "QRF diversity warning: avg ρ={Div:F3} > threshold {Max:F2}. " +
                 "Consider increasing tree count or adding more diversity via feature subsampling.",
                 ensembleDiversity, hp.MaxEnsembleDiversity);
+        ctx.EnsembleDiversity = ensembleDiversity;
 
         // ── 34. Per-tree calibration-set accuracy (#7) ────────────────────────
-        var treeCalAccuracies = ComputePerTreeCalAccuracies(calSet, allTrees, trainSet);
-        _logger.LogDebug("Per-tree cal accuracies computed for {T} trees.", treeCalAccuracies.Length);
+        ctx.TreeCalAccuracies = ComputePerTreeCalAccuracies(calSet, allTrees, trainSet);
+        _logger.LogDebug("Per-tree cal accuracies computed for {T} trees.", ctx.TreeCalAccuracies.Length);
 
         // ── 35. Jackknife+ nonconformity residuals (#9) ───────────────────────
-        double[] jackknifeResiduals = ComputeJackknifeResiduals(trainSet, newTrees, oobMasks);
-        _logger.LogInformation("Jackknife+ residuals: {N} samples", jackknifeResiduals.Length);
+        ctx.JackknifeResiduals = ComputeJackknifeResiduals(trainSet, newTrees, oobMasks);
+        _logger.LogInformation("Jackknife+ residuals: {N} samples", ctx.JackknifeResiduals.Length);
 
         // ── 36. Meta-label secondary classifier (#10) ─────────────────────────
-        var (metaLabelWeights, metaLabelBias) = FitMetaLabelModel(calSet, allTrees, trainSet);
+        var (metaLabelWeights, metaLabelBias) = FitMetaLabelModel(calSet, allTrees, trainSet,
+            featureImportance: ctx.FeatureImportance);
         _logger.LogDebug("Meta-label model: bias={B:F4}", metaLabelBias);
+        ctx.MetaLabelWeights = metaLabelWeights;
+        ctx.MetaLabelBias    = metaLabelBias;
 
         // ── 37. Abstention gate (#6) ──────────────────────────────────────────
         var (abstentionWeights, abstentionBias, abstentionThreshold) = FitAbstentionGate(
-            calSet, allTrees, trainSet, plattA, plattB, metaLabelWeights, metaLabelBias);
+            calSet, allTrees, trainSet, ctx.PlattA, ctx.PlattB, metaLabelWeights, metaLabelBias,
+            sweepThreshold: hp.QrfAbstentionSweepEnabled);
         _logger.LogDebug("Abstention gate: bias={B:F4} threshold={T:F2}", abstentionBias, abstentionThreshold);
+        ctx.AbstentionWeights   = abstentionWeights;
+        ctx.AbstentionBias      = abstentionBias;
+        ctx.AbstentionThreshold = abstentionThreshold;
+
+        // ── 37b. Calibration confidence interval (#8) ────────────────────────
+        var (calCiStdA, calCiStdB) = ComputeCalibrationCI(calSet, allTrees, trainSet);
+        if (calCiStdA > 0.0)
+            _logger.LogDebug("Calibration CI: std(A)={StdA:F4}, std(B)={StdB:F4}", calCiStdA, calCiStdB);
+        ctx.CalCiStdA = calCiStdA;
+        ctx.CalCiStdB = calCiStdB;
+
+        // ── 37c. Feature interactions (#27) ───────────────────────────────────
+        ctx.FeatureInteractions = Compute2ndOrderFeatureInteractions(allTrees);
+        if (ctx.FeatureInteractions.Length > 0)
+            _logger.LogDebug("Top feature interactions: {Pairs}", string.Join(", ", ctx.FeatureInteractions.Take(5)));
 
         _logger.LogInformation(
             "QuantileRfModelTrainer complete: T={T} trees, acc={Acc:P1}, OOB={OOB:P1}, Brier={B:F4}, Sharpe={Sharpe:F2}",
-            allTrees.Count, evalMetrics.Accuracy, oobAccuracy, evalMetrics.BrierScore, evalMetrics.SharpeRatio);
+            allTrees.Count, ctx.EvalMetrics.Accuracy, ctx.OobAccuracy, ctx.EvalMetrics.BrierScore, ctx.EvalMetrics.SharpeRatio);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // PHASE 7: Serialize snapshot and return result
+    // ══════════════════════════════════════════════════════════════════════════
+
+    private TrainingResult SerializeSnapshot(TrainingContext ctx)
+    {
+        var hp       = ctx.Hp;
+        var allTrees = ctx.AllTrees;
 
         // ── 38. Serialise model snapshot ──────────────────────────────────────
+        // #22: Weight cascade at inference: InferenceHelpers.AggregateProbs combines
+        // MetaWeights (stacking), EnsembleSelectionWeights (GES), and LearnerCalAccuracies
+        // (per-tree cal accuracy) via softmax-weighted averaging. The three weighting
+        // mechanisms are complementary: meta-learner handles tree correlation, GES handles
+        // redundancy, and cal-accuracy handles individual tree reliability.
         var gbmTrees     = allTrees.Select(ConvertTreeNodesToGbm).ToList();
-        var qrfWeightRow = featureImportance.Select(f => (double)f).ToArray();
+        var qrfWeightRow = ctx.FeatureImportance.Select(f => (double)f).ToArray();
 
         var snapshot = new ModelSnapshot
         {
             Type                       = ModelType,
             Version                    = ModelVersion,
             Features                   = MLFeatureHelper.FeatureNames,
-            Means                      = means,
-            Stds                       = stds,
+            Means                      = ctx.Means,
+            Stds                       = ctx.Stds,
             BaseLearnersK              = allTrees.Count,
             Weights                    = [qrfWeightRow],
             Biases                     = [],
-            MagWeights                 = magWeights,
-            MagBias                    = magBias,
-            MagQ90Weights              = magQ90Weights,
-            MagQ90Bias                 = magQ90Bias,
-            PlattA                     = plattA,
-            PlattB                     = plattB,
-            PlattABuy                  = plattABuy,
-            PlattBBuy                  = plattBBuy,
-            PlattASell                 = plattASell,
-            PlattBSell                 = plattBSell,
-            AvgKellyFraction           = avgKellyFraction,
-            Metrics                    = evalMetrics,
-            OobAccuracy                = oobAccuracy,
-            TrainSamples               = trainSet.Count,
-            TestSamples                = testSet.Count,
-            CalSamples                 = calSet.Count,
-            EmbargoSamples             = embargo,
+            MagWeights                 = ctx.MagWeights,
+            MagBias                    = ctx.MagBias,
+            MagQ90Weights              = ctx.MagQ90Weights,
+            MagQ90Bias                 = ctx.MagQ90Bias,
+            PlattA                     = ctx.PlattA,
+            PlattB                     = ctx.PlattB,
+            PlattABuy                  = ctx.PlattABuy,
+            PlattBBuy                  = ctx.PlattBBuy,
+            PlattASell                 = ctx.PlattASell,
+            PlattBSell                 = ctx.PlattBSell,
+            AvgKellyFraction           = ctx.AvgKellyFraction,
+            Metrics                    = ctx.EvalMetrics,
+            OobAccuracy                = ctx.OobAccuracy,
+            TrainSamples               = ctx.TrainSet.Count,
+            TestSamples                = ctx.TestSet.Count,
+            CalSamples                 = ctx.CalSet.Count,
+            EmbargoSamples             = hp.EmbargoBarCount,
             TrainedOn                  = DateTime.UtcNow,
             TrainedAtUtc               = DateTime.UtcNow,
-            FeatureImportance          = featureImportance,
-            FeatureImportanceScores    = calImportanceScores,
-            FeatureStabilityScores     = cvResult.FeatureStabilityScores ?? [],
-            ActiveFeatureMask          = activeMask,
-            PrunedFeatureCount         = prunedCount,
-            OptimalThreshold           = optimalThreshold,
-            Ece                        = ece,
-            IsotonicBreakpoints        = isotonicBp,
-            ConformalQHat              = conformalQHat,
+            FeatureImportance          = ctx.FeatureImportance,
+            FeatureImportanceScores    = ctx.CalImportanceScores,
+            FeatureStabilityScores     = ctx.CvResult.FeatureStabilityScores ?? [],
+            ActiveFeatureMask          = ctx.ActiveMask,
+            PrunedFeatureCount         = ctx.PrunedCount,
+            OptimalThreshold           = ctx.OptimalThreshold,
+            Ece                        = ctx.Ece,
+            IsotonicBreakpoints        = ctx.IsotonicBp,
+            ConformalQHat              = ctx.ConformalQHat,
             ConformalCoverage          = hp.ConformalCoverage,
-            FeatureQuantileBreakpoints = featureQuantileBp,
-            ParentModelId              = parentModelId ?? 0,
-            GenerationNumber           = generationNum,
-            BrierSkillScore            = brierSkillScore,
-            SanitizedLearnerCount      = sanitizedCount,
+            FeatureQuantileBreakpoints = ctx.FeatureQuantileBp,
+            ParentModelId              = ctx.ParentModelId ?? 0,
+            GenerationNumber           = ctx.GenerationNum,
+            BrierSkillScore            = ctx.BrierSkillScore,
+            SanitizedLearnerCount      = ctx.SanitizedCount,
             FracDiffD                  = hp.FracDiffD,
             AgeDecayLambda             = hp.AgeDecayLambda,
-            DurbinWatsonStatistic      = durbinWatson,
-            TemperatureScale           = temperatureScale,
-            WalkForwardSharpeTrend     = cvResult.SharpeTrend,
+            DurbinWatsonStatistic      = ctx.DurbinWatson,
+            TemperatureScale           = ctx.TemperatureScale,
+            WalkForwardSharpeTrend     = ctx.CvResult.SharpeTrend,
             HyperparamsJson            = JsonSerializer.Serialize(hp, JsonOptions),
             GbmTreesJson               = JsonSerializer.Serialize(gbmTrees, JsonOptions),
             QrfWeights                 = [qrfWeightRow],
             // ── New v4.0 fields ───────────────────────────────────────────────
-            MetaWeights                = metaWeights,                   // #2
-            MetaBias                   = metaBias,                      // #2
-            EnsembleSelectionWeights   = gesWeights,                    // #3
-            OobPrunedLearnerCount      = oobPrunedCount,                // #4
-            EnsembleDiversity          = ensembleDiversity,             // #5
-            AbstentionWeights          = abstentionWeights,             // #6
-            AbstentionBias             = abstentionBias,                // #6
-            AbstentionThreshold        = abstentionThreshold,           // #6
-            LearnerCalAccuracies       = treeCalAccuracies,             // #7
-            JackknifeResiduals         = jackknifeResiduals,            // #9
-            MetaLabelWeights           = metaLabelWeights,              // #10
-            MetaLabelBias              = metaLabelBias,                 // #10
+            MetaWeights                = ctx.MetaWeights,                   // #2
+            MetaBias                   = ctx.MetaBias,                      // #2
+            EnsembleSelectionWeights   = ctx.GesWeights,                    // #3
+            OobPrunedLearnerCount      = ctx.OobPrunedCount,                // #4
+            EnsembleDiversity          = ctx.EnsembleDiversity,             // #5
+            AbstentionWeights          = ctx.AbstentionWeights,             // #6
+            AbstentionBias             = ctx.AbstentionBias,                // #6
+            AbstentionThreshold        = ctx.AbstentionThreshold,           // #6
+            LearnerCalAccuracies       = ctx.TreeCalAccuracies,             // #7
+            JackknifeResiduals         = ctx.JackknifeResiduals,            // #9
+            MetaLabelWeights           = ctx.MetaLabelWeights,              // #10
+            MetaLabelBias              = ctx.MetaLabelBias,                 // #10
             MetaLabelThreshold         = 0.5,                           // #10
-            RedundantFeaturePairs      = redundantPairs,                // #13
+            RedundantFeaturePairs      = ctx.RedundantPairs,                // #13
             // ── MLP magnitude regressor (QrfMagHiddenDim > 0) ─────────────────
             QrfMlpHiddenDim            = hp.QrfMagHiddenDim,
-            QrfMlpW1                   = mlpW1,
-            QrfMlpB1                   = mlpB1,
-            QrfMlpW2                   = mlpW2,
-            QrfMlpB2                   = mlpB2,
+            QrfMlpW1                   = ctx.MlpW1,
+            QrfMlpB1                   = ctx.MlpB1,
+            QrfMlpW2                   = ctx.MlpW2,
+            QrfMlpB2                   = ctx.MlpB2,
         };
 
-        byte[] modelBytes = JsonSerializer.SerializeToUtf8Bytes(snapshot, JsonOptions);
-        return new TrainingResult(evalMetrics, cvResult, modelBytes);
+        // #15: Memory pressure check — estimate serialized size before allocating
+        byte[] modelBytes;
+        try
+        {
+            modelBytes = JsonSerializer.SerializeToUtf8Bytes(snapshot, JsonOptions);
+        }
+        catch (OutOfMemoryException)
+        {
+            _logger.LogError("QuantileRF: serialization failed due to OOM (estimated tree count={T}).", allTrees.Count);
+            return new TrainingResult(ctx.EvalMetrics, ctx.CvResult, []);
+        }
+
+        double modelSizeMb = modelBytes.Length / (1024.0 * 1024.0);
+        if (hp.QrfMaxModelSizeMb > 0 && modelSizeMb > hp.QrfMaxModelSizeMb)
+        {
+            _logger.LogWarning(
+                "QuantileRF model size {Size:F1}MB exceeds limit {Limit}MB — returning empty model.",
+                modelSizeMb, hp.QrfMaxModelSizeMb);
+            return new TrainingResult(ctx.EvalMetrics, ctx.CvResult, []);
+        }
+        _logger.LogInformation("QuantileRF model serialized: {Size:F1}MB", modelSizeMb);
+
+        // #36: Log total training time
+        ctx.TotalStopwatch.Stop();
+        _logger.LogInformation("QuantileRF training completed in {Elapsed}.", ctx.TotalStopwatch.Elapsed);
+
+        return new TrainingResult(ctx.EvalMetrics, ctx.CvResult, modelBytes);
     }
 
     // ── Walk-forward cross-validation ─────────────────────────────────────────
@@ -842,8 +1362,8 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
         int                  sqrtF,
         int                  treeCount,
         CancellationToken    ct,
-        int                  maxDepth = MaxDepth,
-        int                  minLeaf  = MinLeaf)
+        int                  maxDepth = DefaultMaxDepth,
+        int                  minLeaf  = DefaultMinLeaf)
     {
         int folds   = hp.WalkForwardFolds > 0 ? hp.WalkForwardFolds : 3;
         int embargo = hp.EmbargoBarCount;
@@ -1053,6 +1573,13 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
 
     // ── Tree building ─────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Recursively builds a single decision tree using variance-reduction (Gini-equivalent
+    /// for binary labels). Uses histogram-based split finding (256 equal-width bins) for
+    /// O(N + 256) per feature candidate per node instead of O(N log N) sort-based search.
+    /// Feature candidates are sampled via Fisher-Yates partial shuffle (unbiased) or
+    /// importance-weighted CDF when warm-start scores are available.
+    /// </summary>
     private static void BuildTree(
         List<TrainingSample> trainSet,
         List<int>            sampleIdx,
@@ -1064,76 +1591,116 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
         double[]             impAccum,
         ref int              impSplits,
         float[]?             importanceScores = null,
-        int                  maxDepth = MaxDepth,
-        int                  minLeaf  = MinLeaf)
+        int                  maxDepth = DefaultMaxDepth,
+        int                  minLeaf  = DefaultMinLeaf)
     {
         var node = new TreeNode();
         nodes.Add(node);
 
         if (sampleIdx.Count < minLeaf || depth >= maxDepth)
         {
-            int posCount = 0;
-            foreach (int idx in sampleIdx) if (trainSet[idx].Direction > 0) posCount++;
-            node.LeafDirection   = sampleIdx.Count > 0 ? (double)posCount / sampleIdx.Count : 0.5;
-            node.LeafPosCount    = posCount;
-            node.LeafTotalCount  = sampleIdx.Count;
+            PopulateLeafNode(node, trainSet, sampleIdx);
             return;
         }
 
-        // Sample √F candidate features — biased toward high-importance features when available (#12)
         var candidateFeats = importanceScores is { Length: > 0 }
             ? GenerateBiasedCandidateFeats(F, sqrtF, importanceScores, rng)
-            : Enumerable.Range(0, F).OrderBy(_ => rng.Next()).Take(sqrtF).ToList();
+            : FisherYatesPartialShuffle(F, sqrtF, rng);
 
         int    bestFeat   = -1;
         double bestThresh = 0.0;
         double bestGain   = -1.0;
-        double parentVar  = ComputeVariance(trainSet, sampleIdx);
+
+        // Inline parent variance: p*(1-p) for binary labels
+        int parentPos = 0;
+        foreach (int idx in sampleIdx) if (trainSet[idx].Direction > 0) parentPos++;
+        int    totalN    = sampleIdx.Count;
+        double parentP   = (double)parentPos / totalN;
+        double parentVar = parentP * (1.0 - parentP);
+
+        // Histogram-based split finding: 256 equal-width bins per feature.
+        // O(N + 256) per feature candidate, replacing O(N log N) sort.
+        // Bin arrays are allocated once and reused across feature candidates.
+        const int numBins = 256;
+        var binPos   = new int[numBins];
+        var binTotal = new int[numBins];
 
         foreach (int fi in candidateFeats)
         {
-            var sorted = sampleIdx.OrderBy(idx => trainSet[idx].Features[fi]).ToList();
-
-            for (int midIdx = minLeaf; midIdx < sorted.Count - minLeaf; midIdx++)
+            // Pass 1: find min/max of this feature across samples in sampleIdx
+            double fMin = double.MaxValue, fMax = double.MinValue;
+            foreach (int idx in sampleIdx)
             {
-                double xLeft  = trainSet[sorted[midIdx - 1]].Features[fi];
-                double xRight = trainSet[sorted[midIdx]].Features[fi];
-                if (xRight - xLeft < 1e-12) continue;
+                double v = trainSet[idx].Features[fi];
+                if (v < fMin) fMin = v;
+                if (v > fMax) fMax = v;
+            }
 
-                double thresh     = (xLeft + xRight) * 0.5;
-                var    leftGroup  = sorted.Take(midIdx).ToList();
-                var    rightGroup = sorted.Skip(midIdx).ToList();
+            double range = fMax - fMin;
+            if (range < 1e-12) continue; // all values identical — no split possible
+
+            double binWidth = range / numBins;
+
+            // Pass 2: bin samples and count pos/total per bin
+            Array.Clear(binPos, 0, numBins);
+            Array.Clear(binTotal, 0, numBins);
+            foreach (int idx in sampleIdx)
+            {
+                int bin = Math.Min(numBins - 1, (int)((trainSet[idx].Features[fi] - fMin) / binWidth));
+                binTotal[bin]++;
+                if (trainSet[idx].Direction > 0) binPos[bin]++;
+            }
+
+            // Pass 3: sweep bins left-to-right, accumulate posLeft/totalLeft
+            int leftTotal = 0, leftPos = 0;
+            for (int b = 0; b < numBins - 1; b++)
+            {
+                leftTotal += binTotal[b];
+                leftPos   += binPos[b];
+
+                if (leftTotal < minLeaf) continue;
+                int rightTotal = totalN - leftTotal;
+                if (rightTotal < minLeaf) break;
+
+                int rightPos = parentPos - leftPos;
+                double meanL = (double)leftPos  / leftTotal;
+                double meanR = (double)rightPos / rightTotal;
 
                 double weightedVar =
-                    (leftGroup.Count  * ComputeVariance(trainSet, leftGroup)
-                   + rightGroup.Count * ComputeVariance(trainSet, rightGroup))
-                   / sampleIdx.Count;
+                    (leftTotal  * meanL * (1.0 - meanL)
+                   + rightTotal * meanR * (1.0 - meanR))
+                   / totalN;
 
                 double gain = parentVar - weightedVar;
-                if (gain > bestGain) { bestGain = gain; bestFeat = fi; bestThresh = thresh; }
+                if (gain > bestGain)
+                {
+                    bestGain   = gain;
+                    bestFeat   = fi;
+                    bestThresh = fMin + (b + 1) * binWidth; // bin boundary
+                }
             }
         }
 
         if (bestFeat < 0 || bestGain <= 0)
         {
-            int posCount = 0;
-            foreach (int idx in sampleIdx) if (trainSet[idx].Direction > 0) posCount++;
-            node.LeafDirection   = sampleIdx.Count > 0 ? (double)posCount / sampleIdx.Count : 0.5;
-            node.LeafPosCount    = posCount;
-            node.LeafTotalCount  = sampleIdx.Count;
+            PopulateLeafNode(node, trainSet, sampleIdx);
             return;
         }
 
-        var leftIndices  = sampleIdx.Where(idx => (double)trainSet[idx].Features[bestFeat] <= bestThresh).ToList();
-        var rightIndices = sampleIdx.Where(idx => (double)trainSet[idx].Features[bestFeat] >  bestThresh).ToList();
+        // Partition into left/right child sets using the chosen threshold
+        var leftIndices  = new List<int>(totalN);
+        var rightIndices = new List<int>(totalN);
+        foreach (int idx in sampleIdx)
+        {
+            if ((double)trainSet[idx].Features[bestFeat] <= bestThresh)
+                leftIndices.Add(idx);
+            else
+                rightIndices.Add(idx);
+        }
 
         if (leftIndices.Count < minLeaf || rightIndices.Count < minLeaf)
         {
-            int posCount = 0;
-            foreach (int idx in sampleIdx) if (trainSet[idx].Direction > 0) posCount++;
-            node.LeafDirection   = sampleIdx.Count > 0 ? (double)posCount / sampleIdx.Count : 0.5;
-            node.LeafPosCount    = posCount;
-            node.LeafTotalCount  = sampleIdx.Count;
+            PopulateLeafNode(node, trainSet, sampleIdx);
             return;
         }
 
@@ -1146,6 +1713,33 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
         BuildTree(trainSet, leftIndices,  depth + 1, nodes, rng, F, sqrtF, impAccum, ref impSplits, importanceScores, maxDepth, minLeaf);
         node.RightChild  = nodes.Count;
         BuildTree(trainSet, rightIndices, depth + 1, nodes, rng, F, sqrtF, impAccum, ref impSplits, importanceScores, maxDepth, minLeaf);
+    }
+
+    /// <summary>Populates a leaf node with class counts from the sample indices.</summary>
+    private static void PopulateLeafNode(TreeNode node, List<TrainingSample> trainSet, List<int> sampleIdx)
+    {
+        int posCount = 0;
+        foreach (int idx in sampleIdx) if (trainSet[idx].Direction > 0) posCount++;
+        node.LeafDirection  = sampleIdx.Count > 0 ? (double)posCount / sampleIdx.Count : 0.5;
+        node.LeafPosCount   = posCount;
+        node.LeafTotalCount = sampleIdx.Count;
+    }
+
+    /// <summary>
+    /// #2: Unbiased Fisher-Yates partial shuffle — selects <paramref name="k"/> indices
+    /// from 0…<paramref name="n"/>-1 without replacement. O(k) time and allocation.
+    /// </summary>
+    private static List<int> FisherYatesPartialShuffle(int n, int k, Random rng)
+    {
+        k = Math.Min(k, n);
+        var indices = new int[n];
+        for (int i = 0; i < n; i++) indices[i] = i;
+        for (int i = 0; i < k; i++)
+        {
+            int j = rng.Next(i, n);
+            (indices[i], indices[j]) = (indices[j], indices[i]);
+        }
+        return [.. indices.AsSpan(0, k)];
     }
 
     /// <summary>
@@ -1161,55 +1755,99 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
         Random               rng,
         CancellationToken    ct,
         float[]?             importanceScores = null,
-        int                  maxDepth = MaxDepth,
-        int                  minLeaf  = MinLeaf)
+        int                  maxDepth = DefaultMaxDepth,
+        int                  minLeaf  = DefaultMinLeaf)
     {
         int trainCount  = trainSet.Count;
         var trees       = new List<List<TreeNode>>(treeCount);
-        double[] accum  = new double[F];
-        int      splits = 0;
 
-        for (int tIdx = 0; tIdx < treeCount && !ct.IsCancellationRequested; tIdx++)
+        // Build pos/neg index lists for stratified bootstrap (matches main training loop)
+        var posIdx = new List<int>(trainCount);
+        var negIdx = new List<int>(trainCount);
+        for (int i = 0; i < trainCount; i++)
         {
+            if (trainSet[i].Direction > 0) posIdx.Add(i);
+            else                           negIdx.Add(i);
+        }
+        bool useStratified = posIdx.Count >= MinStratifiedClassCount && negIdx.Count >= MinStratifiedClassCount;
+
+        // #33: Parallel tree construction (matching main training loop)
+        var treeSeeds = new int[treeCount];
+        for (int i = 0; i < treeCount; i++) treeSeeds[i] = rng.Next();
+
+        var treeSlots = new List<TreeNode>?[treeCount];
+        Parallel.For(0, treeCount, new ParallelOptions { CancellationToken = ct }, tIdx =>
+        {
+            var localRng = new Random(treeSeeds[tIdx]);
+            var localAccum = new double[F];
+            int localSplits = 0;
             var bootstrapIdx = new List<int>(trainCount);
-            for (int bi = 0; bi < trainCount; bi++)
-                bootstrapIdx.Add(cumDensity is null ? rng.Next(trainCount) : SampleWeighted(rng, cumDensity));
+
+            if (useStratified)
+            {
+                for (int bi = 0; bi < posIdx.Count; bi++)
+                    bootstrapIdx.Add(posIdx[localRng.Next(posIdx.Count)]);
+                for (int bi = 0; bi < negIdx.Count; bi++)
+                    bootstrapIdx.Add(negIdx[localRng.Next(negIdx.Count)]);
+                for (int i = bootstrapIdx.Count - 1; i > 0; i--)
+                {
+                    int j = localRng.Next(i + 1);
+                    (bootstrapIdx[i], bootstrapIdx[j]) = (bootstrapIdx[j], bootstrapIdx[i]);
+                }
+            }
+            else
+            {
+                for (int bi = 0; bi < trainCount; bi++)
+                    bootstrapIdx.Add(cumDensity is null ? localRng.Next(trainCount) : SampleWeighted(localRng, cumDensity));
+            }
 
             var nodes = new List<TreeNode>();
-            BuildTree(trainSet, bootstrapIdx, 0, nodes, rng, F, sqrtF, accum, ref splits, importanceScores, maxDepth, minLeaf);
-            if (nodes.Count > 0) trees.Add(nodes);
-        }
+            BuildTree(trainSet, bootstrapIdx, 0, nodes, localRng, F, sqrtF, localAccum, ref localSplits, importanceScores, maxDepth, minLeaf);
+            treeSlots[tIdx] = nodes.Count > 0 ? nodes : null;
+        });
+
+        foreach (var slot in treeSlots)
+            if (slot is not null) trees.Add(slot);
+
         return trees;
     }
 
     // ── Per-tree leaf-fraction probability ───────────────────────────────────
 
     /// <summary>
-    /// Traverses a single tree to the matching leaf and returns the fraction of
-    /// positive (Buy) training samples stored there: LeafPosCount / LeafTotalCount.
-    /// Returns 0.5 for degenerate leaves with no samples.
+    /// #30: Iterative (non-recursive) traversal to the matching leaf. Returns the
+    /// fraction of positive (Buy) training samples: LeafPosCount / LeafTotalCount.
+    /// Returns 0.5 for degenerate leaves with no samples or out-of-bounds indices.
     /// </summary>
     private static double GetLeafProb(List<TreeNode> nodes, int nodeIndex, float[] features)
     {
-        if (nodeIndex < 0 || nodeIndex >= nodes.Count) return 0.5;
-        var node = nodes[nodeIndex];
-
-        if (node.SplitFeat < 0 || node.SplitFeat >= features.Length)
-            return node.LeafTotalCount > 0
-                ? (double)node.LeafPosCount / node.LeafTotalCount
-                : 0.5;
-
-        return features[node.SplitFeat] <= node.SplitThresh
-            ? GetLeafProb(nodes, node.LeftChild,  features)
-            : GetLeafProb(nodes, node.RightChild, features);
+        int idx = nodeIndex;
+        while (idx >= 0 && idx < nodes.Count)
+        {
+            var node = nodes[idx];
+            if (node.SplitFeat < 0 || node.SplitFeat >= features.Length)
+                return node.LeafTotalCount > 0
+                    ? (double)node.LeafPosCount / node.LeafTotalCount
+                    : 0.5;
+            idx = features[node.SplitFeat] <= node.SplitThresh
+                ? node.LeftChild
+                : node.RightChild;
+        }
+        return 0.5;
     }
 
     // ── Raw QRF probability (leaf-fraction, no Platt) ─────────────────────────
 
+    /// <summary>
+    /// Average leaf-fraction probability across all trees (uncalibrated).
+    /// #47: The <paramref name="trainSet"/> parameter is retained for call-site
+    /// compatibility across trainers but is not used — leaf counts are pre-computed
+    /// during tree construction and stored in the nodes directly.
+    /// </summary>
     private static double PredictRawProb(
         float[]              features,
         List<List<TreeNode>> allTrees,
-        List<TrainingSample> trainSet)   // trainSet retained for call-site compatibility
+        List<TrainingSample> trainSet)
     {
         if (allTrees.Count == 0) return 0.5;
         double sum = 0.0;
@@ -1221,6 +1859,10 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
 
     // ── Calibrated probability (Platt + optional isotonic) ────────────────────
 
+    /// <summary>
+    /// Produces a calibrated probability: raw QRF leaf-fraction → Platt sigmoid →
+    /// optional isotonic PAVA correction. Used for threshold decisions and evaluation.
+    /// </summary>
     private static double PredictProb(
         float[]              features,
         List<List<TreeNode>> allTrees,
@@ -1240,12 +1882,16 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
 
     // ── Platt scaling (SGD, 200 epochs) ───────────────────────────────────────
 
+    /// <summary>
+    /// #4: Platt scaling with early convergence termination. SGD stops when the
+    /// absolute change in both A and B falls below <see cref="PlattConvergenceDelta"/>.
+    /// </summary>
     private static (double A, double B) FitPlattScaling(
         List<TrainingSample> calSet,
         List<List<TreeNode>> allTrees,
         List<TrainingSample> trainSet)
     {
-        if (calSet.Count < 10) return (1.0, 0.0);
+        if (calSet.Count < MinCalSamples) return (1.0, 0.0);
 
         int n      = calSet.Count;
         var logits = new double[n];
@@ -1260,10 +1906,8 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
         }
 
         double plattA = 1.0, plattB = 0.0;
-        const double lr     = 0.01;
-        const int    epochs = 200;
 
-        for (int epoch = 0; epoch < epochs; epoch++)
+        for (int epoch = 0; epoch < PlattMaxEpochs; epoch++)
         {
             double dA = 0, dB = 0;
             for (int i = 0; i < n; i++)
@@ -1273,32 +1917,117 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
                 dA += err * logits[i];
                 dB += err;
             }
-            plattA -= lr * dA / n;
-            plattB -= lr * dB / n;
+            double stepA = PlattLearningRate * dA / n;
+            double stepB = PlattLearningRate * dB / n;
+            plattA -= stepA;
+            plattB -= stepB;
+
+            // #4: Early convergence — stop when updates are negligible
+            if (Math.Abs(stepA) < PlattConvergenceDelta && Math.Abs(stepB) < PlattConvergenceDelta)
+                break;
         }
 
         return (double.IsFinite(plattA) ? plattA : 1.0,
                 double.IsFinite(plattB) ? plattB : 0.0);
     }
 
-    // ── Class-conditional Platt (separate Buy/Sell calibrators) ──────────────
+    // ── Class-conditional Platt (full calset, class-weighted labels) ─────────
+    //
+    // Buy calibrator:  labels buy=1, sell=0, buy samples weighted 3:1 vs sell.
+    // Sell calibrator:  labels sell=1, buy=0, sell samples weighted 3:1 vs buy.
+    // Both calibrators see the full calibration set so both classes constrain the
+    // sigmoid — matching the approach used by GbmModelTrainer.
 
     private static (double ABuy, double BBuy, double ASell, double BSell) FitClassConditionalPlatt(
         List<TrainingSample> calSet,
         List<List<TreeNode>> allTrees,
         List<TrainingSample> trainSet)
     {
-        var buySamples  = calSet.Where(s => s.Direction > 0).ToList();
-        var sellSamples = calSet.Where(s => s.Direction <= 0).ToList();
+        if (calSet.Count < MinCalSamplesPlatt) return (0.0, 0.0, 0.0, 0.0);
 
-        var (aBuy, bBuy)   = buySamples.Count  >= 10 ? FitPlattScaling(buySamples,  allTrees, trainSet) : (1.0, 0.0);
-        var (aSell, bSell) = sellSamples.Count >= 10 ? FitPlattScaling(sellSamples, allTrees, trainSet) : (1.0, 0.0);
+        int n      = calSet.Count;
+        var logits = new double[n];
+        var isBuy  = new bool[n];
+        int buyCount = 0;
+        for (int i = 0; i < n; i++)
+        {
+            double raw = PredictRawProb(calSet[i].Features, allTrees, trainSet);
+            raw        = Math.Clamp(raw, 1e-7, 1.0 - 1e-7);
+            logits[i]  = MLFeatureHelper.Logit(raw);
+            isBuy[i]   = calSet[i].Direction > 0;
+            if (isBuy[i]) buyCount++;
+        }
+        int sellCount = n - buyCount;
 
-        return (aBuy, bBuy, aSell, bSell);
+        // #5: Adaptive class weights proportional to inverse class frequency
+        // (replaces hardcoded 3:1). Minority class gets higher weight so that
+        // both classes contribute equally to the gradient regardless of imbalance.
+        double buyWeightForBuyCal  = sellCount > 0 ? (double)sellCount / buyCount  : 1.0;
+        double sellWeightForBuyCal = 1.0;
+        double sellWeightForSellCal = buyCount > 0 ? (double)buyCount / sellCount : 1.0;
+        double buyWeightForSellCal  = 1.0;
+
+        // Clamp weights to avoid extreme ratios
+        buyWeightForBuyCal   = Math.Clamp(buyWeightForBuyCal,   1.0, 10.0);
+        sellWeightForSellCal = Math.Clamp(sellWeightForSellCal, 1.0, 10.0);
+
+        // Buy calibrator: standard labels (buy=1, sell=0), upweight buy samples
+        double aBuy = 1.0, bBuy = 0.0;
+        for (int epoch = 0; epoch < PlattMaxEpochs; epoch++)
+        {
+            double dA = 0, dB = 0;
+            for (int i = 0; i < n; i++)
+            {
+                double calibP = MLFeatureHelper.Sigmoid(aBuy * logits[i] + bBuy);
+                double label  = isBuy[i] ? 1.0 : 0.0;
+                double w      = isBuy[i] ? buyWeightForBuyCal : sellWeightForBuyCal;
+                double err    = (calibP - label) * w;
+                dA += err * logits[i];
+                dB += err;
+            }
+            double stepA = PlattLearningRate * dA / n;
+            double stepB = PlattLearningRate * dB / n;
+            aBuy -= stepA;
+            bBuy -= stepB;
+            if (Math.Abs(stepA) < PlattConvergenceDelta && Math.Abs(stepB) < PlattConvergenceDelta)
+                break;
+        }
+
+        // Sell calibrator: inverted labels (sell=1, buy=0), upweight sell samples
+        double aSell = 1.0, bSell = 0.0;
+        for (int epoch = 0; epoch < PlattMaxEpochs; epoch++)
+        {
+            double dA = 0, dB = 0;
+            for (int i = 0; i < n; i++)
+            {
+                double calibP = MLFeatureHelper.Sigmoid(aSell * logits[i] + bSell);
+                double label  = isBuy[i] ? 0.0 : 1.0;
+                double w      = isBuy[i] ? buyWeightForSellCal : sellWeightForSellCal;
+                double err    = (calibP - label) * w;
+                dA += err * logits[i];
+                dB += err;
+            }
+            double stepA = PlattLearningRate * dA / n;
+            double stepB = PlattLearningRate * dB / n;
+            aSell -= stepA;
+            bSell -= stepB;
+            if (Math.Abs(stepA) < PlattConvergenceDelta && Math.Abs(stepB) < PlattConvergenceDelta)
+                break;
+        }
+
+        return (double.IsFinite(aBuy)  ? aBuy  : 0.0,
+                double.IsFinite(bBuy)  ? bBuy  : 0.0,
+                double.IsFinite(aSell) ? aSell : 0.0,
+                double.IsFinite(bSell) ? bSell : 0.0);
     }
 
     // ── Isotonic calibration (PAVA) ───────────────────────────────────────────
 
+    /// <summary>
+    /// #6: Isotonic calibration (PAVA) with minimum block size regularisation.
+    /// Blocks smaller than <see cref="IsotonicMinBlockSize"/> are merged with their
+    /// neighbour to prevent overfitting on small calibration sets.
+    /// </summary>
     private static double[] FitIsotonicCalibration(
         List<TrainingSample> calSet,
         List<List<TreeNode>> allTrees,
@@ -1306,7 +2035,7 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
         double               plattA,
         double               plattB)
     {
-        if (calSet.Count < 10) return [];
+        if (calSet.Count < MinCalSamples) return [];
 
         int n     = calSet.Count;
         var pairs = new (double P, double Y)[n];
@@ -1319,6 +2048,7 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
         }
         Array.Sort(pairs, (a, b) => a.P.CompareTo(b.P));
 
+        // Standard PAVA
         var stack = new List<(double SumY, double SumP, int Count)>(pairs.Length);
         foreach (var (P, Y) in pairs)
         {
@@ -1333,6 +2063,19 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
                     stack[^1] = (prevSumY + lastSumY, prevSumP + lastSumP, prevCount + lastCount);
                 }
                 else break;
+            }
+        }
+
+        // #6: Merge blocks smaller than IsotonicMinBlockSize with their right neighbour
+        // to regularise against overfitting on small cal sets.
+        for (int i = stack.Count - 2; i >= 0; i--)
+        {
+            if (stack[i].Count < IsotonicMinBlockSize && i + 1 < stack.Count)
+            {
+                var (sy, sp, sc) = stack[i];
+                var (ny, np, nc) = stack[i + 1];
+                stack[i + 1] = (sy + ny, sp + np, sc + nc);
+                stack.RemoveAt(i);
             }
         }
 
@@ -1404,6 +2147,10 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
 
     // ── EV-optimal threshold sweep ────────────────────────────────────────────
 
+    /// <summary>
+    /// #3: Uses <c>hp.ThresholdSearchStepBps</c> for finer-grained search.
+    /// Default 50 bps = 0.5 % steps (vs. legacy 100 bps = 1 % steps).
+    /// </summary>
     private static double ComputeOptimalThreshold(
         List<TrainingSample> calSet,
         List<List<TreeNode>> allTrees,
@@ -1412,7 +2159,8 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
         double               plattB,
         double[]             isotonicBp,
         int                  searchMin = 30,
-        int                  searchMax = 75)
+        int                  searchMax = 75,
+        int                  stepBps   = 50)
     {
         if (calSet.Count < 30) return 0.5;
 
@@ -1421,9 +2169,10 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
             probs[i] = PredictProb(calSet[i].Features, allTrees, trainSet, plattA, plattB, isotonicBp);
 
         double bestEv = double.MinValue, bestThreshold = 0.5;
-        for (int ti = searchMin; ti <= searchMax; ti++)
+        int step = Math.Max(1, stepBps);
+        for (int bps = searchMin * 100; bps <= searchMax * 100; bps += step)
         {
-            double t = ti / 100.0, ev = 0;
+            double t = bps / 10000.0, ev = 0;
             for (int i = 0; i < calSet.Count; i++)
             {
                 bool correct = (probs[i] >= t) == (calSet[i].Direction > 0);
@@ -1435,28 +2184,65 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
         return bestThreshold;
     }
 
-    // ── Kelly fraction (half-Kelly, on calibrated probs) ─────────────────────
+    // ── Kelly fraction (half-Kelly or magnitude-adjusted) ────────────────────
 
+    /// <summary>
+    /// #44: When <c>useAdjusted</c> is true, uses the magnitude-aware Kelly:
+    /// f = p − (1−p) × avgLoss/avgWin. Otherwise uses simplified 2p−1.
+    /// Always applies half-Kelly (÷2) for conservatism.
+    /// </summary>
     private static double ComputeAvgKellyFraction(
         List<TrainingSample> calSet,
         List<List<TreeNode>> allTrees,
         List<TrainingSample> trainSet,
         double               plattA,
         double               plattB,
-        double[]             isotonicBp)
+        double[]             isotonicBp,
+        bool                 useAdjusted = false)
     {
         if (calSet.Count == 0) return 0;
-        double sum = 0;
+
+        if (useAdjusted)
+        {
+            // Compute average win/loss magnitudes on the calibration set
+            double winSum = 0, lossSum = 0;
+            int    winN = 0,   lossN = 0;
+            foreach (var s in calSet)
+            {
+                double p = PredictProb(s.Features, allTrees, trainSet, plattA, plattB, isotonicBp);
+                bool correct = (p >= 0.5) == (s.Direction > 0);
+                if (correct) { winSum  += (double)s.Magnitude; winN++; }
+                else         { lossSum += (double)s.Magnitude; lossN++; }
+            }
+            double avgWin  = winN  > 0 ? winSum  / winN  : 1.0;
+            double avgLoss = lossN > 0 ? lossSum / lossN : 1.0;
+            double ratio   = avgWin > Eps ? avgLoss / avgWin : 1.0;
+
+            double sum = 0;
+            foreach (var s in calSet)
+            {
+                double p = PredictProb(s.Features, allTrees, trainSet, plattA, plattB, isotonicBp);
+                double kelly = p - (1.0 - p) * ratio;
+                sum += Math.Max(0, kelly);
+            }
+            return sum / calSet.Count * 0.5;
+        }
+
+        // Simplified Kelly: 2p − 1 (assumes symmetric payoff)
+        double simpleSum = 0;
         foreach (var s in calSet)
         {
             double p = PredictProb(s.Features, allTrees, trainSet, plattA, plattB, isotonicBp);
-            sum += Math.Max(0, 2 * p - 1);
+            simpleSum += Math.Max(0, 2 * p - 1);
         }
-        return sum / calSet.Count * 0.5; // half-Kelly
+        return simpleSum / calSet.Count * 0.5;
     }
 
-    // ── Temperature scaling (grid search T ∈ [0.5, 5.0]) ─────────────────────
+    // ── Temperature scaling (grid search T ∈ [0.5, 5.0], 0.01 steps) ────────
 
+    /// <summary>
+    /// #7: Finer grid search (0.01 steps vs. legacy 0.1 steps) for optimal NLL.
+    /// </summary>
     private static double FitTemperatureScaling(
         List<TrainingSample> calSet,
         List<List<TreeNode>> allTrees,
@@ -1464,9 +2250,9 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
     {
         double bestT = 1.0, bestLoss = double.MaxValue;
 
-        for (int ti = 5; ti <= 50; ti++)
+        for (int ti = 50; ti <= 500; ti++)
         {
-            double T = ti / 10.0, loss = 0;
+            double T = ti / 100.0, loss = 0;
             foreach (var s in calSet)
             {
                 double raw = PredictRawProb(s.Features, allTrees, trainSet);
@@ -1712,19 +2498,20 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
 
             if (!canEarlyStop) continue;
 
+            // #42: Reuse a single hidden-activation buffer across validation samples
             double valLoss = 0.0;
+            var valHidden = new double[H];
             foreach (var s in valSlice)
             {
-                var hv = new double[H];
                 for (int h = 0; h < H; h++)
                 {
                     double z = b1[h];
                     for (int j = 0; j < F && j < s.Features.Length; j++)
                         z += W1[h * F + j] * s.Features[j];
-                    hv[h] = Math.Max(0.0, z);
+                    valHidden[h] = Math.Max(0.0, z);
                 }
                 double p2 = b2;
-                for (int h = 0; h < H; h++) p2 += W2[h] * hv[h];
+                for (int h = 0; h < H; h++) p2 += W2[h] * valHidden[h];
                 double e = p2 - s.Magnitude;
                 valLoss += Math.Abs(e) <= 1.0 ? 0.5 * e * e : Math.Abs(e) - 0.5;
             }
@@ -1749,16 +2536,31 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
 
     // ── Quantile magnitude regressor (pinball loss, SGD) ─────────────────────
 
+    /// <summary>
+    /// #40: Quantile regressor with early stopping on a validation split.
+    /// #41: L2 regularisation via <paramref name="l2"/>.
+    /// </summary>
     private static (double[] Weights, double Bias) FitQuantileRegressor(
-        List<TrainingSample> train, int F, double tau)
+        List<TrainingSample> train, int F, double tau,
+        double l2 = 0.0, int earlyStopPatience = 0)
     {
         var    w  = new double[F];
         double b  = 0;
         const double sgdLr = 0.001;
+        const int    epochs = 100;
 
-        for (int epoch = 0; epoch < 100; epoch++)
+        bool canEarlyStop = earlyStopPatience > 0 && train.Count >= 30;
+        int  valSize      = canEarlyStop ? Math.Max(5, train.Count / 10) : 0;
+        var  valSlice     = canEarlyStop ? train[^valSize..] : train;
+        var  trainSlice   = canEarlyStop ? train[..^valSize] : train;
+
+        var    bestW = new double[F];
+        double bestB = 0, bestVal = double.MaxValue;
+        int    patience = 0;
+
+        for (int epoch = 0; epoch < epochs; epoch++)
         {
-            foreach (var s in train)
+            foreach (var s in trainSlice)
             {
                 double pred = b;
                 for (int j = 0; j < F && j < s.Features.Length; j++) pred += w[j] * s.Features[j];
@@ -1766,14 +2568,42 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
                 double grad = err >= 0 ? tau : -(1 - tau);
                 b += sgdLr * grad;
                 for (int j = 0; j < F && j < s.Features.Length; j++)
-                    w[j] += sgdLr * grad * s.Features[j];
+                    w[j] += sgdLr * (grad * s.Features[j] - l2 * w[j]);
             }
+
+            if (!canEarlyStop) continue;
+
+            double valLoss = 0;
+            foreach (var s in valSlice)
+            {
+                double pred = b;
+                for (int j = 0; j < F && j < s.Features.Length; j++) pred += w[j] * s.Features[j];
+                double err = s.Magnitude - pred;
+                valLoss += err >= 0 ? tau * err : (tau - 1) * err;
+            }
+            valLoss /= valSlice.Count;
+
+            if (valLoss < bestVal)
+            {
+                bestVal = valLoss;
+                Array.Copy(w, bestW, F);
+                bestB    = b;
+                patience = 0;
+            }
+            else if (++patience >= earlyStopPatience)
+                break;
         }
+
+        if (canEarlyStop) { w = bestW; b = bestB; }
         return (w, b);
     }
 
     // ── Permutation feature importance on test set (Fisher-Yates, seed 42) ────
 
+    /// <summary>
+    /// #28: Multi-shuffle permutation importance. Averages across <paramref name="repeats"/>
+    /// independent shuffles to reduce variance in importance estimates.
+    /// </summary>
     private static float[] ComputePermutationImportance(
         List<TrainingSample> testSet,
         List<List<TreeNode>> allTrees,
@@ -1782,9 +2612,11 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
         double               plattB,
         double[]             isotonicBp,
         int                  F,
-        int                  seed = 42)
+        int                  seed = 42,
+        int                  repeats = DefaultPermutationRepeats)
     {
         int n = testSet.Count;
+        repeats = Math.Max(1, repeats);
 
         int baseCorrect = 0;
         foreach (var s in testSet)
@@ -1797,29 +2629,33 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
         var importance = new float[F];
         var shuffled   = new float[n];
         var featBuf    = new float[F];
-        var rng        = seed != 0 ? new Random(seed + 1) : new Random();
 
         for (int fi = 0; fi < F; fi++)
         {
-            for (int i = 0; i < n; i++) shuffled[i] = testSet[i].Features[fi];
-            for (int i = n - 1; i > 0; i--)
+            double dropSum = 0;
+            for (int rep = 0; rep < repeats; rep++)
             {
-                int j = rng.Next(i + 1);
-                (shuffled[i], shuffled[j]) = (shuffled[j], shuffled[i]);
-            }
+                var rng = seed != 0 ? new Random(seed + fi * repeats + rep + 1) : new Random();
+                for (int i = 0; i < n; i++) shuffled[i] = testSet[i].Features[fi];
+                for (int i = n - 1; i > 0; i--)
+                {
+                    int j = rng.Next(i + 1);
+                    (shuffled[i], shuffled[j]) = (shuffled[j], shuffled[i]);
+                }
 
-            int correct = 0;
-            for (int i = 0; i < n; i++)
-            {
-                var orig = testSet[i].Features;
-                int fLen = Math.Min(orig.Length, F);
-                for (int j = 0; j < fLen; j++) featBuf[j] = orig[j];
-                featBuf[fi] = shuffled[i];
-                double p = PredictProb(featBuf, allTrees, trainSet, plattA, plattB, isotonicBp);
-                if ((p >= 0.5 ? 1 : 0) == (testSet[i].Direction > 0 ? 1 : 0)) correct++;
+                int correct = 0;
+                for (int i = 0; i < n; i++)
+                {
+                    var orig = testSet[i].Features;
+                    int fLen = Math.Min(orig.Length, F);
+                    for (int j = 0; j < fLen; j++) featBuf[j] = orig[j];
+                    featBuf[fi] = shuffled[i];
+                    double p = PredictProb(featBuf, allTrees, trainSet, plattA, plattB, isotonicBp);
+                    if ((p >= 0.5 ? 1 : 0) == (testSet[i].Direction > 0 ? 1 : 0)) correct++;
+                }
+                dropSum += Math.Max(0.0, baseAcc - (double)correct / n);
             }
-
-            importance[fi] = (float)Math.Max(0.0, baseAcc - (double)correct / n);
+            importance[fi] = (float)(dropSum / repeats);
         }
 
         double total = 0;
@@ -2105,10 +2941,18 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
 
     // ── Stationarity gate (lag-1 Pearson correlation as ADF proxy) ────────────
 
+    /// <summary>
+    /// #12: Improved stationarity test using a sample-size-aware critical value.
+    /// For N &gt; 100, the threshold is relaxed slightly (0.97 − 0.5/√N) to account for
+    /// the fact that lag-1 correlation estimates are biased upward in small samples.
+    /// </summary>
     private static int CountNonStationaryFeatures(List<TrainingSample> samples, int F)
     {
         int n = samples.Count;
         if (n < 3) return 0;
+
+        // Sample-size-aware critical value for lag-1 correlation
+        double criticalRho = StationarityRhoThreshold - (n > 100 ? 0.5 / Math.Sqrt(n) : 0.0);
 
         int nonStat = 0;
         for (int fi = 0; fi < F; fi++)
@@ -2127,7 +2971,7 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
             double varY  = sumY2 - sumY * sumY / nc;
             double denom = Math.Sqrt(Math.Max(0, varX * varY));
             double rho   = denom > 1e-12 ? (sumXY - sumX * sumY / nc) / denom : 0;
-            if (Math.Abs(rho) > 0.97) nonStat++;
+            if (Math.Abs(rho) > criticalRho) nonStat++;
         }
         return nonStat;
     }
@@ -2171,10 +3015,9 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
         int cutoff = trainSet.Count - recentCount;
         var w      = new double[F];
         double b   = 0;
-        const double sgdLr = 0.01;
 
         // Logistic discriminator: recent = 1, historical = 0
-        for (int epoch = 0; epoch < 30; epoch++)
+        for (int epoch = 0; epoch < DensityRatioEpochs; epoch++)
         {
             for (int i = 0; i < trainSet.Count; i++)
             {
@@ -2184,9 +3027,9 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
                     z += w[j] * trainSet[i].Features[j];
                 double p   = MLFeatureHelper.Sigmoid(z);
                 double err = p - label;
-                b -= sgdLr * err;
+                b -= DensityRatioLr * err;
                 for (int j = 0; j < F && j < trainSet[i].Features.Length; j++)
-                    w[j] -= sgdLr * err * trainSet[i].Features[j];
+                    w[j] -= DensityRatioLr * err * trainSet[i].Features[j];
             }
         }
 
@@ -2242,8 +3085,41 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
     {
         if (trainSet.Count < 30) return [];
 
-        int n       = Math.Min(trainSet.Count, 500);
-        int numBins = Math.Max(5, (int)Math.Ceiling(1 + Math.Log2(n)));
+        // #24: Random subsample (seeded) instead of taking the first N samples
+        int maxN = Math.Min(trainSet.Count, MaxMiDefaultSamples);
+        List<TrainingSample> miSamples;
+        if (trainSet.Count > maxN)
+        {
+            var miRng = new Random(42);
+            var indices = Enumerable.Range(0, trainSet.Count).OrderBy(_ => miRng.Next()).Take(maxN).ToList();
+            miSamples = [.. indices.Select(i => trainSet[i])];
+        }
+        else
+        {
+            miSamples = trainSet;
+        }
+        int n = miSamples.Count;
+
+        // #25: Freedman-Diaconis bin count — adapts to actual data distribution.
+        // Compute IQR of the first feature as representative, fall back to Sturges.
+        int numBins;
+        {
+            var f0 = new double[n];
+            for (int i = 0; i < n; i++) f0[i] = miSamples[i].Features.Length > 0 ? miSamples[i].Features[0] : 0;
+            Array.Sort(f0);
+            double q1 = f0[n / 4], q3 = f0[3 * n / 4];
+            double iqr = q3 - q1;
+            double range = f0[^1] - f0[0];
+            if (iqr > 1e-12 && range > 1e-12)
+            {
+                double binWidth = 2.0 * iqr / Math.Cbrt(n);
+                numBins = Math.Clamp((int)Math.Ceiling(range / binWidth), 5, 50);
+            }
+            else
+            {
+                numBins = Math.Max(5, (int)Math.Ceiling(1 + Math.Log2(n)));
+            }
+        }
 
         var featureMin    = new double[F];
         var featureMax    = new double[F];
@@ -2256,7 +3132,7 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
         {
             for (int i = 0; i < n; i++)
             {
-                double v = trainSet[i].Features[j];
+                double v = miSamples[i].Features[j];
                 if (v < featureMin[j]) featureMin[j] = v;
                 if (v > featureMax[j]) featureMax[j] = v;
             }
@@ -2264,7 +3140,7 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
             double binWidth = range > 1e-15 ? range / numBins : 1.0;
             for (int i = 0; i < n; i++)
             {
-                int bin = (int)((trainSet[i].Features[j] - featureMin[j]) / binWidth);
+                int bin = (int)((miSamples[i].Features[j] - featureMin[j]) / binWidth);
                 featureBinIdx[j * n + i] = Math.Clamp(bin, 0, numBins - 1);
             }
         }
@@ -2332,14 +3208,25 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
         return mask;
     }
 
-    private static List<TrainingSample> ApplyMask(List<TrainingSample> samples, bool[] mask) =>
-        [.. samples.Select(s =>
+    /// <summary>
+    /// #34: Lightweight mask — skips clone when mask is all-true (no features pruned).
+    /// When features are pruned, zeroes masked features in a cloned array.
+    /// </summary>
+    private static List<TrainingSample> ApplyMask(List<TrainingSample> samples, bool[] mask)
+    {
+        // Fast path: no-op when all features are active
+        bool allActive = true;
+        foreach (bool m in mask) if (!m) { allActive = false; break; }
+        if (allActive) return samples;
+
+        return [.. samples.Select(s =>
         {
             var f = (float[])s.Features.Clone();
             for (int j = 0; j < f.Length && j < mask.Length; j++)
                 if (!mask[j]) f[j] = 0f;
             return s with { Features = f };
         })];
+    }
 
     // ── Weighted bootstrap sampling ───────────────────────────────────────────
 
@@ -2348,20 +3235,6 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
         double r   = rng.NextDouble() * cumWeights[^1];
         int    idx = Array.BinarySearch(cumWeights, r);
         return idx < 0 ? Math.Min(~idx, cumWeights.Length - 1) : idx;
-    }
-
-    // ── Variance helper ───────────────────────────────────────────────────────
-
-    private static double ComputeVariance(List<TrainingSample> trainSet, List<int> indices)
-    {
-        if (indices.Count == 0) return 0.0;
-        double mean   = indices.Average(idx => trainSet[idx].Direction > 0 ? 1.0 : 0.0);
-        double varSum = indices.Sum(idx =>
-        {
-            double d = (trainSet[idx].Direction > 0 ? 1.0 : 0.0) - mean;
-            return d * d;
-        });
-        return varSum / indices.Count;
     }
 
     // ── Standard deviation helper ─────────────────────────────────────────────
@@ -2392,9 +3265,9 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
     // ── Stacking meta-learner over per-tree probs (#2) ────────────────────────
 
     /// <summary>
-    /// Fits a T-weight logistic regression over per-tree leaf-fraction probabilities
-    /// on the calibration set. Uniform initialisation (1/T), 300 epochs SGD, lr=0.01.
-    /// Returns (MetaWeights[T], MetaBias).
+    /// #20: Meta-learner with Adam optimizer (replaces vanilla SGD) for faster and
+    /// more stable convergence. Fits T-weight logistic regression over per-tree
+    /// leaf-fraction probabilities. Uniform initialisation (1/T).
     /// </summary>
     private static (double[] MetaWeights, double MetaBias) FitMetaLearner(
         List<TrainingSample> calSet,
@@ -2402,7 +3275,7 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
         List<TrainingSample> trainSet)
     {
         int T = allTrees.Count;
-        if (calSet.Count < 20 || T < 2) return (new double[T], 0.0);
+        if (calSet.Count < MinCalSamplesPlatt || T < 2) return (new double[T], 0.0);
 
         int n = calSet.Count;
         var calLP     = new double[n][];
@@ -2416,6 +3289,12 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
         var mw = new double[T];
         for (int t = 0; t < T; t++) mw[t] = 1.0 / T;
         double mb = 0.0;
+
+        // Adam moment buffers
+        var    mMw = new double[T]; var vMw = new double[T];
+        double mMb = 0, vMb = 0;
+        double beta1t = 1.0, beta2t = 1.0;
+        int    step = 0;
 
         const double Lr     = 0.01;
         const int    Epochs = 300;
@@ -2435,8 +3314,27 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
                 for (int t = 0; t < T; t++) dW[t] += err * lp[t];
                 dB += err;
             }
-            for (int t = 0; t < T; t++) mw[t] -= Lr * dW[t] / n;
-            mb -= Lr * dB / n;
+
+            step++;
+            beta1t *= AdamBeta1;
+            beta2t *= AdamBeta2;
+            double bc1    = 1.0 - beta1t;
+            double bc2    = 1.0 - beta2t;
+            double alphAt = Lr * Math.Sqrt(bc2) / bc1;
+
+            for (int t = 0; t < T; t++)
+            {
+                double g = dW[t] / n;
+                mMw[t] = AdamBeta1 * mMw[t] + (1 - AdamBeta1) * g;
+                vMw[t] = AdamBeta2 * vMw[t] + (1 - AdamBeta2) * g * g;
+                mw[t] -= alphAt * mMw[t] / (Math.Sqrt(vMw[t]) + AdamEpsilon);
+            }
+            {
+                double g = dB / n;
+                mMb = AdamBeta1 * mMb + (1 - AdamBeta1) * g;
+                vMb = AdamBeta2 * vMb + (1 - AdamBeta2) * g * g;
+                mb -= alphAt * mMb / (Math.Sqrt(vMb) + AdamEpsilon);
+            }
         }
 
         return (mw, mb);
@@ -2450,14 +3348,19 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
     /// Returns normalised usage frequencies (sum = 1) for all T trees.
     /// Returns an empty array when the cal set is too small.
     /// </summary>
+    /// <summary>
+    /// #19: GES with configurable rounds and early stopping when NLL stops improving.
+    /// #38: Returns tree selection counts for logging.
+    /// </summary>
     private static double[] RunGreedyTreeSelection(
         List<TrainingSample> calSet,
         List<List<TreeNode>> allTrees,
         List<TrainingSample> trainSet,
-        int                  rounds = 100)
+        int                  rounds = DefaultGesRounds,
+        int                  earlyStopPatience = 0)
     {
         int T = allTrees.Count;
-        if (calSet.Count < 10 || T < 2) return [];
+        if (calSet.Count < MinCalSamples || T < 2) return [];
 
         int gesN  = calSet.Count;
         var allLP = new double[gesN][];
@@ -2467,6 +3370,8 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
         var counts   = new int[T];
         var ensProbs = new double[gesN];
         int ensSize  = 0;
+        double prevBestLoss = double.MaxValue;
+        int    noImproveCnt = 0;
 
         for (int round = 0; round < rounds; round++)
         {
@@ -2491,6 +3396,18 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
             ensSize++;
             for (int i = 0; i < gesN; i++)
                 ensProbs[i] = (ensProbs[i] * (ensSize - 1) + allLP[i][bestT]) / ensSize;
+
+            // #19: Early stop if NLL hasn't improved
+            if (earlyStopPatience > 0)
+            {
+                if (bestLoss < prevBestLoss - 1e-8)
+                {
+                    prevBestLoss = bestLoss;
+                    noImproveCnt = 0;
+                }
+                else if (++noImproveCnt >= earlyStopPatience)
+                    break;
+            }
         }
 
         double total = counts.Sum();
@@ -2538,25 +3455,38 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
             return evaluated > 0 ? (double)correct / evaluated : 0.0;
         }
 
-        double baseAcc  = ComputeOobAcc(trainSet, newTrees, oobMasks);
-        var    toRemove = new List<int>();
-
-        for (int k = 0; k < newTrees.Count; k++)
+        // #10: Iterative re-evaluation — after removing one tree, recompute
+        // baseline accuracy before evaluating the next candidate.
+        int pruned = 0;
+        bool changed = true;
+        while (changed && newTrees.Count >= 2)
         {
-            // Require at least one tree remaining for meaningful OOB estimate
-            if (newTrees.Count - toRemove.Count - 1 < 1) break;
-            double accWithout = ComputeOobAcc(trainSet, newTrees, oobMasks, skipIdx: k);
-            if (accWithout > baseAcc)
-                toRemove.Add(k);
+            changed = false;
+            double baseAcc = ComputeOobAcc(trainSet, newTrees, oobMasks);
+            int    worstK  = -1;
+            double bestAcc = baseAcc;
+
+            for (int k = 0; k < newTrees.Count; k++)
+            {
+                if (newTrees.Count - 1 < 1) break;
+                double accWithout = ComputeOobAcc(trainSet, newTrees, oobMasks, skipIdx: k);
+                if (accWithout > bestAcc)
+                {
+                    bestAcc = accWithout;
+                    worstK  = k;
+                }
+            }
+
+            if (worstK >= 0)
+            {
+                newTrees.RemoveAt(worstK);
+                oobMasks.RemoveAt(worstK);
+                pruned++;
+                changed = true;
+            }
         }
 
-        for (int r = toRemove.Count - 1; r >= 0; r--)
-        {
-            newTrees.RemoveAt(toRemove[r]);
-            oobMasks.RemoveAt(toRemove[r]);
-        }
-
-        return toRemove.Count;
+        return pruned;
     }
 
     // ── Tree ensemble diversity (#5) ──────────────────────────────────────────
@@ -2569,7 +3499,7 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
     private static double ComputeTreeDiversity(
         List<List<TreeNode>> allTrees,
         List<TrainingSample> trainSet,
-        int                  maxSamples = 200)
+        int                  maxSamples = MaxDiversitySamples)
     {
         int T = allTrees.Count;
         if (T < 2 || trainSet.Count == 0) return 0.0;
@@ -2593,14 +3523,33 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
             }
         }
 
+        // #31: For large T, sample a random subset of pairs instead of O(T²) full scan.
+        int totalPairs = T * (T - 1) / 2;
+        int maxPairs   = 500;
         double sumCorr = 0.0;
         int    pairs   = 0;
-        for (int i = 0; i < T; i++)
-            for (int j = i + 1; j < T; j++)
+
+        if (totalPairs <= maxPairs)
+        {
+            for (int i = 0; i < T; i++)
+                for (int j = i + 1; j < T; j++)
+                {
+                    sumCorr += PearsonCorrelation(predictions[i], predictions[j], sampleCount);
+                    pairs++;
+                }
+        }
+        else
+        {
+            var pairRng = new Random(42);
+            for (int p = 0; p < maxPairs; p++)
             {
+                int i = pairRng.Next(T);
+                int j = pairRng.Next(T - 1);
+                if (j >= i) j++;
                 sumCorr += PearsonCorrelation(predictions[i], predictions[j], sampleCount);
                 pairs++;
             }
+        }
 
         return pairs > 0 ? sumCorr / pairs : 0.0;
     }
@@ -2636,22 +3585,39 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
     // ── Meta-label secondary classifier (#10) ────────────────────────────────
 
     /// <summary>
-    /// Trains a 7-feature logistic classifier on [rawProb, treeStd, feat[0..4]].
-    /// Label = 1 when the QRF ensemble prediction was correct on the calibration sample.
-    /// 30 epochs SGD with L2 regularisation.
+    /// #23: Meta-label classifier using [rawProb, treeStd, top-5-by-importance features]
+    /// instead of the first 5 by index. When <paramref name="featureImportance"/> is available,
+    /// the 5 features with highest importance are selected; otherwise falls back to feat[0..4].
     /// </summary>
     private static (double[] Weights, double Bias) FitMetaLabelModel(
         List<TrainingSample> calSet,
         List<List<TreeNode>> allTrees,
-        List<TrainingSample> trainSet)
+        List<TrainingSample> trainSet,
+        float[]?             featureImportance = null)
     {
         const int    MetaFeatureDim = 7;   // rawProb + treeStd + 5 raw features
         const int    Epochs         = 30;
         const double Lr             = 0.01;
         const double L2             = 0.001;
 
-        if (calSet.Count < 10)
+        if (calSet.Count < MinCalSamples)
             return (new double[MetaFeatureDim], 0.0);
+
+        // #23: Select top-5 feature indices by importance (or first 5 as fallback)
+        int F = calSet.Count > 0 ? calSet[0].Features.Length : 0;
+        int topN = Math.Min(5, F);
+        int[] topFeatIdx;
+        if (featureImportance is { Length: > 0 } && featureImportance.Length >= F)
+        {
+            topFeatIdx = Enumerable.Range(0, F)
+                .OrderByDescending(i => featureImportance[i])
+                .Take(topN)
+                .ToArray();
+        }
+        else
+        {
+            topFeatIdx = Enumerable.Range(0, topN).ToArray();
+        }
 
         int T     = allTrees.Count;
         var mw    = new double[MetaFeatureDim];
@@ -2674,8 +3640,8 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
 
                 metaF[0] = rawProb;
                 metaF[1] = treeStd;
-                int rawTop = Math.Min(5, s.Features.Length);
-                for (int i = 0; i < rawTop; i++) metaF[2 + i] = s.Features[i];
+                for (int i = 0; i < topN; i++)
+                    metaF[2 + i] = topFeatIdx[i] < s.Features.Length ? s.Features[topFeatIdx[i]] : 0.0;
 
                 int predicted = rawProb >= 0.5 ? 1 : -1;
                 int actual    = s.Direction > 0 ? 1 : -1;
@@ -2714,7 +3680,8 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
         double               plattA,
         double               plattB,
         double[]             metaLabelWeights,
-        double               metaLabelBias)
+        double               metaLabelBias,
+        bool                 sweepThreshold = false)
     {
         const int    Dim    = 3;   // [calibP, treeStd, metaLabelScore]
         const int    Epochs = 50;
@@ -2775,7 +3742,56 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
             ab -= Lr * dB / n;
         }
 
-        return (aw, ab, 0.5);
+        // #21: Learn optimal abstention threshold by sweeping cal set for best
+        // precision at ≥50 % recall (when enabled)
+        double threshold = 0.5;
+        if (sweepThreshold)
+        {
+            double bestPrec = 0;
+            for (int pct = 30; pct <= 70; pct++)
+            {
+                double thr = pct / 100.0;
+                int tpA = 0, fpA = 0, fnA = 0;
+                foreach (var s in calSet)
+                {
+                    double[] tp2 = GetTreeProbs(s.Features, allTrees, trainSet);
+                    double rawP2 = tp2.Average();
+                    double rawPC2 = Math.Clamp(rawP2, 1e-7, 1.0 - 1e-7);
+                    double cP2 = MLFeatureHelper.Sigmoid(plattA * MLFeatureHelper.Logit(rawPC2) + plattB);
+                    double lbl2 = (cP2 >= 0.5) == (s.Direction > 0) ? 1.0 : 0.0;
+
+                    // Recompute gate features per sample for the threshold sweep
+                    double vr2 = 0;
+                    for (int t2 = 0; t2 < tp2.Length; t2++) { double d2 = tp2[t2] - rawP2; vr2 += d2 * d2; }
+                    double ts2 = T > 1 ? Math.Sqrt(vr2 / (T - 1)) : 0.0;
+                    double[] mf2 = [rawP2, ts2, 0, 0, 0, 0, 0];
+                    int top2 = Math.Min(5, s.Features.Length);
+                    for (int i2 = 0; i2 < top2; i2++) mf2[2 + i2] = s.Features[i2];
+                    double mz2 = metaLabelBias;
+                    for (int i2 = 0; i2 < MetaDim && i2 < metaLabelWeights.Length; i2++)
+                        mz2 += metaLabelWeights[i2] * mf2[i2];
+                    double ms2 = MLFeatureHelper.Sigmoid(mz2);
+
+                    double[] af2 = [cP2, ts2, ms2];
+                    double gz = ab;
+                    for (int i2 = 0; i2 < Dim; i2++) gz += aw[i2] * af2[i2];
+                    double gateP = MLFeatureHelper.Sigmoid(gz);
+                    bool pass = gateP >= thr;
+                    if (pass && lbl2 >= 0.5) tpA++;
+                    else if (pass && lbl2 < 0.5) fpA++;
+                    else if (!pass && lbl2 >= 0.5) fnA++;
+                }
+                double recall2 = (tpA + fnA) > 0 ? (double)tpA / (tpA + fnA) : 0;
+                double prec2   = (tpA + fpA) > 0 ? (double)tpA / (tpA + fpA) : 0;
+                if (recall2 >= 0.50 && prec2 > bestPrec)
+                {
+                    bestPrec = prec2;
+                    threshold = thr;
+                }
+            }
+        }
+
+        return (aw, ab, threshold);
     }
 
     // ── Jackknife+ nonconformity residuals (#9) ───────────────────────────────
@@ -3039,5 +4055,90 @@ public sealed class QuantileRfModelTrainer : IMLModelTrainer
             });
         }
         return new GbmTree { Nodes = gbmNodes };
+    }
+
+    // ── Calibration confidence interval (#8) ──────────────────────────────────
+
+    /// <summary>
+    /// #8: Bootstrap the calibration set to estimate uncertainty of Platt parameters.
+    /// Returns (stdA, stdB) — the standard deviations of A and B across resamples.
+    /// </summary>
+    private static (double StdA, double StdB) ComputeCalibrationCI(
+        List<TrainingSample> calSet,
+        List<List<TreeNode>> allTrees,
+        List<TrainingSample> trainSet,
+        int                  bootstrapRounds = 50,
+        int                  seed = 42)
+    {
+        if (calSet.Count < MinCalSamplesPlatt) return (0, 0);
+
+        var aValues = new double[bootstrapRounds];
+        var bValues = new double[bootstrapRounds];
+        var rng     = new Random(seed);
+
+        for (int r = 0; r < bootstrapRounds; r++)
+        {
+            var resample = new List<TrainingSample>(calSet.Count);
+            for (int i = 0; i < calSet.Count; i++)
+                resample.Add(calSet[rng.Next(calSet.Count)]);
+            var (a, b) = FitPlattScaling(resample, allTrees, trainSet);
+            aValues[r] = a;
+            bValues[r] = b;
+        }
+
+        return (StdDevArr(aValues), StdDevArr(bValues));
+
+        static double StdDevArr(double[] values)
+        {
+            double mean = values.Average();
+            double varSum = 0;
+            foreach (var v in values) varSum += (v - mean) * (v - mean);
+            return values.Length > 1 ? Math.Sqrt(varSum / (values.Length - 1)) : 0;
+        }
+    }
+
+    // ── 2nd-order feature interactions (#27) ──────────────────────────────────
+
+    /// <summary>
+    /// #27: Tracks which feature pairs co-occur on root→child paths across all trees.
+    /// Returns a list of "FeatureA:FeatureB" pairs that co-occur in more than
+    /// <paramref name="minCoOccurrenceFraction"/> of all trees.
+    /// </summary>
+    private static string[] Compute2ndOrderFeatureInteractions(
+        List<List<TreeNode>> allTrees,
+        double               minCoOccurrenceFraction = 0.5)
+    {
+        if (allTrees.Count < 2) return [];
+
+        var pairCounts = new Dictionary<(int, int), int>();
+        foreach (var tree in allTrees)
+        {
+            var featsInTree = new HashSet<int>();
+            foreach (var node in tree)
+                if (node.SplitFeat >= 0) featsInTree.Add(node.SplitFeat);
+
+            var featList = featsInTree.OrderBy(f => f).ToList();
+            for (int i = 0; i < featList.Count; i++)
+                for (int j = i + 1; j < featList.Count; j++)
+                {
+                    var key = (featList[i], featList[j]);
+                    pairCounts.TryGetValue(key, out int cnt);
+                    pairCounts[key] = cnt + 1;
+                }
+        }
+
+        int threshold = (int)(allTrees.Count * minCoOccurrenceFraction);
+        return [.. pairCounts
+            .Where(kv => kv.Value >= threshold)
+            .OrderByDescending(kv => kv.Value)
+            .Take(20)
+            .Select(kv =>
+            {
+                string a = kv.Key.Item1 < MLFeatureHelper.FeatureNames.Length
+                    ? MLFeatureHelper.FeatureNames[kv.Key.Item1] : $"F{kv.Key.Item1}";
+                string b = kv.Key.Item2 < MLFeatureHelper.FeatureNames.Length
+                    ? MLFeatureHelper.FeatureNames[kv.Key.Item2] : $"F{kv.Key.Item2}";
+                return $"{a}×{b}";
+            })];
     }
 }

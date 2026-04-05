@@ -68,7 +68,9 @@ public partial class OptimizationWorker
             int maxRunsPerWeek = config.MaxRunsPerWeek > 0 ? config.MaxRunsPerWeek : 20;
             var weekCutoff = DateTime.UtcNow.AddDays(-7);
             var recentRunCount = await db.Set<OptimizationRun>()
-                .Where(r => !r.IsDeleted && r.StartedAt >= weekCutoff)
+                .Where(r => !r.IsDeleted
+                         && r.Status != OptimizationRunStatus.Queued
+                         && r.StartedAt >= weekCutoff)
                 .CountAsync(ct);
             if (recentRunCount >= maxRunsPerWeek)
             {
@@ -297,25 +299,35 @@ public partial class OptimizationWorker
         int queued = 0;
         foreach (var candidate in toSchedule)
         {
-            writeDb.Set<OptimizationRun>().Add(new OptimizationRun
+            var scheduledRun = new OptimizationRun
             {
                 StrategyId             = candidate.StrategyId,
                 TriggerType            = TriggerType.Scheduled,
                 Status                 = OptimizationRunStatus.Queued,
                 BaselineParametersJson = CanonicalParameterJson.Normalize(candidate.ParamsJson),
                 StartedAt              = DateTime.UtcNow,
-            });
-            queued++;
+            };
+            writeDb.Set<OptimizationRun>().Add(scheduledRun);
 
-            _logger.LogInformation(
-                "OptimizationWorker: auto-queued optimization for strategy {Id} ({Name}) — " +
-                "priority={Prio}, severity={Sev:F2}, WR={WR:P1} PF={PF:F2}",
-                candidate.StrategyId, candidate.Name, candidate.Priority,
-                candidate.Severity, (double)candidate.WinRate, (double)candidate.ProfitFactor);
+            try
+            {
+                await writeCtx.SaveChangesAsync(ct);
+                queued++;
+
+                _logger.LogInformation(
+                    "OptimizationWorker: auto-queued optimization for strategy {Id} ({Name}) — " +
+                    "priority={Prio}, severity={Sev:F2}, WR={WR:P1} PF={PF:F2}",
+                    candidate.StrategyId, candidate.Name, candidate.Priority,
+                    candidate.Severity, (double)candidate.WinRate, (double)candidate.ProfitFactor);
+            }
+            catch (DbUpdateException ex) when (IsActiveQueueConstraintViolation(ex))
+            {
+                writeDb.Entry(scheduledRun).State = EntityState.Detached;
+                _logger.LogInformation(
+                    "OptimizationWorker: skipped duplicate auto-queue for strategy {Id} ({Name}) — another worker already queued or claimed it",
+                    candidate.StrategyId, candidate.Name);
+            }
         }
-
-        if (queued > 0)
-            await writeCtx.SaveChangesAsync(ct);
     }
 
     // ── Chronic failure escalation ──────────────────────────────────────────

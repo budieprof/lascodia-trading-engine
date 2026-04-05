@@ -233,6 +233,7 @@ public class OptimizationImprovementsTest
     [Fact]
     public void PromoteRollout_Progresses25To50To75To100()
     {
+        var originalStart = DateTime.UtcNow.AddDays(-4);
         var strategy = new Strategy
         {
             Id = 1,
@@ -240,7 +241,7 @@ public class OptimizationImprovementsTest
             ParametersJson = """{"Fast":12}""",
             RollbackParametersJson = """{"Fast":8}""",
             RolloutPct = 25,
-            RolloutStartedAt = DateTime.UtcNow,
+            RolloutStartedAt = originalStart,
             RolloutOptimizationRunId = 99,
             StrategyType = StrategyType.BreakoutScalper,
             Symbol = "EURUSD",
@@ -251,11 +252,17 @@ public class OptimizationImprovementsTest
         bool completed = GradualRolloutManager.PromoteRollout(strategy);
         Assert.False(completed);
         Assert.Equal(50, strategy.RolloutPct);
+        Assert.NotNull(strategy.RolloutStartedAt);
+        Assert.True(strategy.RolloutStartedAt > originalStart);
+
+        var secondTierStart = strategy.RolloutStartedAt;
 
         // 50 → 75
         completed = GradualRolloutManager.PromoteRollout(strategy);
         Assert.False(completed);
         Assert.Equal(75, strategy.RolloutPct);
+        Assert.NotNull(strategy.RolloutStartedAt);
+        Assert.True(strategy.RolloutStartedAt > secondTierStart);
 
         // 75 → 100 (complete — clears rollback state)
         completed = GradualRolloutManager.PromoteRollout(strategy);

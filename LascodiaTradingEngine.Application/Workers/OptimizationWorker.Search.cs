@@ -36,6 +36,14 @@ public partial class OptimizationWorker
         throw new InvalidOperationException("OptimizationWorker: no surrogate available for initial candidate suggestions.");
     }
 
+    internal static int UpdateConsecutiveFailureStreak(int currentStreak, int successfulEvaluations, int failedEvaluations)
+    {
+        if (failedEvaluations <= 0)
+            return successfulEvaluations > 0 ? 0 : currentStreak;
+
+        return successfulEvaluations > 0 ? 0 : currentStreak + failedEvaluations;
+    }
+
     /// <summary>
     /// Builds the parameter grid, configures the TPE/GP surrogate, warm-starts from
     /// prior runs, runs successive halving + seed phase + surrogate-guided exploration,
@@ -117,7 +125,7 @@ public partial class OptimizationWorker
         // Exclude previously-promoted parameters (parameter memory)
         var previousParams = await db.Set<OptimizationRun>()
             .Where(r => r.StrategyId == strategy.Id
-                     && (r.Status == OptimizationRunStatus.Approved || r.Status == OptimizationRunStatus.Completed)
+                     && r.Status == OptimizationRunStatus.Approved
                      && r.BestParametersJson != null && !r.IsDeleted)
             .Select(r => r.BestParametersJson!)
             .ToListAsync(runCt);
@@ -152,8 +160,7 @@ public partial class OptimizationWorker
 
         // ── Stage 6: Bayesian search with purged K-fold ────────────
         // Load multi-objective acquisition config early so surrogate creation can branch on it.
-        bool useEhviEarly = await OptimizationGridBuilder.GetConfigAsync(
-            db, "Optimization:UseEhviAcquisition", false, runCt);
+        bool useEhviEarly = config.UseEhviAcquisition;
 
         // Select surrogate: EHVI (3 independent GPs) when enabled, otherwise
         // TPE for low-dimensional (< 6 params) or GP-UCB for higher.
@@ -196,8 +203,7 @@ public partial class OptimizationWorker
         // GPs, more compute but better Pareto coverage). Both opt-in, both default off.
         // When neither is enabled, the surrogate optimizes the fixed health score composite.
         // Declared here (before checkpoint resume) so checkpoint observations can feed EHVI.
-        bool useParegoScalarization = await OptimizationGridBuilder.GetConfigAsync(
-            db, "Optimization:UseParegoScalarization", false, runCt);
+        bool useParegoScalarization = config.UseParegoScalarization;
         bool useEhvi = useEhviEarly; // Already loaded above for surrogate selection
         if (useEhvi) useParegoScalarization = false;
         var paregoScalarizer = new ParegoScalarizer(searchSeed);
@@ -268,7 +274,7 @@ public partial class OptimizationWorker
         // conditions change. Half-life of 30 days: 30d→50% decay, 60d→75%, 90d→87.5%.
         var priorRuns = await db.Set<OptimizationRun>()
             .Where(r => r.StrategyId == strategy.Id
-                     && (r.Status == OptimizationRunStatus.Completed || r.Status == OptimizationRunStatus.Approved)
+                     && r.Status == OptimizationRunStatus.Approved
                      && r.BestParametersJson != null && r.BestHealthScore.HasValue
                      && !r.IsDeleted)
             .OrderByDescending(r => r.CompletedAt)
@@ -611,6 +617,8 @@ public partial class OptimizationWorker
             seedCandidates.AddRange(backfill);
         }
 
+        int seedSuccesses = 0;
+        int seedFailures = 0;
         await Parallel.ForEachAsync(seedCandidates, parallelOptions, async (paramSet, pCt) =>
         {
             if (Volatile.Read(ref consecutiveFailures) >= config.CircuitBreakerThreshold) return;
@@ -626,7 +634,7 @@ public partial class OptimizationWorker
                     config.ScreeningTimeoutSeconds, protocol.KFolds, embargoPerFold,
                     config.MinCandidateTrades, pCt);
                 Interlocked.Increment(ref totalIters);
-                Interlocked.Exchange(ref consecutiveFailures, 0);
+                Interlocked.Increment(ref seedSuccesses);
                 _metrics.OptimizationCandidatesScreened.Add(1);
                 lock (_evalLock) allEvaluated.Add(new ScoredCandidate(paramsJson, score, result, _cvValue));
 
@@ -650,14 +658,19 @@ public partial class OptimizationWorker
             catch (OperationCanceledException) when (!pCt.IsCancellationRequested)
             {
                 Interlocked.Increment(ref totalIters);
-                Interlocked.Increment(ref consecutiveFailures);
+                Interlocked.Increment(ref seedFailures);
             }
             catch
             {
                 Interlocked.Increment(ref totalIters);
-                Interlocked.Increment(ref consecutiveFailures);
+                Interlocked.Increment(ref seedFailures);
             }
         });
+
+        consecutiveFailures = UpdateConsecutiveFailureStreak(
+            consecutiveFailures,
+            Volatile.Read(ref seedSuccesses),
+            Volatile.Read(ref seedFailures));
 
         if (consecutiveFailures >= config.CircuitBreakerThreshold)
         {
@@ -743,6 +756,8 @@ public partial class OptimizationWorker
 
             long batchBestScoreBits = 0L; // Atomic-friendly storage for decimal via double bits
             int batchSpent = 0;
+            int batchSuccesses = 0;
+            int batchFailures = 0;
             await Parallel.ForEachAsync(suggestions, parallelOptions, async (suggestion, pCt) =>
             {
                 if (Volatile.Read(ref consecutiveFailures) >= config.CircuitBreakerThreshold) return;
@@ -759,7 +774,7 @@ public partial class OptimizationWorker
                         config.ScreeningTimeoutSeconds, protocol.KFolds, embargoPerFold,
                         config.MinCandidateTrades, pCt);
                     Interlocked.Increment(ref totalIters);
-                    Interlocked.Exchange(ref consecutiveFailures, 0);
+                    Interlocked.Increment(ref batchSuccesses);
                     _metrics.OptimizationCandidatesScreened.Add(1);
                     // Record the standard health score on the candidate (for downstream ranking)
                     lock (_evalLock) allEvaluated.Add(new ScoredCandidate(paramsJson, score, result, _cvVal));
@@ -789,7 +804,7 @@ public partial class OptimizationWorker
                 catch
                 {
                     Interlocked.Increment(ref totalIters);
-                    Interlocked.Increment(ref consecutiveFailures);
+                    Interlocked.Increment(ref batchFailures);
                 }
             });
             int spentThisBatch = Volatile.Read(ref batchSpent);
@@ -799,6 +814,11 @@ public partial class OptimizationWorker
                     "OptimizationWorker: surrogate batch produced no fresh candidates after deduplication — stopping exploration early");
                 break;
             }
+
+            consecutiveFailures = UpdateConsecutiveFailureStreak(
+                consecutiveFailures,
+                Volatile.Read(ref batchSuccesses),
+                Volatile.Read(ref batchFailures));
 
             decimal batchBestScore = (decimal)BitConverter.Int64BitsToDouble(Interlocked.Read(ref batchBestScoreBits));
             remaining -= spentThisBatch;

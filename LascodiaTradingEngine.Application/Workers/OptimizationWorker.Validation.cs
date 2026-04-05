@@ -34,10 +34,14 @@ public partial class OptimizationWorker
         BacktestOptions screeningOptions,
         OptimizationGridBuilder.DataProtocol protocol,
         OptimizationConfig config, DbContext db,
-        int totalIters, decimal baselineComparisonScore, IWriteApplicationDbContext writeCtx,
+        int totalIters, decimal baselineComparisonScore, string baselineParamsJson,
+        IWriteApplicationDbContext writeCtx,
         CurrencyPair? pairInfo,
         CancellationToken ct, CancellationToken runCt)
     {
+        var parameterGrid = await _gridBuilder.BuildParameterGridAsync(db, strategy.StrategyType, runCt);
+        var parameterBounds = OptimizationGridBuilder.ExtractTpeBounds(parameterGrid);
+
         // Pre-fetch shared data (independent of which candidate is being validated)
         var higherTf = GetHigherTimeframe(strategy.Timeframe);
         MarketRegimeEnum? higherRegime = null;
@@ -87,7 +91,8 @@ public partial class OptimizationWorker
                 strategy, candidate.ParamsJson, trainCandles, screeningOptions,
                 config.ScreeningTimeoutSeconds, candidate.HealthScore,
                 config.SensitivityPerturbPct, runCt,
-                config.SensitivityDegradationTolerance, config.MaxParallelBacktests);
+                config.SensitivityDegradationTolerance, config.MaxParallelBacktests,
+                parameterBounds);
             gateSw.Stop();
             _metrics.OptimizationGateDurationMs.Record(gateSw.Elapsed.TotalMilliseconds, new KeyValuePair<string, object?>("gate", "sensitivity"));
             gateTimings.Add(("Sensitivity", gateSw.Elapsed.TotalMilliseconds));
@@ -104,7 +109,8 @@ public partial class OptimizationWorker
             gateSw.Restart();
             BacktestResult oosResult;
             decimal oosHealthScore;
-            if (testCandles.Count >= config.MinOosCandlesForValidation)
+            bool hasSufficientOosData = testCandles.Count >= config.MinOosCandlesForValidation;
+            if (hasSufficientOosData)
             {
                 oosResult = await _validator.RunWithTimeoutAsync(
                     strategy, candidate.ParamsJson, testCandles, screeningOptions, config.ScreeningTimeoutSeconds, runCt);
@@ -235,7 +241,7 @@ public partial class OptimizationWorker
             gateSw.Restart();
             var (wfAvgScore, wfStable) = await _validator.WalkForwardValidateAsync(
                 strategy, candidate.ParamsJson, testCandles, screeningOptions, config.ScreeningTimeoutSeconds, runCt,
-                config.WalkForwardMinMaxRatio);
+                config.WalkForwardMinMaxRatio, baselineParamsJson);
             gateSw.Stop();
             _metrics.OptimizationGateDurationMs.Record(gateSw.Elapsed.TotalMilliseconds, new KeyValuePair<string, object?>("gate", "walk_forward"));
             gateTimings.Add(("WalkForward", gateSw.Elapsed.TotalMilliseconds));
@@ -402,7 +408,7 @@ public partial class OptimizationWorker
 
             // ── P5: Apply asset-class threshold multipliers ────────────
             var assetClass = StrategyGenerationHelpers.ClassifyAsset(strategy.Symbol, pairInfo);
-            var (_, acPF, acSh, _) = StrategyGenerationHelpers.GetAssetClassThresholdMultipliers(assetClass);
+            var (_, acPF, acSh, acDD) = StrategyGenerationHelpers.GetAssetClassThresholdMultipliers(assetClass);
             effectiveMinScore *= (decimal)Math.Max(acSh, acPF);
 
             // ── P7: Kelly position sizing sensitivity check ────────────
@@ -452,7 +458,7 @@ public partial class OptimizationWorker
             if (oosResult.Trades is { Count: >= 5 })
             {
                 double r2 = StrategyScreeningEngine.ComputeEquityCurveR2(oosResult.Trades, config.ScreeningInitialBalance);
-                double minR2 = await OptimizationGridBuilder.GetConfigAsync<double>(db, "Optimization:MinEquityCurveR2", 0.60, ct);
+                double minR2 = config.MinEquityCurveR2;
                 if (r2 < minR2)
                 {
                     equityCurveOk = false;
@@ -468,7 +474,7 @@ public partial class OptimizationWorker
             if (oosResult.Trades is { Count: >= 10 })
             {
                 double concentration = StrategyScreeningEngine.ComputeTradeTimeConcentration(oosResult.Trades);
-                double maxConcentration = await OptimizationGridBuilder.GetConfigAsync<double>(db, "Optimization:MaxTradeTimeConcentration", 0.60, ct);
+                double maxConcentration = config.MaxTradeTimeConcentration;
                 if (concentration > maxConcentration)
                 {
                     timeConcentrationOk = false;
@@ -544,7 +550,9 @@ public partial class OptimizationWorker
                 timeConcentrationOk,
                 acSh,
                 acPF,
-                genesisRegressionOk));
+                acDD,
+                genesisRegressionOk,
+                hasSufficientOosData));
 
             lastResult = new CandidateValidationResult(
                 approval.Passed, candidate, oosHealthScore, oosResult,
@@ -570,6 +578,7 @@ public partial class OptimizationWorker
             if (!portfolioCorrelationSafe) _metrics.OptimizationGateRejections.Add(1, new KeyValuePair<string, object?>("gate", "portfolio_correlation"));
             if (!cvConsistent) _metrics.OptimizationGateRejections.Add(1, new KeyValuePair<string, object?>("gate", "cv_consistency"));
             if (!permSignificant) _metrics.OptimizationGateRejections.Add(1, new KeyValuePair<string, object?>("gate", "permutation_test"));
+            if (!hasSufficientOosData) _metrics.OptimizationGateRejections.Add(1, new KeyValuePair<string, object?>("gate", "insufficient_oos_data"));
             if (!kellySizingOk) _metrics.OptimizationGateRejections.Add(1, new KeyValuePair<string, object?>("gate", "kelly_sizing"));
             if (!equityCurveOk) _metrics.OptimizationGateRejections.Add(1, new KeyValuePair<string, object?>("gate", "equity_curve_r2"));
             if (!timeConcentrationOk) _metrics.OptimizationGateRejections.Add(1, new KeyValuePair<string, object?>("gate", "time_concentration"));

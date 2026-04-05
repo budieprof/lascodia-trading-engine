@@ -58,6 +58,11 @@ internal sealed class GradualRolloutManager
             return true;
         }
 
+        // Reset the observation window at each intermediate tier so 50%/75%
+        // promotions require fresh evidence from that tier instead of inheriting
+        // time and snapshots collected while the strategy was still at 25%/50%.
+        strategy.RolloutStartedAt = DateTime.UtcNow;
+
         return false;
     }
 

@@ -286,7 +286,8 @@ public sealed class TabNetModelTrainer : IMLModelTrainer
             : new float[F];
 
         var topFeatures = featureImportance
-            .Select((imp, idx) => (Importance: imp, Name: MLFeatureHelper.FeatureNames[idx]))
+            .Select((imp, idx) => (Importance: imp,
+                Name: idx < MLFeatureHelper.FeatureNames.Length ? MLFeatureHelper.FeatureNames[idx] : $"Poly{idx}"))
             .OrderByDescending(x => x.Importance)
             .Take(5);
         _logger.LogInformation(
@@ -497,6 +498,7 @@ public sealed class TabNetModelTrainer : IMLModelTrainer
             AdaptiveLabelSmoothing     = effectiveLabelSmoothing,
             ConformalCoverage          = hp.ConformalCoverage,
             TabNetAttentionJson        = JsonSerializer.Serialize(meanAttn, JsonOpts),
+            TabNetStepAttentionWeights = wAttention.Select(w => (double[])w.Clone()).ToArray(),
             FeatureSubsetIndices       = polyTopIdx.Length > 0 ? [polyTopIdx] : null,
         };
 
@@ -562,11 +564,15 @@ public sealed class TabNetModelTrainer : IMLModelTrainer
             {
                 for (int s = 0; s < nSteps && s < warmStart.Weights.Length; s++)
                     if (warmStart.Weights[s]?.Length == F) wf[s] = (double[])warmStart.Weights[s].Clone();
+                if (warmStart.TabNetStepAttentionWeights?.Length == nSteps)
+                    for (int s = 0; s < nSteps; s++)
+                        if (warmStart.TabNetStepAttentionWeights[s]?.Length == F)
+                            wAttention[s] = (double[])warmStart.TabNetStepAttentionWeights[s].Clone();
                 if (warmStart.Biases?.Length > 0) bOut = warmStart.Biases[0];
                 if (useMagHead && warmStart.MagWeights?.Length == F)
                     wMag = (double[])warmStart.MagWeights.Clone();
                 _logger.LogInformation(
-                    "TabNet warm-start: loaded prior weights (gen={Gen})", warmStart.GenerationNumber);
+                    "TabNet warm-start: loaded prior weights + attention (gen={Gen})", warmStart.GenerationNumber);
             }
             catch (Exception ex)
             {
@@ -612,6 +618,14 @@ public sealed class TabNetModelTrainer : IMLModelTrainer
         double[] stepMaskedFlat = pool.Rent(nSteps * F);
         double[] stepZs         = new double[nSteps];
 
+        // ── Mini-batch gradient accumulators ──────────────────────────────
+        const int BatchSize = 32;
+        double accGWOut = 0, accGBOut = 0;
+        double accGBMag = 0;
+        double[] accGWMag  = useMagHead ? new double[F] : [];
+        double[][] accGWf  = Enumerable.Range(0, nSteps).Select(_ => new double[F]).ToArray();
+        double[][] accGWA  = Enumerable.Range(0, nSteps).Select(_ => new double[F]).ToArray();
+
         try
         {
             for (int ep = 0; ep < maxEpochs && !ct.IsCancellationRequested; ep++)
@@ -620,7 +634,6 @@ public sealed class TabNetModelTrainer : IMLModelTrainer
 
                 for (int i = 0; i < nFit; i++)
                 {
-                    adamT++;
                     double sampleWt = temporalWeights.Length > i ? temporalWeights[i] : 1.0 / nFit;
 
                     for (int j = 0; j < F; j++) xBuf[j] = fitSet[i].Features[j];
@@ -685,38 +698,18 @@ public sealed class TabNetModelTrainer : IMLModelTrainer
                             : HuberDelta * Math.Sign(magErr);
                     }
 
-                    // ── Backward pass (Adam) ──────────────────────────────
-                    double bc1 = 1.0 - Math.Pow(AdamBeta1, adamT);
-                    double bc2 = 1.0 - Math.Pow(AdamBeta2, adamT);
+                    // ── Accumulate gradients ──────────────────────────────
+                    accGWOut += sampleWt * (errCE * stepOut + l2Lambda * wOut);
+                    accGBOut += sampleWt * errCE;
 
-                    double gWOut = sampleWt * (errCE * stepOut + l2Lambda * wOut);
-                    mWO = AdamBeta1 * mWO + (1 - AdamBeta1) * gWOut;
-                    vWO = AdamBeta2 * vWO + (1 - AdamBeta2) * gWOut * gWOut;
-                    wOut -= cosLr * (mWO / bc1) / (Math.Sqrt(vWO / bc2) + AdamEpsilon);
-
-                    double gBOut = sampleWt * errCE;
-                    mBO = AdamBeta1 * mBO + (1 - AdamBeta1) * gBOut;
-                    vBO = AdamBeta2 * vBO + (1 - AdamBeta2) * gBOut * gBOut;
-                    bOut -= cosLr * (mBO / bc1) / (Math.Sqrt(vBO / bc2) + AdamEpsilon);
-
-                    // wMag and bMag gradients
                     if (useMagHead)
                     {
                         double scaledHuber = sampleWt * magLossWeight * huberGrad;
                         for (int j = 0; j < F; j++)
-                        {
-                            double gMj = scaledHuber * hFinalBuf[j] + l2Lambda * wMag[j];
-                            mWMag[j] = AdamBeta1 * mWMag[j] + (1 - AdamBeta1) * gMj;
-                            vWMag[j] = AdamBeta2 * vWMag[j] + (1 - AdamBeta2) * gMj * gMj;
-                            wMag[j] -= cosLr * (mWMag[j] / bc1) / (Math.Sqrt(vWMag[j] / bc2) + AdamEpsilon);
-                        }
-                        double gBMag = sampleWt * magLossWeight * huberGrad;
-                        mBMag = AdamBeta1 * mBMag + (1 - AdamBeta1) * gBMag;
-                        vBMag = AdamBeta2 * vBMag + (1 - AdamBeta2) * gBMag * gBMag;
-                        bMag -= cosLr * (mBMag / bc1) / (Math.Sqrt(vBMag / bc2) + AdamEpsilon);
+                            accGWMag[j] += scaledHuber * hFinalBuf[j] + l2Lambda * wMag[j];
+                        accGBMag += sampleWt * magLossWeight * huberGrad;
                     }
 
-                    // Per-step wf and wAttention gradients
                     double dStepOut = sampleWt * errCE * wOut;
                     for (int s = 0; s < nSteps; s++)
                     {
@@ -728,20 +721,72 @@ public sealed class TabNetModelTrainer : IMLModelTrainer
                             double attnSJ   = stepAttnsFlat[baseIdx + j];
                             double maskedSJ = stepMaskedFlat[baseIdx + j];
 
-                            double gWf = dZ * maskedSJ + l2Lambda * wf[s][j];
-                            mWf[s][j] = AdamBeta1 * mWf[s][j] + (1 - AdamBeta1) * gWf;
-                            vWf[s][j] = AdamBeta2 * vWf[s][j] + (1 - AdamBeta2) * gWf * gWf;
-                            wf[s][j] -= cosLr * (mWf[s][j] / bc1) / (Math.Sqrt(vWf[s][j] / bc2) + AdamEpsilon);
+                            accGWf[s][j] += dZ * maskedSJ + l2Lambda * wf[s][j];
 
-                            // Attention gradient: direction loss + sparsity + magnitude head contribution
                             double magAttnGrad = useMagHead
                                 ? sampleWt * magLossWeight * huberGrad * wMag[j] * xBuf[j] / nSteps
                                 : 0.0;
-                            double gWA = dZ * wf[s][j] * xBuf[j] + sparsity * attnSJ + magAttnGrad;
-                            mWA[s][j] = AdamBeta1 * mWA[s][j] + (1 - AdamBeta1) * gWA;
-                            vWA[s][j] = AdamBeta2 * vWA[s][j] + (1 - AdamBeta2) * gWA * gWA;
-                            wAttention[s][j] -= cosLr * (mWA[s][j] / bc1) / (Math.Sqrt(vWA[s][j] / bc2) + AdamEpsilon);
+                            accGWA[s][j] += dZ * wf[s][j] * xBuf[j] + sparsity * attnSJ + magAttnGrad;
                         }
+                    }
+
+                    // ── Apply Adam update at batch boundaries ─────────────
+                    bool isBatchEnd = (i + 1) % BatchSize == 0 || i == nFit - 1;
+                    if (isBatchEnd)
+                    {
+                        int batchLen = (i % BatchSize) + 1;
+                        if (i == nFit - 1 && nFit % BatchSize != 0) batchLen = nFit % BatchSize;
+                        double invBatch = 1.0 / batchLen;
+
+                        adamT++;
+                        double bc1 = 1.0 - Math.Pow(AdamBeta1, adamT);
+                        double bc2 = 1.0 - Math.Pow(AdamBeta2, adamT);
+
+                        double gWOut = accGWOut * invBatch;
+                        mWO = AdamBeta1 * mWO + (1 - AdamBeta1) * gWOut;
+                        vWO = AdamBeta2 * vWO + (1 - AdamBeta2) * gWOut * gWOut;
+                        wOut -= cosLr * (mWO / bc1) / (Math.Sqrt(vWO / bc2) + AdamEpsilon);
+
+                        double gBOut = accGBOut * invBatch;
+                        mBO = AdamBeta1 * mBO + (1 - AdamBeta1) * gBOut;
+                        vBO = AdamBeta2 * vBO + (1 - AdamBeta2) * gBOut * gBOut;
+                        bOut -= cosLr * (mBO / bc1) / (Math.Sqrt(vBO / bc2) + AdamEpsilon);
+
+                        if (useMagHead)
+                        {
+                            for (int j = 0; j < F; j++)
+                            {
+                                double gMj = accGWMag[j] * invBatch;
+                                mWMag[j] = AdamBeta1 * mWMag[j] + (1 - AdamBeta1) * gMj;
+                                vWMag[j] = AdamBeta2 * vWMag[j] + (1 - AdamBeta2) * gMj * gMj;
+                                wMag[j] -= cosLr * (mWMag[j] / bc1) / (Math.Sqrt(vWMag[j] / bc2) + AdamEpsilon);
+                            }
+                            double gBMag = accGBMag * invBatch;
+                            mBMag = AdamBeta1 * mBMag + (1 - AdamBeta1) * gBMag;
+                            vBMag = AdamBeta2 * vBMag + (1 - AdamBeta2) * gBMag * gBMag;
+                            bMag -= cosLr * (mBMag / bc1) / (Math.Sqrt(vBMag / bc2) + AdamEpsilon);
+                        }
+
+                        for (int s = 0; s < nSteps; s++)
+                        {
+                            for (int j = 0; j < F; j++)
+                            {
+                                double gWf = accGWf[s][j] * invBatch;
+                                mWf[s][j] = AdamBeta1 * mWf[s][j] + (1 - AdamBeta1) * gWf;
+                                vWf[s][j] = AdamBeta2 * vWf[s][j] + (1 - AdamBeta2) * gWf * gWf;
+                                wf[s][j] -= cosLr * (mWf[s][j] / bc1) / (Math.Sqrt(vWf[s][j] / bc2) + AdamEpsilon);
+
+                                double gWA = accGWA[s][j] * invBatch;
+                                mWA[s][j] = AdamBeta1 * mWA[s][j] + (1 - AdamBeta1) * gWA;
+                                vWA[s][j] = AdamBeta2 * vWA[s][j] + (1 - AdamBeta2) * gWA * gWA;
+                                wAttention[s][j] -= cosLr * (mWA[s][j] / bc1) / (Math.Sqrt(vWA[s][j] / bc2) + AdamEpsilon);
+                            }
+                        }
+
+                        // Reset accumulators
+                        accGWOut = 0; accGBOut = 0; accGBMag = 0;
+                        if (useMagHead) Array.Clear(accGWMag);
+                        for (int s = 0; s < nSteps; s++) { Array.Clear(accGWf[s]); Array.Clear(accGWA[s]); }
                     }
                 }
 
@@ -1447,20 +1492,54 @@ public sealed class TabNetModelTrainer : IMLModelTrainer
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  JACKKNIFE+ RESIDUALS
+    //  JACKKNIFE+ RESIDUALS  (K-fold cross-residuals)
+    //  Each sample's residual comes from a model that never trained on it,
+    //  providing valid coverage guarantees for prediction intervals.
     // ═══════════════════════════════════════════════════════════════════════
 
-    private static double[] ComputeJackknifeResiduals(
+    private double[] ComputeJackknifeResiduals(
         IReadOnlyList<TrainingSample> trainSet,
         double[][] wAttention, double[][] wf, double wOut, double bOut, int nSteps, int F)
     {
         int n = trainSet.Count;
         var residuals = new double[n];
-        for (int i = 0; i < n; i++)
+
+        // K-fold cross-residuals: retrain on K-1 folds, predict held-out fold
+        const int K = 5;
+        int foldSize = n / K;
+
+        // Fall back to full-model residuals when dataset is too small for K-fold
+        if (foldSize < 30)
         {
-            double p = TabNetRawProbFromFloats(trainSet[i].Features, wAttention, wf, wOut, bOut, nSteps, F);
-            residuals[i] = Math.Abs(p - (trainSet[i].Direction > 0 ? 1.0 : 0.0));
+            for (int i = 0; i < n; i++)
+            {
+                double p = TabNetRawProbFromFloats(trainSet[i].Features, wAttention, wf, wOut, bOut, nSteps, F);
+                residuals[i] = Math.Abs(p - (trainSet[i].Direction > 0 ? 1.0 : 0.0));
+            }
+            return residuals;
         }
+
+        var allSamples = trainSet is List<TrainingSample> lst ? lst : trainSet.ToList();
+        for (int fold = 0; fold < K; fold++)
+        {
+            int heldStart = fold * foldSize;
+            int heldEnd   = fold == K - 1 ? n : (fold + 1) * foldSize;
+
+            var foldTrain = new List<TrainingSample>(n - (heldEnd - heldStart));
+            for (int i = 0; i < heldStart; i++) foldTrain.Add(allSamples[i]);
+            for (int i = heldEnd; i < n; i++) foldTrain.Add(allSamples[i]);
+
+            // Quick retrain with reduced epochs
+            var (fWA, fWf, fWO, fBO, _, _) = FitTabNet(
+                foldTrain, F, nSteps, 0.02, 0.0001, 15, 0.0, null, null, 0, 0, 3, 0.0, CancellationToken.None);
+
+            for (int i = heldStart; i < heldEnd; i++)
+            {
+                double p = TabNetRawProbFromFloats(allSamples[i].Features, fWA, fWf, fWO, fBO, nSteps, F);
+                residuals[i] = Math.Abs(p - (allSamples[i].Direction > 0 ? 1.0 : 0.0));
+            }
+        }
+
         return residuals;
     }
 
@@ -1595,7 +1674,7 @@ public sealed class TabNetModelTrainer : IMLModelTrainer
                 for (int j = 0; j < F && j < trainSet[i].Features.Length; j++)
                     pred += w[j] * trainSet[i].Features[j];
                 double residual  = trainSet[i].Magnitude - pred;
-                double grad      = residual >= 0 ? -(1.0 - tau) : tau; // pinball subgradient
+                double grad      = residual >= 0 ? -tau : (1.0 - tau); // pinball subgradient: dρ/dŷ
                 b -= sgdLr * grad;
                 for (int j = 0; j < F && j < trainSet[i].Features.Length; j++)
                     w[j] -= sgdLr * grad * trainSet[i].Features[j];
@@ -2003,7 +2082,10 @@ public sealed class TabNetModelTrainer : IMLModelTrainer
             returns.Add(ret);
             equity += ret;
             if (equity > peak) peak = equity;
-            double dd = peak > 0 ? (peak - equity) / peak : 0;
+            // Absolute drawdown from peak; when peak is zero or negative, use absolute drop
+            double dd = peak > 1e-10
+                ? (peak - equity) / peak
+                : (peak - equity > 0 ? 1.0 : 0.0);
             if (dd > maxDD) maxDD = dd;
         }
         double avgRet = returns.Average();
