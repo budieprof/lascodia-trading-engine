@@ -12,11 +12,13 @@ using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.AuditTrail.Commands.LogDecision;
 using LascodiaTradingEngine.Application.Backtesting.Models;
 using LascodiaTradingEngine.Application.Backtesting.Services;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Events;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Utilities;
 using LascodiaTradingEngine.Application.Optimization;
+using LascodiaTradingEngine.Application.Services;
 using LascodiaTradingEngine.Application.Workers;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
@@ -28,7 +30,7 @@ public class OptimizationWorkerTest
     [Fact]
     public async Task TemporalChunkedEvaluateAsync_ReturnsCandidateSpecificCvPerCall()
     {
-        var validator = new OptimizationValidator(new TestBacktestEngine());
+        var validator = new OptimizationValidator(new TestBacktestEngine(), TimeProvider.System);
         validator.SetInitialBalance(10_000m);
 
         var strategy = new Strategy
@@ -131,17 +133,14 @@ public class OptimizationWorkerTest
             })
             .ToList();
 
-        var worker = CreateWorker();
-        var method = typeof(OptimizationWorker).GetMethod(
-            "GetRegimeAwareCandlesAsync",
-            BindingFlags.NonPublic | BindingFlags.Instance)!;
-
-        // blendRatio=0.0 tests pure regime filtering (no non-regime candle blending)
-        var task = (Task<List<Candle>>)method.Invoke(
-            worker,
-            [db.Object, "EURUSD", Timeframe.H1, allCandles, CancellationToken.None, 0.0])!;
-
-        var filtered = await task;
+        var filtered = await OptimizationDataLoader.GetRegimeAwareCandlesAsync(
+            db.Object,
+            Mock.Of<ILogger>(),
+            "EURUSD",
+            Timeframe.H1,
+            allCandles,
+            CancellationToken.None,
+            0.0);
 
         Assert.Equal(101, filtered.Count);
         Assert.Equal(new DateTime(2026, 03, 22, 22, 0, 0, DateTimeKind.Utc), filtered[0].Timestamp);
@@ -192,16 +191,14 @@ public class OptimizationWorkerTest
             })
             .ToList();
 
-        var worker = CreateWorker();
-        var method = typeof(OptimizationWorker).GetMethod(
-            "GetRegimeAwareCandlesAsync",
-            BindingFlags.NonPublic | BindingFlags.Instance)!;
-
-        var task = (Task<List<Candle>>)method.Invoke(
-            worker,
-            [db.Object, "EURUSD", Timeframe.H1, allCandles, CancellationToken.None, 0.0])!;
-
-        var filtered = await task;
+        var filtered = await OptimizationDataLoader.GetRegimeAwareCandlesAsync(
+            db.Object,
+            Mock.Of<ILogger>(),
+            "EURUSD",
+            Timeframe.H1,
+            allCandles,
+            CancellationToken.None,
+            0.0);
 
         Assert.Equal(120, filtered.Count);
         Assert.Equal(regimeStart, filtered[0].Timestamp);
@@ -240,16 +237,14 @@ public class OptimizationWorkerTest
             })
             .ToList();
 
-        var worker = CreateWorker();
-        var method = typeof(OptimizationWorker).GetMethod(
-            "GetRegimeAwareCandlesAsync",
-            BindingFlags.NonPublic | BindingFlags.Instance)!;
-
-        var task = (Task<List<Candle>>)method.Invoke(
-            worker,
-            [db.Object, "EURUSD", Timeframe.H1, allCandles, CancellationToken.None, 1.0])!;
-
-        var filtered = await task;
+        var filtered = await OptimizationDataLoader.GetRegimeAwareCandlesAsync(
+            db.Object,
+            Mock.Of<ILogger>(),
+            "EURUSD",
+            Timeframe.H1,
+            allCandles,
+            CancellationToken.None,
+            1.0);
 
         Assert.Equal(allCandles.Count, filtered.Count);
         Assert.Equal(allCandles[0].Timestamp, filtered[0].Timestamp);
@@ -625,16 +620,11 @@ public class OptimizationWorkerTest
             ],
             seenParameterJson: [paramsJson]);
 
-        var worker = CreateWorker();
-        var method = typeof(OptimizationWorker).GetMethod(
-            "RestoreCheckpoint",
-            BindingFlags.NonPublic | BindingFlags.Instance)!;
-
-        var checkpoint = method.Invoke(worker, [checkpointJson])!;
-        var iterations = (int)checkpoint.GetType().GetProperty("Iterations")!.GetValue(checkpoint)!;
-        var stagnantBatches = (int)checkpoint.GetType().GetProperty("StagnantBatches")!.GetValue(checkpoint)!;
-        var surrogateKind = (string?)checkpoint.GetType().GetProperty("SurrogateKind")!.GetValue(checkpoint)!;
-        var observations = (System.Collections.IEnumerable)checkpoint.GetType().GetProperty("Observations")!.GetValue(checkpoint)!;
+        var checkpoint = OptimizationCheckpointStore.Restore(checkpointJson);
+        var iterations = checkpoint.Iterations;
+        var stagnantBatches = checkpoint.StagnantBatches;
+        var surrogateKind = checkpoint.SurrogateKind;
+        var observations = checkpoint.Observations;
         var observation = observations.Cast<object>().Single();
 
         Assert.Equal(12, iterations);
@@ -828,15 +818,10 @@ public class OptimizationWorkerTest
         db.Setup(c => c.Set<BacktestRun>()).Returns(backtestDbSet.Object);
         db.Setup(c => c.Set<WalkForwardRun>()).Returns(walkDbSet.Object);
 
-        var method = typeof(OptimizationWorker).GetMethod(
-            "EnsureValidationFollowUpsAsync",
-            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var coordinator = CreateFollowUpCoordinator();
 
-        var firstCall = (Task<bool>)method.Invoke(null, [db.Object, run, strategy, config, CancellationToken.None])!;
-        var firstResult = await firstCall;
-
-        var secondCall = (Task<bool>)method.Invoke(null, [db.Object, run, strategy, config, CancellationToken.None])!;
-        var secondResult = await secondCall;
+        var firstResult = await coordinator.EnsureValidationFollowUpsAsync(db.Object, run, strategy, config, CancellationToken.None);
+        var secondResult = await coordinator.EnsureValidationFollowUpsAsync(db.Object, run, strategy, config, CancellationToken.None);
 
         Assert.Single(backtests);
         Assert.Single(walks);
@@ -878,11 +863,8 @@ public class OptimizationWorkerTest
         db.Setup(c => c.Set<BacktestRun>()).Returns(backtestDbSet.Object);
         db.Setup(c => c.Set<WalkForwardRun>()).Returns(walkDbSet.Object);
 
-        var method = typeof(OptimizationWorker).GetMethod(
-            "EnsureValidationFollowUpsAsync",
-            BindingFlags.NonPublic | BindingFlags.Static)!;
-
-        await (Task<bool>)method.Invoke(null, [db.Object, run, strategy, config, CancellationToken.None])!;
+        var coordinator = CreateFollowUpCoordinator();
+        await coordinator.EnsureValidationFollowUpsAsync(db.Object, run, strategy, config, CancellationToken.None);
 
         var backtest = Assert.Single(backtests);
         var walkForward = Assert.Single(walks);
@@ -935,11 +917,8 @@ public class OptimizationWorkerTest
         db.Setup(c => c.Set<BacktestRun>()).Returns(backtestDbSet.Object);
         db.Setup(c => c.Set<WalkForwardRun>()).Returns(walkDbSet.Object);
 
-        var method = typeof(OptimizationWorker).GetMethod(
-            "EnsureValidationFollowUpsAsync",
-            BindingFlags.NonPublic | BindingFlags.Static)!;
-
-        bool hadAllRows = await (Task<bool>)method.Invoke(null, [db.Object, run, strategy, config, CancellationToken.None])!;
+        var coordinator = CreateFollowUpCoordinator();
+        bool hadAllRows = await coordinator.EnsureValidationFollowUpsAsync(db.Object, run, strategy, config, CancellationToken.None);
 
         Assert.False(hadAllRows);
         var walkForward = Assert.Single(walks);
@@ -1009,17 +988,12 @@ public class OptimizationWorkerTest
         writeCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
         writeCtx.Setup(x => x.SaveChangesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(1);
 
-        var services = new ServiceCollection()
-            .AddSingleton(readCtx.Object)
-            .AddSingleton(writeCtx.Object)
-            .AddMetrics()
-            .BuildServiceProvider();
-
-        var worker = new OptimizationWorker(
-            Mock.Of<ILogger<OptimizationWorker>>(),
-            services.GetRequiredService<IServiceScopeFactory>(),
-            Mock.Of<IBacktestEngine>(),
-            new TradingMetrics(services.GetRequiredService<System.Diagnostics.Metrics.IMeterFactory>()));
+        var worker = CreateWorker(
+            scopeFactory: CreateWorkerScopeFactory(configureServices: services =>
+            {
+                services.AddSingleton(readCtx.Object);
+                services.AddSingleton(writeCtx.Object);
+            }));
 
         var method = typeof(OptimizationWorker).GetMethod(
             "MonitorFollowUpResultsAsync",
@@ -1100,17 +1074,12 @@ public class OptimizationWorkerTest
         writeCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
         writeCtx.Setup(x => x.SaveChangesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(1);
 
-        var services = new ServiceCollection()
-            .AddSingleton(readCtx.Object)
-            .AddSingleton(writeCtx.Object)
-            .AddMetrics()
-            .BuildServiceProvider();
-
-        var worker = new OptimizationWorker(
-            Mock.Of<ILogger<OptimizationWorker>>(),
-            services.GetRequiredService<IServiceScopeFactory>(),
-            Mock.Of<IBacktestEngine>(),
-            new TradingMetrics(services.GetRequiredService<System.Diagnostics.Metrics.IMeterFactory>()));
+        var worker = CreateWorker(
+            scopeFactory: CreateWorkerScopeFactory(configureServices: services =>
+            {
+                services.AddSingleton(readCtx.Object);
+                services.AddSingleton(writeCtx.Object);
+            }));
 
         var method = typeof(OptimizationWorker).GetMethod(
             "MonitorFollowUpResultsAsync",
@@ -1166,10 +1135,10 @@ public class OptimizationWorkerTest
     [Fact]
     public void UpdateConsecutiveFailureStreak_ResetsOnlyWhenBatchHasSuccess()
     {
-        Assert.Equal(7, OptimizationWorker.UpdateConsecutiveFailureStreak(3, successfulEvaluations: 0, failedEvaluations: 4));
-        Assert.Equal(0, OptimizationWorker.UpdateConsecutiveFailureStreak(3, successfulEvaluations: 1, failedEvaluations: 4));
-        Assert.Equal(3, OptimizationWorker.UpdateConsecutiveFailureStreak(3, successfulEvaluations: 0, failedEvaluations: 0));
-        Assert.Equal(0, OptimizationWorker.UpdateConsecutiveFailureStreak(3, successfulEvaluations: 2, failedEvaluations: 0));
+        Assert.Equal(7, OptimizationSearchCoordinator.UpdateConsecutiveFailureStreak(3, successfulEvaluations: 0, failedEvaluations: 4));
+        Assert.Equal(0, OptimizationSearchCoordinator.UpdateConsecutiveFailureStreak(3, successfulEvaluations: 1, failedEvaluations: 4));
+        Assert.Equal(3, OptimizationSearchCoordinator.UpdateConsecutiveFailureStreak(3, successfulEvaluations: 0, failedEvaluations: 0));
+        Assert.Equal(0, OptimizationSearchCoordinator.UpdateConsecutiveFailureStreak(3, successfulEvaluations: 2, failedEvaluations: 0));
     }
 
     [Fact]
@@ -1191,7 +1160,7 @@ public class OptimizationWorkerTest
             ["Slow"] = 0.80
         };
 
-        var adjusted = OptimizationWorker.ApplyImportanceGuidedBoundAdjustments(
+        var adjusted = OptimizationSearchCoordinator.ApplyImportanceGuidedBoundAdjustments(
             currentBounds, outerBounds, importance);
 
         Assert.True(adjusted["Fast"].Min < currentBounds["Fast"].Min);
@@ -1214,7 +1183,7 @@ public class OptimizationWorkerTest
             Trades = []
         };
 
-        double paregoScore = OptimizationWorker.GetCheckpointSurrogateObservationScore(
+        double paregoScore = OptimizationSearchCoordinator.GetCheckpointSurrogateObservationScore(
             useParegoScalarization: true,
             paregoScalarizer: scalarizer,
             result: result,
@@ -1229,7 +1198,7 @@ public class OptimizationWorkerTest
     {
         var scalarizer = new ParegoScalarizer(321);
 
-        bool valid = OptimizationWorker.TryGetWarmStartSurrogateObservationScore(
+        bool valid = OptimizationSearchCoordinator.TryGetWarmStartSurrogateObservationScore(
             useParegoScalarization: true,
             paregoScalarizer: scalarizer,
             healthScore: 0.80m,
@@ -1245,7 +1214,7 @@ public class OptimizationWorkerTest
             surrogateScore,
             precision: 10);
 
-        bool missingObjectives = OptimizationWorker.TryGetWarmStartSurrogateObservationScore(
+        bool missingObjectives = OptimizationSearchCoordinator.TryGetWarmStartSurrogateObservationScore(
             useParegoScalarization: true,
             paregoScalarizer: scalarizer,
             healthScore: 0.80m,
@@ -1319,15 +1288,12 @@ public class OptimizationWorkerTest
             })
             .ToList();
 
-        var intervalMethod = typeof(OptimizationWorker).GetMethod(
-            "BuildRegimeIntervals",
-            BindingFlags.NonPublic | BindingFlags.Static)!;
-        var filterMethod = typeof(OptimizationWorker).GetMethod(
-            "FilterCandlesByIntervals",
-            BindingFlags.NonPublic | BindingFlags.Static)!;
-
-        var intervals = intervalMethod.Invoke(null, [snapshots, MarketRegime.Trending, snapshots[0].DetectedAt, new DateTime(2026, 03, 05, 0, 0, 0, DateTimeKind.Utc)])!;
-        var filtered = (List<Candle>)filterMethod.Invoke(null, [candles, intervals])!;
+        var intervals = OptimizationRegimeIntervalBuilder.BuildRegimeIntervals(
+            snapshots,
+            MarketRegime.Trending,
+            snapshots[0].DetectedAt,
+            new DateTime(2026, 03, 05, 0, 0, 0, DateTimeKind.Utc));
+        var filtered = OptimizationRegimeIntervalBuilder.FilterCandlesByIntervals(candles, intervals);
 
         Assert.Equal(48, filtered.Count);
         Assert.Equal(new DateTime(2026, 03, 01, 0, 0, 0, DateTimeKind.Utc), filtered.First().Timestamp);
@@ -1370,12 +1336,7 @@ public class OptimizationWorkerTest
         db.Setup(c => c.Set<CurrencyPair>()).Returns(pairDbSet.Object);
         db.Setup(c => c.Set<StrategyRegimeParams>()).Returns(regimeParamsDbSet.Object);
 
-        var services = new ServiceCollection().BuildServiceProvider();
-        var worker = new OptimizationWorker(
-            Mock.Of<ILogger<OptimizationWorker>>(),
-            services.GetRequiredService<IServiceScopeFactory>(),
-            new BaselineSplitBacktestEngine(),
-            (TradingMetrics)FormatterServices.GetUninitializedObject(typeof(TradingMetrics)));
+        var worker = CreateWorker(new BaselineSplitBacktestEngine());
 
         var strategy = new Strategy
         {
@@ -1441,12 +1402,7 @@ public class OptimizationWorkerTest
         db.Setup(c => c.Set<CurrencyPair>()).Returns(pairDbSet.Object);
         db.Setup(c => c.Set<StrategyRegimeParams>()).Returns(regimeParamsDbSet.Object);
 
-        var services = new ServiceCollection().BuildServiceProvider();
-        var worker = new OptimizationWorker(
-            Mock.Of<ILogger<OptimizationWorker>>(),
-            services.GetRequiredService<IServiceScopeFactory>(),
-            new BaselineSplitBacktestEngine(),
-            (TradingMetrics)FormatterServices.GetUninitializedObject(typeof(TradingMetrics)));
+        var worker = CreateWorker(new BaselineSplitBacktestEngine());
 
         var strategy = new Strategy
         {
@@ -1481,9 +1437,10 @@ public class OptimizationWorkerTest
         var gapStart = nowUtc.Date.AddDays(-40);
         while (gapStart.DayOfWeek != DayOfWeek.Monday)
             gapStart = gapStart.AddDays(-1);
+        var seriesStart = nowUtc.AddHours(-1099);
 
         var candles = Enumerable.Range(0, 1100)
-            .Select(i => gapStart.AddDays(-5).AddHours(i))
+            .Select(i => seriesStart.AddHours(i))
             .Where(ts => ts < gapStart || ts >= gapStart.AddHours(96))
             .Where(ts => ts <= nowUtc)
             .Select((ts, i) => new Candle
@@ -1528,12 +1485,7 @@ public class OptimizationWorkerTest
         db.Setup(c => c.Set<CurrencyPair>()).Returns(pairDbSet.Object);
         db.Setup(c => c.Set<StrategyRegimeParams>()).Returns(regimeParamsDbSet.Object);
 
-        var services = new ServiceCollection().BuildServiceProvider();
-        var worker = new OptimizationWorker(
-            Mock.Of<ILogger<OptimizationWorker>>(),
-            services.GetRequiredService<IServiceScopeFactory>(),
-            new BaselineSplitBacktestEngine(),
-            (TradingMetrics)FormatterServices.GetUninitializedObject(typeof(TradingMetrics)));
+        var worker = CreateWorker(new BaselineSplitBacktestEngine());
 
         var strategy = new Strategy
         {
@@ -1606,12 +1558,7 @@ public class OptimizationWorkerTest
         db.Setup(c => c.Set<CurrencyPair>()).Returns(pairDbSet.Object);
         db.Setup(c => c.Set<StrategyRegimeParams>()).Returns(regimeParamsDbSet.Object);
 
-        var services = new ServiceCollection().BuildServiceProvider();
-        var worker = new OptimizationWorker(
-            Mock.Of<ILogger<OptimizationWorker>>(),
-            services.GetRequiredService<IServiceScopeFactory>(),
-            new BaselineSplitBacktestEngine(),
-            (TradingMetrics)FormatterServices.GetUninitializedObject(typeof(TradingMetrics)));
+        var worker = CreateWorker(new BaselineSplitBacktestEngine());
 
         var strategy = new Strategy
         {
@@ -1666,12 +1613,7 @@ public class OptimizationWorkerTest
         db.Setup(c => c.Set<CurrencyPair>()).Returns(pairDbSet.Object);
         db.Setup(c => c.Set<StrategyRegimeParams>()).Returns(regimeParamsDbSet.Object);
 
-        var services = new ServiceCollection().BuildServiceProvider();
-        var worker = new OptimizationWorker(
-            Mock.Of<ILogger<OptimizationWorker>>(),
-            services.GetRequiredService<IServiceScopeFactory>(),
-            new BaselineSplitBacktestEngine(),
-            (TradingMetrics)FormatterServices.GetUninitializedObject(typeof(TradingMetrics)));
+        var worker = CreateWorker(new BaselineSplitBacktestEngine());
 
         var strategy = new Strategy
         {
@@ -1704,7 +1646,7 @@ public class OptimizationWorkerTest
         bool[] isInteger = [true, true];
         var ehvi = new EhviAcquisition(paramNames, lower, upper, isInteger, seed: 123);
 
-        var suggestions = OptimizationWorker.SuggestInitialCandidates(
+        var suggestions = OptimizationSearchCoordinator.SuggestInitialCandidates(
             tpe: null,
             gp: null,
             ehvi: ehvi,
@@ -1837,7 +1779,7 @@ public class OptimizationWorkerTest
         OptimizationRunStatus status,
         bool expected)
     {
-        bool actual = OptimizationWorker.ShouldPreservePersistedResult(completionPersisted, status);
+        bool actual = OptimizationRunLifecycle.ShouldPreservePersistedResult(completionPersisted, status);
         Assert.Equal(expected, actual);
     }
 
@@ -2179,19 +2121,13 @@ public class OptimizationWorkerTest
         alertDispatcher.Setup(x => x.DispatchBySeverityAsync(It.IsAny<Alert>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
 
-        var services = new ServiceCollection()
-            .AddSingleton(readCtx.Object)
-            .AddSingleton(writeCtx.Object)
-            .AddSingleton(alertDispatcher.Object)
-            .BuildServiceProvider();
-
-        var metricsServices = new ServiceCollection().AddMetrics().BuildServiceProvider();
-        var meterFactory = metricsServices.GetRequiredService<System.Diagnostics.Metrics.IMeterFactory>();
-        var worker = new OptimizationWorker(
-            Mock.Of<ILogger<OptimizationWorker>>(),
-            services.GetRequiredService<IServiceScopeFactory>(),
-            Mock.Of<IBacktestEngine>(),
-            new TradingMetrics(meterFactory));
+        var worker = CreateWorker(
+            scopeFactory: CreateWorkerScopeFactory(configureServices: services =>
+            {
+                services.AddSingleton(readCtx.Object);
+                services.AddSingleton(writeCtx.Object);
+                services.AddSingleton(alertDispatcher.Object);
+            }));
 
         var method = typeof(OptimizationWorker).GetMethod(
             "MonitorFollowUpResultsAsync",
@@ -2208,7 +2144,7 @@ public class OptimizationWorkerTest
         var alert = new Alert();
         var nowUtc = new DateTime(2026, 04, 05, 12, 0, 0, DateTimeKind.Utc);
 
-        string message = OptimizationWorker.PopulateFollowUpFailureAlert(
+        string message = OptimizationFollowUpCoordinator.PopulateFollowUpFailureAlert(
             alert,
             optimizationRunId: 501,
             strategyId: 77,
@@ -2239,7 +2175,7 @@ public class OptimizationWorkerTest
         OptimizationRunStatus status,
         bool expected)
     {
-        bool actual = OptimizationWorker.ShouldPreservePersistedResult(completionPersisted, status);
+        bool actual = OptimizationRunLifecycle.ShouldPreservePersistedResult(completionPersisted, status);
 
         Assert.Equal(expected, actual);
     }
@@ -2455,16 +2391,70 @@ public class OptimizationWorkerTest
 
     private static OptimizationWorker CreateWorker(
         IBacktestEngine? backtestEngine = null,
-        IServiceScopeFactory? scopeFactory = null)
+        IServiceScopeFactory? scopeFactory = null,
+        TimeProvider? timeProvider = null)
     {
         var logger = Mock.Of<ILogger<OptimizationWorker>>();
-        scopeFactory ??= Mock.Of<IServiceScopeFactory>();
         backtestEngine ??= Mock.Of<IBacktestEngine>();
+        scopeFactory ??= CreateWorkerScopeFactory(backtestEngine, timeProvider: timeProvider);
         var metricsServices = new ServiceCollection().AddMetrics().BuildServiceProvider();
         var meterFactory = metricsServices.GetRequiredService<System.Diagnostics.Metrics.IMeterFactory>();
         var metrics = new TradingMetrics(meterFactory);
+        var services = (IServiceProvider)scopeFactory;
+        var configProvider = services.GetRequiredService<OptimizationConfigProvider>();
+        var schedulingCoordinator = services.GetRequiredService<OptimizationSchedulingCoordinator>();
+        var chronicFailureEscalator = services.GetRequiredService<OptimizationChronicFailureEscalator>();
+        var healthRecorder = services.GetRequiredService<OptimizationWorkerHealthRecorder>();
+        var effectiveTimeProvider = timeProvider ?? TimeProvider.System;
 
-        return new OptimizationWorker(logger, scopeFactory, backtestEngine, metrics);
+        return new OptimizationWorker(
+            logger,
+            scopeFactory,
+            metrics,
+            configProvider,
+            schedulingCoordinator,
+            chronicFailureEscalator,
+            healthRecorder,
+            effectiveTimeProvider);
+    }
+
+    private static IServiceScopeFactory CreateWorkerScopeFactory(
+        IBacktestEngine? backtestEngine = null,
+        Action<ServiceCollection>? configureServices = null,
+        TimeProvider? timeProvider = null)
+    {
+        backtestEngine ??= Mock.Of<IBacktestEngine>();
+        timeProvider ??= TimeProvider.System;
+
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddMetrics();
+        services.AddSingleton(timeProvider);
+        services.AddSingleton<TradingMetrics>(sp => new TradingMetrics(
+            sp.GetRequiredService<System.Diagnostics.Metrics.IMeterFactory>()));
+        services.AutoRegisterAttributedServices(typeof(OptimizationRunProcessor).Assembly);
+        services.AddSingleton<IBacktestEngine>(backtestEngine);
+        services.AddSingleton<ISpreadProfileProvider>(Mock.Of<ISpreadProfileProvider>());
+        configureServices?.Invoke(services);
+
+        var serviceProvider = services.BuildServiceProvider();
+        return serviceProvider.GetRequiredService<IServiceScopeFactory>();
+    }
+
+    private static OptimizationFollowUpCoordinator CreateFollowUpCoordinator(TimeProvider? timeProvider = null)
+    {
+        var metricsServices = new ServiceCollection().AddMetrics().BuildServiceProvider();
+        var meterFactory = metricsServices.GetRequiredService<System.Diagnostics.Metrics.IMeterFactory>();
+        var effectiveTimeProvider = timeProvider ?? TimeProvider.System;
+        return new OptimizationFollowUpCoordinator(
+            Mock.Of<IServiceScopeFactory>(),
+            Mock.Of<IAlertDispatcher>(),
+            new OptimizationRunScopedConfigService(
+                new OptimizationConfigProvider(Mock.Of<ILogger<OptimizationConfigProvider>>(), effectiveTimeProvider),
+                Mock.Of<ILogger<OptimizationRunScopedConfigService>>()),
+            Mock.Of<ILogger<OptimizationFollowUpCoordinator>>(),
+            new TradingMetrics(meterFactory),
+            effectiveTimeProvider);
     }
 
     private static OptimizationRun MakeCompletedOptimizationRun(long id, long strategyId, DateTime completedAtUtc) => new()
@@ -2481,94 +2471,84 @@ public class OptimizationWorkerTest
         IsDeleted = false
     };
 
-    private static object CreateOptimizationConfig(
+    private static OptimizationConfig CreateOptimizationConfig(
         int cooldownDays,
         int maxConsecutiveFailuresBeforeEscalation,
         int maxRunsPerWeek = 20,
         decimal screeningInitialBalance = 10_000m)
     {
-        // OptimizationConfig was extracted to LascodiaTradingEngine.Application.Optimization namespace
-        var configType = typeof(OptimizationConfig).Assembly
-            .GetType("LascodiaTradingEngine.Application.Optimization.OptimizationConfig", throwOnError: true)!;
-
-        var values = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
+        return new OptimizationConfig
         {
-            ["SchedulePollSeconds"] = 7200,
-            ["CooldownDays"] = cooldownDays,
-            ["MaxQueuedPerCycle"] = 3,
-            ["AutoScheduleEnabled"] = true,
-            ["MinWinRate"] = 0.60,
-            ["MinProfitFactor"] = 1.0,
-            ["MinTotalTrades"] = 10,
-            ["AutoApprovalImprovementThreshold"] = 0.10m,
-            ["AutoApprovalMinHealthScore"] = 0.55m,
-            ["TopNCandidates"] = 5,
-            ["CoarsePhaseThreshold"] = 10,
-            ["ScreeningTimeoutSeconds"] = 30,
-            ["ScreeningSpreadPoints"] = 20.0,
-            ["ScreeningCommissionPerLot"] = 7.0,
-            ["ScreeningSlippagePips"] = 1.0,
-            ["MaxOosDegradationPct"] = 0.60,
-            ["SuppressDuringDrawdownRecovery"] = true,
-            ["SeasonalBlackoutEnabled"] = true,
-            ["BlackoutPeriods"] = "12/20-01/05",
-            ["MaxRunTimeoutMinutes"] = 30,
-            ["MaxParallelBacktests"] = 4,
-            ["MinCandidateTrades"] = 10,
-            ["EmbargoRatio"] = 0.05,
-            ["CorrelationParamThreshold"] = 0.15,
-            ["TpeBudget"] = 50,
-            ["TpeInitialSamples"] = 15,
-            ["PurgedKFolds"] = 5,
-            ["SensitivityPerturbPct"] = 0.10,
-            ["BootstrapIterations"] = 1000,
-            ["MinBootstrapCILower"] = 0.40m,
-            ["CostSensitivityEnabled"] = true,
-            ["AdaptiveBoundsEnabled"] = true,
-            ["TemporalOverlapThreshold"] = 0.70,
-            ["DataScarcityThreshold"] = 200,
-            ["ScreeningInitialBalance"] = screeningInitialBalance,
-            ["PortfolioCorrelationThreshold"] = 0.80,
-            ["MaxConsecutiveFailuresBeforeEscalation"] = maxConsecutiveFailuresBeforeEscalation,
-            ["CheckpointEveryN"] = 10,
-            ["GpEarlyStopPatience"] = 4,
-            ["SensitivityDegradationTolerance"] = 0.20,
-            ["WalkForwardMinMaxRatio"] = 0.50,
-            ["CostStressMultiplier"] = 2.0,
-            ["MinOosCandlesForValidation"] = 50,
-            ["MaxCvCoefficientOfVariation"] = 0.50,
-            ["PermutationIterations"] = 1000,
-            ["MaxRetryAttempts"] = 3,
-            ["CandleLookbackMonths"] = 12,
-            ["CandleLookbackAutoScale"] = true,
-            ["RequireEADataAvailability"] = false,
-            ["MaxConcurrentRuns"] = 2,
-            ["UseSymbolSpecificSpread"] = true,
-            ["RegimeBlendRatio"] = 0.50,
-            ["CpcvNFolds"] = 6,
-            ["CpcvTestFoldCount"] = 2,
-            ["CpcvMaxCombinations"] = 15,
-            ["CircuitBreakerThreshold"] = 10,
-            ["SuccessiveHalvingRungs"] = "0.25,0.50",
-            ["MaxCrossRegimeEvals"] = 4,
-            ["PresetName"] = "balanced",
-            ["HyperbandEnabled"] = true,
-            ["HyperbandEta"] = 3,
-            ["MaxRunsPerWeek"] = maxRunsPerWeek,
-            ["RegimeStabilityHours"] = 6,
-            ["UseEhviAcquisition"] = false,
-            ["UseParegoScalarization"] = false,
-            ["MinEquityCurveR2"] = 0.60,
-            ["MaxTradeTimeConcentration"] = 0.60
+            SchedulePollSeconds = 7200,
+            CooldownDays = cooldownDays,
+            RolloutObservationDays = 14,
+            MaxQueuedPerCycle = 3,
+            FollowUpMonitorBatchSize = 10,
+            AutoScheduleEnabled = true,
+            MaxRunsPerWeek = maxRunsPerWeek,
+            MinWinRate = 0.60,
+            MinProfitFactor = 1.0,
+            MinTotalTrades = 10,
+            AutoApprovalImprovementThreshold = 0.10m,
+            AutoApprovalMinHealthScore = 0.55m,
+            TopNCandidates = 5,
+            CoarsePhaseThreshold = 10,
+            TpeBudget = 50,
+            TpeInitialSamples = 15,
+            PurgedKFolds = 5,
+            AdaptiveBoundsEnabled = true,
+            GpEarlyStopPatience = 4,
+            PresetName = "balanced",
+            HyperbandEnabled = true,
+            HyperbandEta = 3,
+            UseEhviAcquisition = false,
+            UseParegoScalarization = false,
+            ScreeningTimeoutSeconds = 30,
+            ScreeningSpreadPoints = 20.0,
+            ScreeningCommissionPerLot = 7.0,
+            ScreeningSlippagePips = 1.0,
+            ScreeningInitialBalance = screeningInitialBalance,
+            MaxParallelBacktests = 4,
+            MinCandidateTrades = 10,
+            MaxRunTimeoutMinutes = 30,
+            CircuitBreakerThreshold = 10,
+            SuccessiveHalvingRungs = "0.25,0.50",
+            MaxOosDegradationPct = 0.60,
+            EmbargoRatio = 0.05,
+            CorrelationParamThreshold = 0.15,
+            SensitivityPerturbPct = 0.10,
+            SensitivityDegradationTolerance = 0.20,
+            BootstrapIterations = 1000,
+            MinBootstrapCILower = 0.40m,
+            CostSensitivityEnabled = true,
+            CostStressMultiplier = 2.0,
+            TemporalOverlapThreshold = 0.70,
+            PortfolioCorrelationThreshold = 0.80,
+            WalkForwardMinMaxRatio = 0.50,
+            MinOosCandlesForValidation = 50,
+            MaxCvCoefficientOfVariation = 0.50,
+            PermutationIterations = 1000,
+            MinEquityCurveR2 = 0.60,
+            MaxTradeTimeConcentration = 0.60,
+            CpcvNFolds = 6,
+            CpcvTestFoldCount = 2,
+            CpcvMaxCombinations = 15,
+            DataScarcityThreshold = 200,
+            CandleLookbackMonths = 12,
+            CandleLookbackAutoScale = true,
+            UseSymbolSpecificSpread = true,
+            RegimeBlendRatio = 0.50,
+            MaxCrossRegimeEvals = 4,
+            RegimeStabilityHours = 6,
+            SuppressDuringDrawdownRecovery = true,
+            SeasonalBlackoutEnabled = true,
+            BlackoutPeriods = "12/20-01/05",
+            RequireEADataAvailability = false,
+            MaxRetryAttempts = 3,
+            MaxConsecutiveFailuresBeforeEscalation = maxConsecutiveFailuresBeforeEscalation,
+            CheckpointEveryN = 10,
+            MaxConcurrentRuns = 2,
         };
-
-        var instance = Activator.CreateInstance(configType, nonPublic: true)!;
-        foreach (var prop in configType.GetProperties(BindingFlags.Instance | BindingFlags.Public))
-        {
-            if (values.TryGetValue(prop.Name, out var value))
-                prop.SetValue(instance, value);
-        }
-        return instance;
     }
 
     private static object CreateRunContext(
@@ -2633,48 +2613,48 @@ public class OptimizationWorkerTest
         // CandidateValidationResult may exist as nested or extracted. Prefer nested.
         var resultType = typeof(OptimizationWorker).GetNestedType("CandidateValidationResult", BindingFlags.NonPublic)
             ?? typeof(OptimizationConfig).Assembly.GetType("LascodiaTradingEngine.Application.Optimization.CandidateValidationResult", throwOnError: true)!;
-        var ctor = resultType
-            .GetConstructors(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)
-            .OrderByDescending(candidate => candidate.GetParameters().Length)
-            .First();
+        var createMethod = resultType
+            .GetMethods(BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public)
+            .First(method => string.Equals(method.Name, "Create", StringComparison.Ordinal));
 
         var values = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
         {
-            ["Passed"] = passed,
-            ["Winner"] = scoredCandidate,
-            ["OosHealthScore"] = oosHealthScore,
-            ["OosResult"] = oosResult,
-            ["CILower"] = ciLower,
-            ["CIMedian"] = oosHealthScore,
-            ["CIUpper"] = ciUpper,
-            ["PermPValue"] = 0.01,
-            ["PermCorrectedAlpha"] = 0.05,
-            ["PermSignificant"] = true,
-            ["SensitivityOk"] = true,
-            ["SensitivityReport"] = "ok",
-            ["CostSensitiveOk"] = true,
-            ["PessimisticScore"] = pessimisticScore,
-            ["DegradationFailed"] = false,
-            ["WfAvgScore"] = wfAvgScore,
-            ["WfStable"] = true,
-            ["MtfCompatible"] = true,
-            ["CorrelationSafe"] = true,
-            ["TemporalCorrelationSafe"] = true,
-            ["TemporalMaxOverlap"] = 0.0,
-            ["PortfolioCorrelationSafe"] = true,
-            ["PortfolioMaxCorrelation"] = 0.0,
-            ["CvConsistent"] = true,
-            ["CvValue"] = 0.10,
-            ["ApprovalReportJson"] = "{}",
-            ["FailureReason"] = failureReason,
-            ["FailedCandidates"] = null
+            ["passed"] = passed,
+            ["winner"] = scoredCandidate,
+            ["oosHealthScore"] = oosHealthScore,
+            ["oosResult"] = oosResult,
+            ["hasOosValidation"] = true,
+            ["ciLower"] = ciLower,
+            ["ciMedian"] = oosHealthScore,
+            ["ciUpper"] = ciUpper,
+            ["permPValue"] = 0.01,
+            ["permCorrectedAlpha"] = 0.05,
+            ["permSignificant"] = true,
+            ["sensitivityOk"] = true,
+            ["sensitivityReport"] = "ok",
+            ["costSensitiveOk"] = true,
+            ["pessimisticScore"] = pessimisticScore,
+            ["degradationFailed"] = false,
+            ["wfAvgScore"] = wfAvgScore,
+            ["wfStable"] = true,
+            ["mtfCompatible"] = true,
+            ["correlationSafe"] = true,
+            ["temporalCorrelationSafe"] = true,
+            ["temporalMaxOverlap"] = 0.0,
+            ["portfolioCorrelationSafe"] = true,
+            ["portfolioMaxCorrelation"] = 0.0,
+            ["cvConsistent"] = true,
+            ["cvValue"] = 0.10,
+            ["approvalReportJson"] = """{"hasSufficientOutOfSampleData":true}""",
+            ["failureReason"] = failureReason,
+            ["failedCandidates"] = null
         };
 
-        var args = ctor.GetParameters()
+        var args = createMethod.GetParameters()
             .Select(parameter => values[parameter.Name!])
             .ToArray();
 
-        return ctor.Invoke(args);
+        return createMethod.Invoke(null, args)!;
     }
 
     private sealed class TestBacktestEngine : IBacktestEngine
@@ -2743,12 +2723,8 @@ public class OptimizationWorkerTest
     [Fact]
     public void RetryEligibilityWindow_ScalesWithConfiguredRetryAttempts()
     {
-        var method = typeof(OptimizationWorker).GetMethod(
-            "GetRetryEligibilityWindow",
-            BindingFlags.NonPublic | BindingFlags.Static)!;
-
-        var twoAttempts = (TimeSpan)method.Invoke(null, [2])!;
-        var threeAttempts = (TimeSpan)method.Invoke(null, [3])!;
+        var twoAttempts = OptimizationPolicyHelpers.GetRetryEligibilityWindow(2);
+        var threeAttempts = OptimizationPolicyHelpers.GetRetryEligibilityWindow(3);
 
         Assert.Equal(TimeSpan.FromMinutes(45), twoAttempts);
         Assert.Equal(TimeSpan.FromMinutes(75), threeAttempts);
@@ -2757,11 +2733,7 @@ public class OptimizationWorkerTest
     [Fact]
     public void ExecutionLeaseHeartbeatInterval_IsShorterThanLeaseDuration()
     {
-        var method = typeof(OptimizationWorker).GetMethod(
-            "GetExecutionLeaseHeartbeatInterval",
-            BindingFlags.NonPublic | BindingFlags.Static)!;
-
-        var interval = (TimeSpan)method.Invoke(null, [])!;
+        var interval = OptimizationRunLeaseManager.GetHeartbeatInterval();
 
         Assert.True(interval >= TimeSpan.FromMinutes(1));
         Assert.True(interval < TimeSpan.FromMinutes(10));
@@ -2820,12 +2792,12 @@ public class OptimizationWorkerTest
         writeCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
         writeCtx.Setup(x => x.SaveChangesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(1);
 
-        var services = new ServiceCollection()
-            .AddSingleton(readCtx.Object)
-            .AddSingleton(writeCtx.Object)
-            .BuildServiceProvider();
-
-        var worker = CreateWorker(scopeFactory: services.GetRequiredService<IServiceScopeFactory>());
+        var worker = CreateWorker(
+            scopeFactory: CreateWorkerScopeFactory(configureServices: services =>
+            {
+                services.AddSingleton(readCtx.Object);
+                services.AddSingleton(writeCtx.Object);
+            }));
         var method = typeof(OptimizationWorker).GetMethod(
             "RetryFailedRunsAsync",
             BindingFlags.NonPublic | BindingFlags.Instance)!;
@@ -2888,12 +2860,12 @@ public class OptimizationWorkerTest
         writeCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
         writeCtx.Setup(x => x.SaveChangesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(1);
 
-        var services = new ServiceCollection()
-            .AddSingleton(readCtx.Object)
-            .AddSingleton(writeCtx.Object)
-            .BuildServiceProvider();
-
-        var worker = CreateWorker(scopeFactory: services.GetRequiredService<IServiceScopeFactory>());
+        var worker = CreateWorker(
+            scopeFactory: CreateWorkerScopeFactory(configureServices: services =>
+            {
+                services.AddSingleton(readCtx.Object);
+                services.AddSingleton(writeCtx.Object);
+            }));
         var method = typeof(OptimizationWorker).GetMethod(
             "RetryFailedRunsAsync",
             BindingFlags.NonPublic | BindingFlags.Instance)!;
@@ -2954,12 +2926,12 @@ public class OptimizationWorkerTest
         writeCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
         writeCtx.Setup(x => x.SaveChangesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(1);
 
-        var services = new ServiceCollection()
-            .AddSingleton(readCtx.Object)
-            .AddSingleton(writeCtx.Object)
-            .BuildServiceProvider();
-
-        var worker = CreateWorker(scopeFactory: services.GetRequiredService<IServiceScopeFactory>());
+        var worker = CreateWorker(
+            scopeFactory: CreateWorkerScopeFactory(configureServices: services =>
+            {
+                services.AddSingleton(readCtx.Object);
+                services.AddSingleton(writeCtx.Object);
+            }));
         var method = typeof(OptimizationWorker).GetMethod(
             "RetryFailedRunsAsync",
             BindingFlags.NonPublic | BindingFlags.Instance)!;
@@ -2969,6 +2941,72 @@ public class OptimizationWorkerTest
         var retriedRun = optimizationRuns.Single(r => r.Id == 452);
         Assert.Equal(OptimizationRunStatus.Queued, retriedRun.Status);
         Assert.Equal(1, retriedRun.RetryCount);
+    }
+
+    [Fact]
+    public async Task RetryFailedRunsAsync_AbandonsConfigErrorRun_WhenRetriesDisabled()
+    {
+        var nowUtc = DateTime.UtcNow;
+        var optimizationRuns = new List<OptimizationRun>
+        {
+            new()
+            {
+                Id = 453,
+                StrategyId = 90,
+                Status = OptimizationRunStatus.Failed,
+                RetryCount = 0,
+                FailureCategory = OptimizationFailureCategory.ConfigError,
+                ErrorMessage = "Invalid Optimization:EmbargoRatio",
+                CompletedAt = nowUtc.AddMinutes(-5),
+                StartedAt = nowUtc.AddMinutes(-30),
+                IsDeleted = false
+            }
+        };
+
+        var configs = new List<EngineConfig>
+        {
+            new()
+            {
+                Id = 1,
+                Key = "Optimization:MaxRetryAttempts",
+                Value = "0",
+                DataType = ConfigDataType.Int,
+                IsDeleted = false
+            }
+        };
+        var alerts = new List<Alert>();
+
+        var optRunDbSet = optimizationRuns.AsQueryable().BuildMockDbSet();
+        var configDbSet = configs.AsQueryable().BuildMockDbSet();
+        var alertDbSet = alerts.AsQueryable().BuildMockDbSet();
+
+        var db = new Mock<DbContext>();
+        db.Setup(c => c.Set<OptimizationRun>()).Returns(optRunDbSet.Object);
+        db.Setup(c => c.Set<EngineConfig>()).Returns(configDbSet.Object);
+        db.Setup(c => c.Set<Alert>()).Returns(alertDbSet.Object);
+
+        var readCtx = new Mock<IReadApplicationDbContext>();
+        readCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
+
+        var writeCtx = new Mock<IWriteApplicationDbContext>();
+        writeCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
+        writeCtx.Setup(x => x.SaveChangesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(1);
+
+        var worker = CreateWorker(
+            scopeFactory: CreateWorkerScopeFactory(configureServices: services =>
+            {
+                services.AddSingleton(readCtx.Object);
+                services.AddSingleton(writeCtx.Object);
+            }));
+        var method = typeof(OptimizationWorker).GetMethod(
+            "RetryFailedRunsAsync",
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
+
+        await (Task)method.Invoke(worker, [CancellationToken.None])!;
+
+        var abandonedRun = optimizationRuns.Single(r => r.Id == 453);
+        Assert.Equal(OptimizationRunStatus.Abandoned, abandonedRun.Status);
+        Assert.Contains("invalid configuration", abandonedRun.ErrorMessage!, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -3209,17 +3247,13 @@ public class OptimizationWorkerTest
     [Fact]
     public void AreParametersSimilarToAny_ReturnsTrue_ForMatchingCategoricalOnlyParameters()
     {
-        var method = typeof(OptimizationWorker).GetMethod(
-            "AreParametersSimilarToAny",
-            BindingFlags.NonPublic | BindingFlags.Static)!;
-
         const string candidateJson = """{"Mode":"Breakout","Session":"London"}""";
         var parsed = new List<Dictionary<string, JsonElement>>
         {
             JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(candidateJson)!
         };
 
-        var isSimilar = (bool)method.Invoke(null, [candidateJson, parsed, 0.15])!;
+        var isSimilar = OptimizationPolicyHelpers.AreParametersSimilarToAny(candidateJson, parsed, 0.15);
 
         Assert.True(isSimilar);
     }
@@ -3461,6 +3495,56 @@ public class OptimizationWorkerTest
     }
 
     [Fact]
+    public void CheckpointStore_CompatibilityCheck_FailsWhenDataWindowFingerprintChanges()
+    {
+        string json = OptimizationCheckpointStore.Serialize(
+            iterations: 3,
+            stagnantBatches: 1,
+            surrogateKind: "TPE",
+            surrogateRandomState: 42UL,
+            observations:
+            [
+                new OptimizationCheckpointStore.Observation(
+                    Sequence: 1,
+                    ParamsJson: """{"A":1,"B":2}""",
+                    HealthScore: 0.65m,
+                    CvCoefficientOfVariation: 0.08,
+                    Result: new BacktestResult
+                    {
+                        TotalTrades = 25,
+                        WinRate = 0.56m,
+                        ProfitFactor = 1.3m,
+                        Trades = []
+                    })
+            ],
+            seenParameterJson: ["""{"A":1,"B":2}"""],
+            dataWindowFingerprint: "ORIGINAL",
+            candleWindowStartUtc: new DateTime(2026, 03, 01, 0, 0, 0, DateTimeKind.Utc),
+            candleWindowEndUtc: new DateTime(2026, 03, 10, 0, 0, 0, DateTimeKind.Utc),
+            candleCount: 200,
+            trainCandleCount: 150,
+            testCandleCount: 40,
+            optimizationRegimeText: "Trending");
+
+        var restored = OptimizationCheckpointStore.Restore(json);
+
+        bool compatible = OptimizationCheckpointStore.TryValidateCompatibility(
+            restored,
+            currentDataWindowFingerprint: "CHANGED",
+            candleWindowStartUtc: new DateTime(2026, 03, 01, 0, 0, 0, DateTimeKind.Utc),
+            candleWindowEndUtc: new DateTime(2026, 03, 10, 0, 0, 0, DateTimeKind.Utc),
+            candleCount: 200,
+            trainCandleCount: 150,
+            testCandleCount: 40,
+            optimizationRegimeText: "Trending",
+            mismatchReason: out var mismatchReason,
+            currentSurrogateKind: "TPE");
+
+        Assert.False(compatible);
+        Assert.Equal("data window fingerprint changed", mismatchReason);
+    }
+
+    [Fact]
     public void CheckpointStore_Serialize_TrimsWhenOverLimit()
     {
         // Create many observations with large ParamsJson to exceed MaxCheckpointChars (1M)
@@ -3601,15 +3685,11 @@ public class OptimizationWorkerTest
         var db = new Mock<DbContext>();
         db.Setup(c => c.Set<EngineConfig>()).Returns(configDbSet.Object);
 
-        var method = typeof(OptimizationWorker).GetMethod(
-            "LoadConfigurationAsync",
-            BindingFlags.NonPublic | BindingFlags.Static)!;
-
-        var task = (Task)method.Invoke(null, [db.Object, CancellationToken.None])!;
-        await task;
-
-        var result = task.GetType().GetProperty("Result")!.GetValue(task)!;
-        var maxRunsPerWeek = (int)result.GetType().GetProperty("MaxRunsPerWeek")!.GetValue(result)!;
+        var result = await OptimizationConfigProvider.LoadDirectAsync(
+            db.Object,
+            Mock.Of<ILogger>(),
+            CancellationToken.None);
+        var maxRunsPerWeek = result.MaxRunsPerWeek;
 
         Assert.Equal(7, maxRunsPerWeek);
     }
@@ -3680,7 +3760,7 @@ public class OptimizationWorkerTest
     [Fact]
     public void Binomial_CorrectValues()
     {
-        var binomialMethod = typeof(OptimizationWorker).GetMethod(
+        var binomialMethod = typeof(OptimizationValidationCoordinator).GetMethod(
             "Binomial",
             BindingFlags.NonPublic | BindingFlags.Static)!;
 
@@ -3942,7 +4022,10 @@ public class OptimizationWorkerTest
         var run = new OptimizationRun { Id = 1 };
         var leaseDuration = TimeSpan.FromMinutes(10);
 
-        OptimizationRunClaimer.StampHeartbeat(run, leaseDuration);
+        OptimizationRunClaimer.StampHeartbeat(
+            run,
+            leaseDuration,
+            new DateTime(2026, 04, 07, 12, 0, 0, DateTimeKind.Utc));
 
         Assert.NotNull(run.LastHeartbeatAt);
         Assert.NotNull(run.ExecutionLeaseExpiresAt);
@@ -3955,18 +4038,11 @@ public class OptimizationWorkerTest
     [Fact]
     public void HasLeaseOwnershipChanged_ReturnsTrue_WhenTokenOrStatusDiffers()
     {
-        var method = typeof(OptimizationWorker).GetMethod(
-            "HasLeaseOwnershipChanged",
-            BindingFlags.NonPublic | BindingFlags.Static,
-            binder: null,
-            [typeof(Guid), typeof(OptimizationRunStatus), typeof(Guid?)],
-            modifiers: null)!;
-
         var expectedToken = Guid.NewGuid();
 
-        Assert.False((bool)method.Invoke(null, [expectedToken, OptimizationRunStatus.Running, expectedToken])!);
-        Assert.True((bool)method.Invoke(null, [expectedToken, OptimizationRunStatus.Running, Guid.NewGuid()])!);
-        Assert.True((bool)method.Invoke(null, [expectedToken, OptimizationRunStatus.Completed, expectedToken])!);
+        Assert.False(OptimizationRunLeaseManager.HasLeaseOwnershipChanged(expectedToken, OptimizationRunStatus.Running, expectedToken));
+        Assert.True(OptimizationRunLeaseManager.HasLeaseOwnershipChanged(expectedToken, OptimizationRunStatus.Running, Guid.NewGuid()));
+        Assert.True(OptimizationRunLeaseManager.HasLeaseOwnershipChanged(expectedToken, OptimizationRunStatus.Completed, expectedToken));
     }
 
     [Fact]
@@ -4000,12 +4076,10 @@ public class OptimizationWorkerTest
         db.Setup(c => c.Set<WalkForwardRun>()).Returns(walkDbSet.Object);
 
         var config = CreateOptimizationConfig(cooldownDays: 14, maxConsecutiveFailuresBeforeEscalation: 3);
-        var method = typeof(OptimizationWorker).GetMethod(
-            "EnsureValidationFollowUpsAsync",
-            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var coordinator = CreateFollowUpCoordinator();
 
-        var result = (Task<bool>)method.Invoke(null, [db.Object, run, strategy, config, CancellationToken.None])!;
-        Assert.False(await result);
+        var result = await coordinator.EnsureValidationFollowUpsAsync(db.Object, run, strategy, config, CancellationToken.None);
+        Assert.False(result);
 
         var backtest = Assert.Single(backtests);
         var walkForward = Assert.Single(walks);
@@ -4186,7 +4260,7 @@ public class OptimizationWorkerTest
     public async Task CostSensitivitySweepAsync_PreservesDynamicSpreadModel_AndExecutionSettings()
     {
         var engine = new OptionsCapturingBacktestEngine();
-        var validator = new OptimizationValidator(engine);
+        var validator = new OptimizationValidator(engine, TimeProvider.System);
         validator.SetInitialBalance(10_000m);
 
         var strategy = new Strategy
@@ -4258,7 +4332,7 @@ public class OptimizationWorkerTest
     [Fact]
     public async Task WalkForwardValidateAsync_UsesProvidedBaselineParams_InsteadOfLiveStrategyParams()
     {
-        var validator = new OptimizationValidator(new BaselineSelectionBacktestEngine());
+        var validator = new OptimizationValidator(new BaselineSelectionBacktestEngine(), TimeProvider.System);
         validator.SetInitialBalance(10_000m);
 
         var strategy = new Strategy
@@ -4298,7 +4372,7 @@ public class OptimizationWorkerTest
     public async Task CpcvEvaluateAsync_UsesTrainAndTestEvaluationsPerCombination()
     {
         var engine = new RecordingBacktestEngine();
-        var validator = new OptimizationValidator(engine);
+        var validator = new OptimizationValidator(engine, TimeProvider.System);
         validator.SetInitialBalance(10_000m);
 
         var strategy = new Strategy
@@ -4345,7 +4419,7 @@ public class OptimizationWorkerTest
     public async Task SensitivityCheckAsync_ClampsToBounds_AndPreservesIntegerParameters()
     {
         var engine = new RecordingBacktestEngine();
-        var validator = new OptimizationValidator(engine);
+        var validator = new OptimizationValidator(engine, TimeProvider.System);
         validator.SetInitialBalance(10_000m);
 
         var strategy = new Strategy
@@ -4412,16 +4486,9 @@ public class OptimizationWorkerTest
     [InlineData("12/20-01/05", 1, 5, true)]      // Jan 5 — boundary end
     public void IsInBlackoutPeriod_WraparoundRanges(string periods, int month, int day, bool expected)
     {
-        var method = typeof(OptimizationWorker)
-            .GetMethod("IsInBlackoutPeriod", BindingFlags.NonPublic | BindingFlags.Static)!;
-        // Temporarily patch DateTime — use the static method directly with the periods string.
-        // The method uses DateTime.UtcNow internally, so we verify the parsing logic
-        // by testing that the static TryParseMonthDay and ordinal comparison works correctly.
-        // Since we can't mock UtcNow, we test the boundary logic through the periods format.
-        var result = (bool)method.Invoke(null, [periods])!;
-        // This test validates the parsing and wrap-around logic is correct.
-        // The actual date comparison depends on UtcNow, so we verify the structural behavior below.
-        Assert.IsType<bool>(result);
+        var utcNow = new DateTime(2026, month, day, 12, 0, 0, DateTimeKind.Utc);
+        var result = OptimizationPolicyHelpers.IsInBlackoutPeriod(periods, utcNow);
+        Assert.Equal(expected, result);
     }
 
     // #2: IsInBlackoutPeriod — malformed input
@@ -4432,9 +4499,7 @@ public class OptimizationWorkerTest
     [InlineData("01/32-02/01")]    // Invalid day
     public void IsInBlackoutPeriod_MalformedInput_ReturnsFalse(string periods)
     {
-        var method = typeof(OptimizationWorker)
-            .GetMethod("IsInBlackoutPeriod", BindingFlags.NonPublic | BindingFlags.Static)!;
-        var result = (bool)method.Invoke(null, [periods])!;
+        var result = OptimizationPolicyHelpers.IsInBlackoutPeriod(periods, new DateTime(2026, 06, 15, 12, 0, 0, DateTimeKind.Utc));
         Assert.False(result);
     }
 
@@ -4442,12 +4507,9 @@ public class OptimizationWorkerTest
     [Fact]
     public void IsMeaningfullyDeteriorating_IdenticalScores_ReturnsFalse()
     {
-        var method = typeof(OptimizationWorker)
-            .GetMethod("IsMeaningfullyDeteriorating", BindingFlags.NonPublic | BindingFlags.Static)!;
-        decimal predictedDecline = 0m;
-        var args = new object[] { (IReadOnlyList<decimal>)new List<decimal> { 0.70m, 0.70m, 0.70m }, predictedDecline };
-        var result = (bool)method.Invoke(null, args)!;
-        predictedDecline = (decimal)args[1];
+        var result = OptimizationPolicyHelpers.IsMeaningfullyDeteriorating(
+            new List<decimal> { 0.70m, 0.70m, 0.70m },
+            out decimal predictedDecline);
         Assert.False(result);
         Assert.Equal(0m, predictedDecline);
     }
@@ -4455,23 +4517,19 @@ public class OptimizationWorkerTest
     [Fact]
     public void IsMeaningfullyDeteriorating_AscendingScores_ReturnsFalse()
     {
-        var method = typeof(OptimizationWorker)
-            .GetMethod("IsMeaningfullyDeteriorating", BindingFlags.NonPublic | BindingFlags.Static)!;
-        decimal predictedDecline = 0m;
         // Snapshots ordered newest-first: 0.80 (newest), 0.70, 0.60 (oldest) → ascending trend
-        var args = new object[] { (IReadOnlyList<decimal>)new List<decimal> { 0.80m, 0.70m, 0.60m }, predictedDecline };
-        var result = (bool)method.Invoke(null, args)!;
+        var result = OptimizationPolicyHelpers.IsMeaningfullyDeteriorating(
+            new List<decimal> { 0.80m, 0.70m, 0.60m },
+            out _);
         Assert.False(result);
     }
 
     [Fact]
     public void IsMeaningfullyDeteriorating_FewerThan3Snapshots_ReturnsFalse()
     {
-        var method = typeof(OptimizationWorker)
-            .GetMethod("IsMeaningfullyDeteriorating", BindingFlags.NonPublic | BindingFlags.Static)!;
-        decimal predictedDecline = 0m;
-        var args = new object[] { (IReadOnlyList<decimal>)new List<decimal> { 0.80m, 0.60m }, predictedDecline };
-        var result = (bool)method.Invoke(null, args)!;
+        var result = OptimizationPolicyHelpers.IsMeaningfullyDeteriorating(
+            new List<decimal> { 0.80m, 0.60m },
+            out _);
         Assert.False(result);
     }
 
@@ -4482,9 +4540,7 @@ public class OptimizationWorkerTest
     [InlineData(5, 255)]  // 15 << 4 + 15 = 255 min
     public void GetRetryEligibilityWindow_ReturnsCorrectTimeSpan(int maxRetries, int expectedMinutes)
     {
-        var method = typeof(OptimizationWorker)
-            .GetMethod("GetRetryEligibilityWindow", BindingFlags.NonPublic | BindingFlags.Static)!;
-        var result = (TimeSpan)method.Invoke(null, [maxRetries])!;
+        var result = OptimizationPolicyHelpers.GetRetryEligibilityWindow(maxRetries);
         Assert.Equal(TimeSpan.FromMinutes(expectedMinutes), result);
     }
 
@@ -4492,7 +4548,7 @@ public class OptimizationWorkerTest
     [Fact]
     public void ResolveStrategyCurrencies_WithNullPairInfo_ExtractsFromSymbol()
     {
-        var result = OptimizationWorker.ResolveStrategyCurrencies("EURUSD", null);
+        var result = OptimizationRunMetadataService.ResolveStrategyCurrencies("EURUSD", null);
         Assert.Contains("EUR", result);
         Assert.Contains("USD", result);
         Assert.Equal(2, result.Count);
@@ -4502,7 +4558,7 @@ public class OptimizationWorkerTest
     public void ResolveStrategyCurrencies_WithPairInfo_UsesPairFields()
     {
         var pair = new CurrencyPair { BaseCurrency = "GBP", QuoteCurrency = "JPY" };
-        var result = OptimizationWorker.ResolveStrategyCurrencies("GBPJPY", pair);
+        var result = OptimizationRunMetadataService.ResolveStrategyCurrencies("GBPJPY", pair);
         Assert.Contains("GBP", result);
         Assert.Contains("JPY", result);
     }
@@ -4510,7 +4566,7 @@ public class OptimizationWorkerTest
     [Fact]
     public void ResolveStrategyCurrencies_ShortSymbol_ReturnsEmpty()
     {
-        var result = OptimizationWorker.ResolveStrategyCurrencies("XAU", null);
+        var result = OptimizationRunMetadataService.ResolveStrategyCurrencies("XAU", null);
         Assert.Empty(result);
     }
 
@@ -4518,30 +4574,21 @@ public class OptimizationWorkerTest
     [Fact]
     public void ParseFidelityRungs_MalformedValues_IgnoredWithDefault()
     {
-        var method = typeof(OptimizationWorker)
-            .GetMethod("ParseFidelityRungs", BindingFlags.NonPublic | BindingFlags.Instance)!;
-        var worker = CreateWorkerInstance();
-        var result = (double[])method.Invoke(worker, ["abc,def"])!;
+        var result = OptimizationPolicyHelpers.ParseFidelityRungs("abc,def", Mock.Of<ILogger>(), "OptimizationWorkerTest");
         Assert.Equal([0.25, 0.50], result); // Falls back to default
     }
 
     [Fact]
     public void ParseFidelityRungs_PartiallyValid_KeepsValidValues()
     {
-        var method = typeof(OptimizationWorker)
-            .GetMethod("ParseFidelityRungs", BindingFlags.NonPublic | BindingFlags.Instance)!;
-        var worker = CreateWorkerInstance();
-        var result = (double[])method.Invoke(worker, ["abc,0.30,0.60"])!;
+        var result = OptimizationPolicyHelpers.ParseFidelityRungs("abc,0.30,0.60", Mock.Of<ILogger>(), "OptimizationWorkerTest");
         Assert.Equal([0.30, 0.60], result);
     }
 
     [Fact]
     public void ParseFidelityRungs_OutOfRangeValues_Excluded()
     {
-        var method = typeof(OptimizationWorker)
-            .GetMethod("ParseFidelityRungs", BindingFlags.NonPublic | BindingFlags.Instance)!;
-        var worker = CreateWorkerInstance();
-        var result = (double[])method.Invoke(worker, ["0,0.50,1.0,1.5"])!;
+        var result = OptimizationPolicyHelpers.ParseFidelityRungs("0,0.50,1.0,1.5", Mock.Of<ILogger>(), "OptimizationWorkerTest");
         Assert.Equal([0.50], result); // 0, 1.0, and 1.5 are excluded
     }
 
@@ -4549,36 +4596,27 @@ public class OptimizationWorkerTest
     [Fact]
     public void DiffConfigSnapshots_NumericPrecision_NoFalsePositive()
     {
-        var method = typeof(OptimizationWorker)
-            .GetMethod("DiffConfigSnapshots", BindingFlags.NonPublic | BindingFlags.Static)!;
-
         string prior   = """{"Version":1,"Config":{"TpeBudget":50,"EmbargoRatio":0.05}}""";
         string current = """{"Version":1,"Config":{"TpeBudget":50,"EmbargoRatio":0.05}}""";
-        var result = (System.Collections.IList)method.Invoke(null, [prior, current])!;
+        var result = OptimizationRunScopedConfigService.DiffConfigSnapshots(prior, current);
         Assert.Empty(result);
     }
 
     [Fact]
     public void DiffConfigSnapshots_DetectsChangedKey()
     {
-        var method = typeof(OptimizationWorker)
-            .GetMethod("DiffConfigSnapshots", BindingFlags.NonPublic | BindingFlags.Static)!;
-
         string prior   = """{"Version":1,"Config":{"TpeBudget":50}}""";
         string current = """{"Version":1,"Config":{"TpeBudget":100}}""";
-        var result = (System.Collections.IList)method.Invoke(null, [prior, current])!;
+        var result = OptimizationRunScopedConfigService.DiffConfigSnapshots(prior, current);
         Assert.Single(result);
     }
 
     [Fact]
     public void DiffConfigSnapshots_DetectsAddedKey()
     {
-        var method = typeof(OptimizationWorker)
-            .GetMethod("DiffConfigSnapshots", BindingFlags.NonPublic | BindingFlags.Static)!;
-
         string prior   = """{"Version":1,"Config":{"TpeBudget":50}}""";
         string current = """{"Version":1,"Config":{"TpeBudget":50,"NewKey":true}}""";
-        var result = (System.Collections.IList)method.Invoke(null, [prior, current])!;
+        var result = OptimizationRunScopedConfigService.DiffConfigSnapshots(prior, current);
         Assert.Single(result);
     }
 
@@ -4595,7 +4633,7 @@ public class OptimizationWorkerTest
     public void ShouldPreservePersistedResult_AllCombinations(bool persisted, string statusStr, bool expected)
     {
         var status = Enum.Parse<OptimizationRunStatus>(statusStr);
-        var result = OptimizationWorker.ShouldPreservePersistedResult(persisted, status);
+        var result = OptimizationRunLifecycle.ShouldPreservePersistedResult(persisted, status);
         Assert.Equal(expected, result);
     }
 
@@ -4610,7 +4648,7 @@ public class OptimizationWorkerTest
         int coarsePhaseThreshold,
         bool expected)
     {
-        bool actual = OptimizationWorker.ShouldRunCoarseScreening(
+        bool actual = OptimizationSearchCoordinator.ShouldRunCoarseScreening(
             candidateCount,
             trainCandles,
             coarsePhaseThreshold);
@@ -4626,7 +4664,7 @@ public class OptimizationWorkerTest
         int coarsePhaseThreshold,
         bool expected)
     {
-        bool actual = OptimizationWorker.ShouldContinueCoarseScreening(
+        bool actual = OptimizationSearchCoordinator.ShouldContinueCoarseScreening(
             candidateCount,
             coarsePhaseThreshold);
 
@@ -4664,7 +4702,7 @@ public class OptimizationWorkerTest
     [Fact]
     public void UpdateConsecutiveFailureStreak_NoSuccessesNoFailures_KeepsCurrent()
     {
-        int result = OptimizationWorker.UpdateConsecutiveFailureStreak(5, 0, 0);
+        int result = OptimizationSearchCoordinator.UpdateConsecutiveFailureStreak(5, 0, 0);
         Assert.Equal(5, result);
     }
 
@@ -4685,7 +4723,7 @@ public class OptimizationWorkerTest
             }).ToList(),
         };
         decimal score = 0.65m;
-        var (lower, median, upper) = OptimizationWorker.ComputeBootstrapCI(oosResult, score, 10_000m, 500, 42);
+        var (lower, median, upper) = OptimizationValidationCoordinator.ComputeBootstrapCI(oosResult, score, 10_000m, 500, 42);
         // Pure synthetic: lower = score * (0.50 + 0.13) = score * 0.63
         Assert.True(lower < score);
         Assert.Equal(score, median);
@@ -4709,7 +4747,7 @@ public class OptimizationWorkerTest
             Trades = trades,
         };
         decimal score = 0.60m;
-        var (lower, median, upper) = OptimizationWorker.ComputeBootstrapCI(oosResult, score, 10_000m, 500, 42);
+        var (lower, median, upper) = OptimizationValidationCoordinator.ComputeBootstrapCI(oosResult, score, 10_000m, 500, 42);
         // In blending zone (10 trades, between 7 and 15): lower should be between synthetic and empirical
         Assert.True(lower < score);
         Assert.True(lower > 0); // Not degenerate
@@ -4726,20 +4764,11 @@ public class OptimizationWorkerTest
             Trades = [],
         };
         decimal score = 0.50m;
-        var (lower, median, upper) = OptimizationWorker.ComputeBootstrapCI(oosResult, score, 10_000m, 500, 42);
+        var (lower, median, upper) = OptimizationValidationCoordinator.ComputeBootstrapCI(oosResult, score, 10_000m, 500, 42);
         // 0 trades → penalty = 0.50, so lower = 0.50 * 0.50 = 0.25
         Assert.Equal(score * 0.50m, lower);
         Assert.Equal(score, median);
         Assert.Equal(score, upper);
-    }
-
-    private static OptimizationWorker CreateWorkerInstance()
-    {
-        var logger = new Mock<ILogger<OptimizationWorker>>();
-        var scopeFactory = new Mock<IServiceScopeFactory>();
-        var backtestEngine = new Mock<IBacktestEngine>();
-        var metrics = (TradingMetrics)FormatterServices.GetUninitializedObject(typeof(TradingMetrics));
-        return new OptimizationWorker(logger.Object, scopeFactory.Object, backtestEngine.Object, metrics);
     }
 
     private sealed class RecordingBacktestEngine : IBacktestEngine

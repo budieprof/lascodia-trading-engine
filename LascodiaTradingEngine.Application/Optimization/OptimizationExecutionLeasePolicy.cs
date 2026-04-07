@@ -7,15 +7,16 @@ internal static class OptimizationExecutionLeasePolicy
 {
     internal static readonly TimeSpan LeaseDuration = TimeSpan.FromMinutes(10);
 
-    internal static void StampHeartbeat(OptimizationRun run)
-        => OptimizationRunClaimer.StampHeartbeat(run, LeaseDuration);
+    internal static void StampHeartbeat(OptimizationRun run, DateTime utcNow)
+        => OptimizationRunClaimer.StampHeartbeat(run, LeaseDuration, utcNow);
 
     internal static async Task HeartbeatRunAsync(
         OptimizationRun run,
         IWriteApplicationDbContext writeCtx,
+        DateTime utcNow,
         CancellationToken ct)
     {
-        StampHeartbeat(run);
+        StampHeartbeat(run, utcNow);
         await writeCtx.SaveChangesAsync(ct);
     }
 

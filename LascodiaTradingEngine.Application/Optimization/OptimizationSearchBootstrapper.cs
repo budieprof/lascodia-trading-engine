@@ -51,15 +51,19 @@ internal sealed class OptimizationSearchBootstrapper
     private readonly OptimizationGridBuilder _gridBuilder;
     private readonly TradingMetrics _metrics;
     private readonly ILogger<OptimizationSearchBootstrapper> _logger;
+    private readonly TimeProvider _timeProvider;
+    private DateTime UtcNow => _timeProvider.GetUtcNow().UtcDateTime;
 
     public OptimizationSearchBootstrapper(
         OptimizationGridBuilder gridBuilder,
         TradingMetrics metrics,
-        ILogger<OptimizationSearchBootstrapper> logger)
+        ILogger<OptimizationSearchBootstrapper> logger,
+        TimeProvider timeProvider)
     {
         _gridBuilder = gridBuilder;
         _metrics = metrics;
         _logger = logger;
+        _timeProvider = timeProvider;
     }
 
     internal async Task<SearchBootstrapState> BootstrapAsync(
@@ -401,7 +405,7 @@ internal sealed class OptimizationSearchBootstrapper
     {
         int warmStarted = 0;
         const double decayHalfLifeDays = 30.0;
-        var nowUtcForDecay = DateTime.UtcNow;
+        var nowUtcForDecay = UtcNow;
         string? currentRegimeStr = currentRegimeForBaseline?.ToString();
 
         foreach (var prior in priorRuns)

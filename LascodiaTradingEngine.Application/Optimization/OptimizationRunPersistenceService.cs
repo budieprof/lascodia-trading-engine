@@ -28,19 +28,22 @@ public sealed class OptimizationRunPersistenceService
 {
     private readonly ILogger<OptimizationRunPersistenceService> _logger;
     private readonly OptimizationRunMetadataService _runMetadataService;
+    private readonly TimeProvider _timeProvider;
+    private DateTime UtcNow => _timeProvider.GetUtcNow().UtcDateTime;
 
     public OptimizationRunPersistenceService(
         ILogger<OptimizationRunPersistenceService> logger,
-        OptimizationRunMetadataService runMetadataService)
+        OptimizationRunMetadataService runMetadataService,
+        TimeProvider timeProvider)
     {
         _logger = logger;
         _runMetadataService = runMetadataService;
+        _timeProvider = timeProvider;
     }
 
     internal async Task PersistAsync(
         OptimizationRunPersistenceContext context,
         IWriteApplicationDbContext writeCtx,
-        PipelinePersistenceState persistenceState,
         CancellationToken ct)
     {
         var run = context.Run;
@@ -60,7 +63,7 @@ public sealed class OptimizationRunPersistenceService
             OptimizationCheckpointStore.MaxApprovalReportChars,
             "approval report",
             _logger);
-        OptimizationExecutionLeasePolicy.StampHeartbeat(run);
+        OptimizationExecutionLeasePolicy.StampHeartbeat(run, UtcNow);
         run.RunMetadataJson = _runMetadataService.SerializeRunMetadata(
             run,
             context.Strategy,
@@ -80,11 +83,25 @@ public sealed class OptimizationRunPersistenceService
             vr.HasOosValidation ? vr.OosHealthScore : null,
             vr.Passed);
 
-        if (vr.Passed)
-            return;
-
-        OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Completed, DateTime.UtcNow);
+        OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Completed, UtcNow);
+        run.ResultsPersistedAt = UtcNow;
+        run.ApprovalEvaluatedAt = null;
+        run.ValidationFollowUpsCreatedAt = null;
+        run.ValidationFollowUpStatus = null;
+        run.FollowUpLastCheckedAt = null;
+        run.NextFollowUpCheckAt = null;
+        run.FollowUpRepairAttempts = 0;
+        run.FollowUpLastStatusCode = null;
+        run.FollowUpLastStatusMessage = null;
+        run.FollowUpStatusUpdatedAt = null;
+        run.CompletionPublicationPayloadJson = null;
+        run.CompletionPublicationStatus = null;
+        run.CompletionPublicationAttempts = 0;
+        run.CompletionPublicationLastAttemptAt = null;
+        run.CompletionPublicationPreparedAt = null;
+        run.CompletionPublicationCompletedAt = null;
+        run.CompletionPublicationErrorMessage = null;
+        run.LifecycleReconciledAt = null;
         await writeCtx.SaveChangesAsync(ct);
-        persistenceState.CompletionPersisted = true;
     }
 }

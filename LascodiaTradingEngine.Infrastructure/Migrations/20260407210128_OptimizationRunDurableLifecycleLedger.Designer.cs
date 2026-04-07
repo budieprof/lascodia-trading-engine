@@ -3,6 +3,7 @@ using System;
 using LascodiaTradingEngine.Infrastructure.Persistence.DbContexts;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 
@@ -11,9 +12,11 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace LascodiaTradingEngine.Infrastructure.Migrations
 {
     [DbContext(typeof(WriteApplicationDbContext))]
-    partial class WriteApplicationDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260407210128_OptimizationRunDurableLifecycleLedger")]
+    partial class OptimizationRunDurableLifecycleLedger
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -3616,18 +3619,7 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
 
                     b.HasIndex("StrategyId", "Status");
 
-                    b.ToTable("OptimizationRun", t =>
-                        {
-                            t.HasCheckConstraint("CK_OptimizationRun_ApprovalStatesRequireApprovalEvaluated", "\"Status\" NOT IN ('Approved','Rejected') OR \"ApprovalEvaluatedAt\" IS NOT NULL");
-
-                            t.HasCheckConstraint("CK_OptimizationRun_CompletionPreparedRequiresPayload", "\"CompletionPublicationPreparedAt\" IS NULL OR \"CompletionPublicationPayloadJson\" IS NOT NULL");
-
-                            t.HasCheckConstraint("CK_OptimizationRun_CompletionPublishedRequiresPreparedPayload", "\"CompletionPublicationStatus\" IS DISTINCT FROM 'Published' OR (\"CompletionPublicationPayloadJson\" IS NOT NULL AND \"CompletionPublicationPreparedAt\" IS NOT NULL AND \"CompletionPublicationCompletedAt\" IS NOT NULL)");
-
-                            t.HasCheckConstraint("CK_OptimizationRun_FollowUpStatusRequiresCreation", "\"ValidationFollowUpStatus\" IS NULL OR \"ValidationFollowUpsCreatedAt\" IS NOT NULL");
-
-                            t.HasCheckConstraint("CK_OptimizationRun_TerminalRunsRequireResultsPersisted", "\"Status\" NOT IN ('Completed','Approved','Rejected') OR \"ResultsPersistedAt\" IS NOT NULL");
-                        });
+                    b.ToTable("OptimizationRun");
                 });
 
             modelBuilder.Entity("LascodiaTradingEngine.Domain.Entities.Order", b =>

@@ -264,7 +264,9 @@ public class HyperbandSchedulerTest
             new TradingMetrics(metricsServices.GetRequiredService<System.Diagnostics.Metrics.IMeterFactory>()));
 
         using var cts = new CancellationTokenSource();
-        var validator = new OptimizationValidator(new SelfCancellingBacktestEngine(cts));
+        var validator = new OptimizationValidator(
+            new SelfCancellingBacktestEngine(cts),
+            TimeProvider.System);
         validator.SetInitialBalance(10_000m);
 
         var brackets = new List<HyperbandScheduler.Bracket>

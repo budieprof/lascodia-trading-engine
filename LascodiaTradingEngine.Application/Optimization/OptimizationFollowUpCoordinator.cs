@@ -18,25 +18,38 @@ public sealed class OptimizationFollowUpCoordinator
     private static readonly TimeSpan FollowUpRepairRecheckInterval = TimeSpan.FromMinutes(5);
 
     private readonly IServiceScopeFactory _scopeFactory;
+    private readonly IAlertDispatcher _alertDispatcher;
+    private readonly OptimizationRunScopedConfigService _runScopedConfigService;
     private readonly ILogger _logger;
     private readonly TradingMetrics _metrics;
+    private readonly TimeProvider _timeProvider;
+    private DateTime UtcNow => _timeProvider.GetUtcNow().UtcDateTime;
 
     public OptimizationFollowUpCoordinator(
         IServiceScopeFactory scopeFactory,
+        IAlertDispatcher alertDispatcher,
+        OptimizationRunScopedConfigService runScopedConfigService,
         ILogger<OptimizationFollowUpCoordinator> logger,
-        TradingMetrics metrics)
-        : this(scopeFactory, (ILogger)logger, metrics)
+        TradingMetrics metrics,
+        TimeProvider timeProvider)
+        : this(scopeFactory, alertDispatcher, runScopedConfigService, (ILogger)logger, metrics, timeProvider)
     {
     }
 
     internal OptimizationFollowUpCoordinator(
         IServiceScopeFactory scopeFactory,
+        IAlertDispatcher alertDispatcher,
+        OptimizationRunScopedConfigService runScopedConfigService,
         ILogger logger,
-        TradingMetrics metrics)
+        TradingMetrics metrics,
+        TimeProvider timeProvider)
     {
         _scopeFactory = scopeFactory;
+        _alertDispatcher = alertDispatcher;
+        _runScopedConfigService = runScopedConfigService;
         _logger = logger;
         _metrics = metrics;
+        _timeProvider = timeProvider;
     }
 
     internal async Task MonitorAsync(
@@ -45,9 +58,8 @@ public sealed class OptimizationFollowUpCoordinator
     {
         await using var scope = _scopeFactory.CreateAsyncScope();
         var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
-        var alertDispatcher = scope.ServiceProvider.GetService<IAlertDispatcher>();
         var writeDb = writeCtx.GetDbContext();
-        var nowUtc = DateTime.UtcNow;
+        var nowUtc = UtcNow;
         decimal defaultMinBacktestHealthScore = config.AutoApprovalMinHealthScore * 0.80m;
         int defaultMinCandidateTrades = config.MinCandidateTrades;
         decimal defaultMaxWalkForwardCv = (decimal)config.MaxCvCoefficientOfVariation;
@@ -140,12 +152,11 @@ public sealed class OptimizationFollowUpCoordinator
 
             bool hadStoredSnapshot = !string.IsNullOrWhiteSpace(run.ConfigSnapshotJson);
             OptimizationConfig? runScopedConfig = null;
-            if (hadStoredSnapshot && !TryGetRunScopedConfigSnapshot(run, out runScopedConfig))
+            if (hadStoredSnapshot && !_runScopedConfigService.TryLoadRunScopedConfigSnapshot(run, out runScopedConfig))
             {
                 await FailRunForMalformedConfigSnapshotAsync(
                     writeDb,
                     writeCtx,
-                    alertDispatcher,
                     run,
                     nowUtc,
                     ct);
@@ -170,7 +181,6 @@ public sealed class OptimizationFollowUpCoordinator
                 await RepairOrFailMissingFollowUpsAsync(
                     writeDb,
                     writeCtx,
-                    alertDispatcher,
                     run,
                     strategyLookup.GetValueOrDefault(run.StrategyId),
                     backtestRun,
@@ -194,7 +204,7 @@ public sealed class OptimizationFollowUpCoordinator
                     nowUtc);
                 _metrics.OptimizationFollowUpDeferredChecks.Add(1);
                 await DetectAndAlertOnStuckFollowUpsAsync(
-                    writeDb, writeCtx, alertDispatcher, run, backtestRun, wfRun, ct);
+                    writeDb, writeCtx, run, backtestRun, wfRun, ct);
                 await writeCtx.SaveChangesAsync(ct);
                 continue;
             }
@@ -268,25 +278,17 @@ public sealed class OptimizationFollowUpCoordinator
 
             if (followUpAlert is not null && followUpAlertMessage is not null)
             {
-                if (alertDispatcher is null)
-                {
-                    _logger.LogDebug(
-                        "Optimization follow-up failure alert for run {RunId} was persisted but no IAlertDispatcher is registered",
-                        run.Id);
-                    continue;
-                }
-
                 try
                 {
-                    await alertDispatcher.DispatchBySeverityAsync(followUpAlert, followUpAlertMessage, ct);
+                    await _alertDispatcher.DispatchBySeverityAsync(followUpAlert, followUpAlertMessage, ct);
                 }
                 catch (Exception ex)
                 {
-                    OptimizationRunProgressTracker.RecordOperationalIssue(
-                        run,
-                        "FollowUpAlertDispatchFailed",
-                        $"Follow-up failure alert dispatch degraded: {ex.Message}",
-                        DateTime.UtcNow);
+                        OptimizationRunProgressTracker.RecordOperationalIssue(
+                            run,
+                            "FollowUpAlertDispatchFailed",
+                            $"Follow-up failure alert dispatch degraded: {ex.Message}",
+                            nowUtc);
                     await writeCtx.SaveChangesAsync(CancellationToken.None);
                     _logger.LogWarning(ex,
                         "Optimization follow-up failure alert dispatch failed for run {RunId} (non-fatal)",
@@ -321,7 +323,7 @@ public sealed class OptimizationFollowUpCoordinator
         decimal followUpInitialBalance = config.ScreeningInitialBalance;
         if (!string.IsNullOrWhiteSpace(run.ConfigSnapshotJson))
         {
-            if (!TryGetRunScopedConfigSnapshot(run, out var runScopedConfig))
+            if (!_runScopedConfigService.TryLoadRunScopedConfigSnapshot(run, out var runScopedConfig))
             {
                 throw new OptimizationConfigSnapshotException(run.Id);
             }
@@ -399,7 +401,7 @@ public sealed class OptimizationFollowUpCoordinator
         }
 
         bool hadAllFollowUpsBeforeRepair = hasBacktest && hasWalkForward;
-        var nowUtc = DateTime.UtcNow;
+        var nowUtc = UtcNow;
         if (!run.ValidationFollowUpsCreatedAt.HasValue || !hadAllFollowUpsBeforeRepair)
             run.ValidationFollowUpsCreatedAt = nowUtc;
         run.ValidationFollowUpStatus = ValidationFollowUpStatus.Pending;
@@ -422,15 +424,9 @@ public sealed class OptimizationFollowUpCoordinator
         return hadAllFollowUpsBeforeRepair;
     }
 
-    internal static bool TryGetRunScopedConfigSnapshot(
-        OptimizationRun run,
-        out OptimizationConfig config)
-        => OptimizationRunScopedConfigService.TryGetRunScopedConfigSnapshot(run, out config);
-
     private async Task FailRunForMalformedConfigSnapshotAsync(
         DbContext writeDb,
         IWriteApplicationDbContext writeCtx,
-        IAlertDispatcher? alertDispatcher,
         OptimizationRun run,
         DateTime nowUtc,
         CancellationToken ct)
@@ -471,20 +467,17 @@ public sealed class OptimizationFollowUpCoordinator
             "Optimization follow-up monitoring failed closed for run {RunId} — stored config snapshot is malformed or unsupported",
             run.Id);
 
-        if (alertDispatcher is null)
-            return;
-
         try
         {
-            await alertDispatcher.DispatchBySeverityAsync(alert, alertMessage, ct);
+            await _alertDispatcher.DispatchBySeverityAsync(alert, alertMessage, ct);
         }
         catch (Exception ex)
         {
-            OptimizationRunProgressTracker.RecordOperationalIssue(
-                run,
-                "MalformedSnapshotAlertDispatchFailed",
-                $"Malformed-snapshot follow-up alert dispatch degraded: {ex.Message}",
-                DateTime.UtcNow);
+                OptimizationRunProgressTracker.RecordOperationalIssue(
+                    run,
+                    "MalformedSnapshotAlertDispatchFailed",
+                    $"Malformed-snapshot follow-up alert dispatch degraded: {ex.Message}",
+                    nowUtc);
             await writeCtx.SaveChangesAsync(CancellationToken.None);
             _logger.LogWarning(ex,
                 "Optimization follow-up malformed-snapshot alert dispatch failed for run {RunId} (non-fatal)",
@@ -539,13 +532,7 @@ public sealed class OptimizationFollowUpCoordinator
     }
 
     internal static bool IsDuplicateFollowUpConstraintViolation(DbUpdateException ex)
-    {
-        string message = ex.InnerException?.Message ?? ex.Message;
-        return message.Contains("IX_BacktestRun_SourceOptimizationRunId", StringComparison.OrdinalIgnoreCase)
-            || message.Contains("IX_WalkForwardRun_SourceOptimizationRunId", StringComparison.OrdinalIgnoreCase)
-            || message.Contains("duplicate key", StringComparison.OrdinalIgnoreCase)
-               && message.Contains("SourceOptimizationRunId", StringComparison.OrdinalIgnoreCase);
-    }
+        => OptimizationDbExceptionClassifier.IsDuplicateFollowUpConstraintViolation(ex);
 
     internal static void DetachPendingValidationFollowUps(DbContext writeDb, long optimizationRunId)
     {
@@ -601,7 +588,6 @@ public sealed class OptimizationFollowUpCoordinator
     private async Task RepairOrFailMissingFollowUpsAsync(
         DbContext writeDb,
         IWriteApplicationDbContext writeCtx,
-        IAlertDispatcher? alertDispatcher,
         OptimizationRun run,
         Strategy? strategy,
         BacktestRun? backtestRun,
@@ -642,7 +628,7 @@ public sealed class OptimizationFollowUpCoordinator
 
                     if (existingCount > 0)
                     {
-                        run.ValidationFollowUpsCreatedAt ??= DateTime.UtcNow;
+                        run.ValidationFollowUpsCreatedAt ??= nowUtc;
                         run.ValidationFollowUpStatus ??= ValidationFollowUpStatus.Pending;
                     }
 
@@ -705,31 +691,27 @@ public sealed class OptimizationFollowUpCoordinator
             "Optimization follow-up rows missing for approved run {RunId} and strategy {StrategyId} cannot be loaded for repair",
             run.Id, run.StrategyId);
 
-        if (alertDispatcher is not null)
+        try
         {
-            try
-            {
-                await alertDispatcher.DispatchBySeverityAsync(missingFollowUpAlert, missingFollowUpAlertMessage, ct);
-            }
-            catch (Exception ex)
-            {
-                OptimizationRunProgressTracker.RecordOperationalIssue(
-                    run,
-                    "MissingFollowUpAlertDispatchFailed",
-                    $"Missing follow-up alert dispatch degraded: {ex.Message}",
-                    DateTime.UtcNow);
-                await writeCtx.SaveChangesAsync(CancellationToken.None);
-                _logger.LogWarning(ex,
-                    "Missing follow-up alert dispatch failed for run {RunId} (non-fatal)",
-                    run.Id);
-            }
+            await _alertDispatcher.DispatchBySeverityAsync(missingFollowUpAlert, missingFollowUpAlertMessage, ct);
+        }
+        catch (Exception ex)
+        {
+            OptimizationRunProgressTracker.RecordOperationalIssue(
+                run,
+                "MissingFollowUpAlertDispatchFailed",
+                $"Missing follow-up alert dispatch degraded: {ex.Message}",
+                nowUtc);
+            await writeCtx.SaveChangesAsync(CancellationToken.None);
+            _logger.LogWarning(ex,
+                "Missing follow-up alert dispatch failed for run {RunId} (non-fatal)",
+                run.Id);
         }
     }
 
     private async Task DetectAndAlertOnStuckFollowUpsAsync(
         DbContext writeDb,
         IWriteApplicationDbContext writeCtx,
-        IAlertDispatcher? alertDispatcher,
         OptimizationRun run,
         BacktestRun backtestRun,
         WalkForwardRun walkForwardRun,
@@ -738,11 +720,12 @@ public sealed class OptimizationFollowUpCoordinator
         DateTime? backtestAnchorUtc = GetIncompleteFollowUpAnchorUtc(run, backtestRun.StartedAt, backtestRun.Status);
         DateTime? walkForwardAnchorUtc = GetIncompleteFollowUpAnchorUtc(run, walkForwardRun.StartedAt, walkForwardRun.Status);
 
+        var nowUtc = UtcNow;
         double? backtestAgeHours = backtestAnchorUtc.HasValue
-            ? (DateTime.UtcNow - backtestAnchorUtc.Value).TotalHours
+            ? (nowUtc - backtestAnchorUtc.Value).TotalHours
             : null;
         double? walkForwardAgeHours = walkForwardAnchorUtc.HasValue
-            ? (DateTime.UtcNow - walkForwardAnchorUtc.Value).TotalHours
+            ? (nowUtc - walkForwardAnchorUtc.Value).TotalHours
             : null;
 
         bool backtestStuck = backtestAgeHours.HasValue && backtestAgeHours.Value >= FollowUpStuckThreshold.TotalHours;
@@ -752,7 +735,6 @@ public sealed class OptimizationFollowUpCoordinator
             return;
 
         string alertSymbol = BuildFollowUpStuckAlertSymbol(run.Id);
-        var nowUtc = DateTime.UtcNow;
         var alert = await writeDb.Set<Alert>()
             .FirstOrDefaultAsync(a => a.Symbol == alertSymbol && !a.IsDeleted, ct);
 
@@ -801,26 +783,23 @@ public sealed class OptimizationFollowUpCoordinator
 
         await writeCtx.SaveChangesAsync(ct);
 
-        if (alertDispatcher is null)
-            return;
-
         try
         {
-            await alertDispatcher.DispatchBySeverityAsync(alert, message, ct);
+            await _alertDispatcher.DispatchBySeverityAsync(alert, message, ct);
         }
-            catch (Exception ex)
-            {
-                OptimizationRunProgressTracker.RecordOperationalIssue(
-                    run,
-                    "StuckFollowUpAlertDispatchFailed",
-                    $"Stuck follow-up alert dispatch degraded: {ex.Message}",
-                    DateTime.UtcNow);
-                await writeCtx.SaveChangesAsync(CancellationToken.None);
-                _logger.LogWarning(ex,
-                    "Stuck follow-up alert dispatch failed for run {RunId} (non-fatal)",
-                    run.Id);
-            }
+        catch (Exception ex)
+        {
+            OptimizationRunProgressTracker.RecordOperationalIssue(
+                run,
+                "StuckFollowUpAlertDispatchFailed",
+                $"Stuck follow-up alert dispatch degraded: {ex.Message}",
+                nowUtc);
+            await writeCtx.SaveChangesAsync(CancellationToken.None);
+            _logger.LogWarning(ex,
+                "Stuck follow-up alert dispatch failed for run {RunId} (non-fatal)",
+                run.Id);
         }
+    }
 
     private static (DateTime FromDate, DateTime ToDate) ResolveFollowUpWindowUtc(
         OptimizationRun run,

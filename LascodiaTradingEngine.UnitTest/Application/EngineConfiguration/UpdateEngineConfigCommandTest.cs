@@ -8,6 +8,7 @@ using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.AuditTrail.Commands.LogDecision;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.EngineConfiguration.Commands.UpsertEngineConfig;
+using LascodiaTradingEngine.Application.Optimization;
 using LascodiaTradingEngine.Domain.Entities;
 using ApprovalOperationType = LascodiaTradingEngine.Domain.Enums.ApprovalOperationType;
 
@@ -112,7 +113,7 @@ public class UpdateEngineConfigCommandTest
         _mockWriteContext.Setup(c => c.SaveChangesAsync(It.IsAny<CancellationToken>()))
             .ReturnsAsync(1);
 
-        var handler = new UpsertEngineConfigCommandHandler(_mockWriteContext.Object, _mockMediator.Object, _mockApprovalWorkflow.Object, _mockCurrentUser.Object);
+        var handler = CreateHandler();
         var command = new UpsertEngineConfigCommand
         {
             Key = "NewSetting",
@@ -151,7 +152,7 @@ public class UpdateEngineConfigCommandTest
         _mockWriteContext.Setup(c => c.SaveChangesAsync(It.IsAny<CancellationToken>()))
             .ReturnsAsync(1);
 
-        var handler = new UpsertEngineConfigCommandHandler(_mockWriteContext.Object, _mockMediator.Object, _mockApprovalWorkflow.Object, _mockCurrentUser.Object);
+        var handler = CreateHandler();
         var command = new UpsertEngineConfigCommand
         {
             Key = "MaxOrderSize",
@@ -169,4 +170,55 @@ public class UpdateEngineConfigCommandTest
         Assert.Equal("Updated", result.message);
         Assert.Equal(5, result.data);
     }
+
+    [Theory]
+    [InlineData("Optimization:SchedulePollSeconds", true)]
+    [InlineData("Backtest:Gate:MinWinRate", true)]
+    [InlineData("Orders:RouteTimeoutSeconds", false)]
+    public async Task Handler_InvalidatesOptimizationCache_OnlyForOptimizationRelatedKeys(string key, bool shouldInvalidate)
+    {
+        var configs = new List<EngineConfig>().AsQueryable().BuildMockDbSet();
+        var auditLogs = new List<EngineConfigAuditLog>().AsQueryable().BuildMockDbSet();
+        var mockDbContext = new Mock<DbContext>();
+        mockDbContext.Setup(c => c.Set<EngineConfig>()).Returns(configs.Object);
+        mockDbContext.Setup(c => c.Set<EngineConfigAuditLog>()).Returns(auditLogs.Object);
+        _mockWriteContext.Setup(c => c.GetDbContext()).Returns(mockDbContext.Object);
+        _mockWriteContext.Setup(c => c.SaveChangesAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(1);
+
+        var configProvider = new OptimizationConfigProvider(
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<OptimizationConfigProvider>.Instance,
+            TimeProvider.System);
+        await configProvider.LoadAsync(mockDbContext.Object, CancellationToken.None);
+        var before = configProvider.GetCacheSnapshot();
+
+        var handler = CreateHandler(configProvider, TimeProvider.System);
+        var command = new UpsertEngineConfigCommand
+        {
+            Key = key,
+            Value = "123",
+            DataType = "Int",
+            IsHotReloadable = true
+        };
+
+        var result = await handler.Handle(command, CancellationToken.None);
+
+        Assert.True(result.status);
+        var after = configProvider.GetCacheSnapshot();
+        Assert.Equal(!shouldInvalidate, after.IsCached);
+        Assert.Equal(before.Generation + (shouldInvalidate ? 1 : 0), after.Generation);
+    }
+
+    private UpsertEngineConfigCommandHandler CreateHandler(
+        OptimizationConfigProvider? configProvider = null,
+        TimeProvider? timeProvider = null)
+        => new(
+            _mockWriteContext.Object,
+            _mockMediator.Object,
+            _mockApprovalWorkflow.Object,
+            _mockCurrentUser.Object,
+            configProvider ?? new OptimizationConfigProvider(
+                Microsoft.Extensions.Logging.Abstractions.NullLogger<OptimizationConfigProvider>.Instance,
+                timeProvider ?? TimeProvider.System),
+            timeProvider ?? TimeProvider.System);
 }

@@ -1,5 +1,6 @@
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
@@ -11,23 +12,37 @@ namespace LascodiaTradingEngine.Application.Optimization;
 /// at 25% traffic, ramp to 100% after a configurable observation window, and automatically
 /// roll back if post-rollout performance degrades below the approval threshold.
 /// </summary>
-internal sealed class GradualRolloutManager
+[RegisterService(Microsoft.Extensions.DependencyInjection.ServiceLifetime.Singleton)]
+public sealed class GradualRolloutManager
 {
     private readonly ILogger _logger;
+    private readonly TimeProvider _timeProvider;
+    private DateTime UtcNow => _timeProvider.GetUtcNow().UtcDateTime;
 
-    internal GradualRolloutManager(ILogger logger) => _logger = logger;
+    public GradualRolloutManager(
+        ILogger<GradualRolloutManager> logger,
+        TimeProvider timeProvider)
+        : this((ILogger)logger, timeProvider)
+    {
+    }
+
+    internal GradualRolloutManager(ILogger logger, TimeProvider timeProvider)
+    {
+        _logger = logger;
+        _timeProvider = timeProvider;
+    }
 
     /// <summary>
     /// Initiates a gradual rollout: saves the current params as rollback, sets the new params,
     /// and starts at <paramref name="initialPct"/>% traffic.
     /// </summary>
     internal static void StartRollout(
-        Strategy strategy, string newParamsJson, long optimizationRunId, int initialPct = 25)
+        Strategy strategy, string newParamsJson, long optimizationRunId, DateTime utcNow, int initialPct = 25)
     {
         strategy.RollbackParametersJson = strategy.ParametersJson;
         strategy.ParametersJson = CanonicalParameterJson.Normalize(newParamsJson);
         strategy.RolloutPct = initialPct;
-        strategy.RolloutStartedAt = DateTime.UtcNow;
+        strategy.RolloutStartedAt = utcNow;
         strategy.RolloutOptimizationRunId = optimizationRunId;
     }
 
@@ -35,7 +50,7 @@ internal sealed class GradualRolloutManager
     /// Promotes the rollout to the next tier (25→50→75→100) or completes it.
     /// Returns true if the rollout is now complete (100%).
     /// </summary>
-    internal static bool PromoteRollout(Strategy strategy)
+    internal static bool PromoteRollout(Strategy strategy, DateTime utcNow)
     {
         int current = strategy.RolloutPct ?? 100;
         int next = current switch
@@ -61,7 +76,7 @@ internal sealed class GradualRolloutManager
         // Reset the observation window at each intermediate tier so 50%/75%
         // promotions require fresh evidence from that tier instead of inheriting
         // time and snapshots collected while the strategy was still at 25%/50%.
-        strategy.RolloutStartedAt = DateTime.UtcNow;
+        strategy.RolloutStartedAt = utcNow;
 
         return false;
     }
@@ -97,7 +112,7 @@ internal sealed class GradualRolloutManager
         if (strategy.RolloutStartedAt is null) return null;
 
         // Check if we've been in this rollout tier long enough
-        double daysSinceStart = (DateTime.UtcNow - strategy.RolloutStartedAt.Value).TotalDays;
+        double daysSinceStart = (UtcNow - strategy.RolloutStartedAt.Value).TotalDays;
         double daysPerTier = observationWindowDays / 4.0; // 4 tiers: 25→50→75→100
         if (daysSinceStart < daysPerTier) return null;
 
@@ -172,7 +187,7 @@ internal sealed class GradualRolloutManager
         }
 
         // All good — promote to next tier
-        bool completed = PromoteRollout(strategy);
+        bool completed = PromoteRollout(strategy, UtcNow);
         _logger.LogInformation(
             "GradualRolloutManager: strategy {Id} rollout {Action} — avg score {Score:F2}, now at {Pct}%",
             strategy.Id, completed ? "completed" : "promoted", avgScore, strategy.RolloutPct ?? 100);

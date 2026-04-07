@@ -48,13 +48,22 @@ public class GetOptimizationWorkerHealthQueryTest
             AbandonedRuns = 1,
             PendingFollowUps = 5,
             PendingCompletionPublications = 2,
+            ApprovedRunsMissingFollowUps = 1,
+            PendingCompletionPreparation = 3,
+            StrandedLifecycleRuns = 2,
+            LifecycleRepairsLastCycle = 4,
+            LifecycleBatchesLastCycle = 2,
             ConfigCacheAgeSeconds = 12,
             ConfigRefreshIntervalSeconds = 30,
             ConfigRefreshDueAtUtc = DateTime.Parse("2026-04-06T10:15:00Z").ToUniversalTime(),
+            LastLifecycleReconciledAtUtc = DateTime.Parse("2026-04-06T10:14:30Z").ToUniversalTime(),
             OldestRunningRunId = 99,
             OldestRunningStage = OptimizationExecutionStage.Validation,
             OldestRunningStageMessage = "Applying validation gates.",
-            OldestRunningStageUpdatedAt = DateTime.Parse("2026-04-06T10:10:00Z").ToUniversalTime()
+            OldestRunningStageUpdatedAt = DateTime.Parse("2026-04-06T10:10:00Z").ToUniversalTime(),
+            OldestStrandedLifecycleRunId = 44,
+            OldestStrandedLifecycleStatus = OptimizationRunStatus.Approved,
+            OldestStrandedLifecycleAnchorAtUtc = DateTime.Parse("2026-04-06T09:55:00Z").ToUniversalTime()
         });
 
         var handler = new GetOptimizationWorkerHealthQueryHandler(healthMonitor.Object, optimizationHealthStore.Object);
@@ -69,13 +78,22 @@ public class GetOptimizationWorkerHealthQueryTest
         Assert.Equal(1, response.data.AbandonedRuns);
         Assert.Equal(5, response.data.PendingFollowUps);
         Assert.Equal(2, response.data.PendingCompletionPublications);
+        Assert.Equal(1, response.data.ApprovedRunsMissingFollowUps);
+        Assert.Equal(3, response.data.PendingCompletionPreparation);
+        Assert.Equal(2, response.data.StrandedLifecycleRuns);
+        Assert.Equal(4, response.data.LifecycleRepairsLastCycle);
+        Assert.Equal(2, response.data.LifecycleBatchesLastCycle);
         Assert.Equal(12, response.data.ConfigCacheAgeSeconds);
         Assert.Equal(30, response.data.ConfigRefreshIntervalSeconds);
         Assert.Equal(DateTime.Parse("2026-04-06T10:15:00Z").ToUniversalTime(), response.data.ConfigRefreshDueAtUtc);
+        Assert.Equal(DateTime.Parse("2026-04-06T10:14:30Z").ToUniversalTime(), response.data.LastLifecycleReconciledAtUtc);
         Assert.Equal(99, response.data.OldestRunningRunId);
         Assert.Equal(OptimizationExecutionStage.Validation, response.data.OldestRunningStage);
         Assert.Equal("Applying validation gates.", response.data.OldestRunningStageMessage);
         Assert.Equal(DateTime.Parse("2026-04-06T10:10:00Z").ToUniversalTime(), response.data.OldestRunningStageUpdatedAt);
+        Assert.Equal(44, response.data.OldestStrandedLifecycleRunId);
+        Assert.Equal(OptimizationRunStatus.Approved, response.data.OldestStrandedLifecycleStatus);
+        Assert.Equal(DateTime.Parse("2026-04-06T09:55:00Z").ToUniversalTime(), response.data.OldestStrandedLifecycleAnchorAtUtc);
         Assert.NotNull(response.data.OptimizationWorker);
         Assert.Equal("OptimizationWorker", response.data.OptimizationWorker!.WorkerName);
         Assert.Equal(250, response.data.OptimizationWorker.LastCycleDurationMs);

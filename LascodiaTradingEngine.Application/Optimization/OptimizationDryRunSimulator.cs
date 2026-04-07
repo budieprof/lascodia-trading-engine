@@ -1,5 +1,8 @@
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging.Abstractions;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -10,8 +13,21 @@ namespace LascodiaTradingEngine.Application.Optimization;
 /// Loads config, validates, estimates candle counts, grid size, and resource requirements.
 /// Used by the dry-run endpoint to let operators tune config before committing compute.
 /// </summary>
-internal static class OptimizationDryRunSimulator
+[RegisterService(ServiceLifetime.Singleton)]
+public sealed class OptimizationDryRunSimulator
 {
+    private readonly OptimizationConfigProvider _configProvider;
+    private readonly TimeProvider _timeProvider;
+    private DateTime UtcNow => _timeProvider.GetUtcNow().UtcDateTime;
+
+    internal OptimizationDryRunSimulator(
+        OptimizationConfigProvider configProvider,
+        TimeProvider timeProvider)
+    {
+        _configProvider = configProvider;
+        _timeProvider = timeProvider;
+    }
+
     internal sealed record DryRunResult(
         bool ConfigValid,
         List<string> ConfigIssues,
@@ -35,8 +51,10 @@ internal static class OptimizationDryRunSimulator
         double EstimatedRunTimeMinutes,
         Dictionary<string, string> EffectiveConfig);
 
-    internal static async Task<DryRunResult> SimulateAsync(
-        DbContext db, long strategyId, CancellationToken ct)
+    internal async Task<DryRunResult> SimulateAsync(
+        DbContext db,
+        long strategyId,
+        CancellationToken ct)
     {
         var strategy = await db.Set<Strategy>()
             .Where(s => s.Id == strategyId && !s.IsDeleted)
@@ -44,129 +62,158 @@ internal static class OptimizationDryRunSimulator
             .FirstOrDefaultAsync(ct);
 
         if (strategy is null)
-            return new DryRunResult(false, ["Strategy not found"], "", 0, 0, 0, 0, 0, 0, 0, "", 0, 0, 0, false, false, null, 0, 0, 0, new());
-
-        // Load config using the same loader as the worker
-        var allKeys = new[]
         {
-            "Optimization:Preset", "Optimization:TpeBudget", "Optimization:TpeInitialSamples",
-            "Optimization:PurgedKFolds", "Optimization:MaxParallelBacktests",
-            "Optimization:MaxRunTimeoutMinutes", "Optimization:CandleLookbackMonths",
-            "Optimization:EmbargoRatio", "Optimization:ScreeningSpreadPoints",
-            "Optimization:UseSymbolSpecificSpread", "Optimization:MaxConcurrentRuns",
-            "Optimization:SeasonalBlackoutEnabled", "Optimization:BlackoutPeriods",
-            "Optimization:SuppressDuringDrawdownRecovery", "Optimization:DataScarcityThreshold",
-            "Optimization:ScreeningTimeoutSeconds", "Optimization:TopNCandidates",
-            "Optimization:BootstrapIterations", "Optimization:PermutationIterations",
-            "Optimization:CheckpointEveryN", "Optimization:AutoApprovalImprovementThreshold",
-            "Optimization:AutoApprovalMinHealthScore", "Optimization:MinBootstrapCILower",
-            "Optimization:CorrelationParamThreshold", "Optimization:SensitivityPerturbPct",
-            "Optimization:GpEarlyStopPatience", "Optimization:CooldownDays",
-        };
+            return new DryRunResult(
+                false,
+                ["Strategy not found"],
+                "",
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                "",
+                0,
+                0,
+                0,
+                false,
+                false,
+                null,
+                0,
+                0,
+                0,
+                new());
+        }
 
-        var b = await OptimizationGridBuilder.GetConfigBatchAsync(db, allKeys, ct);
+        var config = await _configProvider.LoadAsync(db, ct);
+        var configIssues = OptimizationConfigValidator.Validate(
+            config.AutoApprovalImprovementThreshold,
+            config.AutoApprovalMinHealthScore,
+            config.MinBootstrapCILower,
+            config.EmbargoRatio,
+            config.TpeBudget,
+            config.TpeInitialSamples,
+            config.MaxParallelBacktests,
+            config.ScreeningTimeoutSeconds,
+            config.CorrelationParamThreshold,
+            config.SensitivityPerturbPct,
+            config.GpEarlyStopPatience,
+            config.CooldownDays,
+            config.CheckpointEveryN,
+            NullLogger.Instance,
+            config.SensitivityDegradationTolerance,
+            config.WalkForwardMinMaxRatio,
+            config.CostStressMultiplier,
+            config.CpcvNFolds,
+            config.CpcvTestFoldCount,
+            config.MinOosCandlesForValidation,
+            config.CircuitBreakerThreshold,
+            config.MinCandidateTrades,
+            config.SuccessiveHalvingRungs,
+            config.RegimeBlendRatio,
+            config.MinEquityCurveR2,
+            config.MaxTradeTimeConcentration);
 
-        var presetName = OptimizationGridBuilder.GetConfigValue(b, "Optimization:Preset", "balanced");
-        int tpeBudget = OptimizationGridBuilder.GetConfigValue(b, "Optimization:TpeBudget", 50);
-        int tpeInitial = OptimizationGridBuilder.GetConfigValue(b, "Optimization:TpeInitialSamples", 15);
-        int maxParallel = OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxParallelBacktests", 4);
-        int maxTimeout = OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxRunTimeoutMinutes", 30);
-        int lookbackMonths = OptimizationGridBuilder.GetConfigValue(b, "Optimization:CandleLookbackMonths", 6);
-        double embargoRatio = OptimizationGridBuilder.GetConfigValue(b, "Optimization:EmbargoRatio", 0.05);
-        double spreadPoints = OptimizationGridBuilder.GetConfigValue(b, "Optimization:ScreeningSpreadPoints", 20.0);
-        bool useSymbolSpread = OptimizationGridBuilder.GetConfigValue(b, "Optimization:UseSymbolSpecificSpread", true);
-        int maxConcurrent = OptimizationGridBuilder.GetConfigValue(b, "Optimization:MaxConcurrentRuns", 3);
-        int dataScarcity = OptimizationGridBuilder.GetConfigValue(b, "Optimization:DataScarcityThreshold", 200);
-        int screeningTimeout = OptimizationGridBuilder.GetConfigValue(b, "Optimization:ScreeningTimeoutSeconds", 30);
+        int effectiveLookbackMonths = config.CandleLookbackAutoScale
+            ? OptimizationDataLoader.ComputeEffectiveLookback(strategy.Timeframe, config.CandleLookbackMonths)
+            : config.CandleLookbackMonths;
 
-        // Estimate candle count
-        var candleLookbackStart = DateTime.UtcNow.AddMonths(-lookbackMonths);
+        var candleLookbackStart = UtcNow.AddMonths(-effectiveLookbackMonths);
         int candleCount = await db.Set<Candle>()
             .CountAsync(c => c.Symbol == strategy.Symbol
                           && c.Timeframe == strategy.Timeframe
                           && c.Timestamp >= candleLookbackStart
-                          && c.IsClosed && !c.IsDeleted, ct);
+                          && c.Timestamp <= UtcNow
+                          && c.IsClosed
+                          && !c.IsDeleted, ct);
 
-        var protocol = OptimizationGridBuilder.GetDataProtocol(candleCount, dataScarcity);
+        var protocol = OptimizationGridBuilder.GetDataProtocol(candleCount, config.DataScarcityThreshold);
         int trainCandles = (int)(candleCount * protocol.TrainRatio);
-        int embargoCandles = Math.Max(1, (int)(candleCount * embargoRatio));
-        int testCandles = candleCount - trainCandles - embargoCandles;
+        int embargoCandles = Math.Max(1, (int)(candleCount * config.EmbargoRatio));
+        int testCandles = Math.Max(0, candleCount - trainCandles - embargoCandles);
 
-        // Estimate grid size
-        var gridBuilder = new OptimizationGridBuilder(null!);
         int gridSize = 0;
         try
         {
-            var grid = await gridBuilder.BuildParameterGridAsync(db, strategy.StrategyType, ct);
+            var grid = await new OptimizationGridBuilder(NullLogger<OptimizationGridBuilder>.Instance)
+                .BuildParameterGridAsync(db, strategy.StrategyType, ct);
             gridSize = grid.Count;
         }
-        catch { /* non-fatal */ }
+        catch
+        {
+        }
 
-        // Parameter memory: count previously promoted params
         int previouslyPromoted = await db.Set<OptimizationRun>()
             .CountAsync(r => r.StrategyId == strategy.Id
                           && (r.Status == OptimizationRunStatus.Approved || r.Status == OptimizationRunStatus.Completed)
-                          && r.BestParametersJson != null && !r.IsDeleted, ct);
+                          && r.BestParametersJson != null
+                          && !r.IsDeleted, ct);
         int freshCandidates = Math.Max(0, gridSize - previouslyPromoted);
 
-        // Surrogate type
         int paramDimensions = 0;
         try
         {
             var parsed = JsonSerializer.Deserialize<Dictionary<string, object>>(strategy.ParametersJson);
             paramDimensions = parsed?.Count ?? 0;
         }
-        catch { }
+        catch
+        {
+        }
+
         string surrogateType = paramDimensions >= 6 ? "GP-UCB" : "TPE";
 
-        // Current state
         int running = await db.Set<OptimizationRun>()
             .CountAsync(r => r.Status == OptimizationRunStatus.Running && !r.IsDeleted, ct);
         int queued = await db.Set<OptimizationRun>()
             .CountAsync(r => r.Status == OptimizationRunStatus.Queued && !r.IsDeleted, ct);
 
-        // Blackout
-        string blackoutPeriods = OptimizationGridBuilder.GetConfigValue(b, "Optimization:BlackoutPeriods", "12/20-01/05");
-        bool blackoutEnabled = OptimizationGridBuilder.GetConfigValue(b, "Optimization:SeasonalBlackoutEnabled", true);
-
-        // Current regime
-        var regime = await db.Set<MarketRegimeSnapshot>()
+        var currentRegime = await db.Set<MarketRegimeSnapshot>()
             .Where(s => s.Symbol == strategy.Symbol && s.Timeframe == strategy.Timeframe && !s.IsDeleted)
             .OrderByDescending(s => s.DetectedAt)
             .Select(s => s.Regime.ToString())
             .FirstOrDefaultAsync(ct);
 
-        // Spread
-        double effectiveSpread = spreadPoints;
-        if (useSymbolSpread)
+        bool inDrawdownRecovery = await db.Set<DrawdownSnapshot>()
+            .OrderByDescending(s => s.RecordedAt)
+            .Where(s => !s.IsDeleted)
+            .Select(s => s.RecoveryMode != RecoveryMode.Normal)
+            .FirstOrDefaultAsync(ct);
+
+        double effectiveSpread = config.ScreeningSpreadPoints;
+        if (config.UseSymbolSpecificSpread)
         {
             var pair = await db.Set<CurrencyPair>()
                 .FirstOrDefaultAsync(p => p.Symbol == strategy.Symbol && !p.IsDeleted, ct);
             if (pair is not null && pair.SpreadPoints > 0)
-                effectiveSpread = Math.Max(spreadPoints, pair.SpreadPoints * 1.5);
+                effectiveSpread = Math.Max(config.ScreeningSpreadPoints, pair.SpreadPoints * 1.5);
         }
 
-        // Estimated run time (very rough)
-        double estimatedMinutes = (double)tpeBudget / maxParallel * screeningTimeout / 60.0 * 1.3; // 30% overhead
+        double estimatedMinutes = (double)config.TpeBudget
+            / Math.Max(1, config.MaxParallelBacktests)
+            * config.ScreeningTimeoutSeconds
+            / 60.0
+            * 1.3;
 
         var effectiveConfig = new Dictionary<string, string>
         {
-            ["Preset"] = presetName,
-            ["TpeBudget"] = tpeBudget.ToString(),
-            ["TpeInitialSamples"] = tpeInitial.ToString(),
-            ["MaxParallelBacktests"] = maxParallel.ToString(),
-            ["MaxRunTimeoutMinutes"] = maxTimeout.ToString(),
-            ["CandleLookbackMonths"] = lookbackMonths.ToString(),
-            ["EmbargoRatio"] = embargoRatio.ToString("F2"),
+            ["Preset"] = config.PresetName,
+            ["TpeBudget"] = config.TpeBudget.ToString(),
+            ["TpeInitialSamples"] = config.TpeInitialSamples.ToString(),
+            ["MaxParallelBacktests"] = config.MaxParallelBacktests.ToString(),
+            ["MaxRunTimeoutMinutes"] = config.MaxRunTimeoutMinutes.ToString(),
+            ["CandleLookbackMonths"] = effectiveLookbackMonths.ToString(),
+            ["EmbargoRatio"] = config.EmbargoRatio.ToString("F2"),
             ["DataProtocol"] = $"TrainRatio={protocol.TrainRatio:F2}, KFolds={protocol.KFolds}",
             ["SurrogateType"] = surrogateType,
         };
 
         return new DryRunResult(
-            ConfigValid: true,
-            ConfigIssues: [],
-            PresetName: presetName,
-            EffectiveTpeBudget: tpeBudget,
+            ConfigValid: configIssues.Count == 0,
+            ConfigIssues: configIssues,
+            PresetName: config.PresetName,
+            EffectiveTpeBudget: config.TpeBudget,
             EstimatedCandleCount: candleCount,
             EstimatedTrainCandles: trainCandles,
             EstimatedTestCandles: testCandles,
@@ -174,14 +221,15 @@ internal static class OptimizationDryRunSimulator
             GridSize: gridSize,
             FreshCandidatesAfterMemory: freshCandidates,
             SurrogateType: surrogateType,
-            MaxConcurrentRuns: maxConcurrent,
+            MaxConcurrentRuns: config.MaxConcurrentRuns,
             CurrentlyRunning: running,
             CurrentlyQueued: queued,
-            InBlackoutPeriod: false,
-            InDrawdownRecovery: false,
-            CurrentRegime: regime,
+            InBlackoutPeriod: config.SeasonalBlackoutEnabled
+                && OptimizationPolicyHelpers.IsInBlackoutPeriod(config.BlackoutPeriods, UtcNow),
+            InDrawdownRecovery: inDrawdownRecovery,
+            CurrentRegime: currentRegime,
             EstimatedSpreadPoints: effectiveSpread,
-            CandleLookbackMonths: lookbackMonths,
+            CandleLookbackMonths: effectiveLookbackMonths,
             EstimatedRunTimeMinutes: Math.Round(estimatedMinutes, 1),
             EffectiveConfig: effectiveConfig);
     }

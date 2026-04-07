@@ -184,13 +184,12 @@ internal static class OptimizationPolicyHelpers
         return parsed.ToArray();
     }
 
-    internal static bool IsInBlackoutPeriod(string blackoutPeriods, DateTime? utcNow = null)
+    internal static bool IsInBlackoutPeriod(string blackoutPeriods, DateTime utcNow)
     {
         if (string.IsNullOrWhiteSpace(blackoutPeriods))
             return false;
 
-        var now = utcNow ?? DateTime.UtcNow;
-        int todayOrdinal = now.Month * 100 + now.Day;
+        int todayOrdinal = utcNow.Month * 100 + utcNow.Day;
 
         foreach (var period in blackoutPeriods.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {

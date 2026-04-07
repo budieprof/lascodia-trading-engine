@@ -9,7 +9,7 @@ using LascodiaTradingEngine.Domain.Entities;
 namespace LascodiaTradingEngine.Application.Optimization;
 
 [RegisterService(ServiceLifetime.Singleton)]
-internal sealed class OptimizationRunScopedConfigService
+public sealed class OptimizationRunScopedConfigService
 {
     internal sealed record ConfigChange(string Key, string OldValue, string NewValue);
 
@@ -101,6 +101,9 @@ internal sealed class OptimizationRunScopedConfigService
 
     internal static bool TryGetRunScopedConfigSnapshot(OptimizationRun run, out OptimizationConfig config)
         => OptimizationRunContracts.TryDeserializeConfigSnapshot(run, out config);
+
+    internal bool TryLoadRunScopedConfigSnapshot(OptimizationRun run, out OptimizationConfig config)
+        => TryGetRunScopedConfigSnapshot(run, out config);
 
     internal static List<ConfigChange> DiffConfigSnapshots(string priorJson, string currentJson)
     {

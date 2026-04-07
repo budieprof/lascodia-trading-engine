@@ -221,7 +221,8 @@ public class OptimizationImprovementsTest
             Timeframe = Timeframe.H1
         };
 
-        GradualRolloutManager.StartRollout(strategy, """{"Fast":12}""", optimizationRunId: 99);
+        var rolloutStart = new DateTime(2026, 04, 07, 10, 0, 0, DateTimeKind.Utc);
+        GradualRolloutManager.StartRollout(strategy, """{"Fast":12}""", optimizationRunId: 99, rolloutStart);
 
         Assert.Equal("""{"Fast":8}""", strategy.RollbackParametersJson);
         Assert.Equal("""{"Fast":12}""", strategy.ParametersJson);
@@ -233,7 +234,7 @@ public class OptimizationImprovementsTest
     [Fact]
     public void PromoteRollout_Progresses25To50To75To100()
     {
-        var originalStart = DateTime.UtcNow.AddDays(-4);
+        var originalStart = new DateTime(2026, 04, 03, 12, 0, 0, DateTimeKind.Utc);
         var strategy = new Strategy
         {
             Id = 1,
@@ -249,7 +250,7 @@ public class OptimizationImprovementsTest
         };
 
         // 25 → 50
-        bool completed = GradualRolloutManager.PromoteRollout(strategy);
+        bool completed = GradualRolloutManager.PromoteRollout(strategy, originalStart.AddDays(1));
         Assert.False(completed);
         Assert.Equal(50, strategy.RolloutPct);
         Assert.NotNull(strategy.RolloutStartedAt);
@@ -258,14 +259,14 @@ public class OptimizationImprovementsTest
         var secondTierStart = strategy.RolloutStartedAt;
 
         // 50 → 75
-        completed = GradualRolloutManager.PromoteRollout(strategy);
+        completed = GradualRolloutManager.PromoteRollout(strategy, originalStart.AddDays(2));
         Assert.False(completed);
         Assert.Equal(75, strategy.RolloutPct);
         Assert.NotNull(strategy.RolloutStartedAt);
         Assert.True(strategy.RolloutStartedAt > secondTierStart);
 
         // 75 → 100 (complete — clears rollback state)
-        completed = GradualRolloutManager.PromoteRollout(strategy);
+        completed = GradualRolloutManager.PromoteRollout(strategy, originalStart.AddDays(3));
         Assert.True(completed);
         Assert.Null(strategy.RolloutPct);
         Assert.Null(strategy.RollbackParametersJson);

@@ -10,7 +10,7 @@ using LascodiaTradingEngine.Domain.Entities;
 
 namespace LascodiaTradingEngine.Application.Optimization;
 
-[RegisterService(ServiceLifetime.Singleton)]
+[RegisterService(ServiceLifetime.Scoped)]
 internal sealed class OptimizationThresholdAdjustmentEvaluator
 {
     internal sealed record ThresholdAdjustmentResult(
@@ -25,16 +25,16 @@ internal sealed class OptimizationThresholdAdjustmentEvaluator
         bool GenesisRegressionOk,
         IReadOnlyList<(string Gate, double DurationMs)> GateTimings);
 
-    private readonly IServiceScopeFactory _scopeFactory;
+    private readonly ILivePerformanceBenchmark _livePerformanceBenchmark;
     private readonly OptimizationValidator _validator;
     private readonly ILogger<OptimizationThresholdAdjustmentEvaluator> _logger;
 
     public OptimizationThresholdAdjustmentEvaluator(
-        IServiceScopeFactory scopeFactory,
+        ILivePerformanceBenchmark livePerformanceBenchmark,
         OptimizationValidator validator,
         ILogger<OptimizationThresholdAdjustmentEvaluator> logger)
     {
-        _scopeFactory = scopeFactory;
+        _livePerformanceBenchmark = livePerformanceBenchmark;
         _validator = validator;
         _logger = logger;
     }
@@ -56,20 +56,15 @@ internal sealed class OptimizationThresholdAdjustmentEvaluator
 
         try
         {
-            await using var haircutScope = _scopeFactory.CreateAsyncScope();
-            var liveBenchmark = haircutScope.ServiceProvider.GetService<ILivePerformanceBenchmark>();
-            if (liveBenchmark != null)
+            var haircuts = await _livePerformanceBenchmark.GetCachedHaircutsAsync(ct);
+            if (haircuts.SampleCount >= 5 || haircuts.SampleCount < 0)
             {
-                var haircuts = await liveBenchmark.GetCachedHaircutsAsync(ct);
-                if (haircuts.SampleCount >= 5 || haircuts.SampleCount < 0)
-                {
-                    effectiveMinScore = config.AutoApprovalMinHealthScore /
-                        (decimal)Math.Max(0.5, haircuts.SharpeHaircut);
-                    _logger.LogDebug(
-                        "OptimizationWorker: haircut-adjusted approval threshold: {Original:F2} -> {Adjusted:F2}",
-                        config.AutoApprovalMinHealthScore,
-                        effectiveMinScore);
-                }
+                effectiveMinScore = config.AutoApprovalMinHealthScore /
+                    (decimal)Math.Max(0.5, haircuts.SharpeHaircut);
+                _logger.LogDebug(
+                    "OptimizationWorker: haircut-adjusted approval threshold: {Original:F2} -> {Adjusted:F2}",
+                    config.AutoApprovalMinHealthScore,
+                    effectiveMinScore);
             }
         }
         catch (Exception ex)

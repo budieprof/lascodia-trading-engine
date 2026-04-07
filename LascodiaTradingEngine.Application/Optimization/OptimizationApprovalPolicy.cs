@@ -56,7 +56,7 @@ internal static class OptimizationApprovalPolicy
         bool MultiObjectiveGateOk,
         bool SafetyGatesOk,
         string FailureReason,
-        IReadOnlyDictionary<string, object> StructuredReport);
+        OptimizationApprovalReportParser.ApprovalReport Report);
 
     internal static Result Evaluate(Input input)
     {
@@ -119,32 +119,32 @@ internal static class OptimizationApprovalPolicy
             : $"insufficient improvement ({input.CandidateImprovement:+0.00;-0.00}) or score ({input.OosHealthScore:F2}); " +
               $"multi-objective: Sharpe={input.SharpeRatio:F2}, DD={input.MaxDrawdownPct:F1}%, WR={input.WinRate:P0}, PF={input.ProfitFactor:F2}";
 
-        var report = new Dictionary<string, object>
+        var report = new OptimizationApprovalReportParser.ApprovalReport
         {
-            ["passed"] = passed,
-            ["compositeGateOk"] = compositeGateOk,
-            ["multiObjectiveGateOk"] = multiObjectiveGateOk,
-            ["safetyGatesOk"] = safetyGatesOk,
-            ["candidateImprovement"] = input.CandidateImprovement,
-            ["oosHealthScore"] = input.OosHealthScore,
-            ["hasSufficientOutOfSampleData"] = input.HasSufficientOutOfSampleData,
-            ["ciLower"] = input.CILower,
-            ["wfStable"] = input.WfStable,
-            ["mtfCompatible"] = input.MtfCompatible,
-            ["correlationSafe"] = input.CorrelationSafe,
-            ["sensitivityOk"] = input.SensitivityOk,
-            ["costSensitiveOk"] = input.CostSensitiveOk,
-            ["temporalCorrelationSafe"] = input.TemporalCorrelationSafe,
-            ["portfolioCorrelationSafe"] = input.PortfolioCorrelationSafe,
-            ["permSignificant"] = input.PermSignificant,
-            ["cvConsistent"] = input.CvConsistent,
-            ["kellySizingOk"] = input.KellySizingOk,
-            ["equityCurveOk"] = input.EquityCurveOk,
-            ["timeConcentrationOk"] = input.TimeConcentrationOk,
-            ["genesisRegressionOk"] = input.GenesisRegressionOk,
-            ["tailRiskWithinThreshold"] = input.TailRiskWithinThreshold,
-            ["tailRiskVaR99"] = input.TailRiskVaR99,
-            ["failureReason"] = failureReason
+            Passed = passed,
+            CompositeGateOk = compositeGateOk,
+            MultiObjectiveGateOk = multiObjectiveGateOk,
+            SafetyGatesOk = safetyGatesOk,
+            CandidateImprovement = input.CandidateImprovement,
+            OosHealthScore = input.OosHealthScore,
+            HasSufficientOutOfSampleData = input.HasSufficientOutOfSampleData,
+            CiLower = input.CILower,
+            WfStable = input.WfStable,
+            MtfCompatible = input.MtfCompatible,
+            CorrelationSafe = input.CorrelationSafe,
+            SensitivityOk = input.SensitivityOk,
+            CostSensitiveOk = input.CostSensitiveOk,
+            TemporalCorrelationSafe = input.TemporalCorrelationSafe,
+            PortfolioCorrelationSafe = input.PortfolioCorrelationSafe,
+            PermSignificant = input.PermSignificant,
+            CvConsistent = input.CvConsistent,
+            KellySizingOk = input.KellySizingOk,
+            EquityCurveOk = input.EquityCurveOk,
+            TimeConcentrationOk = input.TimeConcentrationOk,
+            GenesisRegressionOk = input.GenesisRegressionOk,
+            TailRiskWithinThreshold = input.TailRiskWithinThreshold,
+            TailRiskVaR99 = input.TailRiskVaR99,
+            FailureReason = failureReason
         };
 
         return new Result(passed, compositeGateOk, multiObjectiveGateOk, safetyGatesOk, failureReason, report);

@@ -13,7 +13,7 @@ using MarketRegimeEnum = LascodiaTradingEngine.Domain.Enums.MarketRegime;
 
 namespace LascodiaTradingEngine.Application.Optimization;
 
-[RegisterService(Microsoft.Extensions.DependencyInjection.ServiceLifetime.Singleton)]
+[RegisterService(Microsoft.Extensions.DependencyInjection.ServiceLifetime.Scoped)]
 internal sealed class OptimizationSearchCoordinator
 {
     private readonly OptimizationValidator _validator;
@@ -21,19 +21,23 @@ internal sealed class OptimizationSearchCoordinator
     private readonly OptimizationSearchBootstrapper _bootstrapper;
     private readonly TradingMetrics _metrics;
     private readonly ILogger<OptimizationSearchCoordinator> _logger;
+    private readonly TimeProvider _timeProvider;
+    private DateTime UtcNow => _timeProvider.GetUtcNow().UtcDateTime;
 
     public OptimizationSearchCoordinator(
         OptimizationValidator validator,
         OptimizationGridBuilder gridBuilder,
         OptimizationSearchBootstrapper bootstrapper,
         TradingMetrics metrics,
-        ILogger<OptimizationSearchCoordinator> logger)
+        ILogger<OptimizationSearchCoordinator> logger,
+        TimeProvider timeProvider)
     {
         _validator = validator;
         _gridBuilder = gridBuilder;
         _bootstrapper = bootstrapper;
         _metrics = metrics;
         _logger = logger;
+        _timeProvider = timeProvider;
     }
 
     // ── Stage: Bayesian Search (Stages 5–6) ─────────────────────────────────
@@ -572,7 +576,7 @@ internal sealed class OptimizationSearchCoordinator
             return BuildSearchResult();
         }
 
-        await OptimizationExecutionLeasePolicy.HeartbeatRunAsync(run, writeCtx, ct);
+        await OptimizationExecutionLeasePolicy.HeartbeatRunAsync(run, writeCtx, UtcNow, ct);
         // Adaptive TPE budget: reduce budget for strategies that historically converge
         // quickly. Track the average early-stop savings ratio from prior runs.
         int effectiveBudget = config.TpeBudget;

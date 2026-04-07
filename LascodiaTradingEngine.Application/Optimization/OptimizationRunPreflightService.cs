@@ -10,24 +10,28 @@ using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.Optimization;
 
-[RegisterService(ServiceLifetime.Singleton)]
+[RegisterService(ServiceLifetime.Scoped)]
 internal sealed class OptimizationRunPreflightService
 {
     private readonly ILogger<OptimizationRunPreflightService> _logger;
     private readonly TradingMetrics _metrics;
     private readonly OptimizationValidator _validator;
     private readonly OptimizationRunScopedConfigService _runScopedConfigService;
+    private readonly TimeProvider _timeProvider;
+    private DateTime UtcNow => _timeProvider.GetUtcNow().UtcDateTime;
 
     public OptimizationRunPreflightService(
         ILogger<OptimizationRunPreflightService> logger,
         TradingMetrics metrics,
         OptimizationValidator validator,
-        OptimizationRunScopedConfigService runScopedConfigService)
+        OptimizationRunScopedConfigService runScopedConfigService,
+        TimeProvider timeProvider)
     {
         _logger = logger;
         _metrics = metrics;
         _validator = validator;
         _runScopedConfigService = runScopedConfigService;
+        _timeProvider = timeProvider;
     }
 
     internal async Task<OptimizationConfig?> PrepareAsync(
@@ -36,6 +40,7 @@ internal sealed class OptimizationRunPreflightService
         IWriteApplicationDbContext writeCtx,
         CancellationToken ct)
     {
+        var nowUtc = UtcNow;
         var config = await _runScopedConfigService.LoadPreflightConfigurationAsync(run, db, ct);
         WarnOnSuspiciousConfig(config);
 
@@ -45,8 +50,9 @@ internal sealed class OptimizationRunPreflightService
         SetRunStage(
             run,
             OptimizationExecutionStage.Preflight,
-            "Loading run-scoped configuration and running preflight safety checks.");
-        await OptimizationExecutionLeasePolicy.HeartbeatRunAsync(run, writeCtx, ct);
+            "Loading run-scoped configuration and running preflight safety checks.",
+            nowUtc);
+        await OptimizationExecutionLeasePolicy.HeartbeatRunAsync(run, writeCtx, nowUtc, ct);
 
         var configIssues = OptimizationConfigValidator.Validate(
             config.AutoApprovalImprovementThreshold, config.AutoApprovalMinHealthScore,
@@ -71,7 +77,7 @@ internal sealed class OptimizationRunPreflightService
                 OptimizationRunStateMachine.Transition(
                     run,
                     OptimizationRunStatus.Failed,
-                    DateTime.UtcNow,
+                    nowUtc,
                     $"Invalid configuration: {issueStr}");
             }
 
@@ -79,13 +85,13 @@ internal sealed class OptimizationRunPreflightService
             return null;
         }
 
-        if (config.SeasonalBlackoutEnabled && OptimizationPolicyHelpers.IsInBlackoutPeriod(config.BlackoutPeriods))
+        if (config.SeasonalBlackoutEnabled && OptimizationPolicyHelpers.IsInBlackoutPeriod(config.BlackoutPeriods, nowUtc))
         {
             _logger.LogInformation("OptimizationRunPreflightService: seasonal blackout active - deferring run {RunId}", run.Id);
             _metrics.OptimizationRunsDeferred.Add(1, new KeyValuePair<string, object?>("reason", "seasonal_blackout"));
-            OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Queued, DateTime.UtcNow);
-            run.DeferredUntilUtc = DateTime.UtcNow.AddHours(6);
-            SetRunStage(run, OptimizationExecutionStage.Queued, "Deferred because a configured seasonal blackout is active.");
+            OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Queued, nowUtc);
+            run.DeferredUntilUtc = nowUtc.AddHours(6);
+            SetRunStage(run, OptimizationExecutionStage.Queued, "Deferred because a configured seasonal blackout is active.", nowUtc);
             await writeCtx.SaveChangesAsync(ct);
             return null;
         }
@@ -94,9 +100,9 @@ internal sealed class OptimizationRunPreflightService
         {
             _logger.LogInformation("OptimizationRunPreflightService: drawdown recovery active - deferring run {RunId}", run.Id);
             _metrics.OptimizationRunsDeferred.Add(1, new KeyValuePair<string, object?>("reason", "drawdown_recovery"));
-            OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Queued, DateTime.UtcNow);
-            run.DeferredUntilUtc = DateTime.UtcNow.AddMinutes(30);
-            SetRunStage(run, OptimizationExecutionStage.Queued, "Deferred because portfolio drawdown recovery is active.");
+            OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Queued, nowUtc);
+            run.DeferredUntilUtc = nowUtc.AddMinutes(30);
+            SetRunStage(run, OptimizationExecutionStage.Queued, "Deferred because portfolio drawdown recovery is active.", nowUtc);
             await writeCtx.SaveChangesAsync(ct);
             return null;
         }
@@ -112,7 +118,7 @@ internal sealed class OptimizationRunPreflightService
             var recentRegimes = await db.Set<MarketRegimeSnapshot>()
                 .Where(s => s.Symbol == preflightStrategy.Symbol
                          && s.Timeframe == preflightStrategy.Timeframe
-                         && s.DetectedAt >= DateTime.UtcNow.AddHours(-regimeStabilityHours)
+                         && s.DetectedAt >= nowUtc.AddHours(-regimeStabilityHours)
                          && !s.IsDeleted)
                 .Select(s => s.Regime)
                 .Distinct()
@@ -127,9 +133,9 @@ internal sealed class OptimizationRunPreflightService
                     regimeStabilityHours,
                     run.Id);
                 _metrics.OptimizationRunsDeferred.Add(1, new KeyValuePair<string, object?>("reason", "regime_transition"));
-                OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Queued, DateTime.UtcNow);
-                run.DeferredUntilUtc = DateTime.UtcNow.AddHours(regimeStabilityHours);
-                SetRunStage(run, OptimizationExecutionStage.Queued, "Deferred because the market regime is still transitioning.");
+                OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Queued, nowUtc);
+                run.DeferredUntilUtc = nowUtc.AddHours(regimeStabilityHours);
+                SetRunStage(run, OptimizationExecutionStage.Queued, "Deferred because the market regime is still transitioning.", nowUtc);
                 await writeCtx.SaveChangesAsync(ct);
                 return null;
             }
@@ -149,9 +155,9 @@ internal sealed class OptimizationRunPreflightService
                     preflightStrategy.Symbol,
                     run.Id);
                 _metrics.OptimizationRunsDeferred.Add(1, new KeyValuePair<string, object?>("reason", "ea_data_unavailable"));
-                OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Queued, DateTime.UtcNow);
-                run.DeferredUntilUtc = DateTime.UtcNow.AddMinutes(15);
-                SetRunStage(run, OptimizationExecutionStage.Queued, "Deferred because no active EA instance is feeding fresh data for the symbol.");
+                OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Queued, nowUtc);
+                run.DeferredUntilUtc = nowUtc.AddMinutes(15);
+                SetRunStage(run, OptimizationExecutionStage.Queued, "Deferred because no active EA instance is feeding fresh data for the symbol.", nowUtc);
                 await writeCtx.SaveChangesAsync(ct);
                 return null;
             }
@@ -184,8 +190,9 @@ internal sealed class OptimizationRunPreflightService
     private static void SetRunStage(
         OptimizationRun run,
         OptimizationExecutionStage stage,
-        string? message)
-        => OptimizationRunProgressTracker.SetStage(run, stage, message, DateTime.UtcNow);
+        string? message,
+        DateTime utcNow)
+        => OptimizationRunProgressTracker.SetStage(run, stage, message, utcNow);
 
     private static async Task<bool> IsInDrawdownRecoveryAsync(DbContext db, CancellationToken ct)
     {

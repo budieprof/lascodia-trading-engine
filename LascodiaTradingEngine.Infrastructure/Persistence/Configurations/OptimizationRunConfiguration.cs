@@ -14,6 +14,27 @@ public class OptimizationRunConfiguration : IEntityTypeConfiguration<Optimizatio
     {
         builder.HasKey(x => x.Id);
         builder.Property(x => x.Id).ValueGeneratedOnAdd();
+        builder.ToTable(t =>
+        {
+            t.HasCheckConstraint(
+                "CK_OptimizationRun_TerminalRunsRequireResultsPersisted",
+                "\"Status\" NOT IN ('Completed','Approved','Rejected') OR \"ResultsPersistedAt\" IS NOT NULL");
+            t.HasCheckConstraint(
+                "CK_OptimizationRun_ApprovalStatesRequireApprovalEvaluated",
+                "\"Status\" NOT IN ('Approved','Rejected') OR \"ApprovalEvaluatedAt\" IS NOT NULL");
+            t.HasCheckConstraint(
+                "CK_OptimizationRun_CompletionPreparedRequiresPayload",
+                "\"CompletionPublicationPreparedAt\" IS NULL OR \"CompletionPublicationPayloadJson\" IS NOT NULL");
+            t.HasCheckConstraint(
+                "CK_OptimizationRun_CompletionPublishedRequiresPreparedPayload",
+                "\"CompletionPublicationStatus\" IS DISTINCT FROM 'Published' " +
+                "OR (\"CompletionPublicationPayloadJson\" IS NOT NULL " +
+                "AND \"CompletionPublicationPreparedAt\" IS NOT NULL " +
+                "AND \"CompletionPublicationCompletedAt\" IS NOT NULL)");
+            t.HasCheckConstraint(
+                "CK_OptimizationRun_FollowUpStatusRequiresCreation",
+                "\"ValidationFollowUpStatus\" IS NULL OR \"ValidationFollowUpsCreatedAt\" IS NOT NULL");
+        });
 
         builder.Property(x => x.TriggerType).HasConversion<string>().IsRequired().HasMaxLength(20);
         builder.Property(x => x.Status).HasConversion<string>().IsRequired().HasMaxLength(20);

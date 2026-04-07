@@ -10,21 +10,25 @@ using MarketRegimeEnum = LascodiaTradingEngine.Domain.Enums.MarketRegime;
 
 namespace LascodiaTradingEngine.Application.Optimization;
 
-[RegisterService(ServiceLifetime.Singleton)]
+[RegisterService(ServiceLifetime.Scoped)]
 internal sealed class OptimizationCrossRegimePersistenceService
 {
     private readonly OptimizationValidator _validator;
     private readonly OptimizationApprovalArtifactStore _artifactStore;
     private readonly ILogger<OptimizationCrossRegimePersistenceService> _logger;
+    private readonly TimeProvider _timeProvider;
+    private DateTime UtcNow => _timeProvider.GetUtcNow().UtcDateTime;
 
     public OptimizationCrossRegimePersistenceService(
         OptimizationValidator validator,
         OptimizationApprovalArtifactStore artifactStore,
-        ILogger<OptimizationCrossRegimePersistenceService> logger)
+        ILogger<OptimizationCrossRegimePersistenceService> logger,
+        TimeProvider timeProvider)
     {
         _validator = validator;
         _artifactStore = artifactStore;
         _logger = logger;
+        _timeProvider = timeProvider;
     }
 
     internal async Task PersistAsync(
@@ -50,7 +54,7 @@ internal sealed class OptimizationCrossRegimePersistenceService
 
         try
         {
-            var lookbackEndUtc = DateTime.UtcNow;
+            var lookbackEndUtc = UtcNow;
             var snapshotHistory = await db.Set<MarketRegimeSnapshot>()
                 .Where(s => s.Symbol == strategy.Symbol
                          && s.Timeframe == strategy.Timeframe
@@ -177,7 +181,7 @@ internal sealed class OptimizationCrossRegimePersistenceService
                 run,
                 "CrossRegimePersistenceFailed",
                 $"Cross-regime evaluation degraded after approval: {ex.Message}",
-                DateTime.UtcNow);
+                UtcNow);
 
             await writeCtx.SaveChangesAsync(CancellationToken.None);
             _logger.LogWarning(ex,

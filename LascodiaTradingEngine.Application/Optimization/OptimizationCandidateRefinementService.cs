@@ -11,7 +11,7 @@ internal sealed record OptimizationCandidateRefinementResult(
     List<ScoredCandidate> RankedCandidates,
     int TotalIterations);
 
-[RegisterService(ServiceLifetime.Singleton)]
+[RegisterService(ServiceLifetime.Scoped)]
 internal sealed class OptimizationCandidateRefinementService
 {
     private readonly OptimizationValidator _validator;

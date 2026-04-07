@@ -17,7 +17,7 @@ using MarketRegimeEnum = LascodiaTradingEngine.Domain.Enums.MarketRegime;
 
 namespace LascodiaTradingEngine.Application.Optimization;
 
-[RegisterService(ServiceLifetime.Singleton)]
+[RegisterService(ServiceLifetime.Scoped)]
 internal sealed class OptimizationRunExecutor
 {
     private static readonly ActivitySource s_activitySource = new("LascodiaTradingEngine.Optimization");
@@ -25,7 +25,6 @@ internal sealed class OptimizationRunExecutor
 
     private readonly ILogger<OptimizationRunExecutor> _logger;
     private readonly TradingMetrics _metrics;
-    private readonly OptimizationValidator _validator;
     private readonly OptimizationDataLoader _dataLoader;
     private readonly OptimizationCandidateRefinementService _candidateRefinementService;
     private readonly OptimizationSearchCoordinator _searchCoordinator;
@@ -34,11 +33,12 @@ internal sealed class OptimizationRunExecutor
     private readonly OptimizationCompletionPublisher _completionPublisher;
     private readonly OptimizationRunMetadataService _runMetadataService;
     private readonly OptimizationRunPersistenceService _runPersistenceService;
+    private readonly TimeProvider _timeProvider;
+    private DateTime UtcNow => _timeProvider.GetUtcNow().UtcDateTime;
 
     public OptimizationRunExecutor(
         ILogger<OptimizationRunExecutor> logger,
         TradingMetrics metrics,
-        OptimizationValidator validator,
         OptimizationDataLoader dataLoader,
         OptimizationCandidateRefinementService candidateRefinementService,
         OptimizationSearchCoordinator searchCoordinator,
@@ -46,11 +46,11 @@ internal sealed class OptimizationRunExecutor
         OptimizationApprovalCoordinator approvalCoordinator,
         OptimizationCompletionPublisher completionPublisher,
         OptimizationRunMetadataService runMetadataService,
-        OptimizationRunPersistenceService runPersistenceService)
+        OptimizationRunPersistenceService runPersistenceService,
+        TimeProvider timeProvider)
     {
         _logger = logger;
         _metrics = metrics;
-        _validator = validator;
         _dataLoader = dataLoader;
         _candidateRefinementService = candidateRefinementService;
         _searchCoordinator = searchCoordinator;
@@ -59,6 +59,7 @@ internal sealed class OptimizationRunExecutor
         _completionPublisher = completionPublisher;
         _runMetadataService = runMetadataService;
         _runPersistenceService = runPersistenceService;
+        _timeProvider = timeProvider;
     }
 
     internal async Task ExecuteAsync(
@@ -72,14 +73,13 @@ internal sealed class OptimizationRunExecutor
         IAlertDispatcher alertDispatcher,
         IIntegrationEventService eventService,
         Stopwatch sw,
-        PipelinePersistenceState persistenceState,
         CancellationToken ct,
         CancellationToken runCt)
     {
         using var dataLoadActivity = s_activitySource.StartActivity("optimization.data_load");
         var phase = PhaseTimer.Start(_logger, _metrics, run.Id, run.StrategyId, "DataLoad");
         SetRunStage(run, OptimizationExecutionStage.DataLoad, "Loading candles, split windows, and baseline evaluation context.");
-        await OptimizationExecutionLeasePolicy.HeartbeatRunAsync(run, writeCtx, ct);
+        await OptimizationExecutionLeasePolicy.HeartbeatRunAsync(run, writeCtx, UtcNow, ct);
 
         var dataLoad = await _dataLoader.LoadAsync(db, run, strategy, config.ToDataLoadingConfig(), runCt);
 
@@ -104,7 +104,7 @@ internal sealed class OptimizationRunExecutor
         using var searchActivity = s_activitySource.StartActivity("optimization.search");
         phase = PhaseTimer.Start(_logger, _metrics, run.Id, run.StrategyId, "Search");
         SetRunStage(run, OptimizationExecutionStage.Search, "Exploring parameter candidates with the surrogate-guided search loop.");
-        await OptimizationExecutionLeasePolicy.HeartbeatRunAsync(run, writeCtx, ct);
+        await OptimizationExecutionLeasePolicy.HeartbeatRunAsync(run, writeCtx, UtcNow, ct);
         var searchResult = await _searchCoordinator.RunAsync(
             db,
             run,
@@ -135,7 +135,7 @@ internal sealed class OptimizationRunExecutor
         if (allEvaluated.Count == 0)
         {
             run.Iterations = totalIters;
-            OptimizationExecutionLeasePolicy.StampHeartbeat(run);
+            OptimizationExecutionLeasePolicy.StampHeartbeat(run, UtcNow);
             run.RunMetadataJson = _runMetadataService.SerializeRunMetadata(
                 run,
                 strategy,
@@ -162,7 +162,7 @@ internal sealed class OptimizationRunExecutor
         searchActivity?.SetTag("iterations", totalIters);
         searchActivity?.SetTag("candidates.evaluated", allEvaluated.Count);
 
-        await OptimizationExecutionLeasePolicy.HeartbeatRunAsync(run, writeCtx, ct);
+        await OptimizationExecutionLeasePolicy.HeartbeatRunAsync(run, writeCtx, UtcNow, ct);
 
         var refinement = await _candidateRefinementService.RefineAsync(
             allEvaluated,
@@ -177,7 +177,7 @@ internal sealed class OptimizationRunExecutor
         using var validationActivity = s_activitySource.StartActivity("optimization.validation");
         phase = PhaseTimer.Start(_logger, _metrics, run.Id, run.StrategyId, "Validation");
         SetRunStage(run, OptimizationExecutionStage.Validation, "Re-scoring Pareto candidates and applying approval validation gates.");
-        await OptimizationExecutionLeasePolicy.HeartbeatRunAsync(run, writeCtx, ct);
+        await OptimizationExecutionLeasePolicy.HeartbeatRunAsync(run, writeCtx, UtcNow, ct);
 
         var vr = await _validationCoordinator.ValidateAsync(
             refinement.RankedCandidates,
@@ -196,7 +196,7 @@ internal sealed class OptimizationRunExecutor
             pairInfo,
             ct,
             runCt);
-        await OptimizationExecutionLeasePolicy.HeartbeatRunAsync(run, writeCtx, ct);
+        await OptimizationExecutionLeasePolicy.HeartbeatRunAsync(run, writeCtx, UtcNow, ct);
 
         phase.Dispose();
         validationActivity?.SetTag("approval.passed", vr.Passed);
@@ -207,7 +207,7 @@ internal sealed class OptimizationRunExecutor
         using var persistActivity = s_activitySource.StartActivity("optimization.persist");
         phase = PhaseTimer.Start(_logger, _metrics, run.Id, run.StrategyId, "Persist");
         SetRunStage(run, OptimizationExecutionStage.Persist, "Persisting best candidate metrics, reports, and run metadata.");
-        await OptimizationExecutionLeasePolicy.HeartbeatRunAsync(run, writeCtx, ct);
+        await OptimizationExecutionLeasePolicy.HeartbeatRunAsync(run, writeCtx, UtcNow, ct);
         await _runPersistenceService.PersistAsync(
             new OptimizationRunPersistenceContext(
                 run,
@@ -224,7 +224,6 @@ internal sealed class OptimizationRunExecutor
                 vr,
                 totalIters),
             writeCtx,
-            persistenceState,
             ct);
 
         phase.Dispose();
@@ -237,7 +236,7 @@ internal sealed class OptimizationRunExecutor
         using var approvalActivity = s_activitySource.StartActivity("optimization.approval");
         phase = PhaseTimer.Start(_logger, _metrics, run.Id, run.StrategyId, "Approval");
         SetRunStage(run, OptimizationExecutionStage.Approval, "Applying auto-approval or manual-review decision.");
-        await OptimizationExecutionLeasePolicy.HeartbeatRunAsync(run, writeCtx, ct);
+        await OptimizationExecutionLeasePolicy.HeartbeatRunAsync(run, writeCtx, UtcNow, ct);
 
         try
         {
@@ -260,16 +259,15 @@ internal sealed class OptimizationRunExecutor
                 vr,
                 optimizationRegime,
                 candleLookbackStart,
-                screeningOptions,
-                persistenceState);
+                screeningOptions);
         }
         finally
         {
             phase.Dispose();
             approvalActivity?.SetTag("approval.decision", run.Status.ToString());
 
-            if (OptimizationRunLifecycle.ShouldPreservePersistedResult(persistenceState.CompletionPersisted, run.Status)
-                && !persistenceState.CompletionArtifactsPublished)
+            if (OptimizationRunLifecycle.ShouldPreservePersistedResult(run)
+                && !OptimizationRunLifecycle.HasPublishedCompletionArtifacts(run))
             {
                 using var completionPublishCts = new CancellationTokenSource(CompletionPublicationTimeout);
                 await PublishCompletionArtifactsAsync(
@@ -283,11 +281,10 @@ internal sealed class OptimizationRunExecutor
                     candidatesPerSec,
                     elapsedMilliseconds,
                     completionPublishCts.Token);
-                persistenceState.CompletionArtifactsPublished = true;
             }
         }
 
-        if (persistenceState.CompletionPersisted)
+        if (OptimizationRunLifecycle.HasPersistedTerminalResult(run))
         {
             _metrics.OptimizationRunsProcessed.Add(1);
             _metrics.OptimizationCycleDurationMs.Record(elapsedMilliseconds);
@@ -375,7 +372,7 @@ internal sealed class OptimizationRunExecutor
                 Iterations = run.Iterations,
                 BaselineScore = run.BaselineHealthScore ?? 0m,
                 BestOosScore = completedOosScore ?? 0m,
-                CompletedAt = run.CompletedAt ?? DateTime.UtcNow,
+                CompletedAt = run.CompletedAt ?? UtcNow,
             };
 
             if (run.CompletionPublicationStatus != OptimizationCompletionPublicationStatus.Published)
@@ -390,7 +387,7 @@ internal sealed class OptimizationRunExecutor
                 run,
                 "CompletionPublicationFailed",
                 $"Completion artifact publication degraded: {ex.Message}",
-                DateTime.UtcNow);
+                UtcNow);
             run.CompletionPublicationStatus = OptimizationCompletionPublicationStatus.Failed;
             run.CompletionPublicationErrorMessage = TruncateForPersistence(ex.Message, 500);
             await writeCtx.SaveChangesAsync(CancellationToken.None);
@@ -417,11 +414,11 @@ internal sealed class OptimizationRunExecutor
         }
     }
 
-    private static void SetRunStage(
+    private void SetRunStage(
         OptimizationRun run,
         OptimizationExecutionStage stage,
         string? message)
-        => OptimizationRunProgressTracker.SetStage(run, stage, message, DateTime.UtcNow);
+        => OptimizationRunProgressTracker.SetStage(run, stage, message, UtcNow);
 
     private static string? TruncateForPersistence(string? value, int maxLength)
     {

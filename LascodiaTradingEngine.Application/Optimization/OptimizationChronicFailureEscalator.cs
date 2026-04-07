@@ -17,9 +17,16 @@ public sealed class OptimizationChronicFailureEscalator
     private const int ChronicFailureAlertCooldownSeconds = 24 * 60 * 60;
 
     private readonly ILogger<OptimizationChronicFailureEscalator> _logger;
+    private readonly TimeProvider _timeProvider;
+    private DateTime UtcNow => _timeProvider.GetUtcNow().UtcDateTime;
 
-    public OptimizationChronicFailureEscalator(ILogger<OptimizationChronicFailureEscalator> logger)
-        => _logger = logger;
+    public OptimizationChronicFailureEscalator(
+        ILogger<OptimizationChronicFailureEscalator> logger,
+        TimeProvider timeProvider)
+    {
+        _logger = logger;
+        _timeProvider = timeProvider;
+    }
 
     internal async Task EscalateAsync(
         DbContext db,
@@ -62,7 +69,7 @@ public sealed class OptimizationChronicFailureEscalator
             strategyName,
             consecutiveFailures);
 
-        var nowUtc = DateTime.UtcNow;
+        var nowUtc = UtcNow;
         string deduplicationKey = BuildDeduplicationKey(strategyId);
         var existingAlert = await writeDb.Set<Alert>()
             .FirstOrDefaultAsync(a => a.DeduplicationKey == deduplicationKey && !a.IsDeleted, ct);

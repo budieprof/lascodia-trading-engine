@@ -1,4 +1,14 @@
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging.Abstractions;
+using MockQueryable.Moq;
+using Moq;
+using LascodiaTradingEngine.Application.Backtesting.Models;
+using LascodiaTradingEngine.Application.Backtesting.Services;
+using LascodiaTradingEngine.Application.Common.Attributes;
+using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Optimization;
+using LascodiaTradingEngine.Application.Services;
 using LascodiaTradingEngine.Application.Workers;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
@@ -153,6 +163,88 @@ public class OptimizationRunArchitectureTest
     }
 
     [Fact]
+    public async Task LoadAsync_ExecutesExtractedDataPathAndPopulatesBaselineContext()
+    {
+        var nowUtc = new DateTimeOffset(2026, 04, 06, 12, 0, 0, TimeSpan.Zero);
+        var candles = Enumerable.Range(0, 600)
+            .Select(i => new Candle
+            {
+                Symbol = "EURUSD",
+                Timeframe = Timeframe.H1,
+                Timestamp = nowUtc.UtcDateTime.AddHours(-(600 - i)),
+                Open = 1.1000m + i * 0.0001m,
+                High = 1.1005m + i * 0.0001m,
+                Low = 1.0995m + i * 0.0001m,
+                Close = 1.1000m + i * 0.0001m,
+                IsClosed = true
+            })
+            .ToList();
+
+        var db = new Mock<DbContext>();
+        db.Setup(c => c.Set<Candle>()).Returns(candles.AsQueryable().BuildMockDbSet().Object);
+        db.Setup(c => c.Set<EconomicEvent>()).Returns(new List<EconomicEvent>().AsQueryable().BuildMockDbSet().Object);
+        db.Setup(c => c.Set<MarketRegimeSnapshot>()).Returns(new List<MarketRegimeSnapshot>().AsQueryable().BuildMockDbSet().Object);
+        db.Setup(c => c.Set<StrategyRegimeParams>()).Returns(new List<StrategyRegimeParams>().AsQueryable().BuildMockDbSet().Object);
+        db.Setup(c => c.Set<CurrencyPair>()).Returns(new List<CurrencyPair>
+        {
+            new() { Symbol = "EURUSD", DecimalPlaces = 5, ContractSize = 100_000m, SpreadPoints = 12, IsDeleted = false }
+        }.AsQueryable().BuildMockDbSet().Object);
+
+        var services = new ServiceCollection().BuildServiceProvider();
+        var loader = new OptimizationDataLoader(
+            NullLogger<OptimizationDataLoader>.Instance,
+            Mock.Of<ISpreadProfileProvider>(),
+            new OptimizationValidator(new BaselineSplitBacktestEngine(), new FakeTimeProvider(nowUtc)),
+            new FakeTimeProvider(nowUtc));
+
+        var strategy = new Strategy
+        {
+            Id = 601,
+            Name = "ExtractedPath",
+            StrategyType = StrategyType.BreakoutScalper,
+            Symbol = "EURUSD",
+            Timeframe = Timeframe.H1,
+            ParametersJson = """{"Fast":12,"Slow":34}"""
+        };
+        var run = new OptimizationRun
+        {
+            Id = 602,
+            StrategyId = strategy.Id,
+            StartedAt = nowUtc.UtcDateTime
+        };
+        var config = CreateConfig() with { UseSymbolSpecificSpread = false };
+
+        var result = await loader.LoadAsync(db.Object, run, strategy, config, CancellationToken.None);
+
+        Assert.NotNull(run.BaselineHealthScore);
+        Assert.NotEmpty(result.TrainCandles);
+        Assert.NotEmpty(result.TestCandles);
+        Assert.Equal(run.BaselineParametersJson, result.BaselineParametersJson);
+        Assert.True(result.BaselineComparisonScore > run.BaselineHealthScore!.Value);
+    }
+
+    [Fact]
+    public void AutoRegisterAttributedServices_ResolvesOptimizationSearchGraph()
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddMetrics();
+        services.AutoRegisterAttributedServices(typeof(OptimizationRunProcessor).Assembly);
+        services.AddSingleton<TimeProvider>(new FakeTimeProvider(new DateTimeOffset(2026, 04, 06, 12, 0, 0, TimeSpan.Zero)));
+        services.AddSingleton<TradingMetrics>(sp => new TradingMetrics(sp.GetRequiredService<System.Diagnostics.Metrics.IMeterFactory>()));
+        services.AddSingleton<IBacktestEngine>(new BaselineSplitBacktestEngine());
+
+        using var provider = services.BuildServiceProvider(validateScopes: true);
+        using var scope = provider.CreateScope();
+
+        var bootstrapper = scope.ServiceProvider.GetRequiredService<OptimizationSearchBootstrapper>();
+        var searchCoordinator = scope.ServiceProvider.GetRequiredService<OptimizationSearchCoordinator>();
+
+        Assert.NotNull(bootstrapper);
+        Assert.NotNull(searchCoordinator);
+    }
+
+    [Fact]
     public void ComputeAdaptiveBudget_ShrinksButDoesNotExceedConfiguredBudget()
     {
         int budget = OptimizationSearchEngine.ComputeAdaptiveBudget(50, [10, 12, 15, 16]);
@@ -243,4 +335,37 @@ public class OptimizationRunArchitectureTest
         CheckpointEveryN = 10,
         MaxConcurrentRuns = 3,
     };
+
+    private sealed class FakeTimeProvider : TimeProvider
+    {
+        private readonly DateTimeOffset _now;
+
+        public FakeTimeProvider(DateTimeOffset now) => _now = now;
+
+        public override DateTimeOffset GetUtcNow() => _now;
+    }
+
+    private sealed class BaselineSplitBacktestEngine : IBacktestEngine
+    {
+        public Task<BacktestResult> RunAsync(
+            Strategy strategy,
+            IReadOnlyList<Candle> candles,
+            decimal initialBalance,
+            CancellationToken ct,
+            BacktestOptions? options = null)
+        {
+            bool isTrainLike = candles.Count >= 300;
+            return Task.FromResult(new BacktestResult
+            {
+                InitialBalance = initialBalance,
+                FinalBalance = initialBalance + (isTrainLike ? 200m : 800m),
+                TotalTrades = isTrainLike ? 40 : 25,
+                WinRate = isTrainLike ? 0.45m : 0.62m,
+                ProfitFactor = isTrainLike ? 1.05m : 1.70m,
+                MaxDrawdownPct = isTrainLike ? 12m : 4m,
+                SharpeRatio = isTrainLike ? 0.4m : 1.6m,
+                Trades = []
+            });
+        }
+    }
 }

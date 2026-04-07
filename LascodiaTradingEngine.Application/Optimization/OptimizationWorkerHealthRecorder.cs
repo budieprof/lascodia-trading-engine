@@ -8,26 +8,31 @@ using LascodiaTradingEngine.Domain.Enums;
 namespace LascodiaTradingEngine.Application.Optimization;
 
 [RegisterService(ServiceLifetime.Singleton)]
-internal sealed class OptimizationWorkerHealthRecorder
+public sealed class OptimizationWorkerHealthRecorder
 {
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IWorkerHealthMonitor? _healthMonitor;
     private readonly IOptimizationWorkerHealthStore _optimizationHealthStore;
+    private readonly TimeProvider _timeProvider;
+    private DateTime UtcNow => _timeProvider.GetUtcNow().UtcDateTime;
 
     public OptimizationWorkerHealthRecorder(
         IServiceScopeFactory scopeFactory,
         IOptimizationWorkerHealthStore optimizationHealthStore,
-        IWorkerHealthMonitor? healthMonitor)
+        IWorkerHealthMonitor? healthMonitor,
+        TimeProvider timeProvider)
     {
         _scopeFactory = scopeFactory;
         _optimizationHealthStore = optimizationHealthStore;
         _healthMonitor = healthMonitor;
+        _timeProvider = timeProvider;
     }
 
     internal async Task RecordAsync(
         OptimizationConfig config,
         DateTime lastConfigRefreshUtc,
         DateTime nextConfigRefreshUtc,
+        OptimizationRunRecoveryCoordinator.LifecycleReconciliationSummary? reconciliationSummary,
         CancellationToken ct)
     {
         if (_healthMonitor is null)
@@ -52,6 +57,18 @@ internal sealed class OptimizationWorkerHealthRecorder
                           && r.Status == OptimizationRunStatus.Approved
                           && (r.ValidationFollowUpStatus == ValidationFollowUpStatus.Pending
                               || r.ValidationFollowUpStatus == null), ct);
+        int approvedRunsMissingFollowUps = await writeDb.Set<OptimizationRun>()
+            .CountAsync(r => !r.IsDeleted
+                          && r.Status == OptimizationRunStatus.Approved
+                          && (r.ValidationFollowUpsCreatedAt == null
+                              || r.ValidationFollowUpStatus == null), ct);
+        int pendingCompletionPreparation = await writeDb.Set<OptimizationRun>()
+            .CountAsync(r => !r.IsDeleted
+                          && (r.Status == OptimizationRunStatus.Completed
+                           || r.Status == OptimizationRunStatus.Approved
+                           || r.Status == OptimizationRunStatus.Rejected)
+                          && r.ResultsPersistedAt != null
+                          && r.CompletionPublicationPayloadJson == null, ct);
         int pendingCompletionPublications = await writeDb.Set<OptimizationRun>()
             .CountAsync(r => !r.IsDeleted
                           && (r.Status == OptimizationRunStatus.Completed
@@ -60,6 +77,42 @@ internal sealed class OptimizationWorkerHealthRecorder
                           && r.CompletionPublicationPayloadJson != null
                           && (r.CompletionPublicationStatus == OptimizationCompletionPublicationStatus.Pending
                            || r.CompletionPublicationStatus == OptimizationCompletionPublicationStatus.Failed), ct);
+        int strandedLifecycleRuns = await writeDb.Set<OptimizationRun>()
+            .CountAsync(r => !r.IsDeleted
+                          && (((r.Status == OptimizationRunStatus.Completed
+                             || r.Status == OptimizationRunStatus.Approved
+                             || r.Status == OptimizationRunStatus.Rejected)
+                            && (r.LifecycleReconciledAt == null
+                             || (r.ResultsPersistedAt != null && r.CompletionPublicationPayloadJson == null)
+                             || (r.CompletionPublicationPayloadJson != null && r.CompletionPublicationStatus == null)
+                             || r.CompletionPublicationErrorMessage != null
+                             || (r.CompletionPublicationStatus == OptimizationCompletionPublicationStatus.Published && r.CompletionPublicationCompletedAt == null)))
+                           || (r.Status == OptimizationRunStatus.Approved
+                               && (r.ValidationFollowUpsCreatedAt == null || r.ValidationFollowUpStatus == null || r.BestParametersJson == null))
+                           || (r.Status == OptimizationRunStatus.Rejected
+                               && (r.ValidationFollowUpsCreatedAt != null || r.ValidationFollowUpStatus != null))), ct);
+        var oldestStrandedLifecycleRun = await writeDb.Set<OptimizationRun>()
+            .Where(r => !r.IsDeleted
+                     && (((r.Status == OptimizationRunStatus.Completed
+                        || r.Status == OptimizationRunStatus.Approved
+                        || r.Status == OptimizationRunStatus.Rejected)
+                       && (r.LifecycleReconciledAt == null
+                        || (r.ResultsPersistedAt != null && r.CompletionPublicationPayloadJson == null)
+                        || (r.CompletionPublicationPayloadJson != null && r.CompletionPublicationStatus == null)
+                        || r.CompletionPublicationErrorMessage != null
+                        || (r.CompletionPublicationStatus == OptimizationCompletionPublicationStatus.Published && r.CompletionPublicationCompletedAt == null)))
+                      || (r.Status == OptimizationRunStatus.Approved
+                          && (r.ValidationFollowUpsCreatedAt == null || r.ValidationFollowUpStatus == null || r.BestParametersJson == null))
+                      || (r.Status == OptimizationRunStatus.Rejected
+                          && (r.ValidationFollowUpsCreatedAt != null || r.ValidationFollowUpStatus != null))))
+            .OrderBy(r => r.CompletedAt ?? r.ApprovedAt ?? r.ResultsPersistedAt ?? r.ExecutionStartedAt ?? r.ClaimedAt ?? (DateTime?)r.QueuedAt ?? r.StartedAt)
+            .Select(r => new
+            {
+                r.Id,
+                r.Status,
+                AnchorAtUtc = r.CompletedAt ?? r.ApprovedAt ?? r.ResultsPersistedAt ?? r.ExecutionStartedAt ?? r.ClaimedAt ?? (DateTime?)r.QueuedAt ?? r.StartedAt
+            })
+            .FirstOrDefaultAsync(ct);
         var oldestRunningRun = await writeDb.Set<OptimizationRun>()
             .Where(r => !r.IsDeleted && r.Status == OptimizationRunStatus.Running)
             .OrderBy(r => r.ExecutionStageUpdatedAt ?? r.ExecutionStartedAt ?? r.ClaimedAt ?? (DateTime?)r.QueuedAt ?? r.StartedAt)
@@ -81,18 +134,27 @@ internal sealed class OptimizationWorkerHealthRecorder
             AbandonedRuns = abandonedRuns,
             PendingFollowUps = pendingFollowUps,
             PendingCompletionPublications = pendingCompletionPublications,
+            ApprovedRunsMissingFollowUps = approvedRunsMissingFollowUps,
+            PendingCompletionPreparation = pendingCompletionPreparation,
+            StrandedLifecycleRuns = strandedLifecycleRuns,
+            LifecycleRepairsLastCycle = reconciliationSummary?.RepairedRuns ?? 0,
+            LifecycleBatchesLastCycle = reconciliationSummary?.BatchesProcessed ?? 0,
             ConfigCacheAgeSeconds = lastConfigRefreshUtc == DateTime.MinValue
                 ? 0
-                : Math.Max(0, (int)(DateTime.UtcNow - lastConfigRefreshUtc).TotalSeconds),
+                : Math.Max(0, (int)(UtcNow - lastConfigRefreshUtc).TotalSeconds),
             ConfigRefreshDueAtUtc = nextConfigRefreshUtc,
             ConfigRefreshIntervalSeconds = Math.Clamp(
                 config.SchedulePollSeconds,
                 30,
-                30),
+                24 * 60 * 60),
+            LastLifecycleReconciledAtUtc = reconciliationSummary?.LastActivityAtUtc,
             OldestRunningRunId = oldestRunningRun?.Id,
             OldestRunningStage = oldestRunningRun?.ExecutionStage,
             OldestRunningStageMessage = oldestRunningRun?.ExecutionStageMessage,
             OldestRunningStageUpdatedAt = oldestRunningRun?.ExecutionStageUpdatedAt,
+            OldestStrandedLifecycleRunId = oldestStrandedLifecycleRun?.Id,
+            OldestStrandedLifecycleStatus = oldestStrandedLifecycleRun?.Status,
+            OldestStrandedLifecycleAnchorAtUtc = oldestStrandedLifecycleRun?.AnchorAtUtc,
         });
         _healthMonitor.RecordWorkerMetadata("OptimizationWorker", null, TimeSpan.FromSeconds(30));
     }

@@ -1,4 +1,3 @@
-using System.Text.Json;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -16,7 +15,7 @@ using MarketRegimeEnum = LascodiaTradingEngine.Domain.Enums.MarketRegime;
 
 namespace LascodiaTradingEngine.Application.Optimization;
 
-[RegisterService(ServiceLifetime.Singleton)]
+[RegisterService(ServiceLifetime.Scoped)]
 internal sealed class OptimizationApprovalCoordinator
 {
     private readonly ILogger<OptimizationApprovalCoordinator> _logger;
@@ -26,6 +25,8 @@ internal sealed class OptimizationApprovalCoordinator
     private readonly OptimizationApprovalArtifactStore _artifactStore;
     private readonly OptimizationCrossRegimePersistenceService _crossRegimePersistenceService;
     private readonly OptimizationChronicFailureEscalator _chronicFailureEscalator;
+    private readonly TimeProvider _timeProvider;
+    private DateTime UtcNow => _timeProvider.GetUtcNow().UtcDateTime;
 
     public OptimizationApprovalCoordinator(
         ILogger<OptimizationApprovalCoordinator> logger,
@@ -34,7 +35,8 @@ internal sealed class OptimizationApprovalCoordinator
         OptimizationFollowUpCoordinator followUpCoordinator,
         OptimizationApprovalArtifactStore artifactStore,
         OptimizationCrossRegimePersistenceService crossRegimePersistenceService,
-        OptimizationChronicFailureEscalator chronicFailureEscalator)
+        OptimizationChronicFailureEscalator chronicFailureEscalator,
+        TimeProvider timeProvider)
     {
         _logger = logger;
         _metrics = metrics;
@@ -43,6 +45,7 @@ internal sealed class OptimizationApprovalCoordinator
         _artifactStore = artifactStore;
         _crossRegimePersistenceService = crossRegimePersistenceService;
         _chronicFailureEscalator = chronicFailureEscalator;
+        _timeProvider = timeProvider;
     }
 
     internal async Task ApplyAsync(
@@ -51,9 +54,9 @@ internal sealed class OptimizationApprovalCoordinator
         CandidateValidationResult vr,
         MarketRegimeEnum? currentRegime,
         DateTime candleLookbackStart,
-        BacktestOptions screeningOptions,
-        PipelinePersistenceState? persistenceState)
+        BacktestOptions screeningOptions)
     {
+        var nowUtc = UtcNow;
         var run = ctx.Run;
         var strategy = ctx.Strategy;
         var db = ctx.Db;
@@ -75,29 +78,12 @@ internal sealed class OptimizationApprovalCoordinator
 
             if (liveStrategy is null)
             {
-                OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Rejected, DateTime.UtcNow);
+                OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Rejected, nowUtc);
                 run.FailureCategory = OptimizationFailureCategory.StrategyRemoved;
-
-                try
-                {
-                    var rejectionReport = string.IsNullOrWhiteSpace(run.ApprovalReportJson)
-                        ? new Dictionary<string, object?>()
-                        : JsonSerializer.Deserialize<Dictionary<string, object?>>(run.ApprovalReportJson) ?? [];
-                    rejectionReport["topCandidateFailureReason"] = "Strategy removed before approved parameters could be applied.";
-                    rejectionReport["approvalBlockedReason"] = "StrategyRemoved";
-                    run.ApprovalReportJson = JsonSerializer.Serialize(rejectionReport);
-                }
-                catch
-                {
-                    run.ApprovalReportJson = JsonSerializer.Serialize(new
-                    {
-                        topCandidateFailureReason = "Strategy removed before approved parameters could be applied.",
-                        approvalBlockedReason = "StrategyRemoved",
-                    });
-                }
+                run.ApprovalReportJson = OptimizationApprovalReportParser.MarkStrategyRemoved(run.ApprovalReportJson);
+                run.ApprovalEvaluatedAt = nowUtc;
 
                 await writeCtx.SaveChangesAsync(ct);
-                persistenceState?.CompletionPersisted = true;
 
                 _logger.LogWarning(
                     "OptimizationApprovalCoordinator: strategy {StrategyId} disappeared before approval for run {RunId} — rejecting auto-approval",
@@ -132,6 +118,7 @@ internal sealed class OptimizationApprovalCoordinator
             var originalErrorMessage = run.ErrorMessage;
             var originalValidationFollowUpsCreatedAt = run.ValidationFollowUpsCreatedAt;
             var originalValidationFollowUpStatus = run.ValidationFollowUpStatus;
+            var originalApprovalEvaluatedAt = run.ApprovalEvaluatedAt;
 
             string? originalRollbackParametersJson = liveStrategy.RollbackParametersJson;
             string? originalStrategyParametersJson = liveStrategy.ParametersJson;
@@ -148,6 +135,7 @@ internal sealed class OptimizationApprovalCoordinator
                 run.ErrorMessage = originalErrorMessage;
                 run.ValidationFollowUpsCreatedAt = originalValidationFollowUpsCreatedAt;
                 run.ValidationFollowUpStatus = originalValidationFollowUpStatus;
+                run.ApprovalEvaluatedAt = originalApprovalEvaluatedAt;
 
                 liveStrategy.RollbackParametersJson = originalRollbackParametersJson;
                 liveStrategy.ParametersJson = originalStrategyParametersJson ?? liveStrategy.ParametersJson;
@@ -163,7 +151,7 @@ internal sealed class OptimizationApprovalCoordinator
                 return;
             }
 
-            GradualRolloutManager.StartRollout(liveStrategy, run.BestParametersJson, run.Id, initialPct: 25);
+            GradualRolloutManager.StartRollout(liveStrategy, run.BestParametersJson, run.Id, nowUtc, initialPct: 25);
             _logger.LogInformation(
                 "OptimizationApprovalCoordinator: initiated gradual rollout for strategy {StrategyId} at 25% traffic",
                 liveStrategy.Id);
@@ -204,7 +192,14 @@ internal sealed class OptimizationApprovalCoordinator
                     persistChanges: false);
             }
 
-            OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Approved, DateTime.UtcNow);
+            if (run.Status == OptimizationRunStatus.Running)
+                OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Completed, nowUtc);
+            else if (run.Status != OptimizationRunStatus.Completed)
+                throw new InvalidOperationException(
+                    $"Cannot approve optimization run {run.Id} from status {run.Status}; expected Completed.");
+
+            OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Approved, nowUtc);
+            run.ApprovalEvaluatedAt = nowUtc;
             var approvedEvent = new OptimizationApprovedIntegrationEvent
             {
                 OptimizationRunId = run.Id,
@@ -213,25 +208,23 @@ internal sealed class OptimizationApprovalCoordinator
                 Timeframe = strategy.Timeframe,
                 Improvement = improvement,
                 OosScore = vr.OosHealthScore,
-                ApprovedAt = run.ApprovedAt ?? DateTime.UtcNow,
+                ApprovedAt = run.ApprovedAt ?? nowUtc,
             };
 
             try
             {
                 await eventService.SaveAndPublish(writeCtx, approvedEvent);
-                persistenceState?.CompletionPersisted = true;
             }
             catch (DbUpdateException ex) when (OptimizationFollowUpCoordinator.IsDuplicateFollowUpConstraintViolation(ex))
             {
                 OptimizationFollowUpCoordinator.DetachPendingValidationFollowUps(writeDb, run.Id);
-                run.ValidationFollowUpsCreatedAt ??= DateTime.UtcNow;
+                run.ValidationFollowUpsCreatedAt ??= nowUtc;
                 run.ValidationFollowUpStatus ??= ValidationFollowUpStatus.Pending;
                 _metrics.OptimizationDuplicateFollowUpsPrevented.Add(1);
 
                 try
                 {
                     await eventService.SaveAndPublish(writeCtx, approvedEvent);
-                    persistenceState?.CompletionPersisted = true;
                 }
                 catch (Exception retryEx)
                 {
@@ -241,7 +234,7 @@ internal sealed class OptimizationApprovalCoordinator
                         run,
                         $"Failed to persist approved optimization changes after duplicate follow-up retry: {retryEx.Message}",
                         OptimizationFailureCategory.Transient,
-                        DateTime.UtcNow);
+                        nowUtc);
                     await writeCtx.SaveChangesAsync(ct);
                     _logger.LogError(retryEx,
                         "OptimizationApprovalCoordinator: failed to persist approval for run {RunId} after duplicate follow-up retry — marked Failed for retry",
@@ -257,7 +250,7 @@ internal sealed class OptimizationApprovalCoordinator
                     run,
                     $"Failed to persist approved optimization changes: {ex.Message}",
                     OptimizationFailureCategory.Transient,
-                    DateTime.UtcNow);
+                    nowUtc);
                 await writeCtx.SaveChangesAsync(ct);
                 _logger.LogError(ex,
                     "OptimizationApprovalCoordinator: failed to persist approval for run {RunId} — marked Failed for retry",
@@ -315,45 +308,31 @@ internal sealed class OptimizationApprovalCoordinator
             try
             {
                 var failedCandidates = (vr.FailedCandidates ?? [])
-                    .Select(f => new { Rank = f.Rank, Params = f.Params, Reason = f.Reason, Score = f.Score })
+                    .Select(f => new OptimizationApprovalReportParser.FailedCandidateDiagnostic(
+                        f.Rank,
+                        f.Params,
+                        f.Reason,
+                        f.Score))
                     .ToArray();
 
                 if (failedCandidates.Length == 0)
                 {
                     failedCandidates =
                     [
-                        new
-                        {
-                            Rank = 1,
-                            Params = vr.Winner.ParamsJson,
-                            Reason = vr.FailureReason ?? "unknown",
-                            Score = vr.HasOosValidation ? vr.OosHealthScore : vr.Winner.HealthScore,
-                        }
+                        new OptimizationApprovalReportParser.FailedCandidateDiagnostic(
+                            1,
+                            vr.Winner.ParamsJson,
+                            vr.FailureReason ?? "unknown",
+                            vr.HasOosValidation ? vr.OosHealthScore : vr.Winner.HealthScore)
                     ];
                 }
 
-                var existingReport = run.ApprovalReportJson;
-                if (string.IsNullOrWhiteSpace(existingReport))
-                {
-                    run.ApprovalReportJson = JsonSerializer.Serialize(new
-                    {
-                        failedCandidates,
-                        topCandidateFailureReason = vr.FailureReason,
-                        failedCandidateScoreSource = vr.HasOosValidation ? "OutOfSample" : "InSample",
-                    });
-                }
-                else
-                {
-                    var existing = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(existingReport)
-                        ?? new Dictionary<string, JsonElement>();
-                    existing["failedCandidates"] = JsonSerializer.SerializeToElement(failedCandidates);
-                    existing["topCandidateFailureReason"] = JsonSerializer.SerializeToElement(vr.FailureReason);
-                    existing["failedCandidateScore"] = JsonSerializer.SerializeToElement(
-                        vr.HasOosValidation ? vr.OosHealthScore : vr.Winner.HealthScore);
-                    existing["failedCandidateScoreSource"] = JsonSerializer.SerializeToElement(
-                        vr.HasOosValidation ? "OutOfSample" : "InSample");
-                    run.ApprovalReportJson = JsonSerializer.Serialize(existing);
-                }
+                run.ApprovalReportJson = OptimizationApprovalReportParser.SetManualReviewDiagnostics(
+                    run.ApprovalReportJson,
+                    failedCandidates,
+                    failureReason,
+                    vr.HasOosValidation ? vr.OosHealthScore : vr.Winner.HealthScore,
+                    vr.HasOosValidation);
             }
             catch (Exception ex)
             {
@@ -362,8 +341,8 @@ internal sealed class OptimizationApprovalCoordinator
                     run.Id);
             }
 
+            run.ApprovalEvaluatedAt = nowUtc;
             await writeCtx.SaveChangesAsync(ct);
-            persistenceState?.CompletionPersisted = true;
 
             _logger.LogInformation(
                 "OptimizationApprovalCoordinator: run {RunId} requires manual review — {Reason}",

@@ -7,8 +7,15 @@ using LascodiaTradingEngine.Domain.Entities;
 namespace LascodiaTradingEngine.Application.Optimization;
 
 [RegisterService(ServiceLifetime.Singleton)]
-internal sealed class OptimizationConfigProvider
+public sealed class OptimizationConfigProvider
 {
+    internal sealed record CacheSnapshot(
+        OptimizationConfig? Config,
+        DateTime LastLoadedAtUtc,
+        DateTime NextRefreshDueAtUtc,
+        long Generation,
+        bool IsCached);
+
     /// <summary>
     /// Single source of truth for all recognized optimization/backtest config keys.
     /// Used by both <see cref="LoadAsync"/> (batch query) and
@@ -52,14 +59,76 @@ internal sealed class OptimizationConfigProvider
         "Optimization:MaxTradeTimeConcentration",
     ];
 
-    private readonly ILogger<OptimizationConfigProvider> _logger;
+    private static readonly TimeSpan CacheTtl = TimeSpan.FromSeconds(60);
 
-    public OptimizationConfigProvider(ILogger<OptimizationConfigProvider> logger)
+    private readonly ILogger<OptimizationConfigProvider> _logger;
+    private readonly TimeProvider _timeProvider;
+    private readonly object _cacheLock = new();
+    private OptimizationConfig? _cachedConfig;
+    private DateTime _cachedAtUtc;
+    private long _cacheGeneration;
+    private DateTime _lastInvalidatedAtUtc;
+    private DateTime UtcNow => _timeProvider.GetUtcNow().UtcDateTime;
+
+    public OptimizationConfigProvider(
+        ILogger<OptimizationConfigProvider> logger,
+        TimeProvider timeProvider)
     {
         _logger = logger;
+        _timeProvider = timeProvider;
     }
 
     internal async Task<OptimizationConfig> LoadAsync(DbContext db, CancellationToken ct)
+    {
+        lock (_cacheLock)
+        {
+            if (_cachedConfig is not null
+                && (UtcNow - _cachedAtUtc) < CacheTtl)
+            {
+                return _cachedConfig;
+            }
+        }
+
+        var config = await LoadDirectAsync(db, _logger, ct);
+        lock (_cacheLock)
+        {
+            _cachedConfig = config;
+            _cachedAtUtc = UtcNow;
+        }
+
+        return config;
+    }
+
+    internal void InvalidateCache()
+    {
+        lock (_cacheLock)
+        {
+            _cachedConfig = null;
+            _cachedAtUtc = default;
+            _cacheGeneration++;
+            _lastInvalidatedAtUtc = UtcNow;
+        }
+    }
+
+    internal CacheSnapshot GetCacheSnapshot()
+    {
+        lock (_cacheLock)
+        {
+            bool isCached = _cachedConfig is not null && _cachedAtUtc != default;
+            var lastLoadedAtUtc = isCached ? _cachedAtUtc : _lastInvalidatedAtUtc;
+            return new CacheSnapshot(
+                _cachedConfig,
+                lastLoadedAtUtc,
+                lastLoadedAtUtc == default ? default : lastLoadedAtUtc.Add(CacheTtl),
+                _cacheGeneration,
+                isCached);
+        }
+    }
+
+    internal static async Task<OptimizationConfig> LoadDirectAsync(
+        DbContext db,
+        ILogger logger,
+        CancellationToken ct)
     {
         var batch = await OptimizationGridBuilder.GetConfigBatchAsync(db, KnownConfigKeys, ct);
         var preset = GetPresetDefaults(OptimizationGridBuilder.GetConfigValue(batch, "Optimization:Preset", "balanced"));
@@ -140,6 +209,12 @@ internal sealed class OptimizationConfigProvider
     }
 
     internal async Task DetectUnknownConfigKeysAsync(DbContext db, CancellationToken ct)
+        => await DetectUnknownConfigKeysAsync(db, _logger, ct);
+
+    internal static async Task DetectUnknownConfigKeysAsync(
+        DbContext db,
+        ILogger logger,
+        CancellationToken ct)
     {
         try
         {
@@ -154,7 +229,7 @@ internal sealed class OptimizationConfigProvider
             var unrecognized = dbKeys.Where(k => !knownKeys.Contains(k)).ToList();
             if (unrecognized.Count > 0)
             {
-                _logger.LogWarning(
+                logger.LogWarning(
                     "OptimizationWorker: {Count} unrecognized config key(s) found — possible typos that will use defaults instead: {Keys}",
                     unrecognized.Count,
                     string.Join(", ", unrecognized));
@@ -162,11 +237,16 @@ internal sealed class OptimizationConfigProvider
         }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "OptimizationWorker: config typo detection failed (non-fatal)");
+            logger.LogDebug(ex, "OptimizationWorker: config typo detection failed (non-fatal)");
         }
     }
 
     internal void LogPresetOverrides(OptimizationConfig config)
+        => LogPresetOverrides(config, _logger);
+
+    internal static void LogPresetOverrides(
+        OptimizationConfig config,
+        ILogger logger)
     {
         var preset = GetPresetDefaults(config.PresetName);
         var overrides = new List<string>();
@@ -184,7 +264,7 @@ internal sealed class OptimizationConfigProvider
 
         if (overrides.Count > 0)
         {
-            _logger.LogInformation(
+            logger.LogInformation(
                 "OptimizationWorker: using preset '{Preset}' with {Count} override(s): {Overrides}",
                 config.PresetName,
                 overrides.Count,
@@ -192,7 +272,7 @@ internal sealed class OptimizationConfigProvider
         }
         else
         {
-            _logger.LogDebug("OptimizationWorker: using preset '{Preset}' with no overrides", config.PresetName);
+            logger.LogDebug("OptimizationWorker: using preset '{Preset}' with no overrides", config.PresetName);
         }
     }
 

@@ -10,6 +10,12 @@ namespace LascodiaTradingEngine.Application.Optimization;
 [RegisterService(ServiceLifetime.Singleton)]
 public sealed class OptimizationApprovalArtifactStore
 {
+    private readonly TimeProvider _timeProvider;
+    private DateTime UtcNow => _timeProvider.GetUtcNow().UtcDateTime;
+
+    public OptimizationApprovalArtifactStore(TimeProvider timeProvider)
+        => _timeProvider = timeProvider;
+
     internal void RollbackTrackedArtifacts(DbContext writeDb, long optimizationRunId, long strategyId)
     {
         try
@@ -60,7 +66,7 @@ public sealed class OptimizationApprovalArtifactStore
             existing.HealthScore = healthScore;
             existing.HealthScoreCILower = ciLower;
             existing.OptimizationRunId = run.Id;
-            existing.OptimizedAt = DateTime.UtcNow;
+            existing.OptimizedAt = UtcNow;
         }
         else
         {
@@ -72,7 +78,7 @@ public sealed class OptimizationApprovalArtifactStore
                 HealthScore = healthScore,
                 HealthScoreCILower = ciLower,
                 OptimizationRunId = run.Id,
-                OptimizedAt = DateTime.UtcNow,
+                OptimizedAt = UtcNow,
             });
         }
 

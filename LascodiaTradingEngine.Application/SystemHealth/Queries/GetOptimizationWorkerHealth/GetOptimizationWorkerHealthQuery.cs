@@ -34,13 +34,22 @@ public sealed class OptimizationWorkerHealthDto
     public int AbandonedRuns { get; init; }
     public int PendingFollowUps { get; init; }
     public int PendingCompletionPublications { get; init; }
+    public int ApprovedRunsMissingFollowUps { get; init; }
+    public int PendingCompletionPreparation { get; init; }
+    public int StrandedLifecycleRuns { get; init; }
+    public int LifecycleRepairsLastCycle { get; init; }
+    public int LifecycleBatchesLastCycle { get; init; }
     public int ConfigCacheAgeSeconds { get; init; }
     public DateTime? ConfigRefreshDueAtUtc { get; init; }
     public int ConfigRefreshIntervalSeconds { get; init; }
+    public DateTime? LastLifecycleReconciledAtUtc { get; init; }
     public long? OldestRunningRunId { get; init; }
     public OptimizationExecutionStage? OldestRunningStage { get; init; }
     public string? OldestRunningStageMessage { get; init; }
     public DateTime? OldestRunningStageUpdatedAt { get; init; }
+    public long? OldestStrandedLifecycleRunId { get; init; }
+    public OptimizationRunStatus? OldestStrandedLifecycleStatus { get; init; }
+    public DateTime? OldestStrandedLifecycleAnchorAtUtc { get; init; }
 }
 
 public class GetOptimizationWorkerHealthQuery : IRequest<ResponseData<OptimizationWorkerHealthDto>>
@@ -80,13 +89,22 @@ public class GetOptimizationWorkerHealthQueryHandler
             AbandonedRuns = typedState.AbandonedRuns,
             PendingFollowUps = typedState.PendingFollowUps,
             PendingCompletionPublications = typedState.PendingCompletionPublications,
+            ApprovedRunsMissingFollowUps = typedState.ApprovedRunsMissingFollowUps,
+            PendingCompletionPreparation = typedState.PendingCompletionPreparation,
+            StrandedLifecycleRuns = typedState.StrandedLifecycleRuns,
+            LifecycleRepairsLastCycle = typedState.LifecycleRepairsLastCycle,
+            LifecycleBatchesLastCycle = typedState.LifecycleBatchesLastCycle,
             ConfigCacheAgeSeconds = typedState.ConfigCacheAgeSeconds,
             ConfigRefreshDueAtUtc = typedState.ConfigRefreshDueAtUtc,
             ConfigRefreshIntervalSeconds = typedState.ConfigRefreshIntervalSeconds,
+            LastLifecycleReconciledAtUtc = typedState.LastLifecycleReconciledAtUtc,
             OldestRunningRunId = typedState.OldestRunningRunId,
             OldestRunningStage = typedState.OldestRunningStage,
             OldestRunningStageMessage = typedState.OldestRunningStageMessage,
             OldestRunningStageUpdatedAt = typedState.OldestRunningStageUpdatedAt,
+            OldestStrandedLifecycleRunId = typedState.OldestStrandedLifecycleRunId,
+            OldestStrandedLifecycleStatus = typedState.OldestStrandedLifecycleStatus,
+            OldestStrandedLifecycleAnchorAtUtc = typedState.OldestStrandedLifecycleAnchorAtUtc,
         };
 
         return Task.FromResult(ResponseData<OptimizationWorkerHealthDto>.Init(dto, true, "Successful", "00"));

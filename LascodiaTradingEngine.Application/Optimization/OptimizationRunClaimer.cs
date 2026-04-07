@@ -36,9 +36,8 @@ internal static class OptimizationRunClaimer
     /// <param name="ct">Cancellation token.</param>
     /// <returns>The ID of the claimed run, or null if no queued run is available.</returns>
     internal static async Task<ClaimResult> ClaimNextRunAsync(
-        DbContext writeDb, int maxConcurrentRuns, TimeSpan leaseDuration, CancellationToken ct)
+        DbContext writeDb, int maxConcurrentRuns, TimeSpan leaseDuration, DateTime nowUtc, CancellationToken ct)
     {
-        var nowUtc = DateTime.UtcNow;
         var leaseExpiry = nowUtc.Add(leaseDuration);
         var leaseToken = Guid.NewGuid();
         var tableName = GetQuotedTableName(writeDb, typeof(OptimizationRun));
@@ -107,10 +106,8 @@ internal static class OptimizationRunClaimer
     /// Re-queues runs with living strategies; marks orphaned runs (deleted strategy) as Failed.
     /// </summary>
     internal static async Task<(int Requeued, int Orphaned)> RequeueExpiredRunsAsync(
-        DbContext db, CancellationToken ct)
+        DbContext db, DateTime nowUtc, CancellationToken ct)
     {
-        var nowUtc = DateTime.UtcNow;
-
         var activeStrategyIds = await db.Set<Strategy>()
             .Where(s => !s.IsDeleted)
             .Select(s => s.Id)
@@ -160,9 +157,9 @@ internal static class OptimizationRunClaimer
     }
 
     /// <summary>Updates the heartbeat timestamp and extends the execution lease.</summary>
-    internal static void StampHeartbeat(OptimizationRun run, TimeSpan leaseDuration)
+    internal static void StampHeartbeat(OptimizationRun run, TimeSpan leaseDuration, DateTime utcNow)
     {
-        run.LastHeartbeatAt = DateTime.UtcNow;
+        run.LastHeartbeatAt = utcNow;
         run.ExecutionLeaseExpiresAt = run.LastHeartbeatAt.Value.Add(leaseDuration);
     }
 

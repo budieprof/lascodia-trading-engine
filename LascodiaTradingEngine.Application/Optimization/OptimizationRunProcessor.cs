@@ -15,7 +15,7 @@ using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.Optimization;
 
-[RegisterService(ServiceLifetime.Singleton)]
+[RegisterService(ServiceLifetime.Scoped)]
 internal sealed class OptimizationRunProcessor
 {
     private static readonly ActivitySource s_activitySource = new("LascodiaTradingEngine.Optimization");
@@ -23,30 +23,31 @@ internal sealed class OptimizationRunProcessor
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<OptimizationRunProcessor> _logger;
     private readonly TradingMetrics _metrics;
-    private readonly OptimizationValidator _validator;
     private readonly OptimizationConfigProvider _configProvider;
     private readonly OptimizationRunPreflightService _preflightService;
     private readonly OptimizationRunExecutor _runExecutor;
     private readonly OptimizationRunLeaseManager _leaseManager;
+    private readonly TimeProvider _timeProvider;
+    private DateTime UtcNow => _timeProvider.GetUtcNow().UtcDateTime;
 
     public OptimizationRunProcessor(
         IServiceScopeFactory scopeFactory,
         ILogger<OptimizationRunProcessor> logger,
         TradingMetrics metrics,
-        OptimizationValidator validator,
         OptimizationConfigProvider configProvider,
         OptimizationRunPreflightService preflightService,
         OptimizationRunExecutor runExecutor,
-        OptimizationRunLeaseManager leaseManager)
+        OptimizationRunLeaseManager leaseManager,
+        TimeProvider timeProvider)
     {
         _scopeFactory = scopeFactory;
         _logger = logger;
         _metrics = metrics;
-        _validator = validator;
         _configProvider = configProvider;
         _preflightService = preflightService;
         _runExecutor = runExecutor;
         _leaseManager = leaseManager;
+        _timeProvider = timeProvider;
     }
 
     internal async Task ProcessNextQueuedRunAsync(CancellationToken ct)
@@ -70,6 +71,7 @@ internal sealed class OptimizationRunProcessor
             writeDb,
             maxConcurrentRuns,
             OptimizationExecutionLeasePolicy.LeaseDuration,
+            UtcNow,
             ct);
 
         if (!claimResult.RunId.HasValue)
@@ -98,7 +100,6 @@ internal sealed class OptimizationRunProcessor
         CancellationTokenSource? leaseHeartbeatCts = null;
         Task? leaseHeartbeatTask = null;
         var runCt = ct;
-        var persistenceState = new PipelinePersistenceState();
         Guid claimedLeaseToken = claimResult.LeaseToken;
 
         using var runActivity = s_activitySource.StartActivity("optimization.run");
@@ -138,7 +139,6 @@ internal sealed class OptimizationRunProcessor
                 alertDispatcher,
                 eventService,
                 sw,
-                persistenceState,
                 ct,
                 runCt);
         }
@@ -149,10 +149,10 @@ internal sealed class OptimizationRunProcessor
                 run.Id,
                 dqEx.Message);
             _metrics.OptimizationRunsDeferred.Add(1, new KeyValuePair<string, object?>("reason", "data_quality"));
-            OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Queued, DateTime.UtcNow);
+            OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Queued, UtcNow);
             run.FailureCategory = OptimizationFailureCategory.DataQuality;
-            run.DeferredUntilUtc = DateTime.UtcNow.AddHours(1);
-            SetRunStage(run, OptimizationExecutionStage.Queued, $"Deferred because source data is not yet usable: {dqEx.Message}");
+            run.DeferredUntilUtc = UtcNow.AddHours(1);
+            SetRunStage(run, OptimizationExecutionStage.Queued, $"Deferred because source data is not yet usable: {dqEx.Message}", UtcNow);
             await writeCtx.SaveChangesAsync(ct);
         }
         catch (DbUpdateConcurrencyException ex)
@@ -166,7 +166,7 @@ internal sealed class OptimizationRunProcessor
                 return;
             }
 
-            if (OptimizationRunLifecycle.ShouldPreservePersistedResult(persistenceState.CompletionPersisted, run.Status))
+            if (await HasDurablePersistedTerminalResultAsync(writeDb, run.Id, CancellationToken.None))
             {
                 _logger.LogError(ex,
                     "OptimizationRunProcessor: post-completion concurrency conflict for run {RunId} after result persistence — keeping status {Status}",
@@ -179,7 +179,7 @@ internal sealed class OptimizationRunProcessor
             if (OptimizationRunStateMachine.CanTransition(run.Status, OptimizationRunStatus.Failed))
             {
                 run.FailureCategory = OptimizationFailureCategory.Transient;
-                OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Failed, DateTime.UtcNow, ex.Message);
+                OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Failed, UtcNow, ex.Message);
             }
 
             await writeCtx.SaveChangesAsync(ct);
@@ -202,7 +202,7 @@ internal sealed class OptimizationRunProcessor
         }
         catch (OperationCanceledException) when (runCts is not null && runCts.IsCancellationRequested && !ct.IsCancellationRequested)
         {
-            if (OptimizationRunLifecycle.ShouldPreservePersistedResult(persistenceState.CompletionPersisted, run.Status))
+            if (await HasDurablePersistedTerminalResultAsync(writeDb, run.Id, CancellationToken.None))
             {
                 _logger.LogWarning(
                     "OptimizationRunProcessor: aggregate timeout fired after completion persistence for run {RunId} — keeping status {Status}",
@@ -221,7 +221,7 @@ internal sealed class OptimizationRunProcessor
                 OptimizationRunStateMachine.Transition(
                     run,
                     OptimizationRunStatus.Failed,
-                    DateTime.UtcNow,
+                    UtcNow,
                     $"Aggregate timeout exceeded ({config?.MaxRunTimeoutMinutes ?? 0} minutes)");
             }
             await writeCtx.SaveChangesAsync(ct);
@@ -244,7 +244,7 @@ internal sealed class OptimizationRunProcessor
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            if (OptimizationRunLifecycle.ShouldPreservePersistedResult(persistenceState.CompletionPersisted, run.Status))
+            if (await HasDurablePersistedTerminalResultAsync(writeDb, run.Id, CancellationToken.None))
             {
                 _logger.LogWarning(
                     "OptimizationRunProcessor: shutdown cancellation arrived after completion persistence for run {RunId} — keeping status {Status}",
@@ -256,7 +256,7 @@ internal sealed class OptimizationRunProcessor
             _logger.LogWarning(
                 "OptimizationRunProcessor: run {RunId} interrupted by shutdown — re-queuing with intermediate results",
                 run.Id);
-            OptimizationRunLifecycle.RequeueForRecovery(run, DateTime.UtcNow);
+            OptimizationRunLifecycle.RequeueForRecovery(run, UtcNow);
 
             using var shutdownCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
             try
@@ -276,7 +276,7 @@ internal sealed class OptimizationRunProcessor
         }
         catch (Exception ex)
         {
-            if (OptimizationRunLifecycle.ShouldPreservePersistedResult(persistenceState.CompletionPersisted, run.Status))
+            if (await HasDurablePersistedTerminalResultAsync(writeDb, run.Id, CancellationToken.None))
             {
                 _logger.LogError(ex,
                     "OptimizationRunProcessor: post-completion step failed for run {RunId} after result persistence — keeping status {Status}",
@@ -289,7 +289,7 @@ internal sealed class OptimizationRunProcessor
             if (OptimizationRunStateMachine.CanTransition(run.Status, OptimizationRunStatus.Failed))
             {
                 run.FailureCategory = OptimizationFailureClassifier.Classify(ex);
-                OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Failed, DateTime.UtcNow, ex.Message);
+                OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Failed, UtcNow, ex.Message);
             }
             else
             {
@@ -338,7 +338,6 @@ internal sealed class OptimizationRunProcessor
             }
 
             runCts?.Dispose();
-            _validator.ClearCache();
         }
     }
 
@@ -359,9 +358,32 @@ internal sealed class OptimizationRunProcessor
         }
     }
 
+    private static async Task<bool> HasDurablePersistedTerminalResultAsync(
+        DbContext writeDb,
+        long runId,
+        CancellationToken ct)
+    {
+        var current = await writeDb.Set<OptimizationRun>()
+            .AsNoTracking()
+            .Where(r => r.Id == runId && !r.IsDeleted)
+            .Select(r => new
+            {
+                r.Status,
+                r.ResultsPersistedAt
+            })
+            .FirstOrDefaultAsync(ct);
+
+        return current is not null
+            && current.ResultsPersistedAt.HasValue
+            && current.Status is OptimizationRunStatus.Completed
+                or OptimizationRunStatus.Approved
+                or OptimizationRunStatus.Rejected;
+    }
+
     private static void SetRunStage(
         OptimizationRun run,
         OptimizationExecutionStage stage,
-        string? message)
-        => OptimizationRunProgressTracker.SetStage(run, stage, message, DateTime.UtcNow);
+        string? message,
+        DateTime utcNow)
+        => OptimizationRunProgressTracker.SetStage(run, stage, message, utcNow);
 }

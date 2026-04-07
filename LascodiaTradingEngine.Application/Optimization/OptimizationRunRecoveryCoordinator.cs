@@ -6,6 +6,7 @@ using Microsoft.Extensions.Logging;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Diagnostics;
+using LascodiaTradingEngine.Application.Common.Events;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
@@ -15,18 +16,42 @@ namespace LascodiaTradingEngine.Application.Optimization;
 [RegisterService(ServiceLifetime.Singleton)]
 internal sealed class OptimizationRunRecoveryCoordinator
 {
+    internal sealed record LifecycleReconciliationSummary(
+        int RepairedRuns,
+        int BatchesProcessed,
+        int MissingCompletionPayloadRepairs,
+        int MalformedCompletionPayloadRepairs,
+        int FollowUpRepairs,
+        int ConfigSnapshotRepairs,
+        int BestParameterRepairs,
+        DateTime StartedAtUtc,
+        DateTime? LastActivityAtUtc);
+
+    private const int LifecycleReconciliationBatchLimit = 50;
+    private const int LifecycleReconciliationMaxBatchesPerCycle = 4;
+
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly TradingMetrics _metrics;
     private readonly ILogger<OptimizationRunRecoveryCoordinator> _logger;
+    private readonly OptimizationFollowUpCoordinator _followUpCoordinator;
+    private readonly OptimizationRunScopedConfigService _runScopedConfigService;
+    private readonly TimeProvider _timeProvider;
+    private DateTime UtcNow => _timeProvider.GetUtcNow().UtcDateTime;
 
     public OptimizationRunRecoveryCoordinator(
         IServiceScopeFactory scopeFactory,
         TradingMetrics metrics,
-        ILogger<OptimizationRunRecoveryCoordinator> logger)
+        ILogger<OptimizationRunRecoveryCoordinator> logger,
+        OptimizationFollowUpCoordinator followUpCoordinator,
+        OptimizationRunScopedConfigService runScopedConfigService,
+        TimeProvider timeProvider)
     {
         _scopeFactory = scopeFactory;
         _metrics = metrics;
         _logger = logger;
+        _followUpCoordinator = followUpCoordinator;
+        _runScopedConfigService = runScopedConfigService;
+        _timeProvider = timeProvider;
     }
 
     internal async Task RecoverStaleRunningRunsAsync(CancellationToken ct)
@@ -36,7 +61,7 @@ internal sealed class OptimizationRunRecoveryCoordinator
             await using var scope = _scopeFactory.CreateAsyncScope();
             var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
             var db = writeCtx.GetDbContext();
-            var nowUtc = DateTime.UtcNow;
+            var nowUtc = UtcNow;
 
             var activeStrategyIds = await db.Set<Strategy>()
                 .Where(s => !s.IsDeleted)
@@ -99,7 +124,7 @@ internal sealed class OptimizationRunRecoveryCoordinator
         var writeCtx = recoveryScope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
         var db = writeCtx.GetDbContext();
 
-        var (requeued, orphaned) = await OptimizationRunClaimer.RequeueExpiredRunsAsync(db, ct);
+        var (requeued, orphaned) = await OptimizationRunClaimer.RequeueExpiredRunsAsync(db, UtcNow, ct);
 
         if (requeued > 0)
             _metrics.OptimizationLeaseReclaims.Add(requeued);
@@ -119,12 +144,13 @@ internal sealed class OptimizationRunRecoveryCoordinator
             var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
             var db = writeCtx.GetDbContext();
 
-            var cutoff = DateTime.UtcNow.AddHours(-24);
+            var nowUtc = UtcNow;
+            var cutoff = nowUtc.AddHours(-24);
             var staleQueuedRuns = await db.Set<OptimizationRun>()
                 .Where(r => r.Status == OptimizationRunStatus.Queued
                           && !r.IsDeleted
                           && r.QueuedAt < cutoff
-                          && (r.DeferredUntilUtc == null || r.DeferredUntilUtc < DateTime.UtcNow))
+                          && (r.DeferredUntilUtc == null || r.DeferredUntilUtc < nowUtc))
                 .ToListAsync(ct);
 
             foreach (var run in staleQueuedRuns)
@@ -132,7 +158,7 @@ internal sealed class OptimizationRunRecoveryCoordinator
                 run.Status = OptimizationRunStatus.Failed;
                 run.ErrorMessage = "Stale: queued for over 24 hours without being claimed";
                 run.FailureCategory = OptimizationFailureCategory.Transient;
-                run.CompletedAt = DateTime.UtcNow;
+                run.CompletedAt = nowUtc;
                 _logger.LogWarning("OptimizationRunRecoveryCoordinator: marking stale queued run {RunId} as Failed", run.Id);
             }
 
@@ -154,7 +180,7 @@ internal sealed class OptimizationRunRecoveryCoordinator
         var writeDb = writeCtx.GetDbContext();
 
         int maxRetryAttempts = Math.Max(0, config.MaxRetryAttempts);
-        var nowUtc = DateTime.UtcNow;
+        var nowUtc = UtcNow;
 
         var retryableRuns = await writeDb.Set<OptimizationRun>()
             .Where(r => r.Status == OptimizationRunStatus.Failed
@@ -226,7 +252,7 @@ internal sealed class OptimizationRunRecoveryCoordinator
                 OptimizationRunStateMachine.Transition(
                     run,
                     OptimizationRunStatus.Abandoned,
-                    DateTime.UtcNow,
+                    nowUtc,
                     $"Superseded by newer optimization attempt {newerRun.RunId} completed at {newerRun.AnchorUtc:O}");
                 await writeCtx.SaveChangesAsync(ct);
                 superseded++;
@@ -238,7 +264,7 @@ internal sealed class OptimizationRunRecoveryCoordinator
                 continue;
             }
 
-            OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Queued, DateTime.UtcNow);
+            OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Queued, nowUtc);
             run.RetryCount++;
             run.DeferredUntilUtc = null;
 
@@ -289,7 +315,7 @@ internal sealed class OptimizationRunRecoveryCoordinator
                     : $"{run.ErrorMessage} [Marked non-retryable: search exhausted]",
                 OptimizationFailureCategory.ConfigError => string.IsNullOrWhiteSpace(run.ErrorMessage)
                     ? "Configuration error — moved to dead-letter queue [Marked non-retryable]"
-                    : $"{run.ErrorMessage} [Marked non-retryable: config error]",
+                    : $"{NormalizeConfigErrorMessage(run.ErrorMessage)} [Marked non-retryable: config error]",
                 OptimizationFailureCategory.StrategyRemoved => string.IsNullOrWhiteSpace(run.ErrorMessage)
                     ? "Strategy removed — moved to dead-letter queue [Marked non-retryable]"
                     : $"{run.ErrorMessage} [Marked non-retryable: strategy removed]",
@@ -300,7 +326,7 @@ internal sealed class OptimizationRunRecoveryCoordinator
             OptimizationRunStateMachine.Transition(
                 run,
                 OptimizationRunStatus.Abandoned,
-                DateTime.UtcNow,
+                nowUtc,
                 abandonmentMessage);
         }
 
@@ -310,17 +336,18 @@ internal sealed class OptimizationRunRecoveryCoordinator
         if (abandoned <= 0)
             return;
 
+        var alertCutoffUtc = nowUtc.AddHours(-24);
         _logger.LogWarning(
             "OptimizationRunRecoveryCoordinator: moved {Count} permanently failed run(s) to dead-letter (Abandoned) — retry budget exhausted, manual investigation required",
             abandoned);
 
         try
         {
-            bool recentAlertExists = await writeDb.Set<Alert>()
-                .AnyAsync(a => a.Symbol == "OptimizationWorker:DeadLetter"
-                           && a.LastTriggeredAt != null
-                           && a.LastTriggeredAt >= DateTime.UtcNow.AddHours(-24)
-                           && !a.IsDeleted, ct);
+                bool recentAlertExists = await writeDb.Set<Alert>()
+                    .AnyAsync(a => a.Symbol == "OptimizationWorker:DeadLetter"
+                               && a.LastTriggeredAt != null
+                               && a.LastTriggeredAt >= alertCutoffUtc
+                               && !a.IsDeleted, ct);
 
             if (recentAlertExists)
             {
@@ -331,15 +358,15 @@ internal sealed class OptimizationRunRecoveryCoordinator
             }
 
             var alertDispatcher = scope.ServiceProvider.GetRequiredService<IAlertDispatcher>();
-            var alert = new Alert
-            {
+                var alert = new Alert
+                {
                 AlertType = AlertType.OptimizationLifecycleIssue,
                 Symbol = "OptimizationWorker:DeadLetter",
                 Channel = AlertChannel.Webhook,
                 Destination = string.Empty,
                 Severity = AlertSeverity.High,
                 IsActive = true,
-                LastTriggeredAt = DateTime.UtcNow,
+                LastTriggeredAt = nowUtc,
                 ConditionJson = JsonSerializer.Serialize(new
                 {
                     Type = "OptimizationDeadLetter",
@@ -362,12 +389,402 @@ internal sealed class OptimizationRunRecoveryCoordinator
         }
     }
 
-    private static bool IsActiveQueueConstraintViolation(DbUpdateException ex)
+    internal async Task<LifecycleReconciliationSummary> ReconcileLifecycleStateAsync(
+        OptimizationConfig config,
+        CancellationToken ct)
     {
-        string message = ex.InnerException?.Message ?? ex.Message;
-        return message.Contains("IX_OptimizationRun_ActivePerStrategy", StringComparison.OrdinalIgnoreCase)
-            || message.Contains("duplicate key", StringComparison.OrdinalIgnoreCase)
-               && message.Contains("OptimizationRun", StringComparison.OrdinalIgnoreCase)
-               && message.Contains("StrategyId", StringComparison.OrdinalIgnoreCase);
+        var startedAtUtc = UtcNow;
+        var summary = new LifecycleReconciliationSummary(
+            RepairedRuns: 0,
+            BatchesProcessed: 0,
+            MissingCompletionPayloadRepairs: 0,
+            MalformedCompletionPayloadRepairs: 0,
+            FollowUpRepairs: 0,
+            ConfigSnapshotRepairs: 0,
+            BestParameterRepairs: 0,
+            StartedAtUtc: startedAtUtc,
+            LastActivityAtUtc: null);
+
+        try
+        {
+            await using var scope = _scopeFactory.CreateAsyncScope();
+            var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+            var writeDb = writeCtx.GetDbContext();
+            for (int batchNumber = 0; batchNumber < LifecycleReconciliationMaxBatchesPerCycle; batchNumber++)
+            {
+                ct.ThrowIfCancellationRequested();
+                var nowUtc = UtcNow;
+
+                var candidateRuns = await writeDb.Set<OptimizationRun>()
+                    .Where(r => !r.IsDeleted && (
+                        ((r.Status == OptimizationRunStatus.Completed
+                          || r.Status == OptimizationRunStatus.Approved
+                          || r.Status == OptimizationRunStatus.Rejected)
+                         && (r.LifecycleReconciledAt == null
+                          || (r.CompletedAt != null && r.ResultsPersistedAt == null)
+                          || ((r.Status == OptimizationRunStatus.Approved || r.Status == OptimizationRunStatus.Rejected) && r.ApprovalEvaluatedAt == null)
+                          || (r.ResultsPersistedAt != null && r.CompletionPublicationPayloadJson == null)
+                          || (r.CompletionPublicationPayloadJson != null && r.CompletionPublicationStatus == null)
+                          || (r.CompletionPublicationPayloadJson != null && r.CompletionPublicationPreparedAt == null)
+                          || r.CompletionPublicationErrorMessage != null
+                          || (r.CompletionPublicationStatus == OptimizationCompletionPublicationStatus.Published && r.CompletionPublicationCompletedAt == null)
+                          || (r.CompletionPublicationStatus == OptimizationCompletionPublicationStatus.Published && r.CompletionPublicationErrorMessage != null)))
+                        || (r.Status == OptimizationRunStatus.Approved
+                            && (r.ValidationFollowUpsCreatedAt == null
+                             || r.ValidationFollowUpStatus == null
+                             || r.BestParametersJson == null))
+                        || (r.Status == OptimizationRunStatus.Rejected
+                            && (r.ValidationFollowUpsCreatedAt != null
+                             || r.ValidationFollowUpStatus != null
+                             || r.NextFollowUpCheckAt != null
+                             || r.FollowUpLastCheckedAt != null
+                             || r.FollowUpRepairAttempts > 0
+                             || r.FollowUpLastStatusCode != null
+                             || r.FollowUpLastStatusMessage != null
+                             || r.FollowUpStatusUpdatedAt != null))))
+                    .OrderBy(r => r.CompletedAt ?? r.ApprovedAt ?? r.ExecutionStartedAt ?? r.ClaimedAt ?? (DateTime?)r.QueuedAt ?? r.StartedAt)
+                    .Take(LifecycleReconciliationBatchLimit)
+                    .ToListAsync(ct);
+
+                if (candidateRuns.Count == 0)
+                    break;
+
+                var strategyIds = candidateRuns.Select(r => r.StrategyId).Distinct().ToList();
+                var strategies = await writeDb.Set<Strategy>()
+                    .Where(s => strategyIds.Contains(s.Id) && !s.IsDeleted)
+                    .ToDictionaryAsync(s => s.Id, ct);
+
+                int repairedThisBatch = 0;
+                int missingCompletionPayloadRepairs = 0;
+                int malformedCompletionPayloadRepairs = 0;
+                int followUpRepairs = 0;
+                int configSnapshotRepairs = 0;
+                int bestParameterRepairs = 0;
+
+                foreach (var run in candidateRuns)
+                {
+                    ct.ThrowIfCancellationRequested();
+
+                    bool changed = false;
+
+                    if (run.CompletedAt.HasValue && run.ResultsPersistedAt == null)
+                    {
+                        run.ResultsPersistedAt = run.CompletedAt.Value;
+                        changed = true;
+                    }
+
+                    if (run.Status is OptimizationRunStatus.Approved or OptimizationRunStatus.Rejected
+                        && run.ApprovalEvaluatedAt == null)
+                    {
+                        run.ApprovalEvaluatedAt = run.ApprovedAt ?? run.CompletedAt ?? nowUtc;
+                        changed = true;
+                    }
+
+                    if (run.Status == OptimizationRunStatus.Approved
+                        && string.IsNullOrWhiteSpace(run.BestParametersJson)
+                        && strategies.TryGetValue(run.StrategyId, out var strategyForBestParams)
+                        && !string.IsNullOrWhiteSpace(strategyForBestParams.ParametersJson))
+                    {
+                        run.BestParametersJson = CanonicalParameterJson.Normalize(strategyForBestParams.ParametersJson);
+                        changed = true;
+                        bestParameterRepairs++;
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(run.ConfigSnapshotJson)
+                        && !_runScopedConfigService.TryLoadRunScopedConfigSnapshot(run, out _))
+                    {
+                        run.ConfigSnapshotJson = OptimizationRunContracts.SerializeConfigSnapshot(config);
+                        OptimizationRunProgressTracker.RecordOperationalIssue(
+                            run,
+                            "MalformedConfigSnapshot",
+                            "Recovered malformed run-scoped configuration snapshot using the current optimization config.",
+                            nowUtc);
+                        changed = true;
+                        configSnapshotRepairs++;
+                    }
+
+                    if (run.Status == OptimizationRunStatus.Rejected && HasFollowUpState(run))
+                    {
+                        ClearFollowUpState(run);
+                        changed = true;
+                        followUpRepairs++;
+                    }
+
+                    if (NeedsCompletionPayloadRepair(run, strategies, out var rebuiltCompletedEvent, out bool hadMalformedPayload))
+                    {
+                        run.CompletionPublicationPayloadJson = JsonSerializer.Serialize(rebuiltCompletedEvent);
+                        run.CompletionPublicationPreparedAt ??= nowUtc;
+                        run.CompletionPublicationStatus ??= run.CompletionPublicationCompletedAt.HasValue
+                            ? OptimizationCompletionPublicationStatus.Published
+                            : OptimizationCompletionPublicationStatus.Pending;
+                        if (run.CompletionPublicationStatus == OptimizationCompletionPublicationStatus.Published)
+                        {
+                            run.CompletionPublicationCompletedAt ??= run.CompletionPublicationLastAttemptAt
+                                ?? run.CompletionPublicationPreparedAt
+                                ?? run.ResultsPersistedAt
+                                ?? run.ApprovedAt
+                                ?? run.CompletedAt
+                                ?? nowUtc;
+                            run.CompletionPublicationErrorMessage = null;
+                        }
+
+                        changed = true;
+                        if (hadMalformedPayload)
+                            malformedCompletionPayloadRepairs++;
+                        else
+                            missingCompletionPayloadRepairs++;
+                    }
+                    else
+                    {
+                        if (run.CompletionPublicationPayloadJson != null && run.CompletionPublicationPreparedAt == null)
+                        {
+                            run.CompletionPublicationPreparedAt = run.CompletionPublicationLastAttemptAt
+                                ?? run.ResultsPersistedAt
+                                ?? run.CompletedAt
+                                ?? run.ApprovedAt
+                                ?? nowUtc;
+                            changed = true;
+                        }
+
+                        if (run.CompletionPublicationPayloadJson != null && run.CompletionPublicationStatus == null)
+                        {
+                            run.CompletionPublicationStatus = run.CompletionPublicationCompletedAt.HasValue
+                                ? OptimizationCompletionPublicationStatus.Published
+                                : OptimizationCompletionPublicationStatus.Pending;
+                            changed = true;
+                        }
+
+                        if (run.CompletionPublicationStatus == OptimizationCompletionPublicationStatus.Published)
+                        {
+                            if (run.CompletionPublicationPreparedAt == null)
+                            {
+                                run.CompletionPublicationPreparedAt = run.CompletionPublicationLastAttemptAt
+                                    ?? run.ResultsPersistedAt
+                                    ?? run.CompletedAt
+                                    ?? run.ApprovedAt
+                                    ?? nowUtc;
+                                changed = true;
+                            }
+
+                            if (run.CompletionPublicationCompletedAt == null)
+                            {
+                                run.CompletionPublicationCompletedAt = run.CompletionPublicationLastAttemptAt
+                                    ?? run.CompletionPublicationPreparedAt
+                                    ?? run.ResultsPersistedAt
+                                    ?? run.ApprovedAt
+                                    ?? run.CompletedAt
+                                    ?? nowUtc;
+                                changed = true;
+                            }
+
+                            if (!string.IsNullOrWhiteSpace(run.CompletionPublicationErrorMessage))
+                            {
+                                run.CompletionPublicationErrorMessage = null;
+                                changed = true;
+                            }
+                        }
+                    }
+
+                    if (run.Status == OptimizationRunStatus.Approved
+                        && (run.ValidationFollowUpsCreatedAt == null || run.ValidationFollowUpStatus == null)
+                        && strategies.TryGetValue(run.StrategyId, out var strategyForFollowUps))
+                    {
+                        var repairConfig = config;
+                        if (!string.IsNullOrWhiteSpace(run.ConfigSnapshotJson)
+                            && _runScopedConfigService.TryLoadRunScopedConfigSnapshot(run, out var runScopedConfig))
+                        {
+                            repairConfig = runScopedConfig;
+                        }
+
+                        bool followUpsAlreadyPresent = await _followUpCoordinator.EnsureValidationFollowUpsAsync(
+                            writeDb,
+                            run,
+                            strategyForFollowUps,
+                            repairConfig,
+                            ct);
+                        if (followUpsAlreadyPresent)
+                            _metrics.OptimizationDuplicateFollowUpsPrevented.Add(1);
+
+                        changed = true;
+                        followUpRepairs++;
+                    }
+
+                    if (!changed && run.LifecycleReconciledAt == null)
+                    {
+                        run.LifecycleReconciledAt = nowUtc;
+                        changed = true;
+                    }
+
+                    if (changed)
+                    {
+                        run.LifecycleReconciledAt = nowUtc;
+                        repairedThisBatch++;
+                    }
+                }
+
+                summary = summary with
+                {
+                    RepairedRuns = summary.RepairedRuns + repairedThisBatch,
+                    BatchesProcessed = summary.BatchesProcessed + 1,
+                    MissingCompletionPayloadRepairs = summary.MissingCompletionPayloadRepairs + missingCompletionPayloadRepairs,
+                    MalformedCompletionPayloadRepairs = summary.MalformedCompletionPayloadRepairs + malformedCompletionPayloadRepairs,
+                    FollowUpRepairs = summary.FollowUpRepairs + followUpRepairs,
+                    ConfigSnapshotRepairs = summary.ConfigSnapshotRepairs + configSnapshotRepairs,
+                    BestParameterRepairs = summary.BestParameterRepairs + bestParameterRepairs,
+                    LastActivityAtUtc = repairedThisBatch > 0 ? nowUtc : summary.LastActivityAtUtc
+                };
+
+                if (repairedThisBatch > 0)
+                    await writeCtx.SaveChangesAsync(ct);
+
+                if (candidateRuns.Count < LifecycleReconciliationBatchLimit || repairedThisBatch == 0)
+                    break;
+
+                await Task.Delay(TimeSpan.FromMilliseconds(Math.Min(250, (batchNumber + 1) * 50)), ct);
+            }
+
+            if (summary.RepairedRuns > 0)
+            {
+                _logger.LogInformation(
+                    "OptimizationRunRecoveryCoordinator: reconciled lifecycle state for {Count} optimization run(s) across {Batches} batch(es) " +
+                    "(missing payloads={MissingPayloads}, malformed payloads={MalformedPayloads}, follow-ups={FollowUps}, config snapshots={Snapshots}, best-parameter repairs={BestParams})",
+                    summary.RepairedRuns,
+                    summary.BatchesProcessed,
+                    summary.MissingCompletionPayloadRepairs,
+                    summary.MalformedCompletionPayloadRepairs,
+                    summary.FollowUpRepairs,
+                    summary.ConfigSnapshotRepairs,
+                    summary.BestParameterRepairs);
+            }
+
+            return summary;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "OptimizationRunRecoveryCoordinator: lifecycle reconciliation sweep failed (non-fatal)");
+            return summary;
+        }
     }
+
+    private static void ClearFollowUpState(OptimizationRun run)
+    {
+        run.ValidationFollowUpsCreatedAt = null;
+        run.ValidationFollowUpStatus = null;
+        run.NextFollowUpCheckAt = null;
+        run.FollowUpLastCheckedAt = null;
+        run.FollowUpRepairAttempts = 0;
+        run.FollowUpLastStatusCode = null;
+        run.FollowUpLastStatusMessage = null;
+        run.FollowUpStatusUpdatedAt = null;
+    }
+
+    private static bool HasFollowUpState(OptimizationRun run)
+        => run.ValidationFollowUpsCreatedAt != null
+        || run.ValidationFollowUpStatus != null
+        || run.NextFollowUpCheckAt != null
+        || run.FollowUpLastCheckedAt != null
+        || run.FollowUpRepairAttempts > 0
+        || !string.IsNullOrWhiteSpace(run.FollowUpLastStatusCode)
+        || !string.IsNullOrWhiteSpace(run.FollowUpLastStatusMessage)
+        || run.FollowUpStatusUpdatedAt != null;
+
+    private static bool NeedsCompletionPayloadRepair(
+        OptimizationRun run,
+        IReadOnlyDictionary<long, Strategy> strategies,
+        out OptimizationCompletedIntegrationEvent? completedEvent,
+        out bool hadMalformedPayload)
+    {
+        completedEvent = null;
+        hadMalformedPayload = false;
+
+        if (!run.ResultsPersistedAt.HasValue
+            && run.Status is not (OptimizationRunStatus.Approved
+                or OptimizationRunStatus.Rejected
+                or OptimizationRunStatus.Completed))
+            return false;
+
+        bool missingPayload = string.IsNullOrWhiteSpace(run.CompletionPublicationPayloadJson);
+        bool malformedPayload = !missingPayload
+            && (!TryDeserializeCompletionPayload(run.CompletionPublicationPayloadJson, out var existingEvent)
+                || !IsCompletionPayloadConsistent(existingEvent, run, strategies.GetValueOrDefault(run.StrategyId)));
+
+        if (!missingPayload && !malformedPayload)
+            return false;
+
+        if (!strategies.TryGetValue(run.StrategyId, out var strategy))
+            return false;
+
+        completedEvent = BuildCompletionEvent(run, strategy);
+        hadMalformedPayload = malformedPayload;
+        return true;
+    }
+
+    private static bool TryDeserializeCompletionPayload(
+        string? payloadJson,
+        out OptimizationCompletedIntegrationEvent? completedEvent)
+    {
+        completedEvent = null;
+        if (string.IsNullOrWhiteSpace(payloadJson))
+            return false;
+
+        try
+        {
+            completedEvent = JsonSerializer.Deserialize<OptimizationCompletedIntegrationEvent>(payloadJson);
+            return completedEvent is not null;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    private static bool IsCompletionPayloadConsistent(
+        OptimizationCompletedIntegrationEvent? completedEvent,
+        OptimizationRun run,
+        Strategy? strategy)
+    {
+        if (completedEvent is null)
+            return false;
+
+        if (completedEvent.OptimizationRunId != run.Id || completedEvent.StrategyId != run.StrategyId)
+            return false;
+
+        if (completedEvent.CompletedAt == default)
+            return false;
+
+        if (strategy is null)
+            return !string.IsNullOrWhiteSpace(completedEvent.Symbol);
+
+        return string.Equals(completedEvent.Symbol, strategy.Symbol, StringComparison.Ordinal)
+            && completedEvent.Timeframe == strategy.Timeframe;
+    }
+
+    private static OptimizationCompletedIntegrationEvent BuildCompletionEvent(
+        OptimizationRun run,
+        Strategy strategy)
+        => new()
+        {
+            OptimizationRunId = run.Id,
+            StrategyId = run.StrategyId,
+            Symbol = strategy.Symbol,
+            Timeframe = strategy.Timeframe,
+            Iterations = run.Iterations,
+            BaselineScore = run.BaselineHealthScore ?? 0m,
+            BestOosScore = run.BestHealthScore ?? 0m,
+            CompletedAt = run.CompletedAt
+                ?? run.ApprovedAt
+                ?? run.ResultsPersistedAt
+                ?? run.ExecutionStartedAt
+                ?? run.ClaimedAt
+                ?? (DateTime?)run.QueuedAt
+                ?? run.StartedAt,
+        };
+
+    private static string NormalizeConfigErrorMessage(string message)
+        => message.Contains("invalid configuration", StringComparison.OrdinalIgnoreCase)
+            ? message
+            : $"Invalid configuration: {message}";
+
+    private static bool IsActiveQueueConstraintViolation(DbUpdateException ex)
+        => OptimizationDbExceptionClassifier.IsActiveQueueConstraintViolation(ex);
 }

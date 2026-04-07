@@ -12,15 +12,19 @@ namespace LascodiaTradingEngine.Application.Optimization;
 [RegisterService(ServiceLifetime.Singleton)]
 public sealed class OptimizationRolloutAlertService
 {
-    private readonly IServiceScopeFactory _scopeFactory;
+    private readonly IAlertDispatcher _alertDispatcher;
     private readonly ILogger<OptimizationRolloutAlertService> _logger;
+    private readonly TimeProvider _timeProvider;
+    private DateTime UtcNow => _timeProvider.GetUtcNow().UtcDateTime;
 
     public OptimizationRolloutAlertService(
-        IServiceScopeFactory scopeFactory,
-        ILogger<OptimizationRolloutAlertService> logger)
+        IAlertDispatcher alertDispatcher,
+        ILogger<OptimizationRolloutAlertService> logger,
+        TimeProvider timeProvider)
     {
-        _scopeFactory = scopeFactory;
+        _alertDispatcher = alertDispatcher;
         _logger = logger;
+        _timeProvider = timeProvider;
     }
 
     internal async Task RaiseEvaluationFailureAlertAsync(
@@ -34,7 +38,7 @@ public sealed class OptimizationRolloutAlertService
         var existingAlert = await writeDb.Set<Alert>()
             .FirstOrDefaultAsync(a => a.DeduplicationKey == deduplicationKey && !a.IsDeleted, ct);
 
-        var nowUtc = DateTime.UtcNow;
+        var nowUtc = UtcNow;
         if (existingAlert?.LastTriggeredAt is DateTime lastTriggeredAt
             && lastTriggeredAt >= nowUtc.AddHours(-6))
         {
@@ -71,14 +75,9 @@ public sealed class OptimizationRolloutAlertService
 
         await writeCtx.SaveChangesAsync(ct);
 
-        await using var alertScope = _scopeFactory.CreateAsyncScope();
-        var alertDispatcher = alertScope.ServiceProvider.GetService<IAlertDispatcher>();
-        if (alertDispatcher is null)
-            return;
-
         try
         {
-            await alertDispatcher.DispatchBySeverityAsync(alert, message, ct);
+            await _alertDispatcher.DispatchBySeverityAsync(alert, message, ct);
         }
         catch (Exception dispatchEx)
         {

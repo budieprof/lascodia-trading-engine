@@ -13,13 +13,17 @@ public sealed class OptimizationRunLeaseManager
 {
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<OptimizationRunLeaseManager> _logger;
+    private readonly TimeProvider _timeProvider;
+    private DateTime UtcNow => _timeProvider.GetUtcNow().UtcDateTime;
 
     public OptimizationRunLeaseManager(
         IServiceScopeFactory scopeFactory,
-        ILogger<OptimizationRunLeaseManager> logger)
+        ILogger<OptimizationRunLeaseManager> logger,
+        TimeProvider timeProvider)
     {
         _scopeFactory = scopeFactory;
         _logger = logger;
+        _timeProvider = timeProvider;
     }
 
     internal static bool HasLeaseOwnershipChanged(
@@ -63,7 +67,7 @@ public sealed class OptimizationRunLeaseManager
                     await using var scope = _scopeFactory.CreateAsyncScope();
                     var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
                     var db = writeCtx.GetDbContext();
-                    var nowUtc = DateTime.UtcNow;
+                    var nowUtc = UtcNow;
 
                     int updated = await db.Set<OptimizationRun>()
                         .Where(r => r.Id == runId
@@ -94,7 +98,7 @@ public sealed class OptimizationRunLeaseManager
                         .ExecuteUpdateAsync(s => s
                             .SetProperty(r => r.LastOperationalIssueCode, "LeaseHeartbeatFailed")
                             .SetProperty(r => r.LastOperationalIssueMessage, TruncateForPersistence(ex.Message, 500))
-                            .SetProperty(r => r.LastOperationalIssueAt, DateTime.UtcNow), CancellationToken.None);
+                            .SetProperty(r => r.LastOperationalIssueAt, UtcNow), CancellationToken.None);
                     _logger.LogDebug(ex,
                         "OptimizationRunLeaseManager: background lease heartbeat failed for run {RunId} (non-fatal)",
                         runId);

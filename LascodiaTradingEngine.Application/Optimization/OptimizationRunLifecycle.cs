@@ -11,6 +11,26 @@ internal static class OptimizationRunLifecycle
                  or OptimizationRunStatus.Approved
                  or OptimizationRunStatus.Rejected;
 
+    internal static bool HasPersistedTerminalResult(OptimizationRun run)
+        => run.ResultsPersistedAt.HasValue
+        && run.Status is OptimizationRunStatus.Completed
+                     or OptimizationRunStatus.Approved
+                     or OptimizationRunStatus.Rejected;
+
+    internal static bool HasPreparedCompletionArtifacts(OptimizationRun run)
+        => run.CompletionPublicationPreparedAt.HasValue
+        || !string.IsNullOrWhiteSpace(run.CompletionPublicationPayloadJson)
+        || run.CompletionPublicationStatus is OptimizationCompletionPublicationStatus.Pending
+            or OptimizationCompletionPublicationStatus.Failed
+            or OptimizationCompletionPublicationStatus.Published;
+
+    internal static bool HasPublishedCompletionArtifacts(OptimizationRun run)
+        => run.CompletionPublicationStatus == OptimizationCompletionPublicationStatus.Published
+        || run.CompletionPublicationCompletedAt.HasValue;
+
+    internal static bool ShouldPreservePersistedResult(OptimizationRun run)
+        => ShouldPreservePersistedResult(HasPersistedTerminalResult(run), run.Status);
+
     internal static void RequeueForRecovery(OptimizationRun run, DateTime utcNow)
         => OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Queued, utcNow);
 
@@ -30,6 +50,8 @@ internal static class OptimizationRunLifecycle
         run.BestMaxDrawdownPct = null;
         run.BestWinRate = null;
         run.ApprovalReportJson = null;
+        run.ResultsPersistedAt = null;
+        run.ApprovalEvaluatedAt = null;
         run.ValidationFollowUpsCreatedAt = null;
         run.ValidationFollowUpStatus = null;
         run.FollowUpLastCheckedAt = null;
@@ -42,8 +64,10 @@ internal static class OptimizationRunLifecycle
         run.CompletionPublicationPayloadJson = null;
         run.CompletionPublicationAttempts = 0;
         run.CompletionPublicationLastAttemptAt = null;
+        run.CompletionPublicationPreparedAt = null;
         run.CompletionPublicationCompletedAt = null;
         run.CompletionPublicationErrorMessage = null;
+        run.LifecycleReconciledAt = null;
         run.LastOperationalIssueCode = null;
         run.LastOperationalIssueMessage = null;
         run.LastOperationalIssueAt = null;

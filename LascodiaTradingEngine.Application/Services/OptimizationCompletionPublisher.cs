@@ -23,15 +23,19 @@ public sealed class OptimizationCompletionPublisher
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<OptimizationCompletionPublisher> _logger;
     private readonly TradingMetrics _metrics;
+    private readonly TimeProvider _timeProvider;
+    private DateTime UtcNow => _timeProvider.GetUtcNow().UtcDateTime;
 
     public OptimizationCompletionPublisher(
         IServiceScopeFactory scopeFactory,
         ILogger<OptimizationCompletionPublisher> logger,
-        TradingMetrics metrics)
+        TradingMetrics metrics,
+        TimeProvider timeProvider)
     {
         _scopeFactory = scopeFactory;
         _logger = logger;
         _metrics = metrics;
+        _timeProvider = timeProvider;
     }
 
     public async Task PrepareAsync(
@@ -44,9 +48,11 @@ public sealed class OptimizationCompletionPublisher
             run,
             OptimizationExecutionStage.CompletionPublication,
             OptimizationRunProgressTracker.GetDefaultStageMessage(OptimizationExecutionStage.CompletionPublication),
-            DateTime.UtcNow);
+            UtcNow);
         run.CompletionPublicationPayloadJson = JsonSerializer.Serialize(completedEvent);
+        run.CompletionPublicationPreparedAt ??= UtcNow;
         run.CompletionPublicationStatus ??= OptimizationCompletionPublicationStatus.Pending;
+        run.CompletionPublicationCompletedAt = null;
         run.CompletionPublicationErrorMessage = null;
         await writeCtx.SaveChangesAsync(ct);
     }
@@ -93,7 +99,7 @@ public sealed class OptimizationCompletionPublisher
         await using var scope = _scopeFactory.CreateAsyncScope();
         var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
         var writeDb = writeCtx.GetDbContext();
-        var replayCutoffUtc = DateTime.UtcNow - ReplayBackoff;
+        var replayCutoffUtc = UtcNow - ReplayBackoff;
 
         var runsToReplay = await writeDb.Set<OptimizationRun>()
             .Where(r => !r.IsDeleted
@@ -122,6 +128,19 @@ public sealed class OptimizationCompletionPublisher
             }
             catch (JsonException ex)
             {
+                var run = await writeDb.Set<OptimizationRun>()
+                    .FirstOrDefaultAsync(r => r.Id == runInfo.Id && !r.IsDeleted, ct);
+                if (run is not null)
+                {
+                    run.CompletionPublicationStatus = OptimizationCompletionPublicationStatus.Failed;
+                    run.CompletionPublicationLastAttemptAt = UtcNow;
+                    run.CompletionPublicationAttempts++;
+                    run.CompletionPublicationErrorMessage = Truncate(
+                        $"Malformed completion payload: {ex.Message}",
+                        500);
+                    await writeCtx.SaveChangesAsync(ct);
+                }
+
                 _logger.LogWarning(ex,
                     "Optimization completion publisher: completion payload for run {RunId} is malformed; replay skipped",
                     runInfo.Id);
@@ -159,7 +178,7 @@ public sealed class OptimizationCompletionPublisher
             if (run is not null)
             {
                 run.CompletionPublicationStatus = OptimizationCompletionPublicationStatus.Pending;
-                run.CompletionPublicationLastAttemptAt = DateTime.UtcNow;
+                run.CompletionPublicationLastAttemptAt = UtcNow;
                 run.CompletionPublicationAttempts++;
                 run.CompletionPublicationErrorMessage = null;
                 await writeCtx.SaveChangesAsync(CancellationToken.None);
@@ -170,8 +189,9 @@ public sealed class OptimizationCompletionPublisher
             if (run is not null)
             {
                 run.CompletionPublicationStatus = OptimizationCompletionPublicationStatus.Published;
-                run.CompletionPublicationCompletedAt = DateTime.UtcNow;
+                run.CompletionPublicationCompletedAt = UtcNow;
                 run.CompletionPublicationErrorMessage = null;
+                run.LifecycleReconciledAt = UtcNow;
                 OptimizationRunProgressTracker.SetTerminalStageFromStatus(run, run.CompletionPublicationCompletedAt.Value);
                 var terminalAt = run.ApprovedAt ?? run.CompletedAt ?? run.CompletionPublicationLastAttemptAt;
                 if (terminalAt.HasValue)
@@ -194,7 +214,7 @@ public sealed class OptimizationCompletionPublisher
                     run,
                     "CompletionReplayFailed",
                     $"Completion replay failed: {ex.Message}",
-                    DateTime.UtcNow);
+                    UtcNow);
                 await writeCtx.SaveChangesAsync(CancellationToken.None);
             }
 

@@ -6,6 +6,7 @@ using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.AuditTrail.Commands.LogDecision;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Utilities;
+using LascodiaTradingEngine.Application.Optimization;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -59,6 +60,8 @@ public class UpsertEngineConfigCommandHandler : IRequestHandler<UpsertEngineConf
     private readonly IMediator _mediator;
     private readonly IApprovalWorkflow _approvalWorkflow;
     private readonly ICurrentUserService _currentUser;
+    private readonly OptimizationConfigProvider _optimizationConfigProvider;
+    private readonly TimeProvider _timeProvider;
 
     private static readonly string[] RiskRelatedKeywords = ["Risk", "Max", "Limit", "VaR", "Drawdown"];
 
@@ -66,12 +69,16 @@ public class UpsertEngineConfigCommandHandler : IRequestHandler<UpsertEngineConf
         IWriteApplicationDbContext context,
         IMediator mediator,
         IApprovalWorkflow approvalWorkflow,
-        ICurrentUserService currentUser)
+        ICurrentUserService currentUser,
+        OptimizationConfigProvider optimizationConfigProvider,
+        TimeProvider timeProvider)
     {
         _context = context;
         _mediator = mediator;
         _approvalWorkflow = approvalWorkflow;
         _currentUser = currentUser;
+        _optimizationConfigProvider = optimizationConfigProvider;
+        _timeProvider = timeProvider;
     }
 
     public async Task<ResponseData<long>> Handle(UpsertEngineConfigCommand request, CancellationToken cancellationToken)
@@ -79,6 +86,7 @@ public class UpsertEngineConfigCommandHandler : IRequestHandler<UpsertEngineConf
         var existing = await _context.GetDbContext()
             .Set<Domain.Entities.EngineConfig>()
             .FirstOrDefaultAsync(x => x.Key == request.Key && !x.IsDeleted, cancellationToken);
+        var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
 
         var dataType = Enum.Parse<ConfigDataType>(request.DataType, ignoreCase: true);
         long currentAccountId = long.TryParse(_currentUser.UserId, out var parsedUid) ? parsedUid : 0;
@@ -119,7 +127,7 @@ public class UpsertEngineConfigCommandHandler : IRequestHandler<UpsertEngineConf
             existing.Description     = request.Description;
             existing.DataType        = dataType;
             existing.IsHotReloadable = request.IsHotReloadable;
-            existing.LastUpdatedAt   = DateTime.UtcNow;
+            existing.LastUpdatedAt   = nowUtc;
 
             // ── Persist EngineConfigAuditLog (same SaveChanges for atomicity) ──
             var auditLog = new EngineConfigAuditLog
@@ -129,11 +137,12 @@ public class UpsertEngineConfigCommandHandler : IRequestHandler<UpsertEngineConf
                 NewValue = request.Value,
                 ChangedByAccountId = currentAccountId,
                 Reason = "Configuration update",
-                ChangedAt = DateTime.UtcNow
+                ChangedAt = nowUtc
             };
             await _context.GetDbContext().Set<EngineConfigAuditLog>().AddAsync(auditLog, cancellationToken);
 
             await _context.SaveChangesAsync(cancellationToken);
+            InvalidateOptimizationConfigCacheIfNeeded(request.Key);
 
             await _mediator.Send(new LogDecisionCommand
             {
@@ -158,7 +167,7 @@ public class UpsertEngineConfigCommandHandler : IRequestHandler<UpsertEngineConf
             Description     = request.Description,
             DataType        = dataType,
             IsHotReloadable = request.IsHotReloadable,
-            LastUpdatedAt   = DateTime.UtcNow
+            LastUpdatedAt   = nowUtc
         };
 
         await _context.GetDbContext()
@@ -173,11 +182,12 @@ public class UpsertEngineConfigCommandHandler : IRequestHandler<UpsertEngineConf
             NewValue = request.Value,
             ChangedByAccountId = currentAccountId,
             Reason = "Configuration created",
-            ChangedAt = DateTime.UtcNow
+            ChangedAt = nowUtc
         };
         await _context.GetDbContext().Set<EngineConfigAuditLog>().AddAsync(createAuditLog, cancellationToken);
 
         await _context.SaveChangesAsync(cancellationToken);
+        InvalidateOptimizationConfigCacheIfNeeded(request.Key);
 
         await _mediator.Send(new LogDecisionCommand
         {
@@ -192,6 +202,15 @@ public class UpsertEngineConfigCommandHandler : IRequestHandler<UpsertEngineConf
         }, cancellationToken);
 
         return ResponseData<long>.Init(entity.Id, true, "Created", "00");
+    }
+
+    private void InvalidateOptimizationConfigCacheIfNeeded(string key)
+    {
+        if (key.StartsWith("Optimization:", StringComparison.OrdinalIgnoreCase)
+            || key.StartsWith("Backtest:Gate:", StringComparison.OrdinalIgnoreCase))
+        {
+            _optimizationConfigProvider.InvalidateCache();
+        }
     }
 
     /// <summary>

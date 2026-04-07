@@ -14,7 +14,7 @@ using MarketRegimeEnum = LascodiaTradingEngine.Domain.Enums.MarketRegime;
 
 namespace LascodiaTradingEngine.Application.Optimization;
 
-[RegisterService(ServiceLifetime.Singleton)]
+[RegisterService(ServiceLifetime.Scoped)]
 internal sealed class OptimizationValidationCoordinator
 {
     private readonly IServiceScopeFactory _scopeFactory;
@@ -23,6 +23,8 @@ internal sealed class OptimizationValidationCoordinator
     private readonly OptimizationThresholdAdjustmentEvaluator _thresholdAdjustmentEvaluator;
     private readonly TradingMetrics _metrics;
     private readonly ILogger<OptimizationValidationCoordinator> _logger;
+    private readonly TimeProvider _timeProvider;
+    private DateTime UtcNow => _timeProvider.GetUtcNow().UtcDateTime;
 
     public OptimizationValidationCoordinator(
         IServiceScopeFactory scopeFactory,
@@ -30,7 +32,8 @@ internal sealed class OptimizationValidationCoordinator
         OptimizationValidationContextLoader contextLoader,
         OptimizationThresholdAdjustmentEvaluator thresholdAdjustmentEvaluator,
         TradingMetrics metrics,
-        ILogger<OptimizationValidationCoordinator> logger)
+        ILogger<OptimizationValidationCoordinator> logger,
+        TimeProvider timeProvider)
     {
         _scopeFactory = scopeFactory;
         _validator = validator;
@@ -38,6 +41,7 @@ internal sealed class OptimizationValidationCoordinator
         _thresholdAdjustmentEvaluator = thresholdAdjustmentEvaluator;
         _metrics = metrics;
         _logger = logger;
+        _timeProvider = timeProvider;
     }
 
     // ── Pareto candidate validation ────────────────────────────────────────
@@ -123,7 +127,7 @@ internal sealed class OptimizationValidationCoordinator
                 bool sensitivityCvConsistent = sensitivityCvValue <= config.MaxCvCoefficientOfVariation;
                 var missingOosResult = new BacktestResult();
 
-                lastResult = new CandidateValidationResult(
+                lastResult = CandidateValidationResult.Create(
                     false,
                     candidate,
                     0m,
@@ -150,13 +154,14 @@ internal sealed class OptimizationValidationCoordinator
                     0,
                     sensitivityCvConsistent,
                     sensitivityCvValue,
-                    JsonSerializer.Serialize(new Dictionary<string, object?>
+                    OptimizationApprovalReportParser.Serialize(new OptimizationApprovalReportParser.ApprovalReport
                     {
-                        ["passed"] = false,
-                        ["sensitivityOk"] = false,
-                        ["failureReason"] = failureReason,
-                        ["hasOosValidation"] = false,
-                        ["inSampleHealthScore"] = candidate.HealthScore,
+                        Passed = false,
+                        SensitivityOk = false,
+                        FailureReason = failureReason,
+                        HasOosValidation = false,
+                        HasSufficientOutOfSampleData = false,
+                        InSampleHealthScore = candidate.HealthScore,
                     }),
                     failureReason);
 
@@ -174,7 +179,7 @@ internal sealed class OptimizationValidationCoordinator
                 if (failedResults.Count < 3)
                     failedResults.Add((candidateRank, candidate.ParamsJson, failureReason, candidate.HealthScore));
 
-                try { await OptimizationExecutionLeasePolicy.HeartbeatRunAsync(run, writeCtx, ct); }
+                try { await OptimizationExecutionLeasePolicy.HeartbeatRunAsync(run, writeCtx, UtcNow, ct); }
                 catch (Exception ex) { _logger.LogDebug(ex, "OptimizationWorker: heartbeat renewal failed during Pareto validation for run {RunId}", run.Id); }
 
                 _logger.LogDebug("OptimizationWorker: run {RunId} candidate #{Rank} sensitivity failed — trying next",
@@ -484,7 +489,7 @@ internal sealed class OptimizationValidationCoordinator
                 genesisRegressionOk,
                 hasSufficientOosData));
 
-            lastResult = new CandidateValidationResult(
+            lastResult = CandidateValidationResult.Create(
                 approval.Passed, candidate, oosHealthScore, oosResult, hasSufficientOosData,
                 ciLower, ciMedian, ciUpper,
                 permPValue, permCorrectedAlpha, permSignificant,
@@ -494,7 +499,7 @@ internal sealed class OptimizationValidationCoordinator
                 correlationSafe, temporalCorrelationSafe, temporalMaxOverlap,
                 portfolioCorrelationSafe, portfolioMaxCorrelation,
                 cvConsistent, cvValue,
-                JsonSerializer.Serialize(approval.StructuredReport),
+                OptimizationApprovalReportParser.Serialize(approval.Report),
                 approval.FailureReason);
 
             // ── Per-gate rejection counters ─────────────────────────
@@ -527,7 +532,7 @@ internal sealed class OptimizationValidationCoordinator
             // Heartbeat renewal: validation of each Pareto candidate can take minutes
             // (CPCV + sensitivity + permutation test). Renew the lease to prevent
             // RequeueExpiredRunningRunsAsync from reclaiming this run mid-validation.
-            try { await OptimizationExecutionLeasePolicy.HeartbeatRunAsync(run, writeCtx, ct); }
+            try { await OptimizationExecutionLeasePolicy.HeartbeatRunAsync(run, writeCtx, UtcNow, ct); }
             catch (Exception ex) { _logger.LogDebug(ex, "OptimizationWorker: heartbeat renewal failed during Pareto validation for run {RunId}", run.Id); }
 
             if (approval.Passed)
@@ -570,7 +575,7 @@ internal sealed class OptimizationValidationCoordinator
                 // (e.g., CPCV with many combinations) from blocking the entire validation phase.
                 string failureReason = $"gate budget timeout ({gateTimeoutSeconds}s)";
                 var missingOosResult = new BacktestResult();
-                lastResult ??= new CandidateValidationResult(
+                lastResult ??= CandidateValidationResult.Create(
                     false,
                     candidate,
                     0m,
@@ -597,13 +602,17 @@ internal sealed class OptimizationValidationCoordinator
                     0,
                     candidate.CvCoefficientOfVariation <= config.MaxCvCoefficientOfVariation,
                     candidate.CvCoefficientOfVariation,
-                    JsonSerializer.Serialize(new Dictionary<string, object?>
+                    OptimizationApprovalReportParser.Serialize(new OptimizationApprovalReportParser.ApprovalReport
                     {
-                        ["passed"] = false,
-                        ["failureReason"] = failureReason,
-                        ["gateBudgetTimeout"] = true,
-                        ["hasOosValidation"] = false,
-                        ["inSampleHealthScore"] = candidate.HealthScore,
+                        Passed = false,
+                        FailureReason = failureReason,
+                        HasOosValidation = false,
+                        HasSufficientOutOfSampleData = false,
+                        InSampleHealthScore = candidate.HealthScore,
+                        ExtensionData = new Dictionary<string, JsonElement>
+                        {
+                            ["gateBudgetTimeout"] = JsonSerializer.SerializeToElement(true)
+                        }
                     }),
                     failureReason);
                 _logger.LogInformation(

@@ -7,6 +7,7 @@ namespace LascodiaTradingEngine.Application.Optimization;
 
 internal static class OptimizationRunContracts
 {
+    public const int LegacyConfigSnapshotVersion = 1;
     public const int ConfigSnapshotVersion = 2;
     public const int RunMetadataVersion = 1;
 
@@ -58,11 +59,23 @@ internal static class OptimizationRunContracts
 
         try
         {
-            var snapshot = JsonSerializer.Deserialize<ConfigSnapshotContract>(snapshotJson);
-            if (snapshot is not null && snapshot.Version == ConfigSnapshotVersion)
+            using var snapshotDoc = JsonDocument.Parse(snapshotJson);
+            if (!snapshotDoc.RootElement.TryGetProperty("Config", out var configElement))
+                return false;
+
+            int version = snapshotDoc.RootElement.TryGetProperty("Version", out var versionElement)
+                && versionElement.TryGetInt32(out int parsedVersion)
+                ? parsedVersion
+                : 0;
+
+            if (version is LegacyConfigSnapshotVersion or ConfigSnapshotVersion)
             {
-                config = snapshot.Config;
-                return true;
+                var parsedConfig = configElement.Deserialize<OptimizationConfig>();
+                if (parsedConfig is not null)
+                {
+                    config = parsedConfig;
+                    return true;
+                }
             }
         }
         catch (JsonException)

@@ -1,8 +1,10 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 using LascodiaTradingEngine.Application.Backtesting.Models;
 using LascodiaTradingEngine.Application.Backtesting.Services;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -13,13 +15,23 @@ namespace LascodiaTradingEngine.Application.Optimization;
 /// parameter sensitivity analysis, transaction cost stress testing, and temporal signal
 /// correlation checking.
 /// </summary>
+[RegisterService(ServiceLifetime.Scoped)]
 internal sealed class OptimizationValidator
 {
+    private const decimal DefaultInitialBalance = 10_000m;
+
     private readonly IBacktestEngine _backtestEngine;
-    private decimal _initialBalance = 10_000m;
+    private readonly TimeProvider _timeProvider;
+    private decimal _initialBalance = DefaultInitialBalance;
     private ConcurrentDictionary<string, BacktestResult>? _cache;
 
-    internal OptimizationValidator(IBacktestEngine backtestEngine) => _backtestEngine = backtestEngine;
+    public OptimizationValidator(IBacktestEngine backtestEngine, TimeProvider timeProvider)
+    {
+        _backtestEngine = backtestEngine;
+        _timeProvider = timeProvider;
+    }
+
+    private DateTime UtcNow => _timeProvider.GetUtcNow().UtcDateTime;
 
     /// <summary>Sets the initial balance used for all backtest runs within this validator.</summary>
     internal void SetInitialBalance(decimal balance) => _initialBalance = balance;
@@ -32,7 +44,11 @@ internal sealed class OptimizationValidator
     internal void EnableCache() => _cache = new ConcurrentDictionary<string, BacktestResult>();
 
     /// <summary>Clears the backtest result cache. Call at the end of each optimization run.</summary>
-    internal void ClearCache() => _cache = null;
+    internal void ClearCache()
+    {
+        _cache = null;
+        _initialBalance = DefaultInitialBalance;
+    }
 
     /// <summary>
     /// Anchored walk-forward stability check on out-of-sample data. Splits the OOS candles
@@ -307,7 +323,7 @@ internal sealed class OptimizationValidator
             .Where(s => s.StrategyId != strategy.Id
                      && s.Strategy!.Symbol == strategy.Symbol
                      && s.Strategy.Status == StrategyStatus.Active
-                     && s.GeneratedAt >= DateTime.UtcNow.AddDays(-30)
+                     && s.GeneratedAt >= UtcNow.AddDays(-30)
                      && !s.IsDeleted)
             .GroupBy(s => s.StrategyId)
             .Select(g => g.Select(s => s.GeneratedAt).ToList())
@@ -632,7 +648,7 @@ internal sealed class OptimizationValidator
             .Where(s => s.StrategyId != strategy.Id
                      && s.Strategy.Status == StrategyStatus.Active
                      && correlatedSymbols.Contains(s.Strategy.Symbol)
-                     && s.EvaluatedAt >= DateTime.UtcNow.AddDays(-60)
+                     && s.EvaluatedAt >= UtcNow.AddDays(-60)
                      && !s.IsDeleted)
             .GroupBy(s => s.StrategyId)
             .Select(g => g.OrderBy(s => s.EvaluatedAt)
@@ -692,13 +708,14 @@ internal sealed class OptimizationValidator
     /// Pass null to fall back to weekend-only tolerance.
     /// </param>
     internal static (bool IsValid, string Issues) ValidateCandleQuality(
-        List<Candle> candles, Timeframe timeframe, int maxGapMultiplier = 5,
+        List<Candle> candles, Timeframe timeframe, DateTime utcNow, int maxGapMultiplier = 5,
         decimal outlierBarRangeThreshold = 0.10m,
         HashSet<DateTime>? holidayDates = null)
     {
         if (candles.Count < 2) return (false, "fewer than 2 candles");
 
         var issues = new List<string>();
+        var effectiveNowUtc = utcNow;
 
         // Check for duplicate timestamps
         var timestamps = candles.Select(c => c.Timestamp).ToList();
@@ -804,14 +821,14 @@ internal sealed class OptimizationValidator
         // extend tolerance by the number of consecutive closed days.
         double stalenessHours = expectedBarMinutes / 60.0 * 10; // 10 bars worth
         var mostRecent = candles[^1].Timestamp;
-        double hoursStale = (DateTime.UtcNow - mostRecent).TotalHours;
+        double hoursStale = (effectiveNowUtc - mostRecent).TotalHours;
         double maxStaleHours = Math.Max(stalenessHours, 65); // 65h covers Friday close → Monday open
 
         if (holidayDates is not null && hoursStale > maxStaleHours)
         {
             // Count consecutive non-trading days from the most recent candle forward
             int closedDays = 0;
-            for (var d = mostRecent.Date.AddDays(1); d <= DateTime.UtcNow.Date; d = d.AddDays(1))
+            for (var d = mostRecent.Date.AddDays(1); d <= effectiveNowUtc.Date; d = d.AddDays(1))
             {
                 bool isWeekend = d.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday;
                 if (isWeekend || holidayDates.Contains(d))
@@ -911,11 +928,13 @@ internal sealed class OptimizationValidator
         Strategy strategy, string paramsJson, List<Candle> candles,
         BacktestOptions options, int timeoutSecs, CancellationToken ct)
     {
+        var cache = _cache;
+
         // Check cache: same params + same candle set = same result.
         // Hash includes count, boundary timestamps, and sampled intermediate timestamps
         // to avoid collisions between lists with identical boundaries but different data.
         string? cacheKey = null;
-        if (_cache is not null)
+        if (cache is not null)
         {
             var hash = new HashCode();
             hash.Add(candles.Count);
@@ -933,7 +952,7 @@ internal sealed class OptimizationValidator
             hash.Add(options.SlippagePriceUnits);
             cacheKey = $"{paramsJson}:{hash.ToHashCode()}";
 
-            if (_cache.TryGetValue(cacheKey, out var cached))
+            if (cache.TryGetValue(cacheKey, out var cached))
                 return cached;
         }
 
@@ -944,8 +963,8 @@ internal sealed class OptimizationValidator
         cts.CancelAfter(TimeSpan.FromSeconds(timeoutSecs));
         var result = await _backtestEngine.RunAsync(candidate, candles, _initialBalance, cts.Token, options);
 
-        if (cacheKey is not null)
-            _cache!.TryAdd(cacheKey, result);
+        if (cacheKey is not null && cache is not null)
+            cache.TryAdd(cacheKey, result);
 
         return result;
     }

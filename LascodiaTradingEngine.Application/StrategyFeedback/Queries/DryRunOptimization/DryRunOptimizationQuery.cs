@@ -55,14 +55,21 @@ public class DryRunOptimizationQueryHandler
     : IRequestHandler<DryRunOptimizationQuery, ResponseData<OptimizationDryRunDto>>
 {
     private readonly IReadApplicationDbContext _readCtx;
+    private readonly OptimizationDryRunSimulator _dryRunSimulator;
 
-    public DryRunOptimizationQueryHandler(IReadApplicationDbContext readCtx) => _readCtx = readCtx;
+    public DryRunOptimizationQueryHandler(
+        IReadApplicationDbContext readCtx,
+        OptimizationDryRunSimulator dryRunSimulator)
+    {
+        _readCtx = readCtx;
+        _dryRunSimulator = dryRunSimulator;
+    }
 
     public async Task<ResponseData<OptimizationDryRunDto>> Handle(
         DryRunOptimizationQuery request, CancellationToken ct)
     {
         var db = _readCtx.GetDbContext();
-        var result = await OptimizationDryRunSimulator.SimulateAsync(db, request.StrategyId, ct);
+        var result = await _dryRunSimulator.SimulateAsync(db, request.StrategyId, ct);
 
         var dto = new OptimizationDryRunDto
         {

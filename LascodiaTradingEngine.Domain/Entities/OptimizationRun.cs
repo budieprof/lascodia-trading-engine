@@ -189,6 +189,19 @@ public class OptimizationRun : Entity<long>
     public DateTime? CompletedAt          { get; set; }
 
     /// <summary>
+    /// UTC timestamp when the terminal optimization result payload was durably persisted.
+    /// This is the authoritative marker that the run can safely survive downstream retries
+    /// without being rewritten as Failed by recovery logic.
+    /// </summary>
+    public DateTime? ResultsPersistedAt   { get; set; }
+
+    /// <summary>
+    /// UTC timestamp when the approval/manual-review decision was durably recorded for the run.
+    /// Set for both auto-approved and manual-review outcomes.
+    /// </summary>
+    public DateTime? ApprovalEvaluatedAt  { get; set; }
+
+    /// <summary>
     /// UTC timestamp when a human operator approved the optimised parameters and
     /// applied them to the strategy. Null until explicitly approved.
     /// </summary>
@@ -236,11 +249,20 @@ public class OptimizationRun : Entity<long>
     /// <summary>UTC timestamp of the latest completion publication attempt.</summary>
     public DateTime? CompletionPublicationLastAttemptAt { get; set; }
 
+    /// <summary>UTC timestamp when the completion publication payload was first prepared for replay-safe publication.</summary>
+    public DateTime? CompletionPublicationPreparedAt { get; set; }
+
     /// <summary>UTC timestamp when completion publication finally succeeded.</summary>
     public DateTime? CompletionPublicationCompletedAt { get; set; }
 
     /// <summary>Last error recorded while publishing completion side effects.</summary>
     public string? CompletionPublicationErrorMessage { get; set; }
+
+    /// <summary>
+    /// UTC timestamp of the most recent lifecycle reconciliation sweep that repaired or
+    /// confirmed this run's durable post-processing state.
+    /// </summary>
+    public DateTime? LifecycleReconciledAt { get; set; }
 
     /// <summary>Soft-delete flag. Filtered out by the global EF Core query filter.</summary>
     public bool    IsDeleted              { get; set; }

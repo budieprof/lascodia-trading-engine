@@ -1,6 +1,8 @@
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -11,11 +13,12 @@ namespace LascodiaTradingEngine.Application.Optimization;
 /// per strategy type, midpoint expansion, TPE bounds extraction, adaptive bounds narrowing,
 /// and parameter type conversions.
 /// </summary>
+[RegisterService(ServiceLifetime.Singleton)]
 internal sealed class OptimizationGridBuilder
 {
-    private readonly ILogger _logger;
+    private readonly ILogger<OptimizationGridBuilder> _logger;
 
-    internal OptimizationGridBuilder(ILogger logger) => _logger = logger;
+    public OptimizationGridBuilder(ILogger<OptimizationGridBuilder> logger) => _logger = logger;
 
     /// <summary>Data-density-dependent evaluation protocol.</summary>
     internal sealed record DataProtocol(double TrainRatio, int KFolds, decimal ScorePenalty);
