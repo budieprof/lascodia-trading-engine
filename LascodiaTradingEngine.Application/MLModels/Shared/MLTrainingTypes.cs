@@ -1632,7 +1632,36 @@ public record TrainingHyperparams(
     /// Minimum acceptance rate required for promotion in legacy training flows.
     /// The current runtime path no longer enforces this gate, so 0.0 disables it.
     /// </summary>
-    double MinAcceptanceRateToPromote = 0.0
+    double MinAcceptanceRateToPromote = 0.0,
+    // ── TabNet v3 architecture hyperparameters ───────────────────────────────
+    /// <summary>Rec #389 v3: Number of sequential attention steps. Default 3.</summary>
+    int TabNetSteps = 3,
+    /// <summary>Rec #389 v3: Entropy-based sparsity regularisation coefficient for attention masks. Default 0.0001.</summary>
+    double TabNetSparsity = 0.0001,
+    /// <summary>Rec #389 v3: Hidden dimension (width) of each FC layer inside the Feature Transformer. Default = 8 × nSteps.</summary>
+    int TabNetHiddenDim = 0,
+    /// <summary>Rec #389 v3: Number of shared FC→BN→GLU blocks across all decision steps. Default 2.</summary>
+    int TabNetSharedLayers = 2,
+    /// <summary>Rec #389 v3: Number of step-specific FC→BN→GLU blocks. Default 2.</summary>
+    int TabNetStepLayers = 2,
+    /// <summary>Rec #389 v3: Prior-scale relaxation γ ∈ [1.0, 2.0] controlling feature reuse across steps. Default 1.5.</summary>
+    double TabNetRelaxationGamma = 1.5,
+    /// <summary>Rec #389 v3: Virtual batch size for Ghost Batch Normalization. Default 128.</summary>
+    int TabNetGhostBatchSize = 128,
+    /// <summary>Rec #389 v3: Output dimension of the Attentive Transformer FC layer. 0 = same as TabNetHiddenDim.</summary>
+    int TabNetAttentionDim = 0,
+    /// <summary>Rec #389 v3: Use true sparsemax (exact zeros) vs softmax fallback. Default true.</summary>
+    bool TabNetUseSparsemax = true,
+    /// <summary>Rec #389 v3: Enable Gated Linear Units (GLU) in the Feature Transformer. Default true.</summary>
+    bool TabNetUseGlu = true,
+    /// <summary>Rec #389 v3: Dropout rate applied after each FC block. Default 0.0.</summary>
+    double TabNetDropoutRate = 0.0,
+    /// <summary>Rec #389 v3: BN running-mean momentum. Default 0.98.</summary>
+    double TabNetMomentumBn = 0.98,
+    /// <summary>Rec #389 v3: Epochs for unsupervised encoder-decoder pre-training. 0 = disabled.</summary>
+    int TabNetPretrainEpochs = 0,
+    /// <summary>Rec #389 v3: Fraction of features masked during pre-training. Default 0.3.</summary>
+    double TabNetPretrainMaskFraction = 0.3
     );
 
 // ── Evaluation metrics ────────────────────────────────────────────────────────
@@ -2704,6 +2733,62 @@ public class ModelSnapshot
     /// audit/test flows. Newer snapshots persist the full output head in <see cref="Weights"/>.
     /// </summary>
     public double TabNetOutputWeight { get; set; }
+
+    // ── TabNet v3 architecture weights (true TabNet: shared + step-specific Feature Transformer with GLU + BN) ──
+
+    /// <summary>Rec #389 v3: Shared FC layer weights [layer][outDim][inDim].</summary>
+    public double[][][]? TabNetSharedWeights { get; set; }
+
+    /// <summary>Rec #389 v3: Shared FC layer biases [layer][dim].</summary>
+    public double[][]? TabNetSharedBiases { get; set; }
+
+    /// <summary>Rec #389 v3: Shared GLU gate weights [layer][outDim][inDim].</summary>
+    public double[][][]? TabNetSharedGateWeights { get; set; }
+
+    /// <summary>Rec #389 v3: Shared GLU gate biases [layer][dim].</summary>
+    public double[][]? TabNetSharedGateBiases { get; set; }
+
+    /// <summary>Rec #389 v3: Step-specific FC weights [step][layer][outDim][inDim].</summary>
+    public double[][][][]? TabNetStepFcWeights { get; set; }
+
+    /// <summary>Rec #389 v3: Step-specific FC biases [step][layer][dim].</summary>
+    public double[][][]? TabNetStepFcBiases { get; set; }
+
+    /// <summary>Rec #389 v3: Step-specific GLU gate weights [step][layer][outDim][inDim].</summary>
+    public double[][][][]? TabNetStepGateWeights { get; set; }
+
+    /// <summary>Rec #389 v3: Step-specific GLU gate biases [step][layer][dim].</summary>
+    public double[][][]? TabNetStepGateBiases { get; set; }
+
+    /// <summary>Rec #389 v3: Attentive Transformer FC weights [step][attDim][inDim].</summary>
+    public double[][][]? TabNetAttentionFcWeights { get; set; }
+
+    /// <summary>Rec #389 v3: Attentive Transformer FC biases [step][attDim].</summary>
+    public double[][]? TabNetAttentionFcBiases { get; set; }
+
+    /// <summary>Rec #389 v3: BN scale (gamma) params [bnIndex][dim].</summary>
+    public double[][]? TabNetBnGammas { get; set; }
+
+    /// <summary>Rec #389 v3: BN shift (beta) params [bnIndex][dim].</summary>
+    public double[][]? TabNetBnBetas { get; set; }
+
+    /// <summary>Rec #389 v3: BN running means for inference [bnIndex][dim].</summary>
+    public double[][]? TabNetBnRunningMeans { get; set; }
+
+    /// <summary>Rec #389 v3: BN running variances for inference [bnIndex][dim].</summary>
+    public double[][]? TabNetBnRunningVars { get; set; }
+
+    /// <summary>Rec #389 v3: Full output-head weights vector [hiddenDim]. Replaces legacy scalar TabNetOutputWeight.</summary>
+    public double[]? TabNetOutputHeadWeights { get; set; }
+
+    /// <summary>Rec #389 v3: Output-head bias.</summary>
+    public double TabNetOutputHeadBias { get; set; }
+
+    /// <summary>Rec #389 v3: Relaxation γ value used during training (stored for inference reproducibility).</summary>
+    public double TabNetRelaxationGamma { get; set; } = 1.5;
+
+    /// <summary>Rec #389 v3: Hidden dimension used during training.</summary>
+    public int TabNetHiddenDim { get; set; }
 
     /// <summary>Rec #390: FT-Transformer per-feature embedding weights (outer = feature, inner = dim).</summary>
     public double[][]? FtTransformerEmbedWeights { get; set; }
