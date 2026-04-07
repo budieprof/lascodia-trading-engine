@@ -931,26 +931,38 @@ internal sealed class OptimizationValidator
         var cache = _cache;
 
         // Check cache: same params + same candle set = same result.
-        // Hash includes count, boundary timestamps, and sampled intermediate timestamps
-        // to avoid collisions between lists with identical boundaries but different data.
+        // Uses two independent HashCode instances to produce a 64-bit composite hash,
+        // reducing birthday-paradox collision risk from ~1/2^16 to ~1/2^32 for typical
+        // per-run evaluation counts. Includes boundary close prices alongside timestamps
+        // to distinguish candle subsets that share boundaries but contain different data.
         string? cacheKey = null;
         if (cache is not null)
         {
-            var hash = new HashCode();
-            hash.Add(candles.Count);
+            var hash1 = new HashCode();
+            var hash2 = new HashCode();
+            hash1.Add(candles.Count);
+            hash2.Add(candles.Count ^ 0x5A5A5A5A);
             if (candles.Count > 0)
             {
-                hash.Add(candles[0].Timestamp.Ticks);
-                hash.Add(candles[^1].Timestamp.Ticks);
+                hash1.Add(candles[0].Timestamp.Ticks);
+                hash1.Add(candles[^1].Timestamp.Ticks);
+                hash1.Add(candles[0].Close);
+                hash1.Add(candles[^1].Close);
+                hash2.Add(candles[0].Close);
+                hash2.Add(candles[^1].Close);
                 // Sample up to 8 evenly-spaced intermediate timestamps for collision resistance
                 int step = Math.Max(1, candles.Count / 8);
                 for (int i = step; i < candles.Count - 1; i += step)
-                    hash.Add(candles[i].Timestamp.Ticks);
+                {
+                    hash1.Add(candles[i].Timestamp.Ticks);
+                    hash2.Add(candles[i].Close);
+                }
             }
-            hash.Add(options.SpreadPriceUnits);
-            hash.Add(options.CommissionPerLot);
-            hash.Add(options.SlippagePriceUnits);
-            cacheKey = $"{paramsJson}:{hash.ToHashCode()}";
+            hash1.Add(options.SpreadPriceUnits);
+            hash1.Add(options.CommissionPerLot);
+            hash1.Add(options.SlippagePriceUnits);
+            hash2.Add(options.SpreadPriceUnits);
+            cacheKey = $"{paramsJson}:{hash1.ToHashCode():X8}{hash2.ToHashCode():X8}";
 
             if (cache.TryGetValue(cacheKey, out var cached))
                 return cached;

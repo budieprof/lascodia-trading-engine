@@ -76,6 +76,7 @@ public class OptimizationWorker : BackgroundService
             try
             {
                 await RequeueExpiredRunningRunsAsync(stoppingToken);
+                await RecoverStaleQueuedRunsAsync(stoppingToken);
                 await RetryFailedRunsAsync(stoppingToken);
                 var reconciliationSummary = await ReconcileLifecycleStateAsync(stoppingToken);
                 await MonitorFollowUpResultsAsync(stoppingToken);
@@ -126,6 +127,13 @@ public class OptimizationWorker : BackgroundService
         await using var scope = _scopeFactory.CreateAsyncScope();
         var recoveryCoordinator = scope.ServiceProvider.GetRequiredService<OptimizationRunRecoveryCoordinator>();
         await recoveryCoordinator.RequeueExpiredRunningRunsAsync(ct);
+    }
+
+    private async Task RecoverStaleQueuedRunsAsync(CancellationToken ct)
+    {
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        var recoveryCoordinator = scope.ServiceProvider.GetRequiredService<OptimizationRunRecoveryCoordinator>();
+        await recoveryCoordinator.RecoverStaleQueuedRunsAsync(ct);
     }
 
     private async Task RetryFailedRunsAsync(CancellationToken ct)

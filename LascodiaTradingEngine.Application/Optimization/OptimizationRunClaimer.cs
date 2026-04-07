@@ -130,11 +130,17 @@ internal static class OptimizationRunClaimer
         int requeued = 0;
         if (toRequeue.Count > 0)
         {
+            // Mirror OptimizationRunStateMachine.Transition(Running → Queued) side effects:
+            // clear CompletedAt, ApprovedAt, ErrorMessage, FailureCategory, lease fields.
             requeued = await db.Set<OptimizationRun>()
                 .Where(r => toRequeue.Contains(r.Id))
                 .ExecuteUpdateAsync(s => s
                     .SetProperty(r => r.Status, OptimizationRunStatus.Queued)
                     .SetProperty(r => r.StartedAt, nowUtc)
+                    .SetProperty(r => r.CompletedAt, (DateTime?)null)
+                    .SetProperty(r => r.ApprovedAt, (DateTime?)null)
+                    .SetProperty(r => r.ErrorMessage, (string?)null)
+                    .SetProperty(r => r.FailureCategory, (OptimizationFailureCategory?)null)
                     .SetProperty(r => r.DeferredUntilUtc, (DateTime?)null)
                     .SetProperty(r => r.ExecutionLeaseExpiresAt, (DateTime?)null)
                     .SetProperty(r => r.ExecutionLeaseToken, (Guid?)null), ct);
@@ -143,12 +149,15 @@ internal static class OptimizationRunClaimer
         int orphaned = 0;
         if (toOrphan.Count > 0)
         {
+            // Mirror OptimizationRunStateMachine.Transition(Running → Failed) side effects:
+            // set CompletedAt, ErrorMessage, FailureCategory, clear lease fields.
             orphaned = await db.Set<OptimizationRun>()
                 .Where(r => toOrphan.Contains(r.Id))
                 .ExecuteUpdateAsync(s => s
                     .SetProperty(r => r.Status, OptimizationRunStatus.Failed)
                     .SetProperty(r => r.ErrorMessage, "Strategy deleted during optimization run")
-                    .SetProperty(r => r.CompletedAt, nowUtc)
+                    .SetProperty(r => r.FailureCategory, (OptimizationFailureCategory?)OptimizationFailureCategory.StrategyRemoved)
+                    .SetProperty(r => r.CompletedAt, (DateTime?)nowUtc)
                     .SetProperty(r => r.ExecutionLeaseExpiresAt, (DateTime?)null)
                     .SetProperty(r => r.ExecutionLeaseToken, (Guid?)null), ct);
         }

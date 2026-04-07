@@ -65,6 +65,27 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                 });
 
             migrationBuilder.CreateTable(
+                name: "BrokerAccountSnapshot",
+                columns: table => new
+                {
+                    Id = table.Column<long>(type: "bigint", nullable: false)
+                        .Annotation("Npgsql:ValueGenerationStrategy", NpgsqlValueGenerationStrategy.IdentityByDefaultColumn),
+                    TradingAccountId = table.Column<long>(type: "bigint", nullable: false),
+                    InstanceId = table.Column<string>(type: "text", nullable: false),
+                    Balance = table.Column<decimal>(type: "numeric", nullable: false),
+                    Equity = table.Column<decimal>(type: "numeric", nullable: false),
+                    MarginUsed = table.Column<decimal>(type: "numeric", nullable: false),
+                    FreeMargin = table.Column<decimal>(type: "numeric", nullable: false),
+                    ReportedAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: false),
+                    IsDeleted = table.Column<bool>(type: "boolean", nullable: false),
+                    OutboxId = table.Column<Guid>(type: "uuid", nullable: false)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_BrokerAccountSnapshot", x => x.Id);
+                });
+
+            migrationBuilder.CreateTable(
                 name: "Candle",
                 columns: table => new
                 {
@@ -102,6 +123,7 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     RetailLong = table.Column<long>(type: "bigint", nullable: false),
                     RetailShort = table.Column<long>(type: "bigint", nullable: false),
                     NetNonCommercialPositioning = table.Column<decimal>(type: "numeric(18,2)", precision: 18, scale: 2, nullable: false),
+                    TotalOpenInterest = table.Column<long>(type: "bigint", nullable: false),
                     NetPositioningChangeWeekly = table.Column<decimal>(type: "numeric(18,2)", precision: 18, scale: 2, nullable: false),
                     IsDeleted = table.Column<bool>(type: "boolean", nullable: false),
                     OutboxId = table.Column<Guid>(type: "uuid", nullable: false)
@@ -127,6 +149,8 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     MaxLotSize = table.Column<decimal>(type: "numeric(18,5)", precision: 18, scale: 5, nullable: false),
                     LotStep = table.Column<decimal>(type: "numeric(18,5)", precision: 18, scale: 5, nullable: false),
                     IsActive = table.Column<bool>(type: "boolean", nullable: false),
+                    TradingHoursJson = table.Column<string>(type: "text", nullable: true),
+                    SpreadPoints = table.Column<double>(type: "double precision", nullable: false),
                     IsDeleted = table.Column<bool>(type: "boolean", nullable: false),
                     OutboxId = table.Column<Guid>(type: "uuid", nullable: false)
                 },
@@ -839,6 +863,175 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                 });
 
             migrationBuilder.CreateTable(
+                name: "SpreadProfiles",
+                columns: table => new
+                {
+                    Id = table.Column<long>(type: "bigint", nullable: false)
+                        .Annotation("Npgsql:ValueGenerationStrategy", NpgsqlValueGenerationStrategy.IdentityByDefaultColumn),
+                    Symbol = table.Column<string>(type: "character varying(20)", maxLength: 20, nullable: false),
+                    HourUtc = table.Column<int>(type: "integer", nullable: false),
+                    DayOfWeek = table.Column<int>(type: "integer", nullable: true),
+                    SessionName = table.Column<string>(type: "character varying(30)", maxLength: 30, nullable: true),
+                    SpreadP25 = table.Column<decimal>(type: "numeric(18,8)", precision: 18, scale: 8, nullable: false),
+                    SpreadP50 = table.Column<decimal>(type: "numeric(18,8)", precision: 18, scale: 8, nullable: false),
+                    SpreadP75 = table.Column<decimal>(type: "numeric(18,8)", precision: 18, scale: 8, nullable: false),
+                    SpreadP95 = table.Column<decimal>(type: "numeric(18,8)", precision: 18, scale: 8, nullable: false),
+                    SpreadMean = table.Column<decimal>(type: "numeric(18,8)", precision: 18, scale: 8, nullable: false),
+                    SampleCount = table.Column<int>(type: "integer", nullable: false),
+                    AggregatedFrom = table.Column<DateTime>(type: "timestamp with time zone", nullable: false),
+                    AggregatedTo = table.Column<DateTime>(type: "timestamp with time zone", nullable: false),
+                    ComputedAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: false),
+                    IsDeleted = table.Column<bool>(type: "boolean", nullable: false),
+                    xmin = table.Column<uint>(type: "xid", rowVersion: true, nullable: false),
+                    OutboxId = table.Column<Guid>(type: "uuid", nullable: false)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_SpreadProfiles", x => x.Id);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "StrategyGenerationCheckpoint",
+                columns: table => new
+                {
+                    Id = table.Column<long>(type: "bigint", nullable: false)
+                        .Annotation("Npgsql:ValueGenerationStrategy", NpgsqlValueGenerationStrategy.IdentityByDefaultColumn),
+                    WorkerName = table.Column<string>(type: "character varying(100)", maxLength: 100, nullable: false),
+                    CycleId = table.Column<string>(type: "character varying(64)", maxLength: 64, nullable: false),
+                    CycleDateUtc = table.Column<DateTime>(type: "timestamp with time zone", nullable: false),
+                    Fingerprint = table.Column<string>(type: "character varying(128)", maxLength: 128, nullable: false),
+                    PayloadJson = table.Column<string>(type: "text", nullable: false),
+                    UsedRestartSafeFallback = table.Column<bool>(type: "boolean", nullable: false),
+                    LastUpdatedAtUtc = table.Column<DateTime>(type: "timestamp with time zone", nullable: false),
+                    IsDeleted = table.Column<bool>(type: "boolean", nullable: false),
+                    OutboxId = table.Column<Guid>(type: "uuid", nullable: false)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_StrategyGenerationCheckpoint", x => x.Id);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "StrategyGenerationCycleRun",
+                columns: table => new
+                {
+                    Id = table.Column<long>(type: "bigint", nullable: false)
+                        .Annotation("Npgsql:ValueGenerationStrategy", NpgsqlValueGenerationStrategy.IdentityByDefaultColumn),
+                    WorkerName = table.Column<string>(type: "character varying(100)", maxLength: 100, nullable: false),
+                    CycleId = table.Column<string>(type: "character varying(64)", maxLength: 64, nullable: false),
+                    Status = table.Column<string>(type: "character varying(32)", maxLength: 32, nullable: false),
+                    Fingerprint = table.Column<string>(type: "character varying(128)", maxLength: 128, nullable: true),
+                    StartedAtUtc = table.Column<DateTime>(type: "timestamp with time zone", nullable: false),
+                    CompletedAtUtc = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
+                    DurationMs = table.Column<double>(type: "double precision", nullable: true),
+                    CandidatesCreated = table.Column<int>(type: "integer", nullable: false),
+                    ReserveCandidatesCreated = table.Column<int>(type: "integer", nullable: false),
+                    CandidatesScreened = table.Column<int>(type: "integer", nullable: false),
+                    SymbolsProcessed = table.Column<int>(type: "integer", nullable: false),
+                    SymbolsSkipped = table.Column<int>(type: "integer", nullable: false),
+                    StrategiesPruned = table.Column<int>(type: "integer", nullable: false),
+                    PortfolioFilterRemoved = table.Column<int>(type: "integer", nullable: false),
+                    FailureStage = table.Column<string>(type: "character varying(64)", maxLength: 64, nullable: true),
+                    FailureMessage = table.Column<string>(type: "character varying(2000)", maxLength: 2000, nullable: true),
+                    LastUpdatedAtUtc = table.Column<DateTime>(type: "timestamp with time zone", nullable: false),
+                    IsDeleted = table.Column<bool>(type: "boolean", nullable: false),
+                    OutboxId = table.Column<Guid>(type: "uuid", nullable: false)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_StrategyGenerationCycleRun", x => x.Id);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "StrategyGenerationFailure",
+                columns: table => new
+                {
+                    Id = table.Column<long>(type: "bigint", nullable: false)
+                        .Annotation("Npgsql:ValueGenerationStrategy", NpgsqlValueGenerationStrategy.IdentityByDefaultColumn),
+                    CandidateId = table.Column<string>(type: "character varying(64)", maxLength: 64, nullable: false),
+                    CycleId = table.Column<string>(type: "character varying(64)", maxLength: 64, nullable: true),
+                    CandidateHash = table.Column<string>(type: "character varying(128)", maxLength: 128, nullable: false),
+                    StrategyType = table.Column<string>(type: "character varying(50)", maxLength: 50, nullable: false),
+                    Symbol = table.Column<string>(type: "character varying(10)", maxLength: 10, nullable: false),
+                    Timeframe = table.Column<string>(type: "character varying(10)", maxLength: 10, nullable: false),
+                    ParametersJson = table.Column<string>(type: "text", nullable: false),
+                    FailureStage = table.Column<string>(type: "character varying(100)", maxLength: 100, nullable: false),
+                    FailureReason = table.Column<string>(type: "character varying(200)", maxLength: 200, nullable: false),
+                    DetailsJson = table.Column<string>(type: "text", nullable: true),
+                    IsReported = table.Column<bool>(type: "boolean", nullable: false),
+                    CreatedAtUtc = table.Column<DateTime>(type: "timestamp with time zone", nullable: false),
+                    ResolvedAtUtc = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
+                    IsDeleted = table.Column<bool>(type: "boolean", nullable: false),
+                    OutboxId = table.Column<Guid>(type: "uuid", nullable: false)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_StrategyGenerationFailure", x => x.Id);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "StrategyGenerationFeedbackState",
+                columns: table => new
+                {
+                    Id = table.Column<long>(type: "bigint", nullable: false)
+                        .Annotation("Npgsql:ValueGenerationStrategy", NpgsqlValueGenerationStrategy.IdentityByDefaultColumn),
+                    StateKey = table.Column<string>(type: "character varying(128)", maxLength: 128, nullable: false),
+                    PayloadJson = table.Column<string>(type: "text", nullable: false),
+                    LastUpdatedAtUtc = table.Column<DateTime>(type: "timestamp with time zone", nullable: false),
+                    IsDeleted = table.Column<bool>(type: "boolean", nullable: false, defaultValue: false),
+                    OutboxId = table.Column<Guid>(type: "uuid", nullable: false)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_StrategyGenerationFeedbackState", x => x.Id);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "StrategyGenerationPendingArtifact",
+                columns: table => new
+                {
+                    Id = table.Column<long>(type: "bigint", nullable: false)
+                        .Annotation("Npgsql:ValueGenerationStrategy", NpgsqlValueGenerationStrategy.IdentityByDefaultColumn),
+                    StrategyId = table.Column<long>(type: "bigint", nullable: false),
+                    CandidateId = table.Column<string>(type: "character varying(64)", maxLength: 64, nullable: false),
+                    CycleId = table.Column<string>(type: "character varying(64)", maxLength: 64, nullable: true),
+                    CandidatePayloadJson = table.Column<string>(type: "text", nullable: false),
+                    NeedsCreationAudit = table.Column<bool>(type: "boolean", nullable: false),
+                    NeedsCreatedEvent = table.Column<bool>(type: "boolean", nullable: false),
+                    NeedsAutoPromoteEvent = table.Column<bool>(type: "boolean", nullable: false),
+                    AttemptCount = table.Column<int>(type: "integer", nullable: false),
+                    LastAttemptAtUtc = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
+                    LastErrorMessage = table.Column<string>(type: "character varying(1000)", maxLength: 1000, nullable: true),
+                    IsDeleted = table.Column<bool>(type: "boolean", nullable: false),
+                    OutboxId = table.Column<Guid>(type: "uuid", nullable: false)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_StrategyGenerationPendingArtifact", x => x.Id);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "StrategyGenerationScheduleState",
+                columns: table => new
+                {
+                    Id = table.Column<long>(type: "bigint", nullable: false)
+                        .Annotation("Npgsql:ValueGenerationStrategy", NpgsqlValueGenerationStrategy.IdentityByDefaultColumn),
+                    WorkerName = table.Column<string>(type: "character varying(100)", maxLength: 100, nullable: false),
+                    LastRunDateUtc = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
+                    CircuitBreakerUntilUtc = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
+                    ConsecutiveFailures = table.Column<int>(type: "integer", nullable: false),
+                    RetriesThisWindow = table.Column<int>(type: "integer", nullable: false),
+                    RetryWindowDateUtc = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
+                    LastUpdatedAtUtc = table.Column<DateTime>(type: "timestamp with time zone", nullable: false),
+                    IsDeleted = table.Column<bool>(type: "boolean", nullable: false),
+                    OutboxId = table.Column<Guid>(type: "uuid", nullable: false)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_StrategyGenerationScheduleState", x => x.Id);
+                });
+
+            migrationBuilder.CreateTable(
                 name: "StressTestScenario",
                 columns: table => new
                 {
@@ -922,6 +1115,28 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                 });
 
             migrationBuilder.CreateTable(
+                name: "TradingSessionSchedules",
+                columns: table => new
+                {
+                    Id = table.Column<long>(type: "bigint", nullable: false)
+                        .Annotation("Npgsql:ValueGenerationStrategy", NpgsqlValueGenerationStrategy.IdentityByDefaultColumn),
+                    Symbol = table.Column<string>(type: "character varying(20)", maxLength: 20, nullable: false),
+                    SessionName = table.Column<string>(type: "character varying(50)", maxLength: 50, nullable: false),
+                    OpenTime = table.Column<TimeSpan>(type: "interval", nullable: false),
+                    CloseTime = table.Column<TimeSpan>(type: "interval", nullable: false),
+                    DayOfWeekStart = table.Column<int>(type: "integer", nullable: false),
+                    DayOfWeekEnd = table.Column<int>(type: "integer", nullable: false),
+                    InstanceId = table.Column<string>(type: "character varying(100)", maxLength: 100, nullable: true),
+                    CreatedAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: false),
+                    IsDeleted = table.Column<bool>(type: "boolean", nullable: false),
+                    OutboxId = table.Column<Guid>(type: "uuid", nullable: false)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_TradingSessionSchedules", x => x.Id);
+                });
+
+            migrationBuilder.CreateTable(
                 name: "WorkerHealthSnapshot",
                 columns: table => new
                 {
@@ -949,6 +1164,32 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                 constraints: table =>
                 {
                     table.PrimaryKey("PK_WorkerHealthSnapshot", x => x.Id);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "AlertDispatchLog",
+                columns: table => new
+                {
+                    Id = table.Column<long>(type: "bigint", nullable: false)
+                        .Annotation("Npgsql:ValueGenerationStrategy", NpgsqlValueGenerationStrategy.IdentityByDefaultColumn),
+                    AlertId = table.Column<long>(type: "bigint", nullable: false),
+                    Channel = table.Column<int>(type: "integer", nullable: false),
+                    Status = table.Column<string>(type: "text", nullable: false),
+                    Message = table.Column<string>(type: "text", nullable: false),
+                    DispatchedAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: false),
+                    ErrorMessage = table.Column<string>(type: "text", nullable: true),
+                    IsDeleted = table.Column<bool>(type: "boolean", nullable: false),
+                    OutboxId = table.Column<Guid>(type: "uuid", nullable: false)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_AlertDispatchLog", x => x.Id);
+                    table.ForeignKey(
+                        name: "FK_AlertDispatchLog_Alert_AlertId",
+                        column: x => x.AlertId,
+                        principalTable: "Alert",
+                        principalColumn: "Id",
+                        onDelete: ReferentialAction.Cascade);
                 });
 
             migrationBuilder.CreateTable(
@@ -1457,6 +1698,35 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                 });
 
             migrationBuilder.CreateTable(
+                name: "PositionLifecycleEvent",
+                columns: table => new
+                {
+                    Id = table.Column<long>(type: "bigint", nullable: false)
+                        .Annotation("Npgsql:ValueGenerationStrategy", NpgsqlValueGenerationStrategy.IdentityByDefaultColumn),
+                    PositionId = table.Column<long>(type: "bigint", nullable: false),
+                    EventType = table.Column<string>(type: "text", nullable: false),
+                    Source = table.Column<string>(type: "text", nullable: false),
+                    PreviousLots = table.Column<decimal>(type: "numeric", nullable: true),
+                    NewLots = table.Column<decimal>(type: "numeric", nullable: true),
+                    SwapAccumulated = table.Column<decimal>(type: "numeric", nullable: true),
+                    CommissionAccumulated = table.Column<decimal>(type: "numeric", nullable: true),
+                    Description = table.Column<string>(type: "text", nullable: true),
+                    OccurredAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: false),
+                    IsDeleted = table.Column<bool>(type: "boolean", nullable: false),
+                    OutboxId = table.Column<Guid>(type: "uuid", nullable: false)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_PositionLifecycleEvent", x => x.Id);
+                    table.ForeignKey(
+                        name: "FK_PositionLifecycleEvent_Position_PositionId",
+                        column: x => x.PositionId,
+                        principalTable: "Position",
+                        principalColumn: "Id",
+                        onDelete: ReferentialAction.Cascade);
+                });
+
+            migrationBuilder.CreateTable(
                 name: "Strategy",
                 columns: table => new
                 {
@@ -1469,11 +1739,24 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     Timeframe = table.Column<string>(type: "character varying(5)", maxLength: 5, nullable: false),
                     ParametersJson = table.Column<string>(type: "text", nullable: false),
                     Status = table.Column<string>(type: "character varying(20)", maxLength: 20, nullable: false),
+                    PauseReason = table.Column<string>(type: "text", nullable: true),
+                    xmin = table.Column<uint>(type: "xid", rowVersion: true, nullable: false),
                     RiskProfileId = table.Column<long>(type: "bigint", nullable: true),
                     CreatedAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: false),
                     LifecycleStage = table.Column<string>(type: "character varying(20)", maxLength: 20, nullable: false),
                     LifecycleStageEnteredAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
                     EstimatedCapacityLots = table.Column<decimal>(type: "numeric(18,2)", precision: 18, scale: 2, nullable: true),
+                    RolloutPct = table.Column<int>(type: "integer", nullable: true),
+                    RollbackParametersJson = table.Column<string>(type: "text", nullable: true),
+                    RolloutStartedAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
+                    RolloutOptimizationRunId = table.Column<long>(type: "bigint", nullable: true),
+                    RolloutEvaluationFailureCount = table.Column<int>(type: "integer", nullable: false),
+                    RolloutLastFailureMessage = table.Column<string>(type: "text", nullable: true),
+                    ScreeningMetricsJson = table.Column<string>(type: "text", nullable: true),
+                    PrunedAtUtc = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
+                    GenerationCycleId = table.Column<string>(type: "text", nullable: true),
+                    GenerationCandidateId = table.Column<string>(type: "text", nullable: true),
+                    ValidationPriority = table.Column<int>(type: "integer", nullable: false),
                     IsDeleted = table.Column<bool>(type: "boolean", nullable: false),
                     OutboxId = table.Column<Guid>(type: "uuid", nullable: false)
                 },
@@ -1552,6 +1835,9 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     RegisteredAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: false),
                     DeregisteredAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
                     LastProcessedDeltaSequence = table.Column<long>(type: "bigint", nullable: true),
+                    LastProcessedPositionSnapshotSequence = table.Column<long>(type: "bigint", nullable: true),
+                    LastProcessedOrderSnapshotSequence = table.Column<long>(type: "bigint", nullable: true),
+                    LastProcessedDealSnapshotSequence = table.Column<long>(type: "bigint", nullable: true),
                     IsDeleted = table.Column<bool>(type: "boolean", nullable: false),
                     RowVersion = table.Column<long>(type: "bigint", nullable: false),
                     TradingAccountId1 = table.Column<long>(type: "bigint", nullable: true),
@@ -1654,6 +1940,10 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     ErrorMessage = table.Column<string>(type: "text", nullable: true),
                     StartedAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: false),
                     CompletedAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
+                    Priority = table.Column<int>(type: "integer", nullable: false),
+                    SourceOptimizationRunId = table.Column<long>(type: "bigint", nullable: true),
+                    ParametersSnapshotJson = table.Column<string>(type: "text", nullable: true),
+                    ValidationQueueKey = table.Column<string>(type: "text", nullable: true),
                     IsDeleted = table.Column<bool>(type: "boolean", nullable: false),
                     OutboxId = table.Column<Guid>(type: "uuid", nullable: false)
                 },
@@ -1680,18 +1970,66 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     Iterations = table.Column<int>(type: "integer", nullable: false),
                     BestParametersJson = table.Column<string>(type: "text", nullable: true),
                     BestHealthScore = table.Column<decimal>(type: "numeric(5,4)", precision: 5, scale: 4, nullable: true),
+                    BestSharpeRatio = table.Column<decimal>(type: "numeric", nullable: true),
+                    BestMaxDrawdownPct = table.Column<decimal>(type: "numeric", nullable: true),
+                    BestWinRate = table.Column<decimal>(type: "numeric", nullable: true),
                     BaselineParametersJson = table.Column<string>(type: "text", nullable: true),
                     BaselineHealthScore = table.Column<decimal>(type: "numeric(5,4)", precision: 5, scale: 4, nullable: true),
+                    ConfigSnapshotJson = table.Column<string>(type: "text", nullable: true),
+                    RunMetadataJson = table.Column<string>(type: "text", nullable: true),
+                    IntermediateResultsJson = table.Column<string>(type: "text", nullable: true),
+                    CheckpointVersion = table.Column<int>(type: "integer", nullable: false),
+                    ApprovalReportJson = table.Column<string>(type: "text", nullable: true),
+                    DeterministicSeed = table.Column<int>(type: "integer", nullable: false),
                     ErrorMessage = table.Column<string>(type: "text", nullable: true),
+                    FailureCategory = table.Column<int>(type: "integer", nullable: true),
+                    RetryCount = table.Column<int>(type: "integer", nullable: false),
+                    LastHeartbeatAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
+                    ExecutionLeaseExpiresAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
+                    ExecutionLeaseToken = table.Column<Guid>(type: "uuid", nullable: true),
+                    xmin = table.Column<uint>(type: "xid", rowVersion: true, nullable: false),
+                    DeferredUntilUtc = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
+                    QueuedAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: false),
+                    ClaimedAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
+                    ExecutionStartedAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
+                    ExecutionStage = table.Column<int>(type: "integer", nullable: false),
+                    ExecutionStageMessage = table.Column<string>(type: "text", nullable: true),
+                    ExecutionStageUpdatedAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
+                    LastOperationalIssueCode = table.Column<string>(type: "text", nullable: true),
+                    LastOperationalIssueMessage = table.Column<string>(type: "text", nullable: true),
+                    LastOperationalIssueAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
                     StartedAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: false),
                     CompletedAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
+                    ResultsPersistedAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
+                    ApprovalEvaluatedAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
                     ApprovedAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
+                    ValidationFollowUpsCreatedAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
+                    ValidationFollowUpStatus = table.Column<string>(type: "character varying(20)", maxLength: 20, nullable: true),
+                    NextFollowUpCheckAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
+                    FollowUpLastCheckedAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
+                    FollowUpRepairAttempts = table.Column<int>(type: "integer", nullable: false),
+                    FollowUpLastStatusCode = table.Column<string>(type: "text", nullable: true),
+                    FollowUpLastStatusMessage = table.Column<string>(type: "text", nullable: true),
+                    FollowUpStatusUpdatedAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
+                    CompletionPublicationPayloadJson = table.Column<string>(type: "text", nullable: true),
+                    CompletionPublicationStatus = table.Column<int>(type: "integer", nullable: true),
+                    CompletionPublicationAttempts = table.Column<int>(type: "integer", nullable: false),
+                    CompletionPublicationLastAttemptAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
+                    CompletionPublicationPreparedAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
+                    CompletionPublicationCompletedAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
+                    CompletionPublicationErrorMessage = table.Column<string>(type: "text", nullable: true),
+                    LifecycleReconciledAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
                     IsDeleted = table.Column<bool>(type: "boolean", nullable: false),
                     OutboxId = table.Column<Guid>(type: "uuid", nullable: false)
                 },
                 constraints: table =>
                 {
                     table.PrimaryKey("PK_OptimizationRun", x => x.Id);
+                    table.CheckConstraint("CK_OptimizationRun_ApprovalStatesRequireApprovalEvaluated", "\"Status\" NOT IN ('Approved','Rejected') OR \"ApprovalEvaluatedAt\" IS NOT NULL");
+                    table.CheckConstraint("CK_OptimizationRun_CompletionPreparedRequiresPayload", "\"CompletionPublicationPreparedAt\" IS NULL OR \"CompletionPublicationPayloadJson\" IS NOT NULL");
+                    table.CheckConstraint("CK_OptimizationRun_CompletionPublishedRequiresPreparedPayload", "\"CompletionPublicationStatus\" IS DISTINCT FROM 1 OR (\"CompletionPublicationPayloadJson\" IS NOT NULL AND \"CompletionPublicationPreparedAt\" IS NOT NULL AND \"CompletionPublicationCompletedAt\" IS NOT NULL)");
+                    table.CheckConstraint("CK_OptimizationRun_FollowUpStatusRequiresCreation", "\"ValidationFollowUpStatus\" IS NULL OR \"ValidationFollowUpsCreatedAt\" IS NOT NULL");
+                    table.CheckConstraint("CK_OptimizationRun_TerminalRunsRequireResultsPersisted", "\"Status\" NOT IN ('Completed','Approved','Rejected') OR \"ResultsPersistedAt\" IS NOT NULL");
                     table.ForeignKey(
                         name: "FK_OptimizationRun_Strategy_StrategyId",
                         column: x => x.StrategyId,
@@ -1882,6 +2220,7 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     ToDate = table.Column<DateTime>(type: "timestamp with time zone", nullable: false),
                     InSampleDays = table.Column<int>(type: "integer", nullable: false),
                     OutOfSampleDays = table.Column<int>(type: "integer", nullable: false),
+                    ReOptimizePerFold = table.Column<bool>(type: "boolean", nullable: false),
                     Status = table.Column<string>(type: "character varying(20)", maxLength: 20, nullable: false),
                     InitialBalance = table.Column<decimal>(type: "numeric(18,2)", precision: 18, scale: 2, nullable: false),
                     AverageOutOfSampleScore = table.Column<decimal>(type: "numeric(18,6)", precision: 18, scale: 6, nullable: true),
@@ -1889,7 +2228,11 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     WindowResultsJson = table.Column<string>(type: "text", nullable: true),
                     ErrorMessage = table.Column<string>(type: "text", nullable: true),
                     StartedAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: false),
+                    Priority = table.Column<int>(type: "integer", nullable: false),
                     CompletedAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
+                    SourceOptimizationRunId = table.Column<long>(type: "bigint", nullable: true),
+                    ParametersSnapshotJson = table.Column<string>(type: "text", nullable: true),
+                    ValidationQueueKey = table.Column<string>(type: "text", nullable: true),
                     IsDeleted = table.Column<bool>(type: "boolean", nullable: false),
                     OutboxId = table.Column<Guid>(type: "uuid", nullable: false)
                 },
@@ -1902,6 +2245,39 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                         principalTable: "Strategy",
                         principalColumn: "Id",
                         onDelete: ReferentialAction.Restrict);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "StrategyRegimeParams",
+                columns: table => new
+                {
+                    Id = table.Column<long>(type: "bigint", nullable: false)
+                        .Annotation("Npgsql:ValueGenerationStrategy", NpgsqlValueGenerationStrategy.IdentityByDefaultColumn),
+                    StrategyId = table.Column<long>(type: "bigint", nullable: false),
+                    Regime = table.Column<string>(type: "character varying(30)", maxLength: 30, nullable: false),
+                    ParametersJson = table.Column<string>(type: "text", nullable: false),
+                    HealthScore = table.Column<decimal>(type: "numeric(18,4)", precision: 18, scale: 4, nullable: false),
+                    HealthScoreCILower = table.Column<decimal>(type: "numeric(18,4)", precision: 18, scale: 4, nullable: true),
+                    OptimizationRunId = table.Column<long>(type: "bigint", nullable: true),
+                    OptimizedAt = table.Column<DateTime>(type: "timestamp with time zone", nullable: false),
+                    IsDeleted = table.Column<bool>(type: "boolean", nullable: false),
+                    OutboxId = table.Column<Guid>(type: "uuid", nullable: false)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_StrategyRegimeParams", x => x.Id);
+                    table.ForeignKey(
+                        name: "FK_StrategyRegimeParams_OptimizationRun_OptimizationRunId",
+                        column: x => x.OptimizationRunId,
+                        principalTable: "OptimizationRun",
+                        principalColumn: "Id",
+                        onDelete: ReferentialAction.SetNull);
+                    table.ForeignKey(
+                        name: "FK_StrategyRegimeParams_Strategy_StrategyId",
+                        column: x => x.StrategyId,
+                        principalTable: "Strategy",
+                        principalColumn: "Id",
+                        onDelete: ReferentialAction.Cascade);
                 });
 
             migrationBuilder.CreateTable(
@@ -2309,9 +2685,21 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                 columns: new[] { "Symbol", "AlertType", "IsActive" });
 
             migrationBuilder.CreateIndex(
+                name: "IX_AlertDispatchLog_AlertId",
+                table: "AlertDispatchLog",
+                column: "AlertId");
+
+            migrationBuilder.CreateIndex(
                 name: "IX_ApprovalRequest_OperationType_TargetEntityId_Status",
                 table: "ApprovalRequest",
                 columns: new[] { "OperationType", "TargetEntityId", "Status" });
+
+            migrationBuilder.CreateIndex(
+                name: "IX_BacktestRun_SourceOptimizationRunId",
+                table: "BacktestRun",
+                column: "SourceOptimizationRunId",
+                unique: true,
+                filter: "\"SourceOptimizationRunId\" IS NOT NULL AND \"IsDeleted\" = false");
 
             migrationBuilder.CreateIndex(
                 name: "IX_BacktestRun_StrategyId",
@@ -2337,7 +2725,8 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
             migrationBuilder.CreateIndex(
                 name: "IX_COTReport_Currency_ReportDate",
                 table: "COTReport",
-                columns: new[] { "Currency", "ReportDate" });
+                columns: new[] { "Currency", "ReportDate" },
+                unique: true);
 
             migrationBuilder.CreateIndex(
                 name: "IX_CurrencyPair_Symbol",
@@ -2370,6 +2759,17 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                 name: "IX_DrawdownSnapshot_RecordedAt",
                 table: "DrawdownSnapshot",
                 column: "RecordedAt");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_EACommand_CreatedAt",
+                table: "EACommand",
+                column: "CreatedAt");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_EACommand_TargetInstanceId_Acknowledged",
+                table: "EACommand",
+                columns: new[] { "TargetInstanceId", "Acknowledged" },
+                filter: "\"IsDeleted\" = false");
 
             migrationBuilder.CreateIndex(
                 name: "IX_EAInstance_InstanceId",
@@ -2696,14 +3096,31 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                 columns: new[] { "Symbol", "Timeframe", "IsActive" });
 
             migrationBuilder.CreateIndex(
-                name: "IX_OptimizationRun_StrategyId",
+                name: "IX_OptimizationRun_ActivePerStrategy",
                 table: "OptimizationRun",
-                column: "StrategyId");
+                column: "StrategyId",
+                unique: true,
+                filter: "\"Status\" IN ('Queued','Running') AND \"IsDeleted\" = false");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_OptimizationRun_Status_DeferredUntilUtc",
+                table: "OptimizationRun",
+                columns: new[] { "Status", "DeferredUntilUtc" });
+
+            migrationBuilder.CreateIndex(
+                name: "IX_OptimizationRun_Status_ExecutionLeaseExpiresAt",
+                table: "OptimizationRun",
+                columns: new[] { "Status", "ExecutionLeaseExpiresAt" });
 
             migrationBuilder.CreateIndex(
                 name: "IX_OptimizationRun_StrategyId_Status",
                 table: "OptimizationRun",
                 columns: new[] { "StrategyId", "Status" });
+
+            migrationBuilder.CreateIndex(
+                name: "IX_OptimizationRun_ValidationFollowUpsCreatedAt",
+                table: "OptimizationRun",
+                column: "ValidationFollowUpsCreatedAt");
 
             migrationBuilder.CreateIndex(
                 name: "IX_Order_StrategyId",
@@ -2741,6 +3158,11 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                 name: "IX_Position_Symbol_Status",
                 table: "Position",
                 columns: new[] { "Symbol", "Status" });
+
+            migrationBuilder.CreateIndex(
+                name: "IX_PositionLifecycleEvent_PositionId",
+                table: "PositionLifecycleEvent",
+                column: "PositionId");
 
             migrationBuilder.CreateIndex(
                 name: "IX_PositionScaleOrder_OrderId",
@@ -2799,6 +3221,16 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                 column: "TradingAccountId");
 
             migrationBuilder.CreateIndex(
+                name: "IX_SpreadProfile_Symbol_Hour_DOW",
+                table: "SpreadProfiles",
+                columns: new[] { "Symbol", "HourUtc", "DayOfWeek" });
+
+            migrationBuilder.CreateIndex(
+                name: "IX_SpreadProfiles_Symbol",
+                table: "SpreadProfiles",
+                column: "Symbol");
+
+            migrationBuilder.CreateIndex(
                 name: "IX_Strategy_RiskProfileId",
                 table: "Strategy",
                 column: "RiskProfileId");
@@ -2820,6 +3252,60 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                 columns: new[] { "StrategyId", "EstimatedAt" });
 
             migrationBuilder.CreateIndex(
+                name: "IX_StrategyGenerationCheckpoint_WorkerName",
+                table: "StrategyGenerationCheckpoint",
+                column: "WorkerName",
+                unique: true,
+                filter: "\"IsDeleted\" = false");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_StrategyGenerationCycleRun_CycleId",
+                table: "StrategyGenerationCycleRun",
+                column: "CycleId",
+                unique: true,
+                filter: "\"IsDeleted\" = false");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_StrategyGenerationCycleRun_WorkerName_StartedAtUtc_IsDeleted",
+                table: "StrategyGenerationCycleRun",
+                columns: new[] { "WorkerName", "StartedAtUtc", "IsDeleted" });
+
+            migrationBuilder.CreateIndex(
+                name: "IX_StrategyGenerationFailure_CandidateId_FailureStage_Resolved~",
+                table: "StrategyGenerationFailure",
+                columns: new[] { "CandidateId", "FailureStage", "ResolvedAtUtc", "IsDeleted" });
+
+            migrationBuilder.CreateIndex(
+                name: "IX_StrategyGenerationFailure_IsReported_ResolvedAtUtc_IsDeleted",
+                table: "StrategyGenerationFailure",
+                columns: new[] { "IsReported", "ResolvedAtUtc", "IsDeleted" });
+
+            migrationBuilder.CreateIndex(
+                name: "IX_StrategyGenerationFeedbackState_StateKey_IsDeleted",
+                table: "StrategyGenerationFeedbackState",
+                columns: new[] { "StateKey", "IsDeleted" },
+                unique: true);
+
+            migrationBuilder.CreateIndex(
+                name: "IX_StrategyGenerationPendingArtifact_CandidateId",
+                table: "StrategyGenerationPendingArtifact",
+                column: "CandidateId",
+                unique: true,
+                filter: "\"IsDeleted\" = false");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_StrategyGenerationPendingArtifact_StrategyId",
+                table: "StrategyGenerationPendingArtifact",
+                column: "StrategyId");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_StrategyGenerationScheduleState_WorkerName",
+                table: "StrategyGenerationScheduleState",
+                column: "WorkerName",
+                unique: true,
+                filter: "\"IsDeleted\" = false");
+
+            migrationBuilder.CreateIndex(
                 name: "IX_StrategyPerformanceSnapshot_EvaluatedAt",
                 table: "StrategyPerformanceSnapshot",
                 column: "EvaluatedAt");
@@ -2828,6 +3314,18 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                 name: "IX_StrategyPerformanceSnapshot_StrategyId",
                 table: "StrategyPerformanceSnapshot",
                 column: "StrategyId");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_StrategyRegimeParams_OptimizationRunId",
+                table: "StrategyRegimeParams",
+                column: "OptimizationRunId");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_StrategyRegimeParams_StrategyId_Regime",
+                table: "StrategyRegimeParams",
+                columns: new[] { "StrategyId", "Regime" },
+                unique: true,
+                filter: "\"IsDeleted\" = false");
 
             migrationBuilder.CreateIndex(
                 name: "IX_StrategyVariant_BaseStrategyId_IsActive",
@@ -2893,6 +3391,11 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                 column: "IsActive");
 
             migrationBuilder.CreateIndex(
+                name: "IX_TradingSessionSchedule_Symbol_Session_Instance",
+                table: "TradingSessionSchedules",
+                columns: new[] { "Symbol", "SessionName", "InstanceId" });
+
+            migrationBuilder.CreateIndex(
                 name: "IX_TransactionCostAnalysis_OrderId",
                 table: "TransactionCostAnalysis",
                 column: "OrderId",
@@ -2907,6 +3410,13 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                 name: "IX_TransactionCostAnalysis_TradeSignalId",
                 table: "TransactionCostAnalysis",
                 column: "TradeSignalId");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_WalkForwardRun_SourceOptimizationRunId",
+                table: "WalkForwardRun",
+                column: "SourceOptimizationRunId",
+                unique: true,
+                filter: "\"SourceOptimizationRunId\" IS NOT NULL AND \"IsDeleted\" = false");
 
             migrationBuilder.CreateIndex(
                 name: "IX_WalkForwardRun_StrategyId",
@@ -2931,13 +3441,16 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                 name: "AccountPerformanceAttribution");
 
             migrationBuilder.DropTable(
-                name: "Alert");
+                name: "AlertDispatchLog");
 
             migrationBuilder.DropTable(
                 name: "ApprovalRequest");
 
             migrationBuilder.DropTable(
                 name: "BacktestRun");
+
+            migrationBuilder.DropTable(
+                name: "BrokerAccountSnapshot");
 
             migrationBuilder.DropTable(
                 name: "Candle");
@@ -3069,10 +3582,10 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                 name: "MLVaeEncoder");
 
             migrationBuilder.DropTable(
-                name: "OptimizationRun");
+                name: "OrderBookSnapshot");
 
             migrationBuilder.DropTable(
-                name: "OrderBookSnapshot");
+                name: "PositionLifecycleEvent");
 
             migrationBuilder.DropTable(
                 name: "PositionScaleOrder");
@@ -3090,13 +3603,37 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                 name: "SignalAllocation");
 
             migrationBuilder.DropTable(
+                name: "SpreadProfiles");
+
+            migrationBuilder.DropTable(
                 name: "StrategyAllocation");
 
             migrationBuilder.DropTable(
                 name: "StrategyCapacity");
 
             migrationBuilder.DropTable(
+                name: "StrategyGenerationCheckpoint");
+
+            migrationBuilder.DropTable(
+                name: "StrategyGenerationCycleRun");
+
+            migrationBuilder.DropTable(
+                name: "StrategyGenerationFailure");
+
+            migrationBuilder.DropTable(
+                name: "StrategyGenerationFeedbackState");
+
+            migrationBuilder.DropTable(
+                name: "StrategyGenerationPendingArtifact");
+
+            migrationBuilder.DropTable(
+                name: "StrategyGenerationScheduleState");
+
+            migrationBuilder.DropTable(
                 name: "StrategyPerformanceSnapshot");
+
+            migrationBuilder.DropTable(
+                name: "StrategyRegimeParams");
 
             migrationBuilder.DropTable(
                 name: "StrategyVariant");
@@ -3111,6 +3648,9 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                 name: "TradeRationale");
 
             migrationBuilder.DropTable(
+                name: "TradingSessionSchedules");
+
+            migrationBuilder.DropTable(
                 name: "TransactionCostAnalysis");
 
             migrationBuilder.DropTable(
@@ -3120,10 +3660,16 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                 name: "WorkerHealthSnapshot");
 
             migrationBuilder.DropTable(
+                name: "Alert");
+
+            migrationBuilder.DropTable(
                 name: "MLShadowEvaluation");
 
             migrationBuilder.DropTable(
                 name: "Position");
+
+            migrationBuilder.DropTable(
+                name: "OptimizationRun");
 
             migrationBuilder.DropTable(
                 name: "StressTestScenario");

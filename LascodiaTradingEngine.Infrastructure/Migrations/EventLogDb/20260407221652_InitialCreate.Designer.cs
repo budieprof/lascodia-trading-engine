@@ -12,7 +12,7 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace LascodiaTradingEngine.Infrastructure.Migrations.EventLogDb
 {
     [DbContext(typeof(EventLogDbContext))]
-    [Migration("20260317095904_InitialCreate")]
+    [Migration("20260407221652_InitialCreate")]
     partial class InitialCreate
     {
         /// <inheritdoc />

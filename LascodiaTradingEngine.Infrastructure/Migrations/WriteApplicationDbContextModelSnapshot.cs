@@ -3622,7 +3622,7 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
 
                             t.HasCheckConstraint("CK_OptimizationRun_CompletionPreparedRequiresPayload", "\"CompletionPublicationPreparedAt\" IS NULL OR \"CompletionPublicationPayloadJson\" IS NOT NULL");
 
-                            t.HasCheckConstraint("CK_OptimizationRun_CompletionPublishedRequiresPreparedPayload", "\"CompletionPublicationStatus\" IS DISTINCT FROM 'Published' OR (\"CompletionPublicationPayloadJson\" IS NOT NULL AND \"CompletionPublicationPreparedAt\" IS NOT NULL AND \"CompletionPublicationCompletedAt\" IS NOT NULL)");
+                            t.HasCheckConstraint("CK_OptimizationRun_CompletionPublishedRequiresPreparedPayload", "\"CompletionPublicationStatus\" IS DISTINCT FROM 1 OR (\"CompletionPublicationPayloadJson\" IS NOT NULL AND \"CompletionPublicationPreparedAt\" IS NOT NULL AND \"CompletionPublicationCompletedAt\" IS NOT NULL)");
 
                             t.HasCheckConstraint("CK_OptimizationRun_FollowUpStatusRequiresCreation", "\"ValidationFollowUpStatus\" IS NULL OR \"ValidationFollowUpsCreatedAt\" IS NOT NULL");
 

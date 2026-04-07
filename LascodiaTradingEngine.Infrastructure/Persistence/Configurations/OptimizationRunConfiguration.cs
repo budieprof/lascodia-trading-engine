@@ -27,7 +27,7 @@ public class OptimizationRunConfiguration : IEntityTypeConfiguration<Optimizatio
                 "\"CompletionPublicationPreparedAt\" IS NULL OR \"CompletionPublicationPayloadJson\" IS NOT NULL");
             t.HasCheckConstraint(
                 "CK_OptimizationRun_CompletionPublishedRequiresPreparedPayload",
-                "\"CompletionPublicationStatus\" IS DISTINCT FROM 'Published' " +
+                "\"CompletionPublicationStatus\" IS DISTINCT FROM 1 " +
                 "OR (\"CompletionPublicationPayloadJson\" IS NOT NULL " +
                 "AND \"CompletionPublicationPreparedAt\" IS NOT NULL " +
                 "AND \"CompletionPublicationCompletedAt\" IS NOT NULL)");
