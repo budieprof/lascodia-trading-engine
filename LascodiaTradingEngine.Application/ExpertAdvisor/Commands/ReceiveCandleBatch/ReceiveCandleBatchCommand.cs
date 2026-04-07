@@ -1,8 +1,10 @@
 using FluentValidation;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ReceiveCandleBackfill;
 using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ReceiveCandleBatch;
@@ -85,10 +87,17 @@ public class ReceiveCandleBatchCommandValidator : AbstractValidator<ReceiveCandl
 public class ReceiveCandleBatchCommandHandler : IRequestHandler<ReceiveCandleBatchCommand, ResponseData<int>>
 {
     private readonly IWriteApplicationDbContext _context;
+    private readonly IMarketDataAnomalyDetector _anomalyDetector;
+    private readonly ILogger<ReceiveCandleBatchCommandHandler> _logger;
 
-    public ReceiveCandleBatchCommandHandler(IWriteApplicationDbContext context)
+    public ReceiveCandleBatchCommandHandler(
+        IWriteApplicationDbContext context,
+        IMarketDataAnomalyDetector anomalyDetector,
+        ILogger<ReceiveCandleBatchCommandHandler> logger)
     {
-        _context = context;
+        _context         = context;
+        _anomalyDetector = anomalyDetector;
+        _logger          = logger;
     }
 
     public async Task<ResponseData<int>> Handle(ReceiveCandleBatchCommand request, CancellationToken cancellationToken)
@@ -96,33 +105,76 @@ public class ReceiveCandleBatchCommandHandler : IRequestHandler<ReceiveCandleBat
         var dbContext = _context.GetDbContext();
         var candleSet = dbContext.Set<Domain.Entities.Candle>();
         int processed = 0;
+        int skippedTimeframes = 0;
+        int skippedAnomalies = 0;
+
+        // Parse, normalize, and validate all items up-front
+        var parsedItems = new List<(string Symbol, Timeframe Timeframe, DateTime NormalizedTs, CandleBatchItem Item)>();
 
         foreach (var item in request.Candles)
         {
-            var symbol    = item.Symbol.ToUpperInvariant();
-            if (!Enum.TryParse<Timeframe>(item.Timeframe, ignoreCase: true, out var timeframe))
-                continue;
-
-            var existing = await candleSet
-                .FirstOrDefaultAsync(
-                    x => x.Symbol == symbol
-                      && x.Timeframe == timeframe
-                      && x.Timestamp == item.Timestamp
-                      && !x.IsDeleted,
-                    cancellationToken);
-
-            if (existing is not null)
+            if (!Enum.TryParse<Timeframe>(item.Timeframe, ignoreCase: true, out var tf))
             {
-                existing.Open     = item.Open;
-                existing.High     = item.High;
-                existing.Low      = item.Low;
-                existing.Close    = item.Close;
-                existing.Volume   = item.Volume;
-                existing.IsClosed = item.IsClosed;
+                skippedTimeframes++;
+                continue;
+            }
+
+            // OHLC anomaly detection — same check as ReceiveCandleCommand
+            var qualityResult = _anomalyDetector.ValidateCandle(
+                item.Open, item.High, item.Low, item.Close,
+                (long)item.Volume, item.Timestamp, null);
+
+            if (!qualityResult.IsValid)
+            {
+                skippedAnomalies++;
+                _logger.LogWarning(
+                    "ReceiveCandleBatch: candle rejected for {Symbol} {Timeframe} at {Timestamp}: {Reason}",
+                    item.Symbol, item.Timeframe, item.Timestamp, qualityResult.Description);
+                continue;
+            }
+
+            // Normalize timestamp to timeframe boundary (prevents near-duplicate rows)
+            var normalizedTs = ReceiveCandleBackfillCommandHandler.NormalizeTimestamp(item.Timestamp, tf);
+
+            parsedItems.Add((Symbol: item.Symbol.ToUpperInvariant(), Timeframe: tf, NormalizedTs: normalizedTs, Item: item));
+        }
+
+        if (skippedTimeframes > 0)
+            _logger.LogWarning("ReceiveCandleBatch: skipped {Count} candle(s) with unrecognised timeframe", skippedTimeframes);
+
+        // Batch-load all existing candles matching the incoming natural keys to avoid N+1 queries.
+        var groups = parsedItems.GroupBy(x => (x.Symbol, x.Timeframe));
+        var existingByKey = new Dictionary<(string Symbol, Timeframe Tf, DateTime Ts), Domain.Entities.Candle>();
+
+        foreach (var group in groups)
+        {
+            var timestamps = group.Select(g => g.NormalizedTs).Distinct().ToList();
+            var existing = await candleSet
+                .Where(x => x.Symbol == group.Key.Symbol
+                          && x.Timeframe == group.Key.Timeframe
+                          && timestamps.Contains(x.Timestamp)
+                          && !x.IsDeleted)
+                .ToListAsync(cancellationToken);
+
+            foreach (var candle in existing)
+                existingByKey[(candle.Symbol, candle.Timeframe, candle.Timestamp)] = candle;
+        }
+
+        // Upsert using the pre-loaded lookup
+        foreach (var (symbol, timeframe, normalizedTs, item) in parsedItems)
+        {
+            if (existingByKey.TryGetValue((symbol, timeframe, normalizedTs), out var existingCandle))
+            {
+                existingCandle.Open     = item.Open;
+                existingCandle.High     = item.High;
+                existingCandle.Low      = item.Low;
+                existingCandle.Close    = item.Close;
+                existingCandle.Volume   = item.Volume;
+                existingCandle.IsClosed = item.IsClosed;
             }
             else
             {
-                await candleSet.AddAsync(new Domain.Entities.Candle
+                var newCandle = new Domain.Entities.Candle
                 {
                     Symbol    = symbol,
                     Timeframe = timeframe,
@@ -131,14 +183,20 @@ public class ReceiveCandleBatchCommandHandler : IRequestHandler<ReceiveCandleBat
                     Low       = item.Low,
                     Close     = item.Close,
                     Volume    = item.Volume,
-                    Timestamp = item.Timestamp,
+                    Timestamp = normalizedTs,
                     IsClosed  = item.IsClosed,
-                }, cancellationToken);
+                };
+                await candleSet.AddAsync(newCandle, cancellationToken);
+                existingByKey[(symbol, timeframe, normalizedTs)] = newCandle;
             }
             processed++;
         }
 
         await _context.SaveChangesAsync(cancellationToken);
-        return ResponseData<int>.Init(processed, true, "Successful", "00");
+
+        string message = skippedAnomalies > 0 || skippedTimeframes > 0
+            ? $"Processed {processed} candles ({skippedTimeframes} bad timeframe(s), {skippedAnomalies} anomaly/anomalies skipped)"
+            : "Successful";
+        return ResponseData<int>.Init(processed, true, message, "00");
     }
 }

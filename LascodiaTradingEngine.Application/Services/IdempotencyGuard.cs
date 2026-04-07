@@ -38,7 +38,10 @@ public class IdempotencyGuard : IIdempotencyGuard
         if (string.IsNullOrEmpty(idempotencyKey))
             return new IdempotencyCheckResult(false, null, null);
 
-        var existing = await _readContext.GetDbContext()
+        // Use write context for the duplicate check to avoid read-replica lag.
+        // When the read DB is a replica, a recently inserted key may not be visible yet,
+        // allowing a duplicate request to pass through.
+        var existing = await _writeContext.GetDbContext()
             .Set<ProcessedIdempotencyKey>()
             .FirstOrDefaultAsync(k => k.Key == idempotencyKey && !k.IsDeleted, cancellationToken);
 

@@ -101,6 +101,9 @@ public class StrategyWorkerTest : IDisposable
         _mockDistributedLock
             .Setup(l => l.TryAcquireAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(mockHandle.Object);
+        _mockDistributedLock
+            .Setup(l => l.TryAcquireAsync(It.IsAny<string>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(mockHandle.Object);
 
         // Default ML scorer returns neutral result
         _mockMlScorer.Setup(s => s.ScoreAsync(

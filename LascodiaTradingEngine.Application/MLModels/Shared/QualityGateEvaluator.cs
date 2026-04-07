@@ -40,7 +40,8 @@ public static class QualityGateEvaluator
         double EvBypassMinEV,
         double EvBypassMinSharpe,
         double BrierBypassMinEV,
-        double BrierBypassMinSharpe);
+        double BrierBypassMinSharpe,
+        bool PortfolioCorrelationOk = true);
 
     public record QualityGateResult(
         bool Passed,
@@ -81,16 +82,19 @@ public static class QualityGateEvaluator
             brierBypassed = true;
         }
 
+        bool portfolioOk = input.PortfolioCorrelationOk;
+
         bool passed =
             input.Accuracy >= input.MinAccuracy &&
             input.ExpectedValue >= input.MinExpectedValue &&
             input.BrierScore <= brierCeiling &&
-            input.SharpeRatio >= input.MinSharpeRatio &&
+            (input.MinSharpeRatio <= 0 || input.SharpeRatio >= input.MinSharpeRatio) &&
             f1Passed &&
             input.WfStdAccuracy <= input.MaxWfStdDev &&
             (input.MaxEce <= 0 || input.Ece <= input.MaxEce) &&
             (input.MinBrierSkillScore <= -1.0 || input.BrierSkillScore >= input.MinBrierSkillScore) &&
-            !qualityRegressionFailed;
+            !qualityRegressionFailed &&
+            portfolioOk;
 
         // Build failure reason
         string? failureReason = passed ? null : BuildFailureReason(input, brierCeiling, f1Passed, evBypassF1, qualityRegressionFailed);
@@ -110,6 +114,7 @@ public static class QualityGateEvaluator
         if (i.MaxEce > 0 && i.Ece > i.MaxEce) reasons.Add($"ece={i.Ece:F4}>{i.MaxEce:F4}");
         if (i.MinBrierSkillScore > -1.0 && i.BrierSkillScore < i.MinBrierSkillScore) reasons.Add($"bss={i.BrierSkillScore:F4}<{i.MinBrierSkillScore:F4}");
         if (oobFailed) reasons.Add($"oobRegression");
+        if (!i.PortfolioCorrelationOk) reasons.Add("portfolioCorrelationFailed");
         return string.Join(", ", reasons);
     }
 }

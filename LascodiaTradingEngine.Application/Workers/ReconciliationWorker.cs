@@ -116,7 +116,48 @@ public class ReconciliationWorker : BackgroundService
         foreach (var instance in activeInstances)
         {
             foreach (var sym in (instance.Symbols ?? string.Empty).Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-                symbolsCoveredByEA.Add(sym);
+                symbolsCoveredByEA.Add(sym.ToUpperInvariant());
+        }
+
+        // Auto-close positions that have been open too long without any price update.
+        // This catches positions where the EA disconnected but the symbol is re-assigned.
+        int staleClosed = 0;
+        int maxAgeHours = await GetConfigAsync(readContext, "Reconciliation:MaxPositionAgeHours", 720, ct);
+        foreach (var pos in enginePositions)
+        {
+            if (!symbolsCoveredByEA.Contains(pos.Symbol)) continue;
+            if ((DateTime.UtcNow - pos.OpenedAt).TotalHours > maxAgeHours)
+            {
+                try
+                {
+                    var staleEntity = await writeDb.Set<Position>()
+                        .FirstOrDefaultAsync(p => p.Id == pos.Id && p.Status == PositionStatus.Open, ct);
+
+                    if (staleEntity is null) continue;
+
+                    staleEntity.Status = PositionStatus.Closed;
+                    staleEntity.ClosedAt = DateTime.UtcNow;
+
+                    await mediator.Send(new LogDecisionCommand
+                    {
+                        EntityType   = "Position",
+                        EntityId     = pos.Id,
+                        DecisionType = "StalePositionClosure",
+                        Outcome      = "Closed",
+                        Reason       = $"Position {pos.Symbol} open for {(DateTime.UtcNow - pos.OpenedAt).TotalHours:F0}h — exceeds {maxAgeHours}h max age, auto-closed by ReconciliationWorker",
+                        Source       = nameof(ReconciliationWorker)
+                    }, ct);
+
+                    staleClosed++;
+                    _logger.LogWarning(
+                        "ReconciliationWorker: auto-closed stale position {Id} ({Symbol}) — open for {Hours:F0}h (max {Max}h)",
+                        pos.Id, pos.Symbol, (DateTime.UtcNow - pos.OpenedAt).TotalHours, maxAgeHours);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "ReconciliationWorker: failed to close stale position {Id}", pos.Id);
+                }
+            }
         }
 
         // Find engine positions whose symbol has no active EA — these are orphaned

@@ -5,6 +5,7 @@ using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Options;
 using LascodiaTradingEngine.Domain.Entities;
+using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.Workers;
 
@@ -74,6 +75,12 @@ public class EACommandPushWorker : BackgroundService
         }
     }
 
+    /// <summary>
+    /// Commands older than this are auto-expired to prevent indefinite accumulation
+    /// when the target EA instance never reconnects.
+    /// </summary>
+    private static readonly TimeSpan CommandExpiryThreshold = TimeSpan.FromHours(24);
+
     private async Task PushPendingCommandsAsync(CancellationToken ct)
     {
         using var scope = _scopeFactory.CreateScope();
@@ -92,6 +99,30 @@ public class EACommandPushWorker : BackgroundService
             // Periodically clear the pushed set when no commands are pending
             _pushedCommandIds.Clear();
             return;
+        }
+
+        // Auto-expire commands that have been pending too long (target EA never reconnected)
+        var expiryCutoff = DateTime.UtcNow - CommandExpiryThreshold;
+        var expiredCommands = pendingCommands.Where(c => c.CreatedAt < expiryCutoff).ToList();
+        if (expiredCommands.Count > 0)
+        {
+            var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+            var writeDb = writeCtx.GetDbContext();
+
+            foreach (var expired in expiredCommands)
+            {
+                var tracked = await writeDb.Set<EACommand>()
+                    .FirstOrDefaultAsync(c => c.Id == expired.Id && !c.Acknowledged, ct);
+                if (tracked is not null)
+                    tracked.FinalizeAck(isRetryable: false, success: false, result: $"Expired: pending for >{CommandExpiryThreshold.TotalHours}h");
+            }
+
+            await writeCtx.SaveChangesAsync(ct);
+            _logger.LogWarning("EACommandPushWorker: expired {Count} stale command(s) older than {Hours}h",
+                expiredCommands.Count, CommandExpiryThreshold.TotalHours);
+
+            // Remove expired from the pending list
+            pendingCommands = pendingCommands.Except(expiredCommands).ToList();
         }
 
         int pushed = 0;

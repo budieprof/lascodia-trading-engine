@@ -65,6 +65,8 @@ public class SignalConflictResolver : ISignalConflictResolver
             var scored = signals
                 .Select(s => (Signal: s, Score: ComputeScore(s)))
                 .OrderByDescending(x => x.Score)
+                .ThenBy(x => x.Signal.ExpiresAt)   // Earlier expiry = more urgent
+                .ThenBy(x => x.Signal.StrategyId) // Final deterministic tie-break
                 .ToList();
 
             var winner = scored[0];
@@ -88,10 +90,13 @@ public class SignalConflictResolver : ISignalConflictResolver
         // ML confidence: 0–1, higher is better
         decimal mlScore = signal.MLConfidenceScore ?? signal.Confidence;
 
-        // Strategy Sharpe: normalize to 0–1 range (assume Sharpe 0–3 is typical range)
+        // Strategy Sharpe: normalize to 0–1 range (assume Sharpe 0–3 is typical range).
+        // When unknown, use a small penalty (0.25) instead of neutral (0.5) so that
+        // strategies with known Sharpe are preferred. Break remaining ties by strategy ID
+        // for deterministic ordering.
         decimal sharpeNormalized = signal.StrategySharpeRatio.HasValue
             ? Math.Clamp(signal.StrategySharpeRatio.Value / 3.0m, 0m, 1.0m)
-            : 0.5m; // Neutral if unknown
+            : 0.25m;
 
         // Capacity headroom: ratio of available capacity (higher = more room)
         decimal capacityScore = signal.EstimatedCapacityLots.HasValue && signal.EstimatedCapacityLots.Value > 0

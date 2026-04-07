@@ -74,6 +74,24 @@ public class EAInstance : Entity<long>
     /// </summary>
     public long? LastProcessedDeltaSequence { get; set; }
 
+    /// <summary>
+    /// Highest position-snapshot sequence number successfully processed from this instance.
+    /// Used for idempotency — duplicate or out-of-order snapshots are rejected.
+    /// </summary>
+    public long? LastProcessedPositionSnapshotSequence { get; set; }
+
+    /// <summary>
+    /// Highest order-snapshot sequence number successfully processed from this instance.
+    /// Used for idempotency — duplicate or out-of-order snapshots are rejected.
+    /// </summary>
+    public long? LastProcessedOrderSnapshotSequence { get; set; }
+
+    /// <summary>
+    /// Highest deal-snapshot sequence number successfully processed from this instance.
+    /// Used for idempotency — duplicate or out-of-order snapshots are rejected.
+    /// </summary>
+    public long? LastProcessedDealSnapshotSequence { get; set; }
+
     /// <summary>Soft-delete flag. Filtered out by the global EF Core query filter.</summary>
     public bool IsDeleted { get; set; }
 

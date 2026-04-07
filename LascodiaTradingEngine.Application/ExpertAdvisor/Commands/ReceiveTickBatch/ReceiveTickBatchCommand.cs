@@ -179,10 +179,11 @@ public class ReceiveTickBatchCommandHandler : IRequestHandler<ReceiveTickBatchCo
             // Auto-reactivate: if the instance was marked Disconnected by the health monitor
             // but is now sending ticks again, it's clearly back online.
             if (eaInstance.Status == EAInstanceStatus.Disconnected)
-            {
                 eaInstance.Status = EAInstanceStatus.Active;
-                await _context.GetDbContext().SaveChangesAsync(cancellationToken);
-            }
+
+            // Always persist the heartbeat update immediately so it survives even when
+            // all ticks are stale (no SaveAndPublish calls below to piggyback on).
+            await _context.GetDbContext().SaveChangesAsync(cancellationToken);
         }
 
         // ── Step 3: Filter and cache ticks ───────────────────────────────────

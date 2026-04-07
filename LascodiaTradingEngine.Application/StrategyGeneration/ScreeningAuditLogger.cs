@@ -105,4 +105,38 @@ public class ScreeningAuditLogger
             Source       = "StrategyGenerationWorker"
         }, ct);
     }
+
+    public async Task LogExecutionFailureAsync(
+        Domain.Enums.StrategyType strategyType,
+        string symbol,
+        Domain.Enums.Timeframe timeframe,
+        Domain.Enums.MarketRegime targetRegime,
+        Domain.Enums.MarketRegime observedRegime,
+        string generationSource,
+        string outcome,
+        string failureCode,
+        Domain.Enums.MarketRegime? reserveTargetRegime,
+        CancellationToken ct)
+    {
+        await _mediator.Send(new LogDecisionCommand
+        {
+            EntityType = "Strategy",
+            EntityId = 0,
+            DecisionType = "StrategyGeneration",
+            Outcome = outcome,
+            Reason = $"{failureCode} while screening {strategyType} on {symbol}/{timeframe}",
+            ContextJson = JsonSerializer.Serialize(new
+            {
+                strategyType = strategyType.ToString(),
+                symbol,
+                timeframe = timeframe.ToString(),
+                targetRegime = targetRegime.ToString(),
+                observedRegime = observedRegime.ToString(),
+                generationSource,
+                failureCode,
+                reserveTargetRegime = reserveTargetRegime?.ToString(),
+            }, JsonOpts),
+            Source = "StrategyGenerationWorker"
+        }, ct);
+    }
 }

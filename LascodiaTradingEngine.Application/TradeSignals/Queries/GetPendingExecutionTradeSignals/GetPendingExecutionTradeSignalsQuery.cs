@@ -4,6 +4,7 @@ using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Application.TradeSignals.Queries.DTOs;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -14,9 +15,12 @@ namespace LascodiaTradingEngine.Application.TradeSignals.Queries.GetPendingExecu
 /// <summary>
 /// Returns trade signals that have been approved but not yet executed (no order placed).
 /// The EA polls this endpoint to discover signals that need broker-side execution.
+/// Optionally filters by the caller's trading account so EAs only see their own signals.
 /// </summary>
 public class GetPendingExecutionTradeSignalsQuery : IRequest<ResponseData<List<TradeSignalDto>>>
 {
+    /// <summary>Optional: only return signals for strategies belonging to this trading account.</summary>
+    public long? TradingAccountId { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
@@ -26,22 +30,56 @@ public class GetPendingExecutionTradeSignalsQueryHandler : IRequestHandler<GetPe
 {
     private readonly IReadApplicationDbContext _context;
     private readonly IMapper _mapper;
+    private readonly IEAOwnershipGuard _ownershipGuard;
 
-    public GetPendingExecutionTradeSignalsQueryHandler(IReadApplicationDbContext context, IMapper mapper)
+    public GetPendingExecutionTradeSignalsQueryHandler(
+        IReadApplicationDbContext context,
+        IMapper mapper,
+        IEAOwnershipGuard ownershipGuard)
     {
-        _context = context;
-        _mapper  = mapper;
+        _context        = context;
+        _mapper         = mapper;
+        _ownershipGuard = ownershipGuard;
     }
 
     public async Task<ResponseData<List<TradeSignalDto>>> Handle(GetPendingExecutionTradeSignalsQuery request, CancellationToken cancellationToken)
     {
-        var signals = await _context.GetDbContext()
+        var dbContext = _context.GetDbContext();
+
+        // Resolve the caller's account if not explicitly provided
+        var accountId = request.TradingAccountId ?? _ownershipGuard.GetCallerAccountId();
+
+        var query = dbContext
             .Set<Domain.Entities.TradeSignal>()
             .AsNoTracking()
             .Where(x => x.Status == TradeSignalStatus.Approved
                       && x.OrderId == null
                       && x.ExpiresAt > DateTime.UtcNow
-                      && !x.IsDeleted)
+                      && !x.IsDeleted);
+
+        // Filter signals to only those whose symbol is covered by the caller's EA instances
+        if (accountId.HasValue)
+        {
+            var ownedSymbols = await dbContext
+                .Set<Domain.Entities.EAInstance>()
+                .AsNoTracking()
+                .Where(e => e.TradingAccountId == accountId.Value
+                         && e.Status == EAInstanceStatus.Active
+                         && !e.IsDeleted)
+                .Select(e => e.Symbols)
+                .ToListAsync(cancellationToken);
+
+            var symbolSet = ownedSymbols
+                .SelectMany(s => s.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                .Select(s => s.ToUpperInvariant())
+                .Distinct()
+                .ToList();
+
+            if (symbolSet.Count > 0)
+                query = query.Where(x => symbolSet.Contains(x.Symbol));
+        }
+
+        var signals = await query
             .OrderBy(x => x.GeneratedAt)
             .ProjectTo<TradeSignalDto>(_mapper.ConfigurationProvider)
             .ToListAsync(cancellationToken);

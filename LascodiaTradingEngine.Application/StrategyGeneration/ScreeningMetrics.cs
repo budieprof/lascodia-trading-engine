@@ -58,6 +58,9 @@ public sealed record ScreeningMetrics
     [JsonPropertyName("monteCarloP")]
     public double MonteCarloPValue { get; init; }
 
+    [JsonPropertyName("shufflePValue")]
+    public double ShufflePValue { get; init; }
+
     [JsonPropertyName("walkForwardWindowsPassed")]
     public int WalkForwardWindowsPassed { get; init; }
 
@@ -78,6 +81,12 @@ public sealed record ScreeningMetrics
 
     [JsonPropertyName("generationSource")]
     public string GenerationSource { get; init; } = "Primary";
+
+    [JsonPropertyName("observedRegime")]
+    public string? ObservedRegime { get; init; }
+
+    [JsonPropertyName("reserveTargetRegime")]
+    public string? ReserveTargetRegime { get; init; }
 
     [JsonPropertyName("screenedAtUtc")]
     public DateTime ScreenedAtUtc { get; init; } = DateTime.UtcNow;
@@ -101,6 +110,36 @@ public sealed record ScreeningMetrics
 
     [JsonPropertyName("liveHaircutApplied")]
     public bool LiveHaircutApplied { get; init; }
+
+    [JsonPropertyName("winRateHaircutApplied")]
+    public double WinRateHaircutApplied { get; init; } = 1.0;
+
+    [JsonPropertyName("profitFactorHaircutApplied")]
+    public double ProfitFactorHaircutApplied { get; init; } = 1.0;
+
+    [JsonPropertyName("sharpeHaircutApplied")]
+    public double SharpeHaircutApplied { get; init; } = 1.0;
+
+    [JsonPropertyName("drawdownInflationApplied")]
+    public double DrawdownInflationApplied { get; init; } = 1.0;
+
+    [JsonPropertyName("cycleId")]
+    public string? CycleId { get; init; }
+
+    [JsonPropertyName("candidateId")]
+    public string? CandidateId { get; init; }
+
+    [JsonPropertyName("selectionScore")]
+    public double SelectionScore { get; init; }
+
+    [JsonPropertyName("selectionScoreBreakdown")]
+    public CandidateSelectionScoreBreakdown? SelectionScoreBreakdown { get; init; }
+
+    [JsonPropertyName("validationPriority")]
+    public int ValidationPriority { get; init; }
+
+    [JsonPropertyName("prunedAtUtc")]
+    public DateTime? PrunedAtUtc { get; init; }
 
     // ── Pipeline trace ─────────────────────────────────────────────────
 
@@ -161,6 +200,10 @@ public sealed record ScreeningMetrics
         FixedLotSharpeRatio = 0,
         IsAutoPromoted = false,
         LiveHaircutApplied = false,
+        WinRateHaircutApplied = 1.0,
+        ProfitFactorHaircutApplied = 1.0,
+        SharpeHaircutApplied = 1.0,
+        DrawdownInflationApplied = 1.0,
     };
 
     /// <summary>Migrates v3 metrics: adds GateTrace field (null for pre-v4 rows).</summary>

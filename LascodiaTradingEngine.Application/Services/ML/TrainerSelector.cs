@@ -115,14 +115,14 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
     /// Discount factor applied to cross-symbol borrowed scores to reduce their
     /// influence relative to native symbol history.
     /// </summary>
-    private const double CrossSymbolDiscountFactor = 0.85;
+    private const double CrossSymbolDiscountFactor = 0.75;
 
     /// <summary>
     /// Minimum number of completed runs a cross-symbol candidate must have
     /// before it is considered for borrowing. Prevents a single lucky run
     /// from driving cold-start selection.
     /// </summary>
-    private const int MinCrossSymbolRunsPerCandidate = 3;
+    private const int MinCrossSymbolRunsPerCandidate = 5;
 
     /// <summary>
     /// Number of empirical regime-specific runs required before empirical affinity

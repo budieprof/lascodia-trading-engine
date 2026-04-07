@@ -670,6 +670,14 @@ public sealed partial class TcnModelTrainer : IMLModelTrainer
         for (int i = 0; i < copyLen; i++)
             flatFeatureImportance[i] = featureImportance[i];
 
+        // Preserve the legacy flat-feature snapshot contract even though TCN prunes
+        // sequence channels internally. Unmapped flat features stay active.
+        var flatActiveFeatureMask = new bool[MLFeatureHelper.FeatureCount];
+        Array.Fill(flatActiveFeatureMask, true);
+        int maskCopyLen = Math.Min(activeMask.Length, flatActiveFeatureMask.Length);
+        for (int i = 0; i < maskCopyLen; i++)
+            flatActiveFeatureMask[i] = activeMask[i];
+
         var snapshot = new ModelSnapshot
         {
             Type                       = ModelType,
@@ -689,7 +697,7 @@ public sealed partial class TcnModelTrainer : IMLModelTrainer
             PlattASell                 = plattASell,
             PlattBSell                 = plattBSell,
             AvgKellyFraction           = avgKellyFraction,
-            ActiveFeatureMask          = activeMask,
+            ActiveFeatureMask          = flatActiveFeatureMask,
             FeatureImportanceScores    = calImportanceScores,
             MagQ90Weights              = magQ90Weights,
             MagQ90Bias                 = magQ90Bias,

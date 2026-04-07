@@ -420,6 +420,21 @@ public sealed class MLDriftMonitorWorker : BackgroundService
                             (disagreementDrift ? 1 : 0) + (relativeDrift ? 1 : 0) +
                             (sharpeDrift ? 1 : 0);
 
+        // Weight drift signals by importance
+        double driftScore = 0;
+        if (accuracyDrift) driftScore += 1.0;        // Accuracy is most important
+        if (calibrationDrift) driftScore += 0.7;
+        if (sharpeDrift) driftScore += 0.5;
+        if (relativeDrift) driftScore += 0.4;
+        if (disagreementDrift) driftScore += 0.3;
+
+        // Log when composite signal is strong
+        if (driftScore >= 1.5)
+        {
+            _logger.LogInformation("MLDriftMonitor: strong composite drift signal ({Score:F1}) for model {ModelId} ({Symbol}/{Tf})",
+                driftScore, model.Id, model.Symbol, model.Timeframe);
+        }
+
         string driftTrigger = activeSignals == 1
             ? (accuracyDrift     ? "AccuracyDrift"
              : calibrationDrift  ? "CalibrationDrift"

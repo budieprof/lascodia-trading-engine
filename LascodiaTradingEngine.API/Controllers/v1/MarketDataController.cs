@@ -1,4 +1,6 @@
+using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using Lascodia.Trading.Engine.SharedApplication.Common.Services;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
@@ -22,6 +24,7 @@ namespace LascodiaTradingEngine.API.Controllers.v1;
 /// </summary>
 [Route("api/v1/lascodia-trading-engine/market-data")]
 [ApiController]
+[EnableRateLimiting("ea")]
 public class MarketDataController : AuthControllerBase<MarketDataController>
 {
     public MarketDataController(

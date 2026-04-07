@@ -22,4 +22,12 @@ public interface IWorkerHealthMonitor
 
     /// <summary>Persists current health snapshots to the database for historical tracking.</summary>
     Task PersistSnapshotsAsync(CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Records static metadata about a worker for observability queries.
+    /// </summary>
+    void RecordWorkerMetadata(string workerName, string purpose, TimeSpan expectedInterval);
+
+    /// <summary>Records that a worker has stopped execution (normal shutdown or crash).</summary>
+    void RecordWorkerStopped(string workerName, string? errorMessage = null);
 }

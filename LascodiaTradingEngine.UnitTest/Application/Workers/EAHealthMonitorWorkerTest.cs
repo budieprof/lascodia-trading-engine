@@ -5,6 +5,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Moq;
 using MockQueryable.Moq;
+using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Workers;
@@ -18,6 +19,7 @@ public class EAHealthMonitorWorkerTest : IDisposable
     private readonly Mock<ILogger<EAHealthMonitorWorker>> _mockLogger;
     private readonly Mock<IServiceScopeFactory> _mockScopeFactory;
     private readonly Mock<IWriteApplicationDbContext> _mockWriteContext;
+    private readonly Mock<IIntegrationEventService> _mockEventBus;
     private readonly TradingMetrics _metrics;
     private readonly TestMeterFactory _meterFactory;
     private readonly EAHealthMonitorWorker _worker;
@@ -27,6 +29,7 @@ public class EAHealthMonitorWorkerTest : IDisposable
         _mockLogger       = new Mock<ILogger<EAHealthMonitorWorker>>();
         _mockScopeFactory = new Mock<IServiceScopeFactory>();
         _mockWriteContext = new Mock<IWriteApplicationDbContext>();
+        _mockEventBus     = new Mock<IIntegrationEventService>();
         _meterFactory     = new TestMeterFactory();
         _metrics          = new TradingMetrics(_meterFactory);
 
@@ -34,6 +37,7 @@ public class EAHealthMonitorWorkerTest : IDisposable
         var mockProvider = new Mock<IServiceProvider>();
 
         mockProvider.Setup(p => p.GetService(typeof(IWriteApplicationDbContext))).Returns(_mockWriteContext.Object);
+        mockProvider.Setup(p => p.GetService(typeof(IIntegrationEventService))).Returns(_mockEventBus.Object);
         mockScope.Setup(s => s.ServiceProvider).Returns(mockProvider.Object);
         _mockScopeFactory.Setup(f => f.CreateScope()).Returns(mockScope.Object);
 
@@ -94,7 +98,9 @@ public class EAHealthMonitorWorkerTest : IDisposable
         await InvokeCheckHeartbeatsAsync();
 
         Assert.Equal(EAInstanceStatus.Disconnected, instances[0].Status);
-        _mockWriteContext.Verify(c => c.SaveChangesAsync(It.IsAny<CancellationToken>()), Times.Once);
+        _mockEventBus.Verify(e => e.SaveAndPublish(
+            It.IsAny<Lascodia.Trading.Engine.SharedApplication.Common.Interfaces.IDbContext>(),
+            It.IsAny<Lascodia.Trading.Engine.EventBus.Events.IntegrationEvent>()), Times.Once);
     }
 
     [Fact]

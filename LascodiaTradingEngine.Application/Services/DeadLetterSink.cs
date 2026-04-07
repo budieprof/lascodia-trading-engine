@@ -1,7 +1,10 @@
+using System.Diagnostics;
 using System.Text.Json;
+using System.Collections.Concurrent;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Attributes;
+using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
 
@@ -17,17 +20,26 @@ namespace LascodiaTradingEngine.Application.Services;
 [RegisterService(ServiceLifetime.Scoped)]
 public class DeadLetterSink : IDeadLetterSink
 {
+    private const int EmergencyBufferLimit = 256;
+
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<DeadLetterSink> _logger;
+    private readonly TradingMetrics _metrics;
+
+    private static readonly ConcurrentQueue<string> EmergencyBuffer = new();
 
     private static readonly string FallbackDirectory =
         Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "dead-letters");
 
-    public DeadLetterSink(IServiceScopeFactory scopeFactory, ILogger<DeadLetterSink> logger)
+    public DeadLetterSink(IServiceScopeFactory scopeFactory, ILogger<DeadLetterSink> logger, TradingMetrics metrics)
     {
         _scopeFactory = scopeFactory;
         _logger = logger;
+        _metrics = metrics;
     }
+
+    public static IReadOnlyList<string> GetEmergencyBuffer()
+        => EmergencyBuffer.ToArray();
 
     public async Task WriteAsync(
         string handlerName,
@@ -38,6 +50,7 @@ public class DeadLetterSink : IDeadLetterSink
         int attempts,
         CancellationToken ct = default)
     {
+        var sw = Stopwatch.StartNew();
         // ── Primary: write to database ──────────────────────────────────────
         try
         {
@@ -58,6 +71,8 @@ public class DeadLetterSink : IDeadLetterSink
 
             await writeContext.SaveChangesAsync(ct);
 
+            sw.Stop();
+            _metrics.DeadLetterSinkLatencyMs.Record(sw.Elapsed.TotalMilliseconds);
             _logger.LogWarning(
                 "DeadLetterSink: persisted dead-letter to DB (handler={Handler}, event={EventType})",
                 handlerName, eventType);
@@ -65,6 +80,8 @@ public class DeadLetterSink : IDeadLetterSink
         }
         catch (Exception dbEx)
         {
+            _metrics.DeadLetterSinkDbFailures.Add(1);
+            BufferEmergencyPayload(eventPayloadJson);
             _logger.LogError(dbEx,
                 "DeadLetterSink: DB write failed for {Handler}/{EventType} — falling back to file",
                 handlerName, eventType);
@@ -93,17 +110,32 @@ public class DeadLetterSink : IDeadLetterSink
             var json = JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true });
             await File.WriteAllTextAsync(filePath, json, ct);
 
+            sw.Stop();
+            _metrics.DeadLetterSinkLatencyMs.Record(sw.Elapsed.TotalMilliseconds);
+            _metrics.DeadLetterSinkFileWrites.Add(1);
             _logger.LogWarning(
                 "DeadLetterSink: DB unavailable — dead-letter written to file {FilePath}",
                 filePath);
         }
         catch (Exception fileEx)
         {
+            BufferEmergencyPayload(eventPayloadJson);
             // Last resort: log the full payload at Critical so it exists in structured logs
             _logger.LogCritical(fileEx,
                 "DeadLetterSink: BOTH DB and file fallback failed for {Handler}/{EventType}. " +
                 "Event payload: {Payload}. Original error: {OriginalError}",
                 handlerName, eventType, eventPayloadJson, errorMessage);
+        }
+    }
+
+    private void BufferEmergencyPayload(string eventPayloadJson)
+    {
+        EmergencyBuffer.Enqueue(eventPayloadJson);
+
+        while (EmergencyBuffer.Count > EmergencyBufferLimit)
+        {
+            if (EmergencyBuffer.TryDequeue(out _))
+                _metrics.DeadLetterSinkBufferOverflows.Add(1);
         }
     }
 }

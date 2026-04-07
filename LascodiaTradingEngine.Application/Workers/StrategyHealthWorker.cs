@@ -461,7 +461,10 @@ public class StrategyHealthWorker : BackgroundService
                 .FirstOrDefaultAsync(x => x.Id == strategy.Id && !x.IsDeleted, ct);
 
             if (liveStrategy is not null && liveStrategy.Status == StrategyStatus.Active)
+            {
                 liveStrategy.Status = StrategyStatus.Paused;
+                liveStrategy.PauseReason = "StrategyHealth";
+            }
 
             // Queue an optimization run — the OptimizationWorker will pick this up
             // and attempt to improve the strategy's parameters.

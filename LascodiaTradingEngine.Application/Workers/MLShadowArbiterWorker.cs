@@ -471,8 +471,19 @@ public sealed class MLShadowArbiterWorker : BackgroundService
                 ? promotableCandidates.Append(freshCurrentShadow)
                 : promotableCandidates;
 
+            // Composite score: accuracy (50%), inverse Brier (25%), magnitude correlation (15%), recency (10%)
+            // This prevents high-accuracy but poorly-calibrated models from winning the tournament.
+            decimal CompositeScore(MLShadowEvaluation s)
+            {
+                decimal accScore  = s.ChallengerDirectionAccuracy;
+                decimal brierInv  = 1m - Math.Clamp(s.ChallengerBrierScore, 0m, 1m);
+                decimal magCorr   = Math.Clamp(s.ChallengerMagnitudeCorrelation, 0m, 1m);
+                decimal recency   = s.CompletedAt.HasValue ? Math.Clamp(1m - (decimal)(DateTime.UtcNow - s.CompletedAt.Value).TotalDays / 30m, 0m, 1m) : 0.5m;
+                return 0.50m * accScore + 0.25m * brierInv + 0.15m * magCorr + 0.10m * recency;
+            }
+
             var ranked = allCandidates
-                .OrderByDescending(s => s.ChallengerDirectionAccuracy)
+                .OrderByDescending(CompositeScore)
                 .ToList();
 
             if (ranked.Count == 0)

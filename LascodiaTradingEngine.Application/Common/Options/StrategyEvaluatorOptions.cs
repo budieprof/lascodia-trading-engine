@@ -1527,4 +1527,19 @@ public class StrategyEvaluatorOptions : ConfigurationOption<StrategyEvaluatorOpt
     /// Defaults to 30.
     /// </summary>
     public int MediatorTimeoutSeconds { get; set; } = 30;
+
+    /// <summary>
+    /// Timeout in seconds for <see cref="IStrategyEvaluator.EvaluateAsync"/> calls.
+    /// Prevents a hung evaluator from blocking the distributed lock indefinitely.
+    /// On timeout, the strategy's circuit breaker failure counter is incremented.
+    /// Defaults to 30.
+    /// </summary>
+    public int EvaluatorTimeoutSeconds { get; set; } = 30;
+
+    /// <summary>
+    /// Timeout in seconds when acquiring the distributed evaluation lock.
+    /// Prevents indefinite blocking if the lock service is unavailable.
+    /// Defaults to 10.
+    /// </summary>
+    public int LockTimeoutSeconds { get; set; } = 10;
 }

@@ -80,7 +80,10 @@ public class ProcessHeartbeatCommandHandler : IRequestHandler<ProcessHeartbeatCo
         entity.LastHeartbeat = DateTime.UtcNow;
         await _context.SaveChangesAsync(cancellationToken);
 
-        var response = new HeartbeatResponse { ServerTime = DateTime.UtcNow };
+        // Capture server time AFTER save to ensure the response reflects
+        // a consistent point in time following successful persistence.
+        var serverTime = DateTime.UtcNow;
+        var response = new HeartbeatResponse { ServerTime = serverTime };
         return ResponseData<HeartbeatResponse>.Init(response, true, "Successful", "00");
     }
 }

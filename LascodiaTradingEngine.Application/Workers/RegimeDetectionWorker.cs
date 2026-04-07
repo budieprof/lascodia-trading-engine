@@ -5,6 +5,7 @@ using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
+using MarketRegimeEnum = LascodiaTradingEngine.Domain.Enums.MarketRegime;
 
 namespace LascodiaTradingEngine.Application.Workers;
 
@@ -62,6 +63,12 @@ public class RegimeDetectionWorker : BackgroundService
 
     /// <summary>How frequently the worker wakes up to run a full regime detection pass.</summary>
     private static readonly TimeSpan PollingInterval = TimeSpan.FromSeconds(60);
+
+    /// <summary>Shorter polling interval used during high-volatility or crisis regimes.</summary>
+    private static readonly TimeSpan HighVolPollingInterval = TimeSpan.FromSeconds(30);
+
+    /// <summary>Tracks the most recently detected regime to enable dynamic interval adjustment.</summary>
+    private MarketRegimeEnum? _latestDetectedRegime;
 
     /// <summary>
     /// Timeframes evaluated on each polling cycle.
@@ -127,9 +134,14 @@ public class RegimeDetectionWorker : BackgroundService
                 _logger.LogError(ex, "Unexpected error in RegimeDetectionWorker polling loop");
             }
 
+            // Dynamic interval: faster during high volatility or crisis regimes
+            var effectiveInterval = _latestDetectedRegime is MarketRegimeEnum.HighVolatility or MarketRegimeEnum.Crisis
+                ? HighVolPollingInterval
+                : PollingInterval;
+
             // Wait before the next detection pass. Task.Delay respects cancellation so
             // the worker shuts down promptly even mid-wait.
-            await Task.Delay(PollingInterval, stoppingToken);
+            await Task.Delay(effectiveInterval, stoppingToken);
         }
 
         _logger.LogInformation("RegimeDetectionWorker stopped");
@@ -225,6 +237,9 @@ public class RegimeDetectionWorker : BackgroundService
                 .AddAsync(snapshot, ct);
 
             await writeContext.SaveChangesAsync(ct);
+
+            // Track the latest detected regime for dynamic interval adjustment
+            _latestDetectedRegime = snapshot.Regime;
 
             _logger.LogInformation(
                 "RegimeDetectionWorker: {Symbol}/{Timeframe} → {Regime} (confidence={Confidence:F2}, ADX={ADX:F2})",

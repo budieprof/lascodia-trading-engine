@@ -109,20 +109,36 @@ public class ReceivePositionSnapshotCommandHandler : IRequestHandler<ReceivePosi
 
         var dbContext = _context.GetDbContext();
 
+        // Load the EA instance's owned symbols to validate each snapshot entry
+        var eaInstance = await dbContext.Set<Domain.Entities.EAInstance>()
+            .FirstOrDefaultAsync(x => x.InstanceId == request.InstanceId && !x.IsDeleted, cancellationToken);
+
+        if (eaInstance is null)
+            return ResponseData<string>.Init(null, false, "EA instance not found", "-14");
+
+        var ownedSymbols = eaInstance.Symbols
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(s => s.ToUpperInvariant())
+            .ToHashSet();
+
+        // Batch-load existing positions by broker ticket to avoid N+1 queries
+        var brokerTickets = request.Positions.Select(p => p.Ticket.ToString()).Distinct().ToList();
+        var existingPositions = await dbContext
+            .Set<Domain.Entities.Position>()
+            .Where(x => brokerTickets.Contains(x.BrokerPositionId!) && !x.IsDeleted)
+            .ToListAsync(cancellationToken);
+        var positionLookup = existingPositions.ToDictionary(p => (p.BrokerPositionId!, p.Symbol));
+
         foreach (var snap in request.Positions)
         {
             var brokerTicket = snap.Ticket.ToString();
             var symbol = snap.Symbol.ToUpperInvariant();
 
-            var existing = await dbContext
-                .Set<Domain.Entities.Position>()
-                .FirstOrDefaultAsync(
-                    x => x.BrokerPositionId == brokerTicket
-                      && x.Symbol == symbol
-                      && !x.IsDeleted,
-                    cancellationToken);
+            // Validate that the reported symbol belongs to this EA instance
+            if (ownedSymbols.Count > 0 && !ownedSymbols.Contains(symbol))
+                continue;
 
-            if (existing is not null)
+            if (positionLookup.TryGetValue((brokerTicket, symbol), out var existing))
             {
                 existing.CurrentPrice  = snap.CurrentPrice;
                 existing.UnrealizedPnL = snap.Profit;
@@ -134,9 +150,10 @@ public class ReceivePositionSnapshotCommandHandler : IRequestHandler<ReceivePosi
             }
             else
             {
-                var direction = Enum.Parse<PositionDirection>(snap.Direction, ignoreCase: true);
+                if (!Enum.TryParse<PositionDirection>(snap.Direction, ignoreCase: true, out var direction))
+                    continue; // Skip positions with unrecognised direction
 
-                await dbContext.Set<Domain.Entities.Position>().AddAsync(new Domain.Entities.Position
+                var newPosition = new Domain.Entities.Position
                 {
                     Symbol            = symbol,
                     Direction         = direction,
@@ -151,7 +168,9 @@ public class ReceivePositionSnapshotCommandHandler : IRequestHandler<ReceivePosi
                     Status            = PositionStatus.Open,
                     BrokerPositionId  = brokerTicket,
                     OpenedAt          = snap.OpenTime,
-                }, cancellationToken);
+                };
+                await dbContext.Set<Domain.Entities.Position>().AddAsync(newPosition, cancellationToken);
+                positionLookup[(brokerTicket, symbol)] = newPosition;
             }
         }
 

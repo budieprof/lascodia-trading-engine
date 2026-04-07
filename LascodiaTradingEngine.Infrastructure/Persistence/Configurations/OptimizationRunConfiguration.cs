@@ -27,6 +27,7 @@ public class OptimizationRunConfiguration : IEntityTypeConfiguration<Optimizatio
         builder.Property(x => x.ApprovalReportJson).HasColumnType("text");
         builder.Property(x => x.ValidationFollowUpStatus).HasConversion<string>().HasMaxLength(20);
         builder.Property(x => x.ExecutionLeaseToken).IsConcurrencyToken();
+        builder.Property(x => x.RowVersion).IsRowVersion();
 
         builder.HasQueryFilter(x => !x.IsDeleted);
 

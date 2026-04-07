@@ -2487,7 +2487,9 @@ public class OptimizationWorkerTest
         int maxRunsPerWeek = 20,
         decimal screeningInitialBalance = 10_000m)
     {
-        var configType = typeof(OptimizationWorker).GetNestedType("OptimizationConfig", BindingFlags.NonPublic)!;
+        // OptimizationConfig was extracted to LascodiaTradingEngine.Application.Optimization namespace
+        var configType = typeof(OptimizationConfig).Assembly
+            .GetType("LascodiaTradingEngine.Application.Optimization.OptimizationConfig", throwOnError: true)!;
 
         var values = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
         {
@@ -2583,7 +2585,10 @@ public class OptimizationWorkerTest
         CancellationToken ct = default,
         CancellationToken runCt = default)
     {
-        var contextType = typeof(OptimizationWorker).GetNestedType("RunContext", BindingFlags.NonPublic)!;
+        // RunContext exists both as a nested type in OptimizationWorker and as an extracted
+        // top-level type. The method under test uses the nested version.
+        var contextType = typeof(OptimizationWorker).GetNestedType("RunContext", BindingFlags.NonPublic)
+            ?? typeof(OptimizationConfig).Assembly.GetType("LascodiaTradingEngine.Application.Optimization.RunContext", throwOnError: true)!;
         return contextType
             .GetConstructors(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)
             .OrderByDescending(ctor => ctor.GetParameters().Length)
@@ -2616,14 +2621,18 @@ public class OptimizationWorkerTest
         decimal pessimisticScore,
         string failureReason)
     {
-        var scoredCandidateType = typeof(OptimizationWorker).GetNestedType("ScoredCandidate", BindingFlags.NonPublic)!;
+        // ScoredCandidate was extracted to LascodiaTradingEngine.Application.Optimization namespace
+        var scoredCandidateType = typeof(OptimizationConfig).Assembly
+            .GetType("LascodiaTradingEngine.Application.Optimization.ScoredCandidate", throwOnError: true)!;
         var scoredCandidate = scoredCandidateType
             .GetConstructors(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)
             .OrderByDescending(ctor => ctor.GetParameters().Length)
             .First()
             .Invoke([winnerParamsJson, oosHealthScore, oosResult, 0.10]);
 
-        var resultType = typeof(OptimizationWorker).GetNestedType("CandidateValidationResult", BindingFlags.NonPublic)!;
+        // CandidateValidationResult may exist as nested or extracted. Prefer nested.
+        var resultType = typeof(OptimizationWorker).GetNestedType("CandidateValidationResult", BindingFlags.NonPublic)
+            ?? typeof(OptimizationConfig).Assembly.GetType("LascodiaTradingEngine.Application.Optimization.CandidateValidationResult", throwOnError: true)!;
         var ctor = resultType
             .GetConstructors(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)
             .OrderByDescending(candidate => candidate.GetParameters().Length)
@@ -3530,8 +3539,9 @@ public class OptimizationWorkerTest
         var restored = OptimizationCheckpointStore.Restore(serialized);
 
         Assert.True(restored.Observations.Count <= 25);
-        Assert.Equal(36, restored.Observations.First().Sequence);
-        Assert.Equal(60, restored.Observations.Last().Sequence);
+        // After trimming, sequences are re-indexed to close gaps (1-based consecutive).
+        Assert.Equal(1, restored.Observations.First().Sequence);
+        Assert.Equal(restored.Observations.Count, restored.Observations.Last().Sequence);
     }
 
     [Fact]

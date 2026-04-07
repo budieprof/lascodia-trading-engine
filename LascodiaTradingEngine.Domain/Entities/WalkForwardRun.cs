@@ -91,6 +91,11 @@ public class WalkForwardRun : Entity<long>
     /// <summary>UTC timestamp when this run was queued / the record was created.</summary>
     public DateTime StartedAt                   { get; set; } = DateTime.UtcNow;
 
+    /// <summary>
+    /// Queue priority for validation scheduling. Higher values are claimed first.
+    /// </summary>
+    public int Priority                         { get; set; }
+
     /// <summary>UTC timestamp when walk-forward processing finished. Null while running.</summary>
     public DateTime? CompletedAt                { get; set; }
 
@@ -106,6 +111,12 @@ public class WalkForwardRun : Entity<long>
     /// strategy parameters so they validate the approved candidate itself.
     /// </summary>
     public string?  ParametersSnapshotJson      { get; set; }
+
+    /// <summary>
+    /// Optional idempotency key for queued validation runs. Used to prevent duplicate
+    /// queued walk-forward runs for the same candidate in recovery/replay paths.
+    /// </summary>
+    public string? ValidationQueueKey           { get; set; }
 
     /// <summary>Soft-delete flag. Filtered out by the global EF Core query filter.</summary>
     public bool    IsDeleted                    { get; set; }

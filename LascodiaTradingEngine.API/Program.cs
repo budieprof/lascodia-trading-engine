@@ -18,6 +18,7 @@ using Autofac.Extensions.DependencyInjection;
 using Autofac;
 using System.Threading.RateLimiting;
 using OpenTelemetry.Metrics;
+using OpenTelemetry.Trace;
 using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.WorkerGroups;
 using LascodiaTradingEngine.API.Middleware;
@@ -51,6 +52,13 @@ if (!builder.Environment.IsDevelopment())
         options.TimestampFormat = "yyyy-MM-ddTHH:mm:ss.fffZ";
         options.UseUtcTimestamp = true;
     });
+
+    // Suppress Debug-level logs from high-frequency ML monitoring workers in production
+    // to reduce log volume. These workers run every 30-60s and produce verbose diagnostics.
+    builder.Logging.AddFilter("LascodiaTradingEngine.Application.Workers.MLFeature", LogLevel.Warning);
+    builder.Logging.AddFilter("LascodiaTradingEngine.Application.Workers.MLCalibration", LogLevel.Warning);
+    builder.Logging.AddFilter("LascodiaTradingEngine.Application.Workers.MLAccuracy", LogLevel.Warning);
+    builder.Logging.AddFilter("LascodiaTradingEngine.Application.Workers.MLPrediction", LogLevel.Information);
 }
 
 builder.Host.UseServiceProviderFactory(new AutofacServiceProviderFactory());
@@ -68,6 +76,11 @@ builder.Services.ConfigureApplicationServices(builder.Configuration);
 builder.Services.ConfigureDbContexts(builder.Configuration);
 builder.Services.AddSharedApplicationDependency(builder.Configuration);
 
+// Worker health check — reports aggregate health of all background workers
+builder.Services.AddHealthChecks()
+    .AddCheck<LascodiaTradingEngine.Application.Common.Services.WorkerHealthCheck>(
+        "workers", tags: new[] { "ready" });
+
 // Override shared library's size-limited IMemoryCache — ML training and inference
 // call IMemoryCache.Set without specifying Size, which throws when SizeLimit is set.
 // Remove the shared library's IMemoryCache registration and re-add without SizeLimit.
@@ -78,6 +91,7 @@ builder.Services.AddSingleton<Microsoft.Extensions.Caching.Memory.IMemoryCache>(
     new Microsoft.Extensions.Caching.Memory.MemoryCache(
         new Microsoft.Extensions.Caching.Memory.MemoryCacheOptions
         {
+            SizeLimit = 10_000,
             CompactionPercentage = 0.25,
             ExpirationScanFrequency = TimeSpan.FromMinutes(5)
         }));
@@ -177,10 +191,19 @@ builder.Services.AddOpenTelemetry()
         metrics.AddMeter("Microsoft.AspNetCore.Server.Kestrel");
         metrics.AddMeter("System.Net.Http");
         metrics.AddPrometheusExporter();
+
+        // OTLP exporter for cloud-native observability (Datadog, Grafana Cloud, etc.)
+        var otlpMetricEndpoint = builder.Configuration["Otlp:Endpoint"];
+        if (!string.IsNullOrEmpty(otlpMetricEndpoint))
+            metrics.AddOtlpExporter(opt => opt.Endpoint = new Uri(otlpMetricEndpoint));
     })
     .WithTracing(tracing =>
     {
         tracing.AddSource("LascodiaTradingEngine");
+
+        var otlpTraceEndpoint = builder.Configuration["Otlp:Endpoint"];
+        if (!string.IsNullOrEmpty(otlpTraceEndpoint))
+            tracing.AddOtlpExporter(opt => opt.Endpoint = new Uri(otlpTraceEndpoint));
     });
 
 // ── Rate Limiting ────────────────────────────────────────────────────────

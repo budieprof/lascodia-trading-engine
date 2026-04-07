@@ -17,6 +17,8 @@ using LascodiaTradingEngine.Application.Services.MarketData;
 using LascodiaTradingEngine.Application.Bridge.Services;
 using LascodiaTradingEngine.Application.Common.Behaviors;
 using LascodiaTradingEngine.Application.Common.Options;
+using LascodiaTradingEngine.Application.RiskProfiles.Services;
+using LascodiaTradingEngine.Application.RiskProfiles.Services.Steps;
 using MediatR;
 using Microsoft.Extensions.Logging;
 using Polly;
@@ -94,6 +96,14 @@ public static class DependencyInjection
         services.AddSingleton<IIntegrationEventHandler<TradeSignalCreatedIntegrationEvent>>(
             sp => sp.GetRequiredService<SignalOrderBridgeWorker>());
         services.AddHostedService(sp => sp.GetRequiredService<SignalOrderBridgeWorker>());
+
+        // ── Drawdown Monitor ────────────────────────────────────────────────────
+        // Hybrid polling + event-driven: regular 60s snapshots + emergency snapshot
+        // on large position loss via PositionClosedIntegrationEvent.
+        services.AddSingleton<DrawdownMonitorWorker>();
+        services.AddSingleton<IIntegrationEventHandler<PositionClosedIntegrationEvent>>(
+            sp => sp.GetRequiredService<DrawdownMonitorWorker>());
+        services.AddHostedService(sp => sp.GetRequiredService<DrawdownMonitorWorker>());
 
         // ── HTTP Clients ─────────────────────────────────────────────────────────
         services.AddHttpClient();
@@ -231,6 +241,17 @@ public static class DependencyInjection
 
         // ── Sentiment Feed (DeepSeek NLP — delegates to IDeepSeekSentimentService) ──────
         services.AddScoped<ISentimentFeed, Services.DeepSeekSentimentFeed>();
+
+        // ── Risk Checker Pipeline ────────────────────────────────────────────────
+        // RiskChecker is registered as a concrete type so the pipeline can inject it
+        // directly. The pipeline wraps it behind IRiskChecker, running all composable
+        // IRiskCheckStep implementations first, then falling back to the monolithic checker.
+        services.AddScoped<RiskChecker>();
+        services.AddScoped<IRiskCheckStep, MarginRiskCheckStep>();
+        services.AddScoped<IRiskCheckStep, ExposureRiskCheckStep>();
+        services.AddScoped<IRiskCheckStep, DrawdownRiskCheckStep>();
+        services.AddScoped<IRiskCheckStep, SpreadRiskCheckStep>();
+        services.AddScoped<IRiskChecker, RiskCheckerPipeline>();
 
         // ── Chaos Testing pipeline behavior (open generic — cannot use [RegisterService]) ──
         // Only register when explicitly enabled to avoid per-request overhead in production.

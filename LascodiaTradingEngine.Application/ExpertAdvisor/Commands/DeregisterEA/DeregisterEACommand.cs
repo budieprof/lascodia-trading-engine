@@ -1,7 +1,9 @@
 using FluentValidation;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
+using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
+using LascodiaTradingEngine.Application.Common.Events;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Domain.Enums;
@@ -46,11 +48,16 @@ public class DeregisterEACommandHandler : IRequestHandler<DeregisterEACommand, R
 {
     private readonly IWriteApplicationDbContext _context;
     private readonly IEAOwnershipGuard _ownershipGuard;
+    private readonly IIntegrationEventService _eventBus;
 
-    public DeregisterEACommandHandler(IWriteApplicationDbContext context, IEAOwnershipGuard ownershipGuard)
+    public DeregisterEACommandHandler(
+        IWriteApplicationDbContext context,
+        IEAOwnershipGuard ownershipGuard,
+        IIntegrationEventService eventBus)
     {
         _context        = context;
         _ownershipGuard = ownershipGuard;
+        _eventBus       = eventBus;
     }
 
     public async Task<ResponseData<string>> Handle(DeregisterEACommand request, CancellationToken cancellationToken)
@@ -72,7 +79,14 @@ public class DeregisterEACommandHandler : IRequestHandler<DeregisterEACommand, R
         entity.Status         = EAInstanceStatus.ShuttingDown;
         entity.DeregisteredAt = DateTime.UtcNow;
 
-        await _context.SaveChangesAsync(cancellationToken);
+        await _eventBus.SaveAndPublish(_context, new EAInstanceDeregisteredIntegrationEvent
+        {
+            EAInstanceId     = entity.Id,
+            InstanceId       = entity.InstanceId,
+            TradingAccountId = entity.TradingAccountId,
+            Symbols          = entity.Symbols,
+            DeregisteredAt   = entity.DeregisteredAt!.Value,
+        });
 
         return ResponseData<string>.Init(null, true, "Successful", "00");
     }

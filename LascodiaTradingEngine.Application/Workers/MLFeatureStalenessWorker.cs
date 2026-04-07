@@ -169,6 +169,15 @@ public sealed class MLFeatureStalenessWorker : BackgroundService
                 "MLFeatureStalenessWorker: {S}/{T} stale features={C}/{F}.",
                 model.Symbol, model.Timeframe, staleCount, F);
         }
+
+        // Prune staleness logs older than 90 days to prevent unbounded table growth.
+        var retentionCutoff = DateTime.UtcNow.AddDays(-90);
+        int pruned = await writeDb.Set<MLFeatureStalenessLog>()
+            .Where(l => l.ComputedAt < retentionCutoff)
+            .ExecuteDeleteAsync(ct);
+
+        if (pruned > 0)
+            _logger.LogInformation("MLFeatureStalenessWorker: pruned {Count} staleness logs older than 90 days.", pruned);
     }
 
     /// <summary>

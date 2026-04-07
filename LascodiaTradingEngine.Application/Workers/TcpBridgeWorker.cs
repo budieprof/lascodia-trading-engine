@@ -31,7 +31,7 @@ namespace LascodiaTradingEngine.Application.Workers;
 /// </summary>
 public class TcpBridgeWorker : BackgroundService
 {
-    private static readonly TimeSpan SignalPollInterval = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan DefaultSignalPollInterval = TimeSpan.FromMilliseconds(200);
     private static readonly TimeSpan ReconnectDelay    = TimeSpan.FromSeconds(3);
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
@@ -364,11 +364,25 @@ public class TcpBridgeWorker : BackgroundService
     {
         _logger.LogInformation("TcpBridgeWorker: shared signal poller starting");
 
+        // Load configurable poll interval once at start
+        var signalPollInterval = DefaultSignalPollInterval;
+        try
+        {
+            using var configScope = _scopeFactory.CreateScope();
+            var configDb = configScope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>().GetDbContext();
+            var config = await configDb.Set<Domain.Entities.EngineConfig>()
+                .AsNoTracking()
+                .FirstOrDefaultAsync(c => c.Key == "TcpBridge:SignalPollIntervalMs", ct);
+            if (config is not null && int.TryParse(config.Value, out var ms) && ms >= 50 && ms <= 1000)
+                signalPollInterval = TimeSpan.FromMilliseconds(ms);
+        }
+        catch { /* Use default */ }
+
         while (!ct.IsCancellationRequested)
         {
             try
             {
-                await Task.Delay(SignalPollInterval, ct);
+                await Task.Delay(signalPollInterval, ct);
 
                 if (_registry.TotalSessionCount == 0) continue;
 
@@ -455,10 +469,12 @@ public class TcpBridgeWorker : BackgroundService
                 // after a command has just been acknowledged via ProcessCommandAckAsync.
                 var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
 
+                var commandAgeCutoff = DateTime.UtcNow.AddMinutes(-30);
                 var commands = await writeCtx.GetDbContext()
                     .Set<Domain.Entities.EACommand>()
                     .Where(c => !c.Acknowledged && !c.IsDeleted
                              && c.RetryCount <= Domain.Entities.EACommand.MaxRetries
+                             && c.CreatedAt >= commandAgeCutoff
                              && connectedInstances.Contains(c.TargetInstanceId))
                     .OrderBy(c => c.CreatedAt)
                     .Take(50)

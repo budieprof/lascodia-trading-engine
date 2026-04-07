@@ -38,6 +38,11 @@ public class WorkerHealthMonitor : IWorkerHealthMonitor
         public int SuccessesLastHour;
         public int ErrorsLastHour;
         public int ConfiguredIntervalSeconds { get; set; } = 60;
+
+        // ── Static metadata for observability ────────────────────────────────
+        public string? Purpose;
+        public int ExpectedIntervalSeconds;
+        public bool IsStopped;
     }
 
     public WorkerHealthMonitor(
@@ -52,6 +57,7 @@ public class WorkerHealthMonitor : IWorkerHealthMonitor
     {
         var state = _state.GetOrAdd(workerName, _ => new WorkerState());
         state.LastSuccessAt = DateTime.UtcNow;
+        state.IsStopped = false; // Reset stopped flag — worker is clearly alive
         Interlocked.Exchange(ref state.ConsecutiveFailures, 0);
         Interlocked.Increment(ref state.SuccessesLastHour);
 
@@ -116,11 +122,61 @@ public class WorkerHealthMonitor : IWorkerHealthMonitor
 
         await ctx.SaveChangesAsync(cancellationToken);
 
+        // Detect crashed/stale workers: if a worker has a configured interval but hasn't
+        // reported success in 3x that interval, mark it as stopped and log a critical alert.
+        foreach (var kvp in _state)
+        {
+            var name = kvp.Key;
+            var state = kvp.Value;
+
+            if (state.IsStopped) continue; // Already marked
+
+            int staleThresholdSecs = Math.Max(180, state.ConfiguredIntervalSeconds * 3);
+            bool isStale = state.LastSuccessAt.HasValue &&
+                           (DateTime.UtcNow - state.LastSuccessAt.Value).TotalSeconds > staleThresholdSecs;
+
+            // Also detect workers that never reported success (registered but never ran)
+            bool neverRan = !state.LastSuccessAt.HasValue && !state.LastErrorAt.HasValue;
+
+            if (isStale)
+            {
+                state.IsStopped = true;
+                _logger.LogCritical(
+                    "WorkerHealthMonitor: worker {Worker} appears CRASHED — no heartbeat for {Elapsed:F0}s " +
+                    "(threshold: {Threshold}s). Last success: {LastSuccess}. Consecutive failures: {Failures}",
+                    name,
+                    (DateTime.UtcNow - state.LastSuccessAt!.Value).TotalSeconds,
+                    staleThresholdSecs,
+                    state.LastSuccessAt,
+                    Volatile.Read(ref state.ConsecutiveFailures));
+            }
+        }
+
         // Reset hourly counters atomically
         foreach (var state in _state.Values)
         {
             Interlocked.Exchange(ref state.SuccessesLastHour, 0);
             Interlocked.Exchange(ref state.ErrorsLastHour, 0);
+        }
+    }
+
+    public void RecordWorkerMetadata(string workerName, string purpose, TimeSpan expectedInterval)
+    {
+        var state = _state.GetOrAdd(workerName, _ => new WorkerState());
+        Volatile.Write(ref state.Purpose, purpose);
+        Volatile.Write(ref state.ExpectedIntervalSeconds, (int)expectedInterval.TotalSeconds);
+    }
+
+    public void RecordWorkerStopped(string workerName, string? errorMessage = null)
+    {
+        var state = _state.GetOrAdd(workerName, _ => new WorkerState());
+        state.IsRunning = false;
+        state.IsStopped = true;
+        if (errorMessage is not null)
+        {
+            state.LastErrorAt = DateTime.UtcNow;
+            state.LastErrorMessage = errorMessage.Length > 500 ? errorMessage[..500] : errorMessage;
+            _logger.LogError("WorkerHealthMonitor: {Worker} stopped with error: {Error}", workerName, errorMessage);
         }
     }
 

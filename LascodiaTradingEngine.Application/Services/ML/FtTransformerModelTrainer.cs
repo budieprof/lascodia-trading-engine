@@ -985,18 +985,22 @@ public sealed partial class FtTransformerModelTrainer : IMLModelTrainer
         // Embeddings
         for (int f = 0; f < F; f++)
         {
-            model.We[f] = ws.FtTransformerEmbedWeights![f].Length == embedDim
-                ? [..ws.FtTransformerEmbedWeights[f]]
+            var warmRow = ws.FtTransformerEmbedWeights![f];
+            model.We[f] = warmRow.Length == embedDim && HasFiniteArray(warmRow)
+                ? [..warmRow]
                 : InitRow(rng, embedDim, Math.Sqrt(2.0 / (1 + embedDim)));
         }
 
         if (ws.FtTransformerEmbedBiases is { Length: > 0 } warmBe && warmBe.Length == F && warmBe[0].Length == embedDim)
-            for (int f = 0; f < F; f++) model.Be[f] = [..warmBe[f]];
+            for (int f = 0; f < F; f++)
+                model.Be[f] = HasFiniteArray(warmBe[f]) ? [..warmBe[f]] : new double[embedDim];
         else
             for (int f = 0; f < F; f++) model.Be[f] = new double[embedDim];
 
         // [CLS] token
-        if (ws.FtTransformerClsToken is { Length: > 0 } warmCls && warmCls.Length == embedDim)
+        if (ws.FtTransformerClsToken is { Length: > 0 } warmCls
+            && warmCls.Length == embedDim
+            && HasFiniteArray(warmCls))
             Array.Copy(warmCls, model.ClsToken, embedDim);
         else
             for (int d = 0; d < embedDim; d++) model.ClsToken[d] = SampleGaussian(rng, 0.02);
@@ -1072,20 +1076,26 @@ public sealed partial class FtTransformerModelTrainer : IMLModelTrainer
             InitialiseLayerWeights(model.Layers[l], embedDim, ffnDim, rng);
 
         // Final LayerNorm
-        if (ws.FtTransformerGammaFinal is { Length: > 0 } warmGF && warmGF.Length == embedDim)
+        if (ws.FtTransformerGammaFinal is { Length: > 0 } warmGF
+            && warmGF.Length == embedDim
+            && HasFiniteArray(warmGF))
             Array.Copy(warmGF, model.GammaFinal, embedDim);
         else
             Array.Fill(model.GammaFinal, 1.0);
 
-        if (ws.FtTransformerBetaFinal is { Length: > 0 } warmBF && warmBF.Length == embedDim)
+        if (ws.FtTransformerBetaFinal is { Length: > 0 } warmBF
+            && warmBF.Length == embedDim
+            && HasFiniteArray(warmBF))
             Array.Copy(warmBF, model.BetaFinal, embedDim);
         else
             Array.Fill(model.BetaFinal, 0.0);
 
-        if (ws.FtTransformerOutputWeights is { Length: > 0 } warmOut && warmOut.Length == embedDim)
+        if (ws.FtTransformerOutputWeights is { Length: > 0 } warmOut
+            && warmOut.Length == embedDim
+            && HasFiniteArray(warmOut))
         {
             model.WOut = [..warmOut];
-            model.BOut = ws.FtTransformerOutputBias;
+            model.BOut = double.IsFinite(ws.FtTransformerOutputBias) ? ws.FtTransformerOutputBias : 0.0;
         }
         else
         {
@@ -1099,18 +1109,36 @@ public sealed partial class FtTransformerModelTrainer : IMLModelTrainer
 
     private static void LoadMatrix(double[][] dst, double[][]? src, int rows, int cols, Random rng, double std)
     {
-        if (src is { Length: > 0 } && src.Length == rows && src[0].Length == cols)
-            for (int r = 0; r < rows; r++) dst[r] = [..src[r]];
-        else
+        if (src is not { Length: > 0 } || src.Length != rows)
+        {
             for (int r = 0; r < rows; r++) dst[r] = InitRow(rng, cols, std);
+            return;
+        }
+
+        for (int r = 0; r < rows; r++)
+        {
+            if (src[r].Length == cols && HasFiniteArray(src[r]))
+                dst[r] = [..src[r]];
+            else
+                dst[r] = InitRow(rng, cols, std);
+        }
     }
 
     private static void LoadVector(double[] dst, double[]? src, int len, double fill)
     {
-        if (src is { Length: > 0 } && src.Length == len)
+        if (src is { Length: > 0 } && src.Length == len && HasFiniteArray(src))
             Array.Copy(src, dst, len);
         else
             Array.Fill(dst, fill);
+    }
+
+    private static bool HasFiniteArray(double[] values)
+    {
+        for (int i = 0; i < values.Length; i++)
+            if (!double.IsFinite(values[i]))
+                return false;
+
+        return true;
     }
 
     // ── Build pruned warm-start from already-trained full model ──────────────

@@ -4,6 +4,7 @@ using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Application.ExpertAdvisor.Queries.DTOs;
 
 namespace LascodiaTradingEngine.Application.ExpertAdvisor.Queries.GetPendingCommands;
@@ -33,15 +34,20 @@ public class GetPendingCommandsQueryHandler : IRequestHandler<GetPendingCommands
 {
     private readonly IReadApplicationDbContext _context;
     private readonly IMapper _mapper;
+    private readonly IEAOwnershipGuard _ownershipGuard;
 
-    public GetPendingCommandsQueryHandler(IReadApplicationDbContext context, IMapper mapper)
+    public GetPendingCommandsQueryHandler(IReadApplicationDbContext context, IMapper mapper, IEAOwnershipGuard ownershipGuard)
     {
-        _context = context;
-        _mapper  = mapper;
+        _context        = context;
+        _mapper         = mapper;
+        _ownershipGuard = ownershipGuard;
     }
 
     public async Task<ResponseData<List<EACommandDto>>> Handle(GetPendingCommandsQuery request, CancellationToken cancellationToken)
     {
+        if (!await _ownershipGuard.IsOwnerAsync(request.EAInstanceId, cancellationToken))
+            return ResponseData<List<EACommandDto>>.Init(null, false, "Unauthorized: caller does not own this EA instance", "-403");
+
         var query = _context.GetDbContext()
             .Set<Domain.Entities.EACommand>()
             .AsNoTracking()

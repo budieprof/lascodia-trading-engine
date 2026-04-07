@@ -44,7 +44,13 @@ public class InDatabaseLivePriceCache : ILivePriceCache
     public void Update(string symbol, decimal bid, decimal ask, DateTime timestamp)
     {
         _store[symbol] = (bid, ask, timestamp);
-        _ = PersistAsync(symbol, bid, ask, timestamp);   // fire-and-forget
+        // Fire-and-forget but surface errors so DB outages are detected
+        _ = PersistAsync(symbol, bid, ask, timestamp).ContinueWith(t =>
+        {
+            if (t.IsFaulted)
+                _logger.LogError(t.Exception?.InnerException ?? t.Exception,
+                    "LivePriceCache: persistence failed for {Symbol} — prices may be lost on restart", symbol);
+        }, TaskScheduler.Default);
     }
 
     public (decimal Bid, decimal Ask, DateTime Timestamp)? Get(string symbol)
@@ -66,13 +72,28 @@ public class InDatabaseLivePriceCache : ILivePriceCache
     {
         var cutoff = DateTime.UtcNow - StalePriceTtl;
         int evicted = 0;
+        var staleSymbols = new List<string>();
         foreach (var kvp in _store)
         {
             if (kvp.Value.Timestamp < cutoff && _store.TryRemove(kvp.Key, out _))
+            {
                 evicted++;
+                staleSymbols.Add(kvp.Key);
+            }
         }
         if (evicted > 0)
-            _logger.LogWarning("Evicted {Count} stale prices from live price cache (TTL={Ttl})", evicted, StalePriceTtl);
+        {
+            _logger.LogWarning(
+                "Evicted {Count} stale prices from live price cache (TTL={Ttl}). Symbols: {Symbols}",
+                evicted, StalePriceTtl, string.Join(",", staleSymbols));
+
+            // Multiple symbols going stale simultaneously indicates price feed interruption
+            if (evicted >= 3)
+                _logger.LogCritical(
+                    "PRICE FEED ALERT: {Count} symbols simultaneously stale — possible EA disconnect or " +
+                    "data feed interruption. Stale symbols: {Symbols}",
+                    evicted, string.Join(",", staleSymbols));
+        }
     }
 
     // ── Startup warm-up ──────────────────────────────────────────────────────

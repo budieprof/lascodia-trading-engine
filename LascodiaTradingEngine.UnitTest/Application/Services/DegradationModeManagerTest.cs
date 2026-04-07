@@ -1,5 +1,7 @@
+using System.Diagnostics.Metrics;
 using Microsoft.Extensions.Logging;
 using Moq;
+using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Services;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -11,7 +13,7 @@ public class DegradationModeManagerTest
 
     public DegradationModeManagerTest()
     {
-        _manager = new DegradationModeManager(Mock.Of<ILogger<DegradationModeManager>>());
+        _manager = new DegradationModeManager(Mock.Of<ILogger<DegradationModeManager>>(), new TradingMetrics(new TestMeterFactory()));
     }
 
     [Fact]
@@ -71,4 +73,10 @@ public class DegradationModeManagerTest
         // EmergencyHalt should NOT auto-recover from heartbeats
         Assert.Equal(DegradationMode.EmergencyHalt, _manager.CurrentMode);
     }
+}
+
+file class TestMeterFactory : IMeterFactory
+{
+    public Meter Create(MeterOptions options) => new(options);
+    public void Dispose() { }
 }

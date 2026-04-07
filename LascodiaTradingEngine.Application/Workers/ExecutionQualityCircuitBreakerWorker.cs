@@ -286,15 +286,19 @@ public sealed class ExecutionQualityCircuitBreakerWorker : BackgroundService
 
         if (!slippageBreached && !latencyBreached)
         {
-            // Check if this strategy was paused by circuit breaker and has now recovered
-            // below the hysteresis recovery threshold — auto-resume it.
+            // Check if this strategy was paused by THIS circuit breaker and has now recovered
+            // below the hysteresis recovery threshold — auto-resume it. Only resume if the
+            // pause reason was "ExecutionQuality" to avoid overriding pauses from other
+            // sources (DrawdownRecovery, StrategyHealth, manual operator pause).
             bool fullyRecovered = avgSlippage <= slippageRecovery && avgLatency <= latencyRecovery;
             if (fullyRecovered && autoPause)
             {
                 int resumed = await writeCtx.Set<Strategy>()
-                    .Where(s => s.Id == strategyId && s.Status == StrategyStatus.Paused && !s.IsDeleted)
+                    .Where(s => s.Id == strategyId && s.Status == StrategyStatus.Paused && !s.IsDeleted
+                             && s.PauseReason == "ExecutionQuality")
                     .ExecuteUpdateAsync(s => s
-                        .SetProperty(x => x.Status, StrategyStatus.Active),
+                        .SetProperty(x => x.Status, StrategyStatus.Active)
+                        .SetProperty(x => x.PauseReason, (string?)null),
                         ct);
 
                 if (resumed > 0)
@@ -345,7 +349,8 @@ public sealed class ExecutionQualityCircuitBreakerWorker : BackgroundService
             int affected = await writeCtx.Set<Strategy>()
                 .Where(s => s.Id == strategyId && s.Status == StrategyStatus.Active && !s.IsDeleted)
                 .ExecuteUpdateAsync(s => s
-                    .SetProperty(x => x.Status, StrategyStatus.Paused),
+                    .SetProperty(x => x.Status, StrategyStatus.Paused)
+                    .SetProperty(x => x.PauseReason, "ExecutionQuality"),
                     ct);
 
             if (affected > 0)

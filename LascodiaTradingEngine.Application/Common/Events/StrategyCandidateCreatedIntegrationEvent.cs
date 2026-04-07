@@ -32,6 +32,15 @@ public record StrategyCandidateCreatedIntegrationEvent : IntegrationEvent
     /// <summary>The market regime the strategy was generated for.</summary>
     public LascodiaTradingEngine.Domain.Enums.MarketRegime Regime { get; init; }
 
+    /// <summary>The regime being observed when the candidate was generated.</summary>
+    public LascodiaTradingEngine.Domain.Enums.MarketRegime ObservedRegime { get; init; }
+
+    /// <summary>Whether the candidate came from primary or reserve generation.</summary>
+    public string GenerationSource { get; init; } = string.Empty;
+
+    /// <summary>Optional reserve target regime when the candidate came from reserve generation.</summary>
+    public LascodiaTradingEngine.Domain.Enums.MarketRegime? ReserveTargetRegime { get; init; }
+
     /// <summary>UTC timestamp when the candidate was created.</summary>
     public DateTime  CreatedAt     { get; init; }
 }

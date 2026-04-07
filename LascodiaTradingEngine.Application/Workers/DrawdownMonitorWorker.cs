@@ -3,6 +3,9 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Lascodia.Trading.Engine.EventBus.Abstractions;
+using LascodiaTradingEngine.Application.Common.Diagnostics;
+using LascodiaTradingEngine.Application.Common.Events;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.DrawdownRecovery.Commands.RecordDrawdownSnapshot;
 using LascodiaTradingEngine.Domain.Entities;
@@ -10,86 +13,60 @@ using LascodiaTradingEngine.Domain.Entities;
 namespace LascodiaTradingEngine.Application.Workers;
 
 /// <summary>
-/// Background service that periodically fetches the active trading account's equity,
-/// computes the current drawdown against the running peak, and persists a
-/// <see cref="DrawdownSnapshot"/> record. Snapshots form the authoritative equity-curve
-/// history used in performance reporting and risk-mode transitions (Normal → Recovery → Halted).
-/// </summary>
-/// <remarks>
-/// <para>
-/// <b>Polling interval:</b> 60 seconds (<see cref="PollingInterval"/>). This cadence
-/// balances snapshot resolution against write volume; a new row is written to the
-/// <c>DrawdownSnapshots</c> table every minute the engine is running.
-/// </para>
+/// Hybrid polling + event-driven worker that monitors account equity and drawdown.
 ///
-/// <para>
-/// <b>Equity curve tracking:</b> The worker maintains a monotonically increasing peak
-/// by comparing the current account equity against the <c>PeakEquity</c> field of the
-/// most recent persisted snapshot. The peak only ever moves up — drawdown is measured
-/// as the percentage decline from the highest equity ever recorded.
-/// </para>
+/// <b>Polling mode:</b> Records a drawdown snapshot every 60 seconds (configurable) by
+/// comparing current equity against the running peak.
 ///
-/// <para>
+/// <b>Event-driven mode:</b> Subscribes to <see cref="PositionClosedIntegrationEvent"/>.
+/// When a position closes with a loss exceeding the <c>Drawdown:EmergencyLossPct</c>
+/// threshold (default 2% of equity), an immediate out-of-cycle snapshot is recorded.
+/// This catches fast drawdowns in volatile markets that could exceed limits between
+/// regular polling intervals.
+///
 /// <b>Division of responsibility:</b>
-/// <list type="bullet">
-///   <item><description>
-///     This worker is the <em>data producer</em>: it records snapshots with their
-///     computed <c>DrawdownPct</c> and assigns a <c>RecoveryMode</c> to each snapshot
-///     via the <see cref="RecordDrawdownSnapshotCommand"/> handler.
-///   </description></item>
-///   <item><description>
-///     <see cref="DrawdownRecoveryWorker"/> is the <em>enforcement layer</em>: it reads
-///     the mode from the latest snapshot and takes corrective action (pausing strategies,
-///     restricting lot sizes, etc.) when the mode changes.
-///   </description></item>
-/// </list>
-/// </para>
-///
-/// <para>
-/// <b>Pipeline position:</b> This worker sits at the start of the drawdown management
-/// pipeline. Downstream consumers (<see cref="DrawdownRecoveryWorker"/>, performance
-/// attribution queries, the risk dashboard) all read from the snapshot table this
-/// worker populates.
-/// </para>
-/// </remarks>
-public class DrawdownMonitorWorker : BackgroundService
+/// This worker is the <em>data producer</em>: it records snapshots with their computed
+/// <c>DrawdownPct</c> and assigns a <c>RecoveryMode</c> via the
+/// <see cref="RecordDrawdownSnapshotCommand"/> handler. <see cref="DrawdownRecoveryWorker"/>
+/// is the <em>enforcement layer</em> that reads the mode and takes corrective action.
+/// </summary>
+public class DrawdownMonitorWorker : BackgroundService, IIntegrationEventHandler<PositionClosedIntegrationEvent>
 {
     private readonly ILogger<DrawdownMonitorWorker> _logger;
     private readonly IServiceScopeFactory _scopeFactory;
+    private readonly TradingMetrics _metrics;
 
-    private const string CK_PollSecs = "Drawdown:PollIntervalSeconds";
-    private const int DefaultPollSeconds = 60;
+    private const string CK_PollSecs          = "Drawdown:PollIntervalSeconds";
+    private const string CK_EmergencyLossPct  = "Drawdown:EmergencyLossPct";
+    private const int DefaultPollSeconds      = 60;
+    private const decimal DefaultEmergencyPct = 2.0m; // 2% of equity triggers emergency snapshot
 
     /// <summary>Max backoff delay on consecutive failures (5 minutes).</summary>
     private static readonly TimeSpan MaxBackoff = TimeSpan.FromMinutes(5);
 
+    /// <summary>Cooldown to prevent flooding from rapid position closures.</summary>
+    private DateTime _lastEmergencySnapshot = DateTime.MinValue;
+    private static readonly TimeSpan EmergencyCooldown = TimeSpan.FromSeconds(10);
+
     private int _consecutiveFailures;
 
-    /// <summary>
-    /// Initialises the worker.
-    /// </summary>
-    /// <param name="logger">Structured logger for this worker.</param>
-    /// <param name="scopeFactory">
-    /// Factory used to open a new DI scope on each polling cycle so that scoped
-    /// services (<see cref="IReadApplicationDbContext"/>, MediatR) are not shared
-    /// across cycles.
-    /// </param>
-    public DrawdownMonitorWorker(ILogger<DrawdownMonitorWorker> logger, IServiceScopeFactory scopeFactory)
+    public DrawdownMonitorWorker(
+        ILogger<DrawdownMonitorWorker> logger,
+        IServiceScopeFactory scopeFactory,
+        TradingMetrics metrics)
     {
         _logger       = logger;
         _scopeFactory = scopeFactory;
+        _metrics      = metrics;
     }
 
-    /// <summary>
-    /// Entry point for the hosted service. Runs a continuous loop: attempt to record
-    /// a snapshot, then wait <see cref="PollingInterval"/> before the next attempt.
-    /// Errors inside <see cref="RecordSnapshotAsync"/> are caught here to prevent the
-    /// loop from crashing; the next cycle will retry.
-    /// </summary>
-    /// <param name="stoppingToken">Signalled by the host on application shutdown.</param>
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Polling mode — regular scheduled snapshots
+    // ═══════════════════════════════════════════════════════════════════════
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("DrawdownMonitorWorker starting");
+        _logger.LogInformation("DrawdownMonitorWorker starting (hybrid: polling + event-driven)");
 
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -136,32 +113,84 @@ public class DrawdownMonitorWorker : BackgroundService
         _logger.LogInformation("DrawdownMonitorWorker stopped");
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Event-driven mode — emergency snapshot on large loss
+    // ═══════════════════════════════════════════════════════════════════════
+
     /// <summary>
-    /// Performs a single snapshot cycle:
-    /// <list type="number">
-    ///   <item><description>Loads the active <see cref="TradingAccount"/>.</description></item>
-    ///   <item><description>
-    ///     Reads the most recent <see cref="DrawdownSnapshot"/> to determine the running
-    ///     peak equity. The peak is the greater of the stored peak and the current equity,
-    ///     ensuring it only ever moves upward.
-    ///   </description></item>
-    ///   <item><description>
-    ///     Dispatches <see cref="RecordDrawdownSnapshotCommand"/> which computes the
-    ///     drawdown percentage and assigns the appropriate <c>RecoveryMode</c> before
-    ///     persisting the snapshot row.
-    ///   </description></item>
-    ///   <item><description>Logs the result at Information level for operational visibility.</description></item>
-    /// </list>
+    /// Called by the event bus when a position is closed. If the realized loss exceeds the
+    /// configurable emergency threshold (% of equity), triggers an immediate drawdown snapshot
+    /// outside the normal polling cycle. This catches fast drawdowns that could exceed limits
+    /// between regular 60-second snapshots.
     /// </summary>
-    /// <param name="ct">Propagated cancellation token.</param>
+    public async Task Handle(PositionClosedIntegrationEvent @event)
+    {
+        // Only react to losses
+        if (@event.WasProfitable || @event.RealisedPnL >= 0)
+            return;
+
+        // Cooldown: don't flood snapshots from rapid consecutive closures
+        if ((DateTime.UtcNow - _lastEmergencySnapshot) < EmergencyCooldown)
+            return;
+
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var readContext = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+
+            // Load the active account to compute loss as % of equity
+            var account = await readContext.GetDbContext()
+                .Set<TradingAccount>()
+                .Where(x => x.IsActive && !x.IsDeleted)
+                .FirstOrDefaultAsync();
+
+            if (account is null || account.Equity <= 0)
+                return;
+
+            // Read configurable emergency threshold from EngineConfig
+            decimal emergencyPct = DefaultEmergencyPct;
+            var configEntry = await readContext.GetDbContext()
+                .Set<Domain.Entities.EngineConfig>()
+                .AsNoTracking()
+                .FirstOrDefaultAsync(c => c.Key == CK_EmergencyLossPct);
+            if (configEntry?.Value is not null && decimal.TryParse(configEntry.Value, out var cfgParsed) && cfgParsed > 0)
+                emergencyPct = cfgParsed;
+
+            decimal lossPct = Math.Abs(@event.RealisedPnL) / account.Equity * 100m;
+            if (lossPct < emergencyPct)
+                return; // Loss is small relative to equity — normal polling will catch it
+
+            _lastEmergencySnapshot = DateTime.UtcNow;
+
+            _logger.LogWarning(
+                "DrawdownMonitorWorker: EMERGENCY snapshot triggered — position {PositionId} ({Symbol}) " +
+                "closed with {LossPct:F2}% loss ({PnL:F2}) exceeding {Threshold:F1}% threshold",
+                @event.PositionId, @event.Symbol, lossPct, @event.RealisedPnL, emergencyPct);
+
+            _metrics.WorkerErrors.Add(1,
+                new KeyValuePair<string, object?>("worker", "DrawdownMonitor"),
+                new KeyValuePair<string, object?>("reason", "emergency_snapshot"));
+
+            await RecordSnapshotAsync(CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "DrawdownMonitorWorker: failed to record emergency snapshot after position {PositionId} closure",
+                @event.PositionId);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Shared snapshot logic
+    // ═══════════════════════════════════════════════════════════════════════
+
     private async Task RecordSnapshotAsync(CancellationToken ct)
     {
         using var scope   = _scopeFactory.CreateScope();
         var readContext   = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
         var mediator      = scope.ServiceProvider.GetRequiredService<IMediator>();
 
-        // Load the active trading account — there should be exactly one IsActive account.
-        // If none exists (e.g. initial setup) we skip silently at Debug level.
         var account = await readContext.GetDbContext()
             .Set<TradingAccount>()
             .Where(x => x.IsActive && !x.IsDeleted)
@@ -175,9 +204,6 @@ public class DrawdownMonitorWorker : BackgroundService
 
         decimal currentEquity = account.Equity;
 
-        // Determine running peak from the most recent snapshot.
-        // Math.Max ensures the peak can only increase — drawdown is always measured
-        // from the highest equity the account has ever achieved.
         var latestSnapshot = await readContext.GetDbContext()
             .Set<DrawdownSnapshot>()
             .OrderByDescending(x => x.RecordedAt)
@@ -185,32 +211,23 @@ public class DrawdownMonitorWorker : BackgroundService
 
         decimal peakEquity = latestSnapshot is not null
             ? Math.Max(latestSnapshot.PeakEquity, currentEquity)
-            : currentEquity; // First snapshot ever: peak equals current equity (0 % drawdown)
+            : currentEquity;
 
-        // Guard against zero peak — can occur if account is not yet funded or if equity
-        // data is stale. Division by zero in the drawdown formula must be prevented.
         if (peakEquity <= 0)
         {
             _logger.LogDebug("DrawdownMonitorWorker: peak equity is zero, skipping snapshot");
             return;
         }
 
-        // Delegate persistence and RecoveryMode assignment to the command handler.
-        // The handler applies the thresholds defined in the default RiskProfile to
-        // classify the snapshot as Normal, Reduced, or Halted.
         await mediator.Send(new RecordDrawdownSnapshotCommand
         {
             CurrentEquity = currentEquity,
             PeakEquity    = peakEquity
         }, ct);
 
-        // Calculate drawdown % here solely for the log message — the canonical value
-        // is computed and stored by the command handler.
         decimal drawdownPct = (peakEquity - currentEquity) / peakEquity * 100m;
 
         // ── Margin level monitoring ─────────────────────────────────────────
-        // Margin level = Equity / MarginUsed × 100%.
-        // Broker margin call is typically at 100%; we warn at 200% and alert at 150%.
         if (account.MarginUsed > 0)
         {
             decimal marginLevel = account.Equity / account.MarginUsed * 100m;

@@ -3,6 +3,7 @@ using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ReceiveOrderSnapshot;
@@ -84,30 +85,51 @@ public class ReceiveOrderSnapshotCommandValidator : AbstractValidator<ReceiveOrd
 public class ReceiveOrderSnapshotCommandHandler : IRequestHandler<ReceiveOrderSnapshotCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;
+    private readonly IEAOwnershipGuard _ownershipGuard;
 
-    public ReceiveOrderSnapshotCommandHandler(IWriteApplicationDbContext context)
+    public ReceiveOrderSnapshotCommandHandler(IWriteApplicationDbContext context, IEAOwnershipGuard ownershipGuard)
     {
-        _context = context;
+        _context        = context;
+        _ownershipGuard = ownershipGuard;
     }
 
     public async Task<ResponseData<string>> Handle(ReceiveOrderSnapshotCommand request, CancellationToken cancellationToken)
     {
+        if (!await _ownershipGuard.IsOwnerAsync(request.InstanceId, cancellationToken))
+            return ResponseData<string>.Init(null, false, "Unauthorized: caller does not own this EA instance", "-403");
+
         var dbContext = _context.GetDbContext();
+
+        // Load the EA instance's owned symbols to validate each snapshot entry
+        var eaInstance = await dbContext.Set<Domain.Entities.EAInstance>()
+            .FirstOrDefaultAsync(x => x.InstanceId == request.InstanceId && !x.IsDeleted, cancellationToken);
+
+        if (eaInstance is null)
+            return ResponseData<string>.Init(null, false, "EA instance not found", "-14");
+
+        var ownedSymbols = eaInstance.Symbols
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(s => s.ToUpperInvariant())
+            .ToHashSet();
+
+        // Batch-load existing orders by broker ticket to avoid N+1 queries
+        var brokerTickets = request.Orders.Select(o => o.Ticket.ToString()).Distinct().ToList();
+        var existingOrders = await dbContext
+            .Set<Domain.Entities.Order>()
+            .Where(x => brokerTickets.Contains(x.BrokerOrderId!) && !x.IsDeleted)
+            .ToListAsync(cancellationToken);
+        var orderLookup = existingOrders.ToDictionary(o => (o.BrokerOrderId!, o.Symbol));
 
         foreach (var snap in request.Orders)
         {
             var brokerTicket = snap.Ticket.ToString();
             var symbol = snap.Symbol.ToUpperInvariant();
 
-            var existing = await dbContext
-                .Set<Domain.Entities.Order>()
-                .FirstOrDefaultAsync(
-                    x => x.BrokerOrderId == brokerTicket
-                      && x.Symbol == symbol
-                      && !x.IsDeleted,
-                    cancellationToken);
+            // Validate that the reported symbol belongs to this EA instance
+            if (ownedSymbols.Count > 0 && !ownedSymbols.Contains(symbol))
+                continue;
 
-            if (existing is not null)
+            if (orderLookup.TryGetValue((brokerTicket, symbol), out var existing))
             {
                 existing.Price      = snap.Price;
                 existing.Quantity   = snap.Volume;
@@ -116,10 +138,11 @@ public class ReceiveOrderSnapshotCommandHandler : IRequestHandler<ReceiveOrderSn
             }
             else
             {
-                var orderType     = Enum.Parse<OrderType>(snap.OrderType, ignoreCase: true);
-                var executionType = Enum.Parse<ExecutionType>(snap.ExecutionType, ignoreCase: true);
+                if (!Enum.TryParse<OrderType>(snap.OrderType, ignoreCase: true, out var orderType)
+                    || !Enum.TryParse<ExecutionType>(snap.ExecutionType, ignoreCase: true, out var executionType))
+                    continue; // Skip orders with unrecognised type/execution values
 
-                await dbContext.Set<Domain.Entities.Order>().AddAsync(new Domain.Entities.Order
+                var newOrder = new Domain.Entities.Order
                 {
                     Symbol        = symbol,
                     OrderType     = orderType,
@@ -131,7 +154,9 @@ public class ReceiveOrderSnapshotCommandHandler : IRequestHandler<ReceiveOrderSn
                     Status        = OrderStatus.Submitted,
                     BrokerOrderId = brokerTicket,
                     CreatedAt     = snap.PlacedTime,
-                }, cancellationToken);
+                };
+                await dbContext.Set<Domain.Entities.Order>().AddAsync(newOrder, cancellationToken);
+                orderLookup[(brokerTicket, symbol)] = newOrder;
             }
         }
 

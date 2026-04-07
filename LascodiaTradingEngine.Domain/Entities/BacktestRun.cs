@@ -79,6 +79,9 @@ public class BacktestRun : Entity<long>
     /// </summary>
     public string?  ParametersSnapshotJson { get; set; }
 
+    /// <summary>Optional idempotency key for validation queue deduplication.</summary>
+    public string?  ValidationQueueKey { get; set; }
+
     /// <summary>Soft-delete flag. Filtered out by the global EF Core query filter.</summary>
     public bool     IsDeleted      { get; set; }
 

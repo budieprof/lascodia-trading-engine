@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Globalization;
 using LascodiaTradingEngine.Application.Backtesting.Models;
 using LascodiaTradingEngine.Application.Backtesting.Services;
+using LascodiaTradingEngine.Application.Services;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 using Microsoft.Extensions.Logging;
@@ -33,13 +34,32 @@ public class StrategyScreeningEngine
     private readonly IBacktestEngine _backtestEngine;
     private readonly ILogger _logger;
     private readonly Action<string>? _onGateRejection;
+    private readonly IStrategyScreeningArtifactFactory _artifactFactory;
+    private readonly TimeProvider _timeProvider;
 
     public StrategyScreeningEngine(IBacktestEngine backtestEngine, ILogger logger,
         Action<string>? onGateRejection = null)
+        : this(
+            backtestEngine,
+            logger,
+            onGateRejection,
+            new StrategyScreeningArtifactFactory(),
+            TimeProvider.System)
+    {
+    }
+
+    public StrategyScreeningEngine(
+        IBacktestEngine backtestEngine,
+        ILogger logger,
+        Action<string>? onGateRejection,
+        IStrategyScreeningArtifactFactory artifactFactory,
+        TimeProvider timeProvider)
     {
         _backtestEngine = backtestEngine;
         _logger = logger;
         _onGateRejection = onGateRejection;
+        _artifactFactory = artifactFactory;
+        _timeProvider = timeProvider;
     }
 
     /// <summary>
@@ -54,6 +74,35 @@ public class StrategyScreeningEngine
         ScreeningConfig config, MarketRegimeEnum regime, string generationSource,
         CancellationToken ct, MarketRegimeEnum? oosRegime = null,
         IReadOnlyList<(DateTime Date, decimal Equity)>? portfolioEquityCurve = null)
+        => await ScreenCandidateAsync(
+            strategyType,
+            symbol,
+            timeframe,
+            enrichedParams,
+            templateIndex,
+            allCandles,
+            trainCandles,
+            testCandles,
+            screeningOptions,
+            thresholds,
+            config,
+            regime,
+            regime,
+            generationSource,
+            ct,
+            oosRegime,
+            portfolioEquityCurve,
+            null);
+
+    public async Task<ScreeningOutcome?> ScreenCandidateAsync(
+        StrategyType strategyType, string symbol, Timeframe timeframe,
+        string enrichedParams, int templateIndex,
+        List<Candle> allCandles, List<Candle> trainCandles, List<Candle> testCandles,
+        BacktestOptions screeningOptions, ScreeningThresholds thresholds,
+        ScreeningConfig config, MarketRegimeEnum targetRegime, MarketRegimeEnum observedRegime,
+        string generationSource, CancellationToken ct, MarketRegimeEnum? oosRegime = null,
+        IReadOnlyList<(DateTime Date, decimal Equity)>? portfolioEquityCurve = null,
+        HaircutRatios? appliedHaircuts = null)
     {
         var gateTrace = new List<ScreeningGateTrace>();
         var gateSw = Stopwatch.StartNew();
@@ -160,7 +209,7 @@ public class StrategyScreeningEngine
 
         // ── IS-to-OOS degradation ratio check ──
         double maxDegradation = config.MaxOosDegradationPct;
-        if (oosRegime.HasValue && oosRegime.Value != regime)
+        if (oosRegime.HasValue && oosRegime.Value != targetRegime)
             maxDegradation *= 1.5; // Relax tolerance when regimes differ
         bool degradationFailed = false;
         if ((double)trainResult.SharpeRatio > thresholds.MinSharpe
@@ -252,8 +301,14 @@ public class StrategyScreeningEngine
 
         // ── Monte Carlo permutation test (#6: variable seed) ──
         // Fix #10: Include date ordinal so different runs on new data produce different random trials
-        int monteCarloSeed = DateTime.UtcNow.DayOfYear ^ DateTime.UtcNow.Year
-            ^ symbol.GetHashCode() ^ (int)strategyType;
+        var utcNow = _timeProvider.GetUtcNow().UtcDateTime;
+        int monteCarloSeed = _artifactFactory.ResolveMonteCarloSeed(
+            strategyType,
+            symbol,
+            timeframe,
+            enrichedParams,
+            allCandles,
+            utcNow);
         double pValue = 0;
         if (config.MonteCarloEnabled && combinedTrades.Count >= 10)
         {
@@ -426,60 +481,50 @@ public class StrategyScreeningEngine
         }
 
         // ── Build structured screening metrics (#13) ──
-        var metrics = new ScreeningMetrics
-        {
-            IsWinRate = (double)trainResult.WinRate,
-            IsProfitFactor = (double)trainResult.ProfitFactor,
-            IsSharpeRatio = (double)trainResult.SharpeRatio,
-            IsMaxDrawdownPct = (double)trainResult.MaxDrawdownPct,
-            IsTotalTrades = trainResult.TotalTrades,
-            OosWinRate = (double)oosResult.WinRate,
-            OosProfitFactor = (double)oosResult.ProfitFactor,
-            OosSharpeRatio = (double)oosResult.SharpeRatio,
-            OosMaxDrawdownPct = (double)oosResult.MaxDrawdownPct,
-            OosTotalTrades = oosResult.TotalTrades,
-            EquityCurveR2 = r2 ?? -1.0, // -1 sentinel = unevaluated (<5 trades)
-            MonteCarloPValue = pValue,
-            WalkForwardWindowsPassed = walkForwardPassed,
-            WalkForwardWindowsMask = walkForwardMask,
-            MaxTradeTimeConcentration = maxConcentration,
-            Regime = regime.ToString(),
-            GenerationSource = generationSource,
-            ScreenedAtUtc = DateTime.UtcNow,
-            MonteCarloSeed = monteCarloSeed,
-            MarginalSharpeContribution = marginalSharpeContribution ?? 0,
-            KellySharpeRatio = kellySharpe,
-            FixedLotSharpeRatio = fixedLotSharpe,
-            GateTrace = gateTrace,
-        };
+        var metrics = _artifactFactory.BuildMetrics(
+            trainResult,
+            oosResult,
+            r2,
+            pValue,
+            shufflePValue,
+            walkForwardPassed,
+            walkForwardMask,
+            maxConcentration,
+            targetRegime,
+            observedRegime,
+            generationSource,
+            generationSource == "Reserve" ? targetRegime.ToString() : null,
+            monteCarloSeed,
+            marginalSharpeContribution,
+            kellySharpe,
+            fixedLotSharpe,
+            appliedHaircuts,
+            gateTrace,
+            utcNow);
 
         // ── Build strategy entity ──
-        var inv = CultureInfo.InvariantCulture;
-        var templateLabel = templateIndex > 0 ? $"-v{templateIndex + 1}" : "";
-        var prefix = generationSource == "Reserve" ? "Auto-Reserve" : "Auto";
-        var newStrategy = new Strategy
-        {
-            Name           = $"{prefix}-{strategyType}-{symbol}-{timeframe}{templateLabel}",
-            Description    = string.Format(inv,
-                "Auto-generated for {0} regime. IS: WR={1:P1}, PF={2:F2}, Sharpe={3:F2}. OOS: WR={4:P1}, PF={5:F2}, Sharpe={6:F2}",
-                regime, trainResult.WinRate, trainResult.ProfitFactor, trainResult.SharpeRatio,
-                oosResult.WinRate, oosResult.ProfitFactor, oosResult.SharpeRatio),
-            StrategyType   = strategyType,
-            Symbol         = symbol,
-            Timeframe      = timeframe,
-            ParametersJson = enrichedParams,
-            Status         = StrategyStatus.Paused,
-            LifecycleStage = StrategyLifecycleStage.Draft,
-            CreatedAt      = DateTime.UtcNow,
-            ScreeningMetricsJson = metrics.ToJson(),
-        };
+        var newStrategy = _artifactFactory.BuildStrategy(
+            strategyType,
+            symbol,
+            timeframe,
+            enrichedParams,
+            templateIndex,
+            generationSource,
+            targetRegime,
+            observedRegime,
+            trainResult,
+            oosResult,
+            metrics,
+            utcNow);
 
         return new ScreeningOutcome
         {
             Strategy = newStrategy,
             TrainResult = trainResult,
             OosResult = oosResult,
-            Regime = regime,
+            Regime = targetRegime,
+            ObservedRegime = observedRegime,
+            GenerationSource = generationSource,
             Metrics = metrics,
             FailureReason = null,
             FailureOutcome = null,
@@ -907,6 +952,8 @@ public sealed record ScreeningOutcome
     public BacktestResult TrainResult { get; init; } = null!;
     public BacktestResult OosResult { get; init; } = null!;
     public MarketRegimeEnum Regime { get; init; }
+    public MarketRegimeEnum ObservedRegime { get; init; }
+    public string GenerationSource { get; init; } = "Primary";
     public ScreeningMetrics Metrics { get; init; } = null!;
 
     /// <summary>Structured failure reason — <see cref="ScreeningFailureReason.None"/> when passed.</summary>

@@ -208,9 +208,11 @@ public sealed class MLDeadLetterWorker : BackgroundService
             return;
         }
 
-        // Read current dead-letter retry count from EngineConfig.
+        // Read current dead-letter retry count from EngineConfig using the WRITE context
+        // to prevent lost-update races when multiple workers process dead letters concurrently
+        // for the same symbol/timeframe (read replica lag could cause both to read the same value).
         string retryCountKey = $"MLDeadLetter:{symbol}:{timeframe}:RetryCount";
-        int    currentRetries = await GetConfigAsync<int>(readCtx, retryCountKey, 0, ct);
+        int    currentRetries = await GetConfigAsync<int>(writeCtx, retryCountKey, 0, ct);
 
         if (currentRetries >= maxRetries)
         {

@@ -3,6 +3,8 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Events;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Options;
 using LascodiaTradingEngine.Domain.Entities;
@@ -94,13 +96,34 @@ public class PortfolioRiskWorker : BackgroundService
                 account.Id, metrics.VaR95, metrics.VaR99,
                 metrics.CVaR95, metrics.StressedVaR, metrics.CorrelationConcentration);
 
-            // Alert if VaR exceeds limit
+            // Alert if VaR exceeds limit — publish event for real-time downstream reaction
             if (account.Equity > 0 && metrics.VaR95 / account.Equity * 100m > _options.MaxVaR95Pct)
             {
                 _logger.LogWarning(
                     "PortfolioRisk: account {Id} VaR95={VaR95:F2} exceeds {Limit}% of equity {Equity:F2}",
                     account.Id, metrics.VaR95, _options.MaxVaR95Pct, account.Equity);
+
+                // Cooldown: only publish one breach event per account per 5-minute window
+                var cooldownKey = $"VaRBreach:{account.Id}";
+                if (!_lastBreachPublished.TryGetValue(cooldownKey, out var lastPublished)
+                    || (DateTime.UtcNow - lastPublished).TotalMinutes >= 5)
+                {
+                    var eventBus = scope.ServiceProvider.GetRequiredService<IIntegrationEventService>();
+                    var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+                    await eventBus.SaveAndPublish(writeCtx, new VaRBreachIntegrationEvent
+                    {
+                        TradingAccountId = account.Id,
+                        PortfolioVaR95   = metrics.VaR95,
+                        VaRLimitPct      = _options.MaxVaR95Pct,
+                        AccountEquity    = account.Equity,
+                        DetectedAt       = DateTime.UtcNow,
+                    });
+                    _lastBreachPublished[cooldownKey] = DateTime.UtcNow;
+                }
             }
         }
     }
+
+    /// <summary>Cooldown tracking to prevent VaR breach event flooding.</summary>
+    private readonly Dictionary<string, DateTime> _lastBreachPublished = new();
 }

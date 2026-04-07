@@ -25,6 +25,16 @@ public class StrategyQueryFilter
     public string? Status { get; set; }
     /// <summary>Filter by exact currency pair symbol.</summary>
     public string? Symbol { get; set; }
+    /// <summary>Filters by whether strategy-generation screening metadata exists.</summary>
+    public bool? HasScreeningMetadata { get; set; }
+    /// <summary>Filters by strategy-generation source (for example Primary or Reserve).</summary>
+    public string? GenerationSource { get; set; }
+    /// <summary>Filters by the observed market regime captured during screening.</summary>
+    public string? ObservedRegime { get; set; }
+    /// <summary>Filters by the reserve target regime captured during screening.</summary>
+    public string? ReserveTargetRegime { get; set; }
+    /// <summary>Filters by whether the strategy was auto-promoted during screening.</summary>
+    public bool? AutoPromotedOnly { get; set; }
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
@@ -63,6 +73,37 @@ public class GetPagedStrategiesQueryHandler
 
         if (!string.IsNullOrWhiteSpace(filter?.Symbol))
             query = query.Where(x => x.Symbol == filter.Symbol);
+
+        if (filter?.HasScreeningMetadata is true)
+            query = query.Where(x => x.ScreeningMetricsJson != null && x.ScreeningMetricsJson != "");
+
+        if (filter?.HasScreeningMetadata is false)
+            query = query.Where(x => x.ScreeningMetricsJson == null || x.ScreeningMetricsJson == "");
+
+        if (!string.IsNullOrWhiteSpace(filter?.GenerationSource))
+            query = query.Where(x =>
+                x.ScreeningMetricsJson != null &&
+                x.ScreeningMetricsJson.Contains($"\"GenerationSource\":\"{filter.GenerationSource}\""));
+
+        if (!string.IsNullOrWhiteSpace(filter?.ObservedRegime))
+            query = query.Where(x =>
+                x.ScreeningMetricsJson != null &&
+                x.ScreeningMetricsJson.Contains($"\"ObservedRegime\":\"{filter.ObservedRegime}\""));
+
+        if (!string.IsNullOrWhiteSpace(filter?.ReserveTargetRegime))
+            query = query.Where(x =>
+                x.ScreeningMetricsJson != null &&
+                x.ScreeningMetricsJson.Contains($"\"ReserveTargetRegime\":\"{filter.ReserveTargetRegime}\""));
+
+        if (filter?.AutoPromotedOnly is true)
+            query = query.Where(x =>
+                x.ScreeningMetricsJson != null &&
+                x.ScreeningMetricsJson.Contains("\"IsAutoPromoted\":true"));
+
+        if (filter?.AutoPromotedOnly is false)
+            query = query.Where(x =>
+                x.ScreeningMetricsJson != null &&
+                x.ScreeningMetricsJson.Contains("\"IsAutoPromoted\":false"));
 
         var data = await pager.ExecuteQuery(query).ToListAsync(cancellationToken);
         var dtos = _mapper.Map<List<StrategyDto>>(data);

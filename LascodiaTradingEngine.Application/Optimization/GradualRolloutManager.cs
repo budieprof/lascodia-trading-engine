@@ -155,7 +155,10 @@ internal sealed class GradualRolloutManager
                 // predicted decline over the observation window exceeds 10% of the
                 // current average, indicating a meaningful downtrend, not noise.
                 double predictedDecline = Math.Abs(slope) * n;
-                if (slope < 0 && predictedDecline > (double)avgScore * 0.10)
+                // Use the larger of relative threshold (10% of avg) and absolute floor (0.02)
+                // to prevent oversensitive rollbacks when avgScore is very small.
+                double declineThreshold = Math.Max((double)avgScore * 0.10, 0.02);
+                if (slope < 0 && predictedDecline > declineThreshold)
                 {
                     _logger.LogWarning(
                         "GradualRolloutManager: rolling back strategy {Id} — deterioration trend during rollout " +

@@ -2,6 +2,9 @@ using FluentValidation.TestHelper;
 using Microsoft.EntityFrameworkCore;
 using Moq;
 using MockQueryable.Moq;
+using Lascodia.Trading.Engine.EventBus.Events;
+using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Events;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ProcessHeartbeat;
@@ -125,7 +128,8 @@ public class EACommandHandlerTests
         var instance = CreateActiveInstance();
         SetupEAInstances([instance]);
 
-        var handler = new DeregisterEACommandHandler(_mockWriteContext.Object, OwnerGuard(true).Object);
+        var mockEventBus = new Mock<IIntegrationEventService>();
+        var handler = new DeregisterEACommandHandler(_mockWriteContext.Object, OwnerGuard(true).Object, mockEventBus.Object);
 
         var result = await handler.Handle(new DeregisterEACommand { InstanceId = "EA-001" }, CancellationToken.None);
 
@@ -133,7 +137,9 @@ public class EACommandHandlerTests
         Assert.Equal("00", result.responseCode);
         Assert.Equal(EAInstanceStatus.ShuttingDown, instance.Status);
         Assert.NotNull(instance.DeregisteredAt);
-        _mockWriteContext.Verify(c => c.SaveChangesAsync(It.IsAny<CancellationToken>()), Times.Once);
+        mockEventBus.Verify(e => e.SaveAndPublish(
+            It.IsAny<IDbContext>(),
+            It.IsAny<IntegrationEvent>()), Times.Once);
     }
 
     [Fact]
@@ -142,7 +148,7 @@ public class EACommandHandlerTests
         var instance = CreateActiveInstance();
         SetupEAInstances([instance]);
 
-        var handler = new DeregisterEACommandHandler(_mockWriteContext.Object, OwnerGuard(false).Object);
+        var handler = new DeregisterEACommandHandler(_mockWriteContext.Object, OwnerGuard(false).Object, new Mock<IIntegrationEventService>().Object);
 
         var result = await handler.Handle(new DeregisterEACommand { InstanceId = "EA-001" }, CancellationToken.None);
 
@@ -157,7 +163,7 @@ public class EACommandHandlerTests
         instance.Status = EAInstanceStatus.ShuttingDown;
         SetupEAInstances([instance]);
 
-        var handler = new DeregisterEACommandHandler(_mockWriteContext.Object, OwnerGuard(true).Object);
+        var handler = new DeregisterEACommandHandler(_mockWriteContext.Object, OwnerGuard(true).Object, new Mock<IIntegrationEventService>().Object);
 
         var result = await handler.Handle(new DeregisterEACommand { InstanceId = "EA-001" }, CancellationToken.None);
 
@@ -170,7 +176,7 @@ public class EACommandHandlerTests
     {
         SetupEAInstances([]);
 
-        var handler = new DeregisterEACommandHandler(_mockWriteContext.Object, OwnerGuard(true).Object);
+        var handler = new DeregisterEACommandHandler(_mockWriteContext.Object, OwnerGuard(true).Object, new Mock<IIntegrationEventService>().Object);
 
         var result = await handler.Handle(new DeregisterEACommand { InstanceId = "EA-999" }, CancellationToken.None);
 

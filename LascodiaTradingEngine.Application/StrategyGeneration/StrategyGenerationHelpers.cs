@@ -1,7 +1,4 @@
 using System.Text.Json;
-using LascodiaTradingEngine.Application.Backtesting.Models;
-using LascodiaTradingEngine.Application.Backtesting.Services;
-using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 using MarketRegimeEnum = LascodiaTradingEngine.Domain.Enums.MarketRegime;
@@ -28,7 +25,7 @@ namespace LascodiaTradingEngine.Application.StrategyGeneration;
 /// <b>Not here:</b> Anything that needs a backtest engine, DB context, logger, or DI scope
 /// belongs in <see cref="StrategyScreeningEngine"/> or <see cref="StrategyGenerationWorker"/>.
 /// </summary>
-public static class StrategyGenerationHelpers
+public static partial class StrategyGenerationHelpers
 {
     /// <summary>Asset class for multi-asset screening parameter adjustments.</summary>
     public enum AssetClass { FxMajor, FxMinor, FxExotic, Index, Commodity, Crypto, Unknown }
@@ -97,75 +94,6 @@ public static class StrategyGenerationHelpers
         if (upper.Length == 6 && pairInfo is { BaseCurrency.Length: 3, QuoteCurrency.Length: 3 })
             return AssetClass.FxExotic;
         return AssetClass.Unknown;
-    }
-
-    // ── Market calendar awareness (#7, #14) ────────────────────────────────
-
-    /// <summary>
-    /// Returns true if generation should be skipped due to weekend/market closure.
-    /// Crypto assets trade 24/7 and are excluded from the weekend check (#7).
-    /// </summary>
-    public static bool IsWeekendForAssetMix(IEnumerable<(string Symbol, CurrencyPair? Pair)> symbols)
-    {
-        var now = DateTime.UtcNow;
-        if (now.DayOfWeek != DayOfWeek.Saturday && now.DayOfWeek != DayOfWeek.Sunday)
-            return false;
-
-        // If ALL symbols are crypto, allow weekend generation
-        bool hasFx = symbols.Any(s => ClassifyAsset(s.Symbol, s.Pair) != AssetClass.Crypto);
-        return hasFx;
-    }
-
-    /// <summary>
-    /// Returns true if the current date/time falls within any configured blackout period.
-    /// Supports optional timezone configuration (#15).
-    /// </summary>
-    public static bool IsInBlackoutPeriod(string blackoutPeriods, string blackoutTimezone = "UTC")
-    {
-        if (string.IsNullOrWhiteSpace(blackoutPeriods)) return false;
-
-        DateTime now;
-        try
-        {
-            var tz = TimeZoneInfo.FindSystemTimeZoneById(blackoutTimezone);
-            now = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, tz);
-        }
-        catch
-        {
-            now = DateTime.UtcNow;
-        }
-
-        int todayOrdinal = now.Month * 100 + now.Day;
-
-        foreach (var period in blackoutPeriods.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-        {
-            var parts = period.Split('-');
-            if (parts.Length != 2) continue;
-            if (!TryParseMonthDay(parts[0], out int startOrdinal)) continue;
-            if (!TryParseMonthDay(parts[1], out int endOrdinal)) continue;
-
-            if (startOrdinal <= endOrdinal)
-            {
-                if (todayOrdinal >= startOrdinal && todayOrdinal <= endOrdinal) return true;
-            }
-            else
-            {
-                if (todayOrdinal >= startOrdinal || todayOrdinal <= endOrdinal) return true;
-            }
-        }
-
-        return false;
-
-        static bool TryParseMonthDay(string s, out int ordinal)
-        {
-            ordinal = 0;
-            var md = s.Split('/');
-            if (md.Length != 2) return false;
-            if (!int.TryParse(md[0], out int month) || !int.TryParse(md[1], out int day)) return false;
-            if (month < 1 || month > 12 || day < 1 || day > 31) return false;
-            ordinal = month * 100 + day;
-            return true;
-        }
     }
 
     // ── Timeframe scaling ──────────────────────────────────────────────────
@@ -359,44 +287,6 @@ public static class StrategyGenerationHelpers
         catch { return parametersJson; }
     }
 
-    /// <summary>Max age of live price data before it's considered stale for spread estimation.</summary>
-    private static readonly TimeSpan LivePriceStalenessLimit = TimeSpan.FromHours(2);
-
-    public static BacktestOptions BuildScreeningOptions(
-        string symbol, CurrencyPair? pairInfo, AssetClass assetClass,
-        double screeningSpreadPoints, double screeningCommissionPerLot,
-        double screeningSlippagePips, ILivePriceCache livePriceCache)
-    {
-        var pointSize = pairInfo != null && pairInfo.DecimalPlaces > 0
-            ? 1.0m / (decimal)Math.Pow(10, pairInfo.DecimalPlaces)
-            : GetDefaultPointSize(assetClass);
-
-        decimal spreadPriceUnits = pointSize * (decimal)screeningSpreadPoints;
-
-        var livePrice = livePriceCache.Get(symbol);
-        if (livePrice.HasValue && livePrice.Value.Ask > livePrice.Value.Bid
-            && (DateTime.UtcNow - livePrice.Value.Timestamp) < LivePriceStalenessLimit)
-        {
-            var liveSpread = livePrice.Value.Ask - livePrice.Value.Bid;
-            if (liveSpread > spreadPriceUnits) spreadPriceUnits = liveSpread;
-        }
-
-        decimal commissionPerLot = ScaleCommissionForAssetClass((decimal)screeningCommissionPerLot, assetClass);
-        if (pairInfo != null && pairInfo.PipSize > 0)
-        {
-            decimal pipSizeRatio = pairInfo.PipSize / 10m;
-            if (pipSizeRatio > 1.5m) commissionPerLot *= pipSizeRatio;
-        }
-
-        return new BacktestOptions
-        {
-            SpreadPriceUnits   = spreadPriceUnits,
-            CommissionPerLot   = commissionPerLot,
-            SlippagePriceUnits = pointSize * (decimal)screeningSlippagePips * 10,
-            ContractSize       = pairInfo?.ContractSize ?? GetDefaultContractSize(assetClass),
-        };
-    }
-
     public static decimal GetDefaultPointSize(AssetClass assetClass) => assetClass switch
     {
         AssetClass.Index     => 0.01m,
@@ -440,96 +330,6 @@ public static class StrategyGenerationHelpers
             if (Enum.TryParse<Timeframe>(part, ignoreCase: true, out var tf))
                 result.Add(tf);
         return result.Count > 0 ? result : [Timeframe.H1, Timeframe.H4];
-    }
-
-    // ── Adaptive threshold helpers (#11, #12, #23) ─────────────────────────
-
-    public static double ComputeAdaptiveMultiplier(double observedMedian, double baseThreshold)
-    {
-        if (baseThreshold <= 0) return 1.0;
-        double ratio = observedMedian / baseThreshold;
-        return Math.Clamp(ratio, 0.85, 1.25);
-    }
-
-    public static double ApplyAdaptiveAdjustment(double threshold, double multiplier)
-        => threshold * multiplier;
-
-    public static double Median(List<double> values)
-    {
-        if (values.Count == 0) return 0;
-        var sorted = values.OrderBy(v => v).ToList();
-        int mid = sorted.Count / 2;
-        return sorted.Count % 2 == 0
-            ? (sorted[mid - 1] + sorted[mid]) / 2.0
-            : sorted[mid];
-    }
-
-    /// <summary>
-    /// Computes recency-weighted survival rate for performance feedback (#12).
-    /// More recent strategies get exponentially higher weight.
-    /// The <paramref name="halfLifeDays"/> parameter controls how fast old data decays —
-    /// shorter half-life weights recent data more heavily. Adjusted by
-    /// <see cref="IFeedbackDecayMonitor"/> based on prediction accuracy.
-    /// </summary>
-    public static double ComputeRecencyWeightedSurvivalRate(
-        IEnumerable<(bool Survived, DateTime CreatedAt)> strategies,
-        double halfLifeDays = 62.0)
-    {
-        double weightedSurvived = 0, totalWeight = 0;
-        var now = DateTime.UtcNow;
-        double denominator = halfLifeDays / Math.Log(2); // halfLifeDays=62 → ~89.4 ≈ previous 90.0
-
-        foreach (var (survived, createdAt) in strategies)
-        {
-            double daysAgo = (now - createdAt).TotalDays;
-            double weight = Math.Exp(-daysAgo / denominator);
-            totalWeight += weight;
-            if (survived) weightedSurvived += weight;
-        }
-
-        return totalWeight > 0 ? weightedSurvived / totalWeight : 0;
-    }
-
-    // ── Regime transition & multi-timeframe helpers (#6, #7, #8, #10) ──────
-
-    /// <summary>
-    /// Strategy types that perform well during regime transitions (volatility
-    /// expansion during shift). Used to allocate a hedge slot when the regime
-    /// detector signals an imminent transition (#6).
-    /// </summary>
-    public static IReadOnlyList<StrategyType> GetTransitionTypes()
-        => new[] { StrategyType.BreakoutScalper, StrategyType.MomentumTrend, StrategyType.SessionBreakout };
-
-    /// <summary>
-    /// Computes a confidence multiplier based on multi-timeframe regime consensus.
-    /// When the higher timeframe agrees with the primary, confidence is boosted;
-    /// disagreement applies a penalty; missing data is neutral (#7).
-    /// </summary>
-    public static double ComputeMultiTimeframeConfidenceBoost(
-        MarketRegimeEnum primaryRegime, string symbol, Timeframe primaryTf,
-        IReadOnlyDictionary<(string, Timeframe), MarketRegimeEnum> regimeBySymbolTf)
-    {
-        var higherTf = GetHigherTimeframe(primaryTf);
-        if (higherTf is null)
-            return 1.0;
-
-        if (regimeBySymbolTf.TryGetValue((symbol, higherTf.Value), out var higherRegime))
-            return higherRegime == primaryRegime ? 1.15 : 0.90;
-
-        return 1.0;
-    }
-
-    /// <summary>
-    /// Scales template count / exploration based on how long the current regime
-    /// has been active. Very young regimes reduce exploration (may be noise);
-    /// mature regimes slightly boost it (#8).
-    /// </summary>
-    public static double ComputeRegimeDurationFactor(DateTime regimeDetectedAt)
-    {
-        var elapsed = DateTime.UtcNow - regimeDetectedAt;
-        if (elapsed.TotalDays < 2) return 0.8;
-        if (elapsed.TotalDays <= 14) return 1.0;
-        return 1.1;
     }
 
     /// <summary>

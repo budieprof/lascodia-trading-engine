@@ -40,6 +40,8 @@ public class StrategyConfiguration : IEntityTypeConfiguration<Strategy>
 
         builder.Property(x => x.EstimatedCapacityLots).HasPrecision(18, 2);
 
+        builder.Property(x => x.RowVersion).IsRowVersion();
+
         builder.HasQueryFilter(x => !x.IsDeleted);
 
         builder.HasIndex(x => x.Symbol);

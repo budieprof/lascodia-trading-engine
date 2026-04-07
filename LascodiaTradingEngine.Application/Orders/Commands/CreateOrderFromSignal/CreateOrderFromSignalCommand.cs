@@ -255,6 +255,13 @@ public class CreateOrderFromSignalCommandHandler
             await Task.Delay(executionDelay, cancellationToken);
         }
 
+        // ── Re-validate signal expiry after risk checks + timing delay ──────
+        // Signal could have expired during the risk check and entry timing evaluation
+        // window. Re-check before committing to order creation.
+        if (signal.ExpiresAt <= DateTime.UtcNow)
+            return ResponseData<long>.Init(0, false,
+                "Signal expired during risk check processing (expiry race)", "-11");
+
         // ── Create order ─────────────────────────────────────────────────────
         // CreateOrderCommand internally uses SaveAndPublish which opens its own
         // ResilientTransaction. We must NOT wrap this in an outer execution strategy
@@ -286,13 +293,55 @@ public class CreateOrderFromSignalCommandHandler
 
         long orderId = orderResult.data;
 
-        // Write OrderId back to signal
-        var signalEntity = await wdb.Set<TradeSignal>()
-            .FirstOrDefaultAsync(x => x.Id == signal.Id && !x.IsDeleted, cancellationToken);
-        if (signalEntity is not null)
+        // Write OrderId back to signal atomically with status guard — prevents concurrent
+        // consumers from both succeeding. Only updates if signal is still Approved with no OrderId.
+        // If this fails, cancel the order to prevent orphans.
+        try
         {
-            signalEntity.OrderId = orderId;
-            await _writeContext.SaveChangesAsync(cancellationToken);
+            int updated = await wdb.Set<TradeSignal>()
+                .Where(x => x.Id == signal.Id
+                          && x.Status == TradeSignalStatus.Approved
+                          && x.OrderId == null
+                          && !x.IsDeleted)
+                .ExecuteUpdateAsync(s => s.SetProperty(p => p.OrderId, orderId), cancellationToken);
+
+            if (updated == 0)
+            {
+                _logger.LogWarning(
+                    "CreateOrderFromSignal: signal {SignalId} was consumed by another request — cancelling order {OrderId}",
+                    signal.Id, orderId);
+
+                var raceOrder = await wdb.Set<Order>()
+                    .FirstOrDefaultAsync(o => o.Id == orderId && !o.IsDeleted, cancellationToken);
+                if (raceOrder is not null)
+                {
+                    raceOrder.Status = OrderStatus.Cancelled;
+                    raceOrder.Notes = "Cancelled: signal consumed by concurrent request";
+                    await _writeContext.SaveChangesAsync(cancellationToken);
+                }
+
+                await RecordAttemptAsync(signal.Id, account.Id, false, "Signal already consumed (race)", cancellationToken);
+                return ResponseData<long>.Init(0, false, "Signal already consumed by another request", "-11");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogCritical(ex,
+                "CreateOrderFromSignal: failed to link order {OrderId} to signal {SignalId} — cancelling order to prevent orphan",
+                orderId, signal.Id);
+
+            // Cancel the orphaned order so it doesn't execute without signal linkage
+            var orphanedOrder = await wdb.Set<Order>()
+                .FirstOrDefaultAsync(o => o.Id == orderId && !o.IsDeleted, cancellationToken);
+            if (orphanedOrder is not null)
+            {
+                orphanedOrder.Status = OrderStatus.Cancelled;
+                orphanedOrder.Notes = $"Cancelled: signal link-back failed — {ex.Message}";
+                await _writeContext.SaveChangesAsync(cancellationToken);
+            }
+
+            await RecordAttemptAsync(signal.Id, account.Id, false, $"Signal link-back failed: {ex.Message}", cancellationToken);
+            return ResponseData<long>.Init(0, false, "Order created but signal link failed — order cancelled", "-11");
         }
 
         await RecordAttemptAsync(signal.Id, account.Id, true, null, cancellationToken);

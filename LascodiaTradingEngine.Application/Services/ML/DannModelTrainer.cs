@@ -1141,6 +1141,7 @@ public sealed class DannModelTrainer : IMLModelTrainer
         var sharpeList = new List<double>(folds);
         var foldImpList = new List<double[]>(folds);
         int badFolds   = 0;
+        int evaluatedFolds = 0;
 
         for (int fold = 0; fold < folds && !ct.IsCancellationRequested; fold++)
         {
@@ -1160,6 +1161,7 @@ public sealed class DannModelTrainer : IMLModelTrainer
 
             var foldTest = samples[testStart..Math.Min(testEnd, samples.Count)];
             if (foldTest.Count < 20) continue;
+            evaluatedFolds++;
 
             var cvHp = hp with
             {
@@ -1222,10 +1224,10 @@ public sealed class DannModelTrainer : IMLModelTrainer
 
         if (accList.Count == 0)
         {
-            // Fixed: all folds failed the equity gate — treat as gate failure so
-            // the caller rejects training rather than silently continuing.
-            _logger.LogWarning("DANN: all CV folds failed equity gate — aborting training.");
-            return (new WalkForwardResult(0, 0, 0, 0, 0, 0), true);
+            // Mirror the other trainers: a small/hostile CV window should not force
+            // an empty snapshot when final training can still proceed.
+            _logger.LogWarning("DANN: no usable CV folds were retained — continuing without a CV gate.");
+            return (new WalkForwardResult(0, 0, 0, 0, 0, evaluatedFolds), false);
         }
 
         double avgAcc  = accList.Average();

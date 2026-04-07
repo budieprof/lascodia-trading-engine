@@ -115,112 +115,6 @@ public partial class OptimizationWorker : BackgroundService
 {
     // ── Inner types ─────────────────────────────────────────────────────────
 
-    /// <summary>All hot-reloadable configuration for a single optimisation cycle.</summary>
-    internal sealed record OptimizationConfig
-    {
-        // Scheduling
-        public required int SchedulePollSeconds { get; init; }
-        public required int CooldownDays { get; init; }
-        public required int MaxQueuedPerCycle { get; init; }
-        public required bool AutoScheduleEnabled { get; init; }
-        public required int MaxRunsPerWeek { get; init; }
-
-        // Performance gates
-        public required double MinWinRate { get; init; }
-        public required double MinProfitFactor { get; init; }
-        public required int MinTotalTrades { get; init; }
-
-        // Approval thresholds
-        public required decimal AutoApprovalImprovementThreshold { get; init; }
-        public required decimal AutoApprovalMinHealthScore { get; init; }
-
-        // Search
-        public required int TopNCandidates { get; init; }
-        public required int CoarsePhaseThreshold { get; init; }
-        public required int TpeBudget { get; init; }
-        public required int TpeInitialSamples { get; init; }
-        public required int PurgedKFolds { get; init; }
-        public required bool AdaptiveBoundsEnabled { get; init; }
-        public required int GpEarlyStopPatience { get; init; }
-        public required string PresetName { get; init; }
-        public required bool HyperbandEnabled { get; init; }
-        public required int HyperbandEta { get; init; }
-        public required bool UseEhviAcquisition { get; init; }
-        public required bool UseParegoScalarization { get; init; }
-
-        // Screening / backtesting
-        public required int ScreeningTimeoutSeconds { get; init; }
-        public required double ScreeningSpreadPoints { get; init; }
-        public required double ScreeningCommissionPerLot { get; init; }
-        public required double ScreeningSlippagePips { get; init; }
-        public required decimal ScreeningInitialBalance { get; init; }
-        public required int MaxParallelBacktests { get; init; }
-        public required int MinCandidateTrades { get; init; }
-        public required int MaxRunTimeoutMinutes { get; init; }
-        public required int CircuitBreakerThreshold { get; init; }
-        public required string SuccessiveHalvingRungs { get; init; }
-
-        // Validation gates
-        public required double MaxOosDegradationPct { get; init; }
-        public required double EmbargoRatio { get; init; }
-        public required double CorrelationParamThreshold { get; init; }
-        public required double SensitivityPerturbPct { get; init; }
-        public required double SensitivityDegradationTolerance { get; init; }
-        public required int BootstrapIterations { get; init; }
-        public required decimal MinBootstrapCILower { get; init; }
-        public required bool CostSensitivityEnabled { get; init; }
-        public required double CostStressMultiplier { get; init; }
-        public required double TemporalOverlapThreshold { get; init; }
-        public required double PortfolioCorrelationThreshold { get; init; }
-        public required double WalkForwardMinMaxRatio { get; init; }
-        public required int MinOosCandlesForValidation { get; init; }
-        public required double MaxCvCoefficientOfVariation { get; init; }
-        public required int PermutationIterations { get; init; }
-        public required double MinEquityCurveR2 { get; init; }
-        public required double MaxTradeTimeConcentration { get; init; }
-
-        // CPCV
-        public required int CpcvNFolds { get; init; }
-        public required int CpcvTestFoldCount { get; init; }
-        public required int CpcvMaxCombinations { get; init; }
-
-        // Data loading
-        public required int DataScarcityThreshold { get; init; }
-        public required int CandleLookbackMonths { get; init; }
-        public required bool CandleLookbackAutoScale { get; init; }
-        public required bool UseSymbolSpecificSpread { get; init; }
-        public required double RegimeBlendRatio { get; init; }
-        public required int MaxCrossRegimeEvals { get; init; }
-        public required int RegimeStabilityHours { get; init; }
-
-        // Suppression / deferral
-        public required bool SuppressDuringDrawdownRecovery { get; init; }
-        public required bool SeasonalBlackoutEnabled { get; init; }
-        public required string BlackoutPeriods { get; init; }
-        public required bool RequireEADataAvailability { get; init; }
-
-        // Retry / escalation
-        public required int MaxRetryAttempts { get; init; }
-        public required int MaxConsecutiveFailuresBeforeEscalation { get; init; }
-        public required int CheckpointEveryN { get; init; }
-        public required int MaxConcurrentRuns { get; init; }
-    }
-
-    /// <summary>
-    /// A scored parameter candidate from the screening phases.
-    /// Check <see cref="TradesTrimmed"/> before accessing <c>Result.Trades</c> —
-    /// trade lists are cleared from low-scoring candidates to reduce heap pressure.
-    /// </summary>
-    internal sealed record ScoredCandidate(
-        string ParamsJson,
-        decimal HealthScore,
-        BacktestResult Result,
-        double CvCoefficientOfVariation = 0.0)
-    {
-        /// <summary>True after trade lists have been cleared to reduce memory pressure.</summary>
-        public bool TradesTrimmed { get; set; }
-    }
-
     private sealed record OptimizationConfigSnapshot(
         int Version,
         OptimizationConfig Config);
@@ -328,6 +222,11 @@ public partial class OptimizationWorker : BackgroundService
 
     private DateTime _nextScheduleScanUtc = DateTime.MinValue;
 
+    // ── Config cache to avoid redundant DB round-trips within the same scan cycle ──
+    private OptimizationConfig? _cachedConfig;
+    private DateTime _configCachedAt;
+    private const int ConfigCacheTtlSeconds = 60;
+
     // ── Constructor ─────────────────────────────────────────────────────────
 
     public OptimizationWorker(
@@ -423,7 +322,7 @@ public partial class OptimizationWorker : BackgroundService
                     var writeCtx = schedScope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
                     var db       = readCtx.GetDbContext();
 
-                    var config = await LoadConfigurationAsync(db, stoppingToken);
+                    var config = await GetOrLoadConfigAsync(db, stoppingToken);
                     _nextScheduleScanUtc = DateTime.UtcNow.AddSeconds(config.SchedulePollSeconds);
 
                     if (config.AutoScheduleEnabled)
@@ -471,7 +370,7 @@ public partial class OptimizationWorker : BackgroundService
         // ── Stage 0+1: Atomic claim with integrated concurrency limit ───
         int maxConcurrentRuns;
         {
-            var config0 = await LoadConfigurationAsync(db, ct);
+            var config0 = await GetOrLoadConfigAsync(db, ct);
             maxConcurrentRuns = config0.MaxConcurrentRuns;
         }
         var claimResult = await OptimizationRunClaimer.ClaimNextRunAsync(
@@ -1595,6 +1494,21 @@ public partial class OptimizationWorker : BackgroundService
         {
             _logger.LogDebug("OptimizationWorker: using preset '{Preset}' with no overrides", presetName);
         }
+    }
+
+    /// <summary>
+    /// Returns a cached <see cref="OptimizationConfig"/> if the TTL has not expired,
+    /// otherwise reloads from the database. Use this in the main scan loop and scheduling
+    /// paths where a slightly stale config is acceptable. Run-scoped contexts that need
+    /// a guaranteed-fresh config should call <see cref="LoadConfigurationAsync"/> directly.
+    /// </summary>
+    private async Task<OptimizationConfig> GetOrLoadConfigAsync(DbContext db, CancellationToken ct)
+    {
+        if (_cachedConfig is not null && (DateTime.UtcNow - _configCachedAt).TotalSeconds < ConfigCacheTtlSeconds)
+            return _cachedConfig;
+        _cachedConfig = await LoadConfigurationAsync(db, ct);
+        _configCachedAt = DateTime.UtcNow;
+        return _cachedConfig;
     }
 
     private static async Task<OptimizationConfig> LoadConfigurationAsync(DbContext db, CancellationToken ct)

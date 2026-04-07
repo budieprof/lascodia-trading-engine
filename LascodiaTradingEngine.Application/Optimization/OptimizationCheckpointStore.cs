@@ -28,7 +28,14 @@ internal static class OptimizationCheckpointStore
         string? SurrogateKind,
         ulong SurrogateRandomState,
         List<Observation> Observations,
-        List<string> SeenParameterJson);
+        List<string> SeenParameterJson,
+        string? DataWindowFingerprint = null,
+        DateTime? CandleWindowStartUtc = null,
+        DateTime? CandleWindowEndUtc = null,
+        int? CandleCount = null,
+        int? TrainCandleCount = null,
+        int? TestCandleCount = null,
+        string? OptimizationRegimeText = null);
 
     internal static State Empty => new(PayloadVersion, 0, 0, null, 0UL, [], []);
 
@@ -39,6 +46,37 @@ internal static class OptimizationCheckpointStore
         ulong surrogateRandomState,
         IEnumerable<Observation> observations,
         IEnumerable<string> seenParameterJson,
+        ILogger? logger = null)
+        => Serialize(
+            iterations,
+            stagnantBatches,
+            surrogateKind,
+            surrogateRandomState,
+            observations,
+            seenParameterJson,
+            dataWindowFingerprint: null,
+            candleWindowStartUtc: null,
+            candleWindowEndUtc: null,
+            candleCount: null,
+            trainCandleCount: null,
+            testCandleCount: null,
+            optimizationRegimeText: null,
+            logger);
+
+    internal static string Serialize(
+        int iterations,
+        int stagnantBatches,
+        string surrogateKind,
+        ulong surrogateRandomState,
+        IEnumerable<Observation> observations,
+        IEnumerable<string> seenParameterJson,
+        string? dataWindowFingerprint,
+        DateTime? candleWindowStartUtc,
+        DateTime? candleWindowEndUtc,
+        int? candleCount,
+        int? trainCandleCount,
+        int? testCandleCount,
+        string? optimizationRegimeText,
         ILogger? logger = null)
     {
         var orderedObservations = observations
@@ -64,7 +102,14 @@ internal static class OptimizationCheckpointStore
             surrogateKind,
             surrogateRandomState,
             orderedObservations,
-            orderedSeen);
+            orderedSeen,
+            dataWindowFingerprint,
+            candleWindowStartUtc,
+            candleWindowEndUtc,
+            candleCount,
+            trainCandleCount,
+            testCandleCount,
+            optimizationRegimeText);
 
         string json = JsonSerializer.Serialize(state);
         if (json.Length <= MaxCheckpointChars)
@@ -84,14 +129,13 @@ internal static class OptimizationCheckpointStore
             MaxCheckpointChars, json.Length);
 
         int keepCount = Math.Max(25, state.Observations.Count / 2);
-        state = state with
-        {
-            Observations = state.Observations
-                .OrderByDescending(o => o.Sequence)
-                .Take(keepCount)
-                .OrderBy(o => o.Sequence)
-                .ToList()
-        };
+        var trimmedObservations = state.Observations
+            .OrderByDescending(o => o.Sequence)
+            .Take(keepCount)
+            .OrderBy(o => o.Sequence)
+            .Select((o, idx) => o with { Sequence = idx + 1 }) // Re-index to close gaps
+            .ToList();
+        state = state with { Observations = trimmedObservations };
 
         json = JsonSerializer.Serialize(state);
         return json.Length <= MaxCheckpointChars
@@ -106,8 +150,16 @@ internal static class OptimizationCheckpointStore
                     .OrderByDescending(o => o.Sequence)
                     .Take(Math.Min(25, state.Observations.Count))
                     .OrderBy(o => o.Sequence)
+                    .Select((o, idx) => o with { Sequence = idx + 1 }) // Re-index to close gaps
                     .ToList(),
-                []));
+                [],
+                dataWindowFingerprint,
+                candleWindowStartUtc,
+                candleWindowEndUtc,
+                candleCount,
+                trainCandleCount,
+                testCandleCount,
+                optimizationRegimeText));
     }
 
     internal static State Restore(string? checkpointJson, ILogger? logger = null)
@@ -183,15 +235,92 @@ internal static class OptimizationCheckpointStore
             "OptimizationCheckpointStore: truncating oversized {Payload} payload ({Actual} chars > {Limit})",
             payloadName, json.Length, maxChars);
 
+        // Preserve as much of the original content as possible by truncating instead
+        // of replacing entirely. Keep the first portion up to the limit so that key
+        // decision fields (scores, gate results) are preserved for auditability.
+        string truncatedContent = json[..Math.Min(maxChars - 200, json.Length)];
         return JsonSerializer.Serialize(new
         {
             truncated = true,
             payload = payloadName,
-            originalLength = json.Length
+            originalLength = json.Length,
+            partialContent = truncatedContent
         });
     }
 
     internal static BacktestResult ToCheckpointResult(BacktestResult result) => result with { Trades = [] };
+
+    internal static bool TryValidateCompatibility(
+        State checkpoint,
+        string currentDataWindowFingerprint,
+        DateTime candleWindowStartUtc,
+        DateTime candleWindowEndUtc,
+        int candleCount,
+        int trainCandleCount,
+        int testCandleCount,
+        string? optimizationRegimeText,
+        out string? mismatchReason,
+        string? currentSurrogateKind = null)
+    {
+        mismatchReason = null;
+
+        if (checkpoint == Empty || checkpoint.Observations.Count == 0)
+            return true;
+
+        if (!string.IsNullOrWhiteSpace(currentSurrogateKind)
+            && !string.IsNullOrWhiteSpace(checkpoint.SurrogateKind)
+            && !string.Equals(checkpoint.SurrogateKind, currentSurrogateKind, StringComparison.OrdinalIgnoreCase))
+        {
+            mismatchReason = $"surrogate kind changed from {checkpoint.SurrogateKind} to {currentSurrogateKind}";
+            return false;
+        }
+
+        if (!string.IsNullOrWhiteSpace(checkpoint.DataWindowFingerprint)
+            && !string.Equals(checkpoint.DataWindowFingerprint, currentDataWindowFingerprint, StringComparison.Ordinal))
+        {
+            mismatchReason = "data window fingerprint changed";
+            return false;
+        }
+
+        if (checkpoint.CandleWindowStartUtc.HasValue && checkpoint.CandleWindowStartUtc.Value != candleWindowStartUtc)
+        {
+            mismatchReason = "candle window start changed";
+            return false;
+        }
+
+        if (checkpoint.CandleWindowEndUtc.HasValue && checkpoint.CandleWindowEndUtc.Value != candleWindowEndUtc)
+        {
+            mismatchReason = "candle window end changed";
+            return false;
+        }
+
+        if (checkpoint.CandleCount.HasValue && checkpoint.CandleCount.Value != candleCount)
+        {
+            mismatchReason = "candle count changed";
+            return false;
+        }
+
+        if (checkpoint.TrainCandleCount.HasValue && checkpoint.TrainCandleCount.Value != trainCandleCount)
+        {
+            mismatchReason = "train candle count changed";
+            return false;
+        }
+
+        if (checkpoint.TestCandleCount.HasValue && checkpoint.TestCandleCount.Value != testCandleCount)
+        {
+            mismatchReason = "test candle count changed";
+            return false;
+        }
+
+        if (!string.IsNullOrWhiteSpace(checkpoint.OptimizationRegimeText)
+            && !string.Equals(checkpoint.OptimizationRegimeText, optimizationRegimeText, StringComparison.OrdinalIgnoreCase))
+        {
+            mismatchReason = "optimization regime changed";
+            return false;
+        }
+
+        return true;
+    }
 
     private sealed record LegacyState(int Version, int Iterations, List<LegacyCandidate> Candidates);
 

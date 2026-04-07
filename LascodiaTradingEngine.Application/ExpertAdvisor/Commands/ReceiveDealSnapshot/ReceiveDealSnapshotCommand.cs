@@ -3,6 +3,7 @@ using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ReceiveDealSnapshot;
@@ -74,7 +75,8 @@ public class ReceiveDealSnapshotCommandValidator : AbstractValidator<ReceiveDeal
             .NotEmpty().WithMessage("InstanceId cannot be empty");
 
         RuleFor(x => x.Deals)
-            .NotNull().WithMessage("Deals cannot be null");
+            .NotNull().WithMessage("Deals cannot be null")
+            .Must(d => d.Count <= 500).WithMessage("Deal snapshot cannot exceed 500 items");
     }
 }
 
@@ -88,28 +90,35 @@ public class ReceiveDealSnapshotCommandValidator : AbstractValidator<ReceiveDeal
 public class ReceiveDealSnapshotCommandHandler : IRequestHandler<ReceiveDealSnapshotCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;
+    private readonly IEAOwnershipGuard _ownershipGuard;
 
-    public ReceiveDealSnapshotCommandHandler(IWriteApplicationDbContext context)
+    public ReceiveDealSnapshotCommandHandler(IWriteApplicationDbContext context, IEAOwnershipGuard ownershipGuard)
     {
-        _context = context;
+        _context        = context;
+        _ownershipGuard = ownershipGuard;
     }
 
     public async Task<ResponseData<string>> Handle(ReceiveDealSnapshotCommand request, CancellationToken cancellationToken)
     {
+        if (!await _ownershipGuard.IsOwnerAsync(request.InstanceId, cancellationToken))
+            return ResponseData<string>.Init(null, false, "Unauthorized: caller does not own this EA instance", "-403");
+
         var dbContext = _context.GetDbContext();
+
+        // Batch-load matching orders to avoid N+1 queries
+        var orderTickets = request.Deals.Select(d => d.OrderTicket.ToString()).Distinct().ToList();
+        var matchingOrders = await dbContext
+            .Set<Domain.Entities.Order>()
+            .Where(x => orderTickets.Contains(x.BrokerOrderId!) && !x.IsDeleted)
+            .ToListAsync(cancellationToken);
+        var orderByTicket = matchingOrders.ToDictionary(o => o.BrokerOrderId!);
 
         foreach (var deal in request.Deals)
         {
             var orderTicket = deal.OrderTicket.ToString();
 
-            // Try to match to an existing engine order by broker order ID
-            var order = await dbContext
-                .Set<Domain.Entities.Order>()
-                .FirstOrDefaultAsync(
-                    x => x.BrokerOrderId == orderTicket && !x.IsDeleted,
-                    cancellationToken);
-
-            if (order is not null && order.Status != OrderStatus.Filled)
+            if (orderByTicket.TryGetValue(orderTicket, out var order)
+                && order.Status != OrderStatus.Filled)
             {
                 order.FilledPrice    = deal.Price;
                 order.FilledQuantity = deal.Volume;

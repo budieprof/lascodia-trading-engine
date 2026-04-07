@@ -150,7 +150,37 @@ public class OptimizationRun : Entity<long>
     /// unavailability, data quality). Prevents the worker from re-evaluating deferred runs
     /// every polling cycle, reducing unnecessary DB churn.
     /// </summary>
+    /// <summary>Optimistic concurrency token — auto-incremented by the database on every update.</summary>
+    public uint RowVersion { get; set; }
+
     public DateTime? DeferredUntilUtc     { get; set; }
+
+    /// <summary>UTC timestamp when the run first entered the queue.</summary>
+    public DateTime QueuedAt              { get; set; } = DateTime.UtcNow;
+
+    /// <summary>UTC timestamp when a worker claimed the run.</summary>
+    public DateTime? ClaimedAt            { get; set; }
+
+    /// <summary>UTC timestamp when the execution pipeline started doing real work.</summary>
+    public DateTime? ExecutionStartedAt   { get; set; }
+
+    /// <summary>Persisted fine-grained execution stage for progress tracking.</summary>
+    public OptimizationExecutionStage ExecutionStage { get; set; } = OptimizationExecutionStage.Queued;
+
+    /// <summary>Human-readable description of the current execution stage.</summary>
+    public string? ExecutionStageMessage  { get; set; }
+
+    /// <summary>UTC timestamp when <see cref="ExecutionStage"/> was last updated.</summary>
+    public DateTime? ExecutionStageUpdatedAt { get; set; }
+
+    /// <summary>Last operational issue code recorded for the run.</summary>
+    public string? LastOperationalIssueCode { get; set; }
+
+    /// <summary>Last operational issue message recorded for the run.</summary>
+    public string? LastOperationalIssueMessage { get; set; }
+
+    /// <summary>UTC timestamp when the last operational issue was recorded.</summary>
+    public DateTime? LastOperationalIssueAt { get; set; }
 
     /// <summary>UTC timestamp when this run was queued / the record was created.</summary>
     public DateTime StartedAt             { get; set; } = DateTime.UtcNow;
@@ -175,6 +205,42 @@ public class OptimizationRun : Entity<long>
     /// Null until follow-ups are created; updated by the workers when they complete.
     /// </summary>
     public ValidationFollowUpStatus? ValidationFollowUpStatus { get; set; }
+
+    /// <summary>UTC timestamp when the follow-up monitor should next revisit this run.</summary>
+    public DateTime? NextFollowUpCheckAt { get; set; }
+
+    /// <summary>UTC timestamp of the latest follow-up monitor check.</summary>
+    public DateTime? FollowUpLastCheckedAt { get; set; }
+
+    /// <summary>How many times missing or broken follow-ups have been repaired.</summary>
+    public int FollowUpRepairAttempts { get; set; }
+
+    /// <summary>Machine-readable code for the latest follow-up state update.</summary>
+    public string? FollowUpLastStatusCode { get; set; }
+
+    /// <summary>Human-readable message for the latest follow-up state update.</summary>
+    public string? FollowUpLastStatusMessage { get; set; }
+
+    /// <summary>UTC timestamp when the follow-up status message was last updated.</summary>
+    public DateTime? FollowUpStatusUpdatedAt { get; set; }
+
+    /// <summary>Serialized integration event payload awaiting completion publication.</summary>
+    public string? CompletionPublicationPayloadJson { get; set; }
+
+    /// <summary>Current state of completion publication side effects.</summary>
+    public OptimizationCompletionPublicationStatus? CompletionPublicationStatus { get; set; }
+
+    /// <summary>Total publication attempts made for the completion payload.</summary>
+    public int CompletionPublicationAttempts { get; set; }
+
+    /// <summary>UTC timestamp of the latest completion publication attempt.</summary>
+    public DateTime? CompletionPublicationLastAttemptAt { get; set; }
+
+    /// <summary>UTC timestamp when completion publication finally succeeded.</summary>
+    public DateTime? CompletionPublicationCompletedAt { get; set; }
+
+    /// <summary>Last error recorded while publishing completion side effects.</summary>
+    public string? CompletionPublicationErrorMessage { get; set; }
 
     /// <summary>Soft-delete flag. Filtered out by the global EF Core query filter.</summary>
     public bool    IsDeleted              { get; set; }

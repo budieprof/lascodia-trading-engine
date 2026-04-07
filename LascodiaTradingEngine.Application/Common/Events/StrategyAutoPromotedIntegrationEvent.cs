@@ -31,6 +31,15 @@ public record StrategyAutoPromotedIntegrationEvent : IntegrationEvent
     /// <summary>The market regime the strategy was generated for.</summary>
     public MarketRegimeEnum Regime { get; init; }
 
+    /// <summary>The regime being observed when the strategy was generated.</summary>
+    public MarketRegimeEnum ObservedRegime { get; init; }
+
+    /// <summary>Whether the strategy came from primary or reserve generation.</summary>
+    public string GenerationSource { get; init; } = string.Empty;
+
+    /// <summary>Optional reserve target regime when the strategy came from reserve generation.</summary>
+    public MarketRegimeEnum? ReserveTargetRegime { get; init; }
+
     /// <summary>In-sample Sharpe ratio at promotion time.</summary>
     public double IsSharpeRatio { get; init; }
 
@@ -43,8 +52,26 @@ public record StrategyAutoPromotedIntegrationEvent : IntegrationEvent
     /// <summary>Monte Carlo sign-flip p-value.</summary>
     public double MonteCarloPValue { get; init; }
 
+    /// <summary>Monte Carlo shuffle p-value.</summary>
+    public double ShufflePValue { get; init; }
+
     /// <summary>Number of walk-forward windows that passed.</summary>
     public int WalkForwardWindowsPassed { get; init; }
+
+    /// <summary>Whether live-performance haircuts were applied.</summary>
+    public bool LiveHaircutApplied { get; init; }
+
+    /// <summary>Win-rate haircut multiplier used during promotion screening.</summary>
+    public double WinRateHaircutApplied { get; init; }
+
+    /// <summary>Profit-factor haircut multiplier used during promotion screening.</summary>
+    public double ProfitFactorHaircutApplied { get; init; }
+
+    /// <summary>Sharpe haircut multiplier used during promotion screening.</summary>
+    public double SharpeHaircutApplied { get; init; }
+
+    /// <summary>Drawdown inflation multiplier used during promotion screening.</summary>
+    public double DrawdownInflationApplied { get; init; }
 
     /// <summary>UTC timestamp when the strategy was auto-promoted.</summary>
     public DateTime PromotedAt { get; init; } = DateTime.UtcNow;

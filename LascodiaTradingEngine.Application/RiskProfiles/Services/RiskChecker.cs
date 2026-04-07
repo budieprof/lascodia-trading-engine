@@ -1,4 +1,3 @@
-using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Options;
 using LascodiaTradingEngine.Domain.Entities;
@@ -16,8 +15,12 @@ namespace LascodiaTradingEngine.Application.RiskProfiles.Services;
 /// Signal-level (Tier 1) checks (expiry, SL/TP consistency, R:R, ML agreement) are handled
 /// by <see cref="SignalValidator"/> and should run before this checker is invoked.
 /// </para>
+/// <para>
+/// This class is registered as a concrete type in DI and wrapped by
+/// <see cref="RiskCheckerPipeline"/>, which runs all <see cref="IRiskCheckStep"/>
+/// implementations before delegating to this monolithic checker as the final fallback.
+/// </para>
 /// </summary>
-[RegisterService]
 public class RiskChecker : IRiskChecker
 {
     private readonly RiskCheckerOptions _options;

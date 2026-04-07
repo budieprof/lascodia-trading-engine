@@ -60,6 +60,14 @@ public sealed class TradingMetrics
     // ── Integration Event Retry ─────────────────────────────────────────
     public Counter<long>     EventRetrySuccesses    { get; }
     public Counter<long>     EventRetryExhausted    { get; }
+    public Counter<long>     EventRetryDeadLettered { get; }
+
+    // ── Degradation & Dead-Letter ─────────────────────────────────────────
+    public Counter<long>     DegradationTransitions     { get; }
+    public Counter<long>     DeadLetterSinkDbFailures   { get; }
+    public Counter<long>     DeadLetterSinkFileWrites   { get; }
+    public Counter<long>     DeadLetterSinkBufferOverflows { get; }
+    public Histogram<double> DeadLetterSinkLatencyMs    { get; }
 
     // ── Strategy Generation ─────────────────────────────────────────────
     public Counter<long>     StrategyCandidatesScreened { get; }
@@ -85,6 +93,7 @@ public sealed class TradingMetrics
     public Counter<long>     StrategyGenCandleCacheEvictions    { get; }
     public Counter<long>     StrategyGenFeedbackAdaptiveContradictions { get; }
     public Counter<long>     StrategyGenTypeFaultDisabled       { get; }
+    public Counter<long>     StrategyGenCompensationCleanupFailures { get; }
     public Histogram<double> StrategyGenScreeningDurationMs    { get; }
 
     // ── Optimization ────────────────────────────────────────────────────
@@ -99,6 +108,14 @@ public sealed class TradingMetrics
     public Counter<long>     OptimizationDuplicateFollowUpsPrevented { get; }
     public Counter<long>     OptimizationRunsDeferred   { get; }
     public Counter<long>     OptimizationFollowUpFailures { get; }
+    public Counter<long>     OptimizationFollowUpDeferredChecks { get; }
+    public Counter<long>     OptimizationFollowUpRepairs { get; }
+    public Histogram<double> OptimizationFollowUpQueueAgeMs { get; }
+    public Histogram<double> OptimizationApprovalToFollowUpCreationMs { get; }
+    public Histogram<double> OptimizationCompletionPublicationLagMs { get; }
+    public Histogram<double> OptimizationCompletionReplayWaitMs { get; }
+    public Counter<long>     OptimizationCompletionReplayAttempts { get; }
+    public Counter<long>     OptimizationCompletionReplayFailures { get; }
     public Histogram<double> OptimizationSurrogateImprovement { get; }
     public Counter<long>     OptimizationSurrogateBatchHits { get; }
     public Counter<long>     OptimizationSurrogateBatchMisses { get; }
@@ -230,8 +247,16 @@ public sealed class TradingMetrics
         WorkerErrors          = _meter.CreateCounter<long>("trading.workers.errors", "errors", "Unhandled worker errors");
 
         // Integration Event Retry
-        EventRetrySuccesses = _meter.CreateCounter<long>("trading.events.retry_successes", "events", "Integration events successfully re-published by retry worker");
-        EventRetryExhausted = _meter.CreateCounter<long>("trading.events.retry_exhausted", "events", "Integration events that exhausted retry attempts");
+        EventRetrySuccesses    = _meter.CreateCounter<long>("trading.events.retry_successes", "events", "Integration events successfully re-published by retry worker");
+        EventRetryExhausted    = _meter.CreateCounter<long>("trading.events.retry_exhausted", "events", "Integration events that exhausted retry attempts");
+        EventRetryDeadLettered = _meter.CreateCounter<long>("trading.events.retry_dead_lettered", "events", "Integration events dead-lettered after retry exhaustion");
+
+        // Degradation & Dead-Letter
+        DegradationTransitions       = _meter.CreateCounter<long>("trading.degradation.transitions", "transitions", "Engine degradation mode transitions");
+        DeadLetterSinkDbFailures     = _meter.CreateCounter<long>("trading.dead_letter.db_failures", "failures", "Dead-letter database write failures");
+        DeadLetterSinkFileWrites     = _meter.CreateCounter<long>("trading.dead_letter.file_writes", "writes", "Dead-letter file fallback writes");
+        DeadLetterSinkBufferOverflows = _meter.CreateCounter<long>("trading.dead_letter.buffer_overflows", "overflows", "Dead-letter emergency buffer overflow drops");
+        DeadLetterSinkLatencyMs      = _meter.CreateHistogram<double>("trading.dead_letter.latency_ms", "ms", "Dead-letter sink write latency");
 
         // Strategy Generation
         StrategyCandidatesScreened = _meter.CreateCounter<long>("trading.strategy_generation.screened", "candidates", "Strategy candidates that completed screening backtest");
@@ -257,6 +282,7 @@ public sealed class TradingMetrics
         StrategyGenCandleCacheEvictions       = _meter.CreateCounter<long>("trading.strategy_generation.candle_cache_evictions", "evictions", "LRU candle cache evictions during strategy generation");
         StrategyGenFeedbackAdaptiveContradictions = _meter.CreateCounter<long>("trading.strategy_generation.feedback_adaptive_contradictions", "contradictions", "Strategy types where feedback boosts but adaptive thresholds tighten (tag: strategy_type)");
         StrategyGenTypeFaultDisabled         = _meter.CreateCounter<long>("trading.strategy_generation.type_fault_disabled", "types", "Strategy types disabled mid-cycle due to repeated screening faults (tag: strategy_type)");
+        StrategyGenCompensationCleanupFailures = _meter.CreateCounter<long>("trading.strategy_generation.compensation_cleanup_failures", "failures", "Failures encountered while cleaning up partially persisted strategy-generation candidates");
         StrategyGenScreeningDurationMs       = _meter.CreateHistogram<double>("trading.strategy_generation.screening_duration", "ms", "Per-candidate screening pipeline duration (tag: strategy_type)");
 
         // Optimization
@@ -271,6 +297,14 @@ public sealed class TradingMetrics
         OptimizationDuplicateFollowUpsPrevented = _meter.CreateCounter<long>("trading.optimization.duplicate_followups_prevented", "runs", "Duplicate validation follow-up creation attempts prevented");
         OptimizationRunsDeferred = _meter.CreateCounter<long>("trading.optimization.runs_deferred", "runs", "Optimization runs deferred back to queue (tagged by reason)");
         OptimizationFollowUpFailures = _meter.CreateCounter<long>("trading.optimization.followup_failures", "runs", "Validation follow-up backtests/walk-forwards that failed for an approved optimization");
+        OptimizationFollowUpDeferredChecks = _meter.CreateCounter<long>("trading.optimization.followup_deferred_checks", "checks", "Follow-up monitor checks deferred because downstream validation is still in-flight");
+        OptimizationFollowUpRepairs = _meter.CreateCounter<long>("trading.optimization.followup_repairs", "repairs", "Follow-up validation repairs triggered for approved optimizations");
+        OptimizationFollowUpQueueAgeMs = _meter.CreateHistogram<double>("trading.optimization.followup_queue_age_ms", "ms", "Age of an approved optimization when the follow-up monitor evaluates it");
+        OptimizationApprovalToFollowUpCreationMs = _meter.CreateHistogram<double>("trading.optimization.approval_to_followup_creation_ms", "ms", "Delay between optimization approval and validation follow-up creation");
+        OptimizationCompletionPublicationLagMs = _meter.CreateHistogram<double>("trading.optimization.completion_publication_lag_ms", "ms", "Delay between terminal optimization state and successful completion publication");
+        OptimizationCompletionReplayWaitMs = _meter.CreateHistogram<double>("trading.optimization.completion_replay_wait_ms", "ms", "How long replay callers waited for detached completion publication work");
+        OptimizationCompletionReplayAttempts = _meter.CreateCounter<long>("trading.optimization.completion_replay_attempts", "attempts", "Completion publication replay attempts");
+        OptimizationCompletionReplayFailures = _meter.CreateCounter<long>("trading.optimization.completion_replay_failures", "failures", "Completion publication replay failures");
         OptimizationSurrogateImprovement = _meter.CreateHistogram<double>("trading.optimization.surrogate_improvement", "score", "Per-batch best score improvement over previous best during surrogate search");
         OptimizationSurrogateBatchHits = _meter.CreateCounter<long>("trading.optimization.surrogate_batch_hits", "batches", "Surrogate-guided batches that improved the global best score");
         OptimizationSurrogateBatchMisses = _meter.CreateCounter<long>("trading.optimization.surrogate_batch_misses", "batches", "Surrogate-guided batches that did not improve the global best score");
@@ -338,5 +372,17 @@ public sealed class TradingMetrics
         SimBrokerExpiredOrders = _meter.CreateCounter<long>("trading.sim_broker.expired_orders", "orders", "Simulated broker expired pending orders");
         SimBrokerMarginLevel   = _meter.CreateHistogram<double>("trading.sim_broker.margin_level", "%", "Simulated broker margin level at evaluation");
         SimBrokerRealizedPnl   = _meter.CreateHistogram<double>("trading.sim_broker.realized_pnl", "USD", "Simulated broker realized P&L per close");
+
+        // Observable gauges — sampled on scrape, not pushed
+        PriceCacheSymbolCount  = _meter.CreateObservableGauge("trading.cache.symbol_count", () => _priceCacheSymbolCountFunc?.Invoke() ?? 0, "symbols", "Number of symbols in live price cache");
+        PriceCacheEvictions    = _meter.CreateCounter<long>("trading.cache.evictions", "evictions", "Price cache stale evictions");
+        PriceFeedStaleAlert    = _meter.CreateCounter<long>("trading.cache.feed_stale_alert", "alerts", "Multi-symbol stale price feed alerts");
     }
+
+    // Observable gauge callback registration
+    private Func<int>? _priceCacheSymbolCountFunc;
+    public void RegisterPriceCacheGauge(Func<int> symbolCountFunc) => _priceCacheSymbolCountFunc = symbolCountFunc;
+    public ObservableGauge<int> PriceCacheSymbolCount { get; }
+    public Counter<long> PriceCacheEvictions { get; }
+    public Counter<long> PriceFeedStaleAlert { get; }
 }

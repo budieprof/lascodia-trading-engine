@@ -159,7 +159,7 @@ public sealed class TrailingStopWorker : BackgroundService
                 TrailingStopType.ATR        =>
                     atrBySymbol.TryGetValue(pos.Symbol, out var atr) && atr > 0
                         ? atr * pos.TrailingStopValue!.Value
-                        : pos.TrailingStopValue!.Value / 10_000m,   // fallback to FixedPips
+                        : LogAtrFallback(pos),   // fallback to FixedPips when ATR unavailable
                 _                           => pos.TrailingStopValue!.Value / 10_000m
             };
 
@@ -228,6 +228,23 @@ public sealed class TrailingStopWorker : BackgroundService
             {
                 try
                 {
+                    // Check for pending (unacknowledged) trailing stop command for this position
+                    // before issuing a new one — prevents command queue flooding when ack is slow
+                    var brokerTicket = long.TryParse(pos.BrokerPositionId, out var parsedTicket) ? parsedTicket : (long?)null;
+                    bool hasPendingCommand = brokerTicket.HasValue && await writeCtx.Set<EACommand>()
+                        .AnyAsync(c => c.TargetTicket == brokerTicket.Value
+                                    && c.CommandType == EACommandType.UpdateTrailing
+                                    && !c.Acknowledged
+                                    && !c.IsDeleted, ct);
+
+                    if (hasPendingCommand)
+                    {
+                        _logger.LogDebug(
+                            "TrailingStop: skipping EA command for position {Id} ({Symbol}) — previous UpdateTrailing command still pending",
+                            pos.Id, pos.Symbol);
+                    }
+                    else
+                    {
                     var eaInstance = await writeCtx.Set<EAInstance>()
                         .ActiveForSymbol(pos.Symbol)
                         .FirstOrDefaultAsync(ct);
@@ -244,6 +261,7 @@ public sealed class TrailingStopWorker : BackgroundService
                         }, ct);
                         await writeCtx.SaveChangesAsync(ct);
                     }
+                    } // end !hasPendingCommand
                 }
                 catch (Exception ex)
                 {
@@ -290,6 +308,17 @@ public sealed class TrailingStopWorker : BackgroundService
 
     /// <summary>
     /// 14-period Average True Range.
+    /// Logs a warning when ATR trailing stop falls back to FixedPips due to insufficient candles,
+    /// and returns the FixedPips fallback distance.
+    private decimal LogAtrFallback(Domain.Entities.Position pos)
+    {
+        _logger.LogWarning(
+            "TrailingStopWorker: ATR unavailable for {Symbol} (position {Id}) — insufficient candle data. " +
+            "Falling back to FixedPips ({Value}). Consider ensuring candle history is available.",
+            pos.Symbol, pos.Id, pos.TrailingStopValue);
+        return pos.TrailingStopValue!.Value / 10_000m;
+    }
+
     /// TR = max(High − Low, |High − PrevClose|, |Low − PrevClose|).
     /// <paramref name="candles"/> should be ordered descending by timestamp; the method
     /// takes up to 15 candles (14 TR values) and returns the simple average.

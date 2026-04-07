@@ -362,11 +362,12 @@ public sealed class MLTrainingWorker : BackgroundService
         if (rowsUpdated == 0)
             return null;
 
-        var now = DateTime.UtcNow;
+        // Use WorkerInstanceId alone to find the claimed run — the 10-second recency
+        // window was too fragile (GC pauses, slow DB could cause false misses).
+        // The combination of WorkerInstanceId + Running status is unique enough.
         return await runSet.FirstOrDefaultAsync(
             r => r.WorkerInstanceId == _instanceId &&
-                 r.Status           == RunStatus.Running &&
-                 r.PickedUpAt       >= now.AddSeconds(-10),
+                 r.Status           == RunStatus.Running,
             ct);
     }
 
@@ -518,22 +519,23 @@ public sealed class MLTrainingWorker : BackgroundService
                     double ageMinutes = (DateTime.UtcNow - latestCandleTs.Value).TotalMinutes;
                     if (ageMinutes > maxCandleAgeMinutes)
                     {
-                        // Count freshness bounces toward the retry budget so the run
-                        // eventually fails with an alert instead of bouncing forever
-                        // when market data ingestion is down.
-                        run.AttemptCount++;
-                        if (run.AttemptCount >= run.MaxAttempts)
+                        // Freshness bounces should NOT consume the regular AttemptCount
+                        // budget — slow data feeds shouldn't prevent training once data
+                        // arrives. Instead, use a calendar-time cutoff: if the run has been
+                        // bouncing for more than 24 hours since creation, fail permanently.
+                        double hoursSinceCreation = (DateTime.UtcNow - run.StartedAt).TotalHours;
+                        if (hoursSinceCreation > 24)
                         {
                             run.Status      = RunStatus.Failed;
                             run.CompletedAt = DateTime.UtcNow;
                             run.ErrorMessage =
                                 $"Freshness gate: latest {run.Symbol}/{run.Timeframe} candle is " +
                                 $"{ageMinutes:F0} min old (threshold: {maxCandleAgeMinutes} min). " +
-                                $"Permanently failed after {run.AttemptCount} freshness bounces.";
+                                $"Permanently failed — run has been waiting for fresh data for {hoursSinceCreation:F1} hours.";
                             await db.SaveChangesAsync(stoppingToken);
                             _logger.LogError(
-                                "Run {RunId}: freshness gate permanently failed after {Attempts} bounces.",
-                                run.Id, run.AttemptCount);
+                                "Run {RunId}: freshness gate permanently failed after {Hours:F1}h of waiting.",
+                                run.Id, hoursSinceCreation);
                             await MaybeCreateTrainingFailureAlertAsync(ctx, run, stoppingToken);
                             return;
                         }
@@ -544,13 +546,13 @@ public sealed class MLTrainingWorker : BackgroundService
                         run.ErrorMessage     =
                             $"Freshness gate: latest {run.Symbol}/{run.Timeframe} candle is " +
                             $"{ageMinutes:F0} min old (threshold: {maxCandleAgeMinutes} min). " +
-                            $"Re-queued (attempt {run.AttemptCount}/{run.MaxAttempts}).";
+                            $"Re-queued (waiting {hoursSinceCreation:F1}h / 24h max).";
                         await db.SaveChangesAsync(stoppingToken);
                         _logger.LogWarning(
                             "Run {RunId}: stale data gate — latest {Symbol}/{Tf} candle is {Age:F0} min old " +
-                            "(threshold: {Max} min). Re-queuing with 30 min delay (attempt {Attempt}/{Max}).",
+                            "(threshold: {Max} min). Re-queuing with 30 min delay (waiting {Hours:F1}h / 24h max).",
                             run.Id, run.Symbol, run.Timeframe, ageMinutes, maxCandleAgeMinutes,
-                            run.AttemptCount, run.MaxAttempts);
+                            hoursSinceCreation);
                         return;
                     }
                 }
@@ -1053,7 +1055,9 @@ public sealed class MLTrainingWorker : BackgroundService
                     return;
                 }
 
-                // New model is better — proceed with promotion
+                // New model is better — proceed with promotion.
+                // The distributed lock acquired at line ~937 (promotionLock) already
+                // serializes this path against concurrent promotions.
                 await SnapshotChampionPerformanceAsync(previousChampion, ctx, stoppingToken);
 
                 // Deactivate ALL active models for this symbol/timeframe, not just the one
@@ -1080,12 +1084,34 @@ public sealed class MLTrainingWorker : BackgroundService
             // ── Safety: ensure no other active models remain for this symbol/timeframe ──
             // This catches edge cases where the FirstOrDefaultAsync above returned null
             // (no champion found) but orphaned active models still exist from prior bugs.
-            await ctx.Set<MLModel>()
-                .Where(m => m.Symbol == run.Symbol && m.Timeframe == run.Timeframe
-                            && m.IsActive && !m.IsDeleted)
-                .ExecuteUpdateAsync(s => s
-                    .SetProperty(m => m.IsActive, false)
-                    .SetProperty(m => m.Status, MLModelStatus.Superseded), stoppingToken);
+            // When previousChampion was null we don't hold the promotion lock yet, so
+            // acquire it here to prevent concurrent promotions from racing.
+            IAsyncDisposable? safetyLock = null;
+            if (previousChampion is null)
+            {
+                var safetyLockKey = $"ml:promote:{run.Symbol}:{run.Timeframe}";
+                safetyLock = await _distributedLock.TryAcquireAsync(safetyLockKey, TimeSpan.FromSeconds(30), stoppingToken);
+                if (safetyLock is null)
+                {
+                    _logger.LogWarning(
+                        "Run {RunId}: could not acquire safety promotion lock for {Symbol}/{Tf} — proceeding cautiously.",
+                        run.Id, run.Symbol, run.Timeframe);
+                }
+            }
+            try
+            {
+                await ctx.Set<MLModel>()
+                    .Where(m => m.Symbol == run.Symbol && m.Timeframe == run.Timeframe
+                                && m.IsActive && !m.IsDeleted)
+                    .ExecuteUpdateAsync(s => s
+                        .SetProperty(m => m.IsActive, false)
+                        .SetProperty(m => m.Status, MLModelStatus.Superseded), stoppingToken);
+            }
+            finally
+            {
+                if (safetyLock is not null)
+                    await safetyLock.DisposeAsync();
+            }
 
             // ── Persist new model ────────────────────────────────────────────
             var cv           = result.CvResult;

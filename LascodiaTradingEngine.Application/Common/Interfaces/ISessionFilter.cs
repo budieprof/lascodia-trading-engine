@@ -11,6 +11,13 @@ public interface ISessionFilter
     /// <summary>Returns the trading session active at the given UTC time.</summary>
     TradingSession GetCurrentSession(DateTime utcTime);
 
+    /// <summary>
+    /// Returns the trading session active at the given UTC time for a specific symbol.
+    /// Checks symbol-specific session schedules first, then falls back to global resolution.
+    /// Returns <c>null</c> if the symbol has specific schedules but none match (outside session).
+    /// </summary>
+    TradingSession? GetCurrentSession(DateTime utcTime, string symbol);
+
     /// <summary>Returns <c>true</c> if the given session is in the allowed sessions list.</summary>
     bool IsSessionAllowed(TradingSession session, IReadOnlyList<TradingSession> allowedSessions);
 

@@ -1,4 +1,6 @@
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
+using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.Optimization;
@@ -19,6 +21,15 @@ internal sealed class OptimizationDataLoader
     private readonly ILogger _logger;
 
     internal OptimizationDataLoader(ILogger logger) => _logger = logger;
+
+    internal Task<DataLoadResult> LoadAsync(
+        DbContext db,
+        OptimizationRun run,
+        Strategy strategy,
+        OptimizationConfig config,
+        CancellationToken ct)
+        => throw new NotSupportedException(
+            "OptimizationDataLoader.LoadAsync is not wired in this extracted facade yet. Use the legacy OptimizationWorker pipeline for execution until the data-loading extraction is completed.");
 
     /// <summary>
     /// Computes the effective lookback period in months based on the strategy's timeframe.

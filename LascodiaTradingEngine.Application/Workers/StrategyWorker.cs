@@ -116,6 +116,11 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
     /// <summary>Tracks when the circuit breaker opened per strategy for half-open recovery.</summary>
     private readonly ConcurrentDictionary<long, DateTime> _circuitOpenedAt = new();
 
+    /// <summary>Tracks how many half-open probe attempts have failed per strategy. When this
+    /// exceeds <c>MaxHalfOpenProbeFailures</c>, the strategy is permanently circuit-broken.</summary>
+    private readonly ConcurrentDictionary<long, int> _halfOpenProbeFailures = new();
+    private const int MaxHalfOpenProbeFailures = 5;
+
     /// <summary>Prevents concurrent expiry sweep executions from the timer.</summary>
     private readonly SemaphoreSlim _expirySweepLock = new(1, 1);
 
@@ -462,14 +467,26 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
                     _consecutiveFailures.TryGetValue(strategy.Id, out var failures) &&
                     failures >= _options.MaxConsecutiveFailures)
                 {
-                    // Half-open: allow a single probe after the recovery period
+                    // Half-open: allow a single probe after the recovery period.
+                    // If the probe has failed too many times, permanently skip this strategy.
+                    if (_halfOpenProbeFailures.TryGetValue(strategy.Id, out var probeFailures) &&
+                        probeFailures >= MaxHalfOpenProbeFailures)
+                    {
+                        _logger.LogWarning(
+                            "Strategy {Id} ({Symbol}): circuit breaker PERMANENTLY OPEN — {Failures} consecutive half-open probe failures",
+                            strategy.Id, strategy.Symbol, probeFailures);
+                        _metrics.StrategiesCircuitBroken.Add(1, new("symbol", strategy.Symbol), new("strategy_id", strategy.Id));
+                        return;
+                    }
+
                     if (_options.CircuitBreakerRecoverySeconds > 0 &&
                         _circuitOpenedAt.TryGetValue(strategy.Id, out var openedAt) &&
                         (DateTime.UtcNow - openedAt).TotalSeconds >= _options.CircuitBreakerRecoverySeconds)
                     {
                         _logger.LogInformation(
-                            "Strategy {Id} ({Symbol}): circuit breaker half-open — allowing probe evaluation after {Recovery}s",
-                            strategy.Id, strategy.Symbol, _options.CircuitBreakerRecoverySeconds);
+                            "Strategy {Id} ({Symbol}): circuit breaker half-open — allowing probe evaluation after {Recovery}s (probe attempt {Attempt}/{Max})",
+                            strategy.Id, strategy.Symbol, _options.CircuitBreakerRecoverySeconds,
+                            (probeFailures) + 1, MaxHalfOpenProbeFailures);
                         // Let the evaluation proceed as a probe; success resets, failure re-opens
                     }
                     else
@@ -499,7 +516,8 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
                 // Prevent duplicate evaluation if price events arrive faster than
                 // evaluation completes — only one evaluation per strategy at a time.
                 var lockKey = $"strategy:eval:{strategy.Id}";
-                await using var evalLock = await _distributedLock.TryAcquireAsync(lockKey, ct);
+                var lockTimeout = TimeSpan.FromSeconds(_options.LockTimeoutSeconds);
+                await using var evalLock = await _distributedLock.TryAcquireAsync(lockKey, lockTimeout, ct);
                 if (evalLock is null)
                 {
                     _logger.LogDebug(
@@ -616,6 +634,36 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
 
                     if (regimeParams is not null)
                     {
+                        // Validate regime params before applying — reject malformed JSON
+                        // or params with invalid values (negative lots, NaN, etc.)
+                        bool regimeParamsValid = true;
+                        try
+                        {
+                            var parsed = System.Text.Json.JsonDocument.Parse(regimeParams);
+                            foreach (var prop in parsed.RootElement.EnumerateObject())
+                            {
+                                if (prop.Value.ValueKind == System.Text.Json.JsonValueKind.Number
+                                    && (double.IsNaN(prop.Value.GetDouble()) || double.IsInfinity(prop.Value.GetDouble())))
+                                {
+                                    regimeParamsValid = false;
+                                    break;
+                                }
+                            }
+                        }
+                        catch
+                        {
+                            regimeParamsValid = false;
+                        }
+
+                        if (!regimeParamsValid)
+                        {
+                            _logger.LogWarning(
+                                "Strategy {Id}: regime params for {Regime} failed validation — using base params",
+                                strategy.Id, currentRegime);
+                            _metrics.WorkerErrors.Add(1, new("worker", "StrategyWorker"), new("reason", "regime_param_validation"));
+                        }
+                        else
+                        {
                         _logger.LogDebug(
                             "Strategy {Id} ({Symbol}/{Tf}): applying regime-conditional params for {Regime}",
                             strategy.Id, strategy.Symbol, strategy.Timeframe, currentRegime);
@@ -636,6 +684,7 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
                             EstimatedCapacityLots   = strategy.EstimatedCapacityLots,
                             IsDeleted               = strategy.IsDeleted,
                         };
+                        } // end regimeParamsValid else
                     }
                 }
 
@@ -676,7 +725,24 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
                 // signal should be generated (e.g., MA crossover detected, RSI hit
                 // oversold level). Returns null if no signal condition is met on this
                 // tick — which is the common case (most ticks don't trigger signals).
-                var signal = await evaluator.EvaluateAsync(evalStrategy, candles, (price.Value.Bid, price.Value.Ask), ct);
+                Domain.Entities.TradeSignal? signal;
+                using (var evalCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
+                {
+                    evalCts.CancelAfter(TimeSpan.FromSeconds(_options.EvaluatorTimeoutSeconds));
+                    try
+                    {
+                        signal = await evaluator.EvaluateAsync(evalStrategy, candles, (price.Value.Bid, price.Value.Ask), evalCts.Token);
+                    }
+                    catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                    {
+                        _logger.LogWarning(
+                            "Strategy {Id} ({Symbol}): evaluator timed out after {Timeout}s",
+                            strategy.Id, strategy.Symbol, _options.EvaluatorTimeoutSeconds);
+                        _metrics.WorkerErrors.Add(1, new("worker", "StrategyWorker"), new("reason", "evaluator_timeout"));
+                        _consecutiveFailures.AddOrUpdate(strategy.Id, 1, (_, count) => count + 1);
+                        return;
+                    }
+                }
                 if (signal is null) return;
 
                 // ── Post-evaluator confidence modifiers ──────────────────────
@@ -892,12 +958,14 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
                         ExpiresAt:            signal.ExpiresAt),
                     mlScore));
 
-                // Reset failure counter on any successful evaluation (no exception).
-                // Circuit breaker is NOT reset here — it is only reset after the signal
-                // survives conflict resolution and is actually persisted, to avoid
-                // prematurely exiting half-open state for strategies that keep losing
-                // conflict resolution.
+                // Reset all circuit breaker state on any successful evaluation (no exception).
+                // Previously this only reset failure counters and deferred the full circuit
+                // breaker reset until post-conflict-resolution, but that caused strategies
+                // to become permanently broken when they consistently lost conflict resolution
+                // despite healthy evaluations.
                 _consecutiveFailures.TryRemove(strategy.Id, out _);
+                _halfOpenProbeFailures.TryRemove(strategy.Id, out _);
+                _circuitOpenedAt.TryRemove(strategy.Id, out _);
             }
             catch (Exception ex)
             {
@@ -905,7 +973,13 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
                 _metrics.WorkerErrors.Add(1, new("worker", "StrategyWorker"), new("strategy_id", strategy.Id));
                 var newCount = _consecutiveFailures.AddOrUpdate(strategy.Id, 1, (_, count) => count + 1);
                 if (newCount >= _options.MaxConsecutiveFailures)
-                    _circuitOpenedAt.TryAdd(strategy.Id, DateTime.UtcNow);
+                {
+                    // Track half-open probe failures separately so permanently broken
+                    // strategies stop oscillating between open/half-open.
+                    if (_circuitOpenedAt.ContainsKey(strategy.Id))
+                        _halfOpenProbeFailures.AddOrUpdate(strategy.Id, 1, (_, c) => c + 1);
+                    _circuitOpenedAt[strategy.Id] = DateTime.UtcNow;
+                }
             }
             finally
             {
@@ -1002,9 +1076,6 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
                     Direction     = pending.Direction.ToString(),
                     EntryPrice    = pending.EntryPrice
                 });
-
-                // Signal survived conflict resolution and was persisted — fully reset circuit breaker
-                _circuitOpenedAt.TryRemove(pending.StrategyId, out _);
 
                 // Record cooldown timestamp (TryAdd avoids overwriting a timestamp
                 // set by a parallel winner for the same strategy on a different timeframe)

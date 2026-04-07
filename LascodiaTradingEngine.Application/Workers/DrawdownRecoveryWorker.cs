@@ -213,6 +213,16 @@ public sealed class DrawdownRecoveryWorker : BackgroundService
             // this worker paused automatically. Manually paused strategies are intentionally
             // excluded to avoid overriding an operator's explicit pause decision.
             await ResumeAutoPausedStrategiesAsync(readCtx, writeCtx, mediator, ct);
+
+            // If the new mode is Reduced (not Normal), log that strategies are resumed
+            // but should continue with reduced lot sizing until fully recovered.
+            if (currentMode == RecoveryMode.Reduced)
+            {
+                _logger.LogWarning(
+                    "DrawdownRecoveryWorker: transitioned Halted → Reduced (not yet Normal). " +
+                    "Strategies resumed but lot sizing should remain reduced. DrawdownPct={DD:F2}%",
+                    latest.DrawdownPct);
+            }
         }
         else if (currentMode == RecoveryMode.Reduced)
         {
@@ -279,7 +289,8 @@ public sealed class DrawdownRecoveryWorker : BackgroundService
         await writeCtx.Set<Strategy>()
             .Where(s => activeIds.Contains(s.Id))
             .ExecuteUpdateAsync(s => s
-                .SetProperty(x => x.Status, StrategyStatus.Paused),
+                .SetProperty(x => x.Status, StrategyStatus.Paused)
+                .SetProperty(x => x.PauseReason, "DrawdownRecovery"),
                 ct);
 
         // Store the IDs so we can resume exactly these strategies later.

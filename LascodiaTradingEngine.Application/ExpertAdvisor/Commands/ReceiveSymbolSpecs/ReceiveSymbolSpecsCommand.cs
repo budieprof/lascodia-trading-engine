@@ -3,6 +3,7 @@ using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Security;
 
 namespace LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ReceiveSymbolSpecs;
 
@@ -66,6 +67,17 @@ public class ReceiveSymbolSpecsCommandValidator : AbstractValidator<ReceiveSymbo
 
         RuleFor(x => x.Specs)
             .NotEmpty().WithMessage("Specs list cannot be empty");
+
+        RuleForEach(x => x.Specs).ChildRules(spec =>
+        {
+            spec.RuleFor(s => s.Symbol).NotEmpty().WithMessage("Symbol cannot be empty");
+            spec.RuleFor(s => s.Digits).InclusiveBetween(0, 8).WithMessage("Digits must be between 0 and 8");
+            spec.RuleFor(s => s.ContractSize).GreaterThan(0).WithMessage("ContractSize must be greater than zero");
+            spec.RuleFor(s => s.MinVolume).GreaterThan(0).WithMessage("MinVolume must be greater than zero");
+            spec.RuleFor(s => s.MaxVolume).GreaterThan(0).WithMessage("MaxVolume must be greater than zero");
+            spec.RuleFor(s => s.MaxVolume).GreaterThanOrEqualTo(s => s.MinVolume).WithMessage("MaxVolume must be >= MinVolume");
+            spec.RuleFor(s => s.VolumeStep).GreaterThan(0).WithMessage("VolumeStep must be greater than zero");
+        });
     }
 }
 
@@ -79,25 +91,34 @@ public class ReceiveSymbolSpecsCommandValidator : AbstractValidator<ReceiveSymbo
 public class ReceiveSymbolSpecsCommandHandler : IRequestHandler<ReceiveSymbolSpecsCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;
+    private readonly IEAOwnershipGuard _ownershipGuard;
 
-    public ReceiveSymbolSpecsCommandHandler(IWriteApplicationDbContext context)
+    public ReceiveSymbolSpecsCommandHandler(IWriteApplicationDbContext context, IEAOwnershipGuard ownershipGuard)
     {
-        _context = context;
+        _context        = context;
+        _ownershipGuard = ownershipGuard;
     }
 
     public async Task<ResponseData<string>> Handle(ReceiveSymbolSpecsCommand request, CancellationToken cancellationToken)
     {
+        if (!await _ownershipGuard.IsOwnerAsync(request.InstanceId, cancellationToken))
+            return ResponseData<string>.Init(null, false, "Unauthorized: caller does not own this EA instance", "-403");
+
         var dbContext = _context.GetDbContext();
+
+        // Batch-load existing currency pairs to avoid N+1 queries
+        var symbols = request.Specs.Select(s => s.Symbol.ToUpperInvariant()).Distinct().ToList();
+        var existingPairs = await dbContext
+            .Set<Domain.Entities.CurrencyPair>()
+            .Where(x => symbols.Contains(x.Symbol) && !x.IsDeleted)
+            .ToListAsync(cancellationToken);
+        var pairBySymbol = existingPairs.ToDictionary(p => p.Symbol);
 
         foreach (var spec in request.Specs)
         {
             var symbol = spec.Symbol.ToUpperInvariant();
 
-            var existing = await dbContext
-                .Set<Domain.Entities.CurrencyPair>()
-                .FirstOrDefaultAsync(x => x.Symbol == symbol && !x.IsDeleted, cancellationToken);
-
-            if (existing is not null)
+            if (pairBySymbol.TryGetValue(symbol, out var existing))
             {
                 existing.DecimalPlaces = spec.Digits;
                 existing.ContractSize  = spec.ContractSize;
@@ -109,7 +130,7 @@ public class ReceiveSymbolSpecsCommandHandler : IRequestHandler<ReceiveSymbolSpe
             }
             else
             {
-                await dbContext.Set<Domain.Entities.CurrencyPair>().AddAsync(new Domain.Entities.CurrencyPair
+                var newPair = new Domain.Entities.CurrencyPair
                 {
                     Symbol        = symbol,
                     DecimalPlaces = spec.Digits,
@@ -120,7 +141,9 @@ public class ReceiveSymbolSpecsCommandHandler : IRequestHandler<ReceiveSymbolSpe
                     BaseCurrency  = spec.BaseCurrency,
                     QuoteCurrency = spec.QuoteCurrency,
                     IsActive      = true,
-                }, cancellationToken);
+                };
+                await dbContext.Set<Domain.Entities.CurrencyPair>().AddAsync(newPair, cancellationToken);
+                pairBySymbol[symbol] = newPair;
             }
         }
 

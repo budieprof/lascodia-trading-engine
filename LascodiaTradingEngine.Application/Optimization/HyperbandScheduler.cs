@@ -372,9 +372,12 @@ internal sealed class HyperbandScheduler
                     }
                 });
 
-            int rungEvals = Volatile.Read(ref rungEvalsAttempted);
-            totalEvals += rungEvals;
-            bracketBudgetRemaining -= rungEvals;
+            // Only count successful evaluations against the budget — failed attempts
+            // shouldn't consume budget since they don't contribute candidate scores.
+            int rungEvalsTotal = Volatile.Read(ref rungEvalsAttempted);
+            int rungEvalsSuccessful = scores.Count;
+            totalEvals += rungEvalsTotal;
+            bracketBudgetRemaining -= rungEvalsSuccessful;
 
             // Circuit breaker tripped — abort this bracket
             if (consecutiveFailures >= circuitBreakerThreshold)

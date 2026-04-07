@@ -84,6 +84,7 @@ namespace LascodiaTradingEngine.Application.Workers;
 public class WalkForwardWorker : BackgroundService
 {
     private readonly ILogger<WalkForwardWorker> _logger;
+    private readonly IWorkerHealthMonitor? _healthMonitor;
 
     /// <summary>
     /// Used to create per-iteration DI scopes so that scoped services such as
@@ -98,11 +99,14 @@ public class WalkForwardWorker : BackgroundService
     /// </summary>
     private readonly IBacktestEngine _backtestEngine;
 
-    /// <summary>
-    /// How long the worker sleeps between polling cycles. 30 seconds balances
-    /// responsiveness against the CPU cost of multi-window backtest evaluations.
-    /// </summary>
-    private static readonly TimeSpan PollingInterval = TimeSpan.FromSeconds(30);
+    /// <summary>Maximum number of walk-forward runs to process concurrently.</summary>
+    private const int DefaultMaxParallelWalkForwards = 4;
+
+    /// <summary>Base polling interval when runs are available (10 seconds).</summary>
+    private static readonly TimeSpan BasePollInterval = TimeSpan.FromSeconds(10);
+
+    /// <summary>Tracks consecutive empty polls for exponential backoff.</summary>
+    private int _emptyPollStreak;
 
     /// <summary>
     /// Initialises the worker with its required dependencies.
@@ -113,17 +117,20 @@ public class WalkForwardWorker : BackgroundService
     public WalkForwardWorker(
         ILogger<WalkForwardWorker> logger,
         IServiceScopeFactory scopeFactory,
-        IBacktestEngine backtestEngine)
+        IBacktestEngine backtestEngine,
+        IWorkerHealthMonitor? healthMonitor = null)
     {
         _logger         = logger;
         _scopeFactory   = scopeFactory;
         _backtestEngine = backtestEngine;
+        _healthMonitor  = healthMonitor;
     }
 
     /// <summary>
     /// Entry point invoked by the hosted-service runtime. Runs a continuous polling
-    /// loop that delegates each tick to <see cref="ProcessAsync"/> and waits
-    /// <see cref="PollingInterval"/> between iterations.
+    /// loop that claims up to <see cref="DefaultMaxParallelWalkForwards"/> queued runs,
+    /// processes them concurrently via <see cref="Task.WhenAll"/>, and applies exponential
+    /// backoff (10s -> 30s -> 60s) when the queue is empty.
     /// </summary>
     /// <param name="stoppingToken">
     /// Signalled by the runtime on application shutdown, causing the loop to exit
@@ -131,13 +138,26 @@ public class WalkForwardWorker : BackgroundService
     /// </param>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("WalkForwardWorker starting");
+        _logger.LogInformation("WalkForwardWorker starting (parallel, max {Max} concurrent)", DefaultMaxParallelWalkForwards);
 
         while (!stoppingToken.IsCancellationRequested)
         {
             try
             {
-                await ProcessAsync(stoppingToken);
+                if (!await ProcessBatchAsync(DefaultMaxParallelWalkForwards, stoppingToken))
+                {
+                    _emptyPollStreak++;
+                    var backoff = _emptyPollStreak switch
+                    {
+                        <= 1 => TimeSpan.FromSeconds(10),
+                        2    => TimeSpan.FromSeconds(30),
+                        _    => TimeSpan.FromSeconds(60),
+                    };
+                    await Task.Delay(backoff, stoppingToken);
+                    continue;
+                }
+
+                _emptyPollStreak = 0;
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -151,243 +171,302 @@ public class WalkForwardWorker : BackgroundService
                 _logger.LogError(ex, "Unexpected error in WalkForwardWorker polling loop");
             }
 
-            await Task.Delay(PollingInterval, stoppingToken);
+            await Task.Delay(BasePollInterval, stoppingToken);
         }
 
         _logger.LogInformation("WalkForwardWorker stopped");
     }
 
     /// <summary>
-    /// Core processing method for a single polling tick. Dequeues the oldest
-    /// <see cref="RunStatus.Queued"/> walk-forward run, slides in-sample/out-of-sample
-    /// windows across the full candle dataset, backtests the strategy on each OOS window,
-    /// aggregates the results, and persists the final metrics. Returns immediately (no-op)
-    /// when the queue is empty.
+    /// Runs a single polling cycle. Kept as a separate method for older tests that
+    /// invoke one cycle directly via reflection.
     /// </summary>
-    /// <remarks>
-    /// A fresh DI scope is created on every call to ensure EF Core DbContext instances are
-    /// isolated and disposed promptly, preventing change-tracker bloat over long-running runs
-    /// with many candle rows loaded.
-    /// </remarks>
-    /// <param name="ct">Cancellation token propagated from <see cref="ExecuteAsync"/>.</param>
-    private async Task ProcessAsync(CancellationToken ct)
-    {
-        // Fresh DI scope per processing cycle for proper EF context isolation.
-        using var scope  = _scopeFactory.CreateScope();
-        var writeContext = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
-        var readContext  = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+    private async Task<bool> ProcessAsync(CancellationToken ct)
+        => await ProcessBatchAsync(1, ct);
 
+    private async Task<bool> ProcessBatchAsync(int maxRuns, CancellationToken ct)
+    {
+        var claimedRunIds = await ClaimQueuedRunsAsync(maxRuns, ct);
+        _healthMonitor?.RecordBacklogDepth(nameof(WalkForwardWorker), claimedRunIds.Count);
+
+        if (claimedRunIds.Count == 0)
+            return false;
+
+        _emptyPollStreak = 0;
+
+        var tasks = claimedRunIds.Select(id => ProcessSingleRunAsync(id, ct));
+        await Task.WhenAll(tasks);
+        return true;
+    }
+
+    /// <summary>
+    /// Claims up to <see cref="DefaultMaxParallelWalkForwards"/> queued walk-forward runs
+    /// by atomically transitioning them from <see cref="RunStatus.Queued"/> to
+    /// <see cref="RunStatus.Running"/>. Returns the list of claimed run IDs.
+    /// </summary>
+    private async Task<List<long>> ClaimQueuedRunsAsync(int maxRuns, CancellationToken ct)
+    {
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        var writeContext = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
         var db = writeContext.GetDbContext();
 
-        // Pick the oldest queued walk-forward run (FIFO by StartedAt).
-        var run = await db.Set<WalkForwardRun>()
+        var runs = await db.Set<WalkForwardRun>()
             .Where(r => r.Status == RunStatus.Queued && !r.IsDeleted)
-            .OrderBy(r => r.StartedAt)
-            .FirstOrDefaultAsync(ct);
+            .OrderByDescending(r => r.Priority)
+            .ThenBy(r => r.StartedAt)
+            .Take(Math.Max(1, maxRuns))
+            .ToListAsync(ct);
 
-        // Nothing in the queue — sleep until the next polling tick.
-        if (run == null) return;
+        if (runs.Count == 0) return [];
 
-        _logger.LogInformation(
-            "WalkForwardWorker: processing run {RunId} for strategy {StrategyId}", run.Id, run.StrategyId);
+        foreach (var run in runs)
+            run.Status = RunStatus.Running;
 
-        // Load strategy via the read-side context (CQRS separation).
-        // If the strategy has been deleted since the run was queued, fail fast
-        // rather than running a meaningless analysis.
-        var strategy = await readContext.GetDbContext()
-            .Set<Strategy>()
-            .FirstOrDefaultAsync(s => s.Id == run.StrategyId && !s.IsDeleted, ct);
-
-        if (strategy == null)
-        {
-            // Fail the run immediately; no point claiming it as Running first because
-            // there is no work to do — the strategy no longer exists.
-            run.Status       = RunStatus.Failed;
-            run.ErrorMessage = $"Strategy {run.StrategyId} not found.";
-            run.CompletedAt  = DateTime.UtcNow;
-            await writeContext.SaveChangesAsync(ct);
-            return;
-        }
-
-        // Claim the run by setting it to Running so no concurrent worker picks it up.
-        run.Status = RunStatus.Running;
         await writeContext.SaveChangesAsync(ct);
 
-        var baseStrategyForRun = CloneStrategy(strategy);
-        if (!string.IsNullOrWhiteSpace(run.ParametersSnapshotJson))
-            baseStrategyForRun.ParametersJson = run.ParametersSnapshotJson;
+        var ids = runs.Select(r => r.Id).ToList();
+        _logger.LogInformation("WalkForwardWorker: claimed {Count} run(s): [{Ids}]",
+            ids.Count, string.Join(", ", ids));
 
+        return ids;
+    }
+
+    /// <summary>
+    /// Processes a single walk-forward run within its own DI scope. Loads the strategy
+    /// and candle data, slides in-sample/out-of-sample windows, backtests each OOS window,
+    /// aggregates results, and persists final metrics. Uses a double-completion guard to
+    /// prevent concurrent workers from overwriting results.
+    /// </summary>
+    private async Task ProcessSingleRunAsync(long runId, CancellationToken ct)
+    {
         try
         {
-            // Load all closed candles spanning the full date window in chronological order.
-            // The entire dataset is loaded into memory because the window-sliding loop
-            // accesses arbitrary sub-ranges via Skip/Take — streaming would require
-            // repeated round-trips that cost more than a single bulk load.
-            var allCandles = await readContext.GetDbContext()
-                .Set<Candle>()
-                .Where(c =>
-                    c.Symbol    == run.Symbol    &&
-                    c.Timeframe == run.Timeframe &&
-                    c.Timestamp >= run.FromDate  &&
-                    c.Timestamp <= run.ToDate    &&
-                    c.IsClosed                   &&  // Exclude the in-progress (open) bar
-                    !c.IsDeleted)
-                .OrderBy(c => c.Timestamp)
-                .ToListAsync(ct);
+            await using var scope = _scopeFactory.CreateAsyncScope();
+            var writeContext = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+            var readContext  = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+            var db = writeContext.GetDbContext();
 
-            if (allCandles.Count == 0)
-                throw new InvalidOperationException(
-                    $"No closed candles found for {run.Symbol}/{run.Timeframe} between {run.FromDate:yyyy-MM-dd} and {run.ToDate:yyyy-MM-dd}.");
+            var run = await db.Set<WalkForwardRun>()
+                .FirstOrDefaultAsync(r => r.Id == runId && !r.IsDeleted, ct);
 
-            var windowResults = new List<WindowResult>();
-
-            int windowIndex = 0;
-            var windowStartUtc = run.FromDate;
-
-            // ── Walk-forward loop ──────────────────────────────────────────────────
-            // The entity stores window sizes in calendar days, so the slices must be built
-            // from timestamps rather than raw candle counts. Each iteration advances by one
-            // OOS period, producing rolling day-based windows across the full date range.
-            while (windowStartUtc < run.ToDate)
+            if (run == null)
             {
-                DateTime inSampleStartUtc = windowStartUtc;
-                DateTime inSampleEndUtc = inSampleStartUtc.AddDays(run.InSampleDays);
-                DateTime oosStartUtc = inSampleEndUtc;
-                DateTime oosEndUtc = oosStartUtc.AddDays(run.OutOfSampleDays);
-                if (oosEndUtc > run.ToDate) break;
-
-                var inSampleCandles = allCandles
-                    .Where(c => c.Timestamp >= inSampleStartUtc && c.Timestamp < inSampleEndUtc)
-                    .ToList();
-
-                var oosCandles = allCandles
-                    .Where(c => c.Timestamp >= oosStartUtc && c.Timestamp < oosEndUtc)
-                    .ToList();
-
-                if (inSampleCandles.Count == 0 || oosCandles.Count == 0)
-                {
-                    windowStartUtc = windowStartUtc.AddDays(run.OutOfSampleDays);
-                    continue;
-                }
-
-                // ── Per-fold re-optimization (true WFA) ─────────────────────
-                // When enabled, re-optimise strategy parameters on the IS candles using a
-                // mini TPE search before evaluating on the OOS segment. This validates
-                // whether the optimisation process itself consistently finds good params.
-                Strategy evalStrategy = baseStrategyForRun;
-                if (run.ReOptimizePerFold
-                    && string.IsNullOrWhiteSpace(run.ParametersSnapshotJson)
-                    && inSampleCandles.Count >= 60)
-                {
-                    var foldOptimised = await ReOptimizeOnFoldAsync(baseStrategyForRun, inSampleCandles, run.InitialBalance, ct);
-                    if (foldOptimised is not null)
-                    {
-                        evalStrategy = foldOptimised;
-                        _logger.LogDebug(
-                            "WalkForwardWorker: run {RunId} window {Window} re-optimised params: {Params}",
-                            run.Id, windowIndex, evalStrategy.ParametersJson);
-                    }
-                }
-
-                var oosResult = await _backtestEngine.RunAsync(evalStrategy, oosCandles, run.InitialBalance, ct);
-
-                // Record full per-window metrics for the JSON breakdown stored in WindowResultsJson.
-                // OosHealthScore maps to SharpeRatio so the AverageOutOfSampleScore field
-                // carries a risk-adjusted return estimate rather than a raw profit figure.
-                var windowResult = new WindowResult
-                {
-                    WindowIndex         = windowIndex,
-                    InSampleFrom        = inSampleCandles[0].Timestamp,
-                    InSampleTo          = inSampleCandles[^1].Timestamp,
-                    OutOfSampleFrom     = oosCandles[0].Timestamp,
-                    OutOfSampleTo       = oosCandles[^1].Timestamp,
-                    OosHealthScore      = (double)oosResult.SharpeRatio,
-                    OosTotalTrades      = oosResult.TotalTrades,
-                    OosWinRate          = (double)oosResult.WinRate,
-                    OosProfitFactor     = (double)oosResult.ProfitFactor,
-                    UsedParametersJson  = evalStrategy.ParametersJson
-                };
-
-                windowResults.Add(windowResult);
-
-                _logger.LogInformation(
-                    "WalkForwardWorker: run {RunId} window {Window} OOS SharpeRatio={Sharpe:F4}",
-                    run.Id, windowIndex, oosResult.SharpeRatio);
-
-                // Advance by one OOS period to create the next rolling day-based window.
-                windowStartUtc = windowStartUtc.AddDays(run.OutOfSampleDays);
-                windowIndex++;
+                _logger.LogWarning("WalkForwardWorker: run {RunId} disappeared after claiming", runId);
+                return;
             }
 
-            if (windowResults.Count == 0)
-                throw new InvalidOperationException("Not enough candle data to form any walk-forward windows.");
-
-            // ── Aggregate statistics across all OOS windows ────────────────────────
-            // Mean Sharpe: primary quality signal — higher is better.
-            // Std-dev of Sharpe: consistency signal — lower means the strategy performs
-            //   similarly across different market conditions rather than excelling in one
-            //   regime and failing in another (a sign of robustness).
-            var scores = windowResults.Select(w => w.OosHealthScore).ToList();
-            double avg    = scores.Average();
-            double mean   = avg;  // Alias for variance calculation below
-            double sumSq  = scores.Sum(s => Math.Pow(s - mean, 2));
-            // Population std-dev (divide by N, not N-1) is used here because we want to
-            // describe the observed dispersion across ALL windows, not estimate a larger
-            // population's variance from a sample.
-            double stdDev = scores.Count > 1 ? Math.Sqrt(sumSq / scores.Count) : 0.0;
-
-            run.AverageOutOfSampleScore = (decimal)avg;
-            run.ScoreConsistency        = (decimal)stdDev;
-            // Persist the full per-window breakdown so the API can expose detailed analytics.
-            run.WindowResultsJson       = JsonSerializer.Serialize(windowResults);
-            run.Status                  = RunStatus.Completed;
-            run.CompletedAt             = DateTime.UtcNow;
-
             _logger.LogInformation(
-                "WalkForwardWorker: run {RunId} completed — Windows={Count}, AvgOOS={Avg:F4}, StdDev={Std:F4}",
-                run.Id, windowResults.Count, avg, stdDev);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "WalkForwardWorker: run {RunId} failed", run.Id);
-            run.Status       = RunStatus.Failed;
-            run.ErrorMessage = ex.Message;
-            run.CompletedAt  = DateTime.UtcNow;
-        }
+                "WalkForwardWorker: processing run {RunId} for strategy {StrategyId}", run.Id, run.StrategyId);
 
-        // Single SaveChanges call persists the final status, all metrics, and the
-        // JSON breakdown in one database round-trip.
-        await writeContext.SaveChangesAsync(ct);
+            // Load strategy via the read-side context (CQRS separation).
+            var strategy = await readContext.GetDbContext()
+                .Set<Strategy>()
+                .FirstOrDefaultAsync(s => s.Id == run.StrategyId && !s.IsDeleted, ct);
 
-        // ── Update optimization follow-up status if this was a validation walk-forward ──
-        if (run.SourceOptimizationRunId.HasValue)
-        {
+            if (strategy == null)
+            {
+                run.Status       = RunStatus.Failed;
+                run.ErrorMessage = $"Strategy {run.StrategyId} not found.";
+                run.CompletedAt  = DateTime.UtcNow;
+                await writeContext.SaveChangesAsync(ct);
+                return;
+            }
+
+            var baseStrategyForRun = CloneStrategy(strategy);
+            if (!string.IsNullOrWhiteSpace(run.ParametersSnapshotJson))
+                baseStrategyForRun.ParametersJson = run.ParametersSnapshotJson;
+
+            RunStatus finalStatus;
+            string? errorMessage = null;
+
             try
             {
-                bool followUpPassed = run.Status == RunStatus.Completed;
-                if (followUpPassed)
+                var allCandles = await readContext.GetDbContext()
+                    .Set<Candle>()
+                    .Where(c =>
+                        c.Symbol    == run.Symbol    &&
+                        c.Timeframe == run.Timeframe &&
+                        c.Timestamp >= run.FromDate  &&
+                        c.Timestamp <= run.ToDate    &&
+                        c.IsClosed                   &&
+                        !c.IsDeleted)
+                    .OrderBy(c => c.Timestamp)
+                    .ToListAsync(ct);
+
+                if (allCandles.Count == 0)
+                    throw new InvalidOperationException(
+                        $"No closed candles found for {run.Symbol}/{run.Timeframe} between {run.FromDate:yyyy-MM-dd} and {run.ToDate:yyyy-MM-dd}.");
+
+                var windowResults = new List<WindowResult>();
+
+                int windowIndex = 0;
+                var windowStartUtc = run.FromDate;
+
+                while (windowStartUtc < run.ToDate)
                 {
-                    decimal maxCv = await GetConfigAsync(db, "Optimization:MaxCvCoefficientOfVariation", 0.50m, ct);
-                    if (!Optimization.OptimizationFollowUpQualityEvaluator.IsWalkForwardQualitySufficient(
-                            run, maxCv, out string reason))
+                    DateTime inSampleStartUtc = windowStartUtc;
+                    DateTime inSampleEndUtc = inSampleStartUtc.AddDays(run.InSampleDays);
+                    DateTime oosStartUtc = inSampleEndUtc;
+                    DateTime oosEndUtc = oosStartUtc.AddDays(run.OutOfSampleDays);
+                    if (oosEndUtc > run.ToDate) break;
+
+                    var inSampleCandles = allCandles
+                        .Where(c => c.Timestamp >= inSampleStartUtc && c.Timestamp < inSampleEndUtc)
+                        .ToList();
+
+                    var oosCandles = allCandles
+                        .Where(c => c.Timestamp >= oosStartUtc && c.Timestamp < oosEndUtc)
+                        .ToList();
+
+                    if (inSampleCandles.Count == 0 || oosCandles.Count == 0)
                     {
-                        followUpPassed = false;
-                        _logger.LogWarning(
-                            "WalkForwardWorker: validation walk-forward for optimization run {OptimizationRunId} failed quality gate — {Reason}",
-                            run.SourceOptimizationRunId.Value, reason);
+                        windowStartUtc = windowStartUtc.AddDays(run.OutOfSampleDays);
+                        continue;
                     }
+
+                    Strategy evalStrategy = baseStrategyForRun;
+                    if (run.ReOptimizePerFold
+                        && string.IsNullOrWhiteSpace(run.ParametersSnapshotJson)
+                        && inSampleCandles.Count >= 60)
+                    {
+                        var foldOptimised = await ReOptimizeOnFoldAsync(baseStrategyForRun, inSampleCandles, run.InitialBalance, ct);
+                        if (foldOptimised is not null)
+                        {
+                            evalStrategy = foldOptimised;
+                            _logger.LogDebug(
+                                "WalkForwardWorker: run {RunId} window {Window} re-optimised params: {Params}",
+                                run.Id, windowIndex, evalStrategy.ParametersJson);
+                        }
+                    }
+
+                    var oosResult = await _backtestEngine.RunAsync(evalStrategy, oosCandles, run.InitialBalance, ct);
+
+                    var windowResult = new WindowResult
+                    {
+                        WindowIndex         = windowIndex,
+                        InSampleFrom        = inSampleCandles[0].Timestamp,
+                        InSampleTo          = inSampleCandles[^1].Timestamp,
+                        OutOfSampleFrom     = oosCandles[0].Timestamp,
+                        OutOfSampleTo       = oosCandles[^1].Timestamp,
+                        OosHealthScore      = (double)oosResult.SharpeRatio,
+                        OosTotalTrades      = oosResult.TotalTrades,
+                        OosWinRate          = (double)oosResult.WinRate,
+                        OosProfitFactor     = (double)oosResult.ProfitFactor,
+                        UsedParametersJson  = evalStrategy.ParametersJson
+                    };
+
+                    windowResults.Add(windowResult);
+
+                    _logger.LogInformation(
+                        "WalkForwardWorker: run {RunId} window {Window} OOS SharpeRatio={Sharpe:F4}",
+                        run.Id, windowIndex, oosResult.SharpeRatio);
+
+                    windowStartUtc = windowStartUtc.AddDays(run.OutOfSampleDays);
+                    windowIndex++;
                 }
 
-                await Optimization.OptimizationFollowUpTracker.UpdateStatusAsync(
-                    db, run.SourceOptimizationRunId.Value,
-                    followUpPassed, writeContext, ct);
+                if (windowResults.Count == 0)
+                    throw new InvalidOperationException("Not enough candle data to form any walk-forward windows.");
+
+                var scores = windowResults.Select(w => w.OosHealthScore).ToList();
+                double avg    = scores.Average();
+                double mean   = avg;
+                double sumSq  = scores.Sum(s => Math.Pow(s - mean, 2));
+                double stdDev = scores.Count > 1 ? Math.Sqrt(sumSq / scores.Count) : 0.0;
+
+                run.AverageOutOfSampleScore = (decimal)avg;
+                run.ScoreConsistency        = (decimal)stdDev;
+                run.WindowResultsJson       = JsonSerializer.Serialize(windowResults);
+                finalStatus                 = RunStatus.Completed;
+                run.CompletedAt             = DateTime.UtcNow;
+
+                _logger.LogInformation(
+                    "WalkForwardWorker: run {RunId} completed — Windows={Count}, AvgOOS={Avg:F4}, StdDev={Std:F4}",
+                    run.Id, windowResults.Count, avg, stdDev);
             }
             catch (Exception ex)
             {
-                _logger.LogDebug(ex,
-                    "WalkForwardWorker: failed to update optimization follow-up status for run {RunId} (non-fatal)",
-                    run.SourceOptimizationRunId.Value);
+                _logger.LogError(ex, "WalkForwardWorker: run {RunId} failed", run.Id);
+                finalStatus  = RunStatus.Failed;
+                errorMessage = ex.Message;
+                run.CompletedAt = DateTime.UtcNow;
             }
+
+            // ── Double-completion guard ─────────────────────────────────────────────
+            // Use ExecuteUpdateAsync with a WHERE clause requiring Status == Running to
+            // prevent concurrent workers from overwriting results if a run was somehow
+            // claimed by multiple instances.
+            int updatedRows;
+            if (finalStatus == RunStatus.Completed)
+            {
+                updatedRows = await db.Set<WalkForwardRun>()
+                    .Where(r => r.Id == runId && r.Status == RunStatus.Running)
+                    .ExecuteUpdateAsync(s => s
+                        .SetProperty(r => r.Status, RunStatus.Completed)
+                        .SetProperty(r => r.CompletedAt, run.CompletedAt)
+                        .SetProperty(r => r.AverageOutOfSampleScore, run.AverageOutOfSampleScore)
+                        .SetProperty(r => r.ScoreConsistency, run.ScoreConsistency)
+                        .SetProperty(r => r.WindowResultsJson, run.WindowResultsJson),
+                    ct);
+            }
+            else
+            {
+                updatedRows = await db.Set<WalkForwardRun>()
+                    .Where(r => r.Id == runId && r.Status == RunStatus.Running)
+                    .ExecuteUpdateAsync(s => s
+                        .SetProperty(r => r.Status, RunStatus.Failed)
+                        .SetProperty(r => r.CompletedAt, run.CompletedAt)
+                        .SetProperty(r => r.ErrorMessage, errorMessage),
+                    ct);
+            }
+
+            if (updatedRows == 0)
+            {
+                _logger.LogWarning(
+                    "WalkForwardWorker: double-completion guard — run {RunId} was no longer Running, skipping result persist",
+                    runId);
+                return;
+            }
+
+            // ── Update optimization follow-up status if this was a validation walk-forward ──
+            if (run.SourceOptimizationRunId.HasValue)
+            {
+                try
+                {
+                    bool followUpPassed = finalStatus == RunStatus.Completed;
+                    if (followUpPassed)
+                    {
+                        decimal maxCv = await GetConfigAsync(db, "Optimization:MaxCvCoefficientOfVariation", 0.50m, ct);
+                        if (!Optimization.OptimizationFollowUpQualityEvaluator.IsWalkForwardQualitySufficient(
+                                run, maxCv, out string reason))
+                        {
+                            followUpPassed = false;
+                            _logger.LogWarning(
+                                "WalkForwardWorker: validation walk-forward for optimization run {OptimizationRunId} failed quality gate — {Reason}",
+                                run.SourceOptimizationRunId.Value, reason);
+                        }
+                    }
+
+                    await Optimization.OptimizationFollowUpTracker.UpdateStatusAsync(
+                        db, run.SourceOptimizationRunId.Value,
+                        followUpPassed, writeContext, ct);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex,
+                        "WalkForwardWorker: failed to update optimization follow-up status for run {RunId} (non-fatal)",
+                        run.SourceOptimizationRunId.Value);
+                }
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Graceful shutdown — let Task.WhenAll propagate.
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "WalkForwardWorker: unhandled error processing run {RunId}", runId);
         }
     }
 

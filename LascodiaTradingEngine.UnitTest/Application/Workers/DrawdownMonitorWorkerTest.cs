@@ -1,3 +1,4 @@
+using System.Diagnostics.Metrics;
 using System.Reflection;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
@@ -6,6 +7,7 @@ using Microsoft.Extensions.Logging;
 using Moq;
 using MockQueryable.Moq;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
+using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.DrawdownRecovery.Commands.RecordDrawdownSnapshot;
 using LascodiaTradingEngine.Application.Workers;
@@ -43,7 +45,7 @@ public class DrawdownMonitorWorkerTest
             .Setup(m => m.Send(It.IsAny<RecordDrawdownSnapshotCommand>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(ResponseData<string>.Init("Normal", true, "Successful", "00"));
 
-        _worker = new DrawdownMonitorWorker(_mockLogger.Object, _mockScopeFactory.Object);
+        _worker = new DrawdownMonitorWorker(_mockLogger.Object, _mockScopeFactory.Object, new TradingMetrics(new TestMeterFactory()));
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
@@ -203,4 +205,10 @@ public class DrawdownMonitorWorkerTest
             m => m.Send(It.IsAny<RecordDrawdownSnapshotCommand>(), It.IsAny<CancellationToken>()),
             Times.Never);
     }
+}
+
+file class TestMeterFactory : IMeterFactory
+{
+    public Meter Create(MeterOptions options) => new(options);
+    public void Dispose() { }
 }

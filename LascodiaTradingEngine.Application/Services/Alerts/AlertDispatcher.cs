@@ -63,8 +63,17 @@ public class AlertDispatcher : IAlertDispatcher, IDisposable
 
         if (senders.TryGetValue(alert.Channel, out var sender))
         {
-            await sender.SendAsync(alert, message, ct);
-            RecordDispatch(alert);
+            try
+            {
+                await sender.SendAsync(alert, message, ct);
+                RecordDispatch(alert);
+                await PersistDispatchLogAsync(alert, alert.Channel, "Sent", message, null);
+            }
+            catch (Exception ex)
+            {
+                await PersistDispatchLogAsync(alert, alert.Channel, "Failed", message, ex.Message);
+                throw;
+            }
         }
         else
         {
@@ -99,9 +108,11 @@ public class AlertDispatcher : IAlertDispatcher, IDisposable
                 {
                     await sender.SendAsync(alert, message, ct);
                     anySent = true;
+                    await PersistDispatchLogAsync(alert, channel, "Sent", message, null);
                 }
                 catch (Exception ex)
                 {
+                    await PersistDispatchLogAsync(alert, channel, "Failed", message, ex.Message);
                     _logger.LogWarning(ex,
                         "AlertDispatcher: failed to send alert {AlertId} via {Channel} (other channels may have succeeded)",
                         alert.Id, channel);
@@ -185,6 +196,31 @@ public class AlertDispatcher : IAlertDispatcher, IDisposable
         {
             _dedup[alert.DeduplicationKey] = DateTime.UtcNow;
             EvictStaleDedupEntries();
+        }
+    }
+
+    /// <summary>Persists a dispatch log entry for dashboard display and delivery SLA tracking.</summary>
+    private async Task PersistDispatchLogAsync(Alert alert, AlertChannel channel, string status, string message, string? error)
+    {
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+            var db = writeCtx.GetDbContext();
+            db.Set<AlertDispatchLog>().Add(new AlertDispatchLog
+            {
+                AlertId      = alert.Id,
+                Channel      = channel,
+                Status       = status,
+                Message      = message.Length > 2000 ? message[..2000] : message,
+                DispatchedAt = DateTime.UtcNow,
+                ErrorMessage = error?.Length > 500 ? error[..500] : error,
+            });
+            await writeCtx.SaveChangesAsync(CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "AlertDispatcher: failed to persist dispatch log for alert {AlertId}", alert.Id);
         }
     }
 

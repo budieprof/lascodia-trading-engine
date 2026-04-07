@@ -1627,7 +1627,12 @@ public record TrainingHyperparams(
     /// <summary>SMOTE target ratio — minority will be oversampled to this fraction of majority count. 1.0 = full parity.</summary>
     double SmoteTargetRatio = 1.0,
     /// <summary>When true, runs Edited Nearest Neighbors cleanup on SMOTE synthetics to remove noisy samples.</summary>
-    bool SmoteEnnEnabled = false
+    bool SmoteEnnEnabled = false,
+    /// <summary>
+    /// Minimum acceptance rate required for promotion in legacy training flows.
+    /// The current runtime path no longer enforces this gate, so 0.0 disables it.
+    /// </summary>
+    double MinAcceptanceRateToPromote = 0.0
     );
 
 // ── Evaluation metrics ────────────────────────────────────────────────────────
@@ -2693,6 +2698,12 @@ public class ModelSnapshot
 
     /// <summary>Rec #389: TabNet per-step attention mask weights (outer = step, inner = F). Used for warm-start transfer.</summary>
     public double[][]? TabNetStepAttentionWeights { get; set; }
+
+    /// <summary>
+    /// Legacy single-value TabNet output-head weight kept for compatibility with older
+    /// audit/test flows. Newer snapshots persist the full output head in <see cref="Weights"/>.
+    /// </summary>
+    public double TabNetOutputWeight { get; set; }
 
     /// <summary>Rec #390: FT-Transformer per-feature embedding weights (outer = feature, inner = dim).</summary>
     public double[][]? FtTransformerEmbedWeights { get; set; }

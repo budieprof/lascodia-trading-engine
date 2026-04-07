@@ -30,5 +30,8 @@ public enum AlertType
     SystemicMLDegradation = 7,
 
     /// <summary>Execution or data pipeline latency exceeded the SLA threshold.</summary>
-    LatencySla = 8
+    LatencySla = 8,
+
+    /// <summary>An optimization lifecycle or recovery issue requires operator visibility.</summary>
+    OptimizationLifecycleIssue = 9
 }

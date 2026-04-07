@@ -31,6 +31,7 @@ public class PositionWorker : BackgroundService
     private readonly TradingMetrics _metrics;
     private readonly IDistributedLock _distributedLock;
     private readonly ConcurrentDictionary<string, int> _consecutiveInvertedQuotes = new();
+    private readonly ConcurrentDictionary<string, int> _consecutiveCacheMisses = new();
 
     public PositionWorker(
         ILogger<PositionWorker> logger,
@@ -132,11 +133,24 @@ public class PositionWorker : BackgroundService
                     {
                         cacheMisses++;
                         _metrics.PriceCacheMisses.Add(1, new KeyValuePair<string, object?>("symbol", position.Symbol));
-                        _logger.LogWarning(
-                            "PositionWorker: no live price for {Symbol} — position {Id} skipped (SL/TP not monitored this cycle)",
-                            position.Symbol, position.Id);
+
+                        // Track consecutive cache misses per symbol for escalation
+                        int consecutiveMisses = _consecutiveCacheMisses.AddOrUpdate(position.Symbol, 1, (_, c) => c + 1);
+                        if (consecutiveMisses >= 10)
+                            _logger.LogCritical(
+                                "PositionWorker: {Count} consecutive cache misses for {Symbol} — price feed may be dead",
+                                consecutiveMisses, position.Symbol);
+                        else if (consecutiveMisses >= 3)
+                            _logger.LogWarning(
+                                "PositionWorker: {Count} consecutive cache misses for {Symbol} — position {Id} SL/TP not monitored",
+                                consecutiveMisses, position.Symbol, position.Id);
+                        else
+                            _logger.LogWarning(
+                                "PositionWorker: no live price for {Symbol} — position {Id} skipped (SL/TP not monitored this cycle)",
+                                position.Symbol, position.Id);
                         continue;
                     }
+                    _consecutiveCacheMisses.TryRemove(position.Symbol, out _);
 
                     // Price sanity: reject inverted quotes (Ask < Bid)
                     if (priceData.Value.Ask < priceData.Value.Bid)
@@ -345,7 +359,7 @@ public class PositionWorker : BackgroundService
         _metrics.PositionsClosed.Add(1, new KeyValuePair<string, object?>("reason", reason));
         _metrics.PositionPnL.Record((double)estimatedPnl);
 
-        await eventService.SaveAndPublish(writeContext, new PositionClosedIntegrationEvent
+        var positionClosedEvent = new PositionClosedIntegrationEvent
         {
             PositionId          = position.Id,
             TradeSignalId       = null,     // Position has no direct FK to TradeSignal; resolved by PredictionOutcomeWorker
@@ -359,6 +373,40 @@ public class PositionWorker : BackgroundService
             WasProfitable       = estimatedPnl > 0,
             CloseReason         = reason,
             ClosedAt            = DateTime.UtcNow
-        });
+        };
+
+        try
+        {
+            await eventService.SaveAndPublish(writeContext, positionClosedEvent);
+        }
+        catch (Exception pubEx)
+        {
+            // Position is already closed in the DB — we must not lose this event.
+            // Write to dead letter so IntegrationEventRetryWorker can pick it up.
+            _logger.LogError(pubEx,
+                "PositionWorker: FAILED to publish PositionClosedIntegrationEvent for position {Id} ({Symbol}). " +
+                "Position is closed but event was not published — writing to dead letter.",
+                position.Id, position.Symbol);
+
+            try
+            {
+                using var dlScope = _scopeFactory.CreateScope();
+                var deadLetter = dlScope.ServiceProvider.GetRequiredService<IDeadLetterSink>();
+                await deadLetter.WriteAsync(
+                    handlerName: "PositionWorker",
+                    eventType: nameof(PositionClosedIntegrationEvent),
+                    eventPayloadJson: System.Text.Json.JsonSerializer.Serialize(positionClosedEvent),
+                    errorMessage: pubEx.Message,
+                    stackTrace: pubEx.StackTrace,
+                    attempts: 1);
+            }
+            catch (Exception dlEx)
+            {
+                _logger.LogCritical(dlEx,
+                    "PositionWorker: BOTH event publish AND dead letter write failed for position {Id}. " +
+                    "Manual intervention required.",
+                    position.Id);
+            }
+        }
     }
 }

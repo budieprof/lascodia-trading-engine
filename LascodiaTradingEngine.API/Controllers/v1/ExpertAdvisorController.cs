@@ -40,6 +40,11 @@ public class ExpertAdvisorController : AuthControllerBase<ExpertAdvisorControlle
         ICurrentUserService userService)
         : base(logger, config, userService) { }
 
+    /// <summary>
+    /// Extracts the X-Request-Id header value sent by EA instances for request correlation.
+    /// </summary>
+    private string? GetRequestId() => HttpContext.Request.Headers["X-Request-Id"].FirstOrDefault();
+
     /// <summary>Register a new EA instance</summary>
     [HttpPost("register")]
     public async Task<ResponseData<long>> Register(RegisterEACommand command)

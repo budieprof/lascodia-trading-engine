@@ -163,9 +163,45 @@ public class IntegrationEventRetryWorker : BackgroundService
                 entry.State = EventStateEnum.PublishedFailed;
                 await eventLog.SaveChangesAsync(CancellationToken.None);
 
-                _logger.LogWarning(ex,
-                    "IntegrationEventRetryWorker: retry failed for event {EventId} ({Type}), attempt {Attempt}/{Max}",
-                    entry.EventId, entry.EventTypeShortName, entry.TimesSent, MaxRetries);
+                if (entry.TimesSent >= MaxRetries)
+                {
+                    exhausted++;
+                    _logger.LogCritical(
+                        "IntegrationEventRetryWorker: event {EventId} ({Type}) EXHAUSTED after {Attempts} retries — " +
+                        "requires manual investigation. Last error: {Error}",
+                        entry.EventId, entry.EventTypeShortName, entry.TimesSent, ex.Message);
+
+                    // Write to dead-letter sink so the event is preserved for manual replay
+                    try
+                    {
+                        var deadLetterSink = scope.ServiceProvider.GetRequiredService<IDeadLetterSink>();
+                        await deadLetterSink.WriteAsync(
+                            handlerName:      nameof(IntegrationEventRetryWorker),
+                            eventType:        entry.EventTypeShortName ?? "Unknown",
+                            eventPayloadJson: entry.Content ?? "{}",
+                            errorMessage:     $"Exhausted after {entry.TimesSent} retries: {ex.Message}",
+                            stackTrace:       ex.StackTrace,
+                            attempts:         entry.TimesSent,
+                            CancellationToken.None);
+                        _metrics.EventRetryDeadLettered.Add(1);
+                    }
+                    catch (Exception dlEx)
+                    {
+                        _logger.LogCritical(dlEx,
+                            "IntegrationEventRetryWorker: FAILED to dead-letter exhausted event {EventId} — event may be lost",
+                            entry.EventId);
+                    }
+
+                    // Mark with terminal state so GetRetryableEventsAsync won't pick it up again.
+                    entry.State = EventStateEnum.NotPublished;
+                    await eventLog.SaveChangesAsync(CancellationToken.None);
+                }
+                else
+                {
+                    _logger.LogWarning(ex,
+                        "IntegrationEventRetryWorker: retry failed for event {EventId} ({Type}), attempt {Attempt}/{Max}",
+                        entry.EventId, entry.EventTypeShortName, entry.TimesSent, MaxRetries);
+                }
             }
         }
 

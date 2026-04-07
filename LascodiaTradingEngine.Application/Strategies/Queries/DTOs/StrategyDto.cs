@@ -1,6 +1,7 @@
 using AutoMapper;
 using Microsoft.AspNetCore.Http;
 using Lascodia.Trading.Engine.SharedLibrary.Mappings;
+using LascodiaTradingEngine.Application.StrategyGeneration;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -29,9 +30,40 @@ public class StrategyDto : IMapFrom<Strategy>
     public long?        RiskProfileId  { get; set; }
     /// <summary>Timestamp when the strategy was created.</summary>
     public DateTime     CreatedAt      { get; set; }
+    /// <summary>Parsed strategy-generation screening metadata when available.</summary>
+    public StrategyScreeningMetadataDto? ScreeningMetadata { get; set; }
 
     public void Mapping(Profile profile, IHttpContextAccessor httpContextAccessor)
     {
-        profile.CreateMap<Strategy, StrategyDto>();
+        profile.CreateMap<Strategy, StrategyDto>()
+            .ForMember(
+                dest => dest.ScreeningMetadata,
+                opt => opt.MapFrom(src => StrategyScreeningMetadataDto.FromJson(src.ScreeningMetricsJson)));
+    }
+}
+
+/// <summary>Compact screening metadata projection for strategy list/read models.</summary>
+public class StrategyScreeningMetadataDto
+{
+    public string? GenerationSource { get; set; }
+    public string? ObservedRegime { get; set; }
+    public string? ReserveTargetRegime { get; set; }
+    public bool LiveHaircutApplied { get; set; }
+    public bool IsAutoPromoted { get; set; }
+
+    internal static StrategyScreeningMetadataDto? FromJson(string? screeningMetricsJson)
+    {
+        var metrics = ScreeningMetrics.FromJson(screeningMetricsJson);
+        if (metrics is null)
+            return null;
+
+        return new StrategyScreeningMetadataDto
+        {
+            GenerationSource = metrics.GenerationSource,
+            ObservedRegime = metrics.ObservedRegime,
+            ReserveTargetRegime = metrics.ReserveTargetRegime,
+            LiveHaircutApplied = metrics.LiveHaircutApplied,
+            IsAutoPromoted = metrics.IsAutoPromoted,
+        };
     }
 }

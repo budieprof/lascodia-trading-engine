@@ -12,7 +12,7 @@ namespace LascodiaTradingEngine.Application.StrategyGeneration;
 /// Allows the worker to resume from a partial cycle after a crash, skipping
 /// already-screened symbols and restoring budget counters.
 /// </summary>
-internal static class GenerationCheckpointStore
+public static class GenerationCheckpointStore
 {
     internal const int PayloadVersion = 2;
     internal const int MaxCheckpointChars = 500_000;
@@ -31,6 +31,9 @@ internal static class GenerationCheckpointStore
         public List<string> CompletedSymbols { get; init; } = [];
         public int CandidatesCreated { get; init; }
         public int ReserveCreated { get; init; }
+        public int CandidatesScreened { get; init; }
+        public int SymbolsProcessed { get; init; }
+        public int SymbolsSkipped { get; init; }
         public List<PendingCandidateState> PendingCandidates { get; init; } = [];
         // String-keyed dicts for JSON serialization (enums/tuples don't round-trip in System.Text.Json)
         public Dictionary<string, int> CandidatesPerCurrency { get; init; } = new();
@@ -38,13 +41,13 @@ internal static class GenerationCheckpointStore
         public Dictionary<string, int> CorrelationGroupCounts { get; init; } = new();
     }
 
-    internal sealed record PendingTradeState
+    public sealed record PendingTradeState
     {
         public decimal PnL { get; init; }
         public DateTime ExitTime { get; init; }
     }
 
-    internal sealed record PendingBacktestResultState
+    public sealed record PendingBacktestResultState
     {
         public int TotalTrades { get; init; }
         public decimal WinRate { get; init; }
@@ -78,7 +81,7 @@ internal static class GenerationCheckpointStore
         };
     }
 
-    internal sealed record PendingCandidateState
+    public sealed record PendingCandidateState
     {
         public string Name { get; init; } = string.Empty;
         public string Description { get; init; } = string.Empty;
@@ -133,23 +136,36 @@ internal static class GenerationCheckpointStore
                 TrainResult = TrainResult.ToBacktestResult(),
                 OosResult = OosResult.ToBacktestResult(),
                 Regime = regime,
+                ObservedRegime = Enum.TryParse<MarketRegimeEnum>(metrics?.ObservedRegime, out var observedRegime)
+                    ? observedRegime
+                    : regime,
+                GenerationSource = metrics?.GenerationSource ?? "Primary",
                 Metrics = metrics ?? new ScreeningMetrics { Regime = Regime },
             };
         }
     }
 
+    internal sealed record SerializationResult(string Json, bool UsedRestartSafeFallback);
+
     internal static State Empty(DateTime cycleDate) => new() { CycleDateUtc = cycleDate };
 
     internal static string Serialize(State state, ILogger? logger = null)
     {
+        return SerializeWithStatus(state, logger).Json;
+    }
+
+    internal static SerializationResult SerializeWithStatus(State state, ILogger? logger = null)
+    {
+        bool usedRestartSafeFallback = false;
         string json = JsonSerializer.Serialize(state, SerializerOptions);
 
         if (json.Length <= MaxCheckpointChars)
-            return json;
+            return new SerializationResult(json, usedRestartSafeFallback);
 
         logger?.LogWarning(
             "GenerationCheckpointStore: checkpoint payload exceeded {Limit} chars ({Actual}); trimming CompletedSymbols",
             MaxCheckpointChars, json.Length);
+        usedRestartSafeFallback = true;
 
         state = state with
         {
@@ -158,7 +174,7 @@ internal static class GenerationCheckpointStore
 
         json = JsonSerializer.Serialize(state, SerializerOptions);
         if (json.Length <= MaxCheckpointChars)
-            return json;
+            return new SerializationResult(json, usedRestartSafeFallback);
 
         logger?.LogWarning(
             "GenerationCheckpointStore: checkpoint payload still exceeded {Limit} chars after trimming CompletedSymbols; trimming pending trade detail",
@@ -174,7 +190,7 @@ internal static class GenerationCheckpointStore
         };
 
         json = JsonSerializer.Serialize(state, SerializerOptions);
-        return json;
+        return new SerializationResult(json, usedRestartSafeFallback);
     }
 
     internal static State? Restore(string? json, DateTime todayUtc, string? expectedFingerprint = null, ILogger? logger = null)

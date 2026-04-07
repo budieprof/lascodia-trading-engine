@@ -46,7 +46,9 @@ internal static class OptimizationApprovalPolicy
         double AssetClassPfMultiplier = 1.0,
         double AssetClassDrawdownMultiplier = 1.0,
         bool GenesisRegressionOk = true,
-        bool HasSufficientOutOfSampleData = true);
+        bool HasSufficientOutOfSampleData = true,
+        double TailRiskVaR99 = 0,
+        bool TailRiskWithinThreshold = true);
 
     internal sealed record Result(
         bool Passed,
@@ -91,7 +93,8 @@ internal static class OptimizationApprovalPolicy
             && input.KellySizingOk
             && input.EquityCurveOk
             && input.TimeConcentrationOk
-            && input.GenesisRegressionOk;
+            && input.GenesisRegressionOk
+            && input.TailRiskWithinThreshold;
 
         bool passed = (compositeGateOk || multiObjectiveGateOk) && safetyGatesOk;
 
@@ -111,6 +114,7 @@ internal static class OptimizationApprovalPolicy
             : !input.KellySizingOk ? $"Kelly sizing fragility (Kelly Sharpe={input.KellySharpeRatio:F2} vs fixed={input.FixedLotSharpeRatio:F2})"
             : !input.EquityCurveOk ? "equity curve R² too low (non-linear equity growth)"
             : !input.TimeConcentrationOk ? "trade time concentration too high (clustering in narrow time windows)"
+            : !input.TailRiskWithinThreshold ? $"tail risk VaR99 exceeds threshold (VaR99={input.TailRiskVaR99:F4})"
             : !input.GenesisRegressionOk ? "genesis quality regression — OOS Sharpe below 80% of original screening OOS Sharpe"
             : $"insufficient improvement ({input.CandidateImprovement:+0.00;-0.00}) or score ({input.OosHealthScore:F2}); " +
               $"multi-objective: Sharpe={input.SharpeRatio:F2}, DD={input.MaxDrawdownPct:F1}%, WR={input.WinRate:P0}, PF={input.ProfitFactor:F2}";
@@ -138,6 +142,8 @@ internal static class OptimizationApprovalPolicy
             ["equityCurveOk"] = input.EquityCurveOk,
             ["timeConcentrationOk"] = input.TimeConcentrationOk,
             ["genesisRegressionOk"] = input.GenesisRegressionOk,
+            ["tailRiskWithinThreshold"] = input.TailRiskWithinThreshold,
+            ["tailRiskVaR99"] = input.TailRiskVaR99,
             ["failureReason"] = failureReason
         };
 

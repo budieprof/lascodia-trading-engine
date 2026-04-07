@@ -106,8 +106,9 @@ internal sealed class OptimizationValidator
             catch { continue; }
         }
 
-        // Require at least half the folds to succeed; otherwise we can't judge stability
-        int minSuccessfulFolds = Math.Max(2, windowCount / 2);
+        // Require at least 60% of folds to succeed; otherwise we can't judge stability.
+        // Math.Max(2, ...) ensures at least 2 folds even for small window counts.
+        int minSuccessfulFolds = Math.Max(2, (int)Math.Ceiling(windowCount * 0.6));
         if (scores.Count < minSuccessfulFolds)
             return (0m, false); // Insufficient data = unstable, not "pass by default"
 
@@ -406,7 +407,9 @@ internal sealed class OptimizationValidator
 
         decimal mean = scores.Sum() / scores.Count;
 
-        // Compute coefficient of variation for cross-fold consistency check
+        // Compute coefficient of variation for cross-fold consistency check.
+        // When only 1 fold succeeded, CV cannot be computed — return a high value
+        // (1.0 = maximum inconsistency) instead of 0 to avoid masking fold failures.
         double cvCoefficientOfVariation;
         if (scores.Count >= 2 && mean > 0)
         {
@@ -415,7 +418,8 @@ internal sealed class OptimizationValidator
         }
         else
         {
-            cvCoefficientOfVariation = 0;
+            // Single fold or zero mean — treat as maximally inconsistent
+            cvCoefficientOfVariation = 1.0;
         }
 
         return (mean, lastResult, cvCoefficientOfVariation);
