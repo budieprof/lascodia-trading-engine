@@ -13,10 +13,10 @@ public sealed partial class TabNetModelTrainer
     private TabNetWeights RunUnsupervisedPretraining(
         List<TrainingSample> samples, int F, int nSteps, int hiddenDim, int attentionDim,
         int sharedLayers, int stepLayers, double gamma, bool useSparsemax,
-        double lr, int epochs, double maskFraction, double bnMomentum, CancellationToken ct)
+        bool useGlu, double lr, int epochs, double maskFraction, double bnMomentum, CancellationToken ct)
     {
         var w = InitializeWeights(F, nSteps, hiddenDim, attentionDim, sharedLayers, stepLayers,
-            gamma, useSparsemax, false);
+            gamma, useSparsemax, useGlu, false);
 
         var rng = new Random(123);
         var decoderW = XavierMatrix(rng, F, hiddenDim);
@@ -105,7 +105,10 @@ public sealed partial class TabNetModelTrainer
             }
 
             if (ep % 5 == 4)
-                UpdateBnRunningStats(w, samples, bnMomentum, 128);
+            {
+                var (epochMeans, epochVars) = ComputeEpochBatchStats(w, samples, 128, rng);
+                ApplyBnRunningStatsEma(w, epochMeans, epochVars, bnMomentum);
+            }
         }
 
         return w;
@@ -115,11 +118,14 @@ public sealed partial class TabNetModelTrainer
         TabNetWeights grad, TabNetWeights w, ForwardResult fwd,
         float[] features, double[] dAggH, int H, int F, BackwardBuffers bwd)
     {
+        var dFutureStep = bwd.DFutureStep;
+        Array.Clear(dFutureStep, 0, H);
+
         for (int s = w.NSteps - 1; s >= 0; s--)
         {
             var dH = new double[H];
             for (int j = 0; j < H; j++)
-                dH[j] = fwd.StepH[s][j] > 0 ? dAggH[j] : 0.0;
+                dH[j] = dFutureStep[j] + (fwd.StepH[s][j] > 0 ? dAggH[j] : 0.0);
 
             // Step-specific layers backward
             double[] dInput = dH;
@@ -144,10 +150,17 @@ public sealed partial class TabNetModelTrainer
 
                 var dBnOut  = new double[H];
                 var dGateIn = new double[H];
-                for (int j = 0; j < H; j++)
+                if (w.UseGlu)
                 {
-                    dBnOut[j]  = dInput[j] * gate[j];
-                    dGateIn[j] = dInput[j] * pre[j] * gate[j] * (1 - gate[j]);
+                    for (int j = 0; j < H; j++)
+                    {
+                        dBnOut[j]  = dInput[j] * gate[j];
+                        dGateIn[j] = dInput[j] * pre[j] * gate[j] * (1 - gate[j]);
+                    }
+                }
+                else
+                {
+                    Array.Copy(dInput, dBnOut, H);
                 }
 
                 // Full BN backward
@@ -176,11 +189,16 @@ public sealed partial class TabNetModelTrainer
                     {
                         double inp = j < fcIn.Length ? fcIn[j] : 0;
                         grad.StepW[s][l][i][j]  += dPreFc[i] * inp;
-                        grad.StepGW[s][l][i][j] += dGateIn[i] * inp;
-                        dNext[j] += dPreFc[i] * w.StepW[s][l][i][j] + dGateIn[i] * w.StepGW[s][l][i][j];
+                        dNext[j] += dPreFc[i] * w.StepW[s][l][i][j];
+                        if (w.UseGlu)
+                        {
+                            grad.StepGW[s][l][i][j] += dGateIn[i] * inp;
+                            dNext[j] += dGateIn[i] * w.StepGW[s][l][i][j];
+                        }
                     }
                     grad.StepB[s][l][i]  += dPreFc[i];
-                    grad.StepGB[s][l][i] += dGateIn[i];
+                    if (w.UseGlu)
+                        grad.StepGB[s][l][i] += dGateIn[i];
                 }
 
                 if (l > 0) for (int j = 0; j < H; j++) dNext[j] += dResidual[j];
@@ -210,10 +228,17 @@ public sealed partial class TabNetModelTrainer
 
                 var dBnOut  = new double[H];
                 var dGateIn = new double[H];
-                for (int j = 0; j < H; j++)
+                if (w.UseGlu)
                 {
-                    dBnOut[j]  = dInput[j] * gate[j];
-                    dGateIn[j] = dInput[j] * pre[j] * gate[j] * (1 - gate[j]);
+                    for (int j = 0; j < H; j++)
+                    {
+                        dBnOut[j]  = dInput[j] * gate[j];
+                        dGateIn[j] = dInput[j] * pre[j] * gate[j] * (1 - gate[j]);
+                    }
+                }
+                else
+                {
+                    Array.Copy(dInput, dBnOut, H);
                 }
 
                 double meanDy = 0, meanDyXn = 0;
@@ -241,10 +266,12 @@ public sealed partial class TabNetModelTrainer
                     {
                         double inp = j < fcIn.Length ? fcIn[j] : 0;
                         grad.SharedW[l][i][j]  += dPreFc[i] * inp;
-                        grad.SharedGW[l][i][j] += dGateIn[i] * inp;
+                        if (w.UseGlu)
+                            grad.SharedGW[l][i][j] += dGateIn[i] * inp;
                     }
                     grad.SharedB[l][i]  += dPreFc[i];
-                    grad.SharedGB[l][i] += dGateIn[i];
+                    if (w.UseGlu)
+                        grad.SharedGB[l][i] += dGateIn[i];
                 }
 
                 if (l > 0)
@@ -260,42 +287,77 @@ public sealed partial class TabNetModelTrainer
             for (int j = 0; j < F && j < dInput.Length; j++)
                 dAttn[j] = dInput[j] * features[j];
 
-            double sDotD = 0, sNorm1 = 0;
+            var dAttnLogits = new double[F];
+            ComputeAttentionLogitGradients(attn, dAttn, F, w.UseSparsemax, dAttnLogits);
+
+            var dAttnBnOut = new double[F];
+            var dAttnInput = new double[F];
+            double attnMeanDy = 0.0, attnMeanDyXn = 0.0;
             for (int j = 0; j < F; j++)
-                if (attn[j] > Eps) { sDotD += attn[j] * dAttn[j]; sNorm1 += attn[j]; }
-            double correction = sNorm1 > Eps ? sDotD / sNorm1 : 0;
+            {
+                double prior = s < fwd.StepPriorScales.Length && j < fwd.StepPriorScales[s].Length
+                    ? fwd.StepPriorScales[s][j]
+                    : 1.0;
+                dAttnBnOut[j] = dAttnLogits[j] * prior;
+
+                double xn = s < fwd.StepAttnXNorm.Length && j < fwd.StepAttnXNorm[s].Length
+                    ? fwd.StepAttnXNorm[s][j]
+                    : 0.0;
+                grad.BnGamma[s][j] += dAttnBnOut[j] * xn;
+                grad.BnBeta[s][j]  += dAttnBnOut[j];
+                attnMeanDy += dAttnBnOut[j];
+                attnMeanDyXn += dAttnBnOut[j] * xn;
+            }
+
+            attnMeanDy /= F;
+            attnMeanDyXn /= F;
+
+            for (int j = 0; j < F; j++)
+            {
+                double bnVar = w.BnVar[s].Length > j ? w.BnVar[s][j] : 1.0;
+                double invStd = Math.Min(1.0 / Math.Sqrt(bnVar + BnEpsilon), MaxInvStd);
+                double xn = s < fwd.StepAttnXNorm.Length && j < fwd.StepAttnXNorm[s].Length
+                    ? fwd.StepAttnXNorm[s][j]
+                    : 0.0;
+                dAttnInput[j] = w.BnGamma[s][j] * invStd * (dAttnBnOut[j] - attnMeanDy - xn * attnMeanDyXn);
+            }
 
             if (s > 0)
             {
+                var dPrevStep = new double[H];
                 double[] hPrevStep = s - 1 < fwd.StepH.Length ? fwd.StepH[s - 1] : new double[H];
                 for (int j = 0; j < F; j++)
                 {
-                    double dLogitJ = attn[j] > Eps ? (dAttn[j] - correction) : 0;
-                    if (Math.Abs(dLogitJ) < 1e-20) continue;
-                    double prior = s < fwd.StepPriorScales.Length && j < fwd.StepPriorScales[s].Length
-                        ? fwd.StepPriorScales[s][j] : 1.0;
-                    double bnVar = w.BnVar[s].Length > j ? w.BnVar[s][j] : 1.0;
-                    double invStd = Math.Min(1.0 / Math.Sqrt(bnVar + BnEpsilon), MaxInvStd);
-                    double dFcJ = dLogitJ * prior * w.BnGamma[s][j] * invStd;
-                    for (int k = 0; k < H && k < w.AttnFcW[s][j].Length; k++)
-                        grad.AttnFcW[s][j][k] += dFcJ * (k < hPrevStep.Length ? hPrevStep[k] : 0);
+                    double dFcJ = dAttnInput[j];
+                    if (Math.Abs(dFcJ) < 1e-20) continue;
+                    int attnDim = Math.Min(H, w.AttnFcW[s][j].Length);
+                    for (int k = 0; k < attnDim; k++)
+                    {
+                        double hPrevK = k < hPrevStep.Length ? hPrevStep[k] : 0.0;
+                        grad.AttnFcW[s][j][k] += dFcJ * hPrevK;
+                        dPrevStep[k] += dFcJ * w.AttnFcW[s][j][k];
+                    }
                     grad.AttnFcB[s][j] += dFcJ;
                 }
+
+                Array.Copy(dPrevStep, dFutureStep, H);
             }
             else if (w.InitialBnFcW.Length > 0)
             {
                 for (int j = 0; j < F; j++)
                 {
-                    double dLogitJ = attn[j] > Eps ? (dAttn[j] - correction) : 0;
-                    if (Math.Abs(dLogitJ) < 1e-20) continue;
-                    double prior = fwd.StepPriorScales[0].Length > j ? fwd.StepPriorScales[0][j] : 1.0;
-                    double bnVar = w.BnVar[0].Length > j ? w.BnVar[0][j] : 1.0;
-                    double invStd = Math.Min(1.0 / Math.Sqrt(bnVar + BnEpsilon), MaxInvStd);
-                    double dFcJ = dLogitJ * prior * w.BnGamma[0][j] * invStd;
+                    double dFcJ = dAttnInput[j];
+                    if (Math.Abs(dFcJ) < 1e-20) continue;
                     for (int k = 0; k < F; k++)
                         grad.InitialBnFcW[j][k] += dFcJ * features[k];
                     grad.InitialBnFcB[j] += dFcJ;
                 }
+
+                Array.Clear(dFutureStep, 0, H);
+            }
+            else
+            {
+                Array.Clear(dFutureStep, 0, H);
             }
         }
     }

@@ -481,7 +481,20 @@ public sealed class MLSignalScorer : IMLSignalScorer
             {
                 try
                 {
-                    return JsonSerializer.Deserialize<ModelSnapshot>(model.ModelBytes!, JsonOptions);
+                    var snapshot = JsonSerializer.Deserialize<ModelSnapshot>(model.ModelBytes!, JsonOptions);
+                    if (snapshot is not null &&
+                        string.Equals(snapshot.Type, "TABNET", StringComparison.OrdinalIgnoreCase))
+                    {
+                        snapshot = TabNetSnapshotSupport.NormalizeSnapshotCopy(snapshot);
+                        var validation = TabNetSnapshotSupport.ValidateNormalizedSnapshot(snapshot, allowLegacyV2: true);
+                        if (!validation.IsValid &&
+                            !(snapshot.Weights is { Length: > 0 } && snapshot.TabNetSharedWeights is not { Length: > 0 }))
+                        {
+                            return null;
+                        }
+                    }
+
+                    return snapshot;
                 }
                 catch
                 {
@@ -898,6 +911,7 @@ public sealed class MLSignalScorer : IMLSignalScorer
         features = ApplyFractionalDifferencing(
             features, snap, candleWindow, modelFeatureCount,
             means, stds, cotEntry, symbol, timeframe, modelId);
+        InferenceHelpers.ApplyModelSpecificFeatureTransforms(features, snap);
         ApplyFeatureMask(features, snap.ActiveFeatureMask, modelFeatureCount);
 
         var engine = ResolveEngine(snap);
@@ -960,6 +974,7 @@ public sealed class MLSignalScorer : IMLSignalScorer
         altFeatures = ApplyFractionalDifferencing(
             altFeatures, altSnap, altWindow, altFc,
             altSnap.Means, altSnap.Stds, cotEntry, altModel.Symbol, tf, altModel.Id);
+        InferenceHelpers.ApplyModelSpecificFeatureTransforms(altFeatures, altSnap);
         ApplyFeatureMask(altFeatures, altSnap.ActiveFeatureMask, altFc);
 
         var altEngine = ResolveEngine(altSnap);
@@ -1210,6 +1225,7 @@ public sealed class MLSignalScorer : IMLSignalScorer
             features, snap, orderedCandles, featureCount, useMeans, useStds, cotEntry,
             signal.Symbol, signalTimeframe, modelId);
 
+        InferenceHelpers.ApplyModelSpecificFeatureTransforms(features, snap);
         ApplyFeatureMask(features, snap.ActiveFeatureMask, featureCount);
 
         return new FeaturePipelineResult(
@@ -1274,6 +1290,18 @@ public sealed class MLSignalScorer : IMLSignalScorer
             features, featureCount,
             snap.FeatureVariances ?? Array.Empty<double>(),
             snap.OodThreshold, DefaultOodThresholdSigma);
+
+        if (string.Equals(snap.Type, "TABNET", StringComparison.OrdinalIgnoreCase) &&
+            snap.TabNetUncertaintyThreshold > 0.0 &&
+            ensembleStd > snap.TabNetUncertaintyThreshold)
+        {
+            isOod = true;
+            oodMahalanobisScore = Math.Max(oodMahalanobisScore ?? 0.0, ensembleStd);
+            _logger.LogDebug(
+                "TabNet uncertainty escalation for {Symbol}/{Tf} model {Id}: uncertainty={Uncertainty:F3} threshold={Threshold:F3} schema={SchemaFp} preproc={PreprocFp}",
+                signal.Symbol, signalTimeframe, model.Id, ensembleStd, snap.TabNetUncertaintyThreshold,
+                snap.FeatureSchemaFingerprint, snap.PreprocessingFingerprint);
+        }
 
         if (isOod)
             _logger.LogDebug(

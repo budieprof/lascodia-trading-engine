@@ -1,5 +1,6 @@
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.MLModels.Shared;
+using LascodiaTradingEngine.Application.Services.Inference;
 using LascodiaTradingEngine.Domain.Entities;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Caching.Memory;
@@ -151,8 +152,8 @@ public sealed class MLOnlinePlattWorker : BackgroundService
             // Global Platt-only online updates are not correct once downstream calibration
             // layers are active, because live inference will still run the class-conditional
             // and/or isotonic stages that were fit to the old global surface.
-            if (snap.PlattABuy != 0.0 ||
-                snap.PlattASell != 0.0 ||
+            if (InferenceHelpers.HasMeaningfulConditionalCalibration(snap.PlattABuy, snap.PlattBBuy) ||
+                InferenceHelpers.HasMeaningfulConditionalCalibration(snap.PlattASell, snap.PlattBSell) ||
                 snap.IsotonicBreakpoints.Length >= 4)
                 continue;
 

@@ -11,7 +11,7 @@ public sealed partial class TabNetModelTrainer
 
     private static TabNetWeights InitializeWeights(
         int F, int nSteps, int hiddenDim, int attentionDim,
-        int sharedLayers, int stepLayers, double gamma, bool useSparsemax, bool useMagHead)
+        int sharedLayers, int stepLayers, double gamma, bool useSparsemax, bool useGlu, bool useMagHead)
     {
         var rng = new Random(42);
         int totalBn = nSteps + sharedLayers + nSteps * stepLayers;
@@ -26,6 +26,7 @@ public sealed partial class TabNetModelTrainer
             StepLayers   = stepLayers,
             Gamma        = gamma,
             UseSparsemax = useSparsemax,
+            UseGlu       = useGlu,
             TotalBnLayers = totalBn,
 
             // Initial BN FC for step-0 attention symmetry
@@ -64,7 +65,7 @@ public sealed partial class TabNetModelTrainer
             w.StepGW[s] = InitFcLayers(rng, stepLayers, hiddenDim, hiddenDim, hiddenDim);
             w.StepGB[s] = InitBiasLayers(stepLayers, hiddenDim);
 
-            w.AttnFcW[s] = XavierMatrix(rng, F, hiddenDim);
+            w.AttnFcW[s] = XavierMatrix(rng, F, attentionDim);
             w.AttnFcB[s] = new double[F];
         }
 
@@ -100,8 +101,45 @@ public sealed partial class TabNetModelTrainer
 
     private static TabNetWeights InitializeGradAccumulator(TabNetWeights w)
     {
-        return InitializeWeights(w.F, w.NSteps, w.HiddenDim, w.AttentionDim,
-            w.SharedLayers, w.StepLayers, w.Gamma, w.UseSparsemax, w.MagW.Length > 0);
+        return new TabNetWeights
+        {
+            NSteps = w.NSteps,
+            F = w.F,
+            HiddenDim = w.HiddenDim,
+            AttentionDim = w.AttentionDim,
+            SharedLayers = w.SharedLayers,
+            StepLayers = w.StepLayers,
+            Gamma = w.Gamma,
+            UseSparsemax = w.UseSparsemax,
+            UseGlu = w.UseGlu,
+            TotalBnLayers = w.TotalBnLayers,
+
+            InitialBnFcW = ZeroDim2(w.InitialBnFcW),
+            InitialBnFcB = new double[w.InitialBnFcB.Length],
+
+            SharedW = ZeroDim3(w.SharedW),
+            SharedB = ZeroDim2(w.SharedB),
+            SharedGW = ZeroDim3(w.SharedGW),
+            SharedGB = ZeroDim2(w.SharedGB),
+
+            StepW = ZeroDim4(w.StepW),
+            StepB = ZeroDim3(w.StepB),
+            StepGW = ZeroDim4(w.StepGW),
+            StepGB = ZeroDim3(w.StepGB),
+
+            AttnFcW = ZeroDim3(w.AttnFcW),
+            AttnFcB = ZeroDim2(w.AttnFcB),
+
+            BnGamma = ZeroDim2(w.BnGamma),
+            BnBeta = ZeroDim2(w.BnBeta),
+            BnMean = ZeroDim2(w.BnMean),
+            BnVar = ZeroDim2(w.BnVar),
+
+            OutputW = new double[w.OutputW.Length],
+            OutputB = 0.0,
+            MagW = new double[w.MagW.Length],
+            MagB = 0.0,
+        };
     }
 
     private static AdamState InitializeAdamState(TabNetWeights w)
@@ -179,7 +217,7 @@ public sealed partial class TabNetModelTrainer
             NSteps = src.NSteps, F = src.F, HiddenDim = src.HiddenDim,
             AttentionDim = src.AttentionDim, SharedLayers = src.SharedLayers,
             StepLayers = src.StepLayers, Gamma = src.Gamma,
-            UseSparsemax = src.UseSparsemax, TotalBnLayers = src.TotalBnLayers,
+            UseSparsemax = src.UseSparsemax, UseGlu = src.UseGlu, TotalBnLayers = src.TotalBnLayers,
 
             InitialBnFcW = DeepClone2(src.InitialBnFcW),
             InitialBnFcB = (double[])src.InitialBnFcB.Clone(),
@@ -205,6 +243,8 @@ public sealed partial class TabNetModelTrainer
         // Shared layers — copy overlapping region even if dimensions differ
         int minShared = Math.Min(src.SharedLayers, dst.SharedLayers);
         int minH = Math.Min(src.HiddenDim, dst.HiddenDim);
+        int minF = Math.Min(src.F, dst.F);
+        int minAtt = Math.Min(src.AttentionDim, dst.AttentionDim);
         for (int l = 0; l < minShared; l++)
         {
             CopyMatrixPartial(src.SharedW[l], dst.SharedW[l], minH);
@@ -224,12 +264,24 @@ public sealed partial class TabNetModelTrainer
                 CopyMatrixPartial(src.StepGW[s][l], dst.StepGW[s][l], minH);
                 CopyArrayPartial(src.StepGB[s][l], dst.StepGB[s][l], minH);
             }
+
+            CopyMatrixPartial(src.AttnFcW[s], dst.AttnFcW[s], minF, minAtt);
+            CopyArrayPartial(src.AttnFcB[s], dst.AttnFcB[s], minF);
+        }
+
+        int minBn = Math.Min(src.TotalBnLayers, dst.TotalBnLayers);
+        for (int b = 0; b < minBn; b++)
+        {
+            int minBnDim = Math.Min(src.BnGamma[b].Length, dst.BnGamma[b].Length);
+            CopyArrayPartial(src.BnGamma[b], dst.BnGamma[b], minBnDim);
+            CopyArrayPartial(src.BnBeta[b], dst.BnBeta[b], minBnDim);
+            CopyArrayPartial(src.BnMean[b], dst.BnMean[b], minBnDim);
+            CopyArrayPartial(src.BnVar[b], dst.BnVar[b], minBnDim);
         }
 
         // Initial BN FC
         if (src.InitialBnFcW.Length > 0 && dst.InitialBnFcW.Length > 0)
         {
-            int minF = Math.Min(src.F, dst.F);
             CopyMatrixPartial(src.InitialBnFcW, dst.InitialBnFcW, minF);
             CopyArrayPartial(src.InitialBnFcB, dst.InitialBnFcB, minF);
         }
@@ -237,10 +289,15 @@ public sealed partial class TabNetModelTrainer
 
     private static void CopyMatrixPartial(double[][] src, double[][] dst, int maxDim)
     {
-        int rows = Math.Min(Math.Min(src.Length, dst.Length), maxDim);
+        CopyMatrixPartial(src, dst, maxDim, maxDim);
+    }
+
+    private static void CopyMatrixPartial(double[][] src, double[][] dst, int maxRows, int maxCols)
+    {
+        int rows = Math.Min(Math.Min(src.Length, dst.Length), maxRows);
         for (int i = 0; i < rows; i++)
         {
-            int cols = Math.Min(Math.Min(src[i].Length, dst[i].Length), maxDim);
+            int cols = Math.Min(Math.Min(src[i].Length, dst[i].Length), maxCols);
             Array.Copy(src[i], dst[i], cols);
         }
     }
@@ -255,73 +312,125 @@ public sealed partial class TabNetModelTrainer
     //  WARM-START LOADING FROM MODEL SNAPSHOT
     // ═══════════════════════════════════════════════════════════════════════
 
-    private void LoadWarmStartWeights(ModelSnapshot snapshot, TabNetWeights w)
+    private TabNetSnapshotSupport.WarmStartLoadReport LoadWarmStartWeights(ModelSnapshot snapshot, TabNetWeights w)
     {
+        snapshot = TabNetSnapshotSupport.NormalizeSnapshotCopy(snapshot);
+        var validation = TabNetSnapshotSupport.ValidateNormalizedSnapshot(snapshot, allowLegacyV2: false);
+        if (!validation.IsValid)
+        {
+            _logger.LogWarning(
+                "TabNet warm-start rejected — invalid snapshot contract: {Issues}",
+                string.Join("; ", validation.Issues));
+            return new TabNetSnapshotSupport.WarmStartLoadReport(0, 0, 0, 0, 1);
+        }
+
+        int attempted = 0, reused = 0, resized = 0, skipped = 0, rejected = 0;
+
+        void CopyArrayTracked(double[]? src, double[] dst)
+        {
+            attempted += dst.Length;
+            if (src is null || src.Length == 0)
+            {
+                skipped += dst.Length;
+                return;
+            }
+
+            int len = Math.Min(src.Length, dst.Length);
+            Array.Copy(src, dst, len);
+            reused += len;
+            if (src.Length != dst.Length)
+                resized += len;
+            if (dst.Length > len)
+                skipped += dst.Length - len;
+        }
+
+        void CopyMatrixTracked(double[][]? src, double[][] dst)
+        {
+            for (int i = 0; i < dst.Length; i++)
+            {
+                if (src is null || i >= src.Length)
+                {
+                    attempted += dst[i].Length;
+                    skipped += dst[i].Length;
+                    continue;
+                }
+
+                attempted += dst[i].Length;
+                int len = Math.Min(src[i].Length, dst[i].Length);
+                Array.Copy(src[i], dst[i], len);
+                reused += len;
+                if (src[i].Length != dst[i].Length)
+                    resized += len;
+                if (dst[i].Length > len)
+                    skipped += dst[i].Length - len;
+            }
+        }
+
         try
         {
             if (snapshot.TabNetSharedWeights is { } sw && sw.Length == w.SharedLayers)
                 for (int l = 0; l < w.SharedLayers; l++)
-                    CopyMatrix(sw[l], w.SharedW[l]);
+                    CopyMatrixTracked(sw[l], w.SharedW[l]);
 
             if (snapshot.TabNetSharedBiases is { } sb && sb.Length == w.SharedLayers)
                 for (int l = 0; l < w.SharedLayers; l++)
-                    CopyArray(sb[l], w.SharedB[l]);
+                    CopyArrayTracked(sb[l], w.SharedB[l]);
 
             if (snapshot.TabNetSharedGateWeights is { } sgw && sgw.Length == w.SharedLayers)
                 for (int l = 0; l < w.SharedLayers; l++)
-                    CopyMatrix(sgw[l], w.SharedGW[l]);
+                    CopyMatrixTracked(sgw[l], w.SharedGW[l]);
 
             if (snapshot.TabNetSharedGateBiases is { } sgb && sgb.Length == w.SharedLayers)
                 for (int l = 0; l < w.SharedLayers; l++)
-                    CopyArray(sgb[l], w.SharedGB[l]);
+                    CopyArrayTracked(sgb[l], w.SharedGB[l]);
 
             if (snapshot.TabNetStepFcWeights is { } sfcw && sfcw.Length == w.NSteps)
                 for (int s = 0; s < w.NSteps; s++)
                     if (sfcw[s].Length == w.StepLayers)
                         for (int l = 0; l < w.StepLayers; l++)
-                            CopyMatrix(sfcw[s][l], w.StepW[s][l]);
+                            CopyMatrixTracked(sfcw[s][l], w.StepW[s][l]);
 
             if (snapshot.TabNetStepFcBiases is { } sfcb && sfcb.Length == w.NSteps)
                 for (int s = 0; s < w.NSteps; s++)
                     if (sfcb[s].Length == w.StepLayers)
                         for (int l = 0; l < w.StepLayers; l++)
-                            CopyArray(sfcb[s][l], w.StepB[s][l]);
+                            CopyArrayTracked(sfcb[s][l], w.StepB[s][l]);
 
             if (snapshot.TabNetStepGateWeights is { } sgwS && sgwS.Length == w.NSteps)
                 for (int s = 0; s < w.NSteps; s++)
                     if (sgwS[s].Length == w.StepLayers)
                         for (int l = 0; l < w.StepLayers; l++)
-                            CopyMatrix(sgwS[s][l], w.StepGW[s][l]);
+                            CopyMatrixTracked(sgwS[s][l], w.StepGW[s][l]);
 
             if (snapshot.TabNetStepGateBiases is { } sgbS && sgbS.Length == w.NSteps)
                 for (int s = 0; s < w.NSteps; s++)
                     if (sgbS[s].Length == w.StepLayers)
                         for (int l = 0; l < w.StepLayers; l++)
-                            CopyArray(sgbS[s][l], w.StepGB[s][l]);
+                            CopyArrayTracked(sgbS[s][l], w.StepGB[s][l]);
 
             if (snapshot.TabNetAttentionFcWeights is { } afw && afw.Length == w.NSteps)
                 for (int s = 0; s < w.NSteps; s++)
-                    CopyMatrix(afw[s], w.AttnFcW[s]);
+                    CopyMatrixTracked(afw[s], w.AttnFcW[s]);
 
             if (snapshot.TabNetAttentionFcBiases is { } afb && afb.Length == w.NSteps)
                 for (int s = 0; s < w.NSteps; s++)
-                    CopyArray(afb[s], w.AttnFcB[s]);
+                    CopyArrayTracked(afb[s], w.AttnFcB[s]);
 
             if (snapshot.TabNetBnGammas is { } bng && bng.Length == w.TotalBnLayers)
                 for (int b = 0; b < w.TotalBnLayers; b++)
-                    CopyArray(bng[b], w.BnGamma[b]);
+                    CopyArrayTracked(bng[b], w.BnGamma[b]);
 
             if (snapshot.TabNetBnBetas is { } bnb && bnb.Length == w.TotalBnLayers)
                 for (int b = 0; b < w.TotalBnLayers; b++)
-                    CopyArray(bnb[b], w.BnBeta[b]);
+                    CopyArrayTracked(bnb[b], w.BnBeta[b]);
 
             if (snapshot.TabNetBnRunningMeans is { } bnm && bnm.Length == w.TotalBnLayers)
                 for (int b = 0; b < w.TotalBnLayers; b++)
-                    CopyArray(bnm[b], w.BnMean[b]);
+                    CopyArrayTracked(bnm[b], w.BnMean[b]);
 
             if (snapshot.TabNetBnRunningVars is { } bnv && bnv.Length == w.TotalBnLayers)
                 for (int b = 0; b < w.TotalBnLayers; b++)
-                    CopyArray(bnv[b], w.BnVar[b]);
+                    CopyArrayTracked(bnv[b], w.BnVar[b]);
 
             if (snapshot.TabNetOutputHeadWeights is { } ohw && ohw.Length == w.HiddenDim)
                 Array.Copy(ohw, w.OutputW, w.HiddenDim);
@@ -333,13 +442,16 @@ public sealed partial class TabNetModelTrainer
 
             // Load initial BN FC weights
             if (snapshot.TabNetInitialBnFcW is { } ibfw && ibfw.Length == w.F)
-                CopyMatrix(ibfw, w.InitialBnFcW);
+                CopyMatrixTracked(ibfw, w.InitialBnFcW);
             if (snapshot.TabNetInitialBnFcB is { } ibfb && ibfb.Length == w.F)
-                Array.Copy(ibfb, w.InitialBnFcB, w.F);
+                CopyArrayTracked(ibfb, w.InitialBnFcB);
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "TabNet warm-start: failed to load v3 weights, starting fresh.");
+            rejected++;
         }
+
+        return new TabNetSnapshotSupport.WarmStartLoadReport(attempted, reused, resized, skipped, rejected);
     }
 }

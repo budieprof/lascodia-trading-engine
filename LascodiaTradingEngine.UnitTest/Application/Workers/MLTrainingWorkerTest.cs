@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -7,6 +8,9 @@ using MockQueryable.Moq;
 using MediatR;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Services;
+using LascodiaTradingEngine.Application.Services.Inference;
+using LascodiaTradingEngine.Application.Services.ML;
 using LascodiaTradingEngine.Application.Workers;
 using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Domain.Entities;
@@ -215,6 +219,55 @@ public class MLTrainingWorkerTest
         return candles;
     }
 
+    private static List<TrainingSample> GenerateTabNetSamples(int count, int featureCount = 12)
+    {
+        var rng = new Random(42);
+        var samples = new List<TrainingSample>(count);
+        for (int i = 0; i < count; i++)
+        {
+            var features = new float[featureCount];
+            for (int j = 0; j < featureCount; j++)
+                features[j] = (float)(rng.NextDouble() * 2 - 1);
+
+            int direction = features[0] > 0 ? 1 : 0;
+            float magnitude = Math.Abs(features[0]) * 0.5f;
+            samples.Add(new TrainingSample(features, direction, magnitude));
+        }
+
+        return samples;
+    }
+
+    private static TrainingHyperparams CreateTabNetHyperparams() => new(
+        K: 3, LearningRate: 0.01, L2Lambda: 0.001, MaxEpochs: 8,
+        EarlyStoppingPatience: 3, MinAccuracyToPromote: 0.50, MinExpectedValue: -0.10,
+        MaxBrierScore: 0.30, MinSharpeRatio: -1.0, MinSamples: 50,
+        ShadowRequiredTrades: 30, ShadowExpiryDays: 14, WalkForwardFolds: 2,
+        EmbargoBarCount: 10, TrainingTimeoutMinutes: 30, TemporalDecayLambda: 1.0,
+        DriftWindowDays: 14, DriftMinPredictions: 30, DriftAccuracyThreshold: 0.50,
+        MaxWalkForwardStdDev: 0.15, LabelSmoothing: 0.0, MinFeatureImportance: 4.0,
+        EnableRegimeSpecificModels: false, FeatureSampleRatio: 1.0, MaxEce: 0.10,
+        UseTripleBarrier: false, TripleBarrierProfitAtrMult: 2.0,
+        TripleBarrierStopAtrMult: 1.0, TripleBarrierHorizonBars: 24,
+        NoiseSigma: 0, FpCostWeight: 1.0, NclLambda: 0, FracDiffD: 0,
+        MaxFoldDrawdown: 1.0, MinFoldCurveSharpe: -999, PolyLearnerFraction: 1.0,
+        PurgeHorizonBars: 0, NoiseCorrectionThreshold: 0.4, MaxLearnerCorrelation: 0.95,
+        SwaStartEpoch: 0, SwaFrequency: 1, MixupAlpha: 0.0,
+        EnableGreedyEnsembleSelection: false, MaxGradNorm: 0.0,
+        AtrLabelSensitivity: 0.0, ShadowMinZScore: 1.645,
+        L1Lambda: 0.0, MagnitudeQuantileTau: 0.0, MagLossWeight: 0.0,
+        DensityRatioWindowDays: 0, BarsPerDay: 24,
+        DurbinWatsonThreshold: 0.0, AdaptiveLrDecayFactor: 0.0,
+        OobPruningEnabled: false, MutualInfoRedundancyThreshold: 0.0,
+        MinSharpeTrendSlope: -99.0, FitTemperatureScale: false,
+        MinBrierSkillScore: -1.0, RecalibrationDecayLambda: 0.0,
+        MaxEnsembleDiversity: 1.0, UseSymmetricCE: false,
+        SymmetricCeAlpha: 0.0, DiversityLambda: 0.0,
+        UseAdaptiveLabelSmoothing: false, AgeDecayLambda: 0.0,
+        UseCovariateShiftWeights: false, MaxBadFoldFraction: 0.5,
+        MinQualityRetentionRatio: 0.0, MultiTaskMagnitudeWeight: 0.3,
+        CurriculumEasyFraction: 0.3, SelfDistillTemp: 3.0,
+        FgsmEpsilon: 0.01, MinF1Score: 0.10, UseClassWeights: true);
+
     private static TrainingResult MakeTrainingResult(
         double accuracy  = 0.65,
         double ev        = 0.05,
@@ -345,6 +398,41 @@ public class MLTrainingWorkerTest
         })!;
 
         await task;
+    }
+
+    private async Task<(byte[] FinalModelBytes, decimal PlattA, decimal PlattB)> InvokePatchSnapshotAsync(
+        byte[] rawModelBytes,
+        MLTrainingRun run,
+        List<Candle> candles,
+        List<TrainingSample> samples,
+        int buyCount,
+        int sellCount,
+        decimal imbalanceRatio,
+        CancellationToken ct = default)
+    {
+        var method = typeof(MLTrainingWorker).GetMethod(
+            "PatchSnapshotAsync",
+            BindingFlags.NonPublic | BindingFlags.Instance);
+        Assert.NotNull(method);
+
+        var task = (Task<(byte[] FinalModelBytes, decimal PlattA, decimal PlattB)>)method!.Invoke(_worker, new object[]
+        {
+            rawModelBytes,
+            run,
+            candles,
+            samples,
+            buyCount,
+            sellCount,
+            imbalanceRatio,
+            -1f,
+            1f,
+            -1f,
+            1f,
+            _mockWriteDbContext.Object,
+            ct,
+        })!;
+
+        return await task;
     }
 
     /// <summary>
@@ -766,5 +854,60 @@ public class MLTrainingWorkerTest
         Assert.Equal(RunStatus.Failed, run.Status);
         Assert.NotNull(run.ErrorMessage);
         Assert.Contains("data quality", run.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact(Timeout = 120000)]
+    public async Task PatchSnapshotAsync_TabNetSnapshot_RemainsInferenceCompatible()
+    {
+        SetupEmptyDefaults();
+
+        var trainer = new TabNetModelTrainer(Mock.Of<ILogger<TabNetModelTrainer>>());
+        var samples = GenerateTabNetSamples(240);
+        var hp = CreateTabNetHyperparams() with
+        {
+            TabNetAttentionDim = 4,
+            TabNetUseSparsemax = false,
+        };
+
+        var trainingResult = await trainer.TrainAsync(samples, hp);
+        var run = MakeRun();
+        var candles = GenerateCandles(run.Symbol, run.Timeframe, 600, run.FromDate);
+        int buyCount = samples.Count(s => s.Direction > 0);
+        int sellCount = samples.Count - buyCount;
+        decimal imbalanceRatio = sellCount == 0 ? buyCount : (decimal)buyCount / sellCount;
+
+        var patched = await InvokePatchSnapshotAsync(
+            trainingResult.ModelBytes,
+            run,
+            candles,
+            samples,
+            buyCount,
+            sellCount,
+            imbalanceRatio);
+
+        var snapshot = JsonSerializer.Deserialize<ModelSnapshot>(patched.FinalModelBytes);
+        Assert.NotNull(snapshot);
+        Assert.Equal("TABNET", snapshot.Type);
+        Assert.NotNull(snapshot.FeatureVariances);
+        Assert.Equal(snapshot.Features.Length, snapshot.FeatureVariances.Length);
+        Assert.NotNull(snapshot.TabNetWarmStartArtifact);
+
+        int featureCount = snapshot.Features.Length;
+        float[] inferenceFeatures = MLSignalScorer.StandardiseFeatures(
+            samples[0].Features, snapshot.Means, snapshot.Stds, featureCount);
+        InferenceHelpers.ApplyModelSpecificFeatureTransforms(inferenceFeatures, snapshot);
+        MLSignalScorer.ApplyFeatureMask(inferenceFeatures, snapshot.ActiveFeatureMask, featureCount);
+
+        var engine = new TabNetInferenceEngine();
+        Assert.True(engine.CanHandle(snapshot));
+
+        var inference = engine.RunInference(
+            inferenceFeatures, featureCount, snapshot, new List<Candle>(), modelId: 1L, mcDropoutSamples: 0, mcDropoutSeed: 0);
+
+        Assert.NotNull(inference);
+        Assert.InRange(inference.Value.Probability, 0.0, 1.0);
+        Assert.True(double.IsFinite(inference.Value.EnsembleStd));
+        Assert.Equal((double)patched.PlattA, snapshot.PlattA, 6);
+        Assert.Equal((double)patched.PlattB, snapshot.PlattB, 6);
     }
 }

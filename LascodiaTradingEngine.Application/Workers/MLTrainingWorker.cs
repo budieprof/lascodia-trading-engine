@@ -10,6 +10,9 @@ using LascodiaTradingEngine.Application.AuditTrail.Commands.LogDecision;
 using LascodiaTradingEngine.Application.Common.Events;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.MLModels.Shared;
+using LascodiaTradingEngine.Application.Services;
+using LascodiaTradingEngine.Application.Services.Inference;
+using LascodiaTradingEngine.Application.Services.ML;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 using LascodiaTradingEngine.Application.Common.WorkerGroups;
@@ -751,6 +754,8 @@ public sealed class MLTrainingWorker : BackgroundService
             // ── Extract snapshot fields needed before quality gate ───────────
             double snapEce = 0.0;
             double snapBss = double.NegativeInfinity;
+            bool snapshotContractValid = true;
+            string snapshotContractIssues = string.Empty;
             if (result.ModelBytes is { Length: > 0 })
             {
                 try
@@ -758,6 +763,13 @@ public sealed class MLTrainingWorker : BackgroundService
                     var snapForGate = JsonSerializer.Deserialize<ModelSnapshot>(result.ModelBytes);
                     if (snapForGate is not null)
                     {
+                        if (string.Equals(snapForGate.Type, "TABNET", StringComparison.OrdinalIgnoreCase))
+                        {
+                            snapForGate = TabNetSnapshotSupport.NormalizeSnapshotCopy(snapForGate);
+                            var validation = TabNetSnapshotSupport.ValidateSnapshot(snapForGate, allowLegacyV2: true);
+                            snapshotContractValid = validation.IsValid;
+                            snapshotContractIssues = string.Join("; ", validation.Issues);
+                        }
                         snapEce = snapForGate.Ece;
                         snapBss = snapForGate.BrierSkillScore;
                     }
@@ -865,6 +877,7 @@ public sealed class MLTrainingWorker : BackgroundService
                 cvCheck.StdAccuracy  <= hp.MaxWalkForwardStdDev                                    &&
                 (hp.MaxEce <= 0 || snapEce <= hp.MaxEce)                                           &&
                 (hp.MinBrierSkillScore <= -1.0 || snapBss >= hp.MinBrierSkillScore)                &&
+                snapshotContractValid                                                               &&
                 !qualityRegressionFailed;
 
             _logger.LogInformation(
@@ -873,7 +886,7 @@ public sealed class MLTrainingWorker : BackgroundService
                 "f1={F1:F3}/{MinF1:F3} regime={Regime} f1Passed={F1Passed} evBypass={EvBypass} " +
                 "brierBypass={BrierBypass} " +
                 "wfStd={WfStd:P1}/{MaxWfStd:P1} ece={Ece:F4}/{MaxEce:F4} " +
-                "bss={Bss:F4}/{MinBss:F4} oobReg={OobNew:P1}/{OobParent:P1} passed={Passed}",
+                "bss={Bss:F4}/{MinBss:F4} snapshotValid={SnapshotValid} oobReg={OobNew:P1}/{OobParent:P1} passed={Passed}",
                 m.Accuracy,              hp.MinAccuracyToPromote,
                 m.ExpectedValue,         hp.MinExpectedValue,
                 m.BrierScore,            brierCeiling,
@@ -883,7 +896,7 @@ public sealed class MLTrainingWorker : BackgroundService
                 brierBypassed,
                 cvCheck.StdAccuracy,     hp.MaxWalkForwardStdDev,
                 snapEce,                 hp.MaxEce,
-                snapBss,                 hp.MinBrierSkillScore,
+                snapBss,                 hp.MinBrierSkillScore, snapshotContractValid,
                 result.FinalMetrics.OobAccuracy, parentOobAccuracy,
                 passed);
 
@@ -900,6 +913,8 @@ public sealed class MLTrainingWorker : BackgroundService
             run.ErrorMessage       = passed ? null : BuildGateFailureMessage(
                 m, cvCheck, hp, snapEce, snapBss, result.FinalMetrics.OobAccuracy, parentOobAccuracy,
                 isTrending, trendingMinAccuracy, trendingMinEV, evBypassF1);
+            if (!passed && !snapshotContractValid)
+                run.ErrorMessage = $"Invalid model snapshot contract: {snapshotContractIssues}";
 
             // ── Training cost tracking (observability) ──────────────────────
             {
@@ -1428,6 +1443,9 @@ public sealed class MLTrainingWorker : BackgroundService
             if (snap is null)
                 return (finalModelBytes, plattA, plattB);
 
+            if (string.Equals(snap.Type, "TABNET", StringComparison.OrdinalIgnoreCase))
+                snap = TabNetSnapshotSupport.NormalizeSnapshotCopy(snap);
+
             plattA = (decimal)snap.PlattA;
             plattB = (decimal)snap.PlattB;
 
@@ -1437,24 +1455,30 @@ public sealed class MLTrainingWorker : BackgroundService
             snap.CotMomNormMin = cotMomMin;
             snap.CotMomNormMax = cotMomMax;
 
-            // Compute per-feature empirical variances from the standardised matrix.
-            // Under N(0,1) each variance should be ≈1.0; drift shows as deviation.
-            if (samples.Count > 0 && snap.Means.Length == MLFeatureHelper.FeatureCount)
+            // Compute per-feature empirical variances from the deployed feature pipeline.
+            // This keeps OOD gating aligned with the exact feature layout inference consumes.
+            if (samples.Count > 0)
             {
-                int f = MLFeatureHelper.FeatureCount;
+                int f = snap.Features.Length > 0 ? snap.Features.Length : snap.Means.Length;
                 var variances = new double[f];
+                var meansVec = new double[f];
+                int n = 0;
                 foreach (var s in samples)
                 {
-                    for (int fi = 0; fi < f && fi < s.Features.Length; fi++)
+                    float[] z = MLSignalScorer.StandardiseFeatures(s.Features, snap.Means, snap.Stds, f);
+                    InferenceHelpers.ApplyModelSpecificFeatureTransforms(z, snap);
+                    MLSignalScorer.ApplyFeatureMask(z, snap.ActiveFeatureMask, f);
+                    n++;
+                    for (int fi = 0; fi < f && fi < z.Length; fi++)
                     {
-                        double std = snap.Stds.Length > fi && snap.Stds[fi] > 0
-                            ? snap.Stds[fi] : 1.0;
-                        double z = (s.Features[fi] - snap.Means[fi]) / std;
-                        variances[fi] += z * z;
+                        double x = z[fi];
+                        double delta = x - meansVec[fi];
+                        meansVec[fi] += delta / n;
+                        variances[fi] += delta * (x - meansVec[fi]);
                     }
                 }
                 for (int fi = 0; fi < f; fi++)
-                    variances[fi] /= samples.Count;
+                    variances[fi] = n > 1 ? Math.Max(0.0, variances[fi] / (n - 1)) : 0.0;
                 snap.FeatureVariances = variances;
             }
 
@@ -1506,6 +1530,13 @@ public sealed class MLTrainingWorker : BackgroundService
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Run {RunId}: per-regime standardisation failed — skipped", run.Id);
+            }
+
+            if (string.Equals(snap.Type, "TABNET", StringComparison.OrdinalIgnoreCase))
+            {
+                var validation = TabNetSnapshotSupport.ValidateSnapshot(snap, allowLegacyV2: true);
+                if (!validation.IsValid)
+                    throw new InvalidOperationException($"Patched TabNet snapshot failed validation: {string.Join("; ", validation.Issues)}");
             }
 
             finalModelBytes = JsonSerializer.SerializeToUtf8Bytes(snap);

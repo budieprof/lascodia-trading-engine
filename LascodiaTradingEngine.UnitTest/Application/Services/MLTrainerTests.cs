@@ -2,7 +2,10 @@ using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using Moq;
 using LascodiaTradingEngine.Application.MLModels.Shared;
+using LascodiaTradingEngine.Application.Services;
+using LascodiaTradingEngine.Application.Services.Inference;
 using LascodiaTradingEngine.Application.Services.ML;
+using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.UnitTest.Application.Services;
@@ -574,6 +577,432 @@ public class MLTrainerTests
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
             () => trainer.TrainAsync(samples, DefaultHp(), ct: cts.Token));
+    }
+
+    [Fact(Timeout = 60000)]
+    public async Task TabNet_TrainAsync_PolySnapshotAndScorePath_RemainUsable()
+    {
+        var trainer = new TabNetModelTrainer(Mock.Of<ILogger<TabNetModelTrainer>>());
+        var samples = GenerateSamples(260, featureCount: 12);
+        var hp = DefaultHp() with
+        {
+            MaxEpochs = 8,
+            WalkForwardFolds = 2,
+            EarlyStoppingPatience = 3,
+            PolyLearnerFraction = 1.0,
+            MinFeatureImportance = 4.0,
+            TabNetAttentionDim = 4,
+            TabNetUseSparsemax = false,
+        };
+
+        var result = await trainer.TrainAsync(samples, hp);
+
+        var snap = JsonSerializer.Deserialize<ModelSnapshot>(result.ModelBytes);
+        Assert.NotNull(snap);
+        Assert.Equal("3.0", snap.Version);
+        Assert.False(snap.TabNetUseSparsemax);
+        Assert.Equal(samples[0].Features.Length, snap.TabNetRawFeatureCount);
+        Assert.NotNull(snap.TabNetPolyTopFeatureIndices);
+        Assert.True(snap.TabNetPolyTopFeatureIndices!.Length > 1);
+        Assert.True(snap.Features.Length > samples[0].Features.Length);
+        Assert.NotNull(snap.FeaturePipelineDescriptors);
+        Assert.NotEmpty(snap.FeaturePipelineDescriptors);
+        Assert.Equal(
+            snap.Features.Length - snap.TabNetRawFeatureCount,
+            snap.FeaturePipelineDescriptors.Sum(d => d.OutputCount));
+        Assert.False(string.IsNullOrWhiteSpace(snap.FeatureSchemaFingerprint));
+        Assert.False(string.IsNullOrWhiteSpace(snap.PreprocessingFingerprint));
+        Assert.False(string.IsNullOrWhiteSpace(snap.TrainerFingerprint));
+        Assert.True(snap.PrunedFeatureCount > 0, "Test setup should exercise the TabNet pruning path.");
+        Assert.NotNull(snap.TabNetAttentionFcWeights);
+        Assert.Equal(4, snap.TabNetAttentionFcWeights![0][0].Length);
+
+        int featureCount = snap.Features.Length;
+        float[] inferenceFeatures = MLSignalScorer.StandardiseFeatures(
+            samples[0].Features, snap.Means, snap.Stds, featureCount);
+        var beforeTransforms = (float[])inferenceFeatures.Clone();
+
+        InferenceHelpers.ApplyModelSpecificFeatureTransforms(inferenceFeatures, snap);
+
+        int rawFeatureCount = snap.TabNetRawFeatureCount;
+        int leftIdx = snap.TabNetPolyTopFeatureIndices[0];
+        int rightIdx = snap.TabNetPolyTopFeatureIndices[1];
+        Assert.Equal(beforeTransforms[leftIdx] * beforeTransforms[rightIdx], inferenceFeatures[rawFeatureCount], 5);
+
+        MLSignalScorer.ApplyFeatureMask(inferenceFeatures, snap.ActiveFeatureMask, featureCount);
+
+        var engine = new TabNetInferenceEngine();
+        var inference = engine.RunInference(
+            inferenceFeatures, featureCount, snap, new List<Candle>(), modelId: 1L, mcDropoutSamples: 0, mcDropoutSeed: 0);
+
+        Assert.NotNull(inference);
+        Assert.InRange(inference.Value.Probability, 0.0, 1.0);
+    }
+
+    [Fact]
+    public void TabNetInferenceEngine_UsesStepZeroProjection_AndHonorsSparsemaxFlag()
+    {
+        var engine = new TabNetInferenceEngine();
+        var features = new float[] { 1f, 0f };
+
+        var softmaxNoProjection = engine.RunInference(
+            features, features.Length, CreateSimpleTabNetSnapshot(useInitialProjection: false, useSparsemax: false),
+            new List<Candle>(), modelId: 1L, mcDropoutSamples: 0, mcDropoutSeed: 0);
+        var softmaxWithProjection = engine.RunInference(
+            features, features.Length, CreateSimpleTabNetSnapshot(useInitialProjection: true, useSparsemax: false),
+            new List<Candle>(), modelId: 1L, mcDropoutSamples: 0, mcDropoutSeed: 0);
+        var sparsemaxNoProjection = engine.RunInference(
+            features, features.Length, CreateSimpleTabNetSnapshot(useInitialProjection: false, useSparsemax: true),
+            new List<Candle>(), modelId: 1L, mcDropoutSamples: 0, mcDropoutSeed: 0);
+
+        Assert.NotNull(softmaxNoProjection);
+        Assert.NotNull(softmaxWithProjection);
+        Assert.NotNull(sparsemaxNoProjection);
+
+        Assert.True(
+            softmaxNoProjection.Value.Probability > softmaxWithProjection.Value.Probability + 0.10,
+            "Step-0 initial projection should materially change the deployed probability.");
+        Assert.True(
+            sparsemaxNoProjection.Value.Probability > softmaxNoProjection.Value.Probability + 0.05,
+            "Sparsemax and softmax should not collapse to the same deployed attention path.");
+    }
+
+    [Fact(Timeout = 60000)]
+    public async Task TabNet_TrainAsync_RawAndDeployedParity_HoldForSerializedSnapshot()
+    {
+        var trainer = new TabNetModelTrainer(Mock.Of<ILogger<TabNetModelTrainer>>());
+        var samples = GenerateSamples(220);
+        var hp = DefaultHp() with
+        {
+            MaxEpochs = 8,
+            WalkForwardFolds = 2,
+            EarlyStoppingPatience = 3,
+        };
+
+        var result = await trainer.TrainAsync(samples, hp);
+        var snap = JsonSerializer.Deserialize<ModelSnapshot>(result.ModelBytes);
+        Assert.NotNull(snap);
+
+        int featureCount = snap.Features.Length;
+        float[] inferenceFeatures = MLSignalScorer.StandardiseFeatures(
+            samples[0].Features, snap.Means, snap.Stds, featureCount);
+        InferenceHelpers.ApplyModelSpecificFeatureTransforms(inferenceFeatures, snap);
+        MLSignalScorer.ApplyFeatureMask(inferenceFeatures, snap.ActiveFeatureMask, featureCount);
+
+        double? expectedRaw = TabNetModelTrainer.ComputeRawProbabilityFromSnapshotForAudit(inferenceFeatures, snap);
+        Assert.NotNull(expectedRaw);
+
+        var engine = new TabNetInferenceEngine();
+        var inference = engine.RunInference(
+            inferenceFeatures, featureCount, snap, new List<Candle>(), modelId: 1L, mcDropoutSamples: 0, mcDropoutSeed: 0);
+
+        Assert.NotNull(inference);
+        Assert.Equal(expectedRaw.Value, inference.Value.Probability, 8);
+
+        double deployed = InferenceHelpers.ApplyDeployedCalibration(inference.Value.Probability, snap);
+        Assert.InRange(deployed, 0.0, 1.0);
+        Assert.True(snap.TabNetAuditArtifact is not null);
+        Assert.True(snap.TabNetAuditArtifact!.MaxRawParityError <= 1e-6);
+    }
+
+    [Fact(Timeout = 60000)]
+    public async Task TabNet_TrainAsync_Persists_DeployedCalibrationArtifact()
+    {
+        var trainer = new TabNetModelTrainer(Mock.Of<ILogger<TabNetModelTrainer>>());
+        var samples = GenerateSamples(220);
+        var hp = DefaultHp() with
+        {
+            MaxEpochs = 8,
+            WalkForwardFolds = 2,
+            EarlyStoppingPatience = 3,
+            FitTemperatureScale = true,
+        };
+
+        var result = await trainer.TrainAsync(samples, hp);
+        var snap = JsonSerializer.Deserialize<ModelSnapshot>(result.ModelBytes);
+        Assert.NotNull(snap);
+        Assert.NotNull(snap.TabNetCalibrationArtifact);
+
+        var artifact = snap.TabNetCalibrationArtifact!;
+        Assert.True(artifact.SelectedGlobalCalibration is "PLATT" or "TEMPERATURE");
+        Assert.Equal(artifact.TemperatureSelected, snap.TemperatureScale > 0.0);
+        Assert.True(artifact.GlobalPlattNll >= 0.0);
+        Assert.True(artifact.PreIsotonicNll >= 0.0);
+        Assert.True(artifact.PostIsotonicNll <= artifact.PreIsotonicNll + 1e-6);
+        Assert.Equal(artifact.IsotonicAccepted ? snap.IsotonicBreakpoints.Length / 2 : 0, artifact.IsotonicBreakpointCount);
+        Assert.Equal(
+            InferenceHelpers.HasMeaningfulConditionalCalibration(snap.PlattABuy, snap.PlattBBuy),
+            artifact.BuyBranchAccepted);
+        Assert.Equal(
+            InferenceHelpers.HasMeaningfulConditionalCalibration(snap.PlattASell, snap.PlattBSell),
+            artifact.SellBranchAccepted);
+        Assert.InRange(InferenceHelpers.ApplyDeployedCalibration(0.73, snap), 0.0, 1.0);
+    }
+
+    [Fact(Timeout = 60000)]
+    public async Task TabNet_TrainAsync_GluDisabled_AuditDiagnosticsRemainValid()
+    {
+        var trainer = new TabNetModelTrainer(Mock.Of<ILogger<TabNetModelTrainer>>());
+        var samples = GenerateSamples(240);
+        var hp = DefaultHp() with
+        {
+            MaxEpochs = 8,
+            WalkForwardFolds = 2,
+            EarlyStoppingPatience = 3,
+            TabNetUseGlu = false,
+        };
+
+        var result = await trainer.TrainAsync(samples, hp);
+
+        var snap = JsonSerializer.Deserialize<ModelSnapshot>(result.ModelBytes);
+        Assert.NotNull(snap);
+        Assert.False(snap.TabNetUseGlu);
+        Assert.NotNull(snap.TabNetPerStepSparsity);
+        Assert.Equal(snap.BaseLearnersK, snap.TabNetPerStepSparsity!.Length);
+        Assert.NotNull(snap.TabNetBnDriftByLayer);
+        Assert.True(snap.TabNetBnDriftByLayer!.Length > 0);
+        Assert.True(snap.TabNetAttentionEntropyThreshold > 0.0);
+        Assert.True(snap.TabNetUncertaintyThreshold > 0.0);
+        Assert.NotNull(snap.TabNetAuditFindings);
+        Assert.True(snap.TabNetTrainInferenceParityMaxError <= 1e-6);
+        Assert.DoesNotContain(
+            snap.TabNetAuditFindings!,
+            finding => finding.Contains("Missing TabNet", StringComparison.OrdinalIgnoreCase));
+        Assert.NotNull(snap.TabNetAuditArtifact);
+        Assert.True(snap.TabNetCalibrationResidualThreshold > 0.0);
+
+        int featureCount = snap.Features.Length;
+        float[] inferenceFeatures = MLSignalScorer.StandardiseFeatures(
+            samples[0].Features, snap.Means, snap.Stds, featureCount);
+        InferenceHelpers.ApplyModelSpecificFeatureTransforms(inferenceFeatures, snap);
+        MLSignalScorer.ApplyFeatureMask(inferenceFeatures, snap.ActiveFeatureMask, featureCount);
+
+        var engine = new TabNetInferenceEngine();
+        Assert.True(engine.CanHandle(snap));
+
+        var inference = engine.RunInference(
+            inferenceFeatures, featureCount, snap, new List<Candle>(), modelId: 1L, mcDropoutSamples: 0, mcDropoutSeed: 0);
+
+        Assert.NotNull(inference);
+        Assert.InRange(inference.Value.Probability, 0.0, 1.0);
+        Assert.True(double.IsFinite(inference.Value.EnsembleStd));
+    }
+
+    [Fact(Timeout = 60000)]
+    public async Task TabNet_TrainAsync_WithUnsupervisedPretraining_RemainsInferenceCompatible()
+    {
+        var trainer = new TabNetModelTrainer(Mock.Of<ILogger<TabNetModelTrainer>>());
+        var samples = GenerateSamples(260);
+        var hp = DefaultHp() with
+        {
+            MaxEpochs = 8,
+            WalkForwardFolds = 2,
+            EarlyStoppingPatience = 3,
+            TabNetPretrainEpochs = 2,
+            TabNetPretrainMaskFraction = 0.35,
+        };
+
+        var result = await trainer.TrainAsync(samples, hp);
+        var snap = JsonSerializer.Deserialize<ModelSnapshot>(result.ModelBytes);
+
+        Assert.NotNull(snap);
+        Assert.Equal("3.0", snap.Version);
+        Assert.NotNull(snap.TabNetAuditArtifact);
+        Assert.True(snap.TabNetTrainInferenceParityMaxError <= 1e-6);
+        Assert.NotNull(snap.TabNetWarmStartArtifact);
+        Assert.True(snap.TabNetWarmStartArtifact!.Attempted >= 0);
+
+        int featureCount = snap.Features.Length;
+        float[] inferenceFeatures = MLSignalScorer.StandardiseFeatures(
+            samples[0].Features, snap.Means, snap.Stds, featureCount);
+        InferenceHelpers.ApplyModelSpecificFeatureTransforms(inferenceFeatures, snap);
+        MLSignalScorer.ApplyFeatureMask(inferenceFeatures, snap.ActiveFeatureMask, featureCount);
+
+        double? expectedRaw = TabNetModelTrainer.ComputeRawProbabilityFromSnapshotForAudit(inferenceFeatures, snap);
+        Assert.NotNull(expectedRaw);
+
+        var engine = new TabNetInferenceEngine();
+        var inference = engine.RunInference(
+            inferenceFeatures, featureCount, snap, new List<Candle>(), modelId: 11L, mcDropoutSamples: 0, mcDropoutSeed: 0);
+
+        Assert.NotNull(inference);
+        Assert.Equal(expectedRaw.Value, inference.Value.Probability, 8);
+    }
+
+    [Fact]
+    public void TabNetSnapshotSupport_UpgradesLegacyFields_AndRejectsInvalidPolyLayouts()
+    {
+        var upgraded = CreateSimpleTabNetSnapshot(useInitialProjection: false, useSparsemax: true);
+        upgraded.TabNetOutputHeadWeights = null;
+        upgraded.TabNetOutputWeight = 0.75;
+        upgraded.TabNetOutputHeadBias = 0.0;
+        upgraded.Biases = [0.25];
+        upgraded.TabNetPerStepAttention = [new[] { 0.9, 0.1 }];
+        upgraded.TabNetPerStepSparsity = null;
+        upgraded.TabNetAuditFindings = null;
+
+        TabNetSnapshotSupport.UpgradeSnapshotInPlace(upgraded);
+        var upgradedValidation = TabNetSnapshotSupport.ValidateSnapshot(upgraded, allowLegacyV2: false);
+
+        Assert.True(upgradedValidation.IsValid, string.Join("; ", upgradedValidation.Issues));
+        Assert.NotNull(upgraded.TabNetOutputHeadWeights);
+        Assert.Single(upgraded.TabNetOutputHeadWeights!);
+        Assert.Equal(0.75, upgraded.TabNetOutputHeadWeights![0], 12);
+        Assert.Equal(0.25, upgraded.TabNetOutputHeadBias, 12);
+        Assert.NotNull(upgraded.TabNetPerStepSparsity);
+        Assert.Single(upgraded.TabNetPerStepSparsity!);
+        Assert.Equal(1.0, upgraded.TabNetPerStepSparsity![0], 12);
+        Assert.NotNull(upgraded.TabNetAuditFindings);
+        Assert.Empty(upgraded.TabNetAuditFindings!);
+
+        var invalidPoly = CreateSimpleTabNetSnapshot(useInitialProjection: false, useSparsemax: true);
+        invalidPoly.TabNetRawFeatureCount = 2;
+        invalidPoly.TabNetPolyTopFeatureIndices = [0, 1];
+        invalidPoly.FeaturePipelineTransforms = [TabNetSnapshotSupport.PolyInteractionsTransform];
+
+        var invalidValidation = TabNetSnapshotSupport.ValidateSnapshot(invalidPoly, allowLegacyV2: false);
+
+        Assert.False(invalidValidation.IsValid);
+        Assert.Contains(
+            invalidValidation.Issues,
+            issue => issue.Contains("Polynomial pipeline replay metadata", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void TabNetSnapshotSupport_NormalizeSnapshotCopy_DoesNotMutateSource_AndBackfillsFingerprints()
+    {
+        var legacy = CreateSimpleTabNetSnapshot(useInitialProjection: false, useSparsemax: true);
+        legacy.FeatureSchemaFingerprint = string.Empty;
+        legacy.PreprocessingFingerprint = string.Empty;
+        legacy.FeaturePipelineDescriptors = [];
+        legacy.TabNetPolyTopFeatureIndices = [0, 1];
+
+        var normalized = TabNetSnapshotSupport.NormalizeSnapshotCopy(legacy);
+
+        Assert.NotSame(legacy, normalized);
+        Assert.Empty(legacy.FeaturePipelineDescriptors);
+        Assert.NotEmpty(normalized.FeaturePipelineDescriptors);
+        Assert.True(string.IsNullOrWhiteSpace(legacy.FeatureSchemaFingerprint));
+        Assert.False(string.IsNullOrWhiteSpace(normalized.FeatureSchemaFingerprint));
+        Assert.False(string.IsNullOrWhiteSpace(normalized.PreprocessingFingerprint));
+        Assert.NotEqual(legacy.FeaturePipelineDescriptors.Length, normalized.FeaturePipelineDescriptors.Length);
+    }
+
+    [Fact]
+    public void TabNetInferenceEngine_GoldenSparsemaxSnapshot_ProbabilityStable()
+    {
+        var engine = new TabNetInferenceEngine();
+        var snapshot = CreateGoldenTabNetSnapshot();
+        var features = new float[] { 1f, 0f };
+
+        var inference = engine.RunInference(
+            features, features.Length, snapshot, new List<Candle>(), modelId: 7L, mcDropoutSamples: 0, mcDropoutSeed: 0);
+
+        Assert.NotNull(inference);
+        Assert.Equal(1.0 / (1.0 + Math.Exp(-1.0)), inference.Value.Probability, 10);
+        Assert.InRange(inference.Value.EnsembleStd, 0.0, 1.0);
+    }
+
+    [Fact]
+    public void TabNet_InferenceEngine_GoldenSnapshot_StaysWithinRuntimeBudget()
+    {
+        var engine = new TabNetInferenceEngine();
+        var snapshot = CreateGoldenTabNetSnapshot();
+        var features = new float[] { 1f, 0f };
+        var candles = new List<Candle>();
+
+        for (int i = 0; i < 10; i++)
+            engine.RunInference(features, features.Length, snapshot, candles, modelId: 7L, mcDropoutSamples: 0, mcDropoutSeed: 0);
+
+        long allocBefore = GC.GetAllocatedBytesForCurrentThread();
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+
+        for (int i = 0; i < 200; i++)
+        {
+            var inference = engine.RunInference(
+                features, features.Length, snapshot, candles, modelId: 7L, mcDropoutSamples: 0, mcDropoutSeed: 0);
+            Assert.NotNull(inference);
+        }
+
+        sw.Stop();
+        long totalAlloc = GC.GetAllocatedBytesForCurrentThread() - allocBefore;
+        double avgMs = sw.Elapsed.TotalMilliseconds / 200.0;
+
+        Assert.True(avgMs < 2.0, $"Average TabNet inference time {avgMs:F3}ms exceeded the 2ms budget.");
+        Assert.True(totalAlloc < 6_000_000, $"TabNet inference allocated {totalAlloc} bytes over 200 runs.");
+    }
+
+    private static ModelSnapshot CreateSimpleTabNetSnapshot(bool useInitialProjection, bool useSparsemax)
+    {
+        return new ModelSnapshot
+        {
+            Type = "TABNET",
+            Version = "3.0",
+            Features = ["F0", "F1"],
+            Means = [0f, 0f],
+            Stds = [1f, 1f],
+            BaseLearnersK = 1,
+            TabNetRawFeatureCount = 2,
+            TabNetUseSparsemax = useSparsemax,
+            TabNetHiddenDim = 1,
+            TabNetRelaxationGamma = 1.5,
+            TabNetSharedWeights = [new[] { new[] { 1.0, 1.0 } }],
+            TabNetSharedBiases = [new[] { 0.0 }],
+            TabNetSharedGateWeights = [new[] { new[] { 0.0, 0.0 } }],
+            TabNetSharedGateBiases = [new[] { 10.0 }],
+            TabNetStepFcWeights = [Array.Empty<double[][]>()],
+            TabNetStepFcBiases = [Array.Empty<double[]>()],
+            TabNetStepGateWeights = [Array.Empty<double[][]>()],
+            TabNetStepGateBiases = [Array.Empty<double[]>()],
+            TabNetAttentionFcWeights = [new[] { new[] { 0.0 }, new[] { 0.0 } }],
+            TabNetAttentionFcBiases = [new[] { 0.0, 0.0 }],
+            TabNetBnGammas = [new[] { 1.0, 1.0 }, new[] { 1.0 }],
+            TabNetBnBetas = [new[] { 0.0, 0.0 }, new[] { 0.0 }],
+            TabNetBnRunningMeans = [new[] { 0.0, 0.0 }, new[] { 0.0 }],
+            TabNetBnRunningVars = [new[] { 1.0, 1.0 }, new[] { 1.0 }],
+            TabNetOutputHeadWeights = [1.0],
+            TabNetOutputHeadBias = 0.0,
+            TabNetInitialBnFcW = useInitialProjection
+                ? [new[] { 0.0, 0.0 }, new[] { 1.0, 0.0 }]
+                : null,
+            TabNetInitialBnFcB = useInitialProjection ? [0.0, 0.0] : null,
+        };
+    }
+
+    private static ModelSnapshot CreateGoldenTabNetSnapshot()
+    {
+        return new ModelSnapshot
+        {
+            Type = "TABNET",
+            Version = "3.0",
+            Features = ["F0", "F1"],
+            Means = [0f, 0f],
+            Stds = [1f, 1f],
+            BaseLearnersK = 1,
+            TabNetRawFeatureCount = 2,
+            TabNetUseSparsemax = true,
+            TabNetHiddenDim = 1,
+            TabNetRelaxationGamma = 1.5,
+            TabNetUseGlu = true,
+            TabNetSharedWeights = [new[] { new[] { 1.0, 0.0 } }],
+            TabNetSharedBiases = [new[] { 0.0 }],
+            TabNetSharedGateWeights = [new[] { new[] { 0.0, 0.0 } }],
+            TabNetSharedGateBiases = [new[] { 50.0 }],
+            TabNetStepFcWeights = [Array.Empty<double[][]>()],
+            TabNetStepFcBiases = [Array.Empty<double[]>()],
+            TabNetStepGateWeights = [Array.Empty<double[][]>()],
+            TabNetStepGateBiases = [Array.Empty<double[]>()],
+            TabNetAttentionFcWeights = [new[] { new[] { 0.0 }, new[] { 0.0 } }],
+            TabNetAttentionFcBiases = [new[] { 0.0, 0.0 }],
+            TabNetBnGammas = [new[] { 1.0, 1.0 }, new[] { 1.0 }],
+            TabNetBnBetas = [new[] { 0.0, 0.0 }, new[] { 0.0 }],
+            TabNetBnRunningMeans = [new[] { 0.0, 0.0 }, new[] { 0.0 }],
+            TabNetBnRunningVars = [new[] { 1.0, 1.0 }, new[] { 1.0 }],
+            TabNetOutputHeadWeights = [1.0],
+            TabNetOutputHeadBias = 0.0,
+            TabNetAttentionEntropyThreshold = 1.0,
+            TabNetUncertaintyThreshold = 1.0,
+        };
     }
 
     // ──────────────────────────────────────────────

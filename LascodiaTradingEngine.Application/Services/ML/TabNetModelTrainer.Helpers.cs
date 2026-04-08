@@ -1,6 +1,8 @@
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using LascodiaTradingEngine.Application.MLModels.Shared;
+using LascodiaTradingEngine.Application.Services.Inference;
+using Microsoft.Extensions.Logging;
 
 namespace LascodiaTradingEngine.Application.Services.ML;
 
@@ -75,6 +77,37 @@ public sealed partial class TabNetModelTrainer
         return Sigmoid(plattA * Logit(raw) + plattB);
     }
 
+    private static double TabNetCalibProb(float[] features, TabNetWeights w, ModelSnapshot calibrationSnapshot)
+    {
+        double raw = Math.Clamp(TabNetRawProb(features, w), ProbClampMin, 1.0 - ProbClampMin);
+        return InferenceHelpers.ApplyDeployedCalibration(raw, calibrationSnapshot);
+    }
+
+    private static ModelSnapshot BuildCalibrationSnapshot(
+        double plattA,
+        double plattB,
+        double temperatureScale = 0.0,
+        double plattABuy = 0.0,
+        double plattBBuy = 0.0,
+        double plattASell = 0.0,
+        double plattBSell = 0.0,
+        double[]? isotonicBreakpoints = null)
+    {
+        return new ModelSnapshot
+        {
+            PlattA = double.IsFinite(plattA) ? plattA : 1.0,
+            PlattB = double.IsFinite(plattB) ? plattB : 0.0,
+            TemperatureScale = double.IsFinite(temperatureScale) && temperatureScale > 0.0 ? temperatureScale : 0.0,
+            PlattABuy = double.IsFinite(plattABuy) ? plattABuy : 0.0,
+            PlattBBuy = double.IsFinite(plattBBuy) ? plattBBuy : 0.0,
+            PlattASell = double.IsFinite(plattASell) ? plattASell : 0.0,
+            PlattBSell = double.IsFinite(plattBSell) ? plattBSell : 0.0,
+            IsotonicBreakpoints = isotonicBreakpoints is { Length: > 0 }
+                ? (double[])isotonicBreakpoints.Clone()
+                : [],
+        };
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     //  WEIGHT SANITIZATION
     // ═══════════════════════════════════════════════════════════════════════
@@ -118,6 +151,9 @@ public sealed partial class TabNetModelTrainer
 
     private static void SanitizeSnapshotArrays(ModelSnapshot s)
     {
+        s.FeaturePipelineTransforms ??= [];
+        s.FeaturePipelineDescriptors ??= [];
+        if (s.TabNetAuditFindings is null) s.TabNetAuditFindings = [];
         if (s.MagWeights is { Length: > 0 }) SanitizeArr(s.MagWeights);
         if (s.MagQ90Weights is { Length: > 0 }) SanitizeArr(s.MagQ90Weights);
         if (s.FeatureImportance is { Length: > 0 }) SanitizeFloatArr(s.FeatureImportance);
@@ -161,6 +197,9 @@ public sealed partial class TabNetModelTrainer
         if (s.TabNetInitialBnFcB is { Length: > 0 }) SanitizeArr(s.TabNetInitialBnFcB);
         if (s.TabNetPerStepAttention is not null) foreach (var r in s.TabNetPerStepAttention) SanitizeArr(r);
         if (s.TabNetAttentionEntropy is { Length: > 0 }) SanitizeArr(s.TabNetAttentionEntropy);
+        if (s.TabNetPerStepSparsity is { Length: > 0 }) SanitizeArr(s.TabNetPerStepSparsity);
+        if (s.TabNetBnDriftByLayer is { Length: > 0 }) SanitizeArr(s.TabNetBnDriftByLayer);
+        if (s.TabNetActivationCentroid is { Length: > 0 }) SanitizeArr(s.TabNetActivationCentroid);
 
         // Legacy arrays
         if (s.Weights is not null)
@@ -179,9 +218,9 @@ public sealed partial class TabNetModelTrainer
         if (!double.IsFinite(s.ConformalCoverage)) s.ConformalCoverage = 0.0;
         if (!double.IsFinite(s.PlattA)) s.PlattA = 1.0;
         if (!double.IsFinite(s.PlattB)) s.PlattB = 0.0;
-        if (!double.IsFinite(s.PlattABuy)) s.PlattABuy = 1.0;
+        if (!double.IsFinite(s.PlattABuy)) s.PlattABuy = 0.0;
         if (!double.IsFinite(s.PlattBBuy)) s.PlattBBuy = 0.0;
-        if (!double.IsFinite(s.PlattASell)) s.PlattASell = 1.0;
+        if (!double.IsFinite(s.PlattASell)) s.PlattASell = 0.0;
         if (!double.IsFinite(s.PlattBSell)) s.PlattBSell = 0.0;
         if (!double.IsFinite(s.MagBias)) s.MagBias = 0.0;
         if (!double.IsFinite(s.MagQ90Bias)) s.MagQ90Bias = 0.0;
@@ -194,6 +233,16 @@ public sealed partial class TabNetModelTrainer
         if (!double.IsFinite(s.DurbinWatsonStatistic)) s.DurbinWatsonStatistic = 2.0;
         if (!double.IsFinite(s.TabNetOutputHeadBias)) s.TabNetOutputHeadBias = 0.0;
         if (!double.IsFinite(s.TabNetRelaxationGamma)) s.TabNetRelaxationGamma = 1.5;
+        if (!double.IsFinite(s.TabNetActivationDistanceMean)) s.TabNetActivationDistanceMean = 0.0;
+        if (!double.IsFinite(s.TabNetActivationDistanceStd)) s.TabNetActivationDistanceStd = 0.0;
+        if (!double.IsFinite(s.TabNetAttentionEntropyThreshold)) s.TabNetAttentionEntropyThreshold = 0.0;
+        if (!double.IsFinite(s.TabNetUncertaintyThreshold)) s.TabNetUncertaintyThreshold = 0.0;
+        if (!double.IsFinite(s.TabNetWarmStartReuseRatio)) s.TabNetWarmStartReuseRatio = 0.0;
+        if (!double.IsFinite(s.TabNetPruningScoreDelta)) s.TabNetPruningScoreDelta = 0.0;
+        if (!double.IsFinite(s.TabNetTrainInferenceParityMaxError)) s.TabNetTrainInferenceParityMaxError = 0.0;
+        if (!double.IsFinite(s.TabNetCalibrationResidualMean)) s.TabNetCalibrationResidualMean = 0.0;
+        if (!double.IsFinite(s.TabNetCalibrationResidualStd)) s.TabNetCalibrationResidualStd = 0.0;
+        if (!double.IsFinite(s.TabNetCalibrationResidualThreshold)) s.TabNetCalibrationResidualThreshold = 0.0;
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -211,13 +260,12 @@ public sealed partial class TabNetModelTrainer
 
     private static List<TrainingSample> ApplyMask(IReadOnlyList<TrainingSample> samples, bool[] mask)
     {
-        int maskedF = mask.Count(m => m);
         var result = new List<TrainingSample>(samples.Count);
         foreach (var s in samples)
         {
-            var nf = new float[maskedF]; int ni = 0;
-            for (int j = 0; j < mask.Length && j < s.Features.Length; j++)
-                if (mask[j]) nf[ni++] = s.Features[j];
+            var nf = (float[])s.Features.Clone();
+            for (int j = 0; j < mask.Length && j < nf.Length; j++)
+                if (!mask[j]) nf[j] = 0f;
             result.Add(s with { Features = nf });
         }
         return result;
@@ -227,38 +275,531 @@ public sealed partial class TabNetModelTrainer
     //  POLYNOMIAL FEATURE AUGMENTATION
     // ═══════════════════════════════════════════════════════════════════════
 
-    private static int[] SelectPolyTopFeatureIndices(List<TrainingSample> samples, int F, ModelSnapshot? warmStart, int topN)
+    private readonly record struct TabNetFeatureExpansionPlan(int[] TopFeatureIndices, int[][] ProductTerms)
     {
-        topN = Math.Min(topN, F); int n = samples.Count; double[] scores = new double[F];
-        if (warmStart?.FeatureImportanceScores is { Length: > 0 } prior && prior.Length == F)
-            for (int j = 0; j < F; j++) scores[j] = prior[j];
-        else
-        {
-            double[] featureMeans = new double[F];
-            for (int i = 0; i < n; i++) for (int j = 0; j < F; j++) featureMeans[j] += samples[i].Features[j];
-            for (int j = 0; j < F; j++) featureMeans[j] /= n;
-            for (int i = 0; i < n; i++) for (int j = 0; j < F; j++) { double d = samples[i].Features[j] - featureMeans[j]; scores[j] += d * d; }
-            for (int j = 0; j < F; j++) scores[j] /= n;
-        }
-        return scores.Select((s, idx) => (Score: s, Idx: idx)).OrderByDescending(t => t.Score)
-            .Take(topN).Select(t => t.Idx).OrderBy(i => i).ToArray();
+        public int AddedFeatureCount => ProductTerms.Length;
+        public bool IsEnabled => ProductTerms.Length > 0;
+
+        public static TabNetFeatureExpansionPlan Empty => new([], []);
     }
 
-    private static List<TrainingSample> AugmentSamplesWithPoly(List<TrainingSample> samples, int origF, int[] topIdx)
+    private static int[] SelectPolyTopFeatureIndices(List<TrainingSample> samples, int F, ModelSnapshot? warmStart, int topN)
     {
-        int pairCount = topIdx.Length * (topIdx.Length - 1) / 2, newF = origF + pairCount;
+        topN = Math.Min(topN, F);
+        if (topN < 2 || samples.Count == 0)
+            return [];
+
+        int n = Math.Min(samples.Count, 600);
+        int bins = Math.Max(4, (int)Math.Ceiling(1 + Math.Log2(n)));
+        var labels = new double[n];
+        var featureColumns = new double[F][];
+        var variances = new double[F];
+        double[] prior = warmStart?.FeatureImportanceScores is { Length: > 0 } warmPrior && warmPrior.Length >= F
+            ? warmPrior
+            : new double[F];
+
+        for (int j = 0; j < F; j++)
+            featureColumns[j] = new double[n];
+
+        for (int i = 0; i < n; i++)
+        {
+            labels[i] = samples[i].Direction > 0 ? 1.0 : 0.0;
+            for (int j = 0; j < F; j++)
+                featureColumns[j][i] = samples[i].Features[j];
+        }
+
+        double maxPrior = prior.Length > 0 ? prior.Take(F).DefaultIfEmpty(0.0).Max() : 0.0;
+        var relevance = new double[F];
+        for (int j = 0; j < F; j++)
+        {
+            double mean = 0.0;
+            for (int i = 0; i < n; i++) mean += featureColumns[j][i];
+            mean /= n;
+
+            double variance = 0.0;
+            for (int i = 0; i < n; i++)
+            {
+                double d = featureColumns[j][i] - mean;
+                variance += d * d;
+            }
+            variances[j] = variance / n;
+
+            double mi = ComputeMI(featureColumns[j], labels, bins);
+            double warmBias = maxPrior > 1e-10 && j < prior.Length ? prior[j] / maxPrior : 0.0;
+            relevance[j] = mi + 0.15 * warmBias + 0.05 * variances[j];
+        }
+
+        var selected = new List<int>(topN);
+        while (selected.Count < topN)
+        {
+            int bestIdx = -1;
+            double bestScore = double.NegativeInfinity;
+            for (int j = 0; j < F; j++)
+            {
+                if (selected.Contains(j))
+                    continue;
+
+                double redundancy = 0.0;
+                if (selected.Count > 0)
+                {
+                    for (int si = 0; si < selected.Count; si++)
+                        redundancy += ComputeMI(featureColumns[j], featureColumns[selected[si]], bins);
+                    redundancy /= selected.Count;
+                }
+
+                double score = relevance[j] - 0.35 * redundancy;
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestIdx = j;
+                }
+            }
+
+            if (bestIdx < 0)
+                break;
+            selected.Add(bestIdx);
+        }
+
+        return selected.OrderBy(i => i).ToArray();
+    }
+
+    private static TabNetFeatureExpansionPlan BuildFeatureExpansionPlan(
+        List<TrainingSample> samples, int F, ModelSnapshot? warmStart, int topN, int maxTerms)
+    {
+        int[] topIdx = SelectPolyTopFeatureIndices(samples, F, warmStart, topN);
+        if (topIdx.Length < 2 || samples.Count == 0)
+            return TabNetFeatureExpansionPlan.Empty;
+
+        int n = Math.Min(samples.Count, 600);
+        int bins = Math.Max(4, (int)Math.Ceiling(1 + Math.Log2(n)));
+        var labels = new double[n];
+        var featureColumns = new double[F][];
+        for (int j = 0; j < F; j++)
+            featureColumns[j] = new double[n];
+
+        for (int i = 0; i < n; i++)
+        {
+            labels[i] = samples[i].Direction > 0 ? 1.0 : 0.0;
+            for (int j = 0; j < F; j++)
+                featureColumns[j][i] = samples[i].Features[j];
+        }
+
+        double[] prior = warmStart?.FeatureImportanceScores is { Length: > 0 } warmPrior && warmPrior.Length >= F
+            ? warmPrior
+            : new double[F];
+        double maxPrior = prior.Length > 0 ? prior.Take(F).DefaultIfEmpty(0.0).Max() : 0.0;
+
+        var candidates = new List<(int[] Term, double[] Values, double Score)>();
+        void AddCandidate(int[] term)
+        {
+            var values = new double[n];
+            for (int i = 0; i < n; i++)
+            {
+                double product = 1.0;
+                for (int t = 0; t < term.Length; t++)
+                    product *= featureColumns[term[t]][i];
+                values[i] = product;
+            }
+
+            double mi = ComputeMI(values, labels, bins);
+            double mean = 0.0;
+            for (int i = 0; i < n; i++) mean += values[i];
+            mean /= n;
+            double variance = 0.0;
+            for (int i = 0; i < n; i++)
+            {
+                double d = values[i] - mean;
+                variance += d * d;
+            }
+            variance /= Math.Max(1, n);
+
+            double warmBias = 0.0;
+            for (int i = 0; i < term.Length; i++)
+                warmBias += maxPrior > 1e-10 && term[i] < prior.Length ? prior[term[i]] / maxPrior : 0.0;
+            warmBias /= term.Length;
+
+            double degreePenalty = term.Length > 2 ? 0.02 * (term.Length - 2) : 0.0;
+            double duplicatePenalty = term.Distinct().Count() < term.Length ? 0.01 : 0.0;
+            double score = mi + 0.05 * variance + 0.08 * warmBias - degreePenalty - duplicatePenalty;
+            if (score > 1e-6)
+                candidates.Add((term, values, score));
+        }
+
+        for (int a = 0; a < topIdx.Length; a++)
+        {
+            for (int b = a + 1; b < topIdx.Length; b++)
+                AddCandidate([topIdx[a], topIdx[b]]);
+        }
+
+        for (int a = 0; a < topIdx.Length; a++)
+            AddCandidate([topIdx[a], topIdx[a]]);
+
+        int tripleLimit = Math.Min(topIdx.Length, 4);
+        for (int a = 0; a < tripleLimit; a++)
+        {
+            for (int b = a + 1; b < tripleLimit; b++)
+            {
+                for (int c = b + 1; c < tripleLimit; c++)
+                    AddCandidate([topIdx[a], topIdx[b], topIdx[c]]);
+            }
+        }
+
+        if (candidates.Count == 0)
+            return TabNetFeatureExpansionPlan.Empty;
+
+        maxTerms = Math.Max(1, Math.Min(maxTerms, candidates.Count));
+        var selectedTerms = new List<int[]>(maxTerms);
+        var selectedValues = new List<double[]>(maxTerms);
+
+        while (selectedTerms.Count < maxTerms)
+        {
+            int bestIdx = -1;
+            double bestScore = double.NegativeInfinity;
+            for (int i = 0; i < candidates.Count; i++)
+            {
+                double score = candidates[i].Score;
+                if (selectedValues.Count > 0)
+                {
+                    double redundancy = 0.0;
+                    for (int j = 0; j < selectedValues.Count; j++)
+                        redundancy += ComputeMI(candidates[i].Values, selectedValues[j], bins);
+                    redundancy /= selectedValues.Count;
+                    score -= 0.25 * redundancy;
+                }
+
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestIdx = i;
+                }
+            }
+
+            if (bestIdx < 0)
+                break;
+
+            selectedTerms.Add(candidates[bestIdx].Term);
+            selectedValues.Add(candidates[bestIdx].Values);
+            candidates.RemoveAt(bestIdx);
+        }
+
+        if (selectedTerms.Count == 0)
+            return TabNetFeatureExpansionPlan.Empty;
+
+        int[][] orderedTerms = selectedTerms
+            .OrderBy(term => term.Length)
+            .ThenBy(term => term.Distinct().Count() < term.Length ? 1 : 0)
+            .ThenBy(term => string.Join(",", term))
+            .Select(term => (int[])term.Clone())
+            .ToArray();
+
+        return new TabNetFeatureExpansionPlan(topIdx, orderedTerms);
+    }
+
+    private static List<TrainingSample> AugmentSamplesWithPoly(
+        List<TrainingSample> samples, int origF, TabNetFeatureExpansionPlan plan)
+    {
+        if (!plan.IsEnabled)
+            return samples;
+
+        int newF = origF + plan.AddedFeatureCount;
         var augmented = new List<TrainingSample>(samples.Count);
         foreach (var s in samples)
         {
             var nf = new float[newF];
             for (int j = 0; j < origF; j++) nf[j] = s.Features[j];
             int k = origF;
-            for (int a = 0; a < topIdx.Length; a++)
-                for (int b = a + 1; b < topIdx.Length; b++)
-                    nf[k++] = s.Features[topIdx[a]] * s.Features[topIdx[b]];
+            for (int t = 0; t < plan.ProductTerms.Length && k < nf.Length; t++)
+            {
+                float product = 1f;
+                var term = plan.ProductTerms[t];
+                for (int i = 0; i < term.Length; i++)
+                    product *= s.Features[term[i]];
+                nf[k++] = product;
+            }
             augmented.Add(s with { Features = nf });
         }
         return augmented;
+    }
+
+    private static string[] BuildTabNetFeatureNames(int rawFeatureCount, TabNetFeatureExpansionPlan plan)
+    {
+        var baseNames = new string[rawFeatureCount];
+        for (int i = 0; i < rawFeatureCount; i++)
+            baseNames[i] = i < MLFeatureHelper.FeatureNames.Length ? MLFeatureHelper.FeatureNames[i] : $"F{i}";
+
+        if (!plan.IsEnabled)
+            return baseNames;
+
+        var names = new string[rawFeatureCount + plan.AddedFeatureCount];
+        Array.Copy(baseNames, names, rawFeatureCount);
+
+        int k = rawFeatureCount;
+        for (int t = 0; t < plan.ProductTerms.Length && k < names.Length; t++)
+        {
+            var term = plan.ProductTerms[t];
+            names[k++] = string.Join("_x_", term.Select(idx =>
+                idx < baseNames.Length ? baseNames[idx] : $"F{idx}"));
+        }
+
+        return names;
+    }
+
+    private static (float[] Means, float[] Stds) BuildTabNetSnapshotStats(
+        float[] rawMeans, float[] rawStds, int rawFeatureCount, TabNetFeatureExpansionPlan plan)
+    {
+        if (!plan.IsEnabled)
+            return (rawMeans, rawStds);
+
+        var means = new float[rawFeatureCount + plan.AddedFeatureCount];
+        var stds = new float[rawFeatureCount + plan.AddedFeatureCount];
+
+        Array.Copy(rawMeans, means, Math.Min(rawFeatureCount, rawMeans.Length));
+        Array.Copy(rawStds, stds, Math.Min(rawFeatureCount, rawStds.Length));
+        for (int i = rawFeatureCount; i < stds.Length; i++)
+            stds[i] = 1f;
+
+        return (means, stds);
+    }
+
+    private bool ShouldAcceptFeatureExpansion(
+        List<TrainingSample> baseSamples,
+        List<TrainingSample> expandedSamples,
+        TrainingHyperparams hp,
+        int baseFeatureCount,
+        int expandedFeatureCount,
+        int nSteps,
+        int hiddenDim,
+        int attentionDim,
+        int sharedLayers,
+        int stepLayers,
+        double gamma,
+        bool useSparsemax,
+        bool useGlu,
+        double lr,
+        double sparsityCoeff,
+        double bnMomentum,
+        CancellationToken ct)
+    {
+        if (expandedFeatureCount <= baseFeatureCount ||
+            baseSamples.Count < Math.Max(80, hp.MinSamples) ||
+            hp.WalkForwardFolds <= 0)
+        {
+            return true;
+        }
+
+        var evalHp = hp with
+        {
+            WalkForwardFolds = Math.Clamp(Math.Min(hp.WalkForwardFolds, 2), 1, 2),
+            MaxEpochs = Math.Max(4, Math.Min(8, hp.MaxEpochs > 0 ? hp.MaxEpochs / 2 : 6)),
+            EarlyStoppingPatience = Math.Max(2, hp.EarlyStoppingPatience / 2),
+            MaxBadFoldFraction = 1.0,
+            MaxFoldDrawdown = 1.0,
+            MinFoldCurveSharpe = -99.0,
+            MinSharpeTrendSlope = -99.0,
+        };
+
+        int evalEpochs = Math.Max(4, Math.Min(evalHp.MaxEpochs, 8));
+        int evalHidden = Math.Max(8, Math.Min(hiddenDim, 16));
+        int evalAttention = Math.Max(1, Math.Min(attentionDim, evalHidden));
+        int evalSteps = Math.Max(2, Math.Min(nSteps, 3));
+
+        var (baseCv, _) = RunWalkForwardCV(
+            baseSamples, evalHp, baseFeatureCount, evalSteps, evalHidden, evalAttention,
+            sharedLayers, stepLayers, gamma, useSparsemax, useGlu, lr, sparsityCoeff, evalEpochs, bnMomentum, ct);
+        var (expandedCv, _) = RunWalkForwardCV(
+            expandedSamples, evalHp, expandedFeatureCount, evalSteps, evalHidden, evalAttention,
+            sharedLayers, stepLayers, gamma, useSparsemax, useGlu, lr, sparsityCoeff, evalEpochs, bnMomentum, ct);
+
+        if (baseCv.FoldCount == 0 || expandedCv.FoldCount == 0)
+            return true;
+
+        static double Score(WalkForwardResult result) =>
+            result.AvgAccuracy +
+            0.10 * result.AvgF1 +
+            0.10 * Math.Tanh(result.AvgEV) +
+            0.05 * Math.Tanh(result.AvgSharpe / 2.0) -
+            0.05 * result.StdAccuracy;
+
+        double baseScore = Score(baseCv);
+        double expandedScore = Score(expandedCv);
+        bool accept = expandedScore >= baseScore - 0.003;
+
+        _logger.LogInformation(
+            "TabNet feature expansion gate: accepted={Accepted} baseScore={BaseScore:F4} expandedScore={ExpandedScore:F4} F {BaseF}->{ExpandedF}",
+            accept, baseScore, expandedScore, baseFeatureCount, expandedFeatureCount);
+
+        return accept;
+    }
+
+    private static double[] ComputeFeatureVariances(IReadOnlyList<TrainingSample> samples, int featureCount)
+    {
+        if (samples.Count == 0 || featureCount <= 0)
+            return [];
+
+        var means = new double[featureCount];
+        var m2 = new double[featureCount];
+        int n = 0;
+
+        foreach (var sample in samples)
+        {
+            n++;
+            for (int j = 0; j < featureCount && j < sample.Features.Length; j++)
+            {
+                double x = sample.Features[j];
+                double delta = x - means[j];
+                means[j] += delta / n;
+                double delta2 = x - means[j];
+                m2[j] += delta * delta2;
+            }
+        }
+
+        var variances = new double[featureCount];
+        for (int j = 0; j < featureCount; j++)
+            variances[j] = n > 1 ? Math.Max(0.0, m2[j] / (n - 1)) : 0.0;
+        return variances;
+    }
+
+    internal static double EstimateWarmStartReuseRatio(
+        ModelSnapshot snapshot, int featureCount, int nSteps, int hiddenDim, int sharedLayers, int stepLayers)
+    {
+        snapshot = TabNetSnapshotSupport.NormalizeSnapshotCopy(snapshot);
+        if (!TabNetSnapshotSupport.IsTabNet(snapshot))
+            return 0.0;
+
+        int attempted = 0;
+        int reusable = 0;
+
+        void AddMatrix(double[][]? src, int rows, int cols)
+        {
+            attempted += rows * cols;
+            if (src is null)
+                return;
+
+            int activeRows = Math.Min(rows, src.Length);
+            for (int i = 0; i < activeRows; i++)
+                reusable += Math.Min(cols, src[i].Length);
+        }
+
+        void AddVector(double[]? src, int len)
+        {
+            attempted += len;
+            if (src is not null)
+                reusable += Math.Min(len, src.Length);
+        }
+
+        AddMatrix(snapshot.TabNetInitialBnFcW, featureCount, featureCount);
+        AddVector(snapshot.TabNetInitialBnFcB, featureCount);
+
+        for (int l = 0; l < sharedLayers; l++)
+        {
+            int inDim = l == 0 ? featureCount : hiddenDim;
+            AddMatrix(l < (snapshot.TabNetSharedWeights?.Length ?? 0) ? snapshot.TabNetSharedWeights![l] : null, hiddenDim, inDim);
+            AddVector(l < (snapshot.TabNetSharedBiases?.Length ?? 0) ? snapshot.TabNetSharedBiases![l] : null, hiddenDim);
+            AddMatrix(l < (snapshot.TabNetSharedGateWeights?.Length ?? 0) ? snapshot.TabNetSharedGateWeights![l] : null, hiddenDim, inDim);
+            AddVector(l < (snapshot.TabNetSharedGateBiases?.Length ?? 0) ? snapshot.TabNetSharedGateBiases![l] : null, hiddenDim);
+        }
+
+        for (int s = 0; s < nSteps; s++)
+        {
+            for (int l = 0; l < stepLayers; l++)
+            {
+                AddMatrix(
+                    s < (snapshot.TabNetStepFcWeights?.Length ?? 0) && l < snapshot.TabNetStepFcWeights![s].Length
+                        ? snapshot.TabNetStepFcWeights[s][l]
+                        : null,
+                    hiddenDim, hiddenDim);
+                AddVector(
+                    s < (snapshot.TabNetStepFcBiases?.Length ?? 0) && l < snapshot.TabNetStepFcBiases![s].Length
+                        ? snapshot.TabNetStepFcBiases[s][l]
+                        : null,
+                    hiddenDim);
+                AddMatrix(
+                    s < (snapshot.TabNetStepGateWeights?.Length ?? 0) && l < snapshot.TabNetStepGateWeights![s].Length
+                        ? snapshot.TabNetStepGateWeights[s][l]
+                        : null,
+                    hiddenDim, hiddenDim);
+                AddVector(
+                    s < (snapshot.TabNetStepGateBiases?.Length ?? 0) && l < snapshot.TabNetStepGateBiases![s].Length
+                        ? snapshot.TabNetStepGateBiases[s][l]
+                        : null,
+                    hiddenDim);
+            }
+
+            int attDim = s < (snapshot.TabNetAttentionFcWeights?.Length ?? 0) &&
+                         snapshot.TabNetAttentionFcWeights![s] is { Length: > 0 } attWeights &&
+                         attWeights[0] is { Length: > 0 }
+                ? attWeights[0].Length
+                : hiddenDim;
+            AddMatrix(
+                s < (snapshot.TabNetAttentionFcWeights?.Length ?? 0) ? snapshot.TabNetAttentionFcWeights![s] : null,
+                featureCount, attDim);
+            AddVector(
+                s < (snapshot.TabNetAttentionFcBiases?.Length ?? 0) ? snapshot.TabNetAttentionFcBiases![s] : null,
+                featureCount);
+        }
+
+        return attempted > 0 ? (double)reusable / attempted : 0.0;
+    }
+
+    internal static double? ComputeRawProbabilityFromSnapshotForAudit(float[] features, ModelSnapshot snapshot)
+    {
+        return TryBuildWeightsFromSnapshot(snapshot, out var weights)
+            ? TabNetRawProb(features, weights)
+            : null;
+    }
+
+    private static bool TryBuildWeightsFromSnapshot(ModelSnapshot snapshot, out TabNetWeights weights)
+    {
+        weights = new TabNetWeights();
+        snapshot = TabNetSnapshotSupport.NormalizeSnapshotCopy(snapshot);
+        var validation = TabNetSnapshotSupport.ValidateNormalizedSnapshot(snapshot, allowLegacyV2: false);
+        if (!validation.IsValid)
+            return false;
+
+        int featureCount = snapshot.Features.Length > 0 ? snapshot.Features.Length : snapshot.Means.Length;
+        int nSteps = snapshot.BaseLearnersK > 0 ? snapshot.BaseLearnersK : 3;
+        int hiddenDim = snapshot.TabNetHiddenDim > 0 ? snapshot.TabNetHiddenDim : 24;
+        int sharedLayers = snapshot.TabNetSharedWeights?.Length ?? 0;
+        int stepLayers = snapshot.TabNetStepFcWeights is { Length: > 0 } stepW ? stepW[0].Length : 0;
+        int attentionDim = snapshot.TabNetAttentionFcWeights is { Length: > 0 } attW && attW[0] is { Length: > 0 }
+            ? attW[0][0].Length
+            : hiddenDim;
+
+        weights = new TabNetWeights
+        {
+            NSteps = nSteps,
+            F = featureCount,
+            HiddenDim = hiddenDim,
+            AttentionDim = attentionDim,
+            SharedLayers = sharedLayers,
+            StepLayers = stepLayers,
+            Gamma = snapshot.TabNetRelaxationGamma > 0 ? snapshot.TabNetRelaxationGamma : 1.5,
+            UseSparsemax = snapshot.TabNetUseSparsemax,
+            UseGlu = snapshot.TabNetUseGlu,
+            InitialBnFcW = snapshot.TabNetInitialBnFcW ?? [],
+            InitialBnFcB = snapshot.TabNetInitialBnFcB ?? [],
+            SharedW = snapshot.TabNetSharedWeights ?? [],
+            SharedB = snapshot.TabNetSharedBiases ?? [],
+            SharedGW = snapshot.TabNetSharedGateWeights ?? [],
+            SharedGB = snapshot.TabNetSharedGateBiases ?? [],
+            StepW = snapshot.TabNetStepFcWeights ?? [],
+            StepB = snapshot.TabNetStepFcBiases ?? [],
+            StepGW = snapshot.TabNetStepGateWeights ?? [],
+            StepGB = snapshot.TabNetStepGateBiases ?? [],
+            AttnFcW = snapshot.TabNetAttentionFcWeights ?? [],
+            AttnFcB = snapshot.TabNetAttentionFcBiases ?? [],
+            BnGamma = snapshot.TabNetBnGammas ?? [],
+            BnBeta = snapshot.TabNetBnBetas ?? [],
+            BnMean = snapshot.TabNetBnRunningMeans ?? [],
+            BnVar = snapshot.TabNetBnRunningVars ?? [],
+            OutputW = snapshot.TabNetOutputHeadWeights ?? [],
+            OutputB = snapshot.TabNetOutputHeadBias,
+            MagW = snapshot.MagWeights ?? [],
+            MagB = snapshot.MagBias,
+            TotalBnLayers = (snapshot.TabNetBnGammas?.Length ?? 0),
+        };
+
+        return true;
     }
 
     // ═══════════════════════════════════════════════════════════════════════

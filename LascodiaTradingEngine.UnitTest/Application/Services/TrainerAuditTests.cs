@@ -63,13 +63,16 @@ public class TrainerAuditTests
         var engine = CreateInferenceEngine(trainerId);
         Assert.True(engine.CanHandle(snapshot), $"Inference engine refused snapshot for trainer '{trainerId}'.");
 
-        float[] inferenceFeatures = MLFeatureHelper.Standardize(samples[0].Features, snapshot.Means, snapshot.Stds);
-        ApplyFeatureMask(inferenceFeatures, snapshot.ActiveFeatureMask);
+        int inferenceFeatureCount = snapshot.Features.Length > 0 ? snapshot.Features.Length : samples[0].Features.Length;
+        float[] inferenceFeatures = MLSignalScorer.StandardiseFeatures(
+            samples[0].Features, snapshot.Means, snapshot.Stds, inferenceFeatureCount);
+        InferenceHelpers.ApplyModelSpecificFeatureTransforms(inferenceFeatures, snapshot);
+        MLSignalScorer.ApplyFeatureMask(inferenceFeatures, snapshot.ActiveFeatureMask, inferenceFeatureCount);
 
         var candleWindow = requiresCandleWindow ? CreateCandleWindow() : new List<Candle>();
         var inference = engine.RunInference(
             inferenceFeatures,
-            inferenceFeatures.Length,
+            inferenceFeatureCount,
             snapshot,
             candleWindow,
             modelId: 1L,
@@ -79,6 +82,13 @@ public class TrainerAuditTests
         Assert.NotNull(inference);
         Assert.InRange(inference.Value.Probability, 0.0, 1.0);
         Assert.True(double.IsFinite(inference.Value.EnsembleStd));
+
+        if (trainerId == "tabnet")
+        {
+            Assert.NotNull(snapshot.TabNetWarmStartArtifact);
+            Assert.True(snapshot.TabNetWarmStartArtifact!.Compatible);
+            Assert.True(snapshot.TabNetWarmStartArtifact.ReuseRatio >= 0.0);
+        }
     }
 
     [Theory(Timeout = 300000)]
@@ -119,14 +129,23 @@ public class TrainerAuditTests
         var engine = CreateInferenceEngine(trainerId);
         Assert.True(engine.CanHandle(snapshot), $"Warm-started snapshot not accepted for trainer '{trainerId}'.");
 
-        float[] inferenceFeatures = MLFeatureHelper.Standardize(samples[0].Features, snapshot.Means, snapshot.Stds);
-        ApplyFeatureMask(inferenceFeatures, snapshot.ActiveFeatureMask);
+        int inferenceFeatureCount = snapshot.Features.Length > 0 ? snapshot.Features.Length : samples[0].Features.Length;
+        float[] inferenceFeatures = MLSignalScorer.StandardiseFeatures(
+            samples[0].Features, snapshot.Means, snapshot.Stds, inferenceFeatureCount);
+        InferenceHelpers.ApplyModelSpecificFeatureTransforms(inferenceFeatures, snapshot);
+        MLSignalScorer.ApplyFeatureMask(inferenceFeatures, snapshot.ActiveFeatureMask, inferenceFeatureCount);
         var candleWindow = requiresCandleWindow ? CreateCandleWindow() : new List<Candle>();
-        var inference = engine.RunInference(inferenceFeatures, inferenceFeatures.Length, snapshot, candleWindow, 1L, 0, 0);
+        var inference = engine.RunInference(inferenceFeatures, inferenceFeatureCount, snapshot, candleWindow, 1L, 0, 0);
 
         Assert.NotNull(inference);
         Assert.InRange(inference.Value.Probability, 0.0, 1.0);
         Assert.True(double.IsFinite(inference.Value.EnsembleStd));
+
+        if (trainerId == "tabnet")
+        {
+            Assert.NotNull(snapshot.TabNetWarmStartArtifact);
+            Assert.True(snapshot.TabNetWarmStartArtifact!.ReuseRatio >= 0.0);
+        }
     }
 
     [Theory(Timeout = 180000)]
@@ -156,10 +175,13 @@ public class TrainerAuditTests
         var engine = CreateInferenceEngine(trainerId);
         Assert.True(engine.CanHandle(snapshot), $"Corrupted-warm-start snapshot not accepted for trainer '{trainerId}'.");
 
-        float[] inferenceFeatures = MLFeatureHelper.Standardize(samples[0].Features, snapshot.Means, snapshot.Stds);
-        ApplyFeatureMask(inferenceFeatures, snapshot.ActiveFeatureMask);
+        int inferenceFeatureCount = snapshot.Features.Length > 0 ? snapshot.Features.Length : samples[0].Features.Length;
+        float[] inferenceFeatures = MLSignalScorer.StandardiseFeatures(
+            samples[0].Features, snapshot.Means, snapshot.Stds, inferenceFeatureCount);
+        InferenceHelpers.ApplyModelSpecificFeatureTransforms(inferenceFeatures, snapshot);
+        MLSignalScorer.ApplyFeatureMask(inferenceFeatures, snapshot.ActiveFeatureMask, inferenceFeatureCount);
         var candleWindow = requiresCandleWindow ? CreateCandleWindow() : new List<Candle>();
-        var inference = engine.RunInference(inferenceFeatures, inferenceFeatures.Length, snapshot, candleWindow, 1L, 0, 0);
+        var inference = engine.RunInference(inferenceFeatures, inferenceFeatureCount, snapshot, candleWindow, 1L, 0, 0);
 
         Assert.NotNull(inference);
         Assert.InRange(inference.Value.Probability, 0.0, 1.0);
@@ -392,6 +414,34 @@ public class TrainerAuditTests
             Assert.NotNull(snapshot.TabNetStepAttentionWeights);
             Assert.Equal(snapshot.Weights.Length, snapshot.TabNetStepAttentionWeights.Length);
             Assert.True(double.IsFinite(snapshot.TabNetOutputWeight));
+            Assert.NotNull(snapshot.FeaturePipelineTransforms);
+            Assert.NotNull(snapshot.FeaturePipelineDescriptors);
+            Assert.NotNull(snapshot.TabNetOutputHeadWeights);
+            Assert.Equal(snapshot.TabNetHiddenDim, snapshot.TabNetOutputHeadWeights!.Length);
+            Assert.NotNull(snapshot.TabNetPerStepSparsity);
+            Assert.Equal(snapshot.BaseLearnersK, snapshot.TabNetPerStepSparsity!.Length);
+            Assert.NotNull(snapshot.TabNetBnDriftByLayer);
+            Assert.True(snapshot.TabNetBnDriftByLayer!.Length > 0);
+            Assert.NotNull(snapshot.TabNetAuditFindings);
+            Assert.NotNull(snapshot.TabNetAuditArtifact);
+            Assert.True(snapshot.TabNetTrainInferenceParityMaxError <= 1e-6);
+            Assert.True(snapshot.TabNetAttentionEntropyThreshold > 0.0);
+            Assert.True(snapshot.TabNetUncertaintyThreshold > 0.0);
+            Assert.True(snapshot.TabNetCalibrationResidualThreshold > 0.0);
+            Assert.False(string.IsNullOrWhiteSpace(snapshot.FeatureSchemaFingerprint));
+            Assert.False(string.IsNullOrWhiteSpace(snapshot.PreprocessingFingerprint));
+            Assert.False(string.IsNullOrWhiteSpace(snapshot.TrainerFingerprint));
+            Assert.True(snapshot.TrainingRandomSeed > 0);
+            Assert.NotNull(snapshot.TrainingSplitSummary);
+
+            if (snapshot.FeaturePipelineTransforms.Any(t =>
+                    string.Equals(t, "TABNET_POLY_INTERACTIONS_V1", StringComparison.OrdinalIgnoreCase)))
+            {
+                Assert.True(snapshot.Features.Length > snapshot.TabNetRawFeatureCount);
+                Assert.NotNull(snapshot.TabNetPolyTopFeatureIndices);
+                Assert.True(snapshot.TabNetPolyTopFeatureIndices!.Length > 1);
+                Assert.NotEmpty(snapshot.FeaturePipelineDescriptors);
+            }
         }
         else if (snapshot.Type == "FTTRANSFORMER")
         {
@@ -447,16 +497,6 @@ public class TrainerAuditTests
 
         foreach (var row in values)
             AssertFinite(row);
-    }
-
-    private static void ApplyFeatureMask(float[] features, bool[] mask)
-    {
-        if (mask.Length != features.Length)
-            return;
-
-        for (int i = 0; i < features.Length; i++)
-            if (!mask[i])
-                features[i] = 0f;
     }
 
     private static string[] BuildFeatureNames(int count)

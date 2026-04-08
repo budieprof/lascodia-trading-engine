@@ -7,6 +7,7 @@ using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Application.Services;
+using LascodiaTradingEngine.Application.Services.Inference;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -321,10 +322,10 @@ public sealed class MLRecalibrationWorker : BackgroundService
         snap.PlattB              = newPlattB;
         snap.IsotonicBreakpoints = newIsotonicBp;
         snap.Ece                 = newEce;
-        // Only update class-conditional Platt if the fitting produced non-zero parameters
-        // (FitSgd returns (0, 0) when a class has fewer than 5 samples).
-        if (newABuy  != 0.0) { snap.PlattABuy  = newABuy;  snap.PlattBBuy  = newBBuy;  }
-        if (newASell != 0.0) { snap.PlattASell = newASell; snap.PlattBSell = newBSell; }
+        snap.PlattABuy  = newABuy;
+        snap.PlattBBuy  = newBBuy;
+        snap.PlattASell = newASell;
+        snap.PlattBSell = newBSell;
 
         writeModel.ModelBytes = JsonSerializer.SerializeToUtf8Bytes(snap);
         await writeCtx.SaveChangesAsync(ct);
@@ -661,8 +662,8 @@ public sealed class MLRecalibrationWorker : BackgroundService
             double                              lr,
             int                                 epochs)
     {
-        var buyPairs  = new List<(double Logit, double Y)>();
-        var sellPairs = new List<(double Logit, double Y)>();
+        var buyPairs  = new List<(double Logit, double BaseProb, double Y)>();
+        var sellPairs = new List<(double Logit, double BaseProb, double Y)>();
 
         // Partition by the same global calibration branch that live inference uses before
         // applying the class-conditional scaler: temperature/global Platt, then >= 0.5.
@@ -675,20 +676,41 @@ public sealed class MLRecalibrationWorker : BackgroundService
                 ? MLFeatureHelper.Sigmoid(logit / temperatureScale)
                 : MLFeatureHelper.Sigmoid(globalPlattA * logit + globalPlattB);
 
-            if (globalCalibP >= 0.5) buyPairs.Add((logit, y));
-            else                     sellPairs.Add((logit, y));
+            if (globalCalibP >= 0.5) buyPairs.Add((logit, globalCalibP, y));
+            else                     sellPairs.Add((logit, globalCalibP, y));
         }
 
         // Local SGD fitter: standard Platt mini-batch SGD for a single (logit, label) dataset.
-        static (double A, double B) FitSgd(List<(double Logit, double Y)> pairs, double lr, int epochs)
+        static (double A, double B) FitSgd(List<(double Logit, double BaseProb, double Y)> pairs, double lr, int epochs)
         {
             // Return (0, 0) sentinel when not enough samples for a reliable fit.
             if (pairs.Count < 5) return (0.0, 0.0);
+            bool hasPositive = pairs.Any(p => p.Y > 0.5);
+            bool hasNegative = pairs.Any(p => p.Y < 0.5);
+            if (!hasPositive || !hasNegative)
+                return (0.0, 0.0);
+
+            static double ComputeNll(IReadOnlyList<(double Logit, double BaseProb, double Y)> pairs, double? a = null, double? b = null)
+            {
+                double loss = 0.0;
+                for (int i = 0; i < pairs.Count; i++)
+                {
+                    double p = a.HasValue && b.HasValue
+                        ? MLFeatureHelper.Sigmoid(a.Value * pairs[i].Logit + b.Value)
+                        : Math.Clamp(pairs[i].BaseProb, 1e-7, 1.0 - 1e-7);
+                    loss -= pairs[i].Y * Math.Log(Math.Max(p, 1e-7))
+                          + (1.0 - pairs[i].Y) * Math.Log(Math.Max(1.0 - p, 1e-7));
+                }
+                return loss / pairs.Count;
+            }
+
+            double baselineLoss = ComputeNll(pairs);
             double a = 1.0, b = 0.0;
+            double bestA = a, bestB = b, bestLoss = double.MaxValue;
             for (int ep = 0; ep < epochs; ep++)
             {
                 double dA = 0, dB = 0;
-                foreach (var (logit, y) in pairs)
+                foreach (var (logit, _, y) in pairs)
                 {
                     double calibP = MLFeatureHelper.Sigmoid(a * logit + b);
                     double err    = calibP - y;
@@ -698,8 +720,20 @@ public sealed class MLRecalibrationWorker : BackgroundService
                 int n = pairs.Count;
                 a -= lr * dA / n;
                 b -= lr * dB / n;
+
+                double loss = ComputeNll(pairs, a, b);
+                if (!double.IsFinite(loss))
+                    return (0.0, 0.0);
+
+                if (loss < bestLoss)
+                {
+                    bestLoss = loss;
+                    bestA = a;
+                    bestB = b;
+                }
             }
-            return (a, b);
+
+            return bestLoss + 1e-6 < baselineLoss ? (bestA, bestB) : (0.0, 0.0);
         }
 
         var (aBuy,  bBuy)  = FitSgd(buyPairs,  lr, epochs);
@@ -725,13 +759,10 @@ public sealed class MLRecalibrationWorker : BackgroundService
             ? MLFeatureHelper.Sigmoid(rawLogit / temperatureScale)
             : MLFeatureHelper.Sigmoid(plattA * rawLogit + plattB);
 
-        double calibP;
-        if (globalCalibP >= 0.5 && plattABuy != 0.0)
-            calibP = MLFeatureHelper.Sigmoid(plattABuy * rawLogit + plattBBuy);
-        else if (globalCalibP < 0.5 && plattASell != 0.0)
-            calibP = MLFeatureHelper.Sigmoid(plattASell * rawLogit + plattBSell);
-        else
-            calibP = globalCalibP;
+        double calibP = InferenceHelpers.ApplyConditionalCalibration(
+            rawLogit, globalCalibP,
+            plattABuy, plattBBuy,
+            plattASell, plattBSell);
 
         if (isotonicBreakpoints.Length >= 4)
             calibP = BaggedLogisticTrainer.ApplyIsotonicCalibration(calibP, isotonicBreakpoints);

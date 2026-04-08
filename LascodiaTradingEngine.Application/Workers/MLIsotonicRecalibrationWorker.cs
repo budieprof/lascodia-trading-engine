@@ -7,6 +7,7 @@ using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Application.Services;
+using LascodiaTradingEngine.Application.Services.Inference;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -317,12 +318,10 @@ public sealed class MLIsotonicRecalibrationWorker : BackgroundService
             ? MLFeatureHelper.Sigmoid(rawLogit / snap.TemperatureScale)
             : MLFeatureHelper.Sigmoid(snap.PlattA * rawLogit + snap.PlattB);
 
-        if (globalCalibP >= 0.5 && snap.PlattABuy != 0.0)
-            return MLFeatureHelper.Sigmoid(snap.PlattABuy * rawLogit + snap.PlattBBuy);
-        if (globalCalibP < 0.5 && snap.PlattASell != 0.0)
-            return MLFeatureHelper.Sigmoid(snap.PlattASell * rawLogit + snap.PlattBSell);
-
-        return globalCalibP;
+        return InferenceHelpers.ApplyConditionalCalibration(
+            rawLogit, globalCalibP,
+            snap.PlattABuy, snap.PlattBBuy,
+            snap.PlattASell, snap.PlattBSell);
     }
 
     private static double ApplyFullCalibration(

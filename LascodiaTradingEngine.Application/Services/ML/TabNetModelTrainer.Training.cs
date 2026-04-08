@@ -22,6 +22,7 @@ public sealed partial class TabNetModelTrainer
         int                  stepLayers,
         double               gamma,
         bool                 useSparsemax,
+        bool                 useGlu,
         double               baseLr,
         double               sparsityCoeff,
         int                  maxEpochs,
@@ -42,6 +43,8 @@ public sealed partial class TabNetModelTrainer
     {
         int n = trainSet.Count;
         bool useMagHead = magLossWeight > 0.0;
+        var warmStartReport = new TabNetSnapshotSupport.WarmStartLoadReport(0, 0, 0, 0, 0);
+        _lastWarmStartLoadReport = warmStartReport;
 
         // Temporal decay weights blended with density weights
         var temporalWeights = ComputeTemporalWeights(n, temporalDecayLambda);
@@ -54,7 +57,7 @@ public sealed partial class TabNetModelTrainer
 
         // ── Initialise weights ─────────────────────────────────────────────
         var w = InitializeWeights(F, nSteps, hiddenDim, attentionDim, sharedLayers, stepLayers,
-            gamma, useSparsemax, useMagHead);
+            gamma, useSparsemax, useGlu, useMagHead);
 
         // ── Load from pre-trained or warm-start ────────────────────────────
         if (pretrainedInit is not null)
@@ -64,14 +67,18 @@ public sealed partial class TabNetModelTrainer
         }
         else if (warmStart?.Type == ModelType && warmStart.Version == ModelVersion)
         {
-            LoadWarmStartWeights(warmStart, w);
-            _logger.LogInformation("TabNet warm-start: loaded v3 weights (gen={Gen})", warmStart.GenerationNumber);
+            warmStartReport = LoadWarmStartWeights(warmStart, w);
+            _logger.LogInformation(
+                "TabNet warm-start: gen={Gen} reused={Reused}/{Attempted} resized={Resized} skipped={Skipped} rejected={Rejected} reuseRatio={ReuseRatio:P1}",
+                warmStart.GenerationNumber, warmStartReport.Reused, warmStartReport.Attempted,
+                warmStartReport.Resized, warmStartReport.Skipped, warmStartReport.Rejected, warmStartReport.ReuseRatio);
         }
         else if (warmStart?.Type == ModelType)
         {
             _logger.LogInformation("TabNet warm-start: version mismatch ({V}→{V2}), starting fresh.",
                 warmStart.Version, ModelVersion);
         }
+        _lastWarmStartLoadReport = warmStartReport;
 
         // ── Adam state ─────────────────────────────────────────────────────
         var adam = InitializeAdamState(w);
@@ -216,6 +223,8 @@ public sealed partial class TabNetModelTrainer
                             ClipGradients(grad, maxGradNorm);
 
                         AdamUpdate(w, grad, adam, cosLr, l2Lambda);
+                        if (miniBatchMeans is not null && miniBatchVars is not null)
+                            ApplyBnRunningStatsEma(w, miniBatchMeans, miniBatchVars, bnMomentum);
                         ZeroGradients(grad);
                         batchCount = 0;
                         needBnRefresh = true; // refresh BN stats for next mini-batch
@@ -226,9 +235,6 @@ public sealed partial class TabNetModelTrainer
                 if (ep % 10 == 9)
                     _logger.LogDebug("TabNet epoch {Ep}: trainLoss={Loss:F4} cosLr={Lr:F5}",
                         ep, epochTrainLoss / nFit, cosLr);
-
-                // ── Update BN running statistics (EMA of epoch batch stats) ──
-                UpdateBnRunningStats(w, fitSet, bnMomentum, ghostBatchSize);
 
                 // ── Early stopping (inference mode: running stats, no batch stats) ──
                 if (valSet.Count >= MinCalibrationSamples && ep % 5 == 4)
@@ -267,6 +273,9 @@ public sealed partial class TabNetModelTrainer
 
         if (bestEpoch > 0)
             return bestW;
+
+        if (warmStart is not null)
+            w.OutputB = double.IsFinite(w.OutputB) ? w.OutputB : 0.0;
 
         return w;
     }
@@ -312,13 +321,16 @@ public sealed partial class TabNetModelTrainer
                 dAggH[j] += scaledHuber * w.MagW[j];
         }
 
+        var dFutureStep = bwd.DFutureStep;
+        Array.Clear(dFutureStep, 0, H);
+
         for (int s = w.NSteps - 1; s >= 0; s--)
         {
             // ReLU gradient
             var dH = bwd.DH;
             Array.Clear(dH, 0, H);
             for (int j = 0; j < H; j++)
-                dH[j] = fwd.StepH[s][j] > 0 ? dAggH[j] : 0.0;
+                dH[j] = dFutureStep[j] + (fwd.StepH[s][j] > 0 ? dAggH[j] : 0.0);
 
             // ── Backward through step-specific layers ────────────
             var dInput = bwd.DInput;
@@ -350,15 +362,21 @@ public sealed partial class TabNetModelTrainer
                         dInput[j] = mask[j] ? dInput[j] * scale : 0;
                 }
 
-                // GLU backward
                 var dBnOut  = bwd.DBnOut;
                 var dGateIn = bwd.DGateIn;
                 Array.Clear(dBnOut, 0, H);
                 Array.Clear(dGateIn, 0, H);
-                for (int j = 0; j < H; j++)
+                if (w.UseGlu)
                 {
-                    dBnOut[j]  = dInput[j] * gate[j];
-                    dGateIn[j] = dInput[j] * pre[j] * gate[j] * (1 - gate[j]);
+                    for (int j = 0; j < H; j++)
+                    {
+                        dBnOut[j]  = dInput[j] * gate[j];
+                        dGateIn[j] = dInput[j] * pre[j] * gate[j] * (1 - gate[j]);
+                    }
+                }
+                else
+                {
+                    Array.Copy(dInput, dBnOut, H);
                 }
 
                 // Full BN backward: ∂L/∂x = γ/σ * (∂L/∂y - mean(∂L/∂y) - x̂ * mean(∂L/∂y * x̂))
@@ -392,11 +410,14 @@ public sealed partial class TabNetModelTrainer
                 {
                     int rowLen = Math.Min(H, w.StepW[s][l][i].Length);
                     SimdMulAdd(grad.StepW[s][l][i],  fcIn, dPreFc[i],  rowLen);
-                    SimdMulAdd(grad.StepGW[s][l][i], fcIn, dGateIn[i], rowLen);
                     SimdMulAdd(dNextInput, w.StepW[s][l][i],  dPreFc[i],  rowLen);
-                    SimdMulAdd(dNextInput, w.StepGW[s][l][i], dGateIn[i], rowLen);
                     grad.StepB[s][l][i]  += dPreFc[i];
-                    grad.StepGB[s][l][i] += dGateIn[i];
+                    if (w.UseGlu)
+                    {
+                        SimdMulAdd(grad.StepGW[s][l][i], fcIn, dGateIn[i], rowLen);
+                        SimdMulAdd(dNextInput, w.StepGW[s][l][i], dGateIn[i], rowLen);
+                        grad.StepGB[s][l][i] += dGateIn[i];
+                    }
                 }
 
                 if (l > 0)
@@ -436,10 +457,17 @@ public sealed partial class TabNetModelTrainer
                 var dGateIn = bwd.DGateIn;
                 Array.Clear(dBnOut, 0, H);
                 Array.Clear(dGateIn, 0, H);
-                for (int j = 0; j < H; j++)
+                if (w.UseGlu)
                 {
-                    dBnOut[j]  = dInput[j] * gate[j];
-                    dGateIn[j] = dInput[j] * pre[j] * gate[j] * (1 - gate[j]);
+                    for (int j = 0; j < H; j++)
+                    {
+                        dBnOut[j]  = dInput[j] * gate[j];
+                        dGateIn[j] = dInput[j] * pre[j] * gate[j] * (1 - gate[j]);
+                    }
+                }
+                else
+                {
+                    Array.Copy(dInput, dBnOut, H);
                 }
 
                 // Full BN backward
@@ -476,12 +504,15 @@ public sealed partial class TabNetModelTrainer
                     int rowLen = Math.Min(inDim, w.SharedW[l][i].Length);
                     int fcInLen = Math.Min(rowLen, fcIn.Length);
                     SimdMulAdd(grad.SharedW[l][i],  fcIn, dPreFc[i],  fcInLen);
-                    SimdMulAdd(grad.SharedGW[l][i], fcIn, dGateIn[i], fcInLen);
                     int propLen = Math.Min(rowLen, nextDim);
                     SimdMulAdd(dNextInput, w.SharedW[l][i],  dPreFc[i],  propLen);
-                    SimdMulAdd(dNextInput, w.SharedGW[l][i], dGateIn[i], propLen);
                     grad.SharedB[l][i]  += dPreFc[i];
-                    grad.SharedGB[l][i] += dGateIn[i];
+                    if (w.UseGlu)
+                    {
+                        SimdMulAdd(grad.SharedGW[l][i], fcIn, dGateIn[i], fcInLen);
+                        SimdMulAdd(dNextInput, w.SharedGW[l][i], dGateIn[i], propLen);
+                        grad.SharedGB[l][i] += dGateIn[i];
+                    }
                 }
 
                 if (l > 0)
@@ -516,67 +547,125 @@ public sealed partial class TabNetModelTrainer
                 }
             }
 
-            // Sparsemax Jacobian
-            double sDotD = 0, sNorm1 = 0;
+            var dAttnLogits = bwd.DAttnLogits;
+            ComputeAttentionLogitGradients(attn, dAttn, F, w.UseSparsemax, dAttnLogits);
+
+            int bnIdx = s;
+            var dAttnBnOut = bwd.DAttnBnOut;
+            var dAttnInput = bwd.DAttnInput;
+            Array.Clear(dAttnBnOut, 0, F);
+            Array.Clear(dAttnInput, 0, F);
+
+            double attnMeanDy = 0.0, attnMeanDyXn = 0.0;
             for (int j = 0; j < F; j++)
             {
-                if (attn[j] > Eps) { sDotD += attn[j] * dAttn[j]; sNorm1 += attn[j]; }
-            }
-            double correction = sNorm1 > Eps ? sDotD / sNorm1 : 0;
+                double prior = s < fwd.StepPriorScales.Length && j < fwd.StepPriorScales[s].Length
+                    ? fwd.StepPriorScales[s][j]
+                    : 1.0;
+                dAttnBnOut[j] = dAttnLogits[j] * prior;
 
-            var dAttnLogits = bwd.DAttnLogits;
-            Array.Clear(dAttnLogits, 0, F);
+                double xn = s < fwd.StepAttnXNorm.Length && j < fwd.StepAttnXNorm[s].Length
+                    ? fwd.StepAttnXNorm[s][j]
+                    : 0.0;
+                grad.BnGamma[bnIdx][j] += dAttnBnOut[j] * xn;
+                grad.BnBeta[bnIdx][j]  += dAttnBnOut[j];
+                attnMeanDy += dAttnBnOut[j];
+                attnMeanDyXn += dAttnBnOut[j] * xn;
+            }
+
+            attnMeanDy /= F;
+            attnMeanDyXn /= F;
+
             for (int j = 0; j < F; j++)
-                dAttnLogits[j] = attn[j] > Eps ? (dAttn[j] - correction) : 0;
+            {
+                double var_ = epochBatchVars is not null && bnIdx < epochBatchVars.Length && j < epochBatchVars[bnIdx].Length
+                    ? epochBatchVars[bnIdx][j]
+                    : (w.BnVar[bnIdx].Length > j ? w.BnVar[bnIdx][j] : 1.0);
+                double invStd = Math.Min(1.0 / Math.Sqrt(var_ + BnEpsilon), MaxInvStd);
+                double xn = s < fwd.StepAttnXNorm.Length && j < fwd.StepAttnXNorm[s].Length
+                    ? fwd.StepAttnXNorm[s][j]
+                    : 0.0;
+                dAttnInput[j] = w.BnGamma[bnIdx][j] * invStd * (dAttnBnOut[j] - attnMeanDy - xn * attnMeanDyXn);
+            }
 
             // Propagate into attention FC weights
+            var dPrevStep = bwd.DPrevStep;
+            Array.Clear(dPrevStep, 0, H);
             if (s > 0)
             {
+                double[] hPrevStep = s > 0 && s - 1 < fwd.StepH.Length ? fwd.StepH[s - 1] : new double[H];
                 for (int j = 0; j < F; j++)
                 {
-                    if (Math.Abs(dAttnLogits[j]) < 1e-20) continue;
-                    double prior = s < fwd.StepPriorScales.Length && j < fwd.StepPriorScales[s].Length
-                        ? fwd.StepPriorScales[s][j] : 1.0;
-                    double dBnJ = dAttnLogits[j] * prior;
-                    double bnVar = epochBatchVars is not null && s < epochBatchVars.Length && j < epochBatchVars[s].Length
-                        ? epochBatchVars[s][j]
-                        : (w.BnVar[s].Length > j ? w.BnVar[s][j] : 1.0);
-                    double invStd = Math.Min(1.0 / Math.Sqrt(bnVar + BnEpsilon), MaxInvStd);
-                    double dFcJ = dBnJ * w.BnGamma[s][j] * invStd;
-                    double[] hPrevStep = s > 0 && s - 1 < fwd.StepH.Length ? fwd.StepH[s - 1] : new double[H];
-                    for (int k = 0; k < H && k < w.AttnFcW[s][j].Length; k++)
-                        grad.AttnFcW[s][j][k] += dFcJ * (k < hPrevStep.Length ? hPrevStep[k] : 0);
+                    double dFcJ = dAttnInput[j];
+                    if (Math.Abs(dFcJ) < 1e-20) continue;
+                    int attnDim = Math.Min(H, w.AttnFcW[s][j].Length);
+                    for (int k = 0; k < attnDim; k++)
+                    {
+                        double hPrevK = k < hPrevStep.Length ? hPrevStep[k] : 0.0;
+                        grad.AttnFcW[s][j][k] += dFcJ * hPrevK;
+                        dPrevStep[k] += dFcJ * w.AttnFcW[s][j][k];
+                    }
                     grad.AttnFcB[s][j] += dFcJ;
                 }
+
+                Array.Copy(dPrevStep, dFutureStep, H);
             }
             else
             {
-                // Step 0: propagate into initial BN FC weights and step-0 BN params
-                int bnIdx = 0;
                 for (int j = 0; j < F; j++)
                 {
-                    if (Math.Abs(dAttnLogits[j]) < 1e-20) continue;
-                    double prior = fwd.StepPriorScales[0].Length > j ? fwd.StepPriorScales[0][j] : 1.0;
-                    double dBnJ = dAttnLogits[j] * prior;
-                    double xn = fwd.Step0AttnXNorm.Length > j ? fwd.Step0AttnXNorm[j] : 0.0;
-                    grad.BnGamma[bnIdx][j] += dBnJ * xn;
-                    grad.BnBeta[bnIdx][j]  += dBnJ;
-
-                    // Through initial BN FC if present
+                    double dFcJ = dAttnInput[j];
+                    if (Math.Abs(dFcJ) < 1e-20) continue;
                     if (w.InitialBnFcW.Length > 0 && w.InitialBnFcW[0].Length == F)
                     {
-                        double bnVar = epochBatchVars is not null && bnIdx < epochBatchVars.Length && j < epochBatchVars[bnIdx].Length
-                            ? epochBatchVars[bnIdx][j]
-                            : (w.BnVar[bnIdx].Length > j ? w.BnVar[bnIdx][j] : 1.0);
-                        double invStd = Math.Min(1.0 / Math.Sqrt(bnVar + BnEpsilon), MaxInvStd);
-                        double dFcJ = dBnJ * w.BnGamma[bnIdx][j] * invStd;
                         for (int k = 0; k < F; k++)
                             grad.InitialBnFcW[j][k] += dFcJ * features[k];
                         grad.InitialBnFcB[j] += dFcJ;
                     }
                 }
+
+                Array.Clear(dFutureStep, 0, H);
             }
         }
+    }
+
+    private static void ComputeAttentionLogitGradients(
+        double[] attn,
+        double[] dAttn,
+        int featureCount,
+        bool useSparsemax,
+        double[] dst)
+    {
+        Array.Clear(dst, 0, featureCount);
+
+        if (useSparsemax)
+        {
+            int supportCount = 0;
+            double supportMean = 0.0;
+            for (int j = 0; j < featureCount; j++)
+            {
+                if (attn[j] <= Eps)
+                    continue;
+                supportMean += dAttn[j];
+                supportCount++;
+            }
+
+            if (supportCount <= 0)
+                return;
+
+            supportMean /= supportCount;
+            for (int j = 0; j < featureCount; j++)
+                dst[j] = attn[j] > Eps ? dAttn[j] - supportMean : 0.0;
+
+            return;
+        }
+
+        double weightedMean = 0.0;
+        for (int j = 0; j < featureCount; j++)
+            weightedMean += attn[j] * dAttn[j];
+
+        for (int j = 0; j < featureCount; j++)
+            dst[j] = attn[j] * (dAttn[j] - weightedMean);
     }
 
     // ═══════════════════════════════════════════════════════════════════════

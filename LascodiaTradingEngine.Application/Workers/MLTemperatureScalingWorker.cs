@@ -1,6 +1,7 @@
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Application.Services;
+using LascodiaTradingEngine.Application.Services.Inference;
 using LascodiaTradingEngine.Domain.Entities;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Caching.Memory;
@@ -277,13 +278,10 @@ public sealed class MLTemperatureScalingWorker : BackgroundService
             ? Sigmoid(rawLogit / temperatureScale)
             : Sigmoid(snap.PlattA * rawLogit + snap.PlattB);
 
-        double calibP;
-        if (globalCalibP >= 0.5 && snap.PlattABuy != 0.0)
-            calibP = Sigmoid(snap.PlattABuy * rawLogit + snap.PlattBBuy);
-        else if (globalCalibP < 0.5 && snap.PlattASell != 0.0)
-            calibP = Sigmoid(snap.PlattASell * rawLogit + snap.PlattBSell);
-        else
-            calibP = globalCalibP;
+        double calibP = InferenceHelpers.ApplyConditionalCalibration(
+            rawLogit, globalCalibP,
+            snap.PlattABuy, snap.PlattBBuy,
+            snap.PlattASell, snap.PlattBSell);
 
         if (snap.IsotonicBreakpoints.Length >= 4)
             calibP = BaggedLogisticTrainer.ApplyIsotonicCalibration(calibP, snap.IsotonicBreakpoints);

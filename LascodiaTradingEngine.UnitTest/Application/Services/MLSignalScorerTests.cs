@@ -370,6 +370,48 @@ public class MLSignalScorerTests
         Assert.Equal(0.8, result, precision: 6);
     }
 
+    [Fact]
+    public void ApplyDeployedCalibration_Ignores_Identity_Conditional_Branches()
+    {
+        var snap = new ModelSnapshot
+        {
+            PlattA = 2.0,
+            PlattB = -0.75,
+            PlattABuy = 1.0,
+            PlattBBuy = 0.0,
+            PlattASell = 1.0,
+            PlattBSell = 0.0
+        };
+
+        double result = InferenceHelpers.ApplyDeployedCalibration(0.8, snap);
+        double expected = InferenceHelpers.ApplyBasicCalibration(0.8, snap);
+
+        Assert.Equal(expected, result, precision: 8);
+    }
+
+    [Fact]
+    public void ApplyDeployedCalibration_Applies_Temperature_Conditional_Then_Isotonic_In_Order()
+    {
+        var snap = new ModelSnapshot
+        {
+            TemperatureScale = 2.0,
+            PlattA = 0.25,
+            PlattB = -1.0,
+            PlattABuy = 1.5,
+            PlattBBuy = -0.1,
+            PlattASell = 0.5,
+            PlattBSell = 0.2,
+            IsotonicBreakpoints = [0.0, 0.0, 0.5, 0.4, 1.0, 0.9]
+        };
+
+        double result = InferenceHelpers.ApplyDeployedCalibration(0.8, snap);
+        double rawLogit = Math.Log(0.8 / 0.2);
+        double branchProb = 1.0 / (1.0 + Math.Exp(-(1.5 * rawLogit - 0.1)));
+        double expected = 0.4 + ((branchProb - 0.5) / 0.5) * 0.5;
+
+        Assert.Equal(expected, result, 8);
+    }
+
     // ────────────────────────────────────────────────────────────────────────
     //  AggregateProbs — edge cases
     // ────────────────────────────────────────────────────────────────────────

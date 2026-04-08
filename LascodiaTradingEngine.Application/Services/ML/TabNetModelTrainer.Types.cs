@@ -20,6 +20,7 @@ public sealed partial class TabNetModelTrainer
         public int StepLayers;
         public double Gamma;
         public bool UseSparsemax;
+        public bool UseGlu;
 
         // Initial BN FC for step-0 attention symmetry (features → F)
         public double[][] InitialBnFcW = [];  // [F][F]
@@ -114,10 +115,10 @@ public sealed partial class TabNetModelTrainer
         public double[][][] StepStepGate    = [];  // [step][layer][hiddenDim]
         public double[][][] StepStepXNorm   = [];  // [step][layer][hiddenDim]
         public double[][][] StepStepFcIn    = [];  // [step][layer][inDim]
-        public double[][] StepAttnPre = [];    // [step][F] — pre-sparsemax logits
+        public double[][] StepAttnPre = [];    // [step][F] — pre-attention logits
         public double[]   PriorScales = [];    // [F] — final prior scales (after all steps)
         public double[][] StepPriorScales = []; // [step][F] — per-step prior scales (before attention)
-        public double[]   Step0AttnXNorm = [];  // [F] — step-0 attention BN xNorm (for backward)
+        public double[][] StepAttnXNorm = [];   // [step][F] — attention BN xNorm (for backward)
 
         // Pooled scratch buffers to avoid per-call allocations in ForwardPass
         public double[] HPrev = [];            // [hiddenDim]
@@ -143,7 +144,7 @@ public sealed partial class TabNetModelTrainer
                 StepAttnPre  = AllocJagged(nSteps, F),
                 PriorScales  = new double[F],
                 StepPriorScales = AllocJagged(nSteps, F),
-                Step0AttnXNorm  = new double[F],
+                StepAttnXNorm   = AllocJagged(nSteps, F),
                 HPrev        = new double[H],
                 AttnInput    = new double[F],
                 GluBuf       = FcBnGluBuffers.Allocate(H, Math.Max(F, H)),
@@ -227,6 +228,10 @@ public sealed partial class TabNetModelTrainer
         public double[] DNextInputF = []; // [F] for shared layer 0 backward
         public double[] DAttn     = [];
         public double[] DAttnLogits = [];
+        public double[] DAttnBnOut = [];
+        public double[] DAttnInput = [];
+        public double[] DFutureStep = [];
+        public double[] DPrevStep = [];
 
         public static BackwardBuffers Allocate(int F, int H)
         {
@@ -243,6 +248,10 @@ public sealed partial class TabNetModelTrainer
                 DNextInputF = new double[F],
                 DAttn       = new double[F],
                 DAttnLogits = new double[F],
+                DAttnBnOut  = new double[F],
+                DAttnInput  = new double[F],
+                DFutureStep = new double[H],
+                DPrevStep   = new double[H],
             };
         }
 
@@ -259,6 +268,10 @@ public sealed partial class TabNetModelTrainer
             Array.Clear(DNextInputF);
             Array.Clear(DAttn);
             Array.Clear(DAttnLogits);
+            Array.Clear(DAttnBnOut);
+            Array.Clear(DAttnInput);
+            Array.Clear(DFutureStep);
+            Array.Clear(DPrevStep);
         }
     }
 

@@ -1733,6 +1733,134 @@ public record TrainingResult(
     WalkForwardResult CvResult,
     byte[]           ModelBytes);
 
+/// <summary>
+/// Typed, versioned replay descriptor for model-specific feature-pipeline transforms.
+/// Used to rebuild augmented features deterministically at inference time.
+/// </summary>
+public class FeatureTransformDescriptor
+{
+    public string Kind { get; set; } = string.Empty;
+    public string Version { get; set; } = "1.0";
+    public string Operation { get; set; } = string.Empty;
+    public int InputFeatureCount { get; set; }
+    public int OutputStartIndex { get; set; }
+    public int OutputCount { get; set; }
+    public int[][] SourceIndexGroups { get; set; } = [];
+}
+
+/// <summary>
+/// Structured trace entry for the lightweight TabNet architecture search.
+/// Persisted into the snapshot for reproducibility and auditability.
+/// </summary>
+public class TabNetAutoTuneTraceEntry
+{
+    public int Steps { get; set; }
+    public int HiddenDim { get; set; }
+    public int AttentionDim { get; set; }
+    public double Gamma { get; set; }
+    public double DropoutRate { get; set; }
+    public double SparsityCoeff { get; set; }
+    public double Score { get; set; }
+    public double CvAccuracy { get; set; }
+    public double CvF1 { get; set; }
+    public double CvExpectedValue { get; set; }
+    public double CvSharpe { get; set; }
+    public double CvStdAccuracy { get; set; }
+    public double HoldoutAccuracy { get; set; }
+    public double HoldoutF1 { get; set; }
+    public double HoldoutExpectedValue { get; set; }
+    public double HoldoutSharpe { get; set; }
+    public double HoldoutBrier { get; set; }
+    public double HoldoutEce { get; set; }
+    public bool Selected { get; set; }
+}
+
+/// <summary>
+/// Structured artifact describing the final TabNet prune-and-retrain decision.
+/// </summary>
+public class TabNetPruningDecisionArtifact
+{
+    public bool Accepted { get; set; }
+    public double BaselineScore { get; set; }
+    public double CandidateScore { get; set; }
+    public double ScoreDelta { get; set; }
+    public double CandidateAccuracy { get; set; }
+    public double CandidateBrier { get; set; }
+    public double CandidateEce { get; set; }
+    public int PrunedFeatureCount { get; set; }
+    public string[] Reasons { get; set; } = [];
+}
+
+/// <summary>
+/// Structured artifact describing the final TabNet model audit.
+/// </summary>
+public class TabNetAuditArtifact
+{
+    public bool SnapshotContractValid { get; set; }
+    public int AuditedSampleCount { get; set; }
+    public double MaxRawParityError { get; set; }
+    public double MeanRawParityError { get; set; }
+    public double MaxDeployedCalibrationDelta { get; set; }
+    public double MaxUncertaintyObserved { get; set; }
+    public double RecordedEce { get; set; }
+    public string FeatureSchemaFingerprint { get; set; } = string.Empty;
+    public string PreprocessingFingerprint { get; set; } = string.Empty;
+    public string[] Findings { get; set; } = [];
+}
+
+/// <summary>
+/// Structured warm-start compatibility and reuse summary for TabNet.
+/// </summary>
+public class TabNetWarmStartArtifact
+{
+    public bool Compatible { get; set; }
+    public string[] CompatibilityIssues { get; set; } = [];
+    public int Attempted { get; set; }
+    public int Reused { get; set; }
+    public int Resized { get; set; }
+    public int Skipped { get; set; }
+    public int Rejected { get; set; }
+    public double ReuseRatio { get; set; }
+}
+
+/// <summary>
+/// Structured artifact describing the final deployed TabNet calibration stack.
+/// </summary>
+public class TabNetCalibrationArtifact
+{
+    public string SelectedGlobalCalibration { get; set; } = "PLATT";
+    public double GlobalPlattNll { get; set; }
+    public double TemperatureNll { get; set; }
+    public bool TemperatureSelected { get; set; }
+    public int BuyBranchSampleCount { get; set; }
+    public double BuyBranchBaselineNll { get; set; }
+    public double BuyBranchFittedNll { get; set; }
+    public bool BuyBranchAccepted { get; set; }
+    public int SellBranchSampleCount { get; set; }
+    public double SellBranchBaselineNll { get; set; }
+    public double SellBranchFittedNll { get; set; }
+    public bool SellBranchAccepted { get; set; }
+    public int IsotonicSampleCount { get; set; }
+    public int IsotonicBreakpointCount { get; set; }
+    public double PreIsotonicNll { get; set; }
+    public double PostIsotonicNll { get; set; }
+    public bool IsotonicAccepted { get; set; }
+}
+
+/// <summary>
+/// Structured train/cal/test split summary persisted for reproducibility.
+/// </summary>
+public class TrainingSplitSummary
+{
+    public int TrainStartIndex { get; set; }
+    public int TrainCount { get; set; }
+    public int CalibrationStartIndex { get; set; }
+    public int CalibrationCount { get; set; }
+    public int TestStartIndex { get; set; }
+    public int TestCount { get; set; }
+    public int EmbargoCount { get; set; }
+}
+
 // ── Serialisable model snapshot ───────────────────────────────────────────────
 
 /// <summary>
@@ -1745,6 +1873,39 @@ public class ModelSnapshot
     public string   Type          { get; set; } = string.Empty;
     public string   Version       { get; set; } = string.Empty;
     public string[] Features      { get; set; } = [];
+    /// <summary>
+    /// Ordered list of replayable feature-pipeline transforms applied after standardisation
+    /// and before inference. Enables train/inference parity for architecture-specific
+    /// preprocessing without hard-coding model-type branches into the scorer.
+    /// </summary>
+    public string[] FeaturePipelineTransforms { get; set; } = [];
+    /// <summary>
+    /// Typed, versioned descriptors for replayable feature-pipeline transforms.
+    /// Preferred over <see cref="FeaturePipelineTransforms"/> for new snapshots.
+    /// </summary>
+    public FeatureTransformDescriptor[] FeaturePipelineDescriptors { get; set; } = [];
+    /// <summary>
+    /// Fingerprint of the raw feature schema expected by this snapshot.
+    /// Used to reject semantically incompatible warm starts and invalid scoring payloads.
+    /// </summary>
+    public string FeatureSchemaFingerprint { get; set; } = string.Empty;
+    /// <summary>
+    /// Fingerprint of the replayable preprocessing layout (transforms + masks + counts).
+    /// Separate from means/stds so warm-start compatibility can remain strict without blocking retraining.
+    /// </summary>
+    public string PreprocessingFingerprint { get; set; } = string.Empty;
+    /// <summary>
+    /// Fingerprint of the trainer architecture/hyperparameter layout used to fit the snapshot.
+    /// </summary>
+    public string TrainerFingerprint { get; set; } = string.Empty;
+    /// <summary>
+    /// Deterministic seed used by the trainer to initialise TabNet weights and auxiliary searches.
+    /// </summary>
+    public int TrainingRandomSeed { get; set; }
+    /// <summary>
+    /// Reproducibility summary of the train/cal/test split boundaries used for the final fit.
+    /// </summary>
+    public TrainingSplitSummary? TrainingSplitSummary { get; set; }
     public float[]  Means         { get; set; } = [];
     public float[]  Stds          { get; set; } = [];
     public int      BaseLearnersK { get; set; }
@@ -2741,6 +2902,18 @@ public class ModelSnapshot
     /// </summary>
     public double TabNetOutputWeight { get; set; }
 
+    /// <summary>
+    /// Number of raw pre-augmentation features used by the TabNet preprocessing path.
+    /// Equals <see cref="Features"/>.Length when polynomial augmentation is disabled.
+    /// </summary>
+    public int TabNetRawFeatureCount { get; set; }
+
+    /// <summary>
+    /// Indices of the raw standardised features used to generate TabNet degree-2 interaction
+    /// features. Empty = polynomial augmentation disabled.
+    /// </summary>
+    public int[]? TabNetPolyTopFeatureIndices { get; set; }
+
     // ── TabNet v3 architecture weights (true TabNet: shared + step-specific Feature Transformer with GLU + BN) ──
 
     /// <summary>Rec #389 v3: Shared FC layer weights [layer][outDim][inDim].</summary>
@@ -2794,6 +2967,12 @@ public class ModelSnapshot
     /// <summary>Rec #389 v3: Relaxation γ value used during training (stored for inference reproducibility).</summary>
     public double TabNetRelaxationGamma { get; set; } = 1.5;
 
+    /// <summary>Rec #389 v3: Whether attention masks were trained with sparsemax or softmax.</summary>
+    public bool TabNetUseSparsemax { get; set; } = true;
+
+    /// <summary>Rec #389 v3: Whether the feature-transformer blocks used GLU gates or plain BN-linear activations.</summary>
+    public bool TabNetUseGlu { get; set; } = true;
+
     /// <summary>Rec #389 v3: Hidden dimension used during training.</summary>
     public int TabNetHiddenDim { get; set; }
 
@@ -2808,6 +2987,66 @@ public class ModelSnapshot
 
     /// <summary>Rec #389 v3: Per-step mean attention entropy (signal quality metric). Low = confident feature selection.</summary>
     public double[]? TabNetAttentionEntropy { get; set; }
+
+    /// <summary>Rec #389 v3: Fraction of features selected (attention > 1e-6) at each decision step.</summary>
+    public double[]? TabNetPerStepSparsity { get; set; }
+
+    /// <summary>Rec #389 v3: Running-stat drift score per BN layer. Higher values imply train/inference normalization mismatch risk.</summary>
+    public double[]? TabNetBnDriftByLayer { get; set; }
+
+    /// <summary>Rec #389 v3: Mean aggregated hidden activation over the calibration/reference window.</summary>
+    public double[]? TabNetActivationCentroid { get; set; }
+
+    /// <summary>Rec #389 v3: Mean Euclidean distance to <see cref="TabNetActivationCentroid"/> over the reference window.</summary>
+    public double TabNetActivationDistanceMean { get; set; }
+
+    /// <summary>Rec #389 v3: Std dev of Euclidean distance to <see cref="TabNetActivationCentroid"/> over the reference window.</summary>
+    public double TabNetActivationDistanceStd { get; set; }
+
+    /// <summary>Rec #389 v3: Attention-entropy threshold above which deployed predictions are considered unusually uncertain.</summary>
+    public double TabNetAttentionEntropyThreshold { get; set; }
+
+    /// <summary>Rec #389 v3: Combined TabNet uncertainty threshold used by live scoring for abstention / OOD escalation.</summary>
+    public double TabNetUncertaintyThreshold { get; set; }
+
+    /// <summary>Rec #389 v3: Fraction of warm-start parameters successfully reused from the parent snapshot.</summary>
+    public double TabNetWarmStartReuseRatio { get; set; }
+
+    /// <summary>Rec #389 v3: Whether the optional prune-and-retrain pass was accepted into the final deployed snapshot.</summary>
+    public bool TabNetPruningAccepted { get; set; }
+
+    /// <summary>Rec #389 v3: Composite pruning score delta (accepted model minus baseline). Positive is better.</summary>
+    public double TabNetPruningScoreDelta { get; set; }
+
+    /// <summary>Rec #389 v3: Maximum absolute difference between trainer forward-pass raw probability and deployed inference on audited samples.</summary>
+    public double TabNetTrainInferenceParityMaxError { get; set; }
+
+    /// <summary>Rec #389 v3: Post-train audit findings. Empty means the snapshot passed the TabNet audit cleanly.</summary>
+    public string[]? TabNetAuditFindings { get; set; }
+
+    /// <summary>Rec #389 v3: Structured post-train audit artifact.</summary>
+    public TabNetAuditArtifact? TabNetAuditArtifact { get; set; }
+
+    /// <summary>Rec #389 v3: Structured architecture-search trace.</summary>
+    public TabNetAutoTuneTraceEntry[]? TabNetAutoTuneTrace { get; set; }
+
+    /// <summary>Rec #389 v3: Structured warm-start compatibility/reuse summary.</summary>
+    public TabNetWarmStartArtifact? TabNetWarmStartArtifact { get; set; }
+
+    /// <summary>Rec #389 v3: Structured pruning decision artifact.</summary>
+    public TabNetPruningDecisionArtifact? TabNetPruningDecision { get; set; }
+
+    /// <summary>Rec #389 v3: Structured deployed-calibration artifact.</summary>
+    public TabNetCalibrationArtifact? TabNetCalibrationArtifact { get; set; }
+
+    /// <summary>Rec #389 v3: Mean absolute calibration residual over the reference calibration window.</summary>
+    public double TabNetCalibrationResidualMean { get; set; }
+
+    /// <summary>Rec #389 v3: Std dev of absolute calibration residual over the reference calibration window.</summary>
+    public double TabNetCalibrationResidualStd { get; set; }
+
+    /// <summary>Rec #389 v3: Upper quantile threshold used to scale margin-based calibration uncertainty at inference time.</summary>
+    public double TabNetCalibrationResidualThreshold { get; set; }
 
     /// <summary>Rec #390: FT-Transformer per-feature embedding weights (outer = feature, inner = dim).</summary>
     public double[][]? FtTransformerEmbedWeights { get; set; }

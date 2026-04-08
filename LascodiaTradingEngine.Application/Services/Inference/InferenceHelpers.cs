@@ -115,14 +115,10 @@ internal static class InferenceHelpers
         double globalCalibP = temperatureScale > 0.0
             ? MLFeatureHelper.Sigmoid(rawLogit / temperatureScale)
             : MLFeatureHelper.Sigmoid(plattA * rawLogit + plattB);
-
-        double calibP;
-        if (globalCalibP >= 0.5 && plattABuy != 0.0)
-            calibP = MLFeatureHelper.Sigmoid(plattABuy * rawLogit + plattBBuy);
-        else if (globalCalibP < 0.5 && plattASell != 0.0)
-            calibP = MLFeatureHelper.Sigmoid(plattASell * rawLogit + plattBSell);
-        else
-            calibP = globalCalibP;
+        double calibP = ApplyConditionalCalibration(
+            rawLogit, globalCalibP,
+            plattABuy, plattBBuy,
+            plattASell, plattBSell);
 
         if (snap.IsotonicBreakpoints.Length >= 4)
             calibP = ApplyIsotonicCalibrationSafe(calibP, snap.IsotonicBreakpoints);
@@ -136,6 +132,118 @@ internal static class InferenceHelpers
         }
 
         return ClampProbability(calibP);
+    }
+
+    internal static bool HasMeaningfulConditionalCalibration(double plattA, double plattB)
+    {
+        double safeA = SanitizeFiniteOrDefault(plattA, 0.0);
+        double safeB = SanitizeFiniteOrDefault(plattB, 0.0);
+        if (Math.Abs(safeA) <= 1e-12 && Math.Abs(safeB) <= 1e-12)
+            return false;
+
+        return Math.Abs(safeA - 1.0) > 1e-9 || Math.Abs(safeB) > 1e-9;
+    }
+
+    internal static double ApplyConditionalCalibration(
+        double rawLogit,
+        double globalCalibP,
+        double plattABuy,
+        double plattBBuy,
+        double plattASell,
+        double plattBSell)
+    {
+        if (globalCalibP >= 0.5 && HasMeaningfulConditionalCalibration(plattABuy, plattBBuy))
+            return ClampProbability(MLFeatureHelper.Sigmoid(plattABuy * rawLogit + plattBBuy));
+
+        if (globalCalibP < 0.5 && HasMeaningfulConditionalCalibration(plattASell, plattBSell))
+            return ClampProbability(MLFeatureHelper.Sigmoid(plattASell * rawLogit + plattBSell));
+
+        return ClampProbability(globalCalibP);
+    }
+
+    /// <summary>
+    /// Rebuilds any persisted feature-pipeline transforms that live between
+    /// standardisation and inference. This keeps the deployed scorer aligned with
+    /// the exact preprocessing layout the trainer serialized into the snapshot.
+    /// </summary>
+    internal static void ApplyModelSpecificFeatureTransforms(float[] features, ModelSnapshot snap)
+    {
+        if (!string.Equals(snap.Type, "TABNET", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        var descriptors = TabNetSnapshotSupport.ResolveFeaturePipelineDescriptors(snap);
+        foreach (var descriptor in descriptors)
+        {
+            if (!string.Equals(descriptor.Kind, TabNetSnapshotSupport.PolyInteractionsTransform, StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(descriptor.Operation, "PRODUCT", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            int rawFeatureCount = descriptor.InputFeatureCount > 0
+                ? Math.Min(descriptor.InputFeatureCount, features.Length)
+                : Math.Min(snap.TabNetRawFeatureCount > 0 ? snap.TabNetRawFeatureCount : features.Length, features.Length);
+            if (rawFeatureCount >= features.Length || descriptor.SourceIndexGroups.Length == 0)
+                continue;
+
+            int outputIndex = Math.Max(rawFeatureCount, descriptor.OutputStartIndex);
+            for (int g = 0; g < descriptor.SourceIndexGroups.Length && outputIndex < features.Length; g++)
+            {
+                var group = descriptor.SourceIndexGroups[g];
+                if (group.Length == 0)
+                    continue;
+
+                float product = 1f;
+                bool valid = true;
+                for (int i = 0; i < group.Length; i++)
+                {
+                    int sourceIndex = group[i];
+                    if (sourceIndex < 0 || sourceIndex >= rawFeatureCount)
+                    {
+                        valid = false;
+                        break;
+                    }
+                    product *= features[sourceIndex];
+                }
+
+                if (valid)
+                    features[outputIndex] = product;
+                outputIndex++;
+            }
+        }
+
+        if (descriptors.Length > 0)
+            return;
+
+        foreach (string transform in snap.FeaturePipelineTransforms ?? [])
+        {
+            if (!string.Equals(transform, TabNetSnapshotSupport.PolyInteractionsTransform, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            if (snap.TabNetPolyTopFeatureIndices is not { Length: > 1 } topIdx)
+                continue;
+
+            int rawFeatureCount = snap.TabNetRawFeatureCount > 0
+                ? Math.Min(snap.TabNetRawFeatureCount, features.Length)
+                : features.Length;
+            if (rawFeatureCount >= features.Length)
+                continue;
+
+            int k = rawFeatureCount;
+            for (int a = 0; a < topIdx.Length && k < features.Length; a++)
+            {
+                int leftIdx = topIdx[a];
+                if (leftIdx < 0 || leftIdx >= rawFeatureCount)
+                    continue;
+
+                for (int b = a + 1; b < topIdx.Length && k < features.Length; b++)
+                {
+                    int rightIdx = topIdx[b];
+                    if (rightIdx < 0 || rightIdx >= rawFeatureCount)
+                        continue;
+
+                    features[k++] = features[leftIdx] * features[rightIdx];
+                }
+            }
+        }
     }
 
     private static double AverageFirstCount(double[] probs, int count)

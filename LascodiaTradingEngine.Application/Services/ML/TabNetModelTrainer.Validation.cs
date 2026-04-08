@@ -13,7 +13,7 @@ public sealed partial class TabNetModelTrainer
         List<TrainingSample> samples, TrainingHyperparams hp,
         int F, int nSteps, int hiddenDim, int attentionDim,
         int sharedLayers, int stepLayers, double gamma, bool useSparsemax,
-        double lr, double sparsityCoeff, int epochs, double bnMomentum,
+        bool useGlu, double lr, double sparsityCoeff, int epochs, double bnMomentum,
         CancellationToken ct)
     {
         int folds    = hp.WalkForwardFolds;
@@ -56,11 +56,11 @@ public sealed partial class TabNetModelTrainer
             int cvEpochs = Math.Max(10, epochs / 3);
             var cvW = FitTabNet(
                 foldTrain, F, nSteps, hiddenDim, attentionDim, sharedLayers, stepLayers,
-                gamma, useSparsemax, lr, sparsityCoeff, cvEpochs,
+                gamma, useSparsemax, useGlu, lr, sparsityCoeff, cvEpochs,
                 hp.LabelSmoothing, null, null, null, hp.TemporalDecayLambda, hp.L2Lambda,
                 hp.EarlyStoppingPatience, 0.0, hp.MaxGradNorm, 0, bnMomentum, 128, 0, ct);
 
-            var m = EvaluateTabNet(foldTest, cvW, 1.0, 0.0, [], 0, F);
+            var m = EvaluateTabNet(foldTest, cvW, BuildCalibrationSnapshot(1.0, 0.0), [], 0, F);
 
             double[] foldImp = ComputeAttentionStats(foldTest, cvW).MeanAttn;
 
@@ -228,9 +228,16 @@ public sealed partial class TabNetModelTrainer
                     }
                     var bnH = ApplyBatchNorm(linear, w.HiddenDim, w.BnGamma[bnSIdx], w.BnBeta[bnSIdx],
                         w.BnMean[bnSIdx], w.BnVar[bnSIdx]);
-                    var gate = FcSigmoid(h, inputDim, w.HiddenDim, w.SharedGW[l], w.SharedGB[l]);
                     var hNew = new double[w.HiddenDim];
-                    for (int j = 0; j < w.HiddenDim; j++) hNew[j] = bnH[j] * gate[j];
+                    if (w.UseGlu)
+                    {
+                        var gate = FcSigmoid(h, inputDim, w.HiddenDim, w.SharedGW[l], w.SharedGB[l]);
+                        for (int j = 0; j < w.HiddenDim; j++) hNew[j] = bnH[j] * gate[j];
+                    }
+                    else
+                    {
+                        Array.Copy(bnH, hNew, w.HiddenDim);
+                    }
                     if (l > 0 && h.Length == w.HiddenDim)
                         for (int j = 0; j < w.HiddenDim; j++)
                             hNew[j] = (hNew[j] + h[j]) * SqrtHalfResidualScale;
@@ -250,9 +257,16 @@ public sealed partial class TabNetModelTrainer
                     }
                     var bnH = ApplyBatchNorm(linear, w.HiddenDim, w.BnGamma[bnStIdx], w.BnBeta[bnStIdx],
                         w.BnMean[bnStIdx], w.BnVar[bnStIdx]);
-                    var gate = FcSigmoid(h, w.HiddenDim, w.HiddenDim, w.StepGW[s][l], w.StepGB[s][l]);
                     var hNew = new double[w.HiddenDim];
-                    for (int j = 0; j < w.HiddenDim; j++) hNew[j] = bnH[j] * gate[j];
+                    if (w.UseGlu)
+                    {
+                        var gate = FcSigmoid(h, w.HiddenDim, w.HiddenDim, w.StepGW[s][l], w.StepGB[s][l]);
+                        for (int j = 0; j < w.HiddenDim; j++) hNew[j] = bnH[j] * gate[j];
+                    }
+                    else
+                    {
+                        Array.Copy(bnH, hNew, w.HiddenDim);
+                    }
                     if (l > 0)
                         for (int j = 0; j < w.HiddenDim; j++)
                             hNew[j] = (hNew[j] + h[j]) * SqrtHalfResidualScale;
@@ -266,23 +280,17 @@ public sealed partial class TabNetModelTrainer
         return (layerSums, layerSqSum);
     }
 
-    private void UpdateBnRunningStats(TabNetWeights w, List<TrainingSample> fitSet, double momentum, int ghostBatchSize)
+    private static void ApplyBnRunningStatsEma(
+        TabNetWeights w, double[][] batchMeans, double[][] batchVars, double momentum)
     {
-        int batchN = Math.Min(fitSet.Count, ghostBatchSize);
-        if (batchN < MinCalibrationSamples) return;
-
-        var (layerSums, layerSqSum) = TraverseBnLayers(w, fitSet, batchN);
-
-        for (int b = 0; b < w.TotalBnLayers; b++)
+        int layerCount = Math.Min(w.TotalBnLayers, Math.Min(batchMeans.Length, batchVars.Length));
+        for (int b = 0; b < layerCount; b++)
         {
-            int dim = layerSums[b].Length;
+            int dim = Math.Min(w.BnMean[b].Length, Math.Min(batchMeans[b].Length, batchVars[b].Length));
             for (int j = 0; j < dim; j++)
             {
-                double batchMean = layerSums[b][j] / batchN;
-                double batchVar  = layerSqSum[b][j] / batchN - batchMean * batchMean;
-                batchVar = Math.Max(batchVar, 0.0);
-
-                w.BnMean[b][j] = momentum * w.BnMean[b][j] + (1 - momentum) * batchMean;
+                double batchVar = Math.Max(0.0, batchVars[b][j]);
+                w.BnMean[b][j] = momentum * w.BnMean[b][j] + (1 - momentum) * batchMeans[b][j];
                 w.BnVar[b][j]  = momentum * w.BnVar[b][j]  + (1 - momentum) * batchVar;
             }
         }

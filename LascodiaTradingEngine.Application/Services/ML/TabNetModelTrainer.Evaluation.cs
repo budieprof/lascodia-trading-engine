@@ -1,4 +1,5 @@
 using LascodiaTradingEngine.Application.MLModels.Shared;
+using LascodiaTradingEngine.Application.Services.Inference;
 
 namespace LascodiaTradingEngine.Application.Services.ML;
 
@@ -10,7 +11,7 @@ public sealed partial class TabNetModelTrainer
 
     private static EvalMetrics EvaluateTabNet(
         IReadOnlyList<TrainingSample> evalSet, TabNetWeights w,
-        double plattA, double plattB, double[] magWeights, double magBias, int origF)
+        ModelSnapshot calibrationSnapshot, double[] magWeights, double magBias, int origF)
     {
         int correct = 0, tp = 0, fp = 0, fn = 0, tn = 0;
         double brierSum = 0, magSse = 0;
@@ -22,7 +23,7 @@ public sealed partial class TabNetModelTrainer
         for (int idx = 0; idx < n; idx++)
         {
             var s   = evalSet[idx];
-            double p = TabNetCalibProb(s.Features, w, plattA, plattB);
+            double p = TabNetCalibProb(s.Features, w, calibrationSnapshot);
             int yHat = p >= 0.5 ? 1 : 0;
             int y    = s.Direction > 0 ? 1 : 0;
 
@@ -76,12 +77,12 @@ public sealed partial class TabNetModelTrainer
     // ═══════════════════════════════════════════════════════════════════════
 
     private static float[] ComputePermutationImportance(
-        IReadOnlyList<TrainingSample> testSet, TabNetWeights w, double plattA, double plattB, CancellationToken ct)
+        IReadOnlyList<TrainingSample> testSet, TabNetWeights w, ModelSnapshot calibrationSnapshot, CancellationToken ct)
     {
         int n = testSet.Count, F = w.F;
         double baseline = 0;
         foreach (var s in testSet)
-            if ((TabNetCalibProb(s.Features, w, plattA, plattB) >= 0.5) == (s.Direction > 0)) baseline++;
+            if ((TabNetCalibProb(s.Features, w, calibrationSnapshot) >= 0.5) == (s.Direction > 0)) baseline++;
         baseline /= n;
         var importance = new float[F];
         Parallel.For(0, F, new ParallelOptions { CancellationToken = ct }, j =>
@@ -95,7 +96,7 @@ public sealed partial class TabNetModelTrainer
             {
                 var scratch = (float[])testSet[idx].Features.Clone();
                 scratch[j] = vals[idx];
-                if ((TabNetCalibProb(scratch, w, plattA, plattB) >= 0.5) == (testSet[idx].Direction > 0)) correct++;
+                if ((TabNetCalibProb(scratch, w, calibrationSnapshot) >= 0.5) == (testSet[idx].Direction > 0)) correct++;
             }
             importance[j] = (float)Math.Max(0, baseline - (double)correct / n);
         });
@@ -172,21 +173,236 @@ public sealed partial class TabNetModelTrainer
         return (meanAttn, perStep, entropy);
     }
 
+    private static double[] ComputePerStepSparsity(double[][] perStepAttention)
+    {
+        var sparsity = new double[perStepAttention.Length];
+        for (int s = 0; s < perStepAttention.Length; s++)
+        {
+            if (perStepAttention[s].Length == 0)
+                continue;
+            int nonZero = 0;
+            for (int j = 0; j < perStepAttention[s].Length; j++)
+                if (perStepAttention[s][j] > 1e-6)
+                    nonZero++;
+            sparsity[s] = (double)nonZero / perStepAttention[s].Length;
+        }
+        return sparsity;
+    }
+
+    private static (double[] BinConfidence, double[] BinAccuracy, int[] BinCounts) ComputeReliabilityDiagram(
+        IReadOnlyList<TrainingSample> samples, TabNetWeights w, ModelSnapshot calibrationSnapshot, int numBins = 10)
+    {
+        if (samples.Count < numBins * 2)
+            return ([], [], []);
+
+        var pairs = new (double CalibP, bool IsPositive)[samples.Count];
+        for (int i = 0; i < samples.Count; i++)
+        {
+            double calibP = TabNetCalibProb(samples[i].Features, w, calibrationSnapshot);
+            pairs[i] = (calibP, samples[i].Direction > 0);
+        }
+        Array.Sort(pairs, (a, b) => a.CalibP.CompareTo(b.CalibP));
+
+        int samplesPerBin = Math.Max(1, samples.Count / numBins);
+        var conf = new double[numBins];
+        var acc = new double[numBins];
+        var counts = new int[numBins];
+
+        for (int b = 0; b < numBins; b++)
+        {
+            int start = b * samplesPerBin;
+            int end = b == numBins - 1 ? samples.Count : Math.Min(samples.Count, (b + 1) * samplesPerBin);
+            if (start >= end)
+                break;
+
+            double sumConf = 0.0;
+            int positives = 0;
+            for (int i = start; i < end; i++)
+            {
+                sumConf += pairs[i].CalibP;
+                if (pairs[i].IsPositive)
+                    positives++;
+            }
+
+            int count = end - start;
+            conf[b] = sumConf / count;
+            acc[b] = (double)positives / count;
+            counts[b] = count;
+        }
+
+        return (conf, acc, counts);
+    }
+
+    private static (double CalibrationLoss, double RefinementLoss) ComputeMurphyDecomposition(
+        IReadOnlyList<TrainingSample> samples, TabNetWeights w, ModelSnapshot calibrationSnapshot, int bins = 10)
+    {
+        if (samples.Count < bins)
+            return (0.0, 0.0);
+
+        var binSumP = new double[bins];
+        var binSumY = new double[bins];
+        var binCount = new int[bins];
+        int totalPos = 0;
+
+        foreach (var sample in samples)
+        {
+            double p = TabNetCalibProb(sample.Features, w, calibrationSnapshot);
+            int y = sample.Direction > 0 ? 1 : 0;
+            int bin = Math.Clamp((int)(p * bins), 0, bins - 1);
+            binSumP[bin] += p;
+            binSumY[bin] += y;
+            binCount[bin]++;
+            totalPos += y;
+        }
+
+        double baseRate = (double)totalPos / samples.Count;
+        double calibrationLoss = 0.0;
+        double refinementLoss = 0.0;
+        for (int b = 0; b < bins; b++)
+        {
+            if (binCount[b] == 0)
+                continue;
+            double avgP = binSumP[b] / binCount[b];
+            double avgY = binSumY[b] / binCount[b];
+            double weight = (double)binCount[b] / samples.Count;
+            calibrationLoss += (avgP - avgY) * (avgP - avgY) * weight;
+            refinementLoss += avgY * Math.Max(0.0, 1.0 - avgY) * weight;
+        }
+
+        if (!double.IsFinite(baseRate))
+            return (0.0, 0.0);
+
+        return (calibrationLoss, refinementLoss);
+    }
+
+    private static double ComputePredictionStabilityScore(
+        IReadOnlyList<TrainingSample> samples, TabNetWeights w, ModelSnapshot calibrationSnapshot)
+    {
+        if (samples.Count == 0)
+            return 0.0;
+
+        double sum = 0.0;
+        for (int i = 0; i < samples.Count; i++)
+            sum += Math.Abs(TabNetCalibProb(samples[i].Features, w, calibrationSnapshot) - 0.5);
+        return sum / samples.Count;
+    }
+
+    private static (double[] Centroid, double DistanceMean, double DistanceStd, double EntropyThreshold, double UncertaintyThreshold)
+        ComputeActivationReferenceStats(IReadOnlyList<TrainingSample> samples, TabNetWeights w)
+    {
+        int count = Math.Min(samples.Count, 400);
+        if (count <= 0)
+            return (new double[w.HiddenDim], 0.0, 0.0, 0.0, 0.0);
+
+        var centroid = new double[w.HiddenDim];
+        var activations = new double[count][];
+        var entropies = new double[count];
+        var priorBuf = new double[w.F];
+        var attnBuf = new double[w.F];
+
+        for (int i = 0; i < count; i++)
+        {
+            var fwd = ForwardPass(samples[i].Features, w, priorBuf, attnBuf, false, 0, null);
+            activations[i] = (double[])fwd.AggregatedH.Clone();
+            for (int h = 0; h < w.HiddenDim; h++)
+                centroid[h] += activations[i][h];
+
+            double entropy = 0.0;
+            for (int s = 0; s < w.NSteps; s++)
+            {
+                for (int j = 0; j < w.F && j < fwd.StepAttn[s].Length; j++)
+                {
+                    double a = fwd.StepAttn[s][j];
+                    if (a > Eps)
+                        entropy -= a * Math.Log(a);
+                }
+            }
+            entropies[i] = entropy / Math.Max(1, w.NSteps);
+        }
+
+        for (int h = 0; h < w.HiddenDim; h++)
+            centroid[h] /= count;
+
+        var distances = new double[count];
+        var combinedUncertainty = new double[count];
+        for (int i = 0; i < count; i++)
+        {
+            double sq = 0.0;
+            for (int h = 0; h < w.HiddenDim; h++)
+            {
+                double d = activations[i][h] - centroid[h];
+                sq += d * d;
+            }
+            distances[i] = Math.Sqrt(sq);
+        }
+
+        double distanceMean = distances.Average();
+        double distanceStd = distances.Length > 1 ? StdDev(distances, distanceMean) : 0.0;
+        double entropyThreshold = Quantile(entropies, 0.90);
+        double distanceScale = distanceMean + 2.0 * Math.Max(distanceStd, 1e-6);
+        for (int i = 0; i < count; i++)
+        {
+            double entropyPart = entropyThreshold > 1e-6 ? Math.Min(1.0, entropies[i] / entropyThreshold) : 0.0;
+            double distancePart = distanceScale > 1e-6 ? Math.Min(1.0, distances[i] / distanceScale) : 0.0;
+            combinedUncertainty[i] = 0.5 * entropyPart + 0.5 * distancePart;
+        }
+
+        return (centroid, distanceMean, distanceStd, entropyThreshold, Quantile(combinedUncertainty, 0.90));
+    }
+
+    private static double[] ComputeBnDriftByLayer(TabNetWeights w, List<TrainingSample> fitSet, int ghostBatchSize)
+    {
+        if (fitSet.Count < MinCalibrationSamples)
+            return [];
+
+        var (batchMeans, batchVars) = ComputeEpochBatchStats(w, fitSet, ghostBatchSize, new Random(12345));
+        var drift = new double[w.TotalBnLayers];
+        for (int b = 0; b < w.TotalBnLayers; b++)
+        {
+            int dim = Math.Min(w.BnMean[b].Length, Math.Min(batchMeans[b].Length, batchVars[b].Length));
+            if (dim == 0)
+                continue;
+            double sum = 0.0;
+            for (int j = 0; j < dim; j++)
+            {
+                double meanDelta = Math.Abs(w.BnMean[b][j] - batchMeans[b][j]);
+                double varDelta = Math.Abs(Math.Sqrt(Math.Max(w.BnVar[b][j], 0.0)) - Math.Sqrt(Math.Max(batchVars[b][j], 0.0)));
+                sum += 0.5 * (meanDelta + varDelta);
+            }
+            drift[b] = sum / dim;
+        }
+        return drift;
+    }
+
+    private static double Quantile(double[] values, double q)
+    {
+        if (values.Length == 0)
+            return 0.0;
+        q = Math.Clamp(q, 0.0, 1.0);
+        var copy = (double[])values.Clone();
+        Array.Sort(copy);
+        double pos = q * (copy.Length - 1);
+        int lo = (int)Math.Floor(pos);
+        int hi = (int)Math.Ceiling(pos);
+        if (lo == hi)
+            return copy[lo];
+        double t = pos - lo;
+        return copy[lo] + (copy[hi] - copy[lo]) * t;
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     //  CONFORMAL / JACKKNIFE / META-LABEL / ABSTENTION / QUANTILE /
     //  BOUNDARY / DURBIN-WATSON / MI / MAGNITUDE REGRESSOR
     // ═══════════════════════════════════════════════════════════════════════
 
     private static double ComputeConformalQHat(
-        IReadOnlyList<TrainingSample> calSet, TabNetWeights w, double plattA, double plattB,
-        double[] isotonicBp, double alpha)
+        IReadOnlyList<TrainingSample> calSet, TabNetWeights w, ModelSnapshot calibrationSnapshot, double alpha)
     {
         if (calSet.Count < MinCalibrationSamples) return 0.5;
         var scores = new double[calSet.Count];
         for (int i = 0; i < calSet.Count; i++)
         {
-            double p = TabNetCalibProb(calSet[i].Features, w, plattA, plattB);
-            if (isotonicBp.Length >= 2) p = ApplyIsotonic(p, isotonicBp);
+            double p = TabNetCalibProb(calSet[i].Features, w, calibrationSnapshot);
             int y = calSet[i].Direction > 0 ? 1 : 0;
             scores[i] = 1.0 - (y == 1 ? p : 1.0 - p);
         }
@@ -287,12 +503,12 @@ public sealed partial class TabNetModelTrainer
     }
 
     private static (double[] Weights, double Bias, double Threshold) FitAbstentionModel(
-        IReadOnlyList<TrainingSample> calSet, TabNetWeights w, double plattA, double plattB)
+        IReadOnlyList<TrainingSample> calSet, TabNetWeights w, ModelSnapshot calibrationSnapshot)
     {
         if (calSet.Count < MinCalibrationSamples) return ([0.0], 0.0, 0.5);
         int n = calSet.Count;
         var probs = new double[n];
-        for (int i = 0; i < n; i++) probs[i] = TabNetCalibProb(calSet[i].Features, w, plattA, plattB);
+        for (int i = 0; i < n; i++) probs[i] = TabNetCalibProb(calSet[i].Features, w, calibrationSnapshot);
         double absW = 0.0, absB = 0.0;
         double mW = 0, vW = 0, mB = 0, vB = 0; int t = 0;
         for (int ep = 0; ep < CalibrationEpochs; ep++)

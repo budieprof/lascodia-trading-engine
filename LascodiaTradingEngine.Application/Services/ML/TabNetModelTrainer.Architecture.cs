@@ -71,9 +71,7 @@ public sealed partial class TabNetModelTrainer
             var (bnAttnOutput, attnXNorm) = ApplyBatchNormWithXNorm(attnInput, F, w.BnGamma[bnIdx], w.BnBeta[bnIdx],
                 activeMean, activeVar);
 
-            // Cache step-0 BN xNorm for backward pass
-            if (s == 0)
-                Array.Copy(attnXNorm, fwd.Step0AttnXNorm, F);
+            Array.Copy(attnXNorm, fwd.StepAttnXNorm[s], F);
 
             // Apply prior scales
             for (int j = 0; j < F; j++)
@@ -117,7 +115,7 @@ public sealed partial class TabNetModelTrainer
                         w.SharedW[l], w.SharedB[l], w.SharedGW[l], w.SharedGB[l],
                         w.BnGamma[bnSharedIdx], w.BnBeta[bnSharedIdx],
                         w.BnMean[bnSharedIdx], w.BnVar[bnSharedIdx], bm, bv,
-                        training, dropoutRate, rng, gluBuf,
+                        training, dropoutRate, rng, w.UseGlu, gluBuf,
                         outBuf, fwd.StepSharedPre[s][l], fwd.StepSharedGate[s][l],
                         fwd.StepSharedXNorm[s][l], fwd.StepSharedFcIn[s][l],
                         s < fwd.StepSharedDropMask.Length && l < fwd.StepSharedDropMask[s].Length
@@ -135,7 +133,7 @@ public sealed partial class TabNetModelTrainer
                         w.SharedW[l], w.SharedB[l], w.SharedGW[l], w.SharedGB[l],
                         w.BnGamma[bnSharedIdx], w.BnBeta[bnSharedIdx],
                         w.BnMean[bnSharedIdx], w.BnVar[bnSharedIdx], bm, bv,
-                        training, dropoutRate, rng);
+                        training, dropoutRate, rng, w.UseGlu);
 
                     Array.Copy(pre, fwd.StepSharedPre[s][l], H);
                     Array.Copy(gate, fwd.StepSharedGate[s][l], H);
@@ -168,7 +166,7 @@ public sealed partial class TabNetModelTrainer
                         w.StepW[s][l], w.StepB[s][l], w.StepGW[s][l], w.StepGB[s][l],
                         w.BnGamma[bnStepIdx], w.BnBeta[bnStepIdx],
                         w.BnMean[bnStepIdx], w.BnVar[bnStepIdx], bm, bv,
-                        training, dropoutRate, rng, gluBuf,
+                        training, dropoutRate, rng, w.UseGlu, gluBuf,
                         outBuf, fwd.StepStepPre[s][l], fwd.StepStepGate[s][l],
                         fwd.StepStepXNorm[s][l], fwd.StepStepFcIn[s][l],
                         s < fwd.StepStepDropMask.Length && l < fwd.StepStepDropMask[s].Length
@@ -186,7 +184,7 @@ public sealed partial class TabNetModelTrainer
                         w.StepW[s][l], w.StepB[s][l], w.StepGW[s][l], w.StepGB[s][l],
                         w.BnGamma[bnStepIdx], w.BnBeta[bnStepIdx],
                         w.BnMean[bnStepIdx], w.BnVar[bnStepIdx], bm, bv,
-                        training, dropoutRate, rng);
+                        training, dropoutRate, rng, w.UseGlu);
 
                     Array.Copy(pre, fwd.StepStepPre[s][l], H);
                     Array.Copy(gate, fwd.StepStepGate[s][l], H);
@@ -228,7 +226,7 @@ public sealed partial class TabNetModelTrainer
         double[][] fcW, double[] fcB, double[][] gateW, double[] gateB,
         double[] bnGamma, double[] bnBeta, double[] bnMean, double[] bnVar,
         double[]? batchMean, double[]? batchVar,
-        bool training, double dropoutRate, Random? rng)
+        bool training, double dropoutRate, Random? rng, bool useGlu)
     {
         // Cache the actual FC input for correct backward gradients through residual connections
         var fcInput = new double[inDim];
@@ -249,14 +247,20 @@ public sealed partial class TabNetModelTrainer
         double[] activeVar  = training && batchVar  is not null ? batchVar  : bnVar;
         var (bnOutput, xNorm) = ApplyBatchNormWithXNorm(linear, outDim, bnGamma, bnBeta, activeMean, activeVar);
 
-        // Gate transform (for GLU)
         var gate = new double[outDim];
-        for (int i = 0; i < outDim; i++)
+        if (useGlu)
         {
-            double val = gateB[i];
-            for (int j = 0; j < inDim && j < gateW[i].Length; j++)
-                val += gateW[i][j] * input[j];
-            gate[i] = Sigmoid(val);
+            for (int i = 0; i < outDim; i++)
+            {
+                double val = gateB[i];
+                for (int j = 0; j < inDim && j < gateW[i].Length; j++)
+                    val += gateW[i][j] * input[j];
+                gate[i] = Sigmoid(val);
+            }
+        }
+        else
+        {
+            Array.Fill(gate, 1.0);
         }
 
         // GLU: linear ⊙ sigmoid(gate)
@@ -286,7 +290,7 @@ public sealed partial class TabNetModelTrainer
         double[][] fcW, double[] fcB, double[][] gateW, double[] gateB,
         double[] bnGamma, double[] bnBeta, double[] bnMean, double[] bnVar,
         double[]? batchMean, double[]? batchVar,
-        bool training, double dropoutRate, Random? rng,
+        bool training, double dropoutRate, Random? rng, bool useGlu,
         FcBnGluBuffers buf,
         double[] dstOutput, double[] dstPre, double[] dstGate, double[] dstXNorm, double[] dstFcIn,
         bool[]? dropMask = null)
@@ -294,15 +298,22 @@ public sealed partial class TabNetModelTrainer
         // Cache FC input
         Array.Copy(input, 0, dstFcIn, 0, Math.Min(inDim, dstFcIn.Length));
 
-        // Linear + gate transforms (SIMD-accelerated inner products)
+        // Linear + optional gate transforms (SIMD-accelerated inner products)
         int dotLen = Math.Min(inDim, fcW.Length > 0 ? fcW[0].Length : inDim);
         for (int i = 0; i < outDim; i++)
         {
             int rowLen = Math.Min(dotLen, fcW[i].Length);
             buf.Linear[i] = fcB[i] + SimdDot(fcW[i], input, rowLen);
 
-            rowLen = Math.Min(dotLen, gateW[i].Length);
-            dstGate[i] = Sigmoid(gateB[i] + SimdDot(gateW[i], input, rowLen));
+            if (useGlu)
+            {
+                rowLen = Math.Min(dotLen, gateW[i].Length);
+                dstGate[i] = Sigmoid(gateB[i] + SimdDot(gateW[i], input, rowLen));
+            }
+            else
+            {
+                dstGate[i] = 1.0;
+            }
         }
 
         // BN
