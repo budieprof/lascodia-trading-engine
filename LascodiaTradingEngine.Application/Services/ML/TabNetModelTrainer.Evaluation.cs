@@ -42,10 +42,13 @@ public sealed partial class TabNetModelTrainer
         double evSum = 0;
         var returns = new List<double>(n);
 
+        // Batch forward pass with pooled buffers to reduce per-sample allocation overhead
+        double[] batchProbs = TabNetCalibProbBatch(evalSet, w, calibrationSnapshot);
+
         for (int idx = 0; idx < n; idx++)
         {
             var s   = evalSet[idx];
-            double p = TabNetCalibProb(s.Features, w, calibrationSnapshot);
+            double p = batchProbs[idx];
             int yHat = p >= decisionThreshold ? 1 : 0;
             int y    = s.Direction > 0 ? 1 : 0;
 
@@ -138,11 +141,13 @@ public sealed partial class TabNetModelTrainer
             for (int i = 0; i < n; i++) vals[i] = testSet[i].Features[j];
             for (int i = n - 1; i > 0; i--) { int k = rng.Next(i + 1); (vals[k], vals[i]) = (vals[i], vals[k]); }
             int correct = 0;
+            var scratch = new float[testSet[0].Features.Length]; // thread-local scratch buffer
             for (int idx = 0; idx < n; idx++)
             {
-                var scratch = (float[])testSet[idx].Features.Clone();
+                Array.Copy(testSet[idx].Features, scratch, scratch.Length);
                 scratch[j] = vals[idx];
                 if ((TabNetCalibProb(scratch, w, calibrationSnapshot) >= decisionThreshold) == (testSet[idx].Direction > 0)) correct++;
+                scratch[j] = testSet[idx].Features[j]; // restore for next iteration
             }
             importance[j] = (float)Math.Max(0, baseline - (double)correct / n);
         });
@@ -167,11 +172,13 @@ public sealed partial class TabNetModelTrainer
             for (int i = 0; i < n; i++) vals[i] = calSet[i].Features[j];
             for (int i = n - 1; i > 0; i--) { int k = rng.Next(i + 1); (vals[k], vals[i]) = (vals[i], vals[k]); }
             int correct = 0;
+            var scratch = new float[calSet[0].Features.Length]; // thread-local scratch buffer
             for (int idx = 0; idx < n; idx++)
             {
-                var scratch = (float[])calSet[idx].Features.Clone();
+                Array.Copy(calSet[idx].Features, scratch, scratch.Length);
                 scratch[j] = vals[idx];
                 if ((TabNetRawProb(scratch, w) >= decisionThreshold) == (calSet[idx].Direction > 0)) correct++;
+                scratch[j] = calSet[idx].Features[j]; // restore
             }
             importance[j] = Math.Max(0, baseAcc - (double)correct / n);
         });
@@ -427,13 +434,30 @@ public sealed partial class TabNetModelTrainer
         q = Math.Clamp(q, 0.0, 1.0);
         var copy = (double[])values.Clone();
         Array.Sort(copy);
-        double pos = q * (copy.Length - 1);
+        return QuantileSorted(copy, q);
+    }
+
+    /// <summary>Quantile on a pre-sorted array (avoids clone+sort when caller already sorted).</summary>
+    private static double QuantileSorted(double[] sorted, double q)
+    {
+        if (sorted.Length == 0) return 0.0;
+        double pos = q * (sorted.Length - 1);
         int lo = (int)Math.Floor(pos);
         int hi = (int)Math.Ceiling(pos);
-        if (lo == hi)
-            return copy[lo];
+        if (lo == hi) return sorted[lo];
         double t = pos - lo;
-        return copy[lo] + (copy[hi] - copy[lo]) * t;
+        return sorted[lo] + (sorted[hi] - sorted[lo]) * t;
+    }
+
+    /// <summary>Quantile using a pre-allocated scratch buffer (avoids heap allocation in hot loops).</summary>
+    private static double QuantilePooled(double[] values, double q, double[] scratch)
+    {
+        if (values.Length == 0) return 0.0;
+        q = Math.Clamp(q, 0.0, 1.0);
+        int len = Math.Min(values.Length, scratch.Length);
+        Array.Copy(values, scratch, len);
+        Array.Sort(scratch, 0, len);
+        return QuantileSorted(scratch.AsSpan(0, len).ToArray(), q);
     }
 
     // ═══════════════════════════════════════════════════════════════════════

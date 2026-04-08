@@ -1728,6 +1728,9 @@ public record WalkForwardResult(
     double AvgEV,
     double AvgSharpe,
     int    FoldCount,
+    double StdF1     = 0.0,
+    double StdEV     = 0.0,
+    double StdSharpe = 0.0,
     /// <summary>
     /// Linear regression slope of per-fold Sharpe ratios (fold index as x).
     /// Negative = deteriorating OOS performance across time.

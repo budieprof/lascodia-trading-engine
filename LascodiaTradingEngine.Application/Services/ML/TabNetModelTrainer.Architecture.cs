@@ -205,8 +205,17 @@ public sealed partial class TabNetModelTrainer
 
             // ── 6. ReLU gate and aggregate ───────────────────────────
             Array.Copy(h, fwd.StepH[s], H);
+            double eta = 0;
             for (int j = 0; j < H; j++)
-                fwd.AggregatedH[j] += Math.Max(h[j], 0.0);
+            {
+                double relu = Math.Max(h[j], 0.0);
+                fwd.AggregatedH[j] += relu;
+                eta += relu;
+            }
+
+            // M_explain: η-weighted attention per the TabNet paper (Arik & Pfister 2021)
+            for (int j = 0; j < F; j++)
+                fwd.ExplainMask[j] += eta * attn[j];
 
             // Update hPrev in-place (pooled buffer)
             Array.Copy(h, hPrev, H);
@@ -327,7 +336,7 @@ public sealed partial class TabNetModelTrainer
         {
             double m = activeMean.Length > i ? activeMean[i] : 0.0;
             double v = activeVar.Length > i ? activeVar[i] : 1.0;
-            dstXNorm[i] = (buf.Linear[i] - m) / Math.Sqrt(v + BnEpsilon);
+            dstXNorm[i] = (buf.Linear[i] - m) / Math.Sqrt(Math.Max(0, v) + BnEpsilon);
             dstPre[i]   = bnGamma[i] * dstXNorm[i] + bnBeta[i];
         }
 
@@ -365,7 +374,7 @@ public sealed partial class TabNetModelTrainer
         {
             double m = mean.Length > i ? mean[i] : 0.0;
             double v = var_.Length > i ? var_[i] : 1.0;
-            double xn = (input[i] - m) / Math.Sqrt(v + BnEpsilon);
+            double xn = (input[i] - m) / Math.Sqrt(Math.Max(0, v) + BnEpsilon);
             output[i] = gamma[i] * xn + beta[i];
         }
         return output;
@@ -381,7 +390,7 @@ public sealed partial class TabNetModelTrainer
         {
             double m = mean.Length > i ? mean[i] : 0.0;
             double v = var_.Length > i ? var_[i] : 1.0;
-            xNorm[i]  = (input[i] - m) / Math.Sqrt(v + BnEpsilon);
+            xNorm[i]  = (input[i] - m) / Math.Sqrt(Math.Max(0, v) + BnEpsilon);
             output[i] = gamma[i] * xNorm[i] + beta[i];
         }
         return (output, xNorm);

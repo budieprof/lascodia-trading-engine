@@ -114,6 +114,14 @@ public sealed partial class TabNetModelTrainer
         var fitSet   = trainSet[..^valSize];
         int nFit     = fitSet.Count;
 
+        // Re-normalize temporal weights over the fit subset so they sum to 1
+        {
+            double fitWtSum = 0;
+            for (int i = 0; i < nFit; i++) fitWtSum += i < temporalWeights.Length ? temporalWeights[i] : 0;
+            if (fitWtSum > Eps)
+                for (int i = 0; i < nFit && i < temporalWeights.Length; i++) temporalWeights[i] /= fitWtSum;
+        }
+
         double bestValLoss = double.MaxValue;
         int    earlyCount  = 0;
         int    bestEpoch   = 0;
@@ -134,6 +142,7 @@ public sealed partial class TabNetModelTrainer
 
         // Pre-allocate ForwardResult and BackwardBuffers once, reuse across all samples/epochs
         var fwdPool = ForwardResult.Allocate(nSteps, F, hiddenDim, sharedLayers, stepLayers);
+        var valFwdPool = ForwardResult.Allocate(nSteps, F, hiddenDim, sharedLayers, stepLayers);
         var bwdPool = BackwardBuffers.Allocate(F, hiddenDim);
 
         try
@@ -269,7 +278,7 @@ public sealed partial class TabNetModelTrainer
                     foreach (var vs in valSet)
                     {
                         var vfwd = ForwardPass(vs.Features, w, priorScales, attnLogits,
-                            training: false, 0, null);
+                            training: false, 0, null, null, null, valFwdPool);
                         int vy = vs.Direction > 0 ? 1 : 0;
                         valLoss -= vy * Math.Log(vfwd.Prob + Eps)
                                  + (1 - vy) * Math.Log(1 - vfwd.Prob + Eps);
@@ -769,7 +778,7 @@ public sealed partial class TabNetModelTrainer
         if (!double.IsFinite(g)) { g = 0; nanFixCount++; }
         m = AdamBeta1 * m + (1 - AdamBeta1) * g;
         v = AdamBeta2 * v + (1 - AdamBeta2) * g * g;
-        param -= lr * (m / bc1) / (Math.Sqrt(v / bc2) + AdamEpsilon);
+        param -= lr * (m / bc1) / (Math.Sqrt(Math.Max(0, v / bc2)) + AdamEpsilon);
         if (!double.IsFinite(param)) { param = 0; nanFixCount++; }
         else param = Math.Clamp(param, -MaxWeightVal, MaxWeightVal);
         return nanFixCount;
@@ -857,6 +866,8 @@ public sealed partial class TabNetModelTrainer
         foreach (var s in grad.StepGB) foreach (var l in s) sqNorm += SqNormArr(l);
         foreach (var s in grad.AttnFcW) sqNorm += SqNorm2D(s);
         foreach (var s in grad.AttnFcB) sqNorm += SqNormArr(s);
+        foreach (var b in grad.BnGamma) sqNorm += SqNormArr(b);
+        foreach (var b in grad.BnBeta) sqNorm += SqNormArr(b);
 
         double norm = Math.Sqrt(sqNorm);
         if (norm > maxNorm)

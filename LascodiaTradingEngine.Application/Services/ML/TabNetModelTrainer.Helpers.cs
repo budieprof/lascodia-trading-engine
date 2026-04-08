@@ -71,6 +71,27 @@ public sealed partial class TabNetModelTrainer
         return fwd.Prob;
     }
 
+    /// <summary>
+    /// Batch evaluation: computes calibrated probabilities for a list of samples,
+    /// reusing pooled forward-pass buffers across all samples to reduce GC pressure.
+    /// </summary>
+    private static double[] TabNetCalibProbBatch(
+        IReadOnlyList<TrainingSample> samples, TabNetWeights w, ModelSnapshot calibrationSnapshot)
+    {
+        int n = samples.Count;
+        var probs = new double[n];
+        var priorBuf = new double[w.F];
+        var attnBuf = new double[w.F];
+        var fwdPool = ForwardResult.Allocate(w.NSteps, w.F, w.HiddenDim, w.SharedLayers, w.StepLayers);
+        for (int i = 0; i < n; i++)
+        {
+            var fwd = ForwardPass(samples[i].Features, w, priorBuf, attnBuf, false, 0, null, null, null, fwdPool);
+            double raw = Math.Clamp(fwd.Prob, ProbClampMin, 1.0 - ProbClampMin);
+            probs[i] = InferenceHelpers.ApplyDeployedCalibration(raw, calibrationSnapshot);
+        }
+        return probs;
+    }
+
     private static double TabNetCalibProb(float[] features, TabNetWeights w, double plattA, double plattB)
     {
         double raw = Math.Clamp(TabNetRawProb(features, w), ProbClampMin, 1.0 - ProbClampMin);

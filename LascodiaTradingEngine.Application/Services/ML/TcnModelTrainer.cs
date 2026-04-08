@@ -914,7 +914,8 @@ public sealed partial class TcnModelTrainer : IMLModelTrainer
         }
 
         return (new WalkForwardResult(avgAcc, stdAcc, f1List.Average(), evList.Average(),
-            sharpeList.Average(), accList.Count, sharpeTrend, featureStabilityScores), equityCurveGateFailed);
+            sharpeList.Average(), accList.Count,
+            SharpeTrend: sharpeTrend, FeatureStabilityScores: featureStabilityScores), equityCurveGateFailed);
     }
 
     // ── TCN model fitting (causal dilated 1D convolution) ─────────────────────

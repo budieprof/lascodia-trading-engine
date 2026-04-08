@@ -423,13 +423,58 @@ public sealed partial class TabNetModelTrainer
             foreach (double v in arr) if (!double.IsFinite(v)) c++;
             return c;
         }
-        int nonFiniteWeights = 0;
-        if (weights.OutputW is { Length: > 0 }) nonFiniteWeights += CountNonFinite1D(weights.OutputW);
-        foreach (var layer in weights.SharedW) nonFiniteWeights += CountNonFinite(layer);
-        foreach (var step in weights.StepW) foreach (var layer in step) nonFiniteWeights += CountNonFinite(layer);
-        foreach (var step in weights.AttnFcW) nonFiniteWeights += CountNonFinite(step);
-        if (nonFiniteWeights > 0)
-            findings.Add($"Model contains {nonFiniteWeights} non-finite (NaN/Inf) weight values.");
+        // #18: Per-layer NaN/Inf breakdown
+        int nonFiniteOutput = weights.OutputW is { Length: > 0 } ? CountNonFinite1D(weights.OutputW) : 0;
+        int nonFiniteShared = 0;
+        foreach (var layer in weights.SharedW) nonFiniteShared += CountNonFinite(layer);
+        int nonFiniteStep = 0;
+        foreach (var step in weights.StepW) foreach (var layer in step) nonFiniteStep += CountNonFinite(layer);
+        int nonFiniteAttn = 0;
+        foreach (var step in weights.AttnFcW) nonFiniteAttn += CountNonFinite(step);
+        if (nonFiniteOutput > 0) findings.Add($"Output head contains {nonFiniteOutput} non-finite weights.");
+        if (nonFiniteShared > 0) findings.Add($"Shared layers contain {nonFiniteShared} non-finite weights.");
+        if (nonFiniteStep > 0) findings.Add($"Step layers contain {nonFiniteStep} non-finite weights.");
+        if (nonFiniteAttn > 0) findings.Add($"Attention layers contain {nonFiniteAttn} non-finite weights.");
+
+        // #19: BN running stats reasonability check
+        int degenerateBnLayers = 0;
+        for (int b = 0; b < weights.TotalBnLayers && b < weights.BnVar.Length; b++)
+        {
+            if (weights.BnVar[b].Length == 0) continue;
+            double maxVar = double.MinValue, minVar = double.MaxValue;
+            foreach (double v in weights.BnVar[b]) { if (v > maxVar) maxVar = v; if (v < minVar) minVar = v; }
+            if (maxVar < Eps || !double.IsFinite(maxVar) || minVar < 0)
+                degenerateBnLayers++;
+        }
+        if (degenerateBnLayers > 0)
+            findings.Add($"{degenerateBnLayers}/{weights.TotalBnLayers} BN layers have degenerate running variance.");
+
+        // #20: Attention entropy distribution sanity check
+        if (snapshot.TabNetAttentionEntropy is { Length: > 0 } attnEnt)
+        {
+            double meanEnt = attnEnt.Average();
+            double maxEnt = Math.Log(Math.Max(1, featureCount) + Eps);
+            if (meanEnt < 0.1)
+                findings.Add($"Attention entropy collapsed (mean={meanEnt:F3}), model may overfit to few features.");
+            if (maxEnt > Eps && meanEnt > 0.95 * maxEnt)
+                findings.Add($"Attention near-uniform (mean={meanEnt:F3}/{maxEnt:F1}), feature selection inactive.");
+        }
+
+        // #21: Gradient flow / sigmoid saturation check on audit samples
+        int saturatedSamples = 0;
+        for (int ai = 0; ai < auditCount; ai++)
+        {
+            int i = ai * auditStride;
+            if (i >= rawAuditSamples.Count) break;
+            float[] features = MLSignalScorer.StandardiseFeatures(rawAuditSamples[i].Features, snapshot.Means, snapshot.Stds, featureCount);
+            InferenceHelpers.ApplyModelSpecificFeatureTransforms(features, snapshot);
+            MLSignalScorer.ApplyFeatureMask(features, snapshot.ActiveFeatureMask, featureCount);
+            double p = TabNetRawProb(features, weights);
+            double gradMag = p * (1.0 - p); // sigmoid derivative
+            if (gradMag < 1e-10) saturatedSamples++;
+        }
+        if (saturatedSamples > auditCount / 2)
+            findings.Add($"Gradient flow concern: {saturatedSamples}/{auditCount} samples have near-zero output gradient (saturated sigmoid).");
 
         if (maxParityError > 1e-6)
             findings.Add($"Train/inference raw-prob parity max error={maxParityError:E3}");

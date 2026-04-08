@@ -115,6 +115,7 @@ public sealed partial class TabNetModelTrainer
     {
         public double   Prob;
         public double[] AggregatedH  = [];     // [hiddenDim] — sum of per-step ReLU outputs
+        public double[] ExplainMask  = [];     // [F] — TabNet M_explain: η-weighted attention aggregation
         public double[][] StepH      = [];     // [step][hiddenDim] — per-step output before ReLU
         public double[][] StepAttn   = [];     // [step][F] — attention masks
         public double[][] StepMasked = [];     // [step][F] — masked input
@@ -150,6 +151,7 @@ public sealed partial class TabNetModelTrainer
             var r = new ForwardResult
             {
                 AggregatedH  = new double[H],
+                ExplainMask  = new double[F],
                 StepH        = AllocJagged(nSteps, H),
                 StepAttn     = AllocJagged(nSteps, F),
                 StepMasked   = AllocJagged(nSteps, F),
@@ -187,6 +189,7 @@ public sealed partial class TabNetModelTrainer
         {
             Prob = 0;
             Array.Clear(AggregatedH);
+            Array.Clear(ExplainMask);
             Array.Clear(HPrev);
 
             // Clear all step-level arrays to prevent stale data leaking across samples

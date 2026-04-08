@@ -55,6 +55,16 @@ public sealed partial class TabNetModelTrainer
             var foldTest = samples[testStart..Math.Min(testEnd, samples.Count)];
             if (foldTest.Count < 20) continue;
 
+            // #22: Per-fold class balance check — skip folds with single class
+            int foldTrainPos = foldTrain.Count(s => s.Direction > 0);
+            int foldTestPos = foldTest.Count(s => s.Direction > 0);
+            if (foldTrainPos == 0 || foldTrainPos == foldTrain.Count || foldTestPos == 0 || foldTestPos == foldTest.Count)
+            {
+                _logger.LogWarning("TabNet CV fold {Fold}: single-class data (trainPos={TrainPos}/{Train}, testPos={TestPos}/{Test}), skipping",
+                    fold, foldTrainPos, foldTrain.Count, foldTestPos, foldTest.Count);
+                continue;
+            }
+
             int foldSelectionCount = Math.Min(
                 Math.Max(runContext.MinCalibrationSamples, foldTrain.Count / 10),
                 Math.Max(0, foldTrain.Count - hp.MinSamples));
@@ -112,6 +122,7 @@ public sealed partial class TabNetModelTrainer
             if (isBad) badFolds++;
         }
 
+        // #24: Minimum fold count enforcement
         if (accList.Count == 0)
         {
             _logger.LogWarning(
@@ -119,14 +130,27 @@ public sealed partial class TabNetModelTrainer
                 folds);
             return (new WalkForwardResult(0, 0, 0, 0, 0, 0), false);
         }
+        if (accList.Count < 2)
+        {
+            _logger.LogWarning(
+                "TabNet walk-forward CV: only {Completed}/{Total} folds completed — variance estimates unreliable.",
+                accList.Count, folds);
+        }
 
+        // #25: Bad-fold threshold — use Ceiling for faithful enforcement
         double badFoldThreshold = hp.MaxBadFoldFraction is > 0.0 and < 1.0 ? hp.MaxBadFoldFraction : 0.5;
-        bool equityCurveGateFailed = badFolds > (int)(accList.Count * badFoldThreshold);
+        bool equityCurveGateFailed = badFolds >= (int)Math.Ceiling(accList.Count * badFoldThreshold);
         if (equityCurveGateFailed)
             _logger.LogWarning("TabNet equity-curve gate: {Bad}/{Total} folds failed", badFolds, accList.Count);
 
         double avgAcc    = accList.Average();
         double stdAcc    = StdDev(accList, avgAcc);
+        double avgF1     = f1List.Average();
+        double stdF1     = StdDev(f1List, avgF1);
+        double avgEV     = evList.Average();
+        double stdEV     = StdDev(evList, avgEV);
+        double avgSharpe = sharpeList.Average();
+        double stdSharpe = StdDev(sharpeList, avgSharpe);
         double sharpeTrend = ComputeSharpeTrend(sharpeList);
 
         if (hp.MinSharpeTrendSlope > -99.0 && sharpeTrend < hp.MinSharpeTrendSlope)
@@ -159,10 +183,13 @@ public sealed partial class TabNetModelTrainer
         return (new WalkForwardResult(
             AvgAccuracy:            avgAcc,
             StdAccuracy:            stdAcc,
-            AvgF1:                  f1List.Average(),
-            AvgEV:                  evList.Average(),
-            AvgSharpe:              sharpeList.Average(),
+            AvgF1:                  avgF1,
+            AvgEV:                  avgEV,
+            AvgSharpe:              avgSharpe,
             FoldCount:              accList.Count,
+            StdF1:                  stdF1,
+            StdEV:                  stdEV,
+            StdSharpe:              stdSharpe,
             SharpeTrend:            sharpeTrend,
             FeatureStabilityScores: featureStabilityScores,
             FoldMetrics:            foldMetrics.ToArray(),

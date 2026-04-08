@@ -366,54 +366,69 @@ public sealed partial class TabNetModelTrainer
             }
         }
 
+        // Shared layers (partial reuse: load Min of available layers)
         try
         {
-            if (snapshot.TabNetSharedWeights is { } sw && sw.Length == w.SharedLayers)
-                for (int l = 0; l < w.SharedLayers; l++)
+            if (snapshot.TabNetSharedWeights is { } sw)
+                for (int l = 0; l < Math.Min(sw.Length, w.SharedLayers); l++)
                     CopyMatrixTracked(sw[l], w.SharedW[l]);
 
-            if (snapshot.TabNetSharedBiases is { } sb && sb.Length == w.SharedLayers)
-                for (int l = 0; l < w.SharedLayers; l++)
+            if (snapshot.TabNetSharedBiases is { } sb)
+                for (int l = 0; l < Math.Min(sb.Length, w.SharedLayers); l++)
                     CopyArrayTracked(sb[l], w.SharedB[l]);
 
-            if (snapshot.TabNetSharedGateWeights is { } sgw && sgw.Length == w.SharedLayers)
-                for (int l = 0; l < w.SharedLayers; l++)
+            if (snapshot.TabNetSharedGateWeights is { } sgw)
+                for (int l = 0; l < Math.Min(sgw.Length, w.SharedLayers); l++)
                     CopyMatrixTracked(sgw[l], w.SharedGW[l]);
 
-            if (snapshot.TabNetSharedGateBiases is { } sgb && sgb.Length == w.SharedLayers)
-                for (int l = 0; l < w.SharedLayers; l++)
+            if (snapshot.TabNetSharedGateBiases is { } sgb)
+                for (int l = 0; l < Math.Min(sgb.Length, w.SharedLayers); l++)
                     CopyArrayTracked(sgb[l], w.SharedGB[l]);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "TabNet warm-start: shared layer load failed, keeping Xavier init for remaining.");
+            rejected++;
+        }
 
-            if (snapshot.TabNetStepFcWeights is { } sfcw && sfcw.Length == w.NSteps)
-                for (int s = 0; s < w.NSteps; s++)
-                    if (sfcw[s].Length == w.StepLayers)
-                        for (int l = 0; l < w.StepLayers; l++)
-                            CopyMatrixTracked(sfcw[s][l], w.StepW[s][l]);
+        // Step-specific layers (partial reuse: load Min of available steps/layers)
+        try
+        {
+            if (snapshot.TabNetStepFcWeights is { } sfcw)
+                for (int s = 0; s < Math.Min(sfcw.Length, w.NSteps); s++)
+                    for (int l = 0; l < Math.Min(sfcw[s].Length, w.StepLayers); l++)
+                        CopyMatrixTracked(sfcw[s][l], w.StepW[s][l]);
 
-            if (snapshot.TabNetStepFcBiases is { } sfcb && sfcb.Length == w.NSteps)
-                for (int s = 0; s < w.NSteps; s++)
-                    if (sfcb[s].Length == w.StepLayers)
-                        for (int l = 0; l < w.StepLayers; l++)
-                            CopyArrayTracked(sfcb[s][l], w.StepB[s][l]);
+            if (snapshot.TabNetStepFcBiases is { } sfcb)
+                for (int s = 0; s < Math.Min(sfcb.Length, w.NSteps); s++)
+                    for (int l = 0; l < Math.Min(sfcb[s].Length, w.StepLayers); l++)
+                        CopyArrayTracked(sfcb[s][l], w.StepB[s][l]);
 
-            if (snapshot.TabNetStepGateWeights is { } sgwS && sgwS.Length == w.NSteps)
-                for (int s = 0; s < w.NSteps; s++)
-                    if (sgwS[s].Length == w.StepLayers)
-                        for (int l = 0; l < w.StepLayers; l++)
-                            CopyMatrixTracked(sgwS[s][l], w.StepGW[s][l]);
+            if (snapshot.TabNetStepGateWeights is { } sgwS)
+                for (int s = 0; s < Math.Min(sgwS.Length, w.NSteps); s++)
+                    for (int l = 0; l < Math.Min(sgwS[s].Length, w.StepLayers); l++)
+                        CopyMatrixTracked(sgwS[s][l], w.StepGW[s][l]);
 
-            if (snapshot.TabNetStepGateBiases is { } sgbS && sgbS.Length == w.NSteps)
-                for (int s = 0; s < w.NSteps; s++)
-                    if (sgbS[s].Length == w.StepLayers)
-                        for (int l = 0; l < w.StepLayers; l++)
-                            CopyArrayTracked(sgbS[s][l], w.StepGB[s][l]);
+            if (snapshot.TabNetStepGateBiases is { } sgbS)
+                for (int s = 0; s < Math.Min(sgbS.Length, w.NSteps); s++)
+                    for (int l = 0; l < Math.Min(sgbS[s].Length, w.StepLayers); l++)
+                        CopyArrayTracked(sgbS[s][l], w.StepGB[s][l]);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "TabNet warm-start: step layer load failed, keeping Xavier init for remaining.");
+            rejected++;
+        }
 
-            if (snapshot.TabNetAttentionFcWeights is { } afw && afw.Length == w.NSteps)
-                for (int s = 0; s < w.NSteps; s++)
+        // Attention FC + BN + output (partial reuse)
+        try
+        {
+            if (snapshot.TabNetAttentionFcWeights is { } afw)
+                for (int s = 0; s < Math.Min(afw.Length, w.NSteps); s++)
                     CopyMatrixTracked(afw[s], w.AttnFcW[s]);
 
-            if (snapshot.TabNetAttentionFcBiases is { } afb && afb.Length == w.NSteps)
-                for (int s = 0; s < w.NSteps; s++)
+            if (snapshot.TabNetAttentionFcBiases is { } afb)
+                for (int s = 0; s < Math.Min(afb.Length, w.NSteps); s++)
                     CopyArrayTracked(afb[s], w.AttnFcB[s]);
 
             if (snapshot.TabNetBnGammas is { } bng && bng.Length == w.TotalBnLayers)

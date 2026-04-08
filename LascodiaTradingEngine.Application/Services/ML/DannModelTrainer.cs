@@ -1267,7 +1267,7 @@ public sealed class DannModelTrainer : IMLModelTrainer
         }
 
         return (new WalkForwardResult(avgAcc, stdAcc, avgF1, avgEV, avgShrp,
-            accList.Count, sharpeTrend, featureStability), gateFailed);
+            accList.Count, SharpeTrend: sharpeTrend, FeatureStabilityScores: featureStability), gateFailed);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

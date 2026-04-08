@@ -64,6 +64,7 @@ public sealed partial class TabNetModelTrainer
         for (int ep = 0; ep < calibrationEpochs; ep++)
         {
             double dA = 0, dB = 0, loss = 0;
+            double hAA = 0, hAB = 0, hBB = 0; // Hessian for Newton-Raphson
             for (int i = 0; i < n; i++)
             {
                 double calibP = Sigmoid(plattA * logits[i] + plattB);
@@ -72,6 +73,10 @@ public sealed partial class TabNetModelTrainer
                 dB += err;
                 loss -= labels[i] * Math.Log(Math.Max(calibP, ProbClampMin))
                       + (1.0 - labels[i]) * Math.Log(Math.Max(1.0 - calibP, ProbClampMin));
+                double w2 = calibP * (1.0 - calibP) + Eps;
+                hAA += w2 * logits[i] * logits[i];
+                hAB += w2 * logits[i];
+                hBB += w2;
             }
             loss /= n;
             if (double.IsFinite(loss) && loss < bestLoss)
@@ -80,11 +85,20 @@ public sealed partial class TabNetModelTrainer
                 bestA = plattA;
                 bestB = plattB;
             }
-            // Gradient clipping
-            double gradNorm = Math.Sqrt(dA * dA + dB * dB) / n;
-            double clipScale = gradNorm > 10.0 ? 10.0 / gradNorm : 1.0;
-            plattA -= calibrationLr * clipScale * dA / n;
-            plattB -= calibrationLr * clipScale * dB / n;
+            // Newton-Raphson with Hessian; fall back to clipped gradient descent if singular
+            double det = hAA * hBB - hAB * hAB;
+            if (Math.Abs(det) > Eps)
+            {
+                plattA -= (hBB * dA - hAB * dB) / det;
+                plattB -= (hAA * dB - hAB * dA) / det;
+            }
+            else
+            {
+                double gradNorm = Math.Sqrt(dA * dA + dB * dB) / n;
+                double clipScale = gradNorm > 10.0 ? 10.0 / gradNorm : 1.0;
+                plattA -= calibrationLr * clipScale * dA / n;
+                plattB -= calibrationLr * clipScale * dB / n;
+            }
         }
         return (double.IsFinite(bestA) ? bestA : 1.0, double.IsFinite(bestB) ? bestB : 0.0);
     }
@@ -437,6 +451,27 @@ public sealed partial class TabNetModelTrainer
             }
         }
 
+        // Post-PAVA: merge blocks with fewer than MinBlockSize samples into adjacent blocks
+        const int MinIsotonicBlockSize = 5;
+        for (int i = blocks.Count - 1; i >= 1; i--)
+        {
+            if (blocks[i].Count < MinIsotonicBlockSize)
+            {
+                blocks[i - 1] = (blocks[i - 1].SumY + blocks[i].SumY,
+                    blocks[i - 1].Count + blocks[i].Count,
+                    blocks[i - 1].XMin, blocks[i].XMax);
+                blocks.RemoveAt(i);
+            }
+        }
+        // Handle first block being too small
+        if (blocks.Count >= 2 && blocks[0].Count < MinIsotonicBlockSize)
+        {
+            blocks[1] = (blocks[0].SumY + blocks[1].SumY,
+                blocks[0].Count + blocks[1].Count,
+                blocks[0].XMin, blocks[1].XMax);
+            blocks.RemoveAt(0);
+        }
+
         var bp = new List<double>();
         foreach (var block in blocks)
         {
@@ -540,6 +575,41 @@ public sealed partial class TabNetModelTrainer
         {
             if (binCount[b] == 0) continue;
             ece += Math.Abs(binCorrect[b] / binCount[b] - binConf[b] / binCount[b]) * binCount[b] / n;
+        }
+        return ece;
+    }
+
+    /// <summary>
+    /// Adaptive (equal-count) ECE: partitions samples into equal-size bins by predicted probability.
+    /// More robust than equal-width ECE when predictions cluster in a narrow range.
+    /// </summary>
+    private static double ComputeAdaptiveEce(
+        IReadOnlyList<TrainingSample> testSet,
+        TabNetWeights w,
+        ModelSnapshot calibrationSnapshot,
+        int bins = 10)
+    {
+        int n = testSet.Count;
+        if (n < bins) return 1.0;
+        var pairs = new (double P, int Y)[n];
+        for (int i = 0; i < n; i++)
+        {
+            double p = TabNetCalibProb(testSet[i].Features, w, calibrationSnapshot);
+            pairs[i] = (p, testSet[i].Direction > 0 ? 1 : 0);
+        }
+        Array.Sort(pairs, (a, b) => a.P.CompareTo(b.P));
+
+        double ece = 0;
+        int binSize = n / bins;
+        for (int b = 0; b < bins; b++)
+        {
+            int start = b * binSize;
+            int end = b == bins - 1 ? n : start + binSize;
+            int count = end - start;
+            if (count == 0) continue;
+            double sumConf = 0, sumCorrect = 0;
+            for (int i = start; i < end; i++) { sumConf += pairs[i].P; sumCorrect += pairs[i].Y; }
+            ece += Math.Abs(sumCorrect / count - sumConf / count) * count / n;
         }
         return ece;
     }
