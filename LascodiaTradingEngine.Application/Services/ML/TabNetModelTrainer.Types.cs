@@ -4,6 +4,17 @@ namespace LascodiaTradingEngine.Application.Services.ML;
 
 public sealed partial class TabNetModelTrainer
 {
+    private sealed class TabNetRunContext
+    {
+        public required double HuberDelta { get; init; }
+        public required int CalibrationEpochs { get; init; }
+        public required double CalibrationLr { get; init; }
+        public required int MinCalibrationSamples { get; init; }
+        public TabNetSnapshotSupport.WarmStartLoadReport WarmStartLoadReport { get; set; } =
+            new(0, 0, 0, 0, 0);
+        public TabNetAutoTuneTraceEntry[] AutoTuneTrace { get; set; } = [];
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     //  INTERNAL WEIGHT CONTAINER
     //  Encapsulates all TabNet architecture weights to avoid parameter explosion.

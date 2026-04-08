@@ -28,9 +28,14 @@ public sealed partial class TabNetModelTrainer
     //  PLATT / TEMPERATURE / CONDITIONAL / ISOTONIC STACK
     // ═══════════════════════════════════════════════════════════════════════
 
-    private static (double A, double B) FitPlattScaling(IReadOnlyList<TrainingSample> calSet, TabNetWeights w)
+    private static (double A, double B) FitPlattScaling(
+        IReadOnlyList<TrainingSample> calSet,
+        TabNetWeights w,
+        int minCalibrationSamples,
+        int calibrationEpochs,
+        double calibrationLr)
     {
-        if (calSet.Count < MinCalibrationSamples) return (1.0, 0.0);
+        if (calSet.Count < minCalibrationSamples) return (1.0, 0.0);
         int n = calSet.Count;
         var logits = new double[n];
         var labels = new double[n];
@@ -42,7 +47,7 @@ public sealed partial class TabNetModelTrainer
         }
 
         double plattA = 1.0, plattB = 0.0;
-        for (int ep = 0; ep < CalibrationEpochs; ep++)
+        for (int ep = 0; ep < calibrationEpochs; ep++)
         {
             double dA = 0, dB = 0;
             for (int i = 0; i < n; i++)
@@ -52,8 +57,8 @@ public sealed partial class TabNetModelTrainer
                 dA += err * logits[i];
                 dB += err;
             }
-            plattA -= CalibrationLr * dA / n;
-            plattB -= CalibrationLr * dB / n;
+            plattA -= calibrationLr * dA / n;
+            plattB -= calibrationLr * dB / n;
         }
         return (plattA, plattB);
     }
@@ -61,9 +66,12 @@ public sealed partial class TabNetModelTrainer
     private static TabNetCalibrationFit FitTabNetCalibrationStack(
         IReadOnlyList<TrainingSample> calSet,
         TabNetWeights w,
-        bool fitTemperatureScale)
+        bool fitTemperatureScale,
+        int minCalibrationSamples,
+        int calibrationEpochs,
+        double calibrationLr)
     {
-        var (plattA, plattB) = FitPlattScaling(calSet, w);
+        var (plattA, plattB) = FitPlattScaling(calSet, w, minCalibrationSamples, calibrationEpochs, calibrationLr);
         if (!double.IsFinite(plattA)) plattA = 1.0;
         if (!double.IsFinite(plattB)) plattB = 0.0;
 
@@ -73,9 +81,9 @@ public sealed partial class TabNetModelTrainer
         double temperatureScale = 0.0;
         double temperatureNll = globalPlattNll;
         string selectedGlobalCalibration = "PLATT";
-        if (fitTemperatureScale && calSet.Count >= MinCalibrationSamples)
+        if (fitTemperatureScale && calSet.Count >= minCalibrationSamples)
         {
-            double candidateTemperature = FitTemperatureScaling(calSet, w);
+            double candidateTemperature = FitTemperatureScaling(calSet, w, minCalibrationSamples, calibrationEpochs, calibrationLr);
             if (double.IsFinite(candidateTemperature) && candidateTemperature > 0.0)
             {
                 var temperatureSnapshot = BuildCalibrationSnapshot(plattA, plattB, candidateTemperature);
@@ -88,7 +96,13 @@ public sealed partial class TabNetModelTrainer
             }
         }
 
-        var conditionalFit = FitClassConditionalPlatt(calSet, w, plattA, plattB, temperatureScale);
+        double routingThreshold = DetermineConditionalRoutingThreshold(
+            calSet,
+            w,
+            BuildCalibrationSnapshot(plattA, plattB, temperatureScale),
+            minCalibrationSamples);
+        var conditionalFit = FitClassConditionalPlatt(
+            calSet, w, plattA, plattB, temperatureScale, routingThreshold, minCalibrationSamples, calibrationEpochs, calibrationLr);
         var preIsotonicSnapshot = BuildCalibrationSnapshot(
             plattA,
             plattB,
@@ -96,10 +110,11 @@ public sealed partial class TabNetModelTrainer
             conditionalFit.Buy.A,
             conditionalFit.Buy.B,
             conditionalFit.Sell.A,
-            conditionalFit.Sell.B);
+            conditionalFit.Sell.B,
+            conditionalRoutingThreshold: routingThreshold);
         double preIsotonicNll = ComputeCalibrationNll(calSet, w, preIsotonicSnapshot);
 
-        double[] isotonicBp = FitIsotonicCalibration(calSet, w, preIsotonicSnapshot);
+        double[] isotonicBp = FitIsotonicCalibration(calSet, w, preIsotonicSnapshot, minCalibrationSamples);
         bool isotonicAccepted = false;
         double postIsotonicNll = preIsotonicNll;
         var finalSnapshot = preIsotonicSnapshot;
@@ -113,7 +128,8 @@ public sealed partial class TabNetModelTrainer
                 conditionalFit.Buy.B,
                 conditionalFit.Sell.A,
                 conditionalFit.Sell.B,
-                isotonicBp);
+                isotonicBp,
+                routingThreshold);
             postIsotonicNll = ComputeCalibrationNll(calSet, w, isotonicSnapshot);
             if (postIsotonicNll + 1e-6 < preIsotonicNll)
             {
@@ -132,6 +148,8 @@ public sealed partial class TabNetModelTrainer
             GlobalPlattNll = globalPlattNll,
             TemperatureNll = temperatureNll,
             TemperatureSelected = string.Equals(selectedGlobalCalibration, "TEMPERATURE", StringComparison.Ordinal),
+            FitSampleCount = calSet.Count,
+            ConditionalRoutingThreshold = routingThreshold,
             BuyBranchSampleCount = conditionalFit.Buy.SampleCount,
             BuyBranchBaselineNll = conditionalFit.Buy.BaselineLoss,
             BuyBranchFittedNll = conditionalFit.Buy.FittedLoss,
@@ -151,7 +169,9 @@ public sealed partial class TabNetModelTrainer
     }
 
     private static ClassConditionalPlattFit FitClassConditionalPlatt(
-        IReadOnlyList<TrainingSample> calSet, TabNetWeights w, double plattA, double plattB, double temperatureScale)
+        IReadOnlyList<TrainingSample> calSet, TabNetWeights w, double plattA, double plattB, double temperatureScale,
+        double routingThreshold,
+        int minCalibrationSamples, int calibrationEpochs, double calibrationLr)
     {
         var buyPairs = new List<(double Logit, double BaseProb, double Y)>(calSet.Count);
         var sellPairs = new List<(double Logit, double BaseProb, double Y)>(calSet.Count);
@@ -165,24 +185,61 @@ public sealed partial class TabNetModelTrainer
                 : Sigmoid(plattA * rawLogit + plattB);
             double y = sample.Direction > 0 ? 1.0 : 0.0;
 
-            if (globalCalibP >= 0.5)
+            if (globalCalibP >= routingThreshold)
                 buyPairs.Add((rawLogit, globalCalibP, y));
             else
                 sellPairs.Add((rawLogit, globalCalibP, y));
         }
 
         return new ClassConditionalPlattFit(
-            FitConditionalPlattBranch(buyPairs),
-            FitConditionalPlattBranch(sellPairs));
+            FitConditionalPlattBranch(buyPairs, minCalibrationSamples, calibrationEpochs, calibrationLr),
+            FitConditionalPlattBranch(sellPairs, minCalibrationSamples, calibrationEpochs, calibrationLr));
     }
 
-    private static ConditionalPlattBranchFit FitConditionalPlattBranch(List<(double Logit, double BaseProb, double Y)> pairs)
+    private static double DetermineConditionalRoutingThreshold(
+        IReadOnlyList<TrainingSample> calSet,
+        TabNetWeights w,
+        ModelSnapshot globalCalibrationSnapshot,
+        int minCalibrationSamples)
+    {
+        if (calSet.Count < minCalibrationSamples * 2)
+            return 0.5;
+
+        var probs = new double[calSet.Count];
+        for (int i = 0; i < calSet.Count; i++)
+            probs[i] = TabNetCalibProb(calSet[i].Features, w, globalCalibrationSnapshot);
+
+        double candidate = Quantile(probs, 0.50);
+        if (!double.IsFinite(candidate))
+            return 0.5;
+
+        candidate = Math.Clamp(candidate, 0.35, 0.65);
+        int buyCount = 0;
+        int sellCount = 0;
+        for (int i = 0; i < probs.Length; i++)
+        {
+            if (probs[i] >= candidate)
+                buyCount++;
+            else
+                sellCount++;
+        }
+
+        return buyCount >= minCalibrationSamples / 2 && sellCount >= minCalibrationSamples / 2
+            ? candidate
+            : 0.5;
+    }
+
+    private static ConditionalPlattBranchFit FitConditionalPlattBranch(
+        List<(double Logit, double BaseProb, double Y)> pairs,
+        int minCalibrationSamples,
+        int calibrationEpochs,
+        double calibrationLr)
     {
         if (pairs.Count == 0)
             return new ConditionalPlattBranchFit(0, 0.0, 0.0, 0.0, 0.0);
 
         double baselineLoss = ComputeConditionalBranchNll(pairs);
-        if (pairs.Count < MinCalibrationSamples)
+        if (pairs.Count < minCalibrationSamples)
             return new ConditionalPlattBranchFit(pairs.Count, baselineLoss, baselineLoss, 0.0, 0.0);
 
         bool hasPositive = false, hasNegative = false;
@@ -200,7 +257,7 @@ public sealed partial class TabNetModelTrainer
         double a = 1.0, b = 0.0;
         double bestA = a, bestB = b, bestLoss = baselineLoss;
 
-        for (int ep = 0; ep < CalibrationEpochs; ep++)
+        for (int ep = 0; ep < calibrationEpochs; ep++)
         {
             double dA = 0.0, dB = 0.0;
             for (int i = 0; i < pairs.Count; i++)
@@ -211,8 +268,8 @@ public sealed partial class TabNetModelTrainer
                 dB += err;
             }
 
-            a -= CalibrationLr * dA / pairs.Count;
-            b -= CalibrationLr * dB / pairs.Count;
+            a -= calibrationLr * dA / pairs.Count;
+            b -= calibrationLr * dB / pairs.Count;
 
             double loss = ComputeConditionalBranchNll(pairs, a, b);
             if (!double.IsFinite(loss))
@@ -283,9 +340,10 @@ public sealed partial class TabNetModelTrainer
     private static double[] FitIsotonicCalibration(
         IReadOnlyList<TrainingSample> calSet,
         TabNetWeights w,
-        ModelSnapshot calibrationSnapshot)
+        ModelSnapshot calibrationSnapshot,
+        int minCalibrationSamples)
     {
-        if (calSet.Count < MinCalibrationSamples) return [];
+        if (calSet.Count < minCalibrationSamples) return [];
         var pairs = new (double X, double Y)[calSet.Count];
         for (int i = 0; i < calSet.Count; i++)
         {
@@ -336,9 +394,14 @@ public sealed partial class TabNetModelTrainer
     //  TEMPERATURE SCALING
     // ═══════════════════════════════════════════════════════════════════════
 
-    private static double FitTemperatureScaling(IReadOnlyList<TrainingSample> calSet, TabNetWeights w)
+    private static double FitTemperatureScaling(
+        IReadOnlyList<TrainingSample> calSet,
+        TabNetWeights w,
+        int minCalibrationSamples,
+        int calibrationEpochs,
+        double calibrationLr)
     {
-        if (calSet.Count < MinCalibrationSamples) return 1.0;
+        if (calSet.Count < minCalibrationSamples) return 1.0;
         int n = calSet.Count;
         var logits = new double[n];
         var labels = new double[n];
@@ -350,12 +413,12 @@ public sealed partial class TabNetModelTrainer
         }
 
         double temperature = 1.0;
-        for (int ep = 0; ep < 100; ep++)
+        for (int ep = 0; ep < calibrationEpochs; ep++)
         {
             double dT = 0;
             for (int i = 0; i < n; i++)
                 dT += (Sigmoid(logits[i] / temperature) - labels[i]) * (-logits[i] / (temperature * temperature));
-            temperature -= CalibrationLr * dT / n;
+            temperature -= calibrationLr * dT / n;
             temperature = Math.Max(0.01, temperature);
         }
         return temperature;
@@ -424,9 +487,10 @@ public sealed partial class TabNetModelTrainer
     private static double ComputeAvgKellyFraction(
         IReadOnlyList<TrainingSample> calSet,
         TabNetWeights w,
-        ModelSnapshot calibrationSnapshot)
+        ModelSnapshot calibrationSnapshot,
+        int minCalibrationSamples)
     {
-        if (calSet.Count < MinCalibrationSamples) return 0;
+        if (calSet.Count < minCalibrationSamples) return 0;
         double kellySum = 0;
         foreach (var sample in calSet)
             kellySum += Math.Max(0, (2 * TabNetCalibProb(sample.Features, w, calibrationSnapshot) - 1) * 0.5);
@@ -436,9 +500,10 @@ public sealed partial class TabNetModelTrainer
     private static double ComputeBrierSkillScore(
         IReadOnlyList<TrainingSample> testSet,
         TabNetWeights w,
-        ModelSnapshot calibrationSnapshot)
+        ModelSnapshot calibrationSnapshot,
+        int minCalibrationSamples)
     {
-        if (testSet.Count < MinCalibrationSamples) return 0;
+        if (testSet.Count < minCalibrationSamples) return 0;
         int n = testSet.Count;
         double baseRate = testSet.Count(s => s.Direction > 0) / (double)n;
         double brierNaive = baseRate * (1 - baseRate), brierModel = 0;
@@ -455,9 +520,10 @@ public sealed partial class TabNetModelTrainer
     private static (double Mean, double Std, double Threshold) ComputeCalibrationResidualStats(
         IReadOnlyList<TrainingSample> calSet,
         TabNetWeights w,
-        ModelSnapshot calibrationSnapshot)
+        ModelSnapshot calibrationSnapshot,
+        int minCalibrationSamples)
     {
-        if (calSet.Count < MinCalibrationSamples)
+        if (calSet.Count < minCalibrationSamples)
             return (0.0, 0.0, 0.0);
 
         var residuals = new double[calSet.Count];

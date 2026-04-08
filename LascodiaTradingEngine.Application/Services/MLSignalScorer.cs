@@ -573,7 +573,16 @@ public sealed class MLSignalScorer : IMLSignalScorer
 
     internal static void ApplyFeatureMask(float[] features, bool[] mask, int featureCount)
     {
-        if (mask.Length != featureCount) return;
+        if (mask.Length == 0)
+            return;
+
+        if (mask.Length != featureCount)
+            throw new InvalidOperationException(
+                $"ActiveFeatureMask length {mask.Length} does not match feature count {featureCount}.");
+
+        if (!mask.Any(v => v))
+            throw new InvalidOperationException("ActiveFeatureMask cannot disable every feature.");
+
         for (int j = 0; j < featureCount; j++)
         {
             if (!mask[j])
@@ -1280,7 +1289,7 @@ public sealed class MLSignalScorer : IMLSignalScorer
 
         var metaLabelScore = ScoringEnrichmentCalculator.ComputeMetaLabelScore(
             calibP, ensembleStd, features, featureCount,
-            snap.MetaLabelWeights, snap.MetaLabelBias);
+            snap.MetaLabelWeights, snap.MetaLabelBias, snap.MetaLabelTopFeatureIndices);
 
         var jackknifeInterval = ScoringEnrichmentCalculator.ComputeJackknifeInterval(snap.JackknifeResiduals);
 
@@ -1311,7 +1320,7 @@ public sealed class MLSignalScorer : IMLSignalScorer
 
         var abstentionScore = ScoringEnrichmentCalculator.ComputeAbstentionScore(
             calibP, ensembleStd, metaLabelScore, oodMahalanobisScore, entropyScore,
-            snap.AbstentionWeights, snap.AbstentionBias);
+            threshold, snap.AbstentionWeights, snap.AbstentionBias);
 
         var regimeRoutingDecision = ScoringEnrichmentCalculator.ComputeRegimeRoutingDecision(
             currentRegime, model.RegimeScope);

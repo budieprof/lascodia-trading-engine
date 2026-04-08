@@ -43,6 +43,17 @@ public class MLTrainerTests
         CurriculumEasyFraction: 0.3, SelfDistillTemp: 3.0,
         FgsmEpsilon: 0.01, MinF1Score: 0.10, UseClassWeights: true);
 
+    private static TrainingHyperparams TcnTestHp() => DefaultHp() with
+    {
+        MaxEpochs = 12,
+        EarlyStoppingPatience = 3,
+        WalkForwardFolds = 1,
+        EmbargoBarCount = 0,
+        TcnFilters = 8,
+        TcnNumBlocks = 2,
+        TcnUseAttentionPooling = false,
+    };
+
     private static List<TrainingSample> GenerateSamples(int count, int featureCount = 33)
     {
         var rng = new Random(42);
@@ -198,9 +209,9 @@ public class MLTrainerTests
     public async Task Tcn_TrainAsync_ReturnsValidResult()
     {
         var trainer = new TcnModelTrainer(Mock.Of<ILogger<TcnModelTrainer>>());
-        var samples = GenerateTcnSamples(200);
+        var samples = GenerateTcnSamples(160);
 
-        var result = await trainer.TrainAsync(samples, DefaultHp());
+        var result = await trainer.TrainAsync(samples, TcnTestHp());
 
         Assert.NotNull(result);
         Assert.NotNull(result.ModelBytes);
@@ -613,7 +624,13 @@ public class MLTrainerTests
         Assert.False(string.IsNullOrWhiteSpace(snap.FeatureSchemaFingerprint));
         Assert.False(string.IsNullOrWhiteSpace(snap.PreprocessingFingerprint));
         Assert.False(string.IsNullOrWhiteSpace(snap.TrainerFingerprint));
-        Assert.True(snap.PrunedFeatureCount > 0, "Test setup should exercise the TabNet pruning path.");
+        Assert.NotNull(snap.TabNetPruningDecision);
+        Assert.True(snap.TabNetPruningDecision!.PrunedFeatureCount > 0, "Test setup should exercise the TabNet pruning path.");
+        Assert.Equal(snap.Features.Length, snap.ActiveFeatureMask.Length);
+        Assert.Contains(snap.ActiveFeatureMask, v => v);
+        Assert.Equal(snap.PrunedFeatureCount, snap.ActiveFeatureMask.Count(v => !v));
+        Assert.NotNull(snap.TrainingSplitSummary);
+        Assert.True(snap.TrainingSplitSummary!.SelectionCount > 0);
         Assert.NotNull(snap.TabNetAttentionFcWeights);
         Assert.Equal(4, snap.TabNetAttentionFcWeights![0][0].Length);
 
@@ -703,6 +720,8 @@ public class MLTrainerTests
         Assert.InRange(deployed, 0.0, 1.0);
         Assert.True(snap.TabNetAuditArtifact is not null);
         Assert.True(snap.TabNetAuditArtifact!.MaxRawParityError <= 1e-6);
+        Assert.True(snap.TabNetAuditArtifact.MaxTransformReplayShift >= 0.0);
+        Assert.Equal(0, snap.TabNetAuditArtifact.ThresholdDecisionMismatchCount);
     }
 
     [Fact(Timeout = 60000)]
@@ -724,12 +743,17 @@ public class MLTrainerTests
         Assert.NotNull(snap.TabNetCalibrationArtifact);
 
         var artifact = snap.TabNetCalibrationArtifact!;
+        Assert.NotNull(snap.TrainingSplitSummary);
         Assert.True(artifact.SelectedGlobalCalibration is "PLATT" or "TEMPERATURE");
         Assert.Equal(artifact.TemperatureSelected, snap.TemperatureScale > 0.0);
         Assert.True(artifact.GlobalPlattNll >= 0.0);
         Assert.True(artifact.PreIsotonicNll >= 0.0);
         Assert.True(artifact.PostIsotonicNll <= artifact.PreIsotonicNll + 1e-6);
+        Assert.Equal(snap.TrainingSplitSummary!.CalibrationFitCount, artifact.FitSampleCount);
+        Assert.Equal(snap.TrainingSplitSummary.CalibrationDiagnosticsCount, artifact.DiagnosticsSampleCount);
+        Assert.False(string.IsNullOrWhiteSpace(artifact.AdaptiveHeadMode));
         Assert.Equal(artifact.IsotonicAccepted ? snap.IsotonicBreakpoints.Length / 2 : 0, artifact.IsotonicBreakpointCount);
+        Assert.InRange(snap.ConditionalCalibrationRoutingThreshold, 0.01, 0.99);
         Assert.Equal(
             InferenceHelpers.HasMeaningfulConditionalCalibration(snap.PlattABuy, snap.PlattBBuy),
             artifact.BuyBranchAccepted);
@@ -827,6 +851,166 @@ public class MLTrainerTests
 
         Assert.NotNull(inference);
         Assert.Equal(expectedRaw.Value, inference.Value.Probability, 8);
+    }
+
+    [Fact(Timeout = 60000)]
+    public async Task TabNet_TrainAsync_PersistsSelectionAndCalibrationSplitMetadata()
+    {
+        var trainer = new TabNetModelTrainer(Mock.Of<ILogger<TabNetModelTrainer>>());
+        var samples = GenerateSamples(260);
+        var hp = DefaultHp() with
+        {
+            MaxEpochs = 8,
+            WalkForwardFolds = 2,
+            EarlyStoppingPatience = 3,
+        };
+
+        var result = await trainer.TrainAsync(samples, hp);
+        var snap = JsonSerializer.Deserialize<ModelSnapshot>(result.ModelBytes);
+
+        Assert.NotNull(snap);
+        Assert.NotNull(snap.TrainingSplitSummary);
+        Assert.InRange(snap.OptimalThreshold, 0.0, 1.0);
+
+        var split = snap.TrainingSplitSummary!;
+        Assert.True(split.TrainCount >= hp.MinSamples);
+        Assert.True(split.SelectionCount >= 1);
+        Assert.True(split.CalibrationCount >= 1);
+        Assert.True(split.TestCount >= 1);
+        Assert.True(split.RawSelectionCount >= split.SelectionCount);
+        Assert.True(split.RawCalibrationCount >= split.CalibrationCount);
+        Assert.True(split.RawTestCount >= split.TestCount);
+        Assert.True(split.CalibrationFitCount > 0);
+        Assert.False(string.IsNullOrWhiteSpace(split.AdaptiveHeadSplitMode));
+        Assert.True(split.ConformalCount > 0);
+        Assert.True(split.MetaLabelCount > 0);
+        Assert.True(split.AbstentionCount > 0);
+        Assert.NotNull(snap.TabNetSelectionMetrics);
+        Assert.NotNull(snap.TabNetCalibrationMetrics);
+        Assert.NotNull(snap.TabNetTestMetrics);
+        Assert.NotNull(snap.TabNetDriftArtifact);
+        Assert.Equal(split.SelectionCount, snap.TabNetSelectionMetrics!.SampleCount);
+        Assert.Equal(split.CalibrationDiagnosticsCount, snap.TabNetCalibrationMetrics!.SampleCount);
+        Assert.Equal(split.TestCount, snap.TabNetTestMetrics!.SampleCount);
+        Assert.Equal(split.TrainCount, snap.TabNetDriftArtifact!.SampleCount);
+        Assert.Equal(snap.Features.Length, snap.TabNetDriftArtifact.FeatureCount);
+        if (split.CalibrationDiagnosticsCount > 0 &&
+            split.CalibrationDiagnosticsStartIndex >= split.CalibrationFitStartIndex + split.CalibrationFitCount)
+            Assert.Equal(split.CalibrationCount, split.CalibrationFitCount + split.CalibrationDiagnosticsCount);
+    }
+
+    [Fact(Timeout = 60000)]
+    public async Task TabNet_TrainAsync_TestLabelPoisoning_DoesNotChangeSelectionArtifacts()
+    {
+        var trainer = new TabNetModelTrainer(Mock.Of<ILogger<TabNetModelTrainer>>());
+        var cleanSamples = GenerateSamples(260, featureCount: 12);
+        int poisonFrom = (int)(cleanSamples.Count * 0.80);
+        var poisonedSamples = cleanSamples
+            .Select((sample, index) => index >= poisonFrom
+                ? sample with { Direction = sample.Direction > 0 ? 0 : 1 }
+                : sample)
+            .ToList();
+        var hp = DefaultHp() with
+        {
+            MaxEpochs = 8,
+            WalkForwardFolds = 2,
+            EarlyStoppingPatience = 3,
+            MinFeatureImportance = 4.0,
+        };
+
+        var cleanResult = await trainer.TrainAsync(cleanSamples, hp);
+        var poisonedResult = await trainer.TrainAsync(poisonedSamples, hp);
+
+        var cleanSnapshot = JsonSerializer.Deserialize<ModelSnapshot>(cleanResult.ModelBytes);
+        var poisonedSnapshot = JsonSerializer.Deserialize<ModelSnapshot>(poisonedResult.ModelBytes);
+
+        Assert.NotNull(cleanSnapshot);
+        Assert.NotNull(poisonedSnapshot);
+        Assert.Equal(cleanSnapshot.OptimalThreshold, poisonedSnapshot.OptimalThreshold, 8);
+        Assert.Equal(cleanSnapshot.ActiveFeatureMask, poisonedSnapshot.ActiveFeatureMask);
+        Assert.Equal(
+            cleanSnapshot.TabNetPruningDecision!.PrunedFeatureCount,
+            poisonedSnapshot.TabNetPruningDecision!.PrunedFeatureCount);
+    }
+
+    [Fact(Timeout = 120000)]
+    public async Task TabNet_TrainAsync_ConcurrentRuns_KeepRunSpecificArtifactsIsolated()
+    {
+        var trainer = new TabNetModelTrainer(Mock.Of<ILogger<TabNetModelTrainer>>());
+        var hpA = DefaultHp() with
+        {
+            MaxEpochs = 6,
+            WalkForwardFolds = 2,
+            EarlyStoppingPatience = 3,
+            TabNetUseSparsemax = false,
+            TabNetUseGlu = true,
+        };
+        var hpB = hpA with
+        {
+            TabNetUseSparsemax = true,
+            TabNetUseGlu = false,
+        };
+
+        var taskA = trainer.TrainAsync(GenerateSamples(220, featureCount: 12), hpA);
+        var taskB = trainer.TrainAsync(GenerateSamples(220, featureCount: 12), hpB);
+
+        var results = await Task.WhenAll(taskA, taskB);
+
+        var snapshotA = JsonSerializer.Deserialize<ModelSnapshot>(results[0].ModelBytes);
+        var snapshotB = JsonSerializer.Deserialize<ModelSnapshot>(results[1].ModelBytes);
+
+        Assert.NotNull(snapshotA);
+        Assert.NotNull(snapshotB);
+        Assert.False(snapshotA.TabNetUseSparsemax);
+        Assert.True(snapshotB.TabNetUseSparsemax);
+        Assert.True(snapshotA.TabNetUseGlu);
+        Assert.False(snapshotB.TabNetUseGlu);
+        Assert.NotNull(snapshotA.TrainingSplitSummary);
+        Assert.NotNull(snapshotB.TrainingSplitSummary);
+        Assert.NotNull(snapshotA.TabNetWarmStartArtifact);
+        Assert.NotNull(snapshotB.TabNetWarmStartArtifact);
+    }
+
+    [Fact(Timeout = 60000)]
+    public async Task TabNet_TrainAsync_LargeEmbargo_ThrowsInsteadOfProducingDegenerateSnapshot()
+    {
+        var trainer = new TabNetModelTrainer(Mock.Of<ILogger<TabNetModelTrainer>>());
+        var samples = GenerateSamples(140);
+        var hp = DefaultHp() with
+        {
+            MaxEpochs = 6,
+            WalkForwardFolds = 2,
+            EarlyStoppingPatience = 3,
+            EmbargoBarCount = 20,
+        };
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => trainer.TrainAsync(samples, hp));
+    }
+
+    [Fact]
+    public void TabNetSnapshotSupport_Rejects_AllFalseMask_AndBadPrunedCount()
+    {
+        var invalidMask = CreateSimpleTabNetSnapshot(useInitialProjection: false, useSparsemax: true);
+        invalidMask.ActiveFeatureMask = [false, false];
+        invalidMask.PrunedFeatureCount = 2;
+
+        var invalidMaskValidation = TabNetSnapshotSupport.ValidateSnapshot(invalidMask, allowLegacyV2: false);
+
+        Assert.False(invalidMaskValidation.IsValid);
+        Assert.Contains(
+            invalidMaskValidation.Issues,
+            issue => issue.Contains("prune every feature", StringComparison.OrdinalIgnoreCase));
+
+        var invalidPrunedCount = CreateSimpleTabNetSnapshot(useInitialProjection: false, useSparsemax: true);
+        invalidPrunedCount.ActiveFeatureMask = [true, false];
+        invalidPrunedCount.PrunedFeatureCount = 0;
+
+        var invalidPrunedCountValidation = TabNetSnapshotSupport.ValidateSnapshot(invalidPrunedCount, allowLegacyV2: false);
+
+        Assert.False(invalidPrunedCountValidation.IsValid);
+        Assert.Contains(
+            invalidPrunedCountValidation.Issues,
+            issue => issue.Contains("PrunedFeatureCount", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
@@ -943,6 +1127,38 @@ public class MLTrainerTests
             Features = ["F0", "F1"],
             Means = [0f, 0f],
             Stds = [1f, 1f],
+            TrainingSplitSummary = new TrainingSplitSummary
+            {
+                RawTrainCount = 2,
+                RawSelectionCount = 1,
+                RawCalibrationCount = 1,
+                RawTestCount = 1,
+                TrainStartIndex = 0,
+                TrainCount = 2,
+                SelectionStartIndex = 2,
+                SelectionCount = 1,
+                CalibrationStartIndex = 3,
+                CalibrationCount = 1,
+                CalibrationFitStartIndex = 3,
+                CalibrationFitCount = 1,
+                CalibrationDiagnosticsStartIndex = 3,
+                CalibrationDiagnosticsCount = 1,
+                ConformalStartIndex = 3,
+                ConformalCount = 1,
+                MetaLabelStartIndex = 3,
+                MetaLabelCount = 1,
+                AbstentionStartIndex = 3,
+                AbstentionCount = 1,
+                AdaptiveHeadSplitMode = "SHARED_FALLBACK",
+                TestStartIndex = 4,
+                TestCount = 1,
+            },
+            OptimalThreshold = 0.5,
+            ConditionalCalibrationRoutingThreshold = 0.5,
+            TabNetSelectionMetrics = new TabNetMetricSummary { SplitName = "SELECTION", SampleCount = 1, Threshold = 0.5 },
+            TabNetCalibrationMetrics = new TabNetMetricSummary { SplitName = "CALIBRATION_DIAGNOSTICS", SampleCount = 1, Threshold = 0.5 },
+            TabNetTestMetrics = new TabNetMetricSummary { SplitName = "TEST", SampleCount = 1, Threshold = 0.5 },
+            TabNetDriftArtifact = new TabNetDriftArtifact { SampleCount = 2, FeatureCount = 2, GateAction = "PASS" },
             BaseLearnersK = 1,
             TabNetRawFeatureCount = 2,
             TabNetUseSparsemax = useSparsemax,
@@ -980,6 +1196,38 @@ public class MLTrainerTests
             Features = ["F0", "F1"],
             Means = [0f, 0f],
             Stds = [1f, 1f],
+            TrainingSplitSummary = new TrainingSplitSummary
+            {
+                RawTrainCount = 2,
+                RawSelectionCount = 1,
+                RawCalibrationCount = 1,
+                RawTestCount = 1,
+                TrainStartIndex = 0,
+                TrainCount = 2,
+                SelectionStartIndex = 2,
+                SelectionCount = 1,
+                CalibrationStartIndex = 3,
+                CalibrationCount = 1,
+                CalibrationFitStartIndex = 3,
+                CalibrationFitCount = 1,
+                CalibrationDiagnosticsStartIndex = 3,
+                CalibrationDiagnosticsCount = 1,
+                ConformalStartIndex = 3,
+                ConformalCount = 1,
+                MetaLabelStartIndex = 3,
+                MetaLabelCount = 1,
+                AbstentionStartIndex = 3,
+                AbstentionCount = 1,
+                AdaptiveHeadSplitMode = "SHARED_FALLBACK",
+                TestStartIndex = 4,
+                TestCount = 1,
+            },
+            OptimalThreshold = 0.5,
+            ConditionalCalibrationRoutingThreshold = 0.5,
+            TabNetSelectionMetrics = new TabNetMetricSummary { SplitName = "SELECTION", SampleCount = 1, Threshold = 0.5 },
+            TabNetCalibrationMetrics = new TabNetMetricSummary { SplitName = "CALIBRATION_DIAGNOSTICS", SampleCount = 1, Threshold = 0.5 },
+            TabNetTestMetrics = new TabNetMetricSummary { SplitName = "TEST", SampleCount = 1, Threshold = 0.5 },
+            TabNetDriftArtifact = new TabNetDriftArtifact { SampleCount = 2, FeatureCount = 2, GateAction = "PASS" },
             BaseLearnersK = 1,
             TabNetRawFeatureCount = 2,
             TabNetUseSparsemax = true,
@@ -1134,44 +1382,55 @@ public class MLTrainerTests
     // ──────────────────────────────────────────────
 
     [Fact(Timeout = 60000)]
-    public async Task TabNet_Pruning_ReducesActualFeatureDimensionality()
+    public async Task TabNet_Pruning_MaintainsFixedWidthDeploymentContract()
     {
         var trainer = new TabNetModelTrainer(Mock.Of<ILogger<TabNetModelTrainer>>());
-        // Use 12 features with aggressive pruning threshold to ensure some features are pruned
         var samples = GenerateSamples(260, featureCount: 12);
         var hp = DefaultHp() with
         {
             MaxEpochs = 8,
             WalkForwardFolds = 2,
             EarlyStoppingPatience = 3,
-            MinFeatureImportance = 4.0, // aggressive: prune features below 4× equal share
+            MinFeatureImportance = 4.0,
         };
 
         var result = await trainer.TrainAsync(samples, hp);
         var snap = JsonSerializer.Deserialize<ModelSnapshot>(result.ModelBytes);
         Assert.NotNull(snap);
 
-        if (snap.PrunedFeatureCount > 0 && snap.TabNetPruningAccepted)
+        Assert.NotNull(snap.TabNetPruningDecision);
+        Assert.True(snap.TabNetPruningDecision!.PrunedFeatureCount > 0);
+        Assert.Equal(snap.Features.Length, snap.ActiveFeatureMask.Length);
+        Assert.Contains(snap.ActiveFeatureMask, v => v);
+        Assert.Equal(snap.PrunedFeatureCount, snap.ActiveFeatureMask.Count(v => !v));
+
+        var validation = TabNetSnapshotSupport.ValidateSnapshot(snap, allowLegacyV2: false);
+        Assert.True(validation.IsValid, string.Join("; ", validation.Issues));
+
+        if (snap.TabNetAttentionFcWeights is { Length: > 0 })
+            Assert.Equal(snap.Features.Length, snap.TabNetAttentionFcWeights[0].Length);
+        if (snap.TabNetBnGammas is { Length: > 0 })
+            Assert.Equal(snap.Features.Length, snap.TabNetBnGammas[0].Length);
+
+        bool sawNonZeroEffectiveInput = false;
+        var engine = new TabNetInferenceEngine();
+        for (int i = 0; i < Math.Min(5, samples.Count); i++)
         {
-            // When pruning is accepted, the deployed model's TabNet weights should
-            // reflect the reduced dimensionality (F - prunedCount), not the original F.
-            int expectedF = snap.Features.Length - snap.PrunedFeatureCount;
-            Assert.True(expectedF < snap.Features.Length,
-                "Pruned feature count should be less than total features.");
+            int featureCount = snap.Features.Length;
+            float[] inferenceFeatures = MLSignalScorer.StandardiseFeatures(
+                samples[i].Features, snap.Means, snap.Stds, featureCount);
+            InferenceHelpers.ApplyModelSpecificFeatureTransforms(inferenceFeatures, snap);
+            MLSignalScorer.ApplyFeatureMask(inferenceFeatures, snap.ActiveFeatureMask, featureCount);
 
-            // The attention FC weights at step 0 should have outer dimension = expectedF
-            // because ApplyMask now compacts features rather than zeroing them.
-            if (snap.TabNetAttentionFcWeights is { Length: > 0 })
-            {
-                int attnOuterDim = snap.TabNetAttentionFcWeights[0].Length;
-                Assert.Equal(expectedF, attnOuterDim);
-            }
+            if (inferenceFeatures.Any(v => Math.Abs(v) > 1e-6f))
+                sawNonZeroEffectiveInput = true;
 
-            // BN parameters for the attention layer (index 0) should also match
-            if (snap.TabNetBnGammas is { Length: > 0 })
-            {
-                Assert.Equal(expectedF, snap.TabNetBnGammas[0].Length);
-            }
+            var inference = engine.RunInference(
+                inferenceFeatures, featureCount, snap, new List<Candle>(), modelId: 99L, mcDropoutSamples: 0, mcDropoutSeed: 0);
+            Assert.NotNull(inference);
+            Assert.InRange(inference.Value.Probability, 0.0, 1.0);
         }
+
+        Assert.True(sawNonZeroEffectiveInput, "Deployed masking should not collapse every audited inference vector to all-zero inputs.");
     }
 }

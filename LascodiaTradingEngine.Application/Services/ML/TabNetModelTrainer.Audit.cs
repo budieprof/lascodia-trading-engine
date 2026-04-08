@@ -34,21 +34,22 @@ public sealed partial class TabNetModelTrainer
         bool useGlu,
         double baselineDropout,
         double baselineSparsity,
+        TabNetRunContext runContext,
         CancellationToken ct)
     {
         var baseline = new TabNetArchitectureChoice(
             baselineSteps, baselineHiddenDim, baselineAttentionDim,
             baselineGamma, baselineDropout, baselineSparsity);
-        _lastAutoTuneTrace = [];
+        runContext.AutoTuneTrace = [];
 
-        if (hp.MaxEpochs < 12 || trainSet.Count < hp.MinSamples * 2 || calSet.Count < MinCalibrationSamples)
+        if (hp.MaxEpochs < 12 || trainSet.Count < hp.MinSamples * 2 || calSet.Count < runContext.MinCalibrationSamples)
             return baseline;
 
         int tuneEpochs = Math.Max(6, Math.Min(12, hp.MaxEpochs / 3));
         double tuneLr = hp.LearningRate > 0 ? hp.LearningRate : 0.02;
         var tuneTrain = trainSet.Take(Math.Max(hp.MinSamples, (int)(trainSet.Count * 0.60))).ToList();
-        var tuneCal = calSet.Take(Math.Max(MinCalibrationSamples, Math.Min(calSet.Count, 120))).ToList();
-        if (tuneTrain.Count < hp.MinSamples || tuneCal.Count < MinCalibrationSamples)
+        var tuneCal = calSet.Take(Math.Max(runContext.MinCalibrationSamples, Math.Min(calSet.Count, 120))).ToList();
+        if (tuneTrain.Count < hp.MinSamples || tuneCal.Count < runContext.MinCalibrationSamples)
             return baseline;
 
         var candidates = new List<TabNetArchitectureChoice>
@@ -128,10 +129,21 @@ public sealed partial class TabNetModelTrainer
                 hp.TabNetMomentumBn > 0 ? hp.TabNetMomentumBn : 0.98,
                 hp.TabNetGhostBatchSize > 0 ? hp.TabNetGhostBatchSize : 128,
                 0,
+                runContext,
                 ct);
 
-            var tuneCalibration = FitTabNetCalibrationStack(tuneCal, tunedWeights, hp.FitTemperatureScale);
-            var tuneMetrics = EvaluateTabNet(tuneCal, tunedWeights, tuneCalibration.FinalSnapshot, [], 0.0, featureCount);
+            var tuneCalibration = FitTabNetCalibrationStack(
+                tuneCal,
+                tunedWeights,
+                hp.FitTemperatureScale,
+                runContext.MinCalibrationSamples,
+                runContext.CalibrationEpochs,
+                runContext.CalibrationLr);
+            double tuneThreshold = ComputeOptimalThreshold(
+                tuneCal, tunedWeights, tuneCalibration.FinalSnapshot,
+                hp.ThresholdSearchMin, hp.ThresholdSearchMax);
+            var tuneMetrics = EvaluateTabNet(
+                tuneCal, tunedWeights, tuneCalibration.FinalSnapshot, [], 0.0, featureCount, tuneThreshold);
             double tuneEce = ComputeEce(tuneCal, tunedWeights, tuneCalibration.FinalSnapshot);
             var cvHp = hp with
             {
@@ -147,7 +159,7 @@ public sealed partial class TabNetModelTrainer
                 tuneTrain, cvHp, featureCount, candidate.NSteps, candidate.HiddenDim,
                 Math.Clamp(candidate.AttentionDim, 1, candidate.HiddenDim),
                 sharedLayers, stepLayers, candidate.Gamma, useSparsemax, useGlu, tuneLr,
-                candidate.SparsityCoeff, tuneEpochs, hp.TabNetMomentumBn > 0 ? hp.TabNetMomentumBn : 0.98, ct);
+                candidate.SparsityCoeff, tuneEpochs, hp.TabNetMomentumBn > 0 ? hp.TabNetMomentumBn : 0.98, runContext, ct);
 
             double score =
                 0.45 * tuneMetrics.Accuracy +
@@ -182,6 +194,10 @@ public sealed partial class TabNetModelTrainer
                 HoldoutSharpe = tuneMetrics.SharpeRatio,
                 HoldoutBrier = tuneMetrics.BrierScore,
                 HoldoutEce = tuneEce,
+                TuneTrainSampleCount = tuneTrain.Count,
+                TuneHoldoutSampleCount = tuneCal.Count,
+                CvFoldCount = tuneCv.FoldCount,
+                HoldoutSplitName = "SELECTION",
                 Selected = false,
             });
 
@@ -199,7 +215,7 @@ public sealed partial class TabNetModelTrainer
                                 Math.Abs(trace[i].Gamma - bestChoice.Gamma) <= 1e-9 &&
                                 Math.Abs(trace[i].DropoutRate - bestChoice.DropoutRate) <= 1e-9 &&
                                 Math.Abs(trace[i].SparsityCoeff - bestChoice.SparsityCoeff) <= 1e-9;
-        _lastAutoTuneTrace = trace
+        runContext.AutoTuneTrace = trace
             .OrderByDescending(t => t.Score)
             .ToArray();
 
@@ -250,10 +266,42 @@ public sealed partial class TabNetModelTrainer
         var findings = new List<string>();
         var engine = new TabNetInferenceEngine();
         int featureCount = snapshot.Features.Length > 0 ? snapshot.Features.Length : snapshot.Means.Length;
+        int activeFeatureCount = snapshot.ActiveFeatureMask is { Length: > 0 } mask
+            ? mask.Count(v => v)
+            : featureCount;
         double maxParityError = 0.0;
         double sumParityError = 0.0;
         double maxCalibratedDelta = 0.0;
         double maxUncertaintyObserved = 0.0;
+        double maxTransformReplayShift = 0.0;
+        double maxMaskApplicationShift = 0.0;
+        int thresholdDecisionMismatchCount = 0;
+        bool allAuditedInputsCollapsedAfterMask;
+
+        if (snapshot.ActiveFeatureMask is { Length: > 0 } activeMask &&
+            snapshot.PrunedFeatureCount != activeMask.Count(v => !v))
+        {
+            findings.Add("Active feature mask and pruned feature count are inconsistent.");
+        }
+        if (!double.IsFinite(snapshot.OptimalThreshold) || snapshot.OptimalThreshold <= 0.0 || snapshot.OptimalThreshold >= 1.0)
+            findings.Add($"Optimal threshold is out of range: {snapshot.OptimalThreshold:F4}");
+        if (snapshot.TabNetSelectionMetrics is null)
+            findings.Add("Missing TabNet selection metrics artifact.");
+        if (snapshot.TabNetCalibrationMetrics is null)
+            findings.Add("Missing TabNet calibration metrics artifact.");
+        if (snapshot.TabNetTestMetrics is null)
+            findings.Add("Missing TabNet test metrics artifact.");
+        if (snapshot.TabNetDriftArtifact is null)
+            findings.Add("Missing TabNet drift artifact.");
+        if (snapshot.TrainingSplitSummary is { } splitSummary)
+        {
+            if (splitSummary.SelectionCount <= 0)
+                findings.Add("Selection split metadata is missing or empty.");
+            if (splitSummary.CalibrationCount <= 0)
+                findings.Add("Calibration split metadata is missing or empty.");
+            if (splitSummary.TestCount <= 0)
+                findings.Add("Test split metadata is missing or empty.");
+        }
 
         // Distribute audit samples evenly across the dataset (not just first-N)
         const int MaxAuditSamples = 24;
@@ -261,13 +309,30 @@ public sealed partial class TabNetModelTrainer
         int auditStride = rawAuditSamples.Count > MaxAuditSamples
             ? rawAuditSamples.Count / MaxAuditSamples
             : 1;
+        allAuditedInputsCollapsedAfterMask = auditCount > 0;
         for (int ai = 0; ai < auditCount; ai++)
         {
             int i = ai * auditStride;
             if (i >= rawAuditSamples.Count) break;
             float[] features = MLSignalScorer.StandardiseFeatures(rawAuditSamples[i].Features, snapshot.Means, snapshot.Stds, featureCount);
+            var beforeTransforms = (float[])features.Clone();
             InferenceHelpers.ApplyModelSpecificFeatureTransforms(features, snapshot);
+            var beforeMask = (float[])features.Clone();
             MLSignalScorer.ApplyFeatureMask(features, snapshot.ActiveFeatureMask, featureCount);
+
+            double transformShift = 0.0;
+            double maskShift = 0.0;
+            double maskedL1 = 0.0;
+            for (int j = 0; j < featureCount && j < beforeMask.Length && j < features.Length; j++)
+            {
+                transformShift += Math.Abs(beforeTransforms[j] - beforeMask[j]);
+                maskShift += Math.Abs(beforeMask[j] - features[j]);
+                maskedL1 += Math.Abs(features[j]);
+            }
+            maxTransformReplayShift = Math.Max(maxTransformReplayShift, transformShift);
+            maxMaskApplicationShift = Math.Max(maxMaskApplicationShift, maskShift);
+            if (maskedL1 > 1e-9)
+                allAuditedInputsCollapsedAfterMask = false;
 
             double expected = TabNetRawProb(features, weights);
             var inference = engine.RunInference(
@@ -286,24 +351,36 @@ public sealed partial class TabNetModelTrainer
             double expectedCalibrated = InferenceHelpers.ApplyDeployedCalibration(expected, snapshot);
             double observedCalibrated = InferenceHelpers.ApplyDeployedCalibration(inference.Value.Probability, snapshot);
             maxCalibratedDelta = Math.Max(maxCalibratedDelta, Math.Abs(expectedCalibrated - observedCalibrated));
+            bool expectedDecision = expectedCalibrated >= snapshot.OptimalThreshold;
+            bool observedDecision = observedCalibrated >= snapshot.OptimalThreshold;
+            if (expectedDecision != observedDecision)
+                thresholdDecisionMismatchCount++;
         }
 
         if (maxParityError > 1e-6)
             findings.Add($"Train/inference raw-prob parity max error={maxParityError:E3}");
+        if (thresholdDecisionMismatchCount > 0)
+            findings.Add($"Thresholded decision parity mismatches observed on {thresholdDecisionMismatchCount} audited samples.");
         if (snapshot.Ece > 0.10)
             findings.Add($"High calibration error ECE={snapshot.Ece:F3}");
         if (snapshot.TabNetUncertaintyThreshold <= 0.0)
             findings.Add("Missing TabNet uncertainty threshold.");
         if (snapshot.TabNetAttentionEntropyThreshold <= 0.0)
             findings.Add("Missing TabNet attention-entropy threshold.");
+        if (allAuditedInputsCollapsedAfterMask)
+            findings.Add("Every audited input collapsed to an all-zero deployed feature vector after masking.");
 
         var artifact = new TabNetAuditArtifact
         {
             SnapshotContractValid = validation.IsValid,
             AuditedSampleCount = auditCount,
+            ActiveFeatureCount = activeFeatureCount,
             MaxRawParityError = maxParityError,
             MeanRawParityError = auditCount > 0 ? sumParityError / auditCount : 0.0,
             MaxDeployedCalibrationDelta = maxCalibratedDelta,
+            MaxTransformReplayShift = maxTransformReplayShift,
+            MaxMaskApplicationShift = maxMaskApplicationShift,
+            ThresholdDecisionMismatchCount = thresholdDecisionMismatchCount,
             MaxUncertaintyObserved = maxUncertaintyObserved,
             RecordedEce = snapshot.Ece,
             FeatureSchemaFingerprint = snapshot.FeatureSchemaFingerprint,

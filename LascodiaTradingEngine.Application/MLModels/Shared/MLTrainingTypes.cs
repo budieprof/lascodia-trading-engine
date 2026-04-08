@@ -1797,6 +1797,10 @@ public class TabNetAutoTuneTraceEntry
     public double HoldoutSharpe { get; set; }
     public double HoldoutBrier { get; set; }
     public double HoldoutEce { get; set; }
+    public int TuneTrainSampleCount { get; set; }
+    public int TuneHoldoutSampleCount { get; set; }
+    public int CvFoldCount { get; set; }
+    public string HoldoutSplitName { get; set; } = "SELECTION";
     public bool Selected { get; set; }
 }
 
@@ -1813,6 +1817,12 @@ public class TabNetPruningDecisionArtifact
     public double CandidateBrier { get; set; }
     public double CandidateEce { get; set; }
     public int PrunedFeatureCount { get; set; }
+    public int RetainedFeatureCount { get; set; }
+    public string SelectionSplitName { get; set; } = "SELECTION";
+    public int SelectionSampleCount { get; set; }
+    public int CalibrationSampleCount { get; set; }
+    public double BaselineThreshold { get; set; }
+    public double CandidateThreshold { get; set; }
     public string[] Reasons { get; set; } = [];
 }
 
@@ -1823,9 +1833,13 @@ public class TabNetAuditArtifact
 {
     public bool SnapshotContractValid { get; set; }
     public int AuditedSampleCount { get; set; }
+    public int ActiveFeatureCount { get; set; }
     public double MaxRawParityError { get; set; }
     public double MeanRawParityError { get; set; }
     public double MaxDeployedCalibrationDelta { get; set; }
+    public double MaxTransformReplayShift { get; set; }
+    public double MaxMaskApplicationShift { get; set; }
+    public int ThresholdDecisionMismatchCount { get; set; }
     public double MaxUncertaintyObserved { get; set; }
     public double RecordedEce { get; set; }
     public string FeatureSchemaFingerprint { get; set; } = string.Empty;
@@ -1857,6 +1871,13 @@ public class TabNetCalibrationArtifact
     public double GlobalPlattNll { get; set; }
     public double TemperatureNll { get; set; }
     public bool TemperatureSelected { get; set; }
+    public int FitSampleCount { get; set; }
+    public int DiagnosticsSampleCount { get; set; }
+    public int ConformalSampleCount { get; set; }
+    public int MetaLabelSampleCount { get; set; }
+    public int AbstentionSampleCount { get; set; }
+    public string AdaptiveHeadMode { get; set; } = "SHARED";
+    public double ConditionalRoutingThreshold { get; set; } = 0.5;
     public int BuyBranchSampleCount { get; set; }
     public double BuyBranchBaselineNll { get; set; }
     public double BuyBranchFittedNll { get; set; }
@@ -1873,17 +1894,79 @@ public class TabNetCalibrationArtifact
 }
 
 /// <summary>
-/// Structured train/cal/test split summary persisted for reproducibility.
+/// Compact metrics persisted for key TabNet model-selection/evaluation splits.
+/// </summary>
+public class TabNetMetricSummary
+{
+    public string SplitName { get; set; } = string.Empty;
+    public int SampleCount { get; set; }
+    public double Threshold { get; set; }
+    public double Accuracy { get; set; }
+    public double Precision { get; set; }
+    public double Recall { get; set; }
+    public double F1 { get; set; }
+    public double ExpectedValue { get; set; }
+    public double BrierScore { get; set; }
+    public double WeightedAccuracy { get; set; }
+    public double SharpeRatio { get; set; }
+    public double Ece { get; set; }
+}
+
+/// <summary>
+/// Structured TabNet drift/stationarity diagnostics computed on the final fit split.
+/// </summary>
+public class TabNetDriftArtifact
+{
+    public int SampleCount { get; set; }
+    public int FeatureCount { get; set; }
+    public int NonStationaryFeatureCount { get; set; }
+    public double NonStationaryFeatureFraction { get; set; }
+    public double MeanLag1Autocorrelation { get; set; }
+    public double MaxLag1Autocorrelation { get; set; }
+    public double MeanVarianceRatioDistance { get; set; }
+    public double MaxVarianceRatioDistance { get; set; }
+    public double MeanPopulationStabilityIndex { get; set; }
+    public double MaxPopulationStabilityIndex { get; set; }
+    public double MeanChangePointScore { get; set; }
+    public double MaxChangePointScore { get; set; }
+    public bool GateTriggered { get; set; }
+    public string GateAction { get; set; } = "PASS";
+    public string[] FlaggedFeatures { get; set; } = [];
+}
+
+/// <summary>
+/// Structured train/selection/calibration/test split summary persisted for reproducibility.
 /// </summary>
 public class TrainingSplitSummary
 {
+    public int RawTrainCount { get; set; }
+    public int RawSelectionCount { get; set; }
+    public int RawCalibrationCount { get; set; }
+    public int RawTestCount { get; set; }
     public int TrainStartIndex { get; set; }
     public int TrainCount { get; set; }
+    public int SelectionStartIndex { get; set; }
+    public int SelectionCount { get; set; }
     public int CalibrationStartIndex { get; set; }
     public int CalibrationCount { get; set; }
+    public int CalibrationFitStartIndex { get; set; }
+    public int CalibrationFitCount { get; set; }
+    public int CalibrationDiagnosticsStartIndex { get; set; }
+    public int CalibrationDiagnosticsCount { get; set; }
+    public int ConformalStartIndex { get; set; }
+    public int ConformalCount { get; set; }
+    public int MetaLabelStartIndex { get; set; }
+    public int MetaLabelCount { get; set; }
+    public int AbstentionStartIndex { get; set; }
+    public int AbstentionCount { get; set; }
+    public string AdaptiveHeadSplitMode { get; set; } = string.Empty;
+    public int AdaptiveHeadCrossFitFoldCount { get; set; }
     public int TestStartIndex { get; set; }
     public int TestCount { get; set; }
     public int EmbargoCount { get; set; }
+    public int TrainEmbargoDropped { get; set; }
+    public int SelectionEmbargoDropped { get; set; }
+    public int CalibrationEmbargoDropped { get; set; }
 }
 
 // ── Serialisable model snapshot ───────────────────────────────────────────────
@@ -1931,6 +2014,18 @@ public class ModelSnapshot
     /// Reproducibility summary of the train/cal/test split boundaries used for the final fit.
     /// </summary>
     public TrainingSplitSummary? TrainingSplitSummary { get; set; }
+    /// <summary>
+    /// Split-scoped metrics for the selection holdout used for thresholding and pruning decisions.
+    /// </summary>
+    public TabNetMetricSummary? TabNetSelectionMetrics { get; set; }
+    /// <summary>
+    /// Split-scoped metrics for the post-fit calibration/diagnostic evaluation slice.
+    /// </summary>
+    public TabNetMetricSummary? TabNetCalibrationMetrics { get; set; }
+    /// <summary>
+    /// Split-scoped metrics for the final held-out test window.
+    /// </summary>
+    public TabNetMetricSummary? TabNetTestMetrics { get; set; }
     public float[]  Means         { get; set; } = [];
     public float[]  Stds          { get; set; } = [];
     public int      BaseLearnersK { get; set; }
@@ -2066,14 +2161,14 @@ public class ModelSnapshot
     // ── Feature pruning mask (set by BaggedLogisticTrainer after importance pruning) ──
 
     /// <summary>
-    /// Boolean mask over the 29 canonical features.
+    /// Boolean mask over the snapshot feature vector.
     /// <c>true</c> = feature is active (used for inference); <c>false</c> = pruned (zeroed).
-    /// Empty or all-true means no features were pruned.
+    /// Empty or all-true means no features were pruned. All-false masks are invalid.
     /// Applied at inference time in <c>MLSignalScorer</c> before the ensemble forward pass.
     /// </summary>
     public bool[] ActiveFeatureMask { get; set; } = [];
 
-    /// <summary>Number of active (non-pruned) features. 0 means all features are active.</summary>
+    /// <summary>Number of pruned (inactive) features. 0 means all snapshot features are active.</summary>
     public int PrunedFeatureCount { get; set; }
 
     // ── Regime scope (set by MLTrainingWorker for regime-specific sub-models) ──
@@ -2097,7 +2192,7 @@ public class ModelSnapshot
     // ── EV-optimal threshold (set by BaggedLogisticTrainer after threshold sweep) ──
 
     /// <summary>
-    /// Decision threshold that maximised expected value on the held-out test set.
+    /// Decision threshold selected on the model-selection split after calibration.
     /// <c>MLSignalScorer</c> compares calibP against this value instead of the fixed 0.5.
     /// Default 0.5 = no optimisation (neutral binary threshold).
     /// </summary>
@@ -2400,6 +2495,12 @@ public class ModelSnapshot
 
     /// <summary>Platt scaling bias fitted on Sell calibration samples. 0.0 = not fitted.</summary>
     public double PlattBSell { get; set; }
+
+    /// <summary>
+    /// Probability routing threshold used by class-conditional calibration.
+    /// Defaults to 0.5 for legacy snapshots.
+    /// </summary>
+    public double ConditionalCalibrationRoutingThreshold { get; set; } = 0.5;
 
     // ── Average Kelly fraction (Round 6) ──────────────────────────────────────
 
@@ -3063,6 +3164,9 @@ public class ModelSnapshot
 
     /// <summary>Rec #389 v3: Structured deployed-calibration artifact.</summary>
     public TabNetCalibrationArtifact? TabNetCalibrationArtifact { get; set; }
+
+    /// <summary>Rec #389 v3: Structured drift/stationarity diagnostics for the final training window.</summary>
+    public TabNetDriftArtifact? TabNetDriftArtifact { get; set; }
 
     /// <summary>Rec #389 v3: Mean absolute calibration residual over the reference calibration window.</summary>
     public double TabNetCalibrationResidualMean { get; set; }

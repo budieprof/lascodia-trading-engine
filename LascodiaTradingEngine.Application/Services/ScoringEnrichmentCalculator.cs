@@ -69,7 +69,7 @@ internal static class ScoringEnrichmentCalculator
 
     internal static decimal? ComputeMetaLabelScore(
         double calibP, double ensembleStd, float[] features, int featureCount,
-        double[] metaLabelWeights, double metaLabelBias)
+        double[] metaLabelWeights, double metaLabelBias, int[]? topFeatureIndices = null)
     {
         if (metaLabelWeights.Length == 0)
             return null;
@@ -83,8 +83,14 @@ internal static class ScoringEnrichmentCalculator
         int featureTerms = Math.Min(Math.Min(5, featureCount), features.Length);
         for (int j = 0; j < featureTerms && 2 + j < metaLabelWeights.Length; j++)
         {
+            int featureIndex = topFeatureIndices is { Length: > 0 } && j < topFeatureIndices.Length
+                ? topFeatureIndices[j]
+                : j;
+            if (featureIndex < 0 || featureIndex >= featureCount || featureIndex >= features.Length)
+                continue;
+
             metaZ += SanitizeFiniteOrDefault(metaLabelWeights[2 + j], 0.0) *
-                     SanitizeFiniteOrDefault(features[j], 0.0);
+                     SanitizeFiniteOrDefault(features[featureIndex], 0.0);
         }
 
         return (decimal)ClampProbabilityOrNeutral(MLFeatureHelper.Sigmoid(metaZ));
@@ -155,8 +161,17 @@ internal static class ScoringEnrichmentCalculator
     internal static decimal? ComputeAbstentionScore(
         double calibP, double ensembleStd, decimal? metaLabelScore,
         double? oodMahalanobisScore, double entropyScore,
+        double decisionThreshold,
         double[] abstentionWeights, double abstentionBias)
     {
+        if (abstentionWeights.Length == 1)
+        {
+            double margin = Math.Abs(ClampProbabilityOrNeutral(calibP) - ClampProbabilityOrNeutral(decisionThreshold));
+            double az = SanitizeFiniteOrDefault(abstentionBias, 0.0) +
+                        SanitizeFiniteOrDefault(abstentionWeights[0], 0.0) * margin;
+            return (decimal)ClampProbabilityOrNeutral(MLFeatureHelper.Sigmoid(az));
+        }
+
         if (!metaLabelScore.HasValue)
             return null;
 

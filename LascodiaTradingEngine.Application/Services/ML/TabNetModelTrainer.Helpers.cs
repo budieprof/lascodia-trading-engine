@@ -91,7 +91,8 @@ public sealed partial class TabNetModelTrainer
         double plattBBuy = 0.0,
         double plattASell = 0.0,
         double plattBSell = 0.0,
-        double[]? isotonicBreakpoints = null)
+        double[]? isotonicBreakpoints = null,
+        double conditionalRoutingThreshold = 0.5)
     {
         return new ModelSnapshot
         {
@@ -102,6 +103,9 @@ public sealed partial class TabNetModelTrainer
             PlattBBuy = double.IsFinite(plattBBuy) ? plattBBuy : 0.0,
             PlattASell = double.IsFinite(plattASell) ? plattASell : 0.0,
             PlattBSell = double.IsFinite(plattBSell) ? plattBSell : 0.0,
+            ConditionalCalibrationRoutingThreshold = double.IsFinite(conditionalRoutingThreshold)
+                ? Math.Clamp(conditionalRoutingThreshold, 0.01, 0.99)
+                : 0.5,
             IsotonicBreakpoints = isotonicBreakpoints is { Length: > 0 }
                 ? (double[])isotonicBreakpoints.Clone()
                 : [],
@@ -151,9 +155,29 @@ public sealed partial class TabNetModelTrainer
 
     private static void SanitizeSnapshotArrays(ModelSnapshot s)
     {
+        static void SanitizeMetricSummary(TabNetMetricSummary? summary)
+        {
+            if (summary is null)
+                return;
+
+            if (!double.IsFinite(summary.Threshold)) summary.Threshold = 0.5;
+            if (!double.IsFinite(summary.Accuracy)) summary.Accuracy = 0.0;
+            if (!double.IsFinite(summary.Precision)) summary.Precision = 0.0;
+            if (!double.IsFinite(summary.Recall)) summary.Recall = 0.0;
+            if (!double.IsFinite(summary.F1)) summary.F1 = 0.0;
+            if (!double.IsFinite(summary.ExpectedValue)) summary.ExpectedValue = 0.0;
+            if (!double.IsFinite(summary.BrierScore)) summary.BrierScore = 1.0;
+            if (!double.IsFinite(summary.WeightedAccuracy)) summary.WeightedAccuracy = summary.Accuracy;
+            if (!double.IsFinite(summary.SharpeRatio)) summary.SharpeRatio = 0.0;
+            if (!double.IsFinite(summary.Ece)) summary.Ece = 1.0;
+        }
+
         s.FeaturePipelineTransforms ??= [];
         s.FeaturePipelineDescriptors ??= [];
         if (s.TabNetAuditFindings is null) s.TabNetAuditFindings = [];
+        SanitizeMetricSummary(s.TabNetSelectionMetrics);
+        SanitizeMetricSummary(s.TabNetCalibrationMetrics);
+        SanitizeMetricSummary(s.TabNetTestMetrics);
         if (s.MagWeights is { Length: > 0 }) SanitizeArr(s.MagWeights);
         if (s.MagQ90Weights is { Length: > 0 }) SanitizeArr(s.MagQ90Weights);
         if (s.FeatureImportance is { Length: > 0 }) SanitizeFloatArr(s.FeatureImportance);
@@ -222,6 +246,7 @@ public sealed partial class TabNetModelTrainer
         if (!double.IsFinite(s.PlattBBuy)) s.PlattBBuy = 0.0;
         if (!double.IsFinite(s.PlattASell)) s.PlattASell = 0.0;
         if (!double.IsFinite(s.PlattBSell)) s.PlattBSell = 0.0;
+        if (!double.IsFinite(s.ConditionalCalibrationRoutingThreshold)) s.ConditionalCalibrationRoutingThreshold = 0.5;
         if (!double.IsFinite(s.MagBias)) s.MagBias = 0.0;
         if (!double.IsFinite(s.MagQ90Bias)) s.MagQ90Bias = 0.0;
         if (!double.IsFinite(s.MetaLabelBias)) s.MetaLabelBias = 0.0;
@@ -243,44 +268,66 @@ public sealed partial class TabNetModelTrainer
         if (!double.IsFinite(s.TabNetCalibrationResidualMean)) s.TabNetCalibrationResidualMean = 0.0;
         if (!double.IsFinite(s.TabNetCalibrationResidualStd)) s.TabNetCalibrationResidualStd = 0.0;
         if (!double.IsFinite(s.TabNetCalibrationResidualThreshold)) s.TabNetCalibrationResidualThreshold = 0.0;
+        if (s.TabNetDriftArtifact is not null)
+        {
+            if (!double.IsFinite(s.TabNetDriftArtifact.NonStationaryFeatureFraction)) s.TabNetDriftArtifact.NonStationaryFeatureFraction = 0.0;
+            if (!double.IsFinite(s.TabNetDriftArtifact.MeanLag1Autocorrelation)) s.TabNetDriftArtifact.MeanLag1Autocorrelation = 0.0;
+            if (!double.IsFinite(s.TabNetDriftArtifact.MaxLag1Autocorrelation)) s.TabNetDriftArtifact.MaxLag1Autocorrelation = 0.0;
+            if (!double.IsFinite(s.TabNetDriftArtifact.MeanVarianceRatioDistance)) s.TabNetDriftArtifact.MeanVarianceRatioDistance = 0.0;
+            if (!double.IsFinite(s.TabNetDriftArtifact.MaxVarianceRatioDistance)) s.TabNetDriftArtifact.MaxVarianceRatioDistance = 0.0;
+            if (!double.IsFinite(s.TabNetDriftArtifact.MeanPopulationStabilityIndex)) s.TabNetDriftArtifact.MeanPopulationStabilityIndex = 0.0;
+            if (!double.IsFinite(s.TabNetDriftArtifact.MaxPopulationStabilityIndex)) s.TabNetDriftArtifact.MaxPopulationStabilityIndex = 0.0;
+            if (!double.IsFinite(s.TabNetDriftArtifact.MeanChangePointScore)) s.TabNetDriftArtifact.MeanChangePointScore = 0.0;
+            if (!double.IsFinite(s.TabNetDriftArtifact.MaxChangePointScore)) s.TabNetDriftArtifact.MaxChangePointScore = 0.0;
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════
     //  FEATURE MASK & PRUNING
     // ═══════════════════════════════════════════════════════════════════════
 
-    private static bool[] BuildFeatureMask(float[] importance, double threshold, int F)
+    private static bool[] BuildFeatureMask(float[] importance, double threshold, int F, int minimumRetainedFeatures = 1)
     {
         var mask = new bool[F];
         if (threshold <= 0) { Array.Fill(mask, true); return mask; }
         double equalShare = 1.0 / F;
         for (int i = 0; i < F; i++) mask[i] = importance[i] >= threshold * equalShare;
+
+        minimumRetainedFeatures = Math.Clamp(minimumRetainedFeatures, 1, Math.Max(1, F));
+        int retained = mask.Count(m => m);
+        if (retained >= minimumRetainedFeatures)
+            return mask;
+
+        Array.Clear(mask);
+        foreach (int idx in Enumerable.Range(0, F)
+                     .OrderByDescending(i => importance[i])
+                     .ThenBy(i => i)
+                     .Take(minimumRetainedFeatures))
+        {
+            mask[idx] = true;
+        }
+
         return mask;
     }
 
     private static List<TrainingSample> ApplyMask(IReadOnlyList<TrainingSample> samples, bool[] mask)
     {
-        int keptCount = mask.Count(m => m);
-        if (keptCount == mask.Length)
+        if (mask.Length == 0 || mask.All(m => m))
         {
-            // No pruning — return shallow copies to avoid unnecessary allocation
             var passthrough = new List<TrainingSample>(samples.Count);
             foreach (var s in samples) passthrough.Add(s);
             return passthrough;
         }
 
-        // Build compacted feature vectors containing only kept features
-        var keptIndices = new int[keptCount];
-        int ki = 0;
-        for (int j = 0; j < mask.Length; j++)
-            if (mask[j]) keptIndices[ki++] = j;
-
         var result = new List<TrainingSample>(samples.Count);
         foreach (var s in samples)
         {
-            var nf = new float[keptCount];
-            for (int j = 0; j < keptCount; j++)
-                nf[j] = keptIndices[j] < s.Features.Length ? s.Features[keptIndices[j]] : 0f;
+            var nf = (float[])s.Features.Clone();
+            for (int j = 0; j < mask.Length && j < nf.Length; j++)
+            {
+                if (!mask[j])
+                    nf[j] = 0f;
+            }
             result.Add(s with { Features = nf });
         }
         return result;
@@ -595,6 +642,7 @@ public sealed partial class TabNetModelTrainer
         double lr,
         double sparsityCoeff,
         double bnMomentum,
+        TabNetRunContext runContext,
         CancellationToken ct)
     {
         if (expandedFeatureCount <= baseFeatureCount ||
@@ -622,10 +670,10 @@ public sealed partial class TabNetModelTrainer
 
         var (baseCv, _) = RunWalkForwardCV(
             baseSamples, evalHp, baseFeatureCount, evalSteps, evalHidden, evalAttention,
-            sharedLayers, stepLayers, gamma, useSparsemax, useGlu, lr, sparsityCoeff, evalEpochs, bnMomentum, ct);
+            sharedLayers, stepLayers, gamma, useSparsemax, useGlu, lr, sparsityCoeff, evalEpochs, bnMomentum, runContext, ct);
         var (expandedCv, _) = RunWalkForwardCV(
             expandedSamples, evalHp, expandedFeatureCount, evalSteps, evalHidden, evalAttention,
-            sharedLayers, stepLayers, gamma, useSparsemax, useGlu, lr, sparsityCoeff, evalEpochs, bnMomentum, ct);
+            sharedLayers, stepLayers, gamma, useSparsemax, useGlu, lr, sparsityCoeff, evalEpochs, bnMomentum, runContext, ct);
 
         if (baseCv.FoldCount == 0 || expandedCv.FoldCount == 0)
             return true;

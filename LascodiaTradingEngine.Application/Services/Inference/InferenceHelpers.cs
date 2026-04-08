@@ -112,13 +112,15 @@ internal static class InferenceHelpers
         double plattBBuy = SanitizeFiniteOrDefault(snap.PlattBBuy, 0.0);
         double plattASell = SanitizeFiniteOrDefault(snap.PlattASell, 0.0);
         double plattBSell = SanitizeFiniteOrDefault(snap.PlattBSell, 0.0);
+        double routingThreshold = SanitizeFiniteOrDefault(snap.ConditionalCalibrationRoutingThreshold, 0.5);
         double globalCalibP = temperatureScale > 0.0
             ? MLFeatureHelper.Sigmoid(rawLogit / temperatureScale)
             : MLFeatureHelper.Sigmoid(plattA * rawLogit + plattB);
         double calibP = ApplyConditionalCalibration(
             rawLogit, globalCalibP,
             plattABuy, plattBBuy,
-            plattASell, plattBSell);
+            plattASell, plattBSell,
+            routingThreshold);
 
         if (snap.IsotonicBreakpoints.Length >= 4)
             calibP = ApplyIsotonicCalibrationSafe(calibP, snap.IsotonicBreakpoints);
@@ -150,12 +152,16 @@ internal static class InferenceHelpers
         double plattABuy,
         double plattBBuy,
         double plattASell,
-        double plattBSell)
+        double plattBSell,
+        double routingThreshold = 0.5)
     {
-        if (globalCalibP >= 0.5 && HasMeaningfulConditionalCalibration(plattABuy, plattBBuy))
+        double effectiveRoutingThreshold = SanitizeFiniteOrDefault(routingThreshold, 0.5);
+        effectiveRoutingThreshold = Math.Clamp(effectiveRoutingThreshold, 0.01, 0.99);
+
+        if (globalCalibP >= effectiveRoutingThreshold && HasMeaningfulConditionalCalibration(plattABuy, plattBBuy))
             return ClampProbability(MLFeatureHelper.Sigmoid(plattABuy * rawLogit + plattBBuy));
 
-        if (globalCalibP < 0.5 && HasMeaningfulConditionalCalibration(plattASell, plattBSell))
+        if (globalCalibP < effectiveRoutingThreshold && HasMeaningfulConditionalCalibration(plattASell, plattBSell))
             return ClampProbability(MLFeatureHelper.Sigmoid(plattASell * rawLogit + plattBSell));
 
         return ClampProbability(globalCalibP);

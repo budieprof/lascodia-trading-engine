@@ -313,6 +313,60 @@ internal static class TabNetSnapshotSupport
                 snapshot.TabNetUseGlu,
                 snapshot.TabNetRelaxationGamma));
         }
+
+        if (!double.IsFinite(snapshot.ConditionalCalibrationRoutingThreshold))
+            snapshot.ConditionalCalibrationRoutingThreshold = 0.5;
+
+        if (snapshot.TrainingSplitSummary is { } split)
+        {
+            if (split.CalibrationDiagnosticsCount <= 0 && split.CalibrationCount > 0)
+            {
+                split.CalibrationDiagnosticsStartIndex = split.CalibrationStartIndex;
+                split.CalibrationDiagnosticsCount = split.CalibrationCount;
+            }
+            if (split.ConformalCount <= 0 && split.CalibrationDiagnosticsCount > 0)
+            {
+                split.ConformalStartIndex = split.CalibrationDiagnosticsStartIndex;
+                split.ConformalCount = split.CalibrationDiagnosticsCount;
+            }
+            if (split.MetaLabelCount <= 0 && split.CalibrationDiagnosticsCount > 0)
+            {
+                split.MetaLabelStartIndex = split.CalibrationDiagnosticsStartIndex;
+                split.MetaLabelCount = split.CalibrationDiagnosticsCount;
+            }
+            if (split.AbstentionCount <= 0 && split.MetaLabelCount > 0)
+            {
+                split.AbstentionStartIndex = split.MetaLabelStartIndex;
+                split.AbstentionCount = split.MetaLabelCount;
+            }
+            if (string.IsNullOrWhiteSpace(split.AdaptiveHeadSplitMode))
+                split.AdaptiveHeadSplitMode = "SHARED_FALLBACK";
+
+            snapshot.TabNetSelectionMetrics ??= new TabNetMetricSummary
+            {
+                SplitName = "SELECTION",
+                SampleCount = split.SelectionCount,
+                Threshold = snapshot.OptimalThreshold,
+            };
+            snapshot.TabNetCalibrationMetrics ??= new TabNetMetricSummary
+            {
+                SplitName = "CALIBRATION_DIAGNOSTICS",
+                SampleCount = split.CalibrationDiagnosticsCount,
+                Threshold = snapshot.OptimalThreshold,
+            };
+            snapshot.TabNetTestMetrics ??= new TabNetMetricSummary
+            {
+                SplitName = "TEST",
+                SampleCount = split.TestCount,
+                Threshold = snapshot.OptimalThreshold,
+            };
+            snapshot.TabNetDriftArtifact ??= new TabNetDriftArtifact
+            {
+                SampleCount = split.TrainCount,
+                FeatureCount = snapshot.Features.Length > 0 ? snapshot.Features.Length : snapshot.Means.Length,
+                GateAction = "LEGACY_BACKFILL",
+            };
+        }
     }
 
     internal static ValidationResult ValidateSnapshot(ModelSnapshot snapshot, bool allowLegacyV2 = true)
@@ -440,8 +494,102 @@ internal static class TabNetSnapshotSupport
 
         if (snapshot.TabNetRawFeatureCount > 0 && snapshot.TabNetRawFeatureCount > featureCount)
             issues.Add("TabNetRawFeatureCount cannot exceed snapshot feature count.");
-        if (snapshot.ActiveFeatureMask is { Length: > 0 } mask && mask.Length != featureCount)
-            issues.Add("ActiveFeatureMask length does not match feature count.");
+        if (!double.IsFinite(snapshot.OptimalThreshold) || snapshot.OptimalThreshold < 0.0 || snapshot.OptimalThreshold > 1.0)
+            issues.Add("OptimalThreshold must be a finite probability in [0, 1].");
+        if (!double.IsFinite(snapshot.ConditionalCalibrationRoutingThreshold) ||
+            snapshot.ConditionalCalibrationRoutingThreshold <= 0.0 ||
+            snapshot.ConditionalCalibrationRoutingThreshold >= 1.0)
+        {
+            issues.Add("ConditionalCalibrationRoutingThreshold must be a finite probability in (0, 1).");
+        }
+        if (snapshot.ActiveFeatureMask is { Length: > 0 } mask)
+        {
+            if (mask.Length != featureCount)
+                issues.Add("ActiveFeatureMask length does not match feature count.");
+            else if (!mask.Any(v => v))
+                issues.Add("ActiveFeatureMask cannot prune every feature.");
+
+            int expectedPrunedCount = mask.Count(v => !v);
+            if (snapshot.PrunedFeatureCount != expectedPrunedCount)
+                issues.Add("PrunedFeatureCount does not match ActiveFeatureMask.");
+        }
+        else if (snapshot.PrunedFeatureCount != 0)
+        {
+            issues.Add("PrunedFeatureCount is non-zero but ActiveFeatureMask is empty.");
+        }
+        if (snapshot.TrainingSplitSummary is null)
+        {
+            issues.Add("TrainingSplitSummary is missing.");
+        }
+        else
+        {
+            var split = snapshot.TrainingSplitSummary;
+            if (split.SelectionCount <= 0)
+                issues.Add("TrainingSplitSummary.SelectionCount must be positive.");
+            if (split.CalibrationCount <= 0)
+                issues.Add("TrainingSplitSummary.CalibrationCount must be positive.");
+            if (split.TestCount <= 0)
+                issues.Add("TrainingSplitSummary.TestCount must be positive.");
+            if (split.CalibrationFitCount > split.CalibrationCount)
+                issues.Add("TrainingSplitSummary.CalibrationFitCount cannot exceed CalibrationCount.");
+            if (split.CalibrationDiagnosticsCount > split.CalibrationCount)
+                issues.Add("TrainingSplitSummary.CalibrationDiagnosticsCount cannot exceed CalibrationCount.");
+            bool diagnosticsDisjointFromFit =
+                split.CalibrationDiagnosticsCount > 0 &&
+                split.CalibrationDiagnosticsStartIndex >= split.CalibrationFitStartIndex + split.CalibrationFitCount;
+            if (split.CalibrationFitCount > 0 &&
+                split.CalibrationDiagnosticsCount > 0 &&
+                diagnosticsDisjointFromFit &&
+                split.CalibrationFitCount + split.CalibrationDiagnosticsCount != split.CalibrationCount)
+            {
+                issues.Add("TrainingSplitSummary calibration subsets do not reconcile to CalibrationCount.");
+            }
+            if (string.IsNullOrWhiteSpace(split.AdaptiveHeadSplitMode))
+                issues.Add("TrainingSplitSummary.AdaptiveHeadSplitMode is missing.");
+            if (split.ConformalCount < 0 || split.MetaLabelCount < 0 || split.AbstentionCount < 0)
+                issues.Add("TrainingSplitSummary adaptive-head counts cannot be negative.");
+            if (string.Equals(split.AdaptiveHeadSplitMode, "DISJOINT", StringComparison.OrdinalIgnoreCase) &&
+                split.CalibrationDiagnosticsCount > 0 &&
+                split.ConformalCount + split.MetaLabelCount + split.AbstentionCount != split.CalibrationDiagnosticsCount)
+            {
+                issues.Add("TrainingSplitSummary DISJOINT adaptive-head slices do not reconcile to CalibrationDiagnosticsCount.");
+            }
+            if (string.Equals(split.AdaptiveHeadSplitMode, "CONFORMAL_DISJOINT_SHARED_ADAPTIVE", StringComparison.OrdinalIgnoreCase) &&
+                split.CalibrationDiagnosticsCount > 0 &&
+                (split.ConformalCount + split.MetaLabelCount != split.CalibrationDiagnosticsCount ||
+                 split.MetaLabelCount != split.AbstentionCount ||
+                 split.MetaLabelStartIndex != split.AbstentionStartIndex))
+            {
+                issues.Add("TrainingSplitSummary shared adaptive-head slices are inconsistent.");
+            }
+            if (snapshot.TabNetSelectionMetrics is null)
+                issues.Add("TabNetSelectionMetrics is missing.");
+            else if (snapshot.TabNetSelectionMetrics.SampleCount != split.SelectionCount)
+                issues.Add("TabNetSelectionMetrics sample count does not match SelectionCount.");
+            if (snapshot.TabNetCalibrationMetrics is null)
+                issues.Add("TabNetCalibrationMetrics is missing.");
+            else if (snapshot.TabNetCalibrationMetrics.SampleCount != split.CalibrationDiagnosticsCount)
+                issues.Add("TabNetCalibrationMetrics sample count does not match CalibrationDiagnosticsCount.");
+            if (snapshot.TabNetTestMetrics is null)
+                issues.Add("TabNetTestMetrics is missing.");
+            else if (snapshot.TabNetTestMetrics.SampleCount != split.TestCount)
+                issues.Add("TabNetTestMetrics sample count does not match TestCount.");
+        }
+
+        if (snapshot.TabNetDriftArtifact is null)
+        {
+            issues.Add("TabNetDriftArtifact is missing.");
+        }
+        else
+        {
+            if (snapshot.TabNetDriftArtifact.FeatureCount != featureCount)
+                issues.Add("TabNetDriftArtifact feature count does not match snapshot feature count.");
+            if (snapshot.TrainingSplitSummary is not null &&
+                snapshot.TabNetDriftArtifact.SampleCount != snapshot.TrainingSplitSummary.TrainCount)
+            {
+                issues.Add("TabNetDriftArtifact sample count does not match training split size.");
+            }
+        }
         if (featureCount > snapshot.TabNetRawFeatureCount &&
             !HasFeaturePipelineTransform(snapshot, PolyInteractionsTransform))
         {

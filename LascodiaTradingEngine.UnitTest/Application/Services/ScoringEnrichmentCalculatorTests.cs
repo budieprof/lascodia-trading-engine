@@ -209,6 +209,19 @@ public class ScoringEnrichmentCalculatorTests
         Assert.InRange(result!.Value, 0.81m, 0.82m);
     }
 
+    [Fact]
+    public void ComputeMetaLabelScore_Uses_TopFeatureIndices_When_Provided()
+    {
+        var result = ScoringEnrichmentCalculator.ComputeMetaLabelScore(
+            0.6, 0.2, new float[] { 1f, 5f, 9f }, 3,
+            new double[] { 0.0, 0.0, 1.0 },
+            0.0,
+            new[] { 2 });
+
+        Assert.NotNull(result);
+        Assert.True(result > 0.99m);
+    }
+
     // ────────────────────────────────────────────────────────────────────────
     //  ComputeAbstentionScore
     // ────────────────────────────────────────────────────────────────────────
@@ -217,7 +230,7 @@ public class ScoringEnrichmentCalculatorTests
     public void ComputeAbstentionScore_Returns_Null_When_No_MetaLabel()
     {
         var result = ScoringEnrichmentCalculator.ComputeAbstentionScore(
-            0.7, 0.1, null, null, 0.5, new double[] { 1, 1, 1, 1, 1 }, 0.0);
+            0.7, 0.1, null, null, 0.5, 0.5, new double[] { 1, 1, 1, 1, 1 }, 0.0);
         Assert.Null(result);
     }
 
@@ -225,7 +238,7 @@ public class ScoringEnrichmentCalculatorTests
     public void ComputeAbstentionScore_With_5_Weights()
     {
         var result = ScoringEnrichmentCalculator.ComputeAbstentionScore(
-            0.7, 0.1, 0.8m, 1.0, 0.3, new double[] { 1, -1, 0.5, 0.2, -0.3 }, 0.0);
+            0.7, 0.1, 0.8m, 1.0, 0.3, 0.5, new double[] { 1, -1, 0.5, 0.2, -0.3 }, 0.0);
 
         Assert.NotNull(result);
         Assert.InRange(result!.Value, 0m, 1m);
@@ -235,17 +248,27 @@ public class ScoringEnrichmentCalculatorTests
     public void ComputeAbstentionScore_With_3_Weights()
     {
         var result = ScoringEnrichmentCalculator.ComputeAbstentionScore(
-            0.7, 0.1, 0.8m, null, 0.3, new double[] { 1, -1, 0.5 }, 0.0);
+            0.7, 0.1, 0.8m, null, 0.3, 0.5, new double[] { 1, -1, 0.5 }, 0.0);
 
         Assert.NotNull(result);
         Assert.InRange(result!.Value, 0m, 1m);
     }
 
     [Fact]
+    public void ComputeAbstentionScore_With_SingleWeight_Uses_DecisionMargin()
+    {
+        var result = ScoringEnrichmentCalculator.ComputeAbstentionScore(
+            0.9, 0.1, null, null, 0.3, 0.7, new double[] { 5.0 }, 0.0);
+
+        Assert.NotNull(result);
+        Assert.True(result > 0.70m);
+    }
+
+    [Fact]
     public void ComputeAbstentionScore_Returns_Null_With_Wrong_Weight_Count()
     {
         var result = ScoringEnrichmentCalculator.ComputeAbstentionScore(
-            0.7, 0.1, 0.8m, null, 0.3, new double[] { 1, -1 }, 0.0);
+            0.7, 0.1, 0.8m, null, 0.3, 0.5, new double[] { 1, -1 }, 0.0);
         Assert.Null(result);
     }
 
@@ -253,7 +276,7 @@ public class ScoringEnrichmentCalculatorTests
     public void ComputeAbstentionScore_Sanitises_NonFinite_Inputs_And_Weights()
     {
         var result = ScoringEnrichmentCalculator.ComputeAbstentionScore(
-            double.NaN, double.NaN, 0.8m, double.NaN, double.NaN,
+            double.NaN, double.NaN, 0.8m, double.NaN, double.NaN, 0.5,
             new double[] { double.NaN, 2.0, double.NaN },
             double.NaN);
 

@@ -14,6 +14,7 @@ public sealed partial class TabNetModelTrainer
         int F, int nSteps, int hiddenDim, int attentionDim,
         int sharedLayers, int stepLayers, double gamma, bool useSparsemax,
         bool useGlu, double lr, double sparsityCoeff, int epochs, double bnMomentum,
+        TabNetRunContext runContext,
         CancellationToken ct)
     {
         int folds    = hp.WalkForwardFolds;
@@ -53,14 +54,28 @@ public sealed partial class TabNetModelTrainer
             var foldTest = samples[testStart..Math.Min(testEnd, samples.Count)];
             if (foldTest.Count < 20) continue;
 
+            int foldSelectionCount = Math.Min(
+                Math.Max(runContext.MinCalibrationSamples, foldTrain.Count / 10),
+                Math.Max(0, foldTrain.Count - hp.MinSamples));
+            if (foldSelectionCount < runContext.MinCalibrationSamples)
+                continue;
+
+            var foldSelection = foldTrain[^foldSelectionCount..];
+            var foldFitTrain = foldTrain[..^foldSelectionCount];
+            if (foldFitTrain.Count < hp.MinSamples)
+                continue;
+
             int cvEpochs = Math.Max(10, epochs / 3);
             var cvW = FitTabNet(
-                foldTrain, F, nSteps, hiddenDim, attentionDim, sharedLayers, stepLayers,
+                foldFitTrain, F, nSteps, hiddenDim, attentionDim, sharedLayers, stepLayers,
                 gamma, useSparsemax, useGlu, lr, sparsityCoeff, cvEpochs,
                 hp.LabelSmoothing, null, null, null, hp.TemporalDecayLambda, hp.L2Lambda,
-                hp.EarlyStoppingPatience, 0.0, hp.MaxGradNorm, 0, bnMomentum, 128, 0, ct);
+                hp.EarlyStoppingPatience, 0.0, hp.MaxGradNorm, 0, bnMomentum, 128, 0, runContext, ct);
 
-            var m = EvaluateTabNet(foldTest, cvW, BuildCalibrationSnapshot(1.0, 0.0), [], 0, F);
+            var foldCalibration = BuildCalibrationSnapshot(1.0, 0.0);
+            double foldThreshold = ComputeOptimalThreshold(
+                foldSelection, cvW, foldCalibration, hp.ThresholdSearchMin, hp.ThresholdSearchMax);
+            var m = EvaluateTabNet(foldTest, cvW, foldCalibration, [], 0, F, foldThreshold);
 
             double[] foldImp = ComputeAttentionStats(foldTest, cvW).MeanAttn;
 
@@ -71,7 +86,7 @@ public sealed partial class TabNetModelTrainer
             for (int i = 0; i < foldTest.Count; i++)
             {
                 var fwd = ForwardPass(foldTest[i].Features, cvW, priorBuf, attnBuf, false, 0, null);
-                preds[i] = (fwd.Prob >= 0.5 ? 1 : -1, foldTest[i].Direction > 0 ? 1 : -1);
+                preds[i] = (fwd.Prob >= foldThreshold ? 1 : -1, foldTest[i].Direction > 0 ? 1 : -1);
             }
             var (maxDD, curveSharpe) = ComputeEquityCurveStats(preds);
 
@@ -302,7 +317,7 @@ public sealed partial class TabNetModelTrainer
     }
 
     private static (double[][] Means, double[][] Vars) ComputeEpochBatchStats(
-        TabNetWeights w, List<TrainingSample> fitSet, int ghostBatchSize, Random epochRng)
+        TabNetWeights w, List<TrainingSample> fitSet, int ghostBatchSize, int minCalibrationSamples, Random epochRng)
     {
         int batchN = Math.Min(fitSet.Count, ghostBatchSize);
         var means = new double[w.TotalBnLayers][];
@@ -314,7 +329,7 @@ public sealed partial class TabNetModelTrainer
             vars[b]  = new double[dim];
         }
 
-        if (batchN < MinCalibrationSamples) return (means, vars);
+        if (batchN < minCalibrationSamples) return (means, vars);
 
         // Shuffle sample indices for true ghost-batch randomization
         var ghostIndices = new int[fitSet.Count];
@@ -345,7 +360,7 @@ public sealed partial class TabNetModelTrainer
     /// Reuses TraverseBnLayers to avoid duplicating the forward-pass traversal logic.
     /// </summary>
     private static (double[][] Means, double[][] Vars) ComputeMiniBatchBnStats(
-        TabNetWeights w, List<TrainingSample> fitSet, int count, int[] sampleIndices)
+        TabNetWeights w, List<TrainingSample> fitSet, int count, int minCalibrationSamples, int[] sampleIndices)
     {
         var means = new double[w.TotalBnLayers][];
         var vars  = new double[w.TotalBnLayers][];
@@ -356,7 +371,7 @@ public sealed partial class TabNetModelTrainer
             vars[b]  = new double[dim];
         }
 
-        if (count < MinCalibrationSamples) return (means, vars);
+        if (count < minCalibrationSamples) return (means, vars);
 
         var (layerSums, layerSqSum) = TraverseBnLayers(w, fitSet, count, sampleIndices);
 
@@ -377,23 +392,175 @@ public sealed partial class TabNetModelTrainer
     //  STATIONARITY / DENSITY / COVARIATE / TEMPORAL / EQUITY / SHARPE
     // ═══════════════════════════════════════════════════════════════════════
 
-    private static int CountNonStationaryFeatures(IReadOnlyList<TrainingSample> trainSet, int F)
+    private static TabNetDriftArtifact ComputeDriftDiagnostics(
+        IReadOnlyList<TrainingSample> trainSet,
+        int featureCount,
+        IReadOnlyList<string> featureNames,
+        double fracDiffD)
     {
-        if (trainSet.Count < 30) return 0;
-        int nonStat = 0;
-        for (int j = 0; j < F; j++)
+        var artifact = new TabNetDriftArtifact
         {
-            var vals = new double[trainSet.Count];
-            for (int i = 0; i < trainSet.Count; i++) vals[i] = trainSet[i].Features[j];
-            int n = vals.Length, half = n / 2;
-            double varFirst = Variance(vals, 0, half), varSecond = Variance(vals, half, n - half);
-            double ratio = varSecond > Eps ? varFirst / varSecond : 1.0;
-            if (ratio > 3.0 || ratio < 0.333) nonStat++;
+            SampleCount = trainSet.Count,
+            FeatureCount = featureCount,
+            GateAction = "PASS",
+        };
+
+        if (trainSet.Count < 30 || featureCount <= 0)
+            return artifact;
+
+        int n = trainSet.Count;
+        int half = Math.Max(1, n / 2);
+        int segment = Math.Max(10, n / 3);
+        int tailStart = Math.Max(0, n - segment);
+        var flaggedFeatures = new List<(string Name, double Score)>();
+        double sumLag = 0.0, maxLag = 0.0;
+        double sumVar = 0.0, maxVar = 0.0;
+        double sumPsi = 0.0, maxPsi = 0.0;
+        double sumCp = 0.0, maxCp = 0.0;
+        int nonStationaryFeatureCount = 0;
+
+        for (int featureIndex = 0; featureIndex < featureCount; featureIndex++)
+        {
+            var values = new double[n];
+            for (int sampleIndex = 0; sampleIndex < n; sampleIndex++)
+                values[sampleIndex] = trainSet[sampleIndex].Features[featureIndex];
+
+            double lag1 = Math.Abs(ComputeLag1Autocorrelation(values));
+            double varFirst = Variance(values, 0, segment);
+            double varLast = Variance(values, tailStart, n - tailStart);
+            double varianceRatioDistance = Math.Abs(Math.Log((varLast + Eps) / (varFirst + Eps)));
+            double psi = ComputePopulationStabilityIndex(values[..half], values[half..]);
+            double changePointScore = ComputeChangePointScore(values);
+
+            sumLag += lag1;
+            sumVar += varianceRatioDistance;
+            sumPsi += psi;
+            sumCp += changePointScore;
+            maxLag = Math.Max(maxLag, lag1);
+            maxVar = Math.Max(maxVar, varianceRatioDistance);
+            maxPsi = Math.Max(maxPsi, psi);
+            maxCp = Math.Max(maxCp, changePointScore);
+
+            bool lagSignal = lag1 > 0.985;
+            bool varianceSignal = varianceRatioDistance > Math.Log(2.5);
+            bool psiSignal = psi > 0.20;
+            bool changePointSignal = changePointScore > 1.50;
+            int triggeredSignals =
+                (lagSignal ? 1 : 0) +
+                (varianceSignal ? 1 : 0) +
+                (psiSignal ? 1 : 0) +
+                (changePointSignal ? 1 : 0);
+
+            if (triggeredSignals >= 2 || (lagSignal && (psiSignal || changePointSignal || varianceSignal)))
+            {
+                nonStationaryFeatureCount++;
+                string name = featureIndex < featureNames.Count ? featureNames[featureIndex] : $"F{featureIndex}";
+                double score =
+                    0.35 * lag1 +
+                    0.20 * varianceRatioDistance +
+                    0.25 * psi +
+                    0.20 * changePointScore;
+                flaggedFeatures.Add((name, score));
+            }
         }
-        return nonStat;
+
+        artifact.NonStationaryFeatureCount = nonStationaryFeatureCount;
+        artifact.NonStationaryFeatureFraction = featureCount > 0 ? (double)nonStationaryFeatureCount / featureCount : 0.0;
+        artifact.MeanLag1Autocorrelation = featureCount > 0 ? sumLag / featureCount : 0.0;
+        artifact.MaxLag1Autocorrelation = maxLag;
+        artifact.MeanVarianceRatioDistance = featureCount > 0 ? sumVar / featureCount : 0.0;
+        artifact.MaxVarianceRatioDistance = maxVar;
+        artifact.MeanPopulationStabilityIndex = featureCount > 0 ? sumPsi / featureCount : 0.0;
+        artifact.MaxPopulationStabilityIndex = maxPsi;
+        artifact.MeanChangePointScore = featureCount > 0 ? sumCp / featureCount : 0.0;
+        artifact.MaxChangePointScore = maxCp;
+        artifact.GateTriggered = fracDiffD == 0.0 && artifact.NonStationaryFeatureFraction > 0.30;
+        artifact.GateAction = artifact.GateTriggered ? "WARN" : "PASS";
+        artifact.FlaggedFeatures = flaggedFeatures
+            .OrderByDescending(entry => entry.Score)
+            .Take(8)
+            .Select(entry => entry.Name)
+            .ToArray();
+        return artifact;
     }
 
-    private static double[] ComputeDensityRatioWeights(IReadOnlyList<TrainingSample> trainSet, int F, int windowDays)
+    private static double ComputeLag1Autocorrelation(double[] values)
+    {
+        if (values.Length < 3)
+            return 0.0;
+
+        double mean = values.Average();
+        double numerator = 0.0;
+        double denominator = 0.0;
+        for (int i = 1; i < values.Length; i++)
+            numerator += (values[i] - mean) * (values[i - 1] - mean);
+        for (int i = 0; i < values.Length; i++)
+        {
+            double centered = values[i] - mean;
+            denominator += centered * centered;
+        }
+
+        return denominator > Eps ? numerator / denominator : 0.0;
+    }
+
+    private static double ComputePopulationStabilityIndex(double[] reference, double[] observed)
+    {
+        if (reference.Length < 5 || observed.Length < 5)
+            return 0.0;
+
+        double[] edges =
+        [
+            Quantile(reference, 0.20),
+            Quantile(reference, 0.40),
+            Quantile(reference, 0.60),
+            Quantile(reference, 0.80),
+        ];
+        var refCounts = new double[edges.Length + 1];
+        var obsCounts = new double[edges.Length + 1];
+
+        foreach (double value in reference)
+            refCounts[FindPsiBin(value, edges)]++;
+        foreach (double value in observed)
+            obsCounts[FindPsiBin(value, edges)]++;
+
+        double psi = 0.0;
+        for (int i = 0; i < refCounts.Length; i++)
+        {
+            double expected = Math.Max(Eps, refCounts[i] / reference.Length);
+            double actual = Math.Max(Eps, obsCounts[i] / observed.Length);
+            psi += (actual - expected) * Math.Log(actual / expected);
+        }
+
+        return psi;
+    }
+
+    private static int FindPsiBin(double value, double[] edges)
+    {
+        for (int i = 0; i < edges.Length; i++)
+            if (value <= edges[i])
+                return i;
+        return edges.Length;
+    }
+
+    private static double ComputeChangePointScore(double[] values)
+    {
+        if (values.Length < 10)
+            return 0.0;
+
+        double mean = values.Average();
+        double std = Math.Sqrt(Math.Max(Eps, Variance(values, 0, values.Length)));
+        double cumulative = 0.0;
+        double maxDeviation = 0.0;
+        for (int i = 0; i < values.Length; i++)
+        {
+            cumulative += values[i] - mean;
+            maxDeviation = Math.Max(maxDeviation, Math.Abs(cumulative));
+        }
+
+        return maxDeviation / (std * Math.Sqrt(values.Length));
+    }
+
+    private static double[] ComputeDensityRatioWeights(IReadOnlyList<TrainingSample> trainSet, int F, int windowDays, double learningRate)
     {
         int n = trainSet.Count, recentCount = Math.Min(n / 3, windowDays * 24);
         if (recentCount < 20) return Enumerable.Repeat(1.0, n).ToArray();
@@ -405,11 +572,11 @@ public sealed partial class TabNetModelTrainer
                 double label = i >= cutoff ? 1.0 : 0.0, z = bias;
                 for (int j = 0; j < F && j < trainSet[i].Features.Length; j++) z += dw[j] * trainSet[i].Features[j];
                 double err = Sigmoid(z) - label;
-                bias -= CalibrationLr * err;
+                bias -= learningRate * err;
                 bias = Math.Clamp(bias, -MaxWeightVal, MaxWeightVal);
                 for (int j = 0; j < F && j < trainSet[i].Features.Length; j++)
                 {
-                    dw[j] -= CalibrationLr * err * trainSet[i].Features[j];
+                    dw[j] -= learningRate * err * trainSet[i].Features[j];
                     dw[j] = Math.Clamp(dw[j], -MaxWeightVal, MaxWeightVal);
                 }
             }

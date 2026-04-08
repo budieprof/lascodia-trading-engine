@@ -26,7 +26,7 @@ namespace LascodiaTradingEngine.Application.Services.ML;
 ///   <item>Z-score standardisation.</item>
 ///   <item>Polynomial feature augmentation (top-5 pairs).</item>
 ///   <item>Walk-forward CV (expanding window, embargo, purging, equity-curve gate, Sharpe trend).</item>
-///   <item>Final splits: 70% train | 10% cal | ~20% test with embargo.</item>
+///   <item>Final splits: 60% train | 10% selection | 10% calibration | ~20% test with embargo.</item>
 ///   <item>Stationarity gate, density-ratio weights, covariate-shift weights, adaptive label smoothing.</item>
 ///   <item>Adam-optimised true TabNet with Ghost BN, sparsemax, GLU, cosine LR, gradient clipping, early stopping.</item>
 ///   <item>Weight sanitization.</item>
@@ -64,23 +64,14 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
     private const int    DefaultCalibrationEpochs = 200;
     private const double DefaultCalibrationLr = 0.01;
     private const int    DefaultMinCalibrationSamples = 10;
+    private const double DefaultDensityRatioLr = 0.01;
     private const int    TrainerSeed = 42;
-
-    // ── Per-run tunables (resolved from TrainingHyperparams at the start of Train) ──
-    // ThreadStatic so static helper methods in partial classes can access them
-    // without parameter threading. Safe because each training run is single-threaded.
-    [ThreadStatic] private static double HuberDelta;
-    [ThreadStatic] private static int    CalibrationEpochs;
-    [ThreadStatic] private static double CalibrationLr;
-    [ThreadStatic] private static int    MinCalibrationSamples;
 
     private static readonly JsonSerializerOptions JsonOpts =
         new() { WriteIndented = false, MaxDepth = 64 };
 
     // ── Dependencies ─────────────────────────────────────────────────────
     private readonly ILogger<TabNetModelTrainer> _logger;
-    private TabNetSnapshotSupport.WarmStartLoadReport _lastWarmStartLoadReport;
-    private TabNetAutoTuneTraceEntry[] _lastAutoTuneTrace = [];
 
     public TabNetModelTrainer(ILogger<TabNetModelTrainer> logger) => _logger = logger;
 
@@ -107,11 +98,13 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
     {
         ct.ThrowIfCancellationRequested();
 
-        // Resolve per-run tunables from hyperparams (fall back to defaults when 0/unset)
-        HuberDelta            = hp.TabNetHuberDelta > 0          ? hp.TabNetHuberDelta            : DefaultHuberDelta;
-        CalibrationEpochs     = hp.TabNetCalibrationEpochs > 0   ? hp.TabNetCalibrationEpochs     : DefaultCalibrationEpochs;
-        CalibrationLr         = hp.TabNetCalibrationLr > 0       ? hp.TabNetCalibrationLr         : DefaultCalibrationLr;
-        MinCalibrationSamples = hp.TabNetMinCalibrationSamples > 0 ? hp.TabNetMinCalibrationSamples : DefaultMinCalibrationSamples;
+        var runContext = new TabNetRunContext
+        {
+            HuberDelta = hp.TabNetHuberDelta > 0 ? hp.TabNetHuberDelta : DefaultHuberDelta,
+            CalibrationEpochs = hp.TabNetCalibrationEpochs > 0 ? hp.TabNetCalibrationEpochs : DefaultCalibrationEpochs,
+            CalibrationLr = hp.TabNetCalibrationLr > 0 ? hp.TabNetCalibrationLr : DefaultCalibrationLr,
+            MinCalibrationSamples = hp.TabNetMinCalibrationSamples > 0 ? hp.TabNetMinCalibrationSamples : DefaultMinCalibrationSamples,
+        };
 
         if (samples.Count < hp.MinSamples)
             throw new InvalidOperationException(
@@ -227,7 +220,7 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
                 int expandedFeatureCount = origF + featureExpansionPlan.AddedFeatureCount;
                 bool acceptExpansion = ShouldAcceptFeatureExpansion(
                     allStd, augmentedStd, hp, origF, expandedFeatureCount, nSteps, hiddenDim, attentionDim,
-                    sharedLayers, stepLayers, gamma, useSparsemax, useGlu, lr, sparsityCoeff, bnMomentum, ct);
+                    sharedLayers, stepLayers, gamma, useSparsemax, useGlu, lr, sparsityCoeff, bnMomentum, runContext, ct);
 
                 if (acceptExpansion)
                 {
@@ -246,6 +239,7 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
         polyTopIdx = featureExpansionPlan.TopFeatureIndices;
         featurePipelineDescriptors = TabNetSnapshotSupport.BuildFeaturePipelineDescriptors(origF, featureExpansionPlan.ProductTerms);
         string[] tabNetFeatureNames = BuildTabNetFeatureNames(origF, featureExpansionPlan);
+        featureSchemaFingerprint = TabNetSnapshotSupport.ComputeFeatureSchemaFingerprint(tabNetFeatureNames, origF);
         string[] featurePipelineTransforms = featurePipelineDescriptors.Length > 0
             ? featurePipelineDescriptors.Select(d => d.Kind).Distinct(StringComparer.OrdinalIgnoreCase).ToArray()
             : TabNetSnapshotSupport.BuildFeaturePipelineTransforms(polyTopIdx);
@@ -299,7 +293,7 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
         // ── 2. Walk-forward cross-validation ───────────────────────────────
         var (cvResult, equityCurveGateFailed) = RunWalkForwardCV(
             allStd, hp, F, nSteps, hiddenDim, attentionDim, sharedLayers, stepLayers,
-            gamma, useSparsemax, useGlu, lr, sparsityCoeff, epochs, bnMomentum, ct);
+            gamma, useSparsemax, useGlu, lr, sparsityCoeff, epochs, bnMomentum, runContext, ct);
         _logger.LogInformation(
             "TabNet Walk-forward CV \u2014 folds={Folds} avgAcc={Acc:P1} stdAcc={Std:P1} avgF1={F1:F3} avgEV={EV:F4} avgSharpe={Sharpe:F2}",
             cvResult.FoldCount, cvResult.AvgAccuracy, cvResult.StdAccuracy,
@@ -307,39 +301,147 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
 
         if (equityCurveGateFailed)
             return new TrainingResult(new EvalMetrics(0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0), cvResult, []);
+        if (cvResult.FoldCount == 0)
+            throw new InvalidOperationException("TabNet walk-forward CV produced no usable folds; training aborted.");
 
         ct.ThrowIfCancellationRequested();
 
-        // ── 3. Final model splits: 70% train | 10% cal | ~20% test ─────────
-        int trainEnd = (int)(allStd.Count * 0.70);
-        int calEnd   = (int)(allStd.Count * 0.80);
-        int embargo  = hp.EmbargoBarCount;
+        // ── 3. Final model splits: 60% train | 10% selection | 10% calibration | ~20% test ──
+        int totalCount = allStd.Count;
+        int embargo = hp.EmbargoBarCount;
+        int boundaryGapCount = embargo * 3;
+        int usableCount = totalCount - boundaryGapCount;
+        int minimumRequiredUsable =
+            hp.MinSamples +
+            runContext.MinCalibrationSamples +
+            runContext.MinCalibrationSamples +
+            runContext.MinCalibrationSamples;
+        if (usableCount < minimumRequiredUsable)
+        {
+            throw new InvalidOperationException(
+                $"TabNet: insufficient samples ({totalCount}) for train/selection/calibration/test splits with embargo={embargo}. " +
+                $"Need at least {minimumRequiredUsable + boundaryGapCount} samples.");
+        }
 
-        var trainSet = allStd[..Math.Max(0, trainEnd - embargo)];
-        var calSet   = allStd[(calEnd > trainEnd ? trainEnd + embargo : trainEnd)
-                               ..(calEnd < allStd.Count ? calEnd : allStd.Count)];
-        var testSet  = allStd[Math.Min(calEnd + embargo, allStd.Count)..];
-        var rawAuditSet = samples[Math.Min(calEnd + embargo, samples.Count)..];
+        int extraUsable = usableCount - minimumRequiredUsable;
+        int trainCount = hp.MinSamples + (int)Math.Floor(extraUsable * 0.60);
+        int selectionCount = runContext.MinCalibrationSamples + (int)Math.Floor(extraUsable * 0.10);
+        int calibrationCount = runContext.MinCalibrationSamples + (int)Math.Floor(extraUsable * 0.10);
+        int testCount = runContext.MinCalibrationSamples + extraUsable - (trainCount - hp.MinSamples) -
+            (selectionCount - runContext.MinCalibrationSamples) - (calibrationCount - runContext.MinCalibrationSamples);
+
+        int trainEnd = trainCount;
+        int selectionStart = Math.Min(totalCount, trainEnd + embargo);
+        int selectionEnd = Math.Min(totalCount, selectionStart + selectionCount);
+        int calibrationStart = Math.Min(totalCount, selectionEnd + embargo);
+        int calibrationEnd = Math.Min(totalCount, calibrationStart + calibrationCount);
+        int testStart = Math.Min(totalCount, calibrationEnd + embargo);
+
+        int rawTrainCount = Math.Min(totalCount, trainCount + embargo);
+        int rawSelectionCount = Math.Min(Math.Max(0, totalCount - rawTrainCount), selectionCount + embargo);
+        int rawCalibrationCount = Math.Min(Math.Max(0, totalCount - rawTrainCount - rawSelectionCount), calibrationCount + embargo);
+        int rawTestCount = Math.Max(0, totalCount - rawTrainCount - rawSelectionCount - rawCalibrationCount);
+
+        var trainSet = allStd[..trainEnd];
+        var selectionSet = allStd[selectionStart..selectionEnd];
+        var calibrationSet = allStd[calibrationStart..calibrationEnd];
+        var testSet = allStd[testStart..];
+        var rawAuditSet = samples[Math.Min(testStart, samples.Count)..];
 
         if (trainSet.Count < hp.MinSamples)
             throw new InvalidOperationException(
                 $"TabNet: Insufficient training samples after splits: {trainSet.Count} < {hp.MinSamples}");
+        if (selectionSet.Count < runContext.MinCalibrationSamples)
+            throw new InvalidOperationException(
+                $"TabNet: Insufficient selection samples after embargo: {selectionSet.Count} < {runContext.MinCalibrationSamples}");
+        if (calibrationSet.Count < runContext.MinCalibrationSamples)
+            throw new InvalidOperationException(
+                $"TabNet: Insufficient calibration samples after embargo: {calibrationSet.Count} < {runContext.MinCalibrationSamples}");
+        if (testSet.Count < runContext.MinCalibrationSamples)
+            throw new InvalidOperationException(
+                $"TabNet: Insufficient test samples after embargo: {testSet.Count} < {runContext.MinCalibrationSamples}");
+
+        int minConformalSamples = Math.Max(5, runContext.MinCalibrationSamples / 2);
+        int minAdaptiveHeadSamples = Math.Max(5, runContext.MinCalibrationSamples / 2);
+        var calibrationFitSet = calibrationSet;
+        var calibrationDiagnosticsSet = calibrationSet;
+        int calibrationFitStart = calibrationStart;
+        int calibrationDiagnosticsStart = calibrationStart;
+        if (calibrationSet.Count >= runContext.MinCalibrationSamples * 2)
+        {
+            int desiredDiagnosticsCount = Math.Max(
+                runContext.MinCalibrationSamples,
+                minConformalSamples + minAdaptiveHeadSamples + minAdaptiveHeadSamples);
+            desiredDiagnosticsCount = Math.Min(
+                desiredDiagnosticsCount,
+                calibrationSet.Count - runContext.MinCalibrationSamples);
+            int calibrationFitCount = Math.Max(
+                runContext.MinCalibrationSamples,
+                calibrationSet.Count - desiredDiagnosticsCount);
+            calibrationFitCount = Math.Min(calibrationFitCount, calibrationSet.Count - runContext.MinCalibrationSamples);
+            calibrationFitSet = calibrationSet[..calibrationFitCount];
+            calibrationDiagnosticsSet = calibrationSet[calibrationFitCount..];
+            calibrationDiagnosticsStart = calibrationStart + calibrationFitCount;
+        }
+
+        var conformalSet = calibrationDiagnosticsSet;
+        var metaLabelSet = calibrationDiagnosticsSet;
+        var abstentionSet = calibrationDiagnosticsSet;
+        int conformalStart = calibrationDiagnosticsStart;
+        int metaLabelStart = calibrationDiagnosticsStart;
+        int abstentionStart = calibrationDiagnosticsStart;
+        string adaptiveHeadSplitMode = "SHARED_FALLBACK";
+        int adaptiveHeadCrossFitFoldCount = 0;
+        if (calibrationDiagnosticsSet.Count >= minConformalSamples + minAdaptiveHeadSamples + minAdaptiveHeadSamples)
+        {
+            int extraAdaptiveCount = calibrationDiagnosticsSet.Count -
+                (minConformalSamples + minAdaptiveHeadSamples + minAdaptiveHeadSamples);
+            int conformalCount = minConformalSamples + extraAdaptiveCount / 3;
+            int metaLabelCount = minAdaptiveHeadSamples + extraAdaptiveCount / 3;
+            int abstentionCount = minAdaptiveHeadSamples + extraAdaptiveCount - (extraAdaptiveCount / 3) - (extraAdaptiveCount / 3);
+
+            conformalSet = calibrationDiagnosticsSet[..conformalCount];
+            metaLabelSet = calibrationDiagnosticsSet[conformalCount..(conformalCount + metaLabelCount)];
+            abstentionSet = calibrationDiagnosticsSet[(conformalCount + metaLabelCount)..];
+            metaLabelStart = calibrationDiagnosticsStart + conformalCount;
+            abstentionStart = metaLabelStart + metaLabelCount;
+            adaptiveHeadSplitMode = "DISJOINT";
+        }
+        else if (calibrationDiagnosticsSet.Count >= minConformalSamples + minAdaptiveHeadSamples)
+        {
+            conformalSet = calibrationDiagnosticsSet[..minConformalSamples];
+            metaLabelSet = calibrationDiagnosticsSet[minConformalSamples..];
+            abstentionSet = metaLabelSet;
+            metaLabelStart = calibrationDiagnosticsStart + minConformalSamples;
+            abstentionStart = metaLabelStart;
+            adaptiveHeadSplitMode = "CONFORMAL_DISJOINT_SHARED_ADAPTIVE";
+        }
+
+        _logger.LogInformation(
+            "TabNet final splits — train={Train} selection={Selection} calibrationFit={CalibrationFit} calibrationDiagnostics={CalibrationDiagnostics} conformal={Conformal} meta={Meta} abstention={Abstention} test={Test} embargo={Embargo}",
+            trainSet.Count, selectionSet.Count, calibrationFitSet.Count, calibrationDiagnosticsSet.Count,
+            conformalSet.Count, metaLabelSet.Count, abstentionSet.Count, testSet.Count, embargo);
 
         // ── 3b. Stationarity gate ──────────────────────────────────────────
+        TabNetDriftArtifact driftArtifact;
         {
-            int nonStatCount = CountNonStationaryFeatures(trainSet, F);
-            double nonStatFraction = F > 0 ? (double)nonStatCount / F : 0.0;
-            if (nonStatFraction > 0.30 && hp.FracDiffD == 0.0)
+            driftArtifact = ComputeDriftDiagnostics(trainSet, F, tabNetFeatureNames, hp.FracDiffD);
+            if (driftArtifact.GateTriggered)
                 _logger.LogWarning(
-                    "TabNet stationarity gate: {NonStat}/{Total} features may have unit root. Consider enabling FracDiffD.",
-                    nonStatCount, F);
+                    "TabNet stationarity gate: {NonStat}/{Total} features flagged (acf={Acf:F3}, psi={Psi:F3}, cp={Cp:F3}). Top flagged: {Features}",
+                    driftArtifact.NonStationaryFeatureCount,
+                    F,
+                    driftArtifact.MeanLag1Autocorrelation,
+                    driftArtifact.MeanPopulationStabilityIndex,
+                    driftArtifact.MeanChangePointScore,
+                    driftArtifact.FlaggedFeatures.Length > 0 ? string.Join(", ", driftArtifact.FlaggedFeatures) : "n/a");
         }
 
         // ── 3c. Density-ratio importance weights ───────────────────────────
         double[]? densityWeights = null;
         if (hp.DensityRatioWindowDays > 0 && trainSet.Count >= 50)
         {
-            densityWeights = ComputeDensityRatioWeights(trainSet, F, hp.DensityRatioWindowDays);
+            densityWeights = ComputeDensityRatioWeights(trainSet, F, hp.DensityRatioWindowDays, DefaultDensityRatioLr);
             _logger.LogDebug("TabNet density-ratio weights computed (recentWindow={W}d).", hp.DensityRatioWindowDays);
         }
 
@@ -379,8 +481,8 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
         }
 
         var selectedConfig = SelectArchitectureConfig(
-            trainSet, calSet, hp, F, nSteps, hiddenDim, attentionDim, sharedLayers, stepLayers,
-            gamma, useSparsemax, useGlu, dropoutRate, sparsityCoeff, ct);
+            trainSet, selectionSet, hp, F, nSteps, hiddenDim, attentionDim, sharedLayers, stepLayers,
+            gamma, useSparsemax, useGlu, dropoutRate, sparsityCoeff, runContext, ct);
         nSteps = selectedConfig.NSteps;
         hiddenDim = selectedConfig.HiddenDim;
         attentionDim = Math.Clamp(selectedConfig.AttentionDim, 1, hiddenDim);
@@ -396,7 +498,7 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
             gamma, useSparsemax, useGlu, lr, sparsityCoeff, epochs, effectiveLabelSmoothing,
             warmStart, pretrainedWeights, densityWeights, hp.TemporalDecayLambda, hp.L2Lambda,
             hp.EarlyStoppingPatience, hp.MagLossWeight, hp.MaxGradNorm,
-            dropoutRate, bnMomentum, ghostBatchSize, hp.TabNetWarmupEpochs, ct);
+            dropoutRate, bnMomentum, ghostBatchSize, hp.TabNetWarmupEpochs, runContext, ct);
 
         _logger.LogInformation("TabNet fitted: steps={S} hidden={H}", nSteps, hiddenDim);
 
@@ -406,9 +508,20 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
             _logger.LogWarning("TabNet sanitized {N} non-finite weight values.", sanitizedCount);
 
         // ── 5. Calibration stack ───────────────────────────────────────────
-        var calibrationFit = FitTabNetCalibrationStack(calSet, weights, hp.FitTemperatureScale);
+        var calibrationFit = FitTabNetCalibrationStack(
+            calibrationFitSet,
+            weights,
+            hp.FitTemperatureScale,
+            runContext.MinCalibrationSamples,
+            runContext.CalibrationEpochs,
+            runContext.CalibrationLr);
         var calibrationSnapshot = calibrationFit.FinalSnapshot;
         var calibrationArtifact = calibrationFit.Artifact;
+        calibrationArtifact.DiagnosticsSampleCount = calibrationDiagnosticsSet.Count;
+        calibrationArtifact.ConformalSampleCount = conformalSet.Count;
+        calibrationArtifact.MetaLabelSampleCount = metaLabelSet.Count;
+        calibrationArtifact.AbstentionSampleCount = abstentionSet.Count;
+        calibrationArtifact.AdaptiveHeadMode = adaptiveHeadSplitMode;
         double plattA = calibrationSnapshot.PlattA;
         double plattB = calibrationSnapshot.PlattB;
         double plattABuy = calibrationSnapshot.PlattABuy;
@@ -428,44 +541,50 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
         }
         else
         {
-            (magWeights, magBias) = FitLinearRegressor(trainSet, F, hp);
+            (magWeights, magBias) = FitLinearRegressor(trainSet, F, hp, runContext.HuberDelta);
         }
 
-        // ── 7. Evaluation on held-out test set ─────────────────────────────
-        double avgKellyFraction = ComputeAvgKellyFraction(calSet, weights, calibrationSnapshot);
-        var finalMetrics = EvaluateTabNet(testSet, weights, calibrationSnapshot, magWeights, magBias, F);
+        // ── 7. Selection threshold + evaluation on held-out test set ──────
+        double optimalThreshold = ComputeOptimalThreshold(
+            selectionSet, weights, calibrationSnapshot,
+            hp.ThresholdSearchMin, hp.ThresholdSearchMax);
+        double avgKellyFraction = ComputeAvgKellyFraction(
+            calibrationDiagnosticsSet, weights, calibrationSnapshot, runContext.MinCalibrationSamples);
+        var selectionMetrics = EvaluateTabNet(
+            selectionSet, weights, calibrationSnapshot, magWeights, magBias, F, optimalThreshold);
+        var finalMetrics = EvaluateTabNet(
+            testSet, weights, calibrationSnapshot, magWeights, magBias, F, optimalThreshold);
         _logger.LogInformation(
-            "TabNet eval \u2014 acc={Acc:P1} f1={F1:F3} ev={EV:F4} brier={Brier:F4} sharpe={Sharpe:F2}",
-            finalMetrics.Accuracy, finalMetrics.F1,
-            finalMetrics.ExpectedValue, finalMetrics.BrierScore, finalMetrics.SharpeRatio);
+            "TabNet selection/test eval \u2014 selectionAcc={SelectionAcc:P1} testAcc={TestAcc:P1} testF1={F1:F3} testEV={EV:F4} testBrier={Brier:F4} testSharpe={Sharpe:F2} threshold={Threshold:F2}",
+            selectionMetrics.Accuracy, finalMetrics.Accuracy, finalMetrics.F1,
+            finalMetrics.ExpectedValue, finalMetrics.BrierScore, finalMetrics.SharpeRatio, optimalThreshold);
 
         // ── 8. ECE ─────────────────────────────────────────────────────────
+        double selectionEce = ComputeEce(selectionSet, weights, calibrationSnapshot);
         double ece = ComputeEce(testSet, weights, calibrationSnapshot);
         double baselinePruningScore = ComputePruningCompositeScore(
-            finalMetrics, ece, 0, F, cvResult.FeatureStabilityScores);
-
-        // ── 9. EV-optimal threshold ────────────────────────────────────────
-        double optimalThreshold = ComputeOptimalThreshold(
-            calSet, weights, calibrationSnapshot,
-            hp.ThresholdSearchMin, hp.ThresholdSearchMax);
+            selectionMetrics, selectionEce, 0, F, cvResult.FeatureStabilityScores);
 
         // ── 10. Permutation feature importance ─────────────────────────────
-        float[] featureImportance = testSet.Count >= MinCalibrationSamples
-            ? ComputePermutationImportance(testSet, weights, calibrationSnapshot, ct)
+        float[] featureImportance = selectionSet.Count >= runContext.MinCalibrationSamples
+            ? ComputePermutationImportance(selectionSet, weights, calibrationSnapshot, optimalThreshold, ct)
             : new float[F];
 
         var topFeatures = featureImportance
-            .Select((imp, idx) => (Importance: imp,
+            .Select((imp, idx) => (Index: idx, Importance: imp,
                 Name: idx < tabNetFeatureNames.Length ? tabNetFeatureNames[idx] : $"F{idx}"))
             .OrderByDescending(x => x.Importance)
             .Take(5);
+        int[] metaLabelTopFeatureIndices = topFeatures
+            .Select(feature => feature.Index)
+            .ToArray();
         _logger.LogInformation(
             "TabNet top 5 features: {Features}",
             string.Join(", ", topFeatures.Select(f => $"{f.Name}={f.Importance:P1}")));
 
         // ── 10b. Cal-set importance (for warm-start transfer) ──────────────
-        double[] calImportanceScores = calSet.Count >= MinCalibrationSamples
-            ? ComputeCalPermutationImportance(calSet, weights, ct)
+        double[] calImportanceScores = calibrationDiagnosticsSet.Count >= runContext.MinCalibrationSamples
+            ? ComputeCalPermutationImportance(calibrationDiagnosticsSet, weights, optimalThreshold, ct)
             : new double[F];
 
         // ── 11. Feature pruning re-train pass ──────────────────────────────
@@ -484,28 +603,43 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
             CandidateBrier = finalMetrics.BrierScore,
             CandidateEce = ece,
             PrunedFeatureCount = prunedCount,
+            RetainedFeatureCount = Math.Max(0, F - prunedCount),
+            SelectionSampleCount = selectionSet.Count,
+            CalibrationSampleCount = calibrationDiagnosticsSet.Count,
+            BaselineThreshold = optimalThreshold,
+            CandidateThreshold = optimalThreshold,
             Reasons = [],
         };
 
-        if (prunedCount > 0 && F - prunedCount >= MinCalibrationSamples)
+        if (prunedCount > 0)
         {
             _logger.LogInformation("TabNet feature pruning: masking {Pruned}/{Total} low-importance features",
                 prunedCount, F);
             int candidatePrunedCount = prunedCount;
 
             var maskedTrain = ApplyMask(trainSet, activeMask);
-            var maskedCal   = ApplyMask(calSet,   activeMask);
+            var maskedSelection = ApplyMask(selectionSet, activeMask);
+            var maskedCalibrationFit = ApplyMask(calibrationFitSet, activeMask);
+            var maskedCalibrationDiagnostics = ApplyMask(calibrationDiagnosticsSet, activeMask);
+            var maskedConformal = ApplyMask(conformalSet, activeMask);
+            var maskedMetaLabel = ApplyMask(metaLabelSet, activeMask);
+            var maskedAbstention = ApplyMask(abstentionSet, activeMask);
             var maskedTest  = ApplyMask(testSet,  activeMask);
-            int maskedF     = F - prunedCount;
 
             int prunedEpochs = Math.Max(10, epochs / 2);
             var prunedW = FitTabNet(
-                maskedTrain, maskedF, nSteps, hiddenDim, attentionDim, sharedLayers, stepLayers,
+                maskedTrain, F, nSteps, hiddenDim, attentionDim, sharedLayers, stepLayers,
                 gamma, useSparsemax, useGlu, lr, sparsityCoeff, prunedEpochs,
                 effectiveLabelSmoothing, null, null, densityWeights, hp.TemporalDecayLambda,
                 hp.L2Lambda, hp.EarlyStoppingPatience, hp.MagLossWeight, hp.MaxGradNorm,
-                dropoutRate, bnMomentum, ghostBatchSize, 0, ct);
-            var prunedCalibrationFit = FitTabNetCalibrationStack(maskedCal, prunedW, hp.FitTemperatureScale);
+                dropoutRate, bnMomentum, ghostBatchSize, 0, runContext, ct);
+            var prunedCalibrationFit = FitTabNetCalibrationStack(
+                maskedCalibrationFit,
+                prunedW,
+                hp.FitTemperatureScale,
+                runContext.MinCalibrationSamples,
+                runContext.CalibrationEpochs,
+                runContext.CalibrationLr);
             var prunedCalibrationSnapshot = prunedCalibrationFit.FinalSnapshot;
 
             double[] pmw;
@@ -513,17 +647,24 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
             if (hp.MagLossWeight > 0.0 && prunedW.MagW.Length > 0)
             { pmw = prunedW.MagW; pmb = prunedW.MagB; }
             else
-            { (pmw, pmb) = FitLinearRegressor(maskedTrain, maskedF, hp); }
+            { (pmw, pmb) = FitLinearRegressor(maskedTrain, F, hp, runContext.HuberDelta); }
 
-            var prunedMetrics = EvaluateTabNet(maskedTest, prunedW, prunedCalibrationSnapshot, pmw, pmb, maskedF);
+            double prunedThreshold = ComputeOptimalThreshold(
+                maskedSelection, prunedW, prunedCalibrationSnapshot,
+                hp.ThresholdSearchMin, hp.ThresholdSearchMax);
+            var prunedSelectionMetrics = EvaluateTabNet(
+                maskedSelection, prunedW, prunedCalibrationSnapshot, pmw, pmb, F, prunedThreshold);
+            var prunedMetrics = EvaluateTabNet(
+                maskedTest, prunedW, prunedCalibrationSnapshot, pmw, pmb, F, prunedThreshold);
+            double prunedSelectionEce = ComputeEce(maskedSelection, prunedW, prunedCalibrationSnapshot);
             double prunedEce = ComputeEce(maskedTest, prunedW, prunedCalibrationSnapshot);
             double prunedScore = ComputePruningCompositeScore(
-                prunedMetrics, prunedEce, prunedCount, F, cvResult.FeatureStabilityScores);
+                prunedSelectionMetrics, prunedSelectionEce, prunedCount, F, cvResult.FeatureStabilityScores);
             pruningScoreDelta = prunedScore - baselinePruningScore;
             bool scoreGate = prunedScore >= baselinePruningScore - 0.01;
-            bool accuracyGate = prunedMetrics.Accuracy + 0.03 >= finalMetrics.Accuracy;
-            bool brierGate = prunedMetrics.BrierScore <= finalMetrics.BrierScore + 0.02;
-            bool eceGate = prunedEce <= ece + 0.02;
+            bool accuracyGate = prunedSelectionMetrics.Accuracy + 0.03 >= selectionMetrics.Accuracy;
+            bool brierGate = prunedSelectionMetrics.BrierScore <= selectionMetrics.BrierScore + 0.02;
+            bool eceGate = prunedSelectionEce <= selectionEce + 0.02;
             if (!scoreGate) pruningReasons.Add("Composite pruning score regressed beyond tolerance.");
             if (!accuracyGate) pruningReasons.Add("Accuracy degraded beyond tolerance.");
             if (!brierGate) pruningReasons.Add("Brier score degraded beyond tolerance.");
@@ -538,10 +679,20 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
                 magWeights   = pmw; magBias = pmb;
                 finalMetrics = prunedMetrics;
                 trainSet     = maskedTrain;
+                selectionSet = maskedSelection;
                 testSet      = maskedTest;
-                calSet       = maskedCal;
+                calibrationFitSet = maskedCalibrationFit;
+                calibrationDiagnosticsSet = maskedCalibrationDiagnostics;
+                conformalSet = maskedConformal;
+                metaLabelSet = maskedMetaLabel;
+                abstentionSet = maskedAbstention;
                 calibrationSnapshot = prunedCalibrationSnapshot;
                 calibrationArtifact = prunedCalibrationFit.Artifact;
+                calibrationArtifact.DiagnosticsSampleCount = calibrationDiagnosticsSet.Count;
+                calibrationArtifact.ConformalSampleCount = conformalSet.Count;
+                calibrationArtifact.MetaLabelSampleCount = metaLabelSet.Count;
+                calibrationArtifact.AbstentionSampleCount = abstentionSet.Count;
+                calibrationArtifact.AdaptiveHeadMode = adaptiveHeadSplitMode;
                 plattA = calibrationSnapshot.PlattA;
                 plattB = calibrationSnapshot.PlattB;
                 plattABuy = calibrationSnapshot.PlattABuy;
@@ -550,15 +701,17 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
                 plattBSell = calibrationSnapshot.PlattBSell;
                 temperatureScale = calibrationSnapshot.TemperatureScale;
                 isotonicBp = calibrationSnapshot.IsotonicBreakpoints;
+                selectionMetrics = prunedSelectionMetrics;
+                selectionEce = prunedSelectionEce;
                 ece              = prunedEce;
-                optimalThreshold = ComputeOptimalThreshold(maskedCal, weights, calibrationSnapshot,
-                    hp.ThresholdSearchMin, hp.ThresholdSearchMax);
-                avgKellyFraction = ComputeAvgKellyFraction(maskedCal, weights, calibrationSnapshot);
-                featureImportance = maskedTest.Count >= MinCalibrationSamples
-                    ? ComputePermutationImportance(maskedTest, weights, calibrationSnapshot, ct)
+                optimalThreshold = prunedThreshold;
+                avgKellyFraction = ComputeAvgKellyFraction(
+                    maskedCalibrationDiagnostics, weights, calibrationSnapshot, runContext.MinCalibrationSamples);
+                featureImportance = maskedSelection.Count >= runContext.MinCalibrationSamples
+                    ? ComputePermutationImportance(maskedSelection, weights, calibrationSnapshot, optimalThreshold, ct)
                     : new float[F];
-                calImportanceScores = maskedCal.Count >= MinCalibrationSamples
-                    ? ComputeCalPermutationImportance(maskedCal, weights, ct)
+                calImportanceScores = maskedCalibrationDiagnostics.Count >= runContext.MinCalibrationSamples
+                    ? ComputeCalPermutationImportance(maskedCalibrationDiagnostics, weights, optimalThreshold, ct)
                     : new double[F];
                 pruningAccepted = true;
                 pruningReasons.Add("Composite score and guardrail metrics stayed within acceptance tolerances.");
@@ -582,10 +735,15 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
                 CandidateBrier = prunedMetrics.BrierScore,
                 CandidateEce = prunedEce,
                 PrunedFeatureCount = candidatePrunedCount,
+                RetainedFeatureCount = Math.Max(0, F - candidatePrunedCount),
+                SelectionSampleCount = selectionSet.Count,
+                CalibrationSampleCount = calibrationDiagnosticsSet.Count,
+                BaselineThreshold = pruningDecision.BaselineThreshold,
+                CandidateThreshold = pruningAccepted ? optimalThreshold : prunedThreshold,
                 Reasons = pruningReasons.ToArray(),
             };
         }
-        else if (prunedCount == 0)
+        else
         {
             activeMask = new bool[F]; Array.Fill(activeMask, true);
             pruningDecision.Reasons = ["Pruning threshold kept all features active."];
@@ -600,33 +758,38 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
             isotonicBp.Length / 2);
 
         double conformalAlpha = Math.Clamp(1.0 - hp.ConformalCoverage, 0.01, 0.50);
-        double conformalQHat = ComputeConformalQHat(calSet, weights, calibrationSnapshot, conformalAlpha);
+        double conformalQHat = ComputeConformalQHat(
+            conformalSet, weights, calibrationSnapshot, conformalAlpha, minConformalSamples);
 
         // ── 11c. Jackknife+ residuals ──────────────────────────────────────
         double[] jackknifeResiduals = ComputeJackknifeResiduals(trainSet, weights);
 
         // ── 11d. Meta-label model ──────────────────────────────────────────
-        var (metaLabelWeights, metaLabelBias) = FitMetaLabelModel(calSet, weights);
+        var (metaLabelWeights, metaLabelBias) = FitMetaLabelModel(
+            metaLabelSet, weights, calibrationSnapshot, optimalThreshold,
+            minAdaptiveHeadSamples, runContext.CalibrationEpochs, runContext.CalibrationLr);
 
         // ── 11e. Abstention gate ───────────────────────────────────────────
         var (abstentionWeights, abstentionBias, abstentionThreshold) = FitAbstentionModel(
-            calSet, weights, calibrationSnapshot);
+            abstentionSet, weights, calibrationSnapshot, optimalThreshold,
+            minAdaptiveHeadSamples, runContext.CalibrationEpochs, runContext.CalibrationLr);
 
         // ── 11f. Quantile magnitude regressor ─────────────────────────────
         double[] magQ90Weights = [];
         double   magQ90Bias    = 0.0;
         if (hp.MagnitudeQuantileTau > 0.0 && trainSet.Count >= hp.MinSamples)
         {
-            (magQ90Weights, magQ90Bias) = FitQuantileRegressor(trainSet, F, hp.MagnitudeQuantileTau);
+            (magQ90Weights, magQ90Bias) = FitQuantileRegressor(
+                trainSet, F, hp.MagnitudeQuantileTau, runContext.MinCalibrationSamples);
         }
 
         // ── 11g. Decision boundary stats ──────────────────────────────────
-        var (dbMean, dbStd) = calSet.Count >= MinCalibrationSamples
-            ? ComputeDecisionBoundaryStats(calSet, weights)
+        var (dbMean, dbStd) = calibrationDiagnosticsSet.Count >= runContext.MinCalibrationSamples
+            ? ComputeDecisionBoundaryStats(calibrationDiagnosticsSet, weights)
             : (0.0, 0.0);
 
         // ── 11h. Durbin-Watson on magnitude residuals ──────────────────────
-        double durbinWatson = ComputeDurbinWatson(trainSet, magWeights, magBias, F);
+        double durbinWatson = ComputeDurbinWatson(trainSet, magWeights, magBias, F, runContext.MinCalibrationSamples);
         if (hp.DurbinWatsonThreshold > 0.0 && durbinWatson < hp.DurbinWatsonThreshold)
             _logger.LogWarning("TabNet magnitude residuals autocorrelated (DW={DW:F3} < {Thr:F2})",
                 durbinWatson, hp.DurbinWatsonThreshold);
@@ -641,10 +804,12 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
         }
 
         // ── 11j. Brier Skill Score ─────────────────────────────────────────
-        double brierSkillScore = ComputeBrierSkillScore(testSet, weights, calibrationSnapshot);
+        double brierSkillScore = ComputeBrierSkillScore(
+            testSet, weights, calibrationSnapshot, runContext.MinCalibrationSamples);
         _logger.LogInformation("TabNet BSS={BSS:F4}", brierSkillScore);
         var (calibrationResidualMean, calibrationResidualStd, calibrationResidualThreshold) =
-            ComputeCalibrationResidualStats(calSet, weights, calibrationSnapshot);
+            ComputeCalibrationResidualStats(
+                calibrationDiagnosticsSet, weights, calibrationSnapshot, runContext.MinCalibrationSamples);
 
         var (reliabilityBinConf, reliabilityBinAcc, reliabilityBinCounts) =
             ComputeReliabilityDiagram(testSet, weights, calibrationSnapshot);
@@ -652,6 +817,9 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
             ComputeMurphyDecomposition(testSet, weights, calibrationSnapshot);
         double predictionStability = ComputePredictionStabilityScore(testSet, weights, calibrationSnapshot);
         double[] featureVariances = ComputeFeatureVariances(trainSet, F);
+        double calibrationEce = ComputeEce(calibrationDiagnosticsSet, weights, calibrationSnapshot);
+        var calibrationMetrics = EvaluateTabNet(
+            calibrationDiagnosticsSet, weights, calibrationSnapshot, magWeights, magBias, F, optimalThreshold);
 
         // ── 11l. PSI baseline ──────────────────────────────────────────────
         var standardisedTrainFeatures = new List<float[]>(trainSet.Count);
@@ -661,9 +829,16 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
         // ── 12. Mean attention + per-step attention + attention entropy ─────
         var (meanAttn, perStepAttn, attnEntropy) = ComputeAttentionStats(testSet, weights);
         double[] perStepSparsity = ComputePerStepSparsity(perStepAttn);
-        double[] bnDriftByLayer = ComputeBnDriftByLayer(weights, trainSet, ghostBatchSize);
+        double[] bnDriftByLayer = ComputeBnDriftByLayer(
+            weights, trainSet, ghostBatchSize, runContext.MinCalibrationSamples);
         var (activationCentroid, activationDistanceMean, activationDistanceStd, attnEntropyThreshold, uncertaintyThreshold) =
-            ComputeActivationReferenceStats(calSet.Count >= MinCalibrationSamples ? calSet : trainSet, weights);
+            ComputeActivationReferenceStats(
+                calibrationDiagnosticsSet.Count >= runContext.MinCalibrationSamples
+                    ? calibrationDiagnosticsSet
+                    : calibrationFitSet.Count >= runContext.MinCalibrationSamples
+                        ? calibrationFitSet
+                        : trainSet,
+                weights);
         double warmStartReuseRatio = warmStart is not null
             ? EstimateWarmStartReuseRatio(warmStart, F, nSteps, hiddenDim, sharedLayers, stepLayers)
             : 0.0;
@@ -705,27 +880,63 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
         calibrationResidualMean = Safe(calibrationResidualMean);
         calibrationResidualStd = Safe(calibrationResidualStd);
         calibrationResidualThreshold = Safe(calibrationResidualThreshold);
+        calibrationEce = Safe(calibrationEce, 1.0);
+        metaLabelTopFeatureIndices = featureImportance
+            .Select((importance, index) => (Index: index, Importance: importance))
+            .OrderByDescending(entry => entry.Importance)
+            .ThenBy(entry => entry.Index)
+            .Take(5)
+            .Select(entry => entry.Index)
+            .ToArray();
+
+        var selectionMetricSummary = CreateMetricSummary(
+            "SELECTION", selectionMetrics, selectionEce, optimalThreshold, selectionSet.Count);
+        var calibrationMetricSummary = CreateMetricSummary(
+            "CALIBRATION_DIAGNOSTICS", calibrationMetrics, calibrationEce, optimalThreshold, calibrationDiagnosticsSet.Count);
+        var testMetricSummary = CreateMetricSummary(
+            "TEST", finalMetrics, ece, optimalThreshold, testSet.Count);
 
         var splitSummary = new TrainingSplitSummary
         {
+            RawTrainCount = rawTrainCount,
+            RawSelectionCount = rawSelectionCount,
+            RawCalibrationCount = rawCalibrationCount,
+            RawTestCount = rawTestCount,
             TrainStartIndex = 0,
             TrainCount = trainSet.Count,
-            CalibrationStartIndex = Math.Max(0, trainEnd),
-            CalibrationCount = calSet.Count,
-            TestStartIndex = Math.Max(0, calEnd + embargo),
+            SelectionStartIndex = selectionStart,
+            SelectionCount = selectionSet.Count,
+            CalibrationStartIndex = calibrationStart,
+            CalibrationCount = calibrationSet.Count,
+            CalibrationFitStartIndex = calibrationFitStart,
+            CalibrationFitCount = calibrationFitSet.Count,
+            CalibrationDiagnosticsStartIndex = calibrationDiagnosticsSet.Count > 0 ? calibrationDiagnosticsStart : 0,
+            CalibrationDiagnosticsCount = calibrationDiagnosticsSet.Count,
+            ConformalStartIndex = conformalSet.Count > 0 ? conformalStart : 0,
+            ConformalCount = conformalSet.Count,
+            MetaLabelStartIndex = metaLabelSet.Count > 0 ? metaLabelStart : 0,
+            MetaLabelCount = metaLabelSet.Count,
+            AbstentionStartIndex = abstentionSet.Count > 0 ? abstentionStart : 0,
+            AbstentionCount = abstentionSet.Count,
+            AdaptiveHeadSplitMode = adaptiveHeadSplitMode,
+            AdaptiveHeadCrossFitFoldCount = adaptiveHeadCrossFitFoldCount,
+            TestStartIndex = testStart,
             TestCount = testSet.Count,
             EmbargoCount = embargo,
+            TrainEmbargoDropped = rawTrainCount - trainSet.Count,
+            SelectionEmbargoDropped = rawSelectionCount - selectionSet.Count,
+            CalibrationEmbargoDropped = rawCalibrationCount - calibrationSet.Count,
         };
         var warmStartArtifact = new TabNetWarmStartArtifact
         {
             Compatible = warmStartCompatibility.IsCompatible,
             CompatibilityIssues = warmStartCompatibility.Issues,
-            Attempted = _lastWarmStartLoadReport.Attempted,
-            Reused = _lastWarmStartLoadReport.Reused,
-            Resized = _lastWarmStartLoadReport.Resized,
-            Skipped = _lastWarmStartLoadReport.Skipped,
-            Rejected = _lastWarmStartLoadReport.Rejected,
-            ReuseRatio = _lastWarmStartLoadReport.ReuseRatio,
+            Attempted = runContext.WarmStartLoadReport.Attempted,
+            Reused = runContext.WarmStartLoadReport.Reused,
+            Resized = runContext.WarmStartLoadReport.Resized,
+            Skipped = runContext.WarmStartLoadReport.Skipped,
+            Rejected = runContext.WarmStartLoadReport.Rejected,
+            ReuseRatio = runContext.WarmStartLoadReport.ReuseRatio,
         };
 
         // ── 13. Serialise model snapshot ───────────────────────────────────
@@ -741,6 +952,9 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
             TrainerFingerprint         = trainerFingerprint,
             TrainingRandomSeed         = TrainerSeed,
             TrainingSplitSummary       = splitSummary,
+            TabNetSelectionMetrics     = selectionMetricSummary,
+            TabNetCalibrationMetrics   = calibrationMetricSummary,
+            TabNetTestMetrics          = testMetricSummary,
             Means                      = snapshotMeans,
             Stds                       = snapshotStds,
             BaseLearnersK              = nSteps,
@@ -756,7 +970,7 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
             Metrics                    = finalMetrics,
             TrainSamples               = trainSet.Count,
             TestSamples                = testSet.Count,
-            CalSamples                 = calSet.Count,
+            CalSamples                 = calibrationSet.Count,
             EmbargoSamples             = embargo,
             TrainedOn                  = DateTime.UtcNow,
             FeatureImportance          = featureImportance,
@@ -776,6 +990,7 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
             MetaLabelWeights           = metaLabelWeights,
             MetaLabelBias              = metaLabelBias,
             MetaLabelThreshold         = 0.5,
+            MetaLabelTopFeatureIndices = metaLabelTopFeatureIndices,
             JackknifeResiduals         = jackknifeResiduals,
             FeatureQuantileBreakpoints = featureQuantileBreakpoints,
             FeatureImportanceScores    = calImportanceScores,
@@ -793,6 +1008,7 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
             PlattBBuy                  = plattBBuy,
             PlattASell                 = plattASell,
             PlattBSell                 = plattBSell,
+            ConditionalCalibrationRoutingThreshold = calibrationSnapshot.ConditionalCalibrationRoutingThreshold,
             AvgKellyFraction           = avgKellyFraction,
             RedundantFeaturePairs      = redundantPairs,
             WalkForwardSharpeTrend     = cvResult.SharpeTrend,
@@ -824,10 +1040,11 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
             TabNetWarmStartReuseRatio = warmStartReuseRatio,
             TabNetPruningAccepted     = pruningAccepted,
             TabNetPruningScoreDelta   = pruningScoreDelta,
-            TabNetAutoTuneTrace       = _lastAutoTuneTrace.Length > 0 ? _lastAutoTuneTrace : null,
+            TabNetAutoTuneTrace       = runContext.AutoTuneTrace.Length > 0 ? runContext.AutoTuneTrace : null,
             TabNetWarmStartArtifact   = warmStartArtifact,
             TabNetPruningDecision     = pruningDecision,
             TabNetCalibrationArtifact = calibrationArtifact,
+            TabNetDriftArtifact       = driftArtifact,
             TabNetCalibrationResidualMean = calibrationResidualMean,
             TabNetCalibrationResidualStd = calibrationResidualStd,
             TabNetCalibrationResidualThreshold = calibrationResidualThreshold,

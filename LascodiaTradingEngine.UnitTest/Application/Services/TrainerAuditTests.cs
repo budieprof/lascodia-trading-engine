@@ -433,6 +433,26 @@ public class TrainerAuditTests
             Assert.False(string.IsNullOrWhiteSpace(snapshot.TrainerFingerprint));
             Assert.True(snapshot.TrainingRandomSeed > 0);
             Assert.NotNull(snapshot.TrainingSplitSummary);
+            Assert.True(snapshot.TabNetAuditArtifact!.ActiveFeatureCount > 0);
+            Assert.True(snapshot.TabNetAuditArtifact.MaxTransformReplayShift >= 0.0);
+            Assert.True(snapshot.TabNetAuditArtifact.MaxMaskApplicationShift >= 0.0);
+            Assert.Equal(0, snapshot.TabNetAuditArtifact.ThresholdDecisionMismatchCount);
+            Assert.True(snapshot.TrainingSplitSummary!.SelectionCount > 0);
+            Assert.True(snapshot.TrainingSplitSummary.CalibrationCount > 0);
+            Assert.True(snapshot.TrainingSplitSummary.TestCount > 0);
+            Assert.False(string.IsNullOrWhiteSpace(snapshot.TrainingSplitSummary.AdaptiveHeadSplitMode));
+            Assert.NotNull(snapshot.TabNetSelectionMetrics);
+            Assert.NotNull(snapshot.TabNetCalibrationMetrics);
+            Assert.NotNull(snapshot.TabNetTestMetrics);
+            Assert.NotNull(snapshot.TabNetDriftArtifact);
+            if (snapshot.TrainingSplitSummary.CalibrationDiagnosticsCount > 0 &&
+                snapshot.TrainingSplitSummary.CalibrationDiagnosticsStartIndex >=
+                snapshot.TrainingSplitSummary.CalibrationFitStartIndex + snapshot.TrainingSplitSummary.CalibrationFitCount)
+            {
+                Assert.Equal(
+                    snapshot.TrainingSplitSummary.CalibrationCount,
+                    snapshot.TrainingSplitSummary.CalibrationFitCount + snapshot.TrainingSplitSummary.CalibrationDiagnosticsCount);
+            }
 
             if (snapshot.FeaturePipelineTransforms.Any(t =>
                     string.Equals(t, "TABNET_POLY_INTERACTIONS_V1", StringComparison.OrdinalIgnoreCase)))

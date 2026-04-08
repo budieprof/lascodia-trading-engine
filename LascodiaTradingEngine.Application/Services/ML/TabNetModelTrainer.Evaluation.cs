@@ -11,7 +11,7 @@ public sealed partial class TabNetModelTrainer
 
     private static EvalMetrics EvaluateTabNet(
         IReadOnlyList<TrainingSample> evalSet, TabNetWeights w,
-        ModelSnapshot calibrationSnapshot, double[] magWeights, double magBias, int origF)
+        ModelSnapshot calibrationSnapshot, double[] magWeights, double magBias, int origF, double decisionThreshold = 0.5)
     {
         int correct = 0, tp = 0, fp = 0, fn = 0, tn = 0;
         double brierSum = 0, magSse = 0;
@@ -24,7 +24,7 @@ public sealed partial class TabNetModelTrainer
         {
             var s   = evalSet[idx];
             double p = TabNetCalibProb(s.Features, w, calibrationSnapshot);
-            int yHat = p >= 0.5 ? 1 : 0;
+            int yHat = p >= decisionThreshold ? 1 : 0;
             int y    = s.Direction > 0 ? 1 : 0;
 
             if (yHat == y) correct++;
@@ -72,17 +72,41 @@ public sealed partial class TabNetModelTrainer
             TP: tp, FP: fp, FN: fn, TN: tn);
     }
 
+    private static TabNetMetricSummary CreateMetricSummary(
+        string splitName,
+        EvalMetrics metrics,
+        double ece,
+        double threshold,
+        int sampleCount)
+    {
+        return new TabNetMetricSummary
+        {
+            SplitName = splitName,
+            SampleCount = sampleCount,
+            Threshold = threshold,
+            Accuracy = metrics.Accuracy,
+            Precision = metrics.Precision,
+            Recall = metrics.Recall,
+            F1 = metrics.F1,
+            ExpectedValue = metrics.ExpectedValue,
+            BrierScore = metrics.BrierScore,
+            WeightedAccuracy = metrics.WeightedAccuracy,
+            SharpeRatio = metrics.SharpeRatio,
+            Ece = ece,
+        };
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     //  PERMUTATION FEATURE IMPORTANCE
     // ═══════════════════════════════════════════════════════════════════════
 
     private static float[] ComputePermutationImportance(
-        IReadOnlyList<TrainingSample> testSet, TabNetWeights w, ModelSnapshot calibrationSnapshot, CancellationToken ct)
+        IReadOnlyList<TrainingSample> testSet, TabNetWeights w, ModelSnapshot calibrationSnapshot, double decisionThreshold, CancellationToken ct)
     {
         int n = testSet.Count, F = w.F;
         double baseline = 0;
         foreach (var s in testSet)
-            if ((TabNetCalibProb(s.Features, w, calibrationSnapshot) >= 0.5) == (s.Direction > 0)) baseline++;
+            if ((TabNetCalibProb(s.Features, w, calibrationSnapshot) >= decisionThreshold) == (s.Direction > 0)) baseline++;
         baseline /= n;
         var importance = new float[F];
         Parallel.For(0, F, new ParallelOptions { CancellationToken = ct }, j =>
@@ -96,7 +120,7 @@ public sealed partial class TabNetModelTrainer
             {
                 var scratch = (float[])testSet[idx].Features.Clone();
                 scratch[j] = vals[idx];
-                if ((TabNetCalibProb(scratch, w, calibrationSnapshot) >= 0.5) == (testSet[idx].Direction > 0)) correct++;
+                if ((TabNetCalibProb(scratch, w, calibrationSnapshot) >= decisionThreshold) == (testSet[idx].Direction > 0)) correct++;
             }
             importance[j] = (float)Math.Max(0, baseline - (double)correct / n);
         });
@@ -106,12 +130,12 @@ public sealed partial class TabNetModelTrainer
     }
 
     private static double[] ComputeCalPermutationImportance(
-        IReadOnlyList<TrainingSample> calSet, TabNetWeights w, CancellationToken ct)
+        IReadOnlyList<TrainingSample> calSet, TabNetWeights w, double decisionThreshold, CancellationToken ct)
     {
         int n = calSet.Count, F = w.F;
         double baseAcc = 0;
         foreach (var s in calSet)
-            if ((TabNetRawProb(s.Features, w) >= 0.5) == (s.Direction > 0)) baseAcc++;
+            if ((TabNetRawProb(s.Features, w) >= decisionThreshold) == (s.Direction > 0)) baseAcc++;
         baseAcc /= n;
         var importance = new double[F];
         Parallel.For(0, F, new ParallelOptions { CancellationToken = ct }, j =>
@@ -125,7 +149,7 @@ public sealed partial class TabNetModelTrainer
             {
                 var scratch = (float[])calSet[idx].Features.Clone();
                 scratch[j] = vals[idx];
-                if ((TabNetRawProb(scratch, w) >= 0.5) == (calSet[idx].Direction > 0)) correct++;
+                if ((TabNetRawProb(scratch, w) >= decisionThreshold) == (calSet[idx].Direction > 0)) correct++;
             }
             importance[j] = Math.Max(0, baseAcc - (double)correct / n);
         });
@@ -350,12 +374,12 @@ public sealed partial class TabNetModelTrainer
         return (centroid, distanceMean, distanceStd, entropyThreshold, Quantile(combinedUncertainty, 0.90));
     }
 
-    private static double[] ComputeBnDriftByLayer(TabNetWeights w, List<TrainingSample> fitSet, int ghostBatchSize)
+    private static double[] ComputeBnDriftByLayer(TabNetWeights w, List<TrainingSample> fitSet, int ghostBatchSize, int minCalibrationSamples)
     {
-        if (fitSet.Count < MinCalibrationSamples)
+        if (fitSet.Count < minCalibrationSamples)
             return [];
 
-        var (batchMeans, batchVars) = ComputeEpochBatchStats(w, fitSet, ghostBatchSize, new Random(TrainerSeed));
+        var (batchMeans, batchVars) = ComputeEpochBatchStats(w, fitSet, ghostBatchSize, minCalibrationSamples, new Random(TrainerSeed));
         var drift = new double[w.TotalBnLayers];
         for (int b = 0; b < w.TotalBnLayers; b++)
         {
@@ -396,9 +420,9 @@ public sealed partial class TabNetModelTrainer
     // ═══════════════════════════════════════════════════════════════════════
 
     private static double ComputeConformalQHat(
-        IReadOnlyList<TrainingSample> calSet, TabNetWeights w, ModelSnapshot calibrationSnapshot, double alpha)
+        IReadOnlyList<TrainingSample> calSet, TabNetWeights w, ModelSnapshot calibrationSnapshot, double alpha, int minCalibrationSamples)
     {
-        if (calSet.Count < MinCalibrationSamples) return 0.5;
+        if (calSet.Count < minCalibrationSamples) return 0.5;
         var scores = new double[calSet.Count];
         for (int i = 0; i < calSet.Count; i++)
         {
@@ -479,55 +503,67 @@ public sealed partial class TabNetModelTrainer
     }
 
     private static (double[] Weights, double Bias) FitMetaLabelModel(
-        IReadOnlyList<TrainingSample> calSet, TabNetWeights w)
+        IReadOnlyList<TrainingSample> calSet,
+        TabNetWeights w,
+        ModelSnapshot calibrationSnapshot,
+        double decisionThreshold,
+        int minCalibrationSamples,
+        int calibrationEpochs,
+        double calibrationLr)
     {
-        if (calSet.Count < MinCalibrationSamples) return ([0.0], 0.0);
+        if (calSet.Count < minCalibrationSamples) return ([0.0], 0.0);
         int n = calSet.Count;
         double metaW = 0.0, metaB = 0.0;
         double mW = 0, vW = 0, mB = 0, vB = 0; int t = 0;
-        for (int ep = 0; ep < CalibrationEpochs; ep++)
+        for (int ep = 0; ep < calibrationEpochs; ep++)
         {
             double dW = 0, dB = 0;
             for (int i = 0; i < n; i++)
             {
-                double p = TabNetRawProb(calSet[i].Features, w);
-                int correct = ((p >= 0.5) == (calSet[i].Direction > 0)) ? 1 : 0;
+                double p = TabNetCalibProb(calSet[i].Features, w, calibrationSnapshot);
+                int correct = ((p >= decisionThreshold) == (calSet[i].Direction > 0)) ? 1 : 0;
                 double metaP = Sigmoid(metaW * p + metaB);
                 dW += (metaP - correct) * p; dB += metaP - correct;
             }
             t++; double bc1 = 1.0 - Math.Pow(AdamBeta1, t), bc2 = 1.0 - Math.Pow(AdamBeta2, t);
             mW = AdamBeta1 * mW + (1 - AdamBeta1) * dW / n; vW = AdamBeta2 * vW + (1 - AdamBeta2) * (dW / n) * (dW / n);
             mB = AdamBeta1 * mB + (1 - AdamBeta1) * dB / n; vB = AdamBeta2 * vB + (1 - AdamBeta2) * (dB / n) * (dB / n);
-            metaW -= CalibrationLr * (mW / bc1) / (Math.Sqrt(vW / bc2) + AdamEpsilon);
-            metaB -= CalibrationLr * (mB / bc1) / (Math.Sqrt(vB / bc2) + AdamEpsilon);
+            metaW -= calibrationLr * (mW / bc1) / (Math.Sqrt(vW / bc2) + AdamEpsilon);
+            metaB -= calibrationLr * (mB / bc1) / (Math.Sqrt(vB / bc2) + AdamEpsilon);
         }
         return ([metaW], metaB);
     }
 
     private static (double[] Weights, double Bias, double Threshold) FitAbstentionModel(
-        IReadOnlyList<TrainingSample> calSet, TabNetWeights w, ModelSnapshot calibrationSnapshot)
+        IReadOnlyList<TrainingSample> calSet,
+        TabNetWeights w,
+        ModelSnapshot calibrationSnapshot,
+        double decisionThreshold,
+        int minCalibrationSamples,
+        int calibrationEpochs,
+        double calibrationLr)
     {
-        if (calSet.Count < MinCalibrationSamples) return ([0.0], 0.0, 0.5);
+        if (calSet.Count < minCalibrationSamples) return ([0.0], 0.0, 0.5);
         int n = calSet.Count;
         var probs = new double[n];
         for (int i = 0; i < n; i++) probs[i] = TabNetCalibProb(calSet[i].Features, w, calibrationSnapshot);
         double absW = 0.0, absB = 0.0;
         double mW = 0, vW = 0, mB = 0, vB = 0; int t = 0;
-        for (int ep = 0; ep < CalibrationEpochs; ep++)
+        for (int ep = 0; ep < calibrationEpochs; ep++)
         {
             double dW = 0, dB = 0;
             for (int i = 0; i < n; i++)
             {
-                double feat = Math.Abs(probs[i] - 0.5);
-                int correct = ((probs[i] >= 0.5) == (calSet[i].Direction > 0)) ? 1 : 0;
+                double feat = Math.Abs(probs[i] - decisionThreshold);
+                int correct = ((probs[i] >= decisionThreshold) == (calSet[i].Direction > 0)) ? 1 : 0;
                 double abstP = Sigmoid(absW * feat + absB);
                 dW += (abstP - correct) * feat; dB += abstP - correct;
             }
             t++; double bc1 = 1.0 - Math.Pow(AdamBeta1, t), bc2 = 1.0 - Math.Pow(AdamBeta2, t);
             mW = AdamBeta1 * mW + (1 - AdamBeta1) * dW / n; vW = AdamBeta2 * vW + (1 - AdamBeta2) * (dW / n) * (dW / n);
             mB = AdamBeta1 * mB + (1 - AdamBeta1) * dB / n; vB = AdamBeta2 * vB + (1 - AdamBeta2) * (dB / n) * (dB / n);
-            absW -= CalibrationLr * (mW / bc1) / (Math.Sqrt(vW / bc2) + AdamEpsilon);
-            absB -= CalibrationLr * (mB / bc1) / (Math.Sqrt(vB / bc2) + AdamEpsilon);
+            absW -= calibrationLr * (mW / bc1) / (Math.Sqrt(vW / bc2) + AdamEpsilon);
+            absB -= calibrationLr * (mB / bc1) / (Math.Sqrt(vB / bc2) + AdamEpsilon);
         }
         double bestPrec = 0, bestThresh = 0.1;
         for (int ti = 1; ti <= 40; ti++)
@@ -535,8 +571,8 @@ public sealed partial class TabNetModelTrainer
             double thresh = ti / 100.0; int tpA = 0, fpA = 0;
             for (int i = 0; i < n; i++)
             {
-                if (Math.Abs(probs[i] - 0.5) < thresh) continue;
-                if ((probs[i] >= 0.5) == (calSet[i].Direction > 0)) tpA++; else fpA++;
+                if (Math.Abs(probs[i] - decisionThreshold) < thresh) continue;
+                if ((probs[i] >= decisionThreshold) == (calSet[i].Direction > 0)) tpA++; else fpA++;
             }
             double prec = (tpA + fpA) > 0 ? (double)tpA / (tpA + fpA) : 0;
             if (prec > bestPrec) { bestPrec = prec; bestThresh = thresh; }
@@ -544,9 +580,9 @@ public sealed partial class TabNetModelTrainer
         return ([absW], absB, bestThresh);
     }
 
-    private static (double[] Weights, double Bias) FitQuantileRegressor(IReadOnlyList<TrainingSample> trainSet, int F, double tau)
+    private static (double[] Weights, double Bias) FitQuantileRegressor(IReadOnlyList<TrainingSample> trainSet, int F, double tau, int minCalibrationSamples)
     {
-        if (trainSet.Count < MinCalibrationSamples) return (new double[F], 0.0);
+        if (trainSet.Count < minCalibrationSamples) return (new double[F], 0.0);
         int n = trainSet.Count; var qw = new double[F]; double b = 0.0;
         for (int ep = 0; ep < 100; ep++)
             for (int i = 0; i < n; i++)
@@ -573,9 +609,9 @@ public sealed partial class TabNetModelTrainer
         return (mean, StdDev(distances.ToList(), mean));
     }
 
-    private static double ComputeDurbinWatson(IReadOnlyList<TrainingSample> trainSet, double[] magWeights, double magBias, int F)
+    private static double ComputeDurbinWatson(IReadOnlyList<TrainingSample> trainSet, double[] magWeights, double magBias, int F, int minCalibrationSamples)
     {
-        if (trainSet.Count < MinCalibrationSamples || magWeights.Length == 0) return 2.0;
+        if (trainSet.Count < minCalibrationSamples || magWeights.Length == 0) return 2.0;
         int n = trainSet.Count; var residuals = new double[n];
         for (int i = 0; i < n; i++)
         {
@@ -612,7 +648,7 @@ public sealed partial class TabNetModelTrainer
         return redundant.ToArray();
     }
 
-    private static (double[] Weights, double Bias) FitLinearRegressor(List<TrainingSample> train, int featureCount, TrainingHyperparams hp)
+    private static (double[] Weights, double Bias) FitLinearRegressor(List<TrainingSample> train, int featureCount, TrainingHyperparams hp, double huberDelta)
     {
         var lw = new double[featureCount]; double b = 0.0;
         bool canEarlyStop = train.Count >= 30;
@@ -633,7 +669,7 @@ public sealed partial class TabNetModelTrainer
                 double pred = b;
                 for (int j = 0; j < featureCount && j < s.Features.Length; j++) pred += lw[j] * s.Features[j];
                 double err = pred - s.Magnitude; if (!double.IsFinite(err)) continue;
-                double huberGrad = Math.Abs(err) <= HuberDelta ? err : HuberDelta * Math.Sign(err);
+                double huberGrad = Math.Abs(err) <= huberDelta ? err : huberDelta * Math.Sign(err);
                 double bc1 = 1.0 - beta1t, bc2 = 1.0 - beta2t, alphat = alpha * Math.Sqrt(bc2) / bc1;
                 mB = AdamBeta1 * mB + (1.0 - AdamBeta1) * huberGrad; vB = AdamBeta2 * vB + (1.0 - AdamBeta2) * huberGrad * huberGrad;
                 b -= alphat * mB / (Math.Sqrt(vB) + AdamEpsilon);

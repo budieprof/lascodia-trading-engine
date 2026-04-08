@@ -49,7 +49,7 @@ public sealed partial class TabNetModelTrainer
         double[]? densityWeights, double temporalDecayLambda,
         double l2Lambda, int patience, double magLossWeight,
         double maxGradNorm, double dropoutRate, double bnMomentum,
-        int ghostBatchSize, int warmupEpochs, CancellationToken ct)
+        int ghostBatchSize, int warmupEpochs, TabNetRunContext runContext, CancellationToken ct)
     {
         var device = torch.CUDA;
         int n = trainSet.Count;
@@ -169,9 +169,9 @@ public sealed partial class TabNetModelTrainer
                         using var magErr = magPred.squeeze(1) - magB;
                         using var absErr = magErr.abs();
                         using var huber = torch.where(
-                            absErr <= (float)HuberDelta,
+                            absErr <= (float)runContext.HuberDelta,
                             magErr.pow(2f) * 0.5f,
-                            absErr * (float)HuberDelta - (float)(0.5 * HuberDelta * HuberDelta)
+                            absErr * (float)runContext.HuberDelta - (float)(0.5 * runContext.HuberDelta * runContext.HuberDelta)
                         ).mean() * (float)magLossWeight;
                         using var totalLoss = loss + huber;
                         totalLoss.backward();
@@ -196,7 +196,7 @@ public sealed partial class TabNetModelTrainer
                 }
 
                 // ── Validation (every 5 epochs) ─────────────────────────────
-                if (nVal >= MinCalibrationSamples && ep % 5 == 4)
+                if (nVal >= runContext.MinCalibrationSamples && ep % 5 == 4)
                 {
                     using (no_grad())
                     {
@@ -252,7 +252,7 @@ public sealed partial class TabNetModelTrainer
         _logger.LogInformation("TabNet GPU training complete (best epoch {Best})", bestEpoch);
 
         // Track warm-start report (no warm-start reuse tracking in GPU path)
-        _lastWarmStartLoadReport = new TabNetSnapshotSupport.WarmStartLoadReport(0, 0, 0, 0, 0);
+        runContext.WarmStartLoadReport = new TabNetSnapshotSupport.WarmStartLoadReport(0, 0, 0, 0, 0);
 
         return weights;
     }

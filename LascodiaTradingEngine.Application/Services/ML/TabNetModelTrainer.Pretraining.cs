@@ -143,7 +143,8 @@ public sealed partial class TabNetModelTrainer
             // Update BN running stats every 2 epochs for fresher statistics
             if (ep % 2 == 1)
             {
-                var (epochMeans, epochVars) = ComputeEpochBatchStats(w, samples, 128, rng);
+                var (epochMeans, epochVars) = ComputeEpochBatchStats(
+                    w, samples, 128, DefaultMinCalibrationSamples, rng);
                 ApplyBnRunningStatsEma(w, epochMeans, epochVars, bnMomentum);
             }
         }
