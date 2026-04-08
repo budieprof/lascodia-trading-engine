@@ -327,6 +327,39 @@ public sealed partial class TabNetModelTrainer
         return (means, vars);
     }
 
+    /// <summary>
+    /// Compute ghost-batch BN stats from a specific set of mini-batch sample indices.
+    /// Reuses TraverseBnLayers to avoid duplicating the forward-pass traversal logic.
+    /// </summary>
+    private static (double[][] Means, double[][] Vars) ComputeMiniBatchBnStats(
+        TabNetWeights w, List<TrainingSample> fitSet, int count, int[] sampleIndices)
+    {
+        var means = new double[w.TotalBnLayers][];
+        var vars  = new double[w.TotalBnLayers][];
+        for (int b = 0; b < w.TotalBnLayers; b++)
+        {
+            int dim = b < w.NSteps ? w.F : w.HiddenDim;
+            means[b] = new double[dim];
+            vars[b]  = new double[dim];
+        }
+
+        if (count < MinCalibrationSamples) return (means, vars);
+
+        var (layerSums, layerSqSum) = TraverseBnLayers(w, fitSet, count, sampleIndices);
+
+        for (int b = 0; b < w.TotalBnLayers; b++)
+        {
+            int dim = layerSums[b].Length;
+            for (int j = 0; j < dim; j++)
+            {
+                means[b][j] = layerSums[b][j] / count;
+                vars[b][j]  = Math.Max(0.0, layerSqSum[b][j] / count - means[b][j] * means[b][j]);
+            }
+        }
+
+        return (means, vars);
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     //  STATIONARITY / DENSITY / COVARIATE / TEMPORAL / EQUITY / SHARPE
     // ═══════════════════════════════════════════════════════════════════════

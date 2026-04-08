@@ -210,10 +210,8 @@ public sealed partial class TabNetModelTrainer
             Array.Copy(h, hPrev, H);
         }
 
-        // ── 7. Output head: FC → sigmoid ─────────────────────────────
-        double logit = w.OutputB;
-        for (int j = 0; j < H; j++)
-            logit += w.OutputW[j] * fwd.AggregatedH[j];
+        // ── 7. Output head: FC → sigmoid (SIMD dot product) ──────────
+        double logit = w.OutputB + SimdDot(w.OutputW, fwd.AggregatedH, H);
 
         fwd.Prob = Sigmoid(logit);
         Array.Copy(priorScalesBuf, fwd.PriorScales, F);
@@ -296,13 +294,15 @@ public sealed partial class TabNetModelTrainer
         // Cache FC input
         Array.Copy(input, 0, dstFcIn, 0, Math.Min(inDim, dstFcIn.Length));
 
-        // Linear transform into buf.Linear
+        // Linear + gate transforms (SIMD-accelerated inner products)
+        int dotLen = Math.Min(inDim, fcW.Length > 0 ? fcW[0].Length : inDim);
         for (int i = 0; i < outDim; i++)
         {
-            double val = fcB[i];
-            for (int j = 0; j < inDim && j < fcW[i].Length; j++)
-                val += fcW[i][j] * input[j];
-            buf.Linear[i] = val;
+            int rowLen = Math.Min(dotLen, fcW[i].Length);
+            buf.Linear[i] = fcB[i] + SimdDot(fcW[i], input, rowLen);
+
+            rowLen = Math.Min(dotLen, gateW[i].Length);
+            dstGate[i] = Sigmoid(gateB[i] + SimdDot(gateW[i], input, rowLen));
         }
 
         // BN
@@ -314,15 +314,6 @@ public sealed partial class TabNetModelTrainer
             double v = activeVar.Length > i ? activeVar[i] : 1.0;
             dstXNorm[i] = (buf.Linear[i] - m) / Math.Sqrt(v + BnEpsilon);
             dstPre[i]   = bnGamma[i] * dstXNorm[i] + bnBeta[i];
-        }
-
-        // Gate transform
-        for (int i = 0; i < outDim; i++)
-        {
-            double val = gateB[i];
-            for (int j = 0; j < inDim && j < gateW[i].Length; j++)
-                val += gateW[i][j] * input[j];
-            dstGate[i] = Sigmoid(val);
         }
 
         // GLU + dropout with mask caching

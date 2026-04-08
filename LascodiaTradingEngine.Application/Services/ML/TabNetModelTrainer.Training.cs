@@ -136,13 +136,38 @@ public sealed partial class TabNetModelTrainer
                     (indices[k], indices[i]) = (indices[i], indices[k]);
                 }
 
-                // Compute batch statistics from a randomized ghost-batch subset each epoch
-                var (epochBatchMeans, epochBatchVars) = ComputeEpochBatchStats(w, fitSet, ghostBatchSize, epochRng);
+                // ── Per-mini-batch ghost BN stats ─────────────────────────
+                // Instead of one epoch-wide pre-pass, recompute ghost-batch
+                // stats from each mini-batch's samples for fresher statistics.
+                double[][] miniBatchMeans = null!;
+                double[][] miniBatchVars  = null!;
+                bool needBnRefresh = true;
 
                 double epochTrainLoss = 0;
 
                 for (int ii = 0; ii < nFit; ii++)
                 {
+                    // Refresh ghost-batch BN stats at each mini-batch boundary
+                    if (needBnRefresh)
+                    {
+                        int mbStart = ii;
+                        int mbEnd   = Math.Min(ii + DefaultBatchSize, nFit);
+                        int mbCount = Math.Min(mbEnd - mbStart, ghostBatchSize);
+                        if (mbCount >= MinCalibrationSamples)
+                        {
+                            var mbIndices = new int[mbCount];
+                            for (int mi = 0; mi < mbCount; mi++)
+                                mbIndices[mi] = indices[mbStart + mi];
+                            (miniBatchMeans, miniBatchVars) = ComputeMiniBatchBnStats(w, fitSet, mbCount, mbIndices);
+                        }
+                        else if (miniBatchMeans is null)
+                        {
+                            // Fallback: compute from the full ghost batch for the first mini-batch
+                            (miniBatchMeans, miniBatchVars) = ComputeEpochBatchStats(w, fitSet, ghostBatchSize, epochRng);
+                        }
+                        needBnRefresh = false;
+                    }
+
                     int idx = indices[ii];
                     var sample = fitSet[idx];
                     double sampleWt = temporalWeights.Length > idx ? temporalWeights[idx] : 1.0 / nFit;
@@ -152,9 +177,9 @@ public sealed partial class TabNetModelTrainer
                         ? rawY * (1 - labelSmoothing) + 0.5 * labelSmoothing
                         : rawY;
 
-                    // ── Forward pass (reuses pooled result, epoch batch stats) ──
+                    // ── Forward pass (reuses pooled result, mini-batch BN stats) ──
                     var fwd = ForwardPass(sample.Features, w, priorScales, attnLogits, training: true,
-                        dropoutRate, epochRng, epochBatchMeans, epochBatchVars, fwdPool);
+                        dropoutRate, epochRng, miniBatchMeans, miniBatchVars, fwdPool);
 
                     double errCE = fwd.Prob - y;
 
@@ -177,11 +202,11 @@ public sealed partial class TabNetModelTrainer
 
                     // ── Backward pass (full BN backward, pooled buffers) ──
                     AccumulateGradients(grad, w, fwd, sample.Features, errCE, sampleWt,
-                        huberGrad, magLossWeight, l2Lambda, sparsityCoeff, useMagHead, epochBatchVars, dropoutRate, bwdPool);
+                        huberGrad, magLossWeight, sparsityCoeff, useMagHead, miniBatchVars, dropoutRate, bwdPool);
 
                     batchCount++;
 
-                    // ── Apply Adam update at batch boundaries ─────────────
+                    // ── Apply AdamW update at batch boundaries ────────────
                     if (batchCount >= DefaultBatchSize || ii == nFit - 1)
                     {
                         double invBatch = 1.0 / batchCount;
@@ -190,9 +215,10 @@ public sealed partial class TabNetModelTrainer
                         if (maxGradNorm > 0)
                             ClipGradients(grad, maxGradNorm);
 
-                        AdamUpdate(w, grad, adam, cosLr);
+                        AdamUpdate(w, grad, adam, cosLr, l2Lambda);
                         ZeroGradients(grad);
                         batchCount = 0;
+                        needBnRefresh = true; // refresh BN stats for next mini-batch
                     }
                 }
 
@@ -252,17 +278,17 @@ public sealed partial class TabNetModelTrainer
     private static void AccumulateGradients(
         TabNetWeights grad, TabNetWeights w, ForwardResult fwd,
         float[] features, double errCE, double sampleWt,
-        double huberGrad, double magLossWeight, double l2Lambda,
+        double huberGrad, double magLossWeight,
         double sparsityCoeff, bool useMagHead,
         double[][]? epochBatchVars, double dropoutRate, BackwardBuffers bwd)
     {
         int H = w.HiddenDim, F = w.F;
         bwd.Clear();
 
-        // ── Output head gradients ────────────────────────────────────
+        // ── Output head gradients (L2 removed — handled by AdamW decoupled decay) ──
         double dLogit = sampleWt * errCE;
         for (int j = 0; j < H; j++)
-            grad.OutputW[j] += dLogit * fwd.AggregatedH[j] + l2Lambda * w.OutputW[j];
+            grad.OutputW[j] += dLogit * fwd.AggregatedH[j];
         grad.OutputB += dLogit;
 
         // ── Magnitude head gradients ─────────────────────────────────
@@ -270,7 +296,7 @@ public sealed partial class TabNetModelTrainer
         {
             double scaledHuber = sampleWt * magLossWeight * huberGrad;
             for (int j = 0; j < H && j < w.MagW.Length; j++)
-                grad.MagW[j] += scaledHuber * fwd.AggregatedH[j] + l2Lambda * w.MagW[j];
+                grad.MagW[j] += scaledHuber * fwd.AggregatedH[j];
             grad.MagB += scaledHuber;
         }
 
@@ -359,18 +385,16 @@ public sealed partial class TabNetModelTrainer
                     dPreFc[j] = w.BnGamma[bnStIdx][j] * invStd * (dBnOut[j] - meanDy - xNorm[j] * meanDyXn);
                 }
 
-                // FC backward using cached FC input
+                // FC backward using cached FC input (SIMD-accelerated)
                 var dNextInput = bwd.DNextInputH;
                 Array.Clear(dNextInput, 0, H);
                 for (int i = 0; i < H; i++)
                 {
-                    for (int j = 0; j < H && j < w.StepW[s][l][i].Length; j++)
-                    {
-                        double inp = j < fcIn.Length ? fcIn[j] : 0;
-                        grad.StepW[s][l][i][j]  += dPreFc[i] * inp + l2Lambda * w.StepW[s][l][i][j];
-                        grad.StepGW[s][l][i][j] += dGateIn[i] * inp + l2Lambda * w.StepGW[s][l][i][j];
-                        dNextInput[j] += dPreFc[i] * w.StepW[s][l][i][j] + dGateIn[i] * w.StepGW[s][l][i][j];
-                    }
+                    int rowLen = Math.Min(H, w.StepW[s][l][i].Length);
+                    SimdMulAdd(grad.StepW[s][l][i],  fcIn, dPreFc[i],  rowLen);
+                    SimdMulAdd(grad.StepGW[s][l][i], fcIn, dGateIn[i], rowLen);
+                    SimdMulAdd(dNextInput, w.StepW[s][l][i],  dPreFc[i],  rowLen);
+                    SimdMulAdd(dNextInput, w.StepGW[s][l][i], dGateIn[i], rowLen);
                     grad.StepB[s][l][i]  += dPreFc[i];
                     grad.StepGB[s][l][i] += dGateIn[i];
                 }
@@ -443,20 +467,19 @@ public sealed partial class TabNetModelTrainer
                     dPreFc[j] = w.BnGamma[bnSIdx][j] * invStd * (dBnOut[j] - meanDy - xNorm[j] * meanDyXn);
                 }
 
-                // FC backward using cached FC input
+                // FC backward using cached FC input (SIMD-accelerated)
                 int nextDim = inDim;
                 var dNextInput = l == 0 ? bwd.DNextInputF : bwd.DNextInputH;
                 Array.Clear(dNextInput, 0, nextDim);
                 for (int i = 0; i < H; i++)
                 {
-                    for (int j = 0; j < inDim && j < w.SharedW[l][i].Length; j++)
-                    {
-                        double inp = j < fcIn.Length ? fcIn[j] : 0;
-                        grad.SharedW[l][i][j]  += dPreFc[i] * inp + l2Lambda * w.SharedW[l][i][j];
-                        grad.SharedGW[l][i][j] += dGateIn[i] * inp + l2Lambda * w.SharedGW[l][i][j];
-                        if (j < nextDim)
-                            dNextInput[j] += dPreFc[i] * w.SharedW[l][i][j] + dGateIn[i] * w.SharedGW[l][i][j];
-                    }
+                    int rowLen = Math.Min(inDim, w.SharedW[l][i].Length);
+                    int fcInLen = Math.Min(rowLen, fcIn.Length);
+                    SimdMulAdd(grad.SharedW[l][i],  fcIn, dPreFc[i],  fcInLen);
+                    SimdMulAdd(grad.SharedGW[l][i], fcIn, dGateIn[i], fcInLen);
+                    int propLen = Math.Min(rowLen, nextDim);
+                    SimdMulAdd(dNextInput, w.SharedW[l][i],  dPreFc[i],  propLen);
+                    SimdMulAdd(dNextInput, w.SharedGW[l][i], dGateIn[i], propLen);
                     grad.SharedB[l][i]  += dPreFc[i];
                     grad.SharedGB[l][i] += dGateIn[i];
                 }
@@ -560,36 +583,41 @@ public sealed partial class TabNetModelTrainer
     //  ADAM OPTIMIZER UPDATE
     // ═══════════════════════════════════════════════════════════════════════
 
-    private static void AdamUpdate(TabNetWeights w, TabNetWeights grad, AdamState adam, double lr)
+    /// <summary>
+    /// AdamW update: decoupled weight decay is applied directly to weights
+    /// before the Adam step, keeping it independent of the adaptive learning rate.
+    /// Biases and BN params are NOT decayed (standard practice).
+    /// </summary>
+    private static void AdamUpdate(TabNetWeights w, TabNetWeights grad, AdamState adam, double lr, double wd = 0)
     {
         adam.T++;
         double bc1 = 1.0 - Math.Pow(AdamBeta1, adam.T);
         double bc2 = 1.0 - Math.Pow(AdamBeta2, adam.T);
 
-        // Initial BN FC
+        // Initial BN FC (weights decayed, biases not)
         if (w.InitialBnFcW.Length > 0)
         {
-            AdamStep2D(w.InitialBnFcW, adam.MInitialBnFcW, adam.VInitialBnFcW, grad.InitialBnFcW, lr, bc1, bc2);
+            AdamWStep2D(w.InitialBnFcW, adam.MInitialBnFcW, adam.VInitialBnFcW, grad.InitialBnFcW, lr, bc1, bc2, wd);
             AdamStepArr(w.InitialBnFcB, adam.MInitialBnFcB, adam.VInitialBnFcB, grad.InitialBnFcB, lr, bc1, bc2);
         }
 
-        // Output head
+        // Output head (weights decayed, bias not)
         AdamStep(ref w.OutputB, ref adam.MOutputB, ref adam.VOutputB, grad.OutputB, lr, bc1, bc2);
-        AdamStepArr(w.OutputW, adam.MOutputW, adam.VOutputW, grad.OutputW, lr, bc1, bc2);
+        AdamWStepArr(w.OutputW, adam.MOutputW, adam.VOutputW, grad.OutputW, lr, bc1, bc2, wd);
 
         // Magnitude head
         if (w.MagW.Length > 0)
         {
             AdamStep(ref w.MagB, ref adam.MMagB, ref adam.VMagB, grad.MagB, lr, bc1, bc2);
-            AdamStepArr(w.MagW, adam.MMagW, adam.VMagW, grad.MagW, lr, bc1, bc2);
+            AdamWStepArr(w.MagW, adam.MMagW, adam.VMagW, grad.MagW, lr, bc1, bc2, wd);
         }
 
-        // Shared layers
+        // Shared layers (FC + gate weights decayed, biases not)
         for (int l = 0; l < w.SharedLayers; l++)
         {
-            AdamStep2D(w.SharedW[l], adam.MSharedW[l], adam.VSharedW[l], grad.SharedW[l], lr, bc1, bc2);
+            AdamWStep2D(w.SharedW[l], adam.MSharedW[l], adam.VSharedW[l], grad.SharedW[l], lr, bc1, bc2, wd);
             AdamStepArr(w.SharedB[l], adam.MSharedB[l], adam.VSharedB[l], grad.SharedB[l], lr, bc1, bc2);
-            AdamStep2D(w.SharedGW[l], adam.MSharedGW[l], adam.VSharedGW[l], grad.SharedGW[l], lr, bc1, bc2);
+            AdamWStep2D(w.SharedGW[l], adam.MSharedGW[l], adam.VSharedGW[l], grad.SharedGW[l], lr, bc1, bc2, wd);
             AdamStepArr(w.SharedGB[l], adam.MSharedGB[l], adam.VSharedGB[l], grad.SharedGB[l], lr, bc1, bc2);
         }
 
@@ -598,17 +626,17 @@ public sealed partial class TabNetModelTrainer
         {
             for (int l = 0; l < w.StepLayers; l++)
             {
-                AdamStep2D(w.StepW[s][l], adam.MStepW[s][l], adam.VStepW[s][l], grad.StepW[s][l], lr, bc1, bc2);
+                AdamWStep2D(w.StepW[s][l], adam.MStepW[s][l], adam.VStepW[s][l], grad.StepW[s][l], lr, bc1, bc2, wd);
                 AdamStepArr(w.StepB[s][l], adam.MStepB[s][l], adam.VStepB[s][l], grad.StepB[s][l], lr, bc1, bc2);
-                AdamStep2D(w.StepGW[s][l], adam.MStepGW[s][l], adam.VStepGW[s][l], grad.StepGW[s][l], lr, bc1, bc2);
+                AdamWStep2D(w.StepGW[s][l], adam.MStepGW[s][l], adam.VStepGW[s][l], grad.StepGW[s][l], lr, bc1, bc2, wd);
                 AdamStepArr(w.StepGB[s][l], adam.MStepGB[s][l], adam.VStepGB[s][l], grad.StepGB[s][l], lr, bc1, bc2);
             }
 
-            AdamStep2D(w.AttnFcW[s], adam.MAttnFcW[s], adam.VAttnFcW[s], grad.AttnFcW[s], lr, bc1, bc2);
+            AdamWStep2D(w.AttnFcW[s], adam.MAttnFcW[s], adam.VAttnFcW[s], grad.AttnFcW[s], lr, bc1, bc2, wd);
             AdamStepArr(w.AttnFcB[s], adam.MAttnFcB[s], adam.VAttnFcB[s], grad.AttnFcB[s], lr, bc1, bc2);
         }
 
-        // BN params
+        // BN params — never weight-decayed
         for (int b = 0; b < w.TotalBnLayers; b++)
         {
             AdamStepArr(w.BnGamma[b], adam.MBnGamma[b], adam.VBnGamma[b], grad.BnGamma[b], lr, bc1, bc2);
@@ -637,6 +665,22 @@ public sealed partial class TabNetModelTrainer
             if (!double.IsFinite(param[j])) param[j] = 0;
             else param[j] = Math.Clamp(param[j], -MaxWeightVal, MaxWeightVal);
         }
+    }
+
+    /// <summary>AdamW array step: decoupled weight decay before Adam update.</summary>
+    private static void AdamWStepArr(double[] param, double[] m, double[] v, double[] g, double lr, double bc1, double bc2, double wd)
+    {
+        if (wd > 0)
+            for (int j = 0; j < param.Length; j++)
+                param[j] *= (1.0 - lr * wd);
+
+        AdamStepArr(param, m, v, g, lr, bc1, bc2);
+    }
+
+    private static void AdamWStep2D(double[][] param, double[][] m, double[][] v, double[][] g, double lr, double bc1, double bc2, double wd)
+    {
+        for (int i = 0; i < param.Length; i++)
+            AdamWStepArr(param[i], m[i], v[i], g[i], lr, bc1, bc2, wd);
     }
 
     private static void AdamStep2D(double[][] param, double[][] m, double[][] v, double[][] g, double lr, double bc1, double bc2)

@@ -1,9 +1,62 @@
+using System.Numerics;
+using System.Runtime.CompilerServices;
 using LascodiaTradingEngine.Application.MLModels.Shared;
 
 namespace LascodiaTradingEngine.Application.Services.ML;
 
 public sealed partial class TabNetModelTrainer
 {
+    // ═══════════════════════════════════════════════════════════════════════
+    //  SIMD-ACCELERATED PRIMITIVES
+    //  Uses System.Numerics.Vector<double> for hardware-width auto-vectorization.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>Dot product of w[0..len) and x[0..len) using SIMD.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static double SimdDot(double[] w, double[] x, int len)
+    {
+        int vecLen = Vector<double>.Count;
+        int i = 0;
+        double sum = 0;
+
+        if (len >= vecLen)
+        {
+            var vSum = Vector<double>.Zero;
+            int end = len - vecLen + 1;
+            for (; i < end; i += vecLen)
+                vSum += new Vector<double>(w, i) * new Vector<double>(x, i);
+            sum = Vector.Dot(vSum, Vector<double>.One);
+        }
+
+        for (; i < len; i++)
+            sum += w[i] * x[i];
+
+        return sum;
+    }
+
+    /// <summary>dst[j] += a * w[j] for j in [0..len), SIMD-accelerated.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void SimdMulAdd(double[] dst, double[] w, double a, int len)
+    {
+        int vecLen = Vector<double>.Count;
+        int i = 0;
+        var vA = new Vector<double>(a);
+
+        if (len >= vecLen)
+        {
+            int end = len - vecLen + 1;
+            for (; i < end; i += vecLen)
+            {
+                var vDst = new Vector<double>(dst, i);
+                var vW   = new Vector<double>(w, i);
+                (vDst + vW * vA).CopyTo(dst, i);
+            }
+        }
+
+        for (; i < len; i++)
+            dst[i] += w[i] * a;
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     //  INFERENCE HELPERS
     // ═══════════════════════════════════════════════════════════════════════
