@@ -22,6 +22,7 @@ public sealed partial class TabNetModelTrainer
     private TabNetArchitectureChoice SelectArchitectureConfig(
         List<TrainingSample> trainSet,
         List<TrainingSample> calSet,
+        int holdoutStartIndex,
         TrainingHyperparams hp,
         int featureCount,
         int baselineSteps,
@@ -87,6 +88,21 @@ public sealed partial class TabNetModelTrainer
             {
                 AttentionDim = Math.Max(1, Math.Max(4, baselineAttentionDim / 2)),
                 SparsityCoeff = Math.Min(1e-3, Math.Max(1e-5, baselineSparsity * 1.25)),
+            },
+            baseline with
+            {
+                HiddenDim = Math.Max(8, (int)Math.Round(baselineHiddenDim * 0.75)),
+                AttentionDim = Math.Max(1, Math.Min(Math.Max(4, baselineAttentionDim), Math.Max(8, (int)Math.Round(baselineHiddenDim * 0.75)))),
+                DropoutRate = Math.Min(0.35, baselineDropout + 0.08),
+                SparsityCoeff = Math.Min(1e-3, Math.Max(1e-5, baselineSparsity * 1.40)),
+            },
+            baseline with
+            {
+                NSteps = Math.Min(6, baselineSteps + 1),
+                HiddenDim = Math.Max(8, (int)Math.Round(baselineHiddenDim * 1.10)),
+                AttentionDim = Math.Max(1, (int)Math.Round(Math.Min(Math.Max(2, baselineAttentionDim), baselineHiddenDim * 1.10))),
+                Gamma = Math.Min(1.95, baselineGamma + 0.12),
+                DropoutRate = Math.Max(0.0, baselineDropout - 0.03),
             }
         };
 
@@ -134,6 +150,7 @@ public sealed partial class TabNetModelTrainer
 
             var tuneCalibration = FitTabNetCalibrationStack(
                 tuneCal,
+                null,
                 tunedWeights,
                 hp.FitTemperatureScale,
                 runContext.MinCalibrationSamples,
@@ -173,6 +190,8 @@ public sealed partial class TabNetModelTrainer
                 0.05 * Math.Tanh(tuneCv.AvgEV) +
                 0.03 * Math.Tanh(tuneCv.AvgSharpe / 2.0) -
                 0.05 * tuneCv.StdAccuracy;
+            string holdoutSliceHash = ComputeStableHash(
+                $"tabnet-autotune:{holdoutStartIndex}:{tuneCal.Count}:{tuneTrain.Count}:{featureCount}");
 
             trace.Add(new TabNetAutoTuneTraceEntry
             {
@@ -194,10 +213,19 @@ public sealed partial class TabNetModelTrainer
                 HoldoutSharpe = tuneMetrics.SharpeRatio,
                 HoldoutBrier = tuneMetrics.BrierScore,
                 HoldoutEce = tuneEce,
+                HoldoutThreshold = tuneThreshold,
                 TuneTrainSampleCount = tuneTrain.Count,
                 TuneHoldoutSampleCount = tuneCal.Count,
+                HoldoutStartIndex = holdoutStartIndex,
+                HoldoutCount = tuneCal.Count,
                 CvFoldCount = tuneCv.FoldCount,
                 HoldoutSplitName = "SELECTION",
+                HoldoutSliceHash = holdoutSliceHash,
+                ScoreBreakdown =
+                    $"holdoutAcc=0.45*{tuneMetrics.Accuracy:F4};holdoutF1=0.10*{tuneMetrics.F1:F4};holdoutEv=0.10*tanh({tuneMetrics.ExpectedValue:F4});" +
+                    $"holdoutSharpe=0.05*tanh({tuneMetrics.SharpeRatio:F4}/2);holdoutBrier=-0.18*{tuneMetrics.BrierScore:F4};" +
+                    $"holdoutEce=-0.14*{tuneEce:F4};cvAcc=0.25*{tuneCv.AvgAccuracy:F4};cvF1=0.06*{tuneCv.AvgF1:F4};" +
+                    $"cvEv=0.05*tanh({tuneCv.AvgEV:F4});cvSharpe=0.03*tanh({tuneCv.AvgSharpe:F4}/2);cvStd=-0.05*{tuneCv.StdAccuracy:F4}",
                 Selected = false,
             });
 
@@ -208,13 +236,36 @@ public sealed partial class TabNetModelTrainer
             }
         }
 
+        double bestHoldoutAccuracy = trace
+            .Where(entry => entry.Score == bestScore)
+            .Select(entry => entry.HoldoutAccuracy)
+            .DefaultIfEmpty(0.0)
+            .Max();
         for (int i = 0; i < trace.Count; i++)
+        {
             trace[i].Selected = trace[i].Steps == bestChoice.NSteps &&
                                 trace[i].HiddenDim == bestChoice.HiddenDim &&
                                 trace[i].AttentionDim == bestChoice.AttentionDim &&
                                 Math.Abs(trace[i].Gamma - bestChoice.Gamma) <= 1e-9 &&
                                 Math.Abs(trace[i].DropoutRate - bestChoice.DropoutRate) <= 1e-9 &&
                                 Math.Abs(trace[i].SparsityCoeff - bestChoice.SparsityCoeff) <= 1e-9;
+            if (trace[i].Selected)
+            {
+                trace[i].RejectionReasons = [];
+                continue;
+            }
+
+            var reasons = new List<string>();
+            if (trace[i].Score + 1e-6 < bestScore)
+                reasons.Add("Composite score below winning candidate.");
+            if (trace[i].HoldoutAccuracy + 1e-6 < bestHoldoutAccuracy)
+                reasons.Add("Holdout accuracy below winner.");
+            if (trace[i].HoldoutEce > trace.Where(entry => entry.Selected).Select(entry => entry.HoldoutEce).DefaultIfEmpty(trace[i].HoldoutEce).First() + 0.01)
+                reasons.Add("Holdout ECE materially worse than winner.");
+            if (trace[i].CvStdAccuracy > trace.Where(entry => entry.Selected).Select(entry => entry.CvStdAccuracy).DefaultIfEmpty(trace[i].CvStdAccuracy).First() + 0.01)
+                reasons.Add("Cross-validation stability worse than winner.");
+            trace[i].RejectionReasons = reasons.ToArray();
+        }
         runContext.AutoTuneTrace = trace
             .OrderByDescending(t => t.Score)
             .ToArray();

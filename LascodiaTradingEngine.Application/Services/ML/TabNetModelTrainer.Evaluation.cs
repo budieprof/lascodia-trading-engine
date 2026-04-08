@@ -1,10 +1,32 @@
 using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Application.Services.Inference;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace LascodiaTradingEngine.Application.Services.ML;
 
 public sealed partial class TabNetModelTrainer
 {
+    private readonly record struct TemporalCrossFitFold(
+        int HoldoutStartIndex,
+        int HoldoutCount,
+        int[] TrainIndices,
+        int[] HoldoutIndices,
+        string Hash);
+
+    private readonly record struct AdaptiveHeadCrossFitResult(
+        bool Used,
+        double[] MetaLabelWeights,
+        double MetaLabelBias,
+        double MetaLabelThreshold,
+        double[] AbstentionWeights,
+        double AbstentionBias,
+        double AbstentionThreshold,
+        int FoldCount,
+        int[] FoldStartIndices,
+        int[] FoldCounts,
+        string[] FoldHashes);
+
     // ═══════════════════════════════════════════════════════════════════════
     //  EVALUATION
     // ═══════════════════════════════════════════════════════════════════════
@@ -435,71 +457,44 @@ public sealed partial class TabNetModelTrainer
         return scores[qIdx];
     }
 
-    /// <summary>
-    /// Jackknife+ residuals using the infinitesimal jackknife approximation.
-    /// For each training sample i, estimates the LOO prediction p_{-i} via:
-    ///   p_{-i} ≈ p_full + h_ii / (1 - h_ii) × (p_full - y_i)
-    /// where h_ii is approximated by the squared gradient norm of sample i
-    /// divided by the mean squared gradient norm (a leverage proxy).
-    /// This avoids n full retraining runs while producing proper LOO residuals.
-    /// </summary>
-    private double[] ComputeJackknifeResiduals(IReadOnlyList<TrainingSample> trainSet, TabNetWeights w)
+    private static (double GlobalQHat, double BuyQHat, double SellQHat) ComputeMondrianConformalQHats(
+        IReadOnlyList<TrainingSample> calSet,
+        TabNetWeights w,
+        ModelSnapshot calibrationSnapshot,
+        double alpha,
+        int minCalibrationSamples)
     {
-        int n = trainSet.Count;
-        if (n == 0) return [];
+        double globalQHat = ComputeConformalQHat(calSet, w, calibrationSnapshot, alpha, minCalibrationSamples);
+        if (calSet.Count < minCalibrationSamples)
+            return (globalQHat, globalQHat, globalQHat);
 
-        var priorBuf = new double[w.F];
-        var attnBuf  = new double[w.F];
-
-        // Pass 1: compute full-model predictions and per-sample gradient norms (leverage proxy)
-        var probs     = new double[n];
-        var gradNorms = new double[n];
-
-        for (int i = 0; i < n; i++)
+        var buyScores = new List<double>(calSet.Count);
+        var sellScores = new List<double>(calSet.Count);
+        for (int i = 0; i < calSet.Count; i++)
         {
-            var fwd = ForwardPass(trainSet[i].Features, w, priorBuf, attnBuf, false, 0, null);
-            probs[i] = fwd.Prob;
-
-            // Approximate leverage h_ii via ||∂loss/∂output||² for this sample
-            // The output-layer gradient norm captures how influential this sample is
-            double y = trainSet[i].Direction > 0 ? 1.0 : 0.0;
-            double errCE = fwd.Prob - y;
-            double sqNorm = 0;
-            for (int j = 0; j < w.HiddenDim && j < w.OutputW.Length; j++)
-            {
-                double g = errCE * fwd.AggregatedH[j];
-                sqNorm += g * g;
-            }
-            sqNorm += errCE * errCE; // bias gradient
-            gradNorms[i] = sqNorm;
+            double p = TabNetCalibProb(calSet[i].Features, w, calibrationSnapshot);
+            if (calSet[i].Direction > 0)
+                buyScores.Add(1.0 - p);
+            else
+                sellScores.Add(p);
         }
 
-        // Mean gradient norm for normalization
-        double meanGradNorm = 0;
-        for (int i = 0; i < n; i++) meanGradNorm += gradNorms[i];
-        meanGradNorm /= n;
-
-        // Pass 2: compute LOO-adjusted residuals
-        var residuals = new double[n];
-        for (int i = 0; i < n; i++)
+        static double ComputeClassQHat(List<double> scores, double alpha, double fallback)
         {
-            double y = trainSet[i].Direction > 0 ? 1.0 : 0.0;
-
-            // h_ii ≈ gradNorm_i / (n × meanGradNorm), clamped to [0, 0.95]
-            // Upper clamp prevents division by near-zero (1 - h_ii) while still
-            // capturing high-leverage points that 0.9 would understate.
-            double hii = meanGradNorm > Eps
-                ? Math.Min(gradNorms[i] / (n * meanGradNorm), 0.95)
-                : 0.0;
-
-            // LOO prediction: p_{-i} ≈ p + h/(1-h) × (p - y)
-            double looCorrection = hii / (1.0 - hii) * (probs[i] - y);
-            double pLoo = Math.Clamp(probs[i] + looCorrection, ProbClampMin, 1.0 - ProbClampMin);
-
-            residuals[i] = Math.Abs(pLoo - y);
+            if (scores.Count == 0)
+                return fallback;
+            scores.Sort();
+            int qIdx = Math.Clamp((int)Math.Ceiling((1.0 - alpha) * (scores.Count + 1)) - 1, 0, scores.Count - 1);
+            return scores[qIdx];
         }
 
-        return residuals;
+        double buyQHat = buyScores.Count >= Math.Max(5, minCalibrationSamples / 2)
+            ? ComputeClassQHat(buyScores, alpha, globalQHat)
+            : globalQHat;
+        double sellQHat = sellScores.Count >= Math.Max(5, minCalibrationSamples / 2)
+            ? ComputeClassQHat(sellScores, alpha, globalQHat)
+            : globalQHat;
+        return (globalQHat, buyQHat, sellQHat);
     }
 
     private static (double[] Weights, double Bias) FitMetaLabelModel(
@@ -509,10 +504,11 @@ public sealed partial class TabNetModelTrainer
         double decisionThreshold,
         int minCalibrationSamples,
         int calibrationEpochs,
-        double calibrationLr)
+        double calibrationLr,
+        int[]? sampleIndices = null)
     {
-        if (calSet.Count < minCalibrationSamples) return ([0.0], 0.0);
-        int n = calSet.Count;
+        int n = sampleIndices?.Length ?? calSet.Count;
+        if (n < minCalibrationSamples) return ([0.0], 0.0);
         double metaW = 0.0, metaB = 0.0;
         double mW = 0, vW = 0, mB = 0, vB = 0; int t = 0;
         for (int ep = 0; ep < calibrationEpochs; ep++)
@@ -520,8 +516,9 @@ public sealed partial class TabNetModelTrainer
             double dW = 0, dB = 0;
             for (int i = 0; i < n; i++)
             {
-                double p = TabNetCalibProb(calSet[i].Features, w, calibrationSnapshot);
-                int correct = ((p >= decisionThreshold) == (calSet[i].Direction > 0)) ? 1 : 0;
+                int sampleIndex = sampleIndices is null ? i : sampleIndices[i];
+                double p = TabNetCalibProb(calSet[sampleIndex].Features, w, calibrationSnapshot);
+                int correct = ((p >= decisionThreshold) == (calSet[sampleIndex].Direction > 0)) ? 1 : 0;
                 double metaP = Sigmoid(metaW * p + metaB);
                 dW += (metaP - correct) * p; dB += metaP - correct;
             }
@@ -541,12 +538,17 @@ public sealed partial class TabNetModelTrainer
         double decisionThreshold,
         int minCalibrationSamples,
         int calibrationEpochs,
-        double calibrationLr)
+        double calibrationLr,
+        int[]? sampleIndices = null)
     {
-        if (calSet.Count < minCalibrationSamples) return ([0.0], 0.0, 0.5);
-        int n = calSet.Count;
+        int n = sampleIndices?.Length ?? calSet.Count;
+        if (n < minCalibrationSamples) return ([0.0], 0.0, 0.5);
         var probs = new double[n];
-        for (int i = 0; i < n; i++) probs[i] = TabNetCalibProb(calSet[i].Features, w, calibrationSnapshot);
+        for (int i = 0; i < n; i++)
+        {
+            int sampleIndex = sampleIndices is null ? i : sampleIndices[i];
+            probs[i] = TabNetCalibProb(calSet[sampleIndex].Features, w, calibrationSnapshot);
+        }
         double absW = 0.0, absB = 0.0;
         double mW = 0, vW = 0, mB = 0, vB = 0; int t = 0;
         for (int ep = 0; ep < calibrationEpochs; ep++)
@@ -555,7 +557,8 @@ public sealed partial class TabNetModelTrainer
             for (int i = 0; i < n; i++)
             {
                 double feat = Math.Abs(probs[i] - decisionThreshold);
-                int correct = ((probs[i] >= decisionThreshold) == (calSet[i].Direction > 0)) ? 1 : 0;
+                int sampleIndex = sampleIndices is null ? i : sampleIndices[i];
+                int correct = ((probs[i] >= decisionThreshold) == (calSet[sampleIndex].Direction > 0)) ? 1 : 0;
                 double abstP = Sigmoid(absW * feat + absB);
                 dW += (abstP - correct) * feat; dB += abstP - correct;
             }
@@ -578,6 +581,206 @@ public sealed partial class TabNetModelTrainer
             if (prec > bestPrec) { bestPrec = prec; bestThresh = thresh; }
         }
         return ([absW], absB, bestThresh);
+    }
+
+    private static AdaptiveHeadCrossFitResult CrossFitAdaptiveHeads(
+        IReadOnlyList<TrainingSample> diagnosticsSet,
+        TabNetWeights w,
+        ModelSnapshot calibrationSnapshot,
+        double decisionThreshold,
+        int minAdaptiveHeadSamples,
+        int calibrationEpochs,
+        double calibrationLr)
+    {
+        var folds = BuildTemporalCrossFitFolds(
+            diagnosticsSet.Count,
+            Math.Max(5, minAdaptiveHeadSamples / 2),
+            maxFolds: 3);
+        if (folds.Count < 2)
+            return new AdaptiveHeadCrossFitResult(false, [0.0], 0.0, 0.5, [0.0], 0.0, 0.5, 0, [], [], []);
+
+        var metaScores = Enumerable.Repeat(double.NaN, diagnosticsSet.Count).ToArray();
+        var abstentionScores = Enumerable.Repeat(double.NaN, diagnosticsSet.Count).ToArray();
+        var correctnessLabels = new int[diagnosticsSet.Count];
+
+        foreach (var fold in folds)
+        {
+            var (foldMetaWeights, foldMetaBias) = FitMetaLabelModel(
+                diagnosticsSet,
+                w,
+                calibrationSnapshot,
+                decisionThreshold,
+                minAdaptiveHeadSamples,
+                calibrationEpochs,
+                calibrationLr,
+                fold.TrainIndices);
+            var (foldAbstentionWeights, foldAbstentionBias, _) = FitAbstentionModel(
+                diagnosticsSet,
+                w,
+                calibrationSnapshot,
+                decisionThreshold,
+                minAdaptiveHeadSamples,
+                calibrationEpochs,
+                calibrationLr,
+                fold.TrainIndices);
+
+            foreach (int holdoutIndex in fold.HoldoutIndices)
+            {
+                double p = TabNetCalibProb(diagnosticsSet[holdoutIndex].Features, w, calibrationSnapshot);
+                int correct = ((p >= decisionThreshold) == (diagnosticsSet[holdoutIndex].Direction > 0)) ? 1 : 0;
+                correctnessLabels[holdoutIndex] = correct;
+                metaScores[holdoutIndex] = ComputeMetaLabelProbability(p, foldMetaWeights, foldMetaBias);
+                abstentionScores[holdoutIndex] = ComputeAbstentionProbability(p, decisionThreshold, foldAbstentionWeights, foldAbstentionBias);
+            }
+        }
+
+        double metaThreshold = SelectBinaryProbabilityThreshold(metaScores, correctnessLabels, defaultThreshold: 0.5, preferPrecision: false);
+        double abstentionThreshold = SelectBinaryProbabilityThreshold(abstentionScores, correctnessLabels, defaultThreshold: 0.5, preferPrecision: true);
+
+        var (metaLabelWeights, metaLabelBias) = FitMetaLabelModel(
+            diagnosticsSet,
+            w,
+            calibrationSnapshot,
+            decisionThreshold,
+            minAdaptiveHeadSamples,
+            calibrationEpochs,
+            calibrationLr);
+        var (abstentionWeights, abstentionBias, _) = FitAbstentionModel(
+            diagnosticsSet,
+            w,
+            calibrationSnapshot,
+            decisionThreshold,
+            minAdaptiveHeadSamples,
+            calibrationEpochs,
+            calibrationLr);
+
+        return new AdaptiveHeadCrossFitResult(
+            true,
+            metaLabelWeights,
+            metaLabelBias,
+            metaThreshold,
+            abstentionWeights,
+            abstentionBias,
+            abstentionThreshold,
+            folds.Count,
+            folds.Select(fold => fold.HoldoutStartIndex).ToArray(),
+            folds.Select(fold => fold.HoldoutCount).ToArray(),
+            folds.Select(fold => fold.Hash).ToArray());
+    }
+
+    private static List<TemporalCrossFitFold> BuildTemporalCrossFitFolds(int totalCount, int minHoldoutCount, int maxFolds)
+    {
+        var folds = new List<TemporalCrossFitFold>();
+        if (totalCount < minHoldoutCount * 2)
+            return folds;
+
+        int foldCount = Math.Min(maxFolds, Math.Max(2, totalCount / Math.Max(minHoldoutCount, 1)));
+        foldCount = Math.Min(foldCount, Math.Max(2, totalCount / minHoldoutCount));
+        if (foldCount < 2)
+            return folds;
+
+        int baseFoldSize = totalCount / foldCount;
+        int remainder = totalCount % foldCount;
+        int start = 0;
+        for (int fold = 0; fold < foldCount; fold++)
+        {
+            int count = baseFoldSize + (fold < remainder ? 1 : 0);
+            if (count < minHoldoutCount)
+                continue;
+
+            int[] holdout = Enumerable.Range(start, count).ToArray();
+            int[] train = Enumerable.Range(0, totalCount)
+                .Where(index => index < start || index >= start + count)
+                .ToArray();
+            if (train.Length < minHoldoutCount)
+            {
+                start += count;
+                continue;
+            }
+
+            string hash = ComputeStableHash($"tabnet-crossfit:{totalCount}:{fold}:{start}:{count}");
+            folds.Add(new TemporalCrossFitFold(start, count, train, holdout, hash));
+            start += count;
+        }
+
+        return folds;
+    }
+
+    private static double ComputeMetaLabelProbability(double calibP, double[] weights, double bias)
+    {
+        if (weights.Length == 0)
+            return 0.5;
+        return Math.Clamp(Sigmoid(weights[0] * calibP + bias), ProbClampMin, 1.0 - ProbClampMin);
+    }
+
+    private static double ComputeAbstentionProbability(double calibP, double decisionThreshold, double[] weights, double bias)
+    {
+        if (weights.Length == 0)
+            return 0.5;
+        double margin = Math.Abs(calibP - decisionThreshold);
+        return Math.Clamp(Sigmoid(weights[0] * margin + bias), ProbClampMin, 1.0 - ProbClampMin);
+    }
+
+    private static double SelectBinaryProbabilityThreshold(
+        double[] scores,
+        int[] labels,
+        double defaultThreshold,
+        bool preferPrecision)
+    {
+        var pairs = scores
+            .Select((score, index) => (Score: score, Label: labels[index]))
+            .Where(pair => double.IsFinite(pair.Score))
+            .ToArray();
+        if (pairs.Length < 10)
+            return defaultThreshold;
+
+        int positives = pairs.Count(pair => pair.Label == 1);
+        if (positives == 0)
+            return defaultThreshold;
+
+        double bestThreshold = defaultThreshold;
+        double bestScore = double.NegativeInfinity;
+        for (int step = 25; step <= 85; step++)
+        {
+            double threshold = step / 100.0;
+            int tp = 0, fp = 0, fn = 0, accepted = 0;
+            for (int i = 0; i < pairs.Length; i++)
+            {
+                if (pairs[i].Score >= threshold)
+                {
+                    accepted++;
+                    if (pairs[i].Label == 1) tp++;
+                    else fp++;
+                }
+                else if (pairs[i].Label == 1)
+                {
+                    fn++;
+                }
+            }
+
+            if (accepted < Math.Max(5, pairs.Length / 20))
+                continue;
+
+            double precision = (tp + fp) > 0 ? (double)tp / (tp + fp) : 0.0;
+            double recall = (tp + fn) > 0 ? (double)tp / (tp + fn) : 0.0;
+            double f1 = (precision + recall) > 0.0 ? 2.0 * precision * recall / (precision + recall) : 0.0;
+            double coverage = (double)accepted / pairs.Length;
+            double score = preferPrecision
+                ? precision + 0.25 * coverage
+                : f1 + 0.10 * precision + 0.05 * coverage;
+            if (score > bestScore)
+            {
+                bestScore = score;
+                bestThreshold = threshold;
+            }
+        }
+
+        return bestScore > double.NegativeInfinity ? bestThreshold : defaultThreshold;
+    }
+
+    private static string ComputeStableHash(string payload)
+    {
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(payload)));
     }
 
     private static (double[] Weights, double Bias) FitQuantileRegressor(IReadOnlyList<TrainingSample> trainSet, int F, double tau, int minCalibrationSamples)

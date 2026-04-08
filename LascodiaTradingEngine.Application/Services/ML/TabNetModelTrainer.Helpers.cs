@@ -234,6 +234,8 @@ public sealed partial class TabNetModelTrainer
         if (!double.IsFinite(s.WalkForwardSharpeTrend)) s.WalkForwardSharpeTrend = 0.0;
         if (!double.IsFinite(s.BrierSkillScore)) s.BrierSkillScore = 0.0;
         if (!double.IsFinite(s.ConformalQHat)) s.ConformalQHat = 0.5;
+        if (!double.IsFinite(s.ConformalQHatBuy)) s.ConformalQHatBuy = s.ConformalQHat;
+        if (!double.IsFinite(s.ConformalQHatSell)) s.ConformalQHatSell = s.ConformalQHat;
         if (!double.IsFinite(s.Ece)) s.Ece = 1.0;
         if (!double.IsFinite(s.OptimalThreshold)) s.OptimalThreshold = 0.5;
         if (!double.IsFinite(s.MetaLabelThreshold)) s.MetaLabelThreshold = 0.5;
@@ -279,6 +281,23 @@ public sealed partial class TabNetModelTrainer
             if (!double.IsFinite(s.TabNetDriftArtifact.MaxPopulationStabilityIndex)) s.TabNetDriftArtifact.MaxPopulationStabilityIndex = 0.0;
             if (!double.IsFinite(s.TabNetDriftArtifact.MeanChangePointScore)) s.TabNetDriftArtifact.MeanChangePointScore = 0.0;
             if (!double.IsFinite(s.TabNetDriftArtifact.MaxChangePointScore)) s.TabNetDriftArtifact.MaxChangePointScore = 0.0;
+            if (!double.IsFinite(s.TabNetDriftArtifact.MeanAdfLikeStatistic)) s.TabNetDriftArtifact.MeanAdfLikeStatistic = 0.0;
+            if (!double.IsFinite(s.TabNetDriftArtifact.MaxAdfLikeStatistic)) s.TabNetDriftArtifact.MaxAdfLikeStatistic = 0.0;
+            if (!double.IsFinite(s.TabNetDriftArtifact.MeanKpssLikeStatistic)) s.TabNetDriftArtifact.MeanKpssLikeStatistic = 0.0;
+            if (!double.IsFinite(s.TabNetDriftArtifact.MaxKpssLikeStatistic)) s.TabNetDriftArtifact.MaxKpssLikeStatistic = 0.0;
+            if (!double.IsFinite(s.TabNetDriftArtifact.MeanRecentMeanShiftScore)) s.TabNetDriftArtifact.MeanRecentMeanShiftScore = 0.0;
+            if (!double.IsFinite(s.TabNetDriftArtifact.MaxRecentMeanShiftScore)) s.TabNetDriftArtifact.MaxRecentMeanShiftScore = 0.0;
+        }
+        if (s.TabNetCalibrationArtifact is not null)
+        {
+            if (string.IsNullOrWhiteSpace(s.TabNetCalibrationArtifact.CalibrationSelectionStrategy))
+                s.TabNetCalibrationArtifact.CalibrationSelectionStrategy = "FIT_ON_FIT_EVAL_ON_DIAGNOSTICS";
+            if (!double.IsFinite(s.TabNetCalibrationArtifact.DiagnosticsSelectedGlobalNll))
+                s.TabNetCalibrationArtifact.DiagnosticsSelectedGlobalNll = 0.0;
+            if (!double.IsFinite(s.TabNetCalibrationArtifact.DiagnosticsSelectedStackNll))
+                s.TabNetCalibrationArtifact.DiagnosticsSelectedStackNll = 0.0;
+            if (!double.IsFinite(s.TabNetCalibrationArtifact.ConditionalRoutingThreshold))
+                s.TabNetCalibrationArtifact.ConditionalRoutingThreshold = 0.5;
         }
     }
 

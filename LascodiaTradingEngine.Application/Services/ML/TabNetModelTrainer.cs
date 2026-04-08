@@ -390,32 +390,13 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
         int conformalStart = calibrationDiagnosticsStart;
         int metaLabelStart = calibrationDiagnosticsStart;
         int abstentionStart = calibrationDiagnosticsStart;
-        string adaptiveHeadSplitMode = "SHARED_FALLBACK";
+        string adaptiveHeadSplitMode = calibrationDiagnosticsSet.Count > 0
+            ? "CROSSFIT_SHARED_DIAGNOSTICS"
+            : "SHARED_FALLBACK";
         int adaptiveHeadCrossFitFoldCount = 0;
-        if (calibrationDiagnosticsSet.Count >= minConformalSamples + minAdaptiveHeadSamples + minAdaptiveHeadSamples)
-        {
-            int extraAdaptiveCount = calibrationDiagnosticsSet.Count -
-                (minConformalSamples + minAdaptiveHeadSamples + minAdaptiveHeadSamples);
-            int conformalCount = minConformalSamples + extraAdaptiveCount / 3;
-            int metaLabelCount = minAdaptiveHeadSamples + extraAdaptiveCount / 3;
-            int abstentionCount = minAdaptiveHeadSamples + extraAdaptiveCount - (extraAdaptiveCount / 3) - (extraAdaptiveCount / 3);
-
-            conformalSet = calibrationDiagnosticsSet[..conformalCount];
-            metaLabelSet = calibrationDiagnosticsSet[conformalCount..(conformalCount + metaLabelCount)];
-            abstentionSet = calibrationDiagnosticsSet[(conformalCount + metaLabelCount)..];
-            metaLabelStart = calibrationDiagnosticsStart + conformalCount;
-            abstentionStart = metaLabelStart + metaLabelCount;
-            adaptiveHeadSplitMode = "DISJOINT";
-        }
-        else if (calibrationDiagnosticsSet.Count >= minConformalSamples + minAdaptiveHeadSamples)
-        {
-            conformalSet = calibrationDiagnosticsSet[..minConformalSamples];
-            metaLabelSet = calibrationDiagnosticsSet[minConformalSamples..];
-            abstentionSet = metaLabelSet;
-            metaLabelStart = calibrationDiagnosticsStart + minConformalSamples;
-            abstentionStart = metaLabelStart;
-            adaptiveHeadSplitMode = "CONFORMAL_DISJOINT_SHARED_ADAPTIVE";
-        }
+        int[] adaptiveHeadCrossFitFoldStarts = [];
+        int[] adaptiveHeadCrossFitFoldCounts = [];
+        string[] adaptiveHeadCrossFitFoldHashes = [];
 
         _logger.LogInformation(
             "TabNet final splits — train={Train} selection={Selection} calibrationFit={CalibrationFit} calibrationDiagnostics={CalibrationDiagnostics} conformal={Conformal} meta={Meta} abstention={Abstention} test={Test} embargo={Embargo}",
@@ -427,14 +408,26 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
         {
             driftArtifact = ComputeDriftDiagnostics(trainSet, F, tabNetFeatureNames, hp.FracDiffD);
             if (driftArtifact.GateTriggered)
+            {
+                if (string.Equals(driftArtifact.GateAction, "REJECT", StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException(
+                        $"TabNet drift gate rejected training: {driftArtifact.NonStationaryFeatureCount}/{F} features flagged; top features: " +
+                        $"{(driftArtifact.FlaggedFeatures.Length > 0 ? string.Join(", ", driftArtifact.FlaggedFeatures) : "n/a")}");
+                }
+
                 _logger.LogWarning(
-                    "TabNet stationarity gate: {NonStat}/{Total} features flagged (acf={Acf:F3}, psi={Psi:F3}, cp={Cp:F3}). Top flagged: {Features}",
+                    "TabNet stationarity gate ({Action}): {NonStat}/{Total} features flagged (acf={Acf:F3}, psi={Psi:F3}, cp={Cp:F3}, adf={Adf:F3}, kpss={Kpss:F3}). Top flagged: {Features}",
+                    driftArtifact.GateAction,
                     driftArtifact.NonStationaryFeatureCount,
                     F,
                     driftArtifact.MeanLag1Autocorrelation,
                     driftArtifact.MeanPopulationStabilityIndex,
                     driftArtifact.MeanChangePointScore,
+                    driftArtifact.MeanAdfLikeStatistic,
+                    driftArtifact.MeanKpssLikeStatistic,
                     driftArtifact.FlaggedFeatures.Length > 0 ? string.Join(", ", driftArtifact.FlaggedFeatures) : "n/a");
+            }
         }
 
         // ── 3c. Density-ratio importance weights ───────────────────────────
@@ -481,7 +474,7 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
         }
 
         var selectedConfig = SelectArchitectureConfig(
-            trainSet, selectionSet, hp, F, nSteps, hiddenDim, attentionDim, sharedLayers, stepLayers,
+            trainSet, selectionSet, selectionStart, hp, F, nSteps, hiddenDim, attentionDim, sharedLayers, stepLayers,
             gamma, useSparsemax, useGlu, dropoutRate, sparsityCoeff, runContext, ct);
         nSteps = selectedConfig.NSteps;
         hiddenDim = selectedConfig.HiddenDim;
@@ -510,6 +503,7 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
         // ── 5. Calibration stack ───────────────────────────────────────────
         var calibrationFit = FitTabNetCalibrationStack(
             calibrationFitSet,
+            calibrationDiagnosticsSet,
             weights,
             hp.FitTemperatureScale,
             runContext.MinCalibrationSamples,
@@ -635,6 +629,7 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
                 dropoutRate, bnMomentum, ghostBatchSize, 0, runContext, ct);
             var prunedCalibrationFit = FitTabNetCalibrationStack(
                 maskedCalibrationFit,
+                maskedCalibrationDiagnostics,
                 prunedW,
                 hp.FitTemperatureScale,
                 runContext.MinCalibrationSamples,
@@ -757,22 +752,103 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
             calibrationArtifact.SellBranchAccepted,
             isotonicBp.Length / 2);
 
+        // ── 11c. Adaptive-head split strategy ──────────────────────────────
+        var adaptiveHeadCrossFit = CrossFitAdaptiveHeads(
+            calibrationDiagnosticsSet,
+            weights,
+            calibrationSnapshot,
+            optimalThreshold,
+            minAdaptiveHeadSamples,
+            runContext.CalibrationEpochs,
+            runContext.CalibrationLr);
+        double[] metaLabelWeights;
+        double metaLabelBias;
+        double metaLabelThreshold;
+        double[] abstentionWeights;
+        double abstentionBias;
+        double abstentionThreshold;
+        if (adaptiveHeadCrossFit.Used)
+        {
+            conformalSet = calibrationDiagnosticsSet;
+            metaLabelSet = calibrationDiagnosticsSet;
+            abstentionSet = calibrationDiagnosticsSet;
+            conformalStart = calibrationDiagnosticsStart;
+            metaLabelStart = calibrationDiagnosticsStart;
+            abstentionStart = calibrationDiagnosticsStart;
+            adaptiveHeadSplitMode = "CROSSFIT_SHARED_DIAGNOSTICS";
+            adaptiveHeadCrossFitFoldCount = adaptiveHeadCrossFit.FoldCount;
+            adaptiveHeadCrossFitFoldStarts = adaptiveHeadCrossFit.FoldStartIndices
+                .Select(index => calibrationDiagnosticsStart + index)
+                .ToArray();
+            adaptiveHeadCrossFitFoldCounts = adaptiveHeadCrossFit.FoldCounts;
+            adaptiveHeadCrossFitFoldHashes = adaptiveHeadCrossFit.FoldHashes;
+            metaLabelWeights = adaptiveHeadCrossFit.MetaLabelWeights;
+            metaLabelBias = adaptiveHeadCrossFit.MetaLabelBias;
+            metaLabelThreshold = adaptiveHeadCrossFit.MetaLabelThreshold;
+            abstentionWeights = adaptiveHeadCrossFit.AbstentionWeights;
+            abstentionBias = adaptiveHeadCrossFit.AbstentionBias;
+            abstentionThreshold = adaptiveHeadCrossFit.AbstentionThreshold;
+        }
+        else
+        {
+            adaptiveHeadCrossFitFoldCount = 0;
+            adaptiveHeadCrossFitFoldStarts = [];
+            adaptiveHeadCrossFitFoldCounts = [];
+            adaptiveHeadCrossFitFoldHashes = [];
+            conformalSet = calibrationDiagnosticsSet;
+            metaLabelSet = calibrationDiagnosticsSet;
+            abstentionSet = calibrationDiagnosticsSet;
+            conformalStart = calibrationDiagnosticsStart;
+            metaLabelStart = calibrationDiagnosticsStart;
+            abstentionStart = calibrationDiagnosticsStart;
+            adaptiveHeadSplitMode = "SHARED_FALLBACK";
+            if (calibrationDiagnosticsSet.Count >= minConformalSamples + minAdaptiveHeadSamples + minAdaptiveHeadSamples)
+            {
+                int extraAdaptiveCount = calibrationDiagnosticsSet.Count -
+                    (minConformalSamples + minAdaptiveHeadSamples + minAdaptiveHeadSamples);
+                int conformalCount = minConformalSamples + extraAdaptiveCount / 3;
+                int metaLabelCount = minAdaptiveHeadSamples + extraAdaptiveCount / 3;
+                int abstentionCount = minAdaptiveHeadSamples + extraAdaptiveCount - (extraAdaptiveCount / 3) - (extraAdaptiveCount / 3);
+
+                conformalSet = calibrationDiagnosticsSet[..conformalCount];
+                metaLabelSet = calibrationDiagnosticsSet[conformalCount..(conformalCount + metaLabelCount)];
+                abstentionSet = calibrationDiagnosticsSet[(conformalCount + metaLabelCount)..];
+                metaLabelStart = calibrationDiagnosticsStart + conformalCount;
+                abstentionStart = metaLabelStart + metaLabelCount;
+                adaptiveHeadSplitMode = "DISJOINT";
+            }
+            else if (calibrationDiagnosticsSet.Count >= minConformalSamples + minAdaptiveHeadSamples)
+            {
+                conformalSet = calibrationDiagnosticsSet[..minConformalSamples];
+                metaLabelSet = calibrationDiagnosticsSet[minConformalSamples..];
+                abstentionSet = metaLabelSet;
+                metaLabelStart = calibrationDiagnosticsStart + minConformalSamples;
+                abstentionStart = metaLabelStart;
+                adaptiveHeadSplitMode = "CONFORMAL_DISJOINT_SHARED_ADAPTIVE";
+            }
+
+            (metaLabelWeights, metaLabelBias) = FitMetaLabelModel(
+                metaLabelSet, weights, calibrationSnapshot, optimalThreshold,
+                minAdaptiveHeadSamples, runContext.CalibrationEpochs, runContext.CalibrationLr);
+            metaLabelThreshold = 0.5;
+            (abstentionWeights, abstentionBias, abstentionThreshold) = FitAbstentionModel(
+                abstentionSet, weights, calibrationSnapshot, optimalThreshold,
+                minAdaptiveHeadSamples, runContext.CalibrationEpochs, runContext.CalibrationLr);
+        }
+
+        // ── 11d. Conformal + blocked OOF residuals ─────────────────────────
         double conformalAlpha = Math.Clamp(1.0 - hp.ConformalCoverage, 0.01, 0.50);
-        double conformalQHat = ComputeConformalQHat(
+        var (conformalQHat, conformalQHatBuy, conformalQHatSell) = ComputeMondrianConformalQHats(
             conformalSet, weights, calibrationSnapshot, conformalAlpha, minConformalSamples);
-
-        // ── 11c. Jackknife+ residuals ──────────────────────────────────────
-        double[] jackknifeResiduals = ComputeJackknifeResiduals(trainSet, weights);
-
-        // ── 11d. Meta-label model ──────────────────────────────────────────
-        var (metaLabelWeights, metaLabelBias) = FitMetaLabelModel(
-            metaLabelSet, weights, calibrationSnapshot, optimalThreshold,
-            minAdaptiveHeadSamples, runContext.CalibrationEpochs, runContext.CalibrationLr);
-
-        // ── 11e. Abstention gate ───────────────────────────────────────────
-        var (abstentionWeights, abstentionBias, abstentionThreshold) = FitAbstentionModel(
-            abstentionSet, weights, calibrationSnapshot, optimalThreshold,
-            minAdaptiveHeadSamples, runContext.CalibrationEpochs, runContext.CalibrationLr);
+        double[] jackknifeResiduals = cvResult.OofResiduals is { Length: > 0 }
+            ? cvResult.OofResiduals
+            : [];
+        calibrationArtifact.DiagnosticsSampleCount = calibrationDiagnosticsSet.Count;
+        calibrationArtifact.ConformalSampleCount = conformalSet.Count;
+        calibrationArtifact.MetaLabelSampleCount = metaLabelSet.Count;
+        calibrationArtifact.AbstentionSampleCount = abstentionSet.Count;
+        calibrationArtifact.AdaptiveHeadMode = adaptiveHeadSplitMode;
+        calibrationArtifact.AdaptiveHeadCrossFitFoldCount = adaptiveHeadCrossFitFoldCount;
 
         // ── 11f. Quantile magnitude regressor ─────────────────────────────
         double[] magQ90Weights = [];
@@ -881,6 +957,11 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
         calibrationResidualStd = Safe(calibrationResidualStd);
         calibrationResidualThreshold = Safe(calibrationResidualThreshold);
         calibrationEce = Safe(calibrationEce, 1.0);
+        conformalQHat = Math.Clamp(Safe(conformalQHat, 0.5), ProbClampMin, 1.0 - ProbClampMin);
+        conformalQHatBuy = Math.Clamp(Safe(conformalQHatBuy, conformalQHat), ProbClampMin, 1.0 - ProbClampMin);
+        conformalQHatSell = Math.Clamp(Safe(conformalQHatSell, conformalQHat), ProbClampMin, 1.0 - ProbClampMin);
+        metaLabelThreshold = Safe(metaLabelThreshold, 0.5);
+        abstentionThreshold = Safe(abstentionThreshold, 0.5);
         metaLabelTopFeatureIndices = featureImportance
             .Select((importance, index) => (Index: index, Importance: importance))
             .OrderByDescending(entry => entry.Importance)
@@ -920,6 +1001,9 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
             AbstentionCount = abstentionSet.Count,
             AdaptiveHeadSplitMode = adaptiveHeadSplitMode,
             AdaptiveHeadCrossFitFoldCount = adaptiveHeadCrossFitFoldCount,
+            AdaptiveHeadCrossFitFoldStartIndices = adaptiveHeadCrossFitFoldStarts,
+            AdaptiveHeadCrossFitFoldCounts = adaptiveHeadCrossFitFoldCounts,
+            AdaptiveHeadCrossFitFoldHashes = adaptiveHeadCrossFitFoldHashes,
             TestStartIndex = testStart,
             TestCount = testSet.Count,
             EmbargoCount = embargo,
@@ -984,12 +1068,14 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
             ReliabilityBinCounts       = reliabilityBinCounts.Length > 0 ? reliabilityBinCounts : null,
             IsotonicBreakpoints        = isotonicBp,
             ConformalQHat              = conformalQHat,
+            ConformalQHatBuy           = conformalQHatBuy,
+            ConformalQHatSell          = conformalQHatSell,
             // TabNet training does not apply fractional differencing, so persisting a non-zero
             // value here would make deployed scoring drift away from the fitted model.
             FracDiffD                  = 0.0,
             MetaLabelWeights           = metaLabelWeights,
             MetaLabelBias              = metaLabelBias,
-            MetaLabelThreshold         = 0.5,
+            MetaLabelThreshold         = metaLabelThreshold,
             MetaLabelTopFeatureIndices = metaLabelTopFeatureIndices,
             JackknifeResiduals         = jackknifeResiduals,
             FeatureQuantileBreakpoints = featureQuantileBreakpoints,

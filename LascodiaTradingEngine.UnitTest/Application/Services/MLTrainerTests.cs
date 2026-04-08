@@ -888,15 +888,32 @@ public class MLTrainerTests
         Assert.NotNull(snap.TabNetSelectionMetrics);
         Assert.NotNull(snap.TabNetCalibrationMetrics);
         Assert.NotNull(snap.TabNetTestMetrics);
+        Assert.NotNull(snap.TabNetCalibrationArtifact);
         Assert.NotNull(snap.TabNetDriftArtifact);
         Assert.Equal(split.SelectionCount, snap.TabNetSelectionMetrics!.SampleCount);
         Assert.Equal(split.CalibrationDiagnosticsCount, snap.TabNetCalibrationMetrics!.SampleCount);
         Assert.Equal(split.TestCount, snap.TabNetTestMetrics!.SampleCount);
         Assert.Equal(split.TrainCount, snap.TabNetDriftArtifact!.SampleCount);
         Assert.Equal(snap.Features.Length, snap.TabNetDriftArtifact.FeatureCount);
+        Assert.InRange(snap.ConformalQHat, 0.0, 1.0);
+        Assert.InRange(snap.ConformalQHatBuy, 0.0, 1.0);
+        Assert.InRange(snap.ConformalQHatSell, 0.0, 1.0);
+        Assert.Equal(split.CalibrationFitCount, snap.TabNetCalibrationArtifact!.FitSampleCount);
+        Assert.Equal(split.CalibrationDiagnosticsCount, snap.TabNetCalibrationArtifact.DiagnosticsSampleCount);
+        Assert.Equal(split.AdaptiveHeadCrossFitFoldCount, snap.TabNetCalibrationArtifact.AdaptiveHeadCrossFitFoldCount);
+        Assert.Equal(split.AdaptiveHeadSplitMode, snap.TabNetCalibrationArtifact.AdaptiveHeadMode, ignoreCase: true);
+        Assert.False(string.IsNullOrWhiteSpace(snap.TabNetCalibrationArtifact.CalibrationSelectionStrategy));
         if (split.CalibrationDiagnosticsCount > 0 &&
             split.CalibrationDiagnosticsStartIndex >= split.CalibrationFitStartIndex + split.CalibrationFitCount)
             Assert.Equal(split.CalibrationCount, split.CalibrationFitCount + split.CalibrationDiagnosticsCount);
+        if (string.Equals(split.AdaptiveHeadSplitMode, "CROSSFIT_SHARED_DIAGNOSTICS", StringComparison.OrdinalIgnoreCase))
+        {
+            Assert.True(split.AdaptiveHeadCrossFitFoldCount >= 2);
+            Assert.Equal(split.AdaptiveHeadCrossFitFoldCount, split.AdaptiveHeadCrossFitFoldStartIndices.Length);
+            Assert.Equal(split.AdaptiveHeadCrossFitFoldCount, split.AdaptiveHeadCrossFitFoldCounts.Length);
+            Assert.Equal(split.AdaptiveHeadCrossFitFoldCount, split.AdaptiveHeadCrossFitFoldHashes.Length);
+            Assert.Equal(split.CalibrationDiagnosticsCount, split.AdaptiveHeadCrossFitFoldCounts.Sum());
+        }
     }
 
     [Fact(Timeout = 60000)]
@@ -1062,6 +1079,9 @@ public class MLTrainerTests
         legacy.PreprocessingFingerprint = string.Empty;
         legacy.FeaturePipelineDescriptors = [];
         legacy.TabNetPolyTopFeatureIndices = [0, 1];
+        legacy.ConformalQHat = 0.2;
+        legacy.ConformalQHatBuy = double.NaN;
+        legacy.ConformalQHatSell = 0.0;
 
         var normalized = TabNetSnapshotSupport.NormalizeSnapshotCopy(legacy);
 
@@ -1072,6 +1092,37 @@ public class MLTrainerTests
         Assert.False(string.IsNullOrWhiteSpace(normalized.FeatureSchemaFingerprint));
         Assert.False(string.IsNullOrWhiteSpace(normalized.PreprocessingFingerprint));
         Assert.NotEqual(legacy.FeaturePipelineDescriptors.Length, normalized.FeaturePipelineDescriptors.Length);
+        Assert.Equal(normalized.ConformalQHat, normalized.ConformalQHatBuy, 12);
+        Assert.Equal(normalized.ConformalQHat, normalized.ConformalQHatSell, 12);
+    }
+
+    [Fact]
+    public void TabNetSnapshotSupport_Rejects_InvalidCrossFitFoldMetadata()
+    {
+        var snapshot = CreateSimpleTabNetSnapshot(useInitialProjection: false, useSparsemax: true);
+        snapshot.TrainingSplitSummary!.AdaptiveHeadSplitMode = "CROSSFIT_SHARED_DIAGNOSTICS";
+        snapshot.TrainingSplitSummary.AdaptiveHeadCrossFitFoldCount = 2;
+        snapshot.TrainingSplitSummary.AdaptiveHeadCrossFitFoldStartIndices = [3];
+        snapshot.TrainingSplitSummary.AdaptiveHeadCrossFitFoldCounts = [1];
+        snapshot.TrainingSplitSummary.AdaptiveHeadCrossFitFoldHashes = ["fold-0"];
+        snapshot.TabNetCalibrationArtifact = new TabNetCalibrationArtifact
+        {
+            FitSampleCount = snapshot.TrainingSplitSummary.CalibrationFitCount,
+            DiagnosticsSampleCount = snapshot.TrainingSplitSummary.CalibrationDiagnosticsCount,
+            ConformalSampleCount = snapshot.TrainingSplitSummary.ConformalCount,
+            MetaLabelSampleCount = snapshot.TrainingSplitSummary.MetaLabelCount,
+            AbstentionSampleCount = snapshot.TrainingSplitSummary.AbstentionCount,
+            AdaptiveHeadMode = snapshot.TrainingSplitSummary.AdaptiveHeadSplitMode,
+            AdaptiveHeadCrossFitFoldCount = snapshot.TrainingSplitSummary.AdaptiveHeadCrossFitFoldCount,
+            ConditionalRoutingThreshold = snapshot.ConditionalCalibrationRoutingThreshold,
+        };
+
+        var validation = TabNetSnapshotSupport.ValidateSnapshot(snapshot, allowLegacyV2: false);
+
+        Assert.False(validation.IsValid);
+        Assert.Contains(
+            validation.Issues,
+            issue => issue.Contains("cross-fit", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]

@@ -24,6 +24,11 @@ public sealed partial class TabNetModelTrainer
         ModelSnapshot PreIsotonicSnapshot,
         TabNetCalibrationArtifact Artifact);
 
+    private readonly record struct GlobalCalibrationSelection(
+        string Name,
+        ModelSnapshot Snapshot,
+        double EvalNll);
+
     // ═══════════════════════════════════════════════════════════════════════
     //  PLATT / TEMPERATURE / CONDITIONAL / ISOTONIC STACK
     // ═══════════════════════════════════════════════════════════════════════
@@ -64,45 +69,56 @@ public sealed partial class TabNetModelTrainer
     }
 
     private static TabNetCalibrationFit FitTabNetCalibrationStack(
-        IReadOnlyList<TrainingSample> calSet,
+        IReadOnlyList<TrainingSample> fitSet,
+        IReadOnlyList<TrainingSample>? diagnosticsSet,
         TabNetWeights w,
         bool fitTemperatureScale,
         int minCalibrationSamples,
         int calibrationEpochs,
         double calibrationLr)
     {
-        var (plattA, plattB) = FitPlattScaling(calSet, w, minCalibrationSamples, calibrationEpochs, calibrationLr);
+        var evalSet = diagnosticsSet is { Count: > 0 }
+            ? diagnosticsSet
+            : fitSet;
+        if (evalSet.Count == 0)
+            evalSet = fitSet;
+
+        var (plattA, plattB) = FitPlattScaling(fitSet, w, minCalibrationSamples, calibrationEpochs, calibrationLr);
         if (!double.IsFinite(plattA)) plattA = 1.0;
         if (!double.IsFinite(plattB)) plattB = 0.0;
 
         var plattSnapshot = BuildCalibrationSnapshot(plattA, plattB);
-        double globalPlattNll = ComputeCalibrationNll(calSet, w, plattSnapshot);
+        double globalPlattNll = ComputeCalibrationNll(evalSet, w, plattSnapshot);
 
         double temperatureScale = 0.0;
         double temperatureNll = globalPlattNll;
         string selectedGlobalCalibration = "PLATT";
-        if (fitTemperatureScale && calSet.Count >= minCalibrationSamples)
+        var selectedGlobalSnapshot = plattSnapshot;
+        if (fitTemperatureScale && fitSet.Count >= minCalibrationSamples)
         {
-            double candidateTemperature = FitTemperatureScaling(calSet, w, minCalibrationSamples, calibrationEpochs, calibrationLr);
+            double candidateTemperature = FitTemperatureScaling(fitSet, w, minCalibrationSamples, calibrationEpochs, calibrationLr);
             if (double.IsFinite(candidateTemperature) && candidateTemperature > 0.0)
             {
                 var temperatureSnapshot = BuildCalibrationSnapshot(plattA, plattB, candidateTemperature);
-                temperatureNll = ComputeCalibrationNll(calSet, w, temperatureSnapshot);
+                temperatureNll = ComputeCalibrationNll(evalSet, w, temperatureSnapshot);
                 if (temperatureNll + 1e-6 < globalPlattNll)
                 {
                     temperatureScale = candidateTemperature;
                     selectedGlobalCalibration = "TEMPERATURE";
+                    selectedGlobalSnapshot = temperatureSnapshot;
                 }
             }
         }
 
         double routingThreshold = DetermineConditionalRoutingThreshold(
-            calSet,
+            fitSet,
+            evalSet,
             w,
-            BuildCalibrationSnapshot(plattA, plattB, temperatureScale),
+            selectedGlobalSnapshot,
+            selectedGlobalCalibration,
             minCalibrationSamples);
         var conditionalFit = FitClassConditionalPlatt(
-            calSet, w, plattA, plattB, temperatureScale, routingThreshold, minCalibrationSamples, calibrationEpochs, calibrationLr);
+            fitSet, w, plattA, plattB, temperatureScale, routingThreshold, minCalibrationSamples, calibrationEpochs, calibrationLr);
         var preIsotonicSnapshot = BuildCalibrationSnapshot(
             plattA,
             plattB,
@@ -112,9 +128,9 @@ public sealed partial class TabNetModelTrainer
             conditionalFit.Sell.A,
             conditionalFit.Sell.B,
             conditionalRoutingThreshold: routingThreshold);
-        double preIsotonicNll = ComputeCalibrationNll(calSet, w, preIsotonicSnapshot);
+        double preIsotonicNll = ComputeCalibrationNll(evalSet, w, preIsotonicSnapshot);
 
-        double[] isotonicBp = FitIsotonicCalibration(calSet, w, preIsotonicSnapshot, minCalibrationSamples);
+        double[] isotonicBp = FitIsotonicCalibration(fitSet, w, preIsotonicSnapshot, minCalibrationSamples);
         bool isotonicAccepted = false;
         double postIsotonicNll = preIsotonicNll;
         var finalSnapshot = preIsotonicSnapshot;
@@ -130,7 +146,7 @@ public sealed partial class TabNetModelTrainer
                 conditionalFit.Sell.B,
                 isotonicBp,
                 routingThreshold);
-            postIsotonicNll = ComputeCalibrationNll(calSet, w, isotonicSnapshot);
+            postIsotonicNll = ComputeCalibrationNll(evalSet, w, isotonicSnapshot);
             if (postIsotonicNll + 1e-6 < preIsotonicNll)
             {
                 finalSnapshot = isotonicSnapshot;
@@ -145,10 +161,18 @@ public sealed partial class TabNetModelTrainer
         var artifact = new TabNetCalibrationArtifact
         {
             SelectedGlobalCalibration = selectedGlobalCalibration,
+            CalibrationSelectionStrategy = diagnosticsSet is { Count: > 0 }
+                ? "FIT_ON_FIT_EVAL_ON_DIAGNOSTICS"
+                : "FIT_AND_EVAL_ON_FIT",
             GlobalPlattNll = globalPlattNll,
             TemperatureNll = temperatureNll,
             TemperatureSelected = string.Equals(selectedGlobalCalibration, "TEMPERATURE", StringComparison.Ordinal),
-            FitSampleCount = calSet.Count,
+            FitSampleCount = fitSet.Count,
+            DiagnosticsSampleCount = evalSet.Count,
+            DiagnosticsSelectedGlobalNll = string.Equals(selectedGlobalCalibration, "TEMPERATURE", StringComparison.Ordinal)
+                ? temperatureNll
+                : globalPlattNll,
+            DiagnosticsSelectedStackNll = isotonicAccepted ? postIsotonicNll : preIsotonicNll,
             ConditionalRoutingThreshold = routingThreshold,
             BuyBranchSampleCount = conditionalFit.Buy.SampleCount,
             BuyBranchBaselineNll = conditionalFit.Buy.BaselineLoss,
@@ -158,7 +182,7 @@ public sealed partial class TabNetModelTrainer
             SellBranchBaselineNll = conditionalFit.Sell.BaselineLoss,
             SellBranchFittedNll = conditionalFit.Sell.FittedLoss,
             SellBranchAccepted = conditionalFit.Sell.Accepted,
-            IsotonicSampleCount = calSet.Count,
+            IsotonicSampleCount = fitSet.Count,
             IsotonicBreakpointCount = isotonicAccepted ? finalSnapshot.IsotonicBreakpoints.Length / 2 : 0,
             PreIsotonicNll = preIsotonicNll,
             PostIsotonicNll = postIsotonicNll,
@@ -197,36 +221,62 @@ public sealed partial class TabNetModelTrainer
     }
 
     private static double DetermineConditionalRoutingThreshold(
-        IReadOnlyList<TrainingSample> calSet,
+        IReadOnlyList<TrainingSample> fitSet,
+        IReadOnlyList<TrainingSample> evalSet,
         TabNetWeights w,
         ModelSnapshot globalCalibrationSnapshot,
+        string selectedGlobalCalibration,
         int minCalibrationSamples)
     {
-        if (calSet.Count < minCalibrationSamples * 2)
+        if (fitSet.Count < minCalibrationSamples * 2 || evalSet.Count < Math.Max(8, minCalibrationSamples / 2))
             return 0.5;
 
-        var probs = new double[calSet.Count];
-        for (int i = 0; i < calSet.Count; i++)
-            probs[i] = TabNetCalibProb(calSet[i].Features, w, globalCalibrationSnapshot);
+        var fitProbs = new double[fitSet.Count];
+        for (int i = 0; i < fitSet.Count; i++)
+            fitProbs[i] = TabNetCalibProb(fitSet[i].Features, w, globalCalibrationSnapshot);
 
-        double candidate = Quantile(probs, 0.50);
-        if (!double.IsFinite(candidate))
-            return 0.5;
-
-        candidate = Math.Clamp(candidate, 0.35, 0.65);
-        int buyCount = 0;
-        int sellCount = 0;
-        for (int i = 0; i < probs.Length; i++)
+        var candidates = new SortedSet<double>
         {
-            if (probs[i] >= candidate)
-                buyCount++;
-            else
-                sellCount++;
+            0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65
+        };
+        candidates.Add(Math.Clamp(Quantile(fitProbs, 0.33), 0.35, 0.65));
+        candidates.Add(Math.Clamp(Quantile(fitProbs, 0.50), 0.35, 0.65));
+        candidates.Add(Math.Clamp(Quantile(fitProbs, 0.67), 0.35, 0.65));
+
+        double bestThreshold = 0.5;
+        double bestEvalNll = ComputeCalibrationNll(evalSet, w, globalCalibrationSnapshot);
+        foreach (double threshold in candidates)
+        {
+            var conditionalFit = FitClassConditionalPlatt(
+                fitSet,
+                w,
+                globalCalibrationSnapshot.PlattA,
+                globalCalibrationSnapshot.PlattB,
+                string.Equals(selectedGlobalCalibration, "TEMPERATURE", StringComparison.Ordinal)
+                    ? globalCalibrationSnapshot.TemperatureScale
+                    : 0.0,
+                threshold,
+                minCalibrationSamples,
+                Math.Max(8, minCalibrationSamples),
+                0.01);
+            var candidateSnapshot = BuildCalibrationSnapshot(
+                globalCalibrationSnapshot.PlattA,
+                globalCalibrationSnapshot.PlattB,
+                globalCalibrationSnapshot.TemperatureScale,
+                conditionalFit.Buy.A,
+                conditionalFit.Buy.B,
+                conditionalFit.Sell.A,
+                conditionalFit.Sell.B,
+                conditionalRoutingThreshold: threshold);
+            double evalNll = ComputeCalibrationNll(evalSet, w, candidateSnapshot);
+            if (evalNll + 1e-6 < bestEvalNll)
+            {
+                bestEvalNll = evalNll;
+                bestThreshold = threshold;
+            }
         }
 
-        return buyCount >= minCalibrationSamples / 2 && sellCount >= minCalibrationSamples / 2
-            ? candidate
-            : 0.5;
+        return bestThreshold;
     }
 
     private static ConditionalPlattBranchFit FitConditionalPlattBranch(

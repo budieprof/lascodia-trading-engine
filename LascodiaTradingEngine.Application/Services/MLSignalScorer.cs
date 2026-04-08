@@ -1285,7 +1285,11 @@ public sealed class MLSignalScorer : IMLSignalScorer
 
         // Pure computations — delegated to ScoringEnrichmentCalculator for testability
         var (conformalSet, conformalSetSize) =
-            ScoringEnrichmentCalculator.ComputeConformalSet(calibP, snap.ConformalQHat);
+            ScoringEnrichmentCalculator.ComputeConformalSet(
+                calibP,
+                snap.ConformalQHat,
+                snap.ConformalQHatBuy,
+                snap.ConformalQHatSell);
 
         var metaLabelScore = ScoringEnrichmentCalculator.ComputeMetaLabelScore(
             calibP, ensembleStd, features, featureCount,

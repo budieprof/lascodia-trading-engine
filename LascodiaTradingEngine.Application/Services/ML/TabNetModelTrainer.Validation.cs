@@ -33,6 +33,7 @@ public sealed partial class TabNetModelTrainer
         var sharpeList = new List<double>(folds);
         var foldImps   = new List<double[]>(folds);
         var foldMetrics = new List<WalkForwardFoldMetric>(folds);
+        var oofResiduals = new List<double>(samples.Count / 3);
         int badFolds   = 0;
 
         for (int fold = 0; fold < folds && !ct.IsCancellationRequested; fold++)
@@ -72,7 +73,15 @@ public sealed partial class TabNetModelTrainer
                 hp.LabelSmoothing, null, null, null, hp.TemporalDecayLambda, hp.L2Lambda,
                 hp.EarlyStoppingPatience, 0.0, hp.MaxGradNorm, 0, bnMomentum, 128, 0, runContext, ct);
 
-            var foldCalibration = BuildCalibrationSnapshot(1.0, 0.0);
+            var foldCalibrationFit = FitTabNetCalibrationStack(
+                foldSelection,
+                null,
+                cvW,
+                hp.FitTemperatureScale,
+                runContext.MinCalibrationSamples,
+                Math.Max(6, runContext.CalibrationEpochs / 2),
+                runContext.CalibrationLr);
+            var foldCalibration = foldCalibrationFit.FinalSnapshot;
             double foldThreshold = ComputeOptimalThreshold(
                 foldSelection, cvW, foldCalibration, hp.ThresholdSearchMin, hp.ThresholdSearchMax);
             var m = EvaluateTabNet(foldTest, cvW, foldCalibration, [], 0, F, foldThreshold);
@@ -81,12 +90,12 @@ public sealed partial class TabNetModelTrainer
 
             // Equity-curve gate
             var preds = new (int Predicted, int Actual)[foldTest.Count];
-            var priorBuf = new double[F];
-            var attnBuf  = new double[F];
             for (int i = 0; i < foldTest.Count; i++)
             {
-                var fwd = ForwardPass(foldTest[i].Features, cvW, priorBuf, attnBuf, false, 0, null);
-                preds[i] = (fwd.Prob >= foldThreshold ? 1 : -1, foldTest[i].Direction > 0 ? 1 : -1);
+                double p = TabNetCalibProb(foldTest[i].Features, cvW, foldCalibration);
+                preds[i] = (p >= foldThreshold ? 1 : -1, foldTest[i].Direction > 0 ? 1 : -1);
+                double y = foldTest[i].Direction > 0 ? 1.0 : 0.0;
+                oofResiduals.Add(Math.Abs(p - y));
             }
             var (maxDD, curveSharpe) = ComputeEquityCurveStats(preds);
 
@@ -156,7 +165,8 @@ public sealed partial class TabNetModelTrainer
             FoldCount:              accList.Count,
             SharpeTrend:            sharpeTrend,
             FeatureStabilityScores: featureStabilityScores,
-            FoldMetrics:            foldMetrics.ToArray()), equityCurveGateFailed);
+            FoldMetrics:            foldMetrics.ToArray(),
+            OofResiduals:           oofResiduals.Count > 0 ? oofResiduals.ToArray() : null), equityCurveGateFailed);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -417,7 +427,11 @@ public sealed partial class TabNetModelTrainer
         double sumVar = 0.0, maxVar = 0.0;
         double sumPsi = 0.0, maxPsi = 0.0;
         double sumCp = 0.0, maxCp = 0.0;
+        double sumAdf = 0.0, maxAdf = double.NegativeInfinity;
+        double sumKpss = 0.0, maxKpss = 0.0;
+        double sumMeanShift = 0.0, maxMeanShift = 0.0;
         int nonStationaryFeatureCount = 0;
+        int severeFeatureCount = 0;
 
         for (int featureIndex = 0; featureIndex < featureCount; featureIndex++)
         {
@@ -431,36 +445,63 @@ public sealed partial class TabNetModelTrainer
             double varianceRatioDistance = Math.Abs(Math.Log((varLast + Eps) / (varFirst + Eps)));
             double psi = ComputePopulationStabilityIndex(values[..half], values[half..]);
             double changePointScore = ComputeChangePointScore(values);
+            double adfLike = ComputeAdfLikeStatistic(values);
+            double kpssLike = ComputeKpssLikeStatistic(values);
+            double meanShift = ComputeNormalisedMeanShift(values, segment, tailStart);
 
             sumLag += lag1;
             sumVar += varianceRatioDistance;
             sumPsi += psi;
             sumCp += changePointScore;
+            sumAdf += adfLike;
+            sumKpss += kpssLike;
+            sumMeanShift += meanShift;
             maxLag = Math.Max(maxLag, lag1);
             maxVar = Math.Max(maxVar, varianceRatioDistance);
             maxPsi = Math.Max(maxPsi, psi);
             maxCp = Math.Max(maxCp, changePointScore);
+            maxAdf = Math.Max(maxAdf, adfLike);
+            maxKpss = Math.Max(maxKpss, kpssLike);
+            maxMeanShift = Math.Max(maxMeanShift, meanShift);
 
             bool lagSignal = lag1 > 0.985;
             bool varianceSignal = varianceRatioDistance > Math.Log(2.5);
             bool psiSignal = psi > 0.20;
             bool changePointSignal = changePointScore > 1.50;
+            bool adfSignal = adfLike > -2.0;
+            bool kpssSignal = kpssLike > 0.50;
+            bool meanShiftSignal = meanShift > 1.0;
             int triggeredSignals =
                 (lagSignal ? 1 : 0) +
                 (varianceSignal ? 1 : 0) +
                 (psiSignal ? 1 : 0) +
-                (changePointSignal ? 1 : 0);
+                (changePointSignal ? 1 : 0) +
+                (adfSignal ? 1 : 0) +
+                (kpssSignal ? 1 : 0) +
+                (meanShiftSignal ? 1 : 0);
+            bool severeFeature =
+                (adfSignal && kpssSignal && psi > 0.25) ||
+                meanShift > 1.75 ||
+                changePointScore > 2.25 ||
+                (varianceRatioDistance > Math.Log(3.0) && psi > 0.30);
 
-            if (triggeredSignals >= 2 || (lagSignal && (psiSignal || changePointSignal || varianceSignal)))
+            if (triggeredSignals >= 3 ||
+                (adfSignal && (kpssSignal || psiSignal || meanShiftSignal)) ||
+                severeFeature)
             {
                 nonStationaryFeatureCount++;
                 string name = featureIndex < featureNames.Count ? featureNames[featureIndex] : $"F{featureIndex}";
                 double score =
-                    0.35 * lag1 +
-                    0.20 * varianceRatioDistance +
-                    0.25 * psi +
-                    0.20 * changePointScore;
+                    0.16 * lag1 +
+                    0.12 * varianceRatioDistance +
+                    0.16 * psi +
+                    0.14 * changePointScore +
+                    0.14 * Math.Max(0.0, adfLike + 3.0) +
+                    0.14 * kpssLike +
+                    0.14 * meanShift;
                 flaggedFeatures.Add((name, score));
+                if (severeFeature)
+                    severeFeatureCount++;
             }
         }
 
@@ -474,8 +515,27 @@ public sealed partial class TabNetModelTrainer
         artifact.MaxPopulationStabilityIndex = maxPsi;
         artifact.MeanChangePointScore = featureCount > 0 ? sumCp / featureCount : 0.0;
         artifact.MaxChangePointScore = maxCp;
-        artifact.GateTriggered = fracDiffD == 0.0 && artifact.NonStationaryFeatureFraction > 0.30;
-        artifact.GateAction = artifact.GateTriggered ? "WARN" : "PASS";
+        artifact.MeanAdfLikeStatistic = featureCount > 0 ? sumAdf / featureCount : 0.0;
+        artifact.MaxAdfLikeStatistic = double.IsFinite(maxAdf) ? maxAdf : 0.0;
+        artifact.MeanKpssLikeStatistic = featureCount > 0 ? sumKpss / featureCount : 0.0;
+        artifact.MaxKpssLikeStatistic = maxKpss;
+        artifact.MeanRecentMeanShiftScore = featureCount > 0 ? sumMeanShift / featureCount : 0.0;
+        artifact.MaxRecentMeanShiftScore = maxMeanShift;
+        string gateAction = "PASS";
+        if (artifact.NonStationaryFeatureFraction > 0.60 || severeFeatureCount > featureCount * 0.45)
+            gateAction = "REJECT";
+        else if (artifact.NonStationaryFeatureFraction > 0.35 || severeFeatureCount > 0)
+            gateAction = "DEGRADED";
+        else if (artifact.NonStationaryFeatureFraction > 0.15)
+            gateAction = "WARN";
+
+        if (fracDiffD > 0.0 && gateAction == "REJECT")
+            gateAction = "DEGRADED";
+        if (fracDiffD > 0.0 && gateAction == "DEGRADED")
+            gateAction = "WARN";
+
+        artifact.GateAction = gateAction;
+        artifact.GateTriggered = !string.Equals(gateAction, "PASS", StringComparison.OrdinalIgnoreCase);
         artifact.FlaggedFeatures = flaggedFeatures
             .OrderByDescending(entry => entry.Score)
             .Take(8)
@@ -534,6 +594,81 @@ public sealed partial class TabNetModelTrainer
         return psi;
     }
 
+    private static double ComputeAdfLikeStatistic(double[] values)
+    {
+        if (values.Length < 12)
+            return 0.0;
+
+        int n = values.Length - 1;
+        double[] lagged = new double[n];
+        double[] delta = new double[n];
+        for (int i = 0; i < n; i++)
+        {
+            lagged[i] = values[i];
+            delta[i] = values[i + 1] - values[i];
+        }
+
+        double meanX = lagged.Average();
+        double meanY = delta.Average();
+        double sxx = 0.0;
+        double sxy = 0.0;
+        for (int i = 0; i < n; i++)
+        {
+            double cx = lagged[i] - meanX;
+            double cy = delta[i] - meanY;
+            sxx += cx * cx;
+            sxy += cx * cy;
+        }
+
+        if (sxx <= Eps)
+            return 0.0;
+
+        double slope = sxy / sxx;
+        double intercept = meanY - slope * meanX;
+        double rss = 0.0;
+        for (int i = 0; i < n; i++)
+        {
+            double err = delta[i] - (intercept + slope * lagged[i]);
+            rss += err * err;
+        }
+
+        double sigma2 = rss / Math.Max(1, n - 2);
+        double stdErr = Math.Sqrt(Math.Max(Eps, sigma2 / sxx));
+        return stdErr > Eps ? slope / stdErr : 0.0;
+    }
+
+    private static double ComputeKpssLikeStatistic(double[] values)
+    {
+        if (values.Length < 12)
+            return 0.0;
+
+        double mean = values.Average();
+        double variance = Variance(values, 0, values.Length);
+        if (variance <= Eps)
+            return 0.0;
+
+        double cumulative = 0.0;
+        double sumSquares = 0.0;
+        for (int i = 0; i < values.Length; i++)
+        {
+            cumulative += values[i] - mean;
+            sumSquares += cumulative * cumulative;
+        }
+
+        return sumSquares / (values.Length * values.Length * variance + Eps);
+    }
+
+    private static double ComputeNormalisedMeanShift(double[] values, int segment, int tailStart)
+    {
+        if (values.Length < segment + 5 || segment <= 0 || tailStart >= values.Length)
+            return 0.0;
+
+        double firstMean = values.Take(segment).Average();
+        double lastMean = values.Skip(tailStart).Average();
+        double std = Math.Sqrt(Math.Max(Eps, Variance(values, 0, values.Length)));
+        return Math.Abs(lastMean - firstMean) / std;
+    }
+
     private static int FindPsiBin(double value, double[] edges)
     {
         for (int i = 0; i < edges.Length; i++)
@@ -562,34 +697,150 @@ public sealed partial class TabNetModelTrainer
 
     private static double[] ComputeDensityRatioWeights(IReadOnlyList<TrainingSample> trainSet, int F, int windowDays, double learningRate)
     {
-        int n = trainSet.Count, recentCount = Math.Min(n / 3, windowDays * 24);
-        if (recentCount < 20) return Enumerable.Repeat(1.0, n).ToArray();
+        int n = trainSet.Count;
+        int recentCount = Math.Min(n / 3, windowDays * 24);
+        if (recentCount < 20)
+            return Enumerable.Repeat(1.0, n).ToArray();
+
         int cutoff = n - recentCount;
-        var dw = new double[F]; double bias = 0;
-        for (int ep = 0; ep < 30; ep++)
-            for (int i = 0; i < n; i++)
+        int oldCount = cutoff;
+        if (oldCount < 20)
+            return Enumerable.Repeat(1.0, n).ToArray();
+
+        int oldDiagStart = Math.Max(1, (int)Math.Floor(oldCount * 0.80));
+        int recentDiagStart = cutoff + Math.Max(1, (int)Math.Floor(recentCount * 0.80));
+        if (oldDiagStart >= cutoff || recentDiagStart >= n)
+            return Enumerable.Repeat(1.0, n).ToArray();
+
+        var trainIndices = new List<int>(oldDiagStart + recentDiagStart - cutoff);
+        for (int i = 0; i < oldDiagStart; i++) trainIndices.Add(i);
+        for (int i = cutoff; i < recentDiagStart; i++) trainIndices.Add(i);
+
+        var diagnosticsIndices = new List<int>((cutoff - oldDiagStart) + (n - recentDiagStart));
+        for (int i = oldDiagStart; i < cutoff; i++) diagnosticsIndices.Add(i);
+        for (int i = recentDiagStart; i < n; i++) diagnosticsIndices.Add(i);
+
+        if (trainIndices.Count < 20 || diagnosticsIndices.Count < 10)
+            return Enumerable.Repeat(1.0, n).ToArray();
+
+        const double L2 = 1e-3;
+        const double ClipMin = 0.25;
+        const double ClipMax = 4.0;
+        var dw = new double[F];
+        double bias = 0.0;
+        double bestLoss = double.PositiveInfinity;
+        double bestAuc = 0.0;
+        var bestDw = new double[F];
+        double bestBias = 0.0;
+        int staleEpochs = 0;
+
+        for (int ep = 0; ep < 60; ep++)
+        {
+            double[] grad = new double[F];
+            double gradBias = 0.0;
+            for (int idx = 0; idx < trainIndices.Count; idx++)
             {
-                double label = i >= cutoff ? 1.0 : 0.0, z = bias;
-                for (int j = 0; j < F && j < trainSet[i].Features.Length; j++) z += dw[j] * trainSet[i].Features[j];
-                double err = Sigmoid(z) - label;
-                bias -= learningRate * err;
-                bias = Math.Clamp(bias, -MaxWeightVal, MaxWeightVal);
+                int i = trainIndices[idx];
+                double label = i >= cutoff ? 1.0 : 0.0;
+                double z = bias;
                 for (int j = 0; j < F && j < trainSet[i].Features.Length; j++)
-                {
-                    dw[j] -= learningRate * err * trainSet[i].Features[j];
-                    dw[j] = Math.Clamp(dw[j], -MaxWeightVal, MaxWeightVal);
-                }
+                    z += dw[j] * trainSet[i].Features[j];
+                double err = Sigmoid(z) - label;
+                gradBias += err;
+                for (int j = 0; j < F && j < trainSet[i].Features.Length; j++)
+                    grad[j] += err * trainSet[i].Features[j];
             }
+
+            double scale = 1.0 / trainIndices.Count;
+            gradBias *= scale;
+            bias -= learningRate * gradBias;
+            bias = Math.Clamp(bias, -MaxWeightVal, MaxWeightVal);
+            for (int j = 0; j < F; j++)
+            {
+                double g = grad[j] * scale + L2 * dw[j];
+                dw[j] -= learningRate * g;
+                dw[j] = Math.Clamp(dw[j], -MaxWeightVal, MaxWeightVal);
+            }
+
+            double diagLoss = 0.0;
+            var diagScores = new double[diagnosticsIndices.Count];
+            var diagLabels = new int[diagnosticsIndices.Count];
+            for (int di = 0; di < diagnosticsIndices.Count; di++)
+            {
+                int i = diagnosticsIndices[di];
+                double z = bias;
+                for (int j = 0; j < F && j < trainSet[i].Features.Length; j++)
+                    z += dw[j] * trainSet[i].Features[j];
+                double p = Math.Clamp(Sigmoid(z), 0.01, 0.99);
+                int label = i >= cutoff ? 1 : 0;
+                diagScores[di] = p;
+                diagLabels[di] = label;
+                diagLoss -= label * Math.Log(p) + (1.0 - label) * Math.Log(1.0 - p);
+            }
+
+            diagLoss /= diagnosticsIndices.Count;
+            double diagAuc = ComputeRankingAuc(diagScores, diagLabels);
+            bool improved = diagLoss + 1e-5 < bestLoss || (Math.Abs(diagLoss - bestLoss) <= 1e-5 && diagAuc > bestAuc);
+            if (improved)
+            {
+                bestLoss = diagLoss;
+                bestAuc = diagAuc;
+                bestBias = bias;
+                Array.Copy(dw, bestDw, F);
+                staleEpochs = 0;
+            }
+            else if (++staleEpochs >= 6)
+            {
+                break;
+            }
+        }
+
+        if (!(bestLoss < 0.68 && bestAuc >= 0.55))
+            return Enumerable.Repeat(1.0, n).ToArray();
+
         var weights = new double[n];
         for (int i = 0; i < n; i++)
         {
-            double z = bias;
-            for (int j = 0; j < F && j < trainSet[i].Features.Length; j++) z += dw[j] * trainSet[i].Features[j];
-            double p = Math.Clamp(Sigmoid(z), 0.01, 0.99); weights[i] = p / (1 - p);
+            double z = bestBias;
+            for (int j = 0; j < F && j < trainSet[i].Features.Length; j++)
+                z += bestDw[j] * trainSet[i].Features[j];
+            double p = Math.Clamp(Sigmoid(z), 0.01, 0.99);
+            weights[i] = Math.Clamp(p / Math.Max(0.01, 1.0 - p), ClipMin, ClipMax);
         }
-        double sum = weights.Sum();
-        if (sum > Eps) for (int i = 0; i < n; i++) weights[i] /= sum;
+
+        double mean = weights.Average();
+        if (mean > Eps)
+        {
+            for (int i = 0; i < n; i++)
+                weights[i] /= mean;
+        }
+
         return weights;
+    }
+
+    private static double ComputeRankingAuc(double[] scores, int[] labels)
+    {
+        if (scores.Length == 0 || scores.Length != labels.Length)
+            return 0.5;
+
+        int positives = labels.Count(label => label == 1);
+        int negatives = labels.Length - positives;
+        if (positives == 0 || negatives == 0)
+            return 0.5;
+
+        var ranked = scores
+            .Select((score, index) => (Score: score, Label: labels[index]))
+            .OrderBy(tuple => tuple.Score)
+            .ToArray();
+
+        double rankSum = 0.0;
+        for (int i = 0; i < ranked.Length; i++)
+        {
+            if (ranked[i].Label == 1)
+                rankSum += i + 1;
+        }
+
+        return (rankSum - positives * (positives + 1) / 2.0) / (positives * negatives);
     }
 
     private static double[] ComputeCovariateShiftWeights(IReadOnlyList<TrainingSample> trainSet, double[][] parentBp, int F)

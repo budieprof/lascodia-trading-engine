@@ -65,6 +65,32 @@ public class ScoringEnrichmentCalculatorTests
         Assert.Equal(0, size);
     }
 
+    [Fact]
+    public void ComputeConformalSet_Uses_ClassConditional_QHats_When_Present()
+    {
+        var (set, size) = ScoringEnrichmentCalculator.ComputeConformalSet(
+            calibP: 0.75,
+            conformalQHat: 0.20,
+            conformalQHatBuy: 0.30,
+            conformalQHatSell: 0.10);
+
+        Assert.Equal("Buy", set);
+        Assert.Equal(1, size);
+    }
+
+    [Fact]
+    public void ComputeConformalSet_Falls_Back_To_Global_QHat_When_ClassConditional_Values_Are_Invalid()
+    {
+        var (set, size) = ScoringEnrichmentCalculator.ComputeConformalSet(
+            calibP: 0.18,
+            conformalQHat: 0.20,
+            conformalQHatBuy: double.NaN,
+            conformalQHatSell: 0.0);
+
+        Assert.Equal("Sell", set);
+        Assert.Equal(1, size);
+    }
+
     // ────────────────────────────────────────────────────────────────────────
     //  ComputeEntropy
     // ────────────────────────────────────────────────────────────────────────

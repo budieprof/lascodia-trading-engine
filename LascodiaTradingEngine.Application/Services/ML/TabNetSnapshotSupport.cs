@@ -316,9 +316,18 @@ internal static class TabNetSnapshotSupport
 
         if (!double.IsFinite(snapshot.ConditionalCalibrationRoutingThreshold))
             snapshot.ConditionalCalibrationRoutingThreshold = 0.5;
+        if (!double.IsFinite(snapshot.ConformalQHat) || snapshot.ConformalQHat <= 0.0 || snapshot.ConformalQHat >= 1.0)
+            snapshot.ConformalQHat = 0.5;
+        if (!double.IsFinite(snapshot.ConformalQHatBuy) || snapshot.ConformalQHatBuy <= 0.0 || snapshot.ConformalQHatBuy >= 1.0)
+            snapshot.ConformalQHatBuy = snapshot.ConformalQHat;
+        if (!double.IsFinite(snapshot.ConformalQHatSell) || snapshot.ConformalQHatSell <= 0.0 || snapshot.ConformalQHatSell >= 1.0)
+            snapshot.ConformalQHatSell = snapshot.ConformalQHat;
 
         if (snapshot.TrainingSplitSummary is { } split)
         {
+            split.AdaptiveHeadCrossFitFoldStartIndices ??= [];
+            split.AdaptiveHeadCrossFitFoldCounts ??= [];
+            split.AdaptiveHeadCrossFitFoldHashes ??= [];
             if (split.CalibrationDiagnosticsCount <= 0 && split.CalibrationCount > 0)
             {
                 split.CalibrationDiagnosticsStartIndex = split.CalibrationStartIndex;
@@ -366,6 +375,27 @@ internal static class TabNetSnapshotSupport
                 FeatureCount = snapshot.Features.Length > 0 ? snapshot.Features.Length : snapshot.Means.Length,
                 GateAction = "LEGACY_BACKFILL",
             };
+            snapshot.TabNetCalibrationArtifact ??= new TabNetCalibrationArtifact
+            {
+                FitSampleCount = split.CalibrationFitCount,
+                DiagnosticsSampleCount = split.CalibrationDiagnosticsCount,
+                ConformalSampleCount = split.ConformalCount,
+                MetaLabelSampleCount = split.MetaLabelCount,
+                AbstentionSampleCount = split.AbstentionCount,
+                AdaptiveHeadMode = split.AdaptiveHeadSplitMode,
+                AdaptiveHeadCrossFitFoldCount = split.AdaptiveHeadCrossFitFoldCount,
+                ConditionalRoutingThreshold = snapshot.ConditionalCalibrationRoutingThreshold,
+            };
+        }
+
+        if (snapshot.TabNetCalibrationArtifact is { } calibrationArtifact)
+        {
+            if (string.IsNullOrWhiteSpace(calibrationArtifact.CalibrationSelectionStrategy))
+                calibrationArtifact.CalibrationSelectionStrategy = "FIT_ON_FIT_EVAL_ON_DIAGNOSTICS";
+            if (string.IsNullOrWhiteSpace(calibrationArtifact.AdaptiveHeadMode))
+                calibrationArtifact.AdaptiveHeadMode = "SHARED";
+            if (!double.IsFinite(calibrationArtifact.ConditionalRoutingThreshold))
+                calibrationArtifact.ConditionalRoutingThreshold = snapshot.ConditionalCalibrationRoutingThreshold;
         }
     }
 
@@ -502,6 +532,12 @@ internal static class TabNetSnapshotSupport
         {
             issues.Add("ConditionalCalibrationRoutingThreshold must be a finite probability in (0, 1).");
         }
+        if (!double.IsFinite(snapshot.ConformalQHat) || snapshot.ConformalQHat <= 0.0 || snapshot.ConformalQHat >= 1.0)
+            issues.Add("ConformalQHat must be a finite probability in (0, 1).");
+        if (!double.IsFinite(snapshot.ConformalQHatBuy) || snapshot.ConformalQHatBuy <= 0.0 || snapshot.ConformalQHatBuy >= 1.0)
+            issues.Add("ConformalQHatBuy must be a finite probability in (0, 1).");
+        if (!double.IsFinite(snapshot.ConformalQHatSell) || snapshot.ConformalQHatSell <= 0.0 || snapshot.ConformalQHatSell >= 1.0)
+            issues.Add("ConformalQHatSell must be a finite probability in (0, 1).");
         if (snapshot.ActiveFeatureMask is { Length: > 0 } mask)
         {
             if (mask.Length != featureCount)
@@ -524,6 +560,9 @@ internal static class TabNetSnapshotSupport
         else
         {
             var split = snapshot.TrainingSplitSummary;
+            var crossFitFoldStarts = split.AdaptiveHeadCrossFitFoldStartIndices ?? [];
+            var crossFitFoldCounts = split.AdaptiveHeadCrossFitFoldCounts ?? [];
+            var crossFitFoldHashes = split.AdaptiveHeadCrossFitFoldHashes ?? [];
             if (split.SelectionCount <= 0)
                 issues.Add("TrainingSplitSummary.SelectionCount must be positive.");
             if (split.CalibrationCount <= 0)
@@ -562,6 +601,73 @@ internal static class TabNetSnapshotSupport
             {
                 issues.Add("TrainingSplitSummary shared adaptive-head slices are inconsistent.");
             }
+            if (split.AdaptiveHeadCrossFitFoldCount < 0)
+                issues.Add("TrainingSplitSummary.AdaptiveHeadCrossFitFoldCount cannot be negative.");
+            if (crossFitFoldStarts.Length != split.AdaptiveHeadCrossFitFoldCount ||
+                crossFitFoldCounts.Length != split.AdaptiveHeadCrossFitFoldCount ||
+                crossFitFoldHashes.Length != split.AdaptiveHeadCrossFitFoldCount)
+            {
+                issues.Add("TrainingSplitSummary adaptive-head cross-fit arrays must match AdaptiveHeadCrossFitFoldCount.");
+            }
+            if (string.Equals(split.AdaptiveHeadSplitMode, "CROSSFIT_SHARED_DIAGNOSTICS", StringComparison.OrdinalIgnoreCase))
+            {
+                if (split.CalibrationDiagnosticsCount <= 0)
+                    issues.Add("TrainingSplitSummary CROSSFIT_SHARED_DIAGNOSTICS mode requires a non-empty calibration diagnostics split.");
+                if (split.AdaptiveHeadCrossFitFoldCount < 2)
+                    issues.Add("TrainingSplitSummary CROSSFIT_SHARED_DIAGNOSTICS mode requires at least two cross-fit folds.");
+                if (split.ConformalCount != split.CalibrationDiagnosticsCount ||
+                    split.MetaLabelCount != split.CalibrationDiagnosticsCount ||
+                    split.AbstentionCount != split.CalibrationDiagnosticsCount)
+                {
+                    issues.Add("TrainingSplitSummary CROSSFIT_SHARED_DIAGNOSTICS mode requires all adaptive heads to cover the full calibration diagnostics split.");
+                }
+                if (split.ConformalStartIndex != split.CalibrationDiagnosticsStartIndex ||
+                    split.MetaLabelStartIndex != split.CalibrationDiagnosticsStartIndex ||
+                    split.AbstentionStartIndex != split.CalibrationDiagnosticsStartIndex)
+                {
+                    issues.Add("TrainingSplitSummary CROSSFIT_SHARED_DIAGNOSTICS mode requires all adaptive heads to start at CalibrationDiagnosticsStartIndex.");
+                }
+
+                int diagnosticsEnd = split.CalibrationDiagnosticsStartIndex + split.CalibrationDiagnosticsCount;
+                int coveredCount = 0;
+                int previousFoldEnd = split.CalibrationDiagnosticsStartIndex;
+                for (int i = 0; i < crossFitFoldCounts.Length; i++)
+                {
+                    if (crossFitFoldCounts[i] <= 0)
+                    {
+                        issues.Add("TrainingSplitSummary adaptive-head cross-fit fold counts must be positive.");
+                        break;
+                    }
+
+                    int foldStart = crossFitFoldStarts[i];
+                    int foldEnd = foldStart + crossFitFoldCounts[i];
+                    if (foldStart < split.CalibrationDiagnosticsStartIndex || foldEnd > diagnosticsEnd)
+                    {
+                        issues.Add("TrainingSplitSummary adaptive-head cross-fit folds must lie within the calibration diagnostics slice.");
+                        break;
+                    }
+                    if (i > 0 && foldStart < previousFoldEnd)
+                    {
+                        issues.Add("TrainingSplitSummary adaptive-head cross-fit folds must be in chronological order without overlap.");
+                        break;
+                    }
+                    if (string.IsNullOrWhiteSpace(crossFitFoldHashes[i]))
+                    {
+                        issues.Add("TrainingSplitSummary adaptive-head cross-fit fold hashes must be populated.");
+                        break;
+                    }
+
+                    coveredCount += crossFitFoldCounts[i];
+                    previousFoldEnd = foldEnd;
+                }
+
+                if (crossFitFoldCounts.Length == split.AdaptiveHeadCrossFitFoldCount &&
+                    coveredCount != 0 &&
+                    coveredCount != split.CalibrationDiagnosticsCount)
+                {
+                    issues.Add("TrainingSplitSummary adaptive-head cross-fit folds do not reconcile to CalibrationDiagnosticsCount.");
+                }
+            }
             if (snapshot.TabNetSelectionMetrics is null)
                 issues.Add("TabNetSelectionMetrics is missing.");
             else if (snapshot.TabNetSelectionMetrics.SampleCount != split.SelectionCount)
@@ -574,6 +680,43 @@ internal static class TabNetSnapshotSupport
                 issues.Add("TabNetTestMetrics is missing.");
             else if (snapshot.TabNetTestMetrics.SampleCount != split.TestCount)
                 issues.Add("TabNetTestMetrics sample count does not match TestCount.");
+        }
+        if (snapshot.TabNetCalibrationArtifact is null)
+        {
+            issues.Add("TabNetCalibrationArtifact is missing.");
+        }
+        else
+        {
+            if (string.IsNullOrWhiteSpace(snapshot.TabNetCalibrationArtifact.CalibrationSelectionStrategy))
+                issues.Add("TabNetCalibrationArtifact.CalibrationSelectionStrategy is missing.");
+            if (!double.IsFinite(snapshot.TabNetCalibrationArtifact.ConditionalRoutingThreshold) ||
+                snapshot.TabNetCalibrationArtifact.ConditionalRoutingThreshold <= 0.0 ||
+                snapshot.TabNetCalibrationArtifact.ConditionalRoutingThreshold >= 1.0)
+            {
+                issues.Add("TabNetCalibrationArtifact.ConditionalRoutingThreshold must be a finite probability in (0, 1).");
+            }
+            if (snapshot.TrainingSplitSummary is not null)
+            {
+                if (snapshot.TabNetCalibrationArtifact.FitSampleCount != snapshot.TrainingSplitSummary.CalibrationFitCount)
+                    issues.Add("TabNetCalibrationArtifact.FitSampleCount does not match TrainingSplitSummary.CalibrationFitCount.");
+                if (snapshot.TabNetCalibrationArtifact.DiagnosticsSampleCount != snapshot.TrainingSplitSummary.CalibrationDiagnosticsCount)
+                    issues.Add("TabNetCalibrationArtifact.DiagnosticsSampleCount does not match TrainingSplitSummary.CalibrationDiagnosticsCount.");
+                if (snapshot.TabNetCalibrationArtifact.ConformalSampleCount != snapshot.TrainingSplitSummary.ConformalCount)
+                    issues.Add("TabNetCalibrationArtifact.ConformalSampleCount does not match TrainingSplitSummary.ConformalCount.");
+                if (snapshot.TabNetCalibrationArtifact.MetaLabelSampleCount != snapshot.TrainingSplitSummary.MetaLabelCount)
+                    issues.Add("TabNetCalibrationArtifact.MetaLabelSampleCount does not match TrainingSplitSummary.MetaLabelCount.");
+                if (snapshot.TabNetCalibrationArtifact.AbstentionSampleCount != snapshot.TrainingSplitSummary.AbstentionCount)
+                    issues.Add("TabNetCalibrationArtifact.AbstentionSampleCount does not match TrainingSplitSummary.AbstentionCount.");
+                if (!string.Equals(
+                        snapshot.TabNetCalibrationArtifact.AdaptiveHeadMode,
+                        snapshot.TrainingSplitSummary.AdaptiveHeadSplitMode,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    issues.Add("TabNetCalibrationArtifact.AdaptiveHeadMode does not match TrainingSplitSummary.AdaptiveHeadSplitMode.");
+                }
+                if (snapshot.TabNetCalibrationArtifact.AdaptiveHeadCrossFitFoldCount != snapshot.TrainingSplitSummary.AdaptiveHeadCrossFitFoldCount)
+                    issues.Add("TabNetCalibrationArtifact.AdaptiveHeadCrossFitFoldCount does not match TrainingSplitSummary.AdaptiveHeadCrossFitFoldCount.");
+            }
         }
 
         if (snapshot.TabNetDriftArtifact is null)

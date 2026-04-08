@@ -1743,7 +1743,13 @@ public record WalkForwardResult(
     /// </summary>
     double[]? FeatureStabilityScores = null,
     /// <summary>Per-fold metrics for downstream regime-aware model selection.</summary>
-    WalkForwardFoldMetric[]? FoldMetrics = null);
+    WalkForwardFoldMetric[]? FoldMetrics = null,
+    /// <summary>
+    /// Chronologically blocked out-of-fold probability residuals |p_oof - y|.
+    /// Persisted into TabNet snapshots as a more faithful uncertainty baseline
+    /// than the previous infinitesimal-jackknife approximation.
+    /// </summary>
+    double[]? OofResiduals = null);
 
 /// <summary>Per-fold walk-forward CV metrics for granular analysis.</summary>
 public record WalkForwardFoldMetric(double Accuracy, double F1, double EV, double Sharpe, double MaxDD);
@@ -1797,10 +1803,16 @@ public class TabNetAutoTuneTraceEntry
     public double HoldoutSharpe { get; set; }
     public double HoldoutBrier { get; set; }
     public double HoldoutEce { get; set; }
+    public double HoldoutThreshold { get; set; }
     public int TuneTrainSampleCount { get; set; }
     public int TuneHoldoutSampleCount { get; set; }
+    public int HoldoutStartIndex { get; set; }
+    public int HoldoutCount { get; set; }
     public int CvFoldCount { get; set; }
     public string HoldoutSplitName { get; set; } = "SELECTION";
+    public string HoldoutSliceHash { get; set; } = string.Empty;
+    public string ScoreBreakdown { get; set; } = string.Empty;
+    public string[] RejectionReasons { get; set; } = [];
     public bool Selected { get; set; }
 }
 
@@ -1868,15 +1880,19 @@ public class TabNetWarmStartArtifact
 public class TabNetCalibrationArtifact
 {
     public string SelectedGlobalCalibration { get; set; } = "PLATT";
+    public string CalibrationSelectionStrategy { get; set; } = "FIT_ON_FIT_EVAL_ON_DIAGNOSTICS";
     public double GlobalPlattNll { get; set; }
     public double TemperatureNll { get; set; }
     public bool TemperatureSelected { get; set; }
     public int FitSampleCount { get; set; }
     public int DiagnosticsSampleCount { get; set; }
+    public double DiagnosticsSelectedGlobalNll { get; set; }
+    public double DiagnosticsSelectedStackNll { get; set; }
     public int ConformalSampleCount { get; set; }
     public int MetaLabelSampleCount { get; set; }
     public int AbstentionSampleCount { get; set; }
     public string AdaptiveHeadMode { get; set; } = "SHARED";
+    public int AdaptiveHeadCrossFitFoldCount { get; set; }
     public double ConditionalRoutingThreshold { get; set; } = 0.5;
     public int BuyBranchSampleCount { get; set; }
     public double BuyBranchBaselineNll { get; set; }
@@ -1929,6 +1945,12 @@ public class TabNetDriftArtifact
     public double MaxPopulationStabilityIndex { get; set; }
     public double MeanChangePointScore { get; set; }
     public double MaxChangePointScore { get; set; }
+    public double MeanAdfLikeStatistic { get; set; }
+    public double MaxAdfLikeStatistic { get; set; }
+    public double MeanKpssLikeStatistic { get; set; }
+    public double MaxKpssLikeStatistic { get; set; }
+    public double MeanRecentMeanShiftScore { get; set; }
+    public double MaxRecentMeanShiftScore { get; set; }
     public bool GateTriggered { get; set; }
     public string GateAction { get; set; } = "PASS";
     public string[] FlaggedFeatures { get; set; } = [];
@@ -1961,6 +1983,9 @@ public class TrainingSplitSummary
     public int AbstentionCount { get; set; }
     public string AdaptiveHeadSplitMode { get; set; } = string.Empty;
     public int AdaptiveHeadCrossFitFoldCount { get; set; }
+    public int[] AdaptiveHeadCrossFitFoldStartIndices { get; set; } = [];
+    public int[] AdaptiveHeadCrossFitFoldCounts { get; set; } = [];
+    public string[] AdaptiveHeadCrossFitFoldHashes { get; set; } = [];
     public int TestStartIndex { get; set; }
     public int TestCount { get; set; }
     public int EmbargoCount { get; set; }

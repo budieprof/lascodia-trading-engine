@@ -445,6 +445,11 @@ public class TrainerAuditTests
             Assert.NotNull(snapshot.TabNetCalibrationMetrics);
             Assert.NotNull(snapshot.TabNetTestMetrics);
             Assert.NotNull(snapshot.TabNetDriftArtifact);
+            Assert.NotNull(snapshot.TabNetCalibrationArtifact);
+            Assert.InRange(snapshot.ConformalQHatBuy, 0.0, 1.0);
+            Assert.InRange(snapshot.ConformalQHatSell, 0.0, 1.0);
+            Assert.Equal(snapshot.TrainingSplitSummary.AdaptiveHeadSplitMode, snapshot.TabNetCalibrationArtifact!.AdaptiveHeadMode, ignoreCase: true);
+            Assert.Equal(snapshot.TrainingSplitSummary.AdaptiveHeadCrossFitFoldCount, snapshot.TabNetCalibrationArtifact.AdaptiveHeadCrossFitFoldCount);
             if (snapshot.TrainingSplitSummary.CalibrationDiagnosticsCount > 0 &&
                 snapshot.TrainingSplitSummary.CalibrationDiagnosticsStartIndex >=
                 snapshot.TrainingSplitSummary.CalibrationFitStartIndex + snapshot.TrainingSplitSummary.CalibrationFitCount)
@@ -452,6 +457,13 @@ public class TrainerAuditTests
                 Assert.Equal(
                     snapshot.TrainingSplitSummary.CalibrationCount,
                     snapshot.TrainingSplitSummary.CalibrationFitCount + snapshot.TrainingSplitSummary.CalibrationDiagnosticsCount);
+            }
+            if (string.Equals(snapshot.TrainingSplitSummary.AdaptiveHeadSplitMode, "CROSSFIT_SHARED_DIAGNOSTICS", StringComparison.OrdinalIgnoreCase))
+            {
+                Assert.True(snapshot.TrainingSplitSummary.AdaptiveHeadCrossFitFoldCount >= 2);
+                Assert.Equal(snapshot.TrainingSplitSummary.AdaptiveHeadCrossFitFoldCount, snapshot.TrainingSplitSummary.AdaptiveHeadCrossFitFoldStartIndices.Length);
+                Assert.Equal(snapshot.TrainingSplitSummary.AdaptiveHeadCrossFitFoldCount, snapshot.TrainingSplitSummary.AdaptiveHeadCrossFitFoldCounts.Length);
+                Assert.Equal(snapshot.TrainingSplitSummary.AdaptiveHeadCrossFitFoldCount, snapshot.TrainingSplitSummary.AdaptiveHeadCrossFitFoldHashes.Length);
             }
 
             if (snapshot.FeaturePipelineTransforms.Any(t =>

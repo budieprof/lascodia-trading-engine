@@ -40,13 +40,25 @@ internal static class ScoringEnrichmentCalculator
     // ═══════════════════════════════════════════════════════════════════════════
 
     internal static (string? Set, int? Size) ComputeConformalSet(double calibP, double conformalQHat)
+        => ComputeConformalSet(calibP, conformalQHat, conformalQHat, conformalQHat);
+
+    internal static (string? Set, int? Size) ComputeConformalSet(
+        double calibP,
+        double conformalQHat,
+        double conformalQHatBuy,
+        double conformalQHatSell)
     {
-        if (!double.IsFinite(conformalQHat) || conformalQHat <= 0.0 || conformalQHat >= 1.0)
+        static bool IsValidQHat(double qHat) =>
+            double.IsFinite(qHat) && qHat > 0.0 && qHat < 1.0;
+
+        if (!IsValidQHat(conformalQHat))
             return (null, null);
 
+        double buyQHat = IsValidQHat(conformalQHatBuy) ? conformalQHatBuy : conformalQHat;
+        double sellQHat = IsValidQHat(conformalQHatSell) ? conformalQHatSell : conformalQHat;
         double probability = ClampProbabilityOrNeutral(calibP);
-        bool includeBuy  = probability >= 1.0 - conformalQHat;
-        bool includeSell = probability <= conformalQHat;
+        bool includeBuy  = probability >= 1.0 - buyQHat;
+        bool includeSell = probability <= sellQHat;
         string set = (includeBuy, includeSell) switch
         {
             (true,  false) => "Buy",
