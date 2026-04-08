@@ -87,7 +87,7 @@ public sealed class OptimizationSchedulingCoordinator
             var recentRunCount = await db.Set<OptimizationRun>()
                 .Where(r => !r.IsDeleted
                          && r.Status != OptimizationRunStatus.Queued
-                         && r.StartedAt >= weekCutoff)
+                         && (r.ClaimedAt ?? r.ExecutionStartedAt ?? (DateTime?)r.StartedAt) >= weekCutoff)
                 .CountAsync(ct);
             if (recentRunCount >= maxRunsPerWeek)
             {

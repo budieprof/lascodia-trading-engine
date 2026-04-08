@@ -17,6 +17,11 @@ public interface IWorkerHealthMonitor
     /// <summary>Records the current backlog depth (e.g. pending items) for the worker.</summary>
     void RecordBacklogDepth(string workerName, int depth);
 
+    /// <summary>
+    /// Records lightweight liveness for long-running workers that do not have a natural cycle boundary.
+    /// </summary>
+    void RecordWorkerHeartbeat(string workerName);
+
     /// <summary>Returns a snapshot of health status for all monitored workers.</summary>
     IReadOnlyList<WorkerHealthSnapshot> GetCurrentSnapshots();
 
@@ -26,7 +31,7 @@ public interface IWorkerHealthMonitor
     /// <summary>
     /// Records static metadata about a worker for observability queries.
     /// </summary>
-    void RecordWorkerMetadata(string workerName, string purpose, TimeSpan expectedInterval);
+    void RecordWorkerMetadata(string workerName, string? purpose, TimeSpan expectedInterval);
 
     /// <summary>Records that a worker has stopped execution (normal shutdown or crash).</summary>
     void RecordWorkerStopped(string workerName, string? errorMessage = null);

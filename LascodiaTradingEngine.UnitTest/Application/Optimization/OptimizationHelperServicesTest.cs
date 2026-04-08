@@ -185,6 +185,25 @@ public class OptimizationHelperServicesTest
     }
 
     [Fact]
+    public async Task ClaimNextRunAsync_RejectsNonPostgresProviders()
+    {
+        var options = new DbContextOptionsBuilder<TestOptimizationDbContext>()
+            .Options;
+
+        await using var db = new TestOptimizationDbContext(options);
+
+        var ex = await Assert.ThrowsAsync<NotSupportedException>(() =>
+            OptimizationRunClaimer.ClaimNextRunAsync(
+                db,
+                maxConcurrentRuns: 1,
+                leaseDuration: TimeSpan.FromMinutes(10),
+                nowUtc: DateTime.UtcNow,
+                CancellationToken.None));
+
+        Assert.Contains("PostgreSQL", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void BuildRegimeIntervals_And_FilterCandlesByIntervals_ReturnExpectedSlice()
     {
         var snapshots = new List<MarketRegimeSnapshot>
@@ -848,6 +867,11 @@ public class OptimizationHelperServicesTest
         public FixedTimeProvider(DateTimeOffset nowUtc) => _nowUtc = nowUtc;
 
         public override DateTimeOffset GetUtcNow() => _nowUtc;
+    }
+
+    private sealed class TestOptimizationDbContext(DbContextOptions<TestOptimizationDbContext> options)
+        : DbContext(options)
+    {
     }
 
     private sealed class InitialBalanceEchoBacktestEngine : IBacktestEngine

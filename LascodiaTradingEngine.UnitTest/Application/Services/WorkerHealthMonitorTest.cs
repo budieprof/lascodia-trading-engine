@@ -97,4 +97,45 @@ public class WorkerHealthMonitorTest
         // Last duration should be the most recently enqueued
         Assert.Equal(200, snapshot.LastCycleDurationMs);
     }
+
+    [Fact]
+    public void RecordWorkerMetadata_UpdatesConfiguredIntervalSeconds()
+    {
+        _monitor.RecordWorkerMetadata("MetadataWorker", "health-check", TimeSpan.FromSeconds(30));
+
+        var snapshots = _monitor.GetCurrentSnapshots();
+        var snapshot = Assert.Single(snapshots);
+
+        Assert.Equal("MetadataWorker", snapshot.WorkerName);
+        Assert.Equal(30, snapshot.ConfiguredIntervalSeconds);
+        Assert.True(snapshot.IsRunning);
+    }
+
+    [Fact]
+    public void RecordCycleSuccess_AfterWorkerStopped_MarksWorkerRunningAgain()
+    {
+        _monitor.RecordWorkerStopped("RestartedWorker");
+
+        _monitor.RecordCycleSuccess("RestartedWorker", 75);
+
+        var snapshots = _monitor.GetCurrentSnapshots();
+        var snapshot = Assert.Single(snapshots);
+
+        Assert.True(snapshot.IsRunning);
+        Assert.NotNull(snapshot.LastSuccessAt);
+    }
+
+    [Fact]
+    public void RecordWorkerHeartbeat_AfterWorkerStopped_MarksWorkerRunningAgain()
+    {
+        _monitor.RecordWorkerStopped("HeartbeatWorker");
+
+        _monitor.RecordWorkerHeartbeat("HeartbeatWorker");
+
+        var snapshots = _monitor.GetCurrentSnapshots();
+        var snapshot = Assert.Single(snapshots);
+
+        Assert.True(snapshot.IsRunning);
+        Assert.NotNull(snapshot.LastSuccessAt);
+    }
 }

@@ -17,8 +17,8 @@ using MarketRegimeEnum = LascodiaTradingEngine.Domain.Enums.MarketRegime;
 
 namespace LascodiaTradingEngine.Application.Optimization;
 
-[RegisterService(ServiceLifetime.Scoped)]
-internal sealed class OptimizationRunExecutor
+[RegisterService(ServiceLifetime.Scoped, typeof(IOptimizationRunExecutor))]
+internal sealed class OptimizationRunExecutor : IOptimizationRunExecutor
 {
     private static readonly ActivitySource s_activitySource = new("LascodiaTradingEngine.Optimization");
     private static readonly TimeSpan CompletionPublicationTimeout = TimeSpan.FromSeconds(30);
@@ -62,7 +62,7 @@ internal sealed class OptimizationRunExecutor
         _timeProvider = timeProvider;
     }
 
-    internal async Task ExecuteAsync(
+    public async Task ExecuteAsync(
         OptimizationRun run,
         Strategy strategy,
         OptimizationConfig config,

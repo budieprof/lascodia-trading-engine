@@ -125,6 +125,8 @@ public sealed class OptimizationConfigProvider
         }
     }
 
+    internal static TimeSpan GetCacheTtl() => CacheTtl;
+
     internal static async Task<OptimizationConfig> LoadDirectAsync(
         DbContext db,
         ILogger logger,

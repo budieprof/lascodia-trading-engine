@@ -155,13 +155,13 @@ public class OptimizationRun : Entity<long>
 
     public DateTime? DeferredUntilUtc     { get; set; }
 
-    /// <summary>UTC timestamp when the run first entered the queue.</summary>
+    /// <summary>UTC timestamp when the run most recently entered the queue, including retries and recovery re-queues.</summary>
     public DateTime QueuedAt              { get; set; } = DateTime.UtcNow;
 
     /// <summary>UTC timestamp when a worker claimed the run.</summary>
     public DateTime? ClaimedAt            { get; set; }
 
-    /// <summary>UTC timestamp when the execution pipeline started doing real work.</summary>
+    /// <summary>UTC timestamp when the execution pipeline first entered preflight/execution work after the claim.</summary>
     public DateTime? ExecutionStartedAt   { get; set; }
 
     /// <summary>Persisted fine-grained execution stage for progress tracking.</summary>
@@ -182,7 +182,7 @@ public class OptimizationRun : Entity<long>
     /// <summary>UTC timestamp when the last operational issue was recorded.</summary>
     public DateTime? LastOperationalIssueAt { get; set; }
 
-    /// <summary>UTC timestamp when this run was queued / the record was created.</summary>
+    /// <summary>UTC timestamp when this run record was originally created.</summary>
     public DateTime StartedAt             { get; set; } = DateTime.UtcNow;
 
     /// <summary>UTC timestamp when grid search finished (succeeded or failed). Null while running.</summary>

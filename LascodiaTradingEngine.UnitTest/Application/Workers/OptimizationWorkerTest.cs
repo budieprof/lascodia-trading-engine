@@ -19,6 +19,7 @@ using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Utilities;
 using LascodiaTradingEngine.Application.Optimization;
 using LascodiaTradingEngine.Application.Services;
+using LascodiaTradingEngine.Application.SystemHealth.Queries.GetOptimizationWorkerHealth;
 using LascodiaTradingEngine.Application.Workers;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
@@ -318,14 +319,8 @@ public class OptimizationWorkerTest
         writeCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
         writeCtx.Setup(x => x.SaveChangesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(1);
 
-        var worker = CreateWorker();
         var config = CreateOptimizationConfig(cooldownDays: 14, maxConsecutiveFailuresBeforeEscalation: 3);
-
-        var method = typeof(OptimizationWorker).GetMethod(
-            "AutoScheduleUnderperformersAsync",
-            BindingFlags.NonPublic | BindingFlags.Instance)!;
-
-        await (Task)method.Invoke(worker, [readCtx.Object, writeCtx.Object, config, CancellationToken.None])!;
+        await InvokeAutoScheduleUnderperformersAsync(readCtx.Object, writeCtx.Object, config);
 
         Assert.DoesNotContain(
             optimizationRuns,
@@ -409,14 +404,8 @@ public class OptimizationWorkerTest
         writeCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
         writeCtx.Setup(x => x.SaveChangesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(1);
 
-        var worker = CreateWorker();
         var config = CreateOptimizationConfig(cooldownDays: 14, maxConsecutiveFailuresBeforeEscalation: 3);
-
-        var method = typeof(OptimizationWorker).GetMethod(
-            "AutoScheduleUnderperformersAsync",
-            BindingFlags.NonPublic | BindingFlags.Instance)!;
-
-        await (Task)method.Invoke(worker, [readCtx.Object, writeCtx.Object, config, CancellationToken.None])!;
+        await InvokeAutoScheduleUnderperformersAsync(readCtx.Object, writeCtx.Object, config);
 
         Assert.Single(optimizationRuns);
         Assert.Equal(OptimizationRunStatus.Rejected, optimizationRuns[0].Status);
@@ -488,14 +477,8 @@ public class OptimizationWorkerTest
         writeCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
         writeCtx.Setup(x => x.SaveChangesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(1);
 
-        var worker = CreateWorker();
         var config = CreateOptimizationConfig(cooldownDays: 14, maxConsecutiveFailuresBeforeEscalation: 3);
-
-        var method = typeof(OptimizationWorker).GetMethod(
-            "AutoScheduleUnderperformersAsync",
-            BindingFlags.NonPublic | BindingFlags.Instance)!;
-
-        await (Task)method.Invoke(worker, [readCtx.Object, writeCtx.Object, config, CancellationToken.None])!;
+        await InvokeAutoScheduleUnderperformersAsync(readCtx.Object, writeCtx.Object, config);
 
         var queuedRun = Assert.Single(optimizationRuns);
         Assert.Equal(43, queuedRun.StrategyId);
@@ -575,17 +558,11 @@ public class OptimizationWorkerTest
         writeCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
         writeCtx.Setup(x => x.SaveChangesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(1);
 
-        var worker = CreateWorker();
         var config = CreateOptimizationConfig(
             cooldownDays: 14,
             maxConsecutiveFailuresBeforeEscalation: 3,
             maxRunsPerWeek: 1);
-
-        var method = typeof(OptimizationWorker).GetMethod(
-            "AutoScheduleUnderperformersAsync",
-            BindingFlags.NonPublic | BindingFlags.Instance)!;
-
-        await (Task)method.Invoke(worker, [readCtx.Object, writeCtx.Object, config, CancellationToken.None])!;
+        await InvokeAutoScheduleUnderperformersAsync(readCtx.Object, writeCtx.Object, config);
 
         Assert.Contains(
             optimizationRuns,
@@ -988,18 +965,7 @@ public class OptimizationWorkerTest
         writeCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
         writeCtx.Setup(x => x.SaveChangesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(1);
 
-        var worker = CreateWorker(
-            scopeFactory: CreateWorkerScopeFactory(configureServices: services =>
-            {
-                services.AddSingleton(readCtx.Object);
-                services.AddSingleton(writeCtx.Object);
-            }));
-
-        var method = typeof(OptimizationWorker).GetMethod(
-            "MonitorFollowUpResultsAsync",
-            BindingFlags.NonPublic | BindingFlags.Instance)!;
-
-        await (Task)method.Invoke(worker, [CancellationToken.None])!;
+        await InvokeMonitorFollowUpResultsAsync(readCtx.Object, writeCtx.Object);
 
         Assert.Equal(ValidationFollowUpStatus.Pending, runs[0].ValidationFollowUpStatus);
         Assert.Single(backtests);
@@ -1074,18 +1040,7 @@ public class OptimizationWorkerTest
         writeCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
         writeCtx.Setup(x => x.SaveChangesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(1);
 
-        var worker = CreateWorker(
-            scopeFactory: CreateWorkerScopeFactory(configureServices: services =>
-            {
-                services.AddSingleton(readCtx.Object);
-                services.AddSingleton(writeCtx.Object);
-            }));
-
-        var method = typeof(OptimizationWorker).GetMethod(
-            "MonitorFollowUpResultsAsync",
-            BindingFlags.NonPublic | BindingFlags.Instance)!;
-
-        await (Task)method.Invoke(worker, [CancellationToken.None])!;
+        await InvokeMonitorFollowUpResultsAsync(readCtx.Object, writeCtx.Object);
 
         Assert.Single(backtests);
         Assert.Single(walks);
@@ -1336,8 +1291,6 @@ public class OptimizationWorkerTest
         db.Setup(c => c.Set<CurrencyPair>()).Returns(pairDbSet.Object);
         db.Setup(c => c.Set<StrategyRegimeParams>()).Returns(regimeParamsDbSet.Object);
 
-        var worker = CreateWorker(new BaselineSplitBacktestEngine());
-
         var strategy = new Strategy
         {
             Id = 9,
@@ -1349,16 +1302,13 @@ public class OptimizationWorkerTest
         };
         var run = new OptimizationRun { Id = 501, StrategyId = strategy.Id, StartedAt = nowUtc };
         var config = CreateOptimizationConfig(cooldownDays: 14, maxConsecutiveFailuresBeforeEscalation: 3);
-
-        var method = typeof(OptimizationWorker).GetMethod(
-            "LoadAndValidateCandlesAsync",
-            BindingFlags.NonPublic | BindingFlags.Instance)!;
-
-        var task = (Task)method.Invoke(worker, [db.Object, run, strategy, config, CancellationToken.None])!;
-        await task;
-
-        var result = task.GetType().GetProperty("Result")!.GetValue(task)!;
-        var baselineComparisonScore = (decimal)result.GetType().GetProperty("BaselineComparisonScore")!.GetValue(result)!;
+        var result = await InvokeLoadAndValidateCandlesAsync(
+            db.Object,
+            run,
+            strategy,
+            config,
+            new BaselineSplitBacktestEngine());
+        var baselineComparisonScore = result.BaselineComparisonScore;
 
         Assert.NotNull(run.BaselineHealthScore);
         Assert.NotEqual(run.BaselineHealthScore!.Value, baselineComparisonScore);
@@ -1402,8 +1352,6 @@ public class OptimizationWorkerTest
         db.Setup(c => c.Set<CurrencyPair>()).Returns(pairDbSet.Object);
         db.Setup(c => c.Set<StrategyRegimeParams>()).Returns(regimeParamsDbSet.Object);
 
-        var worker = CreateWorker(new BaselineSplitBacktestEngine());
-
         var strategy = new Strategy
         {
             Id = 13,
@@ -1415,16 +1363,13 @@ public class OptimizationWorkerTest
         };
         var run = new OptimizationRun { Id = 777, StrategyId = strategy.Id, StartedAt = nowUtc };
         var config = CreateOptimizationConfig(cooldownDays: 14, maxConsecutiveFailuresBeforeEscalation: 3);
-
-        var method = typeof(OptimizationWorker).GetMethod(
-            "LoadAndValidateCandlesAsync",
-            BindingFlags.NonPublic | BindingFlags.Instance)!;
-
-        var task = (Task)method.Invoke(worker, [db.Object, run, strategy, config, CancellationToken.None])!;
-        await task;
-
-        var result = task.GetType().GetProperty("Result")!.GetValue(task)!;
-        var allCandles = (IReadOnlyList<Candle>)result.GetType().GetProperty("AllCandles")!.GetValue(result)!;
+        var result = await InvokeLoadAndValidateCandlesAsync(
+            db.Object,
+            run,
+            strategy,
+            config,
+            new BaselineSplitBacktestEngine());
+        var allCandles = result.AllCandles;
 
         Assert.True(allCandles.Count > candles.Count);
         Assert.NotNull(run.BaselineHealthScore);
@@ -1485,8 +1430,6 @@ public class OptimizationWorkerTest
         db.Setup(c => c.Set<CurrencyPair>()).Returns(pairDbSet.Object);
         db.Setup(c => c.Set<StrategyRegimeParams>()).Returns(regimeParamsDbSet.Object);
 
-        var worker = CreateWorker(new BaselineSplitBacktestEngine());
-
         var strategy = new Strategy
         {
             Id = 21,
@@ -1498,13 +1441,12 @@ public class OptimizationWorkerTest
         };
         var run = new OptimizationRun { Id = 888, StrategyId = strategy.Id, StartedAt = nowUtc };
         var config = CreateOptimizationConfig(cooldownDays: 14, maxConsecutiveFailuresBeforeEscalation: 3);
-
-        var method = typeof(OptimizationWorker).GetMethod(
-            "LoadAndValidateCandlesAsync",
-            BindingFlags.NonPublic | BindingFlags.Instance)!;
-
-        var task = (Task)method.Invoke(worker, [db.Object, run, strategy, config, CancellationToken.None])!;
-        await task;
+        await InvokeLoadAndValidateCandlesAsync(
+            db.Object,
+            run,
+            strategy,
+            config,
+            new BaselineSplitBacktestEngine());
 
         Assert.NotNull(run.BaselineHealthScore);
     }
@@ -1558,8 +1500,6 @@ public class OptimizationWorkerTest
         db.Setup(c => c.Set<CurrencyPair>()).Returns(pairDbSet.Object);
         db.Setup(c => c.Set<StrategyRegimeParams>()).Returns(regimeParamsDbSet.Object);
 
-        var worker = CreateWorker(new BaselineSplitBacktestEngine());
-
         var strategy = new Strategy
         {
             Id = 22,
@@ -1571,13 +1511,13 @@ public class OptimizationWorkerTest
         };
         var run = new OptimizationRun { Id = 889, StrategyId = strategy.Id, StartedAt = nowUtc };
         var config = CreateOptimizationConfig(cooldownDays: 14, maxConsecutiveFailuresBeforeEscalation: 3);
-
-        var method = typeof(OptimizationWorker).GetMethod(
-            "LoadAndValidateCandlesAsync",
-            BindingFlags.NonPublic | BindingFlags.Instance)!;
-
-        var task = (Task)method.Invoke(worker, [db.Object, run, strategy, config, CancellationToken.None])!;
-        var ex = await Assert.ThrowsAsync<DataQualityException>(async () => await task);
+        var ex = await Assert.ThrowsAsync<DataQualityException>(async () =>
+            await InvokeLoadAndValidateCandlesAsync(
+                db.Object,
+                run,
+                strategy,
+                config,
+                new BaselineSplitBacktestEngine()));
 
         Assert.Contains("Data quality validation failed", ex.Message, StringComparison.Ordinal);
     }
@@ -1613,8 +1553,6 @@ public class OptimizationWorkerTest
         db.Setup(c => c.Set<CurrencyPair>()).Returns(pairDbSet.Object);
         db.Setup(c => c.Set<StrategyRegimeParams>()).Returns(regimeParamsDbSet.Object);
 
-        var worker = CreateWorker(new BaselineSplitBacktestEngine());
-
         var strategy = new Strategy
         {
             Id = 23,
@@ -1626,13 +1564,13 @@ public class OptimizationWorkerTest
         };
         var run = new OptimizationRun { Id = 890, StrategyId = strategy.Id, StartedAt = nowUtc };
         var config = CreateOptimizationConfig(cooldownDays: 14, maxConsecutiveFailuresBeforeEscalation: 3);
-
-        var method = typeof(OptimizationWorker).GetMethod(
-            "LoadAndValidateCandlesAsync",
-            BindingFlags.NonPublic | BindingFlags.Instance)!;
-
-        var task = (Task)method.Invoke(worker, [db.Object, run, strategy, config, CancellationToken.None])!;
-        var ex = await Assert.ThrowsAsync<DataQualityException>(async () => await task);
+        var ex = await Assert.ThrowsAsync<DataQualityException>(async () =>
+            await InvokeLoadAndValidateCandlesAsync(
+                db.Object,
+                run,
+                strategy,
+                config,
+                new BaselineSplitBacktestEngine()));
 
         Assert.Contains("CurrencyPair metadata", ex.Message, StringComparison.Ordinal);
     }
@@ -1835,7 +1773,6 @@ public class OptimizationWorkerTest
         eventService.Setup(x => x.SaveAndPublish(It.IsAny<IDbContext>(), It.IsAny<Lascodia.Trading.Engine.EventBus.Events.IntegrationEvent>()))
             .ThrowsAsync(new InvalidOperationException("approval event persistence failed"));
 
-        var worker = CreateWorker();
         var config = CreateOptimizationConfig(cooldownDays: 14, maxConsecutiveFailuresBeforeEscalation: 3);
         var runContext = CreateRunContext(
             run, strategy, config, baselineComparisonScore: 0.40m,
@@ -1862,12 +1799,12 @@ public class OptimizationWorkerTest
             pessimisticScore: 0.68m,
             failureReason: string.Empty);
 
-        var method = typeof(OptimizationWorker).GetMethod(
-            "ApplyApprovalDecisionAsync",
-            BindingFlags.NonPublic | BindingFlags.Instance)!;
-
-        await (Task)method.Invoke(worker,
-            [runContext, validationResult, null, DateTime.UtcNow.AddMonths(-2), new BacktestOptions()])!;
+        await InvokeApplyApprovalDecisionAsync(
+            runContext,
+            validationResult,
+            null,
+            DateTime.UtcNow.AddMonths(-2),
+            new BacktestOptions());
 
         Assert.Equal(OptimizationRunStatus.Failed, run.Status);
         Assert.Equal(OptimizationFailureCategory.Transient, run.FailureCategory);
@@ -1914,7 +1851,6 @@ public class OptimizationWorkerTest
         var alertDispatcher = new Mock<IAlertDispatcher>();
         var eventService = new Mock<IIntegrationEventService>();
 
-        var worker = CreateWorker();
         var config = CreateOptimizationConfig(cooldownDays: 14, maxConsecutiveFailuresBeforeEscalation: 3);
         var runContext = CreateRunContext(
             run, strategy, config, baselineComparisonScore: 0.40m,
@@ -1941,12 +1877,12 @@ public class OptimizationWorkerTest
             pessimisticScore: 0.68m,
             failureReason: string.Empty);
 
-        var method = typeof(OptimizationWorker).GetMethod(
-            "ApplyApprovalDecisionAsync",
-            BindingFlags.NonPublic | BindingFlags.Instance)!;
-
-        await (Task)method.Invoke(worker,
-            [runContext, validationResult, null, DateTime.UtcNow.AddMonths(-2), new BacktestOptions()])!;
+        await InvokeApplyApprovalDecisionAsync(
+            runContext,
+            validationResult,
+            null,
+            DateTime.UtcNow.AddMonths(-2),
+            new BacktestOptions());
 
         Assert.Equal(OptimizationRunStatus.Rejected, run.Status);
         Assert.Equal(OptimizationFailureCategory.StrategyRemoved, run.FailureCategory);
@@ -2004,7 +1940,6 @@ public class OptimizationWorkerTest
         var alertDispatcher = new Mock<IAlertDispatcher>();
         var eventService = new Mock<IIntegrationEventService>();
 
-        var worker = CreateWorker();
         var config = CreateOptimizationConfig(cooldownDays: 14, maxConsecutiveFailuresBeforeEscalation: 3);
         var runContext = CreateRunContext(
             run, strategy, config, baselineComparisonScore: 0.40m,
@@ -2031,12 +1966,12 @@ public class OptimizationWorkerTest
             pessimisticScore: 0.35m,
             failureReason: "Permutation test failed");
 
-        var method = typeof(OptimizationWorker).GetMethod(
-            "ApplyApprovalDecisionAsync",
-            BindingFlags.NonPublic | BindingFlags.Instance)!;
-
-        await (Task)method.Invoke(worker,
-            [runContext, validationResult, null, DateTime.UtcNow.AddMonths(-2), new BacktestOptions()])!;
+        await InvokeApplyApprovalDecisionAsync(
+            runContext,
+            validationResult,
+            null,
+            DateTime.UtcNow.AddMonths(-2),
+            new BacktestOptions());
 
         Assert.Contains("failedCandidates", run.ApprovalReportJson, StringComparison.Ordinal);
         Assert.Contains("topCandidateFailureReason", run.ApprovalReportJson, StringComparison.Ordinal);
@@ -2121,19 +2056,7 @@ public class OptimizationWorkerTest
         alertDispatcher.Setup(x => x.DispatchBySeverityAsync(It.IsAny<Alert>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
 
-        var worker = CreateWorker(
-            scopeFactory: CreateWorkerScopeFactory(configureServices: services =>
-            {
-                services.AddSingleton(readCtx.Object);
-                services.AddSingleton(writeCtx.Object);
-                services.AddSingleton(alertDispatcher.Object);
-            }));
-
-        var method = typeof(OptimizationWorker).GetMethod(
-            "MonitorFollowUpResultsAsync",
-            BindingFlags.NonPublic | BindingFlags.Instance)!;
-
-        await (Task)method.Invoke(worker, [CancellationToken.None])!;
+        await InvokeMonitorFollowUpResultsAsync(readCtx.Object, writeCtx.Object, alertDispatcher.Object);
 
         Assert.Equal(ValidationFollowUpStatus.Failed, run.ValidationFollowUpStatus);
     }
@@ -2284,7 +2207,6 @@ public class OptimizationWorkerTest
             })
             .Returns(Task.CompletedTask);
 
-        var worker = CreateWorker(new RecordingBacktestEngine());
         var config = CreateOptimizationConfig(cooldownDays: 14, maxConsecutiveFailuresBeforeEscalation: 3);
         var runContext = CreateRunContext(
             run, strategy, config, baselineComparisonScore: 0.40m,
@@ -2313,13 +2235,13 @@ public class OptimizationWorkerTest
             pessimisticScore: 0.68m,
             failureReason: string.Empty);
 
-        var method = typeof(OptimizationWorker).GetMethod(
-            "ApplyApprovalDecisionAsync",
-            BindingFlags.NonPublic | BindingFlags.Instance)!;
-
-        var task = (Task)method.Invoke(
-            worker,
-            [runContext, validationResult, MarketRegime.Trending, nowUtc.AddDays(-14), new BacktestOptions()])!;
+        var task = InvokeApplyApprovalDecisionAsync(
+            runContext,
+            validationResult,
+            MarketRegime.Trending,
+            nowUtc.AddDays(-14),
+            new BacktestOptions(),
+            new RecordingBacktestEngine());
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await task);
     }
@@ -2362,14 +2284,7 @@ public class OptimizationWorkerTest
 
         var mediator = new Mock<IMediator>();
         var alertDispatcher = new Mock<IAlertDispatcher>();
-        var worker = CreateWorker();
-
-        var method = typeof(OptimizationWorker).GetMethod(
-            "EscalateChronicFailuresAsync",
-            BindingFlags.NonPublic | BindingFlags.Instance)!;
-
-        await (Task)method.Invoke(worker,
-        [
+        await InvokeEscalateChronicFailuresAsync(
             db.Object,
             db.Object,
             writeCtx.Object,
@@ -2378,9 +2293,7 @@ public class OptimizationWorkerTest
             strategyId,
             "NoisyStrategy",
             3,
-            14,
-            CancellationToken.None
-        ])!;
+            14);
 
         Assert.Single(alerts);
         writeCtx.Verify(x => x.SaveChangesAsync(It.IsAny<CancellationToken>()), Times.Never);
@@ -2389,36 +2302,7 @@ public class OptimizationWorkerTest
             Times.Never);
     }
 
-    private static OptimizationWorker CreateWorker(
-        IBacktestEngine? backtestEngine = null,
-        IServiceScopeFactory? scopeFactory = null,
-        TimeProvider? timeProvider = null)
-    {
-        var logger = Mock.Of<ILogger<OptimizationWorker>>();
-        backtestEngine ??= Mock.Of<IBacktestEngine>();
-        scopeFactory ??= CreateWorkerScopeFactory(backtestEngine, timeProvider: timeProvider);
-        var metricsServices = new ServiceCollection().AddMetrics().BuildServiceProvider();
-        var meterFactory = metricsServices.GetRequiredService<System.Diagnostics.Metrics.IMeterFactory>();
-        var metrics = new TradingMetrics(meterFactory);
-        var services = (IServiceProvider)scopeFactory;
-        var configProvider = services.GetRequiredService<OptimizationConfigProvider>();
-        var schedulingCoordinator = services.GetRequiredService<OptimizationSchedulingCoordinator>();
-        var chronicFailureEscalator = services.GetRequiredService<OptimizationChronicFailureEscalator>();
-        var healthRecorder = services.GetRequiredService<OptimizationWorkerHealthRecorder>();
-        var effectiveTimeProvider = timeProvider ?? TimeProvider.System;
-
-        return new OptimizationWorker(
-            logger,
-            scopeFactory,
-            metrics,
-            configProvider,
-            schedulingCoordinator,
-            chronicFailureEscalator,
-            healthRecorder,
-            effectiveTimeProvider);
-    }
-
-    private static IServiceScopeFactory CreateWorkerScopeFactory(
+    private static ServiceProvider CreateOptimizationServiceProvider(
         IBacktestEngine? backtestEngine = null,
         Action<ServiceCollection>? configureServices = null,
         TimeProvider? timeProvider = null)
@@ -2435,10 +2319,183 @@ public class OptimizationWorkerTest
         services.AutoRegisterAttributedServices(typeof(OptimizationRunProcessor).Assembly);
         services.AddSingleton<IBacktestEngine>(backtestEngine);
         services.AddSingleton<ISpreadProfileProvider>(Mock.Of<ISpreadProfileProvider>());
+        services.AddSingleton<IAlertDispatcher>(Mock.Of<IAlertDispatcher>());
         configureServices?.Invoke(services);
 
-        var serviceProvider = services.BuildServiceProvider();
+        return services.BuildServiceProvider();
+    }
+
+    private static OptimizationWorker CreateWorker(
+        IBacktestEngine? backtestEngine = null,
+        IServiceScopeFactory? scopeFactory = null,
+        TimeProvider? timeProvider = null)
+    {
+        var logger = Mock.Of<ILogger<OptimizationWorker>>();
+        backtestEngine ??= Mock.Of<IBacktestEngine>();
+        scopeFactory ??= CreateWorkerScopeFactory(backtestEngine, timeProvider: timeProvider);
+        var metricsServices = new ServiceCollection().AddMetrics().BuildServiceProvider();
+        var meterFactory = metricsServices.GetRequiredService<System.Diagnostics.Metrics.IMeterFactory>();
+        var metrics = new TradingMetrics(meterFactory);
+        var services = (IServiceProvider)scopeFactory;
+        var healthMonitor = services.GetService<IWorkerHealthMonitor>();
+        var healthStore = services.GetRequiredService<IOptimizationWorkerHealthStore>();
+        var configProvider = services.GetRequiredService<OptimizationConfigProvider>();
+        var loopCoordinator = services.GetRequiredService<IOptimizationWorkerLoopCoordinator>();
+        var effectiveTimeProvider = timeProvider ?? TimeProvider.System;
+
+        return new OptimizationWorker(
+            logger,
+            scopeFactory,
+            metrics,
+            healthMonitor,
+            healthStore,
+            configProvider,
+            loopCoordinator,
+            effectiveTimeProvider,
+            TimeSpan.FromSeconds(30),
+            TimeSpan.FromSeconds(30));
+    }
+
+    private static IServiceScopeFactory CreateWorkerScopeFactory(
+        IBacktestEngine? backtestEngine = null,
+        Action<ServiceCollection>? configureServices = null,
+        TimeProvider? timeProvider = null)
+    {
+        var serviceProvider = CreateOptimizationServiceProvider(backtestEngine, configureServices, timeProvider);
         return serviceProvider.GetRequiredService<IServiceScopeFactory>();
+    }
+
+    private static async Task<DataLoadResult> InvokeLoadAndValidateCandlesAsync(
+        DbContext db,
+        OptimizationRun run,
+        Strategy strategy,
+        OptimizationConfig config,
+        IBacktestEngine? backtestEngine = null,
+        TimeProvider? timeProvider = null)
+    {
+        using var provider = CreateOptimizationServiceProvider(backtestEngine, timeProvider: timeProvider);
+        await using var scope = provider.CreateAsyncScope();
+        var dataLoader = scope.ServiceProvider.GetRequiredService<OptimizationDataLoader>();
+        return await dataLoader.LoadAsync(db, run, strategy, config.ToDataLoadingConfig(), CancellationToken.None);
+    }
+
+    private static async Task InvokeAutoScheduleUnderperformersAsync(
+        IReadApplicationDbContext readCtx,
+        IWriteApplicationDbContext writeCtx,
+        OptimizationConfig config,
+        IBacktestEngine? backtestEngine = null,
+        TimeProvider? timeProvider = null)
+    {
+        using var provider = CreateOptimizationServiceProvider(backtestEngine, services =>
+        {
+            services.AddSingleton(readCtx);
+            services.AddSingleton(writeCtx);
+        }, timeProvider);
+        await using var scope = provider.CreateAsyncScope();
+        var schedulingCoordinator = scope.ServiceProvider.GetRequiredService<OptimizationSchedulingCoordinator>();
+        await schedulingCoordinator.AutoScheduleUnderperformersAsync(readCtx, writeCtx, config, CancellationToken.None);
+    }
+
+    private static async Task InvokeMonitorFollowUpResultsAsync(
+        IReadApplicationDbContext readCtx,
+        IWriteApplicationDbContext writeCtx,
+        IAlertDispatcher? alertDispatcher = null,
+        TimeProvider? timeProvider = null)
+    {
+        using var provider = CreateOptimizationServiceProvider(configureServices: services =>
+        {
+            services.AddSingleton(readCtx);
+            services.AddSingleton(writeCtx);
+            if (alertDispatcher is not null)
+                services.AddSingleton(alertDispatcher);
+        }, timeProvider: timeProvider);
+        await using var scope = provider.CreateAsyncScope();
+        var configProvider = scope.ServiceProvider.GetRequiredService<OptimizationConfigProvider>();
+        var followUpCoordinator = scope.ServiceProvider.GetRequiredService<OptimizationFollowUpCoordinator>();
+        var config = await configProvider.LoadAsync(readCtx.GetDbContext(), CancellationToken.None);
+        await followUpCoordinator.MonitorAsync(config, CancellationToken.None);
+    }
+
+    private static async Task InvokeApplyApprovalDecisionAsync(
+        object ctx,
+        object validationResult,
+        MarketRegime? currentRegime,
+        DateTime candleLookbackStart,
+        BacktestOptions screeningOptions,
+        IBacktestEngine? backtestEngine = null,
+        Action<ServiceCollection>? configureServices = null,
+        TimeProvider? timeProvider = null)
+    {
+        using var provider = CreateOptimizationServiceProvider(backtestEngine, configureServices, timeProvider);
+        await using var scope = provider.CreateAsyncScope();
+        var approvalCoordinator = scope.ServiceProvider.GetRequiredService<OptimizationApprovalCoordinator>();
+        await approvalCoordinator.ApplyAsync(
+            (RunContext)ctx,
+            ((RunContext)ctx).Config.ToApprovalConfig(),
+            (CandidateValidationResult)validationResult,
+            currentRegime,
+            candleLookbackStart,
+            screeningOptions);
+    }
+
+    private static async Task InvokeEscalateChronicFailuresAsync(
+        DbContext db,
+        DbContext writeDb,
+        IWriteApplicationDbContext writeCtx,
+        IMediator mediator,
+        IAlertDispatcher alertDispatcher,
+        long strategyId,
+        string strategyName,
+        int maxConsecutiveFailures,
+        int baseCooldownDays,
+        TimeProvider? timeProvider = null)
+    {
+        using var provider = CreateOptimizationServiceProvider(timeProvider: timeProvider);
+        await using var scope = provider.CreateAsyncScope();
+        var escalator = scope.ServiceProvider.GetRequiredService<OptimizationChronicFailureEscalator>();
+        await escalator.EscalateAsync(
+            db,
+            writeDb,
+            writeCtx,
+            mediator,
+            alertDispatcher,
+            strategyId,
+            strategyName,
+            maxConsecutiveFailures,
+            baseCooldownDays,
+            CancellationToken.None);
+    }
+
+    private static async Task InvokeRetryFailedRunsAsync(
+        IReadApplicationDbContext readCtx,
+        IWriteApplicationDbContext writeCtx,
+        TimeProvider? timeProvider = null)
+    {
+        using var provider = CreateOptimizationServiceProvider(configureServices: services =>
+        {
+            services.AddSingleton(readCtx);
+            services.AddSingleton(writeCtx);
+        }, timeProvider: timeProvider);
+        await using var scope = provider.CreateAsyncScope();
+        var configProvider = scope.ServiceProvider.GetRequiredService<OptimizationConfigProvider>();
+        var recoveryCoordinator = scope.ServiceProvider.GetRequiredService<OptimizationRunRecoveryCoordinator>();
+        var config = await configProvider.LoadAsync(readCtx.GetDbContext(), CancellationToken.None);
+        await recoveryCoordinator.RetryFailedRunsAsync(config, CancellationToken.None);
+    }
+
+    private static async Task InvokeRecoverStaleQueuedRunsAsync(
+        IReadApplicationDbContext readCtx,
+        IWriteApplicationDbContext writeCtx,
+        TimeProvider? timeProvider = null)
+    {
+        using var provider = CreateOptimizationServiceProvider(configureServices: services =>
+        {
+            services.AddSingleton(readCtx);
+            services.AddSingleton(writeCtx);
+        }, timeProvider: timeProvider);
+        await using var scope = provider.CreateAsyncScope();
+        var recoveryCoordinator = scope.ServiceProvider.GetRequiredService<OptimizationRunRecoveryCoordinator>();
+        await recoveryCoordinator.RecoverStaleQueuedRunsAsync(CancellationToken.None);
     }
 
     private static OptimizationFollowUpCoordinator CreateFollowUpCoordinator(TimeProvider? timeProvider = null)
@@ -2455,6 +2512,124 @@ public class OptimizationWorkerTest
             Mock.Of<ILogger<OptimizationFollowUpCoordinator>>(),
             new TradingMetrics(meterFactory),
             effectiveTimeProvider);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_ContinuesCoordinatorCycles_WhileProcessingSlotsAreBusy()
+    {
+        var timeProvider = TimeProvider.System;
+        var configProvider = await CreatePrimedConfigProviderAsync(
+            new EngineConfig
+            {
+                Key = "Optimization:MaxConcurrentRuns",
+                Value = "2",
+                DataType = ConfigDataType.Int,
+                IsDeleted = false
+            },
+            new EngineConfig
+            {
+                Key = "Optimization:SchedulePollSeconds",
+                Value = "1",
+                DataType = ConfigDataType.Int,
+                IsDeleted = false
+            });
+        var blockingProcessor = new BlockingOptimizationRunProcessor(blockingCalls: 2);
+        var readCtx = new Mock<IReadApplicationDbContext>();
+        readCtx.Setup(x => x.GetDbContext()).Returns(new Mock<DbContext>().Object);
+
+        var services = new ServiceCollection()
+            .AddSingleton(readCtx.Object)
+            .AddSingleton<IOptimizationRunProcessor>(blockingProcessor)
+            .BuildServiceProvider();
+
+        var metricsServices = new ServiceCollection().AddMetrics().BuildServiceProvider();
+        var metrics = new TradingMetrics(
+            metricsServices.GetRequiredService<System.Diagnostics.Metrics.IMeterFactory>());
+        var loopCoordinator = new CountingLoopCoordinator();
+        var healthStore = new OptimizationWorkerHealthStore();
+
+        var worker = new OptimizationWorker(
+            Mock.Of<ILogger<OptimizationWorker>>(),
+            services.GetRequiredService<IServiceScopeFactory>(),
+            metrics,
+            healthMonitor: null,
+            healthStore,
+            configProvider,
+            loopCoordinator,
+            timeProvider,
+            TimeSpan.FromMilliseconds(25),
+            TimeSpan.FromSeconds(2));
+
+        await worker.StartAsync(CancellationToken.None);
+        await blockingProcessor.AllBlockingCallsStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        int cycleCountWhileSlotsBusy = await WaitForCoordinatorCyclesAsync(
+            loopCoordinator,
+            minimumCycles: 2,
+            timeout: TimeSpan.FromSeconds(2));
+
+        await worker.StopAsync(CancellationToken.None);
+
+        Assert.Equal(2, blockingProcessor.MaxConcurrentCalls);
+        Assert.True(cycleCountWhileSlotsBusy >= 2);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_WhenConfigLoadFails_ExposesDegradedHealthWithSeparateExecutionStream()
+    {
+        var readCtx = new Mock<IReadApplicationDbContext>();
+        readCtx.Setup(x => x.GetDbContext())
+            .Throws(new InvalidOperationException("configuration database unavailable"));
+
+        using var provider = CreateOptimizationServiceProvider(configureServices: services =>
+        {
+            services.AddSingleton(readCtx.Object);
+        });
+
+        var worker = new OptimizationWorker(
+            provider.GetRequiredService<ILogger<OptimizationWorker>>(),
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            provider.GetRequiredService<TradingMetrics>(),
+            provider.GetRequiredService<IWorkerHealthMonitor>(),
+            provider.GetRequiredService<IOptimizationWorkerHealthStore>(),
+            provider.GetRequiredService<OptimizationConfigProvider>(),
+            new CountingLoopCoordinator(),
+            provider.GetRequiredService<TimeProvider>(),
+            TimeSpan.FromMilliseconds(25),
+            TimeSpan.FromSeconds(1));
+
+        await worker.StartAsync(CancellationToken.None);
+
+        OptimizationWorkerHealthDto? snapshot = null;
+        var deadline = DateTime.UtcNow.AddSeconds(3);
+        while (DateTime.UtcNow < deadline)
+        {
+            var response = await new GetOptimizationWorkerHealthQueryHandler(
+                provider.GetRequiredService<IWorkerHealthMonitor>(),
+                provider.GetRequiredService<IOptimizationWorkerHealthStore>())
+                .Handle(new GetOptimizationWorkerHealthQuery(), CancellationToken.None);
+
+            snapshot = response.data;
+            if (snapshot is not null
+                && snapshot.IsConfigLoadDegraded
+                && snapshot.ConsecutiveConfigLoadFailures > 0
+                && snapshot.CoordinatorWorker?.WorkerName == OptimizationWorkerHealthNames.CoordinatorWorker
+                && snapshot.OptimizationWorker?.WorkerName == OptimizationWorkerHealthNames.ExecutionWorker)
+            {
+                break;
+            }
+
+            await Task.Delay(25);
+        }
+
+        await worker.StopAsync(CancellationToken.None);
+
+        Assert.NotNull(snapshot);
+        Assert.True(snapshot!.IsConfigLoadDegraded);
+        Assert.True(snapshot.ConsecutiveConfigLoadFailures > 0);
+        Assert.Equal("configuration database unavailable", snapshot.LastConfigLoadFailureMessage);
+        Assert.Equal(OptimizationWorkerHealthNames.CoordinatorWorker, snapshot.CoordinatorWorker!.WorkerName);
+        Assert.Equal(OptimizationWorkerHealthNames.ExecutionWorker, snapshot.OptimizationWorker!.WorkerName);
     }
 
     private static OptimizationRun MakeCompletedOptimizationRun(long id, long strategyId, DateTime completedAtUtc) => new()
@@ -2792,17 +2967,7 @@ public class OptimizationWorkerTest
         writeCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
         writeCtx.Setup(x => x.SaveChangesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(1);
 
-        var worker = CreateWorker(
-            scopeFactory: CreateWorkerScopeFactory(configureServices: services =>
-            {
-                services.AddSingleton(readCtx.Object);
-                services.AddSingleton(writeCtx.Object);
-            }));
-        var method = typeof(OptimizationWorker).GetMethod(
-            "RetryFailedRunsAsync",
-            BindingFlags.NonPublic | BindingFlags.Instance)!;
-
-        await (Task)method.Invoke(worker, [CancellationToken.None])!;
+        await InvokeRetryFailedRunsAsync(readCtx.Object, writeCtx.Object);
 
         var failedRun = optimizationRuns.Single(r => r.Id == 401);
         Assert.Equal(OptimizationRunStatus.Failed, failedRun.Status);
@@ -2860,17 +3025,7 @@ public class OptimizationWorkerTest
         writeCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
         writeCtx.Setup(x => x.SaveChangesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(1);
 
-        var worker = CreateWorker(
-            scopeFactory: CreateWorkerScopeFactory(configureServices: services =>
-            {
-                services.AddSingleton(readCtx.Object);
-                services.AddSingleton(writeCtx.Object);
-            }));
-        var method = typeof(OptimizationWorker).GetMethod(
-            "RetryFailedRunsAsync",
-            BindingFlags.NonPublic | BindingFlags.Instance)!;
-
-        await (Task)method.Invoke(worker, [CancellationToken.None])!;
+        await InvokeRetryFailedRunsAsync(readCtx.Object, writeCtx.Object);
 
         var exhaustedRun = optimizationRuns.Single(r => r.Id == 451);
         Assert.Equal(OptimizationRunStatus.Abandoned, exhaustedRun.Status);
@@ -2926,21 +3081,79 @@ public class OptimizationWorkerTest
         writeCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
         writeCtx.Setup(x => x.SaveChangesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(1);
 
-        var worker = CreateWorker(
-            scopeFactory: CreateWorkerScopeFactory(configureServices: services =>
-            {
-                services.AddSingleton(readCtx.Object);
-                services.AddSingleton(writeCtx.Object);
-            }));
-        var method = typeof(OptimizationWorker).GetMethod(
-            "RetryFailedRunsAsync",
-            BindingFlags.NonPublic | BindingFlags.Instance)!;
-
-        await (Task)method.Invoke(worker, [CancellationToken.None])!;
+        await InvokeRetryFailedRunsAsync(readCtx.Object, writeCtx.Object);
 
         var retriedRun = optimizationRuns.Single(r => r.Id == 452);
         Assert.Equal(OptimizationRunStatus.Queued, retriedRun.Status);
         Assert.Equal(1, retriedRun.RetryCount);
+    }
+
+    [Fact]
+    public async Task RetryFailedRunsAsync_RefreshesQueueLifecycleTimestamps_WhenRequeued()
+    {
+        var nowUtc = new DateTimeOffset(2026, 04, 08, 12, 0, 0, TimeSpan.Zero);
+        var staleQueueEntryUtc = nowUtc.UtcDateTime.AddDays(-5);
+        var optimizationRuns = new List<OptimizationRun>
+        {
+            new()
+            {
+                Id = 4521,
+                StrategyId = 891,
+                Status = OptimizationRunStatus.Failed,
+                RetryCount = 0,
+                FailureCategory = OptimizationFailureCategory.Transient,
+                QueuedAt = staleQueueEntryUtc,
+                StartedAt = staleQueueEntryUtc,
+                ClaimedAt = staleQueueEntryUtc.AddMinutes(10),
+                ExecutionStartedAt = staleQueueEntryUtc.AddMinutes(11),
+                LastHeartbeatAt = staleQueueEntryUtc.AddMinutes(20),
+                CompletedAt = nowUtc.UtcDateTime.AddHours(-6),
+                IsDeleted = false
+            }
+        };
+
+        var configs = new List<EngineConfig>
+        {
+            new()
+            {
+                Id = 1,
+                Key = "Optimization:MaxRetryAttempts",
+                Value = "2",
+                DataType = ConfigDataType.Int,
+                IsDeleted = false
+            }
+        };
+        var alerts = new List<Alert>();
+
+        var optRunDbSet = optimizationRuns.AsQueryable().BuildMockDbSet();
+        var configDbSet = configs.AsQueryable().BuildMockDbSet();
+        var alertDbSet = alerts.AsQueryable().BuildMockDbSet();
+
+        var db = new Mock<DbContext>();
+        db.Setup(c => c.Set<OptimizationRun>()).Returns(optRunDbSet.Object);
+        db.Setup(c => c.Set<EngineConfig>()).Returns(configDbSet.Object);
+        db.Setup(c => c.Set<Alert>()).Returns(alertDbSet.Object);
+
+        var readCtx = new Mock<IReadApplicationDbContext>();
+        readCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
+
+        var writeCtx = new Mock<IWriteApplicationDbContext>();
+        writeCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
+        writeCtx.Setup(x => x.SaveChangesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(1);
+
+        var timeProvider = new FixedTimeProvider(nowUtc);
+        await InvokeRetryFailedRunsAsync(readCtx.Object, writeCtx.Object, timeProvider);
+
+        var retriedRun = optimizationRuns.Single(r => r.Id == 4521);
+        Assert.Equal(OptimizationRunStatus.Queued, retriedRun.Status);
+        Assert.Equal(nowUtc.UtcDateTime, retriedRun.QueuedAt);
+        Assert.Null(retriedRun.ClaimedAt);
+        Assert.Null(retriedRun.ExecutionStartedAt);
+        Assert.Null(retriedRun.LastHeartbeatAt);
+
+        await InvokeRecoverStaleQueuedRunsAsync(readCtx.Object, writeCtx.Object, timeProvider);
+
+        Assert.Equal(OptimizationRunStatus.Queued, retriedRun.Status);
     }
 
     [Fact]
@@ -2992,17 +3205,7 @@ public class OptimizationWorkerTest
         writeCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
         writeCtx.Setup(x => x.SaveChangesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(1);
 
-        var worker = CreateWorker(
-            scopeFactory: CreateWorkerScopeFactory(configureServices: services =>
-            {
-                services.AddSingleton(readCtx.Object);
-                services.AddSingleton(writeCtx.Object);
-            }));
-        var method = typeof(OptimizationWorker).GetMethod(
-            "RetryFailedRunsAsync",
-            BindingFlags.NonPublic | BindingFlags.Instance)!;
-
-        await (Task)method.Invoke(worker, [CancellationToken.None])!;
+        await InvokeRetryFailedRunsAsync(readCtx.Object, writeCtx.Object);
 
         var abandonedRun = optimizationRuns.Single(r => r.Id == 453);
         Assert.Equal(OptimizationRunStatus.Abandoned, abandonedRun.Status);
@@ -3104,6 +3307,33 @@ public class OptimizationWorkerTest
 
         OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Completed, DateTime.UtcNow);
 
+        Assert.Null(run.ExecutionLeaseToken);
+        Assert.Null(run.ExecutionLeaseExpiresAt);
+    }
+
+    [Fact]
+    public void StateMachine_Transition_ToQueued_RefreshesQueueLifecycleTimestamps()
+    {
+        var previousQueuedAt = new DateTime(2026, 04, 01, 9, 0, 0, DateTimeKind.Utc);
+        var requeuedAt = new DateTime(2026, 04, 08, 9, 0, 0, DateTimeKind.Utc);
+        var run = new OptimizationRun
+        {
+            Id = 103,
+            Status = OptimizationRunStatus.Running,
+            QueuedAt = previousQueuedAt,
+            ClaimedAt = previousQueuedAt.AddMinutes(15),
+            ExecutionStartedAt = previousQueuedAt.AddMinutes(16),
+            LastHeartbeatAt = previousQueuedAt.AddMinutes(25),
+            ExecutionLeaseToken = Guid.NewGuid(),
+            ExecutionLeaseExpiresAt = previousQueuedAt.AddMinutes(35)
+        };
+
+        OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Queued, requeuedAt);
+
+        Assert.Equal(requeuedAt, run.QueuedAt);
+        Assert.Null(run.ClaimedAt);
+        Assert.Null(run.ExecutionStartedAt);
+        Assert.Null(run.LastHeartbeatAt);
         Assert.Null(run.ExecutionLeaseToken);
         Assert.Null(run.ExecutionLeaseExpiresAt);
     }
@@ -4798,6 +5028,105 @@ public class OptimizationWorkerTest
                 Trades = []
             });
         }
+    }
+
+    private sealed class FixedTimeProvider(DateTimeOffset nowUtc) : TimeProvider
+    {
+        public override DateTimeOffset GetUtcNow() => nowUtc;
+    }
+
+    private sealed class BlockingOptimizationRunProcessor(int blockingCalls) : IOptimizationRunProcessor
+    {
+        private int _startedCalls;
+        private int _activeCalls;
+        private int _maxConcurrentCalls;
+
+        public int MaxConcurrentCalls => Volatile.Read(ref _maxConcurrentCalls);
+        public TaskCompletionSource AllBlockingCallsStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task<bool> ProcessNextQueuedRunAsync(CancellationToken ct)
+        {
+            int callNumber = Interlocked.Increment(ref _startedCalls);
+            if (callNumber > blockingCalls)
+                return false;
+
+            int activeCalls = Interlocked.Increment(ref _activeCalls);
+            UpdateMaxConcurrentCalls(activeCalls);
+
+            if (callNumber == blockingCalls)
+                AllBlockingCallsStarted.TrySetResult();
+
+            try
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _activeCalls);
+            }
+
+            return false;
+        }
+
+        private void UpdateMaxConcurrentCalls(int activeCalls)
+        {
+            int snapshot;
+            do
+            {
+                snapshot = Volatile.Read(ref _maxConcurrentCalls);
+                if (snapshot >= activeCalls)
+                    return;
+            }
+            while (Interlocked.CompareExchange(ref _maxConcurrentCalls, activeCalls, snapshot) != snapshot);
+        }
+    }
+
+    private sealed class CountingLoopCoordinator : IOptimizationWorkerLoopCoordinator
+    {
+        private int _cycleCount;
+
+        public int CycleCount => Volatile.Read(ref _cycleCount);
+
+        public Task WarmStartAsync(CancellationToken ct) => Task.CompletedTask;
+
+        public Task ExecuteCycleAsync(OptimizationWorkerCycleContext cycleContext, CancellationToken ct)
+        {
+            Interlocked.Increment(ref _cycleCount);
+            return Task.CompletedTask;
+        }
+    }
+
+    private static async Task<int> WaitForCoordinatorCyclesAsync(
+        CountingLoopCoordinator loopCoordinator,
+        int minimumCycles,
+        TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow.Add(timeout);
+        while (DateTime.UtcNow < deadline)
+        {
+            int current = loopCoordinator.CycleCount;
+            if (current >= minimumCycles)
+                return current;
+
+            await Task.Delay(25);
+        }
+
+        return loopCoordinator.CycleCount;
+    }
+
+    private static async Task<OptimizationConfigProvider> CreatePrimedConfigProviderAsync(params EngineConfig[] configs)
+    {
+        var configProvider = new OptimizationConfigProvider(
+            Mock.Of<ILogger<OptimizationConfigProvider>>(),
+            TimeProvider.System);
+        var configDbSet = configs.AsQueryable().BuildMockDbSet();
+        var db = new Mock<DbContext>();
+        db.Setup(c => c.Set<EngineConfig>()).Returns(configDbSet.Object);
+        await configProvider.LoadAsync(db.Object, CancellationToken.None);
+        return configProvider;
     }
 
     private sealed class BaselineSelectionBacktestEngine : IBacktestEngine

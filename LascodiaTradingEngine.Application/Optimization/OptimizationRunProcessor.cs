@@ -15,8 +15,8 @@ using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.Optimization;
 
-[RegisterService(ServiceLifetime.Scoped)]
-internal sealed class OptimizationRunProcessor
+[RegisterService(ServiceLifetime.Scoped, typeof(IOptimizationRunProcessor))]
+internal sealed class OptimizationRunProcessor : IOptimizationRunProcessor
 {
     private static readonly ActivitySource s_activitySource = new("LascodiaTradingEngine.Optimization");
 
@@ -25,8 +25,9 @@ internal sealed class OptimizationRunProcessor
     private readonly TradingMetrics _metrics;
     private readonly OptimizationConfigProvider _configProvider;
     private readonly OptimizationRunPreflightService _preflightService;
-    private readonly OptimizationRunExecutor _runExecutor;
+    private readonly IOptimizationRunExecutor _runExecutor;
     private readonly OptimizationRunLeaseManager _leaseManager;
+    private readonly IOptimizationWorkerHealthStore _optimizationHealthStore;
     private readonly TimeProvider _timeProvider;
     private DateTime UtcNow => _timeProvider.GetUtcNow().UtcDateTime;
 
@@ -36,8 +37,9 @@ internal sealed class OptimizationRunProcessor
         TradingMetrics metrics,
         OptimizationConfigProvider configProvider,
         OptimizationRunPreflightService preflightService,
-        OptimizationRunExecutor runExecutor,
+        IOptimizationRunExecutor runExecutor,
         OptimizationRunLeaseManager leaseManager,
+        IOptimizationWorkerHealthStore optimizationHealthStore,
         TimeProvider timeProvider)
     {
         _scopeFactory = scopeFactory;
@@ -47,10 +49,11 @@ internal sealed class OptimizationRunProcessor
         _preflightService = preflightService;
         _runExecutor = runExecutor;
         _leaseManager = leaseManager;
+        _optimizationHealthStore = optimizationHealthStore;
         _timeProvider = timeProvider;
     }
 
-    internal async Task ProcessNextQueuedRunAsync(CancellationToken ct)
+    public async Task<bool> ProcessNextQueuedRunAsync(CancellationToken ct)
     {
         await using var scope = _scopeFactory.CreateAsyncScope();
         var readCtx = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
@@ -67,12 +70,14 @@ internal sealed class OptimizationRunProcessor
             maxConcurrentRuns = config0.MaxConcurrentRuns;
         }
 
+        var claimStopwatch = Stopwatch.StartNew();
         var claimResult = await OptimizationRunClaimer.ClaimNextRunAsync(
             writeDb,
             maxConcurrentRuns,
             OptimizationExecutionLeasePolicy.LeaseDuration,
             UtcNow,
             ct);
+        _metrics.OptimizationClaimLatencyMs.Record(claimStopwatch.Elapsed.TotalMilliseconds);
 
         if (!claimResult.RunId.HasValue)
         {
@@ -83,13 +88,18 @@ internal sealed class OptimizationRunProcessor
                 _logger.LogInformation(
                     "OptimizationRunProcessor: no queued runs and no active strategies — system may be in cold start. Ensure strategies are created and activated via StrategyGenerationWorker or manual configuration");
             }
-            return;
+            return false;
         }
 
         var run = await writeDb.Set<OptimizationRun>()
             .FirstOrDefaultAsync(x => x.Id == claimResult.RunId.Value, ct);
         if (run is null)
-            return;
+            return true;
+
+        var queueAnchorUtc = run.QueuedAt == default ? run.StartedAt : run.QueuedAt;
+        long queueWaitMs = Math.Max(0, (long)(UtcNow - queueAnchorUtc).TotalMilliseconds);
+        _metrics.OptimizationQueueWaitAtClaimMs.Record(queueWaitMs);
+        _optimizationHealthStore.RecordQueueWaitSample(queueWaitMs);
 
         if (claimResult.WasDeferred)
             _metrics.OptimizationDeferredRechecks.Add(1);
@@ -113,7 +123,7 @@ internal sealed class OptimizationRunProcessor
 
             config = await _preflightService.PrepareAsync(run, db, writeCtx, ct);
             if (config is null)
-                return;
+                return true;
 
             _logger.LogInformation(
                 "OptimizationRunProcessor: processing run {RunId} for strategy {StrategyId}",
@@ -163,7 +173,7 @@ internal sealed class OptimizationRunProcessor
                     ex,
                     "OptimizationRunProcessor: stopping stale owner for run {RunId} after lease ownership changed",
                     run.Id);
-                return;
+                return true;
             }
 
             if (await HasDurablePersistedTerminalResultAsync(writeDb, run.Id, CancellationToken.None))
@@ -172,7 +182,7 @@ internal sealed class OptimizationRunProcessor
                     "OptimizationRunProcessor: post-completion concurrency conflict for run {RunId} after result persistence — keeping status {Status}",
                     run.Id,
                     run.Status);
-                return;
+                return true;
             }
 
             _logger.LogError(ex, "OptimizationRunProcessor: concurrency conflict while processing run {RunId}", run.Id);
@@ -208,7 +218,7 @@ internal sealed class OptimizationRunProcessor
                     "OptimizationRunProcessor: aggregate timeout fired after completion persistence for run {RunId} — keeping status {Status}",
                     run.Id,
                     run.Status);
-                return;
+                return true;
             }
 
             _logger.LogWarning(
@@ -250,7 +260,7 @@ internal sealed class OptimizationRunProcessor
                     "OptimizationRunProcessor: shutdown cancellation arrived after completion persistence for run {RunId} — keeping status {Status}",
                     run.Id,
                     run.Status);
-                return;
+                return true;
             }
 
             _logger.LogWarning(
@@ -282,7 +292,7 @@ internal sealed class OptimizationRunProcessor
                     "OptimizationRunProcessor: post-completion step failed for run {RunId} after result persistence — keeping status {Status}",
                     run.Id,
                     run.Status);
-                return;
+                return true;
             }
 
             _logger.LogError(ex, "OptimizationRunProcessor: run {RunId} failed", run.Id);
@@ -339,6 +349,8 @@ internal sealed class OptimizationRunProcessor
 
             runCts?.Dispose();
         }
+
+        return true;
     }
 
     private async Task TryLogDecisionAsync(

@@ -38,6 +38,7 @@ internal static class OptimizationRunClaimer
     internal static async Task<ClaimResult> ClaimNextRunAsync(
         DbContext writeDb, int maxConcurrentRuns, TimeSpan leaseDuration, DateTime nowUtc, CancellationToken ct)
     {
+        EnsurePostgresProvider(writeDb);
         var leaseExpiry = nowUtc.Add(leaseDuration);
         var leaseToken = Guid.NewGuid();
         var tableName = GetQuotedTableName(writeDb, typeof(OptimizationRun));
@@ -58,13 +59,13 @@ internal static class OptimizationRunClaimer
                   AND (""DeferredUntilUtc"" IS NULL OR ""DeferredUntilUtc"" <= @nowUtc)
                   AND EXISTS (SELECT 1 FROM claim_guard WHERE acquired)
                   {concurrencyGuard}
-                ORDER BY ""StartedAt""
+                ORDER BY ""QueuedAt"", ""StartedAt"", ""Id""
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
             )
             UPDATE {tableName}
             SET ""Status"" = @runningStatus,
-                ""StartedAt"" = @nowUtc,
+                ""ClaimedAt"" = @nowUtc,
                 ""LastHeartbeatAt"" = @nowUtc,
                 ""ExecutionLeaseExpiresAt"" = @leaseExpiry,
                 ""ExecutionLeaseToken"" = @leaseToken,
@@ -136,11 +137,14 @@ internal static class OptimizationRunClaimer
                 .Where(r => toRequeue.Contains(r.Id))
                 .ExecuteUpdateAsync(s => s
                     .SetProperty(r => r.Status, OptimizationRunStatus.Queued)
-                    .SetProperty(r => r.StartedAt, nowUtc)
+                    .SetProperty(r => r.QueuedAt, nowUtc)
+                    .SetProperty(r => r.ClaimedAt, (DateTime?)null)
+                    .SetProperty(r => r.ExecutionStartedAt, (DateTime?)null)
                     .SetProperty(r => r.CompletedAt, (DateTime?)null)
                     .SetProperty(r => r.ApprovedAt, (DateTime?)null)
                     .SetProperty(r => r.ErrorMessage, (string?)null)
                     .SetProperty(r => r.FailureCategory, (OptimizationFailureCategory?)null)
+                    .SetProperty(r => r.LastHeartbeatAt, (DateTime?)null)
                     .SetProperty(r => r.DeferredUntilUtc, (DateTime?)null)
                     .SetProperty(r => r.ExecutionLeaseExpiresAt, (DateTime?)null)
                     .SetProperty(r => r.ExecutionLeaseToken, (Guid?)null), ct);
@@ -178,6 +182,26 @@ internal static class OptimizationRunClaimer
         parameter.ParameterName = name;
         parameter.Value = value ?? DBNull.Value;
         command.Parameters.Add(parameter);
+    }
+
+    private static void EnsurePostgresProvider(DbContext db)
+    {
+        const string postgresProvider = "Npgsql.EntityFrameworkCore.PostgreSQL";
+        string? providerName;
+        try
+        {
+            providerName = db.Database.ProviderName;
+        }
+        catch (InvalidOperationException)
+        {
+            providerName = null;
+        }
+
+        if (string.Equals(providerName, postgresProvider, StringComparison.Ordinal))
+            return;
+
+        throw new NotSupportedException(
+            $"OptimizationRunClaimer requires PostgreSQL ({postgresProvider}) because it relies on advisory locks and FOR UPDATE SKIP LOCKED. Actual provider: {providerName ?? "<unknown>"}.");
     }
 
     private static string GetQuotedTableName(DbContext db, Type entityType)

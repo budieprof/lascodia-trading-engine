@@ -2,7 +2,6 @@ using System.Collections.Concurrent;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.DependencyInjection;
 using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
@@ -56,6 +55,7 @@ public class WorkerHealthMonitor : IWorkerHealthMonitor
     public void RecordCycleSuccess(string workerName, long durationMs)
     {
         var state = _state.GetOrAdd(workerName, _ => new WorkerState());
+        state.IsRunning = true;
         state.LastSuccessAt = DateTime.UtcNow;
         state.IsStopped = false; // Reset stopped flag — worker is clearly alive
         Interlocked.Exchange(ref state.ConsecutiveFailures, 0);
@@ -69,6 +69,8 @@ public class WorkerHealthMonitor : IWorkerHealthMonitor
     public void RecordCycleFailure(string workerName, string errorMessage)
     {
         var state = _state.GetOrAdd(workerName, _ => new WorkerState());
+        state.IsRunning = true;
+        state.IsStopped = false;
         state.LastErrorAt = DateTime.UtcNow;
         state.LastErrorMessage = errorMessage.Length > 500 ? errorMessage[..500] : errorMessage;
         Interlocked.Increment(ref state.ConsecutiveFailures);
@@ -78,7 +80,16 @@ public class WorkerHealthMonitor : IWorkerHealthMonitor
     public void RecordBacklogDepth(string workerName, int depth)
     {
         var state = _state.GetOrAdd(workerName, _ => new WorkerState());
+        state.IsRunning = true;
         state.BacklogDepth = depth;
+    }
+
+    public void RecordWorkerHeartbeat(string workerName)
+    {
+        var state = _state.GetOrAdd(workerName, _ => new WorkerState());
+        state.IsRunning = true;
+        state.IsStopped = false;
+        state.LastSuccessAt = DateTime.UtcNow;
     }
 
     public IReadOnlyList<WorkerHealthSnapshot> GetCurrentSnapshots()
@@ -160,11 +171,15 @@ public class WorkerHealthMonitor : IWorkerHealthMonitor
         }
     }
 
-    public void RecordWorkerMetadata(string workerName, string purpose, TimeSpan expectedInterval)
+    public void RecordWorkerMetadata(string workerName, string? purpose, TimeSpan expectedInterval)
     {
         var state = _state.GetOrAdd(workerName, _ => new WorkerState());
+        int intervalSeconds = Math.Max(1, (int)expectedInterval.TotalSeconds);
+        state.IsRunning = true;
+        state.IsStopped = false;
         Volatile.Write(ref state.Purpose, purpose);
-        Volatile.Write(ref state.ExpectedIntervalSeconds, (int)expectedInterval.TotalSeconds);
+        Volatile.Write(ref state.ExpectedIntervalSeconds, intervalSeconds);
+        state.ConfiguredIntervalSeconds = intervalSeconds;
     }
 
     public void RecordWorkerStopped(string workerName, string? errorMessage = null)

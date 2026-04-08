@@ -35,9 +35,6 @@ public sealed class OptimizationWorkerHealthRecorder
         OptimizationRunRecoveryCoordinator.LifecycleReconciliationSummary? reconciliationSummary,
         CancellationToken ct)
     {
-        if (_healthMonitor is null)
-            return;
-
         await using var scope = _scopeFactory.CreateAsyncScope();
         var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
         var writeDb = writeCtx.GetDbContext();
@@ -124,9 +121,18 @@ public sealed class OptimizationWorkerHealthRecorder
                 r.ExecutionStageUpdatedAt
             })
             .FirstOrDefaultAsync(ct);
+        var oldestQueuedRun = await writeDb.Set<OptimizationRun>()
+            .Where(r => !r.IsDeleted && r.Status == OptimizationRunStatus.Queued)
+            .OrderBy(r => r.QueuedAt == default ? r.StartedAt : r.QueuedAt)
+            .Select(r => new
+            {
+                r.Id,
+                QueuedAtUtc = r.QueuedAt == default ? r.StartedAt : r.QueuedAt
+            })
+            .FirstOrDefaultAsync(ct);
 
-        _healthMonitor.RecordBacklogDepth("OptimizationWorker", queuedRuns);
-        _optimizationHealthStore.UpdateMainWorkerState(new OptimizationWorkerHealthStateSnapshot
+        _healthMonitor?.RecordBacklogDepth(OptimizationWorkerHealthNames.CoordinatorWorker, queuedRuns);
+        _optimizationHealthStore.UpdateMainWorkerState(current => current with
         {
             QueuedRuns = queuedRuns,
             RunningRuns = runningRuns,
@@ -143,11 +149,13 @@ public sealed class OptimizationWorkerHealthRecorder
                 ? 0
                 : Math.Max(0, (int)(UtcNow - lastConfigRefreshUtc).TotalSeconds),
             ConfigRefreshDueAtUtc = nextConfigRefreshUtc,
-            ConfigRefreshIntervalSeconds = Math.Clamp(
-                config.SchedulePollSeconds,
-                30,
-                24 * 60 * 60),
+            ConfigRefreshIntervalSeconds = Math.Max(1, (int)OptimizationConfigProvider.GetCacheTtl().TotalSeconds),
             LastLifecycleReconciledAtUtc = reconciliationSummary?.LastActivityAtUtc,
+            OldestQueuedRunId = oldestQueuedRun?.Id,
+            OldestQueuedAtUtc = oldestQueuedRun?.QueuedAtUtc,
+            OldestQueuedAgeSeconds = oldestQueuedRun is null
+                ? 0
+                : Math.Max(0, (int)(UtcNow - oldestQueuedRun.QueuedAtUtc).TotalSeconds),
             OldestRunningRunId = oldestRunningRun?.Id,
             OldestRunningStage = oldestRunningRun?.ExecutionStage,
             OldestRunningStageMessage = oldestRunningRun?.ExecutionStageMessage,
@@ -156,6 +164,5 @@ public sealed class OptimizationWorkerHealthRecorder
             OldestStrandedLifecycleStatus = oldestStrandedLifecycleRun?.Status,
             OldestStrandedLifecycleAnchorAtUtc = oldestStrandedLifecycleRun?.AnchorAtUtc,
         });
-        _healthMonitor.RecordWorkerMetadata("OptimizationWorker", null, TimeSpan.FromSeconds(30));
     }
 }

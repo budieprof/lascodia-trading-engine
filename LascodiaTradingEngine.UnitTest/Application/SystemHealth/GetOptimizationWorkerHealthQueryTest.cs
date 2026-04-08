@@ -1,5 +1,6 @@
 using Moq;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Optimization;
 using LascodiaTradingEngine.Application.SystemHealth.Queries.GetOptimizationWorkerHealth;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
@@ -15,7 +16,7 @@ public class GetOptimizationWorkerHealthQueryTest
         {
             new()
             {
-                WorkerName = "OptimizationWorker",
+                WorkerName = OptimizationWorkerHealthNames.CoordinatorWorker,
                 IsRunning = true,
                 LastCycleDurationMs = 250,
                 CycleDurationP50Ms = 200,
@@ -29,7 +30,16 @@ public class GetOptimizationWorkerHealthQueryTest
             },
             new()
             {
-                WorkerName = "OptimizationCompletionReplayWorker",
+                WorkerName = OptimizationWorkerHealthNames.ExecutionWorker,
+                IsRunning = true,
+                LastSuccessAt = DateTime.Parse("2026-04-06T10:14:30Z").ToUniversalTime(),
+                LastCycleDurationMs = 0,
+                BacklogDepth = 0,
+                ConfiguredIntervalSeconds = 30,
+            },
+            new()
+            {
+                WorkerName = OptimizationWorkerHealthNames.CompletionReplayWorker,
                 IsRunning = true,
                 LastCycleDurationMs = 90,
                 BacklogDepth = 2,
@@ -42,6 +52,17 @@ public class GetOptimizationWorkerHealthQueryTest
         var optimizationHealthStore = new Mock<IOptimizationWorkerHealthStore>();
         optimizationHealthStore.Setup(x => x.GetMainWorkerState()).Returns(new OptimizationWorkerHealthStateSnapshot
         {
+            ActiveProcessingSlots = 2,
+            ConfiguredMaxConcurrentRuns = 3,
+            ProcessingSlotFailuresLastHour = 1,
+            LastProcessingSlotFailureAtUtc = DateTime.Parse("2026-04-06T10:12:00Z").ToUniversalTime(),
+            LastProcessingSlotFailureMessage = "processing slot failed",
+            QueueWaitP50Ms = 1_500,
+            QueueWaitP95Ms = 9_000,
+            QueueWaitP99Ms = 12_000,
+            OldestQueuedRunId = 77,
+            OldestQueuedAtUtc = DateTime.Parse("2026-04-06T10:00:00Z").ToUniversalTime(),
+            OldestQueuedAgeSeconds = 840,
             QueuedRuns = 4,
             RunningRuns = 2,
             RetryableFailedRuns = 1,
@@ -54,8 +75,13 @@ public class GetOptimizationWorkerHealthQueryTest
             LifecycleRepairsLastCycle = 4,
             LifecycleBatchesLastCycle = 2,
             ConfigCacheAgeSeconds = 12,
-            ConfigRefreshIntervalSeconds = 30,
+            ConfigRefreshIntervalSeconds = 60,
             ConfigRefreshDueAtUtc = DateTime.Parse("2026-04-06T10:15:00Z").ToUniversalTime(),
+            LastSuccessfulConfigRefreshAtUtc = DateTime.Parse("2026-04-06T10:14:00Z").ToUniversalTime(),
+            IsConfigLoadDegraded = true,
+            ConsecutiveConfigLoadFailures = 2,
+            LastConfigLoadFailureAtUtc = DateTime.Parse("2026-04-06T10:14:45Z").ToUniversalTime(),
+            LastConfigLoadFailureMessage = "configuration load failed",
             LastLifecycleReconciledAtUtc = DateTime.Parse("2026-04-06T10:14:30Z").ToUniversalTime(),
             OldestRunningRunId = 99,
             OldestRunningStage = OptimizationExecutionStage.Validation,
@@ -72,6 +98,19 @@ public class GetOptimizationWorkerHealthQueryTest
 
         Assert.True(response.status);
         Assert.NotNull(response.data);
+        Assert.NotNull(response.data!.CoordinatorWorker);
+        Assert.Equal(OptimizationWorkerHealthNames.CoordinatorWorker, response.data.CoordinatorWorker!.WorkerName);
+        Assert.Equal(2, response.data.ActiveProcessingSlots);
+        Assert.Equal(3, response.data.ConfiguredMaxConcurrentRuns);
+        Assert.Equal(1, response.data.ProcessingSlotFailuresLastHour);
+        Assert.Equal(DateTime.Parse("2026-04-06T10:12:00Z").ToUniversalTime(), response.data.LastProcessingSlotFailureAtUtc);
+        Assert.Equal("processing slot failed", response.data.LastProcessingSlotFailureMessage);
+        Assert.Equal(1_500, response.data.QueueWaitP50Ms);
+        Assert.Equal(9_000, response.data.QueueWaitP95Ms);
+        Assert.Equal(12_000, response.data.QueueWaitP99Ms);
+        Assert.Equal(77, response.data.OldestQueuedRunId);
+        Assert.Equal(DateTime.Parse("2026-04-06T10:00:00Z").ToUniversalTime(), response.data.OldestQueuedAtUtc);
+        Assert.Equal(840, response.data.OldestQueuedAgeSeconds);
         Assert.Equal(4, response.data!.QueuedRuns);
         Assert.Equal(2, response.data.RunningRuns);
         Assert.Equal(1, response.data.RetryableFailedRuns);
@@ -84,8 +123,13 @@ public class GetOptimizationWorkerHealthQueryTest
         Assert.Equal(4, response.data.LifecycleRepairsLastCycle);
         Assert.Equal(2, response.data.LifecycleBatchesLastCycle);
         Assert.Equal(12, response.data.ConfigCacheAgeSeconds);
-        Assert.Equal(30, response.data.ConfigRefreshIntervalSeconds);
+        Assert.Equal(60, response.data.ConfigRefreshIntervalSeconds);
         Assert.Equal(DateTime.Parse("2026-04-06T10:15:00Z").ToUniversalTime(), response.data.ConfigRefreshDueAtUtc);
+        Assert.Equal(DateTime.Parse("2026-04-06T10:14:00Z").ToUniversalTime(), response.data.LastSuccessfulConfigRefreshAtUtc);
+        Assert.True(response.data.IsConfigLoadDegraded);
+        Assert.Equal(2, response.data.ConsecutiveConfigLoadFailures);
+        Assert.Equal(DateTime.Parse("2026-04-06T10:14:45Z").ToUniversalTime(), response.data.LastConfigLoadFailureAtUtc);
+        Assert.Equal("configuration load failed", response.data.LastConfigLoadFailureMessage);
         Assert.Equal(DateTime.Parse("2026-04-06T10:14:30Z").ToUniversalTime(), response.data.LastLifecycleReconciledAtUtc);
         Assert.Equal(99, response.data.OldestRunningRunId);
         Assert.Equal(OptimizationExecutionStage.Validation, response.data.OldestRunningStage);
@@ -95,10 +139,10 @@ public class GetOptimizationWorkerHealthQueryTest
         Assert.Equal(OptimizationRunStatus.Approved, response.data.OldestStrandedLifecycleStatus);
         Assert.Equal(DateTime.Parse("2026-04-06T09:55:00Z").ToUniversalTime(), response.data.OldestStrandedLifecycleAnchorAtUtc);
         Assert.NotNull(response.data.OptimizationWorker);
-        Assert.Equal("OptimizationWorker", response.data.OptimizationWorker!.WorkerName);
-        Assert.Equal(250, response.data.OptimizationWorker.LastCycleDurationMs);
+        Assert.Equal(OptimizationWorkerHealthNames.ExecutionWorker, response.data.OptimizationWorker!.WorkerName);
+        Assert.Equal(0, response.data.OptimizationWorker.LastCycleDurationMs);
         Assert.NotNull(response.data.CompletionReplayWorker);
-        Assert.Equal("OptimizationCompletionReplayWorker", response.data.CompletionReplayWorker!.WorkerName);
+        Assert.Equal(OptimizationWorkerHealthNames.CompletionReplayWorker, response.data.CompletionReplayWorker!.WorkerName);
         Assert.Equal(90, response.data.CompletionReplayWorker.LastCycleDurationMs);
     }
 }

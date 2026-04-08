@@ -1,17 +1,11 @@
-using MediatR;
+using System.Diagnostics;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
-using LascodiaTradingEngine.Application.Backtesting.Models;
-using LascodiaTradingEngine.Application.Backtesting.Services;
 using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Optimization;
-using LascodiaTradingEngine.Domain.Entities;
-using LascodiaTradingEngine.Domain.Enums;
-using MarketRegimeEnum = LascodiaTradingEngine.Domain.Enums.MarketRegime;
 
 namespace LascodiaTradingEngine.Application.Workers;
 
@@ -21,16 +15,32 @@ namespace LascodiaTradingEngine.Application.Workers;
 /// </summary>
 public class OptimizationWorker : BackgroundService
 {
-    private static readonly TimeSpan PollingInterval = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan DefaultPollingInterval = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan DefaultShutdownDrainTimeout = TimeSpan.FromSeconds(30);
+    private const int ProcessingFailureWindowMinutes = 60;
 
     private readonly ILogger<OptimizationWorker> _logger;
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly TradingMetrics _metrics;
+    private readonly IWorkerHealthMonitor? _healthMonitor;
+    private readonly IOptimizationWorkerHealthStore _optimizationHealthStore;
     private readonly OptimizationConfigProvider _configProvider;
-    private readonly OptimizationSchedulingCoordinator _schedulingCoordinator;
-    private readonly OptimizationChronicFailureEscalator _chronicFailureEscalator;
-    private readonly OptimizationWorkerHealthRecorder _healthRecorder;
+    private readonly IOptimizationWorkerLoopCoordinator _loopCoordinator;
     private readonly TimeProvider _timeProvider;
+    private readonly TimeSpan _pollingInterval;
+    private readonly TimeSpan _shutdownDrainTimeout;
+    private readonly object _processingTasksGate = new();
+    private readonly object _runtimeStateGate = new();
+    private readonly HashSet<Task> _processingTasks = [];
+    private readonly Queue<DateTime> _processingSlotFailureTimestamps = [];
+    private int _configuredMaxConcurrentRuns = 1;
+    private DateTime? _lastProcessingSlotFailureAtUtc;
+    private string? _lastProcessingSlotFailureMessage;
+    private DateTime? _lastSuccessfulConfigRefreshAtUtc;
+    private bool _isConfigLoadDegraded;
+    private int _consecutiveConfigLoadFailures;
+    private DateTime? _lastConfigLoadFailureAtUtc;
+    private string? _lastConfigLoadFailureMessage;
 
     private DateTime _nextScheduleScanUtc = DateTime.MinValue;
 
@@ -40,208 +50,386 @@ public class OptimizationWorker : BackgroundService
         ILogger<OptimizationWorker> logger,
         IServiceScopeFactory scopeFactory,
         TradingMetrics metrics,
+        IWorkerHealthMonitor? healthMonitor,
+        IOptimizationWorkerHealthStore optimizationHealthStore,
         OptimizationConfigProvider configProvider,
-        OptimizationSchedulingCoordinator schedulingCoordinator,
-        OptimizationChronicFailureEscalator chronicFailureEscalator,
-        OptimizationWorkerHealthRecorder healthRecorder,
+        IServiceProvider serviceProvider,
         TimeProvider timeProvider)
+        : this(
+            logger,
+            scopeFactory,
+            metrics,
+            healthMonitor,
+            optimizationHealthStore,
+            configProvider,
+            serviceProvider.GetRequiredService<IOptimizationWorkerLoopCoordinator>(),
+            timeProvider,
+            DefaultPollingInterval,
+            DefaultShutdownDrainTimeout)
+    {
+    }
+
+    internal OptimizationWorker(
+        ILogger<OptimizationWorker> logger,
+        IServiceScopeFactory scopeFactory,
+        TradingMetrics metrics,
+        IWorkerHealthMonitor? healthMonitor,
+        IOptimizationWorkerHealthStore optimizationHealthStore,
+        OptimizationConfigProvider configProvider,
+        IOptimizationWorkerLoopCoordinator loopCoordinator,
+        TimeProvider timeProvider,
+        TimeSpan pollingInterval,
+        TimeSpan shutdownDrainTimeout)
     {
         _logger = logger;
         _scopeFactory = scopeFactory;
         _metrics = metrics;
+        _healthMonitor = healthMonitor;
+        _optimizationHealthStore = optimizationHealthStore;
         _configProvider = configProvider;
-        _schedulingCoordinator = schedulingCoordinator;
-        _chronicFailureEscalator = chronicFailureEscalator;
-        _healthRecorder = healthRecorder;
+        _loopCoordinator = loopCoordinator;
         _timeProvider = timeProvider;
+        _pollingInterval = pollingInterval;
+        _shutdownDrainTimeout = shutdownDrainTimeout;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation("OptimizationWorker starting");
+        _healthMonitor?.RecordWorkerMetadata(
+            OptimizationWorkerHealthNames.CoordinatorWorker,
+            "Coordinates recovery, follow-up monitoring, scheduling, and processing-slot supervision.",
+            _pollingInterval);
+        _healthMonitor?.RecordWorkerMetadata(
+            OptimizationWorkerHealthNames.ExecutionWorker,
+            "Tracks optimization execution-slot liveness, queue-wait pressure, and concurrent capacity.",
+            _pollingInterval);
+        _healthMonitor?.RecordWorkerHeartbeat(OptimizationWorkerHealthNames.ExecutionWorker);
 
         try
         {
-            await using var recoveryScope = _scopeFactory.CreateAsyncScope();
-            var recoveryCoordinator = recoveryScope.ServiceProvider.GetRequiredService<OptimizationRunRecoveryCoordinator>();
-            await recoveryCoordinator.RecoverStaleRunningRunsAsync(stoppingToken);
+            await _loopCoordinator.WarmStartAsync(stoppingToken);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "OptimizationWorker: crash recovery check failed (non-fatal)");
         }
 
-        while (!stoppingToken.IsCancellationRequested)
+        try
         {
-            try
+            while (!stoppingToken.IsCancellationRequested)
             {
-                await RequeueExpiredRunningRunsAsync(stoppingToken);
-                await RecoverStaleQueuedRunsAsync(stoppingToken);
-                await RetryFailedRunsAsync(stoppingToken);
-                var reconciliationSummary = await ReconcileLifecycleStateAsync(stoppingToken);
-                await MonitorFollowUpResultsAsync(stoppingToken);
-
-                if (UtcNow >= _nextScheduleScanUtc)
+                var cycleStopwatch = Stopwatch.StartNew();
+                try
                 {
-                    await using var schedScope = _scopeFactory.CreateAsyncScope();
-                    var readCtx = schedScope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
-                    var writeCtx = schedScope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
-                    var db = readCtx.GetDbContext();
+                    _healthMonitor?.RecordWorkerMetadata(
+                        OptimizationWorkerHealthNames.CoordinatorWorker,
+                        "Coordinates recovery, follow-up monitoring, scheduling, and processing-slot supervision.",
+                        _pollingInterval);
+                    await ExecuteCoordinatorCycleAsync(stoppingToken);
+                    _healthMonitor?.RecordCycleSuccess(OptimizationWorkerHealthNames.CoordinatorWorker, cycleStopwatch.ElapsedMilliseconds);
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "OptimizationWorker: unexpected error in polling loop");
+                    _metrics.WorkerErrors.Add(1, new KeyValuePair<string, object?>("worker", OptimizationWorkerHealthNames.CoordinatorWorker));
+                    _healthMonitor?.RecordCycleFailure(OptimizationWorkerHealthNames.CoordinatorWorker, ex.Message);
 
-                    var config = await GetOrLoadConfigAsync(db, stoppingToken);
-                    _nextScheduleScanUtc = UtcNow.AddSeconds(config.SchedulePollSeconds);
-
-                    if (config.AutoScheduleEnabled)
-                        await AutoScheduleUnderperformersAsync(readCtx, writeCtx, config, stoppingToken);
+                    try
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+                    }
+                    catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                    {
+                        break;
+                    }
                 }
 
-                await ProcessNextQueuedRunAsync(stoppingToken);
-                await RecordHealthAsync(reconciliationSummary, stoppingToken);
+                try
+                {
+                    await Task.Delay(_pollingInterval, stoppingToken);
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    break;
+                }
             }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-            {
-                break;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "OptimizationWorker: unexpected error in polling loop");
-                _metrics.WorkerErrors.Add(1, new KeyValuePair<string, object?>("worker", "OptimizationWorker"));
-                await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
-            }
-
-            await Task.Delay(PollingInterval, stoppingToken);
         }
-
-        _logger.LogInformation("OptimizationWorker stopped");
+        finally
+        {
+            await DrainProcessingTasksAsync();
+            _healthMonitor?.RecordWorkerStopped(OptimizationWorkerHealthNames.ExecutionWorker);
+            _healthMonitor?.RecordWorkerStopped(OptimizationWorkerHealthNames.CoordinatorWorker);
+            _logger.LogInformation("OptimizationWorker stopped");
+        }
     }
 
-    internal async Task ProcessNextQueuedRunAsync(CancellationToken ct)
+    internal async Task<bool> ProcessNextQueuedRunAsync(CancellationToken ct)
     {
         await using var scope = _scopeFactory.CreateAsyncScope();
-        var runProcessor = scope.ServiceProvider.GetRequiredService<OptimizationRunProcessor>();
-        await runProcessor.ProcessNextQueuedRunAsync(ct);
-    }
-
-    private async Task RequeueExpiredRunningRunsAsync(CancellationToken ct)
-    {
-        await using var scope = _scopeFactory.CreateAsyncScope();
-        var recoveryCoordinator = scope.ServiceProvider.GetRequiredService<OptimizationRunRecoveryCoordinator>();
-        await recoveryCoordinator.RequeueExpiredRunningRunsAsync(ct);
-    }
-
-    private async Task RecoverStaleQueuedRunsAsync(CancellationToken ct)
-    {
-        await using var scope = _scopeFactory.CreateAsyncScope();
-        var recoveryCoordinator = scope.ServiceProvider.GetRequiredService<OptimizationRunRecoveryCoordinator>();
-        await recoveryCoordinator.RecoverStaleQueuedRunsAsync(ct);
-    }
-
-    private async Task RetryFailedRunsAsync(CancellationToken ct)
-    {
-        await using var scope = _scopeFactory.CreateAsyncScope();
-        var readCtx = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
-        var db = readCtx.GetDbContext();
-        var recoveryCoordinator = scope.ServiceProvider.GetRequiredService<OptimizationRunRecoveryCoordinator>();
-        var config = await GetOrLoadConfigAsync(db, ct);
-        await recoveryCoordinator.RetryFailedRunsAsync(config, ct);
-    }
-
-    private async Task<OptimizationRunRecoveryCoordinator.LifecycleReconciliationSummary> ReconcileLifecycleStateAsync(CancellationToken ct)
-    {
-        await using var scope = _scopeFactory.CreateAsyncScope();
-        var readCtx = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
-        var db = readCtx.GetDbContext();
-        var recoveryCoordinator = scope.ServiceProvider.GetRequiredService<OptimizationRunRecoveryCoordinator>();
-        var config = await GetOrLoadConfigAsync(db, ct);
-        return await recoveryCoordinator.ReconcileLifecycleStateAsync(config, ct);
-    }
-
-    private async Task MonitorFollowUpResultsAsync(CancellationToken ct)
-    {
-        await using var scope = _scopeFactory.CreateAsyncScope();
-        var readCtx = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
-        var db = readCtx.GetDbContext();
-        var followUpCoordinator = scope.ServiceProvider.GetRequiredService<OptimizationFollowUpCoordinator>();
-        var config = await GetOrLoadConfigAsync(db, ct);
-        await followUpCoordinator.MonitorAsync(config, ct);
-    }
-
-    private async Task AutoScheduleUnderperformersAsync(
-        IReadApplicationDbContext readCtx,
-        IWriteApplicationDbContext writeCtx,
-        OptimizationConfig config,
-        CancellationToken ct)
-        => await _schedulingCoordinator.AutoScheduleUnderperformersAsync(readCtx, writeCtx, config, ct);
-
-    private async Task EscalateChronicFailuresAsync(
-        DbContext db,
-        DbContext writeDb,
-        IWriteApplicationDbContext writeCtx,
-        IMediator mediator,
-        IAlertDispatcher alertDispatcher,
-        long strategyId,
-        string strategyName,
-        int maxConsecutiveFailures,
-        int baseCooldownDays,
-        CancellationToken ct)
-        => await _chronicFailureEscalator.EscalateAsync(
-            db,
-            writeDb,
-            writeCtx,
-            mediator,
-            alertDispatcher,
-            strategyId,
-            strategyName,
-            maxConsecutiveFailures,
-            baseCooldownDays,
-            ct);
-
-    internal async Task ApplyApprovalDecisionAsync(
-        RunContext ctx,
-        CandidateValidationResult vr,
-        MarketRegimeEnum? currentRegime,
-        DateTime candleLookbackStart,
-        BacktestOptions screeningOptions)
-    {
-        await using var scope = _scopeFactory.CreateAsyncScope();
-        var approvalCoordinator = scope.ServiceProvider.GetRequiredService<OptimizationApprovalCoordinator>();
-        await approvalCoordinator.ApplyAsync(
-            ctx,
-            ctx.Config.ToApprovalConfig(),
-            vr,
-            currentRegime,
-            candleLookbackStart,
-            screeningOptions);
-    }
-
-    internal async Task<DataLoadResult> LoadAndValidateCandlesAsync(
-        DbContext db,
-        OptimizationRun run,
-        Strategy strategy,
-        OptimizationConfig config,
-        CancellationToken runCt)
-    {
-        await using var scope = _scopeFactory.CreateAsyncScope();
-        var dataLoader = scope.ServiceProvider.GetRequiredService<OptimizationDataLoader>();
-        return await dataLoader.LoadAsync(db, run, strategy, config.ToDataLoadingConfig(), runCt);
+        var runProcessor = scope.ServiceProvider.GetRequiredService<IOptimizationRunProcessor>();
+        return await runProcessor.ProcessNextQueuedRunAsync(ct);
     }
 
     private async Task<OptimizationConfig> GetOrLoadConfigAsync(DbContext db, CancellationToken ct)
         => await _configProvider.LoadAsync(db, ct);
 
-    private async Task RecordHealthAsync(
-        OptimizationRunRecoveryCoordinator.LifecycleReconciliationSummary reconciliationSummary,
-        CancellationToken ct)
+    private async Task ExecuteCoordinatorCycleAsync(CancellationToken ct)
     {
-        var cacheSnapshot = _configProvider.GetCacheSnapshot();
-        if (cacheSnapshot.Config is null)
+        var cycleConfig = await LoadCycleConfigSnapshotAsync(ct);
+        bool shouldRunScheduling = UtcNow >= _nextScheduleScanUtc;
+        if (shouldRunScheduling)
+            _nextScheduleScanUtc = UtcNow.AddSeconds(cycleConfig.Config.SchedulePollSeconds);
+
+        await _loopCoordinator.ExecuteCycleAsync(
+            new OptimizationWorkerCycleContext(
+                cycleConfig.Config,
+                cycleConfig.LastConfigRefreshUtc,
+                cycleConfig.NextConfigRefreshUtc,
+                shouldRunScheduling && cycleConfig.Config.AutoScheduleEnabled),
+            ct);
+
+        await EnsureProcessingCapacityAsync(cycleConfig.Config.MaxConcurrentRuns, ct);
+    }
+
+    private async Task<CycleConfigSnapshot> LoadCycleConfigSnapshotAsync(CancellationToken ct)
+    {
+        await using var scope = _scopeFactory.CreateAsyncScope();
+
+        try
+        {
+            var readCtx = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+            var db = readCtx.GetDbContext();
+            var config = await GetOrLoadConfigAsync(db, ct);
+            var cacheSnapshot = _configProvider.GetCacheSnapshot();
+            lock (_runtimeStateGate)
+            {
+                _configuredMaxConcurrentRuns = Math.Max(1, config.MaxConcurrentRuns);
+                _lastSuccessfulConfigRefreshAtUtc = cacheSnapshot.LastLoadedAtUtc == default
+                    ? UtcNow
+                    : cacheSnapshot.LastLoadedAtUtc;
+                _isConfigLoadDegraded = false;
+                _consecutiveConfigLoadFailures = 0;
+                _lastConfigLoadFailureAtUtc = null;
+                _lastConfigLoadFailureMessage = null;
+            }
+
+            UpdateRuntimeHealthState();
+            return new CycleConfigSnapshot(
+                config,
+                cacheSnapshot.LastLoadedAtUtc,
+                cacheSnapshot.NextRefreshDueAtUtc);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            lock (_runtimeStateGate)
+            {
+                _isConfigLoadDegraded = true;
+                _consecutiveConfigLoadFailures++;
+                _lastConfigLoadFailureAtUtc = UtcNow;
+                _lastConfigLoadFailureMessage = TruncateErrorMessage(ex.Message);
+            }
+
+            UpdateRuntimeHealthState();
+            throw;
+        }
+    }
+
+    private Task EnsureProcessingCapacityAsync(int configuredMaxConcurrentRuns, CancellationToken ct)
+    {
+        int maxConcurrentRuns = Math.Max(1, configuredMaxConcurrentRuns);
+        lock (_runtimeStateGate)
+            _configuredMaxConcurrentRuns = maxConcurrentRuns;
+
+        PruneCompletedProcessingTasks();
+
+        int activeProcessingTasks = GetActiveProcessingTaskCount();
+        int slotsToLaunch = Math.Max(0, maxConcurrentRuns - activeProcessingTasks);
+        for (int i = 0; i < slotsToLaunch; i++)
+            StartProcessingSlot(ct);
+
+        int activeAfterLaunch = activeProcessingTasks + slotsToLaunch;
+        _metrics.OptimizationActiveProcessingSlots.Record(activeAfterLaunch);
+        _metrics.OptimizationProcessingSlotUtilization.Record((double)activeAfterLaunch / maxConcurrentRuns);
+        UpdateRuntimeHealthState();
+        return Task.CompletedTask;
+    }
+
+    private void StartProcessingSlot(CancellationToken ct)
+    {
+        var task = RunProcessingSlotAsync(ct);
+        lock (_processingTasksGate)
+            _processingTasks.Add(task);
+
+        _ = task.ContinueWith(
+            completedTask =>
+            {
+                lock (_processingTasksGate)
+                    _processingTasks.Remove(completedTask);
+            },
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+    }
+
+    private async Task RunProcessingSlotAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                if (!await ProcessNextQueuedRunAsync(ct))
+                    break;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "OptimizationWorker: processing slot crashed unexpectedly");
+                _metrics.WorkerErrors.Add(1, new KeyValuePair<string, object?>("worker", OptimizationWorkerHealthNames.ExecutionWorker));
+                RecordProcessingSlotFailure(ex);
+                break;
+            }
+        }
+
+        UpdateRuntimeHealthState();
+    }
+
+    private void PruneCompletedProcessingTasks()
+    {
+        lock (_processingTasksGate)
+            _processingTasks.RemoveWhere(task => task.IsCompleted);
+    }
+
+    private async Task DrainProcessingTasksAsync()
+    {
+        Task[] processingTasks;
+        lock (_processingTasksGate)
+            processingTasks = _processingTasks.ToArray();
+
+        if (processingTasks.Length == 0)
             return;
 
-        await _healthRecorder.RecordAsync(
-            cacheSnapshot.Config,
-            cacheSnapshot.LastLoadedAtUtc,
-            cacheSnapshot.NextRefreshDueAtUtc,
-            reconciliationSummary,
-            ct);
+        try
+        {
+            var allProcessingTasks = Task.WhenAll(processingTasks);
+            var completedTask = await Task.WhenAny(
+                allProcessingTasks,
+                Task.Delay(_shutdownDrainTimeout));
+
+            if (completedTask != allProcessingTasks)
+            {
+                _logger.LogWarning(
+                    "OptimizationWorker: shutdown drain timed out after {TimeoutSeconds}s with {Remaining} processing slot(s) still active",
+                    _shutdownDrainTimeout.TotalSeconds,
+                    processingTasks.Count(task => !task.IsCompleted));
+                return;
+            }
+
+            await allProcessingTasks;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "OptimizationWorker: processing slot shutdown observed a non-fatal exception");
+        }
     }
+
+    private void RecordProcessingSlotFailure(Exception ex)
+    {
+        lock (_runtimeStateGate)
+        {
+            _processingSlotFailureTimestamps.Enqueue(UtcNow);
+            PruneProcessingSlotFailuresLocked();
+            _lastProcessingSlotFailureAtUtc = UtcNow;
+            _lastProcessingSlotFailureMessage = TruncateErrorMessage(ex.Message);
+        }
+
+        UpdateRuntimeHealthState();
+    }
+
+    private void UpdateRuntimeHealthState()
+    {
+        int activeProcessingSlots = GetActiveProcessingTaskCount();
+        int processingSlotFailuresLastHour;
+        int configuredMaxConcurrentRuns;
+        DateTime? lastProcessingSlotFailureAtUtc;
+        string? lastProcessingSlotFailureMessage;
+        DateTime? lastSuccessfulConfigRefreshAtUtc;
+        bool isConfigLoadDegraded;
+        int consecutiveConfigLoadFailures;
+        DateTime? lastConfigLoadFailureAtUtc;
+        string? lastConfigLoadFailureMessage;
+
+        lock (_runtimeStateGate)
+        {
+            PruneProcessingSlotFailuresLocked();
+            processingSlotFailuresLastHour = _processingSlotFailureTimestamps.Count;
+            configuredMaxConcurrentRuns = _configuredMaxConcurrentRuns;
+            lastProcessingSlotFailureAtUtc = _lastProcessingSlotFailureAtUtc;
+            lastProcessingSlotFailureMessage = _lastProcessingSlotFailureMessage;
+            lastSuccessfulConfigRefreshAtUtc = _lastSuccessfulConfigRefreshAtUtc;
+            isConfigLoadDegraded = _isConfigLoadDegraded;
+            consecutiveConfigLoadFailures = _consecutiveConfigLoadFailures;
+            lastConfigLoadFailureAtUtc = _lastConfigLoadFailureAtUtc;
+            lastConfigLoadFailureMessage = _lastConfigLoadFailureMessage;
+        }
+
+        var queueWaitPercentiles = _optimizationHealthStore.GetQueueWaitPercentiles();
+        _healthMonitor?.RecordWorkerHeartbeat(OptimizationWorkerHealthNames.ExecutionWorker);
+        _optimizationHealthStore.UpdateMainWorkerState(current => current with
+        {
+            ActiveProcessingSlots = activeProcessingSlots,
+            ConfiguredMaxConcurrentRuns = configuredMaxConcurrentRuns,
+            ProcessingSlotFailuresLastHour = processingSlotFailuresLastHour,
+            LastProcessingSlotFailureAtUtc = lastProcessingSlotFailureAtUtc,
+            LastProcessingSlotFailureMessage = lastProcessingSlotFailureMessage,
+            QueueWaitP50Ms = queueWaitPercentiles.P50Ms,
+            QueueWaitP95Ms = queueWaitPercentiles.P95Ms,
+            QueueWaitP99Ms = queueWaitPercentiles.P99Ms,
+            LastSuccessfulConfigRefreshAtUtc = lastSuccessfulConfigRefreshAtUtc,
+            IsConfigLoadDegraded = isConfigLoadDegraded,
+            ConsecutiveConfigLoadFailures = consecutiveConfigLoadFailures,
+            LastConfigLoadFailureAtUtc = lastConfigLoadFailureAtUtc,
+            LastConfigLoadFailureMessage = lastConfigLoadFailureMessage,
+        });
+    }
+
+    private int GetActiveProcessingTaskCount()
+    {
+        lock (_processingTasksGate)
+            return _processingTasks.Count;
+    }
+
+    private void PruneProcessingSlotFailuresLocked()
+    {
+        var cutoff = UtcNow.AddMinutes(-ProcessingFailureWindowMinutes);
+        while (_processingSlotFailureTimestamps.Count > 0
+            && _processingSlotFailureTimestamps.Peek() < cutoff)
+        {
+            _processingSlotFailureTimestamps.Dequeue();
+        }
+    }
+
+    private static string? TruncateErrorMessage(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return value;
+
+        return value.Length <= 500 ? value : value[..500];
+    }
+
+    private readonly record struct CycleConfigSnapshot(
+        OptimizationConfig Config,
+        DateTime LastConfigRefreshUtc,
+        DateTime NextConfigRefreshUtc);
 }

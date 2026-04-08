@@ -9,8 +9,16 @@ namespace LascodiaTradingEngine.Application.Common.Interfaces;
 public interface IOptimizationWorkerHealthStore
 {
     void UpdateMainWorkerState(OptimizationWorkerHealthStateSnapshot snapshot);
+    void UpdateMainWorkerState(Func<OptimizationWorkerHealthStateSnapshot, OptimizationWorkerHealthStateSnapshot> updater);
+    void RecordQueueWaitSample(long queueWaitMs);
+    QueueWaitPercentileSnapshot GetQueueWaitPercentiles();
     OptimizationWorkerHealthStateSnapshot GetMainWorkerState();
 }
+
+public readonly record struct QueueWaitPercentileSnapshot(
+    long P50Ms,
+    long P95Ms,
+    long P99Ms);
 
 public sealed record OptimizationWorkerHealthStateSnapshot
 {
@@ -28,6 +36,22 @@ public sealed record OptimizationWorkerHealthStateSnapshot
     public int ConfigCacheAgeSeconds { get; init; }
     public DateTime? ConfigRefreshDueAtUtc { get; init; }
     public int ConfigRefreshIntervalSeconds { get; init; }
+    public int ActiveProcessingSlots { get; init; }
+    public int ConfiguredMaxConcurrentRuns { get; init; }
+    public int ProcessingSlotFailuresLastHour { get; init; }
+    public DateTime? LastProcessingSlotFailureAtUtc { get; init; }
+    public string? LastProcessingSlotFailureMessage { get; init; }
+    public long QueueWaitP50Ms { get; init; }
+    public long QueueWaitP95Ms { get; init; }
+    public long QueueWaitP99Ms { get; init; }
+    public long? OldestQueuedRunId { get; init; }
+    public DateTime? OldestQueuedAtUtc { get; init; }
+    public int OldestQueuedAgeSeconds { get; init; }
+    public DateTime? LastSuccessfulConfigRefreshAtUtc { get; init; }
+    public bool IsConfigLoadDegraded { get; init; }
+    public int ConsecutiveConfigLoadFailures { get; init; }
+    public DateTime? LastConfigLoadFailureAtUtc { get; init; }
+    public string? LastConfigLoadFailureMessage { get; init; }
     public DateTime? LastLifecycleReconciledAtUtc { get; init; }
     public long? OldestRunningRunId { get; init; }
     public OptimizationExecutionStage? OldestRunningStage { get; init; }

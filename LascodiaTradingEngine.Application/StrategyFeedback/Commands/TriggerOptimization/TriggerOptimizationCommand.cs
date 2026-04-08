@@ -50,7 +50,8 @@ public class TriggerOptimizationCommandHandler : IRequestHandler<TriggerOptimiza
             .Where(r => r.StrategyId == request.StrategyId
                      && !r.IsDeleted
                      && (r.Status == OptimizationRunStatus.Queued || r.Status == OptimizationRunStatus.Running))
-            .OrderBy(r => r.StartedAt)
+            .OrderBy(r => r.QueuedAt)
+            .ThenBy(r => r.StartedAt)
             .FirstOrDefaultAsync(cancellationToken);
 
         if (activeRun is not null)
@@ -83,7 +84,8 @@ public class TriggerOptimizationCommandHandler : IRequestHandler<TriggerOptimiza
                 .Where(r => r.StrategyId == request.StrategyId
                          && !r.IsDeleted
                          && (r.Status == OptimizationRunStatus.Queued || r.Status == OptimizationRunStatus.Running))
-                .OrderBy(r => r.StartedAt)
+                .OrderBy(r => r.QueuedAt)
+                .ThenBy(r => r.StartedAt)
                 .FirstOrDefaultAsync(cancellationToken);
 
             if (activeRun is not null)

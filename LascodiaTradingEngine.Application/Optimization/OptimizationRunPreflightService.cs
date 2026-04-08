@@ -47,6 +47,7 @@ internal sealed class OptimizationRunPreflightService
         _validator.SetInitialBalance(config.ScreeningInitialBalance);
         _validator.EnableCache();
         EnsureDeterministicSeed(run);
+        run.ExecutionStartedAt ??= nowUtc;
         SetRunStage(
             run,
             OptimizationExecutionStage.Preflight,

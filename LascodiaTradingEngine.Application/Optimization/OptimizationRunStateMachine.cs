@@ -41,11 +41,14 @@ internal static class OptimizationRunStateMachine
         switch (to)
         {
             case OptimizationRunStatus.Queued:
-                run.StartedAt = utcNow;
+                run.QueuedAt = utcNow;
+                run.ClaimedAt = null;
+                run.ExecutionStartedAt = null;
                 run.CompletedAt = null;
                 run.ApprovedAt = null;
                 run.ErrorMessage = null;
                 run.FailureCategory = null;
+                run.LastHeartbeatAt = null;
                 run.ExecutionLeaseExpiresAt = null;
                 run.ExecutionLeaseToken = null;
                 break;

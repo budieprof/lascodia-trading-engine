@@ -127,6 +127,10 @@ public sealed class TradingMetrics
     public Histogram<double> OptimizationComputeSeconds { get; }
     public Histogram<double> OptimizationPhaseDurationMs { get; }
     public Histogram<double> OptimizationCycleDurationMs { get; }
+    public Histogram<double> OptimizationClaimLatencyMs { get; }
+    public Histogram<double> OptimizationQueueWaitAtClaimMs { get; }
+    public Histogram<double> OptimizationActiveProcessingSlots { get; }
+    public Histogram<double> OptimizationProcessingSlotUtilization { get; }
     public Histogram<double> EhviHypervolumeProgress { get; }
     public Histogram<double> EhviGpPredictionError { get; }
     public Counter<long>     OptimizationSurrogateClamps { get; }
@@ -316,6 +320,10 @@ public sealed class TradingMetrics
         OptimizationComputeSeconds = _meter.CreateHistogram<double>("trading.optimization.compute_seconds", "seconds", "Total backtest compute time per optimization run");
         OptimizationPhaseDurationMs = _meter.CreateHistogram<double>("trading.optimization.phase_duration_ms", "ms", "Duration of individual optimization phases (tagged by phase)");
         OptimizationCycleDurationMs = _meter.CreateHistogram<double>("trading.optimization.cycle_duration_ms", "ms", "Duration of a single optimization run");
+        OptimizationClaimLatencyMs = _meter.CreateHistogram<double>("trading.optimization.claim_latency_ms", "ms", "Latency of the atomic queued-run claim operation");
+        OptimizationQueueWaitAtClaimMs = _meter.CreateHistogram<double>("trading.optimization.queue_wait_at_claim_ms", "ms", "How long a run waited in the queue before being claimed");
+        OptimizationActiveProcessingSlots = _meter.CreateHistogram<double>("trading.optimization.active_processing_slots", "slots", "Active optimization processing slots observed by the coordinator");
+        OptimizationProcessingSlotUtilization = _meter.CreateHistogram<double>("trading.optimization.processing_slot_utilization", "ratio", "Observed ratio of active optimization slots to configured max concurrency");
         EhviHypervolumeProgress = _meter.CreateHistogram<double>("trading.optimization.ehvi_hypervolume", "volume", "Pareto front hypervolume after each EHVI batch (tracks multi-objective search progress)");
         EhviGpPredictionError = _meter.CreateHistogram<double>("trading.optimization.ehvi_gp_prediction_error", "error", "Per-objective GP mean absolute prediction error per batch");
         OptimizationSurrogateClamps = _meter.CreateCounter<long>("trading.optimization.surrogate_clamps", "clamps", "GP Cholesky diagonal clamps indicating ill-conditioned surrogate");
