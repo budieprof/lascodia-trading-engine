@@ -783,7 +783,7 @@ public sealed class TabNetModelTrainer : IMLModelTrainer
 
                 // Fix 5: Compute batch statistics at the start of each epoch from a ghost batch.
                 // These are used during training forward passes instead of running stats.
-                var (epochBatchMeans, epochBatchVars) = ComputeEpochBatchStats(w, fitSet, ghostBatchSize);
+                var (epochBatchMeans, epochBatchVars) = ComputeEpochBatchStats(w, fitSet, ghostBatchSize, epochRng);
 
                 for (int ii = 0; ii < nFit; ii++)
                 {
@@ -909,7 +909,8 @@ public sealed class TabNetModelTrainer : IMLModelTrainer
         public double[][][] StepStepXNorm   = [];  // [step][layer][hiddenDim]
         public double[][][] StepStepFcIn    = [];  // [step][layer][inDim]
         public double[][] StepAttnPre = [];    // [step][F] — pre-sparsemax logits
-        public double[]   PriorScales = [];    // [F]
+        public double[]   PriorScales = [];    // [F] — final prior scales (after all steps)
+        public double[][] StepPriorScales = []; // [step][F] — per-step prior scales (before attention)
 
         /// <summary>Pre-allocate all inner arrays for the given architecture dimensions.</summary>
         public static ForwardResult Allocate(int nSteps, int F, int H, int sharedLayers, int stepLayers)
@@ -922,6 +923,7 @@ public sealed class TabNetModelTrainer : IMLModelTrainer
                 StepMasked   = AllocJagged(nSteps, F),
                 StepAttnPre  = AllocJagged(nSteps, F),
                 PriorScales  = new double[F],
+                StepPriorScales = AllocJagged(nSteps, F),
                 StepSharedPre   = Alloc3(nSteps, sharedLayers, H),
                 StepSharedGate  = Alloc3(nSteps, sharedLayers, H),
                 StepSharedXNorm = Alloc3(nSteps, sharedLayers, H),
@@ -992,6 +994,9 @@ public sealed class TabNetModelTrainer : IMLModelTrainer
 
         for (int s = 0; s < nSteps; s++)
         {
+            // Save per-step prior scales before they are modified by this step's attention
+            Array.Copy(priorScalesBuf, 0, fwd.StepPriorScales[s], 0, F);
+
             // ── 1. Attentive Transformer: FC → BN → Sparsemax ────────
             var attnInput = new double[F];
             if (s == 0)
@@ -1350,9 +1355,11 @@ public sealed class TabNetModelTrainer : IMLModelTrainer
     /// Fix 5: Computes per-BN-layer batch statistics from a ghost-batch subsample.
     /// Returns (means[bnIdx][dim], vars[bnIdx][dim]) for use during training forward passes.
     /// Same traversal as UpdateBnRunningStats but returns the stats instead of updating running values.
+    /// The <paramref name="epochRng"/> randomizes which samples are used each epoch for
+    /// additional regularization (true ghost BN behavior).
     /// </summary>
     private static (double[][] Means, double[][] Vars) ComputeEpochBatchStats(
-        TabNetWeights w, List<TrainingSample> fitSet, int ghostBatchSize)
+        TabNetWeights w, List<TrainingSample> fitSet, int ghostBatchSize, Random epochRng)
     {
         int batchN = Math.Min(fitSet.Count, ghostBatchSize);
         var means = new double[w.TotalBnLayers][];
@@ -1365,6 +1372,15 @@ public sealed class TabNetModelTrainer : IMLModelTrainer
         }
 
         if (batchN < 10) return (means, vars);
+
+        // Shuffle sample indices so each epoch uses a different ghost-batch subset
+        var ghostIndices = new int[fitSet.Count];
+        for (int i = 0; i < ghostIndices.Length; i++) ghostIndices[i] = i;
+        for (int i = ghostIndices.Length - 1; i > 0; i--)
+        {
+            int k = epochRng.Next(i + 1);
+            (ghostIndices[k], ghostIndices[i]) = (ghostIndices[i], ghostIndices[k]);
+        }
 
         var layerSums  = new double[w.TotalBnLayers][];
         var layerSqSum = new double[w.TotalBnLayers][];
@@ -1380,7 +1396,7 @@ public sealed class TabNetModelTrainer : IMLModelTrainer
 
         for (int si = 0; si < batchN; si++)
         {
-            var sample = fitSet[si];
+            var sample = fitSet[ghostIndices[si]];
             Array.Fill(priorBuf, 1.0, 0, w.F);
             double[] hPrev = new double[w.HiddenDim];
 
@@ -1693,14 +1709,14 @@ public sealed class TabNetModelTrainer : IMLModelTrainer
             // Propagate into AttnFcW/AttnFcB for s > 0:
             if (s > 0)
             {
-                // dAttnLogits[j] is ∂L/∂logit[j]. logit[j] = priorScale[j] * bnOut[j].
-                // Since we already applied priorScales in the forward, and bnOut is from FC projection,
-                // the gradient w.r.t. the FC output is dAttnLogits[j] * priorScales[j] (approximately).
+                // dAttnLogits[j] is ∂L/∂logit[j]. logit[j] = priorScale_s[j] * bnOut[j].
+                // Use per-step prior scales (saved during forward pass) for exact gradient.
                 // Then through BN (using the same var lookup as shared layers):
                 for (int j = 0; j < F; j++)
                 {
                     if (Math.Abs(dAttnLogits[j]) < 1e-20) continue;
-                    double prior = fwd.PriorScales.Length > j ? fwd.PriorScales[j] : 1.0;
+                    double prior = s < fwd.StepPriorScales.Length && j < fwd.StepPriorScales[s].Length
+                        ? fwd.StepPriorScales[s][j] : 1.0;
                     double dBnJ = dAttnLogits[j] * prior;
                     // Through BN: ∂/∂fc = γ/σ · dBnJ (attention BN at index s)
                     double bnVar = epochBatchVars is not null && s < epochBatchVars.Length && j < epochBatchVars[s].Length
@@ -2150,6 +2166,12 @@ public sealed class TabNetModelTrainer : IMLModelTrainer
         var priorBuf = new double[F];
         var attnBuf  = new double[F];
 
+        // Adam state for encoder weights during pre-training
+        var adam = InitializeAdamState(w);
+        var grad = InitializeGradAccumulator(w);
+        const int PretrainBatchSize = 32;
+        int batchCount = 0;
+
         for (int ep = 0; ep < epochs && !ct.IsCancellationRequested; ep++)
         {
             double cosLr = lr * 0.5 * (1.0 + Math.Cos(Math.PI * ep / epochs));
@@ -2184,16 +2206,168 @@ public sealed class TabNetModelTrainer : IMLModelTrainer
                         recon[j] += decoderW[j][k] * fwd.AggregatedH[k];
                 }
 
-                // MSE loss on masked features only, SGD update on decoder
+                // ── Compute ∂L/∂AggregatedH from reconstruction MSE on masked features ──
+                var dAggH = new double[hiddenDim];
                 for (int j = 0; j < F; j++)
                 {
                     if (!mask[j]) continue;
                     double err = recon[j] - sample.Features[j];
                     epochLoss += err * err;
-                    decoderB[j] -= cosLr * 2 * err / masked;
+                    double dRecon = 2.0 * err / masked;
+
+                    // SGD update on decoder
+                    decoderB[j] -= cosLr * dRecon;
                     for (int k = 0; k < hiddenDim; k++)
-                        decoderW[j][k] -= cosLr * 2 * err * fwd.AggregatedH[k] / masked;
+                    {
+                        dAggH[k] += dRecon * decoderW[j][k];
+                        decoderW[j][k] -= cosLr * dRecon * fwd.AggregatedH[k];
+                    }
                 }
+
+                // ── Backprop through encoder: dAggH → per-step ReLU → layers → attention ──
+                for (int s = nSteps - 1; s >= 0; s--)
+                {
+                    // ReLU gradient
+                    var dH = new double[hiddenDim];
+                    for (int j = 0; j < hiddenDim; j++)
+                        dH[j] = fwd.StepH[s][j] > 0 ? dAggH[j] : 0.0;
+
+                    // Step-specific layers backward
+                    var dInput = dH;
+                    for (int l = w.StepLayers - 1; l >= 0; l--)
+                    {
+                        double[] pre  = fwd.StepStepPre[s][l];
+                        double[] gate = fwd.StepStepGate[s][l];
+                        double[] xn   = fwd.StepStepXNorm[s][l];
+                        double[] fcIn = fwd.StepStepFcIn[s][l];
+                        int bnStIdx = w.NSteps + w.SharedLayers + s * w.StepLayers + l;
+
+                        double[] dResidual = null!;
+                        if (l > 0)
+                        {
+                            dResidual = new double[hiddenDim];
+                            for (int j = 0; j < hiddenDim; j++)
+                            {
+                                dResidual[j] = dInput[j] * 0.7071067811865476;
+                                dInput[j]    = dInput[j] * 0.7071067811865476;
+                            }
+                        }
+
+                        var dBnOut  = new double[hiddenDim];
+                        var dGateIn = new double[hiddenDim];
+                        for (int j = 0; j < hiddenDim; j++)
+                        {
+                            dBnOut[j]  = dInput[j] * gate[j];
+                            dGateIn[j] = dInput[j] * pre[j] * gate[j] * (1 - gate[j]);
+                        }
+
+                        var dPreFc = new double[hiddenDim];
+                        for (int j = 0; j < hiddenDim; j++)
+                        {
+                            grad.BnGamma[bnStIdx][j] += dBnOut[j] * xn[j];
+                            grad.BnBeta[bnStIdx][j]  += dBnOut[j];
+                            double var_ = w.BnVar[bnStIdx].Length > j ? w.BnVar[bnStIdx][j] : 1.0;
+                            dPreFc[j] = dBnOut[j] * w.BnGamma[bnStIdx][j] / Math.Sqrt(var_ + BnEpsilon);
+                        }
+
+                        var dNext = new double[hiddenDim];
+                        for (int i = 0; i < hiddenDim; i++)
+                        {
+                            for (int j = 0; j < hiddenDim && j < w.StepW[s][l][i].Length; j++)
+                            {
+                                double inp = j < fcIn.Length ? fcIn[j] : 0;
+                                grad.StepW[s][l][i][j]  += dPreFc[i] * inp;
+                                grad.StepGW[s][l][i][j] += dGateIn[i] * inp;
+                                dNext[j] += dPreFc[i] * w.StepW[s][l][i][j] + dGateIn[i] * w.StepGW[s][l][i][j];
+                            }
+                            grad.StepB[s][l][i]  += dPreFc[i];
+                            grad.StepGB[s][l][i] += dGateIn[i];
+                        }
+
+                        if (l > 0) for (int j = 0; j < hiddenDim; j++) dNext[j] += dResidual[j];
+                        dInput = dNext;
+                    }
+
+                    // Shared layers backward
+                    for (int l = w.SharedLayers - 1; l >= 0; l--)
+                    {
+                        double[] pre  = fwd.StepSharedPre[s][l];
+                        double[] gate = fwd.StepSharedGate[s][l];
+                        double[] xn   = fwd.StepSharedXNorm[s][l];
+                        double[] fcIn = fwd.StepSharedFcIn[s][l];
+                        int bnSIdx = w.NSteps + l;
+                        int inDim = l == 0 ? F : hiddenDim;
+
+                        double[] dResidual = null!;
+                        if (l > 0)
+                        {
+                            dResidual = new double[hiddenDim];
+                            for (int j = 0; j < hiddenDim; j++)
+                            {
+                                dResidual[j] = dInput[j] * 0.7071067811865476;
+                                dInput[j]    = dInput[j] * 0.7071067811865476;
+                            }
+                        }
+
+                        var dBnOut  = new double[hiddenDim];
+                        var dGateIn = new double[hiddenDim];
+                        for (int j = 0; j < hiddenDim; j++)
+                        {
+                            dBnOut[j]  = dInput[j] * gate[j];
+                            dGateIn[j] = dInput[j] * pre[j] * gate[j] * (1 - gate[j]);
+                        }
+
+                        var dPreFc = new double[hiddenDim];
+                        for (int j = 0; j < hiddenDim; j++)
+                        {
+                            grad.BnGamma[bnSIdx][j] += dBnOut[j] * xn[j];
+                            grad.BnBeta[bnSIdx][j]  += dBnOut[j];
+                            double var_ = w.BnVar[bnSIdx].Length > j ? w.BnVar[bnSIdx][j] : 1.0;
+                            dPreFc[j] = dBnOut[j] * w.BnGamma[bnSIdx][j] / Math.Sqrt(var_ + BnEpsilon);
+                        }
+
+                        var dNext = new double[inDim];
+                        for (int i = 0; i < hiddenDim; i++)
+                        {
+                            for (int j = 0; j < inDim && j < w.SharedW[l][i].Length; j++)
+                            {
+                                double inp = j < fcIn.Length ? fcIn[j] : 0;
+                                grad.SharedW[l][i][j]  += dPreFc[i] * inp;
+                                grad.SharedGW[l][i][j] += dGateIn[i] * inp;
+                            }
+                            grad.SharedB[l][i]  += dPreFc[i];
+                            grad.SharedGB[l][i] += dGateIn[i];
+                        }
+
+                        if (l > 0)
+                            for (int j = 0; j < Math.Min(dNext.Length, hiddenDim); j++)
+                                dNext[j] += dResidual[j];
+
+                        dInput = l == 0 ? dNext : dNext[..hiddenDim];
+                    }
+                }
+
+                batchCount++;
+                if (batchCount >= PretrainBatchSize)
+                {
+                    double invBatch = 1.0 / batchCount;
+                    ScaleGradients(grad, invBatch);
+                    ClipGradients(grad, 1.0);
+                    AdamUpdate(w, grad, adam, cosLr);
+                    ZeroGradients(grad);
+                    batchCount = 0;
+                }
+            }
+
+            // Flush remaining gradients at end of epoch
+            if (batchCount > 0)
+            {
+                double invBatch = 1.0 / batchCount;
+                ScaleGradients(grad, invBatch);
+                ClipGradients(grad, 1.0);
+                AdamUpdate(w, grad, adam, cosLr);
+                ZeroGradients(grad);
+                batchCount = 0;
             }
 
             // Update BN running stats periodically
