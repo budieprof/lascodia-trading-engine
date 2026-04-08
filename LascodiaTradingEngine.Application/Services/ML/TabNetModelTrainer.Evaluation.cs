@@ -569,15 +569,18 @@ public sealed partial class TabNetModelTrainer
             absB -= calibrationLr * (mB / bc1) / (Math.Sqrt(vB / bc2) + AdamEpsilon);
         }
         double bestPrec = 0, bestThresh = 0.1;
+        int minCoverage = Math.Max(1, n / 5); // require at least 20% coverage
         for (int ti = 1; ti <= 40; ti++)
         {
             double thresh = ti / 100.0; int tpA = 0, fpA = 0;
             for (int i = 0; i < n; i++)
             {
                 if (Math.Abs(probs[i] - decisionThreshold) < thresh) continue;
-                if ((probs[i] >= decisionThreshold) == (calSet[i].Direction > 0)) tpA++; else fpA++;
+                int sampleIndex = sampleIndices is null ? i : sampleIndices[i];
+                if ((probs[i] >= decisionThreshold) == (calSet[sampleIndex].Direction > 0)) tpA++; else fpA++;
             }
-            double prec = (tpA + fpA) > 0 ? (double)tpA / (tpA + fpA) : 0;
+            if (tpA + fpA < minCoverage) continue;
+            double prec = (double)tpA / (tpA + fpA);
             if (prec > bestPrec) { bestPrec = prec; bestThresh = thresh; }
         }
         return ([absW], absB, bestThresh);

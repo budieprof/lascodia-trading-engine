@@ -894,7 +894,10 @@ public sealed partial class TabNetModelTrainer
         => 1.0 / (1.0 + Math.Exp(-Math.Clamp(x, -50, 50)));
 
     private static double Logit(double p)
-        => Math.Log(p / (1.0 - p));
+    {
+        p = Math.Clamp(p, ProbClampMin, 1.0 - ProbClampMin);
+        return Math.Log(p / (1.0 - p));
+    }
 
     private static double StdDev(IReadOnlyList<double> vals, double mean)
     {
@@ -952,6 +955,7 @@ public sealed partial class TabNetModelTrainer
 
     private static double ComputeMI(double[] a, double[] b, int bins)
     {
+        if (a.Length == 0 || b.Length == 0) return 0.0;
         double minA = a.Min(), maxA = a.Max(), minB = b.Min(), maxB = b.Max();
         double wA = (maxA - minA) / bins + Eps, wB = (maxB - minB) / bins + Eps;
         int n = a.Length; var joint = new int[bins, bins]; var mA = new int[bins]; var mB = new int[bins];
@@ -973,6 +977,7 @@ public sealed partial class TabNetModelTrainer
 
     private static double ComputeEntropy(double[] vals, int bins)
     {
+        if (vals.Length == 0) return 0.0;
         double min = vals.Min(), max = vals.Max(), width = (max - min) / bins + Eps;
         int n = vals.Length; var counts = new int[bins];
         for (int i = 0; i < n; i++) counts[Math.Clamp((int)((vals[i] - min) / width), 0, bins - 1)]++;

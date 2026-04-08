@@ -433,12 +433,13 @@ public sealed partial class TabNetModelTrainer
                     CopyArrayTracked(bnv[b], w.BnVar[b]);
 
             if (snapshot.TabNetOutputHeadWeights is { } ohw && ohw.Length == w.HiddenDim)
-                Array.Copy(ohw, w.OutputW, w.HiddenDim);
+                CopyArrayTracked(ohw, w.OutputW);
 
+            attempted++; reused++;
             w.OutputB = snapshot.TabNetOutputHeadBias;
 
             if (snapshot.MagWeights is { Length: > 0 } mw && mw.Length == w.HiddenDim)
-                Array.Copy(mw, w.MagW, w.HiddenDim);
+                CopyArrayTracked(mw, w.MagW);
 
             // Load initial BN FC weights
             if (snapshot.TabNetInitialBnFcW is { } ibfw && ibfw.Length == w.F)

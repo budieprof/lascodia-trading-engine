@@ -885,7 +885,8 @@ public sealed partial class TabNetModelTrainer
             if (dd > maxDD) maxDD = dd;
         }
         double avgRet = returns.Average(), stdRet = StdDev(returns, avgRet);
-        return (maxDD, stdRet > 1e-10 ? avgRet / stdRet * Math.Sqrt(252) : 0);
+        // Per-bar Sharpe without annualization — timeframe is unknown, so sqrt(252) would be misleading
+        return (maxDD, stdRet > 1e-10 ? avgRet / stdRet : 0);
     }
 
     private static double ComputeSharpeTrend(IReadOnlyList<double> sharpeList)

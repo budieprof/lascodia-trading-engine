@@ -408,6 +408,29 @@ public sealed partial class TabNetModelTrainer
                 thresholdDecisionMismatchCount++;
         }
 
+        // Weight array NaN/Inf sanity check
+        static int CountNonFinite(double[][] arrays)
+        {
+            int count = 0;
+            foreach (var arr in arrays)
+                foreach (double v in arr)
+                    if (!double.IsFinite(v)) count++;
+            return count;
+        }
+        static int CountNonFinite1D(double[] arr)
+        {
+            int c = 0;
+            foreach (double v in arr) if (!double.IsFinite(v)) c++;
+            return c;
+        }
+        int nonFiniteWeights = 0;
+        if (weights.OutputW is { Length: > 0 }) nonFiniteWeights += CountNonFinite1D(weights.OutputW);
+        foreach (var layer in weights.SharedW) nonFiniteWeights += CountNonFinite(layer);
+        foreach (var step in weights.StepW) foreach (var layer in step) nonFiniteWeights += CountNonFinite(layer);
+        foreach (var step in weights.AttnFcW) nonFiniteWeights += CountNonFinite(step);
+        if (nonFiniteWeights > 0)
+            findings.Add($"Model contains {nonFiniteWeights} non-finite (NaN/Inf) weight values.");
+
         if (maxParityError > 1e-6)
             findings.Add($"Train/inference raw-prob parity max error={maxParityError:E3}");
         if (thresholdDecisionMismatchCount > 0)

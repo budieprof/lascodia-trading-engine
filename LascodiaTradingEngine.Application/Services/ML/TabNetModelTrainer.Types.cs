@@ -134,6 +134,7 @@ public sealed partial class TabNetModelTrainer
         // Pooled scratch buffers to avoid per-call allocations in ForwardPass
         public double[] HPrev = [];            // [hiddenDim]
         public double[] AttnInput = [];        // [F]
+        public double[] SparsemaxScratch = []; // [F] — scratch for pooled sparsemax sort
 
         // Pooled FcBnGlu buffers to avoid 5 allocations per FC→BN→GLU call
         public FcBnGluBuffers? GluBuf;
@@ -158,6 +159,7 @@ public sealed partial class TabNetModelTrainer
                 StepAttnXNorm   = AllocJagged(nSteps, F),
                 HPrev        = new double[H],
                 AttnInput    = new double[F],
+                SparsemaxScratch = new double[F],
                 GluBuf       = FcBnGluBuffers.Allocate(H, Math.Max(F, H)),
                 GluOutA      = new double[H],
                 GluOutB      = new double[H],

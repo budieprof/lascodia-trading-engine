@@ -310,7 +310,7 @@ public sealed partial class TabNetModelTrainer
         int F = (int)x.shape[1];
         int H = p.HiddenDim;
 
-        using var priorScales = torch.ones(new long[] { B, F }, device: x.device);
+        var priorScales = torch.ones(new long[] { B, F }, device: x.device);
         var aggH = torch.zeros(new long[] { B, H }, device: x.device);
         var sparsityLoss = torch.tensor(0f, device: x.device);
         Tensor hPrev = torch.zeros(new long[] { B, H }, device: x.device);
@@ -416,11 +416,13 @@ public sealed partial class TabNetModelTrainer
             aggH.Dispose();
             aggH = newAgg;
 
-            // Update hPrev for next step
+            // Update hPrev for next step (clone to decouple storage from h before disposing h)
+            var newHPrev = h.detach().clone();
             hPrev.Dispose();
-            hPrev = h.detach().alias();
+            hPrev = newHPrev;
 
             // Cleanup
+            attnInput.Dispose();
             bnAttn.Dispose();
             attn.Dispose();
             h.Dispose();
@@ -827,6 +829,18 @@ public sealed partial class TabNetModelTrainer
                 int dim = b < src.NSteps ? src.F : src.HiddenDim;
                 Load1D(dst.BnGamma[b], src.BnGamma[b], dim);
                 Load1D(dst.BnBeta[b], src.BnBeta[b], dim);
+                // BnRunMean/BnRunVar are plain Tensors (not Parameters), load directly
+                {
+                    var meanArr = new float[dim];
+                    for (int j = 0; j < dim && j < src.BnMean[b].Length; j++)
+                        meanArr[j] = (float)src.BnMean[b][j];
+                    dst.BnRunMean[b].copy_(torch.tensor(meanArr, device: dst.BnRunMean[b].device));
+
+                    var varArr = new float[dim];
+                    for (int j = 0; j < dim && j < src.BnVar[b].Length; j++)
+                        varArr[j] = (float)src.BnVar[b][j];
+                    dst.BnRunVar[b].copy_(torch.tensor(varArr, device: dst.BnRunVar[b].device));
+                }
             }
         }
     }

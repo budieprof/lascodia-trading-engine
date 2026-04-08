@@ -383,7 +383,7 @@ public sealed partial class TabNetModelTrainer
                 if (dropoutRate > 0 && s < fwd.StepStepDropMask.Length && l < fwd.StepStepDropMask[s].Length)
                 {
                     bool[] mask = fwd.StepStepDropMask[s][l];
-                    double scale = 1.0 / (1.0 - dropoutRate);
+                    double scale = 1.0 / (1.0 - Math.Min(dropoutRate, 0.99));
                     for (int j = 0; j < H && j < mask.Length; j++)
                         dInput[j] = mask[j] ? dInput[j] * scale : 0;
                 }
@@ -425,7 +425,7 @@ public sealed partial class TabNetModelTrainer
                     double var_ = epochBatchVars is not null && bnStIdx < epochBatchVars.Length && j < epochBatchVars[bnStIdx].Length
                         ? epochBatchVars[bnStIdx][j]
                         : (w.BnVar[bnStIdx].Length > j ? w.BnVar[bnStIdx][j] : 1.0);
-                    double invStd = Math.Min(1.0 / Math.Sqrt(var_ + BnEpsilon), MaxInvStd);
+                    double invStd = Math.Min(1.0 / Math.Sqrt(Math.Max(0, var_) + BnEpsilon), MaxInvStd);
                     dPreFc[j] = w.BnGamma[bnStIdx][j] * invStd * (dBnOut[j] - meanDy - xNorm[j] * meanDyXn);
                 }
 
@@ -474,7 +474,7 @@ public sealed partial class TabNetModelTrainer
                 if (dropoutRate > 0 && s < fwd.StepSharedDropMask.Length && l < fwd.StepSharedDropMask[s].Length)
                 {
                     bool[] mask = fwd.StepSharedDropMask[s][l];
-                    double scale = 1.0 / (1.0 - dropoutRate);
+                    double scale = 1.0 / (1.0 - Math.Min(dropoutRate, 0.99));
                     for (int j = 0; j < H && j < mask.Length; j++)
                         dInput[j] = mask[j] ? dInput[j] * scale : 0;
                 }
@@ -517,7 +517,7 @@ public sealed partial class TabNetModelTrainer
                     double var_ = epochBatchVars is not null && bnSIdx < epochBatchVars.Length && j < epochBatchVars[bnSIdx].Length
                         ? epochBatchVars[bnSIdx][j]
                         : (w.BnVar[bnSIdx].Length > j ? w.BnVar[bnSIdx][j] : 1.0);
-                    double invStd = Math.Min(1.0 / Math.Sqrt(var_ + BnEpsilon), MaxInvStd);
+                    double invStd = Math.Min(1.0 / Math.Sqrt(Math.Max(0, var_) + BnEpsilon), MaxInvStd);
                     dPreFc[j] = w.BnGamma[bnSIdx][j] * invStd * (dBnOut[j] - meanDy - xNorm[j] * meanDyXn);
                 }
 

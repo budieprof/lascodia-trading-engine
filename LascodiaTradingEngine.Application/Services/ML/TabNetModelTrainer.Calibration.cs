@@ -44,28 +44,49 @@ public sealed partial class TabNetModelTrainer
         int n = calSet.Count;
         var logits = new double[n];
         var labels = new double[n];
+        int nPos = 0;
         for (int i = 0; i < n; i++)
         {
             double raw = Math.Clamp(TabNetRawProb(calSet[i].Features, w), ProbClampMin, 1.0 - ProbClampMin);
             logits[i] = Logit(raw);
-            labels[i] = calSet[i].Direction > 0 ? 1.0 : 0.0;
+            if (calSet[i].Direction > 0) nPos++;
         }
+        int nNeg = n - nPos;
+        // Platt (2000) label smoothing: prevents overfitting on small calibration sets
+        double targetPos = (nPos + 1.0) / (nPos + 2.0);
+        double targetNeg = 1.0 / (nNeg + 2.0);
+        for (int i = 0; i < n; i++)
+            labels[i] = calSet[i].Direction > 0 ? targetPos : targetNeg;
 
         double plattA = 1.0, plattB = 0.0;
+        double bestA = plattA, bestB = plattB;
+        double bestLoss = double.PositiveInfinity;
         for (int ep = 0; ep < calibrationEpochs; ep++)
         {
-            double dA = 0, dB = 0;
+            double dA = 0, dB = 0, loss = 0;
             for (int i = 0; i < n; i++)
             {
                 double calibP = Sigmoid(plattA * logits[i] + plattB);
                 double err = calibP - labels[i];
                 dA += err * logits[i];
                 dB += err;
+                loss -= labels[i] * Math.Log(Math.Max(calibP, ProbClampMin))
+                      + (1.0 - labels[i]) * Math.Log(Math.Max(1.0 - calibP, ProbClampMin));
             }
-            plattA -= calibrationLr * dA / n;
-            plattB -= calibrationLr * dB / n;
+            loss /= n;
+            if (double.IsFinite(loss) && loss < bestLoss)
+            {
+                bestLoss = loss;
+                bestA = plattA;
+                bestB = plattB;
+            }
+            // Gradient clipping
+            double gradNorm = Math.Sqrt(dA * dA + dB * dB) / n;
+            double clipScale = gradNorm > 10.0 ? 10.0 / gradNorm : 1.0;
+            plattA -= calibrationLr * clipScale * dA / n;
+            plattB -= calibrationLr * clipScale * dB / n;
         }
-        return (plattA, plattB);
+        return (double.IsFinite(bestA) ? bestA : 1.0, double.IsFinite(bestB) ? bestB : 0.0);
     }
 
     private static TabNetCalibrationFit FitTabNetCalibrationStack(
@@ -433,7 +454,7 @@ public sealed partial class TabNetModelTrainer
             if (p <= bp[i]) return bp[i + 1];
             if (i + 2 < bp.Length && p <= bp[i + 2])
             {
-                double frac = (p - bp[i]) / (bp[i + 2] - bp[i] + Eps);
+                double frac = Math.Clamp((p - bp[i]) / (bp[i + 2] - bp[i] + Eps), 0.0, 1.0);
                 return bp[i + 1] + frac * (bp[i + 3] - bp[i + 1]);
             }
         }
@@ -463,15 +484,31 @@ public sealed partial class TabNetModelTrainer
         }
 
         double temperature = 1.0;
+        double bestTemperature = 1.0;
+        double bestLoss = double.PositiveInfinity;
         for (int ep = 0; ep < calibrationEpochs; ep++)
         {
-            double dT = 0;
+            double dT = 0, loss = 0;
             for (int i = 0; i < n; i++)
-                dT += (Sigmoid(logits[i] / temperature) - labels[i]) * (-logits[i] / (temperature * temperature));
-            temperature -= calibrationLr * dT / n;
+            {
+                double p = Sigmoid(logits[i] / temperature);
+                dT += (p - labels[i]) * (-logits[i] / (temperature * temperature));
+                loss -= labels[i] * Math.Log(Math.Max(p, ProbClampMin))
+                      + (1.0 - labels[i]) * Math.Log(Math.Max(1.0 - p, ProbClampMin));
+            }
+            loss /= n;
+            if (double.IsFinite(loss) && loss < bestLoss)
+            {
+                bestLoss = loss;
+                bestTemperature = temperature;
+            }
+            // Gradient clipping
+            double gradMag = Math.Abs(dT / n);
+            double clipScale = gradMag > 10.0 ? 10.0 / gradMag : 1.0;
+            temperature -= calibrationLr * clipScale * dT / n;
             temperature = Math.Max(0.01, temperature);
         }
-        return temperature;
+        return bestTemperature;
     }
 
     // ═══════════════════════════════════════════════════════════════════════

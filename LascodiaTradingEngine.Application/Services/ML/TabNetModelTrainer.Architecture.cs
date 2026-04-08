@@ -83,12 +83,12 @@ public sealed partial class TabNetModelTrainer
 
             Array.Copy(attnLogitsBuf, 0, fwd.StepAttnPre[s], 0, F);
 
-            // Sparsemax or Softmax
-            double[] attn = w.UseSparsemax
-                ? Sparsemax(attnLogitsBuf, F)
-                : SoftmaxArr(attnLogitsBuf, F);
-
-            Array.Copy(attn, fwd.StepAttn[s], F);
+            // Sparsemax or Softmax (write directly into pooled StepAttn buffer)
+            double[] attn = fwd.StepAttn[s];
+            if (w.UseSparsemax)
+                SparsemaxInto(attnLogitsBuf, F, attn, fwd.SparsemaxScratch);
+            else
+                SoftmaxArrInto(attnLogitsBuf, F, attn);
 
             // ── 2. Prior scale update with configurable γ ────────────
             for (int j = 0; j < F; j++)
@@ -275,7 +275,7 @@ public sealed partial class TabNetModelTrainer
         // Dropout (training only)
         if (training && dropoutRate > 0 && rng is not null)
         {
-            double scale = 1.0 / (1.0 - dropoutRate);
+            double scale = 1.0 / (1.0 - Math.Min(dropoutRate, 0.99));
             for (int i = 0; i < outDim; i++)
                 if (rng.NextDouble() < dropoutRate) output[i] = 0;
                 else output[i] *= scale;
@@ -334,7 +334,7 @@ public sealed partial class TabNetModelTrainer
         // GLU + dropout with mask caching
         if (training && dropoutRate > 0 && rng is not null)
         {
-            double scale = 1.0 / (1.0 - dropoutRate);
+            double scale = 1.0 / (1.0 - Math.Min(dropoutRate, 0.99));
             for (int i = 0; i < outDim; i++)
             {
                 bool kept = rng.NextDouble() >= dropoutRate;
@@ -393,10 +393,21 @@ public sealed partial class TabNetModelTrainer
 
     private static double[] Sparsemax(double[] z, int len)
     {
+        var output = new double[len];
         var sorted = new double[len];
+        SparsemaxInto(z, len, output, sorted);
+        return output;
+    }
+
+    /// <summary>
+    /// Pooled sparsemax that writes into pre-allocated output/scratch buffers,
+    /// eliminating 2 heap allocations per call during the training hot loop.
+    /// </summary>
+    private static void SparsemaxInto(double[] z, int len, double[] output, double[] sorted)
+    {
         for (int i = 0; i < len; i++) sorted[i] = z[i];
-        Array.Sort(sorted);
-        Array.Reverse(sorted);
+        Array.Sort(sorted, 0, len);
+        Array.Reverse(sorted, 0, len);
 
         double cumSum = 0;
         int k = 0;
@@ -413,7 +424,6 @@ public sealed partial class TabNetModelTrainer
         for (int i = 0; i < k; i++) cumSum += sorted[i];
         double tau = (cumSum - 1.0) / k;
 
-        var output = new double[len];
         double sum = 0;
         for (int i = 0; i < len; i++)
         {
@@ -425,19 +435,26 @@ public sealed partial class TabNetModelTrainer
         // on the original logits for a smooth, gradient-friendly distribution rather
         // than a hard uniform that creates a discontinuity.
         if (sum < Eps)
-            return SoftmaxArr(z, len);
-
-        return output;
+            SoftmaxArrInto(z, len, output);
     }
 
     private static double[] SoftmaxArr(double[] x, int len)
     {
+        var e = new double[len];
+        SoftmaxArrInto(x, len, e);
+        return e;
+    }
+
+    /// <summary>
+    /// Pooled softmax that writes into a pre-allocated output buffer.
+    /// </summary>
+    private static void SoftmaxArrInto(double[] x, int len, double[] output)
+    {
         double max = double.MinValue;
         for (int i = 0; i < len; i++) if (x[i] > max) max = x[i];
-        var e = new double[len]; double sum = 0;
-        for (int i = 0; i < len; i++) { e[i] = Math.Exp(x[i] - max); sum += e[i]; }
+        double sum = 0;
+        for (int i = 0; i < len; i++) { output[i] = Math.Exp(x[i] - max); sum += output[i]; }
         sum += Eps;
-        for (int i = 0; i < len; i++) e[i] /= sum;
-        return e;
+        for (int i = 0; i < len; i++) output[i] /= sum;
     }
 }

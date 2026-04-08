@@ -216,7 +216,7 @@ public sealed partial class TabNetModelTrainer
                 for (int j = 0; j < H; j++)
                 {
                     double var_ = w.BnVar[bnStIdx].Length > j ? w.BnVar[bnStIdx][j] : 1.0;
-                    double invStd = Math.Min(1.0 / Math.Sqrt(var_ + BnEpsilon), MaxInvStd);
+                    double invStd = Math.Min(1.0 / Math.Sqrt(Math.Max(0, var_) + BnEpsilon), MaxInvStd);
                     dPreFc[j] = w.BnGamma[bnStIdx][j] * invStd * (dBnOut[j] - meanDy - xn[j] * meanDyXn);
                 }
 
@@ -293,7 +293,7 @@ public sealed partial class TabNetModelTrainer
                 for (int j = 0; j < H; j++)
                 {
                     double var_ = w.BnVar[bnSIdx].Length > j ? w.BnVar[bnSIdx][j] : 1.0;
-                    double invStd = Math.Min(1.0 / Math.Sqrt(var_ + BnEpsilon), MaxInvStd);
+                    double invStd = Math.Min(1.0 / Math.Sqrt(Math.Max(0, var_) + BnEpsilon), MaxInvStd);
                     dPreFc[j] = w.BnGamma[bnSIdx][j] * invStd * (dBnOut[j] - meanDy - xn[j] * meanDyXn);
                 }
 
@@ -304,8 +304,12 @@ public sealed partial class TabNetModelTrainer
                     {
                         double inp = j < fcIn.Length ? fcIn[j] : 0;
                         grad.SharedW[l][i][j]  += dPreFc[i] * inp;
+                        dNext[j] += dPreFc[i] * w.SharedW[l][i][j];
                         if (w.UseGlu)
+                        {
                             grad.SharedGW[l][i][j] += dGateIn[i] * inp;
+                            dNext[j] += dGateIn[i] * w.SharedGW[l][i][j];
+                        }
                     }
                     grad.SharedB[l][i]  += dPreFc[i];
                     if (w.UseGlu)
