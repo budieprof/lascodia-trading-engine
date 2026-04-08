@@ -1661,7 +1661,9 @@ public record TrainingHyperparams(
     /// <summary>Rec #389 v3: Epochs for unsupervised encoder-decoder pre-training. 0 = disabled.</summary>
     int TabNetPretrainEpochs = 0,
     /// <summary>Rec #389 v3: Fraction of features masked during pre-training. Default 0.3.</summary>
-    double TabNetPretrainMaskFraction = 0.3
+    double TabNetPretrainMaskFraction = 0.3,
+    /// <summary>Rec #389 v3: Linear LR warmup epochs before cosine decay kicks in. 0 = disabled. Default 0.</summary>
+    int TabNetWarmupEpochs = 0
     );
 
 // ── Evaluation metrics ────────────────────────────────────────────────────────
@@ -1714,7 +1716,12 @@ public record WalkForwardResult(
     /// Null / empty when fewer than 2 folds completed. Stored in
     /// <see cref="ModelSnapshot.FeatureStabilityScores"/>.
     /// </summary>
-    double[]? FeatureStabilityScores = null);
+    double[]? FeatureStabilityScores = null,
+    /// <summary>Per-fold metrics for downstream regime-aware model selection.</summary>
+    WalkForwardFoldMetric[]? FoldMetrics = null);
+
+/// <summary>Per-fold walk-forward CV metrics for granular analysis.</summary>
+public record WalkForwardFoldMetric(double Accuracy, double F1, double EV, double Sharpe, double MaxDD);
 
 // ── Training result ───────────────────────────────────────────────────────────
 
@@ -2789,6 +2796,18 @@ public class ModelSnapshot
 
     /// <summary>Rec #389 v3: Hidden dimension used during training.</summary>
     public int TabNetHiddenDim { get; set; }
+
+    /// <summary>Rec #389 v3: Initial BN FC weights for step-0 attention symmetry [F][F].</summary>
+    public double[][]? TabNetInitialBnFcW { get; set; }
+
+    /// <summary>Rec #389 v3: Initial BN FC biases for step-0 attention [F].</summary>
+    public double[]? TabNetInitialBnFcB { get; set; }
+
+    /// <summary>Rec #389 v3: Per-step attention importance breakdown [step][F].</summary>
+    public double[][]? TabNetPerStepAttention { get; set; }
+
+    /// <summary>Rec #389 v3: Per-step mean attention entropy (signal quality metric). Low = confident feature selection.</summary>
+    public double[]? TabNetAttentionEntropy { get; set; }
 
     /// <summary>Rec #390: FT-Transformer per-feature embedding weights (outer = feature, inner = dim).</summary>
     public double[][]? FtTransformerEmbedWeights { get; set; }
