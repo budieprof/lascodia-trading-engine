@@ -88,7 +88,8 @@ public sealed partial class TabNetModelTrainer
 
         double avgRet = returns.Count > 0 ? returns.Average() : 0;
         double stdRet = returns.Count > 1 ? StdDev(returns, avgRet) : 0;
-        double sharpe = stdRet > 1e-10 ? avgRet / stdRet * Math.Sqrt(252) : 0;
+        // Per-bar Sharpe without annualization — timeframe is unknown
+        double sharpe = stdRet > 1e-10 ? avgRet / stdRet : 0;
 
         return new EvalMetrics(
             Accuracy: accuracy, Precision: precision, Recall: recall, F1: f1,
@@ -237,7 +238,7 @@ public sealed partial class TabNetModelTrainer
             for (int j = 0; j < perStepAttention[s].Length; j++)
                 if (perStepAttention[s][j] > 1e-6)
                     nonZero++;
-            sparsity[s] = (double)nonZero / perStepAttention[s].Length;
+            sparsity[s] = 1.0 - (double)nonZero / perStepAttention[s].Length;
         }
         return sparsity;
     }
@@ -457,7 +458,13 @@ public sealed partial class TabNetModelTrainer
         int len = Math.Min(values.Length, scratch.Length);
         Array.Copy(values, scratch, len);
         Array.Sort(scratch, 0, len);
-        return QuantileSorted(scratch.AsSpan(0, len).ToArray(), q);
+        // Compute quantile directly on scratch without allocating
+        double pos = q * (len - 1);
+        int lo = (int)Math.Floor(pos);
+        int hi = (int)Math.Ceiling(pos);
+        if (lo == hi || hi >= len) return scratch[lo];
+        double t = pos - lo;
+        return scratch[lo] + (scratch[hi] - scratch[lo]) * t;
     }
 
     // ═══════════════════════════════════════════════════════════════════════

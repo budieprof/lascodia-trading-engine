@@ -326,7 +326,12 @@ public sealed partial class TabNetModelTrainer
             }
             else
             {
-                attnInput = torch.mm(hPrev, p.AttnFcW[s].t()) + p.AttnFcB[s];
+                // Slice hPrev to attentionDim when attentionDim < hiddenDim (CPU path uses partial dot)
+                var attnSource = p.AttentionDim < H
+                    ? hPrev[.., ..p.AttentionDim]
+                    : hPrev;
+                attnInput = torch.mm(attnSource, p.AttnFcW[s].t()) + p.AttnFcB[s];
+                if (p.AttentionDim < H) attnSource.Dispose();
             }
 
             // BatchNorm on attention input
@@ -356,10 +361,11 @@ public sealed partial class TabNetModelTrainer
             newPrior.Dispose();
 
             // ── Feature masking ──────────────────────────────────────────
-            using var masked = x * attn;
+            var masked = x * attn;
 
             // ── Shared Feature Transformer ───────────────────────────────
             Tensor h = masked;
+            bool hIsMasked = true; // track to avoid double-dispose
             int inputDim = F;
             for (int l = 0; l < p.SharedLayers; l++)
             {
@@ -380,8 +386,9 @@ public sealed partial class TabNetModelTrainer
                 }
                 else
                 {
-                    if (!ReferenceEquals(h, masked)) h.Dispose();
+                    if (!hIsMasked) h.Dispose();
                     h = hNew;
+                    hIsMasked = false;
                 }
                 inputDim = H;
             }
@@ -405,10 +412,15 @@ public sealed partial class TabNetModelTrainer
                 }
                 else
                 {
-                    h.Dispose();
+                    if (!hIsMasked) h.Dispose();
                     h = hNew;
+                    hIsMasked = false;
                 }
             }
+
+            // Dispose masked if h diverged from it
+            if (!hIsMasked) masked.Dispose();
+            else hIsMasked = false; // h will be disposed below, which IS masked
 
             // ReLU gate and aggregate
             using var reluH = functional.relu(h);
@@ -524,16 +536,23 @@ public sealed partial class TabNetModelTrainer
         using var cumSum = sorted.cumsum(dim: 1);
         using var range = torch.arange(1, F + 1, dtype: z.dtype, device: z.device).unsqueeze(0);
         using var test = sorted - (cumSum - 1f) / range;
-        using var kMask = test.gt(torch.tensor(0f, device: z.device));
-        using var kFloat = kMask.to_type(ScalarType.Float32).sum(dim: 1, keepdim: true);
+        using var zeroScalar = torch.tensor(0f, device: z.device);
+        using var kMask = test.gt(zeroScalar);
+        using var kMaskFloat = kMask.to_type(ScalarType.Float32);
+        using var kFloat = kMaskFloat.sum(dim: 1, keepdim: true);
         using var kLong = kFloat.to_type(ScalarType.Int64).clamp_min(1);
-        using var cumSumAtK = cumSum.gather(1, kLong - 1);
-        using var tau = (cumSumAtK - 1f) / kFloat.clamp_min(1f);
-        var output = (z - tau).clamp_min(0f);
+        using var kLongIdx = kLong - 1;
+        using var cumSumAtK = cumSum.gather(1, kLongIdx);
+        using var cumSumShifted = cumSumAtK - 1f;
+        using var kFloatClamped = kFloat.clamp_min(1f);
+        using var tau = cumSumShifted / kFloatClamped;
+        using var zMinusTau = z - tau;
+        var output = zMinusTau.clamp_min(0f);
 
         // Fallback: if all entries zero, use softmax (smooth, gradient-friendly)
         using var sum = output.sum(dim: 1, keepdim: true);
-        using var zeroMask = sum.lt(torch.tensor((float)Eps, device: z.device));
+        using var epsScalar = torch.tensor((float)Eps, device: z.device);
+        using var zeroMask = sum.lt(epsScalar);
         bool hasZeros = zeroMask.any().item<bool>();
         if (hasZeros)
         {
@@ -739,19 +758,30 @@ public sealed partial class TabNetModelTrainer
     //  WEIGHT SNAPSHOT / RESTORE (GPU ↔ CPU)
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// <summary>Snapshots all GPU parameter data to CPU float arrays for early-stopping restore.</summary>
+    /// <summary>Snapshots all GPU parameter data + BN running stats to CPU float arrays for early-stopping restore.</summary>
     private static float[][] SnapshotGpuParams(TabNetGpuParams p)
     {
         using (no_grad())
         {
             var snaps = new List<float[]>();
             foreach (var param in p.AllParameters())
-                snaps.Add(param.cpu().data<float>().ToArray());
+            {
+                using var cpu = param.cpu();
+                snaps.Add(cpu.data<float>().ToArray());
+            }
+            // Also snapshot BN running stats (plain Tensors, not Parameters)
+            for (int b = 0; b < p.TotalBnLayers; b++)
+            {
+                using var cpuMean = p.BnRunMean[b].cpu();
+                snaps.Add(cpuMean.data<float>().ToArray());
+                using var cpuVar = p.BnRunVar[b].cpu();
+                snaps.Add(cpuVar.data<float>().ToArray());
+            }
             return snaps.ToArray();
         }
     }
 
-    /// <summary>Restores GPU parameters from a CPU snapshot.</summary>
+    /// <summary>Restores GPU parameters + BN running stats from a CPU snapshot.</summary>
     private static void RestoreGpuParams(TabNetGpuParams p, float[][] snapshot)
     {
         using (no_grad())
@@ -761,6 +791,14 @@ public sealed partial class TabNetModelTrainer
             {
                 using var t = torch.tensor(snapshot[i++], device: param.device).reshape(param.shape);
                 param.copy_(t);
+            }
+            // Restore BN running stats
+            for (int b = 0; b < p.TotalBnLayers && i < snapshot.Length; b++)
+            {
+                using var meanT = torch.tensor(snapshot[i++], device: p.BnRunMean[b].device);
+                p.BnRunMean[b].copy_(meanT);
+                using var varT = torch.tensor(snapshot[i++], device: p.BnRunVar[b].device);
+                p.BnRunVar[b].copy_(varT);
             }
         }
     }
@@ -834,12 +872,14 @@ public sealed partial class TabNetModelTrainer
                     var meanArr = new float[dim];
                     for (int j = 0; j < dim && j < src.BnMean[b].Length; j++)
                         meanArr[j] = (float)src.BnMean[b][j];
-                    dst.BnRunMean[b].copy_(torch.tensor(meanArr, device: dst.BnRunMean[b].device));
+                    using var meanTensor = torch.tensor(meanArr, device: dst.BnRunMean[b].device);
+                    dst.BnRunMean[b].copy_(meanTensor);
 
                     var varArr = new float[dim];
                     for (int j = 0; j < dim && j < src.BnVar[b].Length; j++)
                         varArr[j] = (float)src.BnVar[b][j];
-                    dst.BnRunVar[b].copy_(torch.tensor(varArr, device: dst.BnRunVar[b].device));
+                    using var varTensor = torch.tensor(varArr, device: dst.BnRunVar[b].device);
+                    dst.BnRunVar[b].copy_(varTensor);
                 }
             }
         }
@@ -855,7 +895,8 @@ public sealed partial class TabNetModelTrainer
         {
             double[][] Extract2D(Parameter param, int rows, int cols)
             {
-                var flat = param.cpu().data<float>().ToArray();
+                using var cpu = param.cpu();
+                var flat = cpu.data<float>().ToArray();
                 var result = new double[rows][];
                 for (int i = 0; i < rows; i++)
                 {
@@ -868,7 +909,8 @@ public sealed partial class TabNetModelTrainer
 
             double[] Extract1D(Parameter param, int dim)
             {
-                var flat = param.cpu().data<float>().ToArray();
+                using var cpu = param.cpu();
+                var flat = cpu.data<float>().ToArray();
                 var result = new double[dim];
                 for (int j = 0; j < dim && j < flat.Length; j++)
                     result[j] = flat[j];
@@ -877,7 +919,8 @@ public sealed partial class TabNetModelTrainer
 
             double[] Extract1DTensor(Tensor t, int dim)
             {
-                var flat = t.cpu().data<float>().ToArray();
+                using var cpu = t.cpu();
+                var flat = cpu.data<float>().ToArray();
                 var result = new double[dim];
                 for (int j = 0; j < dim && j < flat.Length; j++)
                     result[j] = flat[j];

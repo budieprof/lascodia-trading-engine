@@ -558,7 +558,7 @@ public sealed partial class TabNetModelTrainer
 
         if (fracDiffD > 0.0 && gateAction == "REJECT")
             gateAction = "DEGRADED";
-        if (fracDiffD > 0.0 && gateAction == "DEGRADED")
+        else if (fracDiffD > 0.0 && gateAction == "DEGRADED")
             gateAction = "WARN";
 
         artifact.GateAction = gateAction;

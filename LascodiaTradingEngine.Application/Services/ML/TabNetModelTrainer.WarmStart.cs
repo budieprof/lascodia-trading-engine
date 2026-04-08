@@ -431,27 +431,29 @@ public sealed partial class TabNetModelTrainer
                 for (int s = 0; s < Math.Min(afb.Length, w.NSteps); s++)
                     CopyArrayTracked(afb[s], w.AttnFcB[s]);
 
-            if (snapshot.TabNetBnGammas is { } bng && bng.Length == w.TotalBnLayers)
-                for (int b = 0; b < w.TotalBnLayers; b++)
+            // BN parameters (partial reuse — load Min of available layers, consistent with shared/step)
+            if (snapshot.TabNetBnGammas is { } bng)
+                for (int b = 0; b < Math.Min(bng.Length, w.TotalBnLayers); b++)
                     CopyArrayTracked(bng[b], w.BnGamma[b]);
 
-            if (snapshot.TabNetBnBetas is { } bnb && bnb.Length == w.TotalBnLayers)
-                for (int b = 0; b < w.TotalBnLayers; b++)
+            if (snapshot.TabNetBnBetas is { } bnb)
+                for (int b = 0; b < Math.Min(bnb.Length, w.TotalBnLayers); b++)
                     CopyArrayTracked(bnb[b], w.BnBeta[b]);
 
-            if (snapshot.TabNetBnRunningMeans is { } bnm && bnm.Length == w.TotalBnLayers)
-                for (int b = 0; b < w.TotalBnLayers; b++)
+            if (snapshot.TabNetBnRunningMeans is { } bnm)
+                for (int b = 0; b < Math.Min(bnm.Length, w.TotalBnLayers); b++)
                     CopyArrayTracked(bnm[b], w.BnMean[b]);
 
-            if (snapshot.TabNetBnRunningVars is { } bnv && bnv.Length == w.TotalBnLayers)
-                for (int b = 0; b < w.TotalBnLayers; b++)
+            if (snapshot.TabNetBnRunningVars is { } bnv)
+                for (int b = 0; b < Math.Min(bnv.Length, w.TotalBnLayers); b++)
                     CopyArrayTracked(bnv[b], w.BnVar[b]);
 
             if (snapshot.TabNetOutputHeadWeights is { } ohw && ohw.Length == w.HiddenDim)
+            {
                 CopyArrayTracked(ohw, w.OutputW);
-
-            attempted++; reused++;
-            w.OutputB = snapshot.TabNetOutputHeadBias;
+                w.OutputB = snapshot.TabNetOutputHeadBias;
+                attempted++; reused++;
+            }
 
             if (snapshot.MagWeights is { Length: > 0 } mw && mw.Length == w.HiddenDim)
                 CopyArrayTracked(mw, w.MagW);

@@ -89,8 +89,13 @@ public sealed partial class TabNetModelTrainer
             double det = hAA * hBB - hAB * hAB;
             if (Math.Abs(det) > Eps)
             {
-                plattA -= (hBB * dA - hAB * dB) / det;
-                plattB -= (hAA * dB - hAB * dA) / det;
+                double stepA = (hBB * dA - hAB * dB) / det;
+                double stepB = (hAA * dB - hAB * dA) / det;
+                // Damp large Newton steps to prevent oscillation near singular Hessians
+                double stepNorm = Math.Sqrt(stepA * stepA + stepB * stepB);
+                double dampScale = stepNorm > 5.0 ? 5.0 / stepNorm : 1.0;
+                plattA -= dampScale * stepA;
+                plattB -= dampScale * stepB;
             }
             else
             {
@@ -261,7 +266,9 @@ public sealed partial class TabNetModelTrainer
         TabNetWeights w,
         ModelSnapshot globalCalibrationSnapshot,
         string selectedGlobalCalibration,
-        int minCalibrationSamples)
+        int minCalibrationSamples,
+        int calibrationEpochs = DefaultCalibrationEpochs,
+        double calibrationLr = DefaultCalibrationLr)
     {
         if (fitSet.Count < minCalibrationSamples * 2 || evalSet.Count < Math.Max(8, minCalibrationSamples / 2))
             return 0.5;
@@ -292,8 +299,8 @@ public sealed partial class TabNetModelTrainer
                     : 0.0,
                 threshold,
                 minCalibrationSamples,
-                Math.Max(8, minCalibrationSamples),
-                0.01);
+                Math.Max(50, calibrationEpochs / 2),
+                calibrationLr);
             var candidateSnapshot = BuildCalibrationSnapshot(
                 globalCalibrationSnapshot.PlattA,
                 globalCalibrationSnapshot.PlattB,
@@ -339,6 +346,13 @@ public sealed partial class TabNetModelTrainer
         if (!hasPositive || !hasNegative)
             return new ConditionalPlattBranchFit(pairs.Count, baselineLoss, baselineLoss, 0.0, 0.0);
 
+        // Apply Platt (2000) label smoothing to conditional branches (consistent with global Platt)
+        int nPos = pairs.Count(p => p.Y > 0.5);
+        int nNeg = pairs.Count - nPos;
+        double targetPos = (nPos + 1.0) / (nPos + 2.0);
+        double targetNeg = 1.0 / (nNeg + 2.0);
+        var smoothedY = pairs.Select(p => p.Y > 0.5 ? targetPos : targetNeg).ToArray();
+
         double a = 1.0, b = 0.0;
         double bestA = a, bestB = b, bestLoss = baselineLoss;
 
@@ -348,7 +362,7 @@ public sealed partial class TabNetModelTrainer
             for (int i = 0; i < pairs.Count; i++)
             {
                 double calibP = Sigmoid(a * pairs[i].Logit + b);
-                double err = calibP - pairs[i].Y;
+                double err = calibP - smoothedY[i];
                 dA += err * pairs[i].Logit;
                 dB += err;
             }
@@ -470,6 +484,21 @@ public sealed partial class TabNetModelTrainer
                 blocks[0].Count + blocks[1].Count,
                 blocks[0].XMin, blocks[1].XMax);
             blocks.RemoveAt(0);
+        }
+
+        // Re-enforce monotonicity after small-block merging (forward pass)
+        for (int i = 1; i < blocks.Count; i++)
+        {
+            double prevMean = blocks[i - 1].SumY / blocks[i - 1].Count;
+            double curMean = blocks[i].SumY / blocks[i].Count;
+            if (curMean < prevMean)
+            {
+                blocks[i - 1] = (blocks[i - 1].SumY + blocks[i].SumY,
+                    blocks[i - 1].Count + blocks[i].Count,
+                    blocks[i - 1].XMin, blocks[i].XMax);
+                blocks.RemoveAt(i);
+                i--; // re-check from same position
+            }
         }
 
         var bp = new List<double>();

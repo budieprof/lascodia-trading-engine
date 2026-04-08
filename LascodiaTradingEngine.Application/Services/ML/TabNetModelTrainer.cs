@@ -171,7 +171,7 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
                 hp.FracDiffD);
 
         // ── 0. Incremental update fast-path ────────────────────────────────
-        if (warmStart is not null && warmStart.Type == ModelType && hp.DensityRatioWindowDays > 0)
+        if (warmStart is not null && string.Equals(warmStart.Type, ModelType, StringComparison.OrdinalIgnoreCase) && hp.DensityRatioWindowDays > 0)
         {
             int recentCount = Math.Min(samples.Count, hp.DensityRatioWindowDays * 24);
             if (recentCount >= hp.MinSamples)
@@ -196,10 +196,12 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
             "TabNetModelTrainer v3: n={N} F={F} steps={S} hidden={H} shared={SL} step={StL} epochs={E} lr={LR} \u03b3={G:F2}",
             samples.Count, F, nSteps, hiddenDim, sharedLayers, stepLayers, epochs, lr, gamma);
 
-        // ── 1. Z-score standardisation ─────────────────────────────────────
-        var rawFeatures = new List<float[]>(samples.Count);
-        foreach (var s in samples) rawFeatures.Add(s.Features);
-        var (means, stds) = MLFeatureHelper.ComputeStandardization(rawFeatures);
+        // ── 1. Z-score standardisation (on ~80% train portion only to prevent test leakage) ──
+        int stdTrainBound = (int)(samples.Count * 0.80);
+        var rawTrainFeatures = new List<float[]>(stdTrainBound);
+        for (int i = 0; i < stdTrainBound && i < samples.Count; i++)
+            rawTrainFeatures.Add(samples[i].Features);
+        var (means, stds) = MLFeatureHelper.ComputeStandardization(rawTrainFeatures);
 
         var allStd = new List<TrainingSample>(samples.Count);
         foreach (var s in samples)
@@ -261,20 +263,22 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
             }
         }
 
-        // ── 1c. Optional unsupervised pre-training ─────────────────────────
+        // ── 1c. Optional unsupervised pre-training (train portion only — exclude test to prevent leakage) ──
         TabNetWeights? pretrainedWeights = null;
         int pretrainEpochs = hp.TabNetPretrainEpochs;
-        if (pretrainEpochs > 0 && allStd.Count >= hp.MinSamples * 2)
+        int pretrainBound = Math.Min(allStd.Count, stdTrainBound);
+        var pretrainSet = pretrainBound < allStd.Count ? allStd[..pretrainBound] : allStd;
+        if (pretrainEpochs > 0 && pretrainSet.Count >= hp.MinSamples * 2)
         {
             double maskFrac = hp.TabNetPretrainMaskFraction > 0 ? hp.TabNetPretrainMaskFraction : 0.3;
 
             // GPU pre-training when CUDA available, with CPU fallback
-            if (allStd.Count >= GpuMinSamples && IsGpuAvailable())
+            if (pretrainSet.Count >= GpuMinSamples && IsGpuAvailable())
             {
                 try
                 {
                     pretrainedWeights = RunUnsupervisedPretrainingGpu(
-                        allStd, F, nSteps, hiddenDim, attentionDim, sharedLayers, stepLayers,
+                        pretrainSet, F, nSteps, hiddenDim, attentionDim, sharedLayers, stepLayers,
                         gamma, useSparsemax, useGlu, lr, pretrainEpochs, maskFrac, bnMomentum, ct);
                 }
                 catch (Exception ex)
@@ -284,7 +288,7 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
             }
 
             pretrainedWeights ??= RunUnsupervisedPretraining(
-                allStd, F, nSteps, hiddenDim, attentionDim, sharedLayers, stepLayers,
+                pretrainSet, F, nSteps, hiddenDim, attentionDim, sharedLayers, stepLayers,
                 gamma, useSparsemax, useGlu, lr, pretrainEpochs, maskFrac, bnMomentum, ct);
             _logger.LogInformation("TabNet pre-training complete ({Epochs} epochs, mask={Mask:P0})",
                 pretrainEpochs, maskFrac);

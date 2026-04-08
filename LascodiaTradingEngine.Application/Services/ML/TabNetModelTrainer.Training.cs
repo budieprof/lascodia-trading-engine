@@ -109,7 +109,7 @@ public sealed partial class TabNetModelTrainer
             InitializeAdamSecondMoment(adam, w);
 
         // ── Validation split for early stopping (last 10% of train) ───────
-        int valSize  = Math.Max(20, n / 10);
+        int valSize  = Math.Clamp(Math.Max(20, n / 10), 1, n - 1);
         var valSet   = trainSet[^valSize..];
         var fitSet   = trainSet[..^valSize];
         int nFit     = fitSet.Count;
@@ -616,7 +616,7 @@ public sealed partial class TabNetModelTrainer
                 double var_ = epochBatchVars is not null && bnIdx < epochBatchVars.Length && j < epochBatchVars[bnIdx].Length
                     ? epochBatchVars[bnIdx][j]
                     : (w.BnVar[bnIdx].Length > j ? w.BnVar[bnIdx][j] : 1.0);
-                double invStd = Math.Min(1.0 / Math.Sqrt(var_ + BnEpsilon), MaxInvStd);
+                double invStd = Math.Min(1.0 / Math.Sqrt(Math.Max(0, var_) + BnEpsilon), MaxInvStd);
                 double xn = s < fwd.StepAttnXNorm.Length && j < fwd.StepAttnXNorm[s].Length
                     ? fwd.StepAttnXNorm[s][j]
                     : 0.0;
@@ -793,7 +793,7 @@ public sealed partial class TabNetModelTrainer
             if (!double.IsFinite(gj)) { gj = 0; nanFixCount++; }
             m[j] = AdamBeta1 * m[j] + (1 - AdamBeta1) * gj;
             v[j] = AdamBeta2 * v[j] + (1 - AdamBeta2) * gj * gj;
-            param[j] -= lr * (m[j] / bc1) / (Math.Sqrt(v[j] / bc2) + AdamEpsilon);
+            param[j] -= lr * (m[j] / bc1) / (Math.Sqrt(Math.Max(0, v[j] / bc2)) + AdamEpsilon);
             if (!double.IsFinite(param[j])) { param[j] = 0; nanFixCount++; }
             else param[j] = Math.Clamp(param[j], -MaxWeightVal, MaxWeightVal);
         }
