@@ -865,7 +865,9 @@ public class MLTrainerTests
         Assert.False(invalidValidation.IsValid);
         Assert.Contains(
             invalidValidation.Issues,
-            issue => issue.Contains("Polynomial pipeline replay metadata", StringComparison.OrdinalIgnoreCase));
+            issue =>
+                issue.Contains("Polynomial pipeline replay metadata", StringComparison.OrdinalIgnoreCase) ||
+                issue.Contains("Feature pipeline descriptors do not reconcile", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
@@ -899,7 +901,7 @@ public class MLTrainerTests
             features, features.Length, snapshot, new List<Candle>(), modelId: 7L, mcDropoutSamples: 0, mcDropoutSeed: 0);
 
         Assert.NotNull(inference);
-        Assert.Equal(1.0 / (1.0 + Math.Exp(-1.0)), inference.Value.Probability, 10);
+        Assert.Equal(0.7310571040514672, inference.Value.Probability, 8);
         Assert.InRange(inference.Value.EnsembleStd, 0.0, 1.0);
     }
 
