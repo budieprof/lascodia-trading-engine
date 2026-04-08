@@ -175,6 +175,34 @@ public sealed partial class TabNetModelTrainer
             Prob = 0;
             Array.Clear(AggregatedH);
             Array.Clear(HPrev);
+
+            // Clear all step-level arrays to prevent stale data leaking across samples
+            for (int s = 0; s < StepH.Length; s++)
+            {
+                Array.Clear(StepH[s]);
+                Array.Clear(StepAttn[s]);
+                Array.Clear(StepMasked[s]);
+                Array.Clear(StepAttnPre[s]);
+                Array.Clear(StepPriorScales[s]);
+                Array.Clear(StepAttnXNorm[s]);
+
+                for (int l = 0; l < StepSharedPre[s].Length; l++)
+                {
+                    Array.Clear(StepSharedPre[s][l]);
+                    Array.Clear(StepSharedGate[s][l]);
+                    Array.Clear(StepSharedXNorm[s][l]);
+                    Array.Clear(StepSharedFcIn[s][l]);
+                }
+                for (int l = 0; l < StepStepPre[s].Length; l++)
+                {
+                    Array.Clear(StepStepPre[s][l]);
+                    Array.Clear(StepStepGate[s][l]);
+                    Array.Clear(StepStepXNorm[s][l]);
+                    Array.Clear(StepStepFcIn[s][l]);
+                }
+            }
+            Array.Clear(PriorScales);
+            Array.Clear(AttnInput);
         }
 
         private static double[][] AllocJagged(int d1, int d2)

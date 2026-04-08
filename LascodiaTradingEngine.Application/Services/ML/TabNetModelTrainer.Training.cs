@@ -43,6 +43,26 @@ public sealed partial class TabNetModelTrainer
     {
         int n = trainSet.Count;
         bool useMagHead = magLossWeight > 0.0;
+
+        // ── GPU fast-path: use TorchSharp when CUDA is available and dataset large enough ──
+        if (n >= GpuMinSamples && IsGpuAvailable())
+        {
+            try
+            {
+                return FitTabNetGpu(trainSet, F, nSteps, hiddenDim, attentionDim,
+                    sharedLayers, stepLayers, gamma, useSparsemax, useGlu,
+                    baseLr, sparsityCoeff, maxEpochs, labelSmoothing,
+                    warmStart, pretrainedInit, densityWeights, temporalDecayLambda,
+                    l2Lambda, patience, magLossWeight, maxGradNorm,
+                    dropoutRate, bnMomentum, ghostBatchSize, warmupEpochs, ct);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "TabNet GPU training failed, falling back to CPU: {Message}", ex.Message);
+            }
+        }
+
         var warmStartReport = new TabNetSnapshotSupport.WarmStartLoadReport(0, 0, 0, 0, 0);
         _lastWarmStartLoadReport = warmStartReport;
 
@@ -223,6 +243,9 @@ public sealed partial class TabNetModelTrainer
                             ClipGradients(grad, maxGradNorm);
 
                         AdamUpdate(w, grad, adam, cosLr, l2Lambda);
+                        if (_nanFixCount > 0)
+                            _logger.LogWarning("TabNet Adam step {T}: replaced {Count} non-finite gradient/parameter values",
+                                adam.T, _nanFixCount);
                         if (miniBatchMeans is not null && miniBatchVars is not null)
                             ApplyBnRunningStatsEma(w, miniBatchMeans, miniBatchVars, bnMomentum);
                         ZeroGradients(grad);
@@ -672,6 +695,9 @@ public sealed partial class TabNetModelTrainer
     //  ADAM OPTIMIZER UPDATE
     // ═══════════════════════════════════════════════════════════════════════
 
+    /// <summary>Counter for non-finite gradient/parameter values replaced during Adam updates.</summary>
+    [ThreadStatic] private static int _nanFixCount;
+
     /// <summary>
     /// AdamW update: decoupled weight decay is applied directly to weights
     /// before the Adam step, keeping it independent of the adaptive learning rate.
@@ -679,6 +705,7 @@ public sealed partial class TabNetModelTrainer
     /// </summary>
     private static void AdamUpdate(TabNetWeights w, TabNetWeights grad, AdamState adam, double lr, double wd = 0)
     {
+        _nanFixCount = 0;
         adam.T++;
         double bc1 = 1.0 - Math.Pow(AdamBeta1, adam.T);
         double bc2 = 1.0 - Math.Pow(AdamBeta2, adam.T);
@@ -735,11 +762,11 @@ public sealed partial class TabNetModelTrainer
 
     private static void AdamStep(ref double param, ref double m, ref double v, double g, double lr, double bc1, double bc2)
     {
-        if (!double.IsFinite(g)) g = 0;
+        if (!double.IsFinite(g)) { g = 0; _nanFixCount++; }
         m = AdamBeta1 * m + (1 - AdamBeta1) * g;
         v = AdamBeta2 * v + (1 - AdamBeta2) * g * g;
         param -= lr * (m / bc1) / (Math.Sqrt(v / bc2) + AdamEpsilon);
-        if (!double.IsFinite(param)) param = 0;
+        if (!double.IsFinite(param)) { param = 0; _nanFixCount++; }
         else param = Math.Clamp(param, -MaxWeightVal, MaxWeightVal);
     }
 
@@ -747,11 +774,12 @@ public sealed partial class TabNetModelTrainer
     {
         for (int j = 0; j < param.Length; j++)
         {
-            double gj = double.IsFinite(g[j]) ? g[j] : 0;
+            double gj = g[j];
+            if (!double.IsFinite(gj)) { gj = 0; _nanFixCount++; }
             m[j] = AdamBeta1 * m[j] + (1 - AdamBeta1) * gj;
             v[j] = AdamBeta2 * v[j] + (1 - AdamBeta2) * gj * gj;
             param[j] -= lr * (m[j] / bc1) / (Math.Sqrt(v[j] / bc2) + AdamEpsilon);
-            if (!double.IsFinite(param[j])) param[j] = 0;
+            if (!double.IsFinite(param[j])) { param[j] = 0; _nanFixCount++; }
             else param[j] = Math.Clamp(param[j], -MaxWeightVal, MaxWeightVal);
         }
     }

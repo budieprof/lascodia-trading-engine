@@ -1663,7 +1663,32 @@ public record TrainingHyperparams(
     /// <summary>Rec #389 v3: Fraction of features masked during pre-training. Default 0.3.</summary>
     double TabNetPretrainMaskFraction = 0.3,
     /// <summary>Rec #389 v3: Linear LR warmup epochs before cosine decay kicks in. 0 = disabled. Default 0.</summary>
-    int TabNetWarmupEpochs = 0
+    int TabNetWarmupEpochs = 0,
+    /// <summary>
+    /// Huber loss delta threshold for the magnitude regression head. Gradients for
+    /// residuals within ±δ are linear (MSE-like); beyond δ they are capped (MAE-like).
+    /// Smaller δ is more robust to outlier magnitudes but provides less gradient signal.
+    /// 0.0 = use default (1.0). Typical 0.5–2.0.
+    /// </summary>
+    double TabNetHuberDelta = 0.0,
+    /// <summary>
+    /// Maximum training epochs for the Platt / temperature / conditional-Platt calibration
+    /// gradient descent loops. More epochs allow finer calibration but increase training time.
+    /// 0 = use default (200). Typical 100–500.
+    /// </summary>
+    int TabNetCalibrationEpochs = 0,
+    /// <summary>
+    /// Learning rate for the Platt / temperature / conditional-Platt calibration SGD.
+    /// 0.0 = use default (0.01). Typical 0.005–0.05.
+    /// </summary>
+    double TabNetCalibrationLr = 0.0,
+    /// <summary>
+    /// Minimum number of samples required in a dataset split (calibration, test, conditional
+    /// branch) before calibration, evaluation, or importance computation is attempted.
+    /// Splits with fewer samples are skipped or use fallback values.
+    /// 0 = use default (10). Typical 10–30.
+    /// </summary>
+    int TabNetMinCalibrationSamples = 0
     );
 
 // ── Evaluation metrics ────────────────────────────────────────────────────────

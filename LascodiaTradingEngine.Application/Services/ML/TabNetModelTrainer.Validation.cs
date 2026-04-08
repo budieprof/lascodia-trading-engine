@@ -89,7 +89,12 @@ public sealed partial class TabNetModelTrainer
         }
 
         if (accList.Count == 0)
+        {
+            _logger.LogWarning(
+                "TabNet walk-forward CV: all {Folds} folds were skipped (insufficient data per fold). CV metrics are unavailable.",
+                folds);
             return (new WalkForwardResult(0, 0, 0, 0, 0, 0), false);
+        }
 
         double badFoldThreshold = hp.MaxBadFoldFraction is > 0.0 and < 1.0 ? hp.MaxBadFoldFraction : 0.5;
         bool equityCurveGateFailed = badFolds > (int)(accList.Count * badFoldThreshold);

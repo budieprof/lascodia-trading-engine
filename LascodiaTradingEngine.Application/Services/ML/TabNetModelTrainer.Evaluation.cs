@@ -87,7 +87,7 @@ public sealed partial class TabNetModelTrainer
         var importance = new float[F];
         Parallel.For(0, F, new ParallelOptions { CancellationToken = ct }, j =>
         {
-            var rng = new Random(j * 13 + 42);
+            var rng = new Random(j * 13 + TrainerSeed);
             var vals = new float[n];
             for (int i = 0; i < n; i++) vals[i] = testSet[i].Features[j];
             for (int i = n - 1; i > 0; i--) { int k = rng.Next(i + 1); (vals[k], vals[i]) = (vals[i], vals[k]); }
@@ -116,7 +116,7 @@ public sealed partial class TabNetModelTrainer
         var importance = new double[F];
         Parallel.For(0, F, new ParallelOptions { CancellationToken = ct }, j =>
         {
-            var rng = new Random(j * 17 + 7);
+            var rng = new Random(j * 17 + TrainerSeed);
             var vals = new float[n];
             for (int i = 0; i < n; i++) vals[i] = calSet[i].Features[j];
             for (int i = n - 1; i > 0; i--) { int k = rng.Next(i + 1); (vals[k], vals[i]) = (vals[i], vals[k]); }
@@ -355,7 +355,7 @@ public sealed partial class TabNetModelTrainer
         if (fitSet.Count < MinCalibrationSamples)
             return [];
 
-        var (batchMeans, batchVars) = ComputeEpochBatchStats(w, fitSet, ghostBatchSize, new Random(12345));
+        var (batchMeans, batchVars) = ComputeEpochBatchStats(w, fitSet, ghostBatchSize, new Random(TrainerSeed));
         var drift = new double[w.TotalBnLayers];
         for (int b = 0; b < w.TotalBnLayers; b++)
         {
@@ -461,9 +461,11 @@ public sealed partial class TabNetModelTrainer
         {
             double y = trainSet[i].Direction > 0 ? 1.0 : 0.0;
 
-            // h_ii ≈ gradNorm_i / (n × meanGradNorm), clamped to [0, 0.9]
+            // h_ii ≈ gradNorm_i / (n × meanGradNorm), clamped to [0, 0.95]
+            // Upper clamp prevents division by near-zero (1 - h_ii) while still
+            // capturing high-leverage points that 0.9 would understate.
             double hii = meanGradNorm > Eps
-                ? Math.Min(gradNorms[i] / (n * meanGradNorm), 0.9)
+                ? Math.Min(gradNorms[i] / (n * meanGradNorm), 0.95)
                 : 0.0;
 
             // LOO prediction: p_{-i} ≈ p + h/(1-h) × (p - y)
@@ -631,7 +633,7 @@ public sealed partial class TabNetModelTrainer
                 double pred = b;
                 for (int j = 0; j < featureCount && j < s.Features.Length; j++) pred += lw[j] * s.Features[j];
                 double err = pred - s.Magnitude; if (!double.IsFinite(err)) continue;
-                double huberGrad = Math.Abs(err) <= 1.0 ? err : Math.Sign(err);
+                double huberGrad = Math.Abs(err) <= HuberDelta ? err : HuberDelta * Math.Sign(err);
                 double bc1 = 1.0 - beta1t, bc2 = 1.0 - beta2t, alphat = alpha * Math.Sqrt(bc2) / bc1;
                 mB = AdamBeta1 * mB + (1.0 - AdamBeta1) * huberGrad; vB = AdamBeta2 * vB + (1.0 - AdamBeta2) * huberGrad * huberGrad;
                 b -= alphat * mB / (Math.Sqrt(vB) + AdamEpsilon);

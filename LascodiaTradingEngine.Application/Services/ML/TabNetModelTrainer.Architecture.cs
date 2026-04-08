@@ -53,10 +53,14 @@ public sealed partial class TabNetModelTrainer
             }
             else
             {
+                // AttnFcW is [F][attentionDim] — attention bottleneck projects
+                // from min(H, attentionDim) dimensions of hPrev into F logits.
+                int attnDim = w.AttentionDim;
                 for (int j = 0; j < F; j++)
                 {
+                    int projDim = Math.Min(attnDim, w.AttnFcW[s][j].Length);
                     double val = 0;
-                    for (int k = 0; k < H && k < w.AttnFcW[s][j].Length; k++)
+                    for (int k = 0; k < projDim; k++)
                         val += w.AttnFcW[s][j][k] * hPrev[k];
                     attnInput[j] = val + w.AttnFcB[s][j];
                 }
@@ -417,9 +421,11 @@ public sealed partial class TabNetModelTrainer
             sum += output[i];
         }
 
-        // Guard: if all entries zeroed (e.g. identical inputs), fall back to uniform
+        // Guard: if all entries zeroed (e.g. identical inputs), fall back to softmax
+        // on the original logits for a smooth, gradient-friendly distribution rather
+        // than a hard uniform that creates a discontinuity.
         if (sum < Eps)
-            for (int i = 0; i < len; i++) output[i] = 1.0 / len;
+            return SoftmaxArr(z, len);
 
         return output;
     }

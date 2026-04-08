@@ -135,7 +135,7 @@ public sealed partial class TabNetModelTrainer
             double tuneEce = ComputeEce(tuneCal, tunedWeights, tuneCalibration.FinalSnapshot);
             var cvHp = hp with
             {
-                WalkForwardFolds = Math.Clamp(Math.Min(hp.WalkForwardFolds, 2), 1, 2),
+                WalkForwardFolds = Math.Clamp(hp.WalkForwardFolds, 1, 3),
                 MaxEpochs = tuneEpochs,
                 EarlyStoppingPatience = Math.Max(3, hp.EarlyStoppingPatience / 2),
                 MaxBadFoldFraction = 1.0,
@@ -255,9 +255,16 @@ public sealed partial class TabNetModelTrainer
         double maxCalibratedDelta = 0.0;
         double maxUncertaintyObserved = 0.0;
 
-        int auditCount = Math.Min(rawAuditSamples.Count, 24);
-        for (int i = 0; i < auditCount; i++)
+        // Distribute audit samples evenly across the dataset (not just first-N)
+        const int MaxAuditSamples = 24;
+        int auditCount = Math.Min(rawAuditSamples.Count, MaxAuditSamples);
+        int auditStride = rawAuditSamples.Count > MaxAuditSamples
+            ? rawAuditSamples.Count / MaxAuditSamples
+            : 1;
+        for (int ai = 0; ai < auditCount; ai++)
         {
+            int i = ai * auditStride;
+            if (i >= rawAuditSamples.Count) break;
             float[] features = MLSignalScorer.StandardiseFeatures(rawAuditSamples[i].Features, snapshot.Means, snapshot.Stds, featureCount);
             InferenceHelpers.ApplyModelSpecificFeatureTransforms(features, snapshot);
             MLSignalScorer.ApplyFeatureMask(features, snapshot.ActiveFeatureMask, featureCount);

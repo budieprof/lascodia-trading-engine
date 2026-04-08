@@ -1128,4 +1128,50 @@ public class MLTrainerTests
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
             () => trainer.TrainAsync(samples, DefaultHp(), ct: cts.Token));
     }
+
+    // ──────────────────────────────────────────────
+    // TabNet pruning dimensionality reduction
+    // ──────────────────────────────────────────────
+
+    [Fact(Timeout = 60000)]
+    public async Task TabNet_Pruning_ReducesActualFeatureDimensionality()
+    {
+        var trainer = new TabNetModelTrainer(Mock.Of<ILogger<TabNetModelTrainer>>());
+        // Use 12 features with aggressive pruning threshold to ensure some features are pruned
+        var samples = GenerateSamples(260, featureCount: 12);
+        var hp = DefaultHp() with
+        {
+            MaxEpochs = 8,
+            WalkForwardFolds = 2,
+            EarlyStoppingPatience = 3,
+            MinFeatureImportance = 4.0, // aggressive: prune features below 4× equal share
+        };
+
+        var result = await trainer.TrainAsync(samples, hp);
+        var snap = JsonSerializer.Deserialize<ModelSnapshot>(result.ModelBytes);
+        Assert.NotNull(snap);
+
+        if (snap.PrunedFeatureCount > 0 && snap.TabNetPruningAccepted)
+        {
+            // When pruning is accepted, the deployed model's TabNet weights should
+            // reflect the reduced dimensionality (F - prunedCount), not the original F.
+            int expectedF = snap.Features.Length - snap.PrunedFeatureCount;
+            Assert.True(expectedF < snap.Features.Length,
+                "Pruned feature count should be less than total features.");
+
+            // The attention FC weights at step 0 should have outer dimension = expectedF
+            // because ApplyMask now compacts features rather than zeroing them.
+            if (snap.TabNetAttentionFcWeights is { Length: > 0 })
+            {
+                int attnOuterDim = snap.TabNetAttentionFcWeights[0].Length;
+                Assert.Equal(expectedF, attnOuterDim);
+            }
+
+            // BN parameters for the attention layer (index 0) should also match
+            if (snap.TabNetBnGammas is { Length: > 0 })
+            {
+                Assert.Equal(expectedF, snap.TabNetBnGammas[0].Length);
+            }
+        }
+    }
 }

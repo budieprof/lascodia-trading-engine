@@ -18,9 +18,14 @@ public sealed partial class TabNetModelTrainer
         var w = InitializeWeights(F, nSteps, hiddenDim, attentionDim, sharedLayers, stepLayers,
             gamma, useSparsemax, useGlu, false);
 
-        var rng = new Random(123);
+        var rng = new Random(TrainerSeed);
         var decoderW = XavierMatrix(rng, F, hiddenDim);
         var decoderB = new double[F];
+
+        // Decoder gradient accumulators (matched to encoder accumulation pattern)
+        var decoderWGrad = new double[F][];
+        for (int j = 0; j < F; j++) decoderWGrad[j] = new double[hiddenDim];
+        var decoderBGrad = new double[F];
 
         var priorBuf = new double[F];
         var attnBuf  = new double[F];
@@ -63,6 +68,7 @@ public sealed partial class TabNetModelTrainer
                 }
 
                 // Compute ∂L/∂AggregatedH from reconstruction MSE on masked features
+                // Accumulate decoder gradients (applied at batch boundary, matching encoder)
                 var dAggH = new double[hiddenDim];
                 for (int j = 0; j < F; j++)
                 {
@@ -71,11 +77,11 @@ public sealed partial class TabNetModelTrainer
                     epochLoss += err * err;
                     double dRecon = 2.0 * err / masked;
 
-                    decoderB[j] -= cosLr * dRecon;
+                    decoderBGrad[j] += dRecon;
                     for (int k = 0; k < hiddenDim; k++)
                     {
                         dAggH[k] += dRecon * decoderW[j][k];
-                        decoderW[j][k] -= cosLr * dRecon * fwd.AggregatedH[k];
+                        decoderWGrad[j][k] += dRecon * fwd.AggregatedH[k];
                     }
                 }
 
@@ -90,6 +96,21 @@ public sealed partial class TabNetModelTrainer
                     ClipGradients(grad, 1.0);
                     AdamUpdate(w, grad, adam, cosLr);
                     ZeroGradients(grad);
+
+                    // Apply accumulated decoder gradients at same batch boundary
+                    for (int j = 0; j < F; j++)
+                    {
+                        decoderB[j] -= cosLr * decoderBGrad[j] * invBatch;
+                        decoderB[j] = Math.Clamp(decoderB[j], -MaxWeightVal, MaxWeightVal);
+                        for (int k = 0; k < hiddenDim; k++)
+                        {
+                            decoderW[j][k] -= cosLr * decoderWGrad[j][k] * invBatch;
+                            decoderW[j][k] = Math.Clamp(decoderW[j][k], -MaxWeightVal, MaxWeightVal);
+                        }
+                        decoderBGrad[j] = 0;
+                        Array.Clear(decoderWGrad[j]);
+                    }
+
                     batchCount = 0;
                 }
             }
@@ -101,10 +122,26 @@ public sealed partial class TabNetModelTrainer
                 ClipGradients(grad, 1.0);
                 AdamUpdate(w, grad, adam, cosLr);
                 ZeroGradients(grad);
+
+                // Flush remaining decoder gradients
+                for (int j = 0; j < F; j++)
+                {
+                    decoderB[j] -= cosLr * decoderBGrad[j] * invBatch;
+                    decoderB[j] = Math.Clamp(decoderB[j], -MaxWeightVal, MaxWeightVal);
+                    for (int k = 0; k < hiddenDim; k++)
+                    {
+                        decoderW[j][k] -= cosLr * decoderWGrad[j][k] * invBatch;
+                        decoderW[j][k] = Math.Clamp(decoderW[j][k], -MaxWeightVal, MaxWeightVal);
+                    }
+                    decoderBGrad[j] = 0;
+                    Array.Clear(decoderWGrad[j]);
+                }
+
                 batchCount = 0;
             }
 
-            if (ep % 5 == 4)
+            // Update BN running stats every 2 epochs for fresher statistics
+            if (ep % 2 == 1)
             {
                 var (epochMeans, epochVars) = ComputeEpochBatchStats(w, samples, 128, rng);
                 ApplyBnRunningStatsEma(w, epochMeans, epochVars, bnMomentum);

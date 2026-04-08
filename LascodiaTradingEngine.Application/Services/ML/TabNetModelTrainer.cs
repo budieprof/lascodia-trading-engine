@@ -52,7 +52,7 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
     private const double AdamBeta2   = 0.999;
     private const double AdamEpsilon = 1e-8;
     private const double BnEpsilon   = 1e-5;
-    private const double HuberDelta  = 1.0;
+    private const double DefaultHuberDelta = 1.0;
     private const double MaxWeightVal = 10.0;
     private const double MaxInvStd    = 1e4;     // prevent gradient explosion from near-zero BN variance
     private const double SqrtHalfResidualScale = 0.7071067811865476; // 1/√2
@@ -61,9 +61,18 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
     private const double ProbClampMin = 1e-7;
     private const int    DefaultBatchSize = 32;
     private const int    MeanAttentionSampleCap = 500;
-    private const int    CalibrationEpochs = 200;
-    private const double CalibrationLr = 0.01;
-    private const int    MinCalibrationSamples = 10;
+    private const int    DefaultCalibrationEpochs = 200;
+    private const double DefaultCalibrationLr = 0.01;
+    private const int    DefaultMinCalibrationSamples = 10;
+    private const int    TrainerSeed = 42;
+
+    // ── Per-run tunables (resolved from TrainingHyperparams at the start of Train) ──
+    // ThreadStatic so static helper methods in partial classes can access them
+    // without parameter threading. Safe because each training run is single-threaded.
+    [ThreadStatic] private static double HuberDelta;
+    [ThreadStatic] private static int    CalibrationEpochs;
+    [ThreadStatic] private static double CalibrationLr;
+    [ThreadStatic] private static int    MinCalibrationSamples;
 
     private static readonly JsonSerializerOptions JsonOpts =
         new() { WriteIndented = false, MaxDepth = 64 };
@@ -98,11 +107,26 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
     {
         ct.ThrowIfCancellationRequested();
 
+        // Resolve per-run tunables from hyperparams (fall back to defaults when 0/unset)
+        HuberDelta            = hp.TabNetHuberDelta > 0          ? hp.TabNetHuberDelta            : DefaultHuberDelta;
+        CalibrationEpochs     = hp.TabNetCalibrationEpochs > 0   ? hp.TabNetCalibrationEpochs     : DefaultCalibrationEpochs;
+        CalibrationLr         = hp.TabNetCalibrationLr > 0       ? hp.TabNetCalibrationLr         : DefaultCalibrationLr;
+        MinCalibrationSamples = hp.TabNetMinCalibrationSamples > 0 ? hp.TabNetMinCalibrationSamples : DefaultMinCalibrationSamples;
+
         if (samples.Count < hp.MinSamples)
             throw new InvalidOperationException(
                 $"TabNetModelTrainer requires at least {hp.MinSamples} samples; got {samples.Count}.");
 
         int F       = samples[0].Features.Length;
+
+        // Validate all samples have consistent feature length
+        for (int i = 1; i < samples.Count; i++)
+        {
+            if (samples[i].Features.Length != F)
+                throw new InvalidOperationException(
+                    $"TabNetModelTrainer: sample {i} has {samples[i].Features.Length} features, expected {F}. " +
+                    "All samples must have the same feature count.");
+        }
         int nSteps  = hp.TabNetSteps > 0 ? hp.TabNetSteps : (hp.K > 0 ? hp.K : 3);
         double lr   = hp.LearningRate > 0 ? hp.LearningRate : 0.02;
         int epochs  = hp.MaxEpochs > 0 ? hp.MaxEpochs : 50;
@@ -117,7 +141,6 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
         double dropoutRate = hp.TabNetDropoutRate;
         double bnMomentum  = hp.TabNetMomentumBn > 0 ? hp.TabNetMomentumBn : 0.98;
         int ghostBatchSize = hp.TabNetGhostBatchSize > 0 ? hp.TabNetGhostBatchSize : 128;
-        const int TrainerSeed = 42;
         string[] rawTabNetFeatureNames = BuildTabNetFeatureNames(F, TabNetFeatureExpansionPlan.Empty);
         string featureSchemaFingerprint = TabNetSnapshotSupport.ComputeFeatureSchemaFingerprint(rawTabNetFeatureNames, F);
         var warmStartCompatibility = new TabNetSnapshotSupport.CompatibilityResult(true, []);
@@ -250,7 +273,23 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
         if (pretrainEpochs > 0 && allStd.Count >= hp.MinSamples * 2)
         {
             double maskFrac = hp.TabNetPretrainMaskFraction > 0 ? hp.TabNetPretrainMaskFraction : 0.3;
-            pretrainedWeights = RunUnsupervisedPretraining(
+
+            // GPU pre-training when CUDA available, with CPU fallback
+            if (allStd.Count >= GpuMinSamples && IsGpuAvailable())
+            {
+                try
+                {
+                    pretrainedWeights = RunUnsupervisedPretrainingGpu(
+                        allStd, F, nSteps, hiddenDim, attentionDim, sharedLayers, stepLayers,
+                        gamma, useSparsemax, useGlu, lr, pretrainEpochs, maskFrac, bnMomentum, ct);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "TabNet GPU pre-training failed, falling back to CPU: {Message}", ex.Message);
+                }
+            }
+
+            pretrainedWeights ??= RunUnsupervisedPretraining(
                 allStd, F, nSteps, hiddenDim, attentionDim, sharedLayers, stepLayers,
                 gamma, useSparsemax, useGlu, lr, pretrainEpochs, maskFrac, bnMomentum, ct);
             _logger.LogInformation("TabNet pre-training complete ({Epochs} epochs, mask={Mask:P0})",
@@ -457,7 +496,7 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
             var maskedTrain = ApplyMask(trainSet, activeMask);
             var maskedCal   = ApplyMask(calSet,   activeMask);
             var maskedTest  = ApplyMask(testSet,  activeMask);
-            int maskedF     = F;
+            int maskedF     = F - prunedCount;
 
             int prunedEpochs = Math.Max(10, epochs / 2);
             var prunedW = FitTabNet(

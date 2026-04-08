@@ -260,12 +260,27 @@ public sealed partial class TabNetModelTrainer
 
     private static List<TrainingSample> ApplyMask(IReadOnlyList<TrainingSample> samples, bool[] mask)
     {
+        int keptCount = mask.Count(m => m);
+        if (keptCount == mask.Length)
+        {
+            // No pruning — return shallow copies to avoid unnecessary allocation
+            var passthrough = new List<TrainingSample>(samples.Count);
+            foreach (var s in samples) passthrough.Add(s);
+            return passthrough;
+        }
+
+        // Build compacted feature vectors containing only kept features
+        var keptIndices = new int[keptCount];
+        int ki = 0;
+        for (int j = 0; j < mask.Length; j++)
+            if (mask[j]) keptIndices[ki++] = j;
+
         var result = new List<TrainingSample>(samples.Count);
         foreach (var s in samples)
         {
-            var nf = (float[])s.Features.Clone();
-            for (int j = 0; j < mask.Length && j < nf.Length; j++)
-                if (!mask[j]) nf[j] = 0f;
+            var nf = new float[keptCount];
+            for (int j = 0; j < keptCount; j++)
+                nf[j] = keptIndices[j] < s.Features.Length ? s.Features[keptIndices[j]] : 0f;
             result.Add(s with { Features = nf });
         }
         return result;
@@ -330,13 +345,14 @@ public sealed partial class TabNetModelTrainer
         }
 
         var selected = new List<int>(topN);
+        var selectedSet = new HashSet<int>(topN);
         while (selected.Count < topN)
         {
             int bestIdx = -1;
             double bestScore = double.NegativeInfinity;
             for (int j = 0; j < F; j++)
             {
-                if (selected.Contains(j))
+                if (selectedSet.Contains(j))
                     continue;
 
                 double redundancy = 0.0;
@@ -358,6 +374,7 @@ public sealed partial class TabNetModelTrainer
             if (bestIdx < 0)
                 break;
             selected.Add(bestIdx);
+            selectedSet.Add(bestIdx);
         }
 
         return selected.OrderBy(i => i).ToArray();
