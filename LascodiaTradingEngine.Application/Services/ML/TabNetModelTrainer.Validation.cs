@@ -40,6 +40,9 @@ public sealed partial class TabNetModelTrainer
         {
             int testEnd    = (fold + 2) * foldSize;
             int testStart  = testEnd - foldSize;
+            // Effective gap between train and test = embargo + lookback window + PurgeHorizonBars.
+            // The embargo prevents label leakage, the lookback window accounts for indicator dependencies,
+            // and PurgeHorizonBars provides an additional configurable purge zone.
             int purgeExtra = MLFeatureHelper.LookbackWindow - 1;
             int trainEnd   = Math.Max(0, testStart - embargo - purgeExtra);
 

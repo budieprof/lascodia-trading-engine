@@ -171,16 +171,20 @@ public sealed partial class TabNetModelTrainer
         return a;
     }
 
-    private static void InitializeAdamSecondMoment(AdamState adam, TabNetWeights w)
+    private static void InitializeAdamSecondMoment(AdamState adam, TabNetWeights w, int parentTrainSamples = 0, int batchSize = DefaultBatchSize, int parentEpochs = 0)
     {
-        // Warm-start Adam's second moment from loaded weight magnitudes to reduce initial instability
+        // Warm-start Adam's second moment from loaded weight magnitudes to reduce initial instability.
+        // T is set to approximate the parent model's training step count so Adam bias correction
+        // produces a similar effective learning rate profile as a continued training run.
+        // With beta1=0.9, T≥50 makes bias correction ≈1.0 (no-op), while T=1 makes it 10x.
         const double MinV = 1e-4;
         static void WarmV(double[] param, double[] v) { for (int i = 0; i < param.Length; i++) v[i] = Math.Max(param[i] * param[i], MinV); }
         static void WarmV2D(double[][] param, double[][] v) { for (int i = 0; i < param.Length; i++) WarmV(param[i], v[i]); }
 
         if (w.InitialBnFcW.Length > 0) WarmV2D(w.InitialBnFcW, adam.VInitialBnFcW);
         WarmV(w.OutputW, adam.VOutputW);
-        if (w.MagW.Length > 0) WarmV(w.MagW, adam.VMagW);
+        adam.VOutputB = Math.Max(w.OutputB * w.OutputB, MinV);
+        if (w.MagW.Length > 0) { WarmV(w.MagW, adam.VMagW); adam.VMagB = Math.Max(w.MagB * w.MagB, MinV); }
 
         for (int l = 0; l < w.SharedLayers; l++)
         {
@@ -203,7 +207,12 @@ public sealed partial class TabNetModelTrainer
             WarmV(w.AttnFcB[s], adam.VAttnFcB[s]);
         }
 
-        adam.T = 10; // Pretend a few steps have passed
+        // Estimate the parent model's Adam step count for bias correction continuity.
+        // Falls back to 50 (bias correction ≈ 1.0) when parent info is unavailable.
+        int estimatedParentSteps = parentTrainSamples > 0 && parentEpochs > 0
+            ? Math.Max(1, parentTrainSamples / Math.Max(1, batchSize)) * parentEpochs
+            : 0;
+        adam.T = estimatedParentSteps > 0 ? estimatedParentSteps : 50;
     }
 
     // ═══════════════════════════════════════════════════════════════════════

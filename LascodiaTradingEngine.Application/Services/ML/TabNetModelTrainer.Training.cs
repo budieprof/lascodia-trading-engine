@@ -106,7 +106,10 @@ public sealed partial class TabNetModelTrainer
 
         // Warm-start Adam second moments from loaded weight magnitudes
         if (warmStart is not null && (pretrainedInit is not null || warmStart.Type == ModelType))
-            InitializeAdamSecondMoment(adam, w);
+            InitializeAdamSecondMoment(adam, w,
+                parentTrainSamples: warmStart.TrainSamples,
+                batchSize: DefaultBatchSize,
+                parentEpochs: maxEpochs);
 
         // ── Validation split for early stopping (last 10% of train) ───────
         int valSize  = n > 1 ? Math.Min(Math.Max(20, n / 10), n - 1) : 0;

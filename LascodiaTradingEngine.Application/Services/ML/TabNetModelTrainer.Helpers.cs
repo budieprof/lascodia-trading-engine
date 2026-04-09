@@ -685,11 +685,15 @@ public sealed partial class TabNetModelTrainer
         TabNetRunContext runContext,
         CancellationToken ct)
     {
-        if (expandedFeatureCount <= baseFeatureCount ||
-            baseSamples.Count < Math.Max(80, hp.MinSamples) ||
-            hp.WalkForwardFolds <= 0)
+        if (expandedFeatureCount <= baseFeatureCount)
+            return true; // no-op: no features were added
+
+        if (baseSamples.Count < Math.Max(80, hp.MinSamples) || hp.WalkForwardFolds <= 0)
         {
-            return true;
+            _logger.LogInformation(
+                "TabNet feature expansion gate: rejected — insufficient samples ({N}) or walk-forward folds disabled for validation",
+                baseSamples.Count);
+            return false;
         }
 
         var evalHp = hp with
@@ -716,7 +720,12 @@ public sealed partial class TabNetModelTrainer
             sharedLayers, stepLayers, gamma, useSparsemax, useGlu, lr, sparsityCoeff, evalEpochs, bnMomentum, runContext, ct);
 
         if (baseCv.FoldCount == 0 || expandedCv.FoldCount == 0)
-            return true;
+        {
+            _logger.LogWarning(
+                "TabNet feature expansion gate: rejected — walk-forward CV produced 0 folds (base={BaseFolds}, expanded={ExpandedFolds})",
+                baseCv.FoldCount, expandedCv.FoldCount);
+            return false;
+        }
 
         static double Score(WalkForwardResult result) =>
             result.AvgAccuracy +
