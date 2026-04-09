@@ -315,6 +315,12 @@ public sealed partial class TabNetModelTrainer
             wArr[i] = (float)w;
         }
 
+        // Normalize blended weights to sum to 1 (matches CPU path normalization)
+        float wSum = 0;
+        for (int i = 0; i < n; i++) wSum += wArr[i];
+        if (wSum > (float)Eps)
+            for (int i = 0; i < n; i++) wArr[i] /= wSum;
+
         return (
             torch.tensor(xArr, device: device).reshape(n, F),
             torch.tensor(yArr, device: device),
