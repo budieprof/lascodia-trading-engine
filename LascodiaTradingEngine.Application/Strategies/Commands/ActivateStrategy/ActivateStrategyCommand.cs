@@ -3,6 +3,7 @@ using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
+using LascodiaTradingEngine.Application.Backtesting;
 using LascodiaTradingEngine.Application.Common.Events;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
@@ -44,19 +45,24 @@ public class ActivateStrategyCommandHandler : IRequestHandler<ActivateStrategyCo
     private readonly IWriteApplicationDbContext _context;
     private readonly IIntegrationEventService _eventBus;
     private readonly IApprovalWorkflow _approvalWorkflow;
-
     private readonly ICurrentUserService _currentUser;
+    private readonly IValidationRunFactory _validationRunFactory;
+    private readonly TimeProvider _timeProvider;
 
     public ActivateStrategyCommandHandler(
         IWriteApplicationDbContext context,
         IIntegrationEventService eventBus,
         IApprovalWorkflow approvalWorkflow,
-        ICurrentUserService currentUser)
+        ICurrentUserService currentUser,
+        IValidationRunFactory validationRunFactory,
+        TimeProvider timeProvider)
     {
         _context  = context;
         _eventBus = eventBus;
         _approvalWorkflow = approvalWorkflow;
         _currentUser = currentUser;
+        _validationRunFactory = validationRunFactory;
+        _timeProvider = timeProvider;
     }
 
     public async Task<ResponseData<string>> Handle(ActivateStrategyCommand request, CancellationToken cancellationToken)
@@ -93,30 +99,34 @@ public class ActivateStrategyCommandHandler : IRequestHandler<ActivateStrategyCo
         if (!await _approvalWorkflow.ConsumeApprovalAsync(ApprovalOperationType.StrategyActivation, request.Id, cancellationToken))
             return ResponseData<string>.Init(null, false, "Approval was already consumed by a concurrent request", "-409");
 
+        var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+
         entity.Status = StrategyStatus.Active;
 
         // ── Update lifecycle stage on successful activation (skip if already Active to preserve timestamp) ──
         if (entity.LifecycleStage != StrategyLifecycleStage.Active)
         {
             entity.LifecycleStage = StrategyLifecycleStage.Active;
-            entity.LifecycleStageEnteredAt = DateTime.UtcNow;
+            entity.LifecycleStageEnteredAt = nowUtc;
         }
 
         // ── Auto-queue an initial BacktestRun so the strategy has a performance baseline ──
-        var toDate   = DateTime.UtcNow;
+        var toDate   = nowUtc;
         var fromDate = toDate.AddYears(-1);
 
-        var backtestRun = new BacktestRun
-        {
-            StrategyId     = entity.Id,
-            Symbol         = entity.Symbol,
-            Timeframe      = entity.Timeframe,
-            FromDate       = fromDate,
-            ToDate         = toDate,
-            InitialBalance = 10_000m,
-            Status         = RunStatus.Queued,
-            StartedAt      = DateTime.UtcNow
-        };
+        var backtestRun = await _validationRunFactory.BuildBacktestRunAsync(
+            _context.GetDbContext(),
+            new BacktestQueueRequest(
+                StrategyId: entity.Id,
+                Symbol: entity.Symbol,
+                Timeframe: entity.Timeframe,
+                FromDate: fromDate,
+                ToDate: toDate,
+                InitialBalance: 10_000m,
+                QueueSource: ValidationRunQueueSources.ActivationBaseline,
+                ParametersSnapshotJson: entity.ParametersJson,
+                ValidationQueueKey: $"backtest:activation:strategy:{entity.Id}"),
+            cancellationToken);
 
         await _context.GetDbContext().Set<BacktestRun>().AddAsync(backtestRun, cancellationToken);
 
@@ -127,7 +137,7 @@ public class ActivateStrategyCommandHandler : IRequestHandler<ActivateStrategyCo
             Name        = entity.Name,
             Symbol      = entity.Symbol,
             Timeframe   = entity.Timeframe,
-            ActivatedAt = DateTime.UtcNow
+            ActivatedAt = nowUtc
         });
 
         return ResponseData<string>.Init("Activated", true, "Successful", "00");

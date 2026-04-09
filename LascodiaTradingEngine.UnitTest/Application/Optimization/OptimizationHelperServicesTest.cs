@@ -4,6 +4,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using MockQueryable.Moq;
 using Moq;
+using LascodiaTradingEngine.Application.Backtesting;
 using LascodiaTradingEngine.Application.Backtesting.Models;
 using LascodiaTradingEngine.Application.Backtesting.Services;
 using LascodiaTradingEngine.Application.Common.Diagnostics;
@@ -770,10 +771,17 @@ public class OptimizationHelperServicesTest
         var runScopedConfigService = new OptimizationRunScopedConfigService(
             configProvider,
             NullLogger<OptimizationRunScopedConfigService>.Instance);
+        var settingsProvider = new ValidationSettingsProvider();
+        var optionsBuilder = new BacktestOptionsSnapshotBuilder(
+            settingsProvider,
+            NullLogger<BacktestOptionsSnapshotBuilder>.Instance);
+        var validationRunFactory = new ValidationRunFactory(optionsBuilder, timeProvider);
         var followUpCoordinator = new OptimizationFollowUpCoordinator(
             scopeFactory,
             Mock.Of<IAlertDispatcher>(),
             runScopedConfigService,
+            validationRunFactory,
+            optionsBuilder,
             NullLogger<OptimizationFollowUpCoordinator>.Instance,
             metrics,
             timeProvider);

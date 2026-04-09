@@ -161,10 +161,13 @@ public sealed partial class TcnModelTrainer
     /// Also returns class-wise ECE for Buy and Sell predictions separately.
     /// </summary>
     internal static (double Mce, double EceBuy, double EceSell) ComputeCalibrationDecomposition(
-        List<TrainingSample> samples, double[] rawProbs, double plattA, double plattB)
+        List<TrainingSample> samples,
+        double[] rawProbs,
+        in TcnCalibrationArtifacts calibration)
     {
         if (samples.Count < 20) return (0, 0, 0);
         const int B = 10;
+        double decisionThreshold = CalibrationThreshold(calibration);
 
         // Global MCE
         var binConf = new double[B]; var binAcc = new int[B]; var binCount = new int[B];
@@ -175,15 +178,20 @@ public sealed partial class TcnModelTrainer
 
         for (int i = 0; i < samples.Count; i++)
         {
-            double p = MLFeatureHelper.Sigmoid(plattA * MLFeatureHelper.Logit(rawProbs[i]) + plattB);
+            double p = ApplyTcnCalibration(rawProbs[i], calibration);
             int bin = Math.Clamp((int)(p * B), 0, B - 1);
             bool isPos = samples[i].Direction == 1;
 
             binConf[bin] += p; binCount[bin]++;
             if (isPos) binAcc[bin]++;
 
-            if (p >= 0.5) { buyConf[bin] += p; buyCount[bin]++; if (isPos) buyAcc[bin]++; }
-            else { sellConf[bin] += p; sellCount[bin]++; if (isPos) sellAcc[bin]++; }
+            if (p >= decisionThreshold) { buyConf[bin] += p; buyCount[bin]++; if (isPos) buyAcc[bin]++; }
+            else
+            {
+                sellConf[bin] += 1.0 - p;
+                sellCount[bin]++;
+                if (!isPos) sellAcc[bin]++;
+            }
         }
 
         double mce = 0;

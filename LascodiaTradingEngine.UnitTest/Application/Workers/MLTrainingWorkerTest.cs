@@ -275,7 +275,8 @@ public class MLTrainingWorkerTest
         double sharpe    = 1.5,
         double f1        = 0.60,
         double wfStd     = 0.03,
-        double oobAcc    = 0.60)
+        double oobAcc    = 0.60,
+        byte[]? modelBytes = null)
     {
         var metrics = new EvalMetrics(
             Accuracy:        accuracy,
@@ -298,8 +299,184 @@ public class MLTrainingWorkerTest
             AvgSharpe:   sharpe,
             FoldCount:   4);
 
-        byte[] modelBytes = System.Text.Encoding.UTF8.GetBytes("{}");
-        return new TrainingResult(metrics, cvResult, modelBytes);
+        return new TrainingResult(metrics, cvResult, modelBytes ?? System.Text.Encoding.UTF8.GetBytes("{}"));
+    }
+
+    private static byte[] CreateFtTransformerPromotionSnapshotBytes(
+        bool includeSplitSummary = true,
+        bool includeAuditArtifact = true,
+        double parityError = 0.0,
+        int thresholdDecisionMismatchCount = 0,
+        string[]? auditFindings = null)
+    {
+        var snapshot = new ModelSnapshot
+        {
+            Type = "FTTRANSFORMER",
+            Version = "6.0",
+            Features = ["F0", "F1"],
+            FtTransformerRawFeatureCount = 2,
+            Means = [0f, 0f],
+            Stds = [1f, 1f],
+            ActiveFeatureMask = [true, true],
+            ConditionalCalibrationRoutingThreshold = 0.5,
+            Ece = 0.05,
+            BrierSkillScore = 0.10,
+            FtTransformerEmbedDim = 2,
+            FtTransformerNumHeads = 1,
+            FtTransformerFfnDim = 2,
+            FtTransformerNumLayers = 1,
+            FtTransformerEmbedWeights =
+            [
+                [1.0, 0.5],
+                [-0.5, 1.0],
+            ],
+            FtTransformerEmbedBiases =
+            [
+                [0.0, 0.0],
+                [0.0, 0.0],
+            ],
+            FtTransformerClsToken = [0.2, -0.1],
+            FtTransformerWq =
+            [
+                [0.0, 0.0],
+                [0.0, 0.0],
+            ],
+            FtTransformerWk =
+            [
+                [0.0, 0.0],
+                [0.0, 0.0],
+            ],
+            FtTransformerWv =
+            [
+                [1.0, 0.0],
+                [0.0, 1.0],
+            ],
+            FtTransformerWo =
+            [
+                [1.0, 0.0],
+                [0.0, 1.0],
+            ],
+            FtTransformerGamma1 = [1.0, 1.0],
+            FtTransformerBeta1 = [0.0, 0.0],
+            FtTransformerWff1 =
+            [
+                [0.0, 0.0],
+                [0.0, 0.0],
+            ],
+            FtTransformerBff1 = [0.0, 0.0],
+            FtTransformerWff2 =
+            [
+                [0.0, 0.0],
+                [0.0, 0.0],
+            ],
+            FtTransformerBff2 = [0.0, 0.0],
+            FtTransformerGamma2 = [1.0, 1.0],
+            FtTransformerBeta2 = [0.0, 0.0],
+            FtTransformerGammaFinal = [1.0, 1.0],
+            FtTransformerBetaFinal = [0.0, 0.0],
+            FtTransformerOutputWeights = [1.0, -0.5],
+            FtTransformerOutputBias = 0.1,
+            FtTransformerSelectionMetrics = new FtTransformerMetricSummary { SplitName = "selection", SampleCount = 20, Threshold = 0.5, Accuracy = 0.6, Precision = 0.6, Recall = 0.6, F1 = 0.6, ExpectedValue = 0.02, BrierScore = 0.2, WeightedAccuracy = 0.6, SharpeRatio = 0.8, Ece = 0.05 },
+            FtTransformerCalibrationMetrics = new FtTransformerMetricSummary { SplitName = "calibration", SampleCount = 20, Threshold = 0.5, Accuracy = 0.6, Precision = 0.6, Recall = 0.6, F1 = 0.6, ExpectedValue = 0.02, BrierScore = 0.2, WeightedAccuracy = 0.6, SharpeRatio = 0.8, Ece = 0.05 },
+            FtTransformerTestMetrics = new FtTransformerMetricSummary { SplitName = "test", SampleCount = 20, Threshold = 0.5, Accuracy = 0.6, Precision = 0.6, Recall = 0.6, F1 = 0.6, ExpectedValue = 0.02, BrierScore = 0.2, WeightedAccuracy = 0.6, SharpeRatio = 0.8, Ece = 0.05 },
+            FtTransformerCalibrationArtifact = new FtTransformerCalibrationArtifact
+            {
+                SelectedGlobalCalibration = "PLATT",
+                CalibrationSelectionStrategy = "FIT_ON_FIT_EVAL_ON_CROSSFIT_DIAGNOSTICS",
+                AdaptiveHeadMode = "CROSSFIT_DIAGNOSTICS_PLUS_CONFORMAL_HOLDOUT",
+                AdaptiveHeadCrossFitFoldCount = 2,
+                FitSampleCount = 10,
+                DiagnosticsSampleCount = 10,
+                ThresholdSelectionSampleCount = 10,
+                KellySelectionSampleCount = 10,
+                ConformalSampleCount = 10,
+                ConformalSelectionStrategy = "DISJOINT_HOLDOUT",
+                ConditionalRoutingThreshold = 0.5,
+                RoutingThresholdCandidateCount = 3,
+                RoutingThresholdSelectedNll = 0.2,
+                BuyBranchSampleCount = 5,
+                SellBranchSampleCount = 5,
+                IsotonicSampleCount = 10,
+                IsotonicBreakpointCount = 0,
+                PreIsotonicNll = 0.2,
+                PostIsotonicNll = 0.2,
+                IsotonicAccepted = false,
+            },
+            FtTransformerWarmStartArtifact = new FtTransformerWarmStartArtifact
+            {
+                Compatible = true,
+                CompatibilityIssues = [],
+                ReusedLayerCount = 1,
+                RestoredPositionalBiasBlocks = 0,
+                DroppedLayerCount = 0,
+                ReuseRatio = 1.0,
+            },
+            FtTransformerTrainInferenceParityMaxError = parityError,
+        };
+
+        if (includeSplitSummary)
+        {
+            snapshot.TrainingSplitSummary = new TrainingSplitSummary
+            {
+                RawTrainCount = 60,
+                RawSelectionCount = 20,
+                RawCalibrationCount = 30,
+                RawTestCount = 20,
+                TrainStartIndex = 0,
+                TrainCount = 60,
+                SelectionStartIndex = 60,
+                SelectionCount = 20,
+                SelectionPruningStartIndex = 60,
+                SelectionPruningCount = 10,
+                SelectionThresholdStartIndex = 70,
+                SelectionThresholdCount = 10,
+                CalibrationStartIndex = 80,
+                CalibrationCount = 30,
+                CalibrationFitStartIndex = 80,
+                CalibrationFitCount = 10,
+                CalibrationDiagnosticsStartIndex = 90,
+                CalibrationDiagnosticsCount = 10,
+                ConformalStartIndex = 100,
+                ConformalCount = 10,
+                MetaLabelStartIndex = 90,
+                MetaLabelCount = 0,
+                AbstentionStartIndex = 90,
+                AbstentionCount = 0,
+                AdaptiveHeadSplitMode = "CROSSFIT_DIAGNOSTICS_PLUS_CONFORMAL_HOLDOUT",
+                AdaptiveHeadCrossFitFoldCount = 2,
+                AdaptiveHeadCrossFitFoldStartIndices = [90, 95],
+                AdaptiveHeadCrossFitFoldCounts = [5, 5],
+                AdaptiveHeadCrossFitFoldHashes = ["fold-0", "fold-1"],
+                TestStartIndex = 110,
+                TestCount = 20,
+            };
+        }
+
+        if (includeAuditArtifact)
+        {
+            snapshot.FtTransformerAuditArtifact = new FtTransformerAuditArtifact
+            {
+                SnapshotContractValid = true,
+                AuditedSampleCount = 10,
+                ActiveFeatureCount = 2,
+                RawFeatureCount = 2,
+                MaxRawParityError = parityError,
+                MeanRawParityError = parityError,
+                MaxDeployedCalibrationDelta = 0.0,
+                ThresholdDecisionMismatchCount = thresholdDecisionMismatchCount,
+                RecordedEce = 0.05,
+                Findings = auditFindings ?? [],
+            };
+        }
+
+        snapshot = FtTransformerSnapshotSupport.NormalizeSnapshotCopy(snapshot);
+        if (snapshot.FtTransformerAuditArtifact is not null)
+        {
+            snapshot.FtTransformerAuditArtifact.FeatureSchemaFingerprint = snapshot.FeatureSchemaFingerprint;
+            snapshot.FtTransformerAuditArtifact.PreprocessingFingerprint = snapshot.PreprocessingFingerprint;
+        }
+
+        return JsonSerializer.SerializeToUtf8Bytes(snapshot);
     }
 
     private static MLTrainingRun MakeRun(
@@ -624,6 +801,45 @@ public class MLTrainingWorkerTest
         Assert.Equal(0.2550m, run.BrierScore);
         Assert.Equal(0.15m, run.ExpectedValue);
         Assert.Equal(1.5m, run.SharpeRatio);
+    }
+
+    [Fact]
+    public async Task QualityGates_FtTransformerMissingSplitSummary_RunMarkedFailed()
+    {
+        var run = MakeRun();
+        var result = MakeTrainingResult(
+            accuracy: 0.70, ev: 0.08, brier: 0.18, sharpe: 1.6, f1: 0.62, wfStd: 0.02,
+            modelBytes: CreateFtTransformerPromotionSnapshotBytes(includeSplitSummary: false));
+        SetupPipelineMocks(run, trainingResult: result);
+
+        await InvokeProcessRunAsync(run);
+
+        Assert.Equal(RunStatus.Failed, run.Status);
+        Assert.NotNull(run.ErrorMessage);
+        Assert.Contains("Invalid model snapshot contract", run.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("TrainingSplitSummary is missing", run.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task QualityGates_FtTransformerAuditFailure_RunMarkedFailed()
+    {
+        var run = MakeRun();
+        var result = MakeTrainingResult(
+            accuracy: 0.70, ev: 0.08, brier: 0.18, sharpe: 1.6, f1: 0.62, wfStd: 0.02,
+            modelBytes: CreateFtTransformerPromotionSnapshotBytes(
+                includeSplitSummary: true,
+                includeAuditArtifact: true,
+                parityError: 1e-3,
+                thresholdDecisionMismatchCount: 1,
+                auditFindings: ["trainer/inference drift detected"]));
+        SetupPipelineMocks(run, trainingResult: result);
+
+        await InvokeProcessRunAsync(run);
+
+        Assert.Equal(RunStatus.Failed, run.Status);
+        Assert.NotNull(run.ErrorMessage);
+        Assert.Contains("Invalid model snapshot contract", run.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("drift", run.ErrorMessage, StringComparison.OrdinalIgnoreCase);
     }
 
     // ════════════════════════════════════════════════════════════════════════

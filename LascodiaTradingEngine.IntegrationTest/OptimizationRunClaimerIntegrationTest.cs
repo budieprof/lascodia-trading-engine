@@ -171,6 +171,84 @@ public class OptimizationRunClaimerIntegrationTest : IClassFixture<PostgresFixtu
         Assert.Null(recoveredRun.ExecutionLeaseToken);
     }
 
+    [Fact]
+    public async Task ClaimNextRunAsync_DoesNotCountLeaseExpiredRunningRunAgainstCapacity()
+    {
+        await ResetDatabaseAsync();
+
+        await using var seedCtx = CreateWriteContext();
+        long staleStrategyId = await SeedStrategyAsync(seedCtx, "StaleRunning");
+        long queuedStrategyId = await SeedStrategyAsync(seedCtx, "QueuedCandidate");
+
+        seedCtx.Set<OptimizationRun>().AddRange(
+            new OptimizationRun
+            {
+                StrategyId = staleStrategyId,
+                TriggerType = TriggerType.Scheduled,
+                Status = OptimizationRunStatus.Running,
+                StartedAt = new DateTime(2026, 04, 07, 8, 0, 0, DateTimeKind.Utc),
+                QueuedAt = new DateTime(2026, 04, 07, 8, 0, 0, DateTimeKind.Utc),
+                ClaimedAt = new DateTime(2026, 04, 07, 8, 5, 0, DateTimeKind.Utc),
+                ExecutionLeaseExpiresAt = new DateTime(2026, 04, 08, 8, 0, 0, DateTimeKind.Utc),
+                ExecutionLeaseToken = Guid.NewGuid(),
+            },
+            new OptimizationRun
+            {
+                StrategyId = queuedStrategyId,
+                TriggerType = TriggerType.Scheduled,
+                Status = OptimizationRunStatus.Queued,
+                StartedAt = new DateTime(2026, 04, 08, 8, 0, 0, DateTimeKind.Utc),
+                QueuedAt = new DateTime(2026, 04, 08, 8, 0, 0, DateTimeKind.Utc),
+            });
+        await seedCtx.SaveChangesAsync();
+
+        await using var claimCtx = CreateWriteContext();
+        var result = await OptimizationRunClaimer.ClaimNextRunAsync(
+            claimCtx,
+            maxConcurrentRuns: 1,
+            leaseDuration: TimeSpan.FromMinutes(10),
+            nowUtc: new DateTime(2026, 04, 09, 10, 0, 0, DateTimeKind.Utc),
+            CancellationToken.None);
+
+        Assert.NotNull(result.RunId);
+    }
+
+    [Fact]
+    public async Task RequeueStaleRunningRunsAsync_RequeuesRunWithMissingLeaseMetadata()
+    {
+        await ResetDatabaseAsync();
+
+        await using var seedCtx = CreateWriteContext();
+        long strategyId = await SeedStrategyAsync(seedCtx, "NullLeaseRecovery");
+        var staleRun = new OptimizationRun
+        {
+            StrategyId = strategyId,
+            TriggerType = TriggerType.Scheduled,
+            Status = OptimizationRunStatus.Running,
+            StartedAt = new DateTime(2026, 04, 05, 9, 0, 0, DateTimeKind.Utc),
+            QueuedAt = new DateTime(2026, 04, 05, 9, 0, 0, DateTimeKind.Utc),
+            ClaimedAt = new DateTime(2026, 04, 05, 9, 5, 0, DateTimeKind.Utc),
+            ExecutionLeaseExpiresAt = null,
+            ExecutionLeaseToken = null,
+        };
+        seedCtx.Set<OptimizationRun>().Add(staleRun);
+        await seedCtx.SaveChangesAsync();
+
+        await using var writeCtx = CreateWriteContext();
+        var nowUtc = new DateTime(2026, 04, 09, 10, 0, 0, DateTimeKind.Utc);
+        var result = await OptimizationRunClaimer.RequeueStaleRunningRunsAsync(
+            writeCtx,
+            nowUtc,
+            CancellationToken.None);
+
+        Assert.Equal((1, 0), result);
+
+        await using var verifyCtx = CreateReadContext();
+        var recoveredRun = await verifyCtx.Set<OptimizationRun>().SingleAsync(r => r.Id == staleRun.Id);
+        Assert.Equal(OptimizationRunStatus.Queued, recoveredRun.Status);
+        Assert.Equal(nowUtc, recoveredRun.QueuedAt);
+    }
+
     private WriteApplicationDbContext CreateWriteContext()
     {
         var options = new DbContextOptionsBuilder<WriteApplicationDbContext>()

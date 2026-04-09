@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
@@ -20,6 +21,7 @@ internal sealed class StrategyGenerationCheckpointCoordinator : IStrategyGenerat
     private readonly IStrategyGenerationCheckpointStore _checkpointStore;
     private readonly IStrategyCandidateSelectionPolicy _candidateSelectionPolicy;
     private readonly IStrategyParameterTemplateProvider _templateProvider;
+    private readonly IStrategyGenerationHealthStore _healthStore;
     private readonly TimeProvider _timeProvider;
 
     public StrategyGenerationCheckpointCoordinator(
@@ -27,12 +29,14 @@ internal sealed class StrategyGenerationCheckpointCoordinator : IStrategyGenerat
         IStrategyGenerationCheckpointStore checkpointStore,
         IStrategyCandidateSelectionPolicy candidateSelectionPolicy,
         IStrategyParameterTemplateProvider templateProvider,
+        IStrategyGenerationHealthStore healthStore,
         TimeProvider timeProvider)
     {
         _logger = logger;
         _checkpointStore = checkpointStore;
         _candidateSelectionPolicy = candidateSelectionPolicy;
         _templateProvider = templateProvider;
+        _healthStore = healthStore;
         _timeProvider = timeProvider;
     }
 
@@ -114,6 +118,7 @@ internal sealed class StrategyGenerationCheckpointCoordinator : IStrategyGenerat
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "StrategyGenerationWorker: checkpoint restore failed — starting fresh");
+            _healthStore.RecordPhaseFailure("checkpoint_restore", ex.Message, _timeProvider.GetUtcNow().UtcDateTime);
         }
 
         return new StrategyGenerationCheckpointResumeState(
@@ -138,6 +143,7 @@ internal sealed class StrategyGenerationCheckpointCoordinator : IStrategyGenerat
         CancellationToken ct,
         string checkpointLabel)
     {
+        var startedAt = Stopwatch.GetTimestamp();
         try
         {
             var checkpointState = new GenerationCheckpointStore.State
@@ -165,12 +171,41 @@ internal sealed class StrategyGenerationCheckpointCoordinator : IStrategyGenerat
 
             await _checkpointStore.SaveCheckpointAsync(writeCtx.GetDbContext(), cycleId, checkpointState, _logger, ct);
             await writeCtx.SaveChangesAsync(ct);
+            var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+            _healthStore.UpdateState(state => state with
+            {
+                LastCheckpointSavedAtUtc = nowUtc,
+                LastCheckpointLabel = checkpointLabel,
+                IsCheckpointPersistenceDegraded = false,
+                ConsecutiveCheckpointSaveFailures = 0,
+                LastCheckpointSaveFailureAtUtc = null,
+                LastCheckpointSaveFailureMessage = null,
+                CapturedAtUtc = nowUtc,
+            });
+            _healthStore.RecordPhaseSuccess(
+                "checkpoint_save",
+                (long)Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds,
+                nowUtc);
         }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "StrategyGenerationWorker: checkpoint save failed for {CheckpointLabel}", checkpointLabel);
+            var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+            _logger.LogWarning(ex, "StrategyGenerationWorker: checkpoint save failed for {CheckpointLabel}", checkpointLabel);
+            _healthStore.UpdateState(state => state with
+            {
+                LastCheckpointLabel = checkpointLabel,
+                IsCheckpointPersistenceDegraded = true,
+                ConsecutiveCheckpointSaveFailures = state.ConsecutiveCheckpointSaveFailures + 1,
+                LastCheckpointSaveFailureAtUtc = nowUtc,
+                LastCheckpointSaveFailureMessage = Truncate(ex.Message),
+                CapturedAtUtc = nowUtc,
+            });
+            _healthStore.RecordPhaseFailure("checkpoint_save", ex.Message, nowUtc);
         }
     }
+
+    private static string Truncate(string message)
+        => message.Length <= 500 ? message : message[..500];
 
     public string ComputeFingerprint(StrategyGenerationScreeningContext context)
     {

@@ -10,7 +10,14 @@ public sealed record StrategyGenerationPendingArtifactRecord(
     bool NeedsAutoPromoteEvent,
     int AttemptCount = 0,
     DateTime? LastAttemptAtUtc = null,
-    string? LastErrorMessage = null);
+    string? LastErrorMessage = null,
+    DateTime? CreationAuditLoggedAtUtc = null,
+    Guid? CandidateCreatedEventId = null,
+    DateTime? CandidateCreatedEventDispatchedAtUtc = null,
+    Guid? AutoPromotedEventId = null,
+    DateTime? AutoPromotedEventDispatchedAtUtc = null,
+    DateTime? QuarantinedAtUtc = null,
+    string? TerminalFailureReason = null);
 
 public sealed record StrategyGenerationPendingArtifactLoadResult(
     IReadOnlyList<StrategyGenerationPendingArtifactRecord> PendingArtifacts,

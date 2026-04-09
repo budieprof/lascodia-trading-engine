@@ -402,6 +402,7 @@ public sealed partial class FtTransformerModelTrainer
                 Scale1D(lg.dGamma2, s); Scale1D(lg.dBeta2, s);
                 Scale2D(lg.dWff1, s); Scale1D(lg.dBff1, s);
                 Scale2D(lg.dWff2, s); Scale1D(lg.dBff2, s);
+                if (lg.dPosBias is not null) Scale2D(lg.dPosBias, s);
             }
             Scale1D(dWOut, s);
             dBOut *= s;
@@ -421,6 +422,7 @@ public sealed partial class FtTransformerModelTrainer
                 normSq += NormSq1D(lg.dGamma2) + NormSq1D(lg.dBeta2);
                 normSq += NormSq2D(lg.dWff1) + NormSq1D(lg.dBff1);
                 normSq += NormSq2D(lg.dWff2) + NormSq1D(lg.dBff2);
+                if (lg.dPosBias is not null) normSq += NormSq2D(lg.dPosBias);
             }
             normSq += NormSq1D(dWOut);
             normSq += NormSq1D(dGammaFinal) + NormSq1D(dBetaFinal);

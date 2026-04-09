@@ -1902,6 +1902,34 @@ public class ElmTrainerHelpersTests
     }
 
     [Fact]
+    public void MlSignalScorer_PredictElmMagnitudeAug_Uses_QuadraticHiddenTerms_When_Present()
+    {
+        MethodInfo predictElmMagnitudeAug = typeof(MLSignalScorer).GetMethod(
+            "PredictElmMagnitudeAug",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        var snapshot = new ModelSnapshot
+        {
+            ElmHiddenDim = 1,
+            FeatureSubsetIndices = [[]],
+            LearnerActivations = [(int)ElmActivation.Relu],
+        };
+
+        double prediction = (double)predictElmMagnitudeAug.Invoke(null,
+        [
+            new[] { 2f },
+            1,
+            new[] { 0.0, 1.5, 2.0 },
+            0.25,
+            snapshot,
+            new[] { new[] { 2.0 } },
+            new[] { new[] { 0.0 } },
+        ])!;
+
+        Assert.Equal(38.25, prediction, precision: 6);
+    }
+
+    [Fact]
     public void ElmInferenceEngine_Computes_Std_Around_Learner_Mean_Not_Stacked_Output()
     {
         var engine = new ElmInferenceEngine();

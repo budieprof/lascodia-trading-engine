@@ -31,7 +31,7 @@ internal sealed class StrategyGenerationPendingArtifactStore : IStrategyGenerati
 
         var entities = await pendingArtifactSet
             .AsNoTracking()
-            .Where(a => !a.IsDeleted)
+            .Where(a => !a.IsDeleted && a.QuarantinedAtUtc == null)
             .OrderBy(a => a.StrategyId)
             .ToListAsync(ct);
 
@@ -55,7 +55,14 @@ internal sealed class StrategyGenerationPendingArtifactStore : IStrategyGenerati
                     entity.NeedsAutoPromoteEvent,
                     entity.AttemptCount,
                     entity.LastAttemptAtUtc,
-                    entity.LastErrorMessage));
+                    entity.LastErrorMessage,
+                    entity.CreationAuditLoggedAtUtc,
+                    entity.CandidateCreatedEventId,
+                    entity.CandidateCreatedEventDispatchedAtUtc,
+                    entity.AutoPromotedEventId,
+                    entity.AutoPromotedEventDispatchedAtUtc,
+                    entity.QuarantinedAtUtc,
+                    entity.TerminalFailureReason));
             }
             catch (Exception ex)
             {
@@ -79,7 +86,7 @@ internal sealed class StrategyGenerationPendingArtifactStore : IStrategyGenerati
             return;
 
         var tracked = await pendingArtifactSet
-            .Where(a => !a.IsDeleted)
+            .Where(a => !a.IsDeleted && a.QuarantinedAtUtc == null)
             .ToListAsync(ct);
 
         var incomingByCandidateId = pendingArtifacts.ToDictionary(a => a.CandidateId, StringComparer.Ordinal);
@@ -113,6 +120,13 @@ internal sealed class StrategyGenerationPendingArtifactStore : IStrategyGenerati
             existing.AttemptCount = pending.AttemptCount;
             existing.LastAttemptAtUtc = pending.LastAttemptAtUtc;
             existing.LastErrorMessage = pending.LastErrorMessage;
+            existing.CreationAuditLoggedAtUtc = pending.CreationAuditLoggedAtUtc;
+            existing.CandidateCreatedEventId = pending.CandidateCreatedEventId;
+            existing.CandidateCreatedEventDispatchedAtUtc = pending.CandidateCreatedEventDispatchedAtUtc;
+            existing.AutoPromotedEventId = pending.AutoPromotedEventId;
+            existing.AutoPromotedEventDispatchedAtUtc = pending.AutoPromotedEventDispatchedAtUtc;
+            existing.QuarantinedAtUtc = pending.QuarantinedAtUtc;
+            existing.TerminalFailureReason = pending.TerminalFailureReason;
             existing.IsDeleted = false;
         }
     }

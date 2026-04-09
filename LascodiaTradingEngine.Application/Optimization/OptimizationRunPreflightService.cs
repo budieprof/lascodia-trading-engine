@@ -90,8 +90,11 @@ internal sealed class OptimizationRunPreflightService
         {
             _logger.LogInformation("OptimizationRunPreflightService: seasonal blackout active - deferring run {RunId}", run.Id);
             _metrics.OptimizationRunsDeferred.Add(1, new KeyValuePair<string, object?>("reason", "seasonal_blackout"));
-            OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Queued, nowUtc);
-            run.DeferredUntilUtc = nowUtc.AddHours(6);
+            OptimizationRunDeferralTracker.ApplyDeferral(
+                run,
+                OptimizationDeferralReason.SeasonalBlackout,
+                nowUtc.AddHours(6),
+                nowUtc);
             SetRunStage(run, OptimizationExecutionStage.Queued, "Deferred because a configured seasonal blackout is active.", nowUtc);
             await writeCtx.SaveChangesAsync(ct);
             return null;
@@ -101,8 +104,11 @@ internal sealed class OptimizationRunPreflightService
         {
             _logger.LogInformation("OptimizationRunPreflightService: drawdown recovery active - deferring run {RunId}", run.Id);
             _metrics.OptimizationRunsDeferred.Add(1, new KeyValuePair<string, object?>("reason", "drawdown_recovery"));
-            OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Queued, nowUtc);
-            run.DeferredUntilUtc = nowUtc.AddMinutes(30);
+            OptimizationRunDeferralTracker.ApplyDeferral(
+                run,
+                OptimizationDeferralReason.DrawdownRecovery,
+                nowUtc.AddMinutes(30),
+                nowUtc);
             SetRunStage(run, OptimizationExecutionStage.Queued, "Deferred because portfolio drawdown recovery is active.", nowUtc);
             await writeCtx.SaveChangesAsync(ct);
             return null;
@@ -134,8 +140,11 @@ internal sealed class OptimizationRunPreflightService
                     regimeStabilityHours,
                     run.Id);
                 _metrics.OptimizationRunsDeferred.Add(1, new KeyValuePair<string, object?>("reason", "regime_transition"));
-                OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Queued, nowUtc);
-                run.DeferredUntilUtc = nowUtc.AddHours(regimeStabilityHours);
+                OptimizationRunDeferralTracker.ApplyDeferral(
+                    run,
+                    OptimizationDeferralReason.RegimeTransition,
+                    nowUtc.AddHours(regimeStabilityHours),
+                    nowUtc);
                 SetRunStage(run, OptimizationExecutionStage.Queued, "Deferred because the market regime is still transitioning.", nowUtc);
                 await writeCtx.SaveChangesAsync(ct);
                 return null;
@@ -156,8 +165,11 @@ internal sealed class OptimizationRunPreflightService
                     preflightStrategy.Symbol,
                     run.Id);
                 _metrics.OptimizationRunsDeferred.Add(1, new KeyValuePair<string, object?>("reason", "ea_data_unavailable"));
-                OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Queued, nowUtc);
-                run.DeferredUntilUtc = nowUtc.AddMinutes(15);
+                OptimizationRunDeferralTracker.ApplyDeferral(
+                    run,
+                    OptimizationDeferralReason.EADataUnavailable,
+                    nowUtc.AddMinutes(15),
+                    nowUtc);
                 SetRunStage(run, OptimizationExecutionStage.Queued, "Deferred because no active EA instance is feeding fresh data for the symbol.", nowUtc);
                 await writeCtx.SaveChangesAsync(ct);
                 return null;
@@ -183,9 +195,18 @@ internal sealed class OptimizationRunPreflightService
     private static void EnsureDeterministicSeed(OptimizationRun run)
     {
         if (run.DeterministicSeed != 0)
+        {
+            run.DeterministicSeedVersion = run.DeterministicSeedVersion == 0
+                ? OptimizationDeterministicSeed.Version
+                : run.DeterministicSeedVersion;
             return;
+        }
 
-        run.DeterministicSeed = HashCode.Combine(run.Id, run.StrategyId, run.QueuedAt == default ? run.StartedAt : run.QueuedAt);
+        run.DeterministicSeedVersion = OptimizationDeterministicSeed.Version;
+        run.DeterministicSeed = OptimizationDeterministicSeed.Compute(
+            run.Id,
+            run.StrategyId,
+            run.QueuedAt == default ? run.StartedAt : run.QueuedAt);
     }
 
     private static void SetRunStage(

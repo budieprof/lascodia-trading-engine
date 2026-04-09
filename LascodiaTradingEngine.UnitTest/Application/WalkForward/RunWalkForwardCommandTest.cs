@@ -1,10 +1,14 @@
 using FluentValidation.TestHelper;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.ChangeTracking;
+using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using MockQueryable.Moq;
+using LascodiaTradingEngine.Application.Backtesting;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.WalkForward.Commands.RunWalkForward;
 using LascodiaTradingEngine.Domain.Entities;
+using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.UnitTest.Application.WalkForward;
 
@@ -19,11 +23,35 @@ public class RunWalkForwardCommandTest
         _mockWriteContext = new Mock<IWriteApplicationDbContext>();
 
         var mockDbContext = new Mock<DbContext>();
-        var runs = new List<WalkForwardRun>().AsQueryable().BuildMockDbSet();
+        var queuedRuns = new List<WalkForwardRun>();
+        var runs = queuedRuns.AsQueryable().BuildMockDbSet();
+        runs.Setup(set => set.AddAsync(It.IsAny<WalkForwardRun>(), It.IsAny<CancellationToken>()))
+            .Callback<WalkForwardRun, CancellationToken>((run, _) => queuedRuns.Add(run))
+            .Returns<WalkForwardRun, CancellationToken>((_, _) =>
+                new ValueTask<EntityEntry<WalkForwardRun>>((EntityEntry<WalkForwardRun>)null!));
+
+        var strategies = new List<Strategy>
+        {
+            new()
+            {
+                Id = 1,
+                Symbol = "EURUSD",
+                Timeframe = Timeframe.H1,
+                ParametersJson = """{"mode":"baseline"}""",
+                IsDeleted = false,
+            }
+        }.AsQueryable().BuildMockDbSet();
+
         mockDbContext.Setup(c => c.Set<WalkForwardRun>()).Returns(runs.Object);
+        mockDbContext.Setup(c => c.Set<Strategy>()).Returns(strategies.Object);
         _mockWriteContext.Setup(c => c.GetDbContext()).Returns(mockDbContext.Object);
 
-        _handler = new RunWalkForwardCommandHandler(_mockWriteContext.Object);
+        var settingsProvider = new ValidationSettingsProvider();
+        var optionsBuilder = new BacktestOptionsSnapshotBuilder(
+            settingsProvider,
+            NullLogger<BacktestOptionsSnapshotBuilder>.Instance);
+        var runFactory = new ValidationRunFactory(optionsBuilder, TimeProvider.System);
+        _handler = new RunWalkForwardCommandHandler(_mockWriteContext.Object, runFactory);
         _validator = new RunWalkForwardCommandValidator();
     }
 

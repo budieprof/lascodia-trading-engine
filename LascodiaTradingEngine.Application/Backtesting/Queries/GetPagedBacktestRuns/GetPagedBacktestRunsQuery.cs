@@ -54,7 +54,7 @@ public class GetPagedBacktestRunsQueryHandler
             .Set<Domain.Entities.BacktestRun>()
             .AsNoTracking()
             .Where(x => !x.IsDeleted)
-            .OrderByDescending(x => x.StartedAt)
+            .OrderByDescending(x => x.QueuedAt)
             .AsQueryable();
 
         if (filter?.StrategyId.HasValue == true)

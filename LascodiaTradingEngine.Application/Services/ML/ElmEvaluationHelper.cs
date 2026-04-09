@@ -33,7 +33,7 @@ internal static class ElmEvaluationHelper
         if (testSet.Count == 0)
             return new EvalMetrics(0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0);
 
-        bool useAug = magAugWeights is not null && magAugWeights.Length == featureCount + hiddenSize;
+        bool useAug = magAugWeights is not null && magAugWeights.Length >= featureCount + hiddenSize;
         double safeDecisionThreshold = double.IsFinite(decisionThreshold)
             ? Math.Clamp(decisionThreshold, 0.0, 1.0)
             : 0.5;
@@ -355,7 +355,7 @@ internal static class ElmEvaluationHelper
 
         bool useAug = magAugWeights is not null && elmInputWeights is not null
                       && elmInputBiases is not null
-                      && magAugWeights.Length == featureCount + hiddenSize;
+                      && magAugWeights.Length >= featureCount + hiddenSize;
 
         double[] residuals = new double[train.Count];
         for (int i = 0; i < train.Count; i++)

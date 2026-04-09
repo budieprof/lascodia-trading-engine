@@ -208,14 +208,24 @@ public sealed class OptimizationCompletionPublisher
 
             if (run is not null && writeCtx is not null)
             {
-                run.CompletionPublicationStatus = OptimizationCompletionPublicationStatus.Failed;
-                run.CompletionPublicationErrorMessage = Truncate(ex.Message, 500);
-                OptimizationRunProgressTracker.RecordOperationalIssue(
-                    run,
-                    "CompletionReplayFailed",
-                    $"Completion replay failed: {ex.Message}",
-                    UtcNow);
-                await writeCtx.SaveChangesAsync(CancellationToken.None);
+                try
+                {
+                    run.CompletionPublicationStatus = OptimizationCompletionPublicationStatus.Failed;
+                    run.CompletionPublicationErrorMessage = Truncate(ex.Message, 500);
+                    OptimizationRunProgressTracker.RecordOperationalIssue(
+                        run,
+                        "CompletionReplayFailed",
+                        $"Completion replay failed: {ex.Message}",
+                        UtcNow);
+                    await writeCtx.SaveChangesAsync(CancellationToken.None);
+                }
+                catch (Exception persistEx)
+                {
+                    _logger.LogWarning(
+                        persistEx,
+                        "Optimization completion publisher: failed to persist replay failure state for run {RunId}",
+                        runId);
+                }
             }
 
             _logger.LogError(ex,
@@ -226,14 +236,25 @@ public sealed class OptimizationCompletionPublisher
             var deadLetterSink = scope.ServiceProvider.GetService<IDeadLetterSink>();
             if (deadLetterSink is not null)
             {
-                await deadLetterSink.WriteAsync(
-                    handlerName: nameof(OptimizationCompletionPublisher),
-                    eventType: nameof(OptimizationCompletedIntegrationEvent),
-                    eventPayloadJson: JsonSerializer.Serialize(completedEvent),
-                    errorMessage: ex.Message,
-                    stackTrace: ex.ToString(),
-                    attempts: Math.Max(1, run?.CompletionPublicationAttempts ?? 1),
-                    ct: CancellationToken.None);
+                try
+                {
+                    await deadLetterSink.WriteAsync(
+                        handlerName: nameof(OptimizationCompletionPublisher),
+                        eventType: nameof(OptimizationCompletedIntegrationEvent),
+                        eventPayloadJson: JsonSerializer.Serialize(completedEvent),
+                        errorMessage: ex.Message,
+                        stackTrace: ex.ToString(),
+                        attempts: Math.Max(1, run?.CompletionPublicationAttempts ?? 1),
+                        ct: CancellationToken.None);
+                }
+                catch (Exception deadLetterEx)
+                {
+                    _logger.LogError(
+                        deadLetterEx,
+                        "Optimization completion publisher: dead-letter persistence also failed for event {EventId} of run {RunId}",
+                        completedEvent.Id,
+                        runId);
+                }
             }
         }
     }

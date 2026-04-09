@@ -109,6 +109,8 @@ internal sealed class StrategyGenerationScheduleCoordinator : IStrategyGeneratio
     private readonly TradingMetrics _metrics;
     private readonly IStrategyGenerationConfigProvider _configProvider;
     private readonly IStrategyGenerationScheduleStateStore _scheduleStateStore;
+    private readonly IDistributedLock _distributedLock;
+    private readonly IStrategyGenerationHealthStore _healthStore;
     private readonly TimeProvider _timeProvider;
     private readonly SchedulingState _state = new();
 
@@ -118,6 +120,8 @@ internal sealed class StrategyGenerationScheduleCoordinator : IStrategyGeneratio
         TradingMetrics metrics,
         IStrategyGenerationConfigProvider configProvider,
         IStrategyGenerationScheduleStateStore scheduleStateStore,
+        IDistributedLock distributedLock,
+        IStrategyGenerationHealthStore healthStore,
         TimeProvider timeProvider)
     {
         _logger = logger;
@@ -125,6 +129,8 @@ internal sealed class StrategyGenerationScheduleCoordinator : IStrategyGeneratio
         _metrics = metrics;
         _configProvider = configProvider;
         _scheduleStateStore = scheduleStateStore;
+        _distributedLock = distributedLock;
+        _healthStore = healthStore;
         _timeProvider = timeProvider;
     }
 
@@ -166,18 +172,17 @@ internal sealed class StrategyGenerationScheduleCoordinator : IStrategyGeneratio
                     _state.CircuitBreakerUntilUtc);
                 _metrics.StrategyGenCircuitBreakerTripped.Add(1);
                 _state.OnCircuitBreakerSkip(todayUtc);
+                RecordSkip("circuit_breaker");
                 await PersistStateAsync(writeDb, writeCtx, stoppingToken);
                 return;
             }
 
-            var distributedLock = scope.ServiceProvider.GetService<IDistributedLock>();
-            await using var generationLock = distributedLock == null
-                ? null
-                : await distributedLock.TryAcquireAsync(LockKey, TimeSpan.FromSeconds(2), stoppingToken);
-            if (distributedLock != null && generationLock == null)
+            await using var generationLock = await TryAcquireGenerationLockAsync(stoppingToken);
+            if (generationLock == null)
             {
                 _logger.LogInformation(
                     "StrategyGenerationWorker: generation cycle lock is already held elsewhere; skipping this poll");
+                RecordSkip("lock_held");
                 return;
             }
 
@@ -225,6 +230,7 @@ internal sealed class StrategyGenerationScheduleCoordinator : IStrategyGeneratio
                 _state.OnRetriesExhausted(todayUtc);
                 _logger.LogWarning(
                     "StrategyGenerationWorker: exhausted retries within schedule window — skipping to next day");
+                RecordSkip("retries_exhausted");
             }
 
             try
@@ -237,8 +243,32 @@ internal sealed class StrategyGenerationScheduleCoordinator : IStrategyGeneratio
             catch (Exception persistEx)
             {
                 _logger.LogWarning(persistEx, "StrategyGenerationWorker: failed to persist scheduling state");
+                _healthStore.RecordPhaseFailure("schedule_state_persist", persistEx.Message, _timeProvider.GetUtcNow().UtcDateTime);
             }
+
+            throw;
         }
+    }
+
+    public async Task ExecuteManualRunAsync(Func<CancellationToken, Task> runCycleAsync, CancellationToken stoppingToken)
+    {
+        await using var generationLock = await TryAcquireGenerationLockAsync(stoppingToken);
+        if (generationLock == null)
+        {
+            _logger.LogInformation(
+                "StrategyGenerationWorker: manual generation cycle skipped because the distributed lock is already held");
+            RecordSkip("lock_held");
+            return;
+        }
+
+        await runCycleAsync(stoppingToken);
+
+        var todayUtc = _timeProvider.GetUtcNow().UtcDateTime.Date;
+        _state.OnSuccess(todayUtc);
+
+        using var scope = _scopeFactory.CreateScope();
+        var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+        await PersistStateAsync(writeCtx.GetDbContext(), writeCtx, stoppingToken);
     }
 
     private async Task PersistStateAsync(
@@ -248,5 +278,25 @@ internal sealed class StrategyGenerationScheduleCoordinator : IStrategyGeneratio
     {
         await _scheduleStateStore.SaveAsync(writeDb, _state.ToSnapshot(), ct);
         await writeCtx.SaveChangesAsync(ct);
+        _healthStore.RecordPhaseSuccess("schedule_state_persist", 0, _timeProvider.GetUtcNow().UtcDateTime);
+    }
+
+    private async Task<IAsyncDisposable?> TryAcquireGenerationLockAsync(CancellationToken ct)
+    {
+        return await _distributedLock.TryAcquireAsync(
+            LockKey,
+            TimeSpan.FromSeconds(2),
+            ct);
+    }
+
+    private void RecordSkip(string reason)
+    {
+        var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+        _healthStore.UpdateState(state => state with
+        {
+            LastSkipReason = reason,
+            LastSkippedAtUtc = nowUtc,
+            CapturedAtUtc = nowUtc,
+        });
     }
 }

@@ -18,6 +18,12 @@ public class StrategyGenerationCycleRun : Entity<long>
     public int SymbolsSkipped { get; set; }
     public int StrategiesPruned { get; set; }
     public int PortfolioFilterRemoved { get; set; }
+    public Guid? SummaryEventId { get; set; }
+    public string? SummaryEventPayloadJson { get; set; }
+    public int SummaryEventDispatchAttempts { get; set; }
+    public DateTime? SummaryEventDispatchedAtUtc { get; set; }
+    public DateTime? SummaryEventFailedAtUtc { get; set; }
+    public string? SummaryEventFailureMessage { get; set; }
     public string? FailureStage { get; set; }
     public string? FailureMessage { get; set; }
     public DateTime LastUpdatedAtUtc { get; set; } = DateTime.UtcNow;

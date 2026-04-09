@@ -64,7 +64,7 @@ public class StrategyScreeningEngine
 
     /// <summary>
     /// Runs the full screening pipeline for a single candidate. Returns a <see cref="ScreeningOutcome"/>
-    /// if the candidate passes all gates, or null if it fails any gate.
+    /// for both passing and structured failure cases, or null only when the caller cancels the overall operation.
     /// </summary>
     public async Task<ScreeningOutcome?> ScreenCandidateAsync(
         StrategyType strategyType, string symbol, Timeframe timeframe,
@@ -115,6 +115,23 @@ public class StrategyScreeningEngine
             ParametersJson = enrichedParams,
         };
 
+        ScreeningOutcome BuildFailedOutcome(
+            ScreeningFailureReason failure,
+            string outcome,
+            string reason,
+            BacktestResult? train = null,
+            BacktestResult? oos = null)
+            => ScreeningOutcome.Failed(
+                tempStrategy,
+                train,
+                oos,
+                targetRegime,
+                observedRegime,
+                generationSource,
+                failure,
+                outcome,
+                reason);
+
         // ── In-sample backtest ──
         BacktestResult trainResult;
         try
@@ -129,21 +146,36 @@ public class StrategyScreeningEngine
             _logger.LogWarning("StrategyScreening: IS backtest timed out for {Type} on {Symbol}/{Tf}",
                 strategyType, symbol, timeframe);
             gateTrace.Add(new("IS_Backtest", false, gateSw.Elapsed.TotalMilliseconds));
-            return null;
+            return BuildFailedOutcome(
+                ScreeningFailureReason.Timeout,
+                "Timeout",
+                $"{strategyType} on {symbol}/{timeframe} IS backtest timed out");
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "StrategyScreening: IS backtest failed for {Type} on {Symbol}/{Tf}",
                 strategyType, symbol, timeframe);
             gateTrace.Add(new("IS_Backtest", false, gateSw.Elapsed.TotalMilliseconds));
-            return null;
+            return BuildFailedOutcome(
+                ScreeningFailureReason.TaskFault,
+                "TaskFault",
+                $"{strategyType} on {symbol}/{timeframe} IS backtest failed: {ex.GetType().Name}");
         }
 
         gateTrace.Add(new("IS_Backtest", true, gateSw.Elapsed.TotalMilliseconds));
         gateSw.Restart();
 
         // ── Zero-trade guard ──
-        if (trainResult.TotalTrades == 0) { gateTrace.Add(new("ZeroTradeGuard_IS", false, gateSw.Elapsed.TotalMilliseconds)); _onGateRejection?.Invoke("zero_trades_is"); return null; }
+        if (trainResult.TotalTrades == 0)
+        {
+            gateTrace.Add(new("ZeroTradeGuard_IS", false, gateSw.Elapsed.TotalMilliseconds));
+            _onGateRejection?.Invoke("zero_trades_is");
+            return BuildFailedOutcome(
+                ScreeningFailureReason.ZeroTradesIS,
+                "ZeroTradesIS",
+                $"{strategyType} on {symbol}/{timeframe} produced zero IS trades",
+                trainResult);
+        }
 
         // ── In-sample threshold gate ──
         if ((double)trainResult.WinRate < thresholds.MinWinRate
@@ -154,8 +186,11 @@ public class StrategyScreeningEngine
         {
             gateTrace.Add(new("IS_Threshold", false, gateSw.Elapsed.TotalMilliseconds));
             _onGateRejection?.Invoke("is_threshold");
-            return ScreeningOutcome.Failed(ScreeningFailureReason.IsThreshold, "ScreeningFailed",
-                $"{strategyType} on {symbol}/{timeframe} IS gates failed");
+            return BuildFailedOutcome(
+                ScreeningFailureReason.IsThreshold,
+                "ScreeningFailed",
+                $"{strategyType} on {symbol}/{timeframe} IS gates failed",
+                trainResult);
         }
 
         gateTrace.Add(new("IS_Threshold", true, gateSw.Elapsed.TotalMilliseconds));
@@ -175,20 +210,38 @@ public class StrategyScreeningEngine
             _logger.LogWarning("StrategyScreening: OOS backtest timed out for {Type} on {Symbol}/{Tf}",
                 strategyType, symbol, timeframe);
             gateTrace.Add(new("OOS_Backtest", false, gateSw.Elapsed.TotalMilliseconds));
-            return null;
+            return BuildFailedOutcome(
+                ScreeningFailureReason.Timeout,
+                "Timeout",
+                $"{strategyType} on {symbol}/{timeframe} OOS backtest timed out",
+                trainResult);
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "StrategyScreening: OOS backtest failed for {Type} on {Symbol}/{Tf}",
                 strategyType, symbol, timeframe);
             gateTrace.Add(new("OOS_Backtest", false, gateSw.Elapsed.TotalMilliseconds));
-            return null;
+            return BuildFailedOutcome(
+                ScreeningFailureReason.TaskFault,
+                "TaskFault",
+                $"{strategyType} on {symbol}/{timeframe} OOS backtest failed: {ex.GetType().Name}",
+                trainResult);
         }
 
         gateTrace.Add(new("OOS_Backtest", true, gateSw.Elapsed.TotalMilliseconds));
         gateSw.Restart();
 
-        if (oosResult.TotalTrades == 0) { gateTrace.Add(new("ZeroTradeGuard_OOS", false, gateSw.Elapsed.TotalMilliseconds)); _onGateRejection?.Invoke("zero_trades_oos"); return null; }
+        if (oosResult.TotalTrades == 0)
+        {
+            gateTrace.Add(new("ZeroTradeGuard_OOS", false, gateSw.Elapsed.TotalMilliseconds));
+            _onGateRejection?.Invoke("zero_trades_oos");
+            return BuildFailedOutcome(
+                ScreeningFailureReason.ZeroTradesOOS,
+                "ZeroTradesOOS",
+                $"{strategyType} on {symbol}/{timeframe} produced zero OOS trades",
+                trainResult,
+                oosResult);
+        }
 
         // ── OOS threshold gate (relaxed) ──
         int oosMinTrades = Math.Max(3, thresholds.MinTotalTrades / 3);
@@ -200,8 +253,12 @@ public class StrategyScreeningEngine
         {
             gateTrace.Add(new("OOS_Threshold", false, gateSw.Elapsed.TotalMilliseconds));
             _onGateRejection?.Invoke("oos_threshold");
-            return ScreeningOutcome.Failed(ScreeningFailureReason.OosThreshold, "OOSFailed",
-                $"{strategyType} on {symbol}/{timeframe} OOS gates failed");
+            return BuildFailedOutcome(
+                ScreeningFailureReason.OosThreshold,
+                "OOSFailed",
+                $"{strategyType} on {symbol}/{timeframe} OOS gates failed",
+                trainResult,
+                oosResult);
         }
 
         gateTrace.Add(new("OOS_Threshold", true, gateSw.Elapsed.TotalMilliseconds));
@@ -231,8 +288,12 @@ public class StrategyScreeningEngine
         {
             gateTrace.Add(new("Degradation", false, gateSw.Elapsed.TotalMilliseconds));
             _onGateRejection?.Invoke("degradation");
-            return ScreeningOutcome.Failed(ScreeningFailureReason.Degradation, "DegradationFailed",
-                $"{strategyType} on {symbol}/{timeframe} excessive IS->OOS degradation");
+            return BuildFailedOutcome(
+                ScreeningFailureReason.Degradation,
+                "DegradationFailed",
+                $"{strategyType} on {symbol}/{timeframe} excessive IS->OOS degradation",
+                trainResult,
+                oosResult);
         }
 
         gateTrace.Add(new("Degradation", true, gateSw.Elapsed.TotalMilliseconds));
@@ -248,8 +309,12 @@ public class StrategyScreeningEngine
             {
                 gateTrace.Add(new("EquityCurveR2", false, gateSw.Elapsed.TotalMilliseconds));
                 _onGateRejection?.Invoke("equity_curve_r2");
-                return ScreeningOutcome.Failed(ScreeningFailureReason.EquityCurveR2, "EquityCurveRejected",
-                    $"{strategyType} on {symbol}/{timeframe} R²={r2.Value:F3} below {config.MinEquityCurveR2:F2}");
+                return BuildFailedOutcome(
+                    ScreeningFailureReason.EquityCurveR2,
+                    "EquityCurveRejected",
+                    $"{strategyType} on {symbol}/{timeframe} R²={r2.Value:F3} below {config.MinEquityCurveR2:F2}",
+                    trainResult,
+                    oosResult);
             }
         }
         // <5 combined trades: R² is unevaluated — stored as -1 sentinel in metrics
@@ -266,8 +331,12 @@ public class StrategyScreeningEngine
             {
                 gateTrace.Add(new("TimeConcentration", false, gateSw.Elapsed.TotalMilliseconds));
                 _onGateRejection?.Invoke("time_concentration");
-                return ScreeningOutcome.Failed(ScreeningFailureReason.TimeConcentration, "TimeConcentrationRejected",
-                    $"{strategyType} on {symbol}/{timeframe} concentration={maxConcentration:P1}");
+                return BuildFailedOutcome(
+                    ScreeningFailureReason.TimeConcentration,
+                    "TimeConcentrationRejected",
+                    $"{strategyType} on {symbol}/{timeframe} concentration={maxConcentration:P1}",
+                    trainResult,
+                    oosResult);
             }
         }
 
@@ -286,8 +355,12 @@ public class StrategyScreeningEngine
             {
                 gateTrace.Add(new("WalkForward", false, gateSw.Elapsed.TotalMilliseconds));
                 _onGateRejection?.Invoke("walk_forward");
-                return ScreeningOutcome.Failed(ScreeningFailureReason.WalkForward, "WalkForwardRejected",
-                    $"{strategyType} on {symbol}/{timeframe} walk-forward {walkForwardPassed}/{config.WalkForwardWindowCount} windows passed (mask=0b{Convert.ToString(walkForwardMask, 2)})");
+                return BuildFailedOutcome(
+                    ScreeningFailureReason.WalkForward,
+                    "WalkForwardRejected",
+                    $"{strategyType} on {symbol}/{timeframe} walk-forward {walkForwardPassed}/{config.WalkForwardWindowCount} windows passed (mask=0b{Convert.ToString(walkForwardMask, 2)})",
+                    trainResult,
+                    oosResult);
             }
         }
         else
@@ -320,8 +393,12 @@ public class StrategyScreeningEngine
             {
                 gateTrace.Add(new("MonteCarloSignFlip", false, gateSw.Elapsed.TotalMilliseconds));
                 _onGateRejection?.Invoke("monte_carlo_signflip");
-                return ScreeningOutcome.Failed(ScreeningFailureReason.MonteCarloSignFlip, "MonteCarloRejected",
-                    $"{strategyType} on {symbol}/{timeframe} p={pValue:F3} > {config.MonteCarloMinPValue:F2}");
+                return BuildFailedOutcome(
+                    ScreeningFailureReason.MonteCarloSignFlip,
+                    "MonteCarloRejected",
+                    $"{strategyType} on {symbol}/{timeframe} p={pValue:F3} > {config.MonteCarloMinPValue:F2}",
+                    trainResult,
+                    oosResult);
             }
         }
 
@@ -342,8 +419,12 @@ public class StrategyScreeningEngine
             {
                 gateTrace.Add(new("MonteCarloShuffle", false, gateSw.Elapsed.TotalMilliseconds));
                 _onGateRejection?.Invoke("monte_carlo_shuffle");
-                return ScreeningOutcome.Failed(ScreeningFailureReason.MonteCarloShuffle, "MonteCarloShuffleRejected",
-                    $"{strategyType} on {symbol}/{timeframe} shuffle p={shufflePValue:F3} > {config.EffectiveShuffleMinPValue:F2}");
+                return BuildFailedOutcome(
+                    ScreeningFailureReason.MonteCarloShuffle,
+                    "MonteCarloShuffleRejected",
+                    $"{strategyType} on {symbol}/{timeframe} shuffle p={shufflePValue:F3} > {config.EffectiveShuffleMinPValue:F2}",
+                    trainResult,
+                    oosResult);
             }
         }
 
@@ -402,8 +483,12 @@ public class StrategyScreeningEngine
                     {
                         gateTrace.Add(new("MarginalSharpe", false, gateSw.Elapsed.TotalMilliseconds));
                         _onGateRejection?.Invoke("marginal_sharpe");
-                        return ScreeningOutcome.Failed(ScreeningFailureReason.MarginalSharpe, "MarginalSharpeRejected",
-                            $"{strategyType} on {symbol}/{timeframe} marginal Sharpe contribution={marginalSharpeContribution:F3} <= 0");
+                        return BuildFailedOutcome(
+                            ScreeningFailureReason.MarginalSharpe,
+                            "MarginalSharpeRejected",
+                            $"{strategyType} on {symbol}/{timeframe} marginal Sharpe contribution={marginalSharpeContribution:F3} <= 0",
+                            trainResult,
+                            oosResult);
                     }
                 }
             }
@@ -463,8 +548,12 @@ public class StrategyScreeningEngine
                     {
                         gateTrace.Add(new("PositionSizing", false, gateSw.Elapsed.TotalMilliseconds));
                         _onGateRejection?.Invoke("position_sizing_sensitivity");
-                        return ScreeningOutcome.Failed(ScreeningFailureReason.PositionSizingSensitivity, "PositionSizingRejected",
-                            $"{strategyType} on {symbol}/{timeframe} Kelly Sharpe={kellySharpe:F3} < 80% of fixed-lot Sharpe={fixedLotSharpe:F3}");
+                        return BuildFailedOutcome(
+                            ScreeningFailureReason.PositionSizingSensitivity,
+                            "PositionSizingRejected",
+                            $"{strategyType} on {symbol}/{timeframe} Kelly Sharpe={kellySharpe:F3} < 80% of fixed-lot Sharpe={fixedLotSharpe:F3}",
+                            trainResult,
+                            oosResult);
                     }
                 }
             }
@@ -971,6 +1060,39 @@ public sealed record ScreeningOutcome
         FailureOutcome = outcome,
         FailureReason = reason,
     };
+
+    public static ScreeningOutcome Failed(
+        Strategy strategy,
+        BacktestResult? trainResult,
+        BacktestResult? oosResult,
+        MarketRegimeEnum regime,
+        MarketRegimeEnum observedRegime,
+        string generationSource,
+        ScreeningFailureReason failure,
+        string outcome,
+        string reason)
+        => new()
+        {
+            Strategy = strategy,
+            TrainResult = trainResult ?? new BacktestResult(),
+            OosResult = oosResult ?? new BacktestResult(),
+            Regime = regime,
+            ObservedRegime = observedRegime,
+            GenerationSource = generationSource,
+            Metrics = new ScreeningMetrics
+            {
+                Regime = regime.ToString(),
+                ObservedRegime = observedRegime.ToString(),
+                GenerationSource = generationSource,
+                ReserveTargetRegime = string.Equals(generationSource, "Reserve", StringComparison.OrdinalIgnoreCase)
+                    ? regime.ToString()
+                    : null,
+                ScreenedAtUtc = DateTime.UtcNow,
+            },
+            Failure = failure,
+            FailureOutcome = outcome,
+            FailureReason = reason,
+        };
 }
 
 /// <summary>Per-gate timing and pass/fail trace for screening pipeline diagnostics.</summary>

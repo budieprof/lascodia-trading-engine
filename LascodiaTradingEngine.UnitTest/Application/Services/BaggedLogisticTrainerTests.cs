@@ -90,15 +90,41 @@ public class BaggedLogisticTrainerTests
     }
 
     [Fact]
-    public void ComputeFinalSplitBoundaries_Uses_Single_Embargo_Between_Train_And_Calibration()
+    public void ComputeFinalSplitBoundaries_Allocates_LeakageSafe_Gaps_Between_Splits()
     {
         var (trainStdEnd, calStart, calEnd, testStart) =
-            BaggedLogisticTrainer.ComputeFinalSplitBoundaries(sampleCount: 100, embargo: 5);
+            BaggedLogisticTrainer.ComputeFinalSplitBoundaries(
+                sampleCount: 180,
+                embargo: 5,
+                purgeHorizonBars: 0,
+                lookbackWindow: 30);
 
-        Assert.Equal(65, trainStdEnd);
-        Assert.Equal(70, calStart);
-        Assert.Equal(80, calEnd);
-        Assert.Equal(85, testStart);
+        Assert.Equal(78, trainStdEnd);
+        Assert.Equal(112, calStart);
+        Assert.Equal(123, calEnd);
+        Assert.Equal(157, testStart);
+    }
+
+    [Fact]
+    public void ComputeDensityRatioRecentCount_Uses_Configured_BarsPerDay()
+    {
+        int recentCount = BaggedLogisticTrainer.ComputeDensityRatioRecentCount(
+            sampleCount: 1000,
+            recentWindowDays: 2,
+            barsPerDay: 96);
+
+        Assert.Equal(192, recentCount);
+    }
+
+    [Fact]
+    public void ComputeIncrementalRecentSampleCount_Uses_Configured_BarsPerDay()
+    {
+        int recentCount = BaggedLogisticTrainer.ComputeIncrementalRecentSampleCount(
+            sampleCount: 500,
+            recentWindowDays: 2,
+            barsPerDay: 96);
+
+        Assert.Equal(192, recentCount);
     }
 
     [Theory]
@@ -436,6 +462,21 @@ public class BaggedLogisticTrainerTests
         var (maxDrawdown, sharpe) = BaggedLogisticTrainer.ComputeEquityCurveStats(predictions);
 
         Assert.True(maxDrawdown > 1.0);
+        Assert.True(double.IsFinite(sharpe));
+    }
+
+    [Fact]
+    public void ComputeEquityCurveStats_Treats_Abstentions_As_Flat_Returns()
+    {
+        var predictions = new (int Predicted, int Actual)[]
+        {
+            (0, 1),
+            (1, 1),
+        };
+
+        var (maxDrawdown, sharpe) = BaggedLogisticTrainer.ComputeEquityCurveStats(predictions);
+
+        Assert.Equal(0.0, maxDrawdown, precision: 6);
         Assert.True(double.IsFinite(sharpe));
     }
 

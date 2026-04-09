@@ -64,7 +64,28 @@ public class GetOptimizationWorkerHealthQueryTest
             OldestQueuedAtUtc = DateTime.Parse("2026-04-06T10:00:00Z").ToUniversalTime(),
             OldestQueuedAgeSeconds = 840,
             QueuedRuns = 4,
+            DeferredQueuedRuns = 2,
+            OldestDeferredQueuedRunId = 78,
+            OldestDeferredQueuedAtUtc = DateTime.Parse("2026-04-06T09:58:00Z").ToUniversalTime(),
+            OldestDeferredUntilUtc = DateTime.Parse("2026-04-06T10:30:00Z").ToUniversalTime(),
+            OldestDeferredQueuedAgeSeconds = 960,
+            MostDeferredQueuedRunId = 78,
+            MostDeferredQueuedDeferralCount = 4,
+            MostRecentDeferredResumeRunId = 80,
+            MostRecentDeferredResumeAtUtc = DateTime.Parse("2026-04-06T10:13:30Z").ToUniversalTime(),
+            DeferredQueuedRunsByReason =
+            [
+                new OptimizationDeferralReasonCountSnapshot(OptimizationDeferralReason.SeasonalBlackout, 1),
+                new OptimizationDeferralReasonCountSnapshot(OptimizationDeferralReason.DataQuality, 1)
+            ],
+            StarvedQueuedRuns = 1,
+            OldestStarvedQueuedRunId = 79,
+            OldestStarvedQueuedAtUtc = DateTime.Parse("2026-04-05T08:00:00Z").ToUniversalTime(),
+            OldestStarvedQueuedAgeSeconds = 97_200,
             RunningRuns = 2,
+            ActiveLeasedRunningRuns = 1,
+            StaleRunningRuns = 1,
+            LeaseMissingRunningRuns = 0,
             RetryableFailedRuns = 1,
             AbandonedRuns = 1,
             PendingFollowUps = 5,
@@ -74,6 +95,13 @@ public class GetOptimizationWorkerHealthQueryTest
             StrandedLifecycleRuns = 2,
             LifecycleRepairsLastCycle = 4,
             LifecycleBatchesLastCycle = 2,
+            LifecycleMissingCompletionPayloadRepairsLastCycle = 1,
+            LifecycleMalformedCompletionPayloadRepairsLastCycle = 1,
+            LifecycleFollowUpRepairsLastCycle = 2,
+            LifecycleConfigSnapshotRepairsLastCycle = 1,
+            LifecycleBestParameterRepairsLastCycle = 0,
+            LeaseReclaimsLastCycle = 2,
+            OrphanedStaleRunningRunsLastCycle = 1,
             ConfigCacheAgeSeconds = 12,
             ConfigRefreshIntervalSeconds = 60,
             ConfigRefreshDueAtUtc = DateTime.Parse("2026-04-06T10:15:00Z").ToUniversalTime(),
@@ -91,6 +119,33 @@ public class GetOptimizationWorkerHealthQueryTest
             OldestStrandedLifecycleStatus = OptimizationRunStatus.Approved,
             OldestStrandedLifecycleAnchorAtUtc = DateTime.Parse("2026-04-06T09:55:00Z").ToUniversalTime()
         });
+        optimizationHealthStore.Setup(x => x.GetPhaseStates()).Returns(
+        [
+            new OptimizationWorkerPhaseStateSnapshot
+            {
+                PhaseName = OptimizationWorkerHealthNames.Phases.StaleRunningRecovery,
+                LastStartedAtUtc = DateTime.Parse("2026-04-06T10:14:05Z").ToUniversalTime(),
+                LastCompletedAtUtc = DateTime.Parse("2026-04-06T10:14:10Z").ToUniversalTime(),
+                LastSuccessAtUtc = DateTime.Parse("2026-04-06T10:14:10Z").ToUniversalTime(),
+                LastDurationMs = 18,
+                LastSuccessDurationMs = 18,
+                SuccessesLastHour = 5,
+                FailuresLastHour = 0
+            },
+            new OptimizationWorkerPhaseStateSnapshot
+            {
+                PhaseName = OptimizationWorkerHealthNames.Phases.AutoScheduling,
+                LastStartedAtUtc = DateTime.Parse("2026-04-06T10:14:18Z").ToUniversalTime(),
+                LastCompletedAtUtc = DateTime.Parse("2026-04-06T10:14:20Z").ToUniversalTime(),
+                LastFailureAtUtc = DateTime.Parse("2026-04-06T10:14:20Z").ToUniversalTime(),
+                LastFailureType = "InvalidOperationException",
+                LastFailureMessage = "schedule failed",
+                ConsecutiveFailures = 2,
+                LastDurationMs = 45,
+                SuccessesLastHour = 1,
+                FailuresLastHour = 2
+            }
+        ]);
 
         var handler = new GetOptimizationWorkerHealthQueryHandler(healthMonitor.Object, optimizationHealthStore.Object);
 
@@ -112,7 +167,35 @@ public class GetOptimizationWorkerHealthQueryTest
         Assert.Equal(DateTime.Parse("2026-04-06T10:00:00Z").ToUniversalTime(), response.data.OldestQueuedAtUtc);
         Assert.Equal(840, response.data.OldestQueuedAgeSeconds);
         Assert.Equal(4, response.data!.QueuedRuns);
+        Assert.Equal(2, response.data.DeferredQueuedRuns);
+        Assert.Equal(78, response.data.OldestDeferredQueuedRunId);
+        Assert.Equal(DateTime.Parse("2026-04-06T09:58:00Z").ToUniversalTime(), response.data.OldestDeferredQueuedAtUtc);
+        Assert.Equal(DateTime.Parse("2026-04-06T10:30:00Z").ToUniversalTime(), response.data.OldestDeferredUntilUtc);
+        Assert.Equal(960, response.data.OldestDeferredQueuedAgeSeconds);
+        Assert.Equal(78, response.data.MostDeferredQueuedRunId);
+        Assert.Equal(4, response.data.MostDeferredQueuedDeferralCount);
+        Assert.Equal(80, response.data.MostRecentDeferredResumeRunId);
+        Assert.Equal(DateTime.Parse("2026-04-06T10:13:30Z").ToUniversalTime(), response.data.MostRecentDeferredResumeAtUtc);
+        Assert.Collection(
+            response.data.DeferredQueuedRunsByReason,
+            item =>
+            {
+                Assert.Equal(OptimizationDeferralReason.SeasonalBlackout, item.Reason);
+                Assert.Equal(1, item.Count);
+            },
+            item =>
+            {
+                Assert.Equal(OptimizationDeferralReason.DataQuality, item.Reason);
+                Assert.Equal(1, item.Count);
+            });
+        Assert.Equal(1, response.data.StarvedQueuedRuns);
+        Assert.Equal(79, response.data.OldestStarvedQueuedRunId);
+        Assert.Equal(DateTime.Parse("2026-04-05T08:00:00Z").ToUniversalTime(), response.data.OldestStarvedQueuedAtUtc);
+        Assert.Equal(97_200, response.data.OldestStarvedQueuedAgeSeconds);
         Assert.Equal(2, response.data.RunningRuns);
+        Assert.Equal(1, response.data.ActiveLeasedRunningRuns);
+        Assert.Equal(1, response.data.StaleRunningRuns);
+        Assert.Equal(0, response.data.LeaseMissingRunningRuns);
         Assert.Equal(1, response.data.RetryableFailedRuns);
         Assert.Equal(1, response.data.AbandonedRuns);
         Assert.Equal(5, response.data.PendingFollowUps);
@@ -122,6 +205,13 @@ public class GetOptimizationWorkerHealthQueryTest
         Assert.Equal(2, response.data.StrandedLifecycleRuns);
         Assert.Equal(4, response.data.LifecycleRepairsLastCycle);
         Assert.Equal(2, response.data.LifecycleBatchesLastCycle);
+        Assert.Equal(1, response.data.LifecycleMissingCompletionPayloadRepairsLastCycle);
+        Assert.Equal(1, response.data.LifecycleMalformedCompletionPayloadRepairsLastCycle);
+        Assert.Equal(2, response.data.LifecycleFollowUpRepairsLastCycle);
+        Assert.Equal(1, response.data.LifecycleConfigSnapshotRepairsLastCycle);
+        Assert.Equal(0, response.data.LifecycleBestParameterRepairsLastCycle);
+        Assert.Equal(2, response.data.LeaseReclaimsLastCycle);
+        Assert.Equal(1, response.data.OrphanedStaleRunningRunsLastCycle);
         Assert.Equal(12, response.data.ConfigCacheAgeSeconds);
         Assert.Equal(60, response.data.ConfigRefreshIntervalSeconds);
         Assert.Equal(DateTime.Parse("2026-04-06T10:15:00Z").ToUniversalTime(), response.data.ConfigRefreshDueAtUtc);
@@ -144,5 +234,58 @@ public class GetOptimizationWorkerHealthQueryTest
         Assert.NotNull(response.data.CompletionReplayWorker);
         Assert.Equal(OptimizationWorkerHealthNames.CompletionReplayWorker, response.data.CompletionReplayWorker!.WorkerName);
         Assert.Equal(90, response.data.CompletionReplayWorker.LastCycleDurationMs);
+        Assert.Collection(
+            response.data.PhaseStates,
+            phase =>
+            {
+                Assert.Equal(OptimizationWorkerHealthNames.Phases.AutoScheduling, phase.PhaseName);
+                Assert.Equal(DateTime.Parse("2026-04-06T10:14:18Z").ToUniversalTime(), phase.LastStartedAtUtc);
+                Assert.Equal(DateTime.Parse("2026-04-06T10:14:20Z").ToUniversalTime(), phase.LastCompletedAtUtc);
+                Assert.Equal(DateTime.Parse("2026-04-06T10:14:20Z").ToUniversalTime(), phase.LastFailureAtUtc);
+                Assert.Equal("InvalidOperationException", phase.LastFailureType);
+                Assert.Equal("schedule failed", phase.LastFailureMessage);
+                Assert.Equal(2, phase.ConsecutiveFailures);
+                Assert.Equal(1, phase.SuccessesLastHour);
+                Assert.Equal(2, phase.FailuresLastHour);
+            },
+            phase =>
+            {
+                Assert.Equal(OptimizationWorkerHealthNames.Phases.StaleRunningRecovery, phase.PhaseName);
+                Assert.Equal(DateTime.Parse("2026-04-06T10:14:05Z").ToUniversalTime(), phase.LastStartedAtUtc);
+                Assert.Equal(DateTime.Parse("2026-04-06T10:14:10Z").ToUniversalTime(), phase.LastCompletedAtUtc);
+                Assert.Equal(DateTime.Parse("2026-04-06T10:14:10Z").ToUniversalTime(), phase.LastSuccessAtUtc);
+                Assert.Equal(18, phase.LastDurationMs);
+                Assert.Equal(18, phase.LastSuccessDurationMs);
+                Assert.Equal(5, phase.SuccessesLastHour);
+                Assert.Equal(0, phase.FailuresLastHour);
+            });
+    }
+
+    [Fact]
+    public async Task Handle_DoesNotBackfillExecutionWorkerFromCoordinatorSnapshot()
+    {
+        var healthMonitor = new Mock<IWorkerHealthMonitor>();
+        healthMonitor.Setup(x => x.GetCurrentSnapshots()).Returns(
+        [
+            new WorkerHealthSnapshot
+            {
+                WorkerName = OptimizationWorkerHealthNames.CoordinatorWorker,
+                IsRunning = true,
+                LastCycleDurationMs = 250
+            }
+        ]);
+
+        var optimizationHealthStore = new Mock<IOptimizationWorkerHealthStore>();
+        optimizationHealthStore.Setup(x => x.GetMainWorkerState()).Returns(new OptimizationWorkerHealthStateSnapshot());
+        optimizationHealthStore.Setup(x => x.GetPhaseStates()).Returns([]);
+
+        var handler = new GetOptimizationWorkerHealthQueryHandler(healthMonitor.Object, optimizationHealthStore.Object);
+
+        var response = await handler.Handle(new GetOptimizationWorkerHealthQuery(), CancellationToken.None);
+
+        Assert.True(response.status);
+        Assert.NotNull(response.data);
+        Assert.NotNull(response.data!.CoordinatorWorker);
+        Assert.Null(response.data.OptimizationWorker);
     }
 }

@@ -1,9 +1,236 @@
 using LascodiaTradingEngine.Application.MLModels.Shared;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace LascodiaTradingEngine.Application.Services.ML;
 
 public sealed partial class FtTransformerModelTrainer
 {
+    // ── Input and preprocessing helpers ──────────────────────────────────────
+
+    private static void ValidateTrainingHyperparams(TrainingHyperparams hp, int featureCount)
+    {
+        if (hp.MaxEpochs <= 0)
+            throw new InvalidOperationException("FtTransformerModelTrainer requires MaxEpochs > 0.");
+        if (hp.EarlyStoppingPatience <= 0)
+            throw new InvalidOperationException("FtTransformerModelTrainer requires EarlyStoppingPatience > 0.");
+        if (hp.EarlyStoppingPatience > hp.MaxEpochs)
+            throw new InvalidOperationException("EarlyStoppingPatience cannot exceed MaxEpochs.");
+        if (!double.IsFinite(hp.LearningRate) || hp.LearningRate <= 0.0)
+            throw new InvalidOperationException("FtTransformerModelTrainer requires a finite positive LearningRate.");
+        if (!double.IsFinite(hp.L2Lambda) || hp.L2Lambda < 0.0)
+            throw new InvalidOperationException("FtTransformerModelTrainer requires L2Lambda >= 0.");
+        if (!double.IsFinite(hp.MaxGradNorm) || hp.MaxGradNorm < 0.0)
+            throw new InvalidOperationException("FtTransformerModelTrainer requires MaxGradNorm >= 0.");
+        if (!double.IsFinite(hp.FtDropoutRate) || hp.FtDropoutRate < 0.0 || hp.FtDropoutRate >= 1.0)
+            throw new InvalidOperationException("FtTransformerModelTrainer requires FtDropoutRate in [0, 1).");
+        if (hp.MiniBatchSize <= 0)
+            throw new InvalidOperationException("FtTransformerModelTrainer requires MiniBatchSize > 0.");
+        if (hp.FtWarmupEpochs < 0)
+            throw new InvalidOperationException("FtTransformerModelTrainer requires FtWarmupEpochs >= 0.");
+        if (hp.ThresholdSearchMin <= 0 || hp.ThresholdSearchMin >= 100)
+            throw new InvalidOperationException("FtTransformerModelTrainer requires ThresholdSearchMin in (0, 100).");
+        if (hp.ThresholdSearchMax <= 0 || hp.ThresholdSearchMax >= 100)
+            throw new InvalidOperationException("FtTransformerModelTrainer requires ThresholdSearchMax in (0, 100).");
+        if (hp.ThresholdSearchMin >= hp.ThresholdSearchMax)
+            throw new InvalidOperationException("ThresholdSearchMin must be smaller than ThresholdSearchMax.");
+        if (hp.ThresholdSearchStepBps <= 0)
+            throw new InvalidOperationException("FtTransformerModelTrainer requires ThresholdSearchStepBps > 0.");
+        if (!double.IsFinite(hp.ConformalCoverage) || hp.ConformalCoverage <= 0.0 || hp.ConformalCoverage >= 1.0)
+            throw new InvalidOperationException("FtTransformerModelTrainer requires ConformalCoverage in (0, 1).");
+        if (hp.MinIsotonicCalibrationSamples < 0)
+            throw new InvalidOperationException("FtTransformerModelTrainer requires MinIsotonicCalibrationSamples >= 0.");
+        if (hp.BarsPerDay <= 0)
+            throw new InvalidOperationException("FtTransformerModelTrainer requires BarsPerDay > 0.");
+        if (hp.FtTransformerHeads < 0)
+            throw new InvalidOperationException("FtTransformerModelTrainer requires FtTransformerHeads >= 0.");
+        if (hp.FtTransformerArchitectureNumLayers < 0)
+            throw new InvalidOperationException("FtTransformerModelTrainer requires FtTransformerArchitectureNumLayers >= 0.");
+        if (!double.IsFinite(hp.MaxWeightMagnitude) || hp.MaxWeightMagnitude < 0.0)
+            throw new InvalidOperationException("FtTransformerModelTrainer requires MaxWeightMagnitude >= 0.");
+    }
+
+    private static int ComputeDeterministicSeed(params object?[] components)
+    {
+        var builder = new StringBuilder("fttransformer-seed-v1");
+        foreach (object? component in components)
+        {
+            builder.Append('|');
+            builder.Append(component?.ToString() ?? "<null>");
+        }
+
+        byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes(builder.ToString()));
+        int seed = BitConverter.ToInt32(hash, 0) & int.MaxValue;
+        return seed == 0 ? 1 : seed;
+    }
+
+    private static int DetermineCalibrationCrossFitFoldCount(int diagnosticsSampleCount)
+    {
+        if (diagnosticsSampleCount >= 30) return 3;
+        if (diagnosticsSampleCount >= 10) return 2;
+        return 1;
+    }
+
+    private static (int[] StartIndices, int[] Counts, string[] Hashes) BuildCrossFitFoldMetadata(
+        int baseStartIndex,
+        int sampleCount,
+        int requestedFoldCount)
+    {
+        int foldCount = Math.Max(1, Math.Min(requestedFoldCount, sampleCount));
+        var starts = new int[foldCount];
+        var counts = new int[foldCount];
+        var hashes = new string[foldCount];
+
+        int cursor = 0;
+        int baseCount = sampleCount / foldCount;
+        int remainder = sampleCount % foldCount;
+        for (int fold = 0; fold < foldCount; fold++)
+        {
+            int count = baseCount + (fold < remainder ? 1 : 0);
+            starts[fold] = baseStartIndex + cursor;
+            counts[fold] = count;
+            hashes[fold] = Convert.ToHexString(
+                SHA256.HashData(Encoding.UTF8.GetBytes($"fttransformer-crossfit-fold|{fold}|{starts[fold]}|{count}")));
+            cursor += count;
+        }
+
+        return (starts, counts, hashes);
+    }
+
+    private static long EstimateTrainingMemoryBytes(
+        int sampleCount,
+        int featureCount,
+        int embedDim,
+        int numHeads,
+        int ffnDim,
+        int numLayers,
+        int miniBatchSize)
+    {
+        try
+        {
+            checked
+            {
+                long batch = Math.Max(1, Math.Min(sampleCount, miniBatchSize));
+                long seqLen = featureCount + 1L;
+                long tokenBytes = batch * seqLen * embedDim * sizeof(double);
+                long attentionBytes = batch * Math.Max(1, numHeads) * seqLen * seqLen * sizeof(double);
+                long ffnBytes = batch * seqLen * ffnDim * sizeof(double);
+                long perLayerWorkingSet = (tokenBytes * 12L) + (attentionBytes * 6L) + (ffnBytes * 4L);
+                long embeddingBytes = featureCount * embedDim * sizeof(double) * 2L;
+                long classifierBytes = embedDim * sizeof(double) * 8L;
+                long sampleFeatureBytes = batch * featureCount * sizeof(float) * 2L;
+                return embeddingBytes + classifierBytes + sampleFeatureBytes + (Math.Max(1, numLayers) * perLayerWorkingSet);
+            }
+        }
+        catch (OverflowException)
+        {
+            return long.MaxValue;
+        }
+    }
+
+    private static void ValidateTrainingSamples(List<TrainingSample> samples)
+    {
+        ArgumentNullException.ThrowIfNull(samples);
+
+        if (samples.Count == 0)
+            throw new InvalidOperationException("FtTransformerModelTrainer requires at least one sample.");
+
+        int expectedFeatureCount = samples[0].Features?.Length ?? 0;
+        if (expectedFeatureCount == 0)
+            throw new InvalidOperationException("FtTransformerModelTrainer requires samples with at least one feature.");
+
+        for (int i = 0; i < samples.Count; i++)
+        {
+            var sample = samples[i];
+            if (sample.Features is null)
+                throw new InvalidOperationException($"Training sample {i} has a null feature vector.");
+
+            if (sample.Features.Length != expectedFeatureCount)
+            {
+                throw new InvalidOperationException(
+                    $"Training sample {i} has feature length {sample.Features.Length}, expected {expectedFeatureCount}.");
+            }
+        }
+    }
+
+    private static List<TrainingSample> StandardizeSamples(
+        List<TrainingSample> samples,
+        float[] means,
+        float[] stds)
+    {
+        int featureCount = means.Length;
+        var standardized = new List<TrainingSample>(samples.Count);
+        foreach (var sample in samples)
+        {
+            float[] features = MLSignalScorer.StandardiseFeatures(sample.Features, means, stds, featureCount);
+            standardized.Add(sample with { Features = features });
+        }
+
+        return standardized;
+    }
+
+    private static string[] ResolveFeatureNames(int featureCount)
+    {
+        var names = new string[featureCount];
+        for (int i = 0; i < featureCount; i++)
+            names[i] = i < MLFeatureHelper.FeatureNames.Length ? MLFeatureHelper.FeatureNames[i] : $"F{i}";
+        return names;
+    }
+
+    private static int[] BuildSelectedFeatureIndices(bool[] mask)
+    {
+        var selected = new List<int>(mask.Length);
+        for (int i = 0; i < mask.Length; i++)
+        {
+            if (mask[i])
+                selected.Add(i);
+        }
+
+        return [.. selected];
+    }
+
+    private static bool[] CreateAllTrueMask(int length)
+    {
+        var mask = new bool[length];
+        Array.Fill(mask, true);
+        return mask;
+    }
+
+    private static float[] SelectFloatValues(float[] values, int[] indices)
+    {
+        var selected = new float[indices.Length];
+        for (int i = 0; i < indices.Length; i++)
+            selected[i] = values[indices[i]];
+        return selected;
+    }
+
+    private static double[] SelectDoubleValues(double[] values, int[] indices)
+    {
+        var selected = new double[indices.Length];
+        for (int i = 0; i < indices.Length; i++)
+            selected[i] = values[indices[i]];
+        return selected;
+    }
+
+    private static float[] SelectFloatValues(float[] values, bool[] mask)
+    {
+        return SelectFloatValues(values, BuildSelectedFeatureIndices(mask));
+    }
+
+    private static string[] SelectFeatureNames(string[] names, int[] indices)
+    {
+        var selected = new string[indices.Length];
+        for (int i = 0; i < indices.Length; i++)
+            selected[i] = names[indices[i]];
+        return selected;
+    }
+
+    private static void InitialisePosBiasRow(double[] row, Random rng)
+    {
+        for (int i = 0; i < row.Length; i++)
+            row[i] = SampleGaussian(rng, 0.02);
+    }
+
     // ── LayerNorm ─────────────────────────────────────────────────────────────
 
     private static void LayerNormForward(double[] x, double[] gamma, double[] beta, double[] y, int D)
@@ -146,6 +373,30 @@ public sealed partial class FtTransformerModelTrainer
         count += SanitiseArray(model.BetaFinal);
         count += SanitiseArray(model.WOut);
         if (!double.IsFinite(model.BOut)) { model.BOut = 0.0; count++; }
+        return count;
+    }
+
+    private static int SanitiseModel(TransformerModel model)
+    {
+        int count = SanitiseWeights(model);
+        if (!model.UsePositionalBias)
+            return count;
+
+        for (int l = 0; l < model.NumLayers; l++)
+        {
+            if (model.Layers[l].PosBias is not null)
+            {
+                for (int h = 0; h < model.NumHeads; h++)
+                {
+                    if (HasNonFiniteArray(model.Layers[l].PosBias![h]))
+                    {
+                        Array.Clear(model.Layers[l].PosBias[h]);
+                        count++;
+                    }
+                }
+            }
+        }
+
         return count;
     }
 

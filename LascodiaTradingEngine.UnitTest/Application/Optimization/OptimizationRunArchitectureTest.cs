@@ -65,6 +65,7 @@ public class OptimizationRunArchitectureTest
             StrategyId = 88,
             Status = OptimizationRunStatus.Completed,
             ApprovedAt = nowUtc.AddMinutes(-20),
+            DeferralReason = OptimizationDeferralReason.DataQuality,
             DeferredUntilUtc = nowUtc.AddMinutes(30),
             BestParametersJson = """{"Fast":12}""",
             BestHealthScore = 0.66m,
@@ -105,6 +106,7 @@ public class OptimizationRunArchitectureTest
         Assert.Equal(OptimizationFailureCategory.Transient, run.FailureCategory);
         Assert.Equal("retry me", run.ErrorMessage);
         Assert.Null(run.ApprovedAt);
+        Assert.Null(run.DeferralReason);
         Assert.Null(run.DeferredUntilUtc);
         Assert.Null(run.BestParametersJson);
         Assert.Null(run.ValidationFollowUpsCreatedAt);
@@ -147,6 +149,56 @@ public class OptimizationRunArchitectureTest
         Assert.Equal("LeaseHeartbeatFailed", run.LastOperationalIssueCode);
         Assert.Equal("Transient lease heartbeat write failed.", run.LastOperationalIssueMessage);
         Assert.Equal(nowUtc.AddMinutes(1), run.LastOperationalIssueAt);
+    }
+
+    [Fact]
+    public void ComputeDeterministicSeed_IsStableAcrossInvocations()
+    {
+        var queueAnchorUtc = new DateTime(2026, 04, 09, 11, 30, 0, DateTimeKind.Utc);
+
+        int first = OptimizationDeterministicSeed.Compute(41, 7, queueAnchorUtc);
+        int second = OptimizationDeterministicSeed.Compute(41, 7, queueAnchorUtc);
+        int different = OptimizationDeterministicSeed.Compute(41, 7, queueAnchorUtc.AddMinutes(1));
+
+        Assert.Equal(first, second);
+        Assert.NotEqual(first, different);
+        Assert.True(first > 0);
+    }
+
+    [Fact]
+    public void DeferralTracker_AppliesAndClearsCurrentDeferralLifecycle()
+    {
+        var deferredAtUtc = new DateTime(2026, 04, 09, 12, 0, 0, DateTimeKind.Utc);
+        var resumedAtUtc = deferredAtUtc.AddMinutes(30);
+        var run = new OptimizationRun
+        {
+            Id = 404,
+            StrategyId = 90,
+            Status = OptimizationRunStatus.Running,
+            DeferralCount = 1,
+            IsDeleted = false
+        };
+
+        OptimizationRunDeferralTracker.ApplyDeferral(
+            run,
+            OptimizationDeferralReason.DataQuality,
+            deferredAtUtc.AddHours(1),
+            deferredAtUtc);
+
+        Assert.Equal(OptimizationRunStatus.Queued, run.Status);
+        Assert.Equal(OptimizationDeferralReason.DataQuality, run.DeferralReason);
+        Assert.Equal(deferredAtUtc, run.DeferredAtUtc);
+        Assert.Equal(deferredAtUtc.AddHours(1), run.DeferredUntilUtc);
+        Assert.Equal(2, run.DeferralCount);
+        Assert.Null(run.LastResumedAtUtc);
+
+        OptimizationRunDeferralTracker.MarkResumed(run, resumedAtUtc);
+
+        Assert.Null(run.DeferralReason);
+        Assert.Null(run.DeferredAtUtc);
+        Assert.Null(run.DeferredUntilUtc);
+        Assert.Equal(resumedAtUtc, run.LastResumedAtUtc);
+        Assert.Equal(2, run.DeferralCount);
     }
 
     [Theory]

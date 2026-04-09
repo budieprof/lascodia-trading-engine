@@ -2,6 +2,7 @@ using System.Text.Json;
 using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.MLModels.Shared;
+using LascodiaTradingEngine.Application.Services;
 using LascodiaTradingEngine.Domain.Enums;
 using Microsoft.Extensions.Logging;
 
@@ -147,10 +148,12 @@ public sealed partial class ElmModelTrainer
             : 0.0;
         double target = sample.Direction > 0 ? 1.0 - smoothing : smoothing;
 
+        var rawFeatures = ElmFeaturePipelineHelper.CloneAndWinsorize(sample.Features, snapshot);
+
         // Standardise using the snapshot's stored means/stds
         var stdFeatures = snapshot.Means is not null && snapshot.Stds is not null
-            ? MLFeatureHelper.Standardize(sample.Features, snapshot.Means, snapshot.Stds)
-            : sample.Features;
+            ? MLFeatureHelper.Standardize(rawFeatures, snapshot.Means, snapshot.Stds)
+            : rawFeatures;
         var maskedFeatures = (float[])stdFeatures.Clone();
         if (snapshot.ActiveFeatureMask is { Length: > 0 } featureMask)
         {
@@ -293,6 +296,14 @@ public sealed partial class ElmModelTrainer
             return false;
         }
 
+        if (snapshot.FracDiffD > 0.0)
+        {
+            _logger.LogDebug(
+                "ELM recalibration skipped — FracDiffD={D:F2} requires historical context not available to the recent-sample buffer",
+                snapshot.FracDiffD);
+            return false;
+        }
+
         if (snapshot.Weights is null || snapshot.Biases is null ||
             snapshot.ElmInputWeights is null || snapshot.ElmInputBiases is null ||
             snapshot.Means is null || snapshot.Stds is null)
@@ -305,7 +316,8 @@ public sealed partial class ElmModelTrainer
         var stdSamples = new List<TrainingSample>(recentSamples.Count);
         foreach (var s in recentSamples)
         {
-            var stdFeatures = MLFeatureHelper.Standardize(s.Features, snapshot.Means, snapshot.Stds);
+            var rawFeatures = ElmFeaturePipelineHelper.CloneAndWinsorize(s.Features, snapshot);
+            var stdFeatures = MLFeatureHelper.Standardize(rawFeatures, snapshot.Means, snapshot.Stds);
             if (snapshot.ActiveFeatureMask is { Length: > 0 } mask)
                 for (int i = 0; i < stdFeatures.Length && i < mask.Length; i++)
                     if (!mask[i]) stdFeatures[i] = 0f;
@@ -497,15 +509,24 @@ public sealed partial class ElmModelTrainer
         double calibP,
         double ensStd,
         float[] features,
-        int featureCount)
+        int featureCount,
+        int[]? topFeatureIndices = null)
     {
-        int featureTerms = Math.Min(Math.Min(5, Math.Max(0, featureCount)), features.Length);
-        var metaFeatures = new double[2 + Math.Min(5, Math.Max(0, featureCount))];
+        int[] effectiveTopFeatures = topFeatureIndices is { Length: > 0 }
+            ? topFeatureIndices.Take(Math.Min(5, topFeatureIndices.Length)).ToArray()
+            : Enumerable.Range(0, Math.Min(5, Math.Max(0, featureCount))).ToArray();
+        var metaFeatures = new double[2 + effectiveTopFeatures.Length];
         metaFeatures[0] = ClampProbabilityOrNeutral(calibP);
         metaFeatures[1] = ClampNonNegativeFinite(ensStd);
 
-        for (int j = 0; j < featureTerms; j++)
-            metaFeatures[j + 2] = SanitizeFiniteOrDefault(features[j], 0.0);
+        for (int j = 0; j < effectiveTopFeatures.Length; j++)
+        {
+            int featureIndex = effectiveTopFeatures[j];
+            if (featureIndex < 0 || featureIndex >= featureCount || featureIndex >= features.Length)
+                continue;
+
+            metaFeatures[j + 2] = SanitizeFiniteOrDefault(features[featureIndex], 0.0);
+        }
 
         return metaFeatures;
     }
@@ -527,6 +548,35 @@ public sealed partial class ElmModelTrainer
             metaZ += SanitizeFiniteOrDefault(metaLabelWeights[j], 0.0) * metaFeatures[j];
 
         return ClampProbabilityOrNeutral(MLFeatureHelper.Sigmoid(metaZ));
+    }
+
+    private static double ComputeMetaLabelScoreWithTopFeatures(
+        double calibP,
+        double ensStd,
+        float[] features,
+        int featureCount,
+        double[] metaLabelWeights,
+        double metaLabelBias,
+        int[]? topFeatureIndices,
+        double[]? metaLabelHiddenWeights = null,
+        double[]? metaLabelHiddenBiases = null,
+        int metaLabelHiddenDim = 0)
+    {
+        if (metaLabelWeights.Length == 0)
+            return 0.5;
+
+        decimal? score = ScoringEnrichmentCalculator.ComputeMetaLabelScore(
+            calibP,
+            ensStd,
+            features,
+            featureCount,
+            metaLabelWeights,
+            metaLabelBias,
+            topFeatureIndices,
+            metaLabelHiddenWeights,
+            metaLabelHiddenBiases,
+            metaLabelHiddenDim);
+        return score.HasValue ? (double)score.Value : 0.5;
     }
 
     private static ElmActivation ResolveLearnerActivation(ElmActivation[] learnerActivations, int learnerIndex)
@@ -585,6 +635,13 @@ public sealed partial class ElmModelTrainer
             learnerIndex >= inputWeights.Length ||
             inputWeights[learnerIndex] is not { Length: > 0 } learnerWeights ||
             learnerWeights.Length != expectedInputWeightLength)
+        {
+            return false;
+        }
+
+        if (warmStart.ElmInputBiases is not { Length: > 0 } inputBiases ||
+            learnerIndex >= inputBiases.Length ||
+            inputBiases[learnerIndex] is not { Length: > 0 })
         {
             return false;
         }

@@ -16,6 +16,11 @@ namespace LascodiaTradingEngine.Application.Optimization;
 [RegisterService(ServiceLifetime.Singleton)]
 internal sealed class OptimizationRunRecoveryCoordinator
 {
+    internal sealed record StaleRunningRecoverySummary(
+        int RequeuedRuns,
+        int OrphanedRuns,
+        DateTime ExecutedAtUtc);
+
     internal sealed record LifecycleReconciliationSummary(
         int RepairedRuns,
         int BatchesProcessed,
@@ -29,6 +34,7 @@ internal sealed class OptimizationRunRecoveryCoordinator
 
     private const int LifecycleReconciliationBatchLimit = 50;
     private const int LifecycleReconciliationMaxBatchesPerCycle = 4;
+    private static readonly TimeSpan StaleQueuedWarningCooldown = TimeSpan.FromMinutes(30);
 
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly TradingMetrics _metrics;
@@ -36,6 +42,9 @@ internal sealed class OptimizationRunRecoveryCoordinator
     private readonly OptimizationFollowUpCoordinator _followUpCoordinator;
     private readonly OptimizationRunScopedConfigService _runScopedConfigService;
     private readonly TimeProvider _timeProvider;
+    private readonly object _staleQueuedWarningGate = new();
+    private DateTime? _lastStaleQueuedWarningAtUtc;
+    private long? _lastStaleQueuedWarningRunId;
     private DateTime UtcNow => _timeProvider.GetUtcNow().UtcDateTime;
 
     public OptimizationRunRecoveryCoordinator(
@@ -54,143 +63,74 @@ internal sealed class OptimizationRunRecoveryCoordinator
         _timeProvider = timeProvider;
     }
 
-    internal async Task RecoverStaleRunningRunsAsync(CancellationToken ct)
+    internal async Task<StaleRunningRecoverySummary> RecoverStaleRunningRunsAsync(CancellationToken ct)
     {
-        try
-        {
-            await using var scope = _scopeFactory.CreateAsyncScope();
-            var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
-            var db = writeCtx.GetDbContext();
-            var nowUtc = UtcNow;
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>().GetDbContext();
+        var nowUtc = UtcNow;
 
-            var activeStrategyIds = await db.Set<Strategy>()
-                .Where(s => !s.IsDeleted)
-                .Select(s => s.Id)
-                .ToListAsync(ct);
-            var activeStrategySet = new HashSet<long>(activeStrategyIds);
+        var (requeued, orphaned) = await OptimizationRunClaimer.RequeueStaleRunningRunsAsync(db, nowUtc, ct);
 
-            var recoveredRuns = await db.Set<OptimizationRun>()
-                .Where(r => r.Status == OptimizationRunStatus.Running
-                         && !r.IsDeleted
-                         && (r.ExecutionLeaseExpiresAt == null || r.ExecutionLeaseExpiresAt < nowUtc)
-                         && activeStrategySet.Contains(r.StrategyId))
-                .ToListAsync(ct);
-            foreach (var recoveredRun in recoveredRuns)
-                OptimizationRunLifecycle.RequeueForRecovery(recoveredRun, nowUtc);
-
-            var orphanedRuns = await db.Set<OptimizationRun>()
-                .Where(r => r.Status == OptimizationRunStatus.Running
-                         && !r.IsDeleted
-                         && (r.ExecutionLeaseExpiresAt == null || r.ExecutionLeaseExpiresAt < nowUtc)
-                         && !activeStrategySet.Contains(r.StrategyId))
-                .ToListAsync(ct);
-            foreach (var orphanedRun in orphanedRuns)
-            {
-                orphanedRun.FailureCategory = OptimizationFailureCategory.StrategyRemoved;
-                OptimizationRunStateMachine.Transition(
-                    orphanedRun,
-                    OptimizationRunStatus.Failed,
-                    nowUtc,
-                    "Strategy deleted during optimization run");
-            }
-
-            if (recoveredRuns.Count > 0 || orphanedRuns.Count > 0)
-                await writeCtx.SaveChangesAsync(ct);
-
-            if (orphanedRuns.Count > 0)
-            {
-                _logger.LogWarning(
-                    "OptimizationRunRecoveryCoordinator: marked {Count} orphaned Running run(s) as Failed (strategy deleted)",
-                    orphanedRuns.Count);
-            }
-
-            if (recoveredRuns.Count > 0)
-            {
-                _metrics.OptimizationLeaseReclaims.Add(recoveredRuns.Count);
-                _logger.LogWarning(
-                    "OptimizationRunRecoveryCoordinator: recovered {Count} stale Running run(s) from prior crash — re-queued",
-                    recoveredRuns.Count);
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "OptimizationRunRecoveryCoordinator: crash recovery check failed (non-fatal)");
-        }
-    }
-
-    internal async Task RequeueExpiredRunningRunsAsync(CancellationToken ct)
-    {
-        await using var recoveryScope = _scopeFactory.CreateAsyncScope();
-        var writeCtx = recoveryScope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
-        var db = writeCtx.GetDbContext();
-
-        var (requeued, orphaned) = await OptimizationRunClaimer.RequeueExpiredRunsAsync(db, UtcNow, ct);
-
-        if (requeued > 0)
-            _metrics.OptimizationLeaseReclaims.Add(requeued);
         if (orphaned > 0)
         {
             _logger.LogWarning(
-                "OptimizationRunRecoveryCoordinator: marked {Count} expired run(s) as Failed — strategy deleted",
+                "OptimizationRunRecoveryCoordinator: marked {Count} orphaned stale Running run(s) as Failed (strategy deleted)",
                 orphaned);
         }
+
+        if (requeued > 0)
+        {
+            _metrics.OptimizationLeaseReclaims.Add(requeued);
+            _logger.LogWarning(
+                "OptimizationRunRecoveryCoordinator: recovered {Count} stale Running run(s) — re-queued",
+                requeued);
+        }
+
+        return new StaleRunningRecoverySummary(requeued, orphaned, nowUtc);
     }
+
+    internal async Task<StaleRunningRecoverySummary> RequeueExpiredRunningRunsAsync(CancellationToken ct)
+        => await RecoverStaleRunningRunsAsync(ct);
 
     internal async Task RecoverStaleQueuedRunsAsync(CancellationToken ct)
     {
-        try
-        {
-            await using var scope = _scopeFactory.CreateAsyncScope();
-            var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
-            var db = writeCtx.GetDbContext();
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>().GetDbContext();
 
-            var nowUtc = UtcNow;
-            var cutoff = nowUtc.AddHours(-24);
-            var staleQueuedRuns = await db.Set<OptimizationRun>()
-                .Where(r => r.Status == OptimizationRunStatus.Queued
-                          && !r.IsDeleted
-                          && r.QueuedAt < cutoff
-                          && (r.DeferredUntilUtc == null || r.DeferredUntilUtc < nowUtc))
-                .ToListAsync(ct);
-
-            foreach (var run in staleQueuedRuns)
+        var nowUtc = UtcNow;
+        var cutoff = nowUtc.AddHours(-24);
+        var oldestStarvedQueuedRun = await db.Set<OptimizationRun>()
+            .Where(r => r.Status == OptimizationRunStatus.Queued
+                      && !r.IsDeleted
+                      && (r.QueuedAt == default ? r.StartedAt : r.QueuedAt) < cutoff
+                      && (r.DeferredUntilUtc == null || r.DeferredUntilUtc <= nowUtc))
+            .OrderBy(r => r.QueuedAt == default ? r.StartedAt : r.QueuedAt)
+            .Select(r => new
             {
-                run.Status = OptimizationRunStatus.Failed;
-                run.ErrorMessage = "Stale: queued for over 24 hours without being claimed";
-                run.FailureCategory = OptimizationFailureCategory.Transient;
-                run.CompletedAt = nowUtc;
-                _logger.LogWarning("OptimizationRunRecoveryCoordinator: marking stale queued run {RunId} as Failed", run.Id);
-            }
+                r.Id,
+                AnchorAtUtc = r.QueuedAt == default ? r.StartedAt : r.QueuedAt,
+            })
+            .FirstOrDefaultAsync(ct);
 
-            if (staleQueuedRuns.Count > 0)
-                await writeCtx.SaveChangesAsync(ct);
-        }
-        catch (Exception ex)
+        if (oldestStarvedQueuedRun is not null && ShouldEmitStaleQueuedWarning(oldestStarvedQueuedRun.Id, nowUtc))
         {
-            _logger.LogError(ex, "OptimizationRunRecoveryCoordinator: stale queued run recovery failed (non-fatal)");
+            _logger.LogWarning(
+                "OptimizationRunRecoveryCoordinator: queued run starvation detected for run {RunId} (age={AgeHours:F1}h) — leaving it queued because queue age alone is not a corruption signal",
+                oldestStarvedQueuedRun.Id,
+                (nowUtc - oldestStarvedQueuedRun.AnchorAtUtc).TotalHours);
         }
     }
 
     internal async Task RetryFailedRunsAsync(OptimizationConfig config, CancellationToken ct)
     {
         await using var scope = _scopeFactory.CreateAsyncScope();
-        var readCtx = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
         var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
-        var db = readCtx.GetDbContext();
         var writeDb = writeCtx.GetDbContext();
 
         int maxRetryAttempts = Math.Max(0, config.MaxRetryAttempts);
         var nowUtc = UtcNow;
 
-        var retryableRuns = await writeDb.Set<OptimizationRun>()
-            .Where(r => r.Status == OptimizationRunStatus.Failed
-                     && !r.IsDeleted
-                     && r.RetryCount < maxRetryAttempts
-                     && r.FailureCategory != OptimizationFailureCategory.ConfigError
-                     && r.FailureCategory != OptimizationFailureCategory.SearchExhausted
-                     && r.FailureCategory != OptimizationFailureCategory.StrategyRemoved
-                     && r.CompletedAt != null
-                     && r.CompletedAt.Value.AddMinutes(15 << r.RetryCount) <= nowUtc)
+        var retryableRuns = await OptimizationRetryPlanner.QueryRetryReadyRuns(writeDb, maxRetryAttempts, nowUtc)
             .OrderBy(r => r.CompletedAt)
             .ToListAsync(ct);
 
@@ -198,17 +138,6 @@ internal sealed class OptimizationRunRecoveryCoordinator
             .Select(r => r.StrategyId)
             .Distinct()
             .ToList();
-
-        var activeStrategySet = retryableStrategyIds.Count == 0
-            ? new HashSet<long>()
-            : (await writeDb.Set<OptimizationRun>()
-                .Where(r => retryableStrategyIds.Contains(r.StrategyId)
-                         && !r.IsDeleted
-                         && (r.Status == OptimizationRunStatus.Queued || r.Status == OptimizationRunStatus.Running))
-                .Select(r => r.StrategyId)
-                .Distinct()
-                .ToListAsync(ct))
-            .ToHashSet();
 
         var terminalRunOrderLookup = retryableStrategyIds.Count == 0
             ? new Dictionary<long, List<(long RunId, DateTime AnchorUtc)>>()
@@ -230,15 +159,6 @@ internal sealed class OptimizationRunRecoveryCoordinator
         foreach (var run in retryableRuns)
         {
             ct.ThrowIfCancellationRequested();
-
-            if (activeStrategySet.Contains(run.StrategyId))
-            {
-                _logger.LogInformation(
-                    "OptimizationRunRecoveryCoordinator: skipped retry for run {RunId} — strategy {StrategyId} already has an active optimization run",
-                    run.Id,
-                    run.StrategyId);
-                continue;
-            }
 
             if (terminalRunOrderLookup.TryGetValue(run.StrategyId, out var terminalRuns)
                 && terminalRuns.Any(other => other.RunId != run.Id
@@ -663,6 +583,23 @@ internal sealed class OptimizationRunRecoveryCoordinator
         {
             _logger.LogError(ex, "OptimizationRunRecoveryCoordinator: lifecycle reconciliation sweep failed (non-fatal)");
             return summary;
+        }
+    }
+
+    private bool ShouldEmitStaleQueuedWarning(long runId, DateTime nowUtc)
+    {
+        lock (_staleQueuedWarningGate)
+        {
+            if (_lastStaleQueuedWarningRunId == runId
+                && _lastStaleQueuedWarningAtUtc.HasValue
+                && nowUtc - _lastStaleQueuedWarningAtUtc.Value < StaleQueuedWarningCooldown)
+            {
+                return false;
+            }
+
+            _lastStaleQueuedWarningRunId = runId;
+            _lastStaleQueuedWarningAtUtc = nowUtc;
+            return true;
         }
     }
 

@@ -1,6 +1,7 @@
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata.Builders;
 using LascodiaTradingEngine.Domain.Entities;
+using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Infrastructure.Persistence.Configurations;
 
@@ -47,6 +48,9 @@ public class OptimizationRunConfiguration : IEntityTypeConfiguration<Optimizatio
         builder.Property(x => x.IntermediateResultsJson).HasColumnType("text");
         builder.Property(x => x.ApprovalReportJson).HasColumnType("text");
         builder.Property(x => x.ValidationFollowUpStatus).HasConversion<string>().HasMaxLength(20);
+        builder.Property(x => x.DeferralReason)
+            .HasConversion<string>()
+            .HasMaxLength(40);
         builder.Property(x => x.ExecutionLeaseToken).IsConcurrencyToken();
         builder.Property(x => x.RowVersion).IsRowVersion();
 
@@ -59,6 +63,9 @@ public class OptimizationRunConfiguration : IEntityTypeConfiguration<Optimizatio
         builder.HasIndex(x => new { x.StrategyId, x.Status });
         builder.HasIndex(x => new { x.Status, x.ExecutionLeaseExpiresAt });
         builder.HasIndex(x => new { x.Status, x.DeferredUntilUtc });
+        builder.HasIndex(x => new { x.Status, x.DeferralReason, x.DeferredUntilUtc });
+        builder.HasIndex(x => new { x.Status, x.DeferralCount, x.DeferredUntilUtc });
+        builder.HasIndex(x => x.LastResumedAtUtc);
         builder.HasIndex(x => x.ValidationFollowUpsCreatedAt);
 
         builder.HasOne(x => x.Strategy)

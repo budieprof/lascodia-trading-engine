@@ -81,18 +81,16 @@ internal static class ScoringEnrichmentCalculator
 
     internal static decimal? ComputeMetaLabelScore(
         double calibP, double ensembleStd, float[] features, int featureCount,
-        double[] metaLabelWeights, double metaLabelBias, int[]? topFeatureIndices = null)
+        double[] metaLabelWeights, double metaLabelBias, int[]? topFeatureIndices = null,
+        double[]? metaLabelHiddenWeights = null, double[]? metaLabelHiddenBiases = null, int metaLabelHiddenDim = 0)
     {
         if (metaLabelWeights.Length == 0)
             return null;
 
-        double metaZ = SanitizeFiniteOrDefault(metaLabelBias, 0.0);
-        if (metaLabelWeights.Length >= 1)
-            metaZ += SanitizeFiniteOrDefault(metaLabelWeights[0], 0.0) * ClampProbabilityOrNeutral(calibP);
-        if (metaLabelWeights.Length >= 2)
-            metaZ += SanitizeFiniteOrDefault(metaLabelWeights[1], 0.0) * ClampNonNegativeFinite(ensembleStd);
-
         int featureTerms = Math.Min(Math.Min(5, featureCount), features.Length);
+        var metaFeatures = new double[2 + featureTerms];
+        metaFeatures[0] = ClampProbabilityOrNeutral(calibP);
+        metaFeatures[1] = ClampNonNegativeFinite(ensembleStd);
         for (int j = 0; j < featureTerms && 2 + j < metaLabelWeights.Length; j++)
         {
             int featureIndex = topFeatureIndices is { Length: > 0 } && j < topFeatureIndices.Length
@@ -101,10 +99,35 @@ internal static class ScoringEnrichmentCalculator
             if (featureIndex < 0 || featureIndex >= featureCount || featureIndex >= features.Length)
                 continue;
 
-            metaZ += SanitizeFiniteOrDefault(metaLabelWeights[2 + j], 0.0) *
-                     SanitizeFiniteOrDefault(features[featureIndex], 0.0);
+            metaFeatures[2 + j] = SanitizeFiniteOrDefault(features[featureIndex], 0.0);
         }
 
+        if (metaLabelHiddenDim > 0 &&
+            metaLabelHiddenWeights is { Length: > 0 } hiddenWeights &&
+            metaLabelHiddenBiases is { Length: > 0 } hiddenBiases &&
+            hiddenWeights.Length == metaLabelHiddenDim * metaFeatures.Length &&
+            hiddenBiases.Length == metaLabelHiddenDim &&
+            metaLabelWeights.Length >= metaLabelHiddenDim)
+        {
+            var hidden = new double[metaLabelHiddenDim];
+            for (int h = 0; h < metaLabelHiddenDim; h++)
+            {
+                double z = SanitizeFiniteOrDefault(hiddenBiases[h], 0.0);
+                int rowOffset = h * metaFeatures.Length;
+                for (int j = 0; j < metaFeatures.Length; j++)
+                    z += SanitizeFiniteOrDefault(hiddenWeights[rowOffset + j], 0.0) * metaFeatures[j];
+                hidden[h] = Math.Max(0.0, z);
+            }
+
+            double mlpZ = SanitizeFiniteOrDefault(metaLabelBias, 0.0);
+            for (int h = 0; h < metaLabelHiddenDim; h++)
+                mlpZ += SanitizeFiniteOrDefault(metaLabelWeights[h], 0.0) * hidden[h];
+            return (decimal)ClampProbabilityOrNeutral(MLFeatureHelper.Sigmoid(mlpZ));
+        }
+
+        double metaZ = SanitizeFiniteOrDefault(metaLabelBias, 0.0);
+        for (int j = 0; j < metaFeatures.Length && j < metaLabelWeights.Length; j++)
+            metaZ += SanitizeFiniteOrDefault(metaLabelWeights[j], 0.0) * metaFeatures[j];
         return (decimal)ClampProbabilityOrNeutral(MLFeatureHelper.Sigmoid(metaZ));
     }
 
@@ -434,6 +457,32 @@ internal static class ScoringEnrichmentCalculator
             .ToArray();
 
         return JsonSerializer.Serialize(top5);
+    }
+
+    internal static string? ComputeNamedContributionsJson(
+        IReadOnlyList<double> values,
+        IReadOnlyList<string> names,
+        IReadOnlyList<double> importanceScores,
+        int topK = 5)
+    {
+        if (names.Count == 0 || values.Count == 0 || importanceScores.Count == 0)
+            return null;
+
+        int count = Math.Min(values.Count, Math.Min(names.Count, importanceScores.Count));
+        if (count == 0)
+            return null;
+
+        var top = Enumerable.Range(0, count)
+            .Select(i => new
+            {
+                Feature = names[i],
+                Value = Math.Round(values[i] * importanceScores[i], 4),
+            })
+            .OrderByDescending(x => Math.Abs(x.Value))
+            .Take(Math.Max(1, topK))
+            .ToArray();
+
+        return JsonSerializer.Serialize(top);
     }
 
     internal static string? ComputeShapContributionsJson(

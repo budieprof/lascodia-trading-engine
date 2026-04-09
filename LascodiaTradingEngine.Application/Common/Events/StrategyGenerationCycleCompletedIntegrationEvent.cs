@@ -40,6 +40,12 @@ public record StrategyGenerationCycleCompletedIntegrationEvent : IntegrationEven
     /// <summary>Consecutive failure count at cycle end.</summary>
     public int ConsecutiveFailures { get; init; }
 
+    /// <summary>True when the cycle exited early without attempting generation work.</summary>
+    public bool Skipped { get; init; }
+
+    /// <summary>Short machine-readable reason when <see cref="Skipped"/> is true.</summary>
+    public string? SkipReason { get; init; }
+
     /// <summary>UTC timestamp when the cycle completed.</summary>
     public DateTime CompletedAtUtc { get; init; } = DateTime.UtcNow;
 }

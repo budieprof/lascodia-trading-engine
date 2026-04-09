@@ -1,5 +1,4 @@
-using System.Text.Json;
-using LascodiaTradingEngine.Application.Backtesting.Models;
+using LascodiaTradingEngine.Application.Backtesting;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -21,24 +20,7 @@ internal static class OptimizationFollowUpQualityEvaluator
             return false;
         }
 
-        if (string.IsNullOrWhiteSpace(run.ResultJson))
-        {
-            reason = "backtest follow-up completed without persisted result metrics";
-            return false;
-        }
-
-        BacktestResult? result;
-        try
-        {
-            result = JsonSerializer.Deserialize<BacktestResult>(run.ResultJson);
-        }
-        catch
-        {
-            reason = "backtest follow-up result metrics were malformed";
-            return false;
-        }
-
-        if (result is null)
+        if (!BacktestRunMetricsReader.TryRead(run, out var result))
         {
             reason = "backtest follow-up result metrics were missing";
             return false;
@@ -50,7 +32,12 @@ internal static class OptimizationFollowUpQualityEvaluator
             return false;
         }
 
-        decimal healthScore = OptimizationHealthScorer.ComputeHealthScore(result);
+        decimal healthScore = OptimizationHealthScorer.ComputeHealthScore(
+            result.WinRate,
+            result.ProfitFactor,
+            result.MaxDrawdownPct,
+            result.SharpeRatio,
+            result.TotalTrades);
         if (healthScore < minHealthScore)
         {
             reason = $"backtest follow-up health score too low ({healthScore:F2} < {minHealthScore:F2})";

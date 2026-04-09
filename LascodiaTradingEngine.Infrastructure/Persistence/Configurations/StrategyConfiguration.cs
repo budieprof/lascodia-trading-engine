@@ -45,6 +45,10 @@ public class StrategyConfiguration : IEntityTypeConfiguration<Strategy>
         builder.HasQueryFilter(x => !x.IsDeleted);
 
         builder.HasIndex(x => x.Symbol);
+        builder.HasIndex(x => new { x.StrategyType, x.Symbol, x.Timeframe })
+            .HasDatabaseName("IX_Strategy_ActiveGenerationKey")
+            .IsUnique()
+            .HasFilter("\"IsDeleted\" = false");
         builder.HasIndex(x => x.RiskProfileId);
 
         builder.HasOne(x => x.RiskProfile)

@@ -36,6 +36,8 @@ public sealed partial class TcnModelTrainer
         var sharpeList = new List<double>();
         int badFolds = 0;
         var plattParams = new List<(double A, double B)>();
+        var foldMetrics = new List<WalkForwardFoldMetric>();
+        double conformalAlpha = Math.Clamp(1.0 - hp.ConformalCoverage, 0.01, 0.50);
 
         var cvHp = hp with
         {
@@ -44,7 +46,7 @@ public sealed partial class TcnModelTrainer
         };
 
         int cvParallelism = Math.Max(1, Math.Min(Environment.ProcessorCount, 4));
-        var results = new (double Acc, double F1, double EV, double Sharpe, bool IsBad, double PlattA, double PlattB)?[combinations.Count];
+        var results = new (double Acc, double F1, double EV, double Sharpe, bool IsBad, double PlattA, double PlattB, double MaxDD)?[combinations.Count];
 
         Parallel.For(0, combinations.Count, new ParallelOptions { CancellationToken = ct, MaxDegreeOfParallelism = cvParallelism }, ci =>
         {
@@ -76,30 +78,52 @@ public sealed partial class TcnModelTrainer
 
             if (foldTrain.Count < hp.MinSamples || foldTest.Count < 20) return;
 
-            var tcn = FitTcnModel(foldTrain, cvHp, null,
+            var (foldTrainFit, foldCal) = CreateFoldTrainCalibrationSplit(foldTrain, embargo);
+            var tcn = FitTcnModel(foldTrainFit, cvHp, null,
                 filters, numBlocks, dilations, useLayerNorm, useAttentionPool, activation, attentionHeads, null, ct);
 
-            // Fit fold-level Platt for recalibration stability
-            var foldRawProbs = PrecomputeRawProbs(foldTest, tcn, filters, useAttentionPool);
-            var (pA, pB) = FitPlattScaling(foldTest, foldRawProbs);
+            TcnCalibrationArtifacts foldCalibration = CreateIdentityCalibrationArtifacts();
+            if (foldCal.Count >= 10)
+            {
+                var foldCalRawProbs = PrecomputeRawProbs(foldCal, tcn, filters, useAttentionPool);
+                foldCalibration = FitCalibrationArtifacts(
+                    foldCal,
+                    foldCalRawProbs,
+                    cvHp,
+                    conformalAlpha,
+                    DefaultConditionalRoutingThreshold);
+            }
 
-            var m = Evaluate(foldTest, tcn, 1.0, 0.0, filters, useAttentionPool);
+            var m = Evaluate(foldTest, tcn, foldCalibration, filters, useAttentionPool);
 
             bool isBad = false;
+            double maxDD = 0.0;
             if (hp.MaxFoldDrawdown < 1.0 || hp.MinFoldCurveSharpe > -99.0)
             {
                 var preds = new (int Predicted, int Actual)[foldTest.Count];
                 for (int pi = 0; pi < foldTest.Count; pi++)
                 {
                     double rawP = TcnProb(foldTest[pi], tcn, filters, useAttentionPool);
-                    preds[pi] = (rawP >= 0.5 ? 1 : -1, foldTest[pi].Direction > 0 ? 1 : -1);
+                    double calibP = ApplyTcnCalibration(rawP, foldCalibration);
+                    preds[pi] = (
+                        calibP >= CalibrationThreshold(foldCalibration) ? 1 : -1,
+                        foldTest[pi].Direction > 0 ? 1 : -1);
                 }
-                var (maxDD, curveSharpe) = ComputeEquityCurveStats(preds);
+                var (foldMaxDD, curveSharpe) = ComputeEquityCurveStats(preds);
+                maxDD = foldMaxDD;
                 if (hp.MaxFoldDrawdown < 1.0 && maxDD > hp.MaxFoldDrawdown) isBad = true;
                 if (hp.MinFoldCurveSharpe > -99.0 && curveSharpe < hp.MinFoldCurveSharpe) isBad = true;
             }
 
-            results[ci] = (m.Accuracy, m.F1, m.ExpectedValue, m.SharpeRatio, isBad, pA, pB);
+            results[ci] = (
+                m.Accuracy,
+                m.F1,
+                m.ExpectedValue,
+                m.SharpeRatio,
+                isBad,
+                foldCalibration.PlattA,
+                foldCalibration.PlattB,
+                maxDD);
         });
 
         foreach (var r in results)
@@ -108,6 +132,7 @@ public sealed partial class TcnModelTrainer
             accList.Add(r.Value.Acc); f1List.Add(r.Value.F1);
             evList.Add(r.Value.EV); sharpeList.Add(r.Value.Sharpe);
             plattParams.Add((r.Value.PlattA, r.Value.PlattB));
+            foldMetrics.Add(new WalkForwardFoldMetric(r.Value.Acc, r.Value.F1, r.Value.EV, r.Value.Sharpe, r.Value.MaxDD));
             if (r.Value.IsBad) badFolds++;
         }
 
@@ -120,9 +145,13 @@ public sealed partial class TcnModelTrainer
 
         double avgAcc = accList.Average();
         double stdAcc = accList.Count > 1 ? Math.Sqrt(accList.Sum(a => (a - avgAcc) * (a - avgAcc)) / (accList.Count - 1)) : 0;
+        var (recalibrationStabilityA, recalibrationStabilityB) = ComputeRecalibrationStability(plattParams);
 
         return (new WalkForwardResult(avgAcc, stdAcc, f1List.Average(), evList.Average(),
-            sharpeList.Average(), accList.Count), failed);
+            sharpeList.Average(), accList.Count,
+            FoldMetrics: foldMetrics.ToArray(),
+            RecalibrationStabilityA: recalibrationStabilityA,
+            RecalibrationStabilityB: recalibrationStabilityB), failed);
     }
 
     /// <summary>Generates all C(n, k) combinations of indices.</summary>
@@ -188,7 +217,7 @@ public sealed partial class TcnModelTrainer
 
             var tcn = FitTcnModel(train, simpleHp, null,
                 filters, numBlocks, dilations, useLayerNorm, useAttentionPool, activation, attentionHeads, null, ct);
-            var metrics = Evaluate(test, tcn, 1.0, 0.0, filters, useAttentionPool);
+            var metrics = Evaluate(test, tcn, CreateIdentityCalibrationArtifacts(), filters, useAttentionPool);
 
             if (metrics.Accuracy >= observedAccuracy)
                 Interlocked.Increment(ref exceeded);

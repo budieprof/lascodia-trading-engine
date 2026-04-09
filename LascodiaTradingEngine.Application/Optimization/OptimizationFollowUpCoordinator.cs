@@ -2,6 +2,7 @@ using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using LascodiaTradingEngine.Application.Backtesting;
 using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Interfaces;
@@ -20,6 +21,8 @@ public sealed class OptimizationFollowUpCoordinator
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IAlertDispatcher _alertDispatcher;
     private readonly OptimizationRunScopedConfigService _runScopedConfigService;
+    private readonly IValidationRunFactory _validationRunFactory;
+    private readonly IBacktestOptionsSnapshotBuilder _optionsSnapshotBuilder;
     private readonly ILogger _logger;
     private readonly TradingMetrics _metrics;
     private readonly TimeProvider _timeProvider;
@@ -29,10 +32,12 @@ public sealed class OptimizationFollowUpCoordinator
         IServiceScopeFactory scopeFactory,
         IAlertDispatcher alertDispatcher,
         OptimizationRunScopedConfigService runScopedConfigService,
+        IValidationRunFactory validationRunFactory,
+        IBacktestOptionsSnapshotBuilder optionsSnapshotBuilder,
         ILogger<OptimizationFollowUpCoordinator> logger,
         TradingMetrics metrics,
         TimeProvider timeProvider)
-        : this(scopeFactory, alertDispatcher, runScopedConfigService, (ILogger)logger, metrics, timeProvider)
+        : this(scopeFactory, alertDispatcher, runScopedConfigService, validationRunFactory, optionsSnapshotBuilder, (ILogger)logger, metrics, timeProvider)
     {
     }
 
@@ -40,6 +45,8 @@ public sealed class OptimizationFollowUpCoordinator
         IServiceScopeFactory scopeFactory,
         IAlertDispatcher alertDispatcher,
         OptimizationRunScopedConfigService runScopedConfigService,
+        IValidationRunFactory validationRunFactory,
+        IBacktestOptionsSnapshotBuilder optionsSnapshotBuilder,
         ILogger logger,
         TradingMetrics metrics,
         TimeProvider timeProvider)
@@ -47,6 +54,8 @@ public sealed class OptimizationFollowUpCoordinator
         _scopeFactory = scopeFactory;
         _alertDispatcher = alertDispatcher;
         _runScopedConfigService = runScopedConfigService;
+        _validationRunFactory = validationRunFactory;
+        _optionsSnapshotBuilder = optionsSnapshotBuilder;
         _logger = logger;
         _metrics = metrics;
         _timeProvider = timeProvider;
@@ -284,12 +293,22 @@ public sealed class OptimizationFollowUpCoordinator
                 }
                 catch (Exception ex)
                 {
-                        OptimizationRunProgressTracker.RecordOperationalIssue(
-                            run,
-                            "FollowUpAlertDispatchFailed",
-                            $"Follow-up failure alert dispatch degraded: {ex.Message}",
-                            nowUtc);
-                    await writeCtx.SaveChangesAsync(CancellationToken.None);
+                    OptimizationRunProgressTracker.RecordOperationalIssue(
+                        run,
+                        "FollowUpAlertDispatchFailed",
+                        $"Follow-up failure alert dispatch degraded: {ex.Message}",
+                        nowUtc);
+                    try
+                    {
+                        await writeCtx.SaveChangesAsync(CancellationToken.None);
+                    }
+                    catch (Exception persistEx)
+                    {
+                        _logger.LogWarning(
+                            persistEx,
+                            "Optimization follow-up degradation marker persistence failed for run {RunId}",
+                            run.Id);
+                    }
                     _logger.LogWarning(ex,
                         "Optimization follow-up failure alert dispatch failed for run {RunId} (non-fatal)",
                         run.Id);
@@ -330,23 +349,25 @@ public sealed class OptimizationFollowUpCoordinator
 
             followUpInitialBalance = runScopedConfig.ScreeningInitialBalance;
         }
+        var nowUtc = UtcNow;
 
         bool hasBacktest = existingBacktest is not null;
         if (existingBacktest is null)
         {
-            writeDb.Set<BacktestRun>().Add(new BacktestRun
-            {
-                StrategyId = run.StrategyId,
-                Symbol = strategy.Symbol,
-                Timeframe = strategy.Timeframe,
-                FromDate = fromDate,
-                ToDate = toDate,
-                InitialBalance = followUpInitialBalance,
-                Status = RunStatus.Queued,
-                StartedAt = default,
-                SourceOptimizationRunId = run.Id,
-                ParametersSnapshotJson = followUpParamsJson
-            });
+            writeDb.Set<BacktestRun>().Add(await _validationRunFactory.BuildBacktestRunAsync(
+                writeDb,
+                new BacktestQueueRequest(
+                    StrategyId: run.StrategyId,
+                    Symbol: strategy.Symbol,
+                    Timeframe: strategy.Timeframe,
+                    FromDate: fromDate,
+                    ToDate: toDate,
+                    InitialBalance: followUpInitialBalance,
+                    QueueSource: ValidationRunQueueSources.OptimizationFollowUp,
+                    SourceOptimizationRunId: run.Id,
+                    ParametersSnapshotJson: followUpParamsJson,
+                    ValidationQueueKey: $"optimization:{run.Id}:backtest"),
+                ct));
         }
         else
         {
@@ -356,6 +377,24 @@ public sealed class OptimizationFollowUpCoordinator
                 existingBacktest.ToDate = toDate;
                 existingBacktest.InitialBalance = followUpInitialBalance;
                 existingBacktest.ParametersSnapshotJson = followUpParamsJson;
+                existingBacktest.BacktestOptionsSnapshotJson = JsonSerializer.Serialize(
+                    await _optionsSnapshotBuilder.BuildAsync(writeDb, strategy.Symbol, ct));
+                existingBacktest.QueueSource = ValidationRunQueueSources.OptimizationFollowUp;
+                existingBacktest.StartedAt = nowUtc;
+                existingBacktest.QueuedAt = nowUtc;
+                existingBacktest.AvailableAt = nowUtc;
+                existingBacktest.ClaimedAt = null;
+                existingBacktest.ClaimedByWorkerId = null;
+                existingBacktest.ExecutionStartedAt = null;
+                existingBacktest.LastAttemptAt = null;
+                existingBacktest.LastHeartbeatAt = null;
+                existingBacktest.ExecutionLeaseExpiresAt = null;
+                existingBacktest.ExecutionLeaseToken = null;
+                existingBacktest.CompletedAt = null;
+                existingBacktest.ErrorMessage = null;
+                existingBacktest.FailureCode = null;
+                existingBacktest.FailureDetailsJson = null;
+                existingBacktest.RetryCount = 0;
             }
             else if (string.IsNullOrWhiteSpace(existingBacktest.ParametersSnapshotJson))
             {
@@ -366,22 +405,23 @@ public sealed class OptimizationFollowUpCoordinator
         bool hasWalkForward = existingWalkForward is not null;
         if (existingWalkForward is null)
         {
-            writeDb.Set<WalkForwardRun>().Add(new WalkForwardRun
-            {
-                StrategyId = run.StrategyId,
-                Symbol = strategy.Symbol,
-                Timeframe = strategy.Timeframe,
-                FromDate = fromDate,
-                ToDate = toDate,
-                InSampleDays = 90,
-                OutOfSampleDays = 30,
-                InitialBalance = followUpInitialBalance,
-                ReOptimizePerFold = false,
-                Status = RunStatus.Queued,
-                StartedAt = default,
-                SourceOptimizationRunId = run.Id,
-                ParametersSnapshotJson = followUpParamsJson
-            });
+            writeDb.Set<WalkForwardRun>().Add(await _validationRunFactory.BuildWalkForwardRunAsync(
+                writeDb,
+                new WalkForwardQueueRequest(
+                    StrategyId: run.StrategyId,
+                    Symbol: strategy.Symbol,
+                    Timeframe: strategy.Timeframe,
+                    FromDate: fromDate,
+                    ToDate: toDate,
+                    InSampleDays: 90,
+                    OutOfSampleDays: 30,
+                    InitialBalance: followUpInitialBalance,
+                    QueueSource: ValidationRunQueueSources.OptimizationFollowUp,
+                    ReOptimizePerFold: false,
+                    SourceOptimizationRunId: run.Id,
+                    ParametersSnapshotJson: followUpParamsJson,
+                    ValidationQueueKey: $"optimization:{run.Id}:walkforward"),
+                ct));
         }
         else
         {
@@ -391,6 +431,24 @@ public sealed class OptimizationFollowUpCoordinator
                 existingWalkForward.ToDate = toDate;
                 existingWalkForward.InitialBalance = followUpInitialBalance;
                 existingWalkForward.ParametersSnapshotJson = followUpParamsJson;
+                existingWalkForward.BacktestOptionsSnapshotJson = JsonSerializer.Serialize(
+                    await _optionsSnapshotBuilder.BuildAsync(writeDb, strategy.Symbol, ct));
+                existingWalkForward.QueueSource = ValidationRunQueueSources.OptimizationFollowUp;
+                existingWalkForward.StartedAt = nowUtc;
+                existingWalkForward.QueuedAt = nowUtc;
+                existingWalkForward.AvailableAt = nowUtc;
+                existingWalkForward.ClaimedAt = null;
+                existingWalkForward.ClaimedByWorkerId = null;
+                existingWalkForward.ExecutionStartedAt = null;
+                existingWalkForward.LastAttemptAt = null;
+                existingWalkForward.LastHeartbeatAt = null;
+                existingWalkForward.ExecutionLeaseExpiresAt = null;
+                existingWalkForward.ExecutionLeaseToken = null;
+                existingWalkForward.CompletedAt = null;
+                existingWalkForward.ErrorMessage = null;
+                existingWalkForward.FailureCode = null;
+                existingWalkForward.FailureDetailsJson = null;
+                existingWalkForward.RetryCount = 0;
             }
             else if (string.IsNullOrWhiteSpace(existingWalkForward.ParametersSnapshotJson))
             {
@@ -401,7 +459,6 @@ public sealed class OptimizationFollowUpCoordinator
         }
 
         bool hadAllFollowUpsBeforeRepair = hasBacktest && hasWalkForward;
-        var nowUtc = UtcNow;
         if (!run.ValidationFollowUpsCreatedAt.HasValue || !hadAllFollowUpsBeforeRepair)
             run.ValidationFollowUpsCreatedAt = nowUtc;
         run.ValidationFollowUpStatus = ValidationFollowUpStatus.Pending;

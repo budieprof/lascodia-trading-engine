@@ -367,8 +367,16 @@ internal sealed class StrategyGenerationReserveScreeningPlanner : IStrategyGener
                         continue;
                     if (IsCorrelationGroupSaturated(symbol, context.CorrelationGroupCounts, config.MaxCorrelatedCandidates))
                         continue;
-                    if (pendingCandidates.Count > 0
-                        && StrategyScreeningEngine.IsCorrelatedWithAccepted(result, pendingCandidates, config.ScreeningInitialBalance))
+                    var correlationCandidates = string.Equals(result.GenerationSource, "Reserve", StringComparison.OrdinalIgnoreCase)
+                        ? pendingCandidates
+                            .Where(existing => !string.Equals(
+                                existing.Strategy.Symbol,
+                                result.Strategy.Symbol,
+                                StringComparison.OrdinalIgnoreCase))
+                            .ToList()
+                        : pendingCandidates;
+                    if (correlationCandidates.Count > 0
+                        && StrategyScreeningEngine.IsCorrelatedWithAccepted(result, correlationCandidates, config.ScreeningInitialBalance))
                     {
                         _metrics.StrategyGenScreeningRejections.Add(1,
                             new KeyValuePair<string, object?>("gate", "correlation_precheck"));

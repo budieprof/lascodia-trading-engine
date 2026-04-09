@@ -87,6 +87,13 @@ public sealed partial class ElmModelTrainer : IMLModelTrainer
         int featureCount = ValidateTrainingSamples(samples);
         int hiddenSize   = hp.ElmHiddenSize is > 0 ? hp.ElmHiddenSize.Value : DefaultHiddenSize;
         int K            = Math.Max(1, hp.K);
+        string[] snapshotFeatureNames = BuildSnapshotFeatureNames(featureCount);
+        string featureSchemaFingerprint = ElmSnapshotSupport.ComputeFeatureSchemaFingerprint(snapshotFeatureNames, featureCount);
+        string basePreprocessingFingerprint = ElmSnapshotSupport.ComputePreprocessingFingerprint(
+            featureCount,
+            hp.FracDiffD,
+            hp.ElmWinsorizePercentile > 0.0);
+        string trainerFingerprint = ElmSnapshotSupport.ComputeTrainerFingerprint(hp, featureCount, hiddenSize, K);
 
         // ── 0. Incremental update fast-path ─────────────────────────────────
         if (hp.UseIncrementalUpdate && warmStart is not null && hp.DensityRatioWindowDays > 0)
@@ -150,45 +157,54 @@ public sealed partial class ElmModelTrainer : IMLModelTrainer
                 $"ElmModelTrainer: training window is too small after split selection ({trainSetEnd} samples). " +
                 $"Reduce EmbargoBarCount or provide more data.");
 
-        // ── 1b. Outlier winsorization (before standardisation) ────────────────
-        // Clips each feature to its [p, 1−p] quantile range computed on the training
-        // split only. This prevents adversarial outliers from distorting the Z-score
-        // statistics and the ridge solve.
-        if (hp.ElmWinsorizePercentile > 0.0)
+        if (warmStart is not null)
         {
-            double pctile = hp.ElmWinsorizePercentile;
-            for (int j = 0; j < featureCount; j++)
+            if (!string.Equals(warmStart.Type, ModelType, StringComparison.OrdinalIgnoreCase))
             {
-                var vals = new float[trainSetEnd];
-                for (int i = 0; i < trainSetEnd; i++) vals[i] = samples[i].Features[j];
-                Array.Sort(vals);
-                int loIdx = Math.Clamp((int)(pctile * trainSetEnd), 0, trainSetEnd - 1);
-                int hiIdx = Math.Clamp((int)((1.0 - pctile) * trainSetEnd), 0, trainSetEnd - 1);
-                float lo = vals[loIdx];
-                float hi = vals[hiIdx];
-                // Apply to ALL samples (train + cal + test) using train-derived quantiles
-                for (int i = 0; i < n; i++)
-                    samples[i].Features[j] = Math.Clamp(samples[i].Features[j], lo, hi);
+                _logger.LogWarning(
+                    "ELM warm-start ignored: snapshot type {Type} is not compatible with {ExpectedType}",
+                    warmStart.Type, ModelType);
+                warmStart = null;
             }
-            _logger.LogInformation("ELM winsorized features at p={Pctile:F3} (quantiles from training split)", pctile);
+            else
+            {
+                warmStart = ElmSnapshotSupport.NormalizeSnapshotCopy(warmStart);
+                var compatibility = ElmSnapshotSupport.AssessWarmStartCompatibility(
+                    warmStart,
+                    featureSchemaFingerprint,
+                    basePreprocessingFingerprint,
+                    trainerFingerprint,
+                    featureCount,
+                    hiddenSize);
+                if (!compatibility.IsCompatible)
+                {
+                    _logger.LogWarning(
+                        "ELM warm-start ignored due to compatibility issues: {Issues}",
+                        string.Join("; ", compatibility.Issues));
+                    warmStart = null;
+                }
+            }
         }
 
-        // ── 2. Z-score standardisation on training samples only ─────────────────
-        // Using all samples would leak the future cal/test distribution into the
-        // standardisation statistics, inflating apparent out-of-sample performance.
-        var rawTrainFeatures = new List<float[]>(trainSetEnd);
-        for (int i = 0; i < trainSetEnd; i++) rawTrainFeatures.Add(samples[i].Features);
-        var (means, stds) = MLFeatureHelper.ComputeStandardization(rawTrainFeatures);
+        // ── 1b. Preprocess features without mutating the caller's samples ─────
+        var preparedData = ElmFeaturePipelineHelper.PrepareTrainingSamples(
+            samples,
+            featureCount,
+            trainSetEnd,
+            hp.ElmWinsorizePercentile,
+            hp.FracDiffD);
+        var allStd = preparedData.Samples;
+        var means = preparedData.Means;
+        var stds = preparedData.Stds;
+        var elmWinsorizeLowerBounds = preparedData.WinsorizeLowerBounds;
+        var elmWinsorizeUpperBounds = preparedData.WinsorizeUpperBounds;
 
-        var allStd = new List<TrainingSample>(samples.Count);
-        foreach (var s in samples)
-            allStd.Add(s with { Features = MLFeatureHelper.Standardize(s.Features, means, stds) });
-
+        if (elmWinsorizeLowerBounds.Length > 0)
+            _logger.LogInformation(
+                "ELM winsorized features at p={Pctile:F3} (quantiles from training split)",
+                hp.ElmWinsorizePercentile);
         if (hp.FracDiffD > 0.0)
-        {
-            allStd = MLFeatureHelper.ApplyFractionalDifferencing(allStd, featureCount, hp.FracDiffD);
             _logger.LogInformation("ELM fractional differencing applied: d={D:F2}", hp.FracDiffD);
-        }
 
         double sharpeAnnFactor = hp.SharpeAnnualisationFactor > 0.0
             ? hp.SharpeAnnualisationFactor : DefaultSharpeAnnualisationFactor;
@@ -198,7 +214,7 @@ public sealed partial class ElmModelTrainer : IMLModelTrainer
             samples.Count, featureCount, hiddenSize, K, hp.ElmActivation, hp.ElmDropoutRate);
 
         // ── 2. Walk-forward cross-validation ────────────────────────────────
-        var (cvResult, equityCurveGateFailed) = RunWalkForwardCV(allStd, hp, featureCount, hiddenSize, ct, sharpeAnnFactor);
+        var (cvResult, equityCurveGateFailed) = RunWalkForwardCV(samples, hp, featureCount, hiddenSize, ct, sharpeAnnFactor);
         _logger.LogInformation(
             "ELM walk-forward CV — folds={Folds} avgAcc={Acc:P1} stdAcc={Std:P1} avgF1={F1:F3} avgEV={EV:F4} avgSharpe={Sharpe:F2}",
             cvResult.FoldCount, cvResult.AvgAccuracy, cvResult.StdAccuracy,
@@ -799,11 +815,24 @@ public sealed partial class ElmModelTrainer : IMLModelTrainer
 
         ct.ThrowIfCancellationRequested();
 
+        double[] metaLabelRankingScores = calImportanceScores.Any(score => score > 0.0)
+            ? calImportanceScores
+            : featureImportance.Select(static value => (double)value).ToArray();
+        int[] metaLabelTopFeatureIndices = metaLabelRankingScores
+            .Select((score, index) => (Score: score, Index: index))
+            .OrderByDescending(item => item.Score)
+            .ThenBy(item => item.Index)
+            .Take(Math.Min(5, effectiveFeatureCount))
+            .Select(item => item.Index)
+            .ToArray();
+        if (metaLabelTopFeatureIndices.Length == 0)
+            metaLabelTopFeatureIndices = Enumerable.Range(0, Math.Min(5, effectiveFeatureCount)).ToArray();
+
         // ── 14. Meta-label secondary classifier ──────────────────────────────
         var (metaLabelWeights, metaLabelBias) = FitMetaLabelModel(
             effectiveCalSet, weights, biases, inputWeights, inputBiases,
             effectiveFeatureCount, hiddenSize, featureSubsets, learnerHiddenSizes, learnerActivations,
-            optimalThreshold, FinalEffectiveCalibProb,
+            optimalThreshold, metaLabelTopFeatureIndices, FinalEffectiveCalibProb,
             stackingWeights, stackingBias,
             hp.ElmSubModelLr, hp.ElmSubModelMaxEpochs, hp.ElmSubModelPatience, embargo, ct);
         _logger.LogDebug("ELM meta-label: bias={B:F4}", metaLabelBias);
@@ -813,7 +842,7 @@ public sealed partial class ElmModelTrainer : IMLModelTrainer
             effectiveCalSet, weights, biases, inputWeights, inputBiases,
             plattA, plattB, metaLabelWeights, metaLabelBias,
             effectiveFeatureCount, hiddenSize, featureSubsets, learnerHiddenSizes, learnerActivations,
-            optimalThreshold, FinalEffectiveCalibProb,
+            optimalThreshold, metaLabelTopFeatureIndices, FinalEffectiveCalibProb,
             stackingWeights, stackingBias,
             hp.ElmSubModelLr, hp.ElmSubModelMaxEpochs, hp.ElmSubModelPatience, embargo, ct);
         _logger.LogDebug("ELM abstention gate: bias={B:F4} threshold={T:F2}", abstentionBias, abstentionThreshold);
@@ -1011,9 +1040,11 @@ public sealed partial class ElmModelTrainer : IMLModelTrainer
         {
             Type                       = ModelType,
             Version                    = ModelVersion,
-            Features                   = BuildSnapshotFeatureNames(featureCount),
+            Features                   = snapshotFeatureNames,
             Means                      = means,
             Stds                       = stds,
+            ElmWinsorizeLowerBounds    = elmWinsorizeLowerBounds,
+            ElmWinsorizeUpperBounds    = elmWinsorizeUpperBounds,
             BaseLearnersK              = K,
             Weights                    = weights,
             Biases                     = biases,
@@ -1046,6 +1077,7 @@ public sealed partial class ElmModelTrainer : IMLModelTrainer
             MetaLabelWeights           = metaLabelWeights,
             MetaLabelBias              = metaLabelBias,
             MetaLabelThreshold         = 0.5,
+            MetaLabelTopFeatureIndices = metaLabelTopFeatureIndices,
             FeatureQuantileBreakpoints = featureQuantileBreakpoints,
             JackknifeResiduals         = jackknifeResiduals,
             OobAccuracy                = oobAccuracy,
@@ -1095,6 +1127,9 @@ public sealed partial class ElmModelTrainer : IMLModelTrainer
             MetaWeights                = stackingWeights ?? [],
             MetaBias                   = stackingBias,
             EnsembleSelectionWeights   = [],
+            FeatureSchemaFingerprint   = featureSchemaFingerprint,
+            PreprocessingFingerprint   = basePreprocessingFingerprint,
+            TrainerFingerprint         = trainerFingerprint,
         };
 
         var modelBytes = JsonSerializer.SerializeToUtf8Bytes(snapshot, JsonOpts);

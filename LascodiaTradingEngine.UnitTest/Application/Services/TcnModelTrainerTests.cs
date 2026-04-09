@@ -60,12 +60,27 @@ public class TcnModelTrainerTests
             rawProbs[i] = Math.Clamp(p, 1e-7, 1 - 1e-7);
         }
 
+        var calibration = TcnModelTrainer.CreateIdentityCalibrationArtifacts();
         var (mce, eceBuy, eceSell) = TcnModelTrainer.ComputeCalibrationDecomposition(
-            samples, rawProbs, 1.0, 0.0);
+            samples, rawProbs, calibration);
 
         Assert.True(mce >= 0);
         Assert.True(eceBuy >= 0);
         Assert.True(eceSell >= 0);
+    }
+
+    [Fact]
+    public void ComputeCalibrationDecomposition_WithPerfectSellPredictions_ReportsNearZeroSellEce()
+    {
+        var samples = Enumerable.Range(0, 20)
+            .Select(_ => new TrainingSample(new float[10], 0, 1.0f))
+            .ToList();
+        var rawProbs = Enumerable.Repeat(1e-7d, samples.Count).ToArray();
+
+        var (_, _, eceSell) = TcnModelTrainer.ComputeCalibrationDecomposition(
+            samples, rawProbs, TcnModelTrainer.CreateIdentityCalibrationArtifacts());
+
+        Assert.InRange(eceSell, 0.0, 1e-5);
     }
 
     [Fact]
@@ -354,7 +369,8 @@ public class TcnModelTrainerTests
             rawProbs[i] = 0.3 + 0.4 * (i % 2); // alternating
         }
 
-        double autocorr = TcnModelTrainer.ComputePredictionAutocorrelation(samples, rawProbs, 1.0, 0.0);
+        double autocorr = TcnModelTrainer.ComputePredictionAutocorrelation(
+            samples, rawProbs, TcnModelTrainer.CreateIdentityCalibrationArtifacts());
 
         Assert.True(double.IsFinite(autocorr));
         Assert.True(autocorr < 0); // alternating pattern should be negatively autocorrelated
@@ -372,7 +388,8 @@ public class TcnModelTrainerTests
             rawProbs[i] = Math.Clamp(rng.NextDouble(), 1e-7, 1 - 1e-7);
         }
 
-        var quantiles = TcnModelTrainer.ComputeConfidenceHistogram(samples, rawProbs, 1.0, 0.0);
+        var quantiles = TcnModelTrainer.ComputeConfidenceHistogram(
+            samples, rawProbs, TcnModelTrainer.CreateIdentityCalibrationArtifacts());
 
         Assert.Equal(5, quantiles.Length); // p10, p25, p50, p75, p90
         for (int i = 1; i < quantiles.Length; i++)
@@ -392,7 +409,7 @@ public class TcnModelTrainerTests
         }
 
         var (calLoss, refLoss) = TcnModelTrainer.ComputeLogLossDecomposition(
-            samples, rawProbs, 1.0, 0.0);
+            samples, rawProbs, TcnModelTrainer.CreateIdentityCalibrationArtifacts());
 
         Assert.True(calLoss >= 0);
         Assert.True(refLoss >= 0);

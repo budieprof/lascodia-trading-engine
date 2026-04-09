@@ -107,6 +107,13 @@ public class OptimizationRun : Entity<long>
     public int     DeterministicSeed      { get; set; }
 
     /// <summary>
+    /// Version of the deterministic seed derivation algorithm used to populate
+    /// <see cref="DeterministicSeed"/>. Persisted so replay and audit logic can
+    /// reconstruct the exact seed contract that produced the run.
+    /// </summary>
+    public int     DeterministicSeedVersion { get; set; }
+
+    /// <summary>
     /// Error details if the run failed. Null on successful completion.
     /// </summary>
     public string? ErrorMessage           { get; set; }
@@ -144,16 +151,37 @@ public class OptimizationRun : Entity<long>
     /// </summary>
     public Guid? ExecutionLeaseToken { get; set; }
 
+    /// <summary>Typed reason for the current defer-until window.</summary>
+    public OptimizationDeferralReason? DeferralReason { get; set; }
+
+    /// <summary>
+    /// UTC timestamp when the current deferral window started. Cleared once the
+    /// run is resumed and claimable again.
+    /// </summary>
+    public DateTime? DeferredAtUtc { get; set; }
+
+    /// <summary>
+    /// Total number of deferral windows applied to this run across its lifetime.
+    /// Useful for diagnosing churn caused by repeated data-quality or market-state gates.
+    /// </summary>
+    public int DeferralCount { get; set; }
+
+    /// <summary>
+    /// UTC timestamp when the run most recently resumed from a deferred state and
+    /// became actively claimable again.
+    /// </summary>
+    public DateTime? LastResumedAtUtc { get; set; }
+
     /// <summary>
     /// UTC timestamp before which this run should not be claimed by the worker. Set when
     /// a run is deferred (seasonal blackout, drawdown recovery, regime transition, EA
     /// unavailability, data quality). Prevents the worker from re-evaluating deferred runs
     /// every polling cycle, reducing unnecessary DB churn.
     /// </summary>
+    public DateTime? DeferredUntilUtc     { get; set; }
+
     /// <summary>Optimistic concurrency token — auto-incremented by the database on every update.</summary>
     public uint RowVersion { get; set; }
-
-    public DateTime? DeferredUntilUtc     { get; set; }
 
     /// <summary>UTC timestamp when the run most recently entered the queue, including retries and recovery re-queues.</summary>
     public DateTime QueuedAt              { get; set; } = DateTime.UtcNow;

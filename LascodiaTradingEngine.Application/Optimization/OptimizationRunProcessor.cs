@@ -64,11 +64,9 @@ internal sealed class OptimizationRunProcessor : IOptimizationRunProcessor
         var db = readCtx.GetDbContext();
         var writeDb = writeCtx.GetDbContext();
 
-        int maxConcurrentRuns;
-        {
-            var config0 = await _configProvider.LoadAsync(db, ct);
-            maxConcurrentRuns = config0.MaxConcurrentRuns;
-        }
+        var configSnapshot = _configProvider.GetCacheSnapshot();
+        int maxConcurrentRuns = configSnapshot.Config?.MaxConcurrentRuns
+            ?? (await _configProvider.LoadAsync(db, ct)).MaxConcurrentRuns;
 
         var claimStopwatch = Stopwatch.StartNew();
         var claimResult = await OptimizationRunClaimer.ClaimNextRunAsync(
@@ -159,11 +157,16 @@ internal sealed class OptimizationRunProcessor : IOptimizationRunProcessor
                 run.Id,
                 dqEx.Message);
             _metrics.OptimizationRunsDeferred.Add(1, new KeyValuePair<string, object?>("reason", "data_quality"));
-            OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Queued, UtcNow);
+            OptimizationRunDeferralTracker.ApplyDeferral(
+                run,
+                OptimizationDeferralReason.DataQuality,
+                UtcNow.AddHours(1),
+                UtcNow);
             run.FailureCategory = OptimizationFailureCategory.DataQuality;
-            run.DeferredUntilUtc = UtcNow.AddHours(1);
             SetRunStage(run, OptimizationExecutionStage.Queued, $"Deferred because source data is not yet usable: {dqEx.Message}", UtcNow);
-            await writeCtx.SaveChangesAsync(ct);
+            if (!await TrySaveOwnedMutationAsync(writeDb, writeCtx, run, claimedLeaseToken, ct,
+                    "OptimizationRunProcessor: lease ownership changed before persisting data-quality deferral for run {RunId}"))
+                return true;
         }
         catch (DbUpdateConcurrencyException ex)
         {
@@ -234,7 +237,9 @@ internal sealed class OptimizationRunProcessor : IOptimizationRunProcessor
                     UtcNow,
                     $"Aggregate timeout exceeded ({config?.MaxRunTimeoutMinutes ?? 0} minutes)");
             }
-            await writeCtx.SaveChangesAsync(ct);
+            if (!await TrySaveOwnedMutationAsync(writeDb, writeCtx, run, claimedLeaseToken, ct,
+                    "OptimizationRunProcessor: lease ownership changed before persisting timeout failure for run {RunId}"))
+                return true;
             _metrics.OptimizationRunsFailed.Add(1);
 
             await TryLogDecisionAsync(
@@ -271,7 +276,9 @@ internal sealed class OptimizationRunProcessor : IOptimizationRunProcessor
             using var shutdownCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
             try
             {
-                await writeCtx.SaveChangesAsync(shutdownCts.Token);
+                if (!await TrySaveOwnedMutationAsync(writeDb, writeCtx, run, claimedLeaseToken, shutdownCts.Token,
+                        "OptimizationRunProcessor: lease ownership changed before persisting shutdown re-queue for run {RunId}"))
+                    return true;
                 _logger.LogInformation(
                     "OptimizationRunProcessor: run {RunId} successfully re-queued with checkpoint data",
                     run.Id);
@@ -308,7 +315,9 @@ internal sealed class OptimizationRunProcessor : IOptimizationRunProcessor
                     run.Status,
                     run.Id);
             }
-            await writeCtx.SaveChangesAsync(ct);
+            if (!await TrySaveOwnedMutationAsync(writeDb, writeCtx, run, claimedLeaseToken, ct,
+                    "OptimizationRunProcessor: lease ownership changed before persisting failure state for run {RunId}"))
+                return true;
 
             _metrics.OptimizationRunsFailed.Add(1);
 
@@ -367,6 +376,35 @@ internal sealed class OptimizationRunProcessor : IOptimizationRunProcessor
         catch (Exception ex)
         {
             _logger.LogWarning(ex, failureMessage, args);
+        }
+    }
+
+    private async Task<bool> TrySaveOwnedMutationAsync(
+        DbContext writeDb,
+        IWriteApplicationDbContext writeCtx,
+        OptimizationRun run,
+        Guid expectedLeaseToken,
+        CancellationToken ct,
+        string staleOwnerMessage)
+    {
+        try
+        {
+            await writeCtx.SaveChangesAsync(ct);
+            return true;
+        }
+        catch (DbUpdateConcurrencyException ex)
+        {
+            if (!await _leaseManager.HasLeaseOwnershipChangedAsync(
+                    writeDb,
+                    run.Id,
+                    expectedLeaseToken,
+                    CancellationToken.None))
+            {
+                throw;
+            }
+
+            _logger.LogWarning(ex, staleOwnerMessage, run.Id);
+            return false;
         }
     }
 

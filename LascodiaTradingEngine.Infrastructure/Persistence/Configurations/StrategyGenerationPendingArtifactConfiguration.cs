@@ -15,6 +15,7 @@ public class StrategyGenerationPendingArtifactConfiguration : IEntityTypeConfigu
         builder.Property(x => x.CycleId).HasMaxLength(64);
         builder.Property(x => x.CandidatePayloadJson).IsRequired().HasColumnType("text");
         builder.Property(x => x.LastErrorMessage).HasMaxLength(1000);
+        builder.Property(x => x.TerminalFailureReason).HasMaxLength(1000);
 
         builder.HasQueryFilter(x => !x.IsDeleted);
 

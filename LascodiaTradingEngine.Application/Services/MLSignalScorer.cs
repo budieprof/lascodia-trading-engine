@@ -340,13 +340,17 @@ public sealed class MLSignalScorer : IMLSignalScorer
                 EntropyScore: (decimal)entropyScore);
         }
 
+        bool predictedBuyForAbstention = effectiveCalibP >= threshold;
+        double abstentionThreshold = predictedBuyForAbstention
+            ? (snap.AbstentionThresholdBuy > 0.0 ? snap.AbstentionThresholdBuy : snap.AbstentionThreshold)
+            : (snap.AbstentionThresholdSell > 0.0 ? snap.AbstentionThresholdSell : snap.AbstentionThreshold);
         if (abstentionScore.HasValue &&
             snap.AbstentionWeights.Length > 0 &&
-            abstentionScore.Value < (decimal)snap.AbstentionThreshold)
+            abstentionScore.Value < (decimal)abstentionThreshold)
         {
             _logger.LogInformation(
                 "ML abstention suppression for {Symbol}/{Tf} model {Id}: score={Score:F3} < threshold={Threshold:F3}",
-                signal.Symbol, signalTimeframe, model.Id, abstentionScore.Value, snap.AbstentionThreshold);
+                signal.Symbol, signalTimeframe, model.Id, abstentionScore.Value, abstentionThreshold);
 
             return new MLScoreResult(
                 PredictedDirection: null,
@@ -493,6 +497,25 @@ public sealed class MLSignalScorer : IMLSignalScorer
                             return null;
                         }
                     }
+                    else if (snapshot is not null &&
+                             string.Equals(snapshot.Type, "FTTRANSFORMER", StringComparison.OrdinalIgnoreCase))
+                    {
+                        snapshot = FtTransformerSnapshotSupport.NormalizeSnapshotCopy(snapshot);
+                        var validation = FtTransformerSnapshotSupport.ValidateNormalizedSnapshot(snapshot);
+                        if (!validation.IsValid)
+                            return null;
+                    }
+                    else if (snapshot is not null &&
+                             string.Equals(snapshot.Type, "elm", StringComparison.OrdinalIgnoreCase))
+                    {
+                        snapshot = ElmSnapshotSupport.NormalizeSnapshotCopy(snapshot);
+                        var validation = ElmSnapshotSupport.ValidateSnapshot(snapshot, allowLegacy: true);
+                        if (!validation.IsValid &&
+                            !(snapshot.Weights is { Length: > 0 } && snapshot.ElmInputWeights is { Length: > 0 }))
+                        {
+                            return null;
+                        }
+                    }
 
                     return snapshot;
                 }
@@ -549,6 +572,54 @@ public sealed class MLSignalScorer : IMLSignalScorer
         return features;
     }
 
+    internal static float[] ProjectFeaturesByRawIndex(float[] features, int[] rawFeatureIndices)
+    {
+        if (rawFeatureIndices.Length == 0)
+            return features;
+
+        if (rawFeatureIndices.Distinct().Count() != rawFeatureIndices.Length)
+            throw new InvalidOperationException("RawFeatureIndices contains duplicate indices.");
+
+        var projected = new float[rawFeatureIndices.Length];
+        for (int i = 0; i < rawFeatureIndices.Length; i++)
+        {
+            int rawIndex = rawFeatureIndices[i];
+            if (rawIndex < 0 || rawIndex >= features.Length)
+                throw new InvalidOperationException(
+                    $"RawFeatureIndices[{i}]={rawIndex} is outside the available feature range 0..{features.Length - 1}.");
+
+            projected[i] = features[rawIndex];
+        }
+
+        return projected;
+    }
+
+    internal static float[] ProjectRawFeaturesForSnapshot(float[] rawFeatures, ModelSnapshot snapshot)
+    {
+        if (string.Equals(snapshot.Type, "FTTRANSFORMER", StringComparison.OrdinalIgnoreCase) &&
+            snapshot.FtTransformerRawFeatureCount > 0 &&
+            rawFeatures.Length != snapshot.FtTransformerRawFeatureCount)
+        {
+            throw new InvalidOperationException(
+                $"FT-Transformer raw feature length {rawFeatures.Length} does not match snapshot raw feature count {snapshot.FtTransformerRawFeatureCount}.");
+        }
+
+        if (snapshot.RawFeatureIndices.Length == 0)
+            return rawFeatures;
+
+        float[] projected = ProjectFeaturesByRawIndex(rawFeatures, snapshot.RawFeatureIndices);
+        int expectedFeatureCount = snapshot.Features.Length > 0
+            ? snapshot.Features.Length
+            : projected.Length;
+        if (projected.Length != expectedFeatureCount)
+        {
+            throw new InvalidOperationException(
+                $"Projected feature count {projected.Length} does not match snapshot schema count {expectedFeatureCount}.");
+        }
+
+        return projected;
+    }
+
     private static (float[] Means, float[] Stds) ResolveStandardisationStats(
         ModelSnapshot snap, string? currentRegime, int featureCount)
     {
@@ -588,6 +659,17 @@ public sealed class MLSignalScorer : IMLSignalScorer
             if (!mask[j])
                 features[j] = 0f;
         }
+    }
+
+    internal static double PredictSnapshotMagnitude(float[] features, int featureCount, ModelSnapshot snap)
+    {
+        if (TryPredictElmMagnitude(features, featureCount, snap, out var elmMagnitude))
+            return Math.Abs(elmMagnitude);
+
+        if (snap.MagWeights.Length >= featureCount && featureCount > 0)
+            return Math.Abs(BaggedLogisticTrainer.PredictMagnitude(features, snap.MagWeights, snap.MagBias));
+
+        return 0.0;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -645,6 +727,8 @@ public sealed class MLSignalScorer : IMLSignalScorer
 
             // Reuse cotEntry — COT data is weekly and unchanged across lags
             float[] lagRaw = MLFeatureHelper.BuildFeatureVector(lagWindow, lagCurrent, lagPrev, cotEntry);
+            lagRaw = ProjectRawFeaturesForSnapshot(lagRaw, snap);
+            lagRaw = ElmFeaturePipelineHelper.CloneAndWinsorize(lagRaw, snap);
 
             double weight = fdWeights[lag];
             for (int j = 0; j < featureCount && j < lagRaw.Length; j++)
@@ -913,7 +997,9 @@ public sealed class MLSignalScorer : IMLSignalScorer
         string? currentRegime,
         CancellationToken cancellationToken)
     {
-        int modelFeatureCount = snap.Features.Length > 0 ? snap.Features.Length : featureCount;
+        rawFeatures = ProjectRawFeaturesForSnapshot(rawFeatures, snap);
+        rawFeatures = ElmFeaturePipelineHelper.CloneAndWinsorize(rawFeatures, snap);
+        int modelFeatureCount = snap.Features.Length > 0 ? snap.Features.Length : rawFeatures.Length;
         var (means, stds) = ResolveStandardisationStats(snap, currentRegime, modelFeatureCount);
         float[] features = StandardiseFeatures(rawFeatures, means, stds, modelFeatureCount);
 
@@ -976,6 +1062,8 @@ public sealed class MLSignalScorer : IMLSignalScorer
         var (featureWindow, altCurrent, altPrevious) = sliced.Value;
 
         float[] altRawFeatures = MLFeatureHelper.BuildFeatureVector(featureWindow, altCurrent, altPrevious, cotEntry);
+        altRawFeatures = ProjectRawFeaturesForSnapshot(altRawFeatures, altSnap);
+        altRawFeatures = ElmFeaturePipelineHelper.CloneAndWinsorize(altRawFeatures, altSnap);
 
         int altFc = altSnap.Features.Length > 0 ? altSnap.Features.Length : altRawFeatures.Length;
         var altFeatures = StandardiseFeatures(altRawFeatures, altSnap.Means, altSnap.Stds, altFc);
@@ -1212,6 +1300,8 @@ public sealed class MLSignalScorer : IMLSignalScorer
         var (window, current, previous) = sliced.Value;
 
         float[] rawFeatures = MLFeatureHelper.BuildFeatureVector(window, current, previous, cotEntry);
+        rawFeatures = ProjectRawFeaturesForSnapshot(rawFeatures, snap);
+        rawFeatures = ElmFeaturePipelineHelper.CloneAndWinsorize(rawFeatures, snap);
 
         int featureCount = snap.Features.Length > 0
             ? snap.Features.Length
@@ -1293,7 +1383,8 @@ public sealed class MLSignalScorer : IMLSignalScorer
 
         var metaLabelScore = ScoringEnrichmentCalculator.ComputeMetaLabelScore(
             calibP, ensembleStd, features, featureCount,
-            snap.MetaLabelWeights, snap.MetaLabelBias, snap.MetaLabelTopFeatureIndices);
+            snap.MetaLabelWeights, snap.MetaLabelBias, snap.MetaLabelTopFeatureIndices,
+            snap.MetaLabelHiddenWeights, snap.MetaLabelHiddenBiases, snap.MetaLabelHiddenDim);
 
         var jackknifeInterval = ScoringEnrichmentCalculator.ComputeJackknifeInterval(snap.JackknifeResiduals);
 
@@ -1358,7 +1449,9 @@ public sealed class MLSignalScorer : IMLSignalScorer
 
         // Counterfactual explanation
         string? counterfactualJson = null;
-        if (snap.Features.Length > 0 && snap.Weights is { Length: > 0 })
+        if (!string.Equals(snap.Type, "AdaBoost", StringComparison.OrdinalIgnoreCase) &&
+            snap.Features.Length > 0 &&
+            snap.Weights is { Length: > 0 })
         {
             try
             {
@@ -1459,6 +1552,8 @@ public sealed class MLSignalScorer : IMLSignalScorer
         double ensembleStd          = ClampNonNegativeFinite(engineResult.Value.EnsembleStd);
         decimal? mcDropoutMean      = engineResult.Value.McDropoutMean;
         decimal? mcDropoutVariance  = engineResult.Value.McDropoutVariance;
+        double[]? modelSpaceValues  = engineResult.Value.ModelSpaceValues;
+        bool isTcn = string.Equals(snap.Type, "TCN", StringComparison.OrdinalIgnoreCase);
 
         // ── 9. Deployed calibration stack ────────────────────────────────────
         double calibP = InferenceHelpers.ApplyDeployedCalibration(rawProb, snap);
@@ -1467,8 +1562,11 @@ public sealed class MLSignalScorer : IMLSignalScorer
         if (_logger.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug) &&
             snap.FeatureStabilityScores is { Length: > 0 })
         {
+            var stabilityNames = isTcn && snap.TcnChannelNames is { Length: > 0 }
+                ? snap.TcnChannelNames
+                : snap.Features;
             var unstable = snap.FeatureStabilityScores
-                .Select((cv, idx) => (CV: cv, Name: idx < snap.Features.Length ? snap.Features[idx] : $"f{idx}"))
+                .Select((cv, idx) => (CV: cv, Name: idx < stabilityNames.Length ? stabilityNames[idx] : $"f{idx}"))
                 .Where(f => f.CV > 1.0)
                 .OrderByDescending(f => f.CV)
                 .Take(3)
@@ -1483,7 +1581,11 @@ public sealed class MLSignalScorer : IMLSignalScorer
         // ── 10. Magnitude prediction ─────────────────────────────────────────
         double magnitude = 0;
         int mlpH = snap.QrfMlpHiddenDim;
-        if (mlpH > 0 && snap.QrfMlpW1.Length == featureCount * mlpH)
+        if (engineResult.Value.Magnitude is double nativeMagnitude)
+        {
+            magnitude = Math.Abs(nativeMagnitude);
+        }
+        else if (mlpH > 0 && snap.QrfMlpW1.Length == featureCount * mlpH)
         {
             var hidden = new double[mlpH];
             for (int h = 0; h < mlpH; h++)
@@ -1498,16 +1600,9 @@ public sealed class MLSignalScorer : IMLSignalScorer
                 mlpOut += snap.QrfMlpW2[h] * hidden[h];
             magnitude = Math.Abs(mlpOut);
         }
-        else if (TryPredictElmMagnitude(features, featureCount, snap, out var elmMagnitude))
+        else
         {
-            magnitude = Math.Abs(elmMagnitude);
-        }
-        else if (snap.MagWeights.Length == featureCount)
-        {
-            magnitude = snap.MagBias;
-            for (int j = 0; j < featureCount; j++)
-                magnitude += snap.MagWeights[j] * features[j];
-            magnitude = Math.Abs(magnitude);
+            magnitude = PredictSnapshotMagnitude(features, featureCount, snap);
         }
 
         // ── 10b. Heteroscedastic magnitude uncertainty ───────────────────────
@@ -1546,15 +1641,29 @@ public sealed class MLSignalScorer : IMLSignalScorer
         string? contributionsJson = null;
         try
         {
-            contributionsJson = ScoringEnrichmentCalculator.ComputeShapContributionsJson(
-                features,
-                snap.Weights,
-                snap.FeatureSubsetIndices,
-                snap.Features,
-                featureCount,
-                snap.FeatureImportanceScores,
-                snap.MlpHiddenWeights,
-                snap.MlpHiddenDim);
+            if (HasTcnModelSpaceExplainability(snap, modelSpaceValues))
+            {
+                contributionsJson = ScoringEnrichmentCalculator.ComputeNamedContributionsJson(
+                    modelSpaceValues!,
+                    snap.TcnChannelNames,
+                    snap.TcnChannelImportanceScores);
+            }
+            else
+            {
+                double[][] explanationWeights =
+                    string.Equals(snap.Type, "AdaBoost", StringComparison.OrdinalIgnoreCase)
+                        ? []
+                        : snap.Weights;
+                contributionsJson = ScoringEnrichmentCalculator.ComputeShapContributionsJson(
+                    features,
+                    explanationWeights,
+                    snap.FeatureSubsetIndices,
+                    snap.Features,
+                    featureCount,
+                    snap.FeatureImportanceScores,
+                    snap.MlpHiddenWeights,
+                    snap.MlpHiddenDim);
+            }
         }
         catch (Exception ex)
         {
@@ -1564,7 +1673,23 @@ public sealed class MLSignalScorer : IMLSignalScorer
 
         // ── 11b. Approximate SHAP values (importance × activation, not true permutation SHAP) ─
         string? shapValuesJson = null;
-        if (snap.FeatureImportanceScores is { Length: > 0 } fiScores && fiScores.Length >= featureCount)
+        if (HasTcnModelSpaceExplainability(snap, modelSpaceValues))
+        {
+            try
+            {
+                int count = Math.Min(modelSpaceValues!.Length, Math.Min(snap.TcnChannelNames.Length, snap.TcnChannelImportanceScores.Length));
+                var approxShapValues = new double[count];
+                for (int j = 0; j < count; j++)
+                    approxShapValues[j] = Math.Round(snap.TcnChannelImportanceScores[j] * modelSpaceValues[j], 6);
+                shapValuesJson = JsonSerializer.Serialize(approxShapValues);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Approximate TCN SHAP computation failed for {Symbol}/{Tf} model {Id}",
+                    signal.Symbol, signalTimeframe, model.Id);
+            }
+        }
+        else if (snap.FeatureImportanceScores is { Length: > 0 } fiScores && fiScores.Length >= featureCount)
         {
             try
             {
@@ -1606,6 +1731,14 @@ public sealed class MLSignalScorer : IMLSignalScorer
             rawProb, calibP, ensembleStd, direction, threshold, confidence,
             magnitude, magnitudeUncertaintyPips, magnitudeP10Pips, magnitudeP90Pips,
             mcDropoutMean, mcDropoutVariance, contributionsJson, shapValuesJson);
+    }
+
+    private static bool HasTcnModelSpaceExplainability(ModelSnapshot snap, double[]? modelSpaceValues)
+    {
+        return string.Equals(snap.Type, "TCN", StringComparison.OrdinalIgnoreCase)
+            && modelSpaceValues is { Length: > 0 }
+            && snap.TcnChannelNames is { Length: > 0 }
+            && snap.TcnChannelImportanceScores is { Length: > 0 };
     }
 
     private static bool TryPredictElmMagnitude(
@@ -1670,6 +1803,7 @@ public sealed class MLSignalScorer : IMLSignalScorer
 
         int hiddenSize = snap.ElmHiddenDim;
         int[] defaultSubset = Enumerable.Range(0, featureCount).ToArray();
+        bool hasQuadratic = augWeights.Length > featureCount + hiddenSize;
         for (int h = 0; h < hiddenSize; h++)
         {
             int augIdx = featureCount + h;
@@ -1706,7 +1840,14 @@ public sealed class MLSignalScorer : IMLSignalScorer
                 hCount++;
             }
 
-            pred += augWeights[augIdx] * (hCount > 0 ? hSum / hCount : 0.0);
+            double meanAct = hCount > 0 ? hSum / hCount : 0.0;
+            pred += augWeights[augIdx] * meanAct;
+            if (hasQuadratic)
+            {
+                int sqIdx = featureCount + hiddenSize + h;
+                if (sqIdx < augWeights.Length)
+                    pred += augWeights[sqIdx] * meanAct * meanAct;
+            }
         }
 
         return pred;

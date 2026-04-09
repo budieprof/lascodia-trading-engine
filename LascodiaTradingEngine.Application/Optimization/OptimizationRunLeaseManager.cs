@@ -87,18 +87,28 @@ public sealed class OptimizationRunLeaseManager
                 }
                 catch (Exception ex)
                 {
-                    await using var issueScope = _scopeFactory.CreateAsyncScope();
-                    var issueWriteCtx = issueScope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
-                    var issueDb = issueWriteCtx.GetDbContext();
-                    await issueDb.Set<OptimizationRun>()
-                        .Where(r => r.Id == runId
-                                 && !r.IsDeleted
-                                 && r.Status == OptimizationRunStatus.Running
-                                 && r.ExecutionLeaseToken == leaseToken)
-                        .ExecuteUpdateAsync(s => s
-                            .SetProperty(r => r.LastOperationalIssueCode, "LeaseHeartbeatFailed")
-                            .SetProperty(r => r.LastOperationalIssueMessage, TruncateForPersistence(ex.Message, 500))
-                            .SetProperty(r => r.LastOperationalIssueAt, UtcNow), CancellationToken.None);
+                    try
+                    {
+                        await using var issueScope = _scopeFactory.CreateAsyncScope();
+                        var issueWriteCtx = issueScope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+                        var issueDb = issueWriteCtx.GetDbContext();
+                        await issueDb.Set<OptimizationRun>()
+                            .Where(r => r.Id == runId
+                                     && !r.IsDeleted
+                                     && r.Status == OptimizationRunStatus.Running
+                                     && r.ExecutionLeaseToken == leaseToken)
+                            .ExecuteUpdateAsync(s => s
+                                .SetProperty(r => r.LastOperationalIssueCode, "LeaseHeartbeatFailed")
+                                .SetProperty(r => r.LastOperationalIssueMessage, TruncateForPersistence(ex.Message, 500))
+                                .SetProperty(r => r.LastOperationalIssueAt, UtcNow), CancellationToken.None);
+                    }
+                    catch (Exception issueEx)
+                    {
+                        _logger.LogWarning(
+                            issueEx,
+                            "OptimizationRunLeaseManager: failed to persist lease-heartbeat degradation state for run {RunId}",
+                            runId);
+                    }
                     _logger.LogDebug(ex,
                         "OptimizationRunLeaseManager: background lease heartbeat failed for run {RunId} (non-fatal)",
                         runId);

@@ -48,6 +48,9 @@ internal static class OptimizationRunStateMachine
                 run.ApprovedAt = null;
                 run.ErrorMessage = null;
                 run.FailureCategory = null;
+                run.DeferralReason = null;
+                run.DeferredAtUtc = null;
+                run.DeferredUntilUtc = null;
                 run.LastHeartbeatAt = null;
                 run.ExecutionLeaseExpiresAt = null;
                 run.ExecutionLeaseToken = null;
@@ -57,6 +60,9 @@ internal static class OptimizationRunStateMachine
                 run.CompletedAt = utcNow;
                 run.ErrorMessage = null;
                 run.FailureCategory = null;
+                run.DeferralReason = null;
+                run.DeferredAtUtc = null;
+                run.DeferredUntilUtc = null;
                 run.ExecutionLeaseExpiresAt = null;
                 run.ExecutionLeaseToken = null;
                 break;
@@ -64,6 +70,9 @@ internal static class OptimizationRunStateMachine
             case OptimizationRunStatus.Failed:
                 run.CompletedAt = utcNow;
                 run.ErrorMessage = errorMessage;
+                run.DeferralReason = null;
+                run.DeferredAtUtc = null;
+                run.DeferredUntilUtc = null;
                 run.ExecutionLeaseExpiresAt = null;
                 run.ExecutionLeaseToken = null;
                 break;
@@ -74,6 +83,9 @@ internal static class OptimizationRunStateMachine
                     run.CompletedAt = utcNow;
                 run.ErrorMessage = null;
                 run.FailureCategory = null;
+                run.DeferralReason = null;
+                run.DeferredAtUtc = null;
+                run.DeferredUntilUtc = null;
                 run.ExecutionLeaseExpiresAt = null;
                 run.ExecutionLeaseToken = null;
                 break;
@@ -83,6 +95,9 @@ internal static class OptimizationRunStateMachine
                     run.CompletedAt = utcNow;
                 run.ErrorMessage = null;
                 run.FailureCategory = null;
+                run.DeferralReason = null;
+                run.DeferredAtUtc = null;
+                run.DeferredUntilUtc = null;
                 run.ExecutionLeaseExpiresAt = null;
                 run.ExecutionLeaseToken = null;
                 break;
@@ -91,6 +106,9 @@ internal static class OptimizationRunStateMachine
                 if (!run.CompletedAt.HasValue)
                     run.CompletedAt = utcNow;
                 run.ErrorMessage = errorMessage ?? "Retry budget exhausted — moved to dead-letter queue";
+                run.DeferralReason = null;
+                run.DeferredAtUtc = null;
+                run.DeferredUntilUtc = null;
                 run.ExecutionLeaseExpiresAt = null;
                 run.ExecutionLeaseToken = null;
                 break;

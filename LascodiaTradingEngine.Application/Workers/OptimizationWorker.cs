@@ -182,18 +182,26 @@ public class OptimizationWorker : BackgroundService
     {
         var cycleConfig = await LoadCycleConfigSnapshotAsync(ct);
         bool shouldRunScheduling = UtcNow >= _nextScheduleScanUtc;
-        if (shouldRunScheduling)
-            _nextScheduleScanUtc = UtcNow.AddSeconds(cycleConfig.Config.SchedulePollSeconds);
 
-        await _loopCoordinator.ExecuteCycleAsync(
-            new OptimizationWorkerCycleContext(
-                cycleConfig.Config,
-                cycleConfig.LastConfigRefreshUtc,
-                cycleConfig.NextConfigRefreshUtc,
-                shouldRunScheduling && cycleConfig.Config.AutoScheduleEnabled),
-            ct);
+        try
+        {
+            await _loopCoordinator.ExecuteCycleAsync(
+                new OptimizationWorkerCycleContext(
+                    cycleConfig.Config,
+                    cycleConfig.LastConfigRefreshUtc,
+                    cycleConfig.NextConfigRefreshUtc,
+                    shouldRunScheduling && cycleConfig.Config.AutoScheduleEnabled),
+                ct);
 
-        await EnsureProcessingCapacityAsync(cycleConfig.Config.MaxConcurrentRuns, ct);
+            if (shouldRunScheduling)
+                _nextScheduleScanUtc = UtcNow.AddSeconds(cycleConfig.Config.SchedulePollSeconds);
+        }
+        finally
+        {
+            // Keep execution-slot replenishment independent from auxiliary coordinator work
+            // so queued runs can still advance when reconciliation/scheduling degrades.
+            await EnsureProcessingCapacityAsync(cycleConfig.Config.MaxConcurrentRuns, ct);
+        }
     }
 
     private async Task<CycleConfigSnapshot> LoadCycleConfigSnapshotAsync(CancellationToken ct)

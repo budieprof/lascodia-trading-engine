@@ -30,6 +30,7 @@ public class WorkerHealthMonitor : IWorkerHealthMonitor
         public string? LastErrorMessage { get; set; }
         public int ConsecutiveFailures;
         public int BacklogDepth { get; set; }
+        public long LastCycleDurationMs { get; set; }
 
         // Sliding window of recent cycle durations (last 60 entries ~= last hour at 60s intervals)
         public readonly ConcurrentQueue<long> RecentDurations = new();
@@ -57,6 +58,7 @@ public class WorkerHealthMonitor : IWorkerHealthMonitor
         var state = _state.GetOrAdd(workerName, _ => new WorkerState());
         state.IsRunning = true;
         state.LastSuccessAt = DateTime.UtcNow;
+        state.LastCycleDurationMs = durationMs;
         state.IsStopped = false; // Reset stopped flag — worker is clearly alive
         Interlocked.Exchange(ref state.ConsecutiveFailures, 0);
         Interlocked.Increment(ref state.SuccessesLastHour);
@@ -106,7 +108,7 @@ public class WorkerHealthMonitor : IWorkerHealthMonitor
                 LastSuccessAt            = kvp.Value.LastSuccessAt,
                 LastErrorAt              = kvp.Value.LastErrorAt,
                 LastErrorMessage         = kvp.Value.LastErrorMessage,
-                LastCycleDurationMs      = durations.Length > 0 ? durations[^1] : 0,
+                LastCycleDurationMs      = kvp.Value.LastCycleDurationMs,
                 CycleDurationP50Ms       = GetPercentile(durations, 0.50),
                 CycleDurationP95Ms       = GetPercentile(durations, 0.95),
                 CycleDurationP99Ms       = GetPercentile(durations, 0.99),
@@ -198,7 +200,7 @@ public class WorkerHealthMonitor : IWorkerHealthMonitor
     private static long GetPercentile(long[] sorted, double percentile)
     {
         if (sorted.Length == 0) return 0;
-        var index = (int)Math.Floor(percentile * (sorted.Length - 1));
+        var index = (int)Math.Ceiling(percentile * sorted.Length) - 1;
         return sorted[Math.Clamp(index, 0, sorted.Length - 1)];
     }
 }

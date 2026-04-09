@@ -32,7 +32,7 @@ public sealed partial class ElmModelTrainer
             return (new WalkForwardResult(0, 0, 0, 0, 0, 0), false);
         }
 
-        var foldResults = new (double Acc, double F1, double EV, double Sharpe, double[] Imp, bool IsBad)?[folds];
+        var foldResults = new (double Acc, double F1, double EV, double Sharpe, double MaxDD, double[] Imp, bool IsBad, double[] OofResiduals)?[folds];
 
         int cvInnerParallelism = Math.Max(1, Environment.ProcessorCount / Math.Max(1, folds));
         Parallel.For(0, folds, new ParallelOptions
@@ -63,14 +63,14 @@ public sealed partial class ElmModelTrainer
                     fullFoldTrain = fullFoldTrain[..purgeFrom];
             }
 
-            var foldTest = samples[testStart..Math.Min(testEnd, samples.Count)];
-            if (foldTest.Count < 20) return;
+            var rawFoldTest = samples[testStart..Math.Min(testEnd, samples.Count)];
+            if (rawFoldTest.Count < 20) return;
 
             // Carve a mini-cal set from the tail of the fold-train window BEFORE fitting
             // the ensemble, so base learners never see the cal samples via bootstrap.
             int cvCalSize = fullFoldTrain.Count / 7; // ~14 % of fold-train as mini cal
-            List<TrainingSample> foldTrain;
-            List<TrainingSample>? cvCalSet = null;
+            List<TrainingSample> rawFoldTrain;
+            List<TrainingSample>? rawCvCalSet = null;
             if (cvCalSize >= 20)
             {
                 int calStart = fullFoldTrain.Count - cvCalSize;
@@ -78,20 +78,41 @@ public sealed partial class ElmModelTrainer
                 int foldTrainEnd = Math.Max(0, calStart - cvGap);
                 if (foldTrainEnd >= hp.MinSamples)
                 {
-                    cvCalSet  = fullFoldTrain[calStart..];
-                    foldTrain = fullFoldTrain[..foldTrainEnd];
+                    rawCvCalSet = fullFoldTrain[calStart..];
+                    rawFoldTrain = fullFoldTrain[..foldTrainEnd];
                 }
                 else
                 {
-                    foldTrain = fullFoldTrain;
+                    rawFoldTrain = fullFoldTrain;
                 }
             }
             else
             {
-                foldTrain = fullFoldTrain;
+                rawFoldTrain = fullFoldTrain;
             }
 
-            if (foldTrain.Count < hp.MinSamples) return;
+            if (rawFoldTrain.Count < hp.MinSamples) return;
+
+            int rawCvCalCount = rawCvCalSet?.Count ?? 0;
+            int rawFoldTestCount = rawFoldTest.Count;
+            var rawFoldCombined = new List<TrainingSample>(rawFoldTrain.Count + rawCvCalCount + rawFoldTestCount);
+            rawFoldCombined.AddRange(rawFoldTrain);
+            if (rawCvCalSet is { Count: > 0 })
+                rawFoldCombined.AddRange(rawCvCalSet);
+            rawFoldCombined.AddRange(rawFoldTest);
+
+            var preparedFold = ElmFeaturePipelineHelper.PrepareTrainingSamples(
+                rawFoldCombined,
+                featureCount,
+                rawFoldTrain.Count,
+                hp.ElmWinsorizePercentile,
+                hp.FracDiffD);
+
+            var foldTrain = preparedFold.Samples[..rawFoldTrain.Count];
+            List<TrainingSample>? cvCalSet = rawCvCalCount > 0
+                ? preparedFold.Samples[rawFoldTrain.Count..(rawFoldTrain.Count + rawCvCalCount)]
+                : null;
+            var foldTest = preparedFold.Samples[(rawFoldTrain.Count + rawCvCalCount)..];
 
             // Use K/2 learners per fold for computational efficiency. This produces
             // systematically pessimistic CV estimates relative to the final K-learner
@@ -168,9 +189,12 @@ public sealed partial class ElmModelTrainer
             for (int j = 0; j < featureCount; j++) foldImp[j] /= kCount;
 
             var foldPredictions = new (int Predicted, int Actual)[foldTest.Count];
+            var foldOofResiduals = new double[foldTest.Count];
             for (int pi = 0; pi < foldTest.Count; pi++)
             {
                 double calibP = CvPrimaryCalibProb(foldTest[pi].Features);
+                double actual = ToBinaryLabel(foldTest[pi].Direction);
+                foldOofResiduals[pi] = Math.Abs(calibP - actual);
                 foldPredictions[pi] = (calibP >= 0.5 ? 1 : -1,
                                        foldTest[pi].Direction > 0 ? 1 : -1);
             }
@@ -183,7 +207,7 @@ public sealed partial class ElmModelTrainer
             if (hp.MinFoldCurveSharpe > -99.0 && foldCurveSharpe < hp.MinFoldCurveSharpe)
                 isBadFold = true;
 
-            foldResults[fold] = (m.Accuracy, m.F1, m.ExpectedValue, m.SharpeRatio, foldImp, isBadFold);
+            foldResults[fold] = (m.Accuracy, m.F1, m.ExpectedValue, m.SharpeRatio, foldMaxDD, foldImp, isBadFold, foldOofResiduals);
         });
 
         var accList    = new List<double>(folds);
@@ -191,6 +215,8 @@ public sealed partial class ElmModelTrainer
         var evList     = new List<double>(folds);
         var sharpeList = new List<double>(folds);
         var foldImps   = new List<double[]>(folds);
+        var foldMetrics = new List<WalkForwardFoldMetric>(folds);
+        var oofResiduals = new List<double>();
         int badFolds   = 0;
 
         foreach (var r in foldResults)
@@ -201,6 +227,8 @@ public sealed partial class ElmModelTrainer
             evList.Add(r.Value.EV);
             sharpeList.Add(r.Value.Sharpe);
             foldImps.Add(r.Value.Imp);
+            foldMetrics.Add(new WalkForwardFoldMetric(r.Value.Acc, r.Value.F1, r.Value.EV, r.Value.Sharpe, r.Value.MaxDD));
+            oofResiduals.AddRange(r.Value.OofResiduals);
             if (r.Value.IsBad) badFolds++;
         }
 
@@ -227,6 +255,12 @@ public sealed partial class ElmModelTrainer
 
         double avgAcc      = accList.Average();
         double stdAcc      = ElmMathHelper.StdDev(accList, avgAcc);
+        double avgF1       = f1List.Average();
+        double stdF1       = ElmMathHelper.StdDev(f1List, avgF1);
+        double avgEv       = evList.Average();
+        double stdEv       = ElmMathHelper.StdDev(evList, avgEv);
+        double avgSharpe   = sharpeList.Average();
+        double stdSharpe   = ElmMathHelper.StdDev(sharpeList, avgSharpe);
         double sharpeTrend = ElmMathHelper.ComputeSharpeTrend(sharpeList);
 
         if (hp.MinSharpeTrendSlope > -99.0 && sharpeTrend < hp.MinSharpeTrendSlope)
@@ -261,12 +295,17 @@ public sealed partial class ElmModelTrainer
         return (new WalkForwardResult(
             AvgAccuracy:            avgAcc,
             StdAccuracy:            stdAcc,
-            AvgF1:                  f1List.Average(),
-            AvgEV:                  evList.Average(),
-            AvgSharpe:              sharpeList.Average(),
+            AvgF1:                  avgF1,
+            AvgEV:                  avgEv,
+            AvgSharpe:              avgSharpe,
             FoldCount:              accList.Count,
+            StdF1:                  stdF1,
+            StdEV:                  stdEv,
+            StdSharpe:              stdSharpe,
             SharpeTrend:            sharpeTrend,
-            FeatureStabilityScores: featureStabilityScores), equityCurveGateFailed);
+            FeatureStabilityScores: featureStabilityScores,
+            FoldMetrics:            foldMetrics.ToArray(),
+            OofResiduals:           oofResiduals.ToArray()), equityCurveGateFailed);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

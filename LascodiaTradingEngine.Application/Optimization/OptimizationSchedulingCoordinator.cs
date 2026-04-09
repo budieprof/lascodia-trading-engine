@@ -2,6 +2,7 @@ using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using LascodiaTradingEngine.Application.Backtesting;
 using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Backtesting.Models;
@@ -184,15 +185,24 @@ public sealed class OptimizationSchedulingCoordinator
         }
 
         var recentBacktests = await db.Set<BacktestRun>()
-            .Where(r => r.Status == RunStatus.Completed && !r.IsDeleted && r.ResultJson != null)
+            .Where(r => r.Status == RunStatus.Completed && !r.IsDeleted)
             .GroupBy(r => r.StrategyId)
-            .Select(g => new
-            {
-                StrategyId = g.Key,
-                ResultJson = g.OrderByDescending(r => r.CompletedAt).First().ResultJson
-            })
+            .Select(g => g.OrderByDescending(r => r.CompletedAt)
+                .Select(r => new
+                {
+                    r.StrategyId,
+                    r.TotalTrades,
+                    r.WinRate,
+                    r.ProfitFactor,
+                    r.MaxDrawdownPct,
+                    r.SharpeRatio,
+                    r.FinalBalance,
+                    r.TotalReturn,
+                    r.ResultJson
+                })
+                .First())
             .ToListAsync(ct);
-        var backtestMap = recentBacktests.ToDictionary(r => r.StrategyId, r => r.ResultJson);
+        var backtestMap = recentBacktests.ToDictionary(r => r.StrategyId);
 
         var activeStrategyIds = activeStrategies.Select(s => s.Id).ToList();
         var allRecentSnapshots = await db.Set<StrategyPerformanceSnapshot>()
@@ -227,20 +237,19 @@ public sealed class OptimizationSchedulingCoordinator
                 continue;
             }
 
-            if (!backtestMap.TryGetValue(strategy.Id, out var resultJson) || string.IsNullOrWhiteSpace(resultJson))
+            if (!backtestMap.TryGetValue(strategy.Id, out var backtestMetricsRow))
                 continue;
 
-            BacktestResult? result;
-            try
-            {
-                result = JsonSerializer.Deserialize<BacktestResult>(resultJson);
-            }
-            catch (JsonException)
-            {
-                continue;
-            }
-
-            if (result is null)
+            if (!global::LascodiaTradingEngine.Application.Backtesting.BacktestRunMetricsReader.TryRead(
+                    backtestMetricsRow.TotalTrades,
+                    backtestMetricsRow.WinRate,
+                    backtestMetricsRow.ProfitFactor,
+                    backtestMetricsRow.MaxDrawdownPct,
+                    backtestMetricsRow.SharpeRatio,
+                    backtestMetricsRow.FinalBalance,
+                    backtestMetricsRow.TotalReturn,
+                    backtestMetricsRow.ResultJson,
+                    out var result))
                 continue;
 
             bool meetsGate = result.TotalTrades >= config.MinTotalTrades

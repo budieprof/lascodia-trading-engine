@@ -45,6 +45,7 @@ public sealed class OptimizationRunMetadataService
         var snapshot = new OptimizationRunContracts.RunMetadataSnapshot
         {
             DeterministicSeed = run.DeterministicSeed,
+            DeterministicSeedVersion = run.DeterministicSeedVersion,
             Surrogate = surrogateKind,
             Symbol = strategy.Symbol,
             Timeframe = strategy.Timeframe,

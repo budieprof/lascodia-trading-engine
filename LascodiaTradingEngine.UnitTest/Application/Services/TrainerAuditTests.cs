@@ -64,10 +64,7 @@ public class TrainerAuditTests
         Assert.True(engine.CanHandle(snapshot), $"Inference engine refused snapshot for trainer '{trainerId}'.");
 
         int inferenceFeatureCount = snapshot.Features.Length > 0 ? snapshot.Features.Length : samples[0].Features.Length;
-        float[] inferenceFeatures = MLSignalScorer.StandardiseFeatures(
-            samples[0].Features, snapshot.Means, snapshot.Stds, inferenceFeatureCount);
-        InferenceHelpers.ApplyModelSpecificFeatureTransforms(inferenceFeatures, snapshot);
-        MLSignalScorer.ApplyFeatureMask(inferenceFeatures, snapshot.ActiveFeatureMask, inferenceFeatureCount);
+        float[] inferenceFeatures = BuildInferenceFeatures(samples[0].Features, snapshot, inferenceFeatureCount);
 
         var candleWindow = requiresCandleWindow ? CreateCandleWindow() : new List<Candle>();
         var inference = engine.RunInference(
@@ -130,10 +127,7 @@ public class TrainerAuditTests
         Assert.True(engine.CanHandle(snapshot), $"Warm-started snapshot not accepted for trainer '{trainerId}'.");
 
         int inferenceFeatureCount = snapshot.Features.Length > 0 ? snapshot.Features.Length : samples[0].Features.Length;
-        float[] inferenceFeatures = MLSignalScorer.StandardiseFeatures(
-            samples[0].Features, snapshot.Means, snapshot.Stds, inferenceFeatureCount);
-        InferenceHelpers.ApplyModelSpecificFeatureTransforms(inferenceFeatures, snapshot);
-        MLSignalScorer.ApplyFeatureMask(inferenceFeatures, snapshot.ActiveFeatureMask, inferenceFeatureCount);
+        float[] inferenceFeatures = BuildInferenceFeatures(samples[0].Features, snapshot, inferenceFeatureCount);
         var candleWindow = requiresCandleWindow ? CreateCandleWindow() : new List<Candle>();
         var inference = engine.RunInference(inferenceFeatures, inferenceFeatureCount, snapshot, candleWindow, 1L, 0, 0);
 
@@ -176,10 +170,7 @@ public class TrainerAuditTests
         Assert.True(engine.CanHandle(snapshot), $"Corrupted-warm-start snapshot not accepted for trainer '{trainerId}'.");
 
         int inferenceFeatureCount = snapshot.Features.Length > 0 ? snapshot.Features.Length : samples[0].Features.Length;
-        float[] inferenceFeatures = MLSignalScorer.StandardiseFeatures(
-            samples[0].Features, snapshot.Means, snapshot.Stds, inferenceFeatureCount);
-        InferenceHelpers.ApplyModelSpecificFeatureTransforms(inferenceFeatures, snapshot);
-        MLSignalScorer.ApplyFeatureMask(inferenceFeatures, snapshot.ActiveFeatureMask, inferenceFeatureCount);
+        float[] inferenceFeatures = BuildInferenceFeatures(samples[0].Features, snapshot, inferenceFeatureCount);
         var candleWindow = requiresCandleWindow ? CreateCandleWindow() : new List<Candle>();
         var inference = engine.RunInference(inferenceFeatures, inferenceFeatureCount, snapshot, candleWindow, 1L, 0, 0);
 
@@ -226,10 +217,26 @@ public class TrainerAuditTests
         };
     }
 
+    private static float[] BuildInferenceFeatures(float[] sampleFeatures, ModelSnapshot snapshot, int inferenceFeatureCount)
+    {
+        float[] rawFeatures =
+            string.Equals(snapshot.Type, "FTTRANSFORMER", StringComparison.OrdinalIgnoreCase) &&
+            snapshot.RawFeatureIndices.Length > 0
+                ? MLSignalScorer.ProjectFeaturesByRawIndex(sampleFeatures, snapshot.RawFeatureIndices)
+                : sampleFeatures;
+
+        float[] inferenceFeatures = MLSignalScorer.StandardiseFeatures(
+            rawFeatures, snapshot.Means, snapshot.Stds, inferenceFeatureCount);
+        InferenceHelpers.ApplyModelSpecificFeatureTransforms(inferenceFeatures, snapshot);
+        MLSignalScorer.ApplyFeatureMask(inferenceFeatures, snapshot.ActiveFeatureMask, inferenceFeatureCount);
+        return inferenceFeatures;
+    }
+
     private static List<TrainingSample> CreateSamples(string trainerId) => trainerId switch
     {
+        "bagged" => GenerateSamples(400),
         "tcn" => GenerateTcnSamples(120),
-        "fttransformer" => GenerateSamples(140),
+        "fttransformer" => GenerateSamples(220),
         "tabnet" => GenerateSamples(220),
         "svgp" => GenerateSamples(600),
         _ => GenerateSamples(180),
@@ -248,7 +255,7 @@ public class TrainerAuditTests
         return trainerId switch
         {
             "dann" => DefaultHp() with { MaxEpochs = 20, WalkForwardFolds = 3, EarlyStoppingPatience = 5 },
-            "fttransformer" => hp with { MaxEpochs = 3, EarlyStoppingPatience = 2 },
+            "fttransformer" => hp with { MaxEpochs = 3, EarlyStoppingPatience = 2, EmbargoBarCount = 0 },
             "tabnet" => hp with
             {
                 MaxEpochs = 4,
@@ -258,7 +265,7 @@ public class TrainerAuditTests
                 FgsmEpsilon = 0.0,
                 MaxLearnerCorrelation = 1.0,
             },
-            "tcn" => hp with { MaxEpochs = 6, WalkForwardFolds = 2, EarlyStoppingPatience = 2 },
+            "tcn" => hp with { MaxEpochs = 6, WalkForwardFolds = 2, EarlyStoppingPatience = 2, EmbargoBarCount = 0 },
             "svgp" => hp with { MaxEpochs = 10, SvgpInducingM = 20 },
             _ => hp,
         };
@@ -385,7 +392,16 @@ public class TrainerAuditTests
         if (snapshot.ActiveFeatureMask.Length > 0)
             Assert.Equal(snapshot.Features.Length, snapshot.ActiveFeatureMask.Length);
 
-        if (snapshot.Type == "TCN")
+        if (snapshot.Type == "BaggedLogisticEnsemble")
+        {
+            Assert.False(string.IsNullOrWhiteSpace(snapshot.FeatureSchemaFingerprint));
+            Assert.False(string.IsNullOrWhiteSpace(snapshot.PreprocessingFingerprint));
+            Assert.False(string.IsNullOrWhiteSpace(snapshot.TrainerFingerprint));
+            Assert.Equal(snapshot.TrainSamples, snapshot.TrainSamplesAtLastCalibration);
+            if (snapshot.MetaWeights.Length > 0)
+                Assert.Empty(snapshot.EnsembleSelectionWeights);
+        }
+        else if (snapshot.Type == "TCN")
         {
             Assert.NotEmpty(snapshot.ConvWeightsJson);
             Assert.NotEmpty(snapshot.SeqMeans);
@@ -480,6 +496,41 @@ public class TrainerAuditTests
             Assert.NotNull(snapshot.FtTransformerEmbedWeights);
             Assert.NotNull(snapshot.FtTransformerClsToken);
             Assert.True(snapshot.FtTransformerEmbedDim > 0);
+            Assert.Equal(snapshot.Features.Length, snapshot.FtTransformerEmbedWeights!.Length);
+            Assert.False(string.IsNullOrWhiteSpace(snapshot.FeatureSchemaFingerprint));
+            Assert.False(string.IsNullOrWhiteSpace(snapshot.PreprocessingFingerprint));
+            Assert.False(string.IsNullOrWhiteSpace(snapshot.TrainerFingerprint));
+            Assert.True(snapshot.TrainingRandomSeed > 0);
+            Assert.Equal(rawFeatureCount, snapshot.FtTransformerRawFeatureCount);
+            Assert.NotNull(snapshot.TrainingSplitSummary);
+            Assert.True(snapshot.TrainingSplitSummary!.SelectionCount > 0);
+            Assert.True(snapshot.TrainingSplitSummary.SelectionPruningCount > 0);
+            Assert.True(snapshot.TrainingSplitSummary.SelectionThresholdCount > 0);
+            Assert.True(snapshot.TrainingSplitSummary!.CalibrationCount > 0);
+            Assert.True(snapshot.TrainingSplitSummary.CalibrationFitCount > 0);
+            Assert.True(snapshot.TrainingSplitSummary.CalibrationDiagnosticsCount > 0);
+            Assert.True(snapshot.TrainingSplitSummary.ConformalCount > 0);
+            Assert.Equal(0, snapshot.TrainingSplitSummary.MetaLabelCount);
+            Assert.Equal(0, snapshot.TrainingSplitSummary.AbstentionCount);
+            Assert.True(snapshot.TrainingSplitSummary.TestCount > 0);
+            Assert.InRange(snapshot.ConditionalCalibrationRoutingThreshold, 0.01, 0.99);
+            Assert.NotNull(snapshot.FtTransformerSelectionMetrics);
+            Assert.NotNull(snapshot.FtTransformerCalibrationMetrics);
+            Assert.NotNull(snapshot.FtTransformerTestMetrics);
+            Assert.NotNull(snapshot.FtTransformerCalibrationArtifact);
+            Assert.NotNull(snapshot.FtTransformerWarmStartArtifact);
+            Assert.NotNull(snapshot.FtTransformerAuditArtifact);
+            Assert.Equal(snapshot.TrainingSplitSummary.AdaptiveHeadSplitMode, snapshot.FtTransformerCalibrationArtifact!.AdaptiveHeadMode, ignoreCase: true);
+            Assert.Equal(snapshot.TrainingSplitSummary.AdaptiveHeadCrossFitFoldCount, snapshot.FtTransformerCalibrationArtifact.AdaptiveHeadCrossFitFoldCount);
+            Assert.Equal(snapshot.TrainingSplitSummary.ConformalCount, snapshot.FtTransformerCalibrationArtifact.ConformalSampleCount);
+            Assert.True(snapshot.FtTransformerTrainInferenceParityMaxError <= 1e-6);
+            Assert.Equal(0, snapshot.FtTransformerAuditArtifact!.ThresholdDecisionMismatchCount);
+            if (snapshot.RawFeatureIndices.Length > 0)
+            {
+                Assert.Equal(snapshot.Features.Length, snapshot.RawFeatureIndices.Length);
+                Assert.All(snapshot.ActiveFeatureMask, value => Assert.True(value));
+                Assert.Equal(snapshot.PrunedFeatureCount, rawFeatureCount - snapshot.Features.Length);
+            }
         }
         else if (snapshot.Type == "ROCKET")
         {

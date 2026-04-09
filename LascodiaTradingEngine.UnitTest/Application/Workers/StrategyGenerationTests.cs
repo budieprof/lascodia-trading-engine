@@ -1,7 +1,9 @@
 using LascodiaTradingEngine.Application.Backtesting.Models;
+using LascodiaTradingEngine.Application.Backtesting.Services;
 using LascodiaTradingEngine.Application.StrategyGeneration;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
+using Microsoft.Extensions.Logging.Abstractions;
 using static LascodiaTradingEngine.Application.StrategyGeneration.StrategyGenerationHelpers;
 using Xunit;
 
@@ -534,6 +536,90 @@ public class StrategyGenerationTests
         Assert.Equal(ScreeningFailureReason.None, outcome.Failure);
     }
 
+    [Fact]
+    public async Task ScreenCandidateAsync_ReturnsStructuredFailure_ForZeroTradesInSample()
+    {
+        var engine = new StrategyScreeningEngine(
+            new SequencedBacktestEngine([new BacktestResult { TotalTrades = 0 }]),
+            NullLogger.Instance);
+
+        var outcome = await engine.ScreenCandidateAsync(
+            StrategyType.MovingAverageCrossover,
+            "EURUSD",
+            Timeframe.H1,
+            "{\"Template\":\"Primary\"}",
+            0,
+            BuildCandles(220),
+            BuildCandles(160),
+            BuildCandles(60),
+            new BacktestOptions(),
+            new ScreeningThresholds(0.55, 1.05, 0.2, 0.30, 5),
+            new ScreeningConfig
+            {
+                ScreeningTimeoutSeconds = 5,
+                ScreeningInitialBalance = 10_000m,
+                MaxOosDegradationPct = 0.60,
+                MinEquityCurveR2 = 0.50,
+                MaxTradeTimeConcentration = 1.0,
+                MonteCarloEnabled = false,
+                MonteCarloShuffleEnabled = false,
+            },
+            MarketRegime.Trending,
+            "Primary",
+            CancellationToken.None);
+
+        Assert.NotNull(outcome);
+        Assert.False(outcome!.Passed);
+        Assert.Equal(ScreeningFailureReason.ZeroTradesIS, outcome.Failure);
+        Assert.Equal("ZeroTradesIS", outcome.FailureOutcome);
+        Assert.Equal(MarketRegime.Trending, outcome.Regime);
+        Assert.Equal("Primary", outcome.GenerationSource);
+        Assert.Equal("EURUSD", outcome.Strategy.Symbol);
+    }
+
+    [Fact]
+    public async Task ScreenCandidateAsync_ReturnsStructuredFailure_ForOosTimeout()
+    {
+        var engine = new StrategyScreeningEngine(
+            new SequencedBacktestEngine([BuildPassingBacktestResult()], timeoutOnCall: 2),
+            NullLogger.Instance);
+
+        var outcome = await engine.ScreenCandidateAsync(
+            StrategyType.RSIReversion,
+            "GBPUSD",
+            Timeframe.H1,
+            "{\"Template\":\"Reserve\"}",
+            0,
+            BuildCandles(220),
+            BuildCandles(160),
+            BuildCandles(60),
+            new BacktestOptions(),
+            new ScreeningThresholds(0.55, 1.05, 0.2, 0.30, 5),
+            new ScreeningConfig
+            {
+                ScreeningTimeoutSeconds = 5,
+                ScreeningInitialBalance = 10_000m,
+                MaxOosDegradationPct = 0.60,
+                MinEquityCurveR2 = 0.50,
+                MaxTradeTimeConcentration = 1.0,
+                MonteCarloEnabled = false,
+                MonteCarloShuffleEnabled = false,
+            },
+            MarketRegime.Ranging,
+            MarketRegime.Trending,
+            "Reserve",
+            CancellationToken.None);
+
+        Assert.NotNull(outcome);
+        Assert.False(outcome!.Passed);
+        Assert.Equal(ScreeningFailureReason.Timeout, outcome.Failure);
+        Assert.Equal("Timeout", outcome.FailureOutcome);
+        Assert.Equal(20, outcome.TrainResult.TotalTrades);
+        Assert.Equal(MarketRegime.Trending, outcome.ObservedRegime);
+        Assert.Equal("Reserve", outcome.GenerationSource);
+        Assert.Equal(MarketRegime.Ranging.ToString(), outcome.Metrics.ReserveTargetRegime);
+    }
+
     // ── ScreeningMetrics schema migration (#8) ────────────────────────────
 
     [Fact]
@@ -714,5 +800,73 @@ public class StrategyGenerationTests
 
         double mult2 = ComputeAdaptiveMultiplier(0.30, 0.60); // median 0.30 / threshold 0.60 = 0.5 → clamped to 0.85
         Assert.Equal(0.85, mult2, precision: 5);
+    }
+
+    private static List<Candle> BuildCandles(int count)
+        => Enumerable.Range(0, count).Select(i => new Candle
+        {
+            Symbol = "TEST",
+            Timeframe = Timeframe.H1,
+            Timestamp = DateTime.UtcNow.AddHours(-count + i),
+            Open = 1.1000m,
+            High = 1.1010m,
+            Low = 1.0990m,
+            Close = 1.1005m,
+            Volume = 1000 + i,
+            IsClosed = true,
+        }).ToList();
+
+    private static BacktestResult BuildPassingBacktestResult()
+    {
+        var trades = Enumerable.Range(0, 20).Select(i => new BacktestTrade
+        {
+            PnL = i % 3 == 0 ? -25m : 80m,
+            EntryTime = DateTime.UtcNow.AddHours(-40 + i * 2),
+            ExitTime = DateTime.UtcNow.AddHours(-39 + i * 2),
+        }).ToList();
+
+        return new BacktestResult
+        {
+            TotalTrades = trades.Count,
+            WinningTrades = 13,
+            LosingTrades = 7,
+            WinRate = 0.65m,
+            ProfitFactor = 1.8m,
+            SharpeRatio = 1.2m,
+            MaxDrawdownPct = 0.12m,
+            Trades = trades,
+            InitialBalance = 10_000m,
+            FinalBalance = 11_200m,
+        };
+    }
+
+    private sealed class SequencedBacktestEngine : IBacktestEngine
+    {
+        private readonly Queue<BacktestResult> _results;
+        private readonly int? _timeoutOnCall;
+        private int _callCount;
+
+        public SequencedBacktestEngine(IEnumerable<BacktestResult> results, int? timeoutOnCall = null)
+        {
+            _results = new Queue<BacktestResult>(results);
+            _timeoutOnCall = timeoutOnCall;
+        }
+
+        public Task<BacktestResult> RunAsync(
+            Strategy strategy,
+            IReadOnlyList<Candle> candles,
+            decimal initialBalance,
+            CancellationToken ct,
+            BacktestOptions? options = null)
+        {
+            _callCount++;
+            if (_timeoutOnCall == _callCount)
+                throw new OperationCanceledException("synthetic timeout");
+
+            if (_results.Count == 0)
+                throw new InvalidOperationException("No more synthetic backtest results were configured.");
+
+            return Task.FromResult(_results.Dequeue());
+        }
     }
 }

@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text.Json;
 using MediatR;
 using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Diagnostics;
@@ -38,6 +39,8 @@ internal sealed class StrategyGenerationCycleRunner : IStrategyGenerationCycleRu
     private readonly IStrategyGenerationCycleRunStore _cycleRunStore;
     private readonly IStrategyGenerationFailureStore _failureStore;
     private readonly IStrategyGenerationCheckpointStore _checkpointStore;
+    private readonly IStrategyGenerationCheckpointCoordinator _checkpointCoordinator;
+    private readonly IStrategyGenerationHealthStore _healthStore;
 
     public StrategyGenerationCycleRunner(
         ILogger<StrategyGenerationWorker> logger,
@@ -56,6 +59,8 @@ internal sealed class StrategyGenerationCycleRunner : IStrategyGenerationCycleRu
         IStrategyGenerationCycleRunStore cycleRunStore,
         IStrategyGenerationFailureStore failureStore,
         IStrategyGenerationCheckpointStore checkpointStore,
+        IStrategyGenerationCheckpointCoordinator checkpointCoordinator,
+        IStrategyGenerationHealthStore healthStore,
         TimeProvider timeProvider)
     {
         _logger = logger;
@@ -74,6 +79,8 @@ internal sealed class StrategyGenerationCycleRunner : IStrategyGenerationCycleRu
         _cycleRunStore = cycleRunStore;
         _failureStore = failureStore;
         _checkpointStore = checkpointStore;
+        _checkpointCoordinator = checkpointCoordinator;
+        _healthStore = healthStore;
         _timeProvider = timeProvider;
     }
 
@@ -123,12 +130,16 @@ internal sealed class StrategyGenerationCycleRunner : IStrategyGenerationCycleRu
                         unreportedFailures.Select(f => f.Id).ToArray(),
                         ct);
                     await writeCtx.SaveChangesAsync(ct);
+                    _healthStore.RecordPhaseSuccess("failure_report_mark", 0, _timeProvider.GetUtcNow().UtcDateTime);
                 }
-                catch
+                catch (Exception ex)
                 {
-                    // Non-critical.
+                    _logger.LogWarning(ex, "StrategyGenerationWorker: failed to mark persistence failures as reported");
+                    _healthStore.RecordPhaseFailure("failure_report_mark", ex.Message, _timeProvider.GetUtcNow().UtcDateTime);
                 }
             }
+
+            await UpdateUnresolvedFailureCountAsync(db, ct);
 
             var velocityCutoff = nowUtc.AddDays(-7);
             var recentAutoCount = await _cycleDataService.CountRecentAutoCandidatesAsync(db, velocityCutoff, ct);
@@ -138,6 +149,22 @@ internal sealed class StrategyGenerationCycleRunner : IStrategyGenerationCycleRu
                     "StrategyGenerationWorker: velocity cap — {Count} candidates created in last 7 days (limit {Limit}), skipping cycle",
                     recentAutoCount,
                     config.MaxCandidatesPerWeek);
+                RecordSkip("velocity_cap");
+                await PublishCycleSummaryAsync(
+                    writeDb,
+                    writeCtx,
+                    cycleId,
+                    eventService,
+                    new StrategyGenerationCycleCompletedIntegrationEvent
+                    {
+                        DurationMs = sw.Elapsed.TotalMilliseconds,
+                        CircuitBreakerActive = false,
+                        ConsecutiveFailures = 0,
+                        Skipped = true,
+                        SkipReason = "velocity_cap",
+                        CompletedAtUtc = _timeProvider.GetUtcNow().UtcDateTime,
+                    },
+                    ct);
                 await CompleteCycleRunAsync(writeDb, writeCtx, cycleId, sw.Elapsed.TotalMilliseconds, 0, 0, 0, 0, 0, 0, 0, ct);
                 return;
             }
@@ -146,6 +173,22 @@ internal sealed class StrategyGenerationCycleRunner : IStrategyGenerationCycleRu
                 && _calendarPolicy.IsInBlackoutPeriod(config.BlackoutPeriods, config.BlackoutTimezone, nowUtc))
             {
                 _logger.LogInformation("StrategyGenerationWorker: seasonal blackout — skipping cycle");
+                RecordSkip("seasonal_blackout");
+                await PublishCycleSummaryAsync(
+                    writeDb,
+                    writeCtx,
+                    cycleId,
+                    eventService,
+                    new StrategyGenerationCycleCompletedIntegrationEvent
+                    {
+                        DurationMs = sw.Elapsed.TotalMilliseconds,
+                        CircuitBreakerActive = false,
+                        ConsecutiveFailures = 0,
+                        Skipped = true,
+                        SkipReason = "seasonal_blackout",
+                        CompletedAtUtc = _timeProvider.GetUtcNow().UtcDateTime,
+                    },
+                    ct);
                 await CompleteCycleRunAsync(writeDb, writeCtx, cycleId, sw.Elapsed.TotalMilliseconds, 0, 0, 0, 0, 0, 0, 0, ct);
                 return;
             }
@@ -153,6 +196,22 @@ internal sealed class StrategyGenerationCycleRunner : IStrategyGenerationCycleRu
             if (config.SuppressDuringDrawdownRecovery && await _cycleDataService.IsInDrawdownRecoveryAsync(db, ct))
             {
                 _logger.LogInformation("StrategyGenerationWorker: drawdown recovery — skipping cycle");
+                RecordSkip("drawdown_recovery");
+                await PublishCycleSummaryAsync(
+                    writeDb,
+                    writeCtx,
+                    cycleId,
+                    eventService,
+                    new StrategyGenerationCycleCompletedIntegrationEvent
+                    {
+                        DurationMs = sw.Elapsed.TotalMilliseconds,
+                        CircuitBreakerActive = false,
+                        ConsecutiveFailures = 0,
+                        Skipped = true,
+                        SkipReason = "drawdown_recovery",
+                        CompletedAtUtc = _timeProvider.GetUtcNow().UtcDateTime,
+                    },
+                    ct);
                 await CompleteCycleRunAsync(writeDb, writeCtx, cycleId, sw.Elapsed.TotalMilliseconds, 0, 0, 0, 0, 0, 0, 0, ct);
                 return;
             }
@@ -164,6 +223,22 @@ internal sealed class StrategyGenerationCycleRunner : IStrategyGenerationCycleRu
             if (activePairs.Count == 0)
             {
                 _logger.LogInformation("StrategyGenerationWorker: no active currency pairs — skipping");
+                RecordSkip("no_active_pairs");
+                await PublishCycleSummaryAsync(
+                    writeDb,
+                    writeCtx,
+                    cycleId,
+                    eventService,
+                    new StrategyGenerationCycleCompletedIntegrationEvent
+                    {
+                        DurationMs = sw.Elapsed.TotalMilliseconds,
+                        CircuitBreakerActive = false,
+                        ConsecutiveFailures = 0,
+                        Skipped = true,
+                        SkipReason = "no_active_pairs",
+                        CompletedAtUtc = _timeProvider.GetUtcNow().UtcDateTime,
+                    },
+                    ct);
                 await CompleteCycleRunAsync(writeDb, writeCtx, cycleId, sw.Elapsed.TotalMilliseconds, 0, 0, 0, 0, 0, 0, 0, ct);
                 return;
             }
@@ -175,6 +250,22 @@ internal sealed class StrategyGenerationCycleRunner : IStrategyGenerationCycleRu
             {
                 _logger.LogInformation("StrategyGenerationWorker: weekend — skipping cycle (non-crypto markets closed)");
                 _metrics.StrategyGenWeekendSkipped.Add(1);
+                RecordSkip("weekend");
+                await PublishCycleSummaryAsync(
+                    writeDb,
+                    writeCtx,
+                    cycleId,
+                    eventService,
+                    new StrategyGenerationCycleCompletedIntegrationEvent
+                    {
+                        DurationMs = sw.Elapsed.TotalMilliseconds,
+                        CircuitBreakerActive = false,
+                        ConsecutiveFailures = 0,
+                        Skipped = true,
+                        SkipReason = "weekend",
+                        CompletedAtUtc = _timeProvider.GetUtcNow().UtcDateTime,
+                    },
+                    ct);
                 await CompleteCycleRunAsync(writeDb, writeCtx, cycleId, sw.Elapsed.TotalMilliseconds, 0, 0, 0, 0, 0, 0, 0, ct);
                 return;
             }
@@ -206,10 +297,12 @@ internal sealed class StrategyGenerationCycleRunner : IStrategyGenerationCycleRu
                     writeDb,
                     StrategyGenerationFeedbackCoordinator.AggregateFeedbackRatesForMapper(feedbackRates),
                     ct);
+                _healthStore.RecordPhaseSuccess("feedback_decay_record", 0, _timeProvider.GetUtcNow().UtcDateTime);
             }
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "StrategyGenerationWorker: feedback decay — failed to record predictions");
+                _healthStore.RecordPhaseFailure("feedback_decay_record", ex.Message, _timeProvider.GetUtcNow().UtcDateTime);
             }
 
             var adaptiveAdjustmentsByContext = config.AdaptiveThresholdsEnabled
@@ -231,6 +324,7 @@ internal sealed class StrategyGenerationCycleRunner : IStrategyGenerationCycleRu
                 catch (Exception ex)
                 {
                     _logger.LogDebug(ex, "StrategyGenerationWorker: live benchmark haircut load failed");
+                    _healthStore.RecordPhaseFailure("haircut_cache_load", ex.Message, _timeProvider.GetUtcNow().UtcDateTime);
                 }
             }
 
@@ -245,6 +339,7 @@ internal sealed class StrategyGenerationCycleRunner : IStrategyGenerationCycleRu
                     catch (Exception ex)
                     {
                         _logger.LogDebug(ex, "StrategyGenerationWorker: bootstrapped haircut failed");
+                        _healthStore.RecordPhaseFailure("haircut_bootstrap_load", ex.Message, _timeProvider.GetUtcNow().UtcDateTime);
                     }
                 }
             }
@@ -259,6 +354,7 @@ internal sealed class StrategyGenerationCycleRunner : IStrategyGenerationCycleRu
                 catch (Exception ex)
                 {
                     _logger.LogDebug(ex, "StrategyGenerationWorker: portfolio equity curve load failed");
+                    _healthStore.RecordPhaseFailure("portfolio_equity_curve_load", ex.Message, _timeProvider.GetUtcNow().UtcDateTime);
                 }
             }
 
@@ -296,6 +392,8 @@ internal sealed class StrategyGenerationCycleRunner : IStrategyGenerationCycleRu
                 PortfolioEquityCurve = portfolioEquityCurve,
                 SpreadProfileProvider = spreadProfileProvider,
             };
+
+            await TryAttachCycleFingerprintAsync(writeDb, writeCtx, cycleId, screeningContext, ct);
 
             var screeningResult = await _screeningCoordinator.ScreenAllCandidatesAsync(db, writeCtx, screeningContext, ct);
             var pendingCandidates = screeningResult.Candidates;
@@ -365,9 +463,12 @@ internal sealed class StrategyGenerationCycleRunner : IStrategyGenerationCycleRu
                     prunedDelta);
             }
 
-            try
-            {
-                await eventService.SaveAndPublish(writeCtx, new StrategyGenerationCycleCompletedIntegrationEvent
+            await PublishCycleSummaryAsync(
+                writeDb,
+                writeCtx,
+                cycleId,
+                eventService,
+                new StrategyGenerationCycleCompletedIntegrationEvent
                 {
                     SymbolsProcessed = screeningResult.SymbolsProcessed,
                     CandidatesCreated = persisted,
@@ -379,31 +480,51 @@ internal sealed class StrategyGenerationCycleRunner : IStrategyGenerationCycleRu
                     DurationMs = sw.Elapsed.TotalMilliseconds,
                     CircuitBreakerActive = false,
                     ConsecutiveFailures = 0,
-                });
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "StrategyGenerationWorker: cycle summary event publish failed");
-            }
+                    Skipped = false,
+                    CompletedAtUtc = _timeProvider.GetUtcNow().UtcDateTime,
+                },
+                ct);
 
             try
             {
                 await _feedbackDecayMonitor.EvaluateAndAdjustAsync(db, writeDb, ct);
+                _healthStore.RecordPhaseSuccess("feedback_decay_evaluate", 0, _timeProvider.GetUtcNow().UtcDateTime);
             }
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "StrategyGenerationWorker: feedback decay evaluation failed");
+                _healthStore.RecordPhaseFailure("feedback_decay_evaluate", ex.Message, _timeProvider.GetUtcNow().UtcDateTime);
             }
 
             try
             {
                 await _checkpointStore.ClearCheckpointAsync(writeDb, ct);
                 await writeCtx.SaveChangesAsync(ct);
+                var clearNowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+                _healthStore.UpdateState(state => state with
+                {
+                    LastCheckpointClearedAtUtc = clearNowUtc,
+                    LastCheckpointClearFailureAtUtc = null,
+                    LastCheckpointClearFailureMessage = null,
+                    CapturedAtUtc = clearNowUtc,
+                });
+                _healthStore.RecordPhaseSuccess("checkpoint_clear", 0, clearNowUtc);
             }
-            catch
+            catch (Exception ex)
             {
-                // Non-critical.
+                var clearNowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+                _logger.LogWarning(ex, "StrategyGenerationWorker: failed to clear checkpoint state");
+                _healthStore.UpdateState(state => state with
+                {
+                    CheckpointClearFailures = state.CheckpointClearFailures + 1,
+                    LastCheckpointClearFailureAtUtc = clearNowUtc,
+                    LastCheckpointClearFailureMessage = TruncateMessage(ex.Message),
+                    CapturedAtUtc = clearNowUtc,
+                });
+                _healthStore.RecordPhaseFailure("checkpoint_clear", ex.Message, clearNowUtc);
             }
+
+            ClearSkipReason();
 
             await CompleteCycleRunAsync(
                 writeDb,
@@ -425,10 +546,12 @@ internal sealed class StrategyGenerationCycleRunner : IStrategyGenerationCycleRu
             {
                 await _cycleRunStore.FailAsync(writeDb, cycleId, "cycle_execution", ex.Message, ct);
                 await writeCtx.SaveChangesAsync(ct);
+                _healthStore.RecordPhaseSuccess("cycle_run_fail", 0, _timeProvider.GetUtcNow().UtcDateTime);
             }
-            catch
+            catch (Exception failEx)
             {
-                // Best effort.
+                _logger.LogWarning(failEx, "StrategyGenerationWorker: failed to persist cycle failure state");
+                _healthStore.RecordPhaseFailure("cycle_run_fail", failEx.Message, _timeProvider.GetUtcNow().UtcDateTime);
             }
 
             throw;
@@ -441,14 +564,20 @@ internal sealed class StrategyGenerationCycleRunner : IStrategyGenerationCycleRu
         string cycleId,
         CancellationToken ct)
     {
+        var startedAt = Stopwatch.GetTimestamp();
         try
         {
             await _cycleRunStore.StartAsync(writeDb, cycleId, null, ct);
             await writeCtx.SaveChangesAsync(ct);
+            _healthStore.RecordPhaseSuccess(
+                "cycle_run_start",
+                (long)Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds,
+                _timeProvider.GetUtcNow().UtcDateTime);
         }
-        catch
+        catch (Exception ex)
         {
-            // Best effort.
+            _logger.LogWarning(ex, "StrategyGenerationWorker: failed to start cycle-run tracking for {CycleId}", cycleId);
+            _healthStore.RecordPhaseFailure("cycle_run_start", ex.Message, _timeProvider.GetUtcNow().UtcDateTime);
         }
     }
 
@@ -466,6 +595,7 @@ internal sealed class StrategyGenerationCycleRunner : IStrategyGenerationCycleRu
         int portfolioFilterRemoved,
         CancellationToken ct)
     {
+        var startedAt = Stopwatch.GetTimestamp();
         try
         {
             await _cycleRunStore.CompleteAsync(
@@ -482,11 +612,163 @@ internal sealed class StrategyGenerationCycleRunner : IStrategyGenerationCycleRu
                     portfolioFilterRemoved),
                 ct);
             await writeCtx.SaveChangesAsync(ct);
+            _healthStore.RecordPhaseSuccess(
+                "cycle_run_complete",
+                (long)Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds,
+                _timeProvider.GetUtcNow().UtcDateTime);
         }
-        catch
+        catch (Exception ex)
         {
-            // Best effort.
+            _logger.LogWarning(ex, "StrategyGenerationWorker: failed to complete cycle-run tracking for {CycleId}", cycleId);
+            _healthStore.RecordPhaseFailure("cycle_run_complete", ex.Message, _timeProvider.GetUtcNow().UtcDateTime);
         }
     }
+
+    private async Task TryAttachCycleFingerprintAsync(
+        DbContext writeDb,
+        IWriteApplicationDbContext writeCtx,
+        string cycleId,
+        StrategyGenerationScreeningContext screeningContext,
+        CancellationToken ct)
+    {
+        var startedAt = Stopwatch.GetTimestamp();
+        try
+        {
+            string fingerprint = _checkpointCoordinator.ComputeFingerprint(screeningContext);
+            await _cycleRunStore.AttachFingerprintAsync(writeDb, cycleId, fingerprint, ct);
+            await writeCtx.SaveChangesAsync(ct);
+            _healthStore.RecordPhaseSuccess(
+                "cycle_fingerprint_attach",
+                (long)Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds,
+                _timeProvider.GetUtcNow().UtcDateTime);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "StrategyGenerationWorker: failed to attach cycle fingerprint for {CycleId}", cycleId);
+            _healthStore.RecordPhaseFailure("cycle_fingerprint_attach", ex.Message, _timeProvider.GetUtcNow().UtcDateTime);
+        }
+    }
+
+    private async Task PublishCycleSummaryAsync(
+        DbContext writeDb,
+        IWriteApplicationDbContext writeCtx,
+        string cycleId,
+        IIntegrationEventService eventService,
+        StrategyGenerationCycleCompletedIntegrationEvent evt,
+        CancellationToken ct)
+    {
+        var startedAt = Stopwatch.GetTimestamp();
+        string payloadJson = JsonSerializer.Serialize(evt);
+        var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+        try
+        {
+            await _cycleRunStore.StageSummaryDispatchSuccessAsync(
+                writeDb,
+                cycleId,
+                evt.Id,
+                payloadJson,
+                nowUtc,
+                ct);
+            await eventService.SaveAndPublish(writeCtx, evt);
+            _healthStore.UpdateState(state => state with
+            {
+                LastSummaryPublishedAtUtc = nowUtc,
+                LastSummaryPublishFailureAtUtc = null,
+                LastSummaryPublishFailureMessage = null,
+                CapturedAtUtc = nowUtc,
+            });
+            _healthStore.RecordPhaseSuccess(
+                "cycle_summary_publish",
+                (long)Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds,
+                nowUtc);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "StrategyGenerationWorker: cycle summary event publish failed");
+            await TryRecordCycleSummaryFailureAsync(writeDb, writeCtx, cycleId, evt.Id, payloadJson, ex, nowUtc, ct);
+            _healthStore.UpdateState(state => state with
+            {
+                SummaryPublishFailures = state.SummaryPublishFailures + 1,
+                LastSummaryPublishFailureAtUtc = nowUtc,
+                LastSummaryPublishFailureMessage = TruncateMessage(ex.Message),
+                CapturedAtUtc = nowUtc,
+            });
+            _healthStore.RecordPhaseFailure("cycle_summary_publish", ex.Message, nowUtc);
+        }
+    }
+
+    private async Task TryRecordCycleSummaryFailureAsync(
+        DbContext writeDb,
+        IWriteApplicationDbContext writeCtx,
+        string cycleId,
+        Guid eventId,
+        string payloadJson,
+        Exception failure,
+        DateTime failedAtUtc,
+        CancellationToken ct)
+    {
+        try
+        {
+            await _cycleRunStore.RecordSummaryDispatchFailureAsync(
+                writeDb,
+                cycleId,
+                eventId,
+                payloadJson,
+                failure.Message,
+                failedAtUtc,
+                ct);
+            await writeCtx.SaveChangesAsync(ct);
+        }
+        catch (Exception recordEx)
+        {
+            _logger.LogWarning(recordEx, "StrategyGenerationWorker: failed to persist cycle summary dispatch failure state");
+            _healthStore.RecordPhaseFailure("cycle_summary_failure_record", recordEx.Message, _timeProvider.GetUtcNow().UtcDateTime);
+        }
+    }
+
+    private async Task UpdateUnresolvedFailureCountAsync(DbContext db, CancellationToken ct)
+    {
+        try
+        {
+            int unresolvedFailures = await db.Set<StrategyGenerationFailure>()
+                .AsNoTracking()
+                .CountAsync(f => !f.IsDeleted && f.ResolvedAtUtc == null, ct);
+            var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+            _healthStore.UpdateState(state => state with
+            {
+                UnresolvedFailures = unresolvedFailures,
+                CapturedAtUtc = nowUtc,
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "StrategyGenerationWorker: failed to update unresolved failure health snapshot");
+            _healthStore.RecordPhaseFailure("unresolved_failure_count", ex.Message, _timeProvider.GetUtcNow().UtcDateTime);
+        }
+    }
+
+    private void RecordSkip(string reason)
+    {
+        var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+        _healthStore.UpdateState(state => state with
+        {
+            LastSkipReason = reason,
+            LastSkippedAtUtc = nowUtc,
+            CapturedAtUtc = nowUtc,
+        });
+    }
+
+    private void ClearSkipReason()
+    {
+        var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+        _healthStore.UpdateState(state => state with
+        {
+            LastSkipReason = null,
+            CapturedAtUtc = nowUtc,
+        });
+    }
+
+    private static string TruncateMessage(string message)
+        => message.Length <= 500 ? message : message[..500];
 
 }

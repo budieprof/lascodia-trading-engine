@@ -26,7 +26,7 @@ public sealed class TcnInferenceEngine : IModelInferenceEngine
     public bool CanHandle(ModelSnapshot snapshot) =>
         snapshot.Type == "TCN"
         && !string.IsNullOrEmpty(snapshot.ConvWeightsJson)
-        && string.Compare(snapshot.Version, "5.0", StringComparison.Ordinal) >= 0;
+        && IsSupportedVersion(snapshot.Version);
 
     public InferenceResult? RunInference(
         float[] features, int featureCount, ModelSnapshot snapshot,
@@ -37,7 +37,7 @@ public sealed class TcnInferenceEngine : IModelInferenceEngine
         if (tcnResult is null)
             return null;
 
-        var (rawProb, tcnSnap, seqStd) = tcnResult.Value;
+        var (rawProb, magnitude, tcnSnap, seqStd, modelSpaceValues) = tcnResult.Value;
         double ensembleStd = 0.0;
 
         decimal? mcMean = null, mcVar = null;
@@ -49,14 +49,14 @@ public sealed class TcnInferenceEngine : IModelInferenceEngine
                 ensembleStd = Math.Sqrt((double)mcVar.Value);
         }
 
-        return new InferenceResult(rawProb, ensembleStd, mcMean, mcVar);
+        return new InferenceResult(rawProb, ensembleStd, mcMean, mcVar, magnitude, modelSpaceValues);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
     // TCN forward pass
     // ═══════════════════════════════════════════════════════════════════════════
 
-    internal static (double Probability, TcnModelTrainer.TcnSnapshotWeights TcnSnap, float[][] SeqStd)?
+    internal static (double Probability, double Magnitude, TcnModelTrainer.TcnSnapshotWeights TcnSnap, float[][] SeqStd, double[] ModelSpaceValues)?
         RunTcnForwardPass(ModelSnapshot snap, List<Candle> candleWindow)
     {
         var tcnSnap = JsonSerializer.Deserialize<TcnModelTrainer.TcnSnapshotWeights>(
@@ -69,10 +69,12 @@ public sealed class TcnInferenceEngine : IModelInferenceEngine
         var seqStd = snap.SeqMeans.Length > 0 && snap.SeqStds.Length > 0
             ? MLFeatureHelper.StandardizeSequence(seqRaw, snap.SeqMeans, snap.SeqStds)
             : seqRaw;
+        seqStd = ApplySequenceChannelMask(seqStd, snap.TcnActiveChannelMask);
 
         int channelIn = tcnSnap.ChannelIn > 0 ? tcnSnap.ChannelIn : seqStd[0].Length;
         int numBlocks = tcnSnap.ConvW.Length;
         int filters = tcnSnap.Filters > 0 ? tcnSnap.Filters : 32;
+        var convB = NormalizeConvBiases(tcnSnap.ConvB, numBlocks, filters);
         var blockInC = new int[numBlocks];
         for (int b = 0; b < numBlocks; b++) blockInC[b] = b == 0 ? channelIn : filters;
 
@@ -87,18 +89,29 @@ public sealed class TcnInferenceEngine : IModelInferenceEngine
 
         double[] h = useAttn
             ? TcnModelTrainer.CausalConvForwardWithAttention(
-                seqStd, tcnSnap.ConvW, tcnSnap.ConvB, resW, blockInC,
+                seqStd, tcnSnap.ConvW, convB, resW, blockInC,
                 filters, numBlocks, dilations,
                 tcnSnap.UseLayerNorm, tcnSnap.LayerNormGamma, tcnSnap.LayerNormBeta, activation,
                 tcnSnap.AttnQueryW!, tcnSnap.AttnKeyW!, tcnSnap.AttnValueW!,
                 tcnSnap.AttentionHeads > 0 ? tcnSnap.AttentionHeads : 1)
             : TcnModelTrainer.CausalConvForwardFull(
-                seqStd, tcnSnap.ConvW, tcnSnap.ConvB, resW, blockInC,
+                seqStd, tcnSnap.ConvW, convB, resW, blockInC,
                 filters, numBlocks, dilations,
                 tcnSnap.UseLayerNorm, tcnSnap.LayerNormGamma, tcnSnap.LayerNormBeta, activation);
 
         double prob = TcnHeadProbability(h, tcnSnap.HeadW, tcnSnap.HeadB, filters);
-        return (prob, tcnSnap, seqStd);
+        double magnitude = tcnSnap.MagHeadB ?? 0.0;
+        if (tcnSnap.MagHeadW is { Length: > 0 })
+        {
+            for (int fi = 0; fi < filters && fi < h.Length && fi < tcnSnap.MagHeadW.Length; fi++)
+                magnitude += tcnSnap.MagHeadW[fi] * h[fi];
+        }
+
+        double[] modelSpaceValues = seqStd.Length > 0
+            ? Array.ConvertAll(seqStd[^1], static v => (double)v)
+            : [];
+
+        return (prob, magnitude, tcnSnap, seqStd, modelSpaceValues);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -133,6 +146,7 @@ public sealed class TcnInferenceEngine : IModelInferenceEngine
         int channelIn = tcnSnap.ChannelIn > 0 ? tcnSnap.ChannelIn : seqStd[0].Length;
         int numBlocks = tcnSnap.ConvW!.Length;
         int filters = tcnSnap.Filters > 0 ? tcnSnap.Filters : 32;
+        var convB = NormalizeConvBiases(tcnSnap.ConvB, numBlocks, filters);
         var blockInC = new int[numBlocks];
         for (int b = 0; b < numBlocks; b++) blockInC[b] = b == 0 ? channelIn : filters;
         var resW = tcnSnap.ResW ?? new double[]?[numBlocks];
@@ -158,13 +172,13 @@ public sealed class TcnInferenceEngine : IModelInferenceEngine
 
             double[] h = useAttn
                 ? TcnModelTrainer.CausalConvForwardWithAttention(
-                    maskedSeq, tcnSnap.ConvW, tcnSnap.ConvB, resW, blockInC,
+                    maskedSeq, tcnSnap.ConvW, convB, resW, blockInC,
                     filters, numBlocks, dilations,
                     tcnSnap.UseLayerNorm, tcnSnap.LayerNormGamma, tcnSnap.LayerNormBeta, activation,
                     tcnSnap.AttnQueryW!, tcnSnap.AttnKeyW!, tcnSnap.AttnValueW!,
                     tcnSnap.AttentionHeads > 0 ? tcnSnap.AttentionHeads : 1)
                 : TcnModelTrainer.CausalConvForwardFull(
-                    maskedSeq, tcnSnap.ConvW, tcnSnap.ConvB, resW, blockInC,
+                    maskedSeq, tcnSnap.ConvW, convB, resW, blockInC,
                     filters, numBlocks, dilations,
                     tcnSnap.UseLayerNorm, tcnSnap.LayerNormGamma, tcnSnap.LayerNormBeta, activation);
 
@@ -181,5 +195,61 @@ public sealed class TcnInferenceEngine : IModelInferenceEngine
         variance /= numSamples > 1 ? numSamples - 1 : 1;
 
         return ((decimal)mean, (decimal)variance);
+    }
+
+    private static bool IsSupportedVersion(string versionString)
+    {
+        if (!Version.TryParse(versionString, out var version))
+            return false;
+
+        return version >= new Version(5, 0);
+    }
+
+    private static float[][] ApplySequenceChannelMask(float[][] seq, bool[]? channelMask)
+    {
+        if (seq.Length == 0 || channelMask is not { Length: > 0 } || !channelMask.Any(active => !active))
+            return seq;
+
+        var masked = new float[seq.Length][];
+        for (int t = 0; t < seq.Length; t++)
+        {
+            masked[t] = (float[])seq[t].Clone();
+            for (int c = 0; c < masked[t].Length && c < channelMask.Length; c++)
+            {
+                if (!channelMask[c])
+                    masked[t][c] = 0f;
+            }
+        }
+
+        return masked;
+    }
+
+    private static double[][] NormalizeConvBiases(double[][]? convB, int numBlocks, int filters)
+    {
+        if (convB is { Length: > 0 })
+        {
+            var normalized = new double[numBlocks][];
+            for (int b = 0; b < numBlocks; b++)
+            {
+                if (b < convB.Length && convB[b] is { Length: > 0 } existing)
+                {
+                    normalized[b] = existing.Length == filters
+                        ? existing
+                        : existing.Take(filters).Concat(new double[Math.Max(0, filters - existing.Length)]).ToArray();
+                }
+                else
+                {
+                    normalized[b] = new double[filters];
+                }
+            }
+
+            return normalized;
+        }
+
+        var defaults = new double[numBlocks][];
+        for (int b = 0; b < numBlocks; b++)
+            defaults[b] = new double[filters];
+
+        return defaults;
     }
 }

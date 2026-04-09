@@ -53,8 +53,44 @@ public class BacktestRun : Entity<long>
     /// </summary>
     public string?  ErrorMessage   { get; set; }
 
-    /// <summary>UTC timestamp when this backtest was queued / the record was created.</summary>
+    /// <summary>Structured failure code for retry/recovery decisions. Null on success.</summary>
+    public ValidationFailureCode? FailureCode { get; set; }
+
+    /// <summary>Optional structured failure payload for diagnostics and dead-letter review.</summary>
+    public string? FailureDetailsJson { get; set; }
+
+    /// <summary>Human-readable source of this queued run (Manual, AutoRefresh, OptimizationFollowUp, etc.).</summary>
+    public ValidationQueueSource QueueSource { get; set; } = ValidationQueueSource.Manual;
+
+    /// <summary>UTC timestamp when this backtest row was originally created.</summary>
     public DateTime StartedAt      { get; set; } = DateTime.UtcNow;
+
+    /// <summary>UTC timestamp when this run most recently entered the queue, including retries/recovery.</summary>
+    public DateTime QueuedAt       { get; set; } = DateTime.UtcNow;
+
+    /// <summary>UTC timestamp when this queued run next becomes eligible for claiming.</summary>
+    public DateTime AvailableAt    { get; set; } = DateTime.UtcNow;
+
+    /// <summary>UTC timestamp when a worker claimed the run.</summary>
+    public DateTime? ClaimedAt     { get; set; }
+
+    /// <summary>Worker instance identifier that currently owns or last owned the run lease.</summary>
+    public string? ClaimedByWorkerId { get; set; }
+
+    /// <summary>UTC timestamp when execution actually began after preflight/loading.</summary>
+    public DateTime? ExecutionStartedAt { get; set; }
+
+    /// <summary>UTC timestamp when the current or most recent execution attempt started.</summary>
+    public DateTime? LastAttemptAt { get; set; }
+
+    /// <summary>UTC timestamp of the worker's latest heartbeat while holding this run.</summary>
+    public DateTime? LastHeartbeatAt { get; set; }
+
+    /// <summary>UTC lease expiration for the worker currently processing this run.</summary>
+    public DateTime? ExecutionLeaseExpiresAt { get; set; }
+
+    /// <summary>Unique ownership token for the current execution lease.</summary>
+    public Guid? ExecutionLeaseToken { get; set; }
 
     /// <summary>UTC timestamp when processing finished (succeeded or failed). Null while running.</summary>
     public DateTime? CompletedAt   { get; set; }
@@ -79,8 +115,37 @@ public class BacktestRun : Entity<long>
     /// </summary>
     public string?  ParametersSnapshotJson { get; set; }
 
+    /// <summary>
+    /// Serialized transaction-cost model resolved at queue time for deterministic replay.
+    /// </summary>
+    public string?  BacktestOptionsSnapshotJson { get; set; }
+
     /// <summary>Optional idempotency key for validation queue deduplication.</summary>
     public string?  ValidationQueueKey { get; set; }
+
+    /// <summary>Number of transient retry attempts already consumed for this run.</summary>
+    public int      RetryCount { get; set; }
+
+    /// <summary>Normalized summary metric mirrored from ResultJson for query/gating efficiency.</summary>
+    public int?     TotalTrades { get; set; }
+
+    /// <summary>Normalized summary metric mirrored from ResultJson for query/gating efficiency.</summary>
+    public decimal? WinRate { get; set; }
+
+    /// <summary>Normalized summary metric mirrored from ResultJson for query/gating efficiency.</summary>
+    public decimal? ProfitFactor { get; set; }
+
+    /// <summary>Normalized summary metric mirrored from ResultJson for query/gating efficiency.</summary>
+    public decimal? MaxDrawdownPct { get; set; }
+
+    /// <summary>Normalized summary metric mirrored from ResultJson for query/gating efficiency.</summary>
+    public decimal? SharpeRatio { get; set; }
+
+    /// <summary>Normalized summary metric mirrored from ResultJson for query/gating efficiency.</summary>
+    public decimal? FinalBalance { get; set; }
+
+    /// <summary>Normalized summary metric mirrored from ResultJson for query/gating efficiency.</summary>
+    public decimal? TotalReturn { get; set; }
 
     /// <summary>Soft-delete flag. Filtered out by the global EF Core query filter.</summary>
     public bool     IsDeleted      { get; set; }

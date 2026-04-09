@@ -41,7 +41,8 @@ public sealed partial class ElmModelTrainer
         var inverseGramDims  = new int[K];
 
         bool useSubsampling = hp.FeatureSampleRatio > 0.0 && hp.FeatureSampleRatio < 1.0;
-        var featureSubsets   = useSubsampling ? new int[K][] : null;
+        bool persistFeatureSubsets = useSubsampling || activeFeatureMask is not null;
+        var featureSubsets   = persistFeatureSubsets ? new int[K][] : null;
 
         int outerSeed = hp.ElmOuterSeed;
 

@@ -1,7 +1,10 @@
 using FluentValidation;
 using MediatR;
+using Microsoft.EntityFrameworkCore;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
+using LascodiaTradingEngine.Application.Backtesting;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.Backtesting.Commands.RunBacktest;
@@ -63,27 +66,49 @@ public class RunBacktestCommandValidator : AbstractValidator<RunBacktestCommand>
 public class RunBacktestCommandHandler : IRequestHandler<RunBacktestCommand, ResponseData<long>>
 {
     private readonly IWriteApplicationDbContext _context;
+    private readonly IValidationRunFactory _validationRunFactory;
 
-    public RunBacktestCommandHandler(IWriteApplicationDbContext context)
+    public RunBacktestCommandHandler(IWriteApplicationDbContext context, IValidationRunFactory validationRunFactory)
     {
         _context = context;
+        _validationRunFactory = validationRunFactory;
     }
 
     public async Task<ResponseData<long>> Handle(RunBacktestCommand request, CancellationToken cancellationToken)
     {
-        var entity = new Domain.Entities.BacktestRun
-        {
-            StrategyId     = request.StrategyId,
-            Symbol         = request.Symbol,
-            Timeframe      = Enum.Parse<Timeframe>(request.Timeframe, ignoreCase: true),
-            FromDate       = request.FromDate,
-            ToDate         = request.ToDate,
-            InitialBalance = request.InitialBalance,
-            Status         = RunStatus.Queued,
-            StartedAt      = DateTime.UtcNow
-        };
+        var db = _context.GetDbContext();
+        var strategy = await db.Set<Strategy>()
+            .FirstOrDefaultAsync(candidate => candidate.Id == request.StrategyId && !candidate.IsDeleted, cancellationToken);
 
-        await _context.GetDbContext()
+        if (strategy == null)
+            return ResponseData<long>.Init(0, false, "Strategy not found", "-14");
+
+        var timeframe = Enum.Parse<Timeframe>(request.Timeframe, ignoreCase: true);
+        string normalizedSymbol = request.Symbol.ToUpperInvariant();
+        if (!string.Equals(strategy.Symbol, normalizedSymbol, StringComparison.OrdinalIgnoreCase)
+            || strategy.Timeframe != timeframe)
+        {
+            return ResponseData<long>.Init(
+                0,
+                false,
+                $"Requested symbol/timeframe {normalizedSymbol}/{timeframe} does not match strategy {strategy.Symbol}/{strategy.Timeframe}",
+                "-409");
+        }
+
+        var entity = await _validationRunFactory.BuildBacktestRunAsync(
+            db,
+            new BacktestQueueRequest(
+                StrategyId: request.StrategyId,
+                Symbol: normalizedSymbol,
+                Timeframe: timeframe,
+                FromDate: request.FromDate,
+                ToDate: request.ToDate,
+                InitialBalance: request.InitialBalance,
+                QueueSource: ValidationRunQueueSources.Manual,
+                ParametersSnapshotJson: strategy.ParametersJson),
+            cancellationToken);
+
+        await db
             .Set<Domain.Entities.BacktestRun>()
             .AddAsync(entity, cancellationToken);
 

@@ -20,6 +20,7 @@ public sealed partial class ElmModelTrainer
         int featureCount, int hiddenSize, int[][]? featureSubsets,
         int[] learnerHiddenSizes, ElmActivation[] learnerActivations,
         double decisionThreshold,
+        int[]? topFeatureIndices = null,
         Func<float[], double>? calibratedProb = null,
         double[]? stackingWeights = null, double stackingBias = 0.0,
         double configLr = 0.0, int configMaxEpochs = 0, int configPatience = 0,
@@ -27,7 +28,7 @@ public sealed partial class ElmModelTrainer
     {
         if (calSet.Count < 10) return ([], 0.0);
 
-        int metaDim = 2 + Math.Min(5, featureCount);
+        int metaDim = 2 + Math.Min(5, topFeatureIndices?.Length ?? featureCount);
         double metaBaseLr = configLr > 0.0 ? configLr : 0.01;
         int maxPatience = configPatience > 0 ? configPatience : 25;
 
@@ -47,7 +48,7 @@ public sealed partial class ElmModelTrainer
                 featureCount, featureSubsets, learnerHiddenSizes, learnerActivations,
                 stackingWeights: stackingWeights, stackingBias: stackingBias));
 
-            metaXs[i] = BuildMetaLabelFeatureVector(calibP, ensStd, s.Features, featureCount);
+            metaXs[i] = BuildMetaLabelFeatureVector(calibP, ensStd, s.Features, featureCount, topFeatureIndices);
 
             targets[i] = (calibP >= decisionThreshold ? 1 : 0) == ToBinaryLabel(s.Direction) ? 1.0 : 0.0;
         }
@@ -84,6 +85,7 @@ public sealed partial class ElmModelTrainer
         int featureCount, int hiddenSize, int[][]? featureSubsets,
         int[] learnerHiddenSizes, ElmActivation[] learnerActivations,
         double decisionThreshold,
+        int[]? topFeatureIndices = null,
         Func<float[], double>? calibratedProb = null,
         double[]? stackingWeights = null, double stackingBias = 0.0,
         double configLr = 0.0, int configMaxEpochs = 0, int configPatience = 0,
@@ -107,7 +109,8 @@ public sealed partial class ElmModelTrainer
                 featureCount, featureSubsets, learnerHiddenSizes, learnerActivations,
                 stackingWeights: stackingWeights, stackingBias: stackingBias));
 
-            double mlScore = ComputeMetaLabelScore(calibP, ensStd, s.Features, featureCount, metaLabelWeights, metaLabelBias);
+            double mlScore = ComputeMetaLabelScoreWithTopFeatures(
+                calibP, ensStd, s.Features, featureCount, metaLabelWeights, metaLabelBias, topFeatureIndices);
 
             absXs[i] = [calibP, ensStd, mlScore];
             absTargets[i] = (calibP >= decisionThreshold ? 1 : 0) == ToBinaryLabel(s.Direction) ? 1.0 : 0.0;
@@ -155,7 +158,8 @@ public sealed partial class ElmModelTrainer
                     featureCount, featureSubsets, learnerHiddenSizes, learnerActivations,
                     stackingWeights: stackingWeights, stackingBias: stackingBias));
 
-                double mlScore = ComputeMetaLabelScore(calibP, ensStd, s.Features, featureCount, metaLabelWeights, metaLabelBias);
+                double mlScore = ComputeMetaLabelScoreWithTopFeatures(
+                    calibP, ensStd, s.Features, featureCount, metaLabelWeights, metaLabelBias, topFeatureIndices);
 
                 double absZ = ab + aw[0] * calibP + aw[1] * ensStd + aw[2] * mlScore;
                 if (MLFeatureHelper.Sigmoid(absZ) < threshold) continue;

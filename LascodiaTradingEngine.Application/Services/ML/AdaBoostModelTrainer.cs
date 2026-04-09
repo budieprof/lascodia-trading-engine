@@ -2,6 +2,7 @@ using System.Text.Json;
 using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.MLModels.Shared;
+using LascodiaTradingEngine.Application.Services.Inference;
 using LascodiaTradingEngine.Domain.Enums;
 using Microsoft.Extensions.Logging;
 using TorchSharp;
@@ -48,9 +49,10 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
     // ── Constants ────────────────────────────────────────────────────────────
 
     private const string ModelType    = "AdaBoost";
-    private const string ModelVersion = "2.0";
+    private const string ModelVersion = "2.1";
 
     private const double Eps = 1e-10;
+    private const double DefaultConditionalRoutingThreshold = 0.5;
 
     private static readonly JsonSerializerOptions JsonOptions =
         new() { WriteIndented = false, MaxDepth = 64 };
@@ -85,7 +87,24 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
     {
         ct.ThrowIfCancellationRequested();
 
+        if (samples.Count == 0)
+            throw new InvalidOperationException("AdaBoostModelTrainer requires at least one sample.");
+
+        if (samples[0].Features is null || samples[0].Features.Length == 0)
+            throw new InvalidOperationException("AdaBoostModelTrainer requires non-empty feature vectors.");
+
         int F = samples[0].Features.Length;
+        for (int i = 0; i < samples.Count; i++)
+        {
+            if (samples[i].Features is null)
+                throw new InvalidOperationException($"Sample {i} has a null feature vector.");
+            if (samples[i].Features.Length != F)
+                throw new InvalidOperationException(
+                    $"AdaBoostModelTrainer requires consistent feature counts; sample {i} has {samples[i].Features.Length}, expected {F}.");
+        }
+
+        string[] snapshotFeatureNames = AdaBoostSnapshotSupport.ResolveFeatureNames(F);
+        string featureSchemaFingerprint = AdaBoostSnapshotSupport.ComputeFeatureSchemaFingerprint(snapshotFeatureNames);
         int K = hp.K > 0 ? hp.K : 20;
 
         // ── 0. Incremental update fast-path ──────────────────────────────────
@@ -118,21 +137,31 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         _logger.LogInformation(
             "AdaBoostModelTrainer starting: {N} samples, F={F}, K={K}", samples.Count, F, K);
 
-        // ── 2. Z-score standardisation — fit scaler on training portion only ──────────────────
-        // Computing stats over ALL samples (including cal/test) is look-ahead bias: the scaler
-        // would observe future feature distributions before they are seen in time.  We approximate
-        // the training boundary (70 % of samples, without the embargo gap) to maximise the number
-        // of stat-fitting samples while still excluding holdout data.
-        int rawTrainLimit = Math.Max(1, (int)(samples.Count * 0.70));
-        var trainRawFeatures = new List<float[]>(rawTrainLimit);
-        for (int i = 0; i < rawTrainLimit; i++) trainRawFeatures.Add(samples[i].Features);
+        // ── 2. Final splits: 70 % train | 10 % cal | ~20 % test ─────────────
+        int trainEnd  = (int)(samples.Count * 0.70);
+        int calEnd    = (int)(samples.Count * 0.80);
+        int embargo   = hp.EmbargoBarCount;
+
+        int trainLimit = Math.Max(0, trainEnd - embargo);
+        int calStart   = Math.Min(trainEnd + embargo, calEnd);
+        int testStart  = Math.Min(calEnd   + embargo, samples.Count);
+
+        // ── 3. Z-score standardisation — fit scaler on the actual embargo-purged training slice ──
+        if (trainLimit == 0)
+            throw new InvalidOperationException("Insufficient training samples remain after the embargo split.");
+
+        var trainRawFeatures = new List<float[]>(trainLimit);
+        for (int i = 0; i < trainLimit; i++) trainRawFeatures.Add(samples[i].Features);
         var (means, stds) = MLFeatureHelper.ComputeStandardization(trainRawFeatures);
 
         var allStd = new List<TrainingSample>(samples.Count);
         foreach (var s in samples)
             allStd.Add(s with { Features = MLFeatureHelper.Standardize(s.Features, means, stds) });
 
-        // ── 3. Walk-forward cross-validation ─────────────────────────────────
+        string initialPreprocessingFingerprint = AdaBoostSnapshotSupport.ComputePreprocessingFingerprint(F, null);
+        string trainerFingerprint = AdaBoostSnapshotSupport.ComputeTrainerFingerprint(hp, F, K, hp.AdaBoostMaxTreeDepth >= 2 ? 2 : 1);
+
+        // ── 4. Walk-forward cross-validation ─────────────────────────────────
         // Pass raw (unstandardised) samples so each fold can fit its own scaler,
         // eliminating the look-ahead bias caused by a global scaler trained on data
         // that overlaps future CV test folds.
@@ -150,15 +179,6 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
 
         ct.ThrowIfCancellationRequested();
 
-        // ── 4. Final splits: 70 % train | 10 % cal | ~20 % test ─────────────
-        int trainEnd  = (int)(allStd.Count * 0.70);
-        int calEnd    = (int)(allStd.Count * 0.80);
-        int embargo   = hp.EmbargoBarCount;
-
-        int trainLimit = Math.Max(0, trainEnd - embargo);
-        int calStart   = Math.Min(trainEnd + embargo, calEnd);
-        int testStart  = Math.Min(calEnd   + embargo, allStd.Count);
-
         var trainSet = allStd[..trainLimit];
         var calSet   = calStart < calEnd        ? allStd[calStart..calEnd] : [];
         var testSet  = testStart < allStd.Count ? allStd[testStart..]     : [];
@@ -173,7 +193,7 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         // that could cause the model to overestimate OOS performance.
         if (testSet.Count >= 20 && trainSet.Count >= 20)
         {
-            double advAuc = ComputeAdversarialAuc(trainSet, testSet, F, _logger);
+            double advAuc = ComputeAdversarialAuc(trainSet, testSet, F, _logger, ct);
             _logger.LogInformation(
                 "Adversarial validation AUC={AUC:F3} (0.50=no shift, >0.65=significant shift)",
                 advAuc);
@@ -212,7 +232,7 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         double[]? densityWeights = null;
         if (hp.DensityRatioWindowDays > 0 && trainSet.Count >= 50)
         {
-            densityWeights = ComputeDensityRatioWeights(trainSet, F, hp.DensityRatioWindowDays);
+            densityWeights = ComputeDensityRatioWeights(trainSet, F, hp.DensityRatioWindowDays, hp.BarsPerDay, ct);
             _logger.LogDebug(
                 "Density-ratio weights computed (recentWindow≈{W}d of train).",
                 hp.DensityRatioWindowDays);
@@ -246,7 +266,7 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
 
         // ── 5. Warm-start: load existing stumps from parent snapshot ──────────
         int effectiveK    = K;
-        int generationNum = 1;
+        int generationNum = 0;
         var warmStumps    = new List<GbmTree>();
         var warmAlphas    = new List<double>();
 
@@ -256,8 +276,20 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         {
             try
             {
+                if (!AdaBoostSnapshotSupport.IsWarmStartCompatible(
+                    warmStart,
+                    snapshotFeatureNames,
+                    featureSchemaFingerprint,
+                    initialPreprocessingFingerprint,
+                    trainerFingerprint,
+                    F,
+                    out string incompatibilityReason))
+                {
+                    throw new InvalidOperationException(incompatibilityReason);
+                }
+
                 var loaded = JsonSerializer.Deserialize<List<GbmTree>>(warmStart.GbmTreesJson, JsonOptions);
-                if (loaded is { Count: > 0 } && warmStart.Weights[0].Length > 0)
+                if (loaded is { Count: > 0 } && warmStart.Weights[0].Length == loaded.Count)
                 {
                     warmStumps    = loaded;
                     warmAlphas    = warmStart.Weights[0].ToList();
@@ -268,6 +300,10 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
                     _logger.LogInformation(
                         "AdaBoost warm-start: loaded {N} stumps from parent (gen={Gen}); adding up to {New} residual rounds.",
                         warmStumps.Count, warmStart.GenerationNumber, effectiveK);
+                }
+                else
+                {
+                    throw new InvalidOperationException("Warm-start stump/alpha counts do not match.");
                 }
             }
             catch (Exception ex)
@@ -446,52 +482,65 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         var (plattA, plattB) = FitPlattScaling(calSet, stumps, alphas);
         _logger.LogDebug("Platt calibration: A={A:F4} B={B:F4}", plattA, plattB);
 
-        // ── 8b. Class-conditional Platt (Buy / Sell separate scalers) ─────────
+        // ── 8b. Temperature scaling selection ─────────────────────────────────
+        double temperatureScale = 0.0;
+        if (hp.FitTemperatureScale && calSet.Count >= 10)
+        {
+            double candidateTemperature = FitTemperatureScaling(calSet, stumps, alphas, ct);
+            double plattNll = ComputeCalibrationNll(calSet, stumps, alphas, plattA, plattB);
+            double tempNll  = ComputeCalibrationNll(calSet, stumps, alphas, plattA, plattB,
+                                                    candidateTemperature);
+            if (tempNll + 1e-6 < plattNll)
+                temperatureScale = candidateTemperature;
+
+            _logger.LogDebug(
+                "Global calibration selection: plattNll={Platt:F6} tempNll={Temp:F6} selectedTemperature={T:F4}",
+                plattNll, tempNll, temperatureScale);
+        }
+
+        // ── 8c. Class-conditional Platt (Buy / Sell separate scalers) ─────────
         var (plattABuy, plattBBuy, plattASell, plattBSell) =
-            FitClassConditionalPlatt(calSet, stumps, alphas);
+            FitClassConditionalPlatt(calSet, stumps, alphas, plattA, plattB, temperatureScale,
+                                     DefaultConditionalRoutingThreshold);
         _logger.LogDebug(
             "Class-conditional Platt — Buy: A={AB:F4} B={BB:F4}  Sell: A={AS:F4} B={BS:F4}",
             plattABuy, plattBBuy, plattASell, plattBSell);
 
-        // ── 8c. Average Kelly fraction on cal set ─────────────────────────────
-        double avgKellyFraction = ComputeAvgKellyFraction(calSet, stumps, alphas, plattA, plattB);
-        _logger.LogDebug("Average Kelly fraction (half-Kelly)={Kelly:F4}", avgKellyFraction);
-
         // ── 9. Isotonic calibration (PAVA) ────────────────────────────────────
-        double[] isotonicBp = FitIsotonicCalibration(calSet, stumps, alphas, plattA, plattB,
-                                                     plattABuy, plattBBuy, plattASell, plattBSell);
+        double[] isotonicBp = FitIsotonicCalibration(
+            calSet, stumps, alphas, plattA, plattB, temperatureScale,
+            plattABuy, plattBBuy, plattASell, plattBSell, DefaultConditionalRoutingThreshold);
         _logger.LogInformation("Isotonic calibration: {N} PAVA breakpoints", isotonicBp.Length / 2);
 
+        // ── 9b. Average Kelly fraction on calibrated cal set ──────────────────
+        double avgKellyFraction = ComputeAvgKellyFraction(
+            calSet, stumps, alphas, plattA, plattB, temperatureScale, isotonicBp,
+            plattABuy, plattBBuy, plattASell, plattBSell, DefaultConditionalRoutingThreshold);
+        _logger.LogDebug("Average Kelly fraction (half-Kelly)={Kelly:F4}", avgKellyFraction);
+
         // ── 10. ECE on held-out test set ──────────────────────────────────────
-        double ece = ComputeEce(testSet, stumps, alphas, plattA, plattB, isotonicBp,
+        double ece = ComputeEce(testSet, stumps, alphas, plattA, plattB, temperatureScale, isotonicBp,
                                 plattABuy: plattABuy, plattBBuy: plattBBuy,
-                                plattASell: plattASell, plattBSell: plattBSell);
+                                plattASell: plattASell, plattBSell: plattBSell,
+                                routingThreshold: DefaultConditionalRoutingThreshold);
         _logger.LogInformation("Post-Platt ECE={Ece:F4}", ece);
 
         // ── 11. EV-optimal threshold (tuned on cal set to avoid test-set leakage) ──
         double optimalThreshold = ComputeOptimalThreshold(
-            calSet, stumps, alphas, plattA, plattB, isotonicBp,
+            calSet, stumps, alphas, plattA, plattB, temperatureScale, isotonicBp,
             hp.ThresholdSearchMin, hp.ThresholdSearchMax,
-            plattABuy, plattBBuy, plattASell, plattBSell);
+            plattABuy, plattBBuy, plattASell, plattBSell, DefaultConditionalRoutingThreshold);
         _logger.LogInformation("EV-optimal threshold={Thr:F2} (default 0.50)", optimalThreshold);
 
-        // ── 11b. Temperature scaling ──────────────────────────────────────────
-        double temperatureScale = 0.0;
-        if (hp.FitTemperatureScale && calSet.Count >= 10)
-        {
-            temperatureScale = FitTemperatureScaling(calSet, stumps, alphas);
-            _logger.LogDebug("Temperature scaling: T={T:F4} (1.0=no correction)", temperatureScale);
-        }
-
         // ── 12. Magnitude linear regressor (Adam + Huber loss) ────────────────
-        var (magWeights, magBias) = FitLinearRegressor(trainSet, F, hp);
+        var (magWeights, magBias) = FitLinearRegressor(trainSet, F, hp, ct);
 
         // ── 12-pre. Quantile magnitude regressor (moved before pruning so pruning can re-fit) ──
         double[] magQ90Weights = [];
         double   magQ90Bias    = 0.0;
         if (hp.MagnitudeQuantileTau > 0.0 && trainSet.Count >= 10)
         {
-            (magQ90Weights, magQ90Bias) = FitQuantileRegressor(trainSet, F, hp.MagnitudeQuantileTau);
+            (magQ90Weights, magQ90Bias) = FitQuantileRegressor(trainSet, F, hp.MagnitudeQuantileTau, ct);
             _logger.LogDebug("Quantile regressor fitted (τ={Tau}).", hp.MagnitudeQuantileTau);
         }
 
@@ -521,17 +570,18 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
                 originalKelly, avgKellyFraction, durbinWatson, dwScaleFactor);
         }
 
-        // ── 13. Permutation feature importance on test set ────────────────────
-        float[] featureImportance = testSet.Count >= 10
-            ? ComputePermutationImportance(testSet, stumps, alphas, plattA, plattB, isotonicBp, F,
-                                           plattABuy, plattBBuy, plattASell, plattBSell)
+        // ── 13. Selection-set permutation importance on calibration set ───────
+        float[] selectionImportance = calSet.Count >= 10
+            ? ComputePermutationImportance(
+                calSet, stumps, alphas, plattA, plattB, temperatureScale, isotonicBp, F, optimalThreshold,
+                plattABuy, plattBBuy, plattASell, plattBSell, DefaultConditionalRoutingThreshold)
             : new float[F];
 
-        var topFeatures = featureImportance
+        var topFeatures = selectionImportance
             .Select((imp, idx) => (
                 Importance: imp,
-                Name:       idx < MLFeatureHelper.FeatureNames.Length
-                            ? MLFeatureHelper.FeatureNames[idx]
+                Name:       idx < snapshotFeatureNames.Length
+                            ? snapshotFeatureNames[idx]
                             : $"F{idx}"))
             .OrderByDescending(x => x.Importance)
             .Take(5);
@@ -539,16 +589,23 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
             string.Join(", ", topFeatures.Select(f => $"{f.Name}={f.Importance:P1}")));
 
         // ── 13b. Feature pruning re-train ─────────────────────────────────────
-        var activeMask  = BuildFeatureMask(featureImportance, hp.MinFeatureImportance, F);
+        var activeMask  = BuildFeatureMask(selectionImportance, hp.MinFeatureImportance, F);
         int prunedCount = activeMask.Count(m => !m);
 
-        if (prunedCount > 0 && F - prunedCount >= 10)
+        if (prunedCount > 0 && F - prunedCount < 10)
+        {
+            prunedCount = 0;
+            Array.Fill(activeMask, true);
+        }
+
+        if (prunedCount > 0)
         {
             var pruneResult = TrainPrunedModel(
                 trainSet, calSet, testSet, activeMask, stumps, alphas,
                 warmStumps, warmAlphas, replayWarmStartWeights, densityWeights,
                 magWeights, magBias, plattA, plattB, plattABuy, plattBBuy, plattASell, plattBSell,
-                isotonicBp, hp, F, effectiveK, shrinkage, sammeR, treeDepth, prunedCount, ct);
+                temperatureScale, isotonicBp, hp, F, effectiveK, shrinkage, sammeR, treeDepth,
+                optimalThreshold, prunedCount, ct);
 
             if (pruneResult is not null)
             {
@@ -561,6 +618,7 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
                 plattB       = pruneResult.Value.PlattB;
                 plattABuy    = pruneResult.Value.PlattABuy;    plattBBuy  = pruneResult.Value.PlattBBuy;
                 plattASell   = pruneResult.Value.PlattASell;   plattBSell = pruneResult.Value.PlattBSell;
+                trainSet     = pruneResult.Value.MaskedTrain;
                 isotonicBp   = pruneResult.Value.IsotonicBp;
                 calSet       = pruneResult.Value.MaskedCal;
                 testSet      = pruneResult.Value.MaskedTest;
@@ -586,25 +644,32 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         // ── 14. Split-conformal qHat ──────────────────────────────────────────
         double conformalAlpha = Math.Clamp(1.0 - hp.ConformalCoverage, 0.01, 0.50);
         double conformalQHat  = ComputeConformalQHat(
-            calSet, stumps, alphas, plattA, plattB, isotonicBp, conformalAlpha,
-            plattABuy, plattBBuy, plattASell, plattBSell);
+            calSet, stumps, alphas, plattA, plattB, temperatureScale, isotonicBp, conformalAlpha,
+            plattABuy, plattBBuy, plattASell, plattBSell, DefaultConditionalRoutingThreshold);
         _logger.LogInformation(
             "Conformal qHat={QHat:F4} ({Cov:P0} coverage)", conformalQHat, hp.ConformalCoverage);
 
-        // ── 15. Feature quantile breakpoints for PSI drift monitoring ──────────
+        // ── 15. Final-model feature importance and PSI baselines ──────────────
+        float[] featureImportance = calSet.Count >= 10
+            ? ComputePermutationImportance(
+                calSet, stumps, alphas, plattA, plattB, temperatureScale, isotonicBp, F, optimalThreshold,
+                plattABuy, plattBBuy, plattASell, plattBSell, DefaultConditionalRoutingThreshold)
+            : new float[F];
+        double[] featureImportanceScores = featureImportance.Select(static v => (double)v).ToArray();
+
         var trainFeatures = new List<float[]>(trainSet.Count);
         foreach (var s in trainSet) trainFeatures.Add(s.Features);
         var featureQuantileBp = MLFeatureHelper.ComputeFeatureQuantileBreakpoints(trainFeatures);
 
         // ── 16. Full evaluation on held-out test set ───────────────────────────
         var evalMetrics = EvaluateModel(
-            testSet, stumps, alphas, magWeights, magBias, plattA, plattB, isotonicBp,
-            plattABuy, plattBBuy, plattASell, plattBSell);
+            testSet, stumps, alphas, magWeights, magBias, plattA, plattB, temperatureScale, isotonicBp,
+            optimalThreshold, plattABuy, plattBBuy, plattASell, plattBSell, DefaultConditionalRoutingThreshold);
 
         // ── 17. Brier Skill Score ─────────────────────────────────────────────
         double brierSkillScore = ComputeBrierSkillScore(
-            testSet, stumps, alphas, plattA, plattB, isotonicBp,
-            plattABuy, plattBBuy, plattASell, plattBSell);
+            testSet, stumps, alphas, plattA, plattB, temperatureScale, isotonicBp,
+            plattABuy, plattBBuy, plattASell, plattBSell, DefaultConditionalRoutingThreshold);
         _logger.LogInformation(
             "Brier Skill Score (BSS)={BSS:F4} (>0 beats naive predictor)", brierSkillScore);
 
@@ -612,23 +677,25 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
             "AdaBoostModelTrainer complete: K={K} stumps, accuracy={Acc:P1}, Brier={B:F4}, Sharpe={Sharpe:F2}",
             stumps.Count, evalMetrics.Accuracy, evalMetrics.BrierScore, evalMetrics.SharpeRatio);
 
-        // ── 18a. Cal-set permutation importance ───────────────────────────────
-        var calPermImportance = calSet.Count >= 20
-            ? ComputeCalPermutationImportance(calSet, stumps, alphas, F)
-            : new double[F];
-        _logger.LogDebug("Cal-set permutation importance: {N} features scored.", calPermImportance.Length);
+        // ── 18a. Calibration-set permutation importance ───────────────────────
+        _logger.LogDebug("Cal-set permutation importance: {N} features scored.", featureImportanceScores.Length);
 
         // ── 18b. Meta-label model (correctness predictor on cal set) ──────────
         double sumAlphaFinal = 0.0;
         foreach (var a in alphas) sumAlphaFinal += a;
         var (metaLabelWeights, metaLabelBias) =
-            FitMetaLabelModel(calSet, stumps, alphas, sumAlphaFinal, F);
+            FitMetaLabelModel(
+                calSet, stumps, alphas, plattA, plattB, temperatureScale, isotonicBp,
+                optimalThreshold, F, plattABuy, plattBBuy, plattASell, plattBSell,
+                DefaultConditionalRoutingThreshold, ct);
         _logger.LogDebug("Meta-label model fitted ({Dim} meta-features).", metaLabelWeights.Length);
 
         // ── 18c. Abstention gate ──────────────────────────────────────────────
         var (abstentionWeights, abstentionBias, abstentionThreshold) =
-            FitAbstentionModel(calSet, stumps, alphas, plattA, plattB,
-                               metaLabelWeights, metaLabelBias, sumAlphaFinal, F);
+            FitAbstentionModel(
+                calSet, stumps, alphas, plattA, plattB, temperatureScale, isotonicBp,
+                metaLabelWeights, metaLabelBias, optimalThreshold, F,
+                plattABuy, plattBBuy, plattASell, plattBSell, DefaultConditionalRoutingThreshold, ct);
         _logger.LogDebug("Abstention gate fitted (threshold={Thr:F2}).", abstentionThreshold);
 
         // ── 18d. Quantile magnitude regressor — already fitted in step 12-pre;
@@ -670,7 +737,7 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         {
             Type                       = ModelType,
             Version                    = ModelVersion,
-            Features                   = MLFeatureHelper.FeatureNames,
+            Features                   = snapshotFeatureNames,
             Means                      = means,
             Stds                       = stds,
             BaseLearnersK              = stumps.Count,
@@ -695,13 +762,15 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
             TrainedOn                  = trainedAt,
             TrainedAtUtc               = trainedAt,
             FeatureImportance          = featureImportance,
-            FeatureImportanceScores    = calPermImportance,
+            FeatureImportanceScores    = featureImportanceScores,
             ActiveFeatureMask          = activeMask,
             PrunedFeatureCount         = prunedCount,
             OptimalThreshold           = optimalThreshold,
             Ece                        = ece,
             IsotonicBreakpoints        = isotonicBp,
             ConformalQHat              = conformalQHat,
+            ConformalQHatBuy           = conformalQHat,
+            ConformalQHatSell          = conformalQHat,
             ConformalCoverage          = hp.ConformalCoverage,
             FeatureQuantileBreakpoints = featureQuantileBp,
             ParentModelId              = parentModelId ?? 0,
@@ -716,6 +785,7 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
             MetaLabelWeights           = metaLabelWeights,
             MetaLabelBias              = metaLabelBias,
             MetaLabelThreshold         = 0.5,
+            MetaLabelTopFeatureIndices = [.. Enumerable.Range(0, Math.Min(5, F))],
             AbstentionWeights          = abstentionWeights,
             AbstentionBias             = abstentionBias,
             AbstentionThreshold        = abstentionThreshold,
@@ -725,6 +795,11 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
             DecisionBoundaryStd        = decisionBoundaryStd,
             RedundantFeaturePairs      = redundantFeaturePairs,
             JackknifeResiduals         = jackknifeResiduals,
+            TrainSamplesAtLastCalibration = trainSet.Count,
+            ConditionalCalibrationRoutingThreshold = DefaultConditionalRoutingThreshold,
+            FeatureSchemaFingerprint   = featureSchemaFingerprint,
+            PreprocessingFingerprint   = AdaBoostSnapshotSupport.ComputePreprocessingFingerprint(F, activeMask),
+            TrainerFingerprint         = AdaBoostSnapshotSupport.ComputeTrainerFingerprint(hp, F, stumps.Count, treeDepth),
             HyperparamsJson            = JsonSerializer.Serialize(hp, JsonOptions),
             GbmTreesJson               = JsonSerializer.Serialize(stumps, JsonOptions),
         };
@@ -918,7 +993,7 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
             // Evaluate fold (no Platt for speed)
             int    correct = 0, tp = 0, fp = 0, fn = 0, tn = 0;
             double brierSum = 0, evSum = 0;
-            var    foldPredictions = new (int Predicted, int Actual)[foldTest.Count];
+            var    foldReturns = new double[foldTest.Count];
 
             for (int pi = 0; pi < foldTest.Count; pi++)
             {
@@ -933,8 +1008,9 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
                 if (yHat == 0 && y == 1) fn++;
                 if (yHat == 0 && y == 0) tn++;
                 brierSum += (p - y) * (p - y);
-                evSum    += (yHat == y ? 1 : -1) * (double)s.Magnitude;
-                foldPredictions[pi] = (score >= 0 ? 1 : -1, s.Direction > 0 ? 1 : -1);
+                double realizedReturn = (yHat == y ? 1 : -1) * (double)s.Magnitude;
+                evSum += realizedReturn;
+                foldReturns[pi] = realizedReturn;
             }
 
             int    nFold = foldTest.Count;
@@ -946,7 +1022,7 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
             double ev    = evSum / nFold;
 
             // ── Equity-curve gate — proper return-series Sharpe ───────────────
-            var (foldMaxDD, foldCurveSharpe) = ComputeEquityCurveStats(foldPredictions);
+            var (foldMaxDD, foldCurveSharpe) = ComputeEquityCurveStats(foldReturns);
             double sharpe = foldCurveSharpe;
 
             bool isBadFold = false;
@@ -1184,7 +1260,7 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
                 // Parity +1: predict +1 when x ≤ thresh, −1 when x > thresh
                 // err1 = Σ w[i∈neg-left]  + Σ w[i∈pos-right]
                 double err1 = cumNegLeft + (totalPos - cumPosLeft);
-                double err2 = 1.0 - err1; // parity −1 has exactly complementary error
+                double err2 = cumPosLeft + (totalNeg - cumNegLeft);
 
                 if (err1 < bestErr) { bestErr = err1; bestFi = fi; bestThresh = thresh; bestParity =  1; }
                 if (err2 < bestErr) { bestErr = err2; bestFi = fi; bestThresh = thresh; bestParity = -1; }
@@ -1242,6 +1318,35 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         return score;
     }
 
+    private static double PredictRawProb(float[] features, List<GbmTree> stumps, List<double> alphas)
+        => Math.Clamp(MLFeatureHelper.Sigmoid(2 * PredictScore(features, stumps, alphas)), 1e-7, 1.0 - 1e-7);
+
+    private static double ComputeEnsembleStd(float[] features, List<GbmTree> stumps, List<double> alphas)
+    {
+        int count = Math.Min(stumps.Count, alphas.Count);
+        if (count <= 1)
+            return 0.0;
+
+        double score = 0.0;
+        var perStumpProbs = new double[count];
+        for (int k = 0; k < count; k++)
+        {
+            double stumpVal = PredictStump(stumps[k], features);
+            score += alphas[k] * stumpVal;
+            perStumpProbs[k] = MLFeatureHelper.Sigmoid(2 * alphas[k] * stumpVal);
+        }
+
+        double rawProb = Math.Clamp(MLFeatureHelper.Sigmoid(2 * score), 1e-7, 1.0 - 1e-7);
+        double variance = 0.0;
+        for (int k = 0; k < count; k++)
+        {
+            double diff = perStumpProbs[k] - rawProb;
+            variance += diff * diff;
+        }
+
+        return Math.Sqrt(variance / (count - 1));
+    }
+
     /// <summary>
     /// Traverses a base-learner tree of arbitrary depth and returns the leaf value.
     /// For SAMME stumps the leaf value is ±1; for SAMME.R it is ½·logit(p_leaf).
@@ -1266,9 +1371,8 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
 
     /// <summary>
     /// Full AdaBoost probability pipeline:
-    /// raw margin → sigmoid(2·score) → logit → Platt(A,B) → optional isotonic correction.
-    /// When class-conditional Platt params are supplied (non-NaN), the Buy scaler is used
-    /// for raw predictions ≥ 0.5 and the Sell scaler for predictions &lt; 0.5.
+    /// raw margin → deployed global calibration (temperature or Platt) →
+    /// optional class-conditional Platt → optional isotonic correction.
     /// </summary>
     private static double PredictProb(
         float[]       features,
@@ -1276,33 +1380,95 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         List<double>  alphas,
         double        plattA,
         double        plattB,
+        double        temperatureScale,
         double[]?     isotonicBp = null,
+        double        decisionThreshold = 0.5,
         double        plattABuy  = double.NaN,
         double        plattBBuy  = double.NaN,
         double        plattASell = double.NaN,
-        double        plattBSell = double.NaN)
+        double        plattBSell = double.NaN,
+        double        routingThreshold = DefaultConditionalRoutingThreshold)
     {
-        double score = PredictScore(features, stumps, alphas);
-        double raw   = MLFeatureHelper.Sigmoid(2 * score);
-        raw          = Math.Clamp(raw, 1e-7, 1.0 - 1e-7);
-        double logit = MLFeatureHelper.Logit(raw);
+        _ = decisionThreshold;
+        double rawProb = PredictRawProb(features, stumps, alphas);
+        return PredictProbFromRaw(
+            rawProb, plattA, plattB, temperatureScale, isotonicBp,
+            plattABuy, plattBBuy, plattASell, plattBSell, routingThreshold);
+    }
 
-        double useA, useB;
-        if (!double.IsNaN(plattABuy) && !double.IsNaN(plattASell))
+    private static double PredictProbFromRaw(
+        double    rawProb,
+        double    plattA,
+        double    plattB,
+        double    temperatureScale,
+        double[]? isotonicBp = null,
+        double    plattABuy  = double.NaN,
+        double    plattBBuy  = double.NaN,
+        double    plattASell = double.NaN,
+        double    plattBSell = double.NaN,
+        double    routingThreshold = DefaultConditionalRoutingThreshold)
+    {
+        return InferenceHelpers.ApplyDeployedCalibration(
+            rawProb,
+            plattA,
+            plattB,
+            temperatureScale,
+            plattABuy,
+            plattBBuy,
+            plattASell,
+            plattBSell,
+            routingThreshold,
+            isotonicBp,
+            ageDecayLambda: 0.0,
+            trainedAtUtc: default,
+            applyAgeDecay: false);
+    }
+
+    private static double PredictPreIsotonicProbFromRaw(
+        double rawProb,
+        double plattA,
+        double plattB,
+        double temperatureScale,
+        double plattABuy  = double.NaN,
+        double plattBBuy  = double.NaN,
+        double plattASell = double.NaN,
+        double plattBSell = double.NaN,
+        double routingThreshold = DefaultConditionalRoutingThreshold)
+    {
+        return PredictProbFromRaw(
+            rawProb,
+            plattA,
+            plattB,
+            temperatureScale,
+            isotonicBp: null,
+            plattABuy,
+            plattBBuy,
+            plattASell,
+            plattBSell,
+            routingThreshold);
+    }
+
+    private static double ComputeCalibrationNll(
+        List<TrainingSample> calSet,
+        List<GbmTree>        stumps,
+        List<double>         alphas,
+        double               plattA,
+        double               plattB,
+        double               temperatureScale = 0.0)
+    {
+        if (calSet.Count == 0)
+            return double.PositiveInfinity;
+
+        double loss = 0.0;
+        foreach (var sample in calSet)
         {
-            useA = raw >= 0.5 ? plattABuy  : plattASell;
-            useB = raw >= 0.5 ? plattBBuy  : plattBSell;
-        }
-        else
-        {
-            useA = plattA;
-            useB = plattB;
+            double rawProb = PredictRawProb(sample.Features, stumps, alphas);
+            double calibP = PredictPreIsotonicProbFromRaw(rawProb, plattA, plattB, temperatureScale);
+            double y = sample.Direction > 0 ? 1.0 : 0.0;
+            loss -= y * Math.Log(calibP + Eps) + (1.0 - y) * Math.Log(1.0 - calibP + Eps);
         }
 
-        double calibP = MLFeatureHelper.Sigmoid(useA * logit + useB);
-        if (isotonicBp is { Length: >= 4 })
-            calibP = ApplyIsotonicCalibration(calibP, isotonicBp);
-        return calibP;
+        return loss / calSet.Count;
     }
 
     // ── Platt scaling ─────────────────────────────────────────────────────────
@@ -1365,10 +1531,12 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         List<double>         alphas,
         double               plattA,
         double               plattB,
+        double               temperatureScale,
         double               plattABuy  = double.NaN,
         double               plattBBuy  = double.NaN,
         double               plattASell = double.NaN,
-        double               plattBSell = double.NaN)
+        double               plattBSell = double.NaN,
+        double               routingThreshold = DefaultConditionalRoutingThreshold)
     {
         if (calSet.Count < 30) return [];
 
@@ -1376,17 +1544,10 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         var pairs = new (double P, double Y)[cn];
         for (int i = 0; i < cn; i++)
         {
-            double score = PredictScore(calSet[i].Features, stumps, alphas);
-            double raw   = MLFeatureHelper.Sigmoid(2 * score);
-            raw          = Math.Clamp(raw, 1e-7, 1.0 - 1e-7);
-            double logit = MLFeatureHelper.Logit(raw);
-            double useA  = (!double.IsNaN(plattABuy) && raw >= 0.5) ? plattABuy
-                         : (!double.IsNaN(plattASell) && raw < 0.5)  ? plattASell
-                         : plattA;
-            double useB  = (!double.IsNaN(plattABuy) && raw >= 0.5) ? plattBBuy
-                         : (!double.IsNaN(plattASell) && raw < 0.5)  ? plattBSell
-                         : plattB;
-            double p     = MLFeatureHelper.Sigmoid(useA * logit + useB);
+            double rawProb = PredictRawProb(calSet[i].Features, stumps, alphas);
+            double p = PredictPreIsotonicProbFromRaw(
+                rawProb, plattA, plattB, temperatureScale,
+                plattABuy, plattBBuy, plattASell, plattBSell, routingThreshold);
             pairs[i]     = (p, calSet[i].Direction > 0 ? 1.0 : 0.0);
         }
         Array.Sort(pairs, (a, b) => a.P.CompareTo(b.P));
@@ -1474,12 +1635,14 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         List<double>         alphas,
         double               plattA,
         double               plattB,
+        double               temperatureScale,
         double[]             isotonicBp,
         int                  bins       = 10,
         double               plattABuy  = double.NaN,
         double               plattBBuy  = double.NaN,
         double               plattASell = double.NaN,
-        double               plattBSell = double.NaN)
+        double               plattBSell = double.NaN,
+        double               routingThreshold = DefaultConditionalRoutingThreshold)
     {
         if (testSet.Count < bins) return 1.0;
 
@@ -1489,8 +1652,9 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
 
         foreach (var s in testSet)
         {
-            double p    = PredictProb(s.Features, stumps, alphas, plattA, plattB, isotonicBp,
-                                      plattABuy, plattBBuy, plattASell, plattBSell);
+            double p    = PredictProb(
+                s.Features, stumps, alphas, plattA, plattB, temperatureScale, isotonicBp, 0.5,
+                plattABuy, plattBBuy, plattASell, plattBSell, routingThreshold);
             int    binI = Math.Clamp((int)(p * bins), 0, bins - 1);
             binConf[binI] += p;
             if (s.Direction > 0) binAcc[binI]++; // positive-class frequency, not classification accuracy
@@ -1517,25 +1681,30 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         List<double>         alphas,
         double               plattA,
         double               plattB,
+        double               temperatureScale,
         double[]             isotonicBp,
         int                  searchMin  = 30,
         int                  searchMax  = 75,
         double               plattABuy  = double.NaN,
         double               plattBBuy  = double.NaN,
         double               plattASell = double.NaN,
-        double               plattBSell = double.NaN)
+        double               plattBSell = double.NaN,
+        double               routingThreshold = DefaultConditionalRoutingThreshold)
     {
         if (calSet.Count < 30) return 0.5;
 
+        int minThreshold = Math.Clamp(Math.Min(searchMin, searchMax), 1, 99);
+        int maxThreshold = Math.Clamp(Math.Max(searchMin, searchMax), minThreshold, 99);
         var probs = new double[calSet.Count];
         for (int i = 0; i < calSet.Count; i++)
-            probs[i] = PredictProb(calSet[i].Features, stumps, alphas, plattA, plattB, isotonicBp,
-                                   plattABuy, plattBBuy, plattASell, plattBSell);
+            probs[i] = PredictProb(
+                calSet[i].Features, stumps, alphas, plattA, plattB, temperatureScale, isotonicBp, 0.5,
+                plattABuy, plattBBuy, plattASell, plattBSell, routingThreshold);
 
         double bestEv        = double.MinValue;
         double bestThreshold = 0.5;
 
-        for (int ti = searchMin; ti <= searchMax; ti++)
+        for (int ti = minThreshold; ti <= maxThreshold; ti++)
         {
             double t  = ti / 100.0;
             double ev = 0;
@@ -1564,7 +1733,8 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
     private static (double[] Weights, double Bias) FitLinearRegressor(
         List<TrainingSample> train,
         int                  F,
-        TrainingHyperparams  hp)
+        TrainingHyperparams  hp,
+        CancellationToken    ct = default)
     {
         if (train.Count == 0) return (new double[F], 0.0);
 
@@ -1613,11 +1783,13 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
 
         for (int epoch = 0; epoch < epochs; epoch++)
         {
+            ct.ThrowIfCancellationRequested();
             // Cosine LR scaling: approximate schedule by scaling loss (preserves moments)
             double cosScale = 0.5 * (1.0 + Math.Cos(Math.PI * epoch / epochs));
 
             for (int start = 0; start < trainN; start += batchSz)
             {
+                ct.ThrowIfCancellationRequested();
                 int end = Math.Min(start + batchSz, trainN);
                 int bsz = end - start;
 
@@ -1674,55 +1846,62 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
     // ── Permutation feature importance (Fisher-Yates shuffle, fixed seed) ─────
 
     private static float[] ComputePermutationImportance(
-        List<TrainingSample> testSet,
+        List<TrainingSample> evalSet,
         List<GbmTree>        stumps,
         List<double>         alphas,
         double               plattA,
         double               plattB,
+        double               temperatureScale,
         double[]             isotonicBp,
         int                  F,
+        double               decisionThreshold,
         double               plattABuy  = double.NaN,
         double               plattBBuy  = double.NaN,
         double               plattASell = double.NaN,
-        double               plattBSell = double.NaN)
+        double               plattBSell = double.NaN,
+        double               routingThreshold = DefaultConditionalRoutingThreshold)
     {
-        int n = testSet.Count;
+        int n = evalSet.Count;
+        if (n == 0)
+            return new float[F];
 
         // Baseline accuracy with original features
         int baseCorrect = 0;
-        foreach (var s in testSet)
+        foreach (var s in evalSet)
         {
-            double p = PredictProb(s.Features, stumps, alphas, plattA, plattB, isotonicBp,
-                                   plattABuy, plattBBuy, plattASell, plattBSell);
-            if ((p >= 0.5 ? 1 : 0) == (s.Direction > 0 ? 1 : 0)) baseCorrect++;
+            double p = PredictProb(
+                s.Features, stumps, alphas, plattA, plattB, temperatureScale, isotonicBp, decisionThreshold,
+                plattABuy, plattBBuy, plattASell, plattBSell, routingThreshold);
+            if ((p >= decisionThreshold ? 1 : 0) == (s.Direction > 0 ? 1 : 0)) baseCorrect++;
         }
         double baseAcc = (double)baseCorrect / n;
 
         var importance = new float[F];
         var shuffled   = new float[n];     // column buffer
         var featBuf    = new float[F];     // per-sample mutable feature vector
-        var rng        = new Random(42);   // fixed seed for reproducibility
 
         for (int fi = 0; fi < F; fi++)
         {
             // Copy and Fisher-Yates shuffle the fi-th feature column
-            for (int i = 0; i < n; i++) shuffled[i] = testSet[i].Features[fi];
+            var localRng = new Random(42 + fi * 17);
+            for (int i = 0; i < n; i++) shuffled[i] = evalSet[i].Features[fi];
             for (int i = n - 1; i > 0; i--)
             {
-                int j = rng.Next(i + 1);
+                int j = localRng.Next(i + 1);
                 (shuffled[i], shuffled[j]) = (shuffled[j], shuffled[i]);
             }
 
             int correct = 0;
             for (int i = 0; i < n; i++)
             {
-                var orig = testSet[i].Features;
+                var orig = evalSet[i].Features;
                 int fLen = Math.Min(orig.Length, F);
                 for (int j = 0; j < fLen; j++) featBuf[j] = orig[j];
                 featBuf[fi] = shuffled[i];
-                double p = PredictProb(featBuf, stumps, alphas, plattA, plattB, isotonicBp,
-                                       plattABuy, plattBBuy, plattASell, plattBSell);
-                if ((p >= 0.5 ? 1 : 0) == (testSet[i].Direction > 0 ? 1 : 0)) correct++;
+                double p = PredictProb(
+                    featBuf, stumps, alphas, plattA, plattB, temperatureScale, isotonicBp, decisionThreshold,
+                    plattABuy, plattBBuy, plattASell, plattBSell, routingThreshold);
+                if ((p >= decisionThreshold ? 1 : 0) == (evalSet[i].Direction > 0 ? 1 : 0)) correct++;
             }
 
             double shuffledAcc = (double)correct / n;
@@ -1746,20 +1925,23 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         List<double>         alphas,
         double               plattA,
         double               plattB,
+        double               temperatureScale,
         double[]             isotonicBp,
         double               alpha      = 0.10,
         double               plattABuy  = double.NaN,
         double               plattBBuy  = double.NaN,
         double               plattASell = double.NaN,
-        double               plattBSell = double.NaN)
+        double               plattBSell = double.NaN,
+        double               routingThreshold = DefaultConditionalRoutingThreshold)
     {
         if (calSet.Count < 20) return 0.5;
 
         var scores = new List<double>(calSet.Count);
         foreach (var s in calSet)
         {
-            double p = PredictProb(s.Features, stumps, alphas, plattA, plattB, isotonicBp,
-                                   plattABuy, plattBBuy, plattASell, plattBSell);
+            double p = PredictProb(
+                s.Features, stumps, alphas, plattA, plattB, temperatureScale, isotonicBp, 0.5,
+                plattABuy, plattBBuy, plattASell, plattBSell, routingThreshold);
             scores.Add(s.Direction > 0 ? 1.0 - p : p); // nonconformity score
         }
         scores.Sort();
@@ -1779,11 +1961,14 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         double               magBias,
         double               plattA,
         double               plattB,
+        double               temperatureScale,
         double[]             isotonicBp,
+        double               decisionThreshold = 0.5,
         double               plattABuy  = double.NaN,
         double               plattBBuy  = double.NaN,
         double               plattASell = double.NaN,
-        double               plattBSell = double.NaN)
+        double               plattBSell = double.NaN,
+        double               routingThreshold = DefaultConditionalRoutingThreshold)
     {
         if (testSet.Count == 0)
             return new EvalMetrics(0, 0, 0, 0, double.MaxValue, 0, 1, 0, 0, 0, 0, 0, 0);
@@ -1793,9 +1978,10 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
 
         foreach (var s in testSet)
         {
-            double p    = PredictProb(s.Features, stumps, alphas, plattA, plattB, isotonicBp,
-                                      plattABuy, plattBBuy, plattASell, plattBSell);
-            int    yHat = p >= 0.5 ? 1 : 0;
+            double p    = PredictProb(
+                s.Features, stumps, alphas, plattA, plattB, temperatureScale, isotonicBp, decisionThreshold,
+                plattABuy, plattBBuy, plattASell, plattBSell, routingThreshold);
+            int    yHat = p >= decisionThreshold ? 1 : 0;
             int    y    = s.Direction > 0 ? 1 : 0;
 
             if (yHat == y) correct++;
@@ -1851,11 +2037,13 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         List<double>         alphas,
         double               plattA,
         double               plattB,
+        double               temperatureScale,
         double[]             isotonicBp,
         double               plattABuy  = double.NaN,
         double               plattBBuy  = double.NaN,
         double               plattASell = double.NaN,
-        double               plattBSell = double.NaN)
+        double               plattBSell = double.NaN,
+        double               routingThreshold = DefaultConditionalRoutingThreshold)
     {
         if (testSet.Count == 0) return 0;
 
@@ -1866,8 +2054,9 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         double brierModel = 0, brierNaive = 0;
         foreach (var s in testSet)
         {
-            double p = PredictProb(s.Features, stumps, alphas, plattA, plattB, isotonicBp,
-                                   plattABuy, plattBBuy, plattASell, plattBSell);
+            double p = PredictProb(
+                s.Features, stumps, alphas, plattA, plattB, temperatureScale, isotonicBp, 0.5,
+                plattABuy, plattBBuy, plattASell, plattBSell, routingThreshold);
             int    y = s.Direction > 0 ? 1 : 0;
             brierModel += (p - y) * (p - y);
             brierNaive += (pBase - y) * (pBase - y);
@@ -1888,7 +2077,11 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         FitClassConditionalPlatt(
             List<TrainingSample> calSet,
             List<GbmTree>        stumps,
-            List<double>         alphas)
+            List<double>         alphas,
+            double               plattA,
+            double               plattB,
+            double               temperatureScale,
+            double               routingThreshold = DefaultConditionalRoutingThreshold)
     {
         const double lr     = 0.01;
         const int    epochs = 200;
@@ -1898,12 +2091,13 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
 
         foreach (var s in calSet)
         {
-            double score = PredictScore(s.Features, stumps, alphas);
-            double rawP  = Math.Clamp(MLFeatureHelper.Sigmoid(2 * score), 1e-7, 1.0 - 1e-7);
+            double rawP  = PredictRawProb(s.Features, stumps, alphas);
             double logit = MLFeatureHelper.Logit(rawP);
             double y     = s.Direction > 0 ? 1.0 : 0.0;
-            if (rawP >= 0.5) buySamples.Add((logit, y));
-            else             sellSamples.Add((logit, y));
+            double globalCalibP = PredictPreIsotonicProbFromRaw(rawP, plattA, plattB, temperatureScale,
+                                                                routingThreshold: routingThreshold);
+            if (globalCalibP >= routingThreshold) buySamples.Add((logit, y));
+            else                                  sellSamples.Add((logit, y));
         }
 
         static (double A, double B) FitSgd(List<(double Logit, double Y)> pairs)
@@ -1953,15 +2147,22 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         List<GbmTree>        stumps,
         List<double>         alphas,
         double               plattA,
-        double               plattB)
+        double               plattB,
+        double               temperatureScale,
+        double[]             isotonicBp,
+        double               plattABuy  = double.NaN,
+        double               plattBBuy  = double.NaN,
+        double               plattASell = double.NaN,
+        double               plattBSell = double.NaN,
+        double               routingThreshold = DefaultConditionalRoutingThreshold)
     {
         if (calSet.Count == 0) return 0.0;
         double sum = 0.0;
         foreach (var s in calSet)
         {
-            double score  = PredictScore(s.Features, stumps, alphas);
-            double rawP   = Math.Clamp(MLFeatureHelper.Sigmoid(2 * score), 1e-7, 1.0 - 1e-7);
-            double calibP = MLFeatureHelper.Sigmoid(plattA * MLFeatureHelper.Logit(rawP) + plattB);
+            double calibP = PredictProb(
+                s.Features, stumps, alphas, plattA, plattB, temperatureScale, isotonicBp, 0.5,
+                plattABuy, plattBBuy, plattASell, plattBSell, routingThreshold);
             sum += Math.Max(0.0, 2.0 * calibP - 1.0);
         }
         return sum / calSet.Count * 0.5;
@@ -1978,7 +2179,8 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
     private static double FitTemperatureScaling(
         List<TrainingSample> calSet,
         List<GbmTree>        stumps,
-        List<double>         alphas)
+        List<double>         alphas,
+        CancellationToken    ct = default)
     {
         if (calSet.Count < 10) return 1.0;
 
@@ -2001,6 +2203,7 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
 
         for (int epoch = 0; epoch < 300; epoch++)
         {
+            ct.ThrowIfCancellationRequested();
             double T    = Math.Exp(logT);
             double invT = 1.0 / Math.Max(T, 1e-8);
             double dLogT = 0.0, loss = 0.0;
@@ -2079,13 +2282,16 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
     private static double[] ComputeDensityRatioWeights(
         List<TrainingSample> trainSet,
         int                  F,
-        int                  recentWindowDays)
+        int                  recentWindowDays,
+        int                  barsPerDay,
+        CancellationToken    ct = default)
     {
         int n = trainSet.Count;
         if (n < 50) { var u = new double[n]; Array.Fill(u, 1.0 / n); return u; }
 
         // Treat last min(n/5, recentWindowDays×barsPerDay) samples as "recent"
-        int recentCount = Math.Max(10, Math.Min(n / 5, recentWindowDays * 24));
+        int resolvedBarsPerDay = barsPerDay > 0 ? barsPerDay : 24;
+        int recentCount = Math.Max(10, Math.Min(n / 5, recentWindowDays * resolvedBarsPerDay));
         recentCount     = Math.Min(recentCount, n - 10);
         int histCount   = n - recentCount;
 
@@ -2107,6 +2313,7 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
 
         for (int epoch = 0; epoch < 40; epoch++)
         {
+            ct.ThrowIfCancellationRequested();
             opt.zero_grad();
             using var logit = torch.mm(xTConst, wP) + bP;
             using var prob  = torch.sigmoid(logit);
@@ -2244,27 +2451,23 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
 
     /// <summary>
     /// Computes the maximum drawdown and Sharpe ratio of the simulated equity curve
-    /// from an array of (Predicted, Actual) binary outcomes.
-    /// Each correct prediction contributes +1, each error −1 to the equity series.
+    /// from a realised return series.
+    /// Each element is the magnitude-weighted return for one prediction.
     /// Returns (MaxDrawdown, Sharpe); both 0.0 for empty input.
     /// </summary>
-    private static (double MaxDrawdown, double Sharpe) ComputeEquityCurveStats(
-        (int Predicted, int Actual)[] predictions)
+    private static (double MaxDrawdown, double Sharpe) ComputeEquityCurveStats(double[] returns)
     {
-        if (predictions.Length == 0) return (0.0, 0.0);
+        if (returns.Length == 0) return (0.0, 0.0);
 
-        var    returns = new double[predictions.Length];
-        double equity  = 0.0;
-        double peak    = 0.0;
+        double equity  = 1.0;
+        double peak    = 1.0;
         double maxDD   = 0.0;
 
-        for (int i = 0; i < predictions.Length; i++)
+        for (int i = 0; i < returns.Length; i++)
         {
-            double ret = predictions[i].Predicted == predictions[i].Actual ? +1.0 : -1.0;
-            returns[i] = ret;
-            equity    += ret;
+            equity += returns[i];
             if (equity > peak) peak = equity;
-            double dd = peak > 0 ? (peak - equity) / peak : 0.0;
+            double dd = peak > 1e-10 ? (peak - equity) / peak : 0.0;
             if (dd > maxDD) maxDD = dd;
         }
 
@@ -2384,15 +2587,24 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         List<TrainingSample> calSet,
         List<GbmTree>        stumps,
         List<double>         alphas,
-        double               sumAlpha,
-        int                  F)
+        double               plattA,
+        double               plattB,
+        double               temperatureScale,
+        double[]             isotonicBp,
+        double               decisionThreshold,
+        int                  F,
+        double               plattABuy  = double.NaN,
+        double               plattBBuy  = double.NaN,
+        double               plattASell = double.NaN,
+        double               plattBSell = double.NaN,
+        double               routingThreshold = DefaultConditionalRoutingThreshold,
+        CancellationToken    ct = default)
     {
         const int MetaDim = 7;   // rawP + scoreNorm + feat[0..4]
         if (calSet.Count < 10) return (new double[MetaDim], 0.0);
 
-        int    n         = calSet.Count;
-        double alphaNorm = Math.Max(sumAlpha, 1e-6);
-        int    rawTop    = Math.Min(5, F);
+        int n      = calSet.Count;
+        int rawTop = Math.Min(5, F);
 
         var xArr = new float[n * MetaDim];
         var yArr = new float[n];
@@ -2400,16 +2612,17 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         for (int i = 0; i < n; i++)
         {
             var    s         = calSet[i];
-            double score     = PredictScore(s.Features, stumps, alphas);
-            double rawP      = MLFeatureHelper.Sigmoid(2 * score);
-            double scoreNorm = Math.Abs(score) / alphaNorm;
+            double calibP    = PredictProb(
+                s.Features, stumps, alphas, plattA, plattB, temperatureScale, isotonicBp, decisionThreshold,
+                plattABuy, plattBBuy, plattASell, plattBSell, routingThreshold);
+            double ensStd    = ComputeEnsembleStd(s.Features, stumps, alphas);
 
-            xArr[i * MetaDim + 0] = (float)rawP;
-            xArr[i * MetaDim + 1] = (float)scoreNorm;
+            xArr[i * MetaDim + 0] = (float)calibP;
+            xArr[i * MetaDim + 1] = (float)ensStd;
             for (int j = 0; j < rawTop; j++)
                 xArr[i * MetaDim + 2 + j] = s.Features[j];
 
-            int predicted = score >= 0 ? 1 : -1;
+            int predicted = calibP >= decisionThreshold ? 1 : -1;
             int actual    = s.Direction > 0 ? 1 : -1;
             yArr[i] = predicted == actual ? 1f : 0f;
         }
@@ -2423,6 +2636,7 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
 
         for (int epoch = 0; epoch < 40; epoch++)
         {
+            ct.ThrowIfCancellationRequested();
             opt.zero_grad();
             using var logit = torch.mm(xTConst, wP) + bP;
             using var prob  = torch.sigmoid(logit);
@@ -2459,18 +2673,43 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         List<double>         alphas,
         double               plattA,
         double               plattB,
+        double               temperatureScale,
+        double[]             isotonicBp,
         double[]             metaLabelWeights,
         double               metaLabelBias,
-        double               sumAlpha,
+        double               decisionThreshold,
         int                  F)
+        =>
+            FitAbstentionModel(
+                calSet, stumps, alphas, plattA, plattB, temperatureScale, isotonicBp,
+                metaLabelWeights, metaLabelBias, decisionThreshold, F,
+                double.NaN, double.NaN, double.NaN, double.NaN, DefaultConditionalRoutingThreshold);
+
+    private static (double[] Weights, double Bias, double Threshold) FitAbstentionModel(
+        List<TrainingSample> calSet,
+        List<GbmTree>        stumps,
+        List<double>         alphas,
+        double               plattA,
+        double               plattB,
+        double               temperatureScale,
+        double[]             isotonicBp,
+        double[]             metaLabelWeights,
+        double               metaLabelBias,
+        double               decisionThreshold,
+        int                  F,
+        double               plattABuy,
+        double               plattBBuy,
+        double               plattASell,
+        double               plattBSell,
+        double               routingThreshold,
+        CancellationToken    ct = default)
     {
         const int Dim     = 3;   // [calibP, scoreNorm, metaLabelScore]
         const int MetaDim = 7;
         if (calSet.Count < 10) return (new double[Dim], 0.0, 0.5);
 
-        int    n        = calSet.Count;
-        double alphaNorm = Math.Max(sumAlpha, 1e-6);
-        int    rawTop    = Math.Min(5, F);
+        int n      = calSet.Count;
+        int rawTop = Math.Min(5, F);
 
         var xArr = new float[n * Dim];
         var yArr = new float[n];
@@ -2479,13 +2718,14 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         for (int i = 0; i < n; i++)
         {
             var    s         = calSet[i];
-            double score     = PredictScore(s.Features, stumps, alphas);
-            double rawP      = Math.Clamp(MLFeatureHelper.Sigmoid(2 * score), 1e-7, 1.0 - 1e-7);
-            double calibP    = MLFeatureHelper.Sigmoid(plattA * MLFeatureHelper.Logit(rawP) + plattB);
-            double scoreNorm = Math.Abs(score) / alphaNorm;
+            double calibP    = PredictProb(
+                s.Features, stumps, alphas, plattA, plattB, temperatureScale, isotonicBp, decisionThreshold,
+                plattABuy, plattBBuy, plattASell, plattBSell, routingThreshold);
+            double ensStd    = ComputeEnsembleStd(s.Features, stumps, alphas);
 
             // Meta-label score
-            mf[0] = rawP; mf[1] = scoreNorm;
+            mf[0] = calibP;
+            mf[1] = ensStd;
             for (int j = 0; j < rawTop; j++) mf[2 + j] = s.Features[j];
             double mz = metaLabelBias;
             for (int j = 0; j < MetaDim && j < metaLabelWeights.Length; j++)
@@ -2493,9 +2733,9 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
             double metaScore = MLFeatureHelper.Sigmoid(mz);
 
             xArr[i * Dim + 0] = (float)calibP;
-            xArr[i * Dim + 1] = (float)scoreNorm;
+            xArr[i * Dim + 1] = (float)ensStd;
             xArr[i * Dim + 2] = (float)metaScore;
-            yArr[i] = (calibP >= 0.5) == (s.Direction > 0) ? 1f : 0f;
+            yArr[i] = (calibP >= decisionThreshold) == (s.Direction > 0) ? 1f : 0f;
         }
 
         using var wP  = new Parameter(zeros(Dim, 1));
@@ -2507,6 +2747,7 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
 
         for (int epoch = 0; epoch < 60; epoch++)
         {
+            ct.ThrowIfCancellationRequested();
             opt.zero_grad();
             using var logit = torch.mm(xTConst, wP) + bP;
             using var prob  = torch.sigmoid(logit);
@@ -2540,7 +2781,8 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
     private static (double[] Weights, double Bias) FitQuantileRegressor(
         List<TrainingSample> train,
         int                  F,
-        double               tau)
+        double               tau,
+        CancellationToken    ct = default)
     {
         if (train.Count == 0) return (new double[F], 0.0);
 
@@ -2562,6 +2804,7 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
 
         for (int pass = 0; pass < 8; pass++)
         {
+            ct.ThrowIfCancellationRequested();
             opt.zero_grad();
             using var xT    = torch.tensor(xArr, device: CPU).reshape(n, F);
             using var yT    = torch.tensor(yArr, device: CPU).reshape(n, 1);
@@ -2813,7 +3056,7 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
                 if (tmpKeys[ti + 1] <= tmpKeys[ti] + 1e-12) continue;
                 double thresh = (tmpKeys[ti] + tmpKeys[ti + 1]) * 0.5;
                 double err1   = cumNegLeft + (totalPos - cumPosLeft);
-                double err2   = 1.0 - err1;
+                double err2   = cumPosLeft + (totalNeg - cumNegLeft);
                 if (err1 < bestErr) { bestErr = err1; bestFi = fi; bestThresh = thresh; bestParity =  1; }
                 if (err2 < bestErr) { bestErr = err2; bestFi = fi; bestThresh = thresh; bestParity = -1; }
             }
@@ -2846,7 +3089,8 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         List<TrainingSample>         trainSet,
         List<TrainingSample>         testSet,
         int                          F,
-        ILogger<AdaBoostModelTrainer> logger)
+        ILogger<AdaBoostModelTrainer> logger,
+        CancellationToken            ct = default)
     {
         int n1    = testSet.Count;
         int n0    = Math.Min(trainSet.Count, n1 * 5);
@@ -2880,6 +3124,7 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
 
         for (int epoch = 0; epoch < 60; epoch++)
         {
+            ct.ThrowIfCancellationRequested();
             opt.zero_grad();
             using var logit = torch.mm(xTConst, wP) + bP;
             using var prob  = torch.sigmoid(logit);
@@ -3133,6 +3378,7 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         double               PlattASell,
         double               PlattBSell,
         double[]             IsotonicBp,
+        List<TrainingSample> MaskedTrain,
         List<TrainingSample> MaskedCal,
         List<TrainingSample> MaskedTest,
         double[]             MagWeights,
@@ -3174,6 +3420,7 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         double               plattBBuy,
         double               plattASell,
         double               plattBSell,
+        double               temperatureScale,
         double[]             isotonicBp,
         TrainingHyperparams  hp,
         int                  F,
@@ -3181,6 +3428,7 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         double               shrinkage,
         bool                 sammeR,
         int                  treeDepth,
+        double               optimalThreshold,
         int                  prunedCount,
         CancellationToken    ct)
     {
@@ -3197,8 +3445,7 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
         var filteredPAlphas = new List<double>(stumps.Count);
         for (int i = 0; i < Math.Min(stumps.Count, alphas.Count); i++)
         {
-            int sf = stumps[i].Nodes?[0].SplitFeature ?? -1;
-            if (sf >= 0 && sf < activeMask.Length && activeMask[sf])
+            if (TreeUsesOnlyActiveFeatures(stumps[i], activeMask))
             {
                 filteredPStumps.Add(stumps[i]);
                 filteredPAlphas.Add(alphas[i]);
@@ -3247,8 +3494,7 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
             var filteredAlphas = new List<double>(warmStumps.Count);
             foreach (var (ws, wa) in warmStumps.Zip(warmAlphas))
             {
-                int sf = ws.Nodes?[0].SplitFeature ?? -1;
-                if (sf >= 0 && sf < activeMask.Length && activeMask[sf])
+                if (TreeUsesOnlyActiveFeatures(ws, activeMask))
                 { filteredStumps.Add(ws); filteredAlphas.Add(wa); }
             }
             if (filteredStumps.Count > 0)
@@ -3321,42 +3567,75 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
 
         // Calibrate the pruned model
         var (pPlattA, pPlattB)  = FitPlattScaling(maskedCal, pStumps, pAlphas);
+        double pTempScale = 0.0;
+        if (hp.FitTemperatureScale && maskedCal.Count >= 10)
+        {
+            double candidateTemperature = FitTemperatureScaling(maskedCal, pStumps, pAlphas, ct);
+            double plattNll = ComputeCalibrationNll(maskedCal, pStumps, pAlphas, pPlattA, pPlattB);
+            double tempNll  = ComputeCalibrationNll(maskedCal, pStumps, pAlphas, pPlattA, pPlattB,
+                                                    candidateTemperature);
+            if (tempNll + 1e-6 < plattNll)
+                pTempScale = candidateTemperature;
+        }
+
         var (pPlattABuy, pPlattBBuy, pPlattASell, pPlattBSell) =
-            FitClassConditionalPlatt(maskedCal, pStumps, pAlphas);
-        double[] pIsotonicBp = FitIsotonicCalibration(maskedCal, pStumps, pAlphas, pPlattA, pPlattB,
-                                                       pPlattABuy, pPlattBBuy, pPlattASell, pPlattBSell);
+            FitClassConditionalPlatt(maskedCal, pStumps, pAlphas, pPlattA, pPlattB, pTempScale,
+                DefaultConditionalRoutingThreshold);
+        double[] pIsotonicBp = FitIsotonicCalibration(
+            maskedCal, pStumps, pAlphas, pPlattA, pPlattB, pTempScale,
+            pPlattABuy, pPlattBBuy, pPlattASell, pPlattBSell, DefaultConditionalRoutingThreshold);
+        double pOptThreshold = ComputeOptimalThreshold(
+            maskedCal, pStumps, pAlphas, pPlattA, pPlattB, pTempScale, pIsotonicBp,
+            hp.ThresholdSearchMin, hp.ThresholdSearchMax,
+            pPlattABuy, pPlattBBuy, pPlattASell, pPlattBSell, DefaultConditionalRoutingThreshold);
 
         // Re-fit magnitude regressors on masked features
-        var (pMagWeights, pMagBias) = FitLinearRegressor(maskedTrain, F, hp);
+        var (pMagWeights, pMagBias) = FitLinearRegressor(maskedTrain, F, hp, ct);
         double pDurbinWatson = ComputeDurbinWatson(maskedTrain, pMagWeights, pMagBias, F);
         double[] pMagQ90Weights = [];
         double   pMagQ90Bias    = 0.0;
         if (hp.MagnitudeQuantileTau > 0.0 && maskedTrain.Count >= 10)
-            (pMagQ90Weights, pMagQ90Bias) = FitQuantileRegressor(maskedTrain, F, hp.MagnitudeQuantileTau);
+            (pMagQ90Weights, pMagQ90Bias) = FitQuantileRegressor(maskedTrain, F, hp.MagnitudeQuantileTau, ct);
 
-        var pMetrics = EvaluateModel(maskedTest, pStumps, pAlphas,
-                                      pMagWeights, pMagBias, pPlattA, pPlattB, pIsotonicBp,
-                                      pPlattABuy, pPlattBBuy, pPlattASell, pPlattBSell);
+        double pAvgKelly = ComputeAvgKellyFraction(
+            maskedCal, pStumps, pAlphas, pPlattA, pPlattB, pTempScale, pIsotonicBp,
+            pPlattABuy, pPlattBBuy, pPlattASell, pPlattBSell, DefaultConditionalRoutingThreshold);
+        var baseSelectionMetrics = EvaluateModel(
+            calSet, stumps, alphas, magWeights, magBias, plattA, plattB, temperatureScale, isotonicBp,
+            optimalThreshold, plattABuy, plattBBuy, plattASell, plattBSell, DefaultConditionalRoutingThreshold);
+        var pSelectionMetrics = EvaluateModel(
+            maskedCal, pStumps, pAlphas, pMagWeights, pMagBias, pPlattA, pPlattB, pTempScale, pIsotonicBp,
+            pOptThreshold, pPlattABuy, pPlattBBuy, pPlattASell, pPlattBSell, DefaultConditionalRoutingThreshold);
+        double baseSelectionEce = ComputeEce(
+            calSet, stumps, alphas, plattA, plattB, temperatureScale, isotonicBp,
+            plattABuy: plattABuy, plattBBuy: plattBBuy,
+            plattASell: plattASell, plattBSell: plattBSell,
+            routingThreshold: DefaultConditionalRoutingThreshold);
+        double pSelectionEce = ComputeEce(
+            maskedCal, pStumps, pAlphas, pPlattA, pPlattB, pTempScale, pIsotonicBp,
+            plattABuy: pPlattABuy, plattBBuy: pPlattBBuy,
+            plattASell: pPlattASell, plattBSell: pPlattBSell,
+            routingThreshold: DefaultConditionalRoutingThreshold);
+        double baseSelectionBrierSkill = ComputeBrierSkillScore(
+            calSet, stumps, alphas, plattA, plattB, temperatureScale, isotonicBp,
+            plattABuy, plattBBuy, plattASell, plattBSell, DefaultConditionalRoutingThreshold);
+        double pSelectionBrierSkill = ComputeBrierSkillScore(
+            maskedCal, pStumps, pAlphas, pPlattA, pPlattB, pTempScale, pIsotonicBp,
+            pPlattABuy, pPlattBBuy, pPlattASell, pPlattBSell, DefaultConditionalRoutingThreshold);
 
-        // Accept pruned model only if accuracy doesn't degrade by more than 1 %
-        var baseMetrics = EvaluateModel(testSet, stumps, alphas,
-                                        magWeights, magBias, plattA, plattB, isotonicBp,
-                                        plattABuy, plattBBuy, plattASell, plattBSell);
-
-        if (pMetrics.Accuracy < baseMetrics.Accuracy - 0.01)
+        if (!IsPrunedModelAcceptable(
+                baseSelectionMetrics,
+                pSelectionMetrics,
+                baseSelectionEce,
+                pSelectionEce,
+                baseSelectionBrierSkill,
+                pSelectionBrierSkill))
             return null;
 
-        double pAvgKelly = ComputeAvgKellyFraction(maskedCal, pStumps, pAlphas, pPlattA, pPlattB);
-        double pEce = ComputeEce(maskedTest, pStumps, pAlphas, pPlattA, pPlattB, pIsotonicBp,
-                                  plattABuy: pPlattABuy, plattBBuy: pPlattBBuy,
-                                  plattASell: pPlattASell, plattBSell: pPlattBSell);
-        double pOptThreshold = ComputeOptimalThreshold(
-            maskedCal, pStumps, pAlphas, pPlattA, pPlattB, pIsotonicBp,
-            hp.ThresholdSearchMin, hp.ThresholdSearchMax,
-            pPlattABuy, pPlattBBuy, pPlattASell, pPlattBSell);
-        double pTempScale = hp.FitTemperatureScale && maskedCal.Count >= 10
-            ? FitTemperatureScaling(maskedCal, pStumps, pAlphas)
-            : 0.0;
+        double pEce = ComputeEce(maskedTest, pStumps, pAlphas, pPlattA, pPlattB, pTempScale, pIsotonicBp,
+            plattABuy: pPlattABuy, plattBBuy: pPlattBBuy,
+            plattASell: pPlattASell, plattBSell: pPlattBSell,
+            routingThreshold: DefaultConditionalRoutingThreshold);
 
         return new PrunedModelResult(
             Stumps:           pStumps,
@@ -3368,6 +3647,7 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
             PlattASell:       pPlattASell,
             PlattBSell:       pPlattBSell,
             IsotonicBp:       pIsotonicBp,
+            MaskedTrain:      maskedTrain,
             MaskedCal:        maskedCal,
             MaskedTest:       maskedTest,
             MagWeights:       pMagWeights,
@@ -3379,7 +3659,56 @@ public sealed class AdaBoostModelTrainer : IMLModelTrainer
             Ece:              pEce,
             OptimalThreshold: pOptThreshold,
             TemperatureScale: pTempScale,
-            Metrics:          pMetrics,
-            BaseAccuracy:     baseMetrics.Accuracy);
+            Metrics:          pSelectionMetrics,
+            BaseAccuracy:     baseSelectionMetrics.Accuracy);
     }
+
+    private static bool TreeUsesOnlyActiveFeatures(GbmTree tree, bool[] activeMask)
+    {
+        if (tree.Nodes is not { Count: > 0 })
+            return false;
+
+        foreach (var node in tree.Nodes)
+        {
+            if (node.IsLeaf)
+                continue;
+
+            if (node.SplitFeature < 0 || node.SplitFeature >= activeMask.Length || !activeMask[node.SplitFeature])
+                return false;
+        }
+
+        return true;
+    }
+
+    private static bool IsPrunedModelAcceptable(
+        EvalMetrics baseMetrics,
+        EvalMetrics prunedMetrics,
+        double      baseEce,
+        double      prunedEce,
+        double      baseBrierSkillScore,
+        double      prunedBrierSkillScore)
+    {
+        const double accuracyTolerance = 0.01;
+        const double evTolerance = 0.005;
+        const double sharpeTolerance = 0.05;
+        const double brierTolerance = 0.005;
+        const double eceTolerance = 0.01;
+        const double bssTolerance = 0.02;
+
+        if (prunedMetrics.Accuracy + accuracyTolerance < baseMetrics.Accuracy)
+            return false;
+        if (prunedMetrics.ExpectedValue + evTolerance < baseMetrics.ExpectedValue)
+            return false;
+        if (prunedMetrics.SharpeRatio + sharpeTolerance < baseMetrics.SharpeRatio)
+            return false;
+        if (prunedMetrics.BrierScore > baseMetrics.BrierScore + brierTolerance)
+            return false;
+        if (prunedEce > baseEce + eceTolerance)
+            return false;
+        if (prunedBrierSkillScore + bssTolerance < baseBrierSkillScore)
+            return false;
+
+        return true;
+    }
+
 }

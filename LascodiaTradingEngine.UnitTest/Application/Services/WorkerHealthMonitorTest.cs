@@ -88,14 +88,41 @@ public class WorkerHealthMonitorTest
         // P50 index = floor(0.50 * 19) = 9 -> value at index 9 = 100
         Assert.Equal(100, snapshot.CycleDurationP50Ms);
 
-        // P95 index = floor(0.95 * 19) = 18 -> value at index 18 = 190
+        // Nearest-rank p95 for 20 samples points at the 19th value.
         Assert.Equal(190, snapshot.CycleDurationP95Ms);
 
-        // P99 index = floor(0.99 * 19) = 18 -> value at index 18 = 190
-        Assert.Equal(190, snapshot.CycleDurationP99Ms);
+        // Nearest-rank p99 for 20 samples points at the last value.
+        Assert.Equal(200, snapshot.CycleDurationP99Ms);
 
         // Last duration should be the most recently enqueued
         Assert.Equal(200, snapshot.LastCycleDurationMs);
+    }
+
+    [Fact]
+    public void GetCurrentSnapshots_UsesNearestRankForSmallSampleTailPercentiles()
+    {
+        _monitor.RecordCycleSuccess("SmallSampleWorker", 100);
+        _monitor.RecordCycleSuccess("SmallSampleWorker", 200);
+
+        var snapshots = _monitor.GetCurrentSnapshots();
+        var snapshot = Assert.Single(snapshots);
+
+        Assert.Equal(100, snapshot.CycleDurationP50Ms);
+        Assert.Equal(200, snapshot.CycleDurationP95Ms);
+        Assert.Equal(200, snapshot.CycleDurationP99Ms);
+    }
+
+    [Fact]
+    public void GetCurrentSnapshots_ReportsActualLastCycleDuration_NotMaxDuration()
+    {
+        _monitor.RecordCycleSuccess("LastDurationWorker", 400);
+        _monitor.RecordCycleSuccess("LastDurationWorker", 150);
+
+        var snapshots = _monitor.GetCurrentSnapshots();
+        var snapshot = Assert.Single(snapshots);
+
+        Assert.Equal(150, snapshot.LastCycleDurationMs);
+        Assert.Equal(400, snapshot.CycleDurationP95Ms);
     }
 
     [Fact]

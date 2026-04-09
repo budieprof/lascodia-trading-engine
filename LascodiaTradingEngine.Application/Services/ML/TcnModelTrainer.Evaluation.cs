@@ -15,11 +15,14 @@ public sealed partial class TcnModelTrainer
     /// Shapley value = weighted average of marginal contributions across all subsets.
     /// </summary>
     internal static double[] ComputeShapleyValues(
-        List<TrainingSample> testSet, TcnWeights tcn, double plattA, double plattB,
+        List<TrainingSample> testSet,
+        TcnWeights tcn,
+        in TcnCalibrationArtifacts calibration,
         int filters, bool useAttentionPool, float[] permImportance, int topK = 6)
     {
         int channelCount = testSet[0].SequenceFeatures![0].Length;
         topK = Math.Min(topK, Math.Min(channelCount, 6));
+        double threshold = CalibrationThreshold(calibration);
 
         // Find top-K channel indices by permutation importance
         var ranked = permImportance
@@ -58,8 +61,8 @@ public sealed partial class TcnModelTrainer
                 }
                 var sample = testSet[si] with { SequenceFeatures = maskedSeq };
                 double p = Math.Clamp(TcnProb(sample, tcn, filters, useAttentionPool), 1e-7, 1 - 1e-7);
-                double calibP = MLFeatureHelper.Sigmoid(plattA * MLFeatureHelper.Logit(p) + plattB);
-                if ((calibP >= 0.5) == (testSet[si].Direction == 1)) correct++;
+                double calibP = ApplyTcnCalibration(p, calibration);
+                if ((calibP >= threshold) == (testSet[si].Direction == 1)) correct++;
             }
             subsetAccuracies[mask] = (double)correct / testSet.Count;
         }
@@ -103,16 +106,18 @@ public sealed partial class TcnModelTrainer
     /// Returns the fraction of samples where the true class is contained in the prediction set.
     /// </summary>
     internal static double ComputePicp(
-        List<TrainingSample> testSet, double[] rawProbs, double plattA, double plattB, double conformalQHat)
+        List<TrainingSample> testSet,
+        double[] rawProbs,
+        in TcnCalibrationArtifacts calibration)
     {
         if (testSet.Count == 0) return 0;
         int covered = 0;
         for (int i = 0; i < testSet.Count; i++)
         {
-            double calibP = MLFeatureHelper.Sigmoid(plattA * MLFeatureHelper.Logit(rawProbs[i]) + plattB);
+            double calibP = ApplyTcnCalibration(rawProbs[i], calibration);
             double trueClassConf = testSet[i].Direction == 1 ? calibP : 1 - calibP;
             // Covered if nonconformity score ≤ qHat
-            if (1.0 - trueClassConf <= conformalQHat) covered++;
+            if (1.0 - trueClassConf <= calibration.ConformalQHat) covered++;
         }
         return (double)covered / testSet.Count;
     }
@@ -126,14 +131,17 @@ public sealed partial class TcnModelTrainer
     /// Uses adaptive bin edges to ensure minimum samples per bin.
     /// </summary>
     internal static (double[] BinConfidence, double[] BinAccuracy, int[] BinCounts) ComputeReliabilityDiagram(
-        List<TrainingSample> samples, double[] rawProbs, double plattA, double plattB, int numBins = 10)
+        List<TrainingSample> samples,
+        double[] rawProbs,
+        in TcnCalibrationArtifacts calibration,
+        int numBins = 10)
     {
         if (samples.Count < numBins * 2) return ([], [], []);
 
         var pairs = new (double CalibP, bool IsPositive)[samples.Count];
         for (int i = 0; i < samples.Count; i++)
         {
-            double calibP = MLFeatureHelper.Sigmoid(plattA * MLFeatureHelper.Logit(rawProbs[i]) + plattB);
+            double calibP = ApplyTcnCalibration(rawProbs[i], calibration);
             pairs[i] = (calibP, samples[i].Direction == 1);
         }
         Array.Sort(pairs, (a, b) => a.CalibP.CompareTo(b.CalibP));
@@ -172,14 +180,17 @@ public sealed partial class TcnModelTrainer
     /// Refinement loss: Σ n_b × H(o_b) where H is binary entropy.
     /// </summary>
     internal static (double CalibrationLoss, double RefinementLoss) ComputeLogLossDecomposition(
-        List<TrainingSample> samples, double[] rawProbs, double plattA, double plattB, int numBins = 10)
+        List<TrainingSample> samples,
+        double[] rawProbs,
+        in TcnCalibrationArtifacts calibration,
+        int numBins = 10)
     {
         if (samples.Count < 20) return (0, 0);
 
         var binConf = new double[numBins]; var binPos = new int[numBins]; var binCount = new int[numBins];
         for (int i = 0; i < samples.Count; i++)
         {
-            double calibP = MLFeatureHelper.Sigmoid(plattA * MLFeatureHelper.Logit(rawProbs[i]) + plattB);
+            double calibP = ApplyTcnCalibration(rawProbs[i], calibration);
             int bin = Math.Clamp((int)(calibP * numBins), 0, numBins - 1);
             binConf[bin] += calibP; binCount[bin]++;
             if (samples[i].Direction == 1) binPos[bin]++;
@@ -214,17 +225,17 @@ public sealed partial class TcnModelTrainer
     /// Computes ECE after applying the full isotonic calibration pipeline (Platt + PAVA).
     /// </summary>
     internal static double ComputePostIsotonicEce(
-        List<TrainingSample> testSet, double[] rawProbs, double plattA, double plattB,
-        double[] isotonicBreakpoints)
+        List<TrainingSample> testSet,
+        double[] rawProbs,
+        in TcnCalibrationArtifacts calibration)
     {
-        if (testSet.Count < 20 || isotonicBreakpoints.Length == 0) return 0;
+        if (testSet.Count < 20 || calibration.IsotonicBreakpoints.Length == 0) return 0;
         const int B = 10;
         var binConf = new double[B]; var binPos = new int[B]; var binCount = new int[B];
 
         for (int i = 0; i < testSet.Count; i++)
         {
-            double plattP = MLFeatureHelper.Sigmoid(plattA * MLFeatureHelper.Logit(rawProbs[i]) + plattB);
-            double isoP = ApplyIsotonicMapping(plattP, isotonicBreakpoints);
+            double isoP = ApplyTcnCalibration(rawProbs[i], calibration);
             int bin = Math.Clamp((int)(isoP * B), 0, B - 1);
             binConf[bin] += isoP; binCount[bin]++;
             if (testSet[i].Direction == 1) binPos[bin]++;
@@ -271,7 +282,9 @@ public sealed partial class TcnModelTrainer
     /// High autocorrelation suggests the model reacts slowly to regime changes.
     /// </summary>
     internal static double ComputePredictionAutocorrelation(
-        List<TrainingSample> testSet, double[] rawProbs, double plattA, double plattB)
+        List<TrainingSample> testSet,
+        double[] rawProbs,
+        in TcnCalibrationArtifacts calibration)
     {
         if (testSet.Count < 10) return 0;
         int n = testSet.Count;
@@ -279,7 +292,7 @@ public sealed partial class TcnModelTrainer
         double mean = 0;
         for (int i = 0; i < n; i++)
         {
-            calibP[i] = MLFeatureHelper.Sigmoid(plattA * MLFeatureHelper.Logit(rawProbs[i]) + plattB);
+            calibP[i] = ApplyTcnCalibration(rawProbs[i], calibration);
             mean += calibP[i];
         }
         mean /= n;
@@ -303,14 +316,17 @@ public sealed partial class TcnModelTrainer
     /// Measures the distribution of prediction confidence.
     /// </summary>
     internal static double[] ComputeConfidenceHistogram(
-        List<TrainingSample> testSet, double[] rawProbs, double plattA, double plattB)
+        List<TrainingSample> testSet,
+        double[] rawProbs,
+        in TcnCalibrationArtifacts calibration)
     {
         if (testSet.Count < 10) return [];
+        double threshold = CalibrationThreshold(calibration);
         var distances = new double[testSet.Count];
         for (int i = 0; i < testSet.Count; i++)
         {
-            double calibP = MLFeatureHelper.Sigmoid(plattA * MLFeatureHelper.Logit(rawProbs[i]) + plattB);
-            distances[i] = Math.Abs(calibP - 0.5);
+            double calibP = ApplyTcnCalibration(rawProbs[i], calibration);
+            distances[i] = Math.Abs(calibP - threshold);
         }
         Array.Sort(distances);
 

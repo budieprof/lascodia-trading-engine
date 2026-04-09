@@ -1,4 +1,5 @@
 using System.Text.Json;
+using LascodiaTradingEngine.Application.Backtesting;
 using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Interfaces;
@@ -28,6 +29,7 @@ internal sealed class StrategyGenerationCandidatePersistenceService : IStrategyG
     private readonly IStrategyGenerationFailureStore _failureStore;
     private readonly IStrategyGenerationConfigProvider _configProvider;
     private readonly IStrategyGenerationArtifactReplayService _artifactReplayService;
+    private readonly IValidationRunFactory _validationRunFactory;
     private readonly TimeProvider _timeProvider;
 
     public StrategyGenerationCandidatePersistenceService(
@@ -38,6 +40,7 @@ internal sealed class StrategyGenerationCandidatePersistenceService : IStrategyG
         IStrategyGenerationFailureStore failureStore,
         IStrategyGenerationConfigProvider configProvider,
         IStrategyGenerationArtifactReplayService artifactReplayService,
+        IValidationRunFactory validationRunFactory,
         TimeProvider timeProvider)
     {
         _logger = logger;
@@ -47,6 +50,7 @@ internal sealed class StrategyGenerationCandidatePersistenceService : IStrategyG
         _failureStore = failureStore;
         _configProvider = configProvider;
         _artifactReplayService = artifactReplayService;
+        _validationRunFactory = validationRunFactory;
         _timeProvider = timeProvider;
     }
 
@@ -132,7 +136,7 @@ internal sealed class StrategyGenerationCandidatePersistenceService : IStrategyG
                 if (queuedSet.Contains(candidate.Strategy.Id))
                     continue;
 
-                writeDb.Set<BacktestRun>().Add(BuildQueuedBacktestRun(candidate));
+                writeDb.Set<BacktestRun>().Add(await BuildQueuedBacktestRunAsync(writeDb, candidate, ct));
             }
 
             await writeCtx.SaveChangesAsync(ct);
@@ -197,12 +201,62 @@ internal sealed class StrategyGenerationCandidatePersistenceService : IStrategyG
                                     && r.Status == RunStatus.Queued
                                     && !r.IsDeleted, ct);
                     if (!queuedAlreadyExists)
-                        writeDb.Set<BacktestRun>().Add(BuildQueuedBacktestRun(candidate));
+                        writeDb.Set<BacktestRun>().Add(await BuildQueuedBacktestRunAsync(writeDb, candidate, ct));
 
                     await writeCtx.SaveChangesAsync(ct);
                     if (tx != null)
                         await tx.CommitAsync(ct);
                     saved.Add(candidate);
+                }
+                catch (DbUpdateException dbEx) when (StrategyGenerationDbExceptionClassifier.IsActiveStrategyDuplicateViolation(dbEx))
+                {
+                    DetachDirtyEntries(writeDb);
+
+                    bool duplicateExists = await db.Set<Strategy>()
+                        .AnyAsync(s => !s.IsDeleted
+                                    && s.StrategyType == candidate.Strategy.StrategyType
+                                    && s.Symbol == candidate.Strategy.Symbol
+                                    && s.Timeframe == candidate.Strategy.Timeframe, ct);
+                    if (duplicateExists)
+                    {
+                        _logger.LogInformation(
+                            "StrategyGenerationWorker: duplicate strategy combo {Type}/{Symbol}/{Tf} was persisted concurrently elsewhere; skipping local duplicate",
+                            candidate.Strategy.StrategyType,
+                            candidate.Strategy.Symbol,
+                            candidate.Strategy.Timeframe);
+                        continue;
+                    }
+
+                    failures.Add(BuildFailureRecord(
+                        candidate,
+                        "individual_persist",
+                        "duplicate_strategy_violation_without_visible_row",
+                        JsonSerializer.Serialize(new { error = dbEx.Message })));
+                }
+                catch (DbUpdateException dbEx) when (StrategyGenerationDbExceptionClassifier.IsActiveValidationQueueDuplicateViolation(dbEx))
+                {
+                    DetachDirtyEntries(writeDb);
+
+                    string? queueKey = _priorityResolver.BuildInitialBacktestQueueKey(candidate);
+                    bool queueAlreadyExists = await db.Set<BacktestRun>()
+                        .AnyAsync(r => !r.IsDeleted
+                                    && r.ValidationQueueKey == queueKey
+                                    && (r.Status == RunStatus.Queued || r.Status == RunStatus.Running), ct);
+                    if (queueAlreadyExists)
+                    {
+                        _logger.LogInformation(
+                            "StrategyGenerationWorker: validation queue key {QueueKey} was claimed concurrently; treating candidate {StrategyId} as persisted",
+                            queueKey,
+                            candidate.Strategy.Id);
+                        saved.Add(candidate);
+                        continue;
+                    }
+
+                    failures.Add(BuildFailureRecord(
+                        candidate,
+                        "individual_persist",
+                        "duplicate_validation_queue_violation_without_visible_row",
+                        JsonSerializer.Serialize(new { error = dbEx.Message, queueKey })));
                 }
                 catch (Exception innerEx)
                 {
@@ -456,13 +510,36 @@ internal sealed class StrategyGenerationCandidatePersistenceService : IStrategyG
 
                 if (!queuedAlreadyExists)
                 {
-                    writeDb.Set<BacktestRun>().Add(BuildQueuedBacktestRun(candidate));
+                    writeDb.Set<BacktestRun>().Add(await BuildQueuedBacktestRunAsync(writeDb, candidate, ct));
                     await writeCtx.SaveChangesAsync(ct);
                 }
 
                 var recoveredMetrics = ScreeningMetrics.FromJson(candidate.Strategy.ScreeningMetricsJson)
                     ?? candidate.Metrics;
                 recovered.Add(candidate with { Metrics = recoveredMetrics });
+            }
+            catch (DbUpdateException dbEx) when (StrategyGenerationDbExceptionClassifier.IsActiveValidationQueueDuplicateViolation(dbEx))
+            {
+                string? queueKey = _priorityResolver.BuildInitialBacktestQueueKey(candidate);
+                bool queuedAlreadyExists = await readDb.Set<BacktestRun>()
+                    .AnyAsync(r => !r.IsDeleted
+                                && r.ValidationQueueKey == queueKey
+                                && (r.Status == RunStatus.Queued || r.Status == RunStatus.Running), ct);
+                if (queuedAlreadyExists)
+                {
+                    var recoveredMetrics = ScreeningMetrics.FromJson(candidate.Strategy.ScreeningMetricsJson)
+                        ?? candidate.Metrics;
+                    recovered.Add(candidate with { Metrics = recoveredMetrics });
+                    DetachDirtyEntries(writeDb);
+                    continue;
+                }
+
+                failures.Add(BuildFailureRecord(
+                    candidate,
+                    "batch_recovery",
+                    "duplicate_validation_queue_violation_without_visible_row",
+                    JsonSerializer.Serialize(new { error = dbEx.Message, queueKey })));
+                DetachDirtyEntries(writeDb);
             }
             catch (Exception ex)
             {
@@ -522,22 +599,26 @@ internal sealed class StrategyGenerationCandidatePersistenceService : IStrategyG
                ScreenedAtUtc = _timeProvider.GetUtcNow().UtcDateTime,
            };
 
-    private BacktestRun BuildQueuedBacktestRun(ScreeningOutcome candidate)
+    private async Task<BacktestRun> BuildQueuedBacktestRunAsync(
+        DbContext writeDb,
+        ScreeningOutcome candidate,
+        CancellationToken ct)
     {
         var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
-        return new BacktestRun
-        {
-            StrategyId = candidate.Strategy.Id,
-            Symbol = candidate.Strategy.Symbol,
-            Timeframe = candidate.Strategy.Timeframe,
-            FromDate = nowUtc.AddDays(-365),
-            ToDate = nowUtc,
-            InitialBalance = 10_000m,
-            Status = RunStatus.Queued,
-            Priority = candidate.Strategy.ValidationPriority,
-            ValidationQueueKey = _priorityResolver.BuildInitialBacktestQueueKey(candidate),
-            StartedAt = nowUtc,
-        };
+        return await _validationRunFactory.BuildBacktestRunAsync(
+            writeDb,
+            new BacktestQueueRequest(
+                StrategyId: candidate.Strategy.Id,
+                Symbol: candidate.Strategy.Symbol,
+                Timeframe: candidate.Strategy.Timeframe,
+                FromDate: nowUtc.AddDays(-365),
+                ToDate: nowUtc,
+                InitialBalance: 10_000m,
+                QueueSource: ValidationRunQueueSources.StrategyGenerationInitial,
+                Priority: candidate.Strategy.ValidationPriority,
+                ParametersSnapshotJson: candidate.Strategy.ParametersJson,
+                ValidationQueueKey: _priorityResolver.BuildInitialBacktestQueueKey(candidate)),
+            ct);
     }
 
     private StrategyGenerationFailureRecord BuildFailureRecord(

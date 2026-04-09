@@ -5,7 +5,7 @@ using MarketRegimeEnum = LascodiaTradingEngine.Domain.Enums.MarketRegime;
 namespace LascodiaTradingEngine.Application.Common.Events;
 
 /// <summary>
-/// Published when a strategy candidate is auto-promoted to ShadowLive because it meets
+/// Published when a strategy candidate is auto-promoted for accelerated validation because it meets
 /// elite screening criteria (2x thresholds, 3/3 walk-forward, p&lt;0.01, R²&gt;0.90).
 /// </summary>
 public record StrategyAutoPromotedIntegrationEvent : IntegrationEvent
@@ -13,7 +13,7 @@ public record StrategyAutoPromotedIntegrationEvent : IntegrationEvent
     /// <summary>Monotonic sequence number for ordering detection.</summary>
     public long SequenceNumber { get; init; } = EventSequence.Next();
 
-    /// <summary>The promoted strategy's database Id.</summary>
+    /// <summary>The fast-tracked strategy's database Id.</summary>
     public long StrategyId { get; init; }
 
     /// <summary>Human-readable strategy name.</summary>
@@ -73,6 +73,6 @@ public record StrategyAutoPromotedIntegrationEvent : IntegrationEvent
     /// <summary>Drawdown inflation multiplier used during promotion screening.</summary>
     public double DrawdownInflationApplied { get; init; }
 
-    /// <summary>UTC timestamp when the strategy was auto-promoted.</summary>
+    /// <summary>UTC timestamp when the accelerated-validation decision was made.</summary>
     public DateTime PromotedAt { get; init; } = DateTime.UtcNow;
 }

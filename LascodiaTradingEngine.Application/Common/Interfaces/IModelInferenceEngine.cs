@@ -10,11 +10,15 @@ namespace LascodiaTradingEngine.Application.Common.Interfaces;
 /// <param name="EnsembleStd">Inter-learner standard deviation (0 for single-output models like TCN).</param>
 /// <param name="McDropoutMean">Mean probability across MC-Dropout samples. Null when MC-Dropout is disabled.</param>
 /// <param name="McDropoutVariance">Variance across MC-Dropout samples. Null when MC-Dropout is disabled.</param>
+/// <param name="Magnitude">Optional model-native magnitude prediction.</param>
+/// <param name="ModelSpaceValues">Optional values in the model's native explainability space.</param>
 public readonly record struct InferenceResult(
     double   Probability,
     double   EnsembleStd,
     decimal? McDropoutMean     = null,
-    decimal? McDropoutVariance = null);
+    decimal? McDropoutVariance = null,
+    double?  Magnitude         = null,
+    double[]? ModelSpaceValues = null);
 
 /// <summary>
 /// Encapsulates model-type-specific inference: forward pass + MC-Dropout uncertainty estimation.

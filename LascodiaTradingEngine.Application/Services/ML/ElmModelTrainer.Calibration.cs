@@ -343,39 +343,7 @@ public sealed partial class ElmModelTrainer
         if (validCount <= 1)
             return 0.0;
 
-        double avg;
-        if (stackingWeights is { Length: > 0 } sw)
-        {
-            double z = stackingBias;
-            for (int k = 0; k < validCount; k++)
-            {
-                int originalIndex = validIndices[k];
-                double stackingWeight = originalIndex < sw.Length && double.IsFinite(sw[originalIndex])
-                    ? sw[originalIndex]
-                    : 0.0;
-                z += stackingWeight * probs[k];
-            }
-            avg = ClampProbabilityOrNeutral(MLFeatureHelper.Sigmoid(z));
-        }
-        else if (learnerWeights is { Length: > 0 } lw)
-        {
-            double sumP = 0.0;
-            double sumW = 0.0;
-            for (int k = 0; k < validCount; k++)
-            {
-                int originalIndex = validIndices[k];
-                double learnerWeight = originalIndex < lw.Length && double.IsFinite(lw[originalIndex]) && lw[originalIndex] > 0.0
-                    ? lw[originalIndex]
-                    : 0.0;
-                sumP += learnerWeight * probs[k];
-                sumW += learnerWeight;
-            }
-            avg = ClampProbabilityOrNeutral(sumW > 1e-15 ? sumP / sumW : probs[..validCount].Average());
-        }
-        else
-        {
-            avg = probs[..validCount].Average();
-        }
+        double avg = probs[..validCount].Average();
 
         double variance = 0.0;
         for (int k = 0; k < validCount; k++)

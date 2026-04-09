@@ -1,4 +1,7 @@
 using System.Buffers;
+using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
@@ -23,7 +26,7 @@ namespace LascodiaTradingEngine.Application.Services;
 ///   <item>Label smoothing (ε=LabelSmoothing) applied to cross-entropy targets.</item>
 ///   <item>Platt scaling (A, B) fitted on the calibration fold after the ensemble is frozen.</item>
 ///   <item>ECE (Expected Calibration Error) computed post-Platt on the held-out test set.</item>
-///   <item>EV-optimal decision threshold swept on the test set to maximise expected value.</item>
+///   <item>EV-optimal decision threshold swept on the calibration set to maximise expected value.</item>
 ///   <item>A parallel linear regressor predicts magnitude in ATR-normalised units.</item>
 ///   <item>Optional feature pruning: low-importance features are masked and the ensemble is re-trained.</item>
 ///   <item>Optional warm-start: ensemble weights are initialised from the previous model snapshot.</item>
@@ -54,6 +57,14 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         public static readonly MlpState None = new(null, null, 0);
         public bool IsActive => HiddenDim > 0 && HiddenW is not null && HiddenB is not null;
     }
+
+    internal readonly record struct PolicyEvaluation(
+        EvalMetrics Metrics,
+        (int Predicted, int Actual)[] Predictions);
+
+    internal readonly record struct WarmStartCompatibilityResult(
+        bool IsCompatible,
+        string[] Issues);
 
     // Adam hyper-parameters (fixed)
     private const double AdamBeta1   = 0.9;
@@ -98,6 +109,29 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         ValidateTrainingSamples(samples);
         var featureCount = samples[0].Features.Length;
         int sampleCount  = samples.Count;
+        int barsPerDay   = BaggedLogisticTrainer.ResolveBarsPerDay(hp.BarsPerDay);
+
+        var snapshotFeatureNames = BuildFeatureNames(featureCount);
+        string featureSchemaFingerprint = BaggedLogisticTrainer.ComputeFeatureSchemaFingerprint(snapshotFeatureNames);
+        string preprocessingFingerprint = BaggedLogisticTrainer.ComputePreprocessingFingerprint(featureCount);
+        string trainerFingerprint = BaggedLogisticTrainer.ComputeTrainerFingerprint(hp, featureCount);
+
+        if (warmStart is not null)
+        {
+            var compatibility = BaggedLogisticTrainer.AssessWarmStartCompatibility(
+                warmStart,
+                featureSchemaFingerprint,
+                preprocessingFingerprint,
+                trainerFingerprint,
+                featureCount);
+            if (!compatibility.IsCompatible)
+            {
+                _logger.LogWarning(
+                    "Warm-start snapshot rejected: {Issues}",
+                    string.Join("; ", compatibility.Issues));
+                warmStart = null;
+            }
+        }
 
         // ── 0. Incremental update fast-path ─────────────────────────────────
         // When UseIncrementalUpdate is enabled and a warm-start snapshot is available,
@@ -105,7 +139,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         // doing a full retrain. Much faster for adapting to regime changes.
         if (hp.UseIncrementalUpdate && warmStart is not null && hp.DensityRatioWindowDays > 0)
         {
-            int recentCount = Math.Min(samples.Count, hp.DensityRatioWindowDays * 24); // approx hourly bars
+            int recentCount = BaggedLogisticTrainer.ComputeIncrementalRecentSampleCount(samples.Count, hp.DensityRatioWindowDays, barsPerDay);
             if (recentCount >= hp.MinSamples)
             {
                 _logger.LogInformation(
@@ -128,7 +162,11 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         // Fit standardisation only on the actual training prefix so future cal/test
         // distribution does not leak into either walk-forward CV or the final model.
         int embargo     = hp.EmbargoBarCount;
-        var (trainStdEnd, calStart, calEnd, testStart) = ComputeFinalSplitBoundaries(sampleCount, embargo);
+        var (trainStdEnd, calStart, calEnd, testStart) = BaggedLogisticTrainer.ComputeFinalSplitBoundaries(
+            sampleCount,
+            embargo,
+            hp.PurgeHorizonBars,
+            MLFeatureHelper.LookbackWindow);
 
         var (means, stds) = ComputeStandardizationStats(samples[..trainStdEnd]);
         var allStd        = ApplyStandardization(samples, means, stds);
@@ -153,6 +191,12 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         if (trainSet.Count < hp.MinSamples)
             throw new InvalidOperationException(
                 $"Insufficient training samples after splits: {trainSet.Count} < {hp.MinSamples}");
+        if (calSet.Count < 30)
+            throw new InvalidOperationException(
+                $"Insufficient calibration samples after leakage-safe splits: {calSet.Count} < 30");
+        if (testSet.Count < 20)
+            throw new InvalidOperationException(
+                $"Insufficient test samples after leakage-safe splits: {testSet.Count} < 20");
 
         // Reduce epochs for warm-start runs — weights already near-optimal
         var effectiveHp = warmStart is not null
@@ -178,7 +222,11 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         double[]? densityWeights = null;
         if (hp.DensityRatioWindowDays > 0 && trainSet.Count >= 50)
         {
-            densityWeights = ComputeDensityRatioWeights(trainSet, featureCount, hp.DensityRatioWindowDays);
+            densityWeights = BaggedLogisticTrainer.ComputeDensityRatioWeights(
+                trainSet,
+                featureCount,
+                hp.DensityRatioWindowDays,
+                barsPerDay);
             _logger.LogDebug("Density-ratio weights computed (recentWindow={W}% of train).",
                 hp.DensityRatioWindowDays);
         }
@@ -206,7 +254,8 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         if (hp.UseCovariateShiftWeights &&
             warmStart?.FeatureQuantileBreakpoints is { Length: > 0 } parentBp)
         {
-            var csWeights = ComputeCovariateShiftWeights(trainSet, parentBp, featureCount);
+            var csWeights = BaggedLogisticTrainer.ComputeCovariateShiftWeights(
+                trainSet, parentBp, featureCount, warmStart.ActiveFeatureMask);
             if (densityWeights is not null)
             {
                 // Plain loop — avoids LINQ Zip+ToArray allocation.
@@ -246,14 +295,6 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
             _logger.LogWarning("Post-fit sanitization: {N}/{K} learners had non-finite parameters.",
                 sanitizedCount, weights.Length);
 
-        // ── 4b. Greedy Ensemble Selection (GES) ──────────────────────────────
-        double[] gesWeights = hp.EnableGreedyEnsembleSelection && calSet.Count >= 20
-            ? RunGreedyEnsembleSelection(calSet, weights, biases, featureCount, featureSubsets, mlp: mlp)
-            : [];
-        if (gesWeights.Length > 0)
-            _logger.LogDebug("GES weights: [{W}]",
-                string.Join(",", gesWeights.Select(w => w.ToString("F3"))));
-
         // ── 5. Fit magnitude regressor ──────────────────────────────────────
         // When multi-task joint loss was active, FitEnsemble returns averaged magnitude
         // head weights; use those directly. Otherwise fall back to the standard OLS pass.
@@ -268,6 +309,8 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         _logger.LogDebug(
             "Stacking meta-learner: bias={B:F4} weights=[{W}]",
             meta.Bias, string.Join(",", meta.Weights.Select(w => w.ToString("F3"))));
+        double[] gesWeights = this.MaybeRunGreedyEnsembleSelection(
+            effectiveHp, calSet, weights, biases, featureCount, featureSubsets, meta, mlp: mlp);
 
         // ── 6. Platt calibration (on meta-learner output) ───────────────────
         var (plattA, plattB) = FitPlattScaling(calSet, weights, biases, featureCount, featureSubsets, meta, mlp);
@@ -457,11 +500,8 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
                 if (!pActiveLearnerMask[k]) pLearnerCalAccuracies[k] = 0.0;
             var pLearnerAccuracyWeights =
                 BuildLearnerAccuracyWeights(pLearnerCalAccuracies, pActiveLearnerMask);
-            var pGesWeights = hp.EnableGreedyEnsembleSelection && maskedCal.Count >= 20
-                ? RunGreedyEnsembleSelection(
-                    maskedCal, pw, pb, featureCount, pSubsets,
-                    activeLearners: pActiveLearnerMask, mlp: pMlp)
-                : [];
+            var pGesWeights = this.MaybeRunGreedyEnsembleSelection(
+                prunedHp, maskedCal, pw, pb, featureCount, pSubsets, pMeta, pActiveLearnerMask, pMlp);
 
             double PFinalRawProb(float[] features)
             {
@@ -586,11 +626,16 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
             if (!provisionalActiveLearnerMask[k]) provisionalLearnerCalAccuracies[k] = 0.0;
         var provisionalLearnerAccuracyWeights =
             BuildLearnerAccuracyWeights(provisionalLearnerCalAccuracies, provisionalActiveLearnerMask);
-        double[] provisionalGesWeights = hp.EnableGreedyEnsembleSelection && postPruneCalSet.Count >= 20
-            ? RunGreedyEnsembleSelection(
-                postPruneCalSet, weights, biases, featureCount, featureSubsets,
-                activeLearners: provisionalActiveLearnerMask, mlp: mlp)
-            : [];
+        double[] provisionalGesWeights = this.MaybeRunGreedyEnsembleSelection(
+            hp,
+            postPruneCalSet,
+            weights,
+            biases,
+            featureCount,
+            featureSubsets,
+            provisionalMeta,
+            provisionalActiveLearnerMask,
+            mlp);
 
         double ProvisionalRawProb(float[] features)
         {
@@ -727,11 +772,16 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         for (int k = 0; k < learnerCalAccuracies.Length && k < activeLearnerMask.Length; k++)
             if (!activeLearnerMask[k]) learnerCalAccuracies[k] = 0.0;
         var learnerAccuracyWeights = BuildLearnerAccuracyWeights(learnerCalAccuracies, activeLearnerMask);
-        gesWeights = hp.EnableGreedyEnsembleSelection && postPruneCalSet.Count >= 20
-            ? RunGreedyEnsembleSelection(
-                postPruneCalSet, weights, biases, featureCount, featureSubsets,
-                activeLearners: activeLearnerMask, mlp: mlp)
-            : [];
+        gesWeights = this.MaybeRunGreedyEnsembleSelection(
+            hp,
+            postPruneCalSet,
+            weights,
+            biases,
+            featureCount,
+            featureSubsets,
+            meta,
+            activeLearnerMask,
+            mlp);
         if (learnerCalAccuracies.Length > 0)
             _logger.LogDebug("Per-learner cal accuracies: [{Accs}]",
                 string.Join(", ", learnerCalAccuracies.Select(a => $"{a:P0}")));
@@ -861,6 +911,14 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
                 trainedAtUtc);
         }
 
+        (double Probability, double EnsembleStd) FinalProductionProbAndStd(float[] features)
+        {
+            var (rawProb, ensembleStd) = ComputeEnsembleProbabilityAndStd(
+                features, weights, biases, featureCount, featureSubsets,
+                meta, gesWeights, learnerAccuracyWeights, learnerCalAccuracies, activeLearnerMask, mlp);
+            return (FinalProductionProbFromRaw(rawProb), ensembleStd);
+        }
+
         optimalThreshold = ComputeOptimalThreshold(
             postPruneCalSet, FinalProductionProb, hp.ThresholdSearchMin, hp.ThresholdSearchMax);
 
@@ -926,10 +984,24 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
                     hp.MutualInfoRedundancyThreshold);
         }
 
-        finalMetrics = EvaluateEnsemble(postPruneTestSet, magWeights, magBias, FinalProductionProb, optimalThreshold)
-            with { OobAccuracy = oobAccuracy };
+        finalMetrics = BaggedLogisticTrainer.EvaluateSelectivePolicy(
+            postPruneTestSet,
+            magWeights,
+            magBias,
+            FinalProductionProbAndStd,
+            optimalThreshold,
+            metaLabelWeights,
+            metaLabelBias,
+            0.5,
+            abstentionWeights,
+            abstentionBias,
+            abstentionThreshold).Metrics with { OobAccuracy = oobAccuracy };
         ece = ComputeProductionEce(postPruneTestSet, FinalProductionProb);
         _logger.LogInformation("Final deployed-base ECE={Ece:F4}", ece);
+        _logger.LogInformation(
+            "Final deployed eval — acc={Acc:P1} f1={F1:F3} ev={EV:F4} brier={Brier:F4} sharpe={Sharpe:F2}",
+            finalMetrics.Accuracy, finalMetrics.F1,
+            finalMetrics.ExpectedValue, finalMetrics.BrierScore, finalMetrics.SharpeRatio);
 
         double ensembleDiversity = ComputeEnsembleDiversity(
             weights, featureCount, featureSubsets, activeLearnerMask, mlp);
@@ -970,7 +1042,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         {
             Type                       = ModelType,
             Version                    = ModelVersion,
-            Features                   = BuildFeatureNames(featureCount),
+            Features                   = snapshotFeatureNames,
             Means                      = means,
             Stds                       = stds,
             BaseLearnersK              = hp.K,
@@ -986,6 +1058,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
             CalSamples                 = calSet.Count,
             EmbargoSamples             = embargo,
             TrainedOn                  = trainedAtUtc,
+            TrainSamplesAtLastCalibration = postPruneTrainSet.Count,
             FeatureImportance          = finalFeatureImportance,
             ActiveFeatureMask          = activeMask,
             PrunedFeatureCount         = prunedCount,
@@ -1039,6 +1112,9 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
             MlpHiddenWeights           = mlp.HiddenW,
             MlpHiddenBiases            = mlp.HiddenB,
             ConformalCoverage          = hp.ConformalCoverage,
+            FeatureSchemaFingerprint   = featureSchemaFingerprint,
+            PreprocessingFingerprint   = preprocessingFingerprint,
+            TrainerFingerprint         = trainerFingerprint,
         };
 
         var modelBytes = JsonSerializer.SerializeToUtf8Bytes(snapshot, JsonOptions);
@@ -1054,6 +1130,9 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         CancellationToken    ct)
     {
         int folds   = hp.WalkForwardFolds;
+        if (folds <= 0)
+            return (new WalkForwardResult(0, 0, 0, 0, 0, 0), false);
+
         int embargo = hp.EmbargoBarCount;
 
         int foldSize = samples.Count / (folds + 1);
@@ -1117,6 +1196,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
             var (foldMeans, foldStds) = ComputeStandardizationStats(foldTrainRaw);
             var foldTrain = ApplyStandardization(foldTrainRaw, foldMeans, foldStds);
             var foldTest  = ApplyStandardization(foldTestRaw,  foldMeans, foldStds);
+            var foldCal   = foldTrain;
 
             var cvHp = hp with
             {
@@ -1124,7 +1204,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
                 EarlyStoppingPatience = Math.Max(5,  hp.EarlyStoppingPatience / 2),
             };
 
-            var (w, b, subs, _, _, _, foldMlpHW, foldMlpHB, _, _) =
+            var (w, b, subs, _, foldMtMagWeights, foldMtMagBias, foldMlpHW, foldMlpHB, foldOobTrainSet, foldOobSamplingWeights) =
                 FitEnsemble(foldTrain, cvHp, featureCount, null, null, ct, forceSequential: true);
             var foldMlp = new MlpState(foldMlpHW, foldMlpHB, cvHp.MlpHiddenDim);
             int foldSanitizedCount = SanitizeLearners(w, b, foldMlp.HiddenW, foldMlp.HiddenB);
@@ -1132,8 +1212,240 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
                 _logger.LogDebug(
                     "Walk-forward fold {Fold}: sanitized {N}/{K} learners before evaluation.",
                     fold, foldSanitizedCount, w.Length);
-            var (mw, mb) = FitLinearRegressor(foldTrain, featureCount, cvHp, ct);
-            var m        = EvaluateEnsemble(foldTest, w, b, mw, mb, 1.0, 0.0, featureCount, subs, mlp: foldMlp);
+            var (mw, mb) = foldMtMagWeights is { Length: > 0 }
+                ? (foldMtMagWeights, foldMtMagBias)
+                : FitLinearRegressor(foldTrain, featureCount, cvHp, ct);
+
+            var foldActiveLearnerMask = ComputeActiveLearnerMask(w, b);
+            var foldMeta = FitMetaLearner(foldCal, w, b, featureCount, subs, foldMlp);
+            var foldLearnerCalAccuracies = ComputeLearnerCalAccuracies(foldCal, w, b, featureCount, subs, foldMlp);
+            for (int k = 0; k < foldLearnerCalAccuracies.Length && k < foldActiveLearnerMask.Length; k++)
+                if (!foldActiveLearnerMask[k]) foldLearnerCalAccuracies[k] = 0.0;
+            var foldLearnerAccuracyWeights = BuildLearnerAccuracyWeights(
+                foldLearnerCalAccuracies, foldActiveLearnerMask);
+            double[] foldGesWeights = MaybeRunGreedyEnsembleSelection(
+                cvHp, foldCal, w, b, featureCount, subs, foldMeta, foldActiveLearnerMask, foldMlp);
+
+            double FoldRawProb(float[] features)
+            {
+                var (rawProb, _) = ComputeEnsembleProbabilityAndStd(
+                    features, w, b, featureCount, subs,
+                    foldMeta, foldGesWeights, foldLearnerAccuracyWeights, foldLearnerCalAccuracies,
+                    foldActiveLearnerMask, foldMlp);
+                return Math.Clamp(rawProb, 1e-7, 1.0 - 1e-7);
+            }
+
+            var foldTrainedAtUtc = DateTime.UtcNow;
+            double foldPlattA = 1.0;
+            double foldPlattB = 0.0;
+            if (foldCal.Count >= 10)
+                (foldPlattA, foldPlattB) = FitPlattScaling(foldCal, FoldRawProb);
+
+            double foldTemperatureScale = 0.0;
+            if (cvHp.FitTemperatureScale && foldCal.Count >= 10)
+            {
+                foldTemperatureScale = FitTemperatureScaling(
+                    foldCal,
+                    FoldRawProb,
+                    foldPlattA,
+                    foldPlattB,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    [],
+                    0.0,
+                    foldTrainedAtUtc);
+            }
+
+            var (foldPlattABuy, foldPlattBBuy, foldPlattASell, foldPlattBSell) = FitClassConditionalPlatt(
+                foldCal, FoldRawProb, foldPlattA, foldPlattB, foldTemperatureScale);
+
+            double FoldPreIsotonicProb(float[] features)
+            {
+                return ApplyProductionCalibration(
+                    FoldRawProb(features),
+                    foldPlattA,
+                    foldPlattB,
+                    foldTemperatureScale,
+                    foldPlattABuy,
+                    foldPlattBBuy,
+                    foldPlattASell,
+                    foldPlattBSell,
+                    [],
+                    0.0,
+                    foldTrainedAtUtc);
+            }
+
+            double[] foldIsotonicBp = FitIsotonicCalibrationGuarded(
+                foldCal, FoldPreIsotonicProb, cvHp.MinIsotonicCalibrationSamples);
+
+            if (cvHp.FitTemperatureScale && foldCal.Count >= 10)
+            {
+                double refitFoldTemperatureScale = FitTemperatureScaling(
+                    foldCal,
+                    FoldRawProb,
+                    foldPlattA,
+                    foldPlattB,
+                    foldPlattABuy,
+                    foldPlattBBuy,
+                    foldPlattASell,
+                    foldPlattBSell,
+                    foldIsotonicBp,
+                    cvHp.AgeDecayLambda,
+                    foldTrainedAtUtc);
+
+                if (Math.Abs(refitFoldTemperatureScale - foldTemperatureScale) > 1e-6)
+                {
+                    foldTemperatureScale = refitFoldTemperatureScale;
+                    (foldPlattABuy, foldPlattBBuy, foldPlattASell, foldPlattBSell) = FitClassConditionalPlatt(
+                        foldCal, FoldRawProb, foldPlattA, foldPlattB, foldTemperatureScale);
+                    foldIsotonicBp = FitIsotonicCalibrationGuarded(
+                        foldCal, FoldPreIsotonicProb, cvHp.MinIsotonicCalibrationSamples);
+                }
+            }
+
+            double FoldProductionProb(float[] features)
+            {
+                return ApplyProductionCalibration(
+                    FoldRawProb(features),
+                    foldPlattA,
+                    foldPlattB,
+                    foldTemperatureScale,
+                    foldPlattABuy,
+                    foldPlattBBuy,
+                    foldPlattASell,
+                    foldPlattBSell,
+                    foldIsotonicBp,
+                    cvHp.AgeDecayLambda,
+                    foldTrainedAtUtc);
+            }
+
+            double FoldProductionProbFromRaw(double rawProb)
+            {
+                return ApplyProductionCalibration(
+                    Math.Clamp(rawProb, 1e-7, 1.0 - 1e-7),
+                    foldPlattA,
+                    foldPlattB,
+                    foldTemperatureScale,
+                    foldPlattABuy,
+                    foldPlattBBuy,
+                    foldPlattASell,
+                    foldPlattBSell,
+                    foldIsotonicBp,
+                    cvHp.AgeDecayLambda,
+                    foldTrainedAtUtc);
+            }
+
+            double foldDecisionThreshold = ComputeOptimalThreshold(
+                foldCal, FoldProductionProb, cvHp.ThresholdSearchMin, cvHp.ThresholdSearchMax);
+
+            if (cvHp.OobPruningEnabled && cvHp.K >= 2)
+            {
+                int foldOobPrunedCount = PruneByOobContribution(
+                    foldOobTrainSet, w, b, foldOobSamplingWeights, featureCount, subs, cvHp.K,
+                    foldMeta, foldGesWeights, foldLearnerAccuracyWeights, foldLearnerCalAccuracies,
+                    foldMlp, foldActiveLearnerMask, FoldProductionProbFromRaw, foldDecisionThreshold);
+                if (foldOobPrunedCount > 0)
+                {
+                    foldActiveLearnerMask = ComputeActiveLearnerMask(w, b);
+                    foldMeta = FitMetaLearner(foldCal, w, b, featureCount, subs, foldMlp);
+                    foldLearnerCalAccuracies = ComputeLearnerCalAccuracies(foldCal, w, b, featureCount, subs, foldMlp);
+                    for (int k = 0; k < foldLearnerCalAccuracies.Length && k < foldActiveLearnerMask.Length; k++)
+                        if (!foldActiveLearnerMask[k]) foldLearnerCalAccuracies[k] = 0.0;
+                    foldLearnerAccuracyWeights = BuildLearnerAccuracyWeights(
+                        foldLearnerCalAccuracies, foldActiveLearnerMask);
+                    foldGesWeights = MaybeRunGreedyEnsembleSelection(
+                        cvHp, foldCal, w, b, featureCount, subs, foldMeta, foldActiveLearnerMask, foldMlp);
+
+                    if (foldCal.Count >= 10)
+                        (foldPlattA, foldPlattB) = FitPlattScaling(foldCal, FoldRawProb);
+                    else
+                        (foldPlattA, foldPlattB) = (1.0, 0.0);
+
+                    foldTemperatureScale = 0.0;
+                    if (cvHp.FitTemperatureScale && foldCal.Count >= 10)
+                    {
+                        foldTemperatureScale = FitTemperatureScaling(
+                            foldCal,
+                            FoldRawProb,
+                            foldPlattA,
+                            foldPlattB,
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            [],
+                            0.0,
+                            foldTrainedAtUtc);
+                    }
+
+                    (foldPlattABuy, foldPlattBBuy, foldPlattASell, foldPlattBSell) = FitClassConditionalPlatt(
+                        foldCal, FoldRawProb, foldPlattA, foldPlattB, foldTemperatureScale);
+                    foldIsotonicBp = FitIsotonicCalibrationGuarded(
+                        foldCal, FoldPreIsotonicProb, cvHp.MinIsotonicCalibrationSamples);
+
+                    if (cvHp.FitTemperatureScale && foldCal.Count >= 10)
+                    {
+                        double refitFoldTemperatureScale = FitTemperatureScaling(
+                            foldCal,
+                            FoldRawProb,
+                            foldPlattA,
+                            foldPlattB,
+                            foldPlattABuy,
+                            foldPlattBBuy,
+                            foldPlattASell,
+                            foldPlattBSell,
+                            foldIsotonicBp,
+                            cvHp.AgeDecayLambda,
+                            foldTrainedAtUtc);
+
+                        if (Math.Abs(refitFoldTemperatureScale - foldTemperatureScale) > 1e-6)
+                        {
+                            foldTemperatureScale = refitFoldTemperatureScale;
+                            (foldPlattABuy, foldPlattBBuy, foldPlattASell, foldPlattBSell) = FitClassConditionalPlatt(
+                                foldCal, FoldRawProb, foldPlattA, foldPlattB, foldTemperatureScale);
+                            foldIsotonicBp = FitIsotonicCalibrationGuarded(
+                                foldCal, FoldPreIsotonicProb, cvHp.MinIsotonicCalibrationSamples);
+                        }
+                    }
+
+                    foldDecisionThreshold = ComputeOptimalThreshold(
+                        foldCal, FoldProductionProb, cvHp.ThresholdSearchMin, cvHp.ThresholdSearchMax);
+                }
+            }
+
+            var (foldMetaLabelWeights, foldMetaLabelBias) = FitMetaLabelModel(
+                foldCal, FoldProductionProb, w, b, featureCount, subs,
+                foldMeta, foldGesWeights, foldLearnerAccuracyWeights, foldLearnerCalAccuracies,
+                foldDecisionThreshold, foldActiveLearnerMask, foldMlp);
+            var (foldAbstentionWeights, foldAbstentionBias, foldAbstentionThreshold) = FitAbstentionModel(
+                foldCal, FoldProductionProb, w, b, foldMetaLabelWeights, foldMetaLabelBias,
+                featureCount, subs, foldMeta, foldGesWeights, foldLearnerAccuracyWeights,
+                foldLearnerCalAccuracies, foldDecisionThreshold, foldActiveLearnerMask, foldMlp);
+
+            (double Probability, double EnsembleStd) FoldProductionProbAndStd(float[] features)
+            {
+                var (rawProb, ensembleStd) = ComputeEnsembleProbabilityAndStd(
+                    features, w, b, featureCount, subs,
+                    foldMeta, foldGesWeights, foldLearnerAccuracyWeights, foldLearnerCalAccuracies,
+                    foldActiveLearnerMask, foldMlp);
+                return (FoldProductionProbFromRaw(rawProb), ensembleStd);
+            }
+
+            var foldEvaluation = BaggedLogisticTrainer.EvaluateSelectivePolicy(
+                foldTest,
+                mw,
+                mb,
+                FoldProductionProbAndStd,
+                foldDecisionThreshold,
+                foldMetaLabelWeights,
+                foldMetaLabelBias,
+                0.5,
+                foldAbstentionWeights,
+                foldAbstentionBias,
+                foldAbstentionThreshold);
+            var m = foldEvaluation.Metrics;
 
             // Compute per-feature mean projected |weight| for walk-forward stability scoring.
             // This keeps MLP/subsampled/poly learners comparable in raw feature space and
@@ -1142,16 +1454,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
                 w, b, featureCount, subs, foldMlp.HiddenW, foldMlp.HiddenDim);
 
             // ── Equity-curve gate ──────────────────────────────────────────────
-            // Plain array — avoids LINQ Select+ToList allocation inside parallel folds.
-            var foldPredictions = new (int Predicted, int Actual)[foldTest.Count];
-            for (int pi = 0; pi < foldTest.Count; pi++)
-            {
-                double rawP = EnsembleProb(foldTest[pi].Features, w, b, featureCount, subs, default, foldMlp.HiddenW, foldMlp.HiddenB, foldMlp.HiddenDim);
-                foldPredictions[pi] = (rawP >= 0.5 ? 1 : -1,
-                                       foldTest[pi].Direction > 0 ? 1 : -1);
-            }
-
-            var (foldMaxDD, foldCurveSharpe) = ComputeEquityCurveStats(foldPredictions);
+            var (foldMaxDD, foldCurveSharpe) = ComputeEquityCurveStats(foldEvaluation.Predictions);
 
             bool isBadFold = false;
             if (hp.MaxFoldDrawdown < 1.0 && foldMaxDD > hp.MaxFoldDrawdown)
@@ -2219,14 +2522,17 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         double    avgMtMagBias    = 0.0;
         if (useMagTask && magWeightsK is { Length: > 0 })
         {
-            avgMtMagWeights = new double[featureCount];
+            int maxMagDim = 0;
+            for (int k = 0; k < hp.K; k++)
+                maxMagDim = Math.Max(maxMagDim, magWeightsK[k].Length);
+            avgMtMagWeights = new double[maxMagDim];
             for (int k = 0; k < hp.K; k++)
             {
-                for (int j = 0; j < featureCount && j < magWeightsK[k].Length; j++)
+                for (int j = 0; j < maxMagDim && j < magWeightsK[k].Length; j++)
                     avgMtMagWeights[j] += magWeightsK[k][j];
                 avgMtMagBias += magBiasesK![k];
             }
-            for (int j = 0; j < featureCount; j++)
+            for (int j = 0; j < maxMagDim; j++)
                 avgMtMagWeights[j] /= hp.K;
             avgMtMagBias /= hp.K;
         }
@@ -2513,6 +2819,30 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
 
     // ── Evaluation ───────────────────────────────────────────────────────────
 
+    internal static double PredictMagnitude(float[] features, double[] magWeights, double magBias, int polyTopN = PolyTopN)
+    {
+        if (features.Length == 0)
+            return magBias;
+
+        double prediction = magBias;
+        int baseCount = Math.Min(features.Length, magWeights.Length);
+        for (int j = 0; j < baseCount; j++)
+            prediction += magWeights[j] * features[j];
+
+        if (magWeights.Length > features.Length)
+        {
+            int actualTop = Math.Min(polyTopN, features.Length);
+            int idx = features.Length;
+            for (int a = 0; a < actualTop; a++)
+            {
+                for (int b = a + 1; b < actualTop && idx < magWeights.Length; b++)
+                    prediction += magWeights[idx++] * features[a] * features[b];
+            }
+        }
+
+        return prediction;
+    }
+
     private static EvalMetrics EvaluateEnsemble(
         List<TrainingSample> testSet,
         double[][]           weights,
@@ -2549,7 +2879,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
                 double y = actualUp ? 1.0 : 0.0;
                 sumBrier += (calibP - y) * (calibP - y);
 
-                double magPred = MLFeatureHelper.DotProduct(magWeights, s.Features) + magBias;
+                double magPred = PredictMagnitude(s.Features, magWeights, magBias);
                 double magErr  = magPred - s.Magnitude;
                 sumMagSqErr += magErr * magErr;
 
@@ -2619,11 +2949,11 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
                 double y = actualUp ? 1.0 : 0.0;
                 sumBrier += (calibP - y) * (calibP - y);
 
-                double magPred = MLFeatureHelper.DotProduct(magWeights, s.Features) + magBias;
+                double magPred = PredictMagnitude(s.Features, magWeights, magBias);
                 double magErr = magPred - s.Magnitude;
                 sumMagSqErr += magErr * magErr;
 
-                double edge = calibP - 0.5;
+                double edge = calibP - decisionThreshold;
                 sumEV += (correct ? 1 : -1) * Math.Abs(edge) * Math.Abs(s.Magnitude);
 
                 int predDir = predictedUp ? 1 : -1;
@@ -2655,6 +2985,146 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
                 WeightedAccuracy: weightedAccuracy,
                 SharpeRatio:      ComputeSharpe(retBuf, retCount),
                 TP: tp, FP: fp, FN: fn, TN: tn);
+        }
+        finally
+        {
+            ArrayPool<double>.Shared.Return(retBuf);
+        }
+    }
+
+    private static PolicyEvaluation EvaluateSelectivePolicy(
+        List<TrainingSample>                  testSet,
+        double[]                              magWeights,
+        double                                magBias,
+        Func<float[], (double Probability, double EnsembleStd)> probabilityAndStdProvider,
+        double                                decisionThreshold = 0.5,
+        double[]?                             metaLabelWeights = null,
+        double                                metaLabelBias = 0.0,
+        double                                metaLabelThreshold = 0.5,
+        double[]?                             abstentionWeights = null,
+        double                                abstentionBias = 0.0,
+        double                                abstentionThreshold = 0.5,
+        double                                abstentionThresholdBuy = 0.0,
+        double                                abstentionThresholdSell = 0.0)
+    {
+        if (testSet.Count == 0)
+            return new PolicyEvaluation(
+                new EvalMetrics(0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0),
+                []);
+
+        int tp = 0, fp = 0, fn = 0, tn = 0;
+        int correctPredictions = 0;
+        double sumMagSqErr = 0.0, sumBrier = 0.0, sumEV = 0.0;
+        double weightedCorrect = 0.0, weightedTotal = 0.0;
+
+        int n = testSet.Count;
+        double[] retBuf = ArrayPool<double>.Shared.Rent(n);
+        var predictions = new (int Predicted, int Actual)[n];
+        int retCount = 0;
+        try
+        {
+            for (int i = 0; i < n; i++)
+            {
+                var s = testSet[i];
+                var (calibP, ensembleStd) = probabilityAndStdProvider(s.Features);
+                calibP = Math.Clamp(calibP, 0.0, 1.0);
+
+                bool actualUp = s.Direction == 1;
+                int actualDir = actualUp ? 1 : -1;
+                double y = actualUp ? 1.0 : 0.0;
+                sumBrier += (calibP - y) * (calibP - y);
+
+                double magPred = PredictMagnitude(s.Features, magWeights, magBias);
+                double magErr = magPred - s.Magnitude;
+                sumMagSqErr += magErr * magErr;
+
+                double wt = 1.0 + (double)i / n;
+                weightedTotal += wt;
+
+                bool predictedUp = calibP >= decisionThreshold;
+                decimal? metaLabelScore = ScoringEnrichmentCalculator.ComputeMetaLabelScore(
+                    calibP,
+                    ensembleStd,
+                    s.Features,
+                    s.Features.Length,
+                    metaLabelWeights ?? [],
+                    metaLabelBias);
+                decimal? abstentionScore = ScoringEnrichmentCalculator.ComputeAbstentionScore(
+                    calibP,
+                    ensembleStd,
+                    metaLabelScore,
+                    null,
+                    ScoringEnrichmentCalculator.ComputeEntropy(calibP),
+                    decisionThreshold,
+                    abstentionWeights ?? [],
+                    abstentionBias);
+
+                double appliedAbstentionThreshold = predictedUp
+                    ? (abstentionThresholdBuy > 0.0 ? abstentionThresholdBuy : abstentionThreshold)
+                    : (abstentionThresholdSell > 0.0 ? abstentionThresholdSell : abstentionThreshold);
+                bool suppressed =
+                    metaLabelScore.HasValue &&
+                    metaLabelWeights is { Length: > 0 } &&
+                    metaLabelScore.Value < (decimal)metaLabelThreshold;
+                suppressed = suppressed || (
+                    abstentionScore.HasValue &&
+                    abstentionWeights is { Length: > 0 } &&
+                    abstentionScore.Value < (decimal)appliedAbstentionThreshold);
+
+                if (suppressed)
+                {
+                    predictions[i] = (0, actualDir);
+                    if (actualUp) fn++;
+                    retBuf[retCount++] = 0.0;
+                    continue;
+                }
+
+                bool correct = predictedUp == actualUp;
+                if (correct)
+                {
+                    correctPredictions++;
+                    weightedCorrect += wt;
+                }
+
+                double edge = calibP - decisionThreshold;
+                sumEV += (correct ? 1 : -1) * Math.Abs(edge) * Math.Abs(s.Magnitude);
+
+                int predDir = predictedUp ? 1 : -1;
+                predictions[i] = (predDir, actualDir);
+                retBuf[retCount++] = predDir * actualDir * Math.Abs(s.Magnitude);
+
+                if (predictedUp)
+                {
+                    if (correct) tp++;
+                    else fp++;
+                }
+                else
+                {
+                    if (correct) tn++;
+                    else fn++;
+                }
+            }
+
+            double accuracy = correctPredictions / (double)n;
+            double precision = (tp + fp) > 0 ? tp / (double)(tp + fp) : 0.0;
+            double recall = (tp + fn) > 0 ? tp / (double)(tp + fn) : 0.0;
+            double f1 = (precision + recall) > 0
+                ? 2 * precision * recall / (precision + recall)
+                : 0.0;
+
+            return new PolicyEvaluation(
+                new EvalMetrics(
+                    Accuracy: accuracy,
+                    Precision: precision,
+                    Recall: recall,
+                    F1: f1,
+                    MagnitudeRmse: Math.Sqrt(sumMagSqErr / n),
+                    ExpectedValue: sumEV / n,
+                    BrierScore: sumBrier / n,
+                    WeightedAccuracy: weightedTotal > 0.0 ? weightedCorrect / weightedTotal : 0.0,
+                    SharpeRatio: ComputeSharpe(retBuf, retCount),
+                    TP: tp, FP: fp, FN: fn, TN: tn),
+                predictions);
         }
         finally
         {
@@ -3179,22 +3649,47 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         return MLFeatureHelper.ComputeStandardization(rawFeatures);
     }
 
+    internal static int ResolveBarsPerDay(int barsPerDay) => barsPerDay > 0 ? barsPerDay : 24;
+
+    internal static int ComputeIncrementalRecentSampleCount(int sampleCount, int recentWindowDays, int barsPerDay)
+        => Math.Min(sampleCount, recentWindowDays * ResolveBarsPerDay(barsPerDay));
+
+    internal static int ComputeDensityRatioRecentCount(int sampleCount, int recentWindowDays, int barsPerDay)
+    {
+        if (sampleCount <= 10)
+            return Math.Max(0, sampleCount - 1);
+
+        int recentCount = Math.Max(
+            10,
+            Math.Min(sampleCount / 5, recentWindowDays * ResolveBarsPerDay(barsPerDay)));
+        return Math.Min(recentCount, sampleCount - 10);
+    }
+
+    internal static int ComputeLeakageGap(int embargo, int purgeHorizonBars, int lookbackWindow)
+    {
+        int lookbackGap = Math.Max(0, embargo) + Math.Max(0, lookbackWindow - 1);
+        int horizonGap = Math.Max(0, purgeHorizonBars);
+        return Math.Max(lookbackGap, horizonGap);
+    }
+
     internal static (int TrainStdEnd, int CalStart, int CalEnd, int TestStart) ComputeFinalSplitBoundaries(
         int sampleCount,
-        int embargo)
+        int embargo,
+        int purgeHorizonBars,
+        int lookbackWindow)
     {
-        int trainEnd = (int)(sampleCount * 0.70);
-        int calEnd = (int)(sampleCount * 0.80);
-        int trainStdEnd = Math.Max(0, trainEnd - embargo);
-        if (trainStdEnd <= 0)
+        int gap = ComputeLeakageGap(embargo, purgeHorizonBars, lookbackWindow);
+        int usableCount = sampleCount - 2 * gap;
+        if (usableCount <= 0)
             throw new InvalidOperationException(
-                $"Embargo ({embargo}) consumes the entire training window ({trainEnd} samples).");
+                $"Leakage-safe gap ({gap}) consumes the entire final split window ({sampleCount} samples).");
 
-        // trainStdEnd already excludes the train/cal embargo, so calibration should begin
-        // exactly one embargo window later rather than applying the gap twice.
-        int calStart = Math.Min(sampleCount, trainStdEnd + embargo);
-        int boundedCalEnd = Math.Min(sampleCount, Math.Max(calEnd, calStart));
-        int testStart = Math.Min(sampleCount, boundedCalEnd + Math.Max(0, embargo));
+        int trainCount = (int)(usableCount * 0.70);
+        int calCount = (int)(usableCount * 0.10);
+        int trainStdEnd = Math.Max(0, trainCount);
+        int calStart = Math.Min(sampleCount, trainStdEnd + gap);
+        int boundedCalEnd = Math.Min(sampleCount, calStart + calCount);
+        int testStart = Math.Min(sampleCount, boundedCalEnd + gap);
         return (trainStdEnd, calStart, boundedCalEnd, testStart);
     }
 
@@ -3388,6 +3883,128 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         for (int i = 0; i < featureCount; i++)
             names[i] = GetFeatureDisplayName(i);
         return names;
+    }
+
+    private double[] MaybeRunGreedyEnsembleSelection(
+        TrainingHyperparams  hp,
+        List<TrainingSample> calSet,
+        double[][]           weights,
+        double[]             biases,
+        int                  featureCount,
+        int[][]?             featureSubsets,
+        MetaLearner          meta,
+        bool[]?              activeLearners = null,
+        MlpState             mlp = default)
+    {
+        if (!hp.EnableGreedyEnsembleSelection || calSet.Count < 20)
+            return [];
+        if (meta.IsActive)
+        {
+            _logger.LogDebug("Skipping GES because stacking meta-learner is active.");
+            return [];
+        }
+
+        var gesWeights = RunGreedyEnsembleSelection(
+            calSet, weights, biases, featureCount, featureSubsets, activeLearners: activeLearners, mlp: mlp);
+        if (gesWeights.Length > 0)
+            _logger.LogDebug("GES weights: [{W}]",
+                string.Join(",", gesWeights.Select(w => w.ToString("F3"))));
+        return gesWeights;
+    }
+
+    internal static string ComputeFeatureSchemaFingerprint(string[] featureNames)
+    {
+        if (featureNames.Length == 0)
+            return string.Empty;
+
+        var builder = new StringBuilder();
+        builder.Append("bagged-feature-schema|");
+        builder.Append(featureNames.Length.ToString(CultureInfo.InvariantCulture));
+        builder.Append('|');
+        for (int i = 0; i < featureNames.Length; i++)
+        {
+            builder.Append(featureNames[i]);
+            builder.Append('|');
+        }
+
+        return ComputeSha256(builder.ToString());
+    }
+
+    internal static string ComputePreprocessingFingerprint(int featureCount)
+    {
+        if (featureCount <= 0)
+            return string.Empty;
+
+        return ComputeSha256(
+            FormattableString.Invariant($"bagged-preproc|{featureCount}|standardize-v1|mask-at-inference"));
+    }
+
+    internal static string ComputeTrainerFingerprint(TrainingHyperparams hp, int featureCount)
+    {
+        return ComputeSha256(string.Join("|",
+            "bagged-trainer",
+            ModelVersion,
+            featureCount.ToString(CultureInfo.InvariantCulture),
+            hp.K.ToString(CultureInfo.InvariantCulture),
+            hp.MlpHiddenDim.ToString(CultureInfo.InvariantCulture),
+            hp.PolyLearnerFraction.ToString("G17", CultureInfo.InvariantCulture)));
+    }
+
+    internal static WarmStartCompatibilityResult AssessWarmStartCompatibility(
+        ModelSnapshot snapshot,
+        string expectedFeatureSchemaFingerprint,
+        string expectedPreprocessingFingerprint,
+        string expectedTrainerFingerprint,
+        int expectedFeatureCount)
+    {
+        var issues = new List<string>();
+        if (!string.Equals(snapshot.Type, ModelType, StringComparison.OrdinalIgnoreCase))
+            issues.Add("Warm-start snapshot type does not match the bagged trainer.");
+        if (snapshot.Features.Length != expectedFeatureCount)
+            issues.Add("Warm-start feature count does not match the current feature count.");
+        if (snapshot.Means.Length != expectedFeatureCount || snapshot.Stds.Length != expectedFeatureCount)
+            issues.Add("Warm-start standardization vectors do not match the current feature count.");
+
+        string actualFeatureSchemaFingerprint =
+            !string.IsNullOrWhiteSpace(snapshot.FeatureSchemaFingerprint)
+                ? snapshot.FeatureSchemaFingerprint
+                : ComputeFeatureSchemaFingerprint(snapshot.Features);
+        if (!string.IsNullOrWhiteSpace(expectedFeatureSchemaFingerprint) &&
+            !string.IsNullOrWhiteSpace(actualFeatureSchemaFingerprint) &&
+            !string.Equals(expectedFeatureSchemaFingerprint, actualFeatureSchemaFingerprint, StringComparison.Ordinal))
+        {
+            issues.Add("Feature schema fingerprint mismatch.");
+        }
+
+        string actualPreprocessingFingerprint =
+            !string.IsNullOrWhiteSpace(snapshot.PreprocessingFingerprint)
+                ? snapshot.PreprocessingFingerprint
+                : ComputePreprocessingFingerprint(snapshot.Features.Length);
+        if (!string.IsNullOrWhiteSpace(expectedPreprocessingFingerprint) &&
+            !string.IsNullOrWhiteSpace(actualPreprocessingFingerprint) &&
+            !string.Equals(expectedPreprocessingFingerprint, actualPreprocessingFingerprint, StringComparison.Ordinal))
+        {
+            issues.Add("Preprocessing fingerprint mismatch.");
+        }
+
+        string actualTrainerFingerprint = snapshot.TrainerFingerprint;
+        if (!string.IsNullOrWhiteSpace(expectedTrainerFingerprint) &&
+            !string.IsNullOrWhiteSpace(actualTrainerFingerprint) &&
+            !string.Equals(expectedTrainerFingerprint, actualTrainerFingerprint, StringComparison.Ordinal))
+        {
+            issues.Add("Trainer fingerprint mismatch.");
+        }
+
+        return new WarmStartCompatibilityResult(issues.Count == 0, [..issues.Distinct()]);
+    }
+
+    private static string ComputeSha256(string value)
+    {
+        byte[] bytes = SHA256.HashData(Encoding.UTF8.GetBytes(value));
+        var builder = new StringBuilder(bytes.Length * 2);
+        foreach (byte b in bytes)
+            builder.Append(b.ToString("x2", CultureInfo.InvariantCulture));
+        return builder.ToString();
     }
 
     internal static void CopyRawFeatureWindow(
@@ -4765,7 +5382,9 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
 
         for (int i = 0; i < predictions.Length; i++)
         {
-            double ret = predictions[i].Predicted == predictions[i].Actual ? +1.0 : -1.0;
+            double ret = predictions[i].Predicted == 0
+                ? 0.0
+                : predictions[i].Predicted == predictions[i].Actual ? +1.0 : -1.0;
             returns[i] = ret;
             equity    += ret;
             if (equity > peak) peak = equity;
@@ -5478,14 +6097,14 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
     private static double[] ComputeDensityRatioWeights(
         List<TrainingSample> trainSet,
         int                  featureCount,
-        int                  recentWindowDays)
+        int                  recentWindowDays,
+        int                  barsPerDay)
     {
         int n = trainSet.Count;
         if (n < 50) { var uniform = new double[n]; Array.Fill(uniform, 1.0 / n); return uniform; }
 
         // Proxy: treat last 20 % (capped at recentWindowDays candle equivalents) as "recent"
-        int recentCount = Math.Max(10, Math.Min(n / 5, recentWindowDays * 24)); // rough H1 candles
-        recentCount     = Math.Min(recentCount, n - 10);
+        int recentCount = ComputeDensityRatioRecentCount(n, recentWindowDays, barsPerDay);
         int histCount   = n - recentCount;
 
         // Simple logistic discriminator: fit 30 epochs of SGD
@@ -5654,9 +6273,7 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
         var residuals = new double[trainSet.Count];
         for (int i = 0; i < trainSet.Count; i++)
         {
-            double pred = magBias;
-            for (int j = 0; j < featureCount && j < magWeights.Length; j++)
-                pred += magWeights[j] * trainSet[i].Features[j];
+            double pred = PredictMagnitude(trainSet[i].Features, magWeights, magBias);
             residuals[i] = trainSet[i].Magnitude - pred;
             if (!double.IsFinite(residuals[i]))
                 return 2.0;
@@ -6347,7 +6964,8 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
     private static double[] ComputeCovariateShiftWeights(
         List<TrainingSample> samples,
         double[][]           parentQuantileBreakpoints,
-        int                  featureCount)
+        int                  featureCount,
+        bool[]?              parentActiveFeatureMask)
     {
         int n = samples.Count;
         var weights = new double[n];
@@ -6359,6 +6977,12 @@ public sealed class BaggedLogisticTrainer : IMLModelTrainer
             for (int j = 0; j < featureCount; j++)
             {
                 if (j >= parentQuantileBreakpoints.Length) continue;
+                if (parentActiveFeatureMask is { Length: > 0 } mask &&
+                    j < mask.Length &&
+                    !mask[j])
+                {
+                    continue;
+                }
                 var bp = parentQuantileBreakpoints[j];
                 if (bp.Length < 2) continue;
                 double q10 = bp[0];

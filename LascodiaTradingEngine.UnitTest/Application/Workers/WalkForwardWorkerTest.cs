@@ -1,9 +1,11 @@
 using System.Reflection;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Logging;
 using MockQueryable.Moq;
 using Moq;
+using LascodiaTradingEngine.Application.Backtesting;
 using LascodiaTradingEngine.Application.Backtesting.Models;
 using LascodiaTradingEngine.Application.Backtesting.Services;
 using LascodiaTradingEngine.Application.Common.Interfaces;
@@ -34,6 +36,8 @@ public class WalkForwardWorkerTest
             Status = RunStatus.Queued,
             Priority = 0,
             StartedAt = DateTime.UtcNow.AddHours(-2),
+            QueuedAt = DateTime.UtcNow.AddHours(-2),
+            AvailableAt = DateTime.UtcNow.AddHours(-2),
             IsDeleted = false,
         };
         var fastTrackRun = new WalkForwardRun
@@ -51,6 +55,8 @@ public class WalkForwardWorkerTest
             Status = RunStatus.Queued,
             Priority = 5,
             StartedAt = DateTime.UtcNow.AddHours(-1),
+            QueuedAt = DateTime.UtcNow.AddHours(-1),
+            AvailableAt = DateTime.UtcNow.AddHours(-1),
             IsDeleted = false,
         };
 
@@ -109,6 +115,9 @@ public class WalkForwardWorkerTest
         db.Setup(c => c.Set<Strategy>()).Returns(strategies.AsQueryable().BuildMockDbSet().Object);
         db.Setup(c => c.Set<Candle>()).Returns(candles.AsQueryable().BuildMockDbSet().Object);
         db.Setup(c => c.Set<EngineConfig>()).Returns(new List<EngineConfig>().AsQueryable().BuildMockDbSet().Object);
+        db.Setup(c => c.Set<EconomicEvent>()).Returns(new List<EconomicEvent>().AsQueryable().BuildMockDbSet().Object);
+        db.Setup(c => c.Set<CurrencyPair>()).Returns(new List<CurrencyPair>().AsQueryable().BuildMockDbSet().Object);
+        db.Setup(c => c.Set<SpreadProfile>()).Returns(new List<SpreadProfile>().AsQueryable().BuildMockDbSet().Object);
 
         var readCtx = new Mock<IReadApplicationDbContext>();
         readCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
@@ -120,12 +129,22 @@ public class WalkForwardWorkerTest
         var services = new ServiceCollection()
             .AddSingleton(readCtx.Object)
             .AddSingleton(writeCtx.Object)
+            .AddSingleton<IValidationWorkerIdentity>(new TestValidationWorkerIdentity("test-walkforward-worker"))
+            .AddScoped<IValidationSettingsProvider, ValidationSettingsProvider>()
+            .AddScoped<IBacktestOptionsSnapshotBuilder>(sp =>
+                new BacktestOptionsSnapshotBuilder(
+                    sp.GetRequiredService<IValidationSettingsProvider>(),
+                    NullLogger<BacktestOptionsSnapshotBuilder>.Instance))
             .BuildServiceProvider();
 
         var worker = new WalkForwardWorker(
             Mock.Of<ILogger<WalkForwardWorker>>(),
             services.GetRequiredService<IServiceScopeFactory>(),
             engine,
+            new InMemoryWalkForwardRunClaimService(),
+            services.GetRequiredService<IValidationSettingsProvider>(),
+            services.GetRequiredService<IBacktestOptionsSnapshotBuilder>(),
+            services.GetRequiredService<IValidationWorkerIdentity>(),
             Mock.Of<IWorkerHealthMonitor>());
 
         var method = typeof(WalkForwardWorker).GetMethod(
@@ -189,5 +208,15 @@ public class WalkForwardWorkerTest
                 Trades = trades,
             });
         }
+    }
+
+    private sealed class TestValidationWorkerIdentity : IValidationWorkerIdentity
+    {
+        public TestValidationWorkerIdentity(string instanceId)
+        {
+            InstanceId = instanceId;
+        }
+
+        public string InstanceId { get; }
     }
 }

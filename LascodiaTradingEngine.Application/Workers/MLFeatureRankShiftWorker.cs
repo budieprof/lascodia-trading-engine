@@ -345,6 +345,17 @@ public sealed class MLFeatureRankShiftWorker : BackgroundService
     /// <returns>Dictionary mapping each feature name to its importance score (higher = more important).</returns>
     private static Dictionary<string, double> ExtractImportance(ModelSnapshot snap)
     {
+        if (string.Equals(snap.Type, "TCN", StringComparison.OrdinalIgnoreCase) &&
+            snap.TcnChannelNames.Length > 0 &&
+            snap.TcnChannelImportanceScores.Length > 0)
+        {
+            int count = Math.Min(snap.TcnChannelNames.Length, snap.TcnChannelImportanceScores.Length);
+            return Enumerable.Range(0, count)
+                .ToDictionary(
+                    i => snap.TcnChannelNames[i],
+                    i => snap.TcnChannelImportanceScores[i]);
+        }
+
         // Prefer explicit importance scores when available.
         if (snap.FeatureImportanceScores.Length > 0 &&
             snap.Features.Length >= snap.FeatureImportanceScores.Length)

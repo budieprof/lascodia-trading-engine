@@ -1526,8 +1526,9 @@ public record TrainingHyperparams(
     /// </summary>
     bool GbmUseSeparateAbstention = false,
     /// <summary>
-    /// When true, partitions training data by detected regime label and builds
-    /// separate tree blocks per regime. Default false.
+    /// Reserved for a future GBM regime-labeled training contract. The current GBM trainer
+    /// rejects this flag because <c>TrainingSample</c> does not yet carry per-sample regime labels.
+    /// Default false.
     /// </summary>
     bool GbmRegimeConditioned = false,
     /// <summary>
@@ -1536,8 +1537,9 @@ public record TrainingHyperparams(
     /// </summary>
     bool GbmConceptDriftGate = false,
     /// <summary>
-    /// When true, stratifies validation loss by regime label during early stopping,
-    /// preventing the best model from being one that compromises across regimes. Default false.
+    /// Reserved for a future GBM regime-labeled training contract. The current GBM trainer
+    /// rejects this flag because <c>TrainingSample</c> does not yet carry per-sample regime labels.
+    /// Default false.
     /// </summary>
     bool GbmRegimeAwareEarlyStopping = false,
     /// <summary>
@@ -1712,7 +1714,17 @@ public record TrainingHyperparams(
     /// Splits with fewer samples are skipped or use fallback values.
     /// 0 = use default (10). Typical 10–30.
     /// </summary>
-    int TabNetMinCalibrationSamples = 0
+    int TabNetMinCalibrationSamples = 0,
+    /// <summary>
+    /// Explicit FT-Transformer attention-head override.
+    /// 0 = use the warm-start architecture when available, otherwise the trainer default.
+    /// </summary>
+    int FtTransformerHeads = 0,
+    /// <summary>
+    /// Explicit FT-Transformer stacked-layer override.
+    /// 0 = use the warm-start architecture when available, otherwise the trainer default.
+    /// </summary>
+    int FtTransformerArchitectureNumLayers = 0
     );
 
 // ── Evaluation metrics ────────────────────────────────────────────────────────
@@ -1776,7 +1788,15 @@ public record WalkForwardResult(
     /// Persisted into TabNet snapshots as a more faithful uncertainty baseline
     /// than the previous infinitesimal-jackknife approximation.
     /// </summary>
-    double[]? OofResiduals = null);
+    double[]? OofResiduals = null,
+    /// <summary>Linear regression slope of fold accuracies over time. Negative = degrading.</summary>
+    double AccuracyDecayRate = 0.0,
+    /// <summary>Linear regression slope of fold F1 scores over time. Negative = degrading.</summary>
+    double F1DecayRate = 0.0,
+    /// <summary>Std. dev. of fold-level Platt A parameters fitted on non-test calibration windows.</summary>
+    double RecalibrationStabilityA = 0.0,
+    /// <summary>Std. dev. of fold-level Platt B parameters fitted on non-test calibration windows.</summary>
+    double RecalibrationStabilityB = 0.0);
 
 /// <summary>Per-fold walk-forward CV metrics for granular analysis.</summary>
 public record WalkForwardFoldMetric(double Accuracy, double F1, double EV, double Sharpe, double MaxDD);
@@ -1956,6 +1976,130 @@ public class TabNetMetricSummary
 }
 
 /// <summary>
+/// Compact metrics persisted for key FT-Transformer model-selection/evaluation splits.
+/// </summary>
+public class FtTransformerMetricSummary
+{
+    public string SplitName { get; set; } = string.Empty;
+    public int SampleCount { get; set; }
+    public double Threshold { get; set; }
+    public double Accuracy { get; set; }
+    public double Precision { get; set; }
+    public double Recall { get; set; }
+    public double F1 { get; set; }
+    public double ExpectedValue { get; set; }
+    public double BrierScore { get; set; }
+    public double WeightedAccuracy { get; set; }
+    public double SharpeRatio { get; set; }
+    public double Ece { get; set; }
+}
+
+/// <summary>
+/// Structured FT-Transformer calibration summary persisted with the snapshot.
+/// </summary>
+public class FtTransformerCalibrationArtifact
+{
+    public string SelectedGlobalCalibration { get; set; } = "PLATT";
+    public string CalibrationSelectionStrategy { get; set; } = "FIT_ON_FIT_EVAL_ON_DIAGNOSTICS";
+    public double GlobalPlattNll { get; set; }
+    public double TemperatureNll { get; set; }
+    public bool TemperatureSelected { get; set; }
+    public string AdaptiveHeadMode { get; set; } = "DISJOINT_DIAGNOSTICS";
+    public int AdaptiveHeadCrossFitFoldCount { get; set; }
+    public int FitSampleCount { get; set; }
+    public int DiagnosticsSampleCount { get; set; }
+    public int ThresholdSelectionSampleCount { get; set; }
+    public int KellySelectionSampleCount { get; set; }
+    public double DiagnosticsSelectedGlobalNll { get; set; }
+    public double DiagnosticsSelectedStackNll { get; set; }
+    public int ConformalSampleCount { get; set; }
+    public string ConformalSelectionStrategy { get; set; } = "DISJOINT_HOLDOUT";
+    public double ConditionalRoutingThreshold { get; set; } = 0.5;
+    public int RoutingThresholdCandidateCount { get; set; }
+    public double RoutingThresholdSelectedNll { get; set; }
+    public int BuyBranchSampleCount { get; set; }
+    public double BuyBranchBaselineNll { get; set; }
+    public double BuyBranchFittedNll { get; set; }
+    public bool BuyBranchAccepted { get; set; }
+    public int SellBranchSampleCount { get; set; }
+    public double SellBranchBaselineNll { get; set; }
+    public double SellBranchFittedNll { get; set; }
+    public bool SellBranchAccepted { get; set; }
+    public int IsotonicSampleCount { get; set; }
+    public int IsotonicBreakpointCount { get; set; }
+    public double PreIsotonicNll { get; set; }
+    public double PostIsotonicNll { get; set; }
+    public bool IsotonicAccepted { get; set; }
+}
+
+/// <summary>
+/// Structured GBM calibration summary persisted with the snapshot.
+/// </summary>
+public class GbmCalibrationArtifact
+{
+    public string SelectedGlobalCalibration { get; set; } = "PLATT";
+    public string CalibrationSelectionStrategy { get; set; } = "FIT_ON_FIT_EVAL_ON_DIAGNOSTICS";
+    public double GlobalPlattNll { get; set; }
+    public double TemperatureNll { get; set; }
+    public bool TemperatureSelected { get; set; }
+    public int FitSampleCount { get; set; }
+    public int DiagnosticsSampleCount { get; set; }
+    public double DiagnosticsSelectedGlobalNll { get; set; }
+    public double DiagnosticsSelectedStackNll { get; set; }
+    public int ConformalSampleCount { get; set; }
+    public int MetaLabelSampleCount { get; set; }
+    public int AbstentionSampleCount { get; set; }
+    public string AdaptiveHeadMode { get; set; } = "SHARED";
+    public int AdaptiveHeadCrossFitFoldCount { get; set; }
+    public double ConditionalRoutingThreshold { get; set; } = 0.5;
+    public int BuyBranchSampleCount { get; set; }
+    public double BuyBranchBaselineNll { get; set; }
+    public double BuyBranchFittedNll { get; set; }
+    public bool BuyBranchAccepted { get; set; }
+    public int SellBranchSampleCount { get; set; }
+    public double SellBranchBaselineNll { get; set; }
+    public double SellBranchFittedNll { get; set; }
+    public bool SellBranchAccepted { get; set; }
+    public int IsotonicSampleCount { get; set; }
+    public int IsotonicBreakpointCount { get; set; }
+    public double PreIsotonicNll { get; set; }
+    public double PostIsotonicNll { get; set; }
+    public bool IsotonicAccepted { get; set; }
+}
+
+/// <summary>
+/// FT-Transformer warm-start compatibility summary.
+/// </summary>
+public class FtTransformerWarmStartArtifact
+{
+    public bool Compatible { get; set; }
+    public string[] CompatibilityIssues { get; set; } = [];
+    public int ReusedLayerCount { get; set; }
+    public int RestoredPositionalBiasBlocks { get; set; }
+    public int DroppedLayerCount { get; set; }
+    public double ReuseRatio { get; set; }
+}
+
+/// <summary>
+/// Structured FT-Transformer post-train parity and contract audit artifact.
+/// </summary>
+public class FtTransformerAuditArtifact
+{
+    public bool SnapshotContractValid { get; set; }
+    public int AuditedSampleCount { get; set; }
+    public int ActiveFeatureCount { get; set; }
+    public int RawFeatureCount { get; set; }
+    public double MaxRawParityError { get; set; }
+    public double MeanRawParityError { get; set; }
+    public double MaxDeployedCalibrationDelta { get; set; }
+    public int ThresholdDecisionMismatchCount { get; set; }
+    public double RecordedEce { get; set; }
+    public string FeatureSchemaFingerprint { get; set; } = string.Empty;
+    public string PreprocessingFingerprint { get; set; } = string.Empty;
+    public string[] Findings { get; set; } = [];
+}
+
+/// <summary>
 /// Structured TabNet drift/stationarity diagnostics computed on the final fit split.
 /// </summary>
 public class TabNetDriftArtifact
@@ -1996,6 +2140,10 @@ public class TrainingSplitSummary
     public int TrainCount { get; set; }
     public int SelectionStartIndex { get; set; }
     public int SelectionCount { get; set; }
+    public int SelectionPruningStartIndex { get; set; }
+    public int SelectionPruningCount { get; set; }
+    public int SelectionThresholdStartIndex { get; set; }
+    public int SelectionThresholdCount { get; set; }
     public int CalibrationStartIndex { get; set; }
     public int CalibrationCount { get; set; }
     public int CalibrationFitStartIndex { get; set; }
@@ -2033,6 +2181,12 @@ public class ModelSnapshot
     public string   Type          { get; set; } = string.Empty;
     public string   Version       { get; set; } = string.Empty;
     public string[] Features      { get; set; } = [];
+    /// <summary>
+    /// Optional mapping from this snapshot's feature-space positions back to the raw
+    /// feature indices emitted by <see cref="MLFeatureHelper.BuildFeatureVector"/>.
+    /// Empty means the snapshot consumes the raw feature order directly.
+    /// </summary>
+    public int[] RawFeatureIndices { get; set; } = [];
     /// <summary>
     /// Ordered list of replayable feature-pipeline transforms applied after standardisation
     /// and before inference. Enables train/inference parity for architecture-specific
@@ -2078,8 +2232,49 @@ public class ModelSnapshot
     /// Split-scoped metrics for the final held-out test window.
     /// </summary>
     public TabNetMetricSummary? TabNetTestMetrics { get; set; }
+    /// <summary>
+    /// Split-scoped metrics for the FT-Transformer selection holdout.
+    /// </summary>
+    public FtTransformerMetricSummary? FtTransformerSelectionMetrics { get; set; }
+    /// <summary>
+    /// Split-scoped metrics for the FT-Transformer calibration diagnostics slice.
+    /// </summary>
+    public FtTransformerMetricSummary? FtTransformerCalibrationMetrics { get; set; }
+    /// <summary>
+    /// Split-scoped metrics for the FT-Transformer final test window.
+    /// </summary>
+    public FtTransformerMetricSummary? FtTransformerTestMetrics { get; set; }
+    /// <summary>
+    /// Structured FT-Transformer calibration summary.
+    /// </summary>
+    public FtTransformerCalibrationArtifact? FtTransformerCalibrationArtifact { get; set; }
+    /// <summary>
+    /// Structured GBM calibration summary.
+    /// </summary>
+    public GbmCalibrationArtifact? GbmCalibrationArtifact { get; set; }
+    /// <summary>
+    /// FT-Transformer warm-start compatibility summary.
+    /// </summary>
+    public FtTransformerWarmStartArtifact? FtTransformerWarmStartArtifact { get; set; }
+    /// <summary>
+    /// FT-Transformer post-train parity and contract audit artifact.
+    /// </summary>
+    public FtTransformerAuditArtifact? FtTransformerAuditArtifact { get; set; }
     public float[]  Means         { get; set; } = [];
     public float[]  Stds          { get; set; } = [];
+
+    /// <summary>
+    /// Per-feature lower clip bounds used by ELM winsorization before Z-score standardization.
+    /// Empty when ELM winsorization was disabled for this snapshot.
+    /// </summary>
+    public float[] ElmWinsorizeLowerBounds { get; set; } = [];
+
+    /// <summary>
+    /// Per-feature upper clip bounds used by ELM winsorization before Z-score standardization.
+    /// Empty when ELM winsorization was disabled for this snapshot.
+    /// </summary>
+    public float[] ElmWinsorizeUpperBounds { get; set; } = [];
+
     public int      BaseLearnersK { get; set; }
 
     [JsonPropertyName("Weights")]
@@ -2284,7 +2479,9 @@ public class ModelSnapshot
 
     /// <summary>
     /// Unweighted OOB accuracy — fraction of training samples correctly classified
-    /// using only the base learners that did not train on each sample.
+    /// using only the base learners that did not train on each sample. For GBM snapshots
+    /// this is measured in raw-probability space so subset-tree OOB predictions are not
+    /// passed through full-ensemble calibration artifacts.
     /// Provides a low-bias generalization estimate without consuming a separate split.
     /// 0.0 when OOB estimation was disabled or insufficient samples were available.
     /// </summary>
@@ -2312,14 +2509,38 @@ public class ModelSnapshot
     // ── Meta-labeling secondary classifier ───────────────────────────────────
 
     /// <summary>
-    /// Weights of the meta-label logistic classifier. Inputs are: calibrated probability,
-    /// ensemble std dev, and the top-N feature values (same order as <see cref="Features"/>).
+    /// Output-layer weights of the meta-label classifier. Inputs are the replayed
+    /// meta-feature vector [calibP, ensembleStd, top feature values...].
+    /// When <see cref="MetaLabelHiddenDim"/> is 0 this is the full linear classifier.
+    /// When <see cref="MetaLabelHiddenDim"/> is &gt; 0 this is the hidden→output weight vector.
     /// Empty = meta-labeling disabled.
     /// </summary>
     public double[] MetaLabelWeights { get; set; } = [];
 
-    /// <summary>Bias term of the meta-label logistic classifier.</summary>
+    /// <summary>
+    /// Output-layer bias of the meta-label classifier.
+    /// Also used as the full linear-model bias when <see cref="MetaLabelHiddenDim"/> is 0.
+    /// </summary>
     public double MetaLabelBias { get; set; }
+
+    /// <summary>
+    /// Hidden-layer width of the meta-label MLP. 0 = linear classifier.
+    /// When &gt; 0, <see cref="MetaLabelHiddenWeights"/> and
+    /// <see cref="MetaLabelHiddenBiases"/> hold the first-layer parameters.
+    /// </summary>
+    public int MetaLabelHiddenDim { get; set; }
+
+    /// <summary>
+    /// Flattened input→hidden weight matrix of the meta-label MLP in row-major order.
+    /// Shape = [MetaLabelHiddenDim × inputDim]. Empty when the meta-label model is linear.
+    /// </summary>
+    public double[] MetaLabelHiddenWeights { get; set; } = [];
+
+    /// <summary>
+    /// Hidden-layer biases of the meta-label MLP. Length = <see cref="MetaLabelHiddenDim"/>.
+    /// Empty when the meta-label model is linear.
+    /// </summary>
+    public double[] MetaLabelHiddenBiases { get; set; } = [];
 
     /// <summary>
     /// Classification threshold for the meta-label model.
@@ -2329,9 +2550,9 @@ public class ModelSnapshot
     public double MetaLabelThreshold { get; set; } = 0.5;
 
     /// <summary>
-    /// Indices of the top-3 features (by permutation importance) used as auxiliary inputs
-    /// in the meta-label and abstention models. Stored so inference can reconstruct
-    /// the same meta-feature vector. Empty = legacy (uses indices 0, 1, 2).
+    /// Indices of the top feature values used as auxiliary inputs in the meta-label model.
+    /// Stored so inference can reconstruct the exact same meta-feature vector.
+    /// Empty = legacy fallback to the first raw features.
     /// </summary>
     public int[] MetaLabelTopFeatureIndices { get; set; } = [];
 
@@ -2439,7 +2660,8 @@ public class ModelSnapshot
 
     /// <summary>
     /// Number of warm-start retrains from the original cold-start ancestor.
-    /// 0 = this model was cold-started. Incremented from parent's GenerationNumber + 1.
+    /// 1 = this model was cold-started in the current lineage convention.
+    /// Warm-start retrains increment from the parent's <see cref="GenerationNumber"/> + 1.
     /// </summary>
     public int GenerationNumber { get; set; }
 
@@ -2507,14 +2729,13 @@ public class ModelSnapshot
     // ── Decision boundary distance scoring (Round 5) ──────────────────────────
 
     /// <summary>
-    /// Mean Euclidean norm of the analytic gradient ∇_x P(Buy|x) over the calibration set.
-    /// For ensemble logistic regression: ‖∇_x P‖ = P(1−P) × ‖w_ensemble‖.
-    /// Higher values indicate the decision boundary is steeper / more confident near x.
+    /// Mean absolute raw-logit distance |logit(P(Buy|x))| over the calibration set.
+    /// Higher values indicate predictions sit farther from the 0.5 decision boundary.
     /// 0.0 = not computed.
     /// </summary>
     public double DecisionBoundaryMean { get; set; }
 
-    /// <summary>Standard deviation of ‖∇_x P(Buy|x)‖ over the calibration set. 0.0 = not computed.</summary>
+    /// <summary>Standard deviation of the calibration-set raw-logit distance statistic. 0.0 = not computed.</summary>
     public double DecisionBoundaryStd { get; set; }
 
     // ── Durbin-Watson auto-correlation statistic (Round 5) ────────────────────
@@ -2604,9 +2825,9 @@ public class ModelSnapshot
     // ── Ensemble diversity (Round 7) ──────────────────────────────────────────
 
     /// <summary>
-    /// Average pairwise Pearson correlation between all base learner weight vectors.
-    /// 0.0 = fully diverse (orthogonal weights); 1.0 = identical learners.
-    /// Values &gt; 0.9 indicate poor diversity; the ensemble is effectively K identical copies.
+    /// Average pairwise prediction disagreement rate across calibration samples.
+    /// 0.0 = learners vote identically; 1.0 = maximal directional disagreement.
+    /// Lower values indicate a redundant ensemble with weak diversity.
     /// </summary>
     public double EnsembleDiversity { get; set; }
 
@@ -2692,6 +2913,25 @@ public class ModelSnapshot
 
     /// <summary>Per-channel standard deviations for TCN sequence feature standardisation.</summary>
     public float[] SeqStds { get; set; } = [];
+
+    /// <summary>
+    /// Ordered TCN sequence-channel names consumed by <see cref="ConvWeightsJson"/>.
+    /// Kept separate from <see cref="Features"/> because the live scorer still builds
+    /// the flat feature vector in the 33-feature space.
+    /// </summary>
+    public string[] TcnChannelNames { get; set; } = [];
+
+    /// <summary>
+    /// Boolean mask over the TCN sequence channels. Applied by the TCN inference engine
+    /// after sequence standardisation so pruned channels stay inactive in production.
+    /// </summary>
+    public bool[] TcnActiveChannelMask { get; set; } = [];
+
+    /// <summary>
+    /// Channel-level TCN importance scores aligned with <see cref="TcnChannelNames"/>.
+    /// Used by TCN-specific explainability and warm-start channel-importance transfer.
+    /// </summary>
+    public double[] TcnChannelImportanceScores { get; set; } = [];
 
     // ── Rec #50: Per-regime temperature scaling ───────────────────────────────
 
@@ -2819,7 +3059,7 @@ public class ModelSnapshot
 
     // ── GBM extended snapshot fields ────────────────────────────────────────
 
-    /// <summary>Venn-ABERS multi-probability calibration points [p_lower, p_upper] per calibration sample.</summary>
+    /// <summary>Approximate Venn-Abers-style multi-probability bounds [p_lower, p_upper] per calibration sample.</summary>
     public double[][] VennAbersMultiP { get; set; } = [];
 
     /// <summary>Coverage-accuracy tradeoff curve: [threshold, coverage, accuracy] triplets from abstention sweep.</summary>
@@ -3232,6 +3472,13 @@ public class ModelSnapshot
     /// <summary>Rec #390: FT-Transformer per-feature embedding weights (outer = feature, inner = dim).</summary>
     public double[][]? FtTransformerEmbedWeights { get; set; }
 
+    /// <summary>
+    /// Rec #390: raw feature-space width expected before optional <see cref="RawFeatureIndices"/>
+    /// projection. Equal to <see cref="Features"/> length when the snapshot consumes the raw
+    /// feature order directly.
+    /// </summary>
+    public int FtTransformerRawFeatureCount { get; set; }
+
     /// <summary>Rec #390: FT-Transformer per-feature embedding biases (outer = feature, inner = dim).</summary>
     public double[][]? FtTransformerEmbedBiases { get; set; }
 
@@ -3291,6 +3538,12 @@ public class ModelSnapshot
 
     /// <summary>Rec #390: Number of stacked transformer blocks used during training.</summary>
     public int FtTransformerNumLayers { get; set; }
+
+    /// <summary>
+    /// Maximum absolute difference between trainer forward-pass raw probability and deployed
+    /// FT inference on audited samples.
+    /// </summary>
+    public double FtTransformerTrainInferenceParityMaxError { get; set; }
 
     /// <summary>Rec #390: FT-Transformer additional layer weights (layers 1..N-1) serialised as JSON (legacy, kept for backward compat).</summary>
     public string? FtTransformerAdditionalLayersJson { get; set; }

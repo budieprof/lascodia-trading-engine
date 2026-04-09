@@ -43,6 +43,8 @@ internal static class OptimizationRunLifecycle
         run.FailureCategory = failureCategory;
         OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Failed, utcNow, errorMessage);
         run.ApprovedAt = null;
+        run.DeferralReason = null;
+        run.DeferredAtUtc = null;
         run.DeferredUntilUtc = null;
         run.BestParametersJson = null;
         run.BestHealthScore = null;

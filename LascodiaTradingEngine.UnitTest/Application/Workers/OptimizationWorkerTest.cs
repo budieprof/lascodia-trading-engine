@@ -4,12 +4,14 @@ using System.Text.Json;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Logging;
 using Moq;
 using MockQueryable.Moq;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.AuditTrail.Commands.LogDecision;
+using LascodiaTradingEngine.Application.Backtesting;
 using LascodiaTradingEngine.Application.Backtesting.Models;
 using LascodiaTradingEngine.Application.Backtesting.Services;
 using LascodiaTradingEngine.Application.Common.Attributes;
@@ -2320,6 +2322,15 @@ public class OptimizationWorkerTest
         services.AddSingleton<IBacktestEngine>(backtestEngine);
         services.AddSingleton<ISpreadProfileProvider>(Mock.Of<ISpreadProfileProvider>());
         services.AddSingleton<IAlertDispatcher>(Mock.Of<IAlertDispatcher>());
+        services.AddSingleton<IValidationSettingsProvider, ValidationSettingsProvider>();
+        services.AddSingleton<IBacktestOptionsSnapshotBuilder>(sp =>
+            new BacktestOptionsSnapshotBuilder(
+                sp.GetRequiredService<IValidationSettingsProvider>(),
+                NullLogger<BacktestOptionsSnapshotBuilder>.Instance));
+        services.AddSingleton<IValidationRunFactory>(sp =>
+            new ValidationRunFactory(
+                sp.GetRequiredService<IBacktestOptionsSnapshotBuilder>(),
+                sp.GetRequiredService<TimeProvider>()));
         configureServices?.Invoke(services);
 
         return services.BuildServiceProvider();
@@ -2503,12 +2514,17 @@ public class OptimizationWorkerTest
         var metricsServices = new ServiceCollection().AddMetrics().BuildServiceProvider();
         var meterFactory = metricsServices.GetRequiredService<System.Diagnostics.Metrics.IMeterFactory>();
         var effectiveTimeProvider = timeProvider ?? TimeProvider.System;
+        var settingsProvider = new ValidationSettingsProvider();
+        var optionsBuilder = new BacktestOptionsSnapshotBuilder(settingsProvider, NullLogger<BacktestOptionsSnapshotBuilder>.Instance);
+        var validationRunFactory = new ValidationRunFactory(optionsBuilder, effectiveTimeProvider);
         return new OptimizationFollowUpCoordinator(
             Mock.Of<IServiceScopeFactory>(),
             Mock.Of<IAlertDispatcher>(),
             new OptimizationRunScopedConfigService(
                 new OptimizationConfigProvider(Mock.Of<ILogger<OptimizationConfigProvider>>(), effectiveTimeProvider),
                 Mock.Of<ILogger<OptimizationRunScopedConfigService>>()),
+            validationRunFactory,
+            optionsBuilder,
             Mock.Of<ILogger<OptimizationFollowUpCoordinator>>(),
             new TradingMetrics(meterFactory),
             effectiveTimeProvider);
@@ -2572,6 +2588,69 @@ public class OptimizationWorkerTest
 
         Assert.Equal(2, blockingProcessor.MaxConcurrentCalls);
         Assert.True(cycleCountWhileSlotsBusy >= 2);
+    }
+
+    [Fact]
+    public async Task ExecuteCoordinatorCycleAsync_WhenCoordinatorFails_StillLaunchesProcessingSlots_AndKeepsSchedulingDue()
+    {
+        var nowUtc = new DateTimeOffset(2026, 04, 09, 9, 0, 0, TimeSpan.Zero);
+        var timeProvider = new FixedTimeProvider(nowUtc);
+        var configProvider = await CreatePrimedConfigProviderAsync(
+            timeProvider,
+            new EngineConfig
+            {
+                Key = "Optimization:MaxConcurrentRuns",
+                Value = "1",
+                DataType = ConfigDataType.Int,
+                IsDeleted = false
+            },
+            new EngineConfig
+            {
+                Key = "Optimization:SchedulePollSeconds",
+                Value = "60",
+                DataType = ConfigDataType.Int,
+                IsDeleted = false
+            });
+
+        var readCtx = new Mock<IReadApplicationDbContext>();
+        readCtx.Setup(x => x.GetDbContext()).Returns(new Mock<DbContext>().Object);
+
+        var processor = new SignalingOptimizationRunProcessor();
+        var services = new ServiceCollection()
+            .AddSingleton(readCtx.Object)
+            .AddSingleton<IOptimizationRunProcessor>(processor)
+            .BuildServiceProvider();
+
+        var metricsServices = new ServiceCollection().AddMetrics().BuildServiceProvider();
+        var metrics = new TradingMetrics(
+            metricsServices.GetRequiredService<System.Diagnostics.Metrics.IMeterFactory>());
+        var worker = new OptimizationWorker(
+            Mock.Of<ILogger<OptimizationWorker>>(),
+            services.GetRequiredService<IServiceScopeFactory>(),
+            metrics,
+            healthMonitor: null,
+            new OptimizationWorkerHealthStore(),
+            configProvider,
+            new ThrowingLoopCoordinator(),
+            timeProvider,
+            TimeSpan.FromMilliseconds(25),
+            TimeSpan.FromSeconds(1));
+
+        var executeCycleMethod = typeof(OptimizationWorker).GetMethod(
+            "ExecuteCoordinatorCycleAsync",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(executeCycleMethod);
+
+        var cycleTask = (Task)executeCycleMethod!.Invoke(worker, [CancellationToken.None])!;
+        await Assert.ThrowsAsync<InvalidOperationException>(async () => await cycleTask);
+        await processor.Invoked.Task.WaitAsync(TimeSpan.FromSeconds(1));
+
+        var nextScheduleScanField = typeof(OptimizationWorker).GetField(
+            "_nextScheduleScanUtc",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(nextScheduleScanField);
+        Assert.Equal(DateTime.MinValue, (DateTime)nextScheduleScanField!.GetValue(worker)!);
+        Assert.Equal(1, processor.InvocationCount);
     }
 
     [Fact]
@@ -3154,6 +3233,43 @@ public class OptimizationWorkerTest
         await InvokeRecoverStaleQueuedRunsAsync(readCtx.Object, writeCtx.Object, timeProvider);
 
         Assert.Equal(OptimizationRunStatus.Queued, retriedRun.Status);
+    }
+
+    [Fact]
+    public async Task RecoverStaleQueuedRunsAsync_LeavesOldEligibleQueuedRunInQueue()
+    {
+        var nowUtc = new DateTimeOffset(2026, 04, 09, 12, 0, 0, TimeSpan.Zero);
+        var optimizationRuns = new List<OptimizationRun>
+        {
+            new()
+            {
+                Id = 4601,
+                StrategyId = 90,
+                Status = OptimizationRunStatus.Queued,
+                QueuedAt = nowUtc.UtcDateTime.AddHours(-25),
+                StartedAt = nowUtc.UtcDateTime.AddHours(-26),
+                IsDeleted = false
+            }
+        };
+
+        var optRunDbSet = optimizationRuns.AsQueryable().BuildMockDbSet();
+        var db = new Mock<DbContext>();
+        db.Setup(c => c.Set<OptimizationRun>()).Returns(optRunDbSet.Object);
+
+        var readCtx = new Mock<IReadApplicationDbContext>();
+        readCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
+
+        var writeCtx = new Mock<IWriteApplicationDbContext>();
+        writeCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
+
+        await InvokeRecoverStaleQueuedRunsAsync(readCtx.Object, writeCtx.Object, new FixedTimeProvider(nowUtc));
+
+        var run = Assert.Single(optimizationRuns);
+        Assert.Equal(OptimizationRunStatus.Queued, run.Status);
+        Assert.Null(run.CompletedAt);
+        Assert.Null(run.ErrorMessage);
+        Assert.Null(run.FailureCategory);
+        writeCtx.Verify(x => x.SaveChangesAsync(It.IsAny<CancellationToken>()), Times.Never);
     }
 
     [Fact]
@@ -4367,6 +4483,10 @@ public class OptimizationWorkerTest
         db.Setup(c => c.Set<BacktestRun>()).Returns(runDbSet.Object);
         db.Setup(c => c.Set<Strategy>()).Returns(strategyDbSet.Object);
         db.Setup(c => c.Set<Candle>()).Returns(candleDbSet.Object);
+        db.Setup(c => c.Set<EconomicEvent>()).Returns(new List<EconomicEvent>().AsQueryable().BuildMockDbSet().Object);
+        db.Setup(c => c.Set<CurrencyPair>()).Returns(new List<CurrencyPair>().AsQueryable().BuildMockDbSet().Object);
+        db.Setup(c => c.Set<SpreadProfile>()).Returns(new List<SpreadProfile>().AsQueryable().BuildMockDbSet().Object);
+        db.Setup(c => c.SaveChangesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(1);
 
         var readCtx = new Mock<IReadApplicationDbContext>();
         readCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
@@ -4383,12 +4503,30 @@ public class OptimizationWorkerTest
             .AddSingleton(readCtx.Object)
             .AddSingleton(writeCtx.Object)
             .AddSingleton(eventService.Object)
+            .AddSingleton<IValidationWorkerIdentity>(new TestValidationWorkerIdentity("test-opt-backtest-worker"))
+            .AddScoped<IValidationSettingsProvider, ValidationSettingsProvider>()
+            .AddScoped<IBacktestOptionsSnapshotBuilder>(sp =>
+                new BacktestOptionsSnapshotBuilder(
+                    sp.GetRequiredService<IValidationSettingsProvider>(),
+                    NullLogger<BacktestOptionsSnapshotBuilder>.Instance))
+            .AddScoped<IValidationRunFactory>(sp =>
+                new ValidationRunFactory(
+                    sp.GetRequiredService<IBacktestOptionsSnapshotBuilder>(),
+                    TimeProvider.System))
+            .AddSingleton<IAutoWalkForwardWindowPolicy, AutoWalkForwardWindowPolicy>()
             .BuildServiceProvider();
 
         var worker = new BacktestWorker(
             Mock.Of<ILogger<BacktestWorker>>(),
             services.GetRequiredService<IServiceScopeFactory>(),
-            engine);
+            engine,
+            new InMemoryBacktestRunClaimService(),
+            services.GetRequiredService<IValidationSettingsProvider>(),
+            Mock.Of<IBacktestAutoScheduler>(),
+            services.GetRequiredService<IValidationRunFactory>(),
+            services.GetRequiredService<IBacktestOptionsSnapshotBuilder>(),
+            services.GetRequiredService<IAutoWalkForwardWindowPolicy>(),
+            services.GetRequiredService<IValidationWorkerIdentity>());
 
         var method = typeof(BacktestWorker).GetMethod(
             "ProcessNextQueuedRunAsync",
@@ -4457,6 +4595,9 @@ public class OptimizationWorkerTest
         db.Setup(c => c.Set<Strategy>()).Returns(strategyDbSet.Object);
         db.Setup(c => c.Set<Candle>()).Returns(candleDbSet.Object);
         db.Setup(c => c.Set<EngineConfig>()).Returns(configDbSet.Object);
+        db.Setup(c => c.Set<EconomicEvent>()).Returns(new List<EconomicEvent>().AsQueryable().BuildMockDbSet().Object);
+        db.Setup(c => c.Set<CurrencyPair>()).Returns(new List<CurrencyPair>().AsQueryable().BuildMockDbSet().Object);
+        db.Setup(c => c.Set<SpreadProfile>()).Returns(new List<SpreadProfile>().AsQueryable().BuildMockDbSet().Object);
 
         var readCtx = new Mock<IReadApplicationDbContext>();
         readCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
@@ -4468,12 +4609,22 @@ public class OptimizationWorkerTest
         var services = new ServiceCollection()
             .AddSingleton(readCtx.Object)
             .AddSingleton(writeCtx.Object)
+            .AddSingleton<IValidationWorkerIdentity>(new TestValidationWorkerIdentity("test-opt-walkforward-worker"))
+            .AddScoped<IValidationSettingsProvider, ValidationSettingsProvider>()
+            .AddScoped<IBacktestOptionsSnapshotBuilder>(sp =>
+                new BacktestOptionsSnapshotBuilder(
+                    sp.GetRequiredService<IValidationSettingsProvider>(),
+                    NullLogger<BacktestOptionsSnapshotBuilder>.Instance))
             .BuildServiceProvider();
 
         var worker = new WalkForwardWorker(
             Mock.Of<ILogger<WalkForwardWorker>>(),
             services.GetRequiredService<IServiceScopeFactory>(),
-            engine);
+            engine,
+            new InMemoryWalkForwardRunClaimService(),
+            services.GetRequiredService<IValidationSettingsProvider>(),
+            services.GetRequiredService<IBacktestOptionsSnapshotBuilder>(),
+            services.GetRequiredService<IValidationWorkerIdentity>());
 
         var method = typeof(WalkForwardWorker).GetMethod(
             "ProcessAsync",
@@ -5117,11 +5268,39 @@ public class OptimizationWorkerTest
         return loopCoordinator.CycleCount;
     }
 
-    private static async Task<OptimizationConfigProvider> CreatePrimedConfigProviderAsync(params EngineConfig[] configs)
+    private sealed class ThrowingLoopCoordinator : IOptimizationWorkerLoopCoordinator
+    {
+        public Task WarmStartAsync(CancellationToken ct) => Task.CompletedTask;
+
+        public Task ExecuteCycleAsync(OptimizationWorkerCycleContext cycleContext, CancellationToken ct)
+            => Task.FromException(new InvalidOperationException("coordinator failure"));
+    }
+
+    private sealed class SignalingOptimizationRunProcessor : IOptimizationRunProcessor
+    {
+        private int _invocationCount;
+
+        public int InvocationCount => Volatile.Read(ref _invocationCount);
+        public TaskCompletionSource<bool> Invoked { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task<bool> ProcessNextQueuedRunAsync(CancellationToken ct)
+        {
+            Interlocked.Increment(ref _invocationCount);
+            Invoked.TrySetResult(true);
+            return Task.FromResult(false);
+        }
+    }
+
+    private static Task<OptimizationConfigProvider> CreatePrimedConfigProviderAsync(params EngineConfig[] configs)
+        => CreatePrimedConfigProviderAsync(TimeProvider.System, configs);
+
+    private static async Task<OptimizationConfigProvider> CreatePrimedConfigProviderAsync(
+        TimeProvider timeProvider,
+        params EngineConfig[] configs)
     {
         var configProvider = new OptimizationConfigProvider(
             Mock.Of<ILogger<OptimizationConfigProvider>>(),
-            TimeProvider.System);
+            timeProvider);
         var configDbSet = configs.AsQueryable().BuildMockDbSet();
         var db = new Mock<DbContext>();
         db.Setup(c => c.Set<EngineConfig>()).Returns(configDbSet.Object);
@@ -5188,6 +5367,16 @@ public class OptimizationWorkerTest
                 Trades = []
             });
         }
+    }
+
+    private sealed class TestValidationWorkerIdentity : IValidationWorkerIdentity
+    {
+        public TestValidationWorkerIdentity(string instanceId)
+        {
+            InstanceId = instanceId;
+        }
+
+        public string InstanceId { get; }
     }
 
 }

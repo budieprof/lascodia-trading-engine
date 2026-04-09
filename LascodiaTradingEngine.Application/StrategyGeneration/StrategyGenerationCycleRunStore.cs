@@ -50,6 +50,62 @@ internal sealed class StrategyGenerationCycleRunStore : IStrategyGenerationCycle
         });
     }
 
+    public async Task AttachFingerprintAsync(DbContext writeDb, string cycleId, string fingerprint, CancellationToken ct)
+    {
+        var cycle = await LoadMutableAsync(writeDb, cycleId, ct);
+        if (cycle == null)
+            return;
+
+        cycle.Fingerprint = fingerprint;
+        cycle.LastUpdatedAtUtc = _timeProvider.GetUtcNow().UtcDateTime;
+    }
+
+    public async Task StageSummaryDispatchSuccessAsync(
+        DbContext writeDb,
+        string cycleId,
+        Guid eventId,
+        string payloadJson,
+        DateTime dispatchedAtUtc,
+        CancellationToken ct)
+    {
+        var cycle = await LoadMutableAsync(writeDb, cycleId, ct);
+        if (cycle == null)
+            return;
+
+        cycle.SummaryEventId = eventId;
+        cycle.SummaryEventPayloadJson = payloadJson;
+        cycle.SummaryEventDispatchAttempts++;
+        cycle.SummaryEventDispatchedAtUtc = dispatchedAtUtc;
+        cycle.SummaryEventFailedAtUtc = null;
+        cycle.SummaryEventFailureMessage = null;
+        cycle.LastUpdatedAtUtc = dispatchedAtUtc;
+    }
+
+    public async Task RecordSummaryDispatchFailureAsync(
+        DbContext writeDb,
+        string cycleId,
+        Guid eventId,
+        string payloadJson,
+        string errorMessage,
+        DateTime failedAtUtc,
+        CancellationToken ct)
+    {
+        var cycle = await LoadMutableAsync(writeDb, cycleId, ct);
+        if (cycle == null)
+            return;
+
+        cycle.SummaryEventId = eventId;
+        cycle.SummaryEventPayloadJson = payloadJson;
+        if (cycle.SummaryEventDispatchAttempts == 0)
+            cycle.SummaryEventDispatchAttempts = 1;
+        cycle.SummaryEventDispatchedAtUtc = null;
+        cycle.SummaryEventFailedAtUtc = failedAtUtc;
+        cycle.SummaryEventFailureMessage = errorMessage.Length <= 1000
+            ? errorMessage
+            : errorMessage[..1000];
+        cycle.LastUpdatedAtUtc = failedAtUtc;
+    }
+
     public async Task CompleteAsync(
         DbContext writeDb,
         string cycleId,

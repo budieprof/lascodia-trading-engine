@@ -104,32 +104,65 @@ internal static class InferenceHelpers
     /// </summary>
     internal static double ApplyDeployedCalibration(double rawProb, ModelSnapshot snap)
     {
+        return ApplyDeployedCalibration(
+            rawProb,
+            snap.PlattA,
+            snap.PlattB,
+            snap.TemperatureScale,
+            snap.PlattABuy,
+            snap.PlattBBuy,
+            snap.PlattASell,
+            snap.PlattBSell,
+            snap.ConditionalCalibrationRoutingThreshold,
+            snap.IsotonicBreakpoints,
+            snap.AgeDecayLambda,
+            snap.TrainedAtUtc,
+            applyAgeDecay: true);
+    }
+
+    internal static double ApplyDeployedCalibration(
+        double rawProb,
+        double plattA,
+        double plattB,
+        double temperatureScale,
+        double plattABuy,
+        double plattBBuy,
+        double plattASell,
+        double plattBSell,
+        double routingThreshold,
+        double[]? isotonicBreakpoints = null,
+        double ageDecayLambda = 0.0,
+        DateTime trainedAtUtc = default,
+        bool applyAgeDecay = false,
+        DateTime? nowUtc = null)
+    {
         double rawLogit = MLFeatureHelper.Logit(ClampLogitProbability(rawProb));
-        double temperatureScale = SanitizeTemperatureScale(snap.TemperatureScale);
-        double plattA = SanitizeFiniteOrDefault(snap.PlattA, 1.0);
-        double plattB = SanitizeFiniteOrDefault(snap.PlattB, 0.0);
-        double plattABuy = SanitizeFiniteOrDefault(snap.PlattABuy, 0.0);
-        double plattBBuy = SanitizeFiniteOrDefault(snap.PlattBBuy, 0.0);
-        double plattASell = SanitizeFiniteOrDefault(snap.PlattASell, 0.0);
-        double plattBSell = SanitizeFiniteOrDefault(snap.PlattBSell, 0.0);
-        double routingThreshold = SanitizeFiniteOrDefault(snap.ConditionalCalibrationRoutingThreshold, 0.5);
-        double globalCalibP = temperatureScale > 0.0
-            ? MLFeatureHelper.Sigmoid(rawLogit / temperatureScale)
-            : MLFeatureHelper.Sigmoid(plattA * rawLogit + plattB);
+        double safeTemperatureScale = SanitizeTemperatureScale(temperatureScale);
+        double safePlattA = SanitizeFiniteOrDefault(plattA, 1.0);
+        double safePlattB = SanitizeFiniteOrDefault(plattB, 0.0);
+        double safePlattABuy = SanitizeFiniteOrDefault(plattABuy, 0.0);
+        double safePlattBBuy = SanitizeFiniteOrDefault(plattBBuy, 0.0);
+        double safePlattASell = SanitizeFiniteOrDefault(plattASell, 0.0);
+        double safePlattBSell = SanitizeFiniteOrDefault(plattBSell, 0.0);
+        double safeRoutingThreshold = SanitizeFiniteOrDefault(routingThreshold, 0.5);
+        double globalCalibP = safeTemperatureScale > 0.0
+            ? MLFeatureHelper.Sigmoid(rawLogit / safeTemperatureScale)
+            : MLFeatureHelper.Sigmoid(safePlattA * rawLogit + safePlattB);
         double calibP = ApplyConditionalCalibration(
             rawLogit, globalCalibP,
-            plattABuy, plattBBuy,
-            plattASell, plattBSell,
-            routingThreshold);
+            safePlattABuy, safePlattBBuy,
+            safePlattASell, safePlattBSell,
+            safeRoutingThreshold);
 
-        if (snap.IsotonicBreakpoints.Length >= 4)
-            calibP = ApplyIsotonicCalibrationSafe(calibP, snap.IsotonicBreakpoints);
+        if (isotonicBreakpoints is { Length: >= 4 })
+            calibP = ApplyIsotonicCalibrationSafe(calibP, isotonicBreakpoints);
 
-        double ageDecayLambda = SanitizeNonNegative(snap.AgeDecayLambda);
-        if (ageDecayLambda > 0.0 && snap.TrainedAtUtc != default)
+        double safeAgeDecayLambda = SanitizeNonNegative(ageDecayLambda);
+        if (applyAgeDecay && safeAgeDecayLambda > 0.0 && trainedAtUtc != default)
         {
-            double daysSinceTrain = (DateTime.UtcNow - snap.TrainedAtUtc).TotalDays;
-            double decayFactor    = Math.Exp(-ageDecayLambda * Math.Max(0.0, daysSinceTrain));
+            DateTime effectiveNowUtc = nowUtc ?? DateTime.UtcNow;
+            double daysSinceTrain = (effectiveNowUtc - trainedAtUtc).TotalDays;
+            double decayFactor    = Math.Exp(-safeAgeDecayLambda * Math.Max(0.0, daysSinceTrain));
             calibP = 0.5 + (calibP - 0.5) * decayFactor;
         }
 
@@ -174,12 +207,15 @@ internal static class InferenceHelpers
     /// </summary>
     internal static void ApplyModelSpecificFeatureTransforms(float[] features, ModelSnapshot snap)
     {
-        if (!string.Equals(snap.Type, "TABNET", StringComparison.OrdinalIgnoreCase))
-            return;
+        FeatureTransformDescriptor[] descriptors = string.Equals(snap.Type, "TABNET", StringComparison.OrdinalIgnoreCase)
+            ? TabNetSnapshotSupport.ResolveFeaturePipelineDescriptors(snap)
+            : snap.FeaturePipelineDescriptors ?? [];
 
-        var descriptors = TabNetSnapshotSupport.ResolveFeaturePipelineDescriptors(snap);
         foreach (var descriptor in descriptors)
         {
+            if (FeaturePipelineTransformSupport.TryApplyInPlace(features, descriptor))
+                continue;
+
             if (!string.Equals(descriptor.Kind, TabNetSnapshotSupport.PolyInteractionsTransform, StringComparison.OrdinalIgnoreCase) ||
                 !string.Equals(descriptor.Operation, "PRODUCT", StringComparison.OrdinalIgnoreCase))
                 continue;
@@ -216,7 +252,7 @@ internal static class InferenceHelpers
             }
         }
 
-        if (descriptors.Length > 0)
+        if (descriptors.Length > 0 || !string.Equals(snap.Type, "TABNET", StringComparison.OrdinalIgnoreCase))
             return;
 
         foreach (string transform in snap.FeaturePipelineTransforms ?? [])

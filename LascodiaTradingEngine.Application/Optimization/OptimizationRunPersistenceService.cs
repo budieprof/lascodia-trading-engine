@@ -86,6 +86,8 @@ public sealed class OptimizationRunPersistenceService
         OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Completed, UtcNow);
         run.ResultsPersistedAt = UtcNow;
         run.ApprovalEvaluatedAt = null;
+        run.DeferralReason = null;
+        run.DeferredAtUtc = null;
         run.ValidationFollowUpsCreatedAt = null;
         run.ValidationFollowUpStatus = null;
         run.FollowUpLastCheckedAt = null;

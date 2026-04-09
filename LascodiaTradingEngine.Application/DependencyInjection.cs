@@ -17,6 +17,7 @@ using LascodiaTradingEngine.Application.Services.MarketData;
 using LascodiaTradingEngine.Application.Bridge.Services;
 using LascodiaTradingEngine.Application.Common.Behaviors;
 using LascodiaTradingEngine.Application.Common.Options;
+using LascodiaTradingEngine.Application.Backtesting;
 using LascodiaTradingEngine.Application.RiskProfiles.Services;
 using LascodiaTradingEngine.Application.RiskProfiles.Services.Steps;
 using MediatR;
@@ -211,6 +212,14 @@ public static class DependencyInjection
 
         // ── Time abstraction ─────────────────────────────────────────────────────
         services.AddSingleton(TimeProvider.System);
+        services.AddSingleton<IValidationWorkerIdentity, ValidationWorkerIdentity>();
+        services.AddSingleton<IValidationSettingsProvider, ValidationSettingsProvider>();
+        services.AddSingleton<IBacktestAutoScheduler, BacktestAutoScheduler>();
+        services.AddSingleton<IBacktestOptionsSnapshotBuilder, BacktestOptionsSnapshotBuilder>();
+        services.AddSingleton<IValidationRunFactory, ValidationRunFactory>();
+        services.AddSingleton<IAutoWalkForwardWindowPolicy, AutoWalkForwardWindowPolicy>();
+        services.AddSingleton<IBacktestRunClaimService, PostgresBacktestRunClaimService>();
+        services.AddSingleton<IWalkForwardRunClaimService, PostgresWalkForwardRunClaimService>();
 
         // ── COT Data Feed (CFTC bulk CSV) ───────────────────────────────────────
         services.AddHttpClient("CftcCOT", c =>

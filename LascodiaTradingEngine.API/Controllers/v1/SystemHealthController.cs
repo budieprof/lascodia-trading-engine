@@ -3,6 +3,7 @@ using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using Lascodia.Trading.Engine.SharedApplication.Common.Services;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using LascodiaTradingEngine.Application.SystemHealth.Queries.GetEngineStatus;
+using LascodiaTradingEngine.Application.SystemHealth.Queries.GetStrategyGenerationWorkerHealth;
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
@@ -24,4 +25,9 @@ public class SystemHealthController : AuthControllerBase<SystemHealthController>
     [HttpGet("status")]
     public async Task<ResponseData<EngineStatusDto>> GetStatus()
         => await Mediator.Send(new GetEngineStatusQuery());
+
+    /// <summary>Get typed strategy-generation worker health, replay state, and phase diagnostics.</summary>
+    [HttpGet("strategy-generation")]
+    public async Task<ResponseData<StrategyGenerationWorkerHealthDto>> GetStrategyGenerationWorkerHealth()
+        => await Mediator.Send(new GetStrategyGenerationWorkerHealthQuery());
 }

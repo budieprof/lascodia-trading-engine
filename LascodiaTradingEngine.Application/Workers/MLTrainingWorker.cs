@@ -437,6 +437,9 @@ public sealed class MLTrainingWorker : BackgroundService
                             TripleBarrierStopAtrMult   = overrides.TripleBarrierStopAtrMult   ?? hp.TripleBarrierStopAtrMult,
                             LabelSmoothing             = overrides.LabelSmoothing             ?? hp.LabelSmoothing,
                             NoiseSigma                 = overrides.NoiseSigma                 ?? hp.NoiseSigma,
+                            FtTransformerHeads         = overrides.FtTransformerHeads         ?? hp.FtTransformerHeads,
+                            FtTransformerArchitectureNumLayers =
+                                overrides.FtTransformerNumLayers ?? hp.FtTransformerArchitectureNumLayers,
                         };
                         _logger.LogInformation(
                             "Run {RunId}: applied hyperparameter overrides from HyperparamConfigJson " +
@@ -770,6 +773,25 @@ public sealed class MLTrainingWorker : BackgroundService
                             snapshotContractValid = validation.IsValid;
                             snapshotContractIssues = string.Join("; ", validation.Issues);
                         }
+                        else if (string.Equals(snapForGate.Type, "GBM", StringComparison.OrdinalIgnoreCase))
+                        {
+                            snapForGate = GbmSnapshotSupport.NormalizeSnapshotCopy(snapForGate);
+                            var validation = GbmSnapshotSupport.ValidateSnapshot(snapForGate, allowLegacy: false);
+                            snapshotContractValid = validation.IsValid;
+                            snapshotContractIssues = string.Join("; ", validation.Issues);
+                        }
+                        else if (string.Equals(snapForGate.Type, "FTTRANSFORMER", StringComparison.OrdinalIgnoreCase))
+                        {
+                            snapForGate = FtTransformerSnapshotSupport.NormalizeSnapshotCopy(snapForGate);
+                            (snapshotContractValid, snapshotContractIssues) = ValidateFtTransformerPromotionSnapshot(snapForGate);
+                        }
+                        else if (string.Equals(snapForGate.Type, "elm", StringComparison.OrdinalIgnoreCase))
+                        {
+                            snapForGate = ElmSnapshotSupport.NormalizeSnapshotCopy(snapForGate);
+                            var validation = ElmSnapshotSupport.ValidateSnapshot(snapForGate, allowLegacy: false);
+                            snapshotContractValid = validation.IsValid;
+                            snapshotContractIssues = string.Join("; ", validation.Issues);
+                        }
                         snapEce = snapForGate.Ece;
                         snapBss = snapForGate.BrierSkillScore;
                     }
@@ -874,6 +896,7 @@ public sealed class MLTrainingWorker : BackgroundService
                 m.BrierScore         <= brierCeiling                                               &&
                 m.SharpeRatio        >= hp.MinSharpeRatio                                          &&
                 f1Passed                                                                           &&
+                cvCheck.FoldCount    > 0                                                          &&
                 cvCheck.StdAccuracy  <= hp.MaxWalkForwardStdDev                                    &&
                 (hp.MaxEce <= 0 || snapEce <= hp.MaxEce)                                           &&
                 (hp.MinBrierSkillScore <= -1.0 || snapBss >= hp.MinBrierSkillScore)                &&
@@ -917,6 +940,7 @@ public sealed class MLTrainingWorker : BackgroundService
                 run.ErrorMessage = $"Invalid model snapshot contract: {snapshotContractIssues}";
 
             // ── Training cost tracking (observability) ──────────────────────
+            try
             {
                 long peakMemoryBytes = GC.GetTotalMemory(forceFullCollection: false);
                 double peakMemoryMb = peakMemoryBytes / (1024.0 * 1024.0);
@@ -934,6 +958,15 @@ public sealed class MLTrainingWorker : BackgroundService
                     "samples={Samples} peakMemory={MemMB:F1}MB",
                     run.Id, run.Symbol, run.Timeframe,
                     run.TrainingDurationMs.Value, run.TotalSamples, peakMemoryMb);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Failed to persist training cost diagnostics for run {RunId} ({Symbol}/{Tf}) — non-fatal.",
+                    run.Id,
+                    run.Symbol,
+                    run.Timeframe);
             }
 
             if (!passed)
@@ -2014,7 +2047,10 @@ public sealed class MLTrainingWorker : BackgroundService
             FgsmEpsilon:                 Cfg<double>("MLTraining:FgsmEpsilon",              0.01),
             MinF1Score:                  Cfg<double>(CK_MinF1,                             0.10),
             UseClassWeights:             Cfg<bool>  (CK_UseClassWeights,                   true),
-            MinIsotonicCalibrationSamples: Cfg<int> ("MLTraining:MinIsotonicCalibrationSamples", 50));
+            MinIsotonicCalibrationSamples: Cfg<int> ("MLTraining:MinIsotonicCalibrationSamples", 50),
+            FtTransformerHeads:          Cfg<int>   ("MLTraining:FtTransformerHeads",       0),
+            FtTransformerArchitectureNumLayers:
+                                          Cfg<int>   ("MLTraining:FtTransformerNumLayers",  0));
     }
 
     /// <summary>
@@ -2331,6 +2367,78 @@ public sealed class MLTrainingWorker : BackgroundService
         {
             _logger.LogWarning(ex, "Self-tuning retry failed for run {RunId} — non-critical", failedRun.Id);
         }
+    }
+
+    private static (bool IsValid, string Issues) ValidateFtTransformerPromotionSnapshot(ModelSnapshot snapshot)
+    {
+        var normalized = FtTransformerSnapshotSupport.NormalizeSnapshotCopy(snapshot);
+        var validation = FtTransformerSnapshotSupport.ValidateNormalizedSnapshot(normalized);
+        var issues = new List<string>(validation.Issues);
+
+        if (normalized.TrainingSplitSummary is null)
+        {
+            issues.Add("TrainingSplitSummary is missing.");
+        }
+        else
+        {
+            if (normalized.TrainingSplitSummary.MetaLabelCount != 0)
+                issues.Add("FT-Transformer snapshots must not advertise meta-label calibration splits.");
+            if (normalized.TrainingSplitSummary.AbstentionCount != 0)
+                issues.Add("FT-Transformer snapshots must not advertise abstention calibration splits.");
+            if (normalized.TrainingSplitSummary.SelectionPruningCount <= 0 ||
+                normalized.TrainingSplitSummary.SelectionThresholdCount <= 0)
+            {
+                issues.Add("FT-Transformer snapshots must persist non-empty selection pruning and threshold sub-splits.");
+            }
+        }
+
+        if (normalized.FtTransformerSelectionMetrics is null)
+            issues.Add("FtTransformerSelectionMetrics is missing.");
+        if (normalized.FtTransformerCalibrationMetrics is null)
+            issues.Add("FtTransformerCalibrationMetrics is missing.");
+        if (normalized.FtTransformerTestMetrics is null)
+            issues.Add("FtTransformerTestMetrics is missing.");
+        if (normalized.FtTransformerCalibrationArtifact is null)
+            issues.Add("FtTransformerCalibrationArtifact is missing.");
+        else if (normalized.TrainingSplitSummary is not null)
+        {
+            if (normalized.FtTransformerCalibrationArtifact.AdaptiveHeadCrossFitFoldCount !=
+                normalized.TrainingSplitSummary.AdaptiveHeadCrossFitFoldCount)
+            {
+                issues.Add("FtTransformerCalibrationArtifact cross-fit metadata does not match TrainingSplitSummary.");
+            }
+
+            if (normalized.FtTransformerCalibrationArtifact.ThresholdSelectionSampleCount > 0 &&
+                normalized.FtTransformerCalibrationArtifact.ThresholdSelectionSampleCount !=
+                normalized.TrainingSplitSummary.SelectionThresholdCount)
+            {
+                issues.Add("FtTransformerCalibrationArtifact threshold-selection sample count does not match TrainingSplitSummary.");
+            }
+        }
+        if (normalized.FtTransformerWarmStartArtifact is null)
+            issues.Add("FtTransformerWarmStartArtifact is missing.");
+
+        if (normalized.FtTransformerAuditArtifact is null)
+        {
+            issues.Add("FtTransformerAuditArtifact is missing.");
+        }
+        else
+        {
+            if (!normalized.FtTransformerAuditArtifact.SnapshotContractValid)
+                issues.Add("FtTransformerAuditArtifact reported an invalid snapshot contract.");
+            if (normalized.FtTransformerAuditArtifact.ThresholdDecisionMismatchCount > 0)
+                issues.Add($"FtTransformerAuditArtifact reported {normalized.FtTransformerAuditArtifact.ThresholdDecisionMismatchCount} threshold decision mismatches.");
+            if (normalized.FtTransformerAuditArtifact.Findings.Length > 0)
+                issues.Add($"FtTransformerAuditArtifact reported findings: {string.Join(" | ", normalized.FtTransformerAuditArtifact.Findings)}");
+        }
+
+        if (!double.IsFinite(normalized.FtTransformerTrainInferenceParityMaxError) ||
+            normalized.FtTransformerTrainInferenceParityMaxError > 1e-6)
+        {
+            issues.Add($"FtTransformerTrainInferenceParityMaxError {normalized.FtTransformerTrainInferenceParityMaxError:G} exceeded the 1e-6 promotion limit.");
+        }
+
+        return (issues.Count == 0, string.Join("; ", issues.Distinct()));
     }
 
     private static string BuildGateFailureMessage(

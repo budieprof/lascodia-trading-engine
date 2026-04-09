@@ -15,6 +15,8 @@ namespace LascodiaTradingEngine.Application.StrategyGeneration;
 public interface IStrategyGenerationScheduler
 {
     Task ExecutePollAsync(Func<CancellationToken, Task> runCycleAsync, CancellationToken stoppingToken);
+
+    Task ExecuteManualRunAsync(Func<CancellationToken, Task> runCycleAsync, CancellationToken stoppingToken);
 }
 
 public interface IStrategyGenerationCycleRunner
@@ -176,6 +178,25 @@ internal interface IStrategyGenerationScheduleStateStore
 internal interface IStrategyGenerationCycleRunStore
 {
     Task StartAsync(DbContext writeDb, string cycleId, string? fingerprint, CancellationToken ct);
+
+    Task AttachFingerprintAsync(DbContext writeDb, string cycleId, string fingerprint, CancellationToken ct);
+
+    Task StageSummaryDispatchSuccessAsync(
+        DbContext writeDb,
+        string cycleId,
+        Guid eventId,
+        string payloadJson,
+        DateTime dispatchedAtUtc,
+        CancellationToken ct);
+
+    Task RecordSummaryDispatchFailureAsync(
+        DbContext writeDb,
+        string cycleId,
+        Guid eventId,
+        string payloadJson,
+        string errorMessage,
+        DateTime failedAtUtc,
+        CancellationToken ct);
 
     Task CompleteAsync(
         DbContext writeDb,

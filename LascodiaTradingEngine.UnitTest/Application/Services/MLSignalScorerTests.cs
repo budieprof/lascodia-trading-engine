@@ -1,7 +1,9 @@
 using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Application.Services;
 using LascodiaTradingEngine.Application.Services.Inference;
+using LascodiaTradingEngine.Application.Services.ML;
 using LascodiaTradingEngine.Domain.Entities;
+using LascodiaTradingEngine.Domain.Enums;
 using System.Text.Json;
 
 namespace LascodiaTradingEngine.UnitTest.Application.Services;
@@ -57,6 +59,19 @@ public class MLSignalScorerTests
         };
 
         Assert.False(new TcnInferenceEngine().CanHandle(snap));
+    }
+
+    [Fact]
+    public void IsTcnModel_Uses_Semantic_Version_Parsing()
+    {
+        var snap = new ModelSnapshot
+        {
+            Type = "TCN",
+            ConvWeightsJson = "{\"ConvW\":[]}",
+            Version = "10.0"
+        };
+
+        Assert.True(new TcnInferenceEngine().CanHandle(snap));
     }
 
     // ────────────────────────────────────────────────────────────────────────
@@ -294,6 +309,29 @@ public class MLSignalScorerTests
         Assert.NotNull(method);
         var result = method!.Invoke(null, [snap, new List<Candle>()]);
         Assert.Null(result);
+    }
+
+    [Fact]
+    public void TcnInferenceEngine_RunInference_Applies_Channel_Mask_And_Returns_Magnitude()
+    {
+        var snapshot = CreateMinimalTcnSnapshot(channelMask: [false, true, true, true, true, true, true, true, true]);
+        var candles = CreateCandleWindow();
+
+        var result = new TcnInferenceEngine().RunInference(
+            features: new float[MLFeatureHelper.FeatureCount],
+            featureCount: MLFeatureHelper.FeatureCount,
+            snapshot,
+            candles,
+            modelId: 1,
+            mcDropoutSamples: 0,
+            mcDropoutSeed: 0);
+
+        Assert.True(result.HasValue);
+        Assert.True(result.Value.Magnitude.HasValue);
+        Assert.Equal(2.5, result.Value.Magnitude.Value, precision: 6);
+        Assert.NotNull(result.Value.ModelSpaceValues);
+        Assert.Equal(MLFeatureHelper.SequenceChannelCount, result.Value.ModelSpaceValues!.Length);
+        Assert.Equal(0.0, result.Value.ModelSpaceValues[0], precision: 6);
     }
 
     // ────────────────────────────────────────────────────────────────────────
@@ -584,5 +622,81 @@ public class MLSignalScorerTests
         Assert.Equal(0f, result[0]); // (5-5)/1 = 0
         Assert.Equal(0f, result[1]); // raw[1] doesn't exist → stays 0
         Assert.Equal(0f, result[2]); // raw[2] doesn't exist → stays 0
+    }
+
+    [Fact]
+    public void PredictSnapshotMagnitude_Uses_Bagged_Polynomial_Terms_When_Present()
+    {
+        var snap = new ModelSnapshot
+        {
+            MagWeights = [1.0, 2.0, 10.0],
+            MagBias = 0.5,
+        };
+
+        double magnitude = MLSignalScorer.PredictSnapshotMagnitude([2f, 3f], 2, snap);
+
+        Assert.Equal(68.5, magnitude, precision: 6);
+    }
+
+    private static ModelSnapshot CreateMinimalTcnSnapshot(bool[]? channelMask = null)
+    {
+        var weights = new TcnModelTrainer.TcnSnapshotWeights
+        {
+            ConvW = [new double[MLFeatureHelper.SequenceChannelCount * 3]],
+            ConvB = [new[] { 1.0 }],
+            HeadW = [0.0, 1.0],
+            HeadB = [0.0, 0.0],
+            MagHeadW = [2.0],
+            MagHeadB = 0.5,
+            ResW = [null],
+            ChannelIn = MLFeatureHelper.SequenceChannelCount,
+            TimeSteps = MLFeatureHelper.LookbackWindow,
+            Filters = 1,
+            UseLayerNorm = false,
+            Activation = (int)TcnActivation.Relu,
+            UseAttentionPooling = false,
+        };
+
+        var seqMeans = new float[MLFeatureHelper.SequenceChannelCount];
+        var seqStds = new float[MLFeatureHelper.SequenceChannelCount];
+        Array.Fill(seqStds, 1f);
+
+        return new ModelSnapshot
+        {
+            Type = "TCN",
+            Version = "5.0",
+            ConvWeightsJson = JsonSerializer.Serialize(weights),
+            SeqMeans = seqMeans,
+            SeqStds = seqStds,
+            TcnActiveChannelMask = channelMask ?? Enumerable.Repeat(true, MLFeatureHelper.SequenceChannelCount).ToArray(),
+            TcnChannelNames = MLFeatureHelper.SequenceChannelNames,
+            TcnChannelImportanceScores = Enumerable.Repeat(1.0, MLFeatureHelper.SequenceChannelCount).ToArray(),
+        };
+    }
+
+    private static List<Candle> CreateCandleWindow()
+    {
+        var candles = new List<Candle>(MLFeatureHelper.LookbackWindow);
+        DateTime start = new(2025, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+
+        for (int i = 0; i < MLFeatureHelper.LookbackWindow; i++)
+        {
+            decimal open = 100m + i;
+            decimal close = open + 0.5m + (i % 3) * 0.1m;
+            candles.Add(new Candle
+            {
+                Symbol = "EURUSD",
+                Timeframe = Timeframe.H1,
+                Open = open,
+                High = close + 0.25m,
+                Low = open - 0.25m,
+                Close = close,
+                Volume = 1000m + (i * 10m),
+                Timestamp = start.AddHours(i),
+                IsClosed = true,
+            });
+        }
+
+        return candles;
     }
 }

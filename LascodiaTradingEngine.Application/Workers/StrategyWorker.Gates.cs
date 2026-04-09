@@ -1,6 +1,6 @@
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
-using LascodiaTradingEngine.Application.Backtesting.Models;
+using LascodiaTradingEngine.Application.Backtesting;
 using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.Workers;
@@ -56,71 +56,81 @@ public partial class StrategyWorker
         var recentBacktests = await ctx.Set<Domain.Entities.BacktestRun>()
             .Where(r => strategyIds.Contains(r.StrategyId)
                         && r.Status == RunStatus.Completed
-                        && !r.IsDeleted
-                        && r.ResultJson != null)
+                        && !r.IsDeleted)
             .GroupBy(r => r.StrategyId)
-            .Select(g => new
-            {
-                StrategyId = g.Key,
-                ResultJson = g.OrderByDescending(r => r.CompletedAt).First().ResultJson
-            })
+            .Select(g => g.OrderByDescending(r => r.CompletedAt)
+                .Select(r => new
+                {
+                    r.StrategyId,
+                    r.TotalTrades,
+                    r.WinRate,
+                    r.ProfitFactor,
+                    r.MaxDrawdownPct,
+                    r.SharpeRatio,
+                    r.FinalBalance,
+                    r.TotalReturn,
+                    r.ResultJson
+                })
+                .First())
             .ToListAsync(ct);
 
         var qualifiedIds = new HashSet<long>();
 
         foreach (var bt in recentBacktests)
         {
-            if (string.IsNullOrWhiteSpace(bt.ResultJson))
-                continue;
-
-            try
+            if (!global::LascodiaTradingEngine.Application.Backtesting.BacktestRunMetricsReader.TryRead(
+                    bt.TotalTrades,
+                    bt.WinRate,
+                    bt.ProfitFactor,
+                    bt.MaxDrawdownPct,
+                    bt.SharpeRatio,
+                    bt.FinalBalance,
+                    bt.TotalReturn,
+                    bt.ResultJson,
+                    out var result))
             {
-                var result = System.Text.Json.JsonSerializer.Deserialize<BacktestResult>(bt.ResultJson);
-                if (result is null) continue;
-
-                // Resolve timeframe-adaptive MinTotalTrades
-                int minTotalTrades = minTradesDefault;
-                if (timeframeMap.TryGetValue(bt.StrategyId, out var tf))
-                {
-                    minTotalTrades = tf switch
-                    {
-                        Timeframe.M1 or Timeframe.M5 or Timeframe.M15 => minTradesM5M15,
-                        Timeframe.H1  => minTradesH1,
-                        Timeframe.H4  => minTradesH4,
-                        Timeframe.D1  => minTradesD1,
-                        _             => minTradesDefault,
-                    };
-                }
-
-                bool meetsMinTrades  = result.TotalTrades >= minTotalTrades;
-                bool meetsWinRate    = (double)result.WinRate >= minWinRate;
-                bool meetsPF         = (double)result.ProfitFactor >= minProfitFactor;
-                bool meetsDrawdown   = (double)result.MaxDrawdownPct <= maxDrawdownPct;
-                bool meetsSharpe     = (double)result.SharpeRatio >= minSharpe;
-
-                if (meetsMinTrades && meetsWinRate && meetsPF && meetsDrawdown && meetsSharpe)
-                {
-                    qualifiedIds.Add(bt.StrategyId);
-                }
-                else
-                {
-                    _logger.LogDebug(
-                        "Strategy {Id} ({Tf}): backtest did not meet qualification — " +
-                        "trades={Trades}/{MinTrades} winRate={WR:P1}/{MinWR:P1} " +
-                        "pf={PF:F2}/{MinPF:F2} dd={DD:P1}/{MaxDD:P1} sharpe={S:F2}/{MinS:F2}",
-                        bt.StrategyId, tf,
-                        result.TotalTrades, minTotalTrades,
-                        (double)result.WinRate, minWinRate,
-                        (double)result.ProfitFactor, minProfitFactor,
-                        (double)result.MaxDrawdownPct, maxDrawdownPct,
-                        (double)result.SharpeRatio, minSharpe);
-                }
-            }
-            catch (System.Text.Json.JsonException ex)
-            {
-                _logger.LogWarning(ex,
-                    "Strategy {Id}: failed to deserialise backtest ResultJson — treating as unqualified",
+                LoggerExtensions.LogWarning(
+                    _logger,
+                    "Strategy {Id}: backtest metrics were unavailable or malformed — treating as unqualified",
                     bt.StrategyId);
+                continue;
+            }
+
+            var tf = timeframeMap.TryGetValue(bt.StrategyId, out var resolvedTf)
+                ? resolvedTf
+                : Timeframe.H1;
+            int minTotalTrades = tf switch
+            {
+                Timeframe.M1 or Timeframe.M5 or Timeframe.M15 => minTradesM5M15,
+                Timeframe.H1 => minTradesH1,
+                Timeframe.H4 => minTradesH4,
+                Timeframe.D1 => minTradesD1,
+                _ => minTradesDefault,
+            };
+
+            bool meetsMinTrades  = result.TotalTrades >= minTotalTrades;
+            bool meetsWinRate    = (double)result.WinRate >= minWinRate;
+            bool meetsPF         = (double)result.ProfitFactor >= minProfitFactor;
+            bool meetsDrawdown   = (double)result.MaxDrawdownPct <= maxDrawdownPct;
+            bool meetsSharpe     = (double)result.SharpeRatio >= minSharpe;
+
+            if (meetsMinTrades && meetsWinRate && meetsPF && meetsDrawdown && meetsSharpe)
+            {
+                qualifiedIds.Add(bt.StrategyId);
+            }
+            else
+            {
+                LoggerExtensions.LogDebug(
+                    _logger,
+                    "Strategy {Id} ({Tf}): backtest did not meet qualification — " +
+                    "trades={Trades}/{MinTrades} winRate={WR:P1}/{MinWR:P1} " +
+                    "pf={PF:F2}/{MinPF:F2} dd={DD:P1}/{MaxDD:P1} sharpe={S:F2}/{MinS:F2}",
+                    bt.StrategyId, tf,
+                    result.TotalTrades, minTotalTrades,
+                    (double)result.WinRate, minWinRate,
+                    (double)result.ProfitFactor, minProfitFactor,
+                    (double)result.MaxDrawdownPct, maxDrawdownPct,
+                    (double)result.SharpeRatio, minSharpe);
             }
         }
 

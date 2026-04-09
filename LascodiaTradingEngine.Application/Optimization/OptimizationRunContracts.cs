@@ -19,6 +19,7 @@ internal static class OptimizationRunContracts
     {
         public int Version { get; init; }
         public int DeterministicSeed { get; init; }
+        public int DeterministicSeedVersion { get; init; }
         public string Surrogate { get; init; } = string.Empty;
         public string Symbol { get; init; } = string.Empty;
         public Timeframe Timeframe { get; init; }

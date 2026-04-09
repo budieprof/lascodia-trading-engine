@@ -33,6 +33,9 @@ public class ScreeningAuditLogger
     public async Task LogFailureAsync(ScreeningOutcome result, CancellationToken ct)
     {
         if (result.FailureOutcome == null) return;
+        string? reserveTargetRegime = string.Equals(result.GenerationSource, "Reserve", StringComparison.OrdinalIgnoreCase)
+            ? result.Regime.ToString()
+            : null;
 
         await _mediator.Send(new LogDecisionCommand
         {
@@ -44,7 +47,13 @@ public class ScreeningAuditLogger
             ContextJson  = JsonSerializer.Serialize(new
             {
                 failureReason = result.Failure.ToString(),
+                strategyType = result.Strategy.StrategyType.ToString(),
+                symbol = result.Strategy.Symbol,
+                timeframe = result.Strategy.Timeframe.ToString(),
                 regime = result.Regime.ToString(),
+                observedRegime = result.ObservedRegime.ToString(),
+                generationSource = result.GenerationSource,
+                reserveTargetRegime,
             }, JsonOpts),
             Source       = "StrategyGenerationWorker"
         }, ct);
@@ -69,6 +78,11 @@ public class ScreeningAuditLogger
             ContextJson  = JsonSerializer.Serialize(new
             {
                 regime = candidate.Regime.ToString(),
+                observedRegime = candidate.ObservedRegime.ToString(),
+                generationSource = candidate.GenerationSource,
+                reserveTargetRegime = string.Equals(candidate.GenerationSource, "Reserve", StringComparison.OrdinalIgnoreCase)
+                    ? candidate.Regime.ToString()
+                    : null,
                 isWinRate = (double)candidate.TrainResult.WinRate,
                 isProfitFactor = (double)candidate.TrainResult.ProfitFactor,
                 isSharpeRatio = (double)candidate.TrainResult.SharpeRatio,

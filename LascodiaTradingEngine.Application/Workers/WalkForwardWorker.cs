@@ -1,8 +1,10 @@
+using System.Diagnostics;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using LascodiaTradingEngine.Application.Backtesting;
 using LascodiaTradingEngine.Application.Backtesting.Models;
 using LascodiaTradingEngine.Application.Backtesting.Services;
 using LascodiaTradingEngine.Application.Common.Interfaces;
@@ -85,6 +87,11 @@ public class WalkForwardWorker : BackgroundService
 {
     private readonly ILogger<WalkForwardWorker> _logger;
     private readonly IWorkerHealthMonitor? _healthMonitor;
+    private readonly IWalkForwardRunClaimService _runClaimService;
+    private readonly IValidationSettingsProvider _settingsProvider;
+    private readonly IBacktestOptionsSnapshotBuilder _optionsSnapshotBuilder;
+    private readonly IValidationWorkerIdentity _workerIdentity;
+    private readonly TimeProvider _timeProvider;
 
     /// <summary>
     /// Used to create per-iteration DI scopes so that scoped services such as
@@ -107,6 +114,7 @@ public class WalkForwardWorker : BackgroundService
 
     /// <summary>Tracks consecutive empty polls for exponential backoff.</summary>
     private int _emptyPollStreak;
+    private DateTime UtcNow => _timeProvider.GetUtcNow().UtcDateTime;
 
     /// <summary>
     /// Initialises the worker with its required dependencies.
@@ -118,12 +126,22 @@ public class WalkForwardWorker : BackgroundService
         ILogger<WalkForwardWorker> logger,
         IServiceScopeFactory scopeFactory,
         IBacktestEngine backtestEngine,
-        IWorkerHealthMonitor? healthMonitor = null)
+        IWalkForwardRunClaimService runClaimService,
+        IValidationSettingsProvider settingsProvider,
+        IBacktestOptionsSnapshotBuilder optionsSnapshotBuilder,
+        IValidationWorkerIdentity workerIdentity,
+        IWorkerHealthMonitor? healthMonitor = null,
+        TimeProvider? timeProvider = null)
     {
         _logger         = logger;
         _scopeFactory   = scopeFactory;
         _backtestEngine = backtestEngine;
+        _runClaimService = runClaimService;
+        _settingsProvider = settingsProvider;
+        _optionsSnapshotBuilder = optionsSnapshotBuilder;
+        _workerIdentity = workerIdentity;
         _healthMonitor  = healthMonitor;
+        _timeProvider   = timeProvider ?? TimeProvider.System;
     }
 
     /// <summary>
@@ -139,12 +157,30 @@ public class WalkForwardWorker : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation("WalkForwardWorker starting (parallel, max {Max} concurrent)", DefaultMaxParallelWalkForwards);
+        await using (var startupScope = _scopeFactory.CreateAsyncScope())
+        {
+            var startupWriteDb = startupScope.ServiceProvider
+                .GetRequiredService<IWriteApplicationDbContext>()
+                .GetDbContext();
+            _runClaimService.EnsureSupportedProvider(startupWriteDb);
+        }
+
+        _healthMonitor?.RecordWorkerMetadata(
+            nameof(WalkForwardWorker),
+            "Executes queued walk-forward validation runs with execution leases and retry-aware recovery.",
+            BasePollInterval);
 
         while (!stoppingToken.IsCancellationRequested)
         {
+            long cycleStarted = Stopwatch.GetTimestamp();
             try
             {
-                if (!await ProcessBatchAsync(DefaultMaxParallelWalkForwards, stoppingToken))
+                _healthMonitor?.RecordWorkerHeartbeat(nameof(WalkForwardWorker));
+
+                var settings = await LoadSettingsAsync(stoppingToken);
+                await RecoverExpiredRunsAsync(settings, stoppingToken);
+
+                if (!await ProcessBatchAsync(settings.MaxParallelRuns, stoppingToken))
                 {
                     _emptyPollStreak++;
                     var backoff = _emptyPollStreak switch
@@ -158,6 +194,9 @@ public class WalkForwardWorker : BackgroundService
                 }
 
                 _emptyPollStreak = 0;
+                _healthMonitor?.RecordCycleSuccess(
+                    nameof(WalkForwardWorker),
+                    (long)Stopwatch.GetElapsedTime(cycleStarted).TotalMilliseconds);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -168,12 +207,14 @@ public class WalkForwardWorker : BackgroundService
             {
                 // Swallow unexpected outer-loop exceptions so the worker stays alive
                 // and continues retrying on the next tick.
+                _healthMonitor?.RecordCycleFailure(nameof(WalkForwardWorker), ex.Message);
                 _logger.LogError(ex, "Unexpected error in WalkForwardWorker polling loop");
             }
 
             await Task.Delay(BasePollInterval, stoppingToken);
         }
 
+        _healthMonitor?.RecordWorkerStopped(nameof(WalkForwardWorker));
         _logger.LogInformation("WalkForwardWorker stopped");
     }
 
@@ -183,6 +224,46 @@ public class WalkForwardWorker : BackgroundService
     /// </summary>
     private async Task<bool> ProcessAsync(CancellationToken ct)
         => await ProcessBatchAsync(1, ct);
+
+    private async Task RecoverExpiredRunsAsync(CancellationToken ct)
+    {
+        var settings = await LoadSettingsAsync(ct);
+        await RecoverExpiredRunsAsync(settings, ct);
+    }
+
+    private async Task RecoverExpiredRunsAsync(WalkForwardWorkerSettings settings, CancellationToken ct)
+    {
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        var writeContext = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+        var db = writeContext.GetDbContext();
+        var nowUtc = UtcNow;
+
+        var (requeued, orphaned) = await _runClaimService.RequeueExpiredRunsAsync(db, nowUtc, ct);
+        var legacyCutoff = nowUtc.AddMinutes(-settings.StaleRunMinutes);
+        var legacyRunningRuns = await db.Set<WalkForwardRun>()
+            .Where(run => !run.IsDeleted
+                       && run.Status == RunStatus.Running
+                       && run.ExecutionLeaseExpiresAt == null
+                       && (run.LastHeartbeatAt ?? run.ExecutionStartedAt ?? run.ClaimedAt ?? (DateTime?)run.StartedAt) < legacyCutoff)
+            .ToListAsync(ct);
+
+        foreach (var run in legacyRunningRuns)
+            WalkForwardRunStateMachine.Transition(run, RunStatus.Queued, nowUtc);
+
+        if (legacyRunningRuns.Count > 0)
+            await writeContext.SaveChangesAsync(ct);
+
+        int totalRecovered = requeued + orphaned + legacyRunningRuns.Count;
+        if (totalRecovered > 0)
+        {
+            _logger.LogInformation(
+                "WalkForwardWorker: recovered {Count} run(s) ({Requeued} re-queued, {Orphaned} orphaned, {Legacy} legacy)",
+                totalRecovered,
+                requeued,
+                orphaned,
+                legacyRunningRuns.Count);
+        }
+    }
 
     private async Task<bool> ProcessBatchAsync(int maxRuns, CancellationToken ct)
     {
@@ -209,22 +290,18 @@ public class WalkForwardWorker : BackgroundService
         await using var scope = _scopeFactory.CreateAsyncScope();
         var writeContext = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
         var db = writeContext.GetDbContext();
+        var ids = new List<long>(Math.Max(1, maxRuns));
+        for (int i = 0; i < Math.Max(1, maxRuns); i++)
+        {
+            var claimResult = await _runClaimService.ClaimNextRunAsync(db, UtcNow, _workerIdentity.InstanceId, ct);
+            if (!claimResult.RunId.HasValue)
+                break;
+            ids.Add(claimResult.RunId.Value);
+        }
 
-        var runs = await db.Set<WalkForwardRun>()
-            .Where(r => r.Status == RunStatus.Queued && !r.IsDeleted)
-            .OrderByDescending(r => r.Priority)
-            .ThenBy(r => r.StartedAt)
-            .Take(Math.Max(1, maxRuns))
-            .ToListAsync(ct);
+        if (ids.Count == 0)
+            return [];
 
-        if (runs.Count == 0) return [];
-
-        foreach (var run in runs)
-            run.Status = RunStatus.Running;
-
-        await writeContext.SaveChangesAsync(ct);
-
-        var ids = runs.Select(r => r.Id).ToList();
         _logger.LogInformation("WalkForwardWorker: claimed {Count} run(s): [{Ids}]",
             ids.Count, string.Join(", ", ids));
 
@@ -243,11 +320,11 @@ public class WalkForwardWorker : BackgroundService
         {
             await using var scope = _scopeFactory.CreateAsyncScope();
             var writeContext = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
-            var readContext  = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
             var db = writeContext.GetDbContext();
+            var settings = await _settingsProvider.GetWalkForwardSettingsAsync(db, _logger, ct);
 
             var run = await db.Set<WalkForwardRun>()
-                .FirstOrDefaultAsync(r => r.Id == runId && !r.IsDeleted, ct);
+                .FirstOrDefaultAsync(candidate => candidate.Id == runId && !candidate.IsDeleted, ct);
 
             if (run == null)
             {
@@ -258,47 +335,139 @@ public class WalkForwardWorker : BackgroundService
             _logger.LogInformation(
                 "WalkForwardWorker: processing run {RunId} for strategy {StrategyId}", run.Id, run.StrategyId);
 
-            // Load strategy via the read-side context (CQRS separation).
-            var strategy = await readContext.GetDbContext()
-                .Set<Strategy>()
-                .FirstOrDefaultAsync(s => s.Id == run.StrategyId && !s.IsDeleted, ct);
-
-            if (strategy == null)
+            if (!run.ExecutionLeaseToken.HasValue)
             {
-                run.Status       = RunStatus.Failed;
-                run.ErrorMessage = $"Strategy {run.StrategyId} not found.";
-                run.CompletedAt  = DateTime.UtcNow;
-                await writeContext.SaveChangesAsync(ct);
+                _logger.LogWarning("WalkForwardWorker: run {RunId} has no execution lease token after claim", run.Id);
                 return;
             }
 
-            var baseStrategyForRun = CloneStrategy(strategy);
-            if (!string.IsNullOrWhiteSpace(run.ParametersSnapshotJson))
-                baseStrategyForRun.ParametersJson = run.ParametersSnapshotJson;
-
-            RunStatus finalStatus;
-            string? errorMessage = null;
+            run.ExecutionStartedAt ??= UtcNow;
+            run.LastAttemptAt ??= UtcNow;
+            run.LastHeartbeatAt = run.ExecutionStartedAt;
+            run.ExecutionLeaseExpiresAt = run.ExecutionStartedAt.Value.Add(WalkForwardExecutionLeasePolicy.LeaseDuration);
+            run.ClaimedByWorkerId ??= _workerIdentity.InstanceId;
 
             try
             {
-                var allCandles = await readContext.GetDbContext()
-                    .Set<Candle>()
-                    .Where(c =>
-                        c.Symbol    == run.Symbol    &&
-                        c.Timeframe == run.Timeframe &&
-                        c.Timestamp >= run.FromDate  &&
-                        c.Timestamp <= run.ToDate    &&
-                        c.IsClosed                   &&
-                        !c.IsDeleted)
-                    .OrderBy(c => c.Timestamp)
+                await writeContext.SaveChangesAsync(ct);
+            }
+            catch (DbUpdateConcurrencyException ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "WalkForwardWorker: lease ownership changed before run {RunId} could begin execution",
+                    run.Id);
+                return;
+            }
+
+            using var leaseCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            var leaseTask = WalkForwardRunLeaseMaintainer.MaintainExecutionLeaseAsync(
+                _scopeFactory,
+                _logger,
+                run.Id,
+                run.ExecutionLeaseToken.Value,
+                leaseCts.Token);
+
+            bool persisted = false;
+
+            try
+            {
+                var strategy = await db.Set<Strategy>()
+                    .FirstOrDefaultAsync(candidate => candidate.Id == run.StrategyId && !candidate.IsDeleted, ct);
+
+                if (strategy == null)
+                {
+                    throw new ValidationRunException(
+                        ValidationRunFailureCodes.StrategyNotFound,
+                        $"Strategy {run.StrategyId} not found.",
+                        failureDetailsJson: ValidationRunException.SerializeDetails(new
+                        {
+                            run.Id,
+                            run.StrategyId
+                        }));
+                }
+
+                var baseStrategyForRun = CloneStrategy(strategy);
+                if (!string.IsNullOrWhiteSpace(run.ParametersSnapshotJson))
+                    baseStrategyForRun.ParametersJson = run.ParametersSnapshotJson;
+
+                if (string.IsNullOrWhiteSpace(run.BacktestOptionsSnapshotJson))
+                {
+                    run.BacktestOptionsSnapshotJson = JsonSerializer.Serialize(
+                        await _optionsSnapshotBuilder.BuildAsync(db, run.Symbol, ct));
+                }
+
+                var optionsSnapshot = JsonSerializer.Deserialize<BacktestOptionsSnapshot>(run.BacktestOptionsSnapshotJson!)
+                    ?? throw new JsonException("Walk-forward options snapshot could not be deserialized.");
+                var backtestOptions = optionsSnapshot.ToOptions();
+
+                if (run.InSampleDays <= 0 || run.OutOfSampleDays <= 0)
+                {
+                    throw new ValidationRunException(
+                        ValidationRunFailureCodes.InvalidWindow,
+                        $"Walk-forward window sizes must be positive (IS={run.InSampleDays}, OOS={run.OutOfSampleDays}).",
+                        failureDetailsJson: ValidationRunException.SerializeDetails(new
+                        {
+                            run.Id,
+                            run.InSampleDays,
+                            run.OutOfSampleDays
+                        }));
+                }
+
+                var allCandles = await db.Set<Candle>()
+                    .Where(candle =>
+                        candle.Symbol == run.Symbol &&
+                        candle.Timeframe == run.Timeframe &&
+                        candle.Timestamp >= run.FromDate &&
+                        candle.Timestamp <= run.ToDate &&
+                        candle.IsClosed &&
+                        !candle.IsDeleted)
+                    .OrderBy(candle => candle.Timestamp)
+                    .Take(settings.MaxCandlesPerRun + 1)
                     .ToListAsync(ct);
 
                 if (allCandles.Count == 0)
-                    throw new InvalidOperationException(
-                        $"No closed candles found for {run.Symbol}/{run.Timeframe} between {run.FromDate:yyyy-MM-dd} and {run.ToDate:yyyy-MM-dd}.");
+                {
+                    throw new ValidationRunException(
+                        ValidationRunFailureCodes.NoClosedCandles,
+                        $"No closed candles found for {run.Symbol}/{run.Timeframe} between {run.FromDate:yyyy-MM-dd} and {run.ToDate:yyyy-MM-dd}.",
+                        failureDetailsJson: ValidationRunException.SerializeDetails(new
+                        {
+                            run.Id,
+                            run.Symbol,
+                            run.Timeframe,
+                            run.FromDate,
+                            run.ToDate
+                        }));
+                }
+
+                if (allCandles.Count > settings.MaxCandlesPerRun)
+                {
+                    throw new ValidationRunException(
+                        ValidationRunFailureCodes.InvalidWindow,
+                        $"Candle set exceeds the configured max size for validation ({settings.MaxCandlesPerRun}).",
+                        failureDetailsJson: ValidationRunException.SerializeDetails(new
+                        {
+                            run.Id,
+                            CandleCount = allCandles.Count,
+                            settings.MaxCandlesPerRun
+                        }));
+                }
+
+                var holidayDates = await LoadHolidayDatesAsync(db, run.Symbol, run.FromDate, run.ToDate, ct);
+                if (!ValidationCandleSeriesInspector.TryValidate(allCandles, run.Timeframe, settings.CandleGapMultiplier, holidayDates, out string candleIssue))
+                {
+                    throw new ValidationRunException(
+                        ValidationRunFailureCodes.InvalidCandleSeries,
+                        $"Invalid candle series: {candleIssue}.",
+                        failureDetailsJson: ValidationRunException.SerializeDetails(new
+                        {
+                            run.Id,
+                            Issue = candleIssue
+                        }));
+                }
 
                 var windowResults = new List<WindowResult>();
-
                 int windowIndex = 0;
                 var windowStartUtc = run.FromDate;
 
@@ -308,15 +477,11 @@ public class WalkForwardWorker : BackgroundService
                     DateTime inSampleEndUtc = inSampleStartUtc.AddDays(run.InSampleDays);
                     DateTime oosStartUtc = inSampleEndUtc;
                     DateTime oosEndUtc = oosStartUtc.AddDays(run.OutOfSampleDays);
-                    if (oosEndUtc > run.ToDate) break;
+                    if (oosEndUtc > run.ToDate)
+                        break;
 
-                    var inSampleCandles = allCandles
-                        .Where(c => c.Timestamp >= inSampleStartUtc && c.Timestamp < inSampleEndUtc)
-                        .ToList();
-
-                    var oosCandles = allCandles
-                        .Where(c => c.Timestamp >= oosStartUtc && c.Timestamp < oosEndUtc)
-                        .ToList();
+                    var inSampleCandles = SliceCandles(allCandles, inSampleStartUtc, inSampleEndUtc);
+                    var oosCandles = SliceCandles(allCandles, oosStartUtc, oosEndUtc);
 
                     if (inSampleCandles.Count == 0 || oosCandles.Count == 0)
                     {
@@ -329,7 +494,12 @@ public class WalkForwardWorker : BackgroundService
                         && string.IsNullOrWhiteSpace(run.ParametersSnapshotJson)
                         && inSampleCandles.Count >= 60)
                     {
-                        var foldOptimised = await ReOptimizeOnFoldAsync(baseStrategyForRun, inSampleCandles, run.InitialBalance, ct);
+                        var foldOptimised = await ReOptimizeOnFoldAsync(
+                            baseStrategyForRun,
+                            inSampleCandles,
+                            run.InitialBalance,
+                            backtestOptions,
+                            ct);
                         if (foldOptimised is not null)
                         {
                             evalStrategy = foldOptimised;
@@ -339,23 +509,26 @@ public class WalkForwardWorker : BackgroundService
                         }
                     }
 
-                    var oosResult = await _backtestEngine.RunAsync(evalStrategy, oosCandles, run.InitialBalance, ct);
+                    var oosResult = await _backtestEngine.RunAsync(
+                        evalStrategy,
+                        oosCandles,
+                        run.InitialBalance,
+                        ct,
+                        backtestOptions);
 
-                    var windowResult = new WindowResult
+                    windowResults.Add(new WindowResult
                     {
-                        WindowIndex         = windowIndex,
-                        InSampleFrom        = inSampleCandles[0].Timestamp,
-                        InSampleTo          = inSampleCandles[^1].Timestamp,
-                        OutOfSampleFrom     = oosCandles[0].Timestamp,
-                        OutOfSampleTo       = oosCandles[^1].Timestamp,
-                        OosHealthScore      = (double)oosResult.SharpeRatio,
-                        OosTotalTrades      = oosResult.TotalTrades,
-                        OosWinRate          = (double)oosResult.WinRate,
-                        OosProfitFactor     = (double)oosResult.ProfitFactor,
-                        UsedParametersJson  = evalStrategy.ParametersJson
-                    };
-
-                    windowResults.Add(windowResult);
+                        WindowIndex = windowIndex,
+                        InSampleFrom = inSampleCandles[0].Timestamp,
+                        InSampleTo = inSampleCandles[^1].Timestamp,
+                        OutOfSampleFrom = oosCandles[0].Timestamp,
+                        OutOfSampleTo = oosCandles[^1].Timestamp,
+                        OosHealthScore = (double)oosResult.SharpeRatio,
+                        OosTotalTrades = oosResult.TotalTrades,
+                        OosWinRate = (double)oosResult.WinRate,
+                        OosProfitFactor = (double)oosResult.ProfitFactor,
+                        UsedParametersJson = evalStrategy.ParametersJson
+                    });
 
                     _logger.LogInformation(
                         "WalkForwardWorker: run {RunId} window {Window} OOS SharpeRatio={Sharpe:F4}",
@@ -366,79 +539,105 @@ public class WalkForwardWorker : BackgroundService
                 }
 
                 if (windowResults.Count == 0)
-                    throw new InvalidOperationException("Not enough candle data to form any walk-forward windows.");
+                {
+                    throw new ValidationRunException(
+                        ValidationRunFailureCodes.InvalidWindow,
+                        "Not enough candle data to form any walk-forward windows.",
+                        failureDetailsJson: ValidationRunException.SerializeDetails(new
+                        {
+                            run.Id,
+                            run.FromDate,
+                            run.ToDate,
+                            run.InSampleDays,
+                            run.OutOfSampleDays
+                        }));
+                }
 
-                var scores = windowResults.Select(w => w.OosHealthScore).ToList();
-                double avg    = scores.Average();
-                double mean   = avg;
-                double sumSq  = scores.Sum(s => Math.Pow(s - mean, 2));
+                var scores = windowResults.Select(result => result.OosHealthScore).ToList();
+                double avg = scores.Average();
+                double sumSq = scores.Sum(score => Math.Pow(score - avg, 2));
                 double stdDev = scores.Count > 1 ? Math.Sqrt(sumSq / scores.Count) : 0.0;
 
                 run.AverageOutOfSampleScore = (decimal)avg;
-                run.ScoreConsistency        = (decimal)stdDev;
-                run.WindowResultsJson       = JsonSerializer.Serialize(windowResults);
-                finalStatus                 = RunStatus.Completed;
-                run.CompletedAt             = DateTime.UtcNow;
+                run.ScoreConsistency = (decimal)stdDev;
+                run.WindowResultsJson = JsonSerializer.Serialize(windowResults);
+                WalkForwardRunStateMachine.Transition(run, RunStatus.Completed, UtcNow);
 
                 _logger.LogInformation(
                     "WalkForwardWorker: run {RunId} completed — Windows={Count}, AvgOOS={Avg:F4}, StdDev={Std:F4}",
                     run.Id, windowResults.Count, avg, stdDev);
+
+                await writeContext.SaveChangesAsync(ct);
+                persisted = true;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                await RequeueCanceledRunAsync(writeContext, run);
+                throw;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "WalkForwardWorker: run {RunId} failed", run.Id);
-                finalStatus  = RunStatus.Failed;
-                errorMessage = ex.Message;
-                run.CompletedAt = DateTime.UtcNow;
+                var failure = ValidationRetryPolicy.Classify(ex);
+                var nowUtc = UtcNow;
+                if (ValidationRetryPolicy.ShouldRetry(failure, run.RetryCount, settings.MaxRetryAttempts))
+                {
+                    var nextAvailableAtUtc = ValidationRetryPolicy.ComputeNextQueueTimeUtc(nowUtc, run.RetryCount, settings.RetryBackoffSeconds);
+                    ValidationRetryPolicy.RequeueWalkForwardRunForRetry(run, nowUtc, nextAvailableAtUtc);
+                    _logger.LogWarning(
+                        ex,
+                        "WalkForwardWorker: run {RunId} hit transient failure {FailureCode}; re-queued for retry #{RetryCount} at {NextQueueTimeUtc:O}",
+                        run.Id,
+                        failure.FailureCode,
+                        run.RetryCount,
+                        nextAvailableAtUtc);
+                }
+                else
+                {
+                    _logger.LogError(ex, "WalkForwardWorker: run {RunId} failed", run.Id);
+                    WalkForwardRunStateMachine.Transition(
+                        run,
+                        RunStatus.Failed,
+                        nowUtc,
+                        ex.Message,
+                        failure.FailureCode,
+                        failure.FailureDetailsJson);
+                }
+                try
+                {
+                    await writeContext.SaveChangesAsync(ct);
+                    persisted = true;
+                }
+                catch (DbUpdateConcurrencyException concurrencyEx)
+                {
+                    _logger.LogWarning(
+                        concurrencyEx,
+                        "WalkForwardWorker: lease ownership changed before failure state for run {RunId} could be persisted",
+                        run.Id);
+                }
+            }
+            finally
+            {
+                leaseCts.Cancel();
+                try
+                {
+                    await leaseTask;
+                }
+                catch (OperationCanceledException) when (leaseCts.IsCancellationRequested || ct.IsCancellationRequested)
+                {
+                }
             }
 
-            // ── Double-completion guard ─────────────────────────────────────────────
-            // Use ExecuteUpdateAsync with a WHERE clause requiring Status == Running to
-            // prevent concurrent workers from overwriting results if a run was somehow
-            // claimed by multiple instances.
-            int updatedRows;
-            if (finalStatus == RunStatus.Completed)
-            {
-                updatedRows = await db.Set<WalkForwardRun>()
-                    .Where(r => r.Id == runId && r.Status == RunStatus.Running)
-                    .ExecuteUpdateAsync(s => s
-                        .SetProperty(r => r.Status, RunStatus.Completed)
-                        .SetProperty(r => r.CompletedAt, run.CompletedAt)
-                        .SetProperty(r => r.AverageOutOfSampleScore, run.AverageOutOfSampleScore)
-                        .SetProperty(r => r.ScoreConsistency, run.ScoreConsistency)
-                        .SetProperty(r => r.WindowResultsJson, run.WindowResultsJson),
-                    ct);
-            }
-            else
-            {
-                updatedRows = await db.Set<WalkForwardRun>()
-                    .Where(r => r.Id == runId && r.Status == RunStatus.Running)
-                    .ExecuteUpdateAsync(s => s
-                        .SetProperty(r => r.Status, RunStatus.Failed)
-                        .SetProperty(r => r.CompletedAt, run.CompletedAt)
-                        .SetProperty(r => r.ErrorMessage, errorMessage),
-                    ct);
-            }
-
-            if (updatedRows == 0)
-            {
-                _logger.LogWarning(
-                    "WalkForwardWorker: double-completion guard — run {RunId} was no longer Running, skipping result persist",
-                    runId);
-                return;
-            }
-
-            // ── Update optimization follow-up status if this was a validation walk-forward ──
-            if (run.SourceOptimizationRunId.HasValue)
+            if (persisted
+                && run.SourceOptimizationRunId.HasValue
+                && (run.Status == RunStatus.Completed || run.Status == RunStatus.Failed))
             {
                 try
                 {
-                    bool followUpPassed = finalStatus == RunStatus.Completed;
+                    bool followUpPassed = run.Status == RunStatus.Completed;
                     if (followUpPassed)
                     {
-                        decimal maxCv = await GetConfigAsync(db, "Optimization:MaxCvCoefficientOfVariation", 0.50m, ct);
                         if (!Optimization.OptimizationFollowUpQualityEvaluator.IsWalkForwardQualitySufficient(
-                                run, maxCv, out string reason))
+                                run, settings.MaxCoefficientOfVariation, out string reason))
                         {
                             followUpPassed = false;
                             _logger.LogWarning(
@@ -461,7 +660,6 @@ public class WalkForwardWorker : BackgroundService
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            // Graceful shutdown — let Task.WhenAll propagate.
             throw;
         }
         catch (Exception ex)
@@ -478,7 +676,7 @@ public class WalkForwardWorker : BackgroundService
     /// Uses a small budget (20 evaluations) to keep walk-forward runs tractable.
     /// </summary>
     private async Task<Strategy?> ReOptimizeOnFoldAsync(
-        Strategy strategy, List<Candle> isCandles, decimal initialBalance, CancellationToken ct)
+        Strategy strategy, List<Candle> isCandles, decimal initialBalance, BacktestOptions backtestOptions, CancellationToken ct)
     {
         try
         {
@@ -504,7 +702,7 @@ public class WalkForwardWorker : BackgroundService
             const int budget = 20;
 
             // Seed with current params
-            var baseResult = await _backtestEngine.RunAsync(strategy, isCandles, initialBalance, ct);
+            var baseResult = await _backtestEngine.RunAsync(strategy, isCandles, initialBalance, ct, backtestOptions);
             double baseScore = (double)ComputeHealthScore(baseResult);
             var baseDbl = currentParams.ToDictionary(
                 kv => kv.Key,
@@ -530,7 +728,7 @@ public class WalkForwardWorker : BackgroundService
 
                 try
                 {
-                    var result = await _backtestEngine.RunAsync(candidate, isCandles, initialBalance, ct);
+                    var result = await _backtestEngine.RunAsync(candidate, isCandles, initialBalance, ct, backtestOptions);
                     decimal score = ComputeHealthScore(result);
                     tpe.AddObservation(suggestion, (double)score);
 
@@ -553,6 +751,32 @@ public class WalkForwardWorker : BackgroundService
         }
     }
 
+    private async Task RequeueCanceledRunAsync(IWriteApplicationDbContext writeContext, WalkForwardRun run)
+    {
+        try
+        {
+            WalkForwardRunStateMachine.Transition(run, RunStatus.Queued, UtcNow);
+            await writeContext.SaveChangesAsync(CancellationToken.None);
+            _logger.LogInformation(
+                "WalkForwardWorker: re-queued run {RunId} after cancellation during shutdown",
+                run.Id);
+        }
+        catch (DbUpdateConcurrencyException ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "WalkForwardWorker: lease ownership changed before canceled run {RunId} could be re-queued",
+                run.Id);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "WalkForwardWorker: failed to re-queue canceled run {RunId}; lease recovery will handle it later",
+                run.Id);
+        }
+    }
+
     private static Strategy CloneStrategy(Strategy source) => new()
     {
         Id                      = source.Id,
@@ -571,6 +795,60 @@ public class WalkForwardWorker : BackgroundService
         IsDeleted               = source.IsDeleted
     };
 
+    private static List<Candle> SliceCandles(
+        List<Candle> candles,
+        DateTime startUtc,
+        DateTime endUtcExclusive)
+    {
+        int startIndex = LowerBound(candles, startUtc);
+        int endIndex = LowerBound(candles, endUtcExclusive);
+        int count = endIndex - startIndex;
+        return count > 0 ? candles.GetRange(startIndex, count) : [];
+    }
+
+    private static int LowerBound(List<Candle> candles, DateTime timestamp)
+    {
+        int lo = 0;
+        int hi = candles.Count;
+        while (lo < hi)
+        {
+            int mid = lo + ((hi - lo) / 2);
+            if (candles[mid].Timestamp < timestamp)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+
+        return lo;
+    }
+
+    private static async Task<HashSet<DateTime>> LoadHolidayDatesAsync(
+        DbContext db,
+        string symbol,
+        DateTime fromUtc,
+        DateTime toUtc,
+        CancellationToken ct)
+    {
+        var pairInfo = await db.Set<CurrencyPair>()
+            .AsNoTracking()
+            .FirstOrDefaultAsync(pair => pair.Symbol == symbol && !pair.IsDeleted, ct);
+        var strategyCurrencies = OptimizationRunMetadataService.ResolveStrategyCurrencies(symbol, pairInfo);
+
+        var holidayQuery = db.Set<EconomicEvent>()
+            .AsNoTracking()
+            .Where(e => e.Impact == EconomicImpact.Holiday
+                     && e.ScheduledAt >= fromUtc
+                     && e.ScheduledAt <= toUtc
+                     && !e.IsDeleted);
+        if (strategyCurrencies.Count > 0)
+            holidayQuery = holidayQuery.Where(e => strategyCurrencies.Contains(e.Currency));
+
+        return new HashSet<DateTime>(await holidayQuery
+            .Select(e => e.ScheduledAt.Date)
+            .Distinct()
+            .ToListAsync(ct));
+    }
+
     /// <summary>
     /// 5-factor health score aligned with OptimizationWorker.ComputeHealthScore.
     /// </summary>
@@ -583,23 +861,14 @@ public class WalkForwardWorker : BackgroundService
              + 0.20m * Math.Min(1m, r.TotalTrades / 50m);
     }
 
-    private static async Task<T> GetConfigAsync<T>(
-        DbContext ctx,
-        string key,
-        T defaultValue,
-        CancellationToken ct)
-    {
-        var entry = await ctx.Set<EngineConfig>()
-            .AsNoTracking()
-            .FirstOrDefaultAsync(c => c.Key == key, ct);
-
-        if (entry?.Value is null) return defaultValue;
-
-        try { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
-        catch { return defaultValue; }
-    }
-
     private sealed record ScoredCandidate(string ParamsJson, decimal HealthScore, BacktestResult Result);
+
+    private async Task<WalkForwardWorkerSettings> LoadSettingsAsync(CancellationToken ct)
+    {
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        var writeContext = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+        return await _settingsProvider.GetWalkForwardSettingsAsync(writeContext.GetDbContext(), _logger, ct);
+    }
 
     // ── Window result record ───────────────────────────────────────────────────
 

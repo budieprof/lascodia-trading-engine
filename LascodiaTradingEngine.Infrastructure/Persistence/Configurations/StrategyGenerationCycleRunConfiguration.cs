@@ -32,6 +32,12 @@ public class StrategyGenerationCycleRunConfiguration : IEntityTypeConfiguration<
         builder.Property(x => x.FailureMessage)
             .HasMaxLength(2000);
 
+        builder.Property(x => x.SummaryEventPayloadJson)
+            .HasColumnType("text");
+
+        builder.Property(x => x.SummaryEventFailureMessage)
+            .HasMaxLength(1000);
+
         builder.HasIndex(x => x.CycleId)
             .IsUnique()
             .HasFilter("\"IsDeleted\" = false");

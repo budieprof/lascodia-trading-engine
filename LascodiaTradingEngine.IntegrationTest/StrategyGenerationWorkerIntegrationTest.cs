@@ -14,6 +14,7 @@ using Lascodia.Trading.Engine.SharedLibrary.Mappings;
 using LascodiaTradingEngine.Application.AuditTrail.Commands.LogDecision;
 using LascodiaTradingEngine.Application.Backtesting.Models;
 using LascodiaTradingEngine.Application.Backtesting.Services;
+using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Events;
 using LascodiaTradingEngine.Application.Common.Interfaces;
@@ -914,6 +915,7 @@ public class StrategyGenerationWorkerIntegrationTest : IClassFixture<PostgresFix
 
         var services = new ServiceCollection();
         services.AddLogging();
+        services.AutoRegisterAttributedServices(typeof(StrategyGenerationWorker).Assembly);
         services.AddSingleton(metrics);
         services.AddSingleton(TimeProvider.System);
         services.AddSingleton(correlationOptions);
@@ -922,6 +924,8 @@ public class StrategyGenerationWorkerIntegrationTest : IClassFixture<PostgresFix
         services.AddSingleton<IStrategyParameterTemplateProvider>(options.TemplateProvider ?? new FixedTemplateProvider());
         services.AddSingleton<ILivePriceCache, InMemoryLivePriceCache>();
         services.AddSingleton<IFeedbackDecayMonitor>(options.FeedbackDecayMonitor ?? new NoOpFeedbackDecayMonitor());
+        services.AddSingleton<IDistributedLock, TestDistributedLock>();
+        services.AddSingleton<IWorkerHealthMonitor, WorkerHealthMonitor>();
         services.AddScoped<IReadApplicationDbContext>(_ => CreateReadContext());
         services.AddScoped<IWriteApplicationDbContext>(_ =>
         {
@@ -935,19 +939,10 @@ public class StrategyGenerationWorkerIntegrationTest : IClassFixture<PostgresFix
         services.AddSingleton<IIntegrationEventService>(sp => sp.GetRequiredService<CapturingIntegrationEventService>());
         if (options.LivePerformanceBenchmark != null)
             services.AddSingleton<ILivePerformanceBenchmark>(options.LivePerformanceBenchmark);
+        services.AddSingleton<StrategyGenerationWorker>();
 
         var provider = services.BuildServiceProvider(validateScopes: true);
-
-        var worker = new StrategyGenerationWorker(
-            provider.GetRequiredService<ILogger<StrategyGenerationWorker>>(),
-            provider.GetRequiredService<IServiceScopeFactory>(),
-            provider.GetRequiredService<IBacktestEngine>(),
-            provider.GetRequiredService<IRegimeStrategyMapper>(),
-            provider.GetRequiredService<IStrategyParameterTemplateProvider>(),
-            provider.GetRequiredService<ILivePriceCache>(),
-            provider.GetRequiredService<TradingMetrics>(),
-            provider.GetRequiredService<IFeedbackDecayMonitor>(),
-            provider.GetRequiredService<CorrelationGroupOptions>());
+        var worker = provider.GetRequiredService<StrategyGenerationWorker>();
 
         return new WorkerHarness(worker, provider, eventService, meterFactory);
     }
@@ -1495,10 +1490,25 @@ public class StrategyGenerationWorkerIntegrationTest : IClassFixture<PostgresFix
 
         public Task SaveAndPublish(IDbContext context, IntegrationEvent evt)
         {
+            context.SaveChanges();
             lock (_gate)
                 _publishedEvents.Add(evt);
 
             return Task.CompletedTask;
+        }
+    }
+
+    private sealed class TestDistributedLock : IDistributedLock
+    {
+        public Task<IAsyncDisposable?> TryAcquireAsync(string lockKey, CancellationToken ct = default)
+            => Task.FromResult<IAsyncDisposable?>(new Releaser());
+
+        public Task<IAsyncDisposable?> TryAcquireAsync(string lockKey, TimeSpan timeout, CancellationToken ct = default)
+            => TryAcquireAsync(lockKey, ct);
+
+        private sealed class Releaser : IAsyncDisposable
+        {
+            public ValueTask DisposeAsync() => ValueTask.CompletedTask;
         }
     }
 

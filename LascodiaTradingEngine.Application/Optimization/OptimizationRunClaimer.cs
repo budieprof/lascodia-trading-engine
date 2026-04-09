@@ -44,9 +44,15 @@ internal static class OptimizationRunClaimer
         var tableName = GetQuotedTableName(writeDb, typeof(OptimizationRun));
 
         // When MaxConcurrentRuns <= 0, skip the concurrency guard (unlimited).
-        // Otherwise, the subquery only returns a row if the count of Running runs is below the limit.
+        // Otherwise, the subquery only returns a row if the count of actively leased Running
+        // runs is below the limit. Lease-expired or lease-missing rows are treated as stale
+        // and should be recovered instead of consuming live execution capacity.
         var concurrencyGuard = maxConcurrentRuns > 0
-            ? $@"AND (SELECT COUNT(*) FROM {tableName} WHERE ""Status"" = @runningStatus AND ""IsDeleted"" = false) < @maxConcurrentRuns"
+            ? $@"AND (SELECT COUNT(*) FROM {tableName}
+                     WHERE ""Status"" = @runningStatus
+                       AND ""IsDeleted"" = false
+                       AND ""ExecutionLeaseExpiresAt"" IS NOT NULL
+                       AND ""ExecutionLeaseExpiresAt"" >= @nowUtc) < @maxConcurrentRuns"
             : "";
 
         var claimSql = $@"
@@ -69,7 +75,12 @@ internal static class OptimizationRunClaimer
                 ""LastHeartbeatAt"" = @nowUtc,
                 ""ExecutionLeaseExpiresAt"" = @leaseExpiry,
                 ""ExecutionLeaseToken"" = @leaseToken,
-                ""DeferredUntilUtc"" = NULL
+                ""DeferredAtUtc"" = NULL,
+                ""DeferredUntilUtc"" = NULL,
+                ""LastResumedAtUtc"" = CASE
+                    WHEN COALESCE((SELECT ""WasDeferred"" FROM candidate), false) THEN @nowUtc
+                    ELSE ""LastResumedAtUtc""
+                END
             WHERE ""Id"" = (SELECT ""Id"" FROM candidate)
             RETURNING ""Id"", COALESCE((SELECT ""WasDeferred"" FROM candidate), false) AS ""WasDeferred""";
 
@@ -106,68 +117,105 @@ internal static class OptimizationRunClaimer
     /// Reclaims runs stuck in Running state whose execution lease has expired.
     /// Re-queues runs with living strategies; marks orphaned runs (deleted strategy) as Failed.
     /// </summary>
-    internal static async Task<(int Requeued, int Orphaned)> RequeueExpiredRunsAsync(
-        DbContext db, DateTime nowUtc, CancellationToken ct)
-    {
-        var activeStrategyIds = await db.Set<Strategy>()
-            .Where(s => !s.IsDeleted)
-            .Select(s => s.Id)
-            .ToListAsync(ct);
-        var activeStrategySet = new HashSet<long>(activeStrategyIds);
-
-        var expiredRuns = await db.Set<OptimizationRun>()
+    internal static IQueryable<OptimizationRun> QueryStaleRunningRuns(
+        DbContext db,
+        DateTime nowUtc)
+        => db.Set<OptimizationRun>()
             .Where(r => r.Status == OptimizationRunStatus.Running
                      && !r.IsDeleted
-                     && r.ExecutionLeaseExpiresAt != null
-                     && r.ExecutionLeaseExpiresAt < nowUtc)
-            .Select(r => new { r.Id, r.StrategyId })
-            .ToListAsync(ct);
+                     && (r.ExecutionLeaseExpiresAt == null || r.ExecutionLeaseExpiresAt < nowUtc));
 
-        if (expiredRuns.Count == 0) return (0, 0);
+    internal static async Task<(int Requeued, int Orphaned)> RequeueStaleRunningRunsAsync(
+        DbContext db, DateTime nowUtc, CancellationToken ct)
+    {
+        EnsurePostgresProvider(db);
+        var runTableName = GetQuotedTableName(db, typeof(OptimizationRun));
+        var strategyTableName = GetQuotedTableName(db, typeof(Strategy));
+        var recoverySql = $@"
+            WITH stale_runs AS (
+                SELECT ""Id"", ""StrategyId""
+                FROM {runTableName}
+                WHERE ""Status"" = @runningStatus
+                  AND ""IsDeleted"" = false
+                  AND (""ExecutionLeaseExpiresAt"" IS NULL OR ""ExecutionLeaseExpiresAt"" < @nowUtc)
+            ),
+            requeued AS (
+                UPDATE {runTableName} AS run
+                SET ""Status"" = @queuedStatus,
+                    ""QueuedAt"" = @nowUtc,
+                    ""ClaimedAt"" = NULL,
+                    ""ExecutionStartedAt"" = NULL,
+                    ""CompletedAt"" = NULL,
+                    ""ApprovedAt"" = NULL,
+                    ""ErrorMessage"" = NULL,
+                    ""FailureCategory"" = NULL,
+                    ""DeferralReason"" = NULL,
+                    ""DeferredAtUtc"" = NULL,
+                    ""DeferredUntilUtc"" = NULL,
+                    ""LastHeartbeatAt"" = NULL,
+                    ""ExecutionLeaseExpiresAt"" = NULL,
+                    ""ExecutionLeaseToken"" = NULL
+                FROM stale_runs
+                WHERE run.""Id"" = stale_runs.""Id""
+                  AND EXISTS (
+                      SELECT 1
+                      FROM {strategyTableName} AS strategy
+                      WHERE strategy.""Id"" = stale_runs.""StrategyId""
+                        AND strategy.""IsDeleted"" = false)
+                RETURNING 1
+            ),
+            orphaned AS (
+                UPDATE {runTableName} AS run
+                SET ""Status"" = @failedStatus,
+                    ""ErrorMessage"" = 'Strategy deleted during optimization run',
+                    ""FailureCategory"" = @strategyRemovedFailureCategory,
+                    ""CompletedAt"" = @nowUtc,
+                    ""DeferralReason"" = NULL,
+                    ""DeferredAtUtc"" = NULL,
+                    ""DeferredUntilUtc"" = NULL,
+                    ""ExecutionLeaseExpiresAt"" = NULL,
+                    ""ExecutionLeaseToken"" = NULL
+                FROM stale_runs
+                WHERE run.""Id"" = stale_runs.""Id""
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {strategyTableName} AS strategy
+                      WHERE strategy.""Id"" = stale_runs.""StrategyId""
+                        AND strategy.""IsDeleted"" = false)
+                RETURNING 1
+            )
+            SELECT
+                COALESCE((SELECT COUNT(*) FROM requeued), 0),
+                COALESCE((SELECT COUNT(*) FROM orphaned), 0);";
 
-        var toRequeue = expiredRuns.Where(r => activeStrategySet.Contains(r.StrategyId)).Select(r => r.Id).ToList();
-        var toOrphan  = expiredRuns.Where(r => !activeStrategySet.Contains(r.StrategyId)).Select(r => r.Id).ToList();
+        var connection = db.Database.GetDbConnection();
+        if (connection.State != ConnectionState.Open)
+            await connection.OpenAsync(ct);
 
-        int requeued = 0;
-        if (toRequeue.Count > 0)
-        {
-            // Mirror OptimizationRunStateMachine.Transition(Running → Queued) side effects:
-            // clear CompletedAt, ApprovedAt, ErrorMessage, FailureCategory, lease fields.
-            requeued = await db.Set<OptimizationRun>()
-                .Where(r => toRequeue.Contains(r.Id))
-                .ExecuteUpdateAsync(s => s
-                    .SetProperty(r => r.Status, OptimizationRunStatus.Queued)
-                    .SetProperty(r => r.QueuedAt, nowUtc)
-                    .SetProperty(r => r.ClaimedAt, (DateTime?)null)
-                    .SetProperty(r => r.ExecutionStartedAt, (DateTime?)null)
-                    .SetProperty(r => r.CompletedAt, (DateTime?)null)
-                    .SetProperty(r => r.ApprovedAt, (DateTime?)null)
-                    .SetProperty(r => r.ErrorMessage, (string?)null)
-                    .SetProperty(r => r.FailureCategory, (OptimizationFailureCategory?)null)
-                    .SetProperty(r => r.LastHeartbeatAt, (DateTime?)null)
-                    .SetProperty(r => r.DeferredUntilUtc, (DateTime?)null)
-                    .SetProperty(r => r.ExecutionLeaseExpiresAt, (DateTime?)null)
-                    .SetProperty(r => r.ExecutionLeaseToken, (Guid?)null), ct);
-        }
+        await using var command = connection.CreateCommand();
+        command.CommandText = recoverySql;
 
-        int orphaned = 0;
-        if (toOrphan.Count > 0)
-        {
-            // Mirror OptimizationRunStateMachine.Transition(Running → Failed) side effects:
-            // set CompletedAt, ErrorMessage, FailureCategory, clear lease fields.
-            orphaned = await db.Set<OptimizationRun>()
-                .Where(r => toOrphan.Contains(r.Id))
-                .ExecuteUpdateAsync(s => s
-                    .SetProperty(r => r.Status, OptimizationRunStatus.Failed)
-                    .SetProperty(r => r.ErrorMessage, "Strategy deleted during optimization run")
-                    .SetProperty(r => r.FailureCategory, (OptimizationFailureCategory?)OptimizationFailureCategory.StrategyRemoved)
-                    .SetProperty(r => r.CompletedAt, (DateTime?)nowUtc)
-                    .SetProperty(r => r.ExecutionLeaseExpiresAt, (DateTime?)null)
-                    .SetProperty(r => r.ExecutionLeaseToken, (Guid?)null), ct);
-        }
+        if (db.Database.CurrentTransaction is not null)
+            command.Transaction = db.Database.CurrentTransaction.GetDbTransaction();
 
-        return (requeued, orphaned);
+        AddParameter(command, "@runningStatus", OptimizationRunStatus.Running.ToString());
+        AddParameter(command, "@queuedStatus", OptimizationRunStatus.Queued.ToString());
+        AddParameter(command, "@failedStatus", OptimizationRunStatus.Failed.ToString());
+        AddParameter(command, "@strategyRemovedFailureCategory", OptimizationFailureCategory.StrategyRemoved.ToString());
+        AddParameter(command, "@nowUtc", nowUtc);
+
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        if (!await reader.ReadAsync(ct))
+            return (0, 0);
+
+        return (reader.GetInt32(0), reader.GetInt32(1));
     }
+
+    internal static Task<(int Requeued, int Orphaned)> RequeueExpiredRunsAsync(
+        DbContext db,
+        DateTime nowUtc,
+        CancellationToken ct)
+        => RequeueStaleRunningRunsAsync(db, nowUtc, ct);
 
     /// <summary>Updates the heartbeat timestamp and extends the execution lease.</summary>
     internal static void StampHeartbeat(OptimizationRun run, TimeSpan leaseDuration, DateTime utcNow)

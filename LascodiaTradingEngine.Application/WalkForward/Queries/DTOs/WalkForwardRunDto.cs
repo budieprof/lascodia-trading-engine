@@ -23,8 +23,18 @@ public class WalkForwardRunDto : IMapFrom<WalkForwardRun>
     public decimal? ScoreConsistency          { get; set; }
     public string?  WindowResultsJson         { get; set; }
     public string?  ErrorMessage              { get; set; }
+    public ValidationFailureCode? FailureCode { get; set; }
+    public string? FailureDetailsJson         { get; set; }
+    public ValidationQueueSource QueueSource  { get; set; }
     public DateTime StartedAt                 { get; set; }
+    public DateTime QueuedAt                  { get; set; }
+    public DateTime AvailableAt               { get; set; }
+    public DateTime? ClaimedAt                { get; set; }
+    public string? ClaimedByWorkerId          { get; set; }
+    public DateTime? ExecutionStartedAt       { get; set; }
+    public DateTime? LastAttemptAt            { get; set; }
     public DateTime? CompletedAt              { get; set; }
+    public int RetryCount                     { get; set; }
 
     public void Mapping(Profile profile, IHttpContextAccessor httpContextAccessor)
     {

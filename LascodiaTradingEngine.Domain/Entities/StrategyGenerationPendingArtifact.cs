@@ -14,5 +14,12 @@ public class StrategyGenerationPendingArtifact : Entity<long>
     public int AttemptCount { get; set; }
     public DateTime? LastAttemptAtUtc { get; set; }
     public string? LastErrorMessage { get; set; }
+    public DateTime? CreationAuditLoggedAtUtc { get; set; }
+    public Guid? CandidateCreatedEventId { get; set; }
+    public DateTime? CandidateCreatedEventDispatchedAtUtc { get; set; }
+    public Guid? AutoPromotedEventId { get; set; }
+    public DateTime? AutoPromotedEventDispatchedAtUtc { get; set; }
+    public DateTime? QuarantinedAtUtc { get; set; }
+    public string? TerminalFailureReason { get; set; }
     public bool IsDeleted { get; set; }
 }

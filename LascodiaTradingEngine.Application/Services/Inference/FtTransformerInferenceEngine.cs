@@ -20,98 +20,129 @@ public sealed class FtTransformerInferenceEngine : IModelInferenceEngine
     private static readonly JsonSerializerOptions JsonOptions =
         new() { PropertyNameCaseInsensitive = true };
 
-    public bool CanHandle(ModelSnapshot snapshot) =>
-        snapshot.Type == "FTTRANSFORMER"
-        && snapshot.FtTransformerEmbedWeights is { Length: > 0 }
-        && snapshot.FtTransformerClsToken is { Length: > 0 }
-        && snapshot.FtTransformerEmbedDim > 0;
+    public bool CanHandle(ModelSnapshot snapshot)
+    {
+        if (!FtTransformerSnapshotSupport.IsFtTransformer(snapshot))
+            return false;
+
+        var normalized = FtTransformerSnapshotSupport.NormalizeSnapshotCopy(snapshot);
+        var validation = FtTransformerSnapshotSupport.ValidateNormalizedSnapshot(normalized);
+        return validation.IsValid;
+    }
 
     public InferenceResult? RunInference(
         float[] features, int featureCount, ModelSnapshot snapshot,
         List<Candle> candleWindow, long modelId,
         int mcDropoutSamples, int mcDropoutSeed)
     {
-        int F  = Math.Min(featureCount, snapshot.FtTransformerEmbedWeights!.Length);
-        int D  = snapshot.FtTransformerEmbedDim;
-        int H  = snapshot.FtTransformerNumHeads > 0 ? snapshot.FtTransformerNumHeads : 1;
+        var normalized = FtTransformerSnapshotSupport.NormalizeSnapshotCopy(snapshot);
+        var validation = FtTransformerSnapshotSupport.ValidateNormalizedSnapshot(normalized);
+        if (!validation.IsValid)
+            throw new InvalidOperationException($"Invalid FT-Transformer snapshot: {string.Join("; ", validation.Issues)}");
+
+        int F  = normalized.FtTransformerEmbedWeights!.Length;
+        int D  = normalized.FtTransformerEmbedDim;
+        int H  = normalized.FtTransformerNumHeads > 0 ? normalized.FtTransformerNumHeads : 1;
         int Dh = D / H;
-        int Ff = snapshot.FtTransformerFfnDim > 0 ? snapshot.FtTransformerFfnDim : D * 4;
+        int Ff = normalized.FtTransformerFfnDim > 0 ? normalized.FtTransformerFfnDim : D * 4;
         int S  = F + 1; // [CLS] + F feature tokens
-        int numLayers = snapshot.FtTransformerNumLayers > 0 ? snapshot.FtTransformerNumLayers : 1;
+        int numLayers = normalized.FtTransformerNumLayers > 0 ? normalized.FtTransformerNumLayers : 1;
+
+        if (featureCount != F)
+        {
+            throw new InvalidOperationException(
+                $"FT-Transformer featureCount {featureCount} does not match snapshot feature count {F}.");
+        }
+
+        if (features.Length != F)
+        {
+            throw new InvalidOperationException(
+                $"FT-Transformer input feature length {features.Length} does not match snapshot feature count {F}.");
+        }
 
         // Allocate embedding matrix
         var E = AllocMatrix(S, D);
 
         // 1. Place [CLS] token at position 0
-        Array.Copy(snapshot.FtTransformerClsToken!, E[0], Math.Min(D, snapshot.FtTransformerClsToken!.Length));
+        Array.Copy(normalized.FtTransformerClsToken!, E[0], D);
 
         // 2. Feature embedding: e_f = We[f] * x_f + Be[f]
-        var We = snapshot.FtTransformerEmbedWeights!;
-        var Be = snapshot.FtTransformerEmbedBiases;
+        var We = normalized.FtTransformerEmbedWeights!;
+        var Be = normalized.FtTransformerEmbedBiases!;
         for (int f = 0; f < F; f++)
         {
-            double xf = f < features.Length ? features[f] : 0.0;
-            for (int d = 0; d < D && d < We[f].Length; d++)
+            double xf = features[f];
+            for (int d = 0; d < D; d++)
             {
-                double bias = Be is not null && f < Be.Length && d < Be[f].Length ? Be[f][d] : 0.0;
-                E[f + 1][d] = We[f][d] * xf + bias;
+                E[f + 1][d] = We[f][d] * xf + Be[f][d];
             }
         }
 
         // 3. Process layer 0 using snapshot's top-level Wq/Wk/Wv/Wo/Gamma/Beta fields
         ProcessLayer(E, S, D, H, Dh, Ff,
-            snapshot.FtTransformerWq, snapshot.FtTransformerWk,
-            snapshot.FtTransformerWv, snapshot.FtTransformerWo,
-            snapshot.FtTransformerGamma1, snapshot.FtTransformerBeta1,
-            snapshot.FtTransformerGamma2, snapshot.FtTransformerBeta2,
-            snapshot.FtTransformerWff1, snapshot.FtTransformerBff1,
-            snapshot.FtTransformerWff2, snapshot.FtTransformerBff2,
-            snapshot.FtTransformerPosBias);
+            normalized.FtTransformerWq, normalized.FtTransformerWk,
+            normalized.FtTransformerWv, normalized.FtTransformerWo,
+            normalized.FtTransformerGamma1, normalized.FtTransformerBeta1,
+            normalized.FtTransformerGamma2, normalized.FtTransformerBeta2,
+            normalized.FtTransformerWff1, normalized.FtTransformerBff1,
+            normalized.FtTransformerWff2, normalized.FtTransformerBff2,
+            normalized.FtTransformerPosBias);
 
         // 4. Process additional layers (prefer binary, fall back to JSON)
         if (numLayers > 1)
         {
             List<SerializedLayerWeights>? additionalLayers = null;
 
-            if (snapshot.FtTransformerAdditionalLayersBytes is { Length: > 4 } blob)
+            if (normalized.FtTransformerAdditionalLayersBytes is { Length: > 4 } blob)
             {
                 try { additionalLayers = DeserializeAdditionalLayers(blob, D, Ff); }
-                catch { /* fall through to JSON */ }
+                catch (Exception ex)
+                {
+                    throw new InvalidOperationException("Invalid FT-Transformer binary additional-layer payload.", ex);
+                }
             }
 
-            if (additionalLayers is null && !string.IsNullOrEmpty(snapshot.FtTransformerAdditionalLayersJson))
+            if (additionalLayers is null && !string.IsNullOrEmpty(normalized.FtTransformerAdditionalLayersJson))
             {
                 try
                 {
                     var arr = JsonSerializer.Deserialize<SerializedLayerWeights[]>(
-                        snapshot.FtTransformerAdditionalLayersJson, JsonOptions);
+                        normalized.FtTransformerAdditionalLayersJson, JsonOptions);
                     if (arr is not null) additionalLayers = new List<SerializedLayerWeights>(arr);
                 }
-                catch { /* continue with layer 0 only */ }
+                catch (JsonException ex)
+                {
+                    throw new InvalidOperationException("Invalid FT-Transformer JSON additional-layer payload.", ex);
+                }
             }
 
-            if (additionalLayers is not null)
-                for (int l = 0; l < additionalLayers.Count; l++)
-                {
-                    var layer = additionalLayers[l];
-                    ProcessLayer(E, S, D, H, Dh, Ff,
-                        layer.Wq, layer.Wk, layer.Wv, layer.Wo,
-                        layer.Gamma1, layer.Beta1,
-                        layer.Gamma2, layer.Beta2,
-                        layer.Wff1, layer.Bff1,
-                        layer.Wff2, layer.Bff2,
-                        layer.PosBias);
-                }
+            if (additionalLayers is null || additionalLayers.Count != numLayers - 1)
+            {
+                throw new InvalidOperationException(
+                    $"FT-Transformer expected {numLayers - 1} additional layers but found {additionalLayers?.Count ?? 0}.");
+            }
+
+            for (int l = 0; l < additionalLayers.Count; l++)
+            {
+                var layer = additionalLayers[l];
+                ProcessLayer(E, S, D, H, Dh, Ff,
+                    layer.Wq, layer.Wk, layer.Wv, layer.Wo,
+                    layer.Gamma1, layer.Beta1,
+                    layer.Gamma2, layer.Beta2,
+                    layer.Wff1, layer.Bff1,
+                    layer.Wff2, layer.Bff2,
+                    layer.PosBias);
+            }
         }
 
         // 5. Final LayerNorm on [CLS] position
         var finalLn = new double[D];
-        LayerNorm(E[0], snapshot.FtTransformerGammaFinal, snapshot.FtTransformerBetaFinal, finalLn, D);
+        LayerNorm(E[0], normalized.FtTransformerGammaFinal, normalized.FtTransformerBetaFinal, finalLn, D);
 
         // 6. Classification head
-        double logit = snapshot.FtTransformerOutputBias;
-        if (snapshot.FtTransformerOutputWeights is { Length: > 0 } wOut)
-            for (int d = 0; d < D && d < wOut.Length; d++)
+        double logit = normalized.FtTransformerOutputBias;
+        if (normalized.FtTransformerOutputWeights is { Length: > 0 } wOut)
+            for (int d = 0; d < D; d++)
                 logit += wOut[d] * finalLn[d];
 
         double rawProb = MLFeatureHelper.Sigmoid(logit);
