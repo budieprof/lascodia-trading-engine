@@ -69,7 +69,7 @@ public sealed partial class TabNetModelTrainer
 
         // ── 3. Allocate TabNet parameters on GPU ─────────────────────────────
         var rng = new Random(TrainerSeed);
-        var parms = new TabNetGpuParams(F, nSteps, hiddenDim, attentionDim,
+        using var parms = new TabNetGpuParams(F, nSteps, hiddenDim, attentionDim,
             sharedLayers, stepLayers, useGlu, useMagHead, device, rng);
 
         // Load warm-start weights if compatible
@@ -99,7 +99,7 @@ public sealed partial class TabNetModelTrainer
                 // Cosine LR with optional warmup
                 double cosLr;
                 if (warmupEpochs > 0 && ep < warmupEpochs)
-                    cosLr = baseLr * (0.1 + 0.9 * ep / warmupEpochs);
+                    cosLr = baseLr * (0.1 + 0.9 * (ep + 1) / Math.Max(1, warmupEpochs));
                 else
                 {
                     int decayEp = ep - warmupEpochs;
@@ -276,8 +276,6 @@ public sealed partial class TabNetModelTrainer
 
         var weights = ExtractGpuWeights(parms, F, nSteps, hiddenDim, attentionDim,
             sharedLayers, stepLayers, gamma, useSparsemax, useGlu, useMagHead);
-
-        parms.Dispose();
 
         _logger.LogInformation("TabNet GPU training complete (best epoch {Best})", bestEpoch);
 
@@ -555,13 +553,14 @@ public sealed partial class TabNetModelTrainer
             using var mean = input.mean(new long[] { 0 });
             using var variance = input.var(new long[] { 0 }, unbiased: false);
 
-            // Update running stats (EMA)
+            // Update running stats (EMA): runMean = momentum * runMean + (1 - momentum) * batchMean
+            // Matches CPU convention where high momentum = slow update (retain history)
             using (no_grad())
             {
-                using var meanScaled = mean * (float)momentum;
-                runMean.mul_((float)(1.0 - momentum)).add_(meanScaled);
-                using var varScaled = variance * (float)momentum;
-                runVar.mul_((float)(1.0 - momentum)).add_(varScaled);
+                using var meanScaled = mean * (float)(1.0 - momentum);
+                runMean.mul_((float)momentum).add_(meanScaled);
+                using var varScaled = variance * (float)(1.0 - momentum);
+                runVar.mul_((float)momentum).add_(varScaled);
             }
 
             using var centered = input - mean;
@@ -1097,7 +1096,7 @@ public sealed partial class TabNetModelTrainer
 
         // ── Allocate encoder params ──────────────────────────────────────
         var rng = new Random(TrainerSeed);
-        var parms = new TabNetGpuParams(F, nSteps, hiddenDim, attentionDim,
+        using var parms = new TabNetGpuParams(F, nSteps, hiddenDim, attentionDim,
             sharedLayers, stepLayers, useGlu, false, device, rng);
 
         // ── Decoder: linear F ← hiddenDim ────────────────────────────────
@@ -1141,8 +1140,9 @@ public sealed partial class TabNetModelTrainer
 
                 // Generate random mask: 1 = masked (to reconstruct), 0 = visible
                 using var maskProbs = torch.rand(new long[] { bsz, F }, device: device);
-                using var mask = maskProbs.lt(torch.tensor((float)maskFraction, device: device))
-                    .to_type(ScalarType.Float32);
+                using var maskThreshold = torch.tensor((float)maskFraction, device: device);
+                using var maskBool = maskProbs.lt(maskThreshold);
+                using var mask = maskBool.to_type(ScalarType.Float32);
 
                 // Skip if no features masked in entire batch
                 using var maskSum = mask.sum();
@@ -1203,7 +1203,6 @@ public sealed partial class TabNetModelTrainer
         // Extract weights back to CPU
         var weights = ExtractGpuWeights(parms, F, nSteps, hiddenDim, attentionDim,
             sharedLayers, stepLayers, gamma, useSparsemax, useGlu, false);
-        parms.Dispose();
 
         _logger.LogInformation("TabNet GPU pre-training complete ({Epochs} epochs)", epochs);
         return weights;
