@@ -136,6 +136,8 @@ public sealed partial class TabNetModelTrainer
         public double[] HPrev = [];            // [hiddenDim]
         public double[] AttnInput = [];        // [F]
         public double[] SparsemaxScratch = []; // [F] — scratch for pooled sparsemax sort
+        public double[] AttnBnOutput = [];    // [F] — pooled attention BN output
+        public double[] AttnBnXNorm  = [];    // [F] — pooled attention BN xNorm
 
         // Pooled FcBnGlu buffers to avoid 5 allocations per FC→BN→GLU call
         public FcBnGluBuffers? GluBuf;
@@ -162,6 +164,8 @@ public sealed partial class TabNetModelTrainer
                 HPrev        = new double[H],
                 AttnInput    = new double[F],
                 SparsemaxScratch = new double[F],
+                AttnBnOutput    = new double[F],
+                AttnBnXNorm     = new double[F],
                 GluBuf       = FcBnGluBuffers.Allocate(H, Math.Max(F, H)),
                 GluOutA      = new double[H],
                 GluOutB      = new double[H],
@@ -325,28 +329,19 @@ public sealed partial class TabNetModelTrainer
 
     private sealed class FcBnGluBuffers
     {
-        public double[] Linear = [];
-        public double[] Gate   = [];
-        public double[] Output = [];
-        public double[] FcInput = []; // cached input clone for backward
+        public double[] Linear = []; // only field used by the pooled FcBnGluPooled path
 
         public static FcBnGluBuffers Allocate(int outDim, int maxInDim)
         {
             return new FcBnGluBuffers
             {
                 Linear  = new double[outDim],
-                Gate    = new double[outDim],
-                Output  = new double[outDim],
-                FcInput = new double[maxInDim],
             };
         }
 
         public void Clear(int outDim, int inDim)
         {
-            Array.Clear(Linear, 0, outDim);
-            Array.Clear(Gate, 0, outDim);
-            Array.Clear(Output, 0, outDim);
-            Array.Clear(FcInput, 0, inDim);
+            Array.Clear(Linear, 0, Math.Min(outDim, Linear.Length));
         }
     }
 }

@@ -456,7 +456,10 @@ public sealed partial class TabNetModelTrainer
             }
 
             if (snapshot.MagWeights is { Length: > 0 } mw && mw.Length == w.HiddenDim)
+            {
                 CopyArrayTracked(mw, w.MagW);
+                w.MagB = snapshot.MagBias;
+            }
 
             // Load initial BN FC weights
             if (snapshot.TabNetInitialBnFcW is { } ibfw && ibfw.Length == w.F)

@@ -109,7 +109,7 @@ public sealed partial class TabNetModelTrainer
             InitializeAdamSecondMoment(adam, w);
 
         // ── Validation split for early stopping (last 10% of train) ───────
-        int valSize  = Math.Clamp(Math.Max(20, n / 10), 1, n - 1);
+        int valSize  = n > 1 ? Math.Min(Math.Max(20, n / 10), n - 1) : 0;
         var valSet   = trainSet[^valSize..];
         var fitSet   = trainSet[..^valSize];
         int nFit     = fitSet.Count;
@@ -152,8 +152,8 @@ public sealed partial class TabNetModelTrainer
                 double cosLr;
                 if (warmupEpochs > 0 && ep < warmupEpochs)
                 {
-                    // Linear warmup: ramp from baseLr/10 to baseLr over warmupEpochs
-                    cosLr = baseLr * (0.1 + 0.9 * ep / warmupEpochs);
+                    // Linear warmup: ramp from baseLr/10 to baseLr (continuous at boundary)
+                    cosLr = baseLr * (0.1 + 0.9 * (ep + 1) / Math.Max(1, warmupEpochs));
                 }
                 else
                 {

@@ -924,7 +924,7 @@ public sealed partial class TabNetModelTrainer
                 double pred = b;
                 for (int j = 0; j < featureCount && j < s.Features.Length; j++) pred += lw[j] * s.Features[j];
                 double err = pred - s.Magnitude; if (!double.IsFinite(err)) continue;
-                valLoss += Math.Abs(err) <= 1.0 ? 0.5 * err * err : Math.Abs(err) - 0.5; valN++;
+                valLoss += Math.Abs(err) <= huberDelta ? 0.5 * err * err : huberDelta * Math.Abs(err) - 0.5 * huberDelta * huberDelta; valN++;
             }
             valLoss = valN > 0 ? valLoss / valN : double.MaxValue;
             if (valLoss < bestValLoss - EarlyStopMinDelta) { bestValLoss = valLoss; Array.Copy(lw, bestW, featureCount); bestB = b; patience = 0; }

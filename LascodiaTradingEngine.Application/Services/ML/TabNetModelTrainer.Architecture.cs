@@ -72,10 +72,18 @@ public sealed partial class TabNetModelTrainer
             double[]? attnBatchVar  = training && epochBatchVars  is not null && bnIdx < epochBatchVars.Length  ? epochBatchVars[bnIdx]  : null;
             double[] activeMean = attnBatchMean ?? w.BnMean[bnIdx];
             double[] activeVar  = attnBatchVar  ?? w.BnVar[bnIdx];
-            var (bnAttnOutput, attnXNorm) = ApplyBatchNormWithXNorm(attnInput, F, w.BnGamma[bnIdx], w.BnBeta[bnIdx],
-                activeMean, activeVar);
+            // Inline pooled attention BN (avoids 2 array allocations per step per sample)
+            var bnAttnOutput = fwd.AttnBnOutput;
+            var attnXNormBuf = fwd.AttnBnXNorm;
+            for (int j = 0; j < F && j < w.BnGamma[bnIdx].Length; j++)
+            {
+                double m = activeMean.Length > j ? activeMean[j] : 0.0;
+                double v = activeVar.Length > j ? activeVar[j] : 1.0;
+                attnXNormBuf[j] = (attnInput[j] - m) / Math.Sqrt(Math.Max(0, v) + BnEpsilon);
+                bnAttnOutput[j] = w.BnGamma[bnIdx][j] * attnXNormBuf[j] + w.BnBeta[bnIdx][j];
+            }
 
-            Array.Copy(attnXNorm, fwd.StepAttnXNorm[s], F);
+            Array.Copy(attnXNormBuf, fwd.StepAttnXNorm[s], F);
 
             // Apply prior scales
             for (int j = 0; j < F; j++)
@@ -463,7 +471,7 @@ public sealed partial class TabNetModelTrainer
         for (int i = 0; i < len; i++) if (x[i] > max) max = x[i];
         double sum = 0;
         for (int i = 0; i < len; i++) { output[i] = Math.Exp(x[i] - max); sum += output[i]; }
-        sum += Eps;
+        if (sum < Eps) sum = Eps;
         for (int i = 0; i < len; i++) output[i] /= sum;
     }
 }

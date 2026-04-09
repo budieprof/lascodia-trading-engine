@@ -215,7 +215,9 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
         if (hp.PolyLearnerFraction > 0.0)
         {
             const int PolyTopN = 5;
-            featureExpansionPlan = BuildFeatureExpansionPlan(allStd, F, warmStart, PolyTopN, maxTerms: 10);
+            // Use train portion only for MI-based feature selection to prevent test label leakage
+            var polyTrainSet = allStd.Count > stdTrainBound ? allStd[..stdTrainBound] : allStd;
+            featureExpansionPlan = BuildFeatureExpansionPlan(polyTrainSet, F, warmStart, PolyTopN, maxTerms: 10);
             if (featureExpansionPlan.IsEnabled)
             {
                 var augmentedStd = AugmentSamplesWithPoly(allStd, F, featureExpansionPlan);
@@ -631,6 +633,9 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
                 effectiveLabelSmoothing, null, null, densityWeights, hp.TemporalDecayLambda,
                 hp.L2Lambda, hp.EarlyStoppingPatience, hp.MagLossWeight, hp.MaxGradNorm,
                 dropoutRate, bnMomentum, ghostBatchSize, 0, runContext, ct);
+            int prunedSanitized = SanitizeWeights(prunedW);
+            if (prunedSanitized > 0)
+                _logger.LogWarning("TabNet pruned model sanitized {N} non-finite weight values.", prunedSanitized);
             var prunedCalibrationFit = FitTabNetCalibrationStack(
                 maskedCalibrationFit,
                 maskedCalibrationDiagnostics,
@@ -671,6 +676,7 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
 
             if (scoreGate && accuracyGate && brierGate && eceGate)
             {
+                sanitizedCount = prunedSanitized; // reflect pruned model's sanitization count
                 _logger.LogInformation(
                     "TabNet pruned model accepted: composite={Score:F4} delta={Delta:+0.0000;-0.0000} acc={Acc:P1}",
                     prunedScore, pruningScoreDelta, prunedMetrics.Accuracy);

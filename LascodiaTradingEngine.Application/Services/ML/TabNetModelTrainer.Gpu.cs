@@ -146,14 +146,30 @@ public sealed partial class TabNetModelTrainer
                         training: true, dropoutRate, bnMomentum);
 
                     // Smoothed labels
-                    using var ySmooth = labelSmoothing > 0
-                        ? yB * (float)(1.0 - labelSmoothing) + (float)(0.5 * labelSmoothing)
-                        : yB.alias();
+                    Tensor ySmooth;
+                    if (labelSmoothing > 0)
+                    {
+                        using var yScaled = yB * (float)(1.0 - labelSmoothing);
+                        ySmooth = yScaled + (float)(0.5 * labelSmoothing);
+                    }
+                    else
+                    {
+                        ySmooth = yB.alias();
+                    }
 
                     // BCE loss (weighted)
                     using var probClamped = prob.clamp((float)ProbClampMin, (float)(1.0 - ProbClampMin));
-                    using var bce = -(ySmooth * probClamped.log() + (1f - ySmooth) * (1f - probClamped).log());
-                    using var weightedBce = (bce * wB).mean();
+                    using var logP = probClamped.log();
+                    using var posLoss = ySmooth * logP;
+                    using var oneMinusY = 1f - ySmooth;
+                    ySmooth.Dispose();
+                    using var oneMinusP = 1f - probClamped;
+                    using var logOneMinusP = oneMinusP.log();
+                    using var negLoss = oneMinusY * logOneMinusP;
+                    using var totalBce = posLoss + negLoss;
+                    using var bce = -totalBce;
+                    using var bceWeighted = bce * wB;
+                    using var weightedBce = bceWeighted.mean();
 
                     // Sparsity regularisation
                     using var sparsityLoss = totalSparsity * (float)sparsityCoeff;
@@ -165,14 +181,20 @@ public sealed partial class TabNetModelTrainer
                     if (useMagHead)
                     {
                         using var magB = magTrain.index_select(0, idxT);
-                        using var magPred = torch.mm(aggH, parms.MagW.t()) + parms.MagB;
-                        using var magErr = magPred.squeeze(1) - magB;
+                        using var magWt = parms.MagW.t();
+                        using var magMm = torch.mm(aggH, magWt);
+                        using var magPredRaw = magMm + parms.MagB;
+                        using var magPred = magPredRaw.squeeze(1);
+                        using var magErr = magPred - magB;
                         using var absErr = magErr.abs();
-                        using var huber = torch.where(
-                            absErr <= (float)runContext.HuberDelta,
-                            magErr.pow(2f) * 0.5f,
-                            absErr * (float)runContext.HuberDelta - (float)(0.5 * runContext.HuberDelta * runContext.HuberDelta)
-                        ).mean() * (float)magLossWeight;
+                        using var errSq = magErr.pow(2f);
+                        using var errSqHalf = errSq * 0.5f;
+                        using var absErrScaled = absErr * (float)runContext.HuberDelta;
+                        using var absErrShifted = absErrScaled - (float)(0.5 * runContext.HuberDelta * runContext.HuberDelta);
+                        using var huberCond = absErr <= (float)runContext.HuberDelta;
+                        using var huberRaw = torch.where(huberCond, errSqHalf, absErrShifted);
+                        using var huberMean = huberRaw.mean();
+                        using var huber = huberMean * (float)magLossWeight;
                         using var totalLoss = loss + huber;
                         totalLoss.backward();
                     }
@@ -208,7 +230,15 @@ public sealed partial class TabNetModelTrainer
                         vAggH.Dispose(); vSparsity.Dispose();
                         using var vProbC = vProb.clamp((float)ProbClampMin, (float)(1.0 - ProbClampMin));
                         vProb.Dispose();
-                        using var vBce = -(yVal * vProbC.log() + (1f - yVal) * (1f - vProbC).log()).mean();
+                        using var vLogP = vProbC.log();
+                        using var vPosLoss = yVal * vLogP;
+                        using var vOneMinusY = 1f - yVal;
+                        using var vOneMinusP = 1f - vProbC;
+                        using var vLogOneMinusP = vOneMinusP.log();
+                        using var vNegLoss = vOneMinusY * vLogOneMinusP;
+                        using var vTotal = vPosLoss + vNegLoss;
+                        using var vNeg = -vTotal;
+                        using var vBce = vNeg.mean();
                         double valLoss = vBce.item<float>();
 
                         if (valLoss < bestValLoss - EarlyStopMinDelta)
@@ -322,7 +352,9 @@ public sealed partial class TabNetModelTrainer
             if (s == 0)
             {
                 // Step-0: learnable initial projection
-                attnInput = torch.mm(x, p.InitialBnFcW.t()) + p.InitialBnFcB;
+                using var initWt = p.InitialBnFcW.t();
+                using var initMm = torch.mm(x, initWt);
+                attnInput = initMm + p.InitialBnFcB;
             }
             else
             {
@@ -330,7 +362,9 @@ public sealed partial class TabNetModelTrainer
                 var attnSource = p.AttentionDim < H
                     ? hPrev[.., ..p.AttentionDim]
                     : hPrev;
-                attnInput = torch.mm(attnSource, p.AttnFcW[s].t()) + p.AttnFcB[s];
+                using var attnWt = p.AttnFcW[s].t();
+                using var attnMm = torch.mm(attnSource, attnWt);
+                attnInput = attnMm + p.AttnFcB[s];
                 if (p.AttentionDim < H) attnSource.Dispose();
             }
 
@@ -349,13 +383,19 @@ public sealed partial class TabNetModelTrainer
                 attn = functional.softmax(scaledLogits, dim: 1);
 
             // Sparsity regularisation: -sum(attn * log(attn + eps))
-            using var attnSparsity = -(attn * (attn + (float)Eps).log()).sum() / (B * nSteps);
+            using var attnPlusEps = attn + (float)Eps;
+            using var attnLog = attnPlusEps.log();
+            using var attnTimesLog = attn * attnLog;
+            using var sparsitySum = attnTimesLog.sum();
+            using var negSparsity = -sparsitySum;
+            using var attnSparsity = negSparsity / (B * nSteps);
             var newSparsityLoss = sparsityLoss + attnSparsity;
             sparsityLoss.Dispose();
             sparsityLoss = newSparsityLoss;
 
             // Update prior scales: prior *= (gamma - attn)
-            using var gammaMinusAttn = ((float)gamma - attn).clamp_min(1e-6f);
+            using var gammaMinusAttnRaw = (float)gamma - attn;
+            using var gammaMinusAttn = gammaMinusAttnRaw.clamp_min(1e-6f);
             var newPrior = priorScales * gammaMinusAttn;
             priorScales.copy_(newPrior);
             newPrior.Dispose();
@@ -379,7 +419,8 @@ public sealed partial class TabNetModelTrainer
                 if (l > 0)
                 {
                     // Residual with sqrt(0.5) scaling
-                    var residual = (hNew + h) * (float)SqrtHalfResidualScale;
+                    using var resSum = hNew + h;
+                    var residual = resSum * (float)SqrtHalfResidualScale;
                     hNew.Dispose();
                     h.Dispose();
                     h = residual;
@@ -405,7 +446,8 @@ public sealed partial class TabNetModelTrainer
                     training, bnMomentum, dropoutRate, useGlu);
                 if (l > 0)
                 {
-                    var residual = (hNew + h) * (float)SqrtHalfResidualScale;
+                    using var resSum = hNew + h;
+                    var residual = resSum * (float)SqrtHalfResidualScale;
                     hNew.Dispose();
                     h.Dispose();
                     h = residual;
@@ -429,7 +471,8 @@ public sealed partial class TabNetModelTrainer
             aggH = newAgg;
 
             // Update hPrev for next step (clone to decouple storage from h before disposing h)
-            var newHPrev = h.detach().clone();
+            using var hDetach = h.detach();
+            var newHPrev = hDetach.clone();
             hPrev.Dispose();
             hPrev = newHPrev;
 
@@ -444,8 +487,11 @@ public sealed partial class TabNetModelTrainer
         priorScales.Dispose();
 
         // ── Output head ──────────────────────────────────────────────────
-        using var logit = torch.mm(aggH, p.OutputW.t()) + p.OutputB;
-        var prob = torch.sigmoid(logit).squeeze(1); // [B]
+        using var outWt = p.OutputW.t();
+        using var outMm = torch.mm(aggH, outWt);
+        using var logit = outMm + p.OutputB;
+        using var sigLogit = torch.sigmoid(logit);
+        var prob = sigLogit.squeeze(1); // [B]
 
         return (prob, aggH, sparsityLoss);
     }
@@ -464,7 +510,9 @@ public sealed partial class TabNetModelTrainer
         bool training, double bnMomentum, double dropoutRate, bool useGlu)
     {
         // FC: [B, inDim] @ [outDim, inDim]^T + bias
-        using var linear = torch.mm(input, fcW.t()) + fcB;
+        using var fcWt = fcW.t();
+        using var mmResult = torch.mm(input, fcWt);
+        using var linear = mmResult + fcB;
 
         // BatchNorm
         var bnOut = GpuBatchNorm(linear, bnGamma, bnBeta, bnRunMean, bnRunVar, training, bnMomentum);
@@ -473,7 +521,9 @@ public sealed partial class TabNetModelTrainer
         if (useGlu && gateW is not null && gateB is not null)
         {
             // GLU: output = BN(FC(x)) * sigmoid(GateFC(x))
-            using var gateLinear = torch.mm(input, gateW.t()) + gateB;
+            using var gateWt = gateW.t();
+            using var gateMm = torch.mm(input, gateWt);
+            using var gateLinear = gateMm + gateB;
             using var gateSigmoid = torch.sigmoid(gateLinear);
             output = bnOut * gateSigmoid;
             bnOut.Dispose();
@@ -508,17 +558,27 @@ public sealed partial class TabNetModelTrainer
             // Update running stats (EMA)
             using (no_grad())
             {
-                runMean.mul_((float)(1.0 - momentum)).add_(mean * (float)momentum);
-                runVar.mul_((float)(1.0 - momentum)).add_(variance * (float)momentum);
+                using var meanScaled = mean * (float)momentum;
+                runMean.mul_((float)(1.0 - momentum)).add_(meanScaled);
+                using var varScaled = variance * (float)momentum;
+                runVar.mul_((float)(1.0 - momentum)).add_(varScaled);
             }
 
-            using var xNorm = (input - mean) / (variance + (float)BnEpsilon).sqrt();
-            return xNorm * gamma + beta;
+            using var centered = input - mean;
+            using var varEps = variance + (float)BnEpsilon;
+            using var stddev = varEps.sqrt();
+            using var xNorm = centered / stddev;
+            using var scaled = xNorm * gamma;
+            return scaled + beta;
         }
         else
         {
-            using var xNorm = (input - runMean) / (runVar + (float)BnEpsilon).sqrt();
-            return xNorm * gamma + beta;
+            using var centered = input - runMean;
+            using var varEps = runVar + (float)BnEpsilon;
+            using var stddev = varEps.sqrt();
+            using var xNorm = centered / stddev;
+            using var scaled = xNorm * gamma;
+            return scaled + beta;
         }
     }
 
@@ -1101,12 +1161,19 @@ public sealed partial class TabNetModelTrainer
                 sparsity.Dispose();
 
                 // Decode: reconstruct all features from aggregated hidden
-                using var recon = torch.mm(aggH, decoderW.t()) + decoderB;
+                using var decWt = decoderW.t();
+                using var decMm = torch.mm(aggH, decWt);
+                using var recon = decMm + decoderB;
                 aggH.Dispose();
 
                 // MSE loss on masked features only
-                using var reconErr = (recon - xB).pow(2f) * mask;
-                using var loss = reconErr.sum() / mask.sum().clamp_min(1f);
+                using var reconDiff = recon - xB;
+                using var reconSq = reconDiff.pow(2f);
+                using var reconErr = reconSq * mask;
+                using var reconSum = reconErr.sum();
+                using var maskDenom = mask.sum();
+                using var maskClamped = maskDenom.clamp_min(1f);
+                using var loss = reconSum / maskClamped;
 
                 loss.backward();
 
