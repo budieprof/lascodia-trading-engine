@@ -474,17 +474,17 @@ public sealed partial class TabNetModelTrainer
             aggH.Dispose();
             aggH = newAgg;
 
-            // Update hPrev for next step (clone to decouple storage from h before disposing h)
-            using var hDetach = h.detach();
-            var newHPrev = hDetach.clone();
+            // Update hPrev — preserve autograd graph so inter-step attention gradients flow
+            // (matching CPU backward's dFutureStep propagation). Don't detach or dispose h;
+            // autograd retains references and frees after backward().
+            var newHPrev = h.clone();
             hPrev.Dispose();
             hPrev = newHPrev;
 
-            // Cleanup
+            // Cleanup (h kept alive for autograd graph; freed after backward())
             attnInput.Dispose();
             bnAttn.Dispose();
             attn.Dispose();
-            h.Dispose();
         }
 
         hPrev.Dispose();
