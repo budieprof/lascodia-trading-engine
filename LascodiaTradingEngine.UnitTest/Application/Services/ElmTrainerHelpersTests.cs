@@ -1816,6 +1816,7 @@ public class ElmTrainerHelpersTests
             2,
             0,
             CancellationToken.None,
+            false,
         ])!;
 
         double[][]? foldWeights = result.Item5;

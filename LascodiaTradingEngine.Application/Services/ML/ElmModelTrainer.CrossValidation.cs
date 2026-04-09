@@ -93,6 +93,11 @@ public sealed partial class ElmModelTrainer
 
             if (foldTrain.Count < hp.MinSamples) return;
 
+            // Use K/2 learners per fold for computational efficiency. This produces
+            // systematically pessimistic CV estimates relative to the final K-learner
+            // ensemble (less diversity, higher variance). This conservative bias is
+            // acceptable for model selection — a strategy that passes CV with K/2
+            // learners will typically perform at least as well with full K.
             var cvLabelSmoothing = hp.LabelSmoothing;
             var (w, b, iw, ib, subs, lhs, cvla, _, _) = FitBaggedElm(
                 foldTrain, hp, featureCount, hiddenSize, Math.Max(1, K / 2),

@@ -150,6 +150,29 @@ public sealed partial class ElmModelTrainer : IMLModelTrainer
                 $"ElmModelTrainer: training window is too small after split selection ({trainSetEnd} samples). " +
                 $"Reduce EmbargoBarCount or provide more data.");
 
+        // ── 1b. Outlier winsorization (before standardisation) ────────────────
+        // Clips each feature to its [p, 1−p] quantile range computed on the training
+        // split only. This prevents adversarial outliers from distorting the Z-score
+        // statistics and the ridge solve.
+        if (hp.ElmWinsorizePercentile > 0.0)
+        {
+            double pctile = hp.ElmWinsorizePercentile;
+            for (int j = 0; j < featureCount; j++)
+            {
+                var vals = new float[trainSetEnd];
+                for (int i = 0; i < trainSetEnd; i++) vals[i] = samples[i].Features[j];
+                Array.Sort(vals);
+                int loIdx = Math.Clamp((int)(pctile * trainSetEnd), 0, trainSetEnd - 1);
+                int hiIdx = Math.Clamp((int)((1.0 - pctile) * trainSetEnd), 0, trainSetEnd - 1);
+                float lo = vals[loIdx];
+                float hi = vals[hiIdx];
+                // Apply to ALL samples (train + cal + test) using train-derived quantiles
+                for (int i = 0; i < n; i++)
+                    samples[i].Features[j] = Math.Clamp(samples[i].Features[j], lo, hi);
+            }
+            _logger.LogInformation("ELM winsorized features at p={Pctile:F3} (quantiles from training split)", pctile);
+        }
+
         // ── 2. Z-score standardisation on training samples only ─────────────────
         // Using all samples would leak the future cal/test distribution into the
         // standardisation statistics, inflating apparent out-of-sample performance.
@@ -200,15 +223,23 @@ public sealed partial class ElmModelTrainer : IMLModelTrainer
             throw new InvalidOperationException(
                 $"ElmModelTrainer: insufficient training samples after splits: {trainSet.Count} < {hp.MinSamples}");
 
+        const int minCalTestSize = 10;
+        if (calSet.Count < minCalTestSize)
+            _logger.LogWarning(
+                "ELM calibration set too small ({CalCount} < {Min}). Platt scaling and threshold estimates may be unreliable.",
+                calSet.Count, minCalTestSize);
+        if (testSet.Count < minCalTestSize)
+            _logger.LogWarning(
+                "ELM test set too small ({TestCount} < {Min}). Final evaluation metrics may be unreliable.",
+                testSet.Count, minCalTestSize);
+
         // ── 3b. Stationarity gate ────────────────────────────────────────────
-        {
-            int nonStatCount = ElmEvaluationHelper.CountNonStationaryFeatures(trainSet, featureCount);
-            double nonStatFraction = featureCount > 0 ? (double)nonStatCount / featureCount : 0.0;
-            if (nonStatFraction > 0.30 && hp.FracDiffD == 0.0)
-                _logger.LogWarning(
-                    "ELM stationarity gate: {NonStat}/{Total} features have unit root. Consider enabling FracDiffD.",
-                    nonStatCount, featureCount);
-        }
+        int nonStationaryFeatureCount = ElmEvaluationHelper.CountNonStationaryFeatures(trainSet, featureCount);
+        double nonStationaryFeatureFraction = featureCount > 0 ? (double)nonStationaryFeatureCount / featureCount : 0.0;
+        if (nonStationaryFeatureFraction > 0.30 && hp.FracDiffD == 0.0)
+            _logger.LogWarning(
+                "ELM stationarity gate: {NonStat}/{Total} features have unit root. Consider enabling FracDiffD.",
+                nonStationaryFeatureCount, featureCount);
 
         // ── 3c. Density-ratio importance weights ──────────────────────────────
         double[]? densityWeights = null;
@@ -244,13 +275,13 @@ public sealed partial class ElmModelTrainer : IMLModelTrainer
             if (densityWeights is not null)
             {
                 for (int i = 0; i < densityWeights.Length && i < csWeights.Length; i++)
-                    densityWeights[i] *= csWeights[i];
+                    densityWeights[i] = Math.Clamp(densityWeights[i] * csWeights[i], 0.05, 20.0);
             }
             else
             {
                 densityWeights = csWeights;
             }
-            _logger.LogDebug("ELM covariate shift weights applied from parent model.");
+            _logger.LogDebug("ELM covariate shift weights applied from parent model (clipped to [0.05, 20.0]).");
         }
 
         // ── 3f. Ridge lambda auto-selection ─────────────────────────────────
@@ -351,12 +382,13 @@ public sealed partial class ElmModelTrainer : IMLModelTrainer
         double[][]? magAugWeightsFolds = null;
         double[]? magAugBiasFolds = null;
 
+        bool magQuad = hp.ElmMagQuadraticTerms;
         if (hp.ElmMagRegressorCvFolds > 1 && trainSet.Count >= hp.MinSamples * 2)
         {
             var magCvResult = FitElmMagnitudeRegressorCV(
                 trainSet, featureCount, hiddenSize, inputWeights, inputBiases, featureSubsets, learnerActivations,
                 hp.ElmMagRegressorLr, hp.ElmMagRegressorMaxEpochs, hp.ElmMagRegressorPatience,
-                hp.ElmMagRegressorCvFolds, embargo, ct);
+                hp.ElmMagRegressorCvFolds, embargo, ct, magQuad);
             magWeights = magCvResult.EquivWeights;
             magBias = magCvResult.EquivBias;
             magAugWeights = magCvResult.AugWeights;
@@ -364,14 +396,14 @@ public sealed partial class ElmModelTrainer : IMLModelTrainer
             magAugWeightsFolds = magCvResult.FoldAugWeights;
             magAugBiasFolds = magCvResult.FoldAugBiases;
             _logger.LogInformation(
-                "ELM magnitude regressor fitted with {Folds}-fold walk-forward CV (prediction-averaged, {FoldCount} valid folds).",
-                hp.ElmMagRegressorCvFolds, magAugWeightsFolds?.Length ?? 0);
+                "ELM magnitude regressor fitted with {Folds}-fold walk-forward CV (prediction-averaged, {FoldCount} valid folds{Quad}).",
+                hp.ElmMagRegressorCvFolds, magAugWeightsFolds?.Length ?? 0, magQuad ? ", quadratic" : "");
         }
         else
         {
             (magWeights, magBias, magAugWeights, magAugBias) = FitElmMagnitudeRegressor(
                 trainSet, featureCount, hiddenSize, inputWeights, inputBiases, featureSubsets, learnerActivations,
-                hp.ElmMagRegressorLr, hp.ElmMagRegressorMaxEpochs, hp.ElmMagRegressorPatience, embargo, ct);
+                hp.ElmMagRegressorLr, hp.ElmMagRegressorMaxEpochs, hp.ElmMagRegressorPatience, embargo, ct, magQuad);
         }
 
         // ── 6b. Quantile magnitude regressor ─────────────────────────────────
@@ -381,7 +413,7 @@ public sealed partial class ElmModelTrainer : IMLModelTrainer
         {
             (magQ90Weights, magQ90Bias) = FitQuantileRegressor(
                 trainSet, featureCount, hp.MagnitudeQuantileTau, hiddenSize,
-                inputWeights, inputBiases, featureSubsets, learnerActivations, embargo, ct);
+                inputWeights, inputBiases, featureSubsets, learnerActivations, embargo, ct, magQuad);
             _logger.LogDebug("ELM quantile magnitude regressor fitted (τ={Tau:F2}).", hp.MagnitudeQuantileTau);
         }
 
@@ -551,13 +583,13 @@ public sealed partial class ElmModelTrainer : IMLModelTrainer
                 (pmw, pmb, pmaw, pmab, pMagAugWeightsFolds, pMagAugBiasFolds) = FitElmMagnitudeRegressorCV(
                     maskedTrain, featureCount, hiddenSize, piw, pib, psub, pla,
                     hp.ElmMagRegressorLr, hp.ElmMagRegressorMaxEpochs, hp.ElmMagRegressorPatience,
-                    hp.ElmMagRegressorCvFolds, embargo, ct);
+                    hp.ElmMagRegressorCvFolds, embargo, ct, magQuad);
             }
             else
             {
                 (pmw, pmb, pmaw, pmab) = FitElmMagnitudeRegressor(
                     maskedTrain, featureCount, hiddenSize, piw, pib, psub, pla,
-                    hp.ElmMagRegressorLr, hp.ElmMagRegressorMaxEpochs, hp.ElmMagRegressorPatience, embargo, ct);
+                    hp.ElmMagRegressorLr, hp.ElmMagRegressorMaxEpochs, hp.ElmMagRegressorPatience, embargo, ct, magQuad);
             }
 
             var pCalib = FitCalibrationPipeline(

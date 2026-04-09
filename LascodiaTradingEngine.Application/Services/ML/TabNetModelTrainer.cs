@@ -196,8 +196,28 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
             "TabNetModelTrainer v3: n={N} F={F} steps={S} hidden={H} shared={SL} step={StL} epochs={E} lr={LR} \u03b3={G:F2}",
             samples.Count, F, nSteps, hiddenDim, sharedLayers, stepLayers, epochs, lr, gamma);
 
-        // ── 1. Z-score standardisation (on ~80% train portion only to prevent test leakage) ──
+        // ── 1. Outlier winsorization + Z-score standardisation ──────────────
         int stdTrainBound = (int)(samples.Count * 0.80);
+
+        // Winsorize before standardisation: clip each feature to train-derived quantiles
+        if (hp.TabNetWinsorizePercentile > 0.0)
+        {
+            double pctile = hp.TabNetWinsorizePercentile;
+            for (int j = 0; j < F; j++)
+            {
+                var vals = new float[stdTrainBound];
+                for (int i = 0; i < stdTrainBound && i < samples.Count; i++) vals[i] = samples[i].Features[j];
+                Array.Sort(vals);
+                int loIdx = Math.Clamp((int)(pctile * stdTrainBound), 0, stdTrainBound - 1);
+                int hiIdx = Math.Clamp((int)((1.0 - pctile) * stdTrainBound), 0, stdTrainBound - 1);
+                float lo = vals[loIdx];
+                float hi = vals[hiIdx];
+                for (int i = 0; i < samples.Count; i++)
+                    samples[i].Features[j] = Math.Clamp(samples[i].Features[j], lo, hi);
+            }
+            _logger.LogInformation("TabNet winsorized features at p={Pctile:F3} (quantiles from training split)", pctile);
+        }
+
         var rawTrainFeatures = new List<float[]>(stdTrainBound);
         for (int i = 0; i < stdTrainBound && i < samples.Count; i++)
             rawTrainFeatures.Add(samples[i].Features);
@@ -452,13 +472,13 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
             if (densityWeights is not null)
             {
                 for (int i = 0; i < densityWeights.Length && i < csWeights.Length; i++)
-                    densityWeights[i] *= csWeights[i];
+                    densityWeights[i] = Math.Clamp(densityWeights[i] * csWeights[i], 0.05, 20.0);
             }
             else
             {
                 densityWeights = csWeights;
             }
-            _logger.LogDebug("TabNet covariate shift weights applied from parent model (gen={Gen}).",
+            _logger.LogDebug("TabNet covariate shift weights applied from parent model (gen={Gen}, clipped to [0.05, 20.0]).",
                 warmStart!.GenerationNumber);
         }
 

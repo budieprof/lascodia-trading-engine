@@ -26,6 +26,11 @@ public sealed partial class ElmModelTrainer
         for (int j = 0; j < Math.Min(Math.Min(featureCount, features.Length), augWeights.Length); j++)
             pred += augWeights[j] * features[j];
 
+        // Detect whether quadratic terms are present by checking if augWeights extends
+        // beyond featureCount + hiddenSize. Old snapshots (length = featureCount + hiddenSize)
+        // skip the squared terms automatically — backward compatible.
+        bool hasQuadratic = augWeights.Length > featureCount + hiddenSize;
+
         for (int h = 0; h < hiddenSize; h++)
         {
             if (featureCount + h >= augWeights.Length) break;
@@ -56,7 +61,15 @@ public sealed partial class ElmModelTrainer
                 hSum += ElmMathHelper.Activate(z, learnerAct);
                 hCount++;
             }
-            pred += augWeights[featureCount + h] * (hCount > 0 ? hSum / hCount : 0.0);
+            double meanAct = hCount > 0 ? hSum / hCount : 0.0;
+            pred += augWeights[featureCount + h] * meanAct;
+            // Squared hidden activation terms for non-linear magnitude patterns
+            if (hasQuadratic)
+            {
+                int sqIdx = featureCount + hiddenSize + h;
+                if (sqIdx < augWeights.Length)
+                    pred += augWeights[sqIdx] * meanAct * meanAct;
+            }
         }
 
         return pred;
@@ -207,13 +220,15 @@ public sealed partial class ElmModelTrainer
         double[][] elmInputWeights, double[][] elmInputBiases, int[][]? featureSubsets,
         ElmActivation[] learnerActivations,
         double configLr = 0.0, int configMaxEpochs = 0, int configPatience = 0,
-        int embargo = 0, CancellationToken ct = default)
+        int embargo = 0, CancellationToken ct = default, bool quadraticTerms = false)
     {
+        int augDim = quadraticTerms
+            ? featureCount + 2 * hiddenSize
+            : featureCount + hiddenSize;
         if (train.Count < 10) return (new double[featureCount], 0.0,
-                                      new double[featureCount + hiddenSize], 0.0);
+                                      new double[augDim], 0.0);
 
         int K = elmInputWeights.Length;
-        int augDim = featureCount + hiddenSize;
         int valSize = Math.Max(10, train.Count / 10);
         if (train.Count <= valSize)
             valSize = Math.Max(1, train.Count / 5);
@@ -223,10 +238,10 @@ public sealed partial class ElmModelTrainer
         int trainSubEnd = train.Count - valSize - magEmbargo;
         if (trainSubEnd < 1)
             return (new double[featureCount], 0.0,
-                new double[featureCount + hiddenSize], 0.0);
+                new double[augDim], 0.0);
         int valStart = trainSubEnd + magEmbargo;
 
-        var augFeatures = BuildAugmentedFeatures(train, featureCount, hiddenSize, K, elmInputWeights, elmInputBiases, featureSubsets, learnerActivations);
+        var augFeatures = BuildAugmentedFeatures(train, featureCount, hiddenSize, K, elmInputWeights, elmInputBiases, featureSubsets, learnerActivations, quadraticTerms);
 
         var targets = new double[train.Count];
         for (int i = 0; i < train.Count; i++) targets[i] = train[i].Magnitude;
@@ -264,18 +279,20 @@ public sealed partial class ElmModelTrainer
         ElmActivation[] learnerActivations,
         double configLr, int configMaxEpochs, int configPatience,
         int cvFolds, int embargo,
-        CancellationToken ct = default)
+        CancellationToken ct = default, bool quadraticTerms = false)
     {
         int foldSize = train.Count / (cvFolds + 1);
         if (foldSize < 20)
         {
             var single = FitElmMagnitudeRegressor(train, featureCount, hiddenSize,
                 elmInputWeights, elmInputBiases, featureSubsets, learnerActivations,
-                configLr, configMaxEpochs, configPatience, embargo, ct);
+                configLr, configMaxEpochs, configPatience, embargo, ct, quadraticTerms);
             return (single.EquivWeights, single.EquivBias, single.AugWeights, single.AugBias, null, null);
         }
 
-        int augDim = featureCount + hiddenSize;
+        int augDim = quadraticTerms
+            ? featureCount + 2 * hiddenSize
+            : featureCount + hiddenSize;
         int purgeExtra = MLFeatureHelper.LookbackWindow - 1;
         var allFoldWeights = new List<double[]>();
         var allFoldBiases = new List<double>();
@@ -291,7 +308,7 @@ public sealed partial class ElmModelTrainer
             var foldTrain = train[..trainEnd];
             var (_, _, foldAugW, foldAugB) = FitElmMagnitudeRegressor(
                 foldTrain, featureCount, hiddenSize, elmInputWeights, elmInputBiases, featureSubsets,
-                learnerActivations, configLr, configMaxEpochs, configPatience, embargo, ct);
+                learnerActivations, configLr, configMaxEpochs, configPatience, embargo, ct, quadraticTerms);
 
             allFoldWeights.Add(foldAugW);
             allFoldBiases.Add(foldAugB);
@@ -301,7 +318,7 @@ public sealed partial class ElmModelTrainer
         {
             var single = FitElmMagnitudeRegressor(train, featureCount, hiddenSize,
                 elmInputWeights, elmInputBiases, featureSubsets, learnerActivations,
-                configLr, configMaxEpochs, configPatience, embargo, ct);
+                configLr, configMaxEpochs, configPatience, embargo, ct, quadraticTerms);
             return (single.EquivWeights, single.EquivBias, single.AugWeights, single.AugBias, null, null);
         }
 
@@ -327,12 +344,14 @@ public sealed partial class ElmModelTrainer
         List<TrainingSample> train, int featureCount, double tau,
         int hiddenSize, double[][] elmInputWeights, double[][] elmInputBiases,
         int[][]? featureSubsets, ElmActivation[] learnerActivations,
-        int embargo = 0, CancellationToken ct = default)
+        int embargo = 0, CancellationToken ct = default, bool quadraticTerms = false)
     {
         if (train.Count < 10) return (new double[featureCount], 0.0);
 
         int K = elmInputWeights.Length;
-        int augDim = featureCount + hiddenSize;
+        int augDim = quadraticTerms
+            ? featureCount + 2 * hiddenSize
+            : featureCount + hiddenSize;
         int valSize = Math.Max(10, train.Count / 10);
         if (train.Count <= valSize)
             valSize = Math.Max(1, train.Count / 5);
@@ -342,7 +361,7 @@ public sealed partial class ElmModelTrainer
             return (new double[featureCount], 0.0);
         int qValStart = trainSubEnd + qEmbargo;
 
-        var augFeatures = BuildAugmentedFeatures(train, featureCount, hiddenSize, K, elmInputWeights, elmInputBiases, featureSubsets, learnerActivations);
+        var augFeatures = BuildAugmentedFeatures(train, featureCount, hiddenSize, K, elmInputWeights, elmInputBiases, featureSubsets, learnerActivations, quadraticTerms);
 
         var targets = new double[train.Count];
         for (int i = 0; i < train.Count; i++) targets[i] = train[i].Magnitude;
@@ -377,10 +396,12 @@ public sealed partial class ElmModelTrainer
     private static double[][] BuildAugmentedFeatures(
         List<TrainingSample> samples, int featureCount, int hiddenSize, int K,
         double[][] elmInputWeights, double[][] elmInputBiases, int[][]? featureSubsets,
-        ElmActivation[] learnerActivations)
+        ElmActivation[] learnerActivations, bool quadraticTerms = false)
     {
         K = Math.Min(K, Math.Min(elmInputWeights.Length, elmInputBiases.Length));
-        int augDim = featureCount + hiddenSize;
+        int augDim = quadraticTerms
+            ? featureCount + 2 * hiddenSize
+            : featureCount + hiddenSize;
 
         // Pre-compute default subset once — avoids per-sample per-learner allocation
         int[] defaultSubset = Enumerable.Range(0, featureCount).ToArray();
@@ -433,7 +454,12 @@ public sealed partial class ElmModelTrainer
                 }
             }
             for (int h = 0; h < hiddenSize; h++)
-                augFeatures[i][featureCount + h] = hCount[h] > 0 ? hSum[h] / hCount[h] : 0.0;
+            {
+                double meanAct = hCount[h] > 0 ? hSum[h] / hCount[h] : 0.0;
+                augFeatures[i][featureCount + h] = meanAct;
+                if (quadraticTerms)
+                    augFeatures[i][featureCount + hiddenSize + h] = meanAct * meanAct;
+            }
         }
         return augFeatures;
     }

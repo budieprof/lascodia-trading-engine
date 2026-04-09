@@ -79,6 +79,11 @@ public sealed partial class TabNetModelTrainer
             if (foldFitTrain.Count < hp.MinSamples)
                 continue;
 
+            // Use epochs/3 per fold for computational efficiency. This produces
+            // systematically pessimistic CV estimates relative to the final fully-trained
+            // model (underfitting bias from fewer gradient steps). This conservative bias
+            // is acceptable for model selection — a strategy that passes CV with 1/3
+            // epochs will typically perform at least as well with full training budget.
             int cvEpochs = Math.Max(10, epochs / 3);
             var cvW = FitTabNet(
                 foldFitTrain, F, nSteps, hiddenDim, attentionDim, sharedLayers, stepLayers,

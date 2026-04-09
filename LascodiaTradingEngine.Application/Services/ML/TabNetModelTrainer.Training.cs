@@ -76,6 +76,26 @@ public sealed partial class TabNetModelTrainer
             if (sum > Eps) for (int i = 0; i < n; i++) temporalWeights[i] /= sum;
         }
 
+        // ── Effective sample size (ESS) monitoring ──
+        {
+            double wSum = 0.0, wSumSq = 0.0;
+            for (int i = 0; i < temporalWeights.Length; i++)
+            {
+                wSum   += temporalWeights[i];
+                wSumSq += temporalWeights[i] * temporalWeights[i];
+            }
+            double ess = wSumSq > 1e-30 ? (wSum * wSum) / wSumSq : n;
+            double essRatio = n > 0 ? ess / n : 1.0;
+            if (essRatio < 0.5)
+                _logger.LogWarning(
+                    "TabNet bootstrap ESS={Ess:F0}/{N} ({Ratio:P0}). " +
+                    "Importance weights are highly concentrated — effective training diversity is reduced. " +
+                    "Consider reducing TemporalDecayLambda or DensityRatioWindowDays.",
+                    ess, n, essRatio);
+            else
+                _logger.LogDebug("TabNet bootstrap ESS={Ess:F0}/{N} ({Ratio:P0})", ess, n, essRatio);
+        }
+
         // ── Initialise weights ─────────────────────────────────────────────
         var w = InitializeWeights(F, nSteps, hiddenDim, attentionDim, sharedLayers, stepLayers,
             gamma, useSparsemax, useGlu, useMagHead);

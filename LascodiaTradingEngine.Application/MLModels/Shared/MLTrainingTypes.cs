@@ -1215,6 +1215,30 @@ public record TrainingHyperparams(
     /// False = use SMOTE when <see cref="ElmUseSmote"/> is enabled (default).
     /// </summary>
     bool ElmUseClassWeights = true,
+    /// <summary>
+    /// Winsorize percentile for ELM features before Z-score standardization.
+    /// Clips each feature to the [p, 1−p] quantile range, reducing the influence
+    /// of adversarial outliers on the standardization statistics and ridge solve.
+    /// 0.0 = disabled (default). Typical 0.01 (clip to p1/p99).
+    /// </summary>
+    double ElmWinsorizePercentile = 0.0,
+    /// <summary>
+    /// Winsorize percentile for TabNet features before Z-score standardization.
+    /// Clips each feature to the [p, 1−p] quantile range computed on the training split,
+    /// reducing the influence of adversarial outliers on standardization and gradient descent.
+    /// 0.0 = disabled (default). Typical 0.01 (clip to p1/p99).
+    /// </summary>
+    double TabNetWinsorizePercentile = 0.0,
+    /// <summary>
+    /// When <c>true</c>, appends squared ELM hidden activation terms to the
+    /// augmented magnitude feature space, enabling the magnitude regressor to capture
+    /// non-linear patterns in predicted move size. The augmented dimension becomes
+    /// <c>featureCount + 2 × hiddenSize</c> instead of <c>featureCount + hiddenSize</c>.
+    /// Existing snapshots without quadratic terms are backward-compatible — inference
+    /// checks <c>augWeights.Length</c> to determine whether squared terms are present.
+    /// False = linear augmented regressor only (default).
+    /// </summary>
+    bool ElmMagQuadraticTerms = false,
     // ── TCN architecture hyperparams ─────────────────────────────────────
     /// <summary>
     /// Number of convolutional filters (output channels) per TCN block.

@@ -61,6 +61,28 @@ public sealed partial class ElmModelTrainer
             temporalWeights = blended;
         }
 
+        // ── Effective sample size (ESS) monitoring ──
+        // ESS = (Σwi)² / Σ(wi²) — measures how many samples effectively contribute
+        // after importance weighting. Low ESS / N ratio means a few samples dominate.
+        {
+            double wSum = 0.0, wSumSq = 0.0;
+            for (int i = 0; i < temporalWeights.Length; i++)
+            {
+                wSum   += temporalWeights[i];
+                wSumSq += temporalWeights[i] * temporalWeights[i];
+            }
+            double ess = wSumSq > 1e-30 ? (wSum * wSum) / wSumSq : train.Count;
+            double essRatio = train.Count > 0 ? ess / train.Count : 1.0;
+            if (essRatio < 0.5)
+                _logger.LogWarning(
+                    "ELM bootstrap ESS={Ess:F0}/{N} ({Ratio:P0}). " +
+                    "Importance weights are highly concentrated — effective training diversity is reduced. " +
+                    "Consider reducing TemporalDecayLambda or DensityRatioWindowDays.",
+                    ess, train.Count, essRatio);
+            else
+                _logger.LogDebug("ELM bootstrap ESS={Ess:F0}/{N} ({Ratio:P0})", ess, train.Count, essRatio);
+        }
+
         // ── Class imbalance handling: class weights (preferred) or SMOTE (legacy) ──
         bool useClassWeights = hp.ElmUseClassWeights;
         double classWeightBuy = 1.0, classWeightSell = 1.0;
