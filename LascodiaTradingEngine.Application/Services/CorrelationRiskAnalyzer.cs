@@ -232,12 +232,15 @@ public class CorrelationRiskAnalyzer : ICorrelationRiskAnalyzer
 
         // Compute portfolio variance: Var(P) = sum_i sum_j w_i * w_j * Cov(i,j)
         // where w is aggregated weight per symbol (multiple positions can share a symbol)
+        // Use absolute (unsigned) weights for MCTR computation. Directional netting
+        // of long and short positions in the same symbol would understate the true
+        // marginal contribution to risk — a hedged pair still contributes basis risk.
         var symbolWeights = new Dictionary<string, decimal>();
         foreach (var p in positions)
         {
             symbolWeights.TryGetValue(p.Symbol, out var existing);
             decimal direction = p.Direction == PositionDirection.Long ? 1m : -1m;
-            symbolWeights[p.Symbol] = existing + direction * weights[p.Id];
+            symbolWeights[p.Symbol] = existing + Math.Abs(direction * weights[p.Id]);
         }
 
         decimal portfolioVariance = 0;

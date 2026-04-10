@@ -72,15 +72,6 @@ public class PortfolioRiskWorker : BackgroundService
         var readContext     = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
         var riskCalculator = scope.ServiceProvider.GetRequiredService<IPortfolioRiskCalculator>();
 
-        // Query positions once — Position has no TradingAccountId FK, and the EA-based
-        // architecture uses a single active account. Positions are shared across accounts.
-        var positions = await readContext.GetDbContext()
-            .Set<Position>()
-            .Where(p => p.Status == Domain.Enums.PositionStatus.Open && !p.IsDeleted)
-            .ToListAsync(ct);
-
-        if (positions.Count == 0) return;
-
         var accounts = await readContext.GetDbContext()
             .Set<TradingAccount>()
             .Where(a => a.IsActive && !a.IsDeleted)
@@ -88,6 +79,18 @@ public class PortfolioRiskWorker : BackgroundService
 
         foreach (var account in accounts)
         {
+            // Filter positions by account affiliation via the opening order's TradingAccountId.
+            // Position has no direct TradingAccountId FK — join through OpenOrderId → Order.
+            var positions = await readContext.GetDbContext()
+                .Set<Position>()
+                .Where(p => p.Status == Domain.Enums.PositionStatus.Open && !p.IsDeleted
+                         && p.OpenOrderId != null
+                         && readContext.GetDbContext().Set<Domain.Entities.Order>()
+                             .Any(o => o.Id == p.OpenOrderId && o.TradingAccountId == account.Id && !o.IsDeleted))
+                .ToListAsync(ct);
+
+            if (positions.Count == 0) continue;
+
             var metrics = await riskCalculator.ComputeAsync(account, positions, ct);
 
             _logger.LogInformation(

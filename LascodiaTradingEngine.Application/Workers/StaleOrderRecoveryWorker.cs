@@ -137,7 +137,8 @@ public sealed class StaleOrderRecoveryWorker : BackgroundService
             .Select(c => c.Parameters)
             .ToListAsync(ct);
 
-        // Parse existing command parameters to extract order IDs for dedup
+        // Parse existing command parameters to extract order IDs for dedup.
+        // Supports both versioned (v >= 1) and legacy (no version field) formats.
         var alreadyRequestedOrderIds = new HashSet<long>();
         foreach (var param in existingCommands)
         {
@@ -173,7 +174,8 @@ public sealed class StaleOrderRecoveryWorker : BackgroundService
                     CommandType      = EACommandType.RequestExecutionStatus,
                     TargetTicket     = !string.IsNullOrEmpty(order.BrokerOrderId) && long.TryParse(order.BrokerOrderId, out var ticket) ? ticket : null,
                     Symbol           = order.Symbol,
-                    Parameters       = JsonSerializer.Serialize(new { engineOrderId = order.Id, brokerOrderId = order.BrokerOrderId }),
+                    // Version field ensures forward-compatible deserialization if the schema evolves.
+                    Parameters       = JsonSerializer.Serialize(new { version = 1, engineOrderId = order.Id, brokerOrderId = order.BrokerOrderId }),
                 }, ct);
                 queued++;
 

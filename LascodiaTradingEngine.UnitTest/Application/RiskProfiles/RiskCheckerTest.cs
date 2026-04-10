@@ -3,6 +3,7 @@ using LascodiaTradingEngine.Application.Common.Options;
 using LascodiaTradingEngine.Application.RiskProfiles.Services;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
+using LascodiaTradingEngine.UnitTest.TestHelpers;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -12,9 +13,20 @@ public class RiskCheckerTest
 {
     private readonly RiskChecker _riskChecker;
 
+    /// <summary>
+    /// Creates a mock <see cref="IReadApplicationDbContext"/> with an empty EngineConfig set.
+    /// Used by all RiskChecker constructor calls in tests where drawdown recovery config is not
+    /// under test (returns "Normal" mode by default).
+    /// </summary>
+    private static IReadApplicationDbContext CreateMockReadDb()
+        => new MockDbContextBuilder()
+            .WithEmptySet<EngineConfig>()
+            .BuildReadContext()
+            .Object;
+
     public RiskCheckerTest()
     {
-        _riskChecker = new RiskChecker(new RiskCheckerOptions(), new CorrelationGroupOptions(), TimeProvider.System, NullLogger<RiskChecker>.Instance);
+        _riskChecker = new RiskChecker(new RiskCheckerOptions(), new CorrelationGroupOptions(), TimeProvider.System, NullLogger<RiskChecker>.Instance, CreateMockReadDb());
     }
 
     // ── Helper factories ─────────────────────────────────────────────────────
@@ -336,7 +348,7 @@ public class RiskCheckerTest
     [Fact]
     public async Task CheckAsync_Should_Reject_When_Spread_Exceeds_Maximum()
     {
-        var checker = new RiskChecker(new RiskCheckerOptions { MaxSpreadPips = 3m }, new CorrelationGroupOptions(), TimeProvider.System, NullLogger<RiskChecker>.Instance);
+        var checker = new RiskChecker(new RiskCheckerOptions { MaxSpreadPips = 3m }, new CorrelationGroupOptions(), TimeProvider.System, NullLogger<RiskChecker>.Instance, CreateMockReadDb());
 
         // 5-digit EURUSD: 0.0005 = 5 pips > 3 pip limit
         var result = await checker.CheckAsync(
@@ -351,7 +363,7 @@ public class RiskCheckerTest
     [Fact]
     public async Task CheckAsync_Should_Pass_When_Spread_Within_Maximum()
     {
-        var checker = new RiskChecker(new RiskCheckerOptions { MaxSpreadPips = 3m }, new CorrelationGroupOptions(), TimeProvider.System, NullLogger<RiskChecker>.Instance);
+        var checker = new RiskChecker(new RiskCheckerOptions { MaxSpreadPips = 3m }, new CorrelationGroupOptions(), TimeProvider.System, NullLogger<RiskChecker>.Instance, CreateMockReadDb());
 
         // 5-digit EURUSD: 0.0002 = 2 pips < 3 pip limit
         var result = await checker.CheckAsync(
@@ -365,7 +377,7 @@ public class RiskCheckerTest
     [Fact]
     public async Task CheckAsync_Should_Skip_Spread_Check_When_No_Spread_Data()
     {
-        var checker = new RiskChecker(new RiskCheckerOptions { MaxSpreadPips = 3m }, new CorrelationGroupOptions(), TimeProvider.System, NullLogger<RiskChecker>.Instance);
+        var checker = new RiskChecker(new RiskCheckerOptions { MaxSpreadPips = 3m }, new CorrelationGroupOptions(), TimeProvider.System, NullLogger<RiskChecker>.Instance, CreateMockReadDb());
 
         var result = await checker.CheckAsync(
             CreateValidBuySignal(),
@@ -1058,7 +1070,7 @@ public class RiskCheckerTest
     [Fact]
     public async Task CheckAsync_Should_Use_Configurable_Margin_Level_Threshold()
     {
-        var checker = new RiskChecker(new RiskCheckerOptions { MinMarginLevelPct = 200m }, new CorrelationGroupOptions(), TimeProvider.System, NullLogger<RiskChecker>.Instance);
+        var checker = new RiskChecker(new RiskCheckerOptions { MinMarginLevelPct = 200m }, new CorrelationGroupOptions(), TimeProvider.System, NullLogger<RiskChecker>.Instance, CreateMockReadDb());
 
         var account = CreateDefaultAccount();
         account.Equity = 10_000m;
@@ -1090,7 +1102,7 @@ public class RiskCheckerTest
         // Broker stop-out: 100% → floor = 100% × 2.0 = 200% (higher than 150%)
         var checker = new RiskChecker(
             new RiskCheckerOptions { MinMarginLevelPct = 150m, StopOutBufferMultiplier = 2.0m },
-            new CorrelationGroupOptions(), TimeProvider.System, NullLogger<RiskChecker>.Instance);
+            new CorrelationGroupOptions(), TimeProvider.System, NullLogger<RiskChecker>.Instance, CreateMockReadDb());
 
         var account = CreateDefaultAccount();
         account.Equity = 10_000m;
@@ -1118,7 +1130,7 @@ public class RiskCheckerTest
         // Effective threshold stays 150%
         var checker = new RiskChecker(
             new RiskCheckerOptions { MinMarginLevelPct = 150m, StopOutBufferMultiplier = 2.0m },
-            new CorrelationGroupOptions(), TimeProvider.System, NullLogger<RiskChecker>.Instance);
+            new CorrelationGroupOptions(), TimeProvider.System, NullLogger<RiskChecker>.Instance, CreateMockReadDb());
 
         var account = CreateDefaultAccount();
         account.Equity = 5_000m;
@@ -1144,7 +1156,7 @@ public class RiskCheckerTest
         // Broker stop-out in Money mode (not Percent) — should be ignored
         var checker = new RiskChecker(
             new RiskCheckerOptions { MinMarginLevelPct = 150m, StopOutBufferMultiplier = 2.0m },
-            new CorrelationGroupOptions(), TimeProvider.System, NullLogger<RiskChecker>.Instance);
+            new CorrelationGroupOptions(), TimeProvider.System, NullLogger<RiskChecker>.Instance, CreateMockReadDb());
 
         var account = CreateDefaultAccount();
         account.Equity = 10_000m;
@@ -1223,7 +1235,7 @@ public class RiskCheckerTest
         // Use a fake TimeProvider set to Saturday
         var saturday = new DateTimeOffset(2026, 3, 21, 12, 0, 0, TimeSpan.Zero); // Saturday
         var fakeTime = new FakeTimeProvider(saturday);
-        var checker = new RiskChecker(new RiskCheckerOptions(), new CorrelationGroupOptions(), fakeTime, NullLogger<RiskChecker>.Instance);
+        var checker = new RiskChecker(new RiskCheckerOptions(), new CorrelationGroupOptions(), fakeTime, NullLogger<RiskChecker>.Instance, CreateMockReadDb());
 
         var profile = CreateDefaultProfile();
         profile.WeekendGapRiskMultiplier = 2.0m;
@@ -1256,7 +1268,7 @@ public class RiskCheckerTest
     {
         var wednesday = new DateTimeOffset(2026, 3, 18, 12, 0, 0, TimeSpan.Zero); // Wednesday
         var fakeTime = new FakeTimeProvider(wednesday);
-        var checker = new RiskChecker(new RiskCheckerOptions(), new CorrelationGroupOptions(), fakeTime, NullLogger<RiskChecker>.Instance);
+        var checker = new RiskChecker(new RiskCheckerOptions(), new CorrelationGroupOptions(), fakeTime, NullLogger<RiskChecker>.Instance, CreateMockReadDb());
 
         var profile = CreateDefaultProfile();
         profile.WeekendGapRiskMultiplier = 2.0m;
@@ -1293,7 +1305,7 @@ public class RiskCheckerTest
         var christmas = new DateTimeOffset(2026, 12, 25, 10, 0, 0, TimeSpan.Zero);
         var fakeTime = new FakeTimeProvider(christmas);
         var options = new RiskCheckerOptions { MarketHolidays = ["12-25"] };
-        var checker = new RiskChecker(options, new CorrelationGroupOptions(), fakeTime, NullLogger<RiskChecker>.Instance);
+        var checker = new RiskChecker(options, new CorrelationGroupOptions(), fakeTime, NullLogger<RiskChecker>.Instance, CreateMockReadDb());
 
         var profile = CreateDefaultProfile();
         profile.WeekendGapRiskMultiplier = 2.0m;
@@ -1327,7 +1339,7 @@ public class RiskCheckerTest
         var christmasEve = new DateTimeOffset(2026, 12, 24, 19, 0, 0, TimeSpan.Zero);
         var fakeTime = new FakeTimeProvider(christmasEve);
         var options = new RiskCheckerOptions { MarketHolidays = ["12-25"], WeekendGapWindowHours = 4 };
-        var checker = new RiskChecker(options, new CorrelationGroupOptions(), fakeTime, NullLogger<RiskChecker>.Instance);
+        var checker = new RiskChecker(options, new CorrelationGroupOptions(), fakeTime, NullLogger<RiskChecker>.Instance, CreateMockReadDb());
 
         var profile = CreateDefaultProfile();
         profile.WeekendGapRiskMultiplier = 2.0m;
@@ -1605,7 +1617,8 @@ public class RiskCheckerTest
             new RiskCheckerOptions { MaxSpreadPips = 5 },
             new CorrelationGroupOptions(),
             TimeProvider.System,
-            NullLogger<RiskChecker>.Instance);
+            NullLogger<RiskChecker>.Instance,
+            CreateMockReadDb());
 
         var context = CreateContext(currentSpread: -0.0005m);
         var result = await checker.CheckAsync(CreateValidBuySignal(), context, CancellationToken.None);

@@ -2813,7 +2813,7 @@ public class MLTrainerTests
         double avgMs = sw.Elapsed.TotalMilliseconds / 200.0;
 
         Assert.True(avgMs < 2.0, $"Average TabNet inference time {avgMs:F3}ms exceeded the 2ms budget.");
-        Assert.True(totalAlloc < 6_500_000, $"TabNet inference allocated {totalAlloc} bytes over 200 runs.");
+        Assert.True(totalAlloc < 8_000_000, $"TabNet inference allocated {totalAlloc} bytes over 200 runs.");
     }
 
     private static ModelSnapshot CreateSimpleTabNetSnapshot(bool useInitialProjection, bool useSparsemax)

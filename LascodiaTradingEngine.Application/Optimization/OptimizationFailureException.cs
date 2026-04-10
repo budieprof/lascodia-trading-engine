@@ -38,10 +38,20 @@ internal sealed class OptimizationConfigSnapshotException : OptimizationFailureE
 
 internal sealed class OptimizationSearchExhaustedException : OptimizationFailureException
 {
-    internal OptimizationSearchExhaustedException()
+    internal OptimizationSearchExhaustedException(int totalEvaluated)
         : base(
-            "All parameter candidates failed during TPE search.",
+            $"Search exhausted: {totalEvaluated} candidates evaluated, none passed validation.",
             OptimizationFailureCategory.SearchExhausted)
+    {
+    }
+}
+
+internal sealed class OptimizationDataQualityException : OptimizationFailureException
+{
+    internal OptimizationDataQualityException()
+        : base(
+            "Search produced zero evaluations — possible data quality issue (insufficient candles, all-NaN features, etc.).",
+            OptimizationFailureCategory.DataQuality)
     {
     }
 }

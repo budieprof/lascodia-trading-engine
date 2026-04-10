@@ -22,17 +22,27 @@ public class EAHealthMonitorWorker : BackgroundService
     private const int HeartbeatTimeoutSeconds = 60;
 
     private readonly IServiceScopeFactory _scopeFactory;
+    private readonly IDegradationModeManager _degradationManager;
+    private readonly IAlertDispatcher _alertDispatcher;
     private readonly ILogger<EAHealthMonitorWorker> _logger;
     private readonly TradingMetrics _metrics;
 
+    /// <summary>Tracks whether we were in an all-disconnected state on the previous cycle
+    /// to avoid repeated transitions and alert spam.</summary>
+    private bool _previousAllDisconnected;
+
     public EAHealthMonitorWorker(
         IServiceScopeFactory scopeFactory,
+        IDegradationModeManager degradationManager,
+        IAlertDispatcher alertDispatcher,
         ILogger<EAHealthMonitorWorker> logger,
         TradingMetrics metrics)
     {
-        _scopeFactory = scopeFactory;
-        _logger       = logger;
-        _metrics      = metrics;
+        _scopeFactory        = scopeFactory;
+        _degradationManager  = degradationManager;
+        _alertDispatcher     = alertDispatcher;
+        _logger              = logger;
+        _metrics             = metrics;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -168,6 +178,68 @@ public class EAHealthMonitorWorker : BackgroundService
             _logger.LogInformation(
                 "EAHealthMonitor: symbol {Symbol} reassigned from {FromInstance} to {ToInstance}",
                 symbol, fromId, toId);
+        }
+
+        // ── All-disconnect detection: if every EA instance is now disconnected,
+        // transition the engine to DataUnavailable mode and dispatch a critical alert.
+        var remainingActiveCount = await db.Set<EAInstance>()
+            .CountAsync(e => e.Status == EAInstanceStatus.Active && !e.IsDeleted, ct);
+
+        if (remainingActiveCount == 0 && !_previousAllDisconnected)
+        {
+            _previousAllDisconnected = true;
+            _logger.LogCritical(
+                "EAHealthMonitorWorker: ALL EA instances disconnected — entering DataUnavailable mode. " +
+                "Signal generation will be blocked until at least one instance reconnects.");
+
+            await _degradationManager.TransitionToAsync(
+                DegradationMode.DataUnavailable,
+                "All EA instances disconnected — no market data source available",
+                ct);
+
+            // Dispatch critical alert for all-disconnect
+            try
+            {
+                var allDisconnectAlert = new Alert
+                {
+                    AlertType     = AlertType.EADisconnected,
+                    Channel       = AlertChannel.Webhook,
+                    Severity      = AlertSeverity.Critical,
+                    Symbol        = "SYSTEM",
+                    Destination   = string.Empty,
+                    IsActive      = true,
+                    ConditionJson = System.Text.Json.JsonSerializer.Serialize(new
+                    {
+                        Source = "EAHealthMonitorWorker",
+                        Event  = "AllInstancesDisconnected",
+                        DisconnectedCount = staleInstances.Count,
+                        DetectedAt = DateTime.UtcNow
+                    })
+                };
+                db.Set<Alert>().Add(allDisconnectAlert);
+                await db.SaveChangesAsync(ct);
+
+                await _alertDispatcher.DispatchBySeverityAsync(
+                    allDisconnectAlert,
+                    "ALL EA instances disconnected — engine entering DataUnavailable mode. " +
+                    "No market data source available. Signal generation is blocked.",
+                    ct);
+            }
+            catch (Exception alertEx)
+            {
+                _logger.LogError(alertEx,
+                    "EAHealthMonitor: failed to dispatch all-disconnect alert");
+            }
+        }
+        else if (remainingActiveCount > 0 && _previousAllDisconnected)
+        {
+            // At least one instance recovered — clear the all-disconnect flag.
+            // DegradationModeManager auto-recovers via subsystem heartbeats,
+            // so no explicit transition back to Normal is needed here.
+            _previousAllDisconnected = false;
+            _logger.LogInformation(
+                "EAHealthMonitorWorker: EA instance(s) recovered — {ActiveCount} active instance(s) available",
+                remainingActiveCount);
         }
     }
 }

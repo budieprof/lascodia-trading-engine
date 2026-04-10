@@ -188,6 +188,12 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
     {
         _stoppingToken = stoppingToken;
 
+        // Wait for the event bus to finish initializing before subscribing.
+        // Without this delay, Subscribe may fire before the bus has established its
+        // broker connection, causing silent message loss on startup.
+        _logger.LogInformation("StrategyWorker: waiting for event bus readiness before subscribing...");
+        await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+
         // Subscribe to the event bus so Handle() is invoked on every price tick
         _eventBus.Subscribe<PriceUpdatedIntegrationEvent, StrategyWorker>();
 
@@ -328,6 +334,14 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
         // ── Pre-fetch strategy health snapshots ─────────────────────────────
         // Filter out strategies with Critical health status to prevent evaluating
         // strategies that the StrategyHealthWorker has flagged as unhealthy.
+        if (strategies.Count == 0)
+        {
+            _logger.LogDebug(
+                "StrategyWorker: no active strategies for symbol {Symbol} — skipping tick",
+                @event.Symbol);
+            return;
+        }
+
         var strategyIds = strategies.Select(s => s.Id).ToList();
         var criticalStrategyIds = new HashSet<long>();
         if (strategyIds.Count > 0)
@@ -616,12 +630,47 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
                     return;
                 }
 
+                // ── Gradual rollout parameter routing ──────────────────────────────
+                // If an optimization rollout is in progress (RolloutPct < 100), route
+                // traffic between old and new parameters deterministically based on a
+                // seed derived from the tick timestamp. This ensures the same tick
+                // always picks the same parameter set, enabling consistent A/B comparison.
+                // Rollout runs BEFORE regime params so that when regime params fail
+                // validation, the fallback preserves rollout modifications (evalStrategy)
+                // instead of reverting to the original unmodified strategy.
+                var evalStrategy = strategy;
+                if (strategy.RolloutPct is not null and < 100)
+                {
+                    int rolloutSeed = HashCode.Combine(strategy.Id, @event.Timestamp.Ticks / TimeSpan.TicksPerMinute);
+                    string selectedParams = Optimization.GradualRolloutManager.SelectParameters(strategy, rolloutSeed);
+                    if (selectedParams != evalStrategy.ParametersJson)
+                    {
+                        evalStrategy = new Domain.Entities.Strategy
+                        {
+                            Id                      = evalStrategy.Id,
+                            Name                    = evalStrategy.Name,
+                            Description             = evalStrategy.Description,
+                            StrategyType            = evalStrategy.StrategyType,
+                            Symbol                  = evalStrategy.Symbol,
+                            Timeframe               = evalStrategy.Timeframe,
+                            ParametersJson          = selectedParams,
+                            Status                  = evalStrategy.Status,
+                            RiskProfileId           = evalStrategy.RiskProfileId,
+                            CreatedAt               = evalStrategy.CreatedAt,
+                            LifecycleStage          = evalStrategy.LifecycleStage,
+                            LifecycleStageEnteredAt = evalStrategy.LifecycleStageEnteredAt,
+                            EstimatedCapacityLots   = evalStrategy.EstimatedCapacityLots,
+                            IsDeleted               = evalStrategy.IsDeleted,
+                        };
+                    }
+                }
+
                 // ── Regime-conditional parameter swap ────────────────────────────────
                 // If the OptimizationWorker has stored regime-specific parameters for
                 // the current market regime, apply them for this evaluation. We create
                 // a shallow copy to avoid dirtying the tracked entity in the outer
-                // DbContext's change tracker.
-                var evalStrategy = strategy;
+                // DbContext's change tracker. When regime params fail validation, the
+                // fallback is evalStrategy (which already has rollout modifications).
                 if (regimeCache.TryGetValue(strategy.Timeframe, out var currentRegime))
                 {
                     var regimeParams = await strategyContext.GetDbContext()
@@ -658,7 +707,7 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
                         if (!regimeParamsValid)
                         {
                             _logger.LogWarning(
-                                "Strategy {Id}: regime params for {Regime} failed validation — using base params",
+                                "Strategy {Id}: regime params for {Regime} failed validation — using evalStrategy params (rollout may be active)",
                                 strategy.Id, currentRegime);
                             _metrics.WorkerErrors.Add(1, new("worker", "StrategyWorker"), new("reason", "regime_param_validation"));
                         }
@@ -669,45 +718,13 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
                             strategy.Id, strategy.Symbol, strategy.Timeframe, currentRegime);
                         evalStrategy = new Domain.Entities.Strategy
                         {
-                            Id                      = strategy.Id,
-                            Name                    = strategy.Name,
-                            Description             = strategy.Description,
-                            StrategyType            = strategy.StrategyType,
-                            Symbol                  = strategy.Symbol,
-                            Timeframe               = strategy.Timeframe,
-                            ParametersJson          = regimeParams,
-                            Status                  = strategy.Status,
-                            RiskProfileId           = strategy.RiskProfileId,
-                            CreatedAt               = strategy.CreatedAt,
-                            LifecycleStage          = strategy.LifecycleStage,
-                            LifecycleStageEnteredAt = strategy.LifecycleStageEnteredAt,
-                            EstimatedCapacityLots   = strategy.EstimatedCapacityLots,
-                            IsDeleted               = strategy.IsDeleted,
-                        };
-                        } // end regimeParamsValid else
-                    }
-                }
-
-                // ── Gradual rollout parameter routing ──────────────────────────────
-                // If an optimization rollout is in progress (RolloutPct < 100), route
-                // traffic between old and new parameters deterministically based on a
-                // seed derived from the tick timestamp. This ensures the same tick
-                // always picks the same parameter set, enabling consistent A/B comparison.
-                if (strategy.RolloutPct is not null and < 100)
-                {
-                    int rolloutSeed = HashCode.Combine(strategy.Id, @event.Timestamp.Ticks / TimeSpan.TicksPerMinute);
-                    string selectedParams = Optimization.GradualRolloutManager.SelectParameters(strategy, rolloutSeed);
-                    if (selectedParams != evalStrategy.ParametersJson)
-                    {
-                        evalStrategy = new Domain.Entities.Strategy
-                        {
                             Id                      = evalStrategy.Id,
                             Name                    = evalStrategy.Name,
                             Description             = evalStrategy.Description,
                             StrategyType            = evalStrategy.StrategyType,
                             Symbol                  = evalStrategy.Symbol,
                             Timeframe               = evalStrategy.Timeframe,
-                            ParametersJson          = selectedParams,
+                            ParametersJson          = regimeParams,
                             Status                  = evalStrategy.Status,
                             RiskProfileId           = evalStrategy.RiskProfileId,
                             CreatedAt               = evalStrategy.CreatedAt,
@@ -716,6 +733,7 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
                             EstimatedCapacityLots   = evalStrategy.EstimatedCapacityLots,
                             IsDeleted               = evalStrategy.IsDeleted,
                         };
+                        } // end regimeParamsValid else
                     }
                 }
 
@@ -934,6 +952,37 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
                 signal.MLConfidenceScore    = mlScore.ConfidenceScore;
                 signal.MLModelId            = mlScore.MLModelId;
 
+                // ── DrawdownRecovery: reduce lot size when in Reduced mode ────
+                // When the DrawdownRecoveryWorker has placed the portfolio into
+                // "Reduced" mode, halve the suggested lot size to limit further
+                // drawdown. The multiplier is configurable via EngineConfig.
+                var recoveryMode = await strategyContext.GetDbContext()
+                    .Set<Domain.Entities.EngineConfig>()
+                    .AsNoTracking()
+                    .Where(c => c.Key == "DrawdownRecovery:ActiveMode" && !c.IsDeleted)
+                    .Select(c => c.Value)
+                    .FirstOrDefaultAsync(ct) ?? "Normal";
+
+                decimal adjustedLotSize = signal.SuggestedLotSize;
+                if (string.Equals(recoveryMode, "Reduced", StringComparison.OrdinalIgnoreCase))
+                {
+                    var lotMultiplierStr = await strategyContext.GetDbContext()
+                        .Set<Domain.Entities.EngineConfig>()
+                        .AsNoTracking()
+                        .Where(c => c.Key == "DrawdownRecovery:ReducedLotMultiplier" && !c.IsDeleted)
+                        .Select(c => c.Value)
+                        .FirstOrDefaultAsync(ct);
+
+                    decimal lotMultiplier = 0.5m;
+                    if (lotMultiplierStr is not null && decimal.TryParse(lotMultiplierStr, out var parsed) && parsed > 0)
+                        lotMultiplier = parsed;
+
+                    adjustedLotSize = signal.SuggestedLotSize * lotMultiplier;
+                    _logger.LogInformation(
+                        "StrategyWorker: DrawdownRecovery Reduced mode active — lot size reduced {Original} → {Adjusted} (×{Mult}) for {Symbol}",
+                        signal.SuggestedLotSize, adjustedLotSize, lotMultiplier, signal.Symbol);
+                }
+
                 // ── Collect candidate signal for conflict resolution ─────────
                 // Instead of persisting immediately, add to the candidate bag.
                 // After all strategies evaluate, the conflict resolver will pick
@@ -949,7 +998,7 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
                         EntryPrice:           signal.EntryPrice,
                         StopLoss:             signal.StopLoss,
                         TakeProfit:           signal.TakeProfit,
-                        SuggestedLotSize:     signal.SuggestedLotSize,
+                        SuggestedLotSize:     adjustedLotSize,
                         Confidence:           signal.Confidence,
                         MLConfidenceScore:    mlScore.ConfidenceScore,
                         MLModelId:            mlScore.MLModelId,
@@ -971,14 +1020,40 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
             {
                 _logger.LogError(ex, "Error evaluating strategy {StrategyId} for {Symbol}", strategy.Id, @event.Symbol);
                 _metrics.WorkerErrors.Add(1, new("worker", "StrategyWorker"), new("strategy_id", strategy.Id));
-                var newCount = _consecutiveFailures.AddOrUpdate(strategy.Id, 1, (_, count) => count + 1);
-                if (newCount >= _options.MaxConsecutiveFailures)
+
+                // Distinguish half-open probe failures from regular failures.
+                // When the circuit is already open, this is a probe attempt — track it
+                // separately so probe failures don't inflate _consecutiveFailures.
+                if (_circuitOpenedAt.ContainsKey(strategy.Id))
                 {
-                    // Track half-open probe failures separately so permanently broken
-                    // strategies stop oscillating between open/half-open.
-                    if (_circuitOpenedAt.ContainsKey(strategy.Id))
-                        _halfOpenProbeFailures.AddOrUpdate(strategy.Id, 1, (_, c) => c + 1);
+                    _halfOpenProbeFailures.AddOrUpdate(strategy.Id, 1, (_, c) => c + 1);
                     _circuitOpenedAt[strategy.Id] = DateTime.UtcNow;
+                }
+                else
+                {
+                    var newCount = _consecutiveFailures.AddOrUpdate(strategy.Id, 1, (_, count) => count + 1);
+                    if (newCount >= _options.MaxConsecutiveFailures)
+                        _circuitOpenedAt[strategy.Id] = DateTime.UtcNow;
+                }
+
+                // Dead-letter audit trail for failed signal evaluations
+                try
+                {
+                    using var dlScope = _scopeFactory.CreateScope();
+                    var deadLetterSink = dlScope.ServiceProvider.GetRequiredService<IDeadLetterSink>();
+                    await deadLetterSink.WriteAsync(
+                        handlerName: "StrategyWorker",
+                        eventType: "StrategyEvaluation",
+                        eventPayloadJson: $"{{\"strategyId\":{strategy.Id},\"symbol\":\"{strategy.Symbol}\"}}",
+                        errorMessage: $"Strategy {strategy.Id} evaluation failed: {ex.Message}",
+                        stackTrace: ex.ToString(),
+                        attempts: _consecutiveFailures.GetValueOrDefault(strategy.Id, 1),
+                        ct);
+                }
+                catch
+                {
+                    // Best-effort dead-letter; don't fail the loop — but track the drop
+                    _metrics.WorkerErrors.Add(1, new("worker", "StrategyWorker"), new("reason", "dead_letter_write_failed"));
                 }
             }
             finally
@@ -1080,7 +1155,7 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
                 // Record cooldown timestamp (TryAdd avoids overwriting a timestamp
                 // set by a parallel winner for the same strategy on a different timeframe)
                 var now = DateTime.UtcNow;
-                _lastSignalTime.AddOrUpdate(pending.StrategyId, now, (_, existing) => existing > now ? existing : now);
+                _lastSignalTime.AddOrUpdate(pending.StrategyId, now, (_, existing) => existing >= now ? existing : now);
 
                 _metrics.SignalsGenerated.Add(1, new("symbol", pending.Symbol), new("strategy_type", pending.StrategyType.ToString()));
 

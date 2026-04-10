@@ -207,26 +207,27 @@ public sealed class TrailingStopWorker : BackgroundService
                 continue;
             }
 
-            // ── Persist the updated SL and trail reference price ──────────────
-            int rowsUpdated = await writeCtx.Set<Position>()
-                .Where(p => p.Id == pos.Id)
-                .ExecuteUpdateAsync(s => s
-                    .SetProperty(p => p.StopLoss,          newSl)
-                    .SetProperty(p => p.TrailingStopLevel, current),
-                    ct);
-
-            if (rowsUpdated == 0)
+            // ── Persist the updated SL, trail reference price, and EACommand atomically ──
+            // Load the tracked entity so we can batch the SL update and EACommand creation
+            // into a single SaveChangesAsync call, ensuring atomicity.
+            try
             {
-                _logger.LogWarning(
-                    "TrailingStop: position {Id} ({Symbol}) SL update returned 0 rows — position may have been closed or deleted. Skipping EA command.",
-                    pos.Id, pos.Symbol);
-                continue;
-            }
+                var trackedPos = await writeCtx.Set<Position>()
+                    .FirstOrDefaultAsync(p => p.Id == pos.Id && !p.IsDeleted, ct);
 
-            // ── Queue EACommand so the EA updates the SL on MT5 ─────────────
-            if (!string.IsNullOrEmpty(pos.BrokerPositionId))
-            {
-                try
+                if (trackedPos is null || trackedPos.Status != PositionStatus.Open)
+                {
+                    _logger.LogWarning(
+                        "TrailingStop: position {Id} ({Symbol}) not found or already closed — skipping.",
+                        pos.Id, pos.Symbol);
+                    continue;
+                }
+
+                trackedPos.StopLoss          = newSl;
+                trackedPos.TrailingStopLevel  = current;
+
+                // ── Queue EACommand so the EA updates the SL on MT5 ─────────────
+                if (!string.IsNullOrEmpty(pos.BrokerPositionId))
                 {
                     // Check for pending (unacknowledged) trailing stop command for this position
                     // before issuing a new one — prevents command queue flooding when ack is slow
@@ -245,51 +246,53 @@ public sealed class TrailingStopWorker : BackgroundService
                     }
                     else
                     {
-                    var eaInstance = await writeCtx.Set<EAInstance>()
-                        .ActiveForSymbol(pos.Symbol)
-                        .FirstOrDefaultAsync(ct);
+                        var eaInstance = await writeCtx.Set<EAInstance>()
+                            .ActiveForSymbol(pos.Symbol)
+                            .FirstOrDefaultAsync(ct);
 
-                    if (eaInstance is not null)
-                    {
-                        await writeCtx.Set<EACommand>().AddAsync(new EACommand
+                        if (eaInstance is not null)
                         {
-                            TargetInstanceId = eaInstance.InstanceId,
-                            CommandType      = EACommandType.UpdateTrailing,
-                            TargetTicket     = long.TryParse(pos.BrokerPositionId, out var ticket) ? ticket : null,
-                            Symbol           = pos.Symbol,
-                            Parameters       = JsonSerializer.Serialize(new { stopLoss = newSl }),
-                        }, ct);
-                        await writeCtx.SaveChangesAsync(ct);
+                            await writeCtx.Set<EACommand>().AddAsync(new EACommand
+                            {
+                                TargetInstanceId = eaInstance.InstanceId,
+                                CommandType      = EACommandType.UpdateTrailing,
+                                TargetTicket     = long.TryParse(pos.BrokerPositionId, out var ticket) ? ticket : null,
+                                Symbol           = pos.Symbol,
+                                Parameters       = JsonSerializer.Serialize(new { stopLoss = newSl }),
+                            }, ct);
+                        }
                     }
-                    } // end !hasPendingCommand
                 }
-                catch (Exception ex)
+
+                // Single SaveChangesAsync: SL update + EACommand creation are atomic
+                await writeCtx.SaveChangesAsync(ct);
+            }
+            catch (Exception ex)
+            {
+                // Dead-letter the failed update to prevent silent loss of SL modifications
+                _logger.LogError(ex,
+                    "TrailingStop: FAILED to update SL and queue EA command for position {Id} ({Symbol}) SL→{NewSl:F5} — dead-lettering",
+                    pos.Id, pos.Symbol, newSl);
+
+                try
                 {
-                    // Dead-letter the failed EA command to prevent silent loss of SL modifications
-                    _logger.LogError(ex,
-                        "TrailingStop: FAILED to queue EA command for position {Id} ({Symbol}) SL→{NewSl:F5} — dead-lettering",
-                        pos.Id, pos.Symbol, newSl);
+                    using var dlScope = _scopeFactory.CreateScope();
+                    var deadLetterSink = dlScope.ServiceProvider.GetRequiredService<IDeadLetterSink>();
 
-                    try
-                    {
-                        using var dlScope = _scopeFactory.CreateScope();
-                        var deadLetterSink = dlScope.ServiceProvider.GetRequiredService<IDeadLetterSink>();
-
-                        await deadLetterSink.WriteAsync(
-                            handlerName:      nameof(TrailingStopWorker),
-                            eventType:        "EACommand:UpdateTrailing",
-                            eventPayloadJson: JsonSerializer.Serialize(new { positionId = pos.Id, symbol = pos.Symbol, newStopLoss = newSl, brokerPositionId = pos.BrokerPositionId }),
-                            errorMessage:     ex.Message,
-                            stackTrace:       ex.StackTrace,
-                            attempts:         1,
-                            ct);
-                    }
-                    catch (Exception dlEx)
-                    {
-                        _logger.LogCritical(dlEx,
-                            "TrailingStop: FAILED to dead-letter EA command for position {Id} — command may be lost",
-                            pos.Id);
-                    }
+                    await deadLetterSink.WriteAsync(
+                        handlerName:      nameof(TrailingStopWorker),
+                        eventType:        "EACommand:UpdateTrailing",
+                        eventPayloadJson: JsonSerializer.Serialize(new { positionId = pos.Id, symbol = pos.Symbol, newStopLoss = newSl, brokerPositionId = pos.BrokerPositionId }),
+                        errorMessage:     ex.Message,
+                        stackTrace:       ex.StackTrace,
+                        attempts:         1,
+                        ct);
+                }
+                catch (Exception dlEx)
+                {
+                    _logger.LogCritical(dlEx,
+                        "TrailingStop: FAILED to dead-letter EA command for position {Id} — command may be lost",
+                        pos.Id);
                 }
             }
 

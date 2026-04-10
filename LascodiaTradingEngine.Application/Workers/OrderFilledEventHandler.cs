@@ -196,6 +196,19 @@ public sealed class OrderFilledEventHandler : IIntegrationEventHandler<OrderFill
             return;
         }
 
+        // State-aware validation: verify the order is actually in Filled (or PartialFill)
+        // status before opening a position. If the event arrived out of order (e.g., a
+        // cancellation was processed before this fill event) the order may already be in a
+        // terminal state. Processing a stale fill would create a phantom position.
+        if (order.Status != OrderStatus.Filled && order.Status != OrderStatus.PartialFill)
+        {
+            _logger.LogWarning(
+                "OrderFilledEventHandler: order {OrderId} is in status {Status}, expected Filled or PartialFill — " +
+                "event may be out of order or already superseded, skipping",
+                @event.OrderId, order.Status);
+            return;
+        }
+
         // Idempotency guard: skip if a position already exists for this order.
         // Prevents duplicate positions when the event bus retries delivery.
         // The check uses OpenOrderId (a foreign key on Position) rather than a dedicated

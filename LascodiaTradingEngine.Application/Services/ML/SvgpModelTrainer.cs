@@ -155,12 +155,11 @@ public sealed partial class SvgpModelTrainer : IMLModelTrainer
         int n       = samples.Count;
         int embargo = hp.EmbargoBarCount;
 
-        // ── 1. Leakage-free split indices ────────────────────────────────────
-        double trainRatio = n < 500 ? 0.80 : 0.70;
-        double calRatio   = n < 500 ? 0.10 : 0.15;
-        int trainEnd    = (int)(n * trainRatio);
-        int calEnd      = (int)(n * (trainRatio + calRatio));
-        int trainStdEnd = Math.Max(0, trainEnd - embargo);
+        // ── 1. Leakage-free 4-way split: 60% train | 10% selection | 10% cal | ~20% test ──
+        int trainEnd     = (int)(n * 0.60);
+        int selectionEnd = (int)(n * 0.70);
+        int calEnd       = (int)(n * 0.80);
+        int trainStdEnd  = Math.Max(0, trainEnd - embargo);
 
         // ── 2. Z-score standardisation (train split only, no leakage) ────────
         var rawTrainFeatures = new List<float[]>(trainStdEnd);
@@ -171,10 +170,12 @@ public sealed partial class SvgpModelTrainer : IMLModelTrainer
         foreach (var s in samples)
             allStd.Add(s with { Features = MLFeatureHelper.Standardize(s.Features, means, stds) });
 
-        var trainSet = allStd[..trainStdEnd];
-        int calStart = Math.Min(trainEnd + embargo, calEnd);
-        var calSet   = allStd[calStart..(calEnd < n ? calEnd : n)];
-        var testSet  = allStd[Math.Min(calEnd + embargo, n)..];
+        var trainSet     = allStd[..trainStdEnd];
+        int selStart     = Math.Min(trainEnd + embargo, selectionEnd);
+        var selectionSet = allStd[selStart..selectionEnd];
+        int calStart     = Math.Min(selectionEnd + embargo, calEnd);
+        var calSet       = allStd[calStart..Math.Min(calEnd, n)];
+        var testSet      = allStd[Math.Min(calEnd + embargo, n)..];
 
         if (trainSet.Count < hp.MinSamples)
             throw new InvalidOperationException(
@@ -184,41 +185,37 @@ public sealed partial class SvgpModelTrainer : IMLModelTrainer
             ? hp.SharpeAnnualisationFactor : DefaultSharpeAnnualisationFactor;
 
         _logger.LogInformation(
-            "SvgpModelTrainer starting: N={N} F={F} M={M} train={Tr} cal={Cal} test={Te}",
-            n, F, M, trainSet.Count, calSet.Count, testSet.Count);
+            "SvgpModelTrainer starting: N={N} F={F} M={M} train={Tr} sel={Sel} cal={Cal} test={Te}",
+            n, F, M, trainSet.Count, selectionSet.Count, calSet.Count, testSet.Count);
 
-        // ── 2b. Stationarity gate (ADF) + fractional differencing ────────────
+        // ── 2b. Drift diagnostics (5-test stationarity) + fractional differencing ──
         double fracDiffD = hp.FracDiffD;
+        var driftArtifact = ComputeSvgpDriftDiagnostics(
+            trainSet, F, MLFeatureHelper.FeatureNames, fracDiffD);
+        if (driftArtifact.GateTriggered)
         {
-            int nonStat = 0;
-            for (int j = 0; j < F; j++)
+            if (driftArtifact.GateAction == "REJECT")
+                throw new InvalidOperationException(
+                    $"SVGP drift diagnostics REJECT: {driftArtifact.NonStationaryFeatureCount}/{F} features non-stationary ({driftArtifact.NonStationaryFraction:P0}).");
+
+            _logger.LogWarning(
+                "SVGP drift diagnostics WARN: {NonStat}/{Total} features non-stationary (action={Action}).",
+                driftArtifact.NonStationaryFeatureCount, F, driftArtifact.GateAction);
+
+            if (fracDiffD == 0.0)
             {
-                var series = trainSet.Select(s => (double)s.Features[j]).ToArray();
-                if (MLFeatureHelper.AdfTest(series) > 0.05) nonStat++;
-            }
-            if (nonStat > F * 0.30)
-            {
-                if (fracDiffD == 0.0)
-                {
-                    fracDiffD = 0.4;
-                    _logger.LogWarning(
-                        "SVGP stationarity gate: {NonStat}/{Total} features have unit root — auto-applying FracDiffD={D:F1}.",
-                        nonStat, F, fracDiffD);
-                }
-                else if (_logger.IsEnabled(LogLevel.Information))
-                {
-                    _logger.LogInformation(
-                        "SVGP stationarity gate: {NonStat}/{Total} features have unit root — applying FracDiffD={D:F2} from hyperparams.",
-                        nonStat, F, fracDiffD);
-                }
+                fracDiffD = 0.4;
+                _logger.LogWarning(
+                    "SVGP drift: auto-applying FracDiffD={D:F1} to address non-stationarity.", fracDiffD);
             }
         }
         if (fracDiffD > 0.0)
         {
-            allStd   = MLFeatureHelper.ApplyFractionalDifferencing(allStd, F, fracDiffD);
-            trainSet = allStd[..trainStdEnd];
-            calSet   = allStd[calStart..(calEnd < n ? calEnd : n)];
-            testSet  = allStd[Math.Min(calEnd + embargo, n)..];
+            allStd       = MLFeatureHelper.ApplyFractionalDifferencing(allStd, F, fracDiffD);
+            trainSet     = allStd[..trainStdEnd];
+            selectionSet = allStd[selStart..selectionEnd];
+            calSet       = allStd[calStart..Math.Min(calEnd, n)];
+            testSet      = allStd[Math.Min(calEnd + embargo, n)..];
         }
 
         // ── 2c. Class-imbalance gate ─────────────────────────────────────────
@@ -230,6 +227,17 @@ public sealed partial class SvgpModelTrainer : IMLModelTrainer
                 throw new InvalidOperationException($"SVGP: extreme class imbalance (Buy={buyRatio:P1}).");
             if (buyRatio < 0.35 || buyRatio > 0.65)
                 _logger.LogWarning("SVGP class imbalance: Buy={Buy:P1}, Sell={Sell:P1}.", buyRatio, 1.0 - buyRatio);
+        }
+
+        // ── 2d. Adversarial validation (train vs test distribution shift) ────
+        double advAuc = 0.5;
+        if (testSet.Count >= 20 && trainSet.Count >= 20)
+        {
+            advAuc = TryComputeAdversarialAucGpu(trainSet, testSet, F, ct)
+                     ?? ComputeAdversarialAuc(trainSet, testSet, F);
+            _logger.LogInformation("SVGP adversarial AUC={AUC:F3}", advAuc);
+            if (hp.SvgpMaxAdversarialAuc > 0.0 && advAuc > hp.SvgpMaxAdversarialAuc)
+                throw new InvalidOperationException($"SVGP: adversarial AUC={advAuc:F3} exceeds threshold.");
         }
 
         var rng    = new Random(hp.ElmOuterSeed > 0 ? hp.ElmOuterSeed : 42);
@@ -384,7 +392,8 @@ public sealed partial class SvgpModelTrainer : IMLModelTrainer
 
         ct.ThrowIfCancellationRequested();
 
-        // ── 7. Posterior prediction (mean + variance) on cal and test sets ────
+        // ── 7. Posterior prediction (mean + variance) on selection, cal and test sets ──
+        var (selMeans,  selVars)  = PredictWithVariance(selectionSet, svgpState, device);
         var (calMeans,  calVars)  = PredictWithVariance(calSet,  svgpState, device);
         var (testMeans, testVars) = PredictWithVariance(testSet, svgpState, device);
 
@@ -415,6 +424,7 @@ public sealed partial class SvgpModelTrainer : IMLModelTrainer
         _logger.LogInformation("SVGP temperature T={T:F4}", tempScale);
 
         // ── 9d. Fully-calibrated probs (Platt + Isotonic + Temperature) ───────
+        float[] finalSelProbs  = ApplyFullCalibration(selMeans,  plattA, plattB, isotonicBp, tempScale);
         float[] finalCalProbs  = ApplyFullCalibration(calMeans,  plattA, plattB, isotonicBp, tempScale);
         float[] finalTestProbs = ApplyFullCalibration(testMeans, plattA, plattB, isotonicBp, tempScale);
 
@@ -423,12 +433,16 @@ public sealed partial class SvgpModelTrainer : IMLModelTrainer
         double bss = ComputeBss(finalTestProbs, testSet);
         _logger.LogInformation("SVGP ECE={Ece:F4} BSS={Bss:F4}", ece, bss);
 
-        // ── 11. EV-optimal threshold and Kelly fraction ───────────────────────
+        // ── 11. EV-optimal threshold and Kelly fraction (selectionSet preferred) ──
+        var thresholdSet   = selectionSet.Count >= 10 ? selectionSet : calSet;
+        var thresholdProbs = selectionSet.Count >= 10 ? finalSelProbs : finalCalProbs;
         double optimalThreshold = ComputeOptimalThreshold(
-            finalCalProbs, calSet, hp.ThresholdSearchMin, hp.ThresholdSearchMax);
-        double avgKellyFraction = ComputeAvgKellyFraction(finalCalProbs, calSet);
+            thresholdProbs, thresholdSet, hp.ThresholdSearchMin, hp.ThresholdSearchMax);
+        double avgKellyFraction = ComputeAvgKellyFraction(thresholdProbs, thresholdSet);
         _logger.LogInformation(
-            "SVGP threshold={Thr:F2} Kelly={Kelly:F4}", optimalThreshold, avgKellyFraction);
+            "SVGP threshold={Thr:F2} Kelly={Kelly:F4} (from {Source})",
+            optimalThreshold, avgKellyFraction,
+            selectionSet.Count >= 10 ? "selection" : "cal");
 
         // ── 12. Magnitude regressors (before final eval so RMSE is correct) ──
         var (magWeights, magBias) = FitMagnitudeRegressor(trainSet, F);
@@ -447,9 +461,10 @@ public sealed partial class SvgpModelTrainer : IMLModelTrainer
 
         ct.ThrowIfCancellationRequested();
 
-        // ── 14. Permutation feature importance (test + cal, parallel) ─────────
-        float[] featureImportance = testSet.Count >= 10
-            ? ComputePermutationImportance(testSet, inducingPts, alphaData, F, M, ardLs, sf2Val, plattA, plattB, ct)
+        // ── 14. Permutation feature importance (selectionSet preferred, test fallback) ──
+        var impSet   = selectionSet.Count >= 10 ? selectionSet : testSet;
+        float[] featureImportance = impSet.Count >= 10
+            ? ComputePermutationImportance(impSet, inducingPts, alphaData, F, M, ardLs, sf2Val, plattA, plattB, ct)
             : new float[F];
 
         if (featureImportance.Any(v => v > 0))
@@ -460,7 +475,8 @@ public sealed partial class SvgpModelTrainer : IMLModelTrainer
                         ? MLFeatureHelper.FeatureNames[idx] : $"F{idx}"))
                 .OrderByDescending(x => x.Importance).Take(5);
             _logger.LogInformation(
-                "SVGP top-5 features (test): {Features}",
+                "SVGP top-5 features ({Source}): {Features}",
+                selectionSet.Count >= 10 ? "selection" : "test",
                 string.Join(", ", top5.Select(f => $"{f.Name}={f.Importance:P1}")));
         }
 
@@ -530,7 +546,39 @@ public sealed partial class SvgpModelTrainer : IMLModelTrainer
                     string.Join(", ", redundantPairs));
         }
 
-        // ── 18. Build model snapshot ──────────────────────────────────────────
+        // ── 18. New metrics (reliability, Murphy, calibration residuals, stability, feature variances) ──
+        Func<float[], double> calibProb = features =>
+        {
+            float[] stdF = MLFeatureHelper.Standardize(features, means, stds);
+            double rawMean = 0;
+            for (int m = 0; m < M; m++)
+            {
+                double sq = 0;
+                for (int d = 0; d < F; d++)
+                {
+                    double diff = (stdF[d] - inducingPts[m][d]) / ardLs[d];
+                    sq += diff * diff;
+                }
+                rawMean += alphaData[m] * sf2Val * Math.Exp(-0.5 * sq);
+            }
+            float plattVal = (float)(plattA * rawMean + plattB);
+            double isoVal  = ApplyIsotonicCalibration(1.0 / (1.0 + Math.Exp(-plattVal)), isotonicBp);
+            double logit   = Math.Log(Math.Max(isoVal, 1e-7) / Math.Max(1.0 - isoVal, 1e-7));
+            return 1.0 / (1.0 + Math.Exp(-logit / Math.Max(tempScale, 1e-6)));
+        };
+
+        var metricsSet = selectionSet.Count >= 10 ? selectionSet : calSet;
+        var (relBinConf, relBinAcc, _) = ComputeReliabilityDiagram(metricsSet, calibProb);
+        var (murphyCalLoss, murphyRefLoss) = ComputeMurphyDecomposition(metricsSet, calibProb);
+        var (calResMean, calResStd, calResThreshold) = ComputeCalibrationResidualStats(metricsSet, calibProb);
+        double predStability = ComputePredictionStabilityScore(metricsSet, calibProb);
+        double[] featureVariances = ComputeFeatureVariancesSvgp(trainSet, F);
+
+        _logger.LogInformation(
+            "SVGP new metrics — murphyCal={Cal:F4} murphyRef={Ref:F4} calResMean={Mean:F4} stability={Stab:F4}",
+            murphyCalLoss, murphyRefLoss, calResMean, predStability);
+
+        // ── 19. Build model snapshot ──────────────────────────────────────────
         // Store inducing points as double[M][F] so the inference engine reads M = Z.Length correctly.
         var svgpPoints = inducingPts.Select(p => p.ToArray()).ToArray();
         var snapshot = new ModelSnapshot
@@ -603,8 +651,22 @@ public sealed partial class SvgpModelTrainer : IMLModelTrainer
             MetaBias                   = 0.0,
             EnsembleDiversity          = 0.0,
             OobPrunedLearnerCount      = 0,
+            // ── New metrics & artifacts ──────────────────────────────────────
+            SvgpDriftArtifact                = driftArtifact,
+            SvgpAdversarialAuc               = SafeSvgp(advAuc, 0.5),
+            SvgpCalibrationResidualMean      = SafeSvgp(calResMean),
+            SvgpCalibrationResidualStd       = SafeSvgp(calResStd),
+            SvgpCalibrationResidualThreshold = SafeSvgp(calResThreshold, 1.0),
+            SvgpCalibrationLoss              = SafeSvgp(murphyCalLoss),
+            SvgpRefinementLoss               = SafeSvgp(murphyRefLoss),
+            SvgpPredictionStabilityScore     = SafeSvgp(predStability),
+            SvgpSelectionSamples             = selectionSet.Count,
+            ReliabilityBinConfidence         = relBinConf,
+            ReliabilityBinAccuracy           = relBinAcc,
+            FeatureVariances                 = featureVariances,
         };
 
+        SanitizeSvgpSnapshotArrays(snapshot);
         byte[] modelBytes = JsonSerializer.SerializeToUtf8Bytes(snapshot, JsonOpts);
         _logger.LogInformation(
             "SvgpModelTrainer complete: acc={Acc:P1} sharpe={Sharpe:F2} ELBO={ELBO:F2} ece={ECE:F4} bss={BSS:F4} gen={Gen}",

@@ -47,17 +47,18 @@ public sealed class GradualRolloutManager
     }
 
     /// <summary>
-    /// Promotes the rollout to the next tier (25→50→75→100) or completes it.
+    /// Promotes the rollout to the next tier (configurable, default 25→50→75→100) or completes it.
     /// Returns true if the rollout is now complete (100%).
     /// </summary>
-    internal static bool PromoteRollout(Strategy strategy, DateTime utcNow)
+    internal static bool PromoteRollout(Strategy strategy, DateTime utcNow,
+        int tier1Pct = 25, int tier2Pct = 50, int tier3Pct = 75)
     {
         int current = strategy.RolloutPct ?? 100;
         int next = current switch
         {
-            <= 25 => 50,
-            <= 50 => 75,
-            <= 75 => 100,
+            _ when current <= tier1Pct => tier2Pct,
+            _ when current <= tier2Pct => tier3Pct,
+            _ when current <= tier3Pct => 100,
             _     => 100,
         };
 
@@ -106,7 +107,8 @@ public sealed class GradualRolloutManager
     /// </returns>
     internal async Task<string?> EvaluateRolloutAsync(
         Strategy strategy, DbContext db, decimal minHealthScore,
-        int observationWindowDays, CancellationToken ct)
+        int observationWindowDays, CancellationToken ct,
+        int tier1Pct = 25, int tier2Pct = 50, int tier3Pct = 75)
     {
         if (strategy.RolloutPct is null or >= 100) return null;
         if (strategy.RolloutStartedAt is null) return null;
@@ -187,7 +189,7 @@ public sealed class GradualRolloutManager
         }
 
         // All good — promote to next tier
-        bool completed = PromoteRollout(strategy, UtcNow);
+        bool completed = PromoteRollout(strategy, UtcNow, tier1Pct, tier2Pct, tier3Pct);
         _logger.LogInformation(
             "GradualRolloutManager: strategy {Id} rollout {Action} — avg score {Score:F2}, now at {Pct}%",
             strategy.Id, completed ? "completed" : "promoted", avgScore, strategy.RolloutPct ?? 100);

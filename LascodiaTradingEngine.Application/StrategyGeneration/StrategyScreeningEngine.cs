@@ -246,10 +246,10 @@ public class StrategyScreeningEngine
         // ── OOS threshold gate (relaxed) ──
         int oosMinTrades = Math.Max(3, thresholds.MinTotalTrades / 3);
         if ((double)oosResult.WinRate < thresholds.MinWinRate
-            || (double)oosResult.ProfitFactor < thresholds.MinProfitFactor * 0.9
+            || (double)oosResult.ProfitFactor < thresholds.MinProfitFactor * config.OosPfRelaxation
             || oosResult.TotalTrades < oosMinTrades
-            || (double)oosResult.MaxDrawdownPct > thresholds.MaxDrawdownPct * 1.1
-            || (double)oosResult.SharpeRatio < thresholds.MinSharpe * 0.8)
+            || (double)oosResult.MaxDrawdownPct > thresholds.MaxDrawdownPct * config.OosDdRelaxation
+            || (double)oosResult.SharpeRatio < thresholds.MinSharpe * config.OosSharpeRelaxation)
         {
             gateTrace.Add(new("OOS_Threshold", false, gateSw.Elapsed.TotalMilliseconds));
             _onGateRejection?.Invoke("oos_threshold");
@@ -267,7 +267,7 @@ public class StrategyScreeningEngine
         // ── IS-to-OOS degradation ratio check ──
         double maxDegradation = config.MaxOosDegradationPct;
         if (oosRegime.HasValue && oosRegime.Value != targetRegime)
-            maxDegradation *= 1.5; // Relax tolerance when regimes differ
+            maxDegradation *= config.RegimeDegradationRelaxation; // Relax tolerance when regimes differ
         bool degradationFailed = false;
         if ((double)trainResult.SharpeRatio > thresholds.MinSharpe
             && (double)(oosResult.SharpeRatio / trainResult.SharpeRatio) < (1.0 - maxDegradation))
@@ -517,7 +517,7 @@ public class StrategyScreeningEngine
                 // Negative Kelly means a losing strategy — skip the position sizing backtest
                 if (kellyFull > 0)
                 {
-                    decimal halfKelly = Math.Clamp(kellyFull * 0.5m, 0.01m, 0.10m);
+                    decimal halfKelly = Math.Clamp(kellyFull * config.KellyFactor, config.KellyMinLot, config.KellyMaxLot);
 
                     var kellyOptions = new BacktestOptions
                     {
@@ -1017,6 +1017,22 @@ public sealed record ScreeningConfig
     public IReadOnlyList<double>? WalkForwardSplitPcts { get; init; }
     public int MonteCarloShufflePermutations { get; init; }
     public double MonteCarloShuffleMinPValue { get; init; }
+
+    /// <summary>OOS profit factor relaxation multiplier (default 0.9).</summary>
+    public double OosPfRelaxation { get; init; } = 0.9;
+    /// <summary>OOS drawdown relaxation multiplier (default 1.1).</summary>
+    public double OosDdRelaxation { get; init; } = 1.1;
+    /// <summary>OOS Sharpe relaxation multiplier (default 0.8).</summary>
+    public double OosSharpeRelaxation { get; init; } = 0.8;
+    /// <summary>Regime degradation relaxation multiplier when OOS regime differs from target (default 1.5).</summary>
+    public double RegimeDegradationRelaxation { get; init; } = 1.5;
+
+    /// <summary>Half-Kelly multiplier for position sizing gate (default 0.5).</summary>
+    public decimal KellyFactor { get; init; } = 0.5m;
+    /// <summary>Minimum lot size floor for Kelly position sizing (default 0.01).</summary>
+    public decimal KellyMinLot { get; init; } = 0.01m;
+    /// <summary>Maximum lot size cap for Kelly position sizing (default 0.10).</summary>
+    public decimal KellyMaxLot { get; init; } = 0.10m;
 
     /// <summary>Effective split percentages (defaults to 0.40, 0.55, 0.70 if not provided).</summary>
     public IReadOnlyList<double> EffectiveSplitPcts => WalkForwardSplitPcts

@@ -114,6 +114,13 @@ public class PartialFillResubmissionWorker : BackgroundService
                 if (alreadyResubmitted)
                     continue;
 
+                // Optimistic concurrency check: re-read the order status immediately
+                // before creating the residual to prevent a race where the order was
+                // fully filled between the initial query and now.
+                var currentOrder = await db.Set<Order>().FindAsync(new object[] { original.Id }, ct);
+                if (currentOrder == null || currentOrder.Status == OrderStatus.Filled)
+                    continue;
+
                 var residualOrder = new Order
                 {
                     Symbol        = original.Symbol,

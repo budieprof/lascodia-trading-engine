@@ -1045,6 +1045,9 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
         // Fallback: if no architecture meets the minimum, use total runs for UCB1 denominator
         if (totalEligibleRuns == 0)
             totalEligibleRuns = runs.Count;
+        // Guard against log(0) in the UCB1 formula when no runs exist at all
+        if (totalEligibleRuns <= 0)
+            totalEligibleRuns = 1;
 
         var ranked = new List<(LearnerArchitecture Arch, double Score)>();
         var underExplored = new List<(LearnerArchitecture Arch, double Score)>();

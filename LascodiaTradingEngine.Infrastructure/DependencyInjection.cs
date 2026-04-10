@@ -32,7 +32,14 @@ public static class DependencyInjection
 
             services.AddDbContext<WriteApplicationDbContext>((sp, options) =>
             {
-                options.SetPostgresDB<WriteApplicationDbContext>(configuration);
+                options.UseNpgsql(
+                    configuration.GetConnectionString("WriteDbConnection") ?? "",
+                    npgsql =>
+                    {
+                        npgsql.CommandTimeout(30);
+                        npgsql.EnableRetryOnFailure(3, TimeSpan.FromSeconds(5), null);
+                        npgsql.MigrationsAssembly(typeof(WriteApplicationDbContext).Assembly.FullName);
+                    });
                 options.AddInterceptors(sp.GetRequiredService<SlowQueryInterceptor>());
             });
 
@@ -52,7 +59,14 @@ public static class DependencyInjection
 
             services.AddDbContext<ReadApplicationDbContext>((sp, options) =>
             {
-                options.SetPostgresDB<ReadApplicationDbContext>(configuration, "ReadDbConnection");
+                options.UseNpgsql(
+                    configuration.GetConnectionString("ReadDbConnection") ?? "",
+                    npgsql =>
+                    {
+                        npgsql.CommandTimeout(30);
+                        npgsql.EnableRetryOnFailure(3, TimeSpan.FromSeconds(5), null);
+                        npgsql.MigrationsAssembly(typeof(ReadApplicationDbContext).Assembly.FullName);
+                    });
                 options.AddInterceptors(sp.GetRequiredService<SlowQueryInterceptor>());
             });
 
@@ -70,6 +84,7 @@ public static class DependencyInjection
             // Deep health checks — registered as named checks for /health endpoint.
             services.AddHealthChecks()
                 .AddCheck<DatabaseHealthCheck>("database", tags: ["ready"])
+                .AddCheck<ConnectionPoolHealthCheck>("connection_pool", tags: ["ready", "live"])
                 .AddCheck<RabbitMQHealthCheck>("event_bus", tags: ["ready"])
                 .AddCheck<BrokerHealthCheck>("broker", tags: ["ready"])
                 .AddCheck<EAHeartbeatHealthCheck>("ea_heartbeat", tags: ["ready", "live"])

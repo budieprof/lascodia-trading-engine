@@ -41,9 +41,8 @@ namespace LascodiaTradingEngine.Application.Workers;
 ///   <item><description>Max peak-to-trough drawdown on the cumulative PnL series</description></item>
 ///   <item><description>
 ///     <b>Health score</b>: composite score in [0, 1] computed as
-///     <c>0.4 × WinRate + 0.3 × min(1, ProfitFactor/2) + 0.3 × max(0, 1 − MaxDrawdown/20)</c>.
-///     Weights reflect industry convention: edge (win rate) is the primary driver,
-///     followed by reward-risk ratio and drawdown resilience.
+///     <c>0.25×WinRate + 0.20×min(1, PF/2) + 0.20×max(0, 1−DD/20) + 0.15×min(1, max(0, Sharpe)/2) + 0.20×min(1, Trades/50)</c>.
+///     Five factors: edge (win rate), reward-risk ratio, drawdown resilience, consistency (Sharpe), and sample size.
 ///   </description></item>
 /// </list>
 /// </para>
@@ -78,8 +77,12 @@ public class StrategyHealthWorker : BackgroundService
 
     private const string CK_PollSecs = "StrategyHealth:PollIntervalSeconds";
     private const string CK_RebalanceDays = "StrategyHealth:RebalanceIntervalDays";
+    private const string CK_HealthyThreshold = "StrategyHealth:HealthyThreshold";
+    private const string CK_CriticalThreshold = "StrategyHealth:CriticalThreshold";
     private const int DefaultPollSeconds = 60;
     private const int DefaultRebalanceDays = 7;
+    private const decimal DefaultHealthyThreshold = 0.6m;
+    private const decimal DefaultCriticalThreshold = 0.3m;
 
     /// <summary>
     /// In-process timestamp of the last successful ensemble rebalance. Initialised from
@@ -237,6 +240,13 @@ public class StrategyHealthWorker : BackgroundService
 
         var mediator = scope.ServiceProvider.GetRequiredService<IMediator>();
 
+        // Read configurable health band thresholds from EngineConfig
+        decimal healthyThreshold = await GetConfigAsync<decimal>(readContext, CK_HealthyThreshold, DefaultHealthyThreshold, ct);
+        decimal criticalThreshold = await GetConfigAsync<decimal>(readContext, CK_CriticalThreshold, DefaultCriticalThreshold, ct);
+        // Sanity: ensure healthy > critical, both in [0, 1]
+        healthyThreshold = Math.Clamp(healthyThreshold, 0.01m, 1.0m);
+        criticalThreshold = Math.Clamp(criticalThreshold, 0.01m, healthyThreshold);
+
         var strategies = await readContext.GetDbContext()
             .Set<Strategy>()
             .Where(x => x.Status == StrategyStatus.Active && !x.IsDeleted)
@@ -248,7 +258,7 @@ public class StrategyHealthWorker : BackgroundService
         {
             try
             {
-                await EvaluateStrategyAsync(strategy, writeContext, readContext, mediator, ct);
+                await EvaluateStrategyAsync(strategy, writeContext, readContext, mediator, ct, healthyThreshold, criticalThreshold);
                 evaluated++;
             }
             catch (Exception ex)
@@ -278,12 +288,14 @@ public class StrategyHealthWorker : BackgroundService
     /// </para>
     ///
     /// <para>
-    /// <b>Health score formula:</b>
-    /// <c>HealthScore = 0.4 × WinRate + 0.3 × min(1, ProfitFactor/2) + 0.3 × max(0, 1 − MaxDrawdown/20)</c>
+    /// <b>Health score formula (5-factor, aligned with OptimizationHealthScorer):</b>
+    /// <c>HealthScore = 0.25×WinRate + 0.20×min(1, PF/2) + 0.20×max(0, 1−DD/20) + 0.15×min(1, max(0, Sharpe)/2) + 0.20×min(1, Trades/50)</c>
     /// <list type="bullet">
-    ///   <item><description>Win rate is capped at 1.0 (100 %) so the win rate term contributes at most 0.4.</description></item>
-    ///   <item><description>Profit factor is normalised by dividing by 2; a PF of 2.0 or higher contributes the full 0.3.</description></item>
-    ///   <item><description>The drawdown term penalises any drawdown &gt; 0 %, reaching zero at 20 % drawdown.</description></item>
+    ///   <item><description>Win rate (25 %): rewards strategies that win more often than they lose.</description></item>
+    ///   <item><description>Profit factor (20 %): normalised by dividing by 2; a PF of 2.0+ contributes the full 0.20.</description></item>
+    ///   <item><description>Drawdown (20 %): penalises deep drawdowns; zero contribution at 20 % drawdown.</description></item>
+    ///   <item><description>Sharpe (15 %): rewards consistency of returns; capped at Sharpe = 2.0.</description></item>
+    ///   <item><description>Sample size (20 %): penalises too-few-trades — reaches full contribution at 50 trades.</description></item>
     /// </list>
     /// </para>
     ///
@@ -303,7 +315,9 @@ public class StrategyHealthWorker : BackgroundService
         IWriteApplicationDbContext writeContext,
         IReadApplicationDbContext readContext,
         IMediator mediator,
-        CancellationToken ct)
+        CancellationToken ct,
+        decimal healthyThreshold = 0.6m,
+        decimal criticalThreshold = 0.3m)
     {
         // Load the last 50 executed signals for this strategy.
         // Only signals with an OrderId are useful — they represent signals that
@@ -419,8 +433,8 @@ public class StrategyHealthWorker : BackgroundService
         decimal healthScore = Optimization.OptimizationHealthScorer.ComputeHealthScore(winRate, profitFactor, maxDrawdown, sharpe, totalTrades);
 
         // Classify into three bands used to drive automated responses.
-        StrategyHealthStatus healthStatus = healthScore >= 0.6m ? StrategyHealthStatus.Healthy
-            : healthScore >= 0.3m ? StrategyHealthStatus.Degrading
+        StrategyHealthStatus healthStatus = healthScore >= healthyThreshold ? StrategyHealthStatus.Healthy
+            : healthScore >= criticalThreshold ? StrategyHealthStatus.Degrading
             : StrategyHealthStatus.Critical;
 
         // Persist the snapshot for dashboard queries and StrategyFeedbackWorker
@@ -510,7 +524,7 @@ public class StrategyHealthWorker : BackgroundService
                 EntityId     = strategy.Id,
                 DecisionType = "AutoPause",
                 Outcome      = "Paused",
-                Reason       = $"HealthScore={healthScore:F2} fell below critical threshold (0.3); strategy auto-paused",
+                Reason       = $"HealthScore={healthScore:F2} fell below critical threshold ({criticalThreshold:F2}); strategy auto-paused",
                 Source       = "StrategyHealthWorker"
             }, ct);
 

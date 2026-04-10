@@ -1773,6 +1773,12 @@ public class StrategyGenerationWorkerIntegrationTest : IClassFixture<PostgresFix
             }
         }
 
+        public Task<List<IntegrationEventLogEntry>> GetStalePublishedEventsAsync(
+            TimeSpan staleThreshold,
+            int batchSize,
+            CancellationToken ct)
+            => Task.FromResult(new List<IntegrationEventLogEntry>());
+
         public Task SaveChangesAsync(CancellationToken ct) => Task.CompletedTask;
     }
 

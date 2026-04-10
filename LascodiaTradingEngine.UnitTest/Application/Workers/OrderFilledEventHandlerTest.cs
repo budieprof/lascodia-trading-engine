@@ -124,6 +124,7 @@ public class OrderFilledEventHandlerTest
             Id        = 1,
             Symbol    = "EURUSD",
             OrderType = OrderType.Buy,
+            Status    = OrderStatus.Filled,
             Quantity  = 0.10m,
             IsDeleted = false
         };
@@ -160,6 +161,7 @@ public class OrderFilledEventHandlerTest
             Id             = 1,
             Symbol         = "EURUSD",
             OrderType      = OrderType.Buy,
+            Status         = OrderStatus.Filled,
             Quantity       = 0.10m,
             FilledQuantity = 0.10m,
             StopLoss       = 1.09000m,
@@ -223,6 +225,7 @@ public class OrderFilledEventHandlerTest
             Id             = 2,
             Symbol         = "GBPUSD",
             OrderType      = OrderType.Sell,
+            Status         = OrderStatus.Filled,
             Quantity       = 0.50m,
             FilledQuantity = null, // fallback to Quantity
             StopLoss       = 1.28000m,
@@ -272,6 +275,7 @@ public class OrderFilledEventHandlerTest
             Id        = 3,
             Symbol    = "USDJPY",
             OrderType = OrderType.Buy,
+            Status    = OrderStatus.Filled,
             Quantity  = 1.00m,
             IsDeleted = false
         };
@@ -341,6 +345,7 @@ public class OrderFilledEventHandlerTest
             Id             = 7,
             Symbol         = "AUDUSD",
             OrderType      = OrderType.Buy,
+            Status         = OrderStatus.Filled,
             Quantity       = 0.25m,
             FilledQuantity = null,
             IsDeleted      = false

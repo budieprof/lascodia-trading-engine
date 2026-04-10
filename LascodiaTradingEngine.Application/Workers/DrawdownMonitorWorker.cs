@@ -36,10 +36,12 @@ public class DrawdownMonitorWorker : BackgroundService, IIntegrationEventHandler
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly TradingMetrics _metrics;
 
-    private const string CK_PollSecs          = "Drawdown:PollIntervalSeconds";
-    private const string CK_EmergencyLossPct  = "Drawdown:EmergencyLossPct";
-    private const int DefaultPollSeconds      = 60;
-    private const decimal DefaultEmergencyPct = 2.0m; // 2% of equity triggers emergency snapshot
+    private const string CK_PollSecs            = "Drawdown:PollIntervalSeconds";
+    private const string CK_EmergencyLossPct    = "Drawdown:EmergencyLossPct";
+    private const string CK_CriticalMarginPct   = "Drawdown:CriticalMarginPct";
+    private const string CK_CautionMarginPct    = "Drawdown:CautionMarginPct";
+    private const int DefaultPollSeconds        = 60;
+    private const decimal DefaultEmergencyPct   = 2.0m; // 2% of equity triggers emergency snapshot
 
     /// <summary>Max backoff delay on consecutive failures (5 minutes).</summary>
     private static readonly TimeSpan MaxBackoff = TimeSpan.FromMinutes(5);
@@ -232,19 +234,42 @@ public class DrawdownMonitorWorker : BackgroundService, IIntegrationEventHandler
         {
             decimal marginLevel = account.Equity / account.MarginUsed * 100m;
 
-            if (marginLevel < 150m)
+            // Read configurable margin thresholds from EngineConfig (hot-reloadable).
+            decimal criticalMarginPct = await GetConfigAsync(readContext, CK_CriticalMarginPct, 150.0m, ct);
+            decimal cautionMarginPct  = await GetConfigAsync(readContext, CK_CautionMarginPct, 200.0m, ct);
+
+            if (marginLevel < criticalMarginPct)
                 _logger.LogError(
-                    "DrawdownMonitorWorker: CRITICAL — margin level {Level:F0}% is below 150% (equity={Equity:F2}, margin={Margin:F2}). " +
+                    "DrawdownMonitorWorker: CRITICAL — margin level {Level:F0}% is below {Critical:F0}% (equity={Equity:F2}, margin={Margin:F2}). " +
                     "Broker margin call imminent.",
-                    marginLevel, account.Equity, account.MarginUsed);
-            else if (marginLevel < 200m)
+                    marginLevel, criticalMarginPct, account.Equity, account.MarginUsed);
+            else if (marginLevel < cautionMarginPct)
                 _logger.LogWarning(
-                    "DrawdownMonitorWorker: margin level {Level:F0}% is below 200% safety threshold (equity={Equity:F2}, margin={Margin:F2})",
-                    marginLevel, account.Equity, account.MarginUsed);
+                    "DrawdownMonitorWorker: margin level {Level:F0}% is below {Caution:F0}% safety threshold (equity={Equity:F2}, margin={Margin:F2})",
+                    marginLevel, cautionMarginPct, account.Equity, account.MarginUsed);
         }
 
         _logger.LogInformation(
             "DrawdownMonitorWorker: snapshot recorded — Equity={Equity:F2}, Peak={Peak:F2}, Drawdown={DD:F2}%",
             currentEquity, peakEquity, drawdownPct);
+    }
+
+    /// <summary>
+    /// Reads a typed value from <see cref="EngineConfig"/> by key, falling back to
+    /// <paramref name="defaultValue"/> if the key is missing or the stored value
+    /// cannot be converted.
+    /// </summary>
+    private static async Task<T> GetConfigAsync<T>(
+        IReadApplicationDbContext readContext, string key, T defaultValue, CancellationToken ct)
+    {
+        var entry = await readContext.GetDbContext()
+            .Set<EngineConfig>()
+            .AsNoTracking()
+            .FirstOrDefaultAsync(c => c.Key == key, ct);
+
+        if (entry?.Value is null) return defaultValue;
+
+        try   { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
+        catch { return defaultValue; }
     }
 }

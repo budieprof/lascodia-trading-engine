@@ -88,7 +88,7 @@ public class SignalAllocationEngine : ISignalAllocationEngine
     private List<SignalAllocation> AllocateEqualRisk(TradeSignal signal, List<TradingAccount> accounts)
     {
         // Each account risks the same percentage of its equity
-        var riskPct = 0.01m; // 1% risk per trade default
+        var riskPct = _options.EqualRiskPercentage;
         if (signal.StopLoss is null || signal.StopLoss == signal.EntryPrice)
             return AllocateProRata(signal, accounts); // Fallback when SL is missing
 

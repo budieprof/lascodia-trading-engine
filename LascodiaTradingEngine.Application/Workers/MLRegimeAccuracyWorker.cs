@@ -96,6 +96,11 @@ public sealed class MLRegimeAccuracyWorker : BackgroundService
                 var ctx     = readDb.GetDbContext();
                 var wCtx    = writeDb.GetDbContext();
 
+                // Set explicit command timeout to prevent long-running queries from
+                // holding connections indefinitely during heavy prediction log scans.
+                ctx.Database.SetCommandTimeout(TimeSpan.FromSeconds(30));
+                wCtx.Database.SetCommandTimeout(TimeSpan.FromSeconds(30));
+
                 // Read interval live so operators can adjust frequency without restart.
                 pollSecs = await GetConfigAsync<int>(ctx, CK_PollSecs, 3600, stoppingToken);
 

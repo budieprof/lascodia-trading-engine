@@ -505,6 +505,13 @@ internal sealed class StrategyGenerationReserveScreeningPlanner : IStrategyGener
             MonteCarloShufflePermutations = config.MonteCarloShufflePermutations,
             MonteCarloShuffleMinPValue = config.MonteCarloShuffleMinPValue,
             ActiveStrategyCount = config.ActiveStrategyCount,
+            OosPfRelaxation = config.OosPfRelaxation,
+            OosDdRelaxation = config.OosDdRelaxation,
+            OosSharpeRelaxation = config.OosSharpeRelaxation,
+            RegimeDegradationRelaxation = config.RegimeDegradationRelaxation,
+            KellyFactor = config.KellyFactor,
+            KellyMinLot = config.KellyMinLot,
+            KellyMaxLot = config.KellyMaxLot,
         };
     }
 

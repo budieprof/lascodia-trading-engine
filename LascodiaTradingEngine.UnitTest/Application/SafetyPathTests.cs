@@ -23,6 +23,7 @@ public class SafetyPathTests
         var mockScopeFactory = new Mock<IServiceScopeFactory>();
         return new WorkerHealthMonitor(
             mockScopeFactory.Object,
+            Mock.Of<IAlertDispatcher>(),
             Mock.Of<ILogger<WorkerHealthMonitor>>());
     }
 

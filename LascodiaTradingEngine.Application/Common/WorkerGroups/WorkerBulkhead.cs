@@ -32,12 +32,16 @@ public static class WorkerBulkhead
         initialCount: Math.Max(Environment.ProcessorCount, 4),
         maxCount: Math.Max(Environment.ProcessorCount, 4));
 
-    // ── ML Monitoring: lighter than training but 58 workers compete ─────
-    // Most monitoring workers do DB reads + light math. Limit concurrency
-    // to prevent connection pool exhaustion from 58 simultaneous queries.
+    // ── ML Monitoring: lighter than training but 82+ workers compete ────
+    // Most monitoring workers do DB reads + light math. The previous limit
+    // of ProcessorCount * 2 (min 8) was under-provisioned — on a 4-core
+    // machine only 8 of 82 workers could run concurrently, causing
+    // starvation and cascading delays in drift/calibration detection.
+    // Raised to ProcessorCount * 4 (min 32) to match the actual worker count
+    // while still preventing connection pool exhaustion.
     public static readonly SemaphoreSlim MLMonitoring = new(
-        initialCount: Math.Max(Environment.ProcessorCount * 2, 8),
-        maxCount: Math.Max(Environment.ProcessorCount * 2, 8));
+        initialCount: Math.Max(32, Environment.ProcessorCount * 4),
+        maxCount: Math.Max(32, Environment.ProcessorCount * 4));
 
     // ── Backtesting: isolated from trading, can use remaining capacity ──
     public static readonly SemaphoreSlim Backtesting = new(

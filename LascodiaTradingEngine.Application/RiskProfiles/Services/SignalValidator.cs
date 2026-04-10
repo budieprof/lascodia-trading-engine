@@ -101,7 +101,16 @@ public class SignalValidator : ISignalValidator
             }
         }
 
-        // ── 8. ML agreement check ───────────────────────────────────────────
+        // ── 8. Confidence range validation ──────────────────────────────────
+        if (signal.Confidence < 0 || signal.Confidence > 1)
+            return Fail("Signal confidence out of range [0, 1].");
+
+        // ── 9. SL equals TP check ──────────────────────────────────────────
+        if (signal.StopLoss.HasValue && signal.TakeProfit.HasValue &&
+            Math.Abs(signal.StopLoss.Value - signal.TakeProfit.Value) < 1e-10m)
+            return Fail("StopLoss equals TakeProfit — zero profit target.");
+
+        // ── 10. ML agreement check ──────────────────────────────────────────
         if (signal.MLPredictedDirection.HasValue &&
             signal.MLConfidenceScore.HasValue &&
             signal.MLPredictedDirection != signal.Direction)

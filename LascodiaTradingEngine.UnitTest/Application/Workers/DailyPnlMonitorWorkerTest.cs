@@ -34,6 +34,19 @@ public class DailyPnlMonitorWorkerTest
         var mockReadContext = new Mock<IReadApplicationDbContext>();
         mockReadContext.Setup(c => c.GetDbContext()).Returns(mockDbContext.Object);
 
+        // Write context for EngineConfig persistence (flatten dedup)
+        var mockWriteDbContext = new Mock<DbContext>();
+        var mockEngineConfigSet = new List<EngineConfig>().AsQueryable().BuildMockDbSet();
+        mockWriteDbContext.Setup(c => c.Set<EngineConfig>()).Returns(mockEngineConfigSet.Object);
+        mockWriteDbContext.Setup(c => c.SaveChangesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(0);
+        var mockWriteContext = new Mock<IWriteApplicationDbContext>();
+        mockWriteContext.Setup(c => c.GetDbContext()).Returns(mockWriteDbContext.Object);
+        mockWriteContext.Setup(c => c.SaveChangesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(0);
+
+        // Also add EngineConfig set to read context for the flatten dedup check
+        var mockReadEngineConfigSet = new List<EngineConfig>().AsQueryable().BuildMockDbSet();
+        mockDbContext.Setup(c => c.Set<EngineConfig>()).Returns(mockReadEngineConfigSet.Object);
+
         var mockMediator = new Mock<IMediator>();
         mockMediator
             .Setup(m => m.Send(It.IsAny<EmergencyFlattenCommand>(), It.IsAny<CancellationToken>()))
@@ -41,6 +54,7 @@ public class DailyPnlMonitorWorkerTest
 
         var mockServiceProvider = new Mock<IServiceProvider>();
         mockServiceProvider.Setup(p => p.GetService(typeof(IReadApplicationDbContext))).Returns(mockReadContext.Object);
+        mockServiceProvider.Setup(p => p.GetService(typeof(IWriteApplicationDbContext))).Returns(mockWriteContext.Object);
         mockServiceProvider.Setup(p => p.GetService(typeof(IMediator))).Returns(mockMediator.Object);
 
         var mockScope = new Mock<IServiceScope>();

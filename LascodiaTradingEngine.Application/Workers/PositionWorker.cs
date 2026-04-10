@@ -375,17 +375,34 @@ public class PositionWorker : BackgroundService
             ClosedAt            = DateTime.UtcNow
         };
 
-        try
+        // Retry the event publish up to 3 times before falling back to dead letter.
+        // Position is already closed in the DB — we must not lose this event.
+        Exception? lastPublishEx = null;
+        for (int attempt = 0; attempt < 3; attempt++)
         {
-            await eventService.SaveAndPublish(writeContext, positionClosedEvent);
+            try
+            {
+                await eventService.SaveAndPublish(writeContext, positionClosedEvent);
+                lastPublishEx = null;
+                break;
+            }
+            catch (Exception pubEx)
+            {
+                lastPublishEx = pubEx;
+                _logger.LogWarning(pubEx,
+                    "PositionWorker: publish attempt {Attempt}/3 failed for PositionClosedIntegrationEvent position {Id} ({Symbol})",
+                    attempt + 1, position.Id, position.Symbol);
+                if (attempt < 2)
+                    await Task.Delay(TimeSpan.FromMilliseconds(100 * (attempt + 1)));
+            }
         }
-        catch (Exception pubEx)
+
+        if (lastPublishEx is not null)
         {
-            // Position is already closed in the DB — we must not lose this event.
-            // Write to dead letter so IntegrationEventRetryWorker can pick it up.
-            _logger.LogError(pubEx,
-                "PositionWorker: FAILED to publish PositionClosedIntegrationEvent for position {Id} ({Symbol}). " +
-                "Position is closed but event was not published — writing to dead letter.",
+            // All retry attempts exhausted — write to dead letter for IntegrationEventRetryWorker
+            _logger.LogError(lastPublishEx,
+                "PositionWorker: FAILED to publish PositionClosedIntegrationEvent after 3 attempts for position {Id} ({Symbol}). " +
+                "Writing to dead letter.",
                 position.Id, position.Symbol);
 
             try
@@ -396,9 +413,9 @@ public class PositionWorker : BackgroundService
                     handlerName: "PositionWorker",
                     eventType: nameof(PositionClosedIntegrationEvent),
                     eventPayloadJson: System.Text.Json.JsonSerializer.Serialize(positionClosedEvent),
-                    errorMessage: pubEx.Message,
-                    stackTrace: pubEx.StackTrace,
-                    attempts: 1);
+                    errorMessage: lastPublishEx.Message,
+                    stackTrace: lastPublishEx.StackTrace,
+                    attempts: 3);
             }
             catch (Exception dlEx)
             {

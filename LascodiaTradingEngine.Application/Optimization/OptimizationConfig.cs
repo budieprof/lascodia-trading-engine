@@ -91,6 +91,24 @@ internal sealed record OptimizationConfig
     public required int MaxConsecutiveFailuresBeforeEscalation { get; init; }
     public required int CheckpointEveryN { get; init; }
     public required int MaxConcurrentRuns { get; init; }
+
+    // Multi-objective approval thresholds
+    public double MultiObjectiveMinSharpe { get; init; } = 1.0;
+    public double MultiObjectiveMaxDrawdownPct { get; init; } = 10.0;
+    public double MultiObjectiveMinWinRate { get; init; } = 0.45;
+    public double MultiObjectiveMinProfitFactor { get; init; } = 1.2;
+
+    // Follow-up stuck detection
+    public double FollowUpStuckThresholdHours { get; init; } = 6.0;
+
+    // Gradual rollout tier percentages
+    public int RolloutTier1Pct { get; init; } = 25;
+    public int RolloutTier2Pct { get; init; } = 50;
+    public int RolloutTier3Pct { get; init; } = 75;
+
+    // Walk-forward minimum candles per window overrides
+    public int? WalkForwardMinCandlesM15 { get; init; }
+    public int? WalkForwardMinCandlesH1 { get; init; }
 }
 
 /// <summary>
@@ -152,6 +170,12 @@ internal sealed record ValidationConfig
     public required int MinCandidateTrades { get; init; }
     public required double MinEquityCurveR2 { get; init; }
     public required double MaxTradeTimeConcentration { get; init; }
+    public double MultiObjectiveMinSharpe { get; init; } = 1.0;
+    public double MultiObjectiveMaxDrawdownPct { get; init; } = 10.0;
+    public double MultiObjectiveMinWinRate { get; init; } = 0.45;
+    public double MultiObjectiveMinProfitFactor { get; init; } = 1.2;
+    public int? WalkForwardMinCandlesM15 { get; init; }
+    public int? WalkForwardMinCandlesH1 { get; init; }
 }
 
 /// <summary>Configuration for auto-approval decisions.</summary>
@@ -255,6 +279,12 @@ internal static class OptimizationConfigMappingExtensions
         MinCandidateTrades = config.MinCandidateTrades,
         MinEquityCurveR2 = config.MinEquityCurveR2,
         MaxTradeTimeConcentration = config.MaxTradeTimeConcentration,
+        MultiObjectiveMinSharpe = config.MultiObjectiveMinSharpe,
+        MultiObjectiveMaxDrawdownPct = config.MultiObjectiveMaxDrawdownPct,
+        MultiObjectiveMinWinRate = config.MultiObjectiveMinWinRate,
+        MultiObjectiveMinProfitFactor = config.MultiObjectiveMinProfitFactor,
+        WalkForwardMinCandlesM15 = config.WalkForwardMinCandlesM15,
+        WalkForwardMinCandlesH1 = config.WalkForwardMinCandlesH1,
     };
 
     public static ApprovalConfig ToApprovalConfig(this OptimizationConfig config) => new()

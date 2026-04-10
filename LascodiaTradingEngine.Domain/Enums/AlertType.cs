@@ -33,5 +33,11 @@ public enum AlertType
     LatencySla = 8,
 
     /// <summary>An optimization lifecycle or recovery issue requires operator visibility.</summary>
-    OptimizationLifecycleIssue = 9
+    OptimizationLifecycleIssue = 9,
+
+    /// <summary>A background worker has crashed (no heartbeat beyond its configured threshold).</summary>
+    WorkerCrash = 10,
+
+    /// <summary>All EA instances disconnected — market data unavailable.</summary>
+    EADisconnected = 11
 }

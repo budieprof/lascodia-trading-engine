@@ -62,10 +62,11 @@ internal sealed class OptimizationValidator
     internal async Task<(decimal AvgScore, bool IsStable)> WalkForwardValidateAsync(
         Strategy strategy, string paramsJson, List<Candle> oosCandles,
         BacktestOptions options, int timeoutSecs, CancellationToken ct,
-        double minMaxRatio = 0.50, string? baselineParamsJson = null)
+        double minMaxRatio = 0.50, string? baselineParamsJson = null,
+        int? minCandlesM15Override = null, int? minCandlesH1Override = null)
     {
         // Timeframe-aware minimum: M1 needs more candles per window to be meaningful
-        int minCandlesPerWindow = GetMinCandlesPerWindow(strategy.Timeframe);
+        int minCandlesPerWindow = GetMinCandlesPerWindow(strategy.Timeframe, minCandlesM15Override, minCandlesH1Override);
         int windowCount = Math.Clamp(oosCandles.Count / minCandlesPerWindow, 2, 8);
         int chunkSize = oosCandles.Count / windowCount;
         if (chunkSize < minCandlesPerWindow) return (0m, true);
@@ -349,16 +350,17 @@ internal sealed class OptimizationValidator
     /// <summary>
     /// Returns the minimum candles required per walk-forward window, scaled by timeframe.
     /// M1 needs far more candles than D1 to represent a meaningful evaluation period.
+    /// Configurable overrides allow callers to tune M15 and H1 defaults (40/20) via EngineConfig.
     /// </summary>
-    private static int GetMinCandlesPerWindow(Timeframe tf) => tf switch
+    internal static int GetMinCandlesPerWindow(Timeframe tf, int? m15Override = null, int? h1Override = null) => tf switch
     {
         Timeframe.M1  => 200,  // 200 minutes ≈ 3.3 hours
         Timeframe.M5  => 100,  // 500 minutes ≈ 8.3 hours
-        Timeframe.M15 => 40,   // 600 minutes ≈ 10 hours
-        Timeframe.H1  => 20,   // 20 hours
+        Timeframe.M15 => m15Override ?? 40,   // 600 minutes ≈ 10 hours
+        Timeframe.H1  => h1Override ?? 20,    // 20 hours
         Timeframe.H4  => 10,   // 40 hours ≈ 1.7 days
         Timeframe.D1  => 5,    // 5 trading days
-        _             => 20,
+        _             => h1Override ?? 20,
     };
 
     /// <summary>Maps a timeframe to an appropriate temporal overlap window in hours.</summary>

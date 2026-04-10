@@ -468,9 +468,16 @@ public sealed class MLDriftMonitorWorker : BackgroundService
         writeCtx.Set<MLTrainingRun>().Add(run);
         await writeCtx.SaveChangesAsync(ct);
 
+        // ── Inter-worker coordination: signal urgent suppression check ────
+        // Set an EngineConfig flag so MLSignalSuppressionWorker can prioritize
+        // this symbol/timeframe on its next iteration instead of waiting for
+        // the full poll cycle (reduces propagation delay from minutes to seconds).
+        var urgentKey = $"MLDrift:UrgentSymbol:{model.Symbol}:{model.Timeframe}";
+        await UpsertConfigAsync(writeCtx, urgentKey, DateTime.UtcNow.ToString("O"), ct);
+
         _logger.LogWarning(
             "Drift detected for model {Id} ({Symbol}/{Tf}): [{Reason}] (trigger={Trigger}) over {N} predictions. " +
-            "Queued retraining run {RunId}.",
+            "Queued retraining run {RunId}. Set urgent flag for suppression worker.",
             model.Id, model.Symbol, model.Timeframe, driftReason, driftTrigger, logs.Count, run.Id);
     }
 

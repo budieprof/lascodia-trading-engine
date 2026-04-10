@@ -1,4 +1,5 @@
 using LascodiaTradingEngine.Domain.Enums;
+using Microsoft.Extensions.Logging;
 
 namespace LascodiaTradingEngine.Application.MLModels.Shared;
 
@@ -8,6 +9,13 @@ namespace LascodiaTradingEngine.Application.MLModels.Shared;
 /// </summary>
 public static class QualityGateEvaluator
 {
+    /// <summary>
+    /// Optional logger for quality gate diagnostics. Set by the DI-aware caller
+    /// (e.g. MLTrainingWorker) before invoking <see cref="Evaluate"/>.
+    /// Thread-safe: callers on different threads may race to set this, but all
+    /// valid ILogger instances produce equivalent behaviour.
+    /// </summary>
+    public static ILogger? DiagnosticLogger { get; set; }
     public record QualityGateInput(
         // Model metrics
         double Accuracy,
@@ -83,6 +91,17 @@ public static class QualityGateEvaluator
         }
 
         bool portfolioOk = input.PortfolioCorrelationOk;
+
+        // Warn when portfolio correlation check is using the default (true) value,
+        // which means the caller likely did not explicitly compute cross-model correlation.
+        // This ensures operators are aware that the gate is effectively bypassed.
+        if (portfolioOk)
+        {
+            DiagnosticLogger?.LogWarning(
+                "QualityGate: PortfolioCorrelationOk is true (default) — " +
+                "caller may not have explicitly computed cross-model feature correlation. " +
+                "Consider passing an explicit value to enforce portfolio diversification.");
+        }
 
         bool passed =
             input.Accuracy >= input.MinAccuracy &&

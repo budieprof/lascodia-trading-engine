@@ -13,4 +13,7 @@ public class SignalAllocationOptions : ConfigurationOption<SignalAllocationOptio
 
     /// <summary>Minimum account equity to be eligible for allocation.</summary>
     public decimal MinAccountEquity { get; set; } = 100m;
+
+    /// <summary>Risk percentage per trade for the EqualRisk allocation method (default 1%).</summary>
+    public decimal EqualRiskPercentage { get; set; } = 0.01m;
 }

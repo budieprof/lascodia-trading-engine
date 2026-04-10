@@ -94,9 +94,18 @@ public partial class StrategyWorker
                 continue;
             }
 
-            var tf = timeframeMap.TryGetValue(bt.StrategyId, out var resolvedTf)
-                ? resolvedTf
-                : Timeframe.H1;
+            Timeframe tf;
+            if (timeframeMap.TryGetValue(bt.StrategyId, out var resolvedTf))
+            {
+                tf = resolvedTf;
+            }
+            else
+            {
+                tf = Timeframe.H1;
+                _logger.LogWarning(
+                    "Strategy {StrategyId}: timeframe not found in lookup — falling back to H1 for trade threshold calculation",
+                    bt.StrategyId);
+            }
             int minTotalTrades = tf switch
             {
                 Timeframe.M1 or Timeframe.M5 or Timeframe.M15 => minTradesM5M15,

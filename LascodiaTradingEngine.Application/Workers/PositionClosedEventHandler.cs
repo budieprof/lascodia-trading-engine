@@ -7,6 +7,7 @@ using LascodiaTradingEngine.Application.AuditTrail.Commands.LogDecision;
 using LascodiaTradingEngine.Application.Common.Events;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
+using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.Workers;
 
@@ -126,6 +127,33 @@ public sealed class PositionClosedEventHandler : IIntegrationEventHandler<Positi
         using var scope = _scopeFactory.CreateScope();
         var mediator    = scope.ServiceProvider.GetRequiredService<IMediator>();
         var readContext = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+
+        // State-aware validation: verify the position exists and is actually closed before
+        // writing the audit log. If the event arrived out of order (e.g., a PositionClosed
+        // event arrives before the position was even created due to event bus reordering),
+        // or the position is still open (stale/duplicate event), skip processing.
+        var position = await readContext.GetDbContext()
+            .Set<Position>()
+            .AsNoTracking()
+            .FirstOrDefaultAsync(p => p.Id == @event.PositionId && !p.IsDeleted);
+
+        if (position is null)
+        {
+            _logger.LogWarning(
+                "PositionClosedEventHandler: position {PositionId} not found — " +
+                "event may be out of order or position was deleted, skipping",
+                @event.PositionId);
+            return;
+        }
+
+        if (position.Status != PositionStatus.Closed)
+        {
+            _logger.LogWarning(
+                "PositionClosedEventHandler: position {PositionId} is in status {Status}, expected Closed — " +
+                "event may be out of order, skipping",
+                @event.PositionId, position.Status);
+            return;
+        }
 
         // Idempotency: skip if this close event was already logged.
         // The triple-key check (EntityType + EntityId + DecisionType) is the canonical

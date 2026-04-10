@@ -82,11 +82,13 @@ public class StrategyHealthWorkerTest : IDisposable
         var signalDbSet       = signals.AsQueryable().BuildMockDbSet();
         var orderDbSet        = orders.AsQueryable().BuildMockDbSet();
         var currencyPairDbSet = currencyPairs.AsQueryable().BuildMockDbSet();
+        var engineConfigDbSet = new List<EngineConfig>().AsQueryable().BuildMockDbSet();
 
         readDbContext.Setup(c => c.Set<Strategy>()).Returns(strategyDbSet.Object);
         readDbContext.Setup(c => c.Set<TradeSignal>()).Returns(signalDbSet.Object);
         readDbContext.Setup(c => c.Set<Order>()).Returns(orderDbSet.Object);
         readDbContext.Setup(c => c.Set<CurrencyPair>()).Returns(currencyPairDbSet.Object);
+        readDbContext.Setup(c => c.Set<EngineConfig>()).Returns(engineConfigDbSet.Object);
 
         _mockReadContext.Setup(c => c.GetDbContext()).Returns(readDbContext.Object);
     }
@@ -471,6 +473,8 @@ public class StrategyHealthWorkerTest : IDisposable
             orders.AsQueryable().BuildMockDbSet().Object);
         readDbContext.Setup(c => c.Set<CurrencyPair>()).Returns(
             currencyPairs.AsQueryable().BuildMockDbSet().Object);
+        readDbContext.Setup(c => c.Set<EngineConfig>()).Returns(
+            new List<EngineConfig>().AsQueryable().BuildMockDbSet().Object);
         _mockReadContext.Setup(c => c.GetDbContext()).Returns(readDbContext.Object);
 
         // Write context: first call to AddAsync for StrategyPerformanceSnapshot throws,

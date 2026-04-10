@@ -284,9 +284,13 @@ internal sealed class OptimizationGridBuilder
         {
             var expanded = new List<double>(values);
             var sorted   = values.ToList();
+            double lowerBound = sorted[0];
+            double upperBound = sorted[^1];
             for (int idx = 0; idx < sorted.Count - 1; idx++)
             {
                 double mid = (sorted[idx] + sorted[idx + 1]) / 2.0;
+                // Clip to bounds in case of floating-point drift
+                mid = Math.Clamp(mid, lowerBound, upperBound);
                 if (!values.Contains(mid))
                     expanded.Add(mid);
             }
@@ -355,6 +359,14 @@ internal sealed class OptimizationGridBuilder
         if (!batch.TryGetValue(key, out var raw) || raw is null) return defaultValue;
         try   { return (T)Convert.ChangeType(raw, typeof(T)); }
         catch { return defaultValue; }
+    }
+
+    internal static T? GetConfigValueNullable<T>(Dictionary<string, string> batch, string key)
+        where T : struct
+    {
+        if (!batch.TryGetValue(key, out var raw) || raw is null) return null;
+        try   { return (T)Convert.ChangeType(raw, typeof(T)); }
+        catch { return null; }
     }
 
     internal static async Task<T> GetConfigAsync<T>(

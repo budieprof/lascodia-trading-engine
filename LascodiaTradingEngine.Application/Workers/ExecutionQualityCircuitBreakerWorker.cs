@@ -281,8 +281,9 @@ public sealed class ExecutionQualityCircuitBreakerWorker : BackgroundService
         // auto-resume it. This prevents flapping where metrics oscillate around the
         // threshold boundary. E.g., with maxSlippage=3.0 and margin=0.20, the strategy
         // trips at >3.0 but only recovers when avgSlippage drops below 2.4 (3.0 * 0.80).
-        double slippageRecovery = maxSlippage * (1.0 - hysteresisMargin);
-        double latencyRecovery  = maxLatencyMs * (1.0 - hysteresisMargin);
+        // Both slippage and latency use the same hysteresis margin for symmetric recovery.
+        double slippageRecoveryThreshold = maxSlippage * (1.0 - hysteresisMargin);
+        double latencyRecoveryThreshold  = maxLatencyMs * (1.0 - hysteresisMargin);
 
         if (!slippageBreached && !latencyBreached)
         {
@@ -290,7 +291,7 @@ public sealed class ExecutionQualityCircuitBreakerWorker : BackgroundService
             // below the hysteresis recovery threshold — auto-resume it. Only resume if the
             // pause reason was "ExecutionQuality" to avoid overriding pauses from other
             // sources (DrawdownRecovery, StrategyHealth, manual operator pause).
-            bool fullyRecovered = avgSlippage <= slippageRecovery && avgLatency <= latencyRecovery;
+            bool fullyRecovered = avgSlippage <= slippageRecoveryThreshold && avgLatency <= latencyRecoveryThreshold;
             if (fullyRecovered && autoPause)
             {
                 int resumed = await writeCtx.Set<Strategy>()
@@ -306,7 +307,7 @@ public sealed class ExecutionQualityCircuitBreakerWorker : BackgroundService
                     _logger.LogInformation(
                         "ExecQualityCircuitBreaker: strategy {Id} AUTO-RESUMED — metrics recovered below hysteresis threshold " +
                         "(avgSlippage={Slip:F2} <= {SlipRecovery:F2}, avgLatency={Lat:F0} <= {LatRecovery:F0})",
-                        strategyId, avgSlippage, slippageRecovery, avgLatency, latencyRecovery);
+                        strategyId, avgSlippage, slippageRecoveryThreshold, avgLatency, latencyRecoveryThreshold);
 
                     await mediator.Send(new LogDecisionCommand
                     {
@@ -314,8 +315,8 @@ public sealed class ExecutionQualityCircuitBreakerWorker : BackgroundService
                         EntityId     = strategyId,
                         DecisionType = "ExecQualityRecovery",
                         Outcome      = "Resumed",
-                        Reason       = $"Metrics recovered: avgSlippage={avgSlippage:F2} pips <= {slippageRecovery:F2}, " +
-                                       $"avgLatency={avgLatency:F0} ms <= {latencyRecovery:F0} " +
+                        Reason       = $"Metrics recovered: avgSlippage={avgSlippage:F2} pips <= {slippageRecoveryThreshold:F2}, " +
+                                       $"avgLatency={avgLatency:F0} ms <= {latencyRecoveryThreshold:F0} " +
                                        $"(hysteresis margin={hysteresisMargin:P0})",
                         Source       = "ExecutionQualityCircuitBreakerWorker"
                     }, ct);

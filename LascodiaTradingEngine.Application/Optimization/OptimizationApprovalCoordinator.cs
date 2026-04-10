@@ -156,10 +156,11 @@ internal sealed class OptimizationApprovalCoordinator
                 return;
             }
 
-            GradualRolloutManager.StartRollout(liveStrategy, run.BestParametersJson, run.Id, nowUtc, initialPct: 25);
+            int rolloutInitialPct = ctx.Config.RolloutTier1Pct;
+            GradualRolloutManager.StartRollout(liveStrategy, run.BestParametersJson, run.Id, nowUtc, initialPct: rolloutInitialPct);
             _logger.LogInformation(
-                "OptimizationApprovalCoordinator: initiated gradual rollout for strategy {StrategyId} at 25% traffic",
-                liveStrategy.Id);
+                "OptimizationApprovalCoordinator: initiated gradual rollout for strategy {StrategyId} at {Pct}% traffic",
+                liveStrategy.Id, rolloutInitialPct);
 
             if (oosResult.TotalTrades > 0 && oosResult.Trades is not null && oosResult.Trades.Count >= 2)
             {
@@ -199,9 +200,10 @@ internal sealed class OptimizationApprovalCoordinator
 
             if (run.Status == OptimizationRunStatus.Running)
                 OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Completed, nowUtc);
-            else if (run.Status != OptimizationRunStatus.Completed)
+            else if (run.Status != OptimizationRunStatus.Completed && run.Status != OptimizationRunStatus.Approved)
                 throw new InvalidOperationException(
-                    $"Cannot approve optimization run {run.Id} from status {run.Status}; expected Completed.");
+                    $"Cannot approve optimization run {run.Id} from status {run.Status}; expected Running, Completed, or Approved.");
+            // If already Completed or Approved, proceed idempotently
 
             OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Approved, nowUtc);
             run.ApprovalEvaluatedAt = nowUtc;
@@ -223,6 +225,11 @@ internal sealed class OptimizationApprovalCoordinator
             catch (DbUpdateException ex) when (OptimizationFollowUpCoordinator.IsDuplicateFollowUpConstraintViolation(ex))
             {
                 OptimizationFollowUpCoordinator.DetachPendingValidationFollowUps(writeDb, run.Id);
+
+                // Reload the run entity to get the latest persisted state before retrying,
+                // since another thread may have modified it concurrently.
+                await writeDb.Entry(run).ReloadAsync(CancellationToken.None);
+
                 run.ValidationFollowUpsCreatedAt ??= nowUtc;
                 run.ValidationFollowUpStatus ??= ValidationFollowUpStatus.Pending;
                 _metrics.OptimizationDuplicateFollowUpsPrevented.Add(1);

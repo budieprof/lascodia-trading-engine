@@ -274,7 +274,8 @@ internal sealed class OptimizationValidationCoordinator
             gateSw.Restart();
             var (wfAvgScore, wfStable) = await _validator.WalkForwardValidateAsync(
                 strategy, candidate.ParamsJson, testCandles, screeningOptions, config.ScreeningTimeoutSeconds, gateCt,
-                config.WalkForwardMinMaxRatio, baselineParamsJson);
+                config.WalkForwardMinMaxRatio, baselineParamsJson,
+                config.WalkForwardMinCandlesM15, config.WalkForwardMinCandlesH1);
             gateSw.Stop();
             _metrics.OptimizationGateDurationMs.Record(gateSw.Elapsed.TotalMilliseconds, new KeyValuePair<string, object?>("gate", "walk_forward"));
             gateTimings.Add(("WalkForward", gateSw.Elapsed.TotalMilliseconds));
@@ -487,7 +488,11 @@ internal sealed class OptimizationValidationCoordinator
                 acPF,
                 acDD,
                 genesisRegressionOk,
-                hasSufficientOosData));
+                hasSufficientOosData,
+                MultiObjectiveMinSharpe: config.MultiObjectiveMinSharpe,
+                MultiObjectiveMaxDrawdownPct: config.MultiObjectiveMaxDrawdownPct,
+                MultiObjectiveMinWinRate: config.MultiObjectiveMinWinRate,
+                MultiObjectiveMinProfitFactor: config.MultiObjectiveMinProfitFactor));
 
             lastResult = CandidateValidationResult.Create(
                 approval.Passed, candidate, oosHealthScore, oosResult, hasSufficientOosData,

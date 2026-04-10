@@ -47,12 +47,12 @@ public class DailyPnlMonitorWorker : BackgroundService
     private int _consecutiveFailures;
 
     /// <summary>
-    /// Tracks accounts that have already been flattened today to avoid repeated
-    /// EmergencyFlatten dispatches for the same breach within a single trading day.
-    /// Reset at midnight UTC.
+    /// EngineConfig key prefix for persisting flattened account dedup state.
+    /// Format: "DailyPnlFlatten:{AccountId}" with value = date string (yyyy-MM-dd).
+    /// This replaces the previous in-memory HashSet which was lost on restart,
+    /// allowing the dedup state to survive process restarts within the same trading day.
     /// </summary>
-    private readonly HashSet<long> _flattenedAccountsToday = new();
-    private DateTime _lastResetDate = DateTime.UtcNow.Date;
+    private const string FlattenConfigKeyPrefix = "DailyPnlFlatten";
 
     public DailyPnlMonitorWorker(
         IServiceScopeFactory scopeFactory,
@@ -73,14 +73,6 @@ public class DailyPnlMonitorWorker : BackgroundService
         {
             try
             {
-                // Reset flattened accounts set at midnight UTC
-                var todayUtc = DateTime.UtcNow.Date;
-                if (todayUtc > _lastResetDate)
-                {
-                    _flattenedAccountsToday.Clear();
-                    _lastResetDate = todayUtc;
-                }
-
                 await CheckDailyPnlAsync(stoppingToken);
                 _consecutiveFailures = 0;
             }
@@ -118,8 +110,10 @@ public class DailyPnlMonitorWorker : BackgroundService
     {
         using var scope     = _scopeFactory.CreateScope();
         var readContext     = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+        var writeContext    = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
         var mediator        = scope.ServiceProvider.GetRequiredService<IMediator>();
         var ctx             = readContext.GetDbContext();
+        var writeCtx        = writeContext.GetDbContext();
 
         var accounts = await ctx.Set<TradingAccount>()
             .Where(a => a.IsActive && !a.IsDeleted && a.MaxAbsoluteDailyLoss > 0)
@@ -129,10 +123,27 @@ public class DailyPnlMonitorWorker : BackgroundService
         if (accounts.Count == 0) return;
 
         var todayUtc = DateTime.UtcNow.Date;
+        var todayStr = todayUtc.ToString("yyyy-MM-dd");
+
+        // Clear stale flatten keys from previous days
+        var staleFlattenKeys = await writeCtx.Set<EngineConfig>()
+            .Where(c => c.Key.StartsWith(FlattenConfigKeyPrefix + ":") && c.Value != todayStr && !c.IsDeleted)
+            .ToListAsync(ct);
+        if (staleFlattenKeys.Count > 0)
+        {
+            foreach (var stale in staleFlattenKeys)
+                stale.IsDeleted = true;
+            await writeCtx.SaveChangesAsync(ct);
+        }
 
         foreach (var account in accounts)
         {
-            if (_flattenedAccountsToday.Contains(account.Id))
+            // Check EngineConfig for persistent flatten dedup (survives process restart)
+            var flattenKey = $"{FlattenConfigKeyPrefix}:{account.Id}";
+            var flattenEntry = await ctx.Set<EngineConfig>()
+                .AsNoTracking()
+                .FirstOrDefaultAsync(c => c.Key == flattenKey && !c.IsDeleted, ct);
+            if (flattenEntry is not null && flattenEntry.Value == todayStr)
                 continue;
 
             // Determine start-of-day equity from AccountPerformanceAttribution (preferred)
@@ -199,7 +210,28 @@ public class DailyPnlMonitorWorker : BackgroundService
                         Reason = $"Daily P&L loss limit breached: loss={dailyLoss:F2} exceeds MaxAbsoluteDailyLoss={account.MaxAbsoluteDailyLoss:F2}"
                     }, ct);
 
-                    _flattenedAccountsToday.Add(account.Id);
+                    // Persist flatten dedup to EngineConfig so it survives process restarts
+                    var persistKey = $"{FlattenConfigKeyPrefix}:{account.Id}";
+                    var existingEntry = await writeCtx.Set<EngineConfig>()
+                        .FirstOrDefaultAsync(c => c.Key == persistKey && !c.IsDeleted, ct);
+                    if (existingEntry is not null)
+                    {
+                        existingEntry.Value = todayStr;
+                        existingEntry.LastUpdatedAt = DateTime.UtcNow;
+                    }
+                    else
+                    {
+                        await writeCtx.Set<EngineConfig>().AddAsync(new EngineConfig
+                        {
+                            Key = persistKey,
+                            Value = todayStr,
+                            Description = $"DailyPnl flatten dedup for account {account.Id}",
+                            DataType = Domain.Enums.ConfigDataType.String,
+                            IsHotReloadable = false,
+                            LastUpdatedAt = DateTime.UtcNow
+                        }, ct);
+                    }
+                    await writeCtx.SaveChangesAsync(ct);
 
                     _logger.LogCritical(
                         "DailyPnlMonitorWorker: EmergencyFlatten dispatched for account {AccountId}",

@@ -20,18 +20,22 @@ public class EAHealthMonitorWorkerTest : IDisposable
     private readonly Mock<IServiceScopeFactory> _mockScopeFactory;
     private readonly Mock<IWriteApplicationDbContext> _mockWriteContext;
     private readonly Mock<IIntegrationEventService> _mockEventBus;
+    private readonly Mock<IDegradationModeManager> _mockDegradationManager;
+    private readonly Mock<IAlertDispatcher> _mockAlertDispatcher;
     private readonly TradingMetrics _metrics;
     private readonly TestMeterFactory _meterFactory;
     private readonly EAHealthMonitorWorker _worker;
 
     public EAHealthMonitorWorkerTest()
     {
-        _mockLogger       = new Mock<ILogger<EAHealthMonitorWorker>>();
-        _mockScopeFactory = new Mock<IServiceScopeFactory>();
-        _mockWriteContext = new Mock<IWriteApplicationDbContext>();
-        _mockEventBus     = new Mock<IIntegrationEventService>();
-        _meterFactory     = new TestMeterFactory();
-        _metrics          = new TradingMetrics(_meterFactory);
+        _mockLogger              = new Mock<ILogger<EAHealthMonitorWorker>>();
+        _mockScopeFactory        = new Mock<IServiceScopeFactory>();
+        _mockWriteContext        = new Mock<IWriteApplicationDbContext>();
+        _mockEventBus            = new Mock<IIntegrationEventService>();
+        _mockDegradationManager  = new Mock<IDegradationModeManager>();
+        _mockAlertDispatcher     = new Mock<IAlertDispatcher>();
+        _meterFactory            = new TestMeterFactory();
+        _metrics                 = new TradingMetrics(_meterFactory);
 
         var mockScope    = new Mock<IServiceScope>();
         var mockProvider = new Mock<IServiceProvider>();
@@ -43,6 +47,8 @@ public class EAHealthMonitorWorkerTest : IDisposable
 
         _worker = new EAHealthMonitorWorker(
             _mockScopeFactory.Object,
+            _mockDegradationManager.Object,
+            _mockAlertDispatcher.Object,
             _mockLogger.Object,
             _metrics);
     }

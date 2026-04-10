@@ -114,6 +114,9 @@ public sealed class MLSignalScorer : IMLSignalScorer
     private const int PredictionCircuitBreakerThreshold = 10;
     private static readonly TimeSpan PredictionCircuitBreakerCooldown = TimeSpan.FromMinutes(30);
 
+    /// <summary>Counter for periodic eviction of stale circuit breaker entries.</summary>
+    private static int _evictionCounter;
+
     private readonly IReadApplicationDbContext          _context;
     private readonly IMemoryCache                      _cache;
     private readonly ILogger<MLSignalScorer>           _logger;
@@ -144,6 +147,10 @@ public sealed class MLSignalScorer : IMLSignalScorer
         CancellationToken     cancellationToken)
     {
         var scoringStart = Stopwatch.GetTimestamp();
+
+        // Periodically evict stale circuit breaker entries to prevent unbounded memory growth
+        if (Interlocked.Increment(ref _evictionCounter) % 100 == 0)
+            EvictStaleCircuitBreakerEntries();
 
         var signalTimeframe = candles.Count > 0 ? candles[0].Timeframe : Timeframe.H1;
         var db              = _context.GetDbContext();
@@ -465,6 +472,27 @@ public sealed class MLSignalScorer : IMLSignalScorer
         _predictionLosses.TryRemove(modelId, out _);
     }
 
+    /// <summary>
+    /// Evicts circuit breaker entries older than 30 minutes to prevent unbounded
+    /// memory growth in the static dictionaries.
+    /// </summary>
+    private static void EvictStaleCircuitBreakerEntries()
+    {
+        var cutoff = DateTime.UtcNow.AddMinutes(-30);
+
+        foreach (var kvp in _inferenceFailures)
+        {
+            if (kvp.Value.LastFailure < cutoff)
+                _inferenceFailures.TryRemove(kvp.Key, out _);
+        }
+
+        foreach (var kvp in _predictionLosses)
+        {
+            if (kvp.Value.LastLoss < cutoff)
+                _predictionLosses.TryRemove(kvp.Key, out _);
+        }
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // Helper: snapshot deserialization with concurrency protection
     // ═══════════════════════════════════════════════════════════════════════════
@@ -628,7 +656,7 @@ public sealed class MLSignalScorer : IMLSignalScorer
         if (W <= 1 || orderedCandles.Count < minCandles)
         {
             if (W > 1)
-                _logger.LogDebug(
+                _logger.LogWarning(
                     "FracDiff inference: insufficient candles ({Have}/{Need}) for {Symbol}/{Tf} — skipping",
                     orderedCandles.Count, minCandles, symbol, timeframe);
             return features;
@@ -742,6 +770,18 @@ public sealed class MLSignalScorer : IMLSignalScorer
                 if (altSnap is not null)
                     altEntries.Add((altModel.Id, altSnap));
             }
+        }
+
+        // If there aren't enough total models (primary + alternates) to meet consensus,
+        // suppress the signal immediately rather than allowing a single surviving model
+        // to pass through as a potentially random result.
+        int totalModelCount = 1 + altEntries.Count; // primary + alternates
+        if (totalModelCount < consensusMin)
+        {
+            _logger.LogDebug(
+                "Consensus filter: {Symbol}/{Tf} — only {Total} models available but need {Min}. Signal suppressed.",
+                symbol, timeframe, totalModelCount, consensusMin);
+            return false;
         }
 
         // Score alternate models concurrently with early cancellation — once quorum

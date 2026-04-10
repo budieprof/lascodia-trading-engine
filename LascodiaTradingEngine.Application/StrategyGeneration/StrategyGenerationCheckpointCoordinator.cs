@@ -144,9 +144,7 @@ internal sealed class StrategyGenerationCheckpointCoordinator : IStrategyGenerat
         string checkpointLabel)
     {
         var startedAt = Stopwatch.GetTimestamp();
-        try
-        {
-            var checkpointState = new GenerationCheckpointStore.State
+        var checkpointState = new GenerationCheckpointStore.State
             {
                 CycleDateUtc = _timeProvider.GetUtcNow().UtcDateTime.Date,
                 Fingerprint = checkpointFingerprint,
@@ -162,13 +160,15 @@ internal sealed class StrategyGenerationCheckpointCoordinator : IStrategyGenerat
                 CandidatesPerCurrency = new Dictionary<string, int>(snapshot.CandidatesPerCurrency),
                 RegimeCandidatesCreated = snapshot.RegimeCandidatesCreated.ToDictionary(kv => kv.Key.ToString(), kv => kv.Value),
                 CorrelationGroupCounts = snapshot.CorrelationGroupCounts.ToDictionary(kv => kv.Key.ToString(), kv => kv.Value),
-            };
-            var preview = GenerationCheckpointStore.SerializeWithStatus(checkpointState, _logger);
-            if (preview.UsedRestartSafeFallback)
-            {
-                // keep metric emission local to the caller; this coordinator is about persistence only.
-            }
+        };
+        var preview = GenerationCheckpointStore.SerializeWithStatus(checkpointState, _logger);
+        if (preview.UsedRestartSafeFallback)
+        {
+            // keep metric emission local to the caller; this coordinator is about persistence only.
+        }
 
+        try
+        {
             await _checkpointStore.SaveCheckpointAsync(writeCtx.GetDbContext(), cycleId, checkpointState, _logger, ct);
             await writeCtx.SaveChangesAsync(ct);
             var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
@@ -187,21 +187,73 @@ internal sealed class StrategyGenerationCheckpointCoordinator : IStrategyGenerat
                 (long)Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds,
                 nowUtc);
         }
+        catch (Exception ex) when (IsTransientDbError(ex))
+        {
+            // Single retry after 500ms for transient DB errors (timeout, deadlock, etc.)
+            _logger.LogWarning(ex, "StrategyGenerationWorker: transient checkpoint save failure for {CheckpointLabel} — retrying once", checkpointLabel);
+            try
+            {
+                await Task.Delay(500, ct);
+                await _checkpointStore.SaveCheckpointAsync(writeCtx.GetDbContext(), cycleId, checkpointState, _logger, ct);
+                await writeCtx.SaveChangesAsync(ct);
+                var retryNowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+                _healthStore.UpdateState(state => state with
+                {
+                    LastCheckpointSavedAtUtc = retryNowUtc,
+                    LastCheckpointLabel = checkpointLabel,
+                    IsCheckpointPersistenceDegraded = false,
+                    ConsecutiveCheckpointSaveFailures = 0,
+                    LastCheckpointSaveFailureAtUtc = null,
+                    LastCheckpointSaveFailureMessage = null,
+                    CapturedAtUtc = retryNowUtc,
+                });
+                _healthStore.RecordPhaseSuccess(
+                    "checkpoint_save",
+                    (long)Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds,
+                    retryNowUtc);
+                _logger.LogInformation("StrategyGenerationWorker: checkpoint save succeeded on retry for {CheckpointLabel}", checkpointLabel);
+                return;
+            }
+            catch (Exception retryEx)
+            {
+                _logger.LogWarning(retryEx, "StrategyGenerationWorker: checkpoint save retry also failed for {CheckpointLabel}", checkpointLabel);
+            }
+
+            RecordCheckpointSaveFailure(checkpointLabel, ex);
+        }
         catch (Exception ex)
         {
-            var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
-            _logger.LogWarning(ex, "StrategyGenerationWorker: checkpoint save failed for {CheckpointLabel}", checkpointLabel);
-            _healthStore.UpdateState(state => state with
-            {
-                LastCheckpointLabel = checkpointLabel,
-                IsCheckpointPersistenceDegraded = true,
-                ConsecutiveCheckpointSaveFailures = state.ConsecutiveCheckpointSaveFailures + 1,
-                LastCheckpointSaveFailureAtUtc = nowUtc,
-                LastCheckpointSaveFailureMessage = Truncate(ex.Message),
-                CapturedAtUtc = nowUtc,
-            });
-            _healthStore.RecordPhaseFailure("checkpoint_save", ex.Message, nowUtc);
+            RecordCheckpointSaveFailure(checkpointLabel, ex);
         }
+    }
+
+    private void RecordCheckpointSaveFailure(string checkpointLabel, Exception ex)
+    {
+        var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+        _logger.LogWarning(ex, "StrategyGenerationWorker: checkpoint save failed for {CheckpointLabel}", checkpointLabel);
+        _healthStore.UpdateState(state => state with
+        {
+            LastCheckpointLabel = checkpointLabel,
+            IsCheckpointPersistenceDegraded = true,
+            ConsecutiveCheckpointSaveFailures = state.ConsecutiveCheckpointSaveFailures + 1,
+            LastCheckpointSaveFailureAtUtc = nowUtc,
+            LastCheckpointSaveFailureMessage = Truncate(ex.Message),
+            CapturedAtUtc = nowUtc,
+        });
+        _healthStore.RecordPhaseFailure("checkpoint_save", ex.Message, nowUtc);
+    }
+
+    private static bool IsTransientDbError(Exception ex)
+    {
+        // Detect transient database errors: timeouts, deadlocks, connection resets.
+        if (ex is TimeoutException) return true;
+        if (ex is Microsoft.EntityFrameworkCore.DbUpdateConcurrencyException) return true;
+
+        // Check for common SQL error patterns in the exception chain
+        var message = ex.InnerException?.Message ?? ex.Message;
+        return message.Contains("deadlock", StringComparison.OrdinalIgnoreCase)
+            || message.Contains("timeout", StringComparison.OrdinalIgnoreCase)
+            || message.Contains("connection", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string Truncate(string message)

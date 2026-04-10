@@ -2,6 +2,7 @@ using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Options;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 
 namespace LascodiaTradingEngine.Application.RiskProfiles.Services;
@@ -27,6 +28,7 @@ public class RiskChecker : IRiskChecker
     private readonly CorrelationGroupOptions _correlationGroups;
     private readonly TimeProvider _timeProvider;
     private readonly ILogger<RiskChecker> _logger;
+    private readonly IReadApplicationDbContext _readDb;
     private readonly IPortfolioRiskCalculator? _portfolioRisk;
     private readonly IGapRiskModel? _gapRiskModel;
 
@@ -35,6 +37,7 @@ public class RiskChecker : IRiskChecker
         CorrelationGroupOptions correlationGroups,
         TimeProvider timeProvider,
         ILogger<RiskChecker> logger,
+        IReadApplicationDbContext readDb,
         IPortfolioRiskCalculator? portfolioRisk = null,
         IGapRiskModel? gapRiskModel = null)
     {
@@ -42,6 +45,7 @@ public class RiskChecker : IRiskChecker
         _correlationGroups = correlationGroups;
         _timeProvider = timeProvider;
         _logger = logger;
+        _readDb = readDb;
         _portfolioRisk = portfolioRisk;
         _gapRiskModel = gapRiskModel;
     }
@@ -101,6 +105,31 @@ public class RiskChecker : IRiskChecker
                   $"{effectiveMaxLot} (base {profile.MaxLotSizePerTrade} × " +
                   $"{Math.Clamp(profile.RecoveryLotSizeMultiplier, 0.01m, 1.0m)} recovery multiplier)."
                 : $"Lot size {signal.SuggestedLotSize} exceeds profile maximum {effectiveMaxLot}.");
+
+        // ── 5b. Drawdown recovery lot reduction (Tier 2 enforcement) ────────
+        // If the account is in Reduced recovery mode, cap the effective lot size
+        // regardless of how the signal was created (strategy worker, API, manual).
+        // This is a second line of defense after StrategyWorker's own reduction.
+        {
+            string recoveryMode = await GetRecoveryModeAsync(cancellationToken);
+            if (string.Equals(recoveryMode, "Reduced", StringComparison.OrdinalIgnoreCase))
+            {
+                decimal multiplier = await GetRecoveryMultiplierAsync(cancellationToken);
+                if (multiplier < 1.0m)
+                {
+                    // Don't reject — just cap. The signal is valid, just oversized for recovery mode.
+                    decimal originalLot = signal.SuggestedLotSize;
+                    signal.SuggestedLotSize = originalLot * multiplier;
+                    _logger.LogInformation(
+                        "Drawdown recovery Tier 2: lot capped from {OriginalLot} to {Lot} (x{Mult}) for account {Account}",
+                        originalLot, signal.SuggestedLotSize, multiplier, account.Id);
+                }
+            }
+            else if (string.Equals(recoveryMode, "Halted", StringComparison.OrdinalIgnoreCase))
+            {
+                return Fail("Account is in Halted recovery mode — all new orders blocked.");
+            }
+        }
 
         // ── 6. Minimum equity floor ─────────────────────────────────────────
         if (profile.MinEquityFloor > 0 && account.Equity < profile.MinEquityFloor)
@@ -260,6 +289,10 @@ public class RiskChecker : IRiskChecker
         if (signal.StopLoss.HasValue && account.Equity > 0)
         {
             decimal riskPips = Math.Abs(signal.EntryPrice - signal.StopLoss.Value);
+
+            // SL == Entry → zero risk distance — meaningless stop loss
+            if (riskPips < 0.0000000001m)
+                return Fail("StopLoss is equal to entry price — zero risk distance.");
             decimal riskAmount = signal.SuggestedLotSize * contractSize * riskPips * quoteToAccountRate * slippageBuffer;
 
             // Apply weekend/holiday gap risk multiplier if within the gap window.
@@ -681,7 +714,7 @@ public class RiskChecker : IRiskChecker
         }
 
         if (int.TryParse(parts[0], out int month) && int.TryParse(parts[1], out int day) &&
-            month >= 1 && month <= 12 && day >= 1 && day <= 31)
+            month >= 1 && month <= 12 && day >= 1 && day <= DateTime.DaysInMonth(year, month))
         {
             try
             {
@@ -697,6 +730,37 @@ public class RiskChecker : IRiskChecker
 
         _logger.LogWarning("RiskChecker: invalid holiday '{Holiday}' — month/day out of range", mmDd);
         return false;
+    }
+
+    /// <summary>
+    /// Reads the current drawdown recovery mode from the <c>DrawdownRecovery:ActiveMode</c>
+    /// engine config key. Returns "Normal" if not set or not found.
+    /// </summary>
+    private async Task<string> GetRecoveryModeAsync(CancellationToken ct)
+    {
+        var config = await _readDb.GetDbContext()
+            .Set<EngineConfig>()
+            .AsNoTracking()
+            .FirstOrDefaultAsync(c => c.Key == "DrawdownRecovery:ActiveMode" && !c.IsDeleted, ct);
+        return config?.Value ?? "Normal";
+    }
+
+    /// <summary>
+    /// Reads the reduced-mode lot multiplier from the <c>DrawdownRecovery:ReducedLotMultiplier</c>
+    /// engine config key. Returns 0.5 (50%) if not set or unparseable.
+    /// </summary>
+    private async Task<decimal> GetRecoveryMultiplierAsync(CancellationToken ct)
+    {
+        const decimal defaultMultiplier = 0.5m;
+        var config = await _readDb.GetDbContext()
+            .Set<EngineConfig>()
+            .AsNoTracking()
+            .FirstOrDefaultAsync(c => c.Key == "DrawdownRecovery:ReducedLotMultiplier" && !c.IsDeleted, ct);
+
+        if (config?.Value is not null && decimal.TryParse(config.Value, out decimal multiplier))
+            return Math.Clamp(multiplier, 0.01m, 1.0m);
+
+        return defaultMultiplier;
     }
 
     private static RiskCheckResult Fail(string reason) =>

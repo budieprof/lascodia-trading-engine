@@ -119,6 +119,16 @@ public sealed class MLFeatureStalenessWorker : BackgroundService
             int F = MLFeatureHelper.FeatureCount;
             int staleCount = 0;
 
+            // Bonferroni correction: when testing F features simultaneously, the base
+            // significance threshold must be divided by F to control the family-wise
+            // error rate. This prevents false positives when many features are tested.
+            // The base threshold of 0.95 is adjusted so that the overall Type-I error
+            // rate is controlled at approximately the same level as a single test.
+            const double baseThreshold = 0.95;
+            double adjustedThreshold = F > 1
+                ? 1.0 - (1.0 - baseThreshold) / F  // Bonferroni-adjusted threshold
+                : baseThreshold;
+
             for (int fi = 0; fi < F && !ct.IsCancellationRequested; fi++)
             {
                 // Extract the univariate time series for feature fi across all samples.
@@ -128,9 +138,9 @@ public sealed class MLFeatureStalenessWorker : BackgroundService
                 // Values near ±1 mean the feature barely changes from one bar to the next.
                 double autocorr = ComputeLag1Autocorr(x);
 
-                // The threshold 0.95 is intentionally conservative — only near-flat series
-                // are flagged, avoiding false positives for legitimately slow indicators.
-                bool isStale = Math.Abs(autocorr) > 0.95;
+                // Bonferroni-corrected threshold: controls family-wise error rate when
+                // testing multiple features simultaneously.
+                bool isStale = Math.Abs(autocorr) > adjustedThreshold;
                 if (isStale) staleCount++;
 
                 string featureName = MLFeatureHelper.FeatureNames[fi];

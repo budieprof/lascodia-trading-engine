@@ -223,6 +223,9 @@ public sealed class StrategyPromotionWorker : InstrumentedBackgroundService
                 // Promote to Approved
                 strategy.LifecycleStage = StrategyLifecycleStage.Approved;
                 strategy.LifecycleStageEnteredAt = DateTime.UtcNow;
+
+                // Save each promotion individually to avoid losing all progress on crash.
+                await writeCtx.SaveChangesAsync(ct);
                 promoted++;
 
                 _logger.LogInformation(
@@ -251,9 +254,6 @@ public sealed class StrategyPromotionWorker : InstrumentedBackgroundService
                         strategy.Id);
                 }
             }
-
-            if (promoted > 0)
-                await writeCtx.SaveChangesAsync(ct);
         }
 
         // ── Phase 2: Approved → Active (auto-activation) ───────────────────
@@ -305,6 +305,9 @@ public sealed class StrategyPromotionWorker : InstrumentedBackgroundService
             strategy.Status = StrategyStatus.Active;
             strategy.LifecycleStage = StrategyLifecycleStage.Active;
             strategy.LifecycleStageEnteredAt = DateTime.UtcNow;
+
+            // Save each activation individually to reduce crash risk.
+            await writeCtx.SaveChangesAsync(ct);
             activated++;
             activeCountBySymbol[strategy.Symbol] = currentActive + 1;
 
@@ -329,32 +332,24 @@ public sealed class StrategyPromotionWorker : InstrumentedBackgroundService
                     "StrategyPromotionWorker: audit log failed for strategy {Id} activation (non-fatal)",
                     strategy.Id);
             }
-        }
 
-        if (activated > 0)
-        {
-            await writeCtx.SaveChangesAsync(ct);
-
-            // Publish activation events for downstream workers
-            foreach (var strategy in approvedStrategies.Where(s => s.Status == StrategyStatus.Active))
+            // Publish activation event immediately after each save
+            try
             {
-                try
+                await eventService.SaveAndPublish(writeCtx, new StrategyActivatedIntegrationEvent
                 {
-                    await eventService.SaveAndPublish(writeCtx, new StrategyActivatedIntegrationEvent
-                    {
-                        StrategyId  = strategy.Id,
-                        Name        = strategy.Name,
-                        Symbol      = strategy.Symbol,
-                        Timeframe   = strategy.Timeframe,
-                        ActivatedAt = strategy.LifecycleStageEnteredAt ?? DateTime.UtcNow,
-                    });
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex,
-                        "StrategyPromotionWorker: activation event publish failed for strategy {Id} (non-fatal)",
-                        strategy.Id);
-                }
+                    StrategyId  = strategy.Id,
+                    Name        = strategy.Name,
+                    Symbol      = strategy.Symbol,
+                    Timeframe   = strategy.Timeframe,
+                    ActivatedAt = strategy.LifecycleStageEnteredAt ?? DateTime.UtcNow,
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "StrategyPromotionWorker: activation event publish failed for strategy {Id} (non-fatal)",
+                    strategy.Id);
             }
         }
 

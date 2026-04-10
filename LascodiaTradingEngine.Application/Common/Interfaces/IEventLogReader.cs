@@ -32,6 +32,17 @@ public interface IEventLogReader
         IReadOnlyCollection<Guid> eventIds,
         CancellationToken ct);
 
+    /// <summary>
+    /// Returns events marked as <c>Published</c> but older than the given threshold.
+    /// These events may have been lost in transit (broker ACK not confirmed) and should
+    /// be re-published to close the data-loss window.
+    /// </summary>
+    /// <param name="staleThreshold">Events marked Published longer ago than this are considered stale.</param>
+    /// <param name="batchSize">Maximum number of events to return.</param>
+    /// <param name="ct">Cancellation token.</param>
+    Task<List<IntegrationEventLogEntry>> GetStalePublishedEventsAsync(
+        TimeSpan staleThreshold, int batchSize, CancellationToken ct);
+
     /// <summary>Persists state changes to event log entries modified in-memory.</summary>
     Task SaveChangesAsync(CancellationToken ct);
 }

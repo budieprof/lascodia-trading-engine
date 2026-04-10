@@ -9,7 +9,7 @@ namespace LascodiaTradingEngine.Application.SignalFilters;
 /// Confirms a signal direction by checking trend on higher timeframes.
 /// Returns true when the majority of applicable higher timeframes agree with the signal direction.
 /// Uses a configurable SMA period (default 50) for trend determination.
-/// D1 signals return false (unconfirmed) since no higher timeframe exists to validate against.
+/// D1 signals return true (fully confirmed) since no higher timeframe exists to contradict them.
 /// </summary>
 [RegisterService]
 public class MultiTimeframeFilter : IMultiTimeframeFilter
@@ -44,9 +44,9 @@ public class MultiTimeframeFilter : IMultiTimeframeFilter
         CancellationToken ct)
     {
         var (confirmations, total) = await CountConfirmationsAsync(symbol, signalDirection, primaryTimeframe, ct);
-        // No higher timeframes available (e.g. D1 signals) — cannot confirm, return false
-        // to force downstream callers to handle the unconfirmed case explicitly.
-        if (total == 0) return false;
+        // No higher timeframes available (e.g. D1 signals) — fully confirmed by default
+        // since there is no higher timeframe to contradict the signal.
+        if (total == 0) return true;
         return confirmations > total / 2;
     }
 
@@ -57,8 +57,9 @@ public class MultiTimeframeFilter : IMultiTimeframeFilter
         CancellationToken ct)
     {
         var (confirmations, total) = await CountConfirmationsAsync(symbol, signalDirection, primaryTimeframe, ct);
-        // No higher timeframes available — return 0 (no confirmation) instead of 1.0
-        if (total == 0) return 0m;
+        // No higher timeframes available (e.g. D1) — fully confirmed since there is
+        // no higher timeframe to check against.
+        if (total == 0) return 1.0m;
         return (decimal)confirmations / total;
     }
 
@@ -88,7 +89,9 @@ public class MultiTimeframeFilter : IMultiTimeframeFilter
                 continue;
 
             decimal sma         = candles.Average(x => x.Close);
-            decimal latestClose = candles[0].Close;
+            // Explicitly find the latest candle rather than relying on query ordering,
+            // to guard against any future refactoring that might change the ORDER BY.
+            decimal latestClose = candles.OrderByDescending(c => c.Timestamp).First().Close;
 
             bool confirms = signalDirection == "Buy"
                 ? latestClose > sma

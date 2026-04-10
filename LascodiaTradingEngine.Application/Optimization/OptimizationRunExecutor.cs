@@ -158,7 +158,18 @@ internal sealed class OptimizationRunExecutor : IOptimizationRunExecutor
                 searchDiagnostics,
                 oosHealthScore: null,
                 autoApproved: null);
-            throw new OptimizationSearchExhaustedException();
+
+            // Distinguish "no evaluations at all" (data quality) from
+            // "evaluations happened but none passed" (genuine search exhaustion).
+            int totalAttempted = searchDiagnostics.SuccessfulEvaluations
+                               + searchDiagnostics.FailedEvaluations
+                               + searchDiagnostics.TimedOutEvaluations;
+            if (totalAttempted == 0)
+            {
+                throw new OptimizationDataQualityException();
+            }
+
+            throw new OptimizationSearchExhaustedException(totalAttempted);
         }
 
         phase.Dispose();

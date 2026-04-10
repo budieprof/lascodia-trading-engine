@@ -15,7 +15,12 @@ public record PortfolioRiskMetrics(
     decimal CorrelationConcentration,
     decimal MonteCarloVaR95 = 0,
     decimal MonteCarloVaR99 = 0,
-    decimal MonteCarloCVaR95 = 0)
+    decimal MonteCarloCVaR95 = 0,
+    decimal EvtVaR95 = 0,
+    decimal EvtVaR99 = 0,
+    decimal EvtCVaR99 = 0,
+    decimal GpdShape = 0,
+    decimal GpdScale = 0)
 {
     /// <summary>Empty metrics instance returned when computation is not possible.</summary>
     public static PortfolioRiskMetrics Empty { get; } = new(0, 0, 0, 0, 0, 0);

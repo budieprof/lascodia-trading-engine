@@ -148,6 +148,12 @@ public sealed class MLSignalSuppressionWorker : BackgroundService
         int    minPredictions   = await GetConfigAsync<int>   (readCtx, CK_MinPredictions,    20,   ct);
         double hardAccuracyFloor = await GetConfigAsync<double>(readCtx, CK_HardAccuracyFloor, 0.44, ct);
 
+        // ── Inter-worker coordination: process urgent drift flags first ──────
+        // MLDriftMonitorWorker sets EngineConfig keys with prefix "MLDrift:UrgentSymbol:"
+        // when drift is detected. We check for these flags and process the corresponding
+        // models immediately, reducing propagation delay from minutes to seconds.
+        await ProcessUrgentDriftFlagsAsync(readCtx, writeCtx, windowDays, minPredictions, hardAccuracyFloor, ct);
+
         // Only evaluate models that are currently active — suppressed but inactive models
         // are already blocked by the IsActive=false gate in MLSignalScorer.
         var activeModels = await readCtx.Set<MLModel>()
@@ -172,6 +178,85 @@ public sealed class MLSignalSuppressionWorker : BackgroundService
                 _logger.LogWarning(ex,
                     "Suppression evaluation failed for {Symbol}/{Tf} model {Id} — skipping.",
                     model.Symbol, model.Timeframe, model.Id);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Checks for urgent drift flags set by <see cref="MLDriftMonitorWorker"/> and immediately
+    /// evaluates the corresponding models for suppression. This reduces the propagation delay
+    /// between drift detection and signal suppression from a full poll cycle (5-10 min) to
+    /// the next iteration (~seconds). Each processed flag is cleared after evaluation.
+    /// </summary>
+    private async Task ProcessUrgentDriftFlagsAsync(
+        Microsoft.EntityFrameworkCore.DbContext readCtx,
+        Microsoft.EntityFrameworkCore.DbContext writeCtx,
+        int                                     windowDays,
+        int                                     minPredictions,
+        double                                  hardAccuracyFloor,
+        CancellationToken                       ct)
+    {
+        const string urgentPrefix = "MLDrift:UrgentSymbol:";
+
+        // Find all urgent flags set by the drift monitor
+        var urgentFlags = await readCtx.Set<EngineConfig>()
+            .Where(c => c.Key.StartsWith(urgentPrefix) && !c.IsDeleted)
+            .AsNoTracking()
+            .ToListAsync(ct);
+
+        if (urgentFlags.Count == 0) return;
+
+        _logger.LogInformation(
+            "Suppression: found {Count} urgent drift flag(s) — processing priority models first.",
+            urgentFlags.Count);
+
+        foreach (var flag in urgentFlags)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            try
+            {
+                // Key format: "MLDrift:UrgentSymbol:{symbol}:{timeframe}"
+                var keyParts = flag.Key[urgentPrefix.Length..].Split(':', 2);
+                if (keyParts.Length < 2) continue;
+
+                string symbol        = keyParts[0];
+                string timeframeStr  = keyParts[1];
+
+                if (!Enum.TryParse<Timeframe>(timeframeStr, out var timeframe))
+                {
+                    _logger.LogWarning("Suppression: could not parse timeframe '{Tf}' from urgent flag '{Key}' — skipping.", timeframeStr, flag.Key);
+                    continue;
+                }
+
+                // Find the active model for this symbol/timeframe and evaluate immediately
+                var urgentModel = await readCtx.Set<MLModel>()
+                    .Where(m => m.Symbol == symbol && m.Timeframe == timeframe
+                                && m.IsActive && !m.IsDeleted)
+                    .AsNoTracking()
+                    .FirstOrDefaultAsync(ct);
+
+                if (urgentModel is not null)
+                {
+                    _logger.LogInformation(
+                        "Suppression: urgent evaluation for {Symbol}/{Tf} model {Id} (drift-flagged).",
+                        symbol, timeframe, urgentModel.Id);
+
+                    await EvaluateModelAsync(
+                        urgentModel, readCtx, writeCtx,
+                        windowDays, minPredictions, hardAccuracyFloor, ct);
+                }
+
+                // Clear the urgent flag after processing (regardless of suppression outcome)
+                await writeCtx.Set<EngineConfig>()
+                    .Where(c => c.Key == flag.Key)
+                    .ExecuteDeleteAsync(ct);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "Suppression: failed to process urgent drift flag '{Key}' — will retry next cycle.",
+                    flag.Key);
             }
         }
     }

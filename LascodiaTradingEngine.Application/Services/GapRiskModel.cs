@@ -96,10 +96,19 @@ public class GapRiskModel : IGapRiskModel
             var prev = dailyCandles[i - 1];
             var curr = dailyCandles[i];
 
-            // Detect weekend gap: >1 calendar day between bars
-            if ((curr.Timestamp - prev.Timestamp).TotalDays > 1.5 && prev.Close != 0)
+            // Detect weekend/holiday gap: >1 calendar day between bars
+            double gapDays = (curr.Timestamp - prev.Timestamp).TotalDays;
+            if (gapDays > 1.5 && prev.Close != 0)
             {
                 var gapPct = Math.Abs(curr.Open - prev.Close) / prev.Close * 100m;
+
+                // Apply tiered multiplier for extended gaps (holidays, long weekends).
+                // A standard weekend gap is ~2 days; anything beyond 3.5 days indicates
+                // a holiday or extended closure where liquidity and price discovery are
+                // absent for longer, amplifying gap risk.
+                if (gapDays > 3.5)
+                    gapPct *= 1.5m; // Extra 50% weight for extended (holiday) gaps
+
                 gapPcts.Add(gapPct);
             }
         }

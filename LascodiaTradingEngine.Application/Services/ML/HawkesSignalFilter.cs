@@ -43,7 +43,10 @@ public sealed class HawkesSignalFilter : IHawkesSignalFilter
 
         foreach (var ts in recentSignalTimestamps)
         {
-            double eventHours = new DateTimeOffset(ts, TimeSpan.Zero).ToUnixTimeSeconds() / 3600.0;
+            // Ensure UTC conversion regardless of the DateTime.Kind of the incoming timestamp.
+            // If Kind is Local, convert to UTC first; if Unspecified, treat as UTC.
+            DateTime utcTs = ts.Kind == DateTimeKind.Local ? ts.ToUniversalTime() : DateTime.SpecifyKind(ts, DateTimeKind.Utc);
+            double eventHours = new DateTimeOffset(utcTs, TimeSpan.Zero).ToUnixTimeSeconds() / 3600.0;
             double dt = nowHours - eventHours;
             if (dt < 0) continue;
             intensity += kernel.Alpha * Math.Exp(-kernel.Beta * dt);

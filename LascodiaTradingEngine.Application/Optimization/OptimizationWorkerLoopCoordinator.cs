@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 
@@ -8,7 +9,18 @@ namespace LascodiaTradingEngine.Application.Optimization;
 [RegisterService(ServiceLifetime.Singleton, typeof(IOptimizationWorkerLoopCoordinator))]
 internal sealed class OptimizationWorkerLoopCoordinator : IOptimizationWorkerLoopCoordinator
 {
+    /// <summary>Per-phase timeout defaults (minutes). Configurable via <see cref="OptimizationConfig"/>.</summary>
+    private static class PhaseTimeoutDefaults
+    {
+        internal const int Recovery = 10;
+        internal const int Scheduling = 5;
+        internal const int Execution = 30;
+        internal const int FollowUp = 10;
+        internal const int HealthRecording = 5;
+    }
+
     private readonly IServiceScopeFactory _scopeFactory;
+    private readonly ILogger<OptimizationWorkerLoopCoordinator> _logger;
     private readonly OptimizationRunRecoveryCoordinator _recoveryCoordinator;
     private readonly OptimizationFollowUpCoordinator _followUpCoordinator;
     private readonly OptimizationSchedulingCoordinator _schedulingCoordinator;
@@ -19,6 +31,7 @@ internal sealed class OptimizationWorkerLoopCoordinator : IOptimizationWorkerLoo
 
     public OptimizationWorkerLoopCoordinator(
         IServiceScopeFactory scopeFactory,
+        ILogger<OptimizationWorkerLoopCoordinator> logger,
         OptimizationRunRecoveryCoordinator recoveryCoordinator,
         OptimizationFollowUpCoordinator followUpCoordinator,
         OptimizationSchedulingCoordinator schedulingCoordinator,
@@ -27,6 +40,7 @@ internal sealed class OptimizationWorkerLoopCoordinator : IOptimizationWorkerLoo
         TimeProvider timeProvider)
     {
         _scopeFactory = scopeFactory;
+        _logger = logger;
         _recoveryCoordinator = recoveryCoordinator;
         _followUpCoordinator = followUpCoordinator;
         _schedulingCoordinator = schedulingCoordinator;
@@ -36,53 +50,73 @@ internal sealed class OptimizationWorkerLoopCoordinator : IOptimizationWorkerLoo
     }
 
     public Task WarmStartAsync(CancellationToken ct)
-        => ExecutePhaseAsync(
+        => ExecutePhaseWithTimeoutAsync(
             OptimizationWorkerHealthNames.Phases.WarmStart,
-            () => _recoveryCoordinator.RecoverStaleRunningRunsAsync(ct));
+            PhaseTimeoutDefaults.Recovery,
+            (linkedCt) => _recoveryCoordinator.RecoverStaleRunningRunsAsync(linkedCt),
+            ct);
 
     public async Task ExecuteCycleAsync(OptimizationWorkerCycleContext cycleContext, CancellationToken ct)
     {
         var staleRunningSummary = await ExecuteCyclePhaseAsync(
             OptimizationWorkerHealthNames.Phases.StaleRunningRecovery,
-            () => _recoveryCoordinator.RecoverStaleRunningRunsAsync(ct));
+            PhaseTimeoutDefaults.Recovery,
+            (linkedCt) => _recoveryCoordinator.RecoverStaleRunningRunsAsync(linkedCt),
+            ct);
         await ExecuteCyclePhaseAsync(
             OptimizationWorkerHealthNames.Phases.StaleQueuedDetection,
-            () => _recoveryCoordinator.RecoverStaleQueuedRunsAsync(ct));
+            PhaseTimeoutDefaults.Recovery,
+            (linkedCt) => _recoveryCoordinator.RecoverStaleQueuedRunsAsync(linkedCt),
+            ct);
         await ExecuteCyclePhaseAsync(
             OptimizationWorkerHealthNames.Phases.RetryFailedRuns,
-            () => _recoveryCoordinator.RetryFailedRunsAsync(cycleContext.Config, ct));
+            PhaseTimeoutDefaults.Recovery,
+            (linkedCt) => _recoveryCoordinator.RetryFailedRunsAsync(cycleContext.Config, linkedCt),
+            ct);
         var reconciliationSummary = await ExecuteCyclePhaseAsync(
             OptimizationWorkerHealthNames.Phases.LifecycleReconciliation,
-            () => _recoveryCoordinator.ReconcileLifecycleStateAsync(cycleContext.Config, ct));
+            PhaseTimeoutDefaults.Execution,
+            (linkedCt) => _recoveryCoordinator.ReconcileLifecycleStateAsync(cycleContext.Config, linkedCt),
+            ct);
         await ExecuteCyclePhaseAsync(
             OptimizationWorkerHealthNames.Phases.FollowUpMonitoring,
-            () => _followUpCoordinator.MonitorAsync(cycleContext.Config, ct));
+            PhaseTimeoutDefaults.FollowUp,
+            (linkedCt) => _followUpCoordinator.MonitorAsync(cycleContext.Config, linkedCt),
+            ct);
 
         if (cycleContext.ShouldRunScheduling)
         {
             await ExecuteCyclePhaseAsync(
                 OptimizationWorkerHealthNames.Phases.AutoScheduling,
-                async () =>
+                PhaseTimeoutDefaults.Scheduling,
+                async (linkedCt) =>
                 {
                     await using var scope = _scopeFactory.CreateAsyncScope();
                     var readCtx = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
                     var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
-                    await _schedulingCoordinator.AutoScheduleUnderperformersAsync(readCtx, writeCtx, cycleContext.Config, ct);
-                });
+                    await _schedulingCoordinator.AutoScheduleUnderperformersAsync(readCtx, writeCtx, cycleContext.Config, linkedCt);
+                },
+                ct);
         }
 
         await ExecuteCyclePhaseAsync(
             OptimizationWorkerHealthNames.Phases.HealthRecording,
-            () => _healthRecorder.RecordAsync(
+            PhaseTimeoutDefaults.HealthRecording,
+            (linkedCt) => _healthRecorder.RecordAsync(
                 cycleContext.Config,
                 cycleContext.LastConfigRefreshUtc,
                 cycleContext.NextConfigRefreshUtc,
                 staleRunningSummary,
                 reconciliationSummary,
-                ct));
+                linkedCt),
+            ct);
     }
 
-    private async Task ExecuteCyclePhaseAsync(string phaseName, Func<Task> work)
+    private async Task ExecuteCyclePhaseAsync(
+        string phaseName,
+        int timeoutMinutes,
+        Func<CancellationToken, Task> work,
+        CancellationToken ct)
     {
         var decision = _optimizationHealthStore.GetPhaseExecutionDecision(phaseName, UtcNow);
         if (!decision.ShouldExecute)
@@ -97,7 +131,11 @@ internal sealed class OptimizationWorkerLoopCoordinator : IOptimizationWorkerLoo
 
         try
         {
-            await ExecutePhaseAsync(phaseName, work);
+            await ExecutePhaseWithTimeoutAsync(phaseName, timeoutMinutes, work, ct);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            // Phase timeout — already recorded as failure in ExecutePhaseWithTimeoutAsync.
         }
         catch (OperationCanceledException)
         {
@@ -109,7 +147,11 @@ internal sealed class OptimizationWorkerLoopCoordinator : IOptimizationWorkerLoo
         }
     }
 
-    private async Task<T?> ExecuteCyclePhaseAsync<T>(string phaseName, Func<Task<T>> work)
+    private async Task<T?> ExecuteCyclePhaseAsync<T>(
+        string phaseName,
+        int timeoutMinutes,
+        Func<CancellationToken, Task<T>> work,
+        CancellationToken ct)
     {
         var decision = _optimizationHealthStore.GetPhaseExecutionDecision(phaseName, UtcNow);
         if (!decision.ShouldExecute)
@@ -124,7 +166,12 @@ internal sealed class OptimizationWorkerLoopCoordinator : IOptimizationWorkerLoo
 
         try
         {
-            return await ExecutePhaseAsync(phaseName, work);
+            return await ExecutePhaseWithTimeoutAsync(phaseName, timeoutMinutes, work, ct);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            // Phase timeout — already recorded as failure in ExecutePhaseWithTimeoutAsync.
+            return default;
         }
         catch (OperationCanceledException)
         {
@@ -136,14 +183,34 @@ internal sealed class OptimizationWorkerLoopCoordinator : IOptimizationWorkerLoo
         }
     }
 
-    private async Task ExecutePhaseAsync(string phaseName, Func<Task> work)
+    private async Task ExecutePhaseWithTimeoutAsync(
+        string phaseName,
+        int timeoutMinutes,
+        Func<CancellationToken, Task> work,
+        CancellationToken ct)
     {
+        using var phaseTimeout = new CancellationTokenSource(TimeSpan.FromMinutes(timeoutMinutes));
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, phaseTimeout.Token);
         var stopwatch = Stopwatch.StartNew();
         _optimizationHealthStore.RecordPhaseStarted(phaseName, UtcNow);
         try
         {
-            await work();
+            await work(linked.Token);
             _optimizationHealthStore.RecordPhaseSuccess(phaseName, stopwatch.ElapsedMilliseconds, UtcNow);
+        }
+        catch (OperationCanceledException) when (phaseTimeout.IsCancellationRequested && !ct.IsCancellationRequested)
+        {
+            _logger.LogWarning(
+                "Phase {Phase} timed out after {Minutes} minutes",
+                phaseName,
+                timeoutMinutes);
+            _optimizationHealthStore.RecordPhaseFailure(
+                phaseName,
+                "PhaseTimeout",
+                $"Phase timed out after {timeoutMinutes} minutes",
+                stopwatch.ElapsedMilliseconds,
+                UtcNow);
+            throw;
         }
         catch (OperationCanceledException)
         {
@@ -156,15 +223,35 @@ internal sealed class OptimizationWorkerLoopCoordinator : IOptimizationWorkerLoo
         }
     }
 
-    private async Task<T> ExecutePhaseAsync<T>(string phaseName, Func<Task<T>> work)
+    private async Task<T> ExecutePhaseWithTimeoutAsync<T>(
+        string phaseName,
+        int timeoutMinutes,
+        Func<CancellationToken, Task<T>> work,
+        CancellationToken ct)
     {
+        using var phaseTimeout = new CancellationTokenSource(TimeSpan.FromMinutes(timeoutMinutes));
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, phaseTimeout.Token);
         var stopwatch = Stopwatch.StartNew();
         _optimizationHealthStore.RecordPhaseStarted(phaseName, UtcNow);
         try
         {
-            var result = await work();
+            var result = await work(linked.Token);
             _optimizationHealthStore.RecordPhaseSuccess(phaseName, stopwatch.ElapsedMilliseconds, UtcNow);
             return result;
+        }
+        catch (OperationCanceledException) when (phaseTimeout.IsCancellationRequested && !ct.IsCancellationRequested)
+        {
+            _logger.LogWarning(
+                "Phase {Phase} timed out after {Minutes} minutes",
+                phaseName,
+                timeoutMinutes);
+            _optimizationHealthStore.RecordPhaseFailure(
+                phaseName,
+                "PhaseTimeout",
+                $"Phase timed out after {timeoutMinutes} minutes",
+                stopwatch.ElapsedMilliseconds,
+                UtcNow);
+            throw;
         }
         catch (OperationCanceledException)
         {

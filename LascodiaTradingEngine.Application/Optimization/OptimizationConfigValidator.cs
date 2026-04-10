@@ -43,9 +43,9 @@ internal static class OptimizationConfigValidator
         var issues = new List<string>();
 
         // Hard errors: these would silently break the system
-        if (minBootstrapCILower >= autoApprovalMinHealthScore)
+        if (minBootstrapCILower > autoApprovalMinHealthScore)
         {
-            issues.Add($"MinBootstrapCILower ({minBootstrapCILower}) >= AutoApprovalMinHealthScore ({autoApprovalMinHealthScore}) — " +
+            issues.Add($"MinBootstrapCILower ({minBootstrapCILower}) > AutoApprovalMinHealthScore ({autoApprovalMinHealthScore}) — " +
                        "CI lower bound can never exceed the absolute score, making auto-approval impossible");
         }
 

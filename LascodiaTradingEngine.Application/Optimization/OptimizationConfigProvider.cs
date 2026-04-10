@@ -57,6 +57,10 @@ public sealed class OptimizationConfigProvider
         "Optimization:MaxRunsPerWeek", "Optimization:UseEhviAcquisition",
         "Optimization:UseParegoScalarization", "Optimization:MinEquityCurveR2",
         "Optimization:MaxTradeTimeConcentration",
+        "Optimization:MultiObjectiveMinSharpe", "Optimization:MultiObjectiveMaxDrawdownPct",
+        "Optimization:MultiObjectiveMinWinRate", "Optimization:MultiObjectiveMinProfitFactor",
+        "Optimization:FollowUpStuckThresholdHours",
+        "Optimization:RolloutTier1Pct", "Optimization:RolloutTier2Pct", "Optimization:RolloutTier3Pct",
     ];
 
     private static readonly TimeSpan CacheTtl = TimeSpan.FromSeconds(60);
@@ -207,6 +211,16 @@ public sealed class OptimizationConfigProvider
             MaxConsecutiveFailuresBeforeEscalation = OptimizationGridBuilder.GetConfigValue(batch, "Optimization:MaxConsecutiveFailuresBeforeEscalation", 3),
             CheckpointEveryN = OptimizationGridBuilder.GetConfigValue(batch, "Optimization:CheckpointEveryN", preset.CheckpointEveryN),
             MaxConcurrentRuns = OptimizationGridBuilder.GetConfigValue(batch, "Optimization:MaxConcurrentRuns", 3),
+            MultiObjectiveMinSharpe = OptimizationGridBuilder.GetConfigValue(batch, "Optimization:MultiObjectiveMinSharpe", 1.0),
+            MultiObjectiveMaxDrawdownPct = OptimizationGridBuilder.GetConfigValue(batch, "Optimization:MultiObjectiveMaxDrawdownPct", 10.0),
+            MultiObjectiveMinWinRate = OptimizationGridBuilder.GetConfigValue(batch, "Optimization:MultiObjectiveMinWinRate", 0.45),
+            MultiObjectiveMinProfitFactor = OptimizationGridBuilder.GetConfigValue(batch, "Optimization:MultiObjectiveMinProfitFactor", 1.2),
+            FollowUpStuckThresholdHours = OptimizationGridBuilder.GetConfigValue(batch, "Optimization:FollowUpStuckThresholdHours", 6.0),
+            RolloutTier1Pct = OptimizationGridBuilder.GetConfigValue(batch, "Optimization:RolloutTier1Pct", 25),
+            RolloutTier2Pct = OptimizationGridBuilder.GetConfigValue(batch, "Optimization:RolloutTier2Pct", 50),
+            RolloutTier3Pct = OptimizationGridBuilder.GetConfigValue(batch, "Optimization:RolloutTier3Pct", 75),
+            WalkForwardMinCandlesM15 = OptimizationGridBuilder.GetConfigValueNullable<int>(batch, "Optimization:WalkForwardMinCandlesM15"),
+            WalkForwardMinCandlesH1 = OptimizationGridBuilder.GetConfigValueNullable<int>(batch, "Optimization:WalkForwardMinCandlesH1"),
         };
     }
 

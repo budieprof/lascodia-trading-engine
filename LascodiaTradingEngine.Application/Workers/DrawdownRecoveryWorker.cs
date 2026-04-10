@@ -68,6 +68,7 @@ public sealed class DrawdownRecoveryWorker : BackgroundService
 
     private readonly IServiceScopeFactory            _scopeFactory;
     private readonly ILogger<DrawdownRecoveryWorker> _logger;
+    private int _consecutiveErrors;
 
     /// <summary>
     /// Initialises the worker.
@@ -118,6 +119,7 @@ public sealed class DrawdownRecoveryWorker : BackgroundService
                 pollSecs = await GetConfigAsync<int>(ctx, CK_PollSecs, 30, stoppingToken);
 
                 await EnforceModeAsync(ctx, writeCtx, mediator, stoppingToken);
+                _consecutiveErrors = 0;
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -126,7 +128,13 @@ public sealed class DrawdownRecoveryWorker : BackgroundService
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "DrawdownRecoveryWorker loop error");
+                _consecutiveErrors++;
+                int backoffSeconds = Math.Min(300, 30 * (1 << Math.Min(_consecutiveErrors, 4)));
+                _logger.LogError(ex,
+                    "DrawdownRecoveryWorker loop error (consecutive={Count}), backing off {Backoff}s",
+                    _consecutiveErrors, backoffSeconds);
+                await Task.Delay(TimeSpan.FromSeconds(backoffSeconds), stoppingToken);
+                continue;
             }
 
             await Task.Delay(TimeSpan.FromSeconds(pollSecs), stoppingToken);

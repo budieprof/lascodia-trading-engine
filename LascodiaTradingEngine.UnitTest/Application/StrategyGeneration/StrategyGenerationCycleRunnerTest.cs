@@ -318,6 +318,12 @@ public class StrategyGenerationCycleRunnerTest : IDisposable
             return Task.FromResult(result);
         }
 
+        public Task<List<Lascodia.Trading.Engine.IntegrationEventLogEF.IntegrationEventLogEntry>> GetStalePublishedEventsAsync(
+            TimeSpan staleThreshold,
+            int batchSize,
+            CancellationToken ct)
+            => Task.FromResult(new List<Lascodia.Trading.Engine.IntegrationEventLogEF.IntegrationEventLogEntry>());
+
         public Task SaveChangesAsync(CancellationToken ct) => Task.CompletedTask;
     }
 

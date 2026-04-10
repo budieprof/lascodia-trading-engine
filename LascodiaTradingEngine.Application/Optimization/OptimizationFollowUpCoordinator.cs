@@ -15,7 +15,7 @@ namespace LascodiaTradingEngine.Application.Optimization;
 [RegisterService(ServiceLifetime.Singleton)]
 public sealed class OptimizationFollowUpCoordinator
 {
-    private static readonly TimeSpan FollowUpStuckThreshold = TimeSpan.FromHours(6);
+    private static readonly TimeSpan DefaultFollowUpStuckThreshold = TimeSpan.FromHours(6);
     private static readonly TimeSpan FollowUpInflightRecheckInterval = TimeSpan.FromMinutes(15);
     private static readonly TimeSpan FollowUpRepairRecheckInterval = TimeSpan.FromMinutes(5);
 
@@ -218,7 +218,8 @@ public sealed class OptimizationFollowUpCoordinator
                     nowUtc);
                 _metrics.OptimizationFollowUpDeferredChecks.Add(1);
                 await DetectAndAlertOnStuckFollowUpsAsync(
-                    writeDb, writeCtx, run, backtestRun, wfRun, ct);
+                    writeDb, writeCtx, run, backtestRun, wfRun, ct,
+                    config.FollowUpStuckThresholdHours);
                 await writeCtx.SaveChangesAsync(ct);
                 continue;
             }
@@ -789,7 +790,8 @@ public sealed class OptimizationFollowUpCoordinator
         OptimizationRun run,
         BacktestRun backtestRun,
         WalkForwardRun walkForwardRun,
-        CancellationToken ct)
+        CancellationToken ct,
+        double followUpStuckThresholdHours = 0)
     {
         DateTime? backtestAnchorUtc = GetIncompleteFollowUpAnchorUtc(run, backtestRun.StartedAt, backtestRun.Status);
         DateTime? walkForwardAnchorUtc = GetIncompleteFollowUpAnchorUtc(run, walkForwardRun.StartedAt, walkForwardRun.Status);
@@ -802,8 +804,11 @@ public sealed class OptimizationFollowUpCoordinator
             ? (nowUtc - walkForwardAnchorUtc.Value).TotalHours
             : null;
 
-        bool backtestStuck = backtestAgeHours.HasValue && backtestAgeHours.Value >= FollowUpStuckThreshold.TotalHours;
-        bool walkForwardStuck = walkForwardAgeHours.HasValue && walkForwardAgeHours.Value >= FollowUpStuckThreshold.TotalHours;
+        double effectiveStuckThresholdHours = followUpStuckThresholdHours > 0
+            ? followUpStuckThresholdHours
+            : DefaultFollowUpStuckThreshold.TotalHours;
+        bool backtestStuck = backtestAgeHours.HasValue && backtestAgeHours.Value >= effectiveStuckThresholdHours;
+        bool walkForwardStuck = walkForwardAgeHours.HasValue && walkForwardAgeHours.Value >= effectiveStuckThresholdHours;
 
         if (!backtestStuck && !walkForwardStuck)
             return;
@@ -838,7 +843,7 @@ public sealed class OptimizationFollowUpCoordinator
             Type = "OptimizationFollowUpStuck",
             OptimizationRunId = run.Id,
             StrategyId = run.StrategyId,
-            ThresholdHours = FollowUpStuckThreshold.TotalHours,
+            ThresholdHours = effectiveStuckThresholdHours,
             BacktestStatus = backtestRun.Status.ToString(),
             WalkForwardStatus = walkForwardRun.Status.ToString(),
             BacktestAgeHours = backtestAgeHours,

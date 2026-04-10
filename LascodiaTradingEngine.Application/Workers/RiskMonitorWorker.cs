@@ -74,6 +74,7 @@ public class RiskMonitorWorker : BackgroundService
     private readonly IServiceScopeFactory _scopeFactory;
     private const int DefaultPollSeconds = 30;
     private const int MaxBackoffSeconds = 300;
+    private const string CK_WarningThresholdPct = "RiskMonitor:WarningThresholdPct";
     private int _consecutiveFailures;
 
     /// <summary>
@@ -179,6 +180,9 @@ public class RiskMonitorWorker : BackgroundService
                 .Set<Domain.Entities.Position>()
                 .CountAsync(x => x.Status == PositionStatus.Open && !x.IsDeleted, cancellationToken);
 
+            // Read the warning threshold from EngineConfig (hot-reloadable, default 80%).
+            double warningThreshold = await GetConfigAsync(context, CK_WarningThresholdPct, 0.80);
+
             if (openPositionCount >= defaultProfile.MaxOpenPositions)
             {
                 // Hard limit reached — the engine should be blocking new positions via
@@ -187,14 +191,13 @@ public class RiskMonitorWorker : BackgroundService
                     "RiskMonitorWorker: open position count {Count} has reached the limit of {Max} set by profile '{Profile}'",
                     openPositionCount, defaultProfile.MaxOpenPositions, defaultProfile.Name);
             }
-            else if (openPositionCount >= defaultProfile.MaxOpenPositions * 0.8)
+            else if (openPositionCount >= defaultProfile.MaxOpenPositions * warningThreshold)
             {
-                // 80 % threshold — early warning so operators can act before the hard limit.
-                // The 0.8 multiplier (80 %) is intentionally hard-coded here; adjust and
-                // redeploy if a different sensitivity is required.
+                // Configurable threshold — early warning so operators can act before the hard limit.
+                // Adjust via EngineConfig key "RiskMonitor:WarningThresholdPct" (e.g. 0.80 = 80%).
                 _logger.LogWarning(
-                    "RiskMonitorWorker: open position count {Count} is approaching the limit of {Max} (profile: '{Profile}')",
-                    openPositionCount, defaultProfile.MaxOpenPositions, defaultProfile.Name);
+                    "RiskMonitorWorker: open position count {Count} is approaching the limit of {Max} (threshold: {Threshold:P0}, profile: '{Profile}')",
+                    openPositionCount, defaultProfile.MaxOpenPositions, warningThreshold, defaultProfile.Name);
             }
             else
             {
@@ -210,5 +213,24 @@ public class RiskMonitorWorker : BackgroundService
             _logger.LogError(ex, "RiskMonitorWorker error during risk monitoring cycle");
             throw;
         }
+    }
+
+    /// <summary>
+    /// Reads a typed value from <see cref="Domain.Entities.EngineConfig"/> by key,
+    /// falling back to <paramref name="defaultValue"/> if the key is missing or
+    /// the stored value cannot be converted.
+    /// </summary>
+    private static async Task<T> GetConfigAsync<T>(
+        IReadApplicationDbContext readContext, string key, T defaultValue)
+    {
+        var entry = await readContext.GetDbContext()
+            .Set<Domain.Entities.EngineConfig>()
+            .AsNoTracking()
+            .FirstOrDefaultAsync(c => c.Key == key);
+
+        if (entry?.Value is null) return defaultValue;
+
+        try   { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
+        catch { return defaultValue; }
     }
 }

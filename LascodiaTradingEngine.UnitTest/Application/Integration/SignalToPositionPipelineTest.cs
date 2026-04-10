@@ -373,7 +373,8 @@ public class SignalToPositionPipelineTest : IDisposable
             StopLoss       = 1.0950m,
             TakeProfit     = 1.1100m,
             IsPaper        = false,
-            IsDeleted      = false
+            IsDeleted      = false,
+            Status         = OrderStatus.Filled
         };
 
         SetupFilledDbSets(
@@ -521,7 +522,8 @@ public class SignalToPositionPipelineTest : IDisposable
             StopLoss       = 1.0950m,
             TakeProfit     = 1.1100m,
             IsPaper        = false,
-            IsDeleted      = false
+            IsDeleted      = false,
+            Status         = OrderStatus.Filled
         };
 
         SetupFilledDbSets(

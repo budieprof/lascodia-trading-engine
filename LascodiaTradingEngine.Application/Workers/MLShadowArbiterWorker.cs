@@ -461,6 +461,14 @@ public sealed class MLShadowArbiterWorker : BackgroundService
             var freshCurrentShadow = await writeCtx.Set<MLShadowEvaluation>()
                 .FirstOrDefaultAsync(s => s.Id == shadow.Id, ct);
 
+            if (freshCurrentShadow is null)
+            {
+                _logger.LogWarning(
+                    "Shadow {Id} disappeared during tournament resolution — skipping tournament.",
+                    shadow.Id);
+                return;
+            }
+
             var promotableCandidates = tournamentSiblings
                 .Where(s => s.Status != ShadowEvaluationStatus.Running &&
                             s.Status != ShadowEvaluationStatus.Processing &&
@@ -544,6 +552,10 @@ public sealed class MLShadowArbiterWorker : BackgroundService
         }
 
         // ── Act on the decision ───────────────────────────────────────────────
+        // Bug #6 fix: acquire the distributed lock BEFORE acting on the promotion
+        // decision. This prevents a race where two workers both decide to promote
+        // and then compete for the lock. Under the lock we re-verify the shadow
+        // status — if another worker already promoted it, we skip.
         if (decision == PromotionDecision.AutoPromoted)
         {
             // Advisory lock scoped to symbol+timeframe prevents concurrent promotion
@@ -555,6 +567,37 @@ public sealed class MLShadowArbiterWorker : BackgroundService
                 _logger.LogWarning(
                     "Shadow eval {Id}: could not acquire promotion lock — another promotion in progress. Skipping.",
                     shadow.Id);
+                return;
+            }
+
+            // Re-read the shadow evaluation status under the lock (check-lock-check pattern).
+            // Another worker may have already completed this evaluation while we were waiting.
+            var shadowStatusUnderLock = await writeCtx.Set<MLShadowEvaluation>()
+                .Where(s => s.Id == shadow.Id)
+                .Select(s => s.Status)
+                .FirstOrDefaultAsync(ct);
+
+            if (shadowStatusUnderLock != ShadowEvaluationStatus.Completed)
+            {
+                _logger.LogInformation(
+                    "Shadow eval {Id}: status changed to {Status} while waiting for lock — " +
+                    "another worker already processed this evaluation. Skipping promotion.",
+                    shadow.Id, shadowStatusUnderLock);
+                return;
+            }
+
+            // Re-verify the challenger model is still eligible (not already active or superseded
+            // by a concurrent promotion from a different shadow evaluation or training run).
+            var challengerStatus = await writeCtx.Set<MLModel>()
+                .Where(m => m.Id == shadow.ChallengerModelId)
+                .Select(m => new { m.IsActive, m.Status })
+                .FirstOrDefaultAsync(ct);
+
+            if (challengerStatus is null || challengerStatus.IsActive || challengerStatus.Status == MLModelStatus.Superseded)
+            {
+                _logger.LogInformation(
+                    "Shadow eval {Id}: challenger model {ChalId} already active or superseded under lock — skipping.",
+                    shadow.Id, shadow.ChallengerModelId);
                 return;
             }
 
@@ -671,9 +714,10 @@ public sealed class MLShadowArbiterWorker : BackgroundService
         await writeCtx.Set<MLModel>()
             .Where(m => m.Id == shadow.ChallengerModelId)
             .ExecuteUpdateAsync(s => s
-                .SetProperty(m => m.IsActive,    true)
-                .SetProperty(m => m.Status,      MLModelStatus.Active)
-                .SetProperty(m => m.ActivatedAt, now),
+                .SetProperty(m => m.IsActive,     true)
+                .SetProperty(m => m.IsSuppressed, false)
+                .SetProperty(m => m.Status,       MLModelStatus.Active)
+                .SetProperty(m => m.ActivatedAt,  now),
                 ct);
 
         _logger.LogWarning(

@@ -8,6 +8,113 @@ using Microsoft.Extensions.Logging;
 namespace LascodiaTradingEngine.Infrastructure.HealthChecks;
 
 /// <summary>
+/// Monitors PostgreSQL connection pool utilisation by checking the number of open connections
+/// against the configured <c>Maximum Pool Size</c>. Reports Degraded when usage exceeds 80%
+/// and Unhealthy when the pool is exhausted, enabling early detection of connection leaks
+/// or insufficient pool sizing before queries start timing out.
+/// </summary>
+public class ConnectionPoolHealthCheck : IHealthCheck
+{
+    private readonly IWriteApplicationDbContext _writeContext;
+    private readonly ILogger<ConnectionPoolHealthCheck> _logger;
+
+    /// <summary>
+    /// Pool usage fraction above which the check reports <see cref="HealthStatus.Degraded"/>.
+    /// Set to 80% to provide an early warning before full exhaustion.
+    /// </summary>
+    private const double DegradedThreshold = 0.80;
+
+    public ConnectionPoolHealthCheck(
+        IWriteApplicationDbContext writeContext,
+        ILogger<ConnectionPoolHealthCheck> logger)
+    {
+        _writeContext = writeContext;
+        _logger = logger;
+    }
+
+    public async Task<HealthCheckResult> CheckHealthAsync(
+        HealthCheckContext context,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var db = _writeContext.GetDbContext().Database;
+            var connectionString = db.GetConnectionString();
+
+            // Extract configured Maximum Pool Size from connection string (default: 100)
+            int maxPoolSize = 200;
+            if (!string.IsNullOrEmpty(connectionString))
+            {
+                var parts = connectionString.Split(';', StringSplitOptions.RemoveEmptyEntries);
+                foreach (var part in parts)
+                {
+                    var kv = part.Split('=', 2);
+                    if (kv.Length == 2 &&
+                        kv[0].Trim().Equals("Maximum Pool Size", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (int.TryParse(kv[1].Trim(), out int parsed))
+                            maxPoolSize = parsed;
+                    }
+                }
+            }
+
+            // Query pg_stat_activity for the number of active connections from this application.
+            // This is a lightweight read that does not lock any resources.
+            var conn = db.GetDbConnection();
+            await db.OpenConnectionAsync(cancellationToken);
+            try
+            {
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database()";
+                var result = await cmd.ExecuteScalarAsync(cancellationToken);
+                int activeConnections = Convert.ToInt32(result);
+
+                double usage = (double)activeConnections / maxPoolSize;
+                var data = new Dictionary<string, object>
+                {
+                    ["active_connections"] = activeConnections,
+                    ["max_pool_size"] = maxPoolSize,
+                    ["usage_pct"] = $"{usage:P0}"
+                };
+
+                if (usage >= 1.0)
+                {
+                    _logger.LogError(
+                        "Connection pool health check: pool EXHAUSTED ({Active}/{Max} connections).",
+                        activeConnections, maxPoolSize);
+                    return HealthCheckResult.Unhealthy(
+                        $"Connection pool exhausted: {activeConnections}/{maxPoolSize} connections in use.",
+                        data: data);
+                }
+
+                if (usage >= DegradedThreshold)
+                {
+                    _logger.LogWarning(
+                        "Connection pool health check: high usage ({Active}/{Max} = {Usage:P0}).",
+                        activeConnections, maxPoolSize, usage);
+                    return HealthCheckResult.Degraded(
+                        $"Connection pool usage high: {activeConnections}/{maxPoolSize} ({usage:P0}).",
+                        data: data);
+                }
+
+                return HealthCheckResult.Healthy(
+                    $"Connection pool healthy: {activeConnections}/{maxPoolSize} ({usage:P0}).",
+                    data: data);
+            }
+            finally
+            {
+                await db.CloseConnectionAsync();
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Connection pool health check threw an exception.");
+            return HealthCheckResult.Unhealthy("Connection pool health check failed.", ex);
+        }
+    }
+}
+
+/// <summary>
 /// Verifies PostgreSQL connectivity by attempting a lightweight connection check
 /// against the write database context.
 /// </summary>

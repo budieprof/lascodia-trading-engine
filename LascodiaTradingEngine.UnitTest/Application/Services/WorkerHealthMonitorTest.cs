@@ -1,6 +1,7 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Moq;
+using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Services;
 
 namespace LascodiaTradingEngine.UnitTest.Application.Services;
@@ -14,6 +15,7 @@ public class WorkerHealthMonitorTest
         var mockScopeFactory = new Mock<IServiceScopeFactory>();
         _monitor = new WorkerHealthMonitor(
             mockScopeFactory.Object,
+            Mock.Of<IAlertDispatcher>(),
             Mock.Of<ILogger<WorkerHealthMonitor>>());
     }
 

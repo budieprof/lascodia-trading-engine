@@ -46,11 +46,12 @@ namespace LascodiaTradingEngine.Application.Workers;
 /// </summary>
 public sealed class MLModelRetirementWorker : BackgroundService
 {
-    private const string CK_PollSecs    = "MLRetirement:PollIntervalSeconds";
-    private const string CK_EwmaThr     = "MLRetirement:CriticalEwmaThreshold";
-    private const string CK_LiveFloor   = "MLRetirement:LiveAccuracyFloor";
-    private const string CK_SigRequired = "MLRetirement:SignalsRequired";
-    private const string CK_AlertDest   = "MLRetirement:AlertDestination";
+    private const string CK_PollSecs      = "MLRetirement:PollIntervalSeconds";
+    private const string CK_EwmaThr       = "MLRetirement:CriticalEwmaThreshold";
+    private const string CK_LiveFloor     = "MLRetirement:LiveAccuracyFloor";
+    private const string CK_SigRequired   = "MLRetirement:SignalsRequired";
+    private const string CK_AlertDest     = "MLRetirement:AlertDestination";
+    private const string CK_GraceMinutes  = "MLRetirement:ActivationGraceMinutes";
 
     private readonly IServiceScopeFactory                _scopeFactory;
     private readonly ILogger<MLModelRetirementWorker>    _logger;
@@ -125,18 +126,35 @@ public sealed class MLModelRetirementWorker : BackgroundService
         double liveFloor    = await GetConfigAsync<double>(readCtx, CK_LiveFloor,    0.48,    ct);
         int    sigsRequired = await GetConfigAsync<int>   (readCtx, CK_SigRequired,  2,       ct);
         string alertDest    = await GetConfigAsync<string>(readCtx, CK_AlertDest,    "ml-ops", ct);
+        int    graceMinutes = await GetConfigAsync<int>   (readCtx, CK_GraceMinutes, 30,      ct);
 
         // Only evaluate active, non-suppressed models — models already suppressed
         // by a previous retirement cycle are excluded to prevent redundant DB updates.
         var activeModels = await readCtx.Set<MLModel>()
             .Where(m => m.IsActive && !m.IsSuppressed && !m.IsDeleted)
             .AsNoTracking()
-            .Select(m => new { m.Id, m.Symbol, m.Timeframe, m.LiveDirectionAccuracy })
+            .Select(m => new { m.Id, m.Symbol, m.Timeframe, m.LiveDirectionAccuracy, m.ActivatedAt })
             .ToListAsync(ct);
+
+        var now = DateTime.UtcNow;
 
         foreach (var model in activeModels)
         {
             ct.ThrowIfCancellationRequested();
+
+            // Grace period: do not retire models that were activated within the last N minutes.
+            // Newly promoted models need time to accumulate enough prediction history for
+            // the degradation signals to be statistically meaningful.
+            if (model.ActivatedAt.HasValue &&
+                (now - model.ActivatedAt.Value).TotalMinutes < graceMinutes)
+            {
+                _logger.LogDebug(
+                    "Retirement: model {Id} ({Symbol}/{Tf}) activated {Ago:F0} min ago — " +
+                    "within {Grace}-min grace period, skipping.",
+                    model.Id, model.Symbol, model.Timeframe,
+                    (now - model.ActivatedAt.Value).TotalMinutes, graceMinutes);
+                continue;
+            }
 
             try
             {
@@ -300,14 +318,10 @@ public sealed class MLModelRetirementWorker : BackgroundService
             .Where(m => m.Id == modelId)
             .ExecuteUpdateAsync(s => s.SetProperty(m => m.IsSuppressed, true), ct);
 
-        // ── Critical alert ────────────────────────────────────────────────────
-        // Deduplicate before inserting — one active MLModelDegraded alert per symbol.
-        bool alertExists = await readCtx.Set<Alert>()
-            .AnyAsync(a => a.Symbol    == symbol                  &&
-                           a.AlertType == AlertType.MLModelDegraded &&
-                           a.IsActive  && !a.IsDeleted, ct);
-
-        if (!alertExists)
+        // ── Critical alert (idempotent insert) ────────────────────────────────
+        // Use try/catch on SaveChanges instead of check-then-insert to avoid
+        // TOCTOU race conditions where two workers both see "no alert" and both insert.
+        try
         {
             writeCtx.Set<Alert>().Add(new Alert
             {
@@ -330,9 +344,17 @@ public sealed class MLModelRetirementWorker : BackgroundService
                 }),
                 IsActive = true,
             });
-        }
 
-        await writeCtx.SaveChangesAsync(ct);
+            await writeCtx.SaveChangesAsync(ct);
+        }
+        catch (DbUpdateException)
+        {
+            // Duplicate alert — another worker already inserted it. This is expected
+            // under concurrent execution and is safe to ignore.
+            _logger.LogDebug(
+                "Retirement: duplicate alert suppressed for {Symbol}/{Tf} model {Id}.",
+                symbol, timeframe, modelId);
+        }
     }
 
     // ── Config helper ─────────────────────────────────────────────────────────

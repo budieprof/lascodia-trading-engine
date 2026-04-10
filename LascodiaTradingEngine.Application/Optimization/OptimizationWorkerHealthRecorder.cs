@@ -38,84 +38,132 @@ public sealed class OptimizationWorkerHealthRecorder
     {
         await using var scope = _scopeFactory.CreateAsyncScope();
         var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
-        var writeDb = writeCtx.GetDbContext();
+        var readDb = writeCtx.GetDbContext();
         var nowUtc = UtcNow;
         var starvationCutoffUtc = nowUtc.AddHours(-24);
+        var deferredRunsStartedCutoffUtc = nowUtc.AddHours(-1);
 
-        var eligibleQueuedRunsQuery = writeDb.Set<OptimizationRun>()
+        // --- Batched status counts: single GROUP BY query instead of 3+ separate COUNT queries ---
+        var statusCounts = await readDb.Set<OptimizationRun>()
+            .AsNoTracking()
+            .Where(r => !r.IsDeleted
+                     && (r.Status == OptimizationRunStatus.Queued
+                      || r.Status == OptimizationRunStatus.Running
+                      || r.Status == OptimizationRunStatus.Abandoned))
+            .GroupBy(r => r.Status)
+            .Select(g => new { Status = g.Key, Count = g.Count() })
+            .ToListAsync(ct);
+
+        int totalQueuedRuns = statusCounts.FirstOrDefault(s => s.Status == OptimizationRunStatus.Queued)?.Count ?? 0;
+        int runningRuns = statusCounts.FirstOrDefault(s => s.Status == OptimizationRunStatus.Running)?.Count ?? 0;
+        int abandonedRuns = statusCounts.FirstOrDefault(s => s.Status == OptimizationRunStatus.Abandoned)?.Count ?? 0;
+
+        var eligibleQueuedRunsQuery = readDb.Set<OptimizationRun>()
+            .AsNoTracking()
             .Where(r => !r.IsDeleted
                      && r.Status == OptimizationRunStatus.Queued
                      && (r.DeferredUntilUtc == null || r.DeferredUntilUtc <= nowUtc));
-        var deferredQueuedRunsQuery = writeDb.Set<OptimizationRun>()
+        var deferredQueuedRunsQuery = readDb.Set<OptimizationRun>()
+            .AsNoTracking()
             .Where(r => !r.IsDeleted
                      && r.Status == OptimizationRunStatus.Queued
                      && r.DeferredUntilUtc != null
                      && r.DeferredUntilUtc > nowUtc);
-        var deferredRunsStartedCutoffUtc = nowUtc.AddHours(-1);
-        var runningRunsQuery = writeDb.Set<OptimizationRun>()
+        var runningRunsQuery = readDb.Set<OptimizationRun>()
+            .AsNoTracking()
             .Where(r => !r.IsDeleted
                      && r.Status == OptimizationRunStatus.Running);
         var starvedQueuedRunsQuery = eligibleQueuedRunsQuery
             .Where(r => (r.QueuedAt == default ? r.StartedAt : r.QueuedAt) < starvationCutoffUtc);
         var retryReadyRunsQuery = OptimizationRetryPlanner.QueryRetryReadyRuns(
-            writeDb,
+            readDb,
             Math.Max(0, config.MaxRetryAttempts),
             nowUtc);
 
+        // --- Batched running-run lease breakdown: single query with conditional counts ---
+        var runningLeaseBreakdown = await runningRunsQuery
+            .GroupBy(_ => 1)
+            .Select(g => new
+            {
+                ActiveLeased = g.Count(r => r.ExecutionLeaseToken != null
+                                          && r.ExecutionLeaseExpiresAt != null
+                                          && r.ExecutionLeaseExpiresAt >= nowUtc),
+                Stale = g.Count(r => r.ExecutionLeaseToken != null
+                                   && r.ExecutionLeaseExpiresAt != null
+                                   && r.ExecutionLeaseExpiresAt < nowUtc),
+                LeaseMissing = g.Count(r => r.ExecutionLeaseToken == null
+                                          || r.ExecutionLeaseExpiresAt == null),
+            })
+            .FirstOrDefaultAsync(ct);
+
+        int activeLeasedRunningRuns = runningLeaseBreakdown?.ActiveLeased ?? 0;
+        int staleRunningRuns = runningLeaseBreakdown?.Stale ?? 0;
+        int leaseMissingRunningRuns = runningLeaseBreakdown?.LeaseMissing ?? 0;
+
         int queuedRuns = await eligibleQueuedRunsQuery.CountAsync(ct);
         int deferredQueuedRuns = await deferredQueuedRunsQuery.CountAsync(ct);
-        int runningRuns = await runningRunsQuery.CountAsync(ct);
-        int activeLeasedRunningRuns = await runningRunsQuery
-            .CountAsync(r => r.ExecutionLeaseToken != null
-                          && r.ExecutionLeaseExpiresAt != null
-                          && r.ExecutionLeaseExpiresAt >= nowUtc, ct);
-        int staleRunningRuns = await runningRunsQuery
-            .CountAsync(r => r.ExecutionLeaseToken != null
-                          && r.ExecutionLeaseExpiresAt != null
-                          && r.ExecutionLeaseExpiresAt < nowUtc, ct);
-        int leaseMissingRunningRuns = await runningRunsQuery
-            .CountAsync(r => r.ExecutionLeaseToken == null
-                          || r.ExecutionLeaseExpiresAt == null, ct);
         int retryableFailedRuns = await retryReadyRunsQuery.CountAsync(ct);
         int starvedQueuedRuns = await starvedQueuedRunsQuery.CountAsync(ct);
-        int deferredRunsStartedLastHour = await writeDb.Set<OptimizationRun>()
-            .CountAsync(r => !r.IsDeleted
-                          && r.DeferredAtUtc != null
-                          && r.DeferredAtUtc >= deferredRunsStartedCutoffUtc, ct);
-        int deferredRunsResumedLastHour = await writeDb.Set<OptimizationRun>()
-            .CountAsync(r => !r.IsDeleted
-                          && r.LastResumedAtUtc != null
-                          && r.LastResumedAtUtc >= deferredRunsStartedCutoffUtc, ct);
+
+        // --- Batched deferral / resume counts: single query ---
+        var deferralResumeCounts = await readDb.Set<OptimizationRun>()
+            .AsNoTracking()
+            .Where(r => !r.IsDeleted
+                     && ((r.DeferredAtUtc != null && r.DeferredAtUtc >= deferredRunsStartedCutoffUtc)
+                      || (r.LastResumedAtUtc != null && r.LastResumedAtUtc >= deferredRunsStartedCutoffUtc)))
+            .GroupBy(_ => 1)
+            .Select(g => new
+            {
+                DeferredStarted = g.Count(r => r.DeferredAtUtc != null && r.DeferredAtUtc >= deferredRunsStartedCutoffUtc),
+                DeferredResumed = g.Count(r => r.LastResumedAtUtc != null && r.LastResumedAtUtc >= deferredRunsStartedCutoffUtc),
+            })
+            .FirstOrDefaultAsync(ct);
+
+        int deferredRunsStartedLastHour = deferralResumeCounts?.DeferredStarted ?? 0;
+        int deferredRunsResumedLastHour = deferralResumeCounts?.DeferredResumed ?? 0;
         int repeatedlyDeferredQueuedRuns = await deferredQueuedRunsQuery
             .CountAsync(r => r.DeferralCount >= 2, ct);
-        int abandonedRuns = await writeDb.Set<OptimizationRun>()
-            .CountAsync(r => !r.IsDeleted && r.Status == OptimizationRunStatus.Abandoned, ct);
-        int pendingFollowUps = await writeDb.Set<OptimizationRun>()
-            .CountAsync(r => !r.IsDeleted
-                          && r.Status == OptimizationRunStatus.Approved
-                          && (r.ValidationFollowUpStatus == ValidationFollowUpStatus.Pending
-                              || r.ValidationFollowUpStatus == null), ct);
-        int approvedRunsMissingFollowUps = await writeDb.Set<OptimizationRun>()
-            .CountAsync(r => !r.IsDeleted
-                          && r.Status == OptimizationRunStatus.Approved
-                          && (r.ValidationFollowUpsCreatedAt == null
-                              || r.ValidationFollowUpStatus == null), ct);
-        int pendingCompletionPreparation = await writeDb.Set<OptimizationRun>()
-            .CountAsync(r => !r.IsDeleted
-                          && (r.Status == OptimizationRunStatus.Completed
-                           || r.Status == OptimizationRunStatus.Approved
-                           || r.Status == OptimizationRunStatus.Rejected)
-                          && r.ResultsPersistedAt != null
-                          && r.CompletionPublicationPayloadJson == null, ct);
-        int pendingCompletionPublications = await writeDb.Set<OptimizationRun>()
-            .CountAsync(r => !r.IsDeleted
-                          && (r.Status == OptimizationRunStatus.Completed
-                           || r.Status == OptimizationRunStatus.Approved
-                           || r.Status == OptimizationRunStatus.Rejected)
-                          && r.CompletionPublicationPayloadJson != null
-                          && (r.CompletionPublicationStatus == OptimizationCompletionPublicationStatus.Pending
-                           || r.CompletionPublicationStatus == OptimizationCompletionPublicationStatus.Failed), ct);
-        int strandedLifecycleRuns = await writeDb.Set<OptimizationRun>()
+
+        // --- Batched approved-run follow-up counts: single query ---
+        var approvedFollowUpCounts = await readDb.Set<OptimizationRun>()
+            .AsNoTracking()
+            .Where(r => !r.IsDeleted && r.Status == OptimizationRunStatus.Approved)
+            .GroupBy(_ => 1)
+            .Select(g => new
+            {
+                PendingFollowUps = g.Count(r => r.ValidationFollowUpStatus == ValidationFollowUpStatus.Pending
+                                             || r.ValidationFollowUpStatus == null),
+                MissingFollowUps = g.Count(r => r.ValidationFollowUpsCreatedAt == null
+                                             || r.ValidationFollowUpStatus == null),
+            })
+            .FirstOrDefaultAsync(ct);
+
+        int pendingFollowUps = approvedFollowUpCounts?.PendingFollowUps ?? 0;
+        int approvedRunsMissingFollowUps = approvedFollowUpCounts?.MissingFollowUps ?? 0;
+
+        // --- Batched completion pipeline counts: single query ---
+        var completionCounts = await readDb.Set<OptimizationRun>()
+            .AsNoTracking()
+            .Where(r => !r.IsDeleted
+                     && (r.Status == OptimizationRunStatus.Completed
+                      || r.Status == OptimizationRunStatus.Approved
+                      || r.Status == OptimizationRunStatus.Rejected)
+                     && r.ResultsPersistedAt != null)
+            .GroupBy(_ => 1)
+            .Select(g => new
+            {
+                PendingPreparation = g.Count(r => r.CompletionPublicationPayloadJson == null),
+                PendingPublication = g.Count(r => r.CompletionPublicationPayloadJson != null
+                                               && (r.CompletionPublicationStatus == OptimizationCompletionPublicationStatus.Pending
+                                                || r.CompletionPublicationStatus == OptimizationCompletionPublicationStatus.Failed)),
+            })
+            .FirstOrDefaultAsync(ct);
+
+        int pendingCompletionPreparation = completionCounts?.PendingPreparation ?? 0;
+        int pendingCompletionPublications = completionCounts?.PendingPublication ?? 0;
+
+        int strandedLifecycleRuns = await readDb.Set<OptimizationRun>()
+            .AsNoTracking()
             .CountAsync(r => !r.IsDeleted
                           && (((r.Status == OptimizationRunStatus.Completed
                              || r.Status == OptimizationRunStatus.Approved
@@ -129,7 +177,10 @@ public sealed class OptimizationWorkerHealthRecorder
                                && (r.ValidationFollowUpsCreatedAt == null || r.ValidationFollowUpStatus == null || r.BestParametersJson == null))
                            || (r.Status == OptimizationRunStatus.Rejected
                                && (r.ValidationFollowUpsCreatedAt != null || r.ValidationFollowUpStatus != null))), ct);
-        var oldestStrandedLifecycleRun = await writeDb.Set<OptimizationRun>()
+
+        // --- "Oldest" queries: limited to .Take(100) to prevent full-table scans ---
+        var oldestStrandedLifecycleRun = await readDb.Set<OptimizationRun>()
+            .AsNoTracking()
             .Where(r => !r.IsDeleted
                      && (((r.Status == OptimizationRunStatus.Completed
                         || r.Status == OptimizationRunStatus.Approved
@@ -144,6 +195,7 @@ public sealed class OptimizationWorkerHealthRecorder
                       || (r.Status == OptimizationRunStatus.Rejected
                           && (r.ValidationFollowUpsCreatedAt != null || r.ValidationFollowUpStatus != null))))
             .OrderBy(r => r.CompletedAt ?? r.ApprovedAt ?? r.ResultsPersistedAt ?? r.ExecutionStartedAt ?? r.ClaimedAt ?? (DateTime?)r.QueuedAt ?? r.StartedAt)
+            .Take(100)
             .Select(r => new
             {
                 r.Id,
@@ -151,9 +203,9 @@ public sealed class OptimizationWorkerHealthRecorder
                 AnchorAtUtc = r.CompletedAt ?? r.ApprovedAt ?? r.ResultsPersistedAt ?? r.ExecutionStartedAt ?? r.ClaimedAt ?? (DateTime?)r.QueuedAt ?? r.StartedAt
             })
             .FirstOrDefaultAsync(ct);
-        var oldestRunningRun = await writeDb.Set<OptimizationRun>()
-            .Where(r => !r.IsDeleted && r.Status == OptimizationRunStatus.Running)
+        var oldestRunningRun = await runningRunsQuery
             .OrderBy(r => r.ExecutionStageUpdatedAt ?? r.ExecutionStartedAt ?? r.ClaimedAt ?? (DateTime?)r.QueuedAt ?? r.StartedAt)
+            .Take(100)
             .Select(r => new
             {
                 r.Id,
@@ -164,6 +216,7 @@ public sealed class OptimizationWorkerHealthRecorder
             .FirstOrDefaultAsync(ct);
         var oldestQueuedRun = await eligibleQueuedRunsQuery
             .OrderBy(r => r.QueuedAt == default ? r.StartedAt : r.QueuedAt)
+            .Take(100)
             .Select(r => new
             {
                 r.Id,
@@ -172,6 +225,7 @@ public sealed class OptimizationWorkerHealthRecorder
             .FirstOrDefaultAsync(ct);
         var oldestDeferredQueuedRun = await deferredQueuedRunsQuery
             .OrderBy(r => r.QueuedAt == default ? r.StartedAt : r.QueuedAt)
+            .Take(100)
             .Select(r => new
             {
                 r.Id,
@@ -182,6 +236,7 @@ public sealed class OptimizationWorkerHealthRecorder
         var oldestActiveDeferral = await deferredQueuedRunsQuery
             .Where(r => r.DeferredAtUtc != null)
             .OrderBy(r => r.DeferredAtUtc)
+            .Take(100)
             .Select(r => new
             {
                 r.Id,
@@ -193,21 +248,25 @@ public sealed class OptimizationWorkerHealthRecorder
             .Select(g => new OptimizationDeferralReasonCountSnapshot(g.Key, g.Count()))
             .OrderBy(x => x.Reason)
             .ToListAsync(ct);
-        var mostDeferredQueuedRun = await writeDb.Set<OptimizationRun>()
+        var mostDeferredQueuedRun = await readDb.Set<OptimizationRun>()
+            .AsNoTracking()
             .Where(r => !r.IsDeleted
                      && r.Status == OptimizationRunStatus.Queued
                      && r.DeferralCount > 0)
             .OrderByDescending(r => r.DeferralCount)
             .ThenBy(r => r.QueuedAt == default ? r.StartedAt : r.QueuedAt)
+            .Take(100)
             .Select(r => new
             {
                 r.Id,
                 r.DeferralCount
             })
             .FirstOrDefaultAsync(ct);
-        var mostRecentDeferredResume = await writeDb.Set<OptimizationRun>()
+        var mostRecentDeferredResume = await readDb.Set<OptimizationRun>()
+            .AsNoTracking()
             .Where(r => !r.IsDeleted && r.LastResumedAtUtc != null)
             .OrderByDescending(r => r.LastResumedAtUtc)
+            .Take(100)
             .Select(r => new
             {
                 r.Id,
@@ -216,6 +275,7 @@ public sealed class OptimizationWorkerHealthRecorder
             .FirstOrDefaultAsync(ct);
         var oldestStarvedQueuedRun = await starvedQueuedRunsQuery
             .OrderBy(r => r.QueuedAt == default ? r.StartedAt : r.QueuedAt)
+            .Take(100)
             .Select(r => new
             {
                 r.Id,

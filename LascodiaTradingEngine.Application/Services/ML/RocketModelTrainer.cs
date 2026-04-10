@@ -18,7 +18,7 @@ namespace LascodiaTradingEngine.Application.Services.ML;
 /// <list type="number">
 ///   <item>Z-score standardisation of raw features before ROCKET transform.</item>
 ///   <item>Walk-forward cross-validation with purging, embargo, equity-curve gate, and Sharpe trend.</item>
-///   <item>70 / 10 / 20 train / calibration / test splits with embargo gaps.</item>
+///   <item>60 / 10 / 10 / 20 train / selection / calibration / test splits with embargo gaps.</item>
 ///   <item>Adam optimizer with cosine-annealing LR schedule + per-epoch early stopping.</item>
 ///   <item>Label smoothing + adaptive label smoothing.</item>
 ///   <item>Warm-start: reuse kernels and weights from a previous model snapshot.</item>
@@ -221,16 +221,18 @@ public sealed partial class RocketModelTrainer : IMLModelTrainer
 
         ct.ThrowIfCancellationRequested();
 
-        // ── 3. Final model splits: 70 % train | 10 % cal | ~20 % test ──────
-        int n        = allStd.Count;
-        int trainEnd = (int)(n * 0.70);
-        int calEnd   = (int)(n * 0.80);
-        int embargo  = hp.EmbargoBarCount;
+        // ── 3. Final model splits: 60% train | 10% selection | 10% cal | ~20% test ──
+        int n            = allStd.Count;
+        int trainEnd     = (int)(n * 0.60);
+        int selectionEnd = (int)(n * 0.70);
+        int calEnd       = (int)(n * 0.80);
+        int embargo      = hp.EmbargoBarCount;
 
-        var trainSet = allStd[..Math.Max(0, trainEnd - embargo)];
-        var calSet   = allStd[(calEnd > trainEnd ? trainEnd + embargo : trainEnd)
-                               ..(calEnd < n ? calEnd : n)];
-        var testSet  = allStd[Math.Min(calEnd + embargo, n)..];
+        var trainSet     = allStd[..Math.Max(0, trainEnd - embargo)];
+        int selStart     = Math.Min(trainEnd + embargo, selectionEnd);
+        var selectionSet = allStd[selStart..selectionEnd];
+        var calSet       = allStd[Math.Min(selectionEnd + embargo, calEnd)..Math.Min(calEnd, n)];
+        var testSet      = allStd[Math.Min(calEnd + embargo, n)..];
 
         if (trainSet.Count < hp.MinSamples)
             throw new InvalidOperationException(
@@ -243,6 +245,10 @@ public sealed partial class RocketModelTrainer : IMLModelTrainer
         if (calSet.Count < 5)
             throw new InvalidOperationException(
                 $"RocketModelTrainer: insufficient calibration samples after splits: {calSet.Count} < 5");
+
+        if (selectionSet.Count < 5)
+            throw new InvalidOperationException(
+                $"RocketModelTrainer: insufficient selection samples after splits: {selectionSet.Count} < 5");
 
         var effectiveHp = warmStart is not null
             ? hp with { MaxEpochs = Math.Max(30, hp.MaxEpochs / 2), LearningRate = hp.LearningRate / 3.0 }
@@ -357,9 +363,10 @@ public sealed partial class RocketModelTrainer : IMLModelTrainer
         }
 
         // ── 5. Extract ROCKET features for all splits ────────────────────────
-        var trainRocket = ExtractRocketFeatures(trainSet, kernelWeights, kernelDilations, kernelPaddings, kernelLengthArr, numKernels, channelStarts, channelEnds);
-        var calRocket   = ExtractRocketFeatures(calSet, kernelWeights, kernelDilations, kernelPaddings, kernelLengthArr, numKernels, channelStarts, channelEnds);
-        var testRocket  = ExtractRocketFeatures(testSet, kernelWeights, kernelDilations, kernelPaddings, kernelLengthArr, numKernels, channelStarts, channelEnds);
+        var trainRocket     = ExtractRocketFeatures(trainSet, kernelWeights, kernelDilations, kernelPaddings, kernelLengthArr, numKernels, channelStarts, channelEnds);
+        var selectionRocket = ExtractRocketFeatures(selectionSet, kernelWeights, kernelDilations, kernelPaddings, kernelLengthArr, numKernels, channelStarts, channelEnds);
+        var calRocket       = ExtractRocketFeatures(calSet, kernelWeights, kernelDilations, kernelPaddings, kernelLengthArr, numKernels, channelStarts, channelEnds);
+        var testRocket      = ExtractRocketFeatures(testSet, kernelWeights, kernelDilations, kernelPaddings, kernelLengthArr, numKernels, channelStarts, channelEnds);
 
         ct.ThrowIfCancellationRequested();
 
@@ -368,6 +375,7 @@ public sealed partial class RocketModelTrainer : IMLModelTrainer
         // ── 5b. Z-score ROCKET features ──────────────────────────────────────
         var (rocketMeans, rocketStds) = ComputeRocketStandardization(trainRocket, dim);
         StandardizeRocketInPlace(trainRocket, rocketMeans, rocketStds, dim);
+        StandardizeRocketInPlace(selectionRocket, rocketMeans, rocketStds, dim);
         StandardizeRocketInPlace(calRocket, rocketMeans, rocketStds, dim);
         StandardizeRocketInPlace(testRocket, rocketMeans, rocketStds, dim);
 
@@ -449,15 +457,15 @@ public sealed partial class RocketModelTrainer : IMLModelTrainer
             ComputeEce(testRocket, testSet, rw, rb, plattA, plattB, dim);
         _logger.LogInformation("ROCKET post-Platt ECE={Ece:F4}", ece);
 
-        // ── 11. EV-optimal decision threshold (on cal set) ───────────────────
+        // ── 11. EV-optimal decision threshold (on selection set) ─────────────
         double optimalThreshold = ComputeOptimalThreshold(
-            calRocket, calSet, rw, rb, plattA, plattB, dim,
+            selectionRocket, selectionSet, rw, rb, plattA, plattB, dim,
             hp.ThresholdSearchMin, hp.ThresholdSearchMax);
         _logger.LogInformation("ROCKET EV-optimal threshold={Thr:F2}", optimalThreshold);
 
-        // ── 12. Permutation feature importance (on original features) ────────
-        var featureImportance = testSet.Count >= 10
-            ? ComputePermutationImportance(testSet, testRocket, rw, rb, plattA, plattB, dim,
+        // ── 12. Permutation feature importance (on selection set) ────────────
+        var featureImportance = selectionSet.Count >= 10
+            ? ComputePermutationImportance(selectionSet, selectionRocket, rw, rb, plattA, plattB, dim,
                 kernelWeights, kernelDilations, kernelPaddings, kernelLengthArr, numKernels,
                 featureCount, rocketMeans, rocketStds, ct, hp.RocketDeterministicParallel)
             : new float[featureCount];
@@ -502,17 +510,20 @@ public sealed partial class RocketModelTrainer : IMLModelTrainer
                 "ROCKET feature pruning: masking {Pruned}/{Total} low-importance features",
                 prunedCount, featureCount);
 
-            var maskedTrain = ApplyMask(trainSet, activeMask);
-            var maskedCal   = ApplyMask(calSet, activeMask);
-            var maskedTest  = ApplyMask(testSet, activeMask);
+            var maskedTrain     = ApplyMask(trainSet, activeMask);
+            var maskedSelection = ApplyMask(selectionSet, activeMask);
+            var maskedCal       = ApplyMask(calSet, activeMask);
+            var maskedTest      = ApplyMask(testSet, activeMask);
 
             // Re-extract ROCKET features on masked data
-            var maskedTrainRocket = ExtractRocketFeatures(maskedTrain, kernelWeights, kernelDilations, kernelPaddings, kernelLengthArr, numKernels);
-            var maskedCalRocket   = ExtractRocketFeatures(maskedCal, kernelWeights, kernelDilations, kernelPaddings, kernelLengthArr, numKernels);
-            var maskedTestRocket  = ExtractRocketFeatures(maskedTest, kernelWeights, kernelDilations, kernelPaddings, kernelLengthArr, numKernels);
+            var maskedTrainRocket     = ExtractRocketFeatures(maskedTrain, kernelWeights, kernelDilations, kernelPaddings, kernelLengthArr, numKernels);
+            var maskedSelectionRocket = ExtractRocketFeatures(maskedSelection, kernelWeights, kernelDilations, kernelPaddings, kernelLengthArr, numKernels);
+            var maskedCalRocket       = ExtractRocketFeatures(maskedCal, kernelWeights, kernelDilations, kernelPaddings, kernelLengthArr, numKernels);
+            var maskedTestRocket      = ExtractRocketFeatures(maskedTest, kernelWeights, kernelDilations, kernelPaddings, kernelLengthArr, numKernels);
 
             var (mrm, mrs) = ComputeRocketStandardization(maskedTrainRocket, dim);
             StandardizeRocketInPlace(maskedTrainRocket, mrm, mrs, dim);
+            StandardizeRocketInPlace(maskedSelectionRocket, mrm, mrs, dim);
             StandardizeRocketInPlace(maskedCalRocket, mrm, mrs, dim);
             StandardizeRocketInPlace(maskedTestRocket, mrm, mrs, dim);
 
@@ -537,6 +548,7 @@ public sealed partial class RocketModelTrainer : IMLModelTrainer
                 plattA = pA; plattB = pB;
                 finalMetrics = prunedMetrics;
                 trainRocket = maskedTrainRocket;
+                selectionRocket = maskedSelectionRocket;
                 calRocket = maskedCalRocket;
                 testRocket = maskedTestRocket;
                 rocketMeans = mrm;
@@ -548,7 +560,7 @@ public sealed partial class RocketModelTrainer : IMLModelTrainer
                 avgKellyFraction = ComputeAvgKellyFraction(calRocket, maskedCal, rw, rb, plattA, plattB, dim);
                 (ece, reliabilityBinConf, reliabilityBinAcc, reliabilityBinCounts) =
                     ComputeEce(testRocket, maskedTest, rw, rb, plattA, plattB, dim);
-                optimalThreshold = ComputeOptimalThreshold(calRocket, maskedCal, rw, rb, plattA, plattB, dim,
+                optimalThreshold = ComputeOptimalThreshold(selectionRocket, maskedSelection, rw, rb, plattA, plattB, dim,
                     hp.ThresholdSearchMin, hp.ThresholdSearchMax);
             }
             else
@@ -911,6 +923,57 @@ public sealed partial class RocketModelTrainer : IMLModelTrainer
             }
         }
 
+        // ── 22h. New metrics: Murphy, calibration residuals, stability, feature variances ──
+        Func<float[], double> calProbFn = features =>
+        {
+            var singleSample = new List<TrainingSample> { new(features, 0, 0) };
+            var rocketFeatList = ExtractRocketFeatures(singleSample, kernelWeights, kernelDilations, kernelPaddings, kernelLengthArr, numKernels, channelStarts, channelEnds);
+            StandardizeRocketInPlace(rocketFeatList, rocketMeans, rocketStds, dim);
+            return CalibratedProb(rocketFeatList[0], rw, rb, plattA, plattB, dim);
+        };
+
+        var (murphyCalLoss, murphyRefLoss) = ComputeMurphyDecomposition(testSet, calProbFn);
+        var (calResidualMean, calResidualStd, calResidualThreshold) = ComputeCalibrationResidualStats(calSet, calProbFn);
+        double predictionStability = ComputePredictionStabilityScore(testSet, calProbFn);
+        double[] featureVariances = ComputeFeatureVariancesRocket(trainSet, featureCount);
+
+        _logger.LogInformation(
+            "ROCKET Murphy decomposition: calLoss={CalLoss:F4} refLoss={RefLoss:F4}", murphyCalLoss, murphyRefLoss);
+        _logger.LogInformation(
+            "ROCKET calibration residuals: mean={Mean:F4} std={Std:F4} threshold={Thr:F4}",
+            calResidualMean, calResidualStd, calResidualThreshold);
+        _logger.LogInformation("ROCKET prediction stability={Stability:F4}", predictionStability);
+
+        // ── 22i. SafeRocket scalar clamping ──────────────────────────────────
+        ece                = SafeRocket(ece);
+        brierSkillScore    = SafeRocket(brierSkillScore);
+        avgKellyFraction   = SafeRocket(avgKellyFraction);
+        optimalThreshold   = SafeRocket(optimalThreshold, 0.5);
+        temperatureScale   = SafeRocket(temperatureScale);
+        durbinWatson       = SafeRocket(durbinWatson);
+        magnitudeR2        = SafeRocket(magnitudeR2);
+        meanKernelEntropy  = SafeRocket(meanKernelEntropy);
+        oobAccuracy        = SafeRocket(oobAccuracy);
+        conformalQHat      = SafeRocket(conformalQHat);
+        plattA             = SafeRocket(plattA);
+        plattB             = SafeRocket(plattB);
+        plattABuy          = SafeRocket(plattABuy);
+        plattBBuy          = SafeRocket(plattBBuy);
+        plattASell         = SafeRocket(plattASell);
+        plattBSell         = SafeRocket(plattBSell);
+        dbMean             = SafeRocket(dbMean);
+        dbStd              = SafeRocket(dbStd);
+        murphyCalLoss      = SafeRocket(murphyCalLoss);
+        murphyRefLoss      = SafeRocket(murphyRefLoss);
+        calResidualMean    = SafeRocket(calResidualMean);
+        calResidualStd     = SafeRocket(calResidualStd);
+        calResidualThreshold = SafeRocket(calResidualThreshold, 1.0);
+        predictionStability = SafeRocket(predictionStability);
+
+        SanitizeDoubleArr(featureVariances);
+        SanitizeFloatArr(featureImportance);
+        SanitizeFloatArr(fastFeatureAttribution);
+
         // ── 23. Mean PPV per kernel (ROCKET-specific diagnostic) ─────────────
         double[] meanPpv = new double[numKernels];
         for (int k = 0; k < numKernels; k++)
@@ -939,6 +1002,7 @@ public sealed partial class RocketModelTrainer : IMLModelTrainer
             TrainSamples               = trainSet.Count,
             TestSamples                = testSet.Count,
             CalSamples                 = calSet.Count,
+            SelectionSamples           = selectionSet.Count,
             EmbargoSamples             = embargo,
             TrainedOn                  = DateTime.UtcNow,
             FeatureImportance          = featureImportance,
@@ -1004,6 +1068,13 @@ public sealed partial class RocketModelTrainer : IMLModelTrainer
             RocketFeatureMeans         = rocketMeans,
             RocketFeatureStds          = rocketStds,
             RocketKernelSeed           = kernelSeed,
+            CalibrationLoss            = murphyCalLoss,
+            RefinementLoss             = murphyRefLoss,
+            PredictionStabilityScore   = predictionStability,
+            FeatureVariances           = featureVariances,
+            RocketCalibrationResidualMean      = calResidualMean,
+            RocketCalibrationResidualStd       = calResidualStd,
+            RocketCalibrationResidualThreshold = calResidualThreshold,
             RocketDriftArtifact        = driftArtifact,
         };
 

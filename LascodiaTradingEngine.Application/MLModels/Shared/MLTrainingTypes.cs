@@ -2923,6 +2923,7 @@ public class ModelSnapshot
     public int     TrainSamples { get; set; }
     public int     TestSamples  { get; set; }
     public int     CalSamples   { get; set; }
+    public int     SelectionSamples { get; set; }
     public int     EmbargoSamples { get; set; }
     public DateTime TrainedOn   { get; set; }
 

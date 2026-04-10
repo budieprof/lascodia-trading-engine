@@ -52,6 +52,12 @@ public class PositionClosedEventHandlerTest
         _handler = new PositionClosedEventHandler(_mockScopeFactory.Object, _mockLogger.Object);
     }
 
+    private void SetupPositions(List<Position> positions)
+    {
+        var mockSet = positions.AsQueryable().BuildMockDbSet();
+        _mockDbContext.Setup(c => c.Set<Position>()).Returns(mockSet.Object);
+    }
+
     private void SetupDecisionLogs(List<DecisionLog> logs)
     {
         var mockSet = logs.AsQueryable().BuildMockDbSet();
@@ -89,7 +95,11 @@ public class PositionClosedEventHandlerTest
     [Fact]
     public async Task Handle_EventReceived_SendsLogDecisionCommand()
     {
-        // Arrange — no existing decision log for this position
+        // Arrange — position exists and is closed; no existing decision log
+        SetupPositions(new List<Position>
+        {
+            new Position { Id = 10, Status = PositionStatus.Closed, IsDeleted = false }
+        });
         SetupDecisionLogs(new List<DecisionLog>());
 
         _mockMediator
@@ -128,6 +138,10 @@ public class PositionClosedEventHandlerTest
     public async Task Handle_UnprofitablePosition_SetsOutcomeToLoss()
     {
         // Arrange
+        SetupPositions(new List<Position>
+        {
+            new Position { Id = 1, Status = PositionStatus.Closed, IsDeleted = false }
+        });
         SetupDecisionLogs(new List<DecisionLog>());
 
         _mockMediator
@@ -151,7 +165,12 @@ public class PositionClosedEventHandlerTest
     [Fact]
     public async Task Handle_DecisionLogAlreadyExists_SkipsDuplicate()
     {
-        // Arrange — a decision log already exists for this position
+        // Arrange — position exists and is closed; decision log already exists
+        SetupPositions(new List<Position>
+        {
+            new Position { Id = 1, Status = PositionStatus.Closed, IsDeleted = false }
+        });
+
         var existingLog = new DecisionLog
         {
             Id           = 99,
@@ -181,7 +200,12 @@ public class PositionClosedEventHandlerTest
     [Fact]
     public async Task Handle_DifferentPositionIdLogged_DoesNotBlockNewPosition()
     {
-        // Arrange — decision log exists for position 1 but event is for position 2
+        // Arrange — position 2 exists and is closed; decision log exists for position 1 only
+        SetupPositions(new List<Position>
+        {
+            new Position { Id = 2, Status = PositionStatus.Closed, IsDeleted = false }
+        });
+
         var existingLog = new DecisionLog
         {
             Id           = 99,
@@ -217,28 +241,46 @@ public class PositionClosedEventHandlerTest
     // -- Test: Gracefully handles missing position (no crash) -----------------
 
     [Fact]
-    public async Task Handle_NoExistingDecisionLog_DoesNotThrow()
+    public async Task Handle_PositionNotFound_SkipsGracefully()
     {
-        // Arrange — empty decision log table; event refers to a position that may
-        // or may not exist. The handler does not look up the Position entity itself;
-        // it only checks DecisionLog for idempotency. So this should succeed.
+        // Arrange — position does not exist in the database; the state-aware
+        // validation should skip processing without throwing.
+        SetupPositions(new List<Position>());
         SetupDecisionLogs(new List<DecisionLog>());
-
-        _mockMediator
-            .Setup(m => m.Send(It.IsAny<LogDecisionCommand>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(ResponseData<long>.Init(1L, true, "Successful", "00"));
 
         var @event = CreateEvent(positionId: 999);
 
         // Act — should not throw
         var exception = await Record.ExceptionAsync(() => _handler.Handle(@event));
 
-        // Assert
+        // Assert — no crash, and no LogDecisionCommand sent (position not found)
         Assert.Null(exception);
 
-        _mockMediator.Verify(m => m.Send(
-            It.Is<LogDecisionCommand>(cmd => cmd.EntityId == 999),
-            It.IsAny<CancellationToken>()),
-            Times.Once);
+        _mockMediator.Verify(
+            m => m.Send(It.IsAny<LogDecisionCommand>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    // -- Test: Position in non-Closed status is skipped ----------------------
+
+    [Fact]
+    public async Task Handle_PositionStillOpen_SkipsOutOfOrderEvent()
+    {
+        // Arrange — position exists but is still Open (event arrived out of order)
+        SetupPositions(new List<Position>
+        {
+            new Position { Id = 1, Status = PositionStatus.Open, IsDeleted = false }
+        });
+        SetupDecisionLogs(new List<DecisionLog>());
+
+        var @event = CreateEvent(positionId: 1);
+
+        // Act
+        await _handler.Handle(@event);
+
+        // Assert — no LogDecisionCommand sent (position not in Closed state)
+        _mockMediator.Verify(
+            m => m.Send(It.IsAny<LogDecisionCommand>(), It.IsAny<CancellationToken>()),
+            Times.Never);
     }
 }

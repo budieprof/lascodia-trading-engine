@@ -48,7 +48,11 @@ internal static class OptimizationApprovalPolicy
         bool GenesisRegressionOk = true,
         bool HasSufficientOutOfSampleData = true,
         double TailRiskVaR99 = 0,
-        bool TailRiskWithinThreshold = true);
+        bool TailRiskWithinThreshold = true,
+        double MultiObjectiveMinSharpe = 1.0,
+        double MultiObjectiveMaxDrawdownPct = 10.0,
+        double MultiObjectiveMinWinRate = 0.45,
+        double MultiObjectiveMinProfitFactor = 1.2);
 
     internal sealed record Result(
         bool Passed,
@@ -66,10 +70,10 @@ internal static class OptimizationApprovalPolicy
         bool multiObjectiveGateOk = false;
         if (!compositeGateOk && input.TotalTrades >= input.MinCandidateTrades)
         {
-            bool strongSharpe  = (double)input.SharpeRatio >= 1.0 * input.AssetClassSharpeMultiplier;
-            bool lowDrawdown   = (double)input.MaxDrawdownPct <= 10.0 / input.AssetClassDrawdownMultiplier;
-            bool decentWinRate = (double)input.WinRate >= 0.45;
-            bool decentPF      = (double)input.ProfitFactor >= 1.2 * input.AssetClassPfMultiplier;
+            bool strongSharpe  = (double)input.SharpeRatio >= input.MultiObjectiveMinSharpe * input.AssetClassSharpeMultiplier;
+            bool lowDrawdown   = (double)input.MaxDrawdownPct <= input.MultiObjectiveMaxDrawdownPct / input.AssetClassDrawdownMultiplier;
+            bool decentWinRate = (double)input.WinRate >= input.MultiObjectiveMinWinRate;
+            bool decentPF      = (double)input.ProfitFactor >= input.MultiObjectiveMinProfitFactor * input.AssetClassPfMultiplier;
 
             int strongMetrics = (strongSharpe ? 1 : 0) + (lowDrawdown ? 1 : 0) +
                                 (decentWinRate ? 1 : 0) + (decentPF ? 1 : 0);

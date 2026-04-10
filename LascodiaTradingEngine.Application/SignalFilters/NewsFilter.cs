@@ -52,6 +52,11 @@ public class NewsFilter : INewsFilter
 
         var upper = symbol.ToUpperInvariant();
 
+        // Non-standard short symbols (e.g. indices like "US30", "SPX") — cannot
+        // reliably extract forex currency codes, skip news filtering.
+        if (upper.Length < 6)
+            return [];
+
         // Standard 6-character forex symbol: first 3 = base, last 3 = quote (e.g. EURUSD)
         // Also handles 6+ char symbols like XAUUSD, XAGUSD
         if (upper.Length >= 6 && upper.All(char.IsLetterOrDigit))

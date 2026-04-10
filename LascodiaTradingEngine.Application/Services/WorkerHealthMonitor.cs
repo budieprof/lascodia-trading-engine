@@ -1,10 +1,12 @@
 using System.Collections.Concurrent;
+using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
+using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.Services;
 
@@ -17,10 +19,17 @@ namespace LascodiaTradingEngine.Application.Services;
 public class WorkerHealthMonitor : IWorkerHealthMonitor
 {
     private readonly IServiceScopeFactory _scopeFactory;
+    private readonly IAlertDispatcher _alertDispatcher;
     private readonly ILogger<WorkerHealthMonitor> _logger;
 
     /// <summary>Per-worker health state, updated in real-time by worker calls.</summary>
     private readonly ConcurrentDictionary<string, WorkerState> _state = new();
+
+    /// <summary>
+    /// Tracks which workers have already had a crash alert dispatched to prevent
+    /// duplicate alert spam. Cleared when the worker resumes (heartbeat received).
+    /// </summary>
+    private readonly ConcurrentDictionary<string, bool> _alertedWorkers = new();
 
     private class WorkerState
     {
@@ -53,10 +62,12 @@ public class WorkerHealthMonitor : IWorkerHealthMonitor
 
     public WorkerHealthMonitor(
         IServiceScopeFactory scopeFactory,
+        IAlertDispatcher alertDispatcher,
         ILogger<WorkerHealthMonitor> logger)
     {
-        _scopeFactory = scopeFactory;
-        _logger       = logger;
+        _scopeFactory    = scopeFactory;
+        _alertDispatcher = alertDispatcher;
+        _logger          = logger;
     }
 
     public void RecordCycleSuccess(string workerName, long durationMs)
@@ -66,6 +77,7 @@ public class WorkerHealthMonitor : IWorkerHealthMonitor
         state.LastSuccessAt = DateTime.UtcNow;
         state.LastCycleDurationMs = durationMs;
         state.IsStopped = false; // Reset stopped flag — worker is clearly alive
+        _alertedWorkers.TryRemove(workerName, out _); // Clear crash alert dedup — worker recovered
         Interlocked.Exchange(ref state.ConsecutiveFailures, 0);
         Interlocked.Increment(ref state.SuccessesLastHour);
 
@@ -187,6 +199,30 @@ public class WorkerHealthMonitor : IWorkerHealthMonitor
 
         await ctx.SaveChangesAsync(cancellationToken);
 
+        // ── Connection pool observability ────────────────────────────────────
+        // Npgsql exposes pool statistics via NpgsqlConnection.GetPoolStatistics()
+        // which returns a Dictionary<string, long> with keys like "Idle", "Busy",
+        // "Min", "Max". If the connection is Npgsql, log a warning when pool
+        // utilization exceeds 80%.
+        // TODO: Once Npgsql pool statistics API is confirmed available in the
+        // current driver version, replace this with:
+        //   var conn = ctx.Database.GetDbConnection();
+        //   if (conn is Npgsql.NpgsqlConnection npgsqlConn)
+        //   {
+        //       var stats = Npgsql.NpgsqlConnection.GetPoolStatistics(npgsqlConn.ConnectionString);
+        //       if (stats is not null && stats.TryGetValue("Max", out var max) &&
+        //           stats.TryGetValue("Busy", out var busy) && max > 0)
+        //       {
+        //           double utilization = (double)busy / max;
+        //           if (utilization > 0.80)
+        //               _logger.LogWarning(
+        //                   "WorkerHealthMonitor: Npgsql pool utilization {Utilization:P0} " +
+        //                   "(Busy={Busy}, Idle={Idle}, Max={Max})",
+        //                   utilization, busy,
+        //                   stats.GetValueOrDefault("Idle"), max);
+        //       }
+        //   }
+
         // Detect crashed/stale workers: if a worker has a configured interval but hasn't
         // reported success in 3x that interval, mark it as stopped and log a critical alert.
         foreach (var kvp in _state)
@@ -206,14 +242,51 @@ public class WorkerHealthMonitor : IWorkerHealthMonitor
             if (isStale)
             {
                 state.IsStopped = true;
+                var elapsedSeconds = (DateTime.UtcNow - state.LastSuccessAt!.Value).TotalSeconds;
+                var consecutiveFailures = Volatile.Read(ref state.ConsecutiveFailures);
+
                 _logger.LogCritical(
                     "WorkerHealthMonitor: worker {Worker} appears CRASHED — no heartbeat for {Elapsed:F0}s " +
                     "(threshold: {Threshold}s). Last success: {LastSuccess}. Consecutive failures: {Failures}",
-                    name,
-                    (DateTime.UtcNow - state.LastSuccessAt!.Value).TotalSeconds,
-                    staleThresholdSecs,
-                    state.LastSuccessAt,
-                    Volatile.Read(ref state.ConsecutiveFailures));
+                    name, elapsedSeconds, staleThresholdSecs, state.LastSuccessAt, consecutiveFailures);
+
+                // Dispatch a critical alert for the crashed worker (deduplicated: one alert per worker until recovery)
+                if (_alertedWorkers.TryAdd(name, true))
+                {
+                    try
+                    {
+                        var crashAlert = new Alert
+                        {
+                            AlertType     = AlertType.WorkerCrash,
+                            Channel       = AlertChannel.Webhook,
+                            Severity      = AlertSeverity.Critical,
+                            Symbol        = "SYSTEM",
+                            Destination   = string.Empty,
+                            IsActive      = true,
+                            ConditionJson = JsonSerializer.Serialize(new
+                            {
+                                Source            = "WorkerHealthMonitor",
+                                WorkerName        = name,
+                                ElapsedSeconds    = Math.Round(elapsedSeconds, 1),
+                                ThresholdSeconds  = staleThresholdSecs,
+                                ConsecutiveErrors = consecutiveFailures,
+                                LastSuccess       = state.LastSuccessAt,
+                                LastError         = state.LastErrorMessage
+                            })
+                        };
+                        await ctx.Set<Alert>().AddAsync(crashAlert, cancellationToken);
+                        await ctx.SaveChangesAsync(cancellationToken);
+
+                        var alertMessage = $"Worker {name} has crashed — no heartbeat for {elapsedSeconds:F0}s " +
+                                           $"(threshold: {staleThresholdSecs}s, consecutive failures: {consecutiveFailures})";
+                        await _alertDispatcher.DispatchBySeverityAsync(crashAlert, alertMessage, cancellationToken);
+                    }
+                    catch (Exception alertEx)
+                    {
+                        _logger.LogError(alertEx,
+                            "WorkerHealthMonitor: failed to dispatch crash alert for worker {Worker}", name);
+                    }
+                }
             }
         }
 

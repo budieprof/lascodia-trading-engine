@@ -116,6 +116,13 @@ public sealed class StrategyGenerationConfigProvider : IStrategyGenerationConfig
             WalkForwardMinWindowsPass = Get("StrategyGeneration:WalkForwardMinWindowsPass", 2),
             WalkForwardSplitPcts = Get("StrategyGeneration:WalkForwardSplitPcts", "0.40,0.55,0.70"),
             WalkForwardSplitPercentages = ParseWalkForwardSplitPcts(Get("StrategyGeneration:WalkForwardSplitPcts", "0.40,0.55,0.70")),
+            OosPfRelaxation = Get("ScreeningGate:OosPfRelaxation", 0.9),
+            OosDdRelaxation = Get("ScreeningGate:OosDdRelaxation", 1.1),
+            OosSharpeRelaxation = Get("ScreeningGate:OosSharpeRelaxation", 0.8),
+            RegimeDegradationRelaxation = Get("ScreeningGate:RegimeDegradationRelaxation", 1.5),
+            KellyFactor = Get("ScreeningGate:KellyFactor", 0.5m),
+            KellyMinLot = Get("ScreeningGate:KellyMinLot", 0.01m),
+            KellyMaxLot = Get("ScreeningGate:KellyMaxLot", 0.10m),
         };
 
         ValidateConfiguration(config);
@@ -275,6 +282,13 @@ public sealed class StrategyGenerationConfigProvider : IStrategyGenerationConfig
         CircuitBreakerMaxFailures = Math.Max(1, config.CircuitBreakerMaxFailures),
         CircuitBreakerBackoffDays = Math.Max(1, config.CircuitBreakerBackoffDays),
         MaxFaultsPerStrategyType = Math.Max(1, config.MaxFaultsPerStrategyType),
+        OosPfRelaxation = Math.Clamp(config.OosPfRelaxation, 0.1, 2.0),
+        OosDdRelaxation = Math.Clamp(config.OosDdRelaxation, 0.1, 5.0),
+        OosSharpeRelaxation = Math.Clamp(config.OosSharpeRelaxation, 0.1, 2.0),
+        RegimeDegradationRelaxation = Math.Clamp(config.RegimeDegradationRelaxation, 1.0, 5.0),
+        KellyFactor = Math.Clamp(config.KellyFactor, 0.1m, 1.0m),
+        KellyMinLot = Math.Clamp(config.KellyMinLot, 0.001m, 1.0m),
+        KellyMaxLot = Math.Clamp(config.KellyMaxLot, config.KellyMinLot, 1.0m),
     };
 
     private IReadOnlyDictionary<string, StrategyGenerationSymbolOverrides> ExtractAllSymbolOverrides(

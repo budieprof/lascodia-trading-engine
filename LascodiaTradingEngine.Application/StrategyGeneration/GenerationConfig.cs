@@ -77,6 +77,15 @@ public sealed record GenerationConfig
     public int MaxFaultsPerStrategyType { get; init; }
 
     public int ActiveStrategyCount { get; set; }
+
+    // ── OOS / position sizing relaxation multipliers (configurable) ──
+    public double OosPfRelaxation { get; init; } = 0.9;
+    public double OosDdRelaxation { get; init; } = 1.1;
+    public double OosSharpeRelaxation { get; init; } = 0.8;
+    public double RegimeDegradationRelaxation { get; init; } = 1.5;
+    public decimal KellyFactor { get; init; } = 0.5m;
+    public decimal KellyMinLot { get; init; } = 0.01m;
+    public decimal KellyMaxLot { get; init; } = 0.10m;
 }
 
 /// <summary>Adaptive threshold multipliers computed from recent screening distributions.</summary>

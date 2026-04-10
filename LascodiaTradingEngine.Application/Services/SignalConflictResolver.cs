@@ -14,8 +14,9 @@ namespace LascodiaTradingEngine.Application.Services;
 ///   <item>Within each group of same-direction signals, keeps only the highest-scoring signal.</item>
 ///   <item>Score = ML confidence (40%) + strategy Sharpe (30%) + capacity headroom (30%).</item>
 /// </list>
-/// Also applies regime coherence filtering: if >50% of strategies for a symbol are blocked
-/// by regime filters (represented by absent signals), remaining signals are suppressed.
+/// Note: regime coherence filtering is handled upstream in StrategyWorker (via
+/// RegimeCoherenceChecker) before signals reach this resolver. This class only
+/// resolves directional conflicts and deduplicates same-direction signals.
 /// </summary>
 [RegisterService(ServiceLifetime.Singleton)]
 public class SignalConflictResolver : ISignalConflictResolver

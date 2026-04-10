@@ -312,6 +312,12 @@ internal static class InferenceHelpers
         if (breakpoints.Length < 2)
             return clampedProbability;
 
+        // Validate breakpoints are monotonically non-decreasing in X.
+        // Corrupt breakpoints (non-monotonic X values) would produce wrong
+        // interpolation results — pass through uncalibrated instead.
+        for (int i = 2; i < breakpoints.Length - 1; i += 2)
+            if (breakpoints[i] < breakpoints[i - 2]) return clampedProbability;
+
         var clean = new List<(double X, double Y)>(breakpoints.Length / 2);
         for (int i = 0; i + 1 < breakpoints.Length; i += 2)
         {
@@ -388,6 +394,11 @@ internal static class InferenceHelpers
 
     private static double SanitizeTemperatureScale(double value)
     {
-        return double.IsFinite(value) && value > 0.0 && value < 10.0 ? value : 0.0;
+        if (double.IsFinite(value) && value > 0.0 && value < 10.0)
+            return value;
+
+        // Temperature scale <= 0 or >= 10 is unusable — fall back to Platt scaling.
+        // Callers should investigate why the model produced an extreme temperature.
+        return 0.0;
     }
 }

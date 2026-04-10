@@ -12,5 +12,7 @@ public enum DegradationMode
     /// <summary>Read database unavailable — serving from cache, new signal generation blocked.</summary>
     ReadDbDegraded = 3,
     /// <summary>Emergency halt — all trading suspended, positions being flattened.</summary>
-    EmergencyHalt = 4
+    EmergencyHalt = 4,
+    /// <summary>All EA instances disconnected — no market data available, signal generation blocked.</summary>
+    DataUnavailable = 5
 }

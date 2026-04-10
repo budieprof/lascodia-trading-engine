@@ -5,7 +5,7 @@ namespace LascodiaTradingEngine.Application.Optimization;
 
 internal static class OptimizationExecutionLeasePolicy
 {
-    internal static readonly TimeSpan LeaseDuration = TimeSpan.FromMinutes(10);
+    internal static readonly TimeSpan LeaseDuration = TimeSpan.FromMinutes(30);
 
     internal static void StampHeartbeat(OptimizationRun run, DateTime utcNow)
         => OptimizationRunClaimer.StampHeartbeat(run, LeaseDuration, utcNow);

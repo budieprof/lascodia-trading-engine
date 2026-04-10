@@ -60,7 +60,10 @@ public sealed class OptimizationSchedulingCoordinator
                     db,
                     config.AutoApprovalMinHealthScore,
                     observationDays,
-                    ct);
+                    ct,
+                    config.RolloutTier1Pct,
+                    config.RolloutTier2Pct,
+                    config.RolloutTier3Pct);
 
                 if (outcome is null)
                     continue;
@@ -88,7 +91,7 @@ public sealed class OptimizationSchedulingCoordinator
             var recentRunCount = await db.Set<OptimizationRun>()
                 .Where(r => !r.IsDeleted
                          && r.Status != OptimizationRunStatus.Queued
-                         && (r.ClaimedAt ?? r.ExecutionStartedAt ?? (DateTime?)r.StartedAt) >= weekCutoff)
+                         && (r.ClaimedAt ?? r.ExecutionStartedAt ?? (DateTime?)r.StartedAt ?? (DateTime?)r.QueuedAt) >= weekCutoff)
                 .CountAsync(ct);
             if (recentRunCount >= maxRunsPerWeek)
             {

@@ -387,6 +387,21 @@ internal sealed class OptimizationRunRecoveryCoordinator
 
                     bool changed = false;
 
+                    // Mark runs whose strategy has been deleted as Abandoned
+                    if (!strategies.ContainsKey(run.StrategyId)
+                        && run.Status is not (OptimizationRunStatus.Abandoned or OptimizationRunStatus.Failed))
+                    {
+                        OptimizationRunStateMachine.Transition(
+                            run,
+                            OptimizationRunStatus.Abandoned,
+                            nowUtc,
+                            "Strategy deleted or not found — marking run as abandoned");
+                        run.FailureCategory = OptimizationFailureCategory.StrategyRemoved;
+                        run.LifecycleReconciledAt = nowUtc;
+                        repairedThisBatch++;
+                        continue;
+                    }
+
                     if (run.CompletedAt.HasValue && run.ResultsPersistedAt == null)
                     {
                         run.ResultsPersistedAt = run.CompletedAt.Value;
