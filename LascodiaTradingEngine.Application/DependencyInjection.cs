@@ -214,6 +214,9 @@ public static class DependencyInjection
         services.AddSingleton(TimeProvider.System);
         services.AddSingleton<IValidationWorkerIdentity, ValidationWorkerIdentity>();
         services.AddSingleton<IValidationSettingsProvider, ValidationSettingsProvider>();
+        services.AddSingleton<IStrategyExecutionSnapshotBuilder, StrategyExecutionSnapshotBuilder>();
+        services.AddSingleton<IValidationTradingCalendar, ValidationTradingCalendar>();
+        services.AddSingleton<IValidationCandleSeriesGuard, ValidationCandleSeriesGuard>();
         services.AddSingleton<IBacktestAutoScheduler, BacktestAutoScheduler>();
         services.AddSingleton<IBacktestOptionsSnapshotBuilder, BacktestOptionsSnapshotBuilder>();
         services.AddSingleton<IValidationRunFactory, ValidationRunFactory>();

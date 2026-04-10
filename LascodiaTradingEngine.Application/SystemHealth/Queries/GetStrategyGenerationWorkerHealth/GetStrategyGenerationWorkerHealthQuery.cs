@@ -17,13 +17,17 @@ public sealed class StrategyGenerationWorkerPhaseHealthDto
 public sealed class StrategyGenerationWorkerHealthDto
 {
     public int PendingArtifacts { get; init; }
+    public int QuarantinedArtifacts { get; init; }
     public int OldestPendingArtifactAgeSeconds { get; init; }
+    public DateTime? LastArtifactQuarantinedAtUtc { get; init; }
+    public string? LastArtifactQuarantineReason { get; init; }
     public int UnresolvedFailures { get; init; }
     public DateTime? LastReplayCompletedAtUtc { get; init; }
     public DateTime? LastReplayFailureAtUtc { get; init; }
     public string? LastReplayFailureMessage { get; init; }
     public int LastReplayArtifactCount { get; init; }
     public int LastReplayCorruptArtifactCount { get; init; }
+    public int PendingSummaryDispatches { get; init; }
     public string? LastSkipReason { get; init; }
     public DateTime? LastSkippedAtUtc { get; init; }
     public DateTime? LastCheckpointSavedAtUtc { get; init; }
@@ -73,13 +77,17 @@ public class GetStrategyGenerationWorkerHealthQueryHandler
         var dto = new StrategyGenerationWorkerHealthDto
         {
             PendingArtifacts = state.PendingArtifacts,
+            QuarantinedArtifacts = state.QuarantinedArtifacts,
             OldestPendingArtifactAgeSeconds = ComputeAgeSeconds(nowUtc, state.OldestPendingArtifactAttemptAtUtc),
+            LastArtifactQuarantinedAtUtc = state.LastArtifactQuarantinedAtUtc,
+            LastArtifactQuarantineReason = state.LastArtifactQuarantineReason,
             UnresolvedFailures = state.UnresolvedFailures,
             LastReplayCompletedAtUtc = state.LastReplayCompletedAtUtc,
             LastReplayFailureAtUtc = state.LastReplayFailureAtUtc,
             LastReplayFailureMessage = state.LastReplayFailureMessage,
             LastReplayArtifactCount = state.LastReplayArtifactCount,
             LastReplayCorruptArtifactCount = state.LastReplayCorruptArtifactCount,
+            PendingSummaryDispatches = state.PendingSummaryDispatches,
             LastSkipReason = state.LastSkipReason,
             LastSkippedAtUtc = state.LastSkippedAtUtc,
             LastCheckpointSavedAtUtc = state.LastCheckpointSavedAtUtc,

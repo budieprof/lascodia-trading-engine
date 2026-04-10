@@ -148,21 +148,29 @@ public sealed partial class ElmModelTrainer
             : 0.0;
         double target = sample.Direction > 0 ? 1.0 - smoothing : smoothing;
 
-        var rawFeatures = ElmFeaturePipelineHelper.CloneAndWinsorize(sample.Features, snapshot);
-
-        // Standardise using the snapshot's stored means/stds
-        var stdFeatures = snapshot.Means is not null && snapshot.Stds is not null
-            ? MLFeatureHelper.Standardize(rawFeatures, snapshot.Means, snapshot.Stds)
-            : rawFeatures;
-        var maskedFeatures = (float[])stdFeatures.Clone();
-        if (snapshot.ActiveFeatureMask is { Length: > 0 } featureMask)
+        float[] maskedFeatures;
+        try
         {
-            for (int i = 0; i < maskedFeatures.Length && i < featureMask.Length; i++)
-                if (!featureMask[i]) maskedFeatures[i] = 0f;
+            bool maskDisablesEveryFeature =
+                snapshot.ActiveFeatureMask is { Length: > 0 } activeMask &&
+                !activeMask.Any(static value => value);
+            var prepared = ElmFeaturePipelineHelper.PrepareSnapshotFeatures(
+                sample.Features,
+                snapshot,
+                applyMask: !maskDisablesEveryFeature);
+            maskedFeatures = maskDisablesEveryFeature
+                ? new float[prepared.FeatureCount]
+                : prepared.Features;
         }
+        catch (InvalidOperationException ex)
+        {
+            _logger.LogDebug(ex, "ELM online update skipped — snapshot preprocessing contract is invalid");
+            return false;
+        }
+
         if (!HasFiniteValues(maskedFeatures))
         {
-            _logger.LogDebug("ELM online update skipped — standardised features became non-finite");
+            _logger.LogDebug("ELM online update skipped — replayed features became non-finite");
             return false;
         }
 
@@ -296,14 +304,6 @@ public sealed partial class ElmModelTrainer
             return false;
         }
 
-        if (snapshot.FracDiffD > 0.0)
-        {
-            _logger.LogDebug(
-                "ELM recalibration skipped — FracDiffD={D:F2} requires historical context not available to the recent-sample buffer",
-                snapshot.FracDiffD);
-            return false;
-        }
-
         if (snapshot.Weights is null || snapshot.Biases is null ||
             snapshot.ElmInputWeights is null || snapshot.ElmInputBiases is null ||
             snapshot.Means is null || snapshot.Stds is null)
@@ -312,16 +312,27 @@ public sealed partial class ElmModelTrainer
             return false;
         }
 
-        // Standardize using the snapshot's stored means/stds
-        var stdSamples = new List<TrainingSample>(recentSamples.Count);
-        foreach (var s in recentSamples)
+        List<TrainingSample> stdSamples;
+        try
         {
-            var rawFeatures = ElmFeaturePipelineHelper.CloneAndWinsorize(s.Features, snapshot);
-            var stdFeatures = MLFeatureHelper.Standardize(rawFeatures, snapshot.Means, snapshot.Stds);
-            if (snapshot.ActiveFeatureMask is { Length: > 0 } mask)
-                for (int i = 0; i < stdFeatures.Length && i < mask.Length; i++)
-                    if (!mask[i]) stdFeatures[i] = 0f;
-            stdSamples.Add(s with { Features = stdFeatures });
+            stdSamples = ElmFeaturePipelineHelper.ReplaySnapshotPreprocessing(recentSamples, snapshot);
+        }
+        catch (InvalidOperationException ex)
+        {
+            _logger.LogDebug(ex, "ELM recalibration skipped — snapshot preprocessing contract is invalid");
+            return false;
+        }
+
+        if (stdSamples.Count == 0 || stdSamples[0].Features.Length == 0)
+        {
+            _logger.LogDebug("ELM recalibration skipped — replayed feature buffer is empty");
+            return false;
+        }
+
+        if (stdSamples.Any(s => s.Features.Length != stdSamples[0].Features.Length || !HasFiniteValues(s.Features)))
+        {
+            _logger.LogDebug("ELM recalibration skipped — replayed feature buffer contains ragged or non-finite rows");
+            return false;
         }
 
         int featureCount = stdSamples[0].Features.Length;
@@ -679,5 +690,300 @@ public sealed partial class ElmModelTrainer
                 return false;
 
         return true;
+    }
+
+    // ── Reliability diagram (10 equal-width bins) ─────────────────────────────
+
+    private static (double[] BinConf, double[] BinAcc, int[] BinCounts) ComputeReliabilityDiagram(
+        List<TrainingSample>  testSet,
+        Func<float[], double> calibProb,
+        int                   bins = 10)
+    {
+        var binConf   = new double[bins];
+        var binAcc    = new double[bins];
+        var binCounts = new int[bins];
+
+        if (testSet.Count < bins) return (binConf, binAcc, binCounts);
+
+        foreach (var s in testSet)
+        {
+            double p = calibProb(s.Features);
+            int b = Math.Clamp((int)(p * bins), 0, bins - 1);
+            binConf[b] += p;
+            if (s.Direction > 0) binAcc[b]++;
+            binCounts[b]++;
+        }
+
+        for (int b = 0; b < bins; b++)
+        {
+            if (binCounts[b] > 0)
+            {
+                binConf[b] /= binCounts[b];
+                binAcc[b]  /= binCounts[b];
+            }
+        }
+        return (binConf, binAcc, binCounts);
+    }
+
+    // ── Murphy decomposition (Brier = calibration + refinement) ───────────────
+
+    private static (double CalibrationLoss, double RefinementLoss) ComputeMurphyDecomposition(
+        List<TrainingSample>  testSet,
+        Func<float[], double> calibProb,
+        int                   bins = 10)
+    {
+        if (testSet.Count < bins) return (0.0, 0.0);
+
+        var binSumP = new double[bins];
+        var binSumY = new double[bins];
+        var binCnt  = new int[bins];
+
+        foreach (var s in testSet)
+        {
+            double p = calibProb(s.Features);
+            int b = Math.Clamp((int)(p * bins), 0, bins - 1);
+            binSumP[b] += p;
+            binSumY[b] += s.Direction > 0 ? 1.0 : 0.0;
+            binCnt[b]++;
+        }
+
+        int    n   = testSet.Count;
+        double cal = 0.0, ref_ = 0.0;
+        for (int b = 0; b < bins; b++)
+        {
+            if (binCnt[b] == 0) continue;
+            double meanP = binSumP[b] / binCnt[b];
+            double meanY = binSumY[b] / binCnt[b];
+            double w     = (double)binCnt[b] / n;
+            cal  += w * (meanY - meanP) * (meanY - meanP);
+            ref_ += w * meanY * (1.0 - meanY);
+        }
+        return (cal, ref_);
+    }
+
+    // ── Calibration residual stats ────────────────────────────────────────────
+
+    private static (double Mean, double Std, double Threshold) ComputeCalibrationResidualStats(
+        List<TrainingSample>  calSet,
+        Func<float[], double> calibProb)
+    {
+        if (calSet.Count < 10) return (0.0, 0.0, 1.0);
+
+        var residuals = new double[calSet.Count];
+        for (int i = 0; i < calSet.Count; i++)
+        {
+            double p = calibProb(calSet[i].Features);
+            double y = calSet[i].Direction > 0 ? 1.0 : 0.0;
+            residuals[i] = Math.Abs(p - y);
+        }
+
+        double mean = 0.0;
+        foreach (double r in residuals) mean += r;
+        mean /= residuals.Length;
+
+        double variance = 0.0;
+        foreach (double r in residuals) { double d = r - mean; variance += d * d; }
+        double std = residuals.Length > 1 ? Math.Sqrt(variance / (residuals.Length - 1)) : 0.0;
+
+        return (mean, std, mean + 2.0 * std);
+    }
+
+    // ── Prediction stability score ────────────────────────────────────────────
+
+    private static double ComputePredictionStabilityScore(
+        List<TrainingSample>  testSet,
+        Func<float[], double> calibProb)
+    {
+        if (testSet.Count == 0) return 0.0;
+
+        double sum = 0.0;
+        foreach (var s in testSet)
+            sum += Math.Abs(calibProb(s.Features) - 0.5);
+        return sum / testSet.Count;
+    }
+
+    // ── Feature variances ─────────────────────────────────────────────────────
+
+    private static double[] ComputeFeatureVariances(List<TrainingSample> trainSet, int F)
+    {
+        if (trainSet.Count < 2) return new double[F];
+
+        var variances = new double[F];
+        int n = trainSet.Count;
+
+        for (int j = 0; j < F; j++)
+        {
+            double sum = 0.0, sumSq = 0.0;
+            for (int i = 0; i < n; i++)
+            {
+                double v = trainSet[i].Features[j];
+                sum   += v;
+                sumSq += v * v;
+            }
+            double mean = sum / n;
+            variances[j] = sumSq / n - mean * mean;
+        }
+        return variances;
+    }
+
+    // ── Cross-fit adaptive heads ──────────────────────────────────────────────
+
+    private (double[] MetaLabelWeights, double MetaLabelBias,
+             double[] AbstentionWeights, double AbstentionBias, double AbstentionThreshold,
+             bool Used, int FoldCount)
+        CrossFitElmAdaptiveHeads(
+            List<TrainingSample>  calSet,
+            double[][]            weights,
+            double[]              biases,
+            double[][]            inputWeights,
+            double[][]            inputBiases,
+            int                   featureCount,
+            int                   hiddenSize,
+            int[][]?              featureSubsets,
+            int[]                 learnerHiddenSizes,
+            ElmActivation[]       learnerActivations,
+            double                optimalThreshold,
+            int[]                 metaLabelTopFeatureIndices,
+            Func<float[], double> calibProb,
+            double[]?             stackingWeights,
+            double                stackingBias,
+            double                subModelLr,
+            int                   subModelMaxEpochs,
+            int                   subModelPatience,
+            int                   embargo,
+            int                   minSamples = 20,
+            CancellationToken     ct = default)
+    {
+        const int K = 3;
+        int n = calSet.Count;
+
+        if (n < minSamples * K)
+            return ([], 0.0, [], 0.0, 0.5, false, 0);
+
+        int foldSize = n / K;
+
+        // Determine dimensions from a trial fit
+        var trialMl = FitMetaLabelModel(
+            calSet[..Math.Min(minSamples, n)],
+            weights, biases, inputWeights, inputBiases,
+            featureCount, hiddenSize, featureSubsets, learnerHiddenSizes, learnerActivations,
+            optimalThreshold, metaLabelTopFeatureIndices, calibProb,
+            stackingWeights, stackingBias,
+            subModelLr, subModelMaxEpochs, subModelPatience, embargo, ct);
+        int mlDim = trialMl.Item1.Length;
+        const int absDim = 3;
+
+        var mlWeightsAccum = new double[mlDim];
+        double mlBiasAccum = 0.0;
+        var absWeightsAccum = new double[absDim];
+        double absBiasAccum = 0.0;
+        int validFolds = 0;
+
+        for (int fold = 0; fold < K && !ct.IsCancellationRequested; fold++)
+        {
+            int testStartFold = fold * foldSize;
+            int testEndFold   = fold == K - 1 ? n : (fold + 1) * foldSize;
+
+            var foldTrain = new List<TrainingSample>(n - (testEndFold - testStartFold));
+            for (int i = 0; i < testStartFold; i++) foldTrain.Add(calSet[i]);
+            for (int i = testEndFold; i < n; i++) foldTrain.Add(calSet[i]);
+
+            if (foldTrain.Count < minSamples) continue;
+
+            var (mw, mb) = FitMetaLabelModel(
+                foldTrain, weights, biases, inputWeights, inputBiases,
+                featureCount, hiddenSize, featureSubsets, learnerHiddenSizes, learnerActivations,
+                optimalThreshold, metaLabelTopFeatureIndices, calibProb,
+                stackingWeights, stackingBias,
+                subModelLr, subModelMaxEpochs, subModelPatience, embargo, ct);
+
+            var (aw, ab, at) = FitAbstentionModel(
+                foldTrain, weights, biases, inputWeights, inputBiases,
+                0, 0, mw, mb,  // plattA/B not needed for abstention features
+                featureCount, hiddenSize, featureSubsets, learnerHiddenSizes, learnerActivations,
+                optimalThreshold, metaLabelTopFeatureIndices, calibProb,
+                stackingWeights, stackingBias,
+                subModelLr, subModelMaxEpochs, subModelPatience, embargo, ct);
+
+            for (int j = 0; j < mlDim && j < mw.Length; j++) mlWeightsAccum[j] += mw[j];
+            mlBiasAccum += mb;
+            for (int j = 0; j < absDim && j < aw.Length; j++) absWeightsAccum[j] += aw[j];
+            absBiasAccum += ab;
+            validFolds++;
+        }
+
+        if (validFolds == 0)
+            return ([], 0.0, [], 0.0, 0.5, false, 0);
+
+        for (int j = 0; j < mlDim; j++) mlWeightsAccum[j] /= validFolds;
+        mlBiasAccum /= validFolds;
+        for (int j = 0; j < absDim; j++) absWeightsAccum[j] /= validFolds;
+        absBiasAccum /= validFolds;
+
+        return (mlWeightsAccum, mlBiasAccum,
+                absWeightsAccum, absBiasAccum, 0.5,
+                true, validFolds);
+    }
+
+    // ── Adversarial validation (CPU fallback) ─────────────────────────────────
+
+    private static double ComputeAdversarialAuc(
+        List<TrainingSample> trainSet,
+        List<TrainingSample> testSet,
+        int                  F)
+    {
+        int n1 = testSet.Count;
+        int n0 = Math.Min(trainSet.Count, n1 * 5);
+        int n  = n0 + n1;
+        if (n < 20) return 0.5;
+
+        var trainSlice = trainSet.Count > n0 ? trainSet[^n0..] : trainSet;
+
+        // Simple logistic regression via SGD
+        var w = new double[F];
+        double b = 0;
+        const double lr = 0.005;
+        const double l2 = 0.01;
+
+        for (int epoch = 0; epoch < 60; epoch++)
+        {
+            double dB = 0;
+            var dW = new double[F];
+
+            for (int i = 0; i < n; i++)
+            {
+                float[] features = i < n0 ? trainSlice[i].Features : testSet[i - n0].Features;
+                double label = i < n0 ? 0.0 : 1.0;
+
+                double z = b;
+                for (int j = 0; j < F && j < features.Length; j++) z += w[j] * features[j];
+                double p = 1.0 / (1.0 + Math.Exp(-z));
+                double err = p - label;
+                dB += err;
+                for (int j = 0; j < F && j < features.Length; j++) dW[j] += err * features[j];
+            }
+
+            b -= lr * dB / n;
+            for (int j = 0; j < F; j++) { w[j] -= lr * (dW[j] / n + l2 * w[j]); }
+        }
+
+        // Score all samples and compute Wilcoxon AUC
+        var scores = new (double Score, int Label)[n];
+        for (int i = 0; i < n; i++)
+        {
+            float[] features = i < n0 ? trainSlice[i].Features : testSet[i - n0].Features;
+            double z = b;
+            for (int j = 0; j < F && j < features.Length; j++) z += w[j] * features[j];
+            scores[i] = (1.0 / (1.0 + Math.Exp(-z)), i < n0 ? 0 : 1);
+        }
+        Array.Sort(scores, (a, c) => c.Score.CompareTo(a.Score));
+
+        long tp = 0, aucNum = 0;
+        foreach (var (_, lbl) in scores)
+        {
+            if (lbl == 1) tp++;
+            else aucNum += tp;
+        }
+        return (n1 > 0 && n0 > 0) ? (double)aucNum / ((long)n1 * n0) : 0.5;
     }
 }

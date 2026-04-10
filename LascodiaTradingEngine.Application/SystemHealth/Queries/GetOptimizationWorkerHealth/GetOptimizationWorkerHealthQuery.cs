@@ -22,6 +22,14 @@ public sealed class OptimizationWorkerHealthSnapshotDto
     public int ErrorsLastHour { get; init; }
     public int SuccessesLastHour { get; init; }
     public int BacklogDepth { get; init; }
+    public long LastQueueLatencyMs { get; init; }
+    public long QueueLatencyP50Ms { get; init; }
+    public long QueueLatencyP95Ms { get; init; }
+    public long LastExecutionDurationMs { get; init; }
+    public long ExecutionDurationP50Ms { get; init; }
+    public long ExecutionDurationP95Ms { get; init; }
+    public int RetriesLastHour { get; init; }
+    public int RecoveriesLastHour { get; init; }
     public int ConfiguredIntervalSeconds { get; init; }
 }
 
@@ -45,6 +53,11 @@ public sealed class OptimizationWorkerPhaseHealthDto
     public long LastSuccessDurationMs { get; init; }
     public int SuccessesLastHour { get; init; }
     public int FailuresLastHour { get; init; }
+    public bool IsDegraded { get; init; }
+    public DateTime? BackoffUntilUtc { get; init; }
+    public DateTime? LastSkippedAtUtc { get; init; }
+    public string? LastSkipReason { get; init; }
+    public int SkippedExecutionsLastHour { get; init; }
 }
 
 public sealed class OptimizationWorkerHealthDto
@@ -73,6 +86,12 @@ public sealed class OptimizationWorkerHealthDto
     public int MostDeferredQueuedDeferralCount { get; init; }
     public long? MostRecentDeferredResumeRunId { get; init; }
     public DateTime? MostRecentDeferredResumeAtUtc { get; init; }
+    public int DeferredRunsStartedLastHour { get; init; }
+    public int DeferredRunsResumedLastHour { get; init; }
+    public int RepeatedlyDeferredQueuedRuns { get; init; }
+    public long? OldestActiveDeferralRunId { get; init; }
+    public DateTime? OldestActiveDeferralAtUtc { get; init; }
+    public int OldestActiveDeferralAgeSeconds { get; init; }
     public IReadOnlyList<OptimizationDeferralReasonCountDto> DeferredQueuedRunsByReason { get; init; } = [];
     public int StarvedQueuedRuns { get; init; }
     public long? OldestStarvedQueuedRunId { get; init; }
@@ -172,6 +191,12 @@ public class GetOptimizationWorkerHealthQueryHandler
             MostDeferredQueuedDeferralCount = typedState.MostDeferredQueuedDeferralCount,
             MostRecentDeferredResumeRunId = typedState.MostRecentDeferredResumeRunId,
             MostRecentDeferredResumeAtUtc = typedState.MostRecentDeferredResumeAtUtc,
+            DeferredRunsStartedLastHour = typedState.DeferredRunsStartedLastHour,
+            DeferredRunsResumedLastHour = typedState.DeferredRunsResumedLastHour,
+            RepeatedlyDeferredQueuedRuns = typedState.RepeatedlyDeferredQueuedRuns,
+            OldestActiveDeferralRunId = typedState.OldestActiveDeferralRunId,
+            OldestActiveDeferralAtUtc = typedState.OldestActiveDeferralAtUtc,
+            OldestActiveDeferralAgeSeconds = typedState.OldestActiveDeferralAgeSeconds,
             DeferredQueuedRunsByReason = typedState.DeferredQueuedRunsByReason
                 .Select(x => new OptimizationDeferralReasonCountDto
                 {
@@ -248,6 +273,14 @@ public class GetOptimizationWorkerHealthQueryHandler
             ErrorsLastHour = snapshot.ErrorsLastHour,
             SuccessesLastHour = snapshot.SuccessesLastHour,
             BacklogDepth = snapshot.BacklogDepth,
+            LastQueueLatencyMs = snapshot.LastQueueLatencyMs,
+            QueueLatencyP50Ms = snapshot.QueueLatencyP50Ms,
+            QueueLatencyP95Ms = snapshot.QueueLatencyP95Ms,
+            LastExecutionDurationMs = snapshot.LastExecutionDurationMs,
+            ExecutionDurationP50Ms = snapshot.ExecutionDurationP50Ms,
+            ExecutionDurationP95Ms = snapshot.ExecutionDurationP95Ms,
+            RetriesLastHour = snapshot.RetriesLastHour,
+            RecoveriesLastHour = snapshot.RecoveriesLastHour,
             ConfiguredIntervalSeconds = snapshot.ConfiguredIntervalSeconds,
         };
     }
@@ -268,6 +301,11 @@ public class GetOptimizationWorkerHealthQueryHandler
             LastSuccessDurationMs = snapshot.LastSuccessDurationMs,
             SuccessesLastHour = snapshot.SuccessesLastHour,
             FailuresLastHour = snapshot.FailuresLastHour,
+            IsDegraded = snapshot.IsDegraded,
+            BackoffUntilUtc = snapshot.BackoffUntilUtc,
+            LastSkippedAtUtc = snapshot.LastSkippedAtUtc,
+            LastSkipReason = snapshot.LastSkipReason,
+            SkippedExecutionsLastHour = snapshot.SkippedExecutionsLastHour,
         };
     }
 }

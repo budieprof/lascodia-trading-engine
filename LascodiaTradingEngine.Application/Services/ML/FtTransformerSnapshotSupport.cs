@@ -8,26 +8,12 @@ namespace LascodiaTradingEngine.Application.Services.ML;
 
 internal static class FtTransformerSnapshotSupport
 {
+    private const string CurrentSnapshotVersion = "8.0";
+    private const string InitialSnapshotVersion = "5.0";
+
     internal readonly record struct ValidationResult(bool IsValid, string[] Issues);
 
     internal readonly record struct CompatibilityResult(bool IsCompatible, string[] Issues);
-
-    private sealed class SerializedLayerWeightsPayload
-    {
-        public double[][]? Wq { get; set; }
-        public double[][]? Wk { get; set; }
-        public double[][]? Wv { get; set; }
-        public double[][]? Wo { get; set; }
-        public double[]? Gamma1 { get; set; }
-        public double[]? Beta1 { get; set; }
-        public double[][]? Wff1 { get; set; }
-        public double[]? Bff1 { get; set; }
-        public double[][]? Wff2 { get; set; }
-        public double[]? Bff2 { get; set; }
-        public double[]? Gamma2 { get; set; }
-        public double[]? Beta2 { get; set; }
-        public double[][]? PosBias { get; set; }
-    }
 
     private static readonly JsonSerializerOptions CloneJsonOptions =
         new()
@@ -195,6 +181,8 @@ internal static class FtTransformerSnapshotSupport
         if (!IsFtTransformer(snapshot))
             return;
 
+        string version = ResolveSnapshotVersion(snapshot.Version);
+
         snapshot.RawFeatureIndices ??= [];
         snapshot.ActiveFeatureMask ??= [];
         snapshot.Features ??= [];
@@ -235,41 +223,43 @@ internal static class FtTransformerSnapshotSupport
         {
             snapshot.TrainerFingerprint = ComputeSha256(string.Join("|",
                 snapshot.Type,
-                snapshot.Version,
+                version,
                 snapshot.FtTransformerEmbedDim,
                 snapshot.FtTransformerNumHeads,
                 snapshot.FtTransformerFfnDim,
                 snapshot.FtTransformerNumLayers));
         }
 
+        snapshot.FtTransformerRawFeatureCount = rawFeatureCount;
         if (!double.IsFinite(snapshot.ConditionalCalibrationRoutingThreshold))
             snapshot.ConditionalCalibrationRoutingThreshold = 0.5;
 
-        snapshot.FtTransformerRawFeatureCount = rawFeatureCount;
-
-        if (snapshot.Version is "5.0" or "6.0" or "")
-            snapshot.Version = "7.0";
-
-        if (snapshot.TrainingSplitSummary is { } split)
+        switch (version)
         {
-            if (split.SelectionCount <= 0 && split.TrainCount > 0)
+            case "5.0":
             {
-                split.SelectionStartIndex = split.TrainStartIndex;
-                split.SelectionCount = split.TrainCount;
+                UpgradeVersion5To6(snapshot, rawFeatureCount);
+                version = "6.0";
+                goto case "6.0";
             }
-
-            if (split.CalibrationDiagnosticsCount <= 0 && split.CalibrationCount > 0)
+            case "6.0":
             {
-                split.CalibrationDiagnosticsStartIndex = split.CalibrationStartIndex;
-                split.CalibrationDiagnosticsCount = split.CalibrationCount;
+                UpgradeVersion6To7(snapshot);
+                version = "7.0";
+                goto case "7.0";
             }
-
-            if (split.ConformalCount <= 0 && split.CalibrationDiagnosticsCount > 0)
+            case "7.0":
             {
-                split.ConformalStartIndex = split.CalibrationDiagnosticsStartIndex;
-                split.ConformalCount = split.CalibrationDiagnosticsCount;
+                UpgradeVersion7To8(snapshot);
+                version = CurrentSnapshotVersion;
+                break;
             }
+            case CurrentSnapshotVersion:
+                UpgradeCurrentSnapshot(snapshot, rawFeatureCount);
+                break;
         }
+
+        snapshot.Version = version;
     }
 
     internal static ValidationResult ValidateSnapshot(ModelSnapshot snapshot)
@@ -296,6 +286,9 @@ internal static class FtTransformerSnapshotSupport
         int numLayers = snapshot.FtTransformerNumLayers > 0 ? snapshot.FtTransformerNumLayers : 1;
         int seqLen = featureCount + 1;
         int seqSq = seqLen * seqLen;
+
+        if (!string.Equals(snapshot.Version, CurrentSnapshotVersion, StringComparison.Ordinal))
+            issues.Add($"Unsupported FT-Transformer snapshot version '{snapshot.Version}'.");
 
         if (featureCount <= 0)
             issues.Add("Snapshot feature count is zero.");
@@ -447,7 +440,7 @@ internal static class FtTransformerSnapshotSupport
 
         if (split.CalibrationFitStartIndex != split.CalibrationStartIndex)
             issues.Add("TrainingSplitSummary calibration-fit split must start at CalibrationStartIndex.");
-        if (split.SelectionPruningCount > 0 || split.SelectionThresholdCount > 0)
+        if (split.SelectionPruningCount > 0 || split.SelectionThresholdCount > 0 || split.SelectionKellyCount > 0)
         {
             if (split.SelectionPruningCount <= 0)
                 issues.Add("TrainingSplitSummary selection-pruning split must be non-empty when selection sub-splits are present.");
@@ -457,8 +450,17 @@ internal static class FtTransformerSnapshotSupport
                 issues.Add("TrainingSplitSummary selection-pruning split must start at SelectionStartIndex.");
             if (split.SelectionThresholdStartIndex != split.SelectionPruningStartIndex + split.SelectionPruningCount)
                 issues.Add("TrainingSplitSummary selection-threshold split must immediately follow the selection-pruning split.");
-            if (split.SelectionPruningCount + split.SelectionThresholdCount != split.SelectionCount)
+            if (split.SelectionKellyCount > 0)
+            {
+                if (split.SelectionKellyStartIndex != split.SelectionThresholdStartIndex + split.SelectionThresholdCount)
+                    issues.Add("TrainingSplitSummary selection-Kelly split must immediately follow the selection-threshold split.");
+                if (split.SelectionPruningCount + split.SelectionThresholdCount + split.SelectionKellyCount != split.SelectionCount)
+                    issues.Add("TrainingSplitSummary selection sub-split counts must sum to SelectionCount.");
+            }
+            else if (split.SelectionPruningCount + split.SelectionThresholdCount != split.SelectionCount)
+            {
                 issues.Add("TrainingSplitSummary selection sub-split counts must sum to SelectionCount.");
+            }
         }
 
         if (split.CalibrationDiagnosticsStartIndex != split.CalibrationFitStartIndex + split.CalibrationFitCount)
@@ -548,6 +550,33 @@ internal static class FtTransformerSnapshotSupport
             {
                 issues.Add("FtTransformerCalibrationArtifact ThresholdSelectionSampleCount does not match TrainingSplitSummary.SelectionThresholdCount.");
             }
+            if (artifact.KellySelectionSampleCount > 0 &&
+                split.SelectionKellyCount > 0 &&
+                artifact.KellySelectionSampleCount != split.SelectionKellyCount)
+            {
+                issues.Add("FtTransformerCalibrationArtifact KellySelectionSampleCount does not match TrainingSplitSummary.SelectionKellyCount.");
+            }
+        }
+
+        if (artifact.RefitSampleCount > 0 && artifact.RefitSampleCount < artifact.FitSampleCount)
+            issues.Add("FtTransformerCalibrationArtifact RefitSampleCount cannot be smaller than FitSampleCount.");
+        if (artifact.RoutingThresholdCandidateCount > 0)
+        {
+            if (artifact.RoutingThresholdCandidates.Length != artifact.RoutingThresholdCandidateCount ||
+                artifact.RoutingThresholdCandidateNlls.Length != artifact.RoutingThresholdCandidateCount ||
+                artifact.RoutingThresholdCandidateEces.Length != artifact.RoutingThresholdCandidateCount)
+            {
+                issues.Add("FtTransformerCalibrationArtifact routing-threshold arrays must match RoutingThresholdCandidateCount.");
+            }
+        }
+
+        int crossFitMetricCount = artifact.SelectedStackCrossFitFoldNlls.Length;
+        if (crossFitMetricCount != artifact.SelectedStackCrossFitFoldEces.Length)
+            issues.Add("FtTransformerCalibrationArtifact selected-stack cross-fit arrays must have equal lengths.");
+        if (artifact.AdaptiveHeadCrossFitFoldCount > 1 && crossFitMetricCount > 0 &&
+            crossFitMetricCount != artifact.AdaptiveHeadCrossFitFoldCount)
+        {
+            issues.Add("FtTransformerCalibrationArtifact selected-stack cross-fit arrays must match AdaptiveHeadCrossFitFoldCount.");
         }
 
         if (artifact.IsotonicAccepted)
@@ -563,7 +592,7 @@ internal static class FtTransformerSnapshotSupport
         }
     }
 
-    private static List<SerializedLayerWeightsPayload>? TryLoadAdditionalLayers(
+    private static List<FtSerializedLayerWeights>? TryLoadAdditionalLayers(
         ModelSnapshot snapshot,
         int embedDim,
         int ffnDim,
@@ -571,7 +600,7 @@ internal static class FtTransformerSnapshotSupport
     {
         if (snapshot.FtTransformerAdditionalLayersBytes is { Length: > 4 } blob)
         {
-            try { return DeserializeAdditionalLayers(blob, embedDim, ffnDim); }
+            try { return FtTransformerAdditionalLayerCodec.DeserializeBinary(blob, embedDim, ffnDim); }
             catch (Exception ex) { issues.Add($"Binary additional layer payload is invalid: {ex.Message}"); }
         }
 
@@ -579,8 +608,8 @@ internal static class FtTransformerSnapshotSupport
         {
             try
             {
-                var layers = JsonSerializer.Deserialize<List<SerializedLayerWeightsPayload>>(
-                    snapshot.FtTransformerAdditionalLayersJson, CloneJsonOptions);
+                var layers = JsonSerializer.Deserialize<List<FtSerializedLayerWeights>>(
+                    snapshot.FtTransformerAdditionalLayersJson, FtTransformerAdditionalLayerCodec.JsonOptions);
                 return layers ?? [];
             }
             catch (JsonException ex)
@@ -668,88 +697,76 @@ internal static class FtTransformerSnapshotSupport
             issues.Add($"{name} contains a non-finite value.");
     }
 
-    private static List<SerializedLayerWeightsPayload> DeserializeAdditionalLayers(byte[] data, int embedDim, int ffnDim)
-    {
-        if (data.Length < 4)
-            throw new InvalidOperationException("Binary blob too short.");
-
-        int payloadLength = data.Length - 4;
-        uint storedCrc = BitConverter.ToUInt32(data, payloadLength);
-        uint computedCrc = ComputeCrc32(data.AsSpan(0, payloadLength));
-        if (storedCrc != computedCrc)
-            throw new InvalidOperationException("CRC32 mismatch.");
-
-        var layers = new List<SerializedLayerWeightsPayload>();
-        using var ms = new MemoryStream(data, 0, payloadLength);
-        using var br = new BinaryReader(ms);
-        int numLayers = br.ReadInt32();
-        int numHeads = br.ReadInt32();
-        int seqSq = br.ReadInt32();
-
-        for (int layer = 0; layer < numLayers; layer++)
-        {
-            var payload = new SerializedLayerWeightsPayload
-            {
-                Wq = ReadMatrix(br, embedDim, embedDim),
-                Wk = ReadMatrix(br, embedDim, embedDim),
-                Wv = ReadMatrix(br, embedDim, embedDim),
-                Wo = ReadMatrix(br, embedDim, embedDim),
-                Gamma1 = ReadVector(br, embedDim),
-                Beta1 = ReadVector(br, embedDim),
-                Wff1 = ReadMatrix(br, embedDim, ffnDim),
-                Bff1 = ReadVector(br, ffnDim),
-                Wff2 = ReadMatrix(br, ffnDim, embedDim),
-                Bff2 = ReadVector(br, embedDim),
-                Gamma2 = ReadVector(br, embedDim),
-                Beta2 = ReadVector(br, embedDim),
-            };
-
-            if (seqSq > 0 && numHeads > 0)
-                payload.PosBias = ReadMatrix(br, numHeads, seqSq);
-
-            layers.Add(payload);
-        }
-
-        return layers;
-    }
-
-    private static double[][] ReadMatrix(BinaryReader br, int rows, int cols)
-    {
-        var matrix = new double[rows][];
-        for (int row = 0; row < rows; row++)
-        {
-            matrix[row] = new double[cols];
-            for (int col = 0; col < cols; col++)
-                matrix[row][col] = br.ReadDouble();
-        }
-
-        return matrix;
-    }
-
-    private static double[] ReadVector(BinaryReader br, int length)
-    {
-        var vector = new double[length];
-        for (int i = 0; i < length; i++)
-            vector[i] = br.ReadDouble();
-        return vector;
-    }
-
-    private static uint ComputeCrc32(ReadOnlySpan<byte> data)
-    {
-        uint crc = 0xFFFFFFFF;
-        foreach (byte b in data)
-        {
-            crc ^= b;
-            for (int i = 0; i < 8; i++)
-                crc = (crc >> 1) ^ (0xEDB88320 & ~((crc & 1) - 1));
-        }
-
-        return ~crc;
-    }
-
     private static string ComputeSha256(string value)
     {
         byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes(value));
         return Convert.ToHexString(hash);
+    }
+
+    private static string ResolveSnapshotVersion(string? version)
+        => string.IsNullOrWhiteSpace(version) ? InitialSnapshotVersion : version.Trim();
+
+    private static void UpgradeVersion5To6(ModelSnapshot snapshot, int rawFeatureCount)
+    {
+        if (!double.IsFinite(snapshot.ConditionalCalibrationRoutingThreshold))
+            snapshot.ConditionalCalibrationRoutingThreshold = 0.5;
+
+        snapshot.FtTransformerRawFeatureCount = rawFeatureCount;
+        EnsureSelectionWindow(snapshot.TrainingSplitSummary);
+    }
+
+    private static void UpgradeVersion6To7(ModelSnapshot snapshot)
+        => EnsureCalibrationDiagnosticsWindow(snapshot.TrainingSplitSummary);
+
+    private static void UpgradeVersion7To8(ModelSnapshot snapshot)
+    {
+        EnsureConformalWindow(snapshot.TrainingSplitSummary);
+        snapshot.Version = CurrentSnapshotVersion;
+    }
+
+    private static void UpgradeCurrentSnapshot(ModelSnapshot snapshot, int rawFeatureCount)
+    {
+        snapshot.FtTransformerRawFeatureCount = rawFeatureCount;
+        if (!double.IsFinite(snapshot.ConditionalCalibrationRoutingThreshold))
+            snapshot.ConditionalCalibrationRoutingThreshold = 0.5;
+        EnsureSelectionWindow(snapshot.TrainingSplitSummary);
+        EnsureCalibrationDiagnosticsWindow(snapshot.TrainingSplitSummary);
+        EnsureConformalWindow(snapshot.TrainingSplitSummary);
+    }
+
+    private static void EnsureSelectionWindow(TrainingSplitSummary? split)
+    {
+        if (split is null)
+            return;
+
+        if (split.SelectionCount <= 0 && split.TrainCount > 0)
+        {
+            split.SelectionStartIndex = split.TrainStartIndex;
+            split.SelectionCount = split.TrainCount;
+        }
+    }
+
+    private static void EnsureCalibrationDiagnosticsWindow(TrainingSplitSummary? split)
+    {
+        if (split is null)
+            return;
+
+        if (split.CalibrationDiagnosticsCount <= 0 && split.CalibrationCount > 0)
+        {
+            split.CalibrationDiagnosticsStartIndex = split.CalibrationStartIndex;
+            split.CalibrationDiagnosticsCount = split.CalibrationCount;
+        }
+    }
+
+    private static void EnsureConformalWindow(TrainingSplitSummary? split)
+    {
+        if (split is null)
+            return;
+
+        if (split.ConformalCount <= 0 && split.CalibrationDiagnosticsCount > 0)
+        {
+            split.ConformalStartIndex = split.CalibrationDiagnosticsStartIndex;
+            split.ConformalCount = split.CalibrationDiagnosticsCount;
+        }
     }
 }

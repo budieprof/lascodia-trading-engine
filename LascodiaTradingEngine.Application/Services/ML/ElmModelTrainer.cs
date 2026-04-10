@@ -128,34 +128,23 @@ public sealed partial class ElmModelTrainer : IMLModelTrainer
         int embargo = hp.EmbargoBarCount;
         int purgeExtra = MLFeatureHelper.LookbackWindow - 1;
 
-        double trainRatio, calRatio;
-        if (hp.ElmTrainSplitRatio > 0.0 && hp.ElmTrainSplitRatio < 1.0)
-        {
-            trainRatio = hp.ElmTrainSplitRatio;
-            calRatio = hp.ElmCalSplitRatio > 0.0 && hp.ElmCalSplitRatio < 1.0
-                ? hp.ElmCalSplitRatio
-                : Math.Min(0.15, (1.0 - trainRatio) / 2.0);
-        }
-        else
-        {
-            double t = Math.Clamp((n - 500.0) / 1500.0, 0.0, 1.0);
-            trainRatio = 0.80 - t * 0.10;
-            calRatio = hp.ElmCalSplitRatio > 0.0 && hp.ElmCalSplitRatio < 1.0
-                ? hp.ElmCalSplitRatio
-                : 0.10 + t * 0.05;
-        }
-        if (trainRatio + calRatio > 0.95) calRatio = 0.95 - trainRatio;
+        // ── 4-way split: 60% train | 10% selection | 10% cal | ~20% test ──
+        int trainEnd     = (int)(n * 0.60);
+        int selectionEnd = (int)(n * 0.70);
+        int calEnd       = (int)(n * 0.80);
 
-        int trainEnd   = (int)(n * trainRatio);
-        int calEnd     = (int)(n * (trainRatio + calRatio));
-        int trainSetEnd = Math.Clamp(trainEnd - purgeExtra, 0, n);
-        int calStart   = Math.Min(trainEnd + embargo, n);
-        int calSetEnd  = Math.Clamp(calEnd, calStart, n);
+        int trainSetEnd     = Math.Clamp(trainEnd - purgeExtra, 0, n);
+        int selectionStart  = Math.Min(trainEnd + embargo, selectionEnd);
+        int selectionSetEnd = Math.Clamp(selectionEnd, selectionStart, n);
+        int calStart        = Math.Min(selectionEnd + embargo, calEnd);
+        int calSetEnd       = Math.Clamp(calEnd, calStart, n);
 
         if (trainSetEnd < 2)
             throw new InvalidOperationException(
                 $"ElmModelTrainer: training window is too small after split selection ({trainSetEnd} samples). " +
                 $"Reduce EmbargoBarCount or provide more data.");
+
+        var warmStartArtifact = BuildElmWarmStartArtifact(false, false, 0, 0, false, false, []);
 
         if (warmStart is not null)
         {
@@ -185,6 +174,15 @@ public sealed partial class ElmModelTrainer : IMLModelTrainer
                 }
             }
         }
+
+        warmStartArtifact = BuildElmWarmStartArtifact(
+            attempted: true,
+            compatible: warmStart is not null,
+            reusedLearnerCount: warmStart?.BaseLearnersK ?? 0,
+            totalParentLearners: warmStart?.BaseLearnersK ?? 0,
+            inputWeightsTransferred: warmStart is not null,
+            pruningRemapped: false,
+            compatibilityIssues: []);
 
         // ── 1b. Preprocess features without mutating the caller's samples ─────
         var preparedData = ElmFeaturePipelineHelper.PrepareTrainingSamples(
@@ -230,10 +228,11 @@ public sealed partial class ElmModelTrainer : IMLModelTrainer
         // ── 3. Final model splits: adaptive train | cal | test ──────────────
         // Split indices (n, embargo, trainEnd, calEnd, trainSetEnd) were computed
         // above in step 1 before standardisation to avoid data leakage.
-        var trainSet = allStd[..trainSetEnd];
-        var calSet   = allStd[calStart..calSetEnd];
-        int testStart = calSet.Count > 0 ? Math.Min(calSetEnd + embargo, n) : calStart;
-        var testSet  = allStd[testStart..];
+        var trainSet     = allStd[..trainSetEnd];
+        var selectionSet = allStd[selectionStart..selectionSetEnd];
+        var calSet       = allStd[calStart..calSetEnd];
+        int testStart    = calSet.Count > 0 ? Math.Min(calSetEnd + embargo, n) : calStart;
+        var testSet      = allStd[testStart..];
 
         if (trainSet.Count < hp.MinSamples)
             throw new InvalidOperationException(
@@ -244,25 +243,59 @@ public sealed partial class ElmModelTrainer : IMLModelTrainer
             _logger.LogWarning(
                 "ELM calibration set too small ({CalCount} < {Min}). Platt scaling and threshold estimates may be unreliable.",
                 calSet.Count, minCalTestSize);
+        if (selectionSet.Count < minCalTestSize)
+            _logger.LogWarning(
+                "ELM selection set too small ({SelCount} < {Min}). Threshold tuning and pruning acceptance may be unreliable.",
+                selectionSet.Count, minCalTestSize);
         if (testSet.Count < minCalTestSize)
             _logger.LogWarning(
                 "ELM test set too small ({TestCount} < {Min}). Final evaluation metrics may be unreliable.",
                 testSet.Count, minCalTestSize);
 
-        // ── 3b. Stationarity gate ────────────────────────────────────────────
-        int nonStationaryFeatureCount = ElmEvaluationHelper.CountNonStationaryFeatures(trainSet, featureCount);
-        double nonStationaryFeatureFraction = featureCount > 0 ? (double)nonStationaryFeatureCount / featureCount : 0.0;
-        if (nonStationaryFeatureFraction > 0.30 && hp.FracDiffD == 0.0)
+        // ── 3b. Multi-signal stationarity gate ──────────────────────────────
+        var driftArtifact = ComputeElmDriftDiagnostics(trainSet, featureCount, snapshotFeatureNames, hp.FracDiffD);
+        if (driftArtifact.GateTriggered)
+        {
+            if (string.Equals(driftArtifact.GateAction, "REJECT", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException(
+                    $"ELM drift gate rejected training: {driftArtifact.NonStationaryFeatureCount}/{featureCount} features flagged.");
             _logger.LogWarning(
-                "ELM stationarity gate: {NonStat}/{Total} features have unit root. Consider enabling FracDiffD.",
-                nonStationaryFeatureCount, featureCount);
+                "ELM stationarity gate ({Action}): {NonStat}/{Total} features flagged.",
+                driftArtifact.GateAction, driftArtifact.NonStationaryFeatureCount, featureCount);
+        }
+
+        // ── 3b2. Class-imbalance gate ──────────────────────────────────────
+        {
+            int posCount = 0;
+            foreach (var s in trainSet) if (s.Direction > 0) posCount++;
+            double buyRatio = (double)posCount / trainSet.Count;
+            if (buyRatio < 0.15 || buyRatio > 0.85)
+                throw new InvalidOperationException(
+                    $"ELM: extreme class imbalance (Buy={buyRatio:P1}). Training would produce a degenerate model.");
+            if (buyRatio < 0.35 || buyRatio > 0.65)
+                _logger.LogWarning("ELM class imbalance: Buy={Buy:P1}, Sell={Sell:P1}.", buyRatio, 1.0 - buyRatio);
+        }
+
+        // ── 3b3. Adversarial validation ────────────────────────────────────
+        if (testSet.Count >= 20 && trainSet.Count >= 20)
+        {
+            double advAuc = TryComputeAdversarialAucGpu(trainSet, testSet, featureCount, ct)
+                            ?? ComputeAdversarialAuc(trainSet, testSet, featureCount);
+            _logger.LogInformation("ELM adversarial AUC={AUC:F3}", advAuc);
+            if (advAuc > 0.65)
+                _logger.LogWarning("ELM adversarial AUC={AUC:F3} indicates meaningful covariate shift.", advAuc);
+            if (hp.ElmMaxAdversarialAuc > 0.0 && advAuc > hp.ElmMaxAdversarialAuc)
+                throw new InvalidOperationException(
+                    $"ELM: adversarial AUC={advAuc:F3} exceeds rejection threshold {hp.ElmMaxAdversarialAuc:F3}.");
+        }
 
         // ── 3c. Density-ratio importance weights ──────────────────────────────
         double[]? densityWeights = null;
         if (hp.DensityRatioWindowDays > 0 && trainSet.Count >= 50)
         {
-            densityWeights = ElmBootstrapHelper.ComputeDensityRatioWeights(
-                trainSet, featureCount, hp.DensityRatioWindowDays, hp.BarsPerDay);
+            densityWeights = TryComputeDensityRatioWeightsGpu(trainSet, featureCount, hp.DensityRatioWindowDays, hp.BarsPerDay, ct)
+                             ?? ElmBootstrapHelper.ComputeDensityRatioWeights(
+                                 trainSet, featureCount, hp.DensityRatioWindowDays, hp.BarsPerDay);
             _logger.LogDebug("ELM density-ratio weights computed (recentWindow={W}d).", hp.DensityRatioWindowDays);
         }
 
@@ -452,16 +485,16 @@ public sealed partial class ElmModelTrainer : IMLModelTrainer
 
         // ── 9. EV-optimal decision threshold ───────────────────────────────
         double optimalThreshold = ElmCalibrationHelper.ComputeOptimalThreshold(
-            calSet, weights, biases, inputWeights, inputBiases,
+            selectionSet, weights, biases, inputWeights, inputBiases,
             plattA, plattB, featureCount, hiddenSize, featureSubsets,
             hp.ThresholdSearchMin, hp.ThresholdSearchMax,
             (f, w, b, iw, ib, pA, pB, fc, hs, fs, lw) => PrimaryCalibProb(f));
         _logger.LogInformation("ELM EV-optimal threshold={Thr:F2}", optimalThreshold);
 
         // ── 10. Permutation feature importance ────────────────────────────
-        var featureImportance = testSet.Count >= 10
+        var featureImportance = selectionSet.Count >= 10
             ? ElmEvaluationHelper.ComputePermutationImportance(
-                testSet, weights, biases, inputWeights, inputBiases,
+                selectionSet, weights, biases, inputWeights, inputBiases,
                 plattA, plattB, featureCount, hiddenSize, featureSubsets,
                 (f, w, b, iw, ib, pA, pB, fc, hs, fs, lw) => PrimaryCalibProb(f), ct, optimalThreshold)
             : new float[featureCount];
@@ -498,6 +531,7 @@ public sealed partial class ElmModelTrainer : IMLModelTrainer
         var effectiveCalSet       = calSet;
         var effectiveTestSet      = testSet;
         var effectiveTrainSet     = trainSet;
+        var effectiveSelectionSet = selectionSet;
         int effectiveFeatureCount = featureCount;
 
         _logger.LogDebug("ELM stage timing: calibration + importance = {Ms}ms", stageStopwatch.ElapsedMilliseconds);
@@ -675,6 +709,8 @@ public sealed partial class ElmModelTrainer : IMLModelTrainer
                 effectiveCalSet       = maskedCal;
                 effectiveTestSet      = maskedTest;
                 effectiveTrainSet     = maskedTrain;
+                var effectiveSelectionMasked = ElmBootstrapHelper.ApplyZeroMask(selectionSet, activeMask);
+                effectiveSelectionSet = effectiveSelectionMasked;
                 effectiveFeatureCount = featureCount;
 
                 // Recompute feature importance for next iteration
@@ -1035,6 +1071,32 @@ public sealed partial class ElmModelTrainer : IMLModelTrainer
 
         _logger.LogDebug("ELM stage timing: post-training metrics = {Ms}ms", stageStopwatch.ElapsedMilliseconds);
 
+        // ── New evaluation metrics ───────────────────────────────────────────
+        var (reliabilityBinConf, reliabilityBinAcc, reliabilityBinCounts) =
+            ComputeReliabilityDiagram(effectiveTestSet, FinalEffectiveCalibProb);
+        var (calibrationLoss, refinementLoss) =
+            ComputeMurphyDecomposition(effectiveTestSet, FinalEffectiveCalibProb);
+        var (calResidualMean, calResidualStd, calResidualThreshold) =
+            ComputeCalibrationResidualStats(effectiveCalSet, FinalEffectiveCalibProb);
+        double predictionStability = ComputePredictionStabilityScore(effectiveTestSet, FinalEffectiveCalibProb);
+        double[] featureVariances = ComputeFeatureVariances(effectiveTrainSet, effectiveFeatureCount);
+
+        // ── Scalar sanitization ──────────────────────────────────────────────
+        ece = SafeElm(ece, 1.0);
+        optimalThreshold = SafeElm(optimalThreshold, 0.5);
+        avgKellyFraction = SafeElm(avgKellyFraction);
+        durbinWatson = SafeElm(durbinWatson, 2.0);
+        brierSkillScore = SafeElm(brierSkillScore);
+        calibrationLoss = SafeElm(calibrationLoss);
+        refinementLoss = SafeElm(refinementLoss);
+        predictionStability = SafeElm(predictionStability);
+        calResidualMean = SafeElm(calResidualMean);
+        calResidualStd = SafeElm(calResidualStd);
+        calResidualThreshold = SafeElm(calResidualThreshold);
+        conformalQHat = Math.Clamp(SafeElm(conformalQHat, 0.5), 1e-7, 1.0 - 1e-7);
+        conformalQHatBuy = Math.Clamp(SafeElm(conformalQHatBuy, conformalQHat), 1e-7, 1.0 - 1e-7);
+        conformalQHatSell = Math.Clamp(SafeElm(conformalQHatSell, conformalQHat), 1e-7, 1.0 - 1e-7);
+
         // ── 23. Serialise model snapshot ────────────────────────────────────
         var snapshot = new ModelSnapshot
         {
@@ -1101,6 +1163,18 @@ public sealed partial class ElmModelTrainer : IMLModelTrainer
             TemperatureScale           = temperatureScale,
             EnsembleDiversity          = ensembleDiversity,
             BrierSkillScore            = brierSkillScore,
+            ReliabilityBinConfidence   = reliabilityBinConf.Length > 0 ? reliabilityBinConf : null,
+            ReliabilityBinAccuracy     = reliabilityBinAcc.Length > 0 ? reliabilityBinAcc : null,
+            ReliabilityBinCounts       = reliabilityBinCounts.Length > 0 ? reliabilityBinCounts : null,
+            CalibrationLoss            = calibrationLoss,
+            RefinementLoss             = refinementLoss,
+            PredictionStabilityScore   = predictionStability,
+            FeatureVariances           = featureVariances,
+            ElmDriftArtifact           = driftArtifact,
+            ElmWarmStartArtifact       = warmStartArtifact,
+            ElmCalibrationResidualMean      = calResidualMean,
+            ElmCalibrationResidualStd       = calResidualStd,
+            ElmCalibrationResidualThreshold = calResidualThreshold,
             TrainedAtUtc               = trainedAtUtc,
             AgeDecayLambda             = hp.AgeDecayLambda,
             FeatureStabilityScores     = cvResult.FeatureStabilityScores ?? [],
@@ -1131,6 +1205,21 @@ public sealed partial class ElmModelTrainer : IMLModelTrainer
             PreprocessingFingerprint   = basePreprocessingFingerprint,
             TrainerFingerprint         = trainerFingerprint,
         };
+
+        SanitizeElmSnapshotArrays(snapshot);
+
+        var auditResult = RunElmModelAudit(snapshot, testSet.Count > 0 ? testSet : calSet);
+        snapshot.ElmAuditArtifact = auditResult.Artifact;
+        if (auditResult.Findings.Length > 0)
+            _logger.LogWarning("ELM audit findings: {Findings}", string.Join("; ", auditResult.Findings));
+
+        snapshot = ElmSnapshotSupport.NormalizeSnapshotCopy(snapshot);
+        var snapshotValidation = ElmSnapshotSupport.ValidateNormalizedSnapshot(snapshot, allowLegacy: false);
+        if (!snapshotValidation.IsValid)
+        {
+            throw new InvalidOperationException(
+                $"ELM snapshot self-audit failed: {string.Join("; ", snapshotValidation.Issues)}");
+        }
 
         var modelBytes = JsonSerializer.SerializeToUtf8Bytes(snapshot, JsonOpts);
 

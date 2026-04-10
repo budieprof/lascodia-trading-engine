@@ -4,6 +4,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Moq;
+using Lascodia.Trading.Engine.IntegrationEventLogEF;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Events;
@@ -23,7 +24,11 @@ public class StrategyGenerationCycleRunnerTest : IDisposable
     public async Task RunAsync_WhenVelocityCapSkips_RecordsSkipReason()
     {
         var healthStore = new StrategyGenerationHealthStore();
-        var runner = CreateVelocityCapRunner(healthStore, publishThrows: false, out var cycleRunStore);
+        var runner = CreateVelocityCapRunner(
+            healthStore,
+            publishThrows: false,
+            EventStateEnum.Published,
+            out var cycleRunStore);
 
         await runner.RunAsync(CancellationToken.None);
 
@@ -37,13 +42,17 @@ public class StrategyGenerationCycleRunnerTest : IDisposable
     public async Task RunAsync_WhenCycleSummaryPublishFails_RecordsSummaryFailure()
     {
         var healthStore = new StrategyGenerationHealthStore();
-        var runner = CreateVelocityCapRunner(healthStore, publishThrows: true, out var cycleRunStore);
+        var runner = CreateVelocityCapRunner(
+            healthStore,
+            publishThrows: false,
+            EventStateEnum.PublishedFailed,
+            out var cycleRunStore);
 
         await runner.RunAsync(CancellationToken.None);
 
         var snapshot = healthStore.GetState();
         Assert.Equal(1, snapshot.SummaryPublishFailures);
-        Assert.Contains("publish failed", snapshot.LastSummaryPublishFailureMessage);
+        Assert.Contains("awaiting outbox publication", snapshot.LastSummaryPublishFailureMessage);
         Assert.Equal(1, cycleRunStore.SummaryFailureRecordCount);
     }
 
@@ -55,6 +64,7 @@ public class StrategyGenerationCycleRunnerTest : IDisposable
     private StrategyGenerationCycleRunner CreateVelocityCapRunner(
         StrategyGenerationHealthStore healthStore,
         bool publishThrows,
+        EventStateEnum summaryPublishState,
         out FakeCycleRunStore cycleRunStore)
     {
         var timeProvider = new TestTimeProvider(new DateTimeOffset(2026, 4, 9, 12, 0, 0, TimeSpan.Zero));
@@ -68,6 +78,7 @@ public class StrategyGenerationCycleRunnerTest : IDisposable
 
         var mediator = new Mock<IMediator>();
         var eventService = new Mock<IIntegrationEventService>();
+        var eventLogReader = new FakeEventLogReader();
         if (publishThrows)
         {
             eventService
@@ -78,6 +89,8 @@ public class StrategyGenerationCycleRunnerTest : IDisposable
         {
             eventService
                 .Setup(x => x.SaveAndPublish(It.IsAny<IDbContext>(), It.IsAny<Lascodia.Trading.Engine.EventBus.Events.IntegrationEvent>()))
+                .Callback<IDbContext, Lascodia.Trading.Engine.EventBus.Events.IntegrationEvent>((_, evt) =>
+                    eventLogReader.SetStatus(evt.Id, summaryPublishState))
                 .Returns(Task.CompletedTask);
         }
 
@@ -86,6 +99,7 @@ public class StrategyGenerationCycleRunnerTest : IDisposable
         serviceProvider.Setup(x => x.GetService(typeof(IWriteApplicationDbContext))).Returns(writeCtx.Object);
         serviceProvider.Setup(x => x.GetService(typeof(IMediator))).Returns(mediator.Object);
         serviceProvider.Setup(x => x.GetService(typeof(IIntegrationEventService))).Returns(eventService.Object);
+        serviceProvider.Setup(x => x.GetService(typeof(IEventLogReader))).Returns(eventLogReader);
         serviceProvider.Setup(x => x.GetService(typeof(ISpreadProfileProvider))).Returns((object?)null);
         serviceProvider.Setup(x => x.GetService(typeof(ILivePerformanceBenchmark))).Returns((object?)null);
         serviceProvider.Setup(x => x.GetService(typeof(IPortfolioEquityCurveProvider))).Returns((object?)null);
@@ -186,6 +200,8 @@ public class StrategyGenerationCycleRunnerTest : IDisposable
     {
         public int StartCallCount { get; private set; }
         public int CompleteCallCount { get; private set; }
+        public int SummaryAttemptCount { get; private set; }
+        public int SummaryPublishedCount { get; private set; }
         public int SummaryFailureRecordCount { get; private set; }
 
         public Task StartAsync(DbContext writeDb, string cycleId, string? fingerprint, CancellationToken ct)
@@ -197,14 +213,37 @@ public class StrategyGenerationCycleRunnerTest : IDisposable
         public Task AttachFingerprintAsync(DbContext writeDb, string cycleId, string fingerprint, CancellationToken ct)
             => Task.CompletedTask;
 
-        public Task StageSummaryDispatchSuccessAsync(
+        public Task StageCompletionAsync(
+            DbContext writeDb,
+            string cycleId,
+            StrategyGenerationCycleRunCompletion completion,
+            CancellationToken ct)
+        {
+            CompleteCallCount++;
+            return Task.CompletedTask;
+        }
+
+        public Task StageSummaryDispatchAttemptAsync(
             DbContext writeDb,
             string cycleId,
             Guid eventId,
             string payloadJson,
+            DateTime attemptedAtUtc,
+            CancellationToken ct)
+        {
+            SummaryAttemptCount++;
+            return Task.CompletedTask;
+        }
+
+        public Task MarkSummaryDispatchPublishedAsync(
+            DbContext writeDb,
+            string cycleId,
             DateTime dispatchedAtUtc,
             CancellationToken ct)
-            => Task.CompletedTask;
+        {
+            SummaryPublishedCount++;
+            return Task.CompletedTask;
+        }
 
         public Task RecordSummaryDispatchFailureAsync(
             DbContext writeDb,
@@ -220,10 +259,7 @@ public class StrategyGenerationCycleRunnerTest : IDisposable
         }
 
         public Task CompleteAsync(DbContext writeDb, string cycleId, StrategyGenerationCycleRunCompletion completion, CancellationToken ct)
-        {
-            CompleteCallCount++;
-            return Task.CompletedTask;
-        }
+            => Task.CompletedTask;
 
         public Task FailAsync(DbContext writeDb, string cycleId, string failureStage, string failureMessage, CancellationToken ct)
             => Task.CompletedTask;
@@ -233,6 +269,11 @@ public class StrategyGenerationCycleRunnerTest : IDisposable
             string currentCycleId,
             CancellationToken ct)
             => Task.FromResult<LascodiaTradingEngine.Domain.Entities.StrategyGenerationCycleRun?>(null);
+
+        public Task<IReadOnlyList<StrategyGenerationSummaryDispatchRecord>> LoadPendingSummaryDispatchesAsync(
+            DbContext readDb,
+            CancellationToken ct)
+            => Task.FromResult<IReadOnlyList<StrategyGenerationSummaryDispatchRecord>>([]);
     }
 
     private sealed class FakeCheckpointStore : IStrategyGenerationCheckpointStore
@@ -245,6 +286,39 @@ public class StrategyGenerationCycleRunnerTest : IDisposable
 
         public Task ClearCheckpointAsync(DbContext writeDb, CancellationToken ct)
             => Task.CompletedTask;
+    }
+
+    private sealed class FakeEventLogReader : IEventLogReader
+    {
+        private readonly Dictionary<Guid, IntegrationEventStatusSnapshot> _statuses = [];
+
+        public void SetStatus(Guid eventId, EventStateEnum state)
+        {
+            _statuses[eventId] = new IntegrationEventStatusSnapshot(
+                eventId,
+                state,
+                state == EventStateEnum.Published ? 1 : 0,
+                DateTime.UtcNow);
+        }
+
+        public Task<List<Lascodia.Trading.Engine.IntegrationEventLogEF.IntegrationEventLogEntry>> GetRetryableEventsAsync(
+            TimeSpan stuckThreshold,
+            int maxRetries,
+            int batchSize,
+            CancellationToken ct)
+            => Task.FromResult(new List<Lascodia.Trading.Engine.IntegrationEventLogEF.IntegrationEventLogEntry>());
+
+        public Task<IReadOnlyDictionary<Guid, IntegrationEventStatusSnapshot>> GetEventStatusSnapshotsAsync(
+            IReadOnlyCollection<Guid> eventIds,
+            CancellationToken ct)
+        {
+            IReadOnlyDictionary<Guid, IntegrationEventStatusSnapshot> result = _statuses
+                .Where(kv => eventIds.Contains(kv.Key))
+                .ToDictionary(kv => kv.Key, kv => kv.Value);
+            return Task.FromResult(result);
+        }
+
+        public Task SaveChangesAsync(CancellationToken ct) => Task.CompletedTask;
     }
 
     private sealed class FakeCheckpointCoordinator : IStrategyGenerationCheckpointCoordinator

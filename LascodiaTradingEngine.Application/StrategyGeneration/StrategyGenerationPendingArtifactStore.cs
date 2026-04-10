@@ -36,14 +36,19 @@ internal sealed class StrategyGenerationPendingArtifactStore : IStrategyGenerati
             .ToListAsync(ct);
 
         var results = new List<StrategyGenerationPendingArtifactRecord>(entities.Count);
-        var corruptArtifactIds = new List<long>();
+        var corruptArtifacts = new List<StrategyGenerationCorruptArtifactRecord>();
         foreach (var entity in entities)
         {
             try
             {
                 var candidate = JsonSerializer.Deserialize<GenerationCheckpointStore.PendingCandidateState>(entity.CandidatePayloadJson);
                 if (candidate == null)
+                {
+                    corruptArtifacts.Add(new StrategyGenerationCorruptArtifactRecord(
+                        entity.Id,
+                        "Pending artifact payload deserialized to null."));
                     continue;
+                }
 
                 results.Add(new StrategyGenerationPendingArtifactRecord(
                     entity.StrategyId,
@@ -66,14 +71,47 @@ internal sealed class StrategyGenerationPendingArtifactStore : IStrategyGenerati
             }
             catch (Exception ex)
             {
-                corruptArtifactIds.Add(entity.Id);
+                corruptArtifacts.Add(new StrategyGenerationCorruptArtifactRecord(
+                    entity.Id,
+                    TruncateReason(ex.Message)));
                 _logger.LogWarning(ex,
-                    "StrategyGenerationPendingArtifactStore: failed to deserialize pending artifact {ArtifactId}; dropping corrupt row",
+                    "StrategyGenerationPendingArtifactStore: failed to deserialize pending artifact {ArtifactId}; quarantining corrupt row",
                     entity.Id);
             }
         }
 
-        return new StrategyGenerationPendingArtifactLoadResult(results, corruptArtifactIds);
+        return new StrategyGenerationPendingArtifactLoadResult(results, corruptArtifacts);
+    }
+
+    public async Task QuarantineCorruptArtifactsAsync(
+        DbContext writeDb,
+        IReadOnlyCollection<StrategyGenerationCorruptArtifactRecord> corruptArtifacts,
+        CancellationToken ct)
+    {
+        if (corruptArtifacts.Count == 0)
+            return;
+
+        var pendingArtifactSet = TryGetSet<StrategyGenerationPendingArtifact>(writeDb);
+        if (pendingArtifactSet == null)
+            return;
+
+        var artifactIds = corruptArtifacts.Select(a => a.ArtifactId).Distinct().ToArray();
+        var tracked = await pendingArtifactSet
+            .Where(a => artifactIds.Contains(a.Id) && !a.IsDeleted)
+            .ToListAsync(ct);
+
+        var reasonsById = corruptArtifacts.ToDictionary(a => a.ArtifactId, a => a.Reason);
+        var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+        foreach (var artifact in tracked)
+        {
+            artifact.NeedsCreationAudit = false;
+            artifact.NeedsCreatedEvent = false;
+            artifact.NeedsAutoPromoteEvent = false;
+            artifact.LastAttemptAtUtc = nowUtc;
+            artifact.LastErrorMessage = reasonsById.GetValueOrDefault(artifact.Id);
+            artifact.QuarantinedAtUtc = nowUtc;
+            artifact.TerminalFailureReason = reasonsById.GetValueOrDefault(artifact.Id);
+        }
     }
 
     public async Task ReplacePendingArtifactsAsync(
@@ -143,4 +181,7 @@ internal sealed class StrategyGenerationPendingArtifactStore : IStrategyGenerati
             return null;
         }
     }
+
+    private static string TruncateReason(string reason)
+        => reason.Length <= 1000 ? reason : reason[..1000];
 }

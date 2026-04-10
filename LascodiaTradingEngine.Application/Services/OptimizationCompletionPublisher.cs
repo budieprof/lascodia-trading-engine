@@ -23,6 +23,7 @@ public sealed class OptimizationCompletionPublisher
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<OptimizationCompletionPublisher> _logger;
     private readonly TradingMetrics _metrics;
+    private readonly OptimizationRunOwnedMutationGuard _ownedMutationGuard;
     private readonly TimeProvider _timeProvider;
     private DateTime UtcNow => _timeProvider.GetUtcNow().UtcDateTime;
 
@@ -30,18 +31,22 @@ public sealed class OptimizationCompletionPublisher
         IServiceScopeFactory scopeFactory,
         ILogger<OptimizationCompletionPublisher> logger,
         TradingMetrics metrics,
+        OptimizationRunOwnedMutationGuard ownedMutationGuard,
         TimeProvider timeProvider)
     {
         _scopeFactory = scopeFactory;
         _logger = logger;
         _metrics = metrics;
+        _ownedMutationGuard = ownedMutationGuard;
         _timeProvider = timeProvider;
     }
 
     public async Task PrepareAsync(
         OptimizationRun run,
+        DbContext writeDb,
         IWriteApplicationDbContext writeCtx,
         OptimizationCompletedIntegrationEvent completedEvent,
+        Guid expectedLeaseToken,
         CancellationToken ct)
     {
         OptimizationRunProgressTracker.SetStage(
@@ -54,7 +59,13 @@ public sealed class OptimizationCompletionPublisher
         run.CompletionPublicationStatus ??= OptimizationCompletionPublicationStatus.Pending;
         run.CompletionPublicationCompletedAt = null;
         run.CompletionPublicationErrorMessage = null;
-        await writeCtx.SaveChangesAsync(ct);
+        await _ownedMutationGuard.SaveChangesOrThrowAsync(
+            writeDb,
+            writeCtx,
+            run,
+            expectedLeaseToken,
+            ct,
+            "OptimizationCompletionPublisher: lease ownership changed before preparing completion payload for run {RunId}");
     }
 
     public async Task PublishWithFallbackAsync(

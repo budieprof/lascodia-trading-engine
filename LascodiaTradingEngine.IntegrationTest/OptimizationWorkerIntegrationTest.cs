@@ -348,6 +348,7 @@ public class OptimizationWorkerIntegrationTest : IClassFixture<PostgresFixture>
             IAlertDispatcher alertDispatcher,
             IIntegrationEventService eventService,
             Stopwatch sw,
+            Guid expectedLeaseToken,
             CancellationToken ct,
             CancellationToken runCt)
         {
@@ -379,6 +380,7 @@ public class OptimizationWorkerIntegrationTest : IClassFixture<PostgresFixture>
             IAlertDispatcher alertDispatcher,
             IIntegrationEventService eventService,
             Stopwatch sw,
+            Guid expectedLeaseToken,
             CancellationToken ct,
             CancellationToken runCt)
         {

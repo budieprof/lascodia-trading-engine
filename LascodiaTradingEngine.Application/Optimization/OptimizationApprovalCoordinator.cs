@@ -25,6 +25,7 @@ internal sealed class OptimizationApprovalCoordinator
     private readonly OptimizationApprovalArtifactStore _artifactStore;
     private readonly OptimizationCrossRegimePersistenceService _crossRegimePersistenceService;
     private readonly OptimizationChronicFailureEscalator _chronicFailureEscalator;
+    private readonly OptimizationRunOwnedMutationGuard _ownedMutationGuard;
     private readonly TimeProvider _timeProvider;
     private DateTime UtcNow => _timeProvider.GetUtcNow().UtcDateTime;
 
@@ -36,6 +37,7 @@ internal sealed class OptimizationApprovalCoordinator
         OptimizationApprovalArtifactStore artifactStore,
         OptimizationCrossRegimePersistenceService crossRegimePersistenceService,
         OptimizationChronicFailureEscalator chronicFailureEscalator,
+        OptimizationRunOwnedMutationGuard ownedMutationGuard,
         TimeProvider timeProvider)
     {
         _logger = logger;
@@ -45,6 +47,7 @@ internal sealed class OptimizationApprovalCoordinator
         _artifactStore = artifactStore;
         _crossRegimePersistenceService = crossRegimePersistenceService;
         _chronicFailureEscalator = chronicFailureEscalator;
+        _ownedMutationGuard = ownedMutationGuard;
         _timeProvider = timeProvider;
     }
 
@@ -83,7 +86,9 @@ internal sealed class OptimizationApprovalCoordinator
                 run.ApprovalReportJson = OptimizationApprovalReportParser.MarkStrategyRemoved(run.ApprovalReportJson);
                 run.ApprovalEvaluatedAt = nowUtc;
 
-                await writeCtx.SaveChangesAsync(ct);
+                await SaveOwnedMutationAsync(
+                    ctx,
+                    "OptimizationApprovalCoordinator: lease ownership changed before persisting strategy-removal rejection for run {RunId}");
 
                 _logger.LogWarning(
                     "OptimizationApprovalCoordinator: strategy {StrategyId} disappeared before approval for run {RunId} — rejecting auto-approval",
@@ -226,6 +231,35 @@ internal sealed class OptimizationApprovalCoordinator
                 {
                     await eventService.SaveAndPublish(writeCtx, approvedEvent);
                 }
+                catch (DbUpdateConcurrencyException retryEx)
+                {
+                    if (await _ownedMutationGuard.HasOwnershipChangedAsync(
+                            writeDb,
+                            run.Id,
+                            ctx.ExpectedLeaseToken,
+                            CancellationToken.None))
+                    {
+                        throw new OptimizationLeaseOwnershipChangedException(
+                            run.Id,
+                            $"OptimizationApprovalCoordinator: lease ownership changed before retrying duplicate follow-up approval persistence for run {run.Id}",
+                            retryEx);
+                    }
+
+                    RestorePreApprovalState();
+                    _artifactStore.RollbackTrackedArtifacts(writeDb, run.Id, strategy.Id);
+                    OptimizationRunLifecycle.FailForRetry(
+                        run,
+                        $"Failed to persist approved optimization changes after duplicate follow-up retry: {retryEx.Message}",
+                        OptimizationFailureCategory.Transient,
+                        nowUtc);
+                    await SaveOwnedMutationAsync(
+                        ctx,
+                        "OptimizationApprovalCoordinator: lease ownership changed before persisting duplicate follow-up retry failure for run {RunId}");
+                    _logger.LogError(retryEx,
+                        "OptimizationApprovalCoordinator: failed to persist approval for run {RunId} after duplicate follow-up retry — marked Failed for retry",
+                        run.Id);
+                    return;
+                }
                 catch (Exception retryEx)
                 {
                     RestorePreApprovalState();
@@ -235,12 +269,43 @@ internal sealed class OptimizationApprovalCoordinator
                         $"Failed to persist approved optimization changes after duplicate follow-up retry: {retryEx.Message}",
                         OptimizationFailureCategory.Transient,
                         nowUtc);
-                    await writeCtx.SaveChangesAsync(ct);
+                    await SaveOwnedMutationAsync(
+                        ctx,
+                        "OptimizationApprovalCoordinator: lease ownership changed before persisting duplicate follow-up retry failure for run {RunId}");
                     _logger.LogError(retryEx,
                         "OptimizationApprovalCoordinator: failed to persist approval for run {RunId} after duplicate follow-up retry — marked Failed for retry",
                         run.Id);
                     return;
                 }
+            }
+            catch (DbUpdateConcurrencyException ex)
+            {
+                if (await _ownedMutationGuard.HasOwnershipChangedAsync(
+                        writeDb,
+                        run.Id,
+                        ctx.ExpectedLeaseToken,
+                        CancellationToken.None))
+                {
+                    throw new OptimizationLeaseOwnershipChangedException(
+                        run.Id,
+                        $"OptimizationApprovalCoordinator: lease ownership changed before persisting approval for run {run.Id}",
+                        ex);
+                }
+
+                RestorePreApprovalState();
+                _artifactStore.RollbackTrackedArtifacts(writeDb, run.Id, strategy.Id);
+                OptimizationRunLifecycle.FailForRetry(
+                    run,
+                    $"Failed to persist approved optimization changes: {ex.Message}",
+                    OptimizationFailureCategory.Transient,
+                    nowUtc);
+                await SaveOwnedMutationAsync(
+                    ctx,
+                    "OptimizationApprovalCoordinator: lease ownership changed before persisting approval failure for run {RunId}");
+                _logger.LogError(ex,
+                    "OptimizationApprovalCoordinator: failed to persist approval for run {RunId} — marked Failed for retry",
+                    run.Id);
+                return;
             }
             catch (Exception ex)
             {
@@ -251,7 +316,9 @@ internal sealed class OptimizationApprovalCoordinator
                     $"Failed to persist approved optimization changes: {ex.Message}",
                     OptimizationFailureCategory.Transient,
                     nowUtc);
-                await writeCtx.SaveChangesAsync(ct);
+                await SaveOwnedMutationAsync(
+                    ctx,
+                    "OptimizationApprovalCoordinator: lease ownership changed before persisting approval failure for run {RunId}");
                 _logger.LogError(ex,
                     "OptimizationApprovalCoordinator: failed to persist approval for run {RunId} — marked Failed for retry",
                     run.Id);
@@ -342,7 +409,9 @@ internal sealed class OptimizationApprovalCoordinator
             }
 
             run.ApprovalEvaluatedAt = nowUtc;
-            await writeCtx.SaveChangesAsync(ct);
+            await SaveOwnedMutationAsync(
+                ctx,
+                "OptimizationApprovalCoordinator: lease ownership changed before persisting manual-review decision for run {RunId}");
 
             _logger.LogInformation(
                 "OptimizationApprovalCoordinator: run {RunId} requires manual review — {Reason}",
@@ -413,4 +482,13 @@ internal sealed class OptimizationApprovalCoordinator
             maxConsecutiveFailures,
             baseCooldownDays,
             ct);
+
+    private Task SaveOwnedMutationAsync(RunContext ctx, string staleOwnerMessage)
+        => _ownedMutationGuard.SaveChangesOrThrowAsync(
+            ctx.WriteDb,
+            ctx.WriteCtx,
+            ctx.Run,
+            ctx.ExpectedLeaseToken,
+            ctx.Ct,
+            staleOwnerMessage);
 }

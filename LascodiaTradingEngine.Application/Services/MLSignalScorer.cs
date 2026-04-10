@@ -319,8 +319,21 @@ public sealed class MLSignalScorer : IMLSignalScorer
              regimeRoutingDecision, minTReconciledProbability,
              estimatedTimeToTargetBars, survivalHazardRate, counterfactualJson) = enrichments;
 
+        bool predictedBuyForAbstention = effectiveCalibP >= threshold;
+        var (appliedAbstentionThreshold, suppressed) = ScoringEnrichmentCalculator.ComputeSelectiveSuppression(
+            predictedBuyForAbstention,
+            metaLabelScore,
+            snap.MetaLabelWeights.Length,
+            snap.MetaLabelThreshold,
+            abstentionScore,
+            snap.AbstentionWeights.Length,
+            snap.AbstentionThreshold,
+            snap.AbstentionThresholdBuy,
+            snap.AbstentionThresholdSell);
+
         if (metaLabelScore.HasValue &&
             snap.MetaLabelWeights.Length > 0 &&
+            suppressed &&
             metaLabelScore.Value < (decimal)snap.MetaLabelThreshold)
         {
             _logger.LogInformation(
@@ -340,17 +353,14 @@ public sealed class MLSignalScorer : IMLSignalScorer
                 EntropyScore: (decimal)entropyScore);
         }
 
-        bool predictedBuyForAbstention = effectiveCalibP >= threshold;
-        double abstentionThreshold = predictedBuyForAbstention
-            ? (snap.AbstentionThresholdBuy > 0.0 ? snap.AbstentionThresholdBuy : snap.AbstentionThreshold)
-            : (snap.AbstentionThresholdSell > 0.0 ? snap.AbstentionThresholdSell : snap.AbstentionThreshold);
         if (abstentionScore.HasValue &&
             snap.AbstentionWeights.Length > 0 &&
-            abstentionScore.Value < (decimal)abstentionThreshold)
+            suppressed &&
+            abstentionScore.Value < (decimal)appliedAbstentionThreshold)
         {
             _logger.LogInformation(
                 "ML abstention suppression for {Symbol}/{Tf} model {Id}: score={Score:F3} < threshold={Threshold:F3}",
-                signal.Symbol, signalTimeframe, model.Id, abstentionScore.Value, abstentionThreshold);
+                signal.Symbol, signalTimeframe, model.Id, abstentionScore.Value, appliedAbstentionThreshold);
 
             return new MLScoreResult(
                 PredictedDirection: null,
@@ -498,6 +508,14 @@ public sealed class MLSignalScorer : IMLSignalScorer
                         }
                     }
                     else if (snapshot is not null &&
+                             string.Equals(snapshot.Type, "AdaBoost", StringComparison.OrdinalIgnoreCase))
+                    {
+                        snapshot = AdaBoostSnapshotSupport.NormalizeSnapshotCopy(snapshot);
+                        var validation = AdaBoostSnapshotSupport.ValidateSnapshot(snapshot, allowLegacy: true);
+                        if (!validation.IsValid)
+                            return null;
+                    }
+                    else if (snapshot is not null &&
                              string.Equals(snapshot.Type, "FTTRANSFORMER", StringComparison.OrdinalIgnoreCase))
                     {
                         snapshot = FtTransformerSnapshotSupport.NormalizeSnapshotCopy(snapshot);
@@ -509,12 +527,9 @@ public sealed class MLSignalScorer : IMLSignalScorer
                              string.Equals(snapshot.Type, "elm", StringComparison.OrdinalIgnoreCase))
                     {
                         snapshot = ElmSnapshotSupport.NormalizeSnapshotCopy(snapshot);
-                        var validation = ElmSnapshotSupport.ValidateSnapshot(snapshot, allowLegacy: true);
-                        if (!validation.IsValid &&
-                            !(snapshot.Weights is { Length: > 0 } && snapshot.ElmInputWeights is { Length: > 0 }))
-                        {
+                        var validation = ElmSnapshotSupport.ValidateNormalizedSnapshot(snapshot, allowLegacy: true);
+                        if (!validation.IsValid)
                             return null;
-                        }
                     }
 
                     return snapshot;
@@ -556,110 +571,24 @@ public sealed class MLSignalScorer : IMLSignalScorer
     // ═══════════════════════════════════════════════════════════════════════════
 
     internal static float[] StandardiseFeatures(float[] rawFeatures, float[] means, float[] stds, int featureCount)
-    {
-        float[] features = new float[featureCount];
-        for (int j = 0; j < featureCount && j < rawFeatures.Length; j++)
-        {
-            if (!float.IsFinite(rawFeatures[j]))
-            {
-                features[j] = 0f;
-                continue;
-            }
-            float std  = j < stds.Length  && stds[j]  > 1e-8f ? stds[j]  : 1f;
-            float mean = j < means.Length ? means[j] : 0f;
-            features[j] = (rawFeatures[j] - mean) / std;
-        }
-        return features;
-    }
+        => ElmFeaturePipelineHelper.StandardiseFeatures(rawFeatures, means, stds, featureCount);
 
     internal static float[] ProjectFeaturesByRawIndex(float[] features, int[] rawFeatureIndices)
-    {
-        if (rawFeatureIndices.Length == 0)
-            return features;
-
-        if (rawFeatureIndices.Distinct().Count() != rawFeatureIndices.Length)
-            throw new InvalidOperationException("RawFeatureIndices contains duplicate indices.");
-
-        var projected = new float[rawFeatureIndices.Length];
-        for (int i = 0; i < rawFeatureIndices.Length; i++)
-        {
-            int rawIndex = rawFeatureIndices[i];
-            if (rawIndex < 0 || rawIndex >= features.Length)
-                throw new InvalidOperationException(
-                    $"RawFeatureIndices[{i}]={rawIndex} is outside the available feature range 0..{features.Length - 1}.");
-
-            projected[i] = features[rawIndex];
-        }
-
-        return projected;
-    }
+        => ElmFeaturePipelineHelper.ProjectFeaturesByRawIndex(features, rawFeatureIndices);
 
     internal static float[] ProjectRawFeaturesForSnapshot(float[] rawFeatures, ModelSnapshot snapshot)
-    {
-        if (string.Equals(snapshot.Type, "FTTRANSFORMER", StringComparison.OrdinalIgnoreCase) &&
-            snapshot.FtTransformerRawFeatureCount > 0 &&
-            rawFeatures.Length != snapshot.FtTransformerRawFeatureCount)
-        {
-            throw new InvalidOperationException(
-                $"FT-Transformer raw feature length {rawFeatures.Length} does not match snapshot raw feature count {snapshot.FtTransformerRawFeatureCount}.");
-        }
-
-        if (snapshot.RawFeatureIndices.Length == 0)
-            return rawFeatures;
-
-        float[] projected = ProjectFeaturesByRawIndex(rawFeatures, snapshot.RawFeatureIndices);
-        int expectedFeatureCount = snapshot.Features.Length > 0
-            ? snapshot.Features.Length
-            : projected.Length;
-        if (projected.Length != expectedFeatureCount)
-        {
-            throw new InvalidOperationException(
-                $"Projected feature count {projected.Length} does not match snapshot schema count {expectedFeatureCount}.");
-        }
-
-        return projected;
-    }
+        => ElmFeaturePipelineHelper.ProjectRawFeaturesForSnapshot(rawFeatures, snapshot);
 
     private static (float[] Means, float[] Stds) ResolveStandardisationStats(
         ModelSnapshot snap, string? currentRegime, int featureCount)
-    {
-        float[] means = snap.Means;
-        float[] stds = snap.Stds;
-        if (currentRegime is not null &&
-            snap.RegimeMeans.TryGetValue(currentRegime, out var regimeMeans) &&
-            snap.RegimeStds.TryGetValue(currentRegime, out var regimeStds) &&
-            regimeMeans.Length == featureCount &&
-            regimeStds.Length == featureCount)
-        {
-            means = regimeMeans;
-            stds = regimeStds;
-        }
-
-        return (means, stds);
-    }
+        => ElmFeaturePipelineHelper.ResolveStandardisationStats(snap, currentRegime, featureCount);
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Helper: apply feature mask (zero pruned features)
     // ═══════════════════════════════════════════════════════════════════════════
 
     internal static void ApplyFeatureMask(float[] features, bool[] mask, int featureCount)
-    {
-        if (mask.Length == 0)
-            return;
-
-        if (mask.Length != featureCount)
-            throw new InvalidOperationException(
-                $"ActiveFeatureMask length {mask.Length} does not match feature count {featureCount}.");
-
-        if (!mask.Any(v => v))
-            throw new InvalidOperationException("ActiveFeatureMask cannot disable every feature.");
-
-        for (int j = 0; j < featureCount; j++)
-        {
-            if (!mask[j])
-                features[j] = 0f;
-        }
-    }
+        => ElmFeaturePipelineHelper.ApplyFeatureMask(features, mask, featureCount);
 
     internal static double PredictSnapshotMagnitude(float[] features, int featureCount, ModelSnapshot snap)
     {
@@ -727,16 +656,21 @@ public sealed class MLSignalScorer : IMLSignalScorer
 
             // Reuse cotEntry — COT data is weekly and unchanged across lags
             float[] lagRaw = MLFeatureHelper.BuildFeatureVector(lagWindow, lagCurrent, lagPrev, cotEntry);
-            lagRaw = ProjectRawFeaturesForSnapshot(lagRaw, snap);
-            lagRaw = ElmFeaturePipelineHelper.CloneAndWinsorize(lagRaw, snap);
+            var lagPrepared = ElmFeaturePipelineHelper.PrepareSnapshotFeatures(
+                lagRaw,
+                snap,
+                meansOverride: useMeans,
+                stdsOverride: useStds,
+                applyTransforms: false,
+                applyMask: false);
 
             double weight = fdWeights[lag];
-            for (int j = 0; j < featureCount && j < lagRaw.Length; j++)
+            for (int j = 0; j < featureCount && j < lagPrepared.Features.Length; j++)
             {
-                if (!float.IsFinite(lagRaw[j])) continue;
-                float std  = j < useStds.Length  && useStds[j]  > 1e-8f ? useStds[j]  : 1f;
-                float mean = j < useMeans.Length ? useMeans[j] : 0f;
-                fdFeatures[j] += (float)(weight * (lagRaw[j] - mean) / std);
+                if (!float.IsFinite(lagPrepared.Features[j]))
+                    continue;
+
+                fdFeatures[j] += (float)(weight * lagPrepared.Features[j]);
             }
         }
 
@@ -997,11 +931,17 @@ public sealed class MLSignalScorer : IMLSignalScorer
         string? currentRegime,
         CancellationToken cancellationToken)
     {
-        rawFeatures = ProjectRawFeaturesForSnapshot(rawFeatures, snap);
-        rawFeatures = ElmFeaturePipelineHelper.CloneAndWinsorize(rawFeatures, snap);
-        int modelFeatureCount = snap.Features.Length > 0 ? snap.Features.Length : rawFeatures.Length;
-        var (means, stds) = ResolveStandardisationStats(snap, currentRegime, modelFeatureCount);
-        float[] features = StandardiseFeatures(rawFeatures, means, stds, modelFeatureCount);
+        var prepared = ElmFeaturePipelineHelper.PrepareSnapshotFeatures(
+            rawFeatures,
+            snap,
+            currentRegime,
+            applyTransforms: false,
+            applyMask: false);
+        rawFeatures = prepared.RawFeatures;
+        int modelFeatureCount = prepared.FeatureCount;
+        float[] features = prepared.Features;
+        var means = prepared.Means;
+        var stds = prepared.Stds;
 
         features = ApplyFractionalDifferencing(
             features, snap, candleWindow, modelFeatureCount,
@@ -1062,15 +1002,18 @@ public sealed class MLSignalScorer : IMLSignalScorer
         var (featureWindow, altCurrent, altPrevious) = sliced.Value;
 
         float[] altRawFeatures = MLFeatureHelper.BuildFeatureVector(featureWindow, altCurrent, altPrevious, cotEntry);
-        altRawFeatures = ProjectRawFeaturesForSnapshot(altRawFeatures, altSnap);
-        altRawFeatures = ElmFeaturePipelineHelper.CloneAndWinsorize(altRawFeatures, altSnap);
-
-        int altFc = altSnap.Features.Length > 0 ? altSnap.Features.Length : altRawFeatures.Length;
-        var altFeatures = StandardiseFeatures(altRawFeatures, altSnap.Means, altSnap.Stds, altFc);
+        var prepared = ElmFeaturePipelineHelper.PrepareSnapshotFeatures(
+            altRawFeatures,
+            altSnap,
+            applyTransforms: false,
+            applyMask: false);
+        altRawFeatures = prepared.RawFeatures;
+        int altFc = prepared.FeatureCount;
+        var altFeatures = prepared.Features;
 
         altFeatures = ApplyFractionalDifferencing(
             altFeatures, altSnap, altWindow, altFc,
-            altSnap.Means, altSnap.Stds, cotEntry, altModel.Symbol, tf, altModel.Id);
+            prepared.Means, prepared.Stds, cotEntry, altModel.Symbol, tf, altModel.Id);
         InferenceHelpers.ApplyModelSpecificFeatureTransforms(altFeatures, altSnap);
         ApplyFeatureMask(altFeatures, altSnap.ActiveFeatureMask, altFc);
 
@@ -1299,26 +1242,18 @@ public sealed class MLSignalScorer : IMLSignalScorer
         }
         var (window, current, previous) = sliced.Value;
 
-        float[] rawFeatures = MLFeatureHelper.BuildFeatureVector(window, current, previous, cotEntry);
-        rawFeatures = ProjectRawFeaturesForSnapshot(rawFeatures, snap);
-        rawFeatures = ElmFeaturePipelineHelper.CloneAndWinsorize(rawFeatures, snap);
-
-        int featureCount = snap.Features.Length > 0
-            ? snap.Features.Length
-            : rawFeatures.Length;
-
-        float[] useMeans = snap.Means;
-        float[] useStds  = snap.Stds;
-        if (currentRegime is not null &&
-            snap.RegimeMeans.TryGetValue(currentRegime, out var rMeans) &&
-            snap.RegimeStds.TryGetValue(currentRegime, out var rStds)   &&
-            rMeans.Length == featureCount)
-        {
-            useMeans = rMeans;
-            useStds  = rStds;
-        }
-
-        float[] features = StandardiseFeatures(rawFeatures, useMeans, useStds, featureCount);
+        float[] builtRawFeatures = MLFeatureHelper.BuildFeatureVector(window, current, previous, cotEntry);
+        var prepared = ElmFeaturePipelineHelper.PrepareSnapshotFeatures(
+            builtRawFeatures,
+            snap,
+            currentRegime,
+            applyTransforms: false,
+            applyMask: false);
+        float[] rawFeatures = prepared.RawFeatures;
+        int featureCount = prepared.FeatureCount;
+        float[] useMeans = prepared.Means;
+        float[] useStds = prepared.Stds;
+        float[] features = prepared.Features;
 
         features = ApplyFractionalDifferencing(
             features, snap, orderedCandles, featureCount, useMeans, useStds, cotEntry,

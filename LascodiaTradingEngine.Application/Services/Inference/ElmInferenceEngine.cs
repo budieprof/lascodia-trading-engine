@@ -18,26 +18,26 @@ namespace LascodiaTradingEngine.Application.Services.Inference;
 public sealed class ElmInferenceEngine : IModelInferenceEngine
 {
     public bool CanHandle(ModelSnapshot snapshot) =>
-        snapshot.Type == "elm"
-        && snapshot.Weights is { Length: > 0 }
-        && snapshot.ElmInputWeights is { Length: > 0 }
-        && snapshot.Biases is { Length: > 0 };
+        TryPrepareSnapshot(snapshot, out _);
 
     public InferenceResult? RunInference(
         float[] features, int featureCount, ModelSnapshot snapshot,
         List<Candle> candleWindow, long modelId,
         int mcDropoutSamples, int mcDropoutSeed)
     {
-        if (snapshot.Weights is not { Length: > 0 } || snapshot.ElmInputWeights is null)
+        if (!TryPrepareSnapshot(snapshot, out var normalized))
             return null;
 
-        var biases = snapshot.Biases;
+        if (normalized.Weights is not { Length: > 0 } || normalized.ElmInputWeights is null)
+            return null;
+
+        var biases = normalized.Biases;
         if (biases is null)
             return null;
 
         int K = Math.Min(
-            snapshot.Weights.Length,
-            Math.Min(biases.Length, snapshot.ElmInputWeights.Length));
+            normalized.Weights.Length,
+            Math.Min(biases.Length, normalized.ElmInputWeights.Length));
         if (K <= 0)
             return null;
 
@@ -46,15 +46,15 @@ public sealed class ElmInferenceEngine : IModelInferenceEngine
 
         for (int k = 0; k < K; k++)
         {
-            if (snapshot.Weights[k] is not { Length: > 0 } wOut ||
-                snapshot.ElmInputWeights[k] is not { Length: > 0 } wIn)
+            if (normalized.Weights[k] is not { Length: > 0 } wOut ||
+                normalized.ElmInputWeights[k] is not { Length: > 0 } wIn)
             {
                 continue;
             }
 
-            var subset = snapshot.FeatureSubsetIndices?.Length > k ? snapshot.FeatureSubsetIndices[k] : null;
-            var inputBiases = snapshot.ElmInputBiases is { Length: > 0 } && k < snapshot.ElmInputBiases.Length
-                ? snapshot.ElmInputBiases[k]
+            var subset = normalized.FeatureSubsetIndices?.Length > k ? normalized.FeatureSubsetIndices[k] : null;
+            var inputBiases = normalized.ElmInputBiases is { Length: > 0 } && k < normalized.ElmInputBiases.Length
+                ? normalized.ElmInputBiases[k]
                 : [];
             int learnerHidden = ResolveLearnerHiddenSize(
                 wOut,
@@ -62,7 +62,7 @@ public sealed class ElmInferenceEngine : IModelInferenceEngine
                 inputBiases,
                 subset,
                 featureCount,
-                snapshot.ElmHiddenDim);
+                normalized.ElmHiddenDim);
 
             probs[validLearners.Count] = ClampProbabilityOrNeutral(ElmLearnerProb(
                 features, wOut, biases[k],
@@ -70,7 +70,7 @@ public sealed class ElmInferenceEngine : IModelInferenceEngine
                 inputBiases ?? [],
                 featureCount, learnerHidden,
                 subset,
-                GetActivation(snapshot.LearnerActivations, k)));
+                GetActivation(normalized.LearnerActivations, k)));
             validLearners.Add(k);
         }
 
@@ -80,10 +80,10 @@ public sealed class ElmInferenceEngine : IModelInferenceEngine
 
         double avg = ClampProbabilityOrNeutral(InferenceHelpers.AggregateProbs(
             probs, validCount,
-            SelectLearnerValues(snapshot.MetaWeights, validLearners), snapshot.MetaBias,
-            SelectLearnerValues(snapshot.EnsembleSelectionWeights, validLearners),
-            SelectLearnerValues(snapshot.LearnerAccuracyWeights, validLearners),
-            SelectLearnerValues(snapshot.LearnerCalAccuracies, validLearners)));
+            SelectLearnerValues(normalized.MetaWeights, validLearners), normalized.MetaBias,
+            SelectLearnerValues(normalized.EnsembleSelectionWeights, validLearners),
+            SelectLearnerValues(normalized.LearnerAccuracyWeights, validLearners),
+            SelectLearnerValues(normalized.LearnerCalAccuracies, validLearners)));
 
         double meanProb = 0.0;
         for (int k = 0; k < validCount; k++)
@@ -96,9 +96,57 @@ public sealed class ElmInferenceEngine : IModelInferenceEngine
 
         decimal? mcMean = null, mcVar = null;
         if (mcDropoutSamples > 0)
-            (mcMean, mcVar) = ComputeMcDropout(features, snapshot, featureCount, mcDropoutSamples, mcDropoutSeed);
+            (mcMean, mcVar) = ComputeMcDropout(features, normalized, featureCount, mcDropoutSamples, mcDropoutSeed);
 
         return new InferenceResult(avg, std, mcMean, mcVar);
+    }
+
+    private static bool TryPrepareSnapshot(ModelSnapshot snapshot, out ModelSnapshot normalized)
+    {
+        normalized = snapshot;
+        if (!ElmSnapshotSupport.IsElm(snapshot))
+            return false;
+
+        normalized = ElmSnapshotSupport.NormalizeSnapshotCopy(snapshot);
+        if (normalized.Weights is not { Length: > 0 } weights ||
+            normalized.Biases is not { Length: > 0 } biases ||
+            normalized.ElmInputWeights is not { Length: > 0 } inputWeights)
+        {
+            return false;
+        }
+
+        if (biases.Length != weights.Length || inputWeights.Length != weights.Length)
+            return false;
+
+        if (normalized.ElmInputBiases is { Length: > 0 } inputBiases &&
+            inputBiases.Length != weights.Length)
+        {
+            return false;
+        }
+
+        if (normalized.FeatureSubsetIndices is { Length: > 0 } featureSubsets &&
+            featureSubsets.Length != weights.Length)
+        {
+            return false;
+        }
+
+        if (normalized.LearnerActivations is { Length: > 0 } learnerActivations &&
+            learnerActivations.Length != 1 &&
+            learnerActivations.Length != weights.Length)
+        {
+            return false;
+        }
+
+        for (int k = 0; k < weights.Length; k++)
+        {
+            if (weights[k] is { Length: > 0 } &&
+                inputWeights[k] is { Length: > 0 })
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static double ElmLearnerProb(

@@ -287,6 +287,11 @@ public class OptimizationWorkerTest
                 StrategyId = 42,
                 Status = RunStatus.Completed,
                 CompletedAt = DateTime.UtcNow.AddDays(-1),
+                TotalTrades = 30,
+                WinRate = 0.30m,
+                ProfitFactor = 0.80m,
+                MaxDrawdownPct = 18m,
+                SharpeRatio = 0.2m,
                 ResultJson = JsonSerializer.Serialize(new BacktestResult
                 {
                     TotalTrades = 30,
@@ -372,6 +377,11 @@ public class OptimizationWorkerTest
                 StrategyId = 52,
                 Status = RunStatus.Completed,
                 CompletedAt = DateTime.UtcNow.AddDays(-1),
+                TotalTrades = 24,
+                WinRate = 0.35m,
+                ProfitFactor = 0.82m,
+                MaxDrawdownPct = 15m,
+                SharpeRatio = 0.10m,
                 ResultJson = JsonSerializer.Serialize(new BacktestResult
                 {
                     TotalTrades = 24,
@@ -440,6 +450,11 @@ public class OptimizationWorkerTest
                 StrategyId = 43,
                 Status = RunStatus.Completed,
                 CompletedAt = DateTime.UtcNow.AddDays(-1),
+                TotalTrades = 40,
+                WinRate = 0.65m,
+                ProfitFactor = 1.60m,
+                MaxDrawdownPct = 7m,
+                SharpeRatio = 1.1m,
                 ResultJson = JsonSerializer.Serialize(new BacktestResult
                 {
                     TotalTrades = 40,
@@ -526,6 +541,11 @@ public class OptimizationWorkerTest
                 StrategyId = 44,
                 Status = RunStatus.Completed,
                 CompletedAt = DateTime.UtcNow.AddDays(-1),
+                TotalTrades = 40,
+                WinRate = 0.35m,
+                ProfitFactor = 0.85m,
+                MaxDrawdownPct = 16m,
+                SharpeRatio = 0.2m,
                 ResultJson = JsonSerializer.Serialize(new BacktestResult
                 {
                     TotalTrades = 40,
@@ -2004,6 +2024,11 @@ public class OptimizationWorkerTest
             StrategyId = 77,
             SourceOptimizationRunId = 501,
             Status = RunStatus.Completed,
+            TotalTrades = 3,
+            WinRate = 0.40m,
+            ProfitFactor = 0.80m,
+            MaxDrawdownPct = 18m,
+            SharpeRatio = 0.1m,
             ResultJson = JsonSerializer.Serialize(new BacktestResult
             {
                 TotalTrades = 3,
@@ -2323,6 +2348,9 @@ public class OptimizationWorkerTest
         services.AddSingleton<ISpreadProfileProvider>(Mock.Of<ISpreadProfileProvider>());
         services.AddSingleton<IAlertDispatcher>(Mock.Of<IAlertDispatcher>());
         services.AddSingleton<IValidationSettingsProvider, ValidationSettingsProvider>();
+        services.AddSingleton<IStrategyExecutionSnapshotBuilder>(new TestStrategyExecutionSnapshotBuilder());
+        services.AddSingleton<IValidationTradingCalendar, ValidationTradingCalendar>();
+        services.AddSingleton<IValidationCandleSeriesGuard, ValidationCandleSeriesGuard>();
         services.AddSingleton<IBacktestOptionsSnapshotBuilder>(sp =>
             new BacktestOptionsSnapshotBuilder(
                 sp.GetRequiredService<IValidationSettingsProvider>(),
@@ -2330,6 +2358,7 @@ public class OptimizationWorkerTest
         services.AddSingleton<IValidationRunFactory>(sp =>
             new ValidationRunFactory(
                 sp.GetRequiredService<IBacktestOptionsSnapshotBuilder>(),
+                sp.GetRequiredService<IStrategyExecutionSnapshotBuilder>(),
                 sp.GetRequiredService<TimeProvider>()));
         configureServices?.Invoke(services);
 
@@ -2516,7 +2545,8 @@ public class OptimizationWorkerTest
         var effectiveTimeProvider = timeProvider ?? TimeProvider.System;
         var settingsProvider = new ValidationSettingsProvider();
         var optionsBuilder = new BacktestOptionsSnapshotBuilder(settingsProvider, NullLogger<BacktestOptionsSnapshotBuilder>.Instance);
-        var validationRunFactory = new ValidationRunFactory(optionsBuilder, effectiveTimeProvider);
+        var snapshotBuilder = new TestStrategyExecutionSnapshotBuilder();
+        var validationRunFactory = new ValidationRunFactory(optionsBuilder, snapshotBuilder, effectiveTimeProvider);
         return new OptimizationFollowUpCoordinator(
             Mock.Of<IServiceScopeFactory>(),
             Mock.Of<IAlertDispatcher>(),
@@ -2525,6 +2555,7 @@ public class OptimizationWorkerTest
                 Mock.Of<ILogger<OptimizationRunScopedConfigService>>()),
             validationRunFactory,
             optionsBuilder,
+            snapshotBuilder,
             Mock.Of<ILogger<OptimizationFollowUpCoordinator>>(),
             new TradingMetrics(meterFactory),
             effectiveTimeProvider);
@@ -2833,6 +2864,7 @@ public class OptimizationWorkerTest
                 strategy,
                 config,
                 baselineComparisonScore,
+                Guid.NewGuid(),
                 db,
                 writeDb,
                 writeCtx,
@@ -2842,6 +2874,49 @@ public class OptimizationWorkerTest
                 ct,
                 runCt
             ]);
+    }
+
+    private sealed class TestStrategyExecutionSnapshotBuilder : IStrategyExecutionSnapshotBuilder
+    {
+        public Task<string?> BuildSnapshotJsonAsync(
+            DbContext writeDb,
+            long strategyId,
+            string? parametersJsonOverride,
+            CancellationToken ct)
+        {
+            Strategy strategy;
+            try
+            {
+                strategy = writeDb.Set<Strategy>()
+                    .FirstOrDefault(candidate => candidate.Id == strategyId && !candidate.IsDeleted)
+                    ?? CreateFallbackStrategy(strategyId, parametersJsonOverride);
+            }
+            catch
+            {
+                strategy = CreateFallbackStrategy(strategyId, parametersJsonOverride);
+            }
+
+            return Task.FromResult<string?>(
+                JsonSerializer.Serialize(
+                    StrategyExecutionSnapshot.FromStrategy(strategy, parametersJsonOverride)));
+        }
+
+        public StrategyExecutionSnapshot? Deserialize(string? strategySnapshotJson)
+            => StrategyExecutionSnapshot.Deserialize(strategySnapshotJson);
+
+        private static Strategy CreateFallbackStrategy(long strategyId, string? parametersJsonOverride)
+            => new()
+            {
+                Id = strategyId,
+                Name = $"Strategy-{strategyId}",
+                StrategyType = StrategyType.BreakoutScalper,
+                Symbol = "EURUSD",
+                Timeframe = Timeframe.H1,
+                ParametersJson = parametersJsonOverride,
+                Status = StrategyStatus.Active,
+                CreatedAt = DateTime.UtcNow,
+                IsDeleted = false,
+            };
     }
 
     private static object CreateCandidateValidationResult(
@@ -4505,6 +4580,9 @@ public class OptimizationWorkerTest
             .AddSingleton(eventService.Object)
             .AddSingleton<IValidationWorkerIdentity>(new TestValidationWorkerIdentity("test-opt-backtest-worker"))
             .AddScoped<IValidationSettingsProvider, ValidationSettingsProvider>()
+            .AddSingleton<IStrategyExecutionSnapshotBuilder>(new TestStrategyExecutionSnapshotBuilder())
+            .AddSingleton<IValidationTradingCalendar, ValidationTradingCalendar>()
+            .AddSingleton<IValidationCandleSeriesGuard, ValidationCandleSeriesGuard>()
             .AddScoped<IBacktestOptionsSnapshotBuilder>(sp =>
                 new BacktestOptionsSnapshotBuilder(
                     sp.GetRequiredService<IValidationSettingsProvider>(),
@@ -4512,6 +4590,7 @@ public class OptimizationWorkerTest
             .AddScoped<IValidationRunFactory>(sp =>
                 new ValidationRunFactory(
                     sp.GetRequiredService<IBacktestOptionsSnapshotBuilder>(),
+                    sp.GetRequiredService<IStrategyExecutionSnapshotBuilder>(),
                     TimeProvider.System))
             .AddSingleton<IAutoWalkForwardWindowPolicy, AutoWalkForwardWindowPolicy>()
             .BuildServiceProvider();
@@ -4525,6 +4604,8 @@ public class OptimizationWorkerTest
             Mock.Of<IBacktestAutoScheduler>(),
             services.GetRequiredService<IValidationRunFactory>(),
             services.GetRequiredService<IBacktestOptionsSnapshotBuilder>(),
+            services.GetRequiredService<IStrategyExecutionSnapshotBuilder>(),
+            services.GetRequiredService<IValidationCandleSeriesGuard>(),
             services.GetRequiredService<IAutoWalkForwardWindowPolicy>(),
             services.GetRequiredService<IValidationWorkerIdentity>());
 
@@ -4611,6 +4692,9 @@ public class OptimizationWorkerTest
             .AddSingleton(writeCtx.Object)
             .AddSingleton<IValidationWorkerIdentity>(new TestValidationWorkerIdentity("test-opt-walkforward-worker"))
             .AddScoped<IValidationSettingsProvider, ValidationSettingsProvider>()
+            .AddSingleton<IStrategyExecutionSnapshotBuilder>(new TestStrategyExecutionSnapshotBuilder())
+            .AddSingleton<IValidationTradingCalendar, ValidationTradingCalendar>()
+            .AddSingleton<IValidationCandleSeriesGuard, ValidationCandleSeriesGuard>()
             .AddScoped<IBacktestOptionsSnapshotBuilder>(sp =>
                 new BacktestOptionsSnapshotBuilder(
                     sp.GetRequiredService<IValidationSettingsProvider>(),
@@ -4624,6 +4708,8 @@ public class OptimizationWorkerTest
             new InMemoryWalkForwardRunClaimService(),
             services.GetRequiredService<IValidationSettingsProvider>(),
             services.GetRequiredService<IBacktestOptionsSnapshotBuilder>(),
+            services.GetRequiredService<IStrategyExecutionSnapshotBuilder>(),
+            services.GetRequiredService<IValidationCandleSeriesGuard>(),
             services.GetRequiredService<IValidationWorkerIdentity>());
 
         var method = typeof(WalkForwardWorker).GetMethod(

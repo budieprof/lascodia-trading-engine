@@ -1,5 +1,3 @@
-using System.Text.Json;
-using LascodiaTradingEngine.Application.Backtesting.Models;
 using LascodiaTradingEngine.Domain.Entities;
 
 namespace LascodiaTradingEngine.Application.Backtesting;
@@ -24,7 +22,6 @@ internal static class BacktestRunMetricsReader
             run.SharpeRatio,
             run.FinalBalance,
             run.TotalReturn,
-            run.ResultJson,
             out metrics);
 
     internal static bool TryRead(
@@ -35,7 +32,6 @@ internal static class BacktestRunMetricsReader
         decimal? sharpeRatio,
         decimal? finalBalance,
         decimal? totalReturn,
-        string? resultJson,
         out BacktestRunMetrics metrics)
     {
         if (totalTrades.HasValue
@@ -55,35 +51,7 @@ internal static class BacktestRunMetricsReader
             return true;
         }
 
-        if (string.IsNullOrWhiteSpace(resultJson))
-        {
-            metrics = default;
-            return false;
-        }
-
-        try
-        {
-            var result = JsonSerializer.Deserialize<BacktestResult>(resultJson);
-            if (result is null)
-            {
-                metrics = default;
-                return false;
-            }
-
-            metrics = new BacktestRunMetrics(
-                result.TotalTrades,
-                result.WinRate,
-                result.ProfitFactor,
-                result.MaxDrawdownPct,
-                result.SharpeRatio,
-                result.FinalBalance,
-                result.TotalReturn);
-            return true;
-        }
-        catch (JsonException)
-        {
-            metrics = default;
-            return false;
-        }
+        metrics = default;
+        return false;
     }
 }

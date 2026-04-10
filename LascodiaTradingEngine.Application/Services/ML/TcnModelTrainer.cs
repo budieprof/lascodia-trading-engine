@@ -57,7 +57,7 @@ public sealed partial class TcnModelTrainer : IMLModelTrainer
     // ── Constants ────────────────────────────────────────────────────────────
 
     private const string ModelType    = "TCN";
-    private const string ModelVersion = "7.0";
+    private const string ModelVersion = "8.0";
     private const double DefaultConditionalRoutingThreshold = 0.5;
 
     private const int DefaultFilters   = 32;
@@ -143,6 +143,19 @@ public sealed partial class TcnModelTrainer : IMLModelTrainer
         bool useGating = hp.TcnUseGating;
         bool useDepthwiseSep = hp.TcnDepthwiseSeparable;
         int lateSplitBlock = hp.TcnLateSplitBlock;
+        string featureSchemaFingerprint = TcnSnapshotSupport.ComputeFeatureSchemaFingerprint(MLFeatureHelper.FeatureNames);
+        string trainerFingerprint = TcnSnapshotSupport.ComputeTrainerFingerprint(
+            hp,
+            filters,
+            numBlocks,
+            useLayerNorm,
+            useAttentionPool,
+            activation,
+            attentionHeads);
+        int trainingRandomSeed = TcnSnapshotSupport.ComputeTrainingRandomSeed(
+            featureSchemaFingerprint,
+            trainerFingerprint,
+            samples.Count);
 
         int T = MLFeatureHelper.LookbackWindow;
         int C = MLFeatureHelper.SequenceChannelCount;
@@ -232,15 +245,26 @@ public sealed partial class TcnModelTrainer : IMLModelTrainer
             }
         }
 
-        // ── 1b. Stationarity gate (soft ADF check on sequence channels) ─────
+        // ── 1b. Multi-signal stationarity gate ──────────────────────────────
+        var driftArtifact = ComputeTcnDriftDiagnostics(allStd, flatFeatureCount, MLFeatureHelper.FeatureNames, hp.FracDiffD);
+        if (driftArtifact.GateTriggered)
         {
-            int channelCount = hasSequence ? C : flatFeatureCount;
-            int nonStatCount = CountNonStationaryChannels(allStd, channelCount);
-            double nonStatFraction = channelCount > 0 ? (double)nonStatCount / channelCount : 0.0;
-            if (nonStatFraction > 0.30 && hp.FracDiffD == 0.0)
-                _logger.LogWarning(
-                    "Stationarity gate: {NonStat}/{Total} channels have unit root (p>0.05). Consider enabling FracDiffD.",
-                    nonStatCount, channelCount);
+            if (string.Equals(driftArtifact.GateAction, "REJECT", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException(
+                    $"TCN drift gate rejected training: {driftArtifact.NonStationaryFeatureCount}/{flatFeatureCount} features flagged.");
+            _logger.LogWarning("TCN stationarity gate ({Action}): {NonStat}/{Total} features flagged.",
+                driftArtifact.GateAction, driftArtifact.NonStationaryFeatureCount, flatFeatureCount);
+        }
+
+        // ── 1b2. Class-imbalance gate ──────────────────────────────────────
+        {
+            int posCount = 0;
+            foreach (var s in allStd) if (s.Direction > 0) posCount++;
+            double buyRatio = (double)posCount / allStd.Count;
+            if (buyRatio < 0.15 || buyRatio > 0.85)
+                throw new InvalidOperationException($"TCN: extreme class imbalance (Buy={buyRatio:P1}).");
+            if (buyRatio < 0.35 || buyRatio > 0.65)
+                _logger.LogWarning("TCN class imbalance: Buy={Buy:P1}, Sell={Sell:P1}.", buyRatio, 1.0 - buyRatio);
         }
 
         // ── 2. Walk-forward cross-validation (or CPCV, item 17) ────────────
@@ -271,9 +295,33 @@ public sealed partial class TcnModelTrainer : IMLModelTrainer
 
         // ── 3. Final model splits: 70% train | 10% Platt cal | ~18% test ────
         int embargo  = hp.EmbargoBarCount;
-        var (trainSet, calSet, testSet) = CreateFinalSplits(allStd, embargo, hp.MinSamples);
+        var (trainSet, selectionSet, calSet, testSet) = CreateFinalSplits(allStd, embargo, hp.MinSamples);
+        int rawTrainCount = (int)(allStd.Count * 0.60);
+        int rawSelectionCount = (int)(allStd.Count * 0.70) - rawTrainCount;
+        int rawCalCount = (int)(allStd.Count * 0.80) - rawTrainCount - rawSelectionCount;
+        int rawTestCount = allStd.Count - rawTrainCount - rawSelectionCount - rawCalCount;
+        int trainStartIndex = 0;
+        int selectionStartIndex = Math.Min(allStd.Count, rawTrainCount + embargo);
+        int calibrationStartIndex = Math.Min(allStd.Count, (int)(allStd.Count * 0.70) + embargo);
+        int testStartIndex = Math.Min(allStd.Count, (int)(allStd.Count * 0.80) + embargo);
+
+        // ── 3a. Adversarial validation ──────────────────────────────────────
+        if (testSet.Count >= 20 && trainSet.Count >= 20)
+        {
+            double advAuc = TryComputeAdversarialAucGpu(trainSet, testSet, flatFeatureCount, ct)
+                            ?? ComputeAdversarialAuc(trainSet, testSet, flatFeatureCount);
+            _logger.LogInformation("TCN adversarial AUC={AUC:F3}", advAuc);
+            if (advAuc > 0.65) _logger.LogWarning("TCN adversarial AUC={AUC:F3} indicates covariate shift.", advAuc);
+            if (hp.TcnMaxAdversarialAuc > 0.0 && advAuc > hp.TcnMaxAdversarialAuc)
+                throw new InvalidOperationException($"TCN: adversarial AUC={advAuc:F3} exceeds threshold {hp.TcnMaxAdversarialAuc:F3}.");
+        }
 
         ModelSnapshot? effectiveWarmStart = warmStart;
+        TcnSnapshotWeights? warmStartSnapshot = null;
+        var warmStartCompatibilityIssues = new List<string>();
+        bool warmStartCompatible = warmStart is null
+            || !hp.TcnValidateWarmStartCompat
+            || string.IsNullOrWhiteSpace(warmStart.ConvWeightsJson);
 
         // Reduce epochs for warm-start runs
         var effectiveHp = effectiveWarmStart is not null
@@ -284,11 +332,8 @@ public sealed partial class TcnModelTrainer : IMLModelTrainer
         double[]? densityWeights = null;
         if (hp.DensityRatioWindowDays > 0 && trainSet.Count >= 50)
         {
-            densityWeights = ComputeDensityRatioWeights(
-                trainSet,
-                flatFeatureCount,
-                hp.DensityRatioWindowDays,
-                ResolveBarsPerDay(hp));
+            densityWeights = TryComputeDensityRatioWeightsGpu(trainSet, flatFeatureCount, hp.DensityRatioWindowDays, ResolveBarsPerDay(hp), ct)
+                             ?? ComputeDensityRatioWeights(trainSet, flatFeatureCount, hp.DensityRatioWindowDays, ResolveBarsPerDay(hp));
             _logger.LogDebug("Density-ratio weights computed (recentWindow={W}d).",
                 hp.DensityRatioWindowDays);
         }
@@ -337,10 +382,13 @@ public sealed partial class TcnModelTrainer : IMLModelTrainer
             {
                 var priorSnap = System.Text.Json.JsonSerializer.Deserialize<TcnSnapshotWeights>(
                     warmStart.ConvWeightsJson, JsonOptions);
+                warmStartSnapshot = priorSnap;
                 if (priorSnap != null)
                 {
                     var (compatible, warnings) = ValidateWarmStartCompatibility(
                         priorSnap, filters, numBlocks, useLayerNorm, useAttentionPool, attentionHeads);
+                    warmStartCompatible = compatible;
+                    warmStartCompatibilityIssues.AddRange(warnings);
                     foreach (var w in warnings)
                         _logger.LogWarning("Warm-start compat: {Warning}", w);
                     if (!compatible)
@@ -352,8 +400,20 @@ public sealed partial class TcnModelTrainer : IMLModelTrainer
 
                     // Channel importance transfer (item 40) — applied in FitTcnModel after warm-start restore
                 }
+                else
+                {
+                    warmStartCompatible = false;
+                    warmStartCompatibilityIssues.Add("Warm-start snapshot weights could not be deserialized.");
+                }
             }
-            catch (Exception ex) { _logger.LogDebug(ex, "Warm-start validation parse failed"); }
+            catch (Exception ex)
+            {
+                warmStartCompatible = false;
+                warmStartCompatibilityIssues.Add($"Warm-start validation parse failed: {ex.Message}");
+                _logger.LogDebug(ex, "Warm-start validation parse failed");
+                effectiveWarmStart = null;
+                effectiveHp = hp;
+            }
         }
 
         // ── 4. Fit TCN model ─────────────────────────────────────────────────
@@ -483,7 +543,23 @@ public sealed partial class TcnModelTrainer : IMLModelTrainer
         double[] abstentionWeights = [];
         double   abstentionBias      = 0.0;
         double   abstentionThreshold = 0.5;
-        if (calSet.Count >= 10)
+        if (calSet.Count >= 60)
+        {
+            var crossFit = CrossFitTcnAbstention(calSet, calRawProbs, calibration);
+            if (crossFit.Used)
+            {
+                abstentionWeights = crossFit.AbstentionWeights;
+                abstentionBias = crossFit.AbstentionBias;
+                abstentionThreshold = crossFit.AbstentionThreshold;
+                _logger.LogDebug("TCN cross-fit abstention: {Folds} folds.", crossFit.FoldCount);
+            }
+            else
+            {
+                (abstentionWeights, abstentionBias, abstentionThreshold) =
+                    FitTcnAbstentionModel(calSet, calRawProbs, calibration);
+            }
+        }
+        else if (calSet.Count >= 10)
         {
             (abstentionWeights, abstentionBias, abstentionThreshold) =
                 FitTcnAbstentionModel(calSet, calRawProbs, calibration);
@@ -565,9 +641,10 @@ public sealed partial class TcnModelTrainer : IMLModelTrainer
                 "Feature pruning: masking {Pruned}/{Total} low-importance channels",
                 prunedCount, channelCountForImp);
 
-            var maskedTrain = ApplySequenceMask(trainSet, activeMask);
-            var maskedCal   = ApplySequenceMask(calSet,   activeMask);
-            var maskedTest  = ApplySequenceMask(testSet,  activeMask);
+            var maskedTrain     = ApplySequenceMask(trainSet, activeMask);
+            var maskedSelection = ApplySequenceMask(selectionSet, activeMask);
+            var maskedCal       = ApplySequenceMask(calSet,   activeMask);
+            var maskedTest      = ApplySequenceMask(testSet,  activeMask);
 
             var prunedHp = effectiveHp with
             {
@@ -595,6 +672,7 @@ public sealed partial class TcnModelTrainer : IMLModelTrainer
                     prunedMetrics.Accuracy, finalMetrics.Accuracy);
                 tcn = prunedTcn;
                 calibration = prunedCalibration;
+                selectionSet = maskedSelection;
                 plattA = calibration.PlattA;
                 plattB = calibration.PlattB;
                 plattABuy = calibration.PlattABuy;
@@ -638,10 +716,48 @@ public sealed partial class TcnModelTrainer : IMLModelTrainer
             activeMask = new bool[channelCountForImp]; Array.Fill(activeMask, true);
         }
 
+        for (int i = 0; i < activeMask.Length && i < featureImportance.Length; i++)
+        {
+            if (!activeMask[i])
+                featureImportance[i] = 0f;
+        }
+
+        for (int i = 0; i < activeMask.Length && i < calImportanceScores.Length; i++)
+        {
+            if (!activeMask[i])
+                calImportanceScores[i] = 0.0;
+        }
+
+        for (int i = 0; i < activeMask.Length && i < shapleyValues.Length; i++)
+        {
+            if (!activeMask[i])
+                shapleyValues[i] = 0.0;
+        }
+
         // ── 11. NaN/Inf weight sanitization ──────────────────────────────────
         int sanitizedCount = SanitizeTcnWeights(tcn);
         if (sanitizedCount > 0)
             _logger.LogWarning("Post-training sanitization: {N} weight arrays had non-finite values.", sanitizedCount);
+
+        // ── New evaluation metrics ───────────────────────────────────────────
+        var (calResidualMean, calResidualStd, calResidualThreshold) =
+            ComputeCalibrationResidualStats(calSet, calRawProbs, calibration);
+        double[] featureVariances = ComputeFeatureVariances(trainSet, flatFeatureCount);
+
+        // ── Scalar sanitization ──────────────────────────────────────────────
+        ece = SafeTcn(ece, 1.0);
+        optimalThreshold = SafeTcn(optimalThreshold, 0.5);
+        avgKellyFraction = SafeTcn(avgKellyFraction);
+        durbinWatson = SafeTcn(durbinWatson, 2.0);
+        brierSkillScore = SafeTcn(brierSkillScore);
+        calibrationLoss = SafeTcn(calibrationLoss);
+        refinementLoss = SafeTcn(refinementLoss);
+        postIsotonicEce = SafeTcn(postIsotonicEce);
+        predAutocorr = SafeTcn(predAutocorr);
+        calResidualMean = SafeTcn(calResidualMean);
+        calResidualStd = SafeTcn(calResidualStd);
+        calResidualThreshold = SafeTcn(calResidualThreshold);
+        conformalQHat = Math.Clamp(SafeTcn(conformalQHat, 0.5), 1e-7, 1.0 - 1e-7);
 
         // ── 12. PSI baseline (feature quantile breakpoints) ──────────────────
         var standardisedTrainFeatures = new List<float[]>(trainSet.Count);
@@ -692,11 +808,98 @@ public sealed partial class TcnModelTrainer : IMLModelTrainer
         for (int i = 0; i < maskCopyLen; i++)
             flatActiveFeatureMask[i] = activeMask[i];
 
+        string preprocessingFingerprint = TcnSnapshotSupport.ComputePreprocessingFingerprint(activeMask);
+        var splitSummary = new TrainingSplitSummary
+        {
+            RawTrainCount = rawTrainCount,
+            RawSelectionCount = rawSelectionCount,
+            RawCalibrationCount = rawCalCount,
+            RawTestCount = rawTestCount,
+            TrainStartIndex = trainStartIndex,
+            TrainCount = trainSet.Count,
+            SelectionStartIndex = selectionStartIndex,
+            SelectionCount = selectionSet.Count,
+            CalibrationStartIndex = calibrationStartIndex,
+            CalibrationCount = calSet.Count,
+            CalibrationFitStartIndex = calibrationStartIndex,
+            CalibrationFitCount = calSet.Count,
+            TestStartIndex = testStartIndex,
+            TestCount = testSet.Count,
+            EmbargoCount = embargo,
+            TrainEmbargoDropped = rawTrainCount - trainSet.Count,
+            CalibrationEmbargoDropped = rawCalCount - calSet.Count,
+        };
+        if (warmStartSnapshot is null && effectiveWarmStart?.ConvWeightsJson != null)
+        {
+            try
+            {
+                warmStartSnapshot = JsonSerializer.Deserialize<TcnSnapshotWeights>(
+                    effectiveWarmStart.ConvWeightsJson,
+                    JsonOptions);
+            }
+            catch (Exception ex)
+            {
+                warmStartCompatibilityIssues.Add($"Warm-start artifact parse failed: {ex.Message}");
+            }
+        }
+        int reusedBlockCount = effectiveWarmStart is not null
+            ? Math.Min(numBlocks, warmStartSnapshot?.ConvW?.Length ?? 0)
+            : 0;
+        int droppedBlockCount = warmStartSnapshot?.ConvW is { Length: > 0 } priorConv
+            ? Math.Max(0, priorConv.Length - reusedBlockCount)
+            : 0;
+        double reuseRatio = warmStartSnapshot?.ConvW is { Length: > 0 } reusableConv && reusableConv.Length > 0
+            ? (double)reusedBlockCount / reusableConv.Length
+            : 0.0;
+        var warmStartArtifact = new TcnWarmStartArtifact
+        {
+            Compatible = warmStart is null || warmStartCompatible,
+            CompatibilityIssues = warmStartCompatibilityIssues.ToArray(),
+            ReusedBlockCount = reusedBlockCount,
+            DroppedBlockCount = droppedBlockCount,
+            ReuseRatio = reuseRatio,
+        };
+        int buyBranchSampleCount = 0;
+        int sellBranchSampleCount = 0;
+        for (int i = 0; i < calSet.Count && i < calRawProbs.Length; i++)
+        {
+            double preConditionalP = ApplyTcnCalibration(calRawProbs[i], calibration, includeIsotonic: false);
+            if (preConditionalP >= calibration.RoutingThreshold) buyBranchSampleCount++;
+            else sellBranchSampleCount++;
+        }
+        var calibrationArtifact = new TcnCalibrationArtifact
+        {
+            SelectedGlobalCalibration = temperatureScale > 0.0 ? "TEMPERATURE" : "PLATT",
+            CalibrationSelectionStrategy = "FIT_ON_CALIBRATION_HOLDOUT",
+            GlobalPlattA = plattA,
+            GlobalPlattB = plattB,
+            TemperatureScale = temperatureScale,
+            BuyBranchPlattA = plattABuy,
+            BuyBranchPlattB = plattBBuy,
+            SellBranchPlattA = plattASell,
+            SellBranchPlattB = plattBSell,
+            ConditionalRoutingThreshold = calibration.RoutingThreshold,
+            IsotonicBreakpoints = isotonicBp,
+            OptimalThreshold = optimalThreshold,
+            ConformalQHat = conformalQHat,
+            CalibrationSampleCount = calSet.Count,
+            DiagnosticsSampleCount = testSet.Count,
+            BuyBranchSampleCount = buyBranchSampleCount,
+            SellBranchSampleCount = sellBranchSampleCount,
+            IsotonicSampleCount = calSet.Count,
+            IsotonicBreakpointCount = isotonicBp.Length / 2,
+        };
+
         var snapshot = new ModelSnapshot
         {
             Type                       = ModelType,
             Version                    = ModelVersion,
             Features                   = MLFeatureHelper.FeatureNames,
+            FeatureSchemaFingerprint   = featureSchemaFingerprint,
+            PreprocessingFingerprint   = preprocessingFingerprint,
+            TrainerFingerprint         = trainerFingerprint,
+            TrainingRandomSeed         = trainingRandomSeed,
+            TrainingSplitSummary       = splitSummary,
             Means                      = flatMeans,
             Stds                       = flatStds,
             BaseLearnersK              = 1,
@@ -755,6 +958,13 @@ public sealed partial class TcnModelTrainer : IMLModelTrainer
             TcnChannelNames            = MLFeatureHelper.SequenceChannelNames,
             TcnActiveChannelMask       = activeMask,
             TcnChannelImportanceScores = calImportanceScores,
+            TcnCalibrationArtifact     = calibrationArtifact,
+            TcnWarmStartArtifact       = warmStartArtifact,
+            TcnDriftArtifact           = driftArtifact,
+            TcnCalibrationResidualMean = calResidualMean,
+            TcnCalibrationResidualStd  = calResidualStd,
+            TcnCalibrationResidualThreshold = calResidualThreshold,
+            FeatureVariances           = featureVariances,
             // ── 100/100 improvement fields ──────────────────────────────────
             BetaCalA                   = betaCalA,
             BetaCalB                   = betaCalB,
@@ -779,6 +989,21 @@ public sealed partial class TcnModelTrainer : IMLModelTrainer
             AccuracyDecayRate          = cvResult.AccuracyDecayRate,
             F1DecayRate                = cvResult.F1DecayRate,
         };
+
+        SanitizeTcnSnapshotArrays(snapshot);
+
+        var auditSamples = activeMask.Any(active => !active)
+            ? ApplySequenceMask(testSet, activeMask)
+            : testSet;
+        var audit = RunTcnModelAudit(
+            snapshot,
+            tcn,
+            auditSamples,
+            calibration,
+            filters,
+            useAttentionPool);
+        snapshot.TcnAuditArtifact = audit.Artifact;
+        snapshot.TcnTrainInferenceParityMaxError = audit.MaxParityError;
 
         var modelBytes = JsonSerializer.SerializeToUtf8Bytes(snapshot, JsonOptions);
 
@@ -813,25 +1038,32 @@ public sealed partial class TcnModelTrainer : IMLModelTrainer
             throw new InvalidOperationException("TcnUseFoldWeighting is only supported for chronological walk-forward CV.");
     }
 
-    private static (List<TrainingSample> TrainSet, List<TrainingSample> CalSet, List<TrainingSample> TestSet)
+    private static (List<TrainingSample> TrainSet, List<TrainingSample> SelectionSet, List<TrainingSample> CalSet, List<TrainingSample> TestSet)
         CreateFinalSplits(List<TrainingSample> samples, int embargo, int minTrainSamples)
     {
         int total = samples.Count;
-        int trainEnd = (int)(total * 0.70);
-        int calEnd = (int)(total * 0.80);
+        int trainEnd     = (int)(total * 0.60);
+        int selectionEnd = (int)(total * 0.70);
+        int calEnd       = (int)(total * 0.80);
 
-        int trainStop = Math.Max(0, trainEnd - embargo);
-        int calStart = Math.Min(total, trainEnd + embargo);
-        int calStop = Math.Max(calStart, calEnd - embargo);
-        int testStart = Math.Min(total, calEnd + embargo);
+        int trainStop     = Math.Max(0, trainEnd - embargo);
+        int selectionStart = Math.Min(total, trainEnd + embargo);
+        int selectionStop  = Math.Max(selectionStart, selectionEnd);
+        int calStart       = Math.Min(total, selectionEnd + embargo);
+        int calStop        = Math.Max(calStart, calEnd - embargo);
+        int testStart      = Math.Min(total, calEnd + embargo);
 
-        var trainSet = samples[..trainStop];
-        var calSet = samples[calStart..calStop];
-        var testSet = samples[testStart..];
+        var trainSet     = samples[..trainStop];
+        var selectionSet = samples[selectionStart..selectionStop];
+        var calSet       = samples[calStart..calStop];
+        var testSet      = samples[testStart..];
 
         if (trainSet.Count < minTrainSamples)
             throw new InvalidOperationException(
                 $"Insufficient training samples after embargoed split: {trainSet.Count} < {minTrainSamples}.");
+        if (selectionSet.Count < 10)
+            throw new InvalidOperationException(
+                $"Selection split collapsed after embargo: {selectionSet.Count} samples remain (need at least 10).");
         if (calSet.Count < 10)
             throw new InvalidOperationException(
                 $"Calibration split collapsed after embargo: {calSet.Count} samples remain (need at least 10).");
@@ -839,7 +1071,7 @@ public sealed partial class TcnModelTrainer : IMLModelTrainer
             throw new InvalidOperationException(
                 $"Test split collapsed after embargo: {testSet.Count} samples remain (need at least 10).");
 
-        return (trainSet, calSet, testSet);
+        return (trainSet, selectionSet, calSet, testSet);
     }
 
     private static (List<TrainingSample> TrainSet, List<TrainingSample> CalSet) CreateFoldTrainCalibrationSplit(

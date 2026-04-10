@@ -29,7 +29,7 @@ public sealed class AdaBoostInferenceEngine : IModelInferenceEngine
     public AdaBoostInferenceEngine(IMemoryCache cache) => _cache = cache;
 
     public bool CanHandle(ModelSnapshot snapshot) =>
-        snapshot.Type == "AdaBoost"
+        AdaBoostSnapshotSupport.IsAdaBoost(snapshot)
         && snapshot.GbmTreesJson is { Length: > 0 }
         && snapshot.Weights is { Length: > 0 };
 
@@ -38,11 +38,16 @@ public sealed class AdaBoostInferenceEngine : IModelInferenceEngine
         List<Candle> candleWindow, long modelId,
         int mcDropoutSamples, int mcDropoutSeed)
     {
-        var stumps = GetOrParseStumps(snapshot, modelId);
+        var normalized = AdaBoostSnapshotSupport.NormalizeSnapshotCopy(snapshot);
+        var validation = AdaBoostSnapshotSupport.ValidateSnapshot(normalized, allowLegacy: true);
+        if (!validation.IsValid)
+            return null;
+
+        var stumps = GetOrParseStumps(normalized, modelId);
         if (stumps is not { Count: > 0 })
             return null;
 
-        double[] alphas = snapshot.Weights[0];
+        double[] alphas = normalized.Weights[0];
         if (alphas.Length == 0)
             return null;
 
@@ -57,7 +62,7 @@ public sealed class AdaBoostInferenceEngine : IModelInferenceEngine
             perStumpProbs[k] = MLFeatureHelper.Sigmoid(2 * alphas[k] * stumpVal);
         }
 
-        double rawProb = MLFeatureHelper.Sigmoid(2 * score);
+        double rawProb = Math.Clamp(MLFeatureHelper.Sigmoid(2 * score), 1e-7, 1.0 - 1e-7);
 
         double variance = 0;
         for (int k = 0; k < count; k++)

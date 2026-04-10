@@ -31,12 +31,18 @@ public class WorkerHealthMonitor : IWorkerHealthMonitor
         public int ConsecutiveFailures;
         public int BacklogDepth { get; set; }
         public long LastCycleDurationMs { get; set; }
+        public long LastQueueLatencyMs { get; set; }
+        public long LastExecutionDurationMs { get; set; }
 
         // Sliding window of recent cycle durations (last 60 entries ~= last hour at 60s intervals)
         public readonly ConcurrentQueue<long> RecentDurations = new();
+        public readonly ConcurrentQueue<long> RecentQueueLatencies = new();
+        public readonly ConcurrentQueue<long> RecentExecutionDurations = new();
         // Volatile int fields + Interlocked for thread-safe increment/reset across worker threads
         public int SuccessesLastHour;
         public int ErrorsLastHour;
+        public int RetriesLastHour;
+        public int RecoveriesLastHour;
         public int ConfiguredIntervalSeconds { get; set; } = 60;
 
         // ── Static metadata for observability ────────────────────────────────
@@ -86,6 +92,40 @@ public class WorkerHealthMonitor : IWorkerHealthMonitor
         state.BacklogDepth = depth;
     }
 
+    public void RecordQueueLatency(string workerName, long durationMs)
+    {
+        var state = _state.GetOrAdd(workerName, _ => new WorkerState());
+        state.IsRunning = true;
+        state.LastQueueLatencyMs = Math.Max(0, durationMs);
+        state.RecentQueueLatencies.Enqueue(state.LastQueueLatencyMs);
+        while (state.RecentQueueLatencies.Count > 60)
+            state.RecentQueueLatencies.TryDequeue(out _);
+    }
+
+    public void RecordExecutionDuration(string workerName, long durationMs)
+    {
+        var state = _state.GetOrAdd(workerName, _ => new WorkerState());
+        state.IsRunning = true;
+        state.LastExecutionDurationMs = Math.Max(0, durationMs);
+        state.RecentExecutionDurations.Enqueue(state.LastExecutionDurationMs);
+        while (state.RecentExecutionDurations.Count > 60)
+            state.RecentExecutionDurations.TryDequeue(out _);
+    }
+
+    public void RecordRetry(string workerName, int count = 1)
+    {
+        var state = _state.GetOrAdd(workerName, _ => new WorkerState());
+        state.IsRunning = true;
+        Interlocked.Add(ref state.RetriesLastHour, Math.Max(0, count));
+    }
+
+    public void RecordRecovery(string workerName, int count = 1)
+    {
+        var state = _state.GetOrAdd(workerName, _ => new WorkerState());
+        state.IsRunning = true;
+        Interlocked.Add(ref state.RecoveriesLastHour, Math.Max(0, count));
+    }
+
     public void RecordWorkerHeartbeat(string workerName)
     {
         var state = _state.GetOrAdd(workerName, _ => new WorkerState());
@@ -100,6 +140,10 @@ public class WorkerHealthMonitor : IWorkerHealthMonitor
         {
             var durations = kvp.Value.RecentDurations.ToArray();
             Array.Sort(durations);
+            var queueLatencies = kvp.Value.RecentQueueLatencies.ToArray();
+            Array.Sort(queueLatencies);
+            var executionDurations = kvp.Value.RecentExecutionDurations.ToArray();
+            Array.Sort(executionDurations);
 
             return new WorkerHealthSnapshot
             {
@@ -116,6 +160,14 @@ public class WorkerHealthMonitor : IWorkerHealthMonitor
                 ErrorsLastHour           = Volatile.Read(ref kvp.Value.ErrorsLastHour),
                 SuccessesLastHour        = Volatile.Read(ref kvp.Value.SuccessesLastHour),
                 BacklogDepth             = kvp.Value.BacklogDepth,
+                LastQueueLatencyMs       = kvp.Value.LastQueueLatencyMs,
+                QueueLatencyP50Ms        = GetPercentile(queueLatencies, 0.50),
+                QueueLatencyP95Ms        = GetPercentile(queueLatencies, 0.95),
+                LastExecutionDurationMs  = kvp.Value.LastExecutionDurationMs,
+                ExecutionDurationP50Ms   = GetPercentile(executionDurations, 0.50),
+                ExecutionDurationP95Ms   = GetPercentile(executionDurations, 0.95),
+                RetriesLastHour          = Volatile.Read(ref kvp.Value.RetriesLastHour),
+                RecoveriesLastHour       = Volatile.Read(ref kvp.Value.RecoveriesLastHour),
                 ConfiguredIntervalSeconds = kvp.Value.ConfiguredIntervalSeconds,
                 CapturedAt               = DateTime.UtcNow
             };
@@ -170,6 +222,8 @@ public class WorkerHealthMonitor : IWorkerHealthMonitor
         {
             Interlocked.Exchange(ref state.SuccessesLastHour, 0);
             Interlocked.Exchange(ref state.ErrorsLastHour, 0);
+            Interlocked.Exchange(ref state.RetriesLastHour, 0);
+            Interlocked.Exchange(ref state.RecoveriesLastHour, 0);
         }
     }
 

@@ -35,14 +35,14 @@ jobs:
           restore-keys: nuget-${{ runner.os }}-
 
       - name: Restore
-        run: dotnet restore
+        run: dotnet restore LascodiaTradingEngine.slnx
 
       - name: Build
-        run: dotnet build --no-restore --configuration Release
+        run: dotnet build LascodiaTradingEngine.slnx --no-restore --configuration Release
 
-      - name: Test
+      - name: Unit Tests
         run: >
-          dotnet test
+          dotnet test LascodiaTradingEngine.UnitTest/LascodiaTradingEngine.UnitTest.csproj
           --no-build
           --configuration Release
           --logger "trx;LogFileName=test-results.trx"

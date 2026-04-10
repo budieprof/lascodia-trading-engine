@@ -26,6 +26,8 @@ public sealed class TcnInferenceEngine : IModelInferenceEngine
     public bool CanHandle(ModelSnapshot snapshot) =>
         snapshot.Type == "TCN"
         && !string.IsNullOrEmpty(snapshot.ConvWeightsJson)
+        && snapshot.SeqMeans.Length == MLFeatureHelper.SequenceChannelCount
+        && snapshot.SeqStds.Length == MLFeatureHelper.SequenceChannelCount
         && IsSupportedVersion(snapshot.Version);
 
     public InferenceResult? RunInference(
@@ -59,20 +61,60 @@ public sealed class TcnInferenceEngine : IModelInferenceEngine
     internal static (double Probability, double Magnitude, TcnModelTrainer.TcnSnapshotWeights TcnSnap, float[][] SeqStd, double[] ModelSpaceValues)?
         RunTcnForwardPass(ModelSnapshot snap, List<Candle> candleWindow)
     {
-        var tcnSnap = JsonSerializer.Deserialize<TcnModelTrainer.TcnSnapshotWeights>(
-            snap.ConvWeightsJson!, JsonOptions);
-
-        if (tcnSnap?.ConvW is null || tcnSnap.HeadW is null || tcnSnap.HeadB is null)
+        if (candleWindow.Count != MLFeatureHelper.LookbackWindow)
+            return null;
+        if (candleWindow.Any(c => !c.IsClosed))
+            return null;
+        if (!TryDeserializeValidatedSnapshot(snap, out var tcnSnap))
             return null;
 
         var seqRaw = MLFeatureHelper.BuildSequenceFeatures(candleWindow);
         var seqStd = snap.SeqMeans.Length > 0 && snap.SeqStds.Length > 0
             ? MLFeatureHelper.StandardizeSequence(seqRaw, snap.SeqMeans, snap.SeqStds)
             : seqRaw;
-        seqStd = ApplySequenceChannelMask(seqStd, snap.TcnActiveChannelMask);
 
+        return ExecuteForwardPass(snap, tcnSnap!, seqStd);
+    }
+
+    internal static (double Probability, double Magnitude, TcnModelTrainer.TcnSnapshotWeights TcnSnap, float[][] SeqStd, double[] ModelSpaceValues)?
+        RunStandardizedSequenceForwardPass(ModelSnapshot snap, float[][] standardizedSequence)
+    {
+        if (standardizedSequence.Length != MLFeatureHelper.LookbackWindow)
+            return null;
+        if (standardizedSequence.Any(row => row is null || row.Length != MLFeatureHelper.SequenceChannelCount))
+            return null;
+        if (!TryDeserializeValidatedSnapshot(snap, out var tcnSnap))
+            return null;
+
+        var seqCopy = new float[standardizedSequence.Length][];
+        for (int t = 0; t < standardizedSequence.Length; t++)
+            seqCopy[t] = (float[])standardizedSequence[t].Clone();
+
+        return ExecuteForwardPass(snap, tcnSnap!, seqCopy);
+    }
+
+    private static (double Probability, double Magnitude, TcnModelTrainer.TcnSnapshotWeights TcnSnap, float[][] SeqStd, double[] ModelSpaceValues)?
+        ExecuteForwardPass(
+            ModelSnapshot snap,
+            TcnModelTrainer.TcnSnapshotWeights tcnSnap,
+            float[][] seqStd)
+    {
+        var validation = TcnSnapshotSupport.ValidateSnapshot(
+            snap,
+            tcnSnap,
+            seqStd.Length,
+            seqStd.Length > 0 ? seqStd[0].Length : 0);
+        if (!validation.IsValid || seqStd.Length == 0 || seqStd[0].Length == 0)
+            return null;
+
+        bool[] activeChannelMask = TcnSnapshotSupport.ResolveActiveChannelMask(snap, seqStd[0].Length);
+        seqStd = ApplySequenceChannelMask(seqStd, activeChannelMask);
+
+        var convW = tcnSnap.ConvW!;
+        var headW = tcnSnap.HeadW!;
+        var headB = tcnSnap.HeadB!;
         int channelIn = tcnSnap.ChannelIn > 0 ? tcnSnap.ChannelIn : seqStd[0].Length;
-        int numBlocks = tcnSnap.ConvW.Length;
+        int numBlocks = convW.Length;
         int filters = tcnSnap.Filters > 0 ? tcnSnap.Filters : 32;
         var convB = NormalizeConvBiases(tcnSnap.ConvB, numBlocks, filters);
         var blockInC = new int[numBlocks];
@@ -89,17 +131,17 @@ public sealed class TcnInferenceEngine : IModelInferenceEngine
 
         double[] h = useAttn
             ? TcnModelTrainer.CausalConvForwardWithAttention(
-                seqStd, tcnSnap.ConvW, convB, resW, blockInC,
+                seqStd, convW, convB, resW, blockInC,
                 filters, numBlocks, dilations,
                 tcnSnap.UseLayerNorm, tcnSnap.LayerNormGamma, tcnSnap.LayerNormBeta, activation,
                 tcnSnap.AttnQueryW!, tcnSnap.AttnKeyW!, tcnSnap.AttnValueW!,
                 tcnSnap.AttentionHeads > 0 ? tcnSnap.AttentionHeads : 1)
             : TcnModelTrainer.CausalConvForwardFull(
-                seqStd, tcnSnap.ConvW, convB, resW, blockInC,
+                seqStd, convW, convB, resW, blockInC,
                 filters, numBlocks, dilations,
                 tcnSnap.UseLayerNorm, tcnSnap.LayerNormGamma, tcnSnap.LayerNormBeta, activation);
 
-        double prob = TcnHeadProbability(h, tcnSnap.HeadW, tcnSnap.HeadB, filters);
+        double prob = TcnHeadProbability(h, headW, headB, filters);
         double magnitude = tcnSnap.MagHeadB ?? 0.0;
         if (tcnSnap.MagHeadW is { Length: > 0 })
         {
@@ -112,6 +154,35 @@ public sealed class TcnInferenceEngine : IModelInferenceEngine
             : [];
 
         return (prob, magnitude, tcnSnap, seqStd, modelSpaceValues);
+    }
+
+    private static bool TryDeserializeValidatedSnapshot(
+        ModelSnapshot snap,
+        out TcnModelTrainer.TcnSnapshotWeights? tcnSnap)
+    {
+        tcnSnap = null;
+        if (string.IsNullOrWhiteSpace(snap.ConvWeightsJson))
+            return false;
+
+        try
+        {
+            tcnSnap = JsonSerializer.Deserialize<TcnModelTrainer.TcnSnapshotWeights>(
+                snap.ConvWeightsJson,
+                JsonOptions);
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+        catch (NotSupportedException)
+        {
+            return false;
+        }
+
+        if (tcnSnap?.ConvW is null || tcnSnap.HeadW is null || tcnSnap.HeadB is null)
+            return false;
+
+        return true;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

@@ -456,6 +456,27 @@ public sealed partial class TabNetModelTrainer : IMLModelTrainer
             }
         }
 
+        // ── 3b2. Class-imbalance gate ──────────────────────────────────────
+        {
+            int posCount = 0;
+            foreach (var s in trainSet) if (s.Direction > 0) posCount++;
+            double buyRatio = (double)posCount / trainSet.Count;
+            if (buyRatio < 0.15 || buyRatio > 0.85)
+                throw new InvalidOperationException(
+                    $"TabNet: extreme class imbalance (Buy={buyRatio:P1}). Training would produce a degenerate model.");
+            if (buyRatio < 0.35 || buyRatio > 0.65)
+                _logger.LogWarning("TabNet class imbalance: Buy={Buy:P1}, Sell={Sell:P1}.", buyRatio, 1.0 - buyRatio);
+        }
+
+        // ── 3b3. Adversarial validation ────────────────────────────────────
+        if (testSet.Count >= 20 && trainSet.Count >= 20)
+        {
+            double advAuc = ComputeAdversarialAuc(trainSet, testSet, F);
+            _logger.LogInformation("TabNet adversarial AUC={AUC:F3}", advAuc);
+            if (advAuc > 0.65)
+                _logger.LogWarning("TabNet adversarial AUC={AUC:F3} indicates meaningful covariate shift.", advAuc);
+        }
+
         // ── 3c. Density-ratio importance weights ───────────────────────────
         double[]? densityWeights = null;
         if (hp.DensityRatioWindowDays > 0 && trainSet.Count >= 50)

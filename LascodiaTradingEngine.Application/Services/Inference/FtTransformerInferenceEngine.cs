@@ -17,9 +17,6 @@ namespace LascodiaTradingEngine.Application.Services.Inference;
 [RegisterService(ServiceLifetime.Scoped, typeof(IModelInferenceEngine))]
 public sealed class FtTransformerInferenceEngine : IModelInferenceEngine
 {
-    private static readonly JsonSerializerOptions JsonOptions =
-        new() { PropertyNameCaseInsensitive = true };
-
     public bool CanHandle(ModelSnapshot snapshot)
     {
         if (!FtTransformerSnapshotSupport.IsFtTransformer(snapshot))
@@ -91,11 +88,11 @@ public sealed class FtTransformerInferenceEngine : IModelInferenceEngine
         // 4. Process additional layers (prefer binary, fall back to JSON)
         if (numLayers > 1)
         {
-            List<SerializedLayerWeights>? additionalLayers = null;
+            List<FtSerializedLayerWeights>? additionalLayers = null;
 
             if (normalized.FtTransformerAdditionalLayersBytes is { Length: > 4 } blob)
             {
-                try { additionalLayers = DeserializeAdditionalLayers(blob, D, Ff); }
+                try { additionalLayers = FtTransformerAdditionalLayerCodec.DeserializeBinary(blob, D, Ff); }
                 catch (Exception ex)
                 {
                     throw new InvalidOperationException("Invalid FT-Transformer binary additional-layer payload.", ex);
@@ -106,9 +103,9 @@ public sealed class FtTransformerInferenceEngine : IModelInferenceEngine
             {
                 try
                 {
-                    var arr = JsonSerializer.Deserialize<SerializedLayerWeights[]>(
-                        normalized.FtTransformerAdditionalLayersJson, JsonOptions);
-                    if (arr is not null) additionalLayers = new List<SerializedLayerWeights>(arr);
+                    var arr = JsonSerializer.Deserialize<FtSerializedLayerWeights[]>(
+                        normalized.FtTransformerAdditionalLayersJson, FtTransformerAdditionalLayerCodec.JsonOptions);
+                    if (arr is not null) additionalLayers = new List<FtSerializedLayerWeights>(arr);
                 }
                 catch (JsonException ex)
                 {
@@ -311,100 +308,4 @@ public sealed class FtTransformerInferenceEngine : IModelInferenceEngine
         return m;
     }
 
-    /// <summary>
-    /// Serialised transformer layer weights for layers 1..N-1 (layer 0 uses top-level snapshot fields).
-    /// Must match the structure written by <c>FtTransformerModelTrainer</c>.
-    /// </summary>
-    private sealed class SerializedLayerWeights
-    {
-        public double[][]? Wq     { get; set; }
-        public double[][]? Wk     { get; set; }
-        public double[][]? Wv     { get; set; }
-        public double[][]? Wo     { get; set; }
-        public double[]?   Gamma1 { get; set; }
-        public double[]?   Beta1  { get; set; }
-        public double[]?   Gamma2 { get; set; }
-        public double[]?   Beta2  { get; set; }
-        public double[][]? Wff1   { get; set; }
-        public double[]?   Bff1   { get; set; }
-        public double[][]? Wff2   { get; set; }
-        public double[]?   Bff2   { get; set; }
-        public double[][]? PosBias { get; set; }
-    }
-
-    // ── Binary layer deserialisation (matches FtTransformerModelTrainer serialiser) ──
-
-    private static List<SerializedLayerWeights> DeserializeAdditionalLayers(byte[] data, int D, int Ff)
-    {
-        // Verify CRC32 trailer
-        if (data.Length < 4) throw new InvalidOperationException("Binary blob too short for CRC trailer.");
-        int payloadLen = data.Length - 4;
-        uint storedCrc = BitConverter.ToUInt32(data, payloadLen);
-        uint computedCrc = ComputeCrc32(data.AsSpan(0, payloadLen));
-        if (storedCrc != computedCrc)
-            throw new InvalidOperationException($"CRC32 mismatch: stored={storedCrc:X8} computed={computedCrc:X8}");
-
-        var result = new List<SerializedLayerWeights>();
-        using var ms = new MemoryStream(data, 0, payloadLen);
-        using var br = new BinaryReader(ms);
-
-        int numLayers = br.ReadInt32();
-        int numHeads  = br.ReadInt32();
-        int seqSq     = br.ReadInt32(); // S*S for PosBias (0 if no positional bias)
-
-        for (int l = 0; l < numLayers; l++)
-        {
-            var lw = new SerializedLayerWeights
-            {
-                Wq     = ReadMatrix(br, D, D),
-                Wk     = ReadMatrix(br, D, D),
-                Wv     = ReadMatrix(br, D, D),
-                Wo     = ReadMatrix(br, D, D),
-                Gamma1 = ReadVector(br, D),
-                Beta1  = ReadVector(br, D),
-                Wff1   = ReadMatrix(br, D, Ff),
-                Bff1   = ReadVector(br, Ff),
-                Wff2   = ReadMatrix(br, Ff, D),
-                Bff2   = ReadVector(br, D),
-                Gamma2 = ReadVector(br, D),
-                Beta2  = ReadVector(br, D),
-            };
-            if (seqSq > 0 && numHeads > 0)
-                lw.PosBias = ReadMatrix(br, numHeads, seqSq);
-            result.Add(lw);
-        }
-        return result;
-    }
-
-    private static double[][] ReadMatrix(BinaryReader br, int rows, int cols)
-    {
-        var m = new double[rows][];
-        for (int r = 0; r < rows; r++)
-        {
-            m[r] = new double[cols];
-            for (int c = 0; c < cols; c++)
-                m[r][c] = br.ReadDouble();
-        }
-        return m;
-    }
-
-    private static double[] ReadVector(BinaryReader br, int len)
-    {
-        var v = new double[len];
-        for (int i = 0; i < len; i++)
-            v[i] = br.ReadDouble();
-        return v;
-    }
-
-    private static uint ComputeCrc32(ReadOnlySpan<byte> data)
-    {
-        uint crc = 0xFFFFFFFF;
-        foreach (byte b in data)
-        {
-            crc ^= b;
-            for (int i = 0; i < 8; i++)
-                crc = (crc >> 1) ^ (0xEDB88320 & ~((crc & 1) - 1));
-        }
-        return ~crc;
-    }
 }

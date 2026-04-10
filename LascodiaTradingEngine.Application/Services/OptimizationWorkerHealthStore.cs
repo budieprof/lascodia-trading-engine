@@ -9,12 +9,16 @@ public sealed class OptimizationWorkerHealthStore : IOptimizationWorkerHealthSto
 {
     private const int QueueWaitSampleLimit = 128;
     private static readonly TimeSpan PhaseEventWindow = TimeSpan.FromHours(1);
+    private static readonly TimeSpan PhaseBackoffBase = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan PhaseBackoffMax = TimeSpan.FromMinutes(15);
+    private const int PhaseFailureBackoffThreshold = 3;
 
     private sealed class PhaseRuntimeState
     {
         public OptimizationWorkerPhaseStateSnapshot Snapshot { get; set; } = new();
         public Queue<DateTime> SuccessTimestampsUtc { get; } = [];
         public Queue<DateTime> FailureTimestampsUtc { get; } = [];
+        public Queue<DateTime> SkipTimestampsUtc { get; } = [];
     }
 
     private readonly object _gate = new();
@@ -44,15 +48,48 @@ public sealed class OptimizationWorkerHealthStore : IOptimizationWorkerHealthSto
         }
     }
 
+    public OptimizationWorkerPhaseExecutionDecision GetPhaseExecutionDecision(string phaseName, DateTime utcNow)
+    {
+        lock (_gate)
+        {
+            var phaseState = GetOrCreatePhaseState(phaseName);
+            PrunePhaseEvents(phaseState.SuccessTimestampsUtc, utcNow);
+            PrunePhaseEvents(phaseState.FailureTimestampsUtc, utcNow);
+            PrunePhaseEvents(phaseState.SkipTimestampsUtc, utcNow);
+
+            if (phaseState.Snapshot.BackoffUntilUtc.HasValue
+                && phaseState.Snapshot.BackoffUntilUtc.Value > utcNow)
+            {
+                return new OptimizationWorkerPhaseExecutionDecision(
+                    ShouldExecute: false,
+                    BackoffUntilUtc: phaseState.Snapshot.BackoffUntilUtc,
+                    Reason: phaseState.Snapshot.LastSkipReason
+                        ?? phaseState.Snapshot.LastFailureMessage
+                        ?? $"{phaseName} is temporarily degraded");
+            }
+
+            return new OptimizationWorkerPhaseExecutionDecision(
+                ShouldExecute: true,
+                BackoffUntilUtc: null,
+                Reason: null);
+        }
+    }
+
     public void RecordPhaseStarted(string phaseName, DateTime utcNow)
     {
         lock (_gate)
         {
             var phaseState = GetOrCreatePhaseState(phaseName);
+            PrunePhaseEvents(phaseState.SuccessTimestampsUtc, utcNow);
+            PrunePhaseEvents(phaseState.FailureTimestampsUtc, utcNow);
+            PrunePhaseEvents(phaseState.SkipTimestampsUtc, utcNow);
             phaseState.Snapshot = phaseState.Snapshot with
             {
                 PhaseName = phaseName,
-                LastStartedAtUtc = utcNow
+                LastStartedAtUtc = utcNow,
+                SuccessesLastHour = phaseState.SuccessTimestampsUtc.Count,
+                FailuresLastHour = phaseState.FailureTimestampsUtc.Count,
+                SkippedExecutionsLastHour = phaseState.SkipTimestampsUtc.Count
             };
         }
     }
@@ -74,7 +111,11 @@ public sealed class OptimizationWorkerHealthStore : IOptimizationWorkerHealthSto
                 LastDurationMs = Math.Max(0, durationMs),
                 LastSuccessDurationMs = Math.Max(0, durationMs),
                 SuccessesLastHour = phaseState.SuccessTimestampsUtc.Count,
-                FailuresLastHour = phaseState.FailureTimestampsUtc.Count
+                FailuresLastHour = phaseState.FailureTimestampsUtc.Count,
+                IsDegraded = false,
+                BackoffUntilUtc = null,
+                LastSkipReason = null,
+                SkippedExecutionsLastHour = phaseState.SkipTimestampsUtc.Count
             };
         }
     }
@@ -86,7 +127,21 @@ public sealed class OptimizationWorkerHealthStore : IOptimizationWorkerHealthSto
             var phaseState = GetOrCreatePhaseState(phaseName);
             PrunePhaseEvents(phaseState.SuccessTimestampsUtc, utcNow);
             PrunePhaseEvents(phaseState.FailureTimestampsUtc, utcNow);
+            PrunePhaseEvents(phaseState.SkipTimestampsUtc, utcNow);
             phaseState.FailureTimestampsUtc.Enqueue(utcNow);
+            int consecutiveFailures = phaseState.Snapshot.ConsecutiveFailures + 1;
+            DateTime? backoffUntilUtc = null;
+            if (consecutiveFailures >= PhaseFailureBackoffThreshold)
+            {
+                int exponent = Math.Min(6, consecutiveFailures - PhaseFailureBackoffThreshold);
+                long ticks = PhaseBackoffBase.Ticks << exponent;
+                if (ticks < 0)
+                    ticks = PhaseBackoffMax.Ticks;
+
+                var backoff = TimeSpan.FromTicks(Math.Min(ticks, PhaseBackoffMax.Ticks));
+                backoffUntilUtc = utcNow.Add(backoff);
+            }
+
             phaseState.Snapshot = phaseState.Snapshot with
             {
                 PhaseName = phaseName,
@@ -94,10 +149,36 @@ public sealed class OptimizationWorkerHealthStore : IOptimizationWorkerHealthSto
                 LastFailureAtUtc = utcNow,
                 LastFailureType = errorType,
                 LastFailureMessage = errorMessage.Length <= 500 ? errorMessage : errorMessage[..500],
-                ConsecutiveFailures = phaseState.Snapshot.ConsecutiveFailures + 1,
+                ConsecutiveFailures = consecutiveFailures,
                 LastDurationMs = Math.Max(0, durationMs),
                 SuccessesLastHour = phaseState.SuccessTimestampsUtc.Count,
                 FailuresLastHour = phaseState.FailureTimestampsUtc.Count,
+                IsDegraded = true,
+                BackoffUntilUtc = backoffUntilUtc,
+                SkippedExecutionsLastHour = phaseState.SkipTimestampsUtc.Count,
+            };
+        }
+    }
+
+    public void RecordPhaseSkipped(string phaseName, string reason, DateTime? backoffUntilUtc, DateTime utcNow)
+    {
+        lock (_gate)
+        {
+            var phaseState = GetOrCreatePhaseState(phaseName);
+            PrunePhaseEvents(phaseState.SuccessTimestampsUtc, utcNow);
+            PrunePhaseEvents(phaseState.FailureTimestampsUtc, utcNow);
+            PrunePhaseEvents(phaseState.SkipTimestampsUtc, utcNow);
+            phaseState.SkipTimestampsUtc.Enqueue(utcNow);
+            phaseState.Snapshot = phaseState.Snapshot with
+            {
+                PhaseName = phaseName,
+                IsDegraded = true,
+                BackoffUntilUtc = backoffUntilUtc,
+                LastSkippedAtUtc = utcNow,
+                LastSkipReason = reason.Length <= 500 ? reason : reason[..500],
+                SuccessesLastHour = phaseState.SuccessTimestampsUtc.Count,
+                FailuresLastHour = phaseState.FailureTimestampsUtc.Count,
+                SkippedExecutionsLastHour = phaseState.SkipTimestampsUtc.Count
             };
         }
     }

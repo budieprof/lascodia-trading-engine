@@ -165,4 +165,27 @@ public class WorkerHealthMonitorTest
         Assert.True(snapshot.IsRunning);
         Assert.NotNull(snapshot.LastSuccessAt);
     }
+
+    [Fact]
+    public void RecordValidationTimingAndRecoveryMetrics_UpdatesSnapshot()
+    {
+        _monitor.RecordQueueLatency("ValidationWorker", 150);
+        _monitor.RecordQueueLatency("ValidationWorker", 300);
+        _monitor.RecordExecutionDuration("ValidationWorker", 800);
+        _monitor.RecordExecutionDuration("ValidationWorker", 1200);
+        _monitor.RecordRetry("ValidationWorker", 2);
+        _monitor.RecordRecovery("ValidationWorker", 3);
+
+        var snapshots = _monitor.GetCurrentSnapshots();
+        var snapshot = Assert.Single(snapshots);
+
+        Assert.Equal(300, snapshot.LastQueueLatencyMs);
+        Assert.Equal(150, snapshot.QueueLatencyP50Ms);
+        Assert.Equal(300, snapshot.QueueLatencyP95Ms);
+        Assert.Equal(1200, snapshot.LastExecutionDurationMs);
+        Assert.Equal(800, snapshot.ExecutionDurationP50Ms);
+        Assert.Equal(1200, snapshot.ExecutionDurationP95Ms);
+        Assert.Equal(2, snapshot.RetriesLastHour);
+        Assert.Equal(3, snapshot.RecoveriesLastHour);
+    }
 }

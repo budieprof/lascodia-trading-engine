@@ -33,6 +33,7 @@ internal sealed class OptimizationRunExecutor : IOptimizationRunExecutor
     private readonly OptimizationCompletionPublisher _completionPublisher;
     private readonly OptimizationRunMetadataService _runMetadataService;
     private readonly OptimizationRunPersistenceService _runPersistenceService;
+    private readonly OptimizationRunOwnedMutationGuard _ownedMutationGuard;
     private readonly TimeProvider _timeProvider;
     private DateTime UtcNow => _timeProvider.GetUtcNow().UtcDateTime;
 
@@ -47,6 +48,7 @@ internal sealed class OptimizationRunExecutor : IOptimizationRunExecutor
         OptimizationCompletionPublisher completionPublisher,
         OptimizationRunMetadataService runMetadataService,
         OptimizationRunPersistenceService runPersistenceService,
+        OptimizationRunOwnedMutationGuard ownedMutationGuard,
         TimeProvider timeProvider)
     {
         _logger = logger;
@@ -59,6 +61,7 @@ internal sealed class OptimizationRunExecutor : IOptimizationRunExecutor
         _completionPublisher = completionPublisher;
         _runMetadataService = runMetadataService;
         _runPersistenceService = runPersistenceService;
+        _ownedMutationGuard = ownedMutationGuard;
         _timeProvider = timeProvider;
     }
 
@@ -73,6 +76,7 @@ internal sealed class OptimizationRunExecutor : IOptimizationRunExecutor
         IAlertDispatcher alertDispatcher,
         IIntegrationEventService eventService,
         Stopwatch sw,
+        Guid expectedLeaseToken,
         CancellationToken ct,
         CancellationToken runCt)
     {
@@ -211,6 +215,7 @@ internal sealed class OptimizationRunExecutor : IOptimizationRunExecutor
         await _runPersistenceService.PersistAsync(
             new OptimizationRunPersistenceContext(
                 run,
+                expectedLeaseToken,
                 strategy,
                 candles,
                 trainCandles,
@@ -245,6 +250,7 @@ internal sealed class OptimizationRunExecutor : IOptimizationRunExecutor
                 strategy,
                 config,
                 baselineComparisonScore,
+                expectedLeaseToken,
                 db,
                 writeDb,
                 writeCtx,
@@ -275,11 +281,12 @@ internal sealed class OptimizationRunExecutor : IOptimizationRunExecutor
                     strategy,
                     writeCtx,
                     mediator,
-                    eventService,
                     vr,
                     totalIters,
                     candidatesPerSec,
                     elapsedMilliseconds,
+                    writeDb,
+                    expectedLeaseToken,
                     completionPublishCts.Token);
             }
         }
@@ -299,11 +306,12 @@ internal sealed class OptimizationRunExecutor : IOptimizationRunExecutor
         Strategy strategy,
         IWriteApplicationDbContext writeCtx,
         IMediator mediator,
-        IIntegrationEventService eventService,
         CandidateValidationResult vr,
         int totalIters,
         double candidatesPerSec,
         double elapsedMilliseconds,
+        DbContext writeDb,
+        Guid expectedLeaseToken,
         CancellationToken ct)
     {
         using var fallbackCompletionCts = ct.IsCancellationRequested
@@ -377,9 +385,13 @@ internal sealed class OptimizationRunExecutor : IOptimizationRunExecutor
 
             if (run.CompletionPublicationStatus != OptimizationCompletionPublicationStatus.Published)
             {
-                await _completionPublisher.PrepareAsync(run, writeCtx, completedEvent, durableCt);
+                await _completionPublisher.PrepareAsync(run, writeDb, writeCtx, completedEvent, expectedLeaseToken, durableCt);
                 await _completionPublisher.PublishWithFallbackAsync(run.Id, completedEvent, durableCt);
             }
+        }
+        catch (OptimizationLeaseOwnershipChangedException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -390,7 +402,16 @@ internal sealed class OptimizationRunExecutor : IOptimizationRunExecutor
                 UtcNow);
             run.CompletionPublicationStatus = OptimizationCompletionPublicationStatus.Failed;
             run.CompletionPublicationErrorMessage = TruncateForPersistence(ex.Message, 500);
-            await writeCtx.SaveChangesAsync(CancellationToken.None);
+            if (!await _ownedMutationGuard.TrySaveChangesAsync(
+                    writeDb,
+                    writeCtx,
+                    run,
+                    expectedLeaseToken,
+                    CancellationToken.None,
+                    "OptimizationRunExecutor: lease ownership changed before persisting completion publication failure for run {RunId}"))
+            {
+                return;
+            }
             _logger.LogError(ex,
                 "OptimizationRunExecutor: completion artifact publication failed for run {RunId}",
                 run.Id);

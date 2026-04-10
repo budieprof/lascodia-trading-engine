@@ -310,6 +310,42 @@ public class ScoringEnrichmentCalculatorTests
         Assert.Equal(0.5m, result!.Value);
     }
 
+    [Fact]
+    public void ComputeSelectiveSuppression_Uses_Side_Specific_Abstention_Thresholds()
+    {
+        var (appliedThreshold, suppressed) = ScoringEnrichmentCalculator.ComputeSelectiveSuppression(
+            predictedUp: true,
+            metaLabelScore: 0.9m,
+            metaLabelWeightCount: 1,
+            metaLabelThreshold: 0.5,
+            abstentionScore: 0.55m,
+            abstentionWeightCount: 1,
+            abstentionThreshold: 0.4,
+            abstentionThresholdBuy: 0.6,
+            abstentionThresholdSell: 0.3);
+
+        Assert.Equal(0.6, appliedThreshold, precision: 6);
+        Assert.True(suppressed);
+    }
+
+    [Fact]
+    public void ComputeSelectiveSuppression_Falls_Back_To_Global_Threshold_When_Side_Specific_Threshold_Is_Disabled()
+    {
+        var (appliedThreshold, suppressed) = ScoringEnrichmentCalculator.ComputeSelectiveSuppression(
+            predictedUp: false,
+            metaLabelScore: null,
+            metaLabelWeightCount: 0,
+            metaLabelThreshold: 0.5,
+            abstentionScore: 0.45m,
+            abstentionWeightCount: 1,
+            abstentionThreshold: 0.5,
+            abstentionThresholdBuy: 0.7,
+            abstentionThresholdSell: 0.0);
+
+        Assert.Equal(0.5, appliedThreshold, precision: 6);
+        Assert.True(suppressed);
+    }
+
     // ────────────────────────────────────────────────────────────────────────
     //  ComputeRegimeRoutingDecision
     // ────────────────────────────────────────────────────────────────────────

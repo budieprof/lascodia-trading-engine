@@ -32,6 +32,26 @@ public class EventLogReader : IEventLogReader
             .ToListAsync(ct);
     }
 
+    public async Task<IReadOnlyDictionary<Guid, IntegrationEventStatusSnapshot>> GetEventStatusSnapshotsAsync(
+        IReadOnlyCollection<Guid> eventIds,
+        CancellationToken ct)
+    {
+        if (eventIds.Count == 0)
+            return new Dictionary<Guid, IntegrationEventStatusSnapshot>();
+
+        return await _context.IntegrationEventLogs
+            .AsNoTracking()
+            .Where(e => eventIds.Contains(e.EventId))
+            .ToDictionaryAsync(
+                e => e.EventId,
+                e => new IntegrationEventStatusSnapshot(
+                    e.EventId,
+                    e.State,
+                    e.TimesSent,
+                    e.CreationTime),
+                ct);
+    }
+
     public Task SaveChangesAsync(CancellationToken ct)
         => _context.SaveChangesAsync(ct);
 }

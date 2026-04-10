@@ -1,4 +1,5 @@
 using LascodiaTradingEngine.Application.MLModels.Shared;
+using LascodiaTradingEngine.Application.Services.Inference;
 
 namespace LascodiaTradingEngine.Application.Services.ML;
 
@@ -10,6 +11,13 @@ internal static class ElmFeaturePipelineHelper
         float[] Stds,
         float[] WinsorizeLowerBounds,
         float[] WinsorizeUpperBounds);
+
+    internal readonly record struct SnapshotPreparedFeatures(
+        float[] RawFeatures,
+        float[] Features,
+        int FeatureCount,
+        float[] Means,
+        float[] Stds);
 
     internal static PreparedSamples PrepareTrainingSamples(
         IReadOnlyList<TrainingSample> samples,
@@ -115,5 +123,180 @@ internal static class ElmFeaturePipelineHelper
         }
 
         return cloned;
+    }
+
+    internal static float[] StandardiseFeatures(float[] rawFeatures, float[] means, float[] stds, int featureCount)
+    {
+        float[] features = new float[featureCount];
+        for (int j = 0; j < featureCount && j < rawFeatures.Length; j++)
+        {
+            if (!float.IsFinite(rawFeatures[j]))
+            {
+                features[j] = 0f;
+                continue;
+            }
+
+            float std = j < stds.Length && stds[j] > 1e-8f ? stds[j] : 1f;
+            float mean = j < means.Length ? means[j] : 0f;
+            features[j] = (rawFeatures[j] - mean) / std;
+        }
+
+        return features;
+    }
+
+    internal static float[] ProjectFeaturesByRawIndex(float[] features, int[] rawFeatureIndices)
+    {
+        if (rawFeatureIndices.Length == 0)
+            return features;
+
+        if (rawFeatureIndices.Distinct().Count() != rawFeatureIndices.Length)
+            throw new InvalidOperationException("RawFeatureIndices contains duplicate indices.");
+
+        var projected = new float[rawFeatureIndices.Length];
+        for (int i = 0; i < rawFeatureIndices.Length; i++)
+        {
+            int rawIndex = rawFeatureIndices[i];
+            if (rawIndex < 0 || rawIndex >= features.Length)
+            {
+                throw new InvalidOperationException(
+                    $"RawFeatureIndices[{i}]={rawIndex} is outside the available feature range 0..{features.Length - 1}.");
+            }
+
+            projected[i] = features[rawIndex];
+        }
+
+        return projected;
+    }
+
+    internal static float[] ProjectRawFeaturesForSnapshot(float[] rawFeatures, ModelSnapshot snapshot)
+    {
+        if (string.Equals(snapshot.Type, "FTTRANSFORMER", StringComparison.OrdinalIgnoreCase) &&
+            snapshot.FtTransformerRawFeatureCount > 0 &&
+            rawFeatures.Length != snapshot.FtTransformerRawFeatureCount)
+        {
+            throw new InvalidOperationException(
+                $"FT-Transformer raw feature length {rawFeatures.Length} does not match snapshot raw feature count {snapshot.FtTransformerRawFeatureCount}.");
+        }
+
+        if (snapshot.RawFeatureIndices.Length == 0)
+            return rawFeatures;
+
+        float[] projected = ProjectFeaturesByRawIndex(rawFeatures, snapshot.RawFeatureIndices);
+        int expectedFeatureCount = snapshot.Features.Length > 0
+            ? snapshot.Features.Length
+            : projected.Length;
+        if (projected.Length != expectedFeatureCount)
+        {
+            throw new InvalidOperationException(
+                $"Projected feature count {projected.Length} does not match snapshot schema count {expectedFeatureCount}.");
+        }
+
+        return projected;
+    }
+
+    internal static (float[] Means, float[] Stds) ResolveStandardisationStats(
+        ModelSnapshot snapshot,
+        string? currentRegime,
+        int featureCount)
+    {
+        float[] means = snapshot.Means;
+        float[] stds = snapshot.Stds;
+        if (currentRegime is not null &&
+            snapshot.RegimeMeans.TryGetValue(currentRegime, out var regimeMeans) &&
+            snapshot.RegimeStds.TryGetValue(currentRegime, out var regimeStds) &&
+            regimeMeans.Length == featureCount &&
+            regimeStds.Length == featureCount)
+        {
+            means = regimeMeans;
+            stds = regimeStds;
+        }
+
+        return (means, stds);
+    }
+
+    internal static void ApplyFeatureMask(float[] features, bool[] mask, int featureCount)
+    {
+        if (mask.Length == 0)
+            return;
+
+        if (mask.Length != featureCount)
+        {
+            throw new InvalidOperationException(
+                $"ActiveFeatureMask length {mask.Length} does not match feature count {featureCount}.");
+        }
+
+        if (!mask.Any(v => v))
+            throw new InvalidOperationException("ActiveFeatureMask cannot disable every feature.");
+
+        for (int j = 0; j < featureCount; j++)
+        {
+            if (!mask[j])
+                features[j] = 0f;
+        }
+    }
+
+    internal static SnapshotPreparedFeatures PrepareSnapshotFeatures(
+        float[] rawFeatures,
+        ModelSnapshot snapshot,
+        string? currentRegime = null,
+        float[]? meansOverride = null,
+        float[]? stdsOverride = null,
+        bool applyTransforms = true,
+        bool applyMask = true)
+    {
+        float[] projectedRawFeatures = ProjectRawFeaturesForSnapshot(rawFeatures, snapshot);
+        float[] replayedRawFeatures = CloneAndWinsorize(projectedRawFeatures, snapshot);
+        int featureCount = snapshot.Features.Length > 0
+            ? snapshot.Features.Length
+            : replayedRawFeatures.Length;
+
+        (float[] means, float[] stds) = meansOverride is { Length: > 0 } && stdsOverride is { Length: > 0 }
+            ? (meansOverride, stdsOverride)
+            : ResolveStandardisationStats(snapshot, currentRegime, featureCount);
+
+        float[] features = StandardiseFeatures(replayedRawFeatures, means, stds, featureCount);
+
+        if (applyTransforms)
+            InferenceHelpers.ApplyModelSpecificFeatureTransforms(features, snapshot);
+        if (applyMask)
+            ApplyFeatureMask(features, snapshot.ActiveFeatureMask, featureCount);
+
+        return new SnapshotPreparedFeatures(replayedRawFeatures, features, featureCount, means, stds);
+    }
+
+    internal static List<TrainingSample> ReplaySnapshotPreprocessing(
+        IReadOnlyList<TrainingSample> samples,
+        ModelSnapshot snapshot,
+        string? currentRegime = null)
+    {
+        var replayed = new List<TrainingSample>(samples.Count);
+        if (samples.Count == 0)
+            return replayed;
+
+        int featureCount = 0;
+        for (int i = 0; i < samples.Count; i++)
+        {
+            var prepared = PrepareSnapshotFeatures(
+                samples[i].Features,
+                snapshot,
+                currentRegime,
+                applyTransforms: false,
+                applyMask: false);
+            featureCount = prepared.FeatureCount;
+            replayed.Add(samples[i] with { Features = prepared.Features });
+        }
+
+        if (snapshot.FracDiffD > 0.0 && featureCount > 0)
+            replayed = MLFeatureHelper.ApplyFractionalDifferencing(replayed, featureCount, snapshot.FracDiffD);
+
+        for (int i = 0; i < replayed.Count; i++)
+        {
+            float[] features = (float[])replayed[i].Features.Clone();
+            InferenceHelpers.ApplyModelSpecificFeatureTransforms(features, snapshot);
+            ApplyFeatureMask(features, snapshot.ActiveFeatureMask, featureCount);
+            replayed[i] = replayed[i] with { Features = features };
+        }
+
+        return replayed;
     }
 }

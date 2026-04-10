@@ -382,25 +382,34 @@ public class MLTrainingWorkerTest
             FtTransformerCalibrationArtifact = new FtTransformerCalibrationArtifact
             {
                 SelectedGlobalCalibration = "PLATT",
-                CalibrationSelectionStrategy = "FIT_ON_FIT_EVAL_ON_CROSSFIT_DIAGNOSTICS",
+                CalibrationSelectionStrategy = "REFIT_ON_FIT_PLUS_DIAGNOSTICS_AFTER_TRUE_CROSSFIT_SELECTION",
                 AdaptiveHeadMode = "CROSSFIT_DIAGNOSTICS_PLUS_CONFORMAL_HOLDOUT",
                 AdaptiveHeadCrossFitFoldCount = 2,
                 FitSampleCount = 10,
                 DiagnosticsSampleCount = 10,
-                ThresholdSelectionSampleCount = 10,
-                KellySelectionSampleCount = 10,
+                RefitSampleCount = 20,
+                ThresholdSelectionSampleCount = 5,
+                KellySelectionSampleCount = 5,
                 ConformalSampleCount = 10,
                 ConformalSelectionStrategy = "DISJOINT_HOLDOUT",
                 ConditionalRoutingThreshold = 0.5,
                 RoutingThresholdCandidateCount = 3,
+                RoutingThresholdCandidates = [0.45, 0.50, 0.55],
+                RoutingThresholdCandidateNlls = [0.3, 0.2, 0.25],
+                RoutingThresholdCandidateEces = [0.08, 0.05, 0.06],
                 RoutingThresholdSelectedNll = 0.2,
+                RoutingThresholdSelectedEce = 0.05,
                 BuyBranchSampleCount = 5,
                 SellBranchSampleCount = 5,
-                IsotonicSampleCount = 10,
+                IsotonicSampleCount = 20,
                 IsotonicBreakpointCount = 0,
                 PreIsotonicNll = 0.2,
                 PostIsotonicNll = 0.2,
+                PreIsotonicEce = 0.05,
+                PostIsotonicEce = 0.05,
                 IsotonicAccepted = false,
+                SelectedStackCrossFitFoldNlls = [0.19, 0.21],
+                SelectedStackCrossFitFoldEces = [0.04, 0.05],
             },
             FtTransformerWarmStartArtifact = new FtTransformerWarmStartArtifact
             {
@@ -429,7 +438,9 @@ public class MLTrainingWorkerTest
                 SelectionPruningStartIndex = 60,
                 SelectionPruningCount = 10,
                 SelectionThresholdStartIndex = 70,
-                SelectionThresholdCount = 10,
+                SelectionThresholdCount = 5,
+                SelectionKellyStartIndex = 75,
+                SelectionKellyCount = 5,
                 CalibrationStartIndex = 80,
                 CalibrationCount = 30,
                 CalibrationFitStartIndex = 80,
@@ -474,6 +485,170 @@ public class MLTrainingWorkerTest
         {
             snapshot.FtTransformerAuditArtifact.FeatureSchemaFingerprint = snapshot.FeatureSchemaFingerprint;
             snapshot.FtTransformerAuditArtifact.PreprocessingFingerprint = snapshot.PreprocessingFingerprint;
+        }
+
+        return JsonSerializer.SerializeToUtf8Bytes(snapshot);
+    }
+
+    private static byte[] CreateGbmPromotionSnapshotBytes(
+        bool includeAuditArtifact = true,
+        double parityError = 0.0,
+        int thresholdDecisionMismatchCount = 0,
+        string[]? auditFindings = null)
+    {
+        var features = new[] { "F0", "F1" };
+        var rawIndices = new[] { 0, 1 };
+        var mask = new[] { true, true };
+        var split = new TrainingSplitSummary
+        {
+            RawTrainCount = 4,
+            RawSelectionCount = 2,
+            RawCalibrationCount = 2,
+            RawTestCount = 2,
+            TrainStartIndex = 0,
+            TrainCount = 4,
+            SelectionStartIndex = 4,
+            SelectionCount = 2,
+            CalibrationStartIndex = 4,
+            CalibrationCount = 2,
+            CalibrationFitStartIndex = 4,
+            CalibrationFitCount = 1,
+            CalibrationDiagnosticsStartIndex = 5,
+            CalibrationDiagnosticsCount = 1,
+            ConformalStartIndex = 5,
+            ConformalCount = 1,
+            MetaLabelStartIndex = 5,
+            MetaLabelCount = 1,
+            AbstentionStartIndex = 5,
+            AbstentionCount = 1,
+            AdaptiveHeadSplitMode = "SHARED_FALLBACK",
+            TestStartIndex = 6,
+            TestCount = 2,
+        };
+
+        var selectionMetric = new GbmMetricSummary
+        {
+            SplitName = "SELECTION",
+            SampleCount = 2,
+            Threshold = 0.5,
+            Accuracy = 0.70,
+            Precision = 0.70,
+            Recall = 0.70,
+            F1 = 0.70,
+            ExpectedValue = 0.08,
+            BrierScore = 0.18,
+            WeightedAccuracy = 0.70,
+            SharpeRatio = 1.6,
+            Ece = 0.05,
+        };
+        var calibrationMetric = new GbmMetricSummary
+        {
+            SplitName = "CALIBRATION_DIAGNOSTICS",
+            SampleCount = 1,
+            Threshold = 0.5,
+            Accuracy = 0.70,
+            Precision = 0.70,
+            Recall = 0.70,
+            F1 = 0.70,
+            ExpectedValue = 0.08,
+            BrierScore = 0.18,
+            WeightedAccuracy = 0.70,
+            SharpeRatio = 1.6,
+            Ece = 0.05,
+        };
+        var testMetric = new GbmMetricSummary
+        {
+            SplitName = "TEST",
+            SampleCount = 2,
+            Threshold = 0.5,
+            Accuracy = 0.70,
+            Precision = 0.70,
+            Recall = 0.70,
+            F1 = 0.70,
+            ExpectedValue = 0.08,
+            BrierScore = 0.18,
+            WeightedAccuracy = 0.70,
+            SharpeRatio = 1.6,
+            Ece = 0.05,
+        };
+
+        var snapshot = new ModelSnapshot
+        {
+            Type = "GBM",
+            Version = "3.2",
+            Features = features,
+            RawFeatureIndices = rawIndices,
+            Means = [0f, 0f],
+            Stds = [1f, 1f],
+            ActiveFeatureMask = mask,
+            PrunedFeatureCount = 0,
+            BaseLearnersK = 1,
+            GbmTreesJson = JsonSerializer.Serialize(new List<GbmTree>
+            {
+                new() { Nodes = [new GbmNode { IsLeaf = true, LeafValue = 0.25 }] }
+            }),
+            GbmPerTreeLearningRates = [0.1],
+            GbmBaseLogOdds = 0.0,
+            GbmLearningRate = 0.1,
+            OptimalThreshold = 0.5,
+            ConformalQHat = 0.1,
+            ConformalQHatBuy = 0.1,
+            ConformalQHatSell = 0.1,
+            ConditionalCalibrationRoutingThreshold = 0.5,
+            FeatureSchemaFingerprint = GbmSnapshotSupport.ComputeFeatureSchemaFingerprint(features, features.Length),
+            PreprocessingFingerprint = GbmSnapshotSupport.ComputePreprocessingFingerprint(features.Length, rawIndices, [], mask),
+            TrainerFingerprint = "worker-test",
+            TrainingRandomSeed = 7,
+            TrainingSplitSummary = split,
+            GbmSelectionMetrics = selectionMetric,
+            GbmCalibrationMetrics = calibrationMetric,
+            GbmTestMetrics = testMetric,
+            GbmCalibrationArtifact = new GbmCalibrationArtifact
+            {
+                SelectedGlobalCalibration = "PLATT",
+                CalibrationSelectionStrategy = "FIT_ON_FIT_EVAL_ON_DIAGNOSTICS",
+                GlobalPlattNll = 0.0,
+                TemperatureNll = 0.0,
+                TemperatureSelected = false,
+                FitSampleCount = 1,
+                DiagnosticsSampleCount = 1,
+                DiagnosticsSelectedGlobalNll = 0.0,
+                DiagnosticsSelectedStackNll = 0.0,
+                ConformalSampleCount = 1,
+                MetaLabelSampleCount = 1,
+                AbstentionSampleCount = 1,
+                AdaptiveHeadMode = split.AdaptiveHeadSplitMode,
+                AdaptiveHeadCrossFitFoldCount = 0,
+                ConditionalRoutingThreshold = 0.5,
+                IsotonicSampleCount = 1,
+                IsotonicBreakpointCount = 0,
+                PreIsotonicNll = 0.0,
+                PostIsotonicNll = 0.0,
+            },
+            GbmTrainInferenceParityMaxError = parityError,
+            Ece = 0.05,
+            BrierSkillScore = 0.10,
+        };
+
+        if (includeAuditArtifact)
+        {
+            snapshot.GbmAuditArtifact = new GbmAuditArtifact
+            {
+                SnapshotContractValid = true,
+                AuditedSampleCount = 2,
+                ActiveFeatureCount = 2,
+                RawFeatureCount = 2,
+                MaxRawParityError = parityError,
+                MeanRawParityError = parityError / 2.0,
+                MaxDeployedCalibrationDelta = parityError,
+                MaxTransformReplayShift = 0.0,
+                MaxMaskApplicationShift = 0.0,
+                ThresholdDecisionMismatchCount = thresholdDecisionMismatchCount,
+                RecordedEce = 0.05,
+                FeatureSchemaFingerprint = snapshot.FeatureSchemaFingerprint,
+                PreprocessingFingerprint = snapshot.PreprocessingFingerprint,
+                Findings = auditFindings ?? [],
+            };
         }
 
         return JsonSerializer.SerializeToUtf8Bytes(snapshot);
@@ -840,6 +1015,44 @@ public class MLTrainingWorkerTest
         Assert.NotNull(run.ErrorMessage);
         Assert.Contains("Invalid model snapshot contract", run.ErrorMessage, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("drift", run.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task QualityGates_GbmMissingAuditArtifact_RunMarkedFailed()
+    {
+        var run = MakeRun();
+        var result = MakeTrainingResult(
+            accuracy: 0.70, ev: 0.08, brier: 0.18, sharpe: 1.6, f1: 0.62, wfStd: 0.02,
+            modelBytes: CreateGbmPromotionSnapshotBytes(includeAuditArtifact: false));
+        SetupPipelineMocks(run, trainingResult: result);
+
+        await InvokeProcessRunAsync(run);
+
+        Assert.Equal(RunStatus.Failed, run.Status);
+        Assert.NotNull(run.ErrorMessage);
+        Assert.Contains("Invalid model snapshot contract", run.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("GbmAuditArtifact is missing", run.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task QualityGates_GbmAuditFailure_RunMarkedFailed()
+    {
+        var run = MakeRun();
+        var result = MakeTrainingResult(
+            accuracy: 0.70, ev: 0.08, brier: 0.18, sharpe: 1.6, f1: 0.62, wfStd: 0.02,
+            modelBytes: CreateGbmPromotionSnapshotBytes(
+                includeAuditArtifact: true,
+                parityError: 1e-3,
+                thresholdDecisionMismatchCount: 1,
+                auditFindings: ["gbm parity drift detected"]));
+        SetupPipelineMocks(run, trainingResult: result);
+
+        await InvokeProcessRunAsync(run);
+
+        Assert.Equal(RunStatus.Failed, run.Status);
+        Assert.NotNull(run.ErrorMessage);
+        Assert.Contains("Invalid model snapshot contract", run.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("parity", run.ErrorMessage, StringComparison.OrdinalIgnoreCase);
     }
 
     // ════════════════════════════════════════════════════════════════════════

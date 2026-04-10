@@ -16,25 +16,8 @@ public sealed partial class FtTransformerModelTrainer
 
     internal static double[]? ComputeOutputWeightGradientFromSnapshotForAudit(float[] features, ModelSnapshot snapshot, double label)
     {
-        if (!TryBuildModelFromSnapshotForAudit(snapshot, out var normalized, out var model))
+        if (!TryComputeGradientFromSnapshotForAudit(features, snapshot, label, out _, out _, out var grad))
             return null;
-
-        int featureCount = normalized.Features.Length;
-        var fwdBuf = new ForwardBuffers(featureCount, model.EmbedDim, model.NumHeads, model.FfnDim, model.NumLayers);
-        var grad = new TransformerGrad(featureCount, model.EmbedDim, model.FfnDim, model.NumLayers);
-        if (model.UsePositionalBias)
-        {
-            int seqSq = model.SeqLen * model.SeqLen;
-            for (int index = 0; index < model.NumLayers; index++)
-            {
-                grad.LayerGrads[index].dPosBias = new double[model.NumHeads][];
-                for (int head = 0; head < model.NumHeads; head++)
-                    grad.LayerGrads[index].dPosBias[head] = new double[seqSq];
-            }
-        }
-        double rawProb = ForwardPassTraining(features, model, featureCount, fwdBuf, new Random(1), 0.0);
-        double err = rawProb - Math.Clamp(label, 0.0, 1.0);
-        BackwardPass(err, model, featureCount, fwdBuf, features, grad, 0.0);
         return (double[])grad.dWOut.Clone();
     }
 
@@ -46,7 +29,7 @@ public sealed partial class FtTransformerModelTrainer
         int headIndex,
         int offset)
     {
-        if (!TryBuildModelFromSnapshotForAudit(snapshot, out var normalized, out var model))
+        if (!TryComputeGradientFromSnapshotForAudit(features, snapshot, label, out _, out var model, out var grad))
             return null;
 
         if (!model.UsePositionalBias ||
@@ -61,26 +44,109 @@ public sealed partial class FtTransformerModelTrainer
             return null;
         }
 
-        int featureCount = normalized.Features.Length;
-        var fwdBuf = new ForwardBuffers(featureCount, model.EmbedDim, model.NumHeads, model.FfnDim, model.NumLayers);
-        var grad = new TransformerGrad(featureCount, model.EmbedDim, model.FfnDim, model.NumLayers);
-        if (model.UsePositionalBias)
-        {
-            int seqSq = model.SeqLen * model.SeqLen;
-            for (int index = 0; index < model.NumLayers; index++)
-            {
-                grad.LayerGrads[index].dPosBias = new double[model.NumHeads][];
-                for (int head = 0; head < model.NumHeads; head++)
-                    grad.LayerGrads[index].dPosBias[head] = new double[seqSq];
-            }
-        }
-        double rawProb = ForwardPassTraining(features, model, featureCount, fwdBuf, new Random(1), 0.0);
-        double err = rawProb - Math.Clamp(label, 0.0, 1.0);
-        BackwardPass(err, model, featureCount, fwdBuf, features, grad, 0.0);
-
         return grad.LayerGrads[layerIndex].dPosBias is { Length: > 0 }
             ? grad.LayerGrads[layerIndex].dPosBias[headIndex][offset]
             : null;
+    }
+
+    internal static double? ComputeFinalLayerNormGammaGradientFromSnapshotForAudit(
+        float[] features,
+        ModelSnapshot snapshot,
+        double label,
+        int index)
+    {
+        if (!TryComputeGradientFromSnapshotForAudit(features, snapshot, label, out _, out _, out var grad) ||
+            index < 0 ||
+            index >= grad.dGammaFinal.Length)
+        {
+            return null;
+        }
+
+        return grad.dGammaFinal[index];
+    }
+
+    internal static double? ComputeAttentionValueWeightGradientFromSnapshotForAudit(
+        float[] features,
+        ModelSnapshot snapshot,
+        double label,
+        int layerIndex,
+        int rowIndex,
+        int columnIndex)
+    {
+        if (!TryComputeGradientFromSnapshotForAudit(features, snapshot, label, out _, out var model, out var grad) ||
+            layerIndex < 0 ||
+            layerIndex >= model.NumLayers ||
+            rowIndex < 0 ||
+            rowIndex >= model.EmbedDim ||
+            columnIndex < 0 ||
+            columnIndex >= model.EmbedDim)
+        {
+            return null;
+        }
+
+        return grad.LayerGrads[layerIndex].dWv[rowIndex][columnIndex];
+    }
+
+    internal static double? ComputeFfnFirstLayerWeightGradientFromSnapshotForAudit(
+        float[] features,
+        ModelSnapshot snapshot,
+        double label,
+        int layerIndex,
+        int rowIndex,
+        int columnIndex)
+    {
+        if (!TryComputeGradientFromSnapshotForAudit(features, snapshot, label, out _, out var model, out var grad) ||
+            layerIndex < 0 ||
+            layerIndex >= model.NumLayers ||
+            rowIndex < 0 ||
+            rowIndex >= model.EmbedDim ||
+            columnIndex < 0 ||
+            columnIndex >= model.FfnDim)
+        {
+            return null;
+        }
+
+        return grad.LayerGrads[layerIndex].dWff1[rowIndex][columnIndex];
+    }
+
+    private static bool TryComputeGradientFromSnapshotForAudit(
+        float[] features,
+        ModelSnapshot snapshot,
+        double label,
+        out ModelSnapshot normalized,
+        out TransformerModel model,
+        out TransformerGrad grad)
+    {
+        if (!TryBuildModelFromSnapshotForAudit(snapshot, out normalized, out model))
+        {
+            grad = null!;
+            return false;
+        }
+
+        int featureCount = normalized.Features.Length;
+        var fwdBuf = new ForwardBuffers(featureCount, model.EmbedDim, model.NumHeads, model.FfnDim, model.NumLayers);
+        grad = CreateAuditGradientBuffers(featureCount, model);
+        double rawProb = ForwardPassTraining(features, model, featureCount, fwdBuf, new Random(1), 0.0);
+        double err = rawProb - Math.Clamp(label, 0.0, 1.0);
+        BackwardPass(err, model, featureCount, fwdBuf, features, grad, 0.0);
+        return true;
+    }
+
+    private static TransformerGrad CreateAuditGradientBuffers(int featureCount, TransformerModel model)
+    {
+        var grad = new TransformerGrad(featureCount, model.EmbedDim, model.FfnDim, model.NumLayers);
+        if (!model.UsePositionalBias)
+            return grad;
+
+        int seqSq = model.SeqLen * model.SeqLen;
+        for (int index = 0; index < model.NumLayers; index++)
+        {
+            grad.LayerGrads[index].dPosBias = new double[model.NumHeads][];
+            for (int head = 0; head < model.NumHeads; head++)
+                grad.LayerGrads[index].dPosBias[head] = new double[seqSq];
+        }
+
+        return grad;
     }
 
     private static bool TryBuildModelFromSnapshotForAudit(

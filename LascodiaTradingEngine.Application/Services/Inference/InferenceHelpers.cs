@@ -84,16 +84,20 @@ internal static class InferenceHelpers
     /// </summary>
     internal static double ApplyBasicCalibration(double rawProb, ModelSnapshot snap)
     {
+        TcnCalibrationArtifact? tcnCalibration = string.Equals(snap.Type, "TCN", StringComparison.OrdinalIgnoreCase)
+            ? TcnSnapshotSupport.ResolveCalibrationArtifact(snap)
+            : null;
         double rawLogit = MLFeatureHelper.Logit(ClampLogitProbability(rawProb));
-        double temperatureScale = SanitizeTemperatureScale(snap.TemperatureScale);
-        double plattA = SanitizeFiniteOrDefault(snap.PlattA, 1.0);
-        double plattB = SanitizeFiniteOrDefault(snap.PlattB, 0.0);
+        double temperatureScale = SanitizeTemperatureScale(tcnCalibration?.TemperatureScale ?? snap.TemperatureScale);
+        double plattA = SanitizeFiniteOrDefault(tcnCalibration?.GlobalPlattA ?? snap.PlattA, 1.0);
+        double plattB = SanitizeFiniteOrDefault(tcnCalibration?.GlobalPlattB ?? snap.PlattB, 0.0);
         double calibP = temperatureScale > 0.0
             ? MLFeatureHelper.Sigmoid(rawLogit / temperatureScale)
             : MLFeatureHelper.Sigmoid(plattA * rawLogit + plattB);
 
-        if (snap.IsotonicBreakpoints.Length >= 4)
-            calibP = ApplyIsotonicCalibrationSafe(calibP, snap.IsotonicBreakpoints);
+        double[] isotonicBreakpoints = tcnCalibration?.IsotonicBreakpoints ?? snap.IsotonicBreakpoints;
+        if (isotonicBreakpoints.Length >= 4)
+            calibP = ApplyIsotonicCalibrationSafe(calibP, isotonicBreakpoints);
 
         return ClampProbability(calibP);
     }
@@ -104,17 +108,20 @@ internal static class InferenceHelpers
     /// </summary>
     internal static double ApplyDeployedCalibration(double rawProb, ModelSnapshot snap)
     {
+        TcnCalibrationArtifact? tcnCalibration = string.Equals(snap.Type, "TCN", StringComparison.OrdinalIgnoreCase)
+            ? TcnSnapshotSupport.ResolveCalibrationArtifact(snap)
+            : null;
         return ApplyDeployedCalibration(
             rawProb,
-            snap.PlattA,
-            snap.PlattB,
-            snap.TemperatureScale,
-            snap.PlattABuy,
-            snap.PlattBBuy,
-            snap.PlattASell,
-            snap.PlattBSell,
-            snap.ConditionalCalibrationRoutingThreshold,
-            snap.IsotonicBreakpoints,
+            tcnCalibration?.GlobalPlattA ?? snap.PlattA,
+            tcnCalibration?.GlobalPlattB ?? snap.PlattB,
+            tcnCalibration?.TemperatureScale ?? snap.TemperatureScale,
+            tcnCalibration?.BuyBranchPlattA ?? snap.PlattABuy,
+            tcnCalibration?.BuyBranchPlattB ?? snap.PlattBBuy,
+            tcnCalibration?.SellBranchPlattA ?? snap.PlattASell,
+            tcnCalibration?.SellBranchPlattB ?? snap.PlattBSell,
+            tcnCalibration?.ConditionalRoutingThreshold ?? snap.ConditionalCalibrationRoutingThreshold,
+            tcnCalibration?.IsotonicBreakpoints ?? snap.IsotonicBreakpoints,
             snap.AgeDecayLambda,
             snap.TrainedAtUtc,
             applyAgeDecay: true);

@@ -8,10 +8,12 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Lascodia.Trading.Engine.EventBus.Events;
+using Lascodia.Trading.Engine.IntegrationEventLogEF;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using Lascodia.Trading.Engine.SharedLibrary.Mappings;
 using LascodiaTradingEngine.Application.AuditTrail.Commands.LogDecision;
+using LascodiaTradingEngine.Application.Backtesting;
 using LascodiaTradingEngine.Application.Backtesting.Models;
 using LascodiaTradingEngine.Application.Backtesting.Services;
 using LascodiaTradingEngine.Application.Common.Attributes;
@@ -197,6 +199,189 @@ public class StrategyGenerationWorkerIntegrationTest : IClassFixture<PostgresFix
         Assert.Contains(
             harness.EventService.PublishedEvents.OfType<StrategyAutoPromotedIntegrationEvent>(),
             e => e.StrategyId == replayStrategyId);
+    }
+
+    [Fact]
+    public async Task RunGenerationCycleAsync_ReconcilesPendingArtifactEvents_AfterOutboxRetryPublishesThem()
+    {
+        await EnsureMigratedAsync();
+
+        await SeedSuccessScenarioAsync("RETRY1");
+
+        bool failInitialEventPublish = true;
+        await using var harness = CreateHarness(new DeterministicBacktestEngine(), new HarnessOptions
+        {
+            LivePerformanceBenchmark = new FixedLivePerformanceBenchmark(),
+            ShouldFailInitialPublish = evt =>
+                failInitialEventPublish
+                && (evt is StrategyCandidateCreatedIntegrationEvent or StrategyAutoPromotedIntegrationEvent),
+        });
+
+        await harness.Worker.RunGenerationCycleAsync(CancellationToken.None);
+
+        await using (var readCtx = CreateReadContext())
+        {
+            var pendingArtifacts = await readCtx.Set<StrategyGenerationPendingArtifact>()
+                .Where(a => !a.IsDeleted && a.QuarantinedAtUtc == null)
+                .OrderBy(a => a.Id)
+                .ToListAsync();
+            Assert.NotEmpty(pendingArtifacts);
+            Assert.All(pendingArtifacts, artifact => Assert.False(artifact.NeedsCreatedEvent));
+            Assert.All(pendingArtifacts, artifact => Assert.NotNull(artifact.CandidateCreatedEventId));
+            Assert.All(pendingArtifacts, artifact => Assert.Null(artifact.CandidateCreatedEventDispatchedAtUtc));
+        }
+
+        failInitialEventPublish = false;
+        harness.EventService.PromoteFailedEventsToPublished(
+            typeof(StrategyCandidateCreatedIntegrationEvent),
+            typeof(StrategyAutoPromotedIntegrationEvent));
+
+        await harness.Worker.RunGenerationCycleAsync(CancellationToken.None);
+
+        await using var reconciledReadCtx = CreateReadContext();
+        Assert.Empty(await reconciledReadCtx.Set<StrategyGenerationPendingArtifact>()
+            .Where(a => !a.IsDeleted && a.QuarantinedAtUtc == null)
+            .ToListAsync());
+    }
+
+    [Fact]
+    public async Task RunGenerationCycleAsync_ReconcilesCycleSummaryPublication_AfterOutboxRetryPublishesIt()
+    {
+        await EnsureMigratedAsync();
+
+        await SeedFailureScenarioAsync("SUMRY1");
+
+        bool failInitialSummaryPublish = true;
+        await using var harness = CreateHarness(new DeterministicBacktestEngine(), new HarnessOptions
+        {
+            ShouldFailInitialPublish = evt =>
+                failInitialSummaryPublish && evt is StrategyGenerationCycleCompletedIntegrationEvent,
+        });
+
+        await harness.Worker.RunGenerationCycleAsync(CancellationToken.None);
+
+        string failedCycleId;
+        await using (var readCtx = CreateReadContext())
+        {
+            var failedSummaryCycle = await readCtx.Set<StrategyGenerationCycleRun>()
+                .Where(c => !c.IsDeleted && c.Status == "Completed" && c.SummaryEventId != null)
+                .OrderByDescending(c => c.CompletedAtUtc)
+                .FirstAsync();
+            failedCycleId = failedSummaryCycle.CycleId;
+            Assert.Null(failedSummaryCycle.SummaryEventDispatchedAtUtc);
+            Assert.NotNull(failedSummaryCycle.SummaryEventFailedAtUtc);
+        }
+
+        failInitialSummaryPublish = false;
+        harness.EventService.PromoteFailedEventsToPublished(typeof(StrategyGenerationCycleCompletedIntegrationEvent));
+
+        await harness.Worker.RunGenerationCycleAsync(CancellationToken.None);
+
+        await using var reconciledReadCtx = CreateReadContext();
+        var reconciledCycle = await reconciledReadCtx.Set<StrategyGenerationCycleRun>()
+            .AsNoTracking()
+            .SingleAsync(c => c.CycleId == failedCycleId);
+        Assert.NotNull(reconciledCycle.SummaryEventDispatchedAtUtc);
+        Assert.Null(reconciledCycle.SummaryEventFailedAtUtc);
+    }
+
+    [Fact]
+    public async Task RunGenerationCycleAsync_QuarantinesCorruptPendingArtifacts_InsteadOfDroppingThem()
+    {
+        await EnsureMigratedAsync();
+
+        await using var context = CreateWriteContext();
+        await ResetWorkerStateAsync(context);
+        await UpsertConfigAsync(context, BuildStrategyGenerationConfigs(
+            ("StrategyGeneration:MaxCandidatesPerCycle", "0"),
+            ("StrategyGeneration:StrategicReserveQuota", "0"),
+            ("StrategyGeneration:MaxCandidatesPerWeek", "1000"),
+            ("StrategyGeneration:SuppressDuringDrawdownRecovery", "false"),
+            ("StrategyGeneration:SeasonalBlackoutEnabled", "false"),
+            ("StrategyGeneration:SkipWeekends", "false"),
+            ("StrategyGeneration:AdaptiveThresholdsEnabled", "false"),
+            ("StrategyGeneration:PortfolioBacktestEnabled", "false"),
+            ("StrategyGeneration:MonteCarloEnabled", "false"),
+            ("StrategyGeneration:MonteCarloShuffleEnabled", "false"),
+            ("FastTrack:Enabled", "false")));
+
+        var corruptStrategy = new Strategy
+        {
+            Name = "Auto-Corrupt-Artifact-H1",
+            Description = "Corrupt artifact seed",
+            StrategyType = StrategyType.MovingAverageCrossover,
+            Symbol = "BADART",
+            Timeframe = Timeframe.H1,
+            ParametersJson = "{\"Template\":\"Corrupt\"}",
+            Status = StrategyStatus.Paused,
+            LifecycleStage = StrategyLifecycleStage.Draft,
+            CreatedAt = DateTime.UtcNow.AddMinutes(-5),
+            ScreeningMetricsJson = new ScreeningMetrics
+            {
+                Regime = MarketRegimeEnum.Trending.ToString(),
+                ObservedRegime = MarketRegimeEnum.Trending.ToString(),
+                GenerationSource = "Primary",
+            }.ToJson(),
+        };
+        context.Set<Strategy>().Add(corruptStrategy);
+        await context.SaveChangesAsync();
+
+        context.Set<StrategyGenerationPendingArtifact>().Add(new StrategyGenerationPendingArtifact
+        {
+            StrategyId = corruptStrategy.Id,
+            CandidateId = "corrupt-artifact",
+            CandidatePayloadJson = "null",
+            NeedsCreationAudit = true,
+            NeedsCreatedEvent = true,
+            NeedsAutoPromoteEvent = false,
+        });
+        await context.SaveChangesAsync();
+
+        await using var harness = CreateHarness(new DeterministicBacktestEngine());
+        await harness.Worker.RunGenerationCycleAsync(CancellationToken.None);
+
+        await using var readCtx = CreateReadContext();
+        var quarantined = await readCtx.Set<StrategyGenerationPendingArtifact>()
+            .IgnoreQueryFilters()
+            .SingleAsync(a => a.CandidateId == "corrupt-artifact");
+        Assert.NotNull(quarantined.QuarantinedAtUtc);
+        Assert.NotNull(quarantined.TerminalFailureReason);
+        Assert.Contains("deserialized to null", quarantined.TerminalFailureReason, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task RunGenerationCycleAsync_WhenWorkersShareLock_OnlyOneCycleGeneratesCandidates()
+    {
+        await EnsureMigratedAsync();
+
+        await SeedSuccessScenarioAsync("LOCK1");
+        var sharedLock = new NonWaitingSingleLeaseDistributedLock();
+
+        await using var harness1 = CreateHarness(
+            new SlowDeterministicBacktestEngine(TimeSpan.FromMilliseconds(150)),
+            new HarnessOptions
+            {
+                LivePerformanceBenchmark = new FixedLivePerformanceBenchmark(),
+                DistributedLock = sharedLock,
+            });
+        await using var harness2 = CreateHarness(
+            new SlowDeterministicBacktestEngine(TimeSpan.FromMilliseconds(150)),
+            new HarnessOptions
+            {
+                LivePerformanceBenchmark = new FixedLivePerformanceBenchmark(),
+                DistributedLock = sharedLock,
+            });
+
+        await Task.WhenAll(
+            harness1.Worker.RunGenerationCycleAsync(CancellationToken.None),
+            harness2.Worker.RunGenerationCycleAsync(CancellationToken.None));
+
+        await using var readCtx = CreateReadContext();
+        var strategies = await readCtx.Set<Strategy>()
+            .Where(s => !s.IsDeleted && s.Symbol == "LOCK1" && s.Name.StartsWith("Auto"))
+            .OrderBy(s => s.Id)
+            .ToListAsync();
+        Assert.Equal(2, strategies.Count);
     }
 
     [Fact]
@@ -900,7 +1085,7 @@ public class StrategyGenerationWorkerIntegrationTest : IClassFixture<PostgresFix
     private WorkerHarness CreateHarness(IBacktestEngine backtestEngine, HarnessOptions? options = null)
     {
         options ??= new HarnessOptions();
-        var eventService = new CapturingIntegrationEventService();
+        var eventService = new CapturingIntegrationEventService(options.ShouldFailInitialPublish);
         var meterFactory = new TestMeterFactory();
         var metrics = new TradingMetrics(meterFactory);
         var correlationOptions = new CorrelationGroupOptions
@@ -922,9 +1107,13 @@ public class StrategyGenerationWorkerIntegrationTest : IClassFixture<PostgresFix
         services.AddSingleton<IBacktestEngine>(backtestEngine);
         services.AddSingleton<IRegimeStrategyMapper>(options.RegimeStrategyMapper ?? new FixedRegimeStrategyMapper());
         services.AddSingleton<IStrategyParameterTemplateProvider>(options.TemplateProvider ?? new FixedTemplateProvider());
+        services.AddSingleton<IValidationSettingsProvider, ValidationSettingsProvider>();
+        services.AddSingleton<IStrategyExecutionSnapshotBuilder, StrategyExecutionSnapshotBuilder>();
+        services.AddSingleton<IBacktestOptionsSnapshotBuilder, BacktestOptionsSnapshotBuilder>();
+        services.AddSingleton<IValidationRunFactory, ValidationRunFactory>();
         services.AddSingleton<ILivePriceCache, InMemoryLivePriceCache>();
         services.AddSingleton<IFeedbackDecayMonitor>(options.FeedbackDecayMonitor ?? new NoOpFeedbackDecayMonitor());
-        services.AddSingleton<IDistributedLock, TestDistributedLock>();
+        services.AddSingleton<IDistributedLock>(options.DistributedLock ?? new TestDistributedLock());
         services.AddSingleton<IWorkerHealthMonitor, WorkerHealthMonitor>();
         services.AddScoped<IReadApplicationDbContext>(_ => CreateReadContext());
         services.AddScoped<IWriteApplicationDbContext>(_ =>
@@ -937,6 +1126,7 @@ public class StrategyGenerationWorkerIntegrationTest : IClassFixture<PostgresFix
         services.AddScoped<IMediator, DecisionLogMediator>();
         services.AddSingleton(eventService);
         services.AddSingleton<IIntegrationEventService>(sp => sp.GetRequiredService<CapturingIntegrationEventService>());
+        services.AddSingleton<IEventLogReader>(sp => sp.GetRequiredService<CapturingIntegrationEventService>());
         if (options.LivePerformanceBenchmark != null)
             services.AddSingleton<ILivePerformanceBenchmark>(options.LivePerformanceBenchmark);
         services.AddSingleton<StrategyGenerationWorker>();
@@ -1184,6 +1374,8 @@ public class StrategyGenerationWorkerIntegrationTest : IClassFixture<PostgresFix
         public IRegimeStrategyMapper? RegimeStrategyMapper { get; init; }
         public ILivePerformanceBenchmark? LivePerformanceBenchmark { get; init; }
         public IFeedbackDecayMonitor? FeedbackDecayMonitor { get; init; }
+        public Func<IntegrationEvent, bool>? ShouldFailInitialPublish { get; init; }
+        public IDistributedLock? DistributedLock { get; init; }
     }
 
     private sealed class WriteFailurePlan
@@ -1293,6 +1485,28 @@ public class StrategyGenerationWorkerIntegrationTest : IClassFixture<PostgresFix
             return Task.FromResult(BuildStrongResult(
                 candles.Count > 0 ? candles[0].Timestamp : DateTime.UtcNow.AddDays(-5),
                 sharpe));
+        }
+    }
+
+    private sealed class SlowDeterministicBacktestEngine : IBacktestEngine
+    {
+        private readonly TimeSpan _delay;
+        private readonly DeterministicBacktestEngine _inner = new();
+
+        public SlowDeterministicBacktestEngine(TimeSpan delay)
+        {
+            _delay = delay;
+        }
+
+        public async Task<BacktestResult> RunAsync(
+            Strategy strategy,
+            IReadOnlyList<Candle> candles,
+            decimal initialBalance,
+            CancellationToken ct,
+            BacktestOptions? options = null)
+        {
+            await Task.Delay(_delay, ct);
+            return await _inner.RunAsync(strategy, candles, initialBalance, ct, options);
         }
     }
 
@@ -1474,10 +1688,18 @@ public class StrategyGenerationWorkerIntegrationTest : IClassFixture<PostgresFix
         }
     }
 
-    private sealed class CapturingIntegrationEventService : IIntegrationEventService
+    private sealed class CapturingIntegrationEventService : IIntegrationEventService, IEventLogReader
     {
+        private readonly Func<IntegrationEvent, bool>? _shouldFailInitialPublish;
         private readonly List<IntegrationEvent> _publishedEvents = [];
+        private readonly Dictionary<Guid, IntegrationEvent> _eventsById = [];
+        private readonly Dictionary<Guid, IntegrationEventStatusSnapshot> _statuses = [];
         private readonly object _gate = new();
+
+        public CapturingIntegrationEventService(Func<IntegrationEvent, bool>? shouldFailInitialPublish = null)
+        {
+            _shouldFailInitialPublish = shouldFailInitialPublish;
+        }
 
         public IReadOnlyList<IntegrationEvent> PublishedEvents
         {
@@ -1492,10 +1714,66 @@ public class StrategyGenerationWorkerIntegrationTest : IClassFixture<PostgresFix
         {
             context.SaveChanges();
             lock (_gate)
-                _publishedEvents.Add(evt);
+            {
+                _eventsById[evt.Id] = evt;
+                bool failInitialPublish = _shouldFailInitialPublish?.Invoke(evt) == true;
+                _statuses[evt.Id] = new IntegrationEventStatusSnapshot(
+                    evt.Id,
+                    failInitialPublish ? EventStateEnum.PublishedFailed : EventStateEnum.Published,
+                    1,
+                    evt.CreationDate);
+                if (!failInitialPublish)
+                    _publishedEvents.Add(evt);
+            }
 
             return Task.CompletedTask;
         }
+
+        public void PromoteFailedEventsToPublished(params Type[] eventTypes)
+        {
+            lock (_gate)
+            {
+                var filter = eventTypes.Length == 0
+                    ? _eventsById.Values.Where(evt => _statuses.GetValueOrDefault(evt.Id).State != EventStateEnum.Published)
+                    : _eventsById.Values.Where(evt =>
+                        eventTypes.Any(t => t.IsAssignableFrom(evt.GetType()))
+                        && _statuses.GetValueOrDefault(evt.Id).State != EventStateEnum.Published);
+
+                foreach (var evt in filter.ToList())
+                {
+                    var current = _statuses.GetValueOrDefault(evt.Id);
+                    _statuses[evt.Id] = new IntegrationEventStatusSnapshot(
+                        evt.Id,
+                        EventStateEnum.Published,
+                        Math.Max(1, current.TimesSent),
+                        current.CreationTime == default ? evt.CreationDate : current.CreationTime);
+                    if (_publishedEvents.All(p => p.Id != evt.Id))
+                        _publishedEvents.Add(evt);
+                }
+            }
+        }
+
+        public Task<List<IntegrationEventLogEntry>> GetRetryableEventsAsync(
+            TimeSpan stuckThreshold,
+            int maxRetries,
+            int batchSize,
+            CancellationToken ct)
+            => Task.FromResult(new List<IntegrationEventLogEntry>());
+
+        public Task<IReadOnlyDictionary<Guid, IntegrationEventStatusSnapshot>> GetEventStatusSnapshotsAsync(
+            IReadOnlyCollection<Guid> eventIds,
+            CancellationToken ct)
+        {
+            lock (_gate)
+            {
+                IReadOnlyDictionary<Guid, IntegrationEventStatusSnapshot> result = _statuses
+                    .Where(kv => eventIds.Contains(kv.Key))
+                    .ToDictionary(kv => kv.Key, kv => kv.Value);
+                return Task.FromResult(result);
+            }
+        }
+
+        public Task SaveChangesAsync(CancellationToken ct) => Task.CompletedTask;
     }
 
     private sealed class TestDistributedLock : IDistributedLock
@@ -1509,6 +1787,41 @@ public class StrategyGenerationWorkerIntegrationTest : IClassFixture<PostgresFix
         private sealed class Releaser : IAsyncDisposable
         {
             public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        }
+    }
+
+    private sealed class NonWaitingSingleLeaseDistributedLock : IDistributedLock
+    {
+        private int _held;
+
+        public Task<IAsyncDisposable?> TryAcquireAsync(string lockKey, CancellationToken ct = default)
+        {
+            if (Interlocked.CompareExchange(ref _held, 1, 0) != 0)
+                return Task.FromResult<IAsyncDisposable?>(null);
+
+            return Task.FromResult<IAsyncDisposable?>(new Releaser(this));
+        }
+
+        public Task<IAsyncDisposable?> TryAcquireAsync(string lockKey, TimeSpan timeout, CancellationToken ct = default)
+            => TryAcquireAsync(lockKey, ct);
+
+        private sealed class Releaser : IAsyncDisposable
+        {
+            private readonly NonWaitingSingleLeaseDistributedLock _owner;
+            private int _disposed;
+
+            public Releaser(NonWaitingSingleLeaseDistributedLock owner)
+            {
+                _owner = owner;
+            }
+
+            public ValueTask DisposeAsync()
+            {
+                if (Interlocked.Exchange(ref _disposed, 1) == 0)
+                    Interlocked.Exchange(ref _owner._held, 0);
+
+                return ValueTask.CompletedTask;
+            }
         }
     }
 

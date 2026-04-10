@@ -131,6 +131,9 @@ public class WalkForwardWorkerTest
             .AddSingleton(writeCtx.Object)
             .AddSingleton<IValidationWorkerIdentity>(new TestValidationWorkerIdentity("test-walkforward-worker"))
             .AddScoped<IValidationSettingsProvider, ValidationSettingsProvider>()
+            .AddSingleton<IStrategyExecutionSnapshotBuilder, StrategyExecutionSnapshotBuilder>()
+            .AddSingleton<IValidationTradingCalendar, ValidationTradingCalendar>()
+            .AddSingleton<IValidationCandleSeriesGuard, ValidationCandleSeriesGuard>()
             .AddScoped<IBacktestOptionsSnapshotBuilder>(sp =>
                 new BacktestOptionsSnapshotBuilder(
                     sp.GetRequiredService<IValidationSettingsProvider>(),
@@ -144,6 +147,8 @@ public class WalkForwardWorkerTest
             new InMemoryWalkForwardRunClaimService(),
             services.GetRequiredService<IValidationSettingsProvider>(),
             services.GetRequiredService<IBacktestOptionsSnapshotBuilder>(),
+            services.GetRequiredService<IStrategyExecutionSnapshotBuilder>(),
+            services.GetRequiredService<IValidationCandleSeriesGuard>(),
             services.GetRequiredService<IValidationWorkerIdentity>(),
             Mock.Of<IWorkerHealthMonitor>());
 

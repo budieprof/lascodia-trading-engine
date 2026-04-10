@@ -50,7 +50,8 @@ public class RunBacktestCommandTest
         var optionsBuilder = new BacktestOptionsSnapshotBuilder(
             settingsProvider,
             NullLogger<BacktestOptionsSnapshotBuilder>.Instance);
-        var runFactory = new ValidationRunFactory(optionsBuilder, TimeProvider.System);
+        var snapshotBuilder = new StrategyExecutionSnapshotBuilder();
+        var runFactory = new ValidationRunFactory(optionsBuilder, snapshotBuilder, TimeProvider.System);
         _handler = new RunBacktestCommandHandler(_mockWriteContext.Object, runFactory);
         _validator = new RunBacktestCommandValidator();
     }

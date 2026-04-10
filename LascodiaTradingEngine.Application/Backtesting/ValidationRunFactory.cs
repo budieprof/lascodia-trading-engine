@@ -20,6 +20,7 @@ public readonly record struct BacktestQueueRequest(
     int Priority = 0,
     long? SourceOptimizationRunId = null,
     string? ParametersSnapshotJson = null,
+    string? StrategySnapshotJson = null,
     string? ValidationQueueKey = null,
     string? BacktestOptionsSnapshotJson = null);
 
@@ -37,6 +38,7 @@ public readonly record struct WalkForwardQueueRequest(
     bool ReOptimizePerFold = false,
     long? SourceOptimizationRunId = null,
     string? ParametersSnapshotJson = null,
+    string? StrategySnapshotJson = null,
     string? ValidationQueueKey = null,
     string? BacktestOptionsSnapshotJson = null);
 
@@ -161,13 +163,16 @@ internal sealed class BacktestOptionsSnapshotBuilder : IBacktestOptionsSnapshotB
 internal sealed class ValidationRunFactory : IValidationRunFactory
 {
     private readonly IBacktestOptionsSnapshotBuilder _optionsSnapshotBuilder;
+    private readonly IStrategyExecutionSnapshotBuilder _strategySnapshotBuilder;
     private readonly TimeProvider _timeProvider;
 
     public ValidationRunFactory(
         IBacktestOptionsSnapshotBuilder optionsSnapshotBuilder,
+        IStrategyExecutionSnapshotBuilder strategySnapshotBuilder,
         TimeProvider timeProvider)
     {
         _optionsSnapshotBuilder = optionsSnapshotBuilder;
+        _strategySnapshotBuilder = strategySnapshotBuilder;
         _timeProvider = timeProvider;
     }
 
@@ -178,6 +183,9 @@ internal sealed class ValidationRunFactory : IValidationRunFactory
     {
         string normalizedSymbol = request.Symbol.ToUpperInvariant();
         string? parameterSnapshot = NormalizeParameters(request.ParametersSnapshotJson);
+        string strategySnapshotJson = request.StrategySnapshotJson
+            ?? await _strategySnapshotBuilder.BuildSnapshotJsonAsync(writeDb, request.StrategyId, parameterSnapshot, ct)
+            ?? throw new InvalidOperationException($"Strategy {request.StrategyId} could not be snapshotted for deterministic backtest execution.");
         string optionsSnapshotJson = request.BacktestOptionsSnapshotJson
             ?? JsonSerializer.Serialize(await _optionsSnapshotBuilder.BuildAsync(writeDb, normalizedSymbol, ct));
         var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
@@ -194,6 +202,7 @@ internal sealed class ValidationRunFactory : IValidationRunFactory
             Priority = request.Priority,
             SourceOptimizationRunId = request.SourceOptimizationRunId,
             ParametersSnapshotJson = parameterSnapshot,
+            StrategySnapshotJson = strategySnapshotJson,
             BacktestOptionsSnapshotJson = optionsSnapshotJson,
             ValidationQueueKey = request.ValidationQueueKey,
             QueueSource = request.QueueSource,
@@ -230,6 +239,9 @@ internal sealed class ValidationRunFactory : IValidationRunFactory
     {
         string normalizedSymbol = request.Symbol.ToUpperInvariant();
         string? parameterSnapshot = NormalizeParameters(request.ParametersSnapshotJson);
+        string strategySnapshotJson = request.StrategySnapshotJson
+            ?? await _strategySnapshotBuilder.BuildSnapshotJsonAsync(writeDb, request.StrategyId, parameterSnapshot, ct)
+            ?? throw new InvalidOperationException($"Strategy {request.StrategyId} could not be snapshotted for deterministic walk-forward execution.");
         string optionsSnapshotJson = request.BacktestOptionsSnapshotJson
             ?? JsonSerializer.Serialize(await _optionsSnapshotBuilder.BuildAsync(writeDb, normalizedSymbol, ct));
         var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
@@ -249,6 +261,7 @@ internal sealed class ValidationRunFactory : IValidationRunFactory
             Priority = request.Priority,
             SourceOptimizationRunId = request.SourceOptimizationRunId,
             ParametersSnapshotJson = parameterSnapshot,
+            StrategySnapshotJson = strategySnapshotJson,
             BacktestOptionsSnapshotJson = optionsSnapshotJson,
             ValidationQueueKey = request.ValidationQueueKey,
             QueueSource = request.QueueSource,

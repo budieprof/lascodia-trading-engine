@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using LascodiaTradingEngine.Application.MLModels.Shared;
+using LascodiaTradingEngine.Application.Services;
 
 namespace LascodiaTradingEngine.Application.Services.ML;
 
@@ -44,7 +45,7 @@ internal static class ElmSnapshotSupport
             return new CompatibilityResult(false, ["Warm-start snapshot is not an ELM snapshot."]);
 
         var normalized = NormalizeSnapshotCopy(snapshot);
-        var validation = ValidateSnapshot(normalized, allowLegacy: true);
+        var validation = ValidateNormalizedSnapshot(normalized, allowLegacy: true);
         var issues = new List<string>(validation.Issues);
 
         if (!string.IsNullOrWhiteSpace(expectedFeatureSchemaFingerprint) &&
@@ -178,12 +179,21 @@ internal static class ElmSnapshotSupport
         snapshot.Features ??= [];
         snapshot.Means ??= [];
         snapshot.Stds ??= [];
+        snapshot.RawFeatureIndices ??= [];
+        snapshot.FeaturePipelineTransforms ??= [];
+        snapshot.FeaturePipelineDescriptors ??= [];
         snapshot.ActiveFeatureMask ??= [];
+        snapshot.Weights ??= [];
+        snapshot.Biases ??= [];
         snapshot.ElmInputWeights ??= [];
         snapshot.ElmInputBiases ??= [];
+        snapshot.FeatureSubsetIndices ??= [];
+        snapshot.LearnerActivations ??= [];
         snapshot.ElmWinsorizeLowerBounds ??= [];
         snapshot.ElmWinsorizeUpperBounds ??= [];
         snapshot.MetaLabelTopFeatureIndices ??= [];
+        snapshot.ElmInverseGram ??= [];
+        snapshot.ElmInverseGramDim ??= [];
 
         int featureCount = snapshot.Features.Length > 0
             ? snapshot.Features.Length
@@ -213,8 +223,20 @@ internal static class ElmSnapshotSupport
         if (!IsElm(snapshot))
             return new ValidationResult(false, ["Snapshot is not an ELM snapshot."]);
 
-        var normalized = NormalizeSnapshotCopy(snapshot);
+        return ValidateNormalizedSnapshot(NormalizeSnapshotCopy(snapshot), allowLegacy);
+    }
+
+    internal static ValidationResult ValidateNormalizedSnapshot(ModelSnapshot normalized, bool allowLegacy)
+    {
         var issues = new List<string>();
+        var weights = normalized.Weights ?? [];
+        var biases = normalized.Biases ?? [];
+        var inputWeights = normalized.ElmInputWeights ?? [];
+        var inputBiases = normalized.ElmInputBiases ?? [];
+        var featureSubsets = normalized.FeatureSubsetIndices ?? [];
+        var learnerActivations = normalized.LearnerActivations ?? [];
+        var activeFeatureMask = normalized.ActiveFeatureMask ?? [];
+        var magWeights = normalized.MagWeights ?? [];
 
         int featureCount = normalized.Features.Length > 0
             ? normalized.Features.Length
@@ -226,9 +248,18 @@ internal static class ElmSnapshotSupport
             issues.Add("Means length does not match the serialized feature schema.");
         if (normalized.Stds.Length > 0 && normalized.Stds.Length != featureCount)
             issues.Add("Stds length does not match the serialized feature schema.");
-        if (normalized.ActiveFeatureMask.Length > 0 && normalized.ActiveFeatureMask.Length != featureCount)
+        if (normalized.RawFeatureIndices.Length > 0 && normalized.RawFeatureIndices.Length != featureCount)
+            issues.Add("RawFeatureIndices length does not match the serialized feature schema.");
+        if (normalized.RawFeatureIndices.Any(index => index < 0))
+            issues.Add("RawFeatureIndices contains a negative index.");
+        if (normalized.RawFeatureIndices.Length > 0 &&
+            normalized.RawFeatureIndices.Distinct().Count() != normalized.RawFeatureIndices.Length)
+        {
+            issues.Add("RawFeatureIndices contains duplicate indices.");
+        }
+        if (activeFeatureMask.Length > 0 && activeFeatureMask.Length != featureCount)
             issues.Add("ActiveFeatureMask length does not match the serialized feature schema.");
-        if (normalized.ActiveFeatureMask.Length > 0 && !normalized.ActiveFeatureMask.Any(v => v))
+        if (activeFeatureMask.Length > 0 && !activeFeatureMask.Any(v => v))
             issues.Add("ActiveFeatureMask disables every feature.");
         if (normalized.ElmWinsorizeLowerBounds.Length != normalized.ElmWinsorizeUpperBounds.Length)
             issues.Add("Winsorization bounds are ragged.");
@@ -236,6 +267,41 @@ internal static class ElmSnapshotSupport
             issues.Add("Winsorization bounds length does not match the serialized feature schema.");
         if (normalized.MetaLabelTopFeatureIndices.Any(i => i < 0 || i >= featureCount))
             issues.Add("MetaLabelTopFeatureIndices contain an out-of-range feature index.");
+        if (normalized.ElmHiddenDim <= 0)
+            issues.Add("ElmHiddenDim must be positive.");
+        if (weights.Length == 0)
+            issues.Add("Weights are missing.");
+        if (biases.Length != weights.Length)
+            issues.Add("Biases length does not match learner count.");
+        if (inputWeights.Length != weights.Length)
+            issues.Add("ElmInputWeights length does not match learner count.");
+        if (inputBiases.Length > 0 && inputBiases.Length != weights.Length)
+            issues.Add("ElmInputBiases length does not match learner count.");
+        if (featureSubsets.Length > 0 && featureSubsets.Length != weights.Length)
+        {
+            issues.Add("FeatureSubsetIndices length does not match learner count.");
+        }
+        if (learnerActivations.Length > 0 &&
+            learnerActivations.Length != 1 &&
+            learnerActivations.Length != weights.Length)
+        {
+            issues.Add("LearnerActivations length must be 1 or match learner count.");
+        }
+        if (normalized.BaseLearnersK > 0 && normalized.BaseLearnersK != weights.Length)
+            issues.Add("BaseLearnersK does not match learner count.");
+        if (normalized.PrunedFeatureCount < 0)
+            issues.Add("PrunedFeatureCount cannot be negative.");
+        if (activeFeatureMask.Length > 0 &&
+            normalized.PrunedFeatureCount != activeFeatureMask.Count(active => !active))
+        {
+            issues.Add("PrunedFeatureCount does not match ActiveFeatureMask.");
+        }
+        if (magWeights.Length > 0 && magWeights.Length != featureCount)
+            issues.Add("MagWeights length does not match the serialized feature schema.");
+
+        ValidateFeaturePipeline(normalized, featureCount, issues);
+        ValidateLearnerMetadata(normalized, featureCount, issues);
+        ValidateInverseGramMetadata(normalized, issues);
 
         if (!string.IsNullOrWhiteSpace(normalized.FeatureSchemaFingerprint))
         {
@@ -262,6 +328,153 @@ internal static class ElmSnapshotSupport
         }
 
         return new ValidationResult(issues.Count == 0, [..issues.Distinct()]);
+    }
+
+    private static void ValidateFeaturePipeline(ModelSnapshot snapshot, int featureCount, List<string> issues)
+    {
+        int rawFeatureCount = snapshot.RawFeatureIndices.Length > 0
+            ? snapshot.RawFeatureIndices.Max() + 1
+            : featureCount;
+
+        var descriptors = snapshot.FeaturePipelineDescriptors ?? [];
+        foreach (var descriptor in descriptors)
+        {
+            if (descriptor.InputFeatureCount != rawFeatureCount)
+                issues.Add("Feature pipeline descriptor input count does not match raw feature count.");
+            if (descriptor.SourceIndexGroups.Length == 0)
+                issues.Add("Feature pipeline descriptor must declare at least one source group.");
+
+            if (string.Equals(descriptor.Operation, FeaturePipelineTransformSupport.GroupSumInPlaceOperation, StringComparison.OrdinalIgnoreCase))
+            {
+                if (descriptor.OutputStartIndex != 0)
+                    issues.Add("In-place feature pipeline descriptors must start at index 0.");
+                if (descriptor.OutputCount != featureCount)
+                    issues.Add("In-place feature pipeline descriptors must preserve the full feature count.");
+            }
+            else
+            {
+                if (descriptor.OutputStartIndex < rawFeatureCount)
+                    issues.Add("Feature pipeline descriptor output start index overlaps raw features.");
+                if (descriptor.OutputCount != descriptor.SourceIndexGroups.Length)
+                    issues.Add("Feature pipeline descriptor output count does not match SourceIndexGroups length.");
+            }
+
+            foreach (var group in descriptor.SourceIndexGroups)
+            {
+                if (group.Length == 0)
+                {
+                    issues.Add("Feature pipeline descriptor source groups cannot be empty.");
+                    break;
+                }
+
+                foreach (int index in group)
+                {
+                    if (index < 0 || index >= rawFeatureCount)
+                    {
+                        issues.Add("Feature pipeline descriptor contains an out-of-range raw feature index.");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    private static void ValidateLearnerMetadata(ModelSnapshot snapshot, int featureCount, List<string> issues)
+    {
+        var inputWeightMatrix = snapshot.ElmInputWeights ?? [];
+        var inputBiasMatrix = snapshot.ElmInputBiases ?? [];
+        var featureSubsets = snapshot.FeatureSubsetIndices ?? [];
+
+        for (int k = 0; k < snapshot.Weights.Length; k++)
+        {
+            if (snapshot.Weights[k] is not { Length: > 0 } outputWeights)
+            {
+                issues.Add($"Learner {k} output weights are missing.");
+                continue;
+            }
+
+            if (k >= inputWeightMatrix.Length || inputWeightMatrix[k] is not { Length: > 0 } inputWeights)
+            {
+                issues.Add($"Learner {k} input weights are missing.");
+                continue;
+            }
+
+            int[] subset = featureSubsets.Length > k
+                ? featureSubsets[k] ?? []
+                : [];
+            if (subset.Length > 0)
+            {
+                if (subset.Any(index => index < 0 || index >= featureCount))
+                    issues.Add($"Learner {k} feature subset contains an out-of-range feature index.");
+                if (subset.Distinct().Count() != subset.Length)
+                    issues.Add($"Learner {k} feature subset contains duplicate feature indices.");
+            }
+
+            int effectiveInputWidth = subset.Length > 0 ? subset.Length : featureCount;
+            if (effectiveInputWidth <= 0)
+            {
+                issues.Add($"Learner {k} does not have any usable input features.");
+                continue;
+            }
+
+            if (inputWeights.Length % effectiveInputWidth != 0)
+            {
+                issues.Add($"Learner {k} input weight matrix length is not divisible by its effective input width.");
+                continue;
+            }
+
+            int hiddenFromInputs = inputWeights.Length / effectiveInputWidth;
+            if (hiddenFromInputs != outputWeights.Length)
+                issues.Add($"Learner {k} hidden dimension inferred from ElmInputWeights does not match output weights.");
+
+            if (inputBiasMatrix.Length > k && inputBiasMatrix[k] is { Length: > 0 } inputBiases)
+            {
+                if (inputBiases.Length != outputWeights.Length)
+                    issues.Add($"Learner {k} ElmInputBiases length does not match hidden dimension.");
+            }
+        }
+    }
+
+    private static void ValidateInverseGramMetadata(ModelSnapshot snapshot, List<string> issues)
+    {
+        if (snapshot.ElmInverseGram is not { Length: > 0 })
+            return;
+
+        if (snapshot.ElmInverseGramDim is not { Length: > 0 } inverseGramDims ||
+            inverseGramDims.Length != snapshot.ElmInverseGram.Length)
+        {
+            issues.Add("ElmInverseGramDim length does not match ElmInverseGram length.");
+            return;
+        }
+
+        if (snapshot.ElmInverseGram.Length != snapshot.Weights.Length)
+            issues.Add("ElmInverseGram length does not match learner count.");
+
+        for (int k = 0; k < Math.Min(snapshot.ElmInverseGram.Length, snapshot.Weights.Length); k++)
+        {
+            int gramDim = inverseGramDims[k];
+            if (gramDim <= 0)
+            {
+                issues.Add($"Learner {k} inverse Gram dimension must be positive.");
+                continue;
+            }
+
+            if (snapshot.ElmInverseGram[k] is not { Length: > 0 } inverseGram)
+            {
+                issues.Add($"Learner {k} inverse Gram matrix is missing.");
+                continue;
+            }
+
+            if (inverseGram.Length != gramDim * gramDim)
+            {
+                issues.Add($"Learner {k} inverse Gram matrix length does not match ElmInverseGramDim.");
+                continue;
+            }
+
+            int hiddenSize = snapshot.Weights[k]?.Length ?? 0;
+            if (hiddenSize > 0 && gramDim != hiddenSize && gramDim != hiddenSize + 1)
+                issues.Add($"Learner {k} inverse Gram dimension is inconsistent with hidden dimension.");
+        }
     }
 
     private static string ComputeSha256(string payload)

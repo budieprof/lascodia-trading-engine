@@ -10,6 +10,7 @@ namespace LascodiaTradingEngine.Application.Optimization;
 
 internal sealed record OptimizationRunPersistenceContext(
     OptimizationRun Run,
+    Guid ExpectedLeaseToken,
     Strategy Strategy,
     IReadOnlyList<Candle> Candles,
     IReadOnlyList<Candle> TrainCandles,
@@ -28,16 +29,19 @@ public sealed class OptimizationRunPersistenceService
 {
     private readonly ILogger<OptimizationRunPersistenceService> _logger;
     private readonly OptimizationRunMetadataService _runMetadataService;
+    private readonly OptimizationRunOwnedMutationGuard _ownedMutationGuard;
     private readonly TimeProvider _timeProvider;
     private DateTime UtcNow => _timeProvider.GetUtcNow().UtcDateTime;
 
     public OptimizationRunPersistenceService(
         ILogger<OptimizationRunPersistenceService> logger,
         OptimizationRunMetadataService runMetadataService,
+        OptimizationRunOwnedMutationGuard ownedMutationGuard,
         TimeProvider timeProvider)
     {
         _logger = logger;
         _runMetadataService = runMetadataService;
+        _ownedMutationGuard = ownedMutationGuard;
         _timeProvider = timeProvider;
     }
 
@@ -104,6 +108,12 @@ public sealed class OptimizationRunPersistenceService
         run.CompletionPublicationCompletedAt = null;
         run.CompletionPublicationErrorMessage = null;
         run.LifecycleReconciledAt = null;
-        await writeCtx.SaveChangesAsync(ct);
+        await _ownedMutationGuard.SaveChangesOrThrowAsync(
+            writeCtx.GetDbContext(),
+            writeCtx,
+            run,
+            context.ExpectedLeaseToken,
+            ct,
+            "OptimizationRunPersistenceService: lease ownership changed before persisting terminal result for run {RunId}");
     }
 }

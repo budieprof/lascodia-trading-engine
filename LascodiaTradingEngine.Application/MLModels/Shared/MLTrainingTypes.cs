@@ -1724,7 +1724,24 @@ public record TrainingHyperparams(
     /// Explicit FT-Transformer stacked-layer override.
     /// 0 = use the warm-start architecture when available, otherwise the trainer default.
     /// </summary>
-    int FtTransformerArchitectureNumLayers = 0
+    int FtTransformerArchitectureNumLayers = 0,
+    /// <summary>
+    /// Deterministic root seed for trainers that need repeatable bagging, validation splits,
+    /// and auxiliary searches. 0 falls back to a trainer-specific default.
+    /// </summary>
+    int TrainingRandomSeed = 42,
+    double AdaBoostWinsorizePercentile = 0.0,
+    double AdaBoostMaxAdversarialAuc = 0.0,
+    double ElmMaxAdversarialAuc = 0.0,
+    double GbmMaxAdversarialAuc = 0.0,
+    double TcnMaxAdversarialAuc = 0.0,
+    double BaggedLogisticMaxAdversarialAuc = 0.0,
+    double DannMaxAdversarialAuc = 0.0,
+    double FtTransformerMaxAdversarialAuc = 0.0,
+    double QrfMaxAdversarialAuc = 0.0,
+    double RocketMaxAdversarialAuc = 0.0,
+    double SmoteMaxAdversarialAuc = 0.0,
+    double SvgpMaxAdversarialAuc = 0.0
     );
 
 // ── Evaluation metrics ────────────────────────────────────────────────────────
@@ -1995,6 +2012,25 @@ public class FtTransformerMetricSummary
 }
 
 /// <summary>
+/// Compact metrics persisted for key GBM model-selection/evaluation splits.
+/// </summary>
+public class GbmMetricSummary
+{
+    public string SplitName { get; set; } = string.Empty;
+    public int SampleCount { get; set; }
+    public double Threshold { get; set; }
+    public double Accuracy { get; set; }
+    public double Precision { get; set; }
+    public double Recall { get; set; }
+    public double F1 { get; set; }
+    public double ExpectedValue { get; set; }
+    public double BrierScore { get; set; }
+    public double WeightedAccuracy { get; set; }
+    public double SharpeRatio { get; set; }
+    public double Ece { get; set; }
+}
+
+/// <summary>
 /// Structured FT-Transformer calibration summary persisted with the snapshot.
 /// </summary>
 public class FtTransformerCalibrationArtifact
@@ -2003,20 +2039,29 @@ public class FtTransformerCalibrationArtifact
     public string CalibrationSelectionStrategy { get; set; } = "FIT_ON_FIT_EVAL_ON_DIAGNOSTICS";
     public double GlobalPlattNll { get; set; }
     public double TemperatureNll { get; set; }
+    public double GlobalPlattEce { get; set; }
+    public double TemperatureEce { get; set; }
     public bool TemperatureSelected { get; set; }
     public string AdaptiveHeadMode { get; set; } = "DISJOINT_DIAGNOSTICS";
     public int AdaptiveHeadCrossFitFoldCount { get; set; }
     public int FitSampleCount { get; set; }
     public int DiagnosticsSampleCount { get; set; }
+    public int RefitSampleCount { get; set; }
     public int ThresholdSelectionSampleCount { get; set; }
     public int KellySelectionSampleCount { get; set; }
     public double DiagnosticsSelectedGlobalNll { get; set; }
+    public double DiagnosticsSelectedGlobalEce { get; set; }
     public double DiagnosticsSelectedStackNll { get; set; }
+    public double DiagnosticsSelectedStackEce { get; set; }
     public int ConformalSampleCount { get; set; }
     public string ConformalSelectionStrategy { get; set; } = "DISJOINT_HOLDOUT";
     public double ConditionalRoutingThreshold { get; set; } = 0.5;
     public int RoutingThresholdCandidateCount { get; set; }
     public double RoutingThresholdSelectedNll { get; set; }
+    public double RoutingThresholdSelectedEce { get; set; }
+    public double[] RoutingThresholdCandidates { get; set; } = [];
+    public double[] RoutingThresholdCandidateNlls { get; set; } = [];
+    public double[] RoutingThresholdCandidateEces { get; set; } = [];
     public int BuyBranchSampleCount { get; set; }
     public double BuyBranchBaselineNll { get; set; }
     public double BuyBranchFittedNll { get; set; }
@@ -2029,7 +2074,11 @@ public class FtTransformerCalibrationArtifact
     public int IsotonicBreakpointCount { get; set; }
     public double PreIsotonicNll { get; set; }
     public double PostIsotonicNll { get; set; }
+    public double PreIsotonicEce { get; set; }
+    public double PostIsotonicEce { get; set; }
     public bool IsotonicAccepted { get; set; }
+    public double[] SelectedStackCrossFitFoldNlls { get; set; } = [];
+    public double[] SelectedStackCrossFitFoldEces { get; set; } = [];
 }
 
 /// <summary>
@@ -2067,6 +2116,364 @@ public class GbmCalibrationArtifact
     public bool IsotonicAccepted { get; set; }
 }
 
+public class GbmDriftArtifact
+{
+    public int NonStationaryFeatureCount { get; set; }
+    public int TotalFeatureCount { get; set; }
+    public double NonStationaryFraction { get; set; }
+    public bool GateTriggered { get; set; }
+    public string GateAction { get; set; } = "PASS";
+    public string[] FlaggedFeatures { get; set; } = [];
+    public double MeanLag1Autocorrelation { get; set; }
+    public double MeanPopulationStabilityIndex { get; set; }
+    public double MeanChangePointScore { get; set; }
+    public double MeanAdfLikeStatistic { get; set; }
+    public double MeanKpssLikeStatistic { get; set; }
+    public double FracDiffDApplied { get; set; }
+}
+
+public class GbmWarmStartArtifact
+{
+    public bool Attempted { get; set; }
+    public bool Compatible { get; set; }
+    public int ReusedTreeCount { get; set; }
+    public int TotalParentTrees { get; set; }
+    public double ReuseRatio { get; set; }
+    public bool PreprocessingReused { get; set; }
+    public bool FeatureLayoutInherited { get; set; }
+    public bool OobReplayApplied { get; set; }
+    public string[] CompatibilityIssues { get; set; } = [];
+}
+
+/// <summary>
+/// Structured TCN calibration summary persisted with the snapshot.
+/// </summary>
+public class TcnCalibrationArtifact
+{
+    public string SelectedGlobalCalibration { get; set; } = "PLATT";
+    public string CalibrationSelectionStrategy { get; set; } = "FIT_ON_CALIBRATION_HOLDOUT";
+    public double GlobalPlattA { get; set; } = 1.0;
+    public double GlobalPlattB { get; set; }
+    public double TemperatureScale { get; set; }
+    public double BuyBranchPlattA { get; set; } = 1.0;
+    public double BuyBranchPlattB { get; set; }
+    public double SellBranchPlattA { get; set; } = 1.0;
+    public double SellBranchPlattB { get; set; }
+    public double ConditionalRoutingThreshold { get; set; } = 0.5;
+    public double[] IsotonicBreakpoints { get; set; } = [];
+    public double OptimalThreshold { get; set; } = 0.5;
+    public double ConformalQHat { get; set; } = 1.0;
+    public int CalibrationSampleCount { get; set; }
+    public int DiagnosticsSampleCount { get; set; }
+    public int BuyBranchSampleCount { get; set; }
+    public int SellBranchSampleCount { get; set; }
+    public int IsotonicSampleCount { get; set; }
+    public int IsotonicBreakpointCount { get; set; }
+}
+
+/// <summary>
+/// Structured TCN warm-start compatibility and reuse summary.
+/// </summary>
+public class TcnWarmStartArtifact
+{
+    public bool Compatible { get; set; }
+    public string[] CompatibilityIssues { get; set; } = [];
+    public int ReusedBlockCount { get; set; }
+    public int DroppedBlockCount { get; set; }
+    public double ReuseRatio { get; set; }
+}
+
+/// <summary>
+/// Structured TCN post-train parity and contract audit artifact.
+/// </summary>
+public class TcnAuditArtifact
+{
+    public bool SnapshotContractValid { get; set; }
+    public int AuditedSampleCount { get; set; }
+    public int ActiveChannelCount { get; set; }
+    public int RawFeatureCount { get; set; }
+    public double MaxRawParityError { get; set; }
+    public double MeanRawParityError { get; set; }
+    public double MaxDeployedCalibrationDelta { get; set; }
+    public int ThresholdDecisionMismatchCount { get; set; }
+    public double RecordedEce { get; set; }
+    public string FeatureSchemaFingerprint { get; set; } = string.Empty;
+    public string PreprocessingFingerprint { get; set; } = string.Empty;
+    public string[] Findings { get; set; } = [];
+}
+
+public class TcnDriftArtifact
+{
+    public int NonStationaryFeatureCount { get; set; }
+    public int TotalFeatureCount { get; set; }
+    public double NonStationaryFraction { get; set; }
+    public bool GateTriggered { get; set; }
+    public string GateAction { get; set; } = "PASS";
+    public string[] FlaggedFeatures { get; set; } = [];
+    public double MeanLag1Autocorrelation { get; set; }
+    public double MeanPopulationStabilityIndex { get; set; }
+    public double MeanChangePointScore { get; set; }
+    public double MeanAdfLikeStatistic { get; set; }
+    public double MeanKpssLikeStatistic { get; set; }
+    public double FracDiffDApplied { get; set; }
+}
+
+/// <summary>
+/// Compact metrics persisted for key AdaBoost model-selection/evaluation splits.
+/// </summary>
+public class AdaBoostMetricSummary
+{
+    public string SplitName { get; set; } = string.Empty;
+    public int SampleCount { get; set; }
+    public double Threshold { get; set; }
+    public double Accuracy { get; set; }
+    public double Precision { get; set; }
+    public double Recall { get; set; }
+    public double F1 { get; set; }
+    public double ExpectedValue { get; set; }
+    public double BrierScore { get; set; }
+    public double WeightedAccuracy { get; set; }
+    public double SharpeRatio { get; set; }
+    public double Ece { get; set; }
+}
+
+/// <summary>
+/// Structured AdaBoost calibration summary persisted with the snapshot.
+/// </summary>
+public class AdaBoostCalibrationArtifact
+{
+    public string SelectedGlobalCalibration { get; set; } = "PLATT";
+    public string CalibrationSelectionStrategy { get; set; } = "FIT_AND_EVAL_ON_SHARED_CALIBRATION";
+    public double GlobalPlattNll { get; set; }
+    public double TemperatureNll { get; set; }
+    public bool TemperatureSelected { get; set; }
+    public int FitSampleCount { get; set; }
+    public int DiagnosticsSampleCount { get; set; }
+    public int ThresholdSelectionSampleCount { get; set; }
+    public int KellySelectionSampleCount { get; set; }
+    public double DiagnosticsSelectedGlobalNll { get; set; }
+    public double DiagnosticsSelectedStackNll { get; set; }
+    public int ConformalSampleCount { get; set; }
+    public int BuyConformalSampleCount { get; set; }
+    public int SellConformalSampleCount { get; set; }
+    public int MetaLabelSampleCount { get; set; }
+    public int AbstentionSampleCount { get; set; }
+    public string AdaptiveHeadMode { get; set; } = "SHARED";
+    public int AdaptiveHeadCrossFitFoldCount { get; set; }
+    public double ConditionalRoutingThreshold { get; set; } = 0.5;
+    public int BuyBranchSampleCount { get; set; }
+    public double BuyBranchBaselineNll { get; set; }
+    public double BuyBranchFittedNll { get; set; }
+    public bool BuyBranchAccepted { get; set; }
+    public int SellBranchSampleCount { get; set; }
+    public double SellBranchBaselineNll { get; set; }
+    public double SellBranchFittedNll { get; set; }
+    public bool SellBranchAccepted { get; set; }
+    public int IsotonicSampleCount { get; set; }
+    public int IsotonicBreakpointCount { get; set; }
+    public double PreIsotonicNll { get; set; }
+    public double PostIsotonicNll { get; set; }
+    public bool IsotonicAccepted { get; set; }
+}
+
+/// <summary>
+/// Structured AdaBoost post-train parity and contract audit artifact.
+/// </summary>
+public class AdaBoostAuditArtifact
+{
+    public bool SnapshotContractValid { get; set; }
+    public int AuditedSampleCount { get; set; }
+    public int ActiveFeatureCount { get; set; }
+    public int RawFeatureCount { get; set; }
+    public double MaxRawParityError { get; set; }
+    public double MeanRawParityError { get; set; }
+    public double MaxDeployedCalibrationDelta { get; set; }
+    public int ThresholdDecisionMismatchCount { get; set; }
+    public double RecordedEce { get; set; }
+    public string FeatureSchemaFingerprint { get; set; } = string.Empty;
+    public string PreprocessingFingerprint { get; set; } = string.Empty;
+    public string[] Findings { get; set; } = [];
+}
+
+public class AdaBoostDriftArtifact
+{
+    public int NonStationaryFeatureCount { get; set; }
+    public int TotalFeatureCount { get; set; }
+    public double NonStationaryFraction { get; set; }
+    public bool GateTriggered { get; set; }
+    public string GateAction { get; set; } = "PASS";
+    public string[] FlaggedFeatures { get; set; } = [];
+    public double MeanLag1Autocorrelation { get; set; }
+    public double MeanPopulationStabilityIndex { get; set; }
+    public double MeanChangePointScore { get; set; }
+    public double MeanAdfLikeStatistic { get; set; }
+    public double MeanKpssLikeStatistic { get; set; }
+    public double FracDiffDApplied { get; set; }
+}
+
+public class ElmDriftArtifact
+{
+    public int NonStationaryFeatureCount { get; set; }
+    public int TotalFeatureCount { get; set; }
+    public double NonStationaryFraction { get; set; }
+    public bool GateTriggered { get; set; }
+    public string GateAction { get; set; } = "PASS";
+    public string[] FlaggedFeatures { get; set; } = [];
+    public double MeanLag1Autocorrelation { get; set; }
+    public double MeanPopulationStabilityIndex { get; set; }
+    public double MeanChangePointScore { get; set; }
+    public double MeanAdfLikeStatistic { get; set; }
+    public double MeanKpssLikeStatistic { get; set; }
+    public double FracDiffDApplied { get; set; }
+}
+
+public class ElmWarmStartArtifact
+{
+    public bool Attempted { get; set; }
+    public bool Compatible { get; set; }
+    public int ReusedLearnerCount { get; set; }
+    public int TotalParentLearners { get; set; }
+    public double ReuseRatio { get; set; }
+    public bool InputWeightsTransferred { get; set; }
+    public bool PruningRemapped { get; set; }
+    public string[] CompatibilityIssues { get; set; } = [];
+}
+
+public class ElmAuditArtifact
+{
+    public bool SnapshotContractValid { get; set; }
+    public int AuditedSampleCount { get; set; }
+    public double MaxRawParityError { get; set; }
+    public double MeanRawParityError { get; set; }
+    public double MaxDeployedCalibrationDelta { get; set; }
+    public int ThresholdDecisionMismatchCount { get; set; }
+    public string[] Findings { get; set; } = [];
+}
+
+public class BaggedLogisticDriftArtifact
+{
+    public int NonStationaryFeatureCount { get; set; }
+    public int TotalFeatureCount { get; set; }
+    public double NonStationaryFraction { get; set; }
+    public bool GateTriggered { get; set; }
+    public string GateAction { get; set; } = "PASS";
+    public string[] FlaggedFeatures { get; set; } = [];
+    public double MeanLag1Autocorrelation { get; set; }
+    public double MeanPopulationStabilityIndex { get; set; }
+    public double MeanChangePointScore { get; set; }
+    public double MeanAdfLikeStatistic { get; set; }
+    public double MeanKpssLikeStatistic { get; set; }
+    public double FracDiffDApplied { get; set; }
+}
+
+public class BaggedLogisticWarmStartArtifact
+{
+    public bool Attempted { get; set; }
+    public bool Compatible { get; set; }
+    public int ReusedLearnerCount { get; set; }
+    public int TotalParentLearners { get; set; }
+    public double ReuseRatio { get; set; }
+    public string[] CompatibilityIssues { get; set; } = [];
+}
+
+public class BaggedLogisticAuditArtifact
+{
+    public bool SnapshotContractValid { get; set; }
+    public int AuditedSampleCount { get; set; }
+    public double MaxRawParityError { get; set; }
+    public double MeanRawParityError { get; set; }
+    public double MaxDeployedCalibrationDelta { get; set; }
+    public int ThresholdDecisionMismatchCount { get; set; }
+    public string[] Findings { get; set; } = [];
+}
+
+public class QrfDriftArtifact
+{
+    public int NonStationaryFeatureCount { get; set; }
+    public int TotalFeatureCount { get; set; }
+    public double NonStationaryFraction { get; set; }
+    public bool GateTriggered { get; set; }
+    public string GateAction { get; set; } = "PASS";
+    public string[] FlaggedFeatures { get; set; } = [];
+    public double MeanLag1Autocorrelation { get; set; }
+    public double MeanPopulationStabilityIndex { get; set; }
+    public double MeanChangePointScore { get; set; }
+    public double MeanAdfLikeStatistic { get; set; }
+    public double MeanKpssLikeStatistic { get; set; }
+    public double FracDiffDApplied { get; set; }
+}
+
+public class QrfWarmStartArtifact
+{
+    public bool Attempted { get; set; }
+    public bool Compatible { get; set; }
+    public int ReusedTreeCount { get; set; }
+    public int TotalParentTrees { get; set; }
+    public double ReuseRatio { get; set; }
+    public string[] CompatibilityIssues { get; set; } = [];
+}
+
+public class QrfAuditArtifact
+{
+    public bool SnapshotContractValid { get; set; }
+    public int AuditedSampleCount { get; set; }
+    public double MaxRawParityError { get; set; }
+    public double MeanRawParityError { get; set; }
+    public double MaxDeployedCalibrationDelta { get; set; }
+    public int ThresholdDecisionMismatchCount { get; set; }
+    public string[] Findings { get; set; } = [];
+}
+
+public class DannDriftArtifact
+{
+    public int NonStationaryFeatureCount { get; set; }
+    public int TotalFeatureCount { get; set; }
+    public double NonStationaryFraction { get; set; }
+    public bool GateTriggered { get; set; }
+    public string GateAction { get; set; } = "PASS";
+    public string[] FlaggedFeatures { get; set; } = [];
+    public double MeanLag1Autocorrelation { get; set; }
+    public double MeanPopulationStabilityIndex { get; set; }
+    public double MeanChangePointScore { get; set; }
+    public double MeanAdfLikeStatistic { get; set; }
+    public double MeanKpssLikeStatistic { get; set; }
+    public double FracDiffDApplied { get; set; }
+}
+
+public class DannWarmStartArtifact
+{
+    public bool Attempted { get; set; }
+    public bool Compatible { get; set; }
+    public int ReusedLayerCount { get; set; }
+    public int TotalParentLayers { get; set; }
+    public double ReuseRatio { get; set; }
+    public string[] CompatibilityIssues { get; set; } = [];
+}
+
+public class DannAuditArtifact
+{
+    public bool SnapshotContractValid { get; set; }
+    public int AuditedSampleCount { get; set; }
+    public double MaxRawParityError { get; set; }
+    public double MeanRawParityError { get; set; }
+    public double MaxDeployedCalibrationDelta { get; set; }
+    public int ThresholdDecisionMismatchCount { get; set; }
+    public string[] Findings { get; set; } = [];
+}
+
+public class AdaBoostWarmStartArtifact
+{
+    public bool Attempted { get; set; }
+    public bool Compatible { get; set; }
+    public int ReusedStumpCount { get; set; }
+    public int SkippedStumpCount { get; set; }
+    public int TotalParentStumps { get; set; }
+    public double ReuseRatio { get; set; }
+    public bool WeightReplayApplied { get; set; }
+    public bool WeightReplaySkippedDueToRegimeChange { get; set; }
+    public string[] CompatibilityIssues { get; set; } = [];
+}
+
 /// <summary>
 /// FT-Transformer warm-start compatibility summary.
 /// </summary>
@@ -2092,6 +2499,27 @@ public class FtTransformerAuditArtifact
     public double MaxRawParityError { get; set; }
     public double MeanRawParityError { get; set; }
     public double MaxDeployedCalibrationDelta { get; set; }
+    public int ThresholdDecisionMismatchCount { get; set; }
+    public double RecordedEce { get; set; }
+    public string FeatureSchemaFingerprint { get; set; } = string.Empty;
+    public string PreprocessingFingerprint { get; set; } = string.Empty;
+    public string[] Findings { get; set; } = [];
+}
+
+/// <summary>
+/// Structured GBM post-train parity and contract audit artifact.
+/// </summary>
+public class GbmAuditArtifact
+{
+    public bool SnapshotContractValid { get; set; }
+    public int AuditedSampleCount { get; set; }
+    public int ActiveFeatureCount { get; set; }
+    public int RawFeatureCount { get; set; }
+    public double MaxRawParityError { get; set; }
+    public double MeanRawParityError { get; set; }
+    public double MaxDeployedCalibrationDelta { get; set; }
+    public double MaxTransformReplayShift { get; set; }
+    public double MaxMaskApplicationShift { get; set; }
     public int ThresholdDecisionMismatchCount { get; set; }
     public double RecordedEce { get; set; }
     public string FeatureSchemaFingerprint { get; set; } = string.Empty;
@@ -2127,6 +2555,134 @@ public class TabNetDriftArtifact
     public string[] FlaggedFeatures { get; set; } = [];
 }
 
+public class RocketDriftArtifact
+{
+    public int NonStationaryFeatureCount { get; set; }
+    public int TotalFeatureCount { get; set; }
+    public double NonStationaryFraction { get; set; }
+    public bool GateTriggered { get; set; }
+    public string GateAction { get; set; } = "PASS";
+    public string[] FlaggedFeatures { get; set; } = [];
+    public double MeanLag1Autocorrelation { get; set; }
+    public double MeanPopulationStabilityIndex { get; set; }
+    public double MeanChangePointScore { get; set; }
+    public double MeanAdfLikeStatistic { get; set; }
+    public double MeanKpssLikeStatistic { get; set; }
+    public double FracDiffDApplied { get; set; }
+}
+
+public class RocketWarmStartArtifact
+{
+    public bool Attempted { get; set; }
+    public bool Compatible { get; set; }
+    public int ReusedKernelCount { get; set; }
+    public int TotalParentKernels { get; set; }
+    public double ReuseRatio { get; set; }
+    public string[] CompatibilityIssues { get; set; } = [];
+}
+
+public class RocketAuditArtifact
+{
+    public bool SnapshotContractValid { get; set; }
+    public int AuditedSampleCount { get; set; }
+    public double MaxRawParityError { get; set; }
+    public double MeanRawParityError { get; set; }
+    public double MaxDeployedCalibrationDelta { get; set; }
+    public int ThresholdDecisionMismatchCount { get; set; }
+    public string[] Findings { get; set; } = [];
+}
+
+public class FtTransformerDriftArtifact
+{
+    public int NonStationaryFeatureCount { get; set; }
+    public int TotalFeatureCount { get; set; }
+    public double NonStationaryFraction { get; set; }
+    public bool GateTriggered { get; set; }
+    public string GateAction { get; set; } = "PASS";
+    public string[] FlaggedFeatures { get; set; } = [];
+    public double MeanLag1Autocorrelation { get; set; }
+    public double MeanPopulationStabilityIndex { get; set; }
+    public double MeanChangePointScore { get; set; }
+    public double MeanAdfLikeStatistic { get; set; }
+    public double MeanKpssLikeStatistic { get; set; }
+    public double FracDiffDApplied { get; set; }
+}
+
+public class SmoteDriftArtifact
+{
+    public int NonStationaryFeatureCount { get; set; }
+    public int TotalFeatureCount { get; set; }
+    public double NonStationaryFraction { get; set; }
+    public bool GateTriggered { get; set; }
+    public string GateAction { get; set; } = "PASS";
+    public string[] FlaggedFeatures { get; set; } = [];
+    public double MeanLag1Autocorrelation { get; set; }
+    public double MeanPopulationStabilityIndex { get; set; }
+    public double MeanChangePointScore { get; set; }
+    public double MeanAdfLikeStatistic { get; set; }
+    public double MeanKpssLikeStatistic { get; set; }
+    public double FracDiffDApplied { get; set; }
+}
+
+public class SmoteWarmStartArtifact
+{
+    public bool Attempted { get; set; }
+    public bool Compatible { get; set; }
+    public int ReusedLearnerCount { get; set; }
+    public int TotalParentLearners { get; set; }
+    public double ReuseRatio { get; set; }
+    public string[] CompatibilityIssues { get; set; } = [];
+}
+
+public class SmoteAuditArtifact
+{
+    public bool SnapshotContractValid { get; set; }
+    public int AuditedSampleCount { get; set; }
+    public double MaxRawParityError { get; set; }
+    public double MeanRawParityError { get; set; }
+    public double MaxDeployedCalibrationDelta { get; set; }
+    public int ThresholdDecisionMismatchCount { get; set; }
+    public string[] Findings { get; set; } = [];
+}
+
+public class SvgpDriftArtifact
+{
+    public int NonStationaryFeatureCount { get; set; }
+    public int TotalFeatureCount { get; set; }
+    public double NonStationaryFraction { get; set; }
+    public bool GateTriggered { get; set; }
+    public string GateAction { get; set; } = "PASS";
+    public string[] FlaggedFeatures { get; set; } = [];
+    public double MeanLag1Autocorrelation { get; set; }
+    public double MeanPopulationStabilityIndex { get; set; }
+    public double MeanChangePointScore { get; set; }
+    public double MeanAdfLikeStatistic { get; set; }
+    public double MeanKpssLikeStatistic { get; set; }
+    public double FracDiffDApplied { get; set; }
+}
+
+public class SvgpWarmStartArtifact
+{
+    public bool Attempted { get; set; }
+    public bool Compatible { get; set; }
+    public int ReusedInducingPointCount { get; set; }
+    public int TotalParentInducingPoints { get; set; }
+    public double ReuseRatio { get; set; }
+    public bool ArdLengthScalesTransferred { get; set; }
+    public string[] CompatibilityIssues { get; set; } = [];
+}
+
+public class SvgpAuditArtifact
+{
+    public bool SnapshotContractValid { get; set; }
+    public int AuditedSampleCount { get; set; }
+    public double MaxRawParityError { get; set; }
+    public double MeanRawParityError { get; set; }
+    public double MaxDeployedCalibrationDelta { get; set; }
+    public int ThresholdDecisionMismatchCount { get; set; }
+    public string[] Findings { get; set; } = [];
+}
+
 /// <summary>
 /// Structured train/selection/calibration/test split summary persisted for reproducibility.
 /// </summary>
@@ -2144,6 +2700,8 @@ public class TrainingSplitSummary
     public int SelectionPruningCount { get; set; }
     public int SelectionThresholdStartIndex { get; set; }
     public int SelectionThresholdCount { get; set; }
+    public int SelectionKellyStartIndex { get; set; }
+    public int SelectionKellyCount { get; set; }
     public int CalibrationStartIndex { get; set; }
     public int CalibrationCount { get; set; }
     public int CalibrationFitStartIndex { get; set; }
@@ -2213,7 +2771,7 @@ public class ModelSnapshot
     /// </summary>
     public string TrainerFingerprint { get; set; } = string.Empty;
     /// <summary>
-    /// Deterministic seed used by the trainer to initialise TabNet weights and auxiliary searches.
+    /// Deterministic seed used by the trainer to initialise model weights and auxiliary searches.
     /// </summary>
     public int TrainingRandomSeed { get; set; }
     /// <summary>
@@ -2245,6 +2803,18 @@ public class ModelSnapshot
     /// </summary>
     public FtTransformerMetricSummary? FtTransformerTestMetrics { get; set; }
     /// <summary>
+    /// Split-scoped metrics for the GBM threshold-selection / pruning evaluation slice.
+    /// </summary>
+    public GbmMetricSummary? GbmSelectionMetrics { get; set; }
+    /// <summary>
+    /// Split-scoped metrics for the GBM post-fit calibration diagnostics slice.
+    /// </summary>
+    public GbmMetricSummary? GbmCalibrationMetrics { get; set; }
+    /// <summary>
+    /// Split-scoped metrics for the GBM final held-out test window.
+    /// </summary>
+    public GbmMetricSummary? GbmTestMetrics { get; set; }
+    /// <summary>
     /// Structured FT-Transformer calibration summary.
     /// </summary>
     public FtTransformerCalibrationArtifact? FtTransformerCalibrationArtifact { get; set; }
@@ -2252,6 +2822,36 @@ public class ModelSnapshot
     /// Structured GBM calibration summary.
     /// </summary>
     public GbmCalibrationArtifact? GbmCalibrationArtifact { get; set; }
+    public GbmDriftArtifact? GbmDriftArtifact { get; set; }
+    public GbmWarmStartArtifact? GbmWarmStartArtifact { get; set; }
+    public double GbmCalibrationResidualMean { get; set; }
+    public double GbmCalibrationResidualStd { get; set; }
+    public double GbmCalibrationResidualThreshold { get; set; }
+    /// <summary>
+    /// Split-scoped metrics for the AdaBoost selection holdout.
+    /// </summary>
+    public AdaBoostMetricSummary? AdaBoostSelectionMetrics { get; set; }
+    /// <summary>
+    /// Split-scoped metrics for the AdaBoost calibration diagnostics slice.
+    /// </summary>
+    public AdaBoostMetricSummary? AdaBoostCalibrationMetrics { get; set; }
+    /// <summary>
+    /// Split-scoped metrics for the AdaBoost final test window.
+    /// </summary>
+    public AdaBoostMetricSummary? AdaBoostTestMetrics { get; set; }
+    /// <summary>
+    /// Structured AdaBoost calibration summary.
+    /// </summary>
+    public AdaBoostCalibrationArtifact? AdaBoostCalibrationArtifact { get; set; }
+    /// <summary>
+    /// AdaBoost post-train parity and contract audit artifact.
+    /// </summary>
+    public AdaBoostAuditArtifact? AdaBoostAuditArtifact { get; set; }
+    public AdaBoostDriftArtifact? AdaBoostDriftArtifact { get; set; }
+    public AdaBoostWarmStartArtifact? AdaBoostWarmStartArtifact { get; set; }
+    public double AdaBoostCalibrationResidualMean { get; set; }
+    public double AdaBoostCalibrationResidualStd { get; set; }
+    public double AdaBoostCalibrationResidualThreshold { get; set; }
     /// <summary>
     /// FT-Transformer warm-start compatibility summary.
     /// </summary>
@@ -2260,6 +2860,14 @@ public class ModelSnapshot
     /// FT-Transformer post-train parity and contract audit artifact.
     /// </summary>
     public FtTransformerAuditArtifact? FtTransformerAuditArtifact { get; set; }
+    public FtTransformerDriftArtifact? FtTransformerDriftArtifact { get; set; }
+    public double FtTransformerCalibrationResidualMean { get; set; }
+    public double FtTransformerCalibrationResidualStd { get; set; }
+    public double FtTransformerCalibrationResidualThreshold { get; set; }
+    /// <summary>
+    /// GBM post-train parity and contract audit artifact.
+    /// </summary>
+    public GbmAuditArtifact? GbmAuditArtifact { get; set; }
     public float[]  Means         { get; set; } = [];
     public float[]  Stds          { get; set; } = [];
 
@@ -2660,7 +3268,7 @@ public class ModelSnapshot
 
     /// <summary>
     /// Number of warm-start retrains from the original cold-start ancestor.
-    /// 1 = this model was cold-started in the current lineage convention.
+    /// 0 = this model was cold-started in the current lineage convention.
     /// Warm-start retrains increment from the parent's <see cref="GenerationNumber"/> + 1.
     /// </summary>
     public int GenerationNumber { get; set; }
@@ -2933,6 +3541,23 @@ public class ModelSnapshot
     /// </summary>
     public double[] TcnChannelImportanceScores { get; set; } = [];
 
+    /// <summary>Structured deployed-calibration artifact for TCN snapshots.</summary>
+    public TcnCalibrationArtifact? TcnCalibrationArtifact { get; set; }
+
+    /// <summary>Structured warm-start compatibility and reuse summary for TCN snapshots.</summary>
+    public TcnWarmStartArtifact? TcnWarmStartArtifact { get; set; }
+
+    /// <summary>Structured post-train audit artifact for TCN snapshots.</summary>
+    public TcnAuditArtifact? TcnAuditArtifact { get; set; }
+
+    public TcnDriftArtifact? TcnDriftArtifact { get; set; }
+    public double TcnCalibrationResidualMean { get; set; }
+    public double TcnCalibrationResidualStd { get; set; }
+    public double TcnCalibrationResidualThreshold { get; set; }
+
+    /// <summary>Maximum absolute difference between trainer raw probability and persisted-snapshot TCN inference on audited samples.</summary>
+    public double TcnTrainInferenceParityMaxError { get; set; }
+
     // ── Rec #50: Per-regime temperature scaling ───────────────────────────────
 
     /// <summary>
@@ -2997,6 +3622,17 @@ public class ModelSnapshot
     public int SwaCheckpointCount { get; set; }
 
     public int SmoteSeed { get; set; }
+    public SmoteDriftArtifact? SmoteDriftArtifact { get; set; }
+    public SmoteWarmStartArtifact? SmoteWarmStartArtifact { get; set; }
+    public SmoteAuditArtifact? SmoteAuditArtifact { get; set; }
+    public double SmoteCalibrationResidualMean { get; set; }
+    public double SmoteCalibrationResidualStd { get; set; }
+    public double SmoteCalibrationResidualThreshold { get; set; }
+    public int SmoteSelectionSamples { get; set; }
+    public double SmoteAdversarialAuc { get; set; }
+    public double SmoteCalibrationLoss { get; set; }
+    public double SmoteRefinementLoss { get; set; }
+    public double SmotePredictionStabilityScore { get; set; }
 
     // ── Rec #67: Echo State Network readout ──────────────────────────────────
 
@@ -3545,6 +4181,12 @@ public class ModelSnapshot
     /// </summary>
     public double FtTransformerTrainInferenceParityMaxError { get; set; }
 
+    /// <summary>
+    /// Maximum absolute difference between trainer GBM raw probability and deployed
+    /// GBM inference on audited samples.
+    /// </summary>
+    public double GbmTrainInferenceParityMaxError { get; set; }
+
     /// <summary>Rec #390: FT-Transformer additional layer weights (layers 1..N-1) serialised as JSON (legacy, kept for backward compat).</summary>
     public string? FtTransformerAdditionalLayersJson { get; set; }
 
@@ -3667,6 +4309,18 @@ public class ModelSnapshot
     /// <summary>Observation noise variance σ_noise² fitted during ELBO optimisation.</summary>
     public double SvgpNoiseVariance { get; set; } = 0.1;
 
+    public SvgpDriftArtifact? SvgpDriftArtifact { get; set; }
+    public SvgpWarmStartArtifact? SvgpWarmStartArtifact { get; set; }
+    public SvgpAuditArtifact? SvgpAuditArtifact { get; set; }
+    public double SvgpCalibrationResidualMean { get; set; }
+    public double SvgpCalibrationResidualStd { get; set; }
+    public double SvgpCalibrationResidualThreshold { get; set; }
+    public double SvgpAdversarialAuc { get; set; }
+    public double SvgpCalibrationLoss { get; set; }
+    public double SvgpRefinementLoss { get; set; }
+    public double SvgpPredictionStabilityScore { get; set; }
+    public int SvgpSelectionSamples { get; set; }
+
     /// <summary>Rec #448 ESN: trained output layer weights from ridge regression.</summary>
     public double[]? EsnOutputWeights { get; set; }
 
@@ -3703,6 +4357,27 @@ public class ModelSnapshot
     /// <c>ElmInverseGram[k]</c> has length <c>ElmInverseGramDim[k] * ElmInverseGramDim[k]</c>.
     /// </summary>
     public int[]? ElmInverseGramDim { get; set; }
+
+    public ElmDriftArtifact? ElmDriftArtifact { get; set; }
+    public ElmWarmStartArtifact? ElmWarmStartArtifact { get; set; }
+    public ElmAuditArtifact? ElmAuditArtifact { get; set; }
+    public double ElmCalibrationResidualMean { get; set; }
+    public double ElmCalibrationResidualStd { get; set; }
+    public double ElmCalibrationResidualThreshold { get; set; }
+
+    public BaggedLogisticDriftArtifact? BaggedLogisticDriftArtifact { get; set; }
+    public BaggedLogisticWarmStartArtifact? BaggedLogisticWarmStartArtifact { get; set; }
+    public BaggedLogisticAuditArtifact? BaggedLogisticAuditArtifact { get; set; }
+    public double BaggedLogisticCalibrationResidualMean { get; set; }
+    public double BaggedLogisticCalibrationResidualStd { get; set; }
+    public double BaggedLogisticCalibrationResidualThreshold { get; set; }
+
+    public DannDriftArtifact? DannDriftArtifact { get; set; }
+    public DannWarmStartArtifact? DannWarmStartArtifact { get; set; }
+    public DannAuditArtifact? DannAuditArtifact { get; set; }
+    public double DannCalibrationResidualMean { get; set; }
+    public double DannCalibrationResidualStd { get; set; }
+    public double DannCalibrationResidualThreshold { get; set; }
 
     /// <summary>Rec #450 DLinear: trend component linear projection weights.</summary>
     public double[]? DLinearTrendWeights { get; set; }
@@ -3797,6 +4472,12 @@ public class ModelSnapshot
     public double[][]? BekkWeights { get; set; }           // BEKK-GARCH (#507) — c, a, b parameter rows
     public double[][]? FarimaWeights { get; set; }         // FARIMA (#508) — [[best_d, best_phi]] single row
     public double[][]? QrfWeights { get; set; }            // Quantile RF (#509) — feature importance as single row
+    public QrfDriftArtifact? QrfDriftArtifact { get; set; }
+    public QrfWarmStartArtifact? QrfWarmStartArtifact { get; set; }
+    public QrfAuditArtifact? QrfAuditArtifact { get; set; }
+    public double QrfCalibrationResidualMean { get; set; }
+    public double QrfCalibrationResidualStd { get; set; }
+    public double QrfCalibrationResidualThreshold { get; set; }
     public double[][]? SiameseWeights { get; set; }        // Siamese (#510) — W1 rows followed by W2 rows
 
     // Batch 19 trainer snapshots
@@ -3998,4 +4679,11 @@ public class ModelSnapshot
     /// Per-fold augmented-space magnitude biases from walk-forward CV.
     /// </summary>
     public double[]? MagAugBiasFolds { get; set; }
+
+    public RocketDriftArtifact? RocketDriftArtifact { get; set; }
+    public RocketWarmStartArtifact? RocketWarmStartArtifact { get; set; }
+    public RocketAuditArtifact? RocketAuditArtifact { get; set; }
+    public double RocketCalibrationResidualMean { get; set; }
+    public double RocketCalibrationResidualStd { get; set; }
+    public double RocketCalibrationResidualThreshold { get; set; }
 }

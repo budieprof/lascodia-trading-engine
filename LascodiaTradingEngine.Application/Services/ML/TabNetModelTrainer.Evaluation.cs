@@ -933,4 +933,39 @@ public sealed partial class TabNetModelTrainer
         if (canEarlyStop) { lw = bestW; b = bestB; }
         return (lw, b);
     }
+
+    // ── Adversarial validation (CPU) ──────────────────────────────────────────
+
+    private static double ComputeAdversarialAuc(
+        List<TrainingSample> trainSet, List<TrainingSample> testSet, int F)
+    {
+        int n1 = testSet.Count; int n0 = Math.Min(trainSet.Count, n1 * 5); int n = n0 + n1;
+        if (n < 20) return 0.5;
+        var trainSlice = trainSet.Count > n0 ? trainSet[^n0..] : trainSet;
+        var w = new double[F]; double b = 0;
+        for (int epoch = 0; epoch < 60; epoch++)
+        {
+            double dB = 0; var dW = new double[F];
+            for (int i = 0; i < n; i++)
+            {
+                float[] features = i < n0 ? trainSlice[i].Features : testSet[i - n0].Features;
+                double label = i < n0 ? 0.0 : 1.0;
+                double z = b; for (int j = 0; j < F && j < features.Length; j++) z += w[j] * features[j];
+                double p = 1.0 / (1.0 + Math.Exp(-z)); double err = p - label;
+                dB += err; for (int j = 0; j < F && j < features.Length; j++) dW[j] += err * features[j];
+            }
+            b -= 0.005 * dB / n; for (int j = 0; j < F; j++) w[j] -= 0.005 * (dW[j] / n + 0.01 * w[j]);
+        }
+        var scores = new (double Score, int Label)[n];
+        for (int i = 0; i < n; i++)
+        {
+            float[] features = i < n0 ? trainSlice[i].Features : testSet[i - n0].Features;
+            double z = b; for (int j = 0; j < F && j < features.Length; j++) z += w[j] * features[j];
+            scores[i] = (1.0 / (1.0 + Math.Exp(-z)), i < n0 ? 0 : 1);
+        }
+        Array.Sort(scores, (a, c) => c.Score.CompareTo(a.Score));
+        long tp = 0, aucNum = 0;
+        foreach (var (_, lbl) in scores) { if (lbl == 1) tp++; else aucNum += tp; }
+        return (n1 > 0 && n0 > 0) ? (double)aucNum / ((long)n1 * n0) : 0.5;
+    }
 }

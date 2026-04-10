@@ -332,6 +332,9 @@ public class BacktestWorkerTest
             .AddSingleton<IValidationWorkerIdentity>(new TestValidationWorkerIdentity("test-backtest-worker"))
             .AddScoped<IValidationSettingsProvider, ValidationSettingsProvider>()
             .AddScoped<IBacktestAutoScheduler, BacktestAutoScheduler>()
+            .AddSingleton<IStrategyExecutionSnapshotBuilder, StrategyExecutionSnapshotBuilder>()
+            .AddSingleton<IValidationTradingCalendar, ValidationTradingCalendar>()
+            .AddSingleton<IValidationCandleSeriesGuard, ValidationCandleSeriesGuard>()
             .AddScoped<IBacktestOptionsSnapshotBuilder>(sp =>
                 new BacktestOptionsSnapshotBuilder(
                     sp.GetRequiredService<IValidationSettingsProvider>(),
@@ -339,6 +342,7 @@ public class BacktestWorkerTest
             .AddScoped<IValidationRunFactory>(sp =>
                 new ValidationRunFactory(
                     sp.GetRequiredService<IBacktestOptionsSnapshotBuilder>(),
+                    sp.GetRequiredService<IStrategyExecutionSnapshotBuilder>(),
                     TimeProvider.System))
             .AddSingleton<IAutoWalkForwardWindowPolicy, AutoWalkForwardWindowPolicy>()
             .BuildServiceProvider();
@@ -353,6 +357,8 @@ public class BacktestWorkerTest
                 services.GetRequiredService<IBacktestAutoScheduler>(),
                 services.GetRequiredService<IValidationRunFactory>(),
                 services.GetRequiredService<IBacktestOptionsSnapshotBuilder>(),
+                services.GetRequiredService<IStrategyExecutionSnapshotBuilder>(),
+                services.GetRequiredService<IValidationCandleSeriesGuard>(),
                 services.GetRequiredService<IAutoWalkForwardWindowPolicy>(),
                 services.GetRequiredService<IValidationWorkerIdentity>()),
             writeCtx,

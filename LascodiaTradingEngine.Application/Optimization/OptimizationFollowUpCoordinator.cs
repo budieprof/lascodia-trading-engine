@@ -3,6 +3,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Backtesting;
+using LascodiaTradingEngine.Application.Backtesting.Models;
 using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Interfaces;
@@ -23,6 +24,7 @@ public sealed class OptimizationFollowUpCoordinator
     private readonly OptimizationRunScopedConfigService _runScopedConfigService;
     private readonly IValidationRunFactory _validationRunFactory;
     private readonly IBacktestOptionsSnapshotBuilder _optionsSnapshotBuilder;
+    private readonly IStrategyExecutionSnapshotBuilder _strategySnapshotBuilder;
     private readonly ILogger _logger;
     private readonly TradingMetrics _metrics;
     private readonly TimeProvider _timeProvider;
@@ -34,10 +36,11 @@ public sealed class OptimizationFollowUpCoordinator
         OptimizationRunScopedConfigService runScopedConfigService,
         IValidationRunFactory validationRunFactory,
         IBacktestOptionsSnapshotBuilder optionsSnapshotBuilder,
+        IStrategyExecutionSnapshotBuilder strategySnapshotBuilder,
         ILogger<OptimizationFollowUpCoordinator> logger,
         TradingMetrics metrics,
         TimeProvider timeProvider)
-        : this(scopeFactory, alertDispatcher, runScopedConfigService, validationRunFactory, optionsSnapshotBuilder, (ILogger)logger, metrics, timeProvider)
+        : this(scopeFactory, alertDispatcher, runScopedConfigService, validationRunFactory, optionsSnapshotBuilder, strategySnapshotBuilder, (ILogger)logger, metrics, timeProvider)
     {
     }
 
@@ -47,6 +50,7 @@ public sealed class OptimizationFollowUpCoordinator
         OptimizationRunScopedConfigService runScopedConfigService,
         IValidationRunFactory validationRunFactory,
         IBacktestOptionsSnapshotBuilder optionsSnapshotBuilder,
+        IStrategyExecutionSnapshotBuilder strategySnapshotBuilder,
         ILogger logger,
         TradingMetrics metrics,
         TimeProvider timeProvider)
@@ -56,6 +60,7 @@ public sealed class OptimizationFollowUpCoordinator
         _runScopedConfigService = runScopedConfigService;
         _validationRunFactory = validationRunFactory;
         _optionsSnapshotBuilder = optionsSnapshotBuilder;
+        _strategySnapshotBuilder = strategySnapshotBuilder;
         _logger = logger;
         _metrics = metrics;
         _timeProvider = timeProvider;
@@ -350,6 +355,12 @@ public sealed class OptimizationFollowUpCoordinator
             followUpInitialBalance = runScopedConfig.ScreeningInitialBalance;
         }
         var nowUtc = UtcNow;
+        string strategySnapshotJson = await _strategySnapshotBuilder.BuildSnapshotJsonAsync(
+                writeDb,
+                run.StrategyId,
+                followUpParamsJson,
+                ct)
+            ?? JsonSerializer.Serialize(StrategyExecutionSnapshot.FromStrategy(strategy, followUpParamsJson));
 
         bool hasBacktest = existingBacktest is not null;
         if (existingBacktest is null)
@@ -366,6 +377,7 @@ public sealed class OptimizationFollowUpCoordinator
                     QueueSource: ValidationRunQueueSources.OptimizationFollowUp,
                     SourceOptimizationRunId: run.Id,
                     ParametersSnapshotJson: followUpParamsJson,
+                    StrategySnapshotJson: strategySnapshotJson,
                     ValidationQueueKey: $"optimization:{run.Id}:backtest"),
                 ct));
         }
@@ -377,6 +389,7 @@ public sealed class OptimizationFollowUpCoordinator
                 existingBacktest.ToDate = toDate;
                 existingBacktest.InitialBalance = followUpInitialBalance;
                 existingBacktest.ParametersSnapshotJson = followUpParamsJson;
+                existingBacktest.StrategySnapshotJson = strategySnapshotJson;
                 existingBacktest.BacktestOptionsSnapshotJson = JsonSerializer.Serialize(
                     await _optionsSnapshotBuilder.BuildAsync(writeDb, strategy.Symbol, ct));
                 existingBacktest.QueueSource = ValidationRunQueueSources.OptimizationFollowUp;
@@ -399,6 +412,7 @@ public sealed class OptimizationFollowUpCoordinator
             else if (string.IsNullOrWhiteSpace(existingBacktest.ParametersSnapshotJson))
             {
                 existingBacktest.ParametersSnapshotJson = followUpParamsJson;
+                existingBacktest.StrategySnapshotJson ??= strategySnapshotJson;
             }
         }
 
@@ -420,6 +434,7 @@ public sealed class OptimizationFollowUpCoordinator
                     ReOptimizePerFold: false,
                     SourceOptimizationRunId: run.Id,
                     ParametersSnapshotJson: followUpParamsJson,
+                    StrategySnapshotJson: strategySnapshotJson,
                     ValidationQueueKey: $"optimization:{run.Id}:walkforward"),
                 ct));
         }
@@ -431,6 +446,7 @@ public sealed class OptimizationFollowUpCoordinator
                 existingWalkForward.ToDate = toDate;
                 existingWalkForward.InitialBalance = followUpInitialBalance;
                 existingWalkForward.ParametersSnapshotJson = followUpParamsJson;
+                existingWalkForward.StrategySnapshotJson = strategySnapshotJson;
                 existingWalkForward.BacktestOptionsSnapshotJson = JsonSerializer.Serialize(
                     await _optionsSnapshotBuilder.BuildAsync(writeDb, strategy.Symbol, ct));
                 existingWalkForward.QueueSource = ValidationRunQueueSources.OptimizationFollowUp;
@@ -453,6 +469,7 @@ public sealed class OptimizationFollowUpCoordinator
             else if (string.IsNullOrWhiteSpace(existingWalkForward.ParametersSnapshotJson))
             {
                 existingWalkForward.ParametersSnapshotJson = followUpParamsJson;
+                existingWalkForward.StrategySnapshotJson ??= strategySnapshotJson;
             }
 
             existingWalkForward.ReOptimizePerFold = false;

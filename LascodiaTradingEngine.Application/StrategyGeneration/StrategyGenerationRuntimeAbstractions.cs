@@ -181,11 +181,23 @@ internal interface IStrategyGenerationCycleRunStore
 
     Task AttachFingerprintAsync(DbContext writeDb, string cycleId, string fingerprint, CancellationToken ct);
 
-    Task StageSummaryDispatchSuccessAsync(
+    Task StageCompletionAsync(
+        DbContext writeDb,
+        string cycleId,
+        StrategyGenerationCycleRunCompletion completion,
+        CancellationToken ct);
+
+    Task StageSummaryDispatchAttemptAsync(
         DbContext writeDb,
         string cycleId,
         Guid eventId,
         string payloadJson,
+        DateTime attemptedAtUtc,
+        CancellationToken ct);
+
+    Task MarkSummaryDispatchPublishedAsync(
+        DbContext writeDb,
+        string cycleId,
         DateTime dispatchedAtUtc,
         CancellationToken ct);
 
@@ -215,6 +227,10 @@ internal interface IStrategyGenerationCycleRunStore
         DbContext readDb,
         string currentCycleId,
         CancellationToken ct);
+
+    Task<IReadOnlyList<StrategyGenerationSummaryDispatchRecord>> LoadPendingSummaryDispatchesAsync(
+        DbContext readDb,
+        CancellationToken ct);
 }
 
 internal interface IStrategyGenerationCheckpointStore
@@ -239,6 +255,11 @@ internal interface IStrategyGenerationPendingArtifactStore
 {
     Task<StrategyGenerationPendingArtifactLoadResult> LoadPendingArtifactsAsync(
         DbContext readDb,
+        CancellationToken ct);
+
+    Task QuarantineCorruptArtifactsAsync(
+        DbContext writeDb,
+        IReadOnlyCollection<StrategyGenerationCorruptArtifactRecord> corruptArtifacts,
         CancellationToken ct);
 
     Task ReplacePendingArtifactsAsync(

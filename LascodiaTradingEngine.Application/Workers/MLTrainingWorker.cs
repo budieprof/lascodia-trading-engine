@@ -776,9 +776,12 @@ public sealed class MLTrainingWorker : BackgroundService
                         else if (string.Equals(snapForGate.Type, "GBM", StringComparison.OrdinalIgnoreCase))
                         {
                             snapForGate = GbmSnapshotSupport.NormalizeSnapshotCopy(snapForGate);
-                            var validation = GbmSnapshotSupport.ValidateSnapshot(snapForGate, allowLegacy: false);
-                            snapshotContractValid = validation.IsValid;
-                            snapshotContractIssues = string.Join("; ", validation.Issues);
+                            (snapshotContractValid, snapshotContractIssues) = ValidateGbmPromotionSnapshot(snapForGate);
+                        }
+                        else if (string.Equals(snapForGate.Type, "AdaBoost", StringComparison.OrdinalIgnoreCase))
+                        {
+                            snapForGate = AdaBoostSnapshotSupport.NormalizeSnapshotCopy(snapForGate);
+                            (snapshotContractValid, snapshotContractIssues) = ValidateAdaBoostPromotionSnapshot(snapForGate);
                         }
                         else if (string.Equals(snapForGate.Type, "FTTRANSFORMER", StringComparison.OrdinalIgnoreCase))
                         {
@@ -788,7 +791,7 @@ public sealed class MLTrainingWorker : BackgroundService
                         else if (string.Equals(snapForGate.Type, "elm", StringComparison.OrdinalIgnoreCase))
                         {
                             snapForGate = ElmSnapshotSupport.NormalizeSnapshotCopy(snapForGate);
-                            var validation = ElmSnapshotSupport.ValidateSnapshot(snapForGate, allowLegacy: false);
+                            var validation = ElmSnapshotSupport.ValidateNormalizedSnapshot(snapForGate, allowLegacy: false);
                             snapshotContractValid = validation.IsValid;
                             snapshotContractIssues = string.Join("; ", validation.Issues);
                         }
@@ -1478,6 +1481,8 @@ public sealed class MLTrainingWorker : BackgroundService
 
             if (string.Equals(snap.Type, "TABNET", StringComparison.OrdinalIgnoreCase))
                 snap = TabNetSnapshotSupport.NormalizeSnapshotCopy(snap);
+            else if (string.Equals(snap.Type, "AdaBoost", StringComparison.OrdinalIgnoreCase))
+                snap = AdaBoostSnapshotSupport.NormalizeSnapshotCopy(snap);
 
             plattA = (decimal)snap.PlattA;
             plattB = (decimal)snap.PlattB;
@@ -1570,6 +1575,12 @@ public sealed class MLTrainingWorker : BackgroundService
                 var validation = TabNetSnapshotSupport.ValidateSnapshot(snap, allowLegacyV2: true);
                 if (!validation.IsValid)
                     throw new InvalidOperationException($"Patched TabNet snapshot failed validation: {string.Join("; ", validation.Issues)}");
+            }
+            else if (string.Equals(snap.Type, "AdaBoost", StringComparison.OrdinalIgnoreCase))
+            {
+                var validation = AdaBoostSnapshotSupport.ValidateSnapshot(snap, allowLegacy: false);
+                if (!validation.IsValid)
+                    throw new InvalidOperationException($"Patched AdaBoost snapshot failed validation: {string.Join("; ", validation.Issues)}");
             }
 
             finalModelBytes = JsonSerializer.SerializeToUtf8Bytes(snap);
@@ -2369,6 +2380,62 @@ public sealed class MLTrainingWorker : BackgroundService
         }
     }
 
+    private static (bool IsValid, string Issues) ValidateGbmPromotionSnapshot(ModelSnapshot snapshot)
+    {
+        var normalized = GbmSnapshotSupport.NormalizeSnapshotCopy(snapshot);
+        var validation = GbmSnapshotSupport.ValidateSnapshot(normalized, allowLegacy: false);
+        var issues = new List<string>(validation.Issues);
+
+        if (normalized.TrainingSplitSummary is null)
+        {
+            issues.Add("TrainingSplitSummary is missing.");
+        }
+        else
+        {
+            if (normalized.TrainingSplitSummary.SelectionCount <= 0)
+                issues.Add("GBM snapshots must persist a non-empty selection split.");
+            if (normalized.TrainingSplitSummary.CalibrationCount <= 0)
+                issues.Add("GBM snapshots must persist a non-empty calibration split.");
+            if (normalized.TrainingSplitSummary.TestCount <= 0)
+                issues.Add("GBM snapshots must persist a non-empty test split.");
+        }
+
+        if (normalized.GbmSelectionMetrics is null)
+            issues.Add("GbmSelectionMetrics is missing.");
+        if (normalized.GbmCalibrationMetrics is null)
+            issues.Add("GbmCalibrationMetrics is missing.");
+        if (normalized.GbmTestMetrics is null)
+            issues.Add("GbmTestMetrics is missing.");
+        if (normalized.GbmCalibrationArtifact is null)
+            issues.Add("GbmCalibrationArtifact is missing.");
+
+        if (normalized.GbmAuditArtifact is null)
+        {
+            issues.Add("GbmAuditArtifact is missing.");
+        }
+        else
+        {
+            if (!normalized.GbmAuditArtifact.SnapshotContractValid)
+                issues.Add("GbmAuditArtifact reported an invalid snapshot contract.");
+            if (normalized.GbmAuditArtifact.ThresholdDecisionMismatchCount > 0)
+            {
+                issues.Add(
+                    $"GbmAuditArtifact reported {normalized.GbmAuditArtifact.ThresholdDecisionMismatchCount} threshold decision mismatches.");
+            }
+            if (normalized.GbmAuditArtifact.Findings.Length > 0)
+                issues.Add($"GbmAuditArtifact reported findings: {string.Join(" | ", normalized.GbmAuditArtifact.Findings)}");
+        }
+
+        if (!double.IsFinite(normalized.GbmTrainInferenceParityMaxError) ||
+            normalized.GbmTrainInferenceParityMaxError > 1e-6)
+        {
+            issues.Add(
+                $"GbmTrainInferenceParityMaxError {normalized.GbmTrainInferenceParityMaxError:G} exceeded the 1e-6 promotion limit.");
+        }
+
+        return (issues.Count == 0, string.Join("; ", issues.Distinct()));
+    }
+
     private static (bool IsValid, string Issues) ValidateFtTransformerPromotionSnapshot(ModelSnapshot snapshot)
     {
         var normalized = FtTransformerSnapshotSupport.NormalizeSnapshotCopy(snapshot);
@@ -2386,9 +2453,10 @@ public sealed class MLTrainingWorker : BackgroundService
             if (normalized.TrainingSplitSummary.AbstentionCount != 0)
                 issues.Add("FT-Transformer snapshots must not advertise abstention calibration splits.");
             if (normalized.TrainingSplitSummary.SelectionPruningCount <= 0 ||
-                normalized.TrainingSplitSummary.SelectionThresholdCount <= 0)
+                normalized.TrainingSplitSummary.SelectionThresholdCount <= 0 ||
+                normalized.TrainingSplitSummary.SelectionKellyCount <= 0)
             {
-                issues.Add("FT-Transformer snapshots must persist non-empty selection pruning and threshold sub-splits.");
+                issues.Add("FT-Transformer snapshots must persist non-empty selection pruning, threshold, and Kelly sub-splits.");
             }
         }
 
@@ -2414,6 +2482,32 @@ public sealed class MLTrainingWorker : BackgroundService
             {
                 issues.Add("FtTransformerCalibrationArtifact threshold-selection sample count does not match TrainingSplitSummary.");
             }
+            if (normalized.FtTransformerCalibrationArtifact.KellySelectionSampleCount > 0 &&
+                normalized.FtTransformerCalibrationArtifact.KellySelectionSampleCount !=
+                normalized.TrainingSplitSummary.SelectionKellyCount)
+            {
+                issues.Add("FtTransformerCalibrationArtifact Kelly-selection sample count does not match TrainingSplitSummary.");
+            }
+
+            if (normalized.FtTransformerCalibrationArtifact.KellySelectionSampleCount <= 0)
+                issues.Add("FtTransformerCalibrationArtifact Kelly-selection sample count is missing.");
+            if (normalized.FtTransformerCalibrationArtifact.RefitSampleCount <
+                normalized.FtTransformerCalibrationArtifact.FitSampleCount)
+            {
+                issues.Add("FtTransformerCalibrationArtifact refit sample count is inconsistent.");
+            }
+            if (normalized.FtTransformerCalibrationArtifact.RoutingThresholdCandidateCount > 0)
+            {
+                if (normalized.FtTransformerCalibrationArtifact.RoutingThresholdCandidates.Length !=
+                    normalized.FtTransformerCalibrationArtifact.RoutingThresholdCandidateCount ||
+                    normalized.FtTransformerCalibrationArtifact.RoutingThresholdCandidateNlls.Length !=
+                    normalized.FtTransformerCalibrationArtifact.RoutingThresholdCandidateCount ||
+                    normalized.FtTransformerCalibrationArtifact.RoutingThresholdCandidateEces.Length !=
+                    normalized.FtTransformerCalibrationArtifact.RoutingThresholdCandidateCount)
+                {
+                    issues.Add("FtTransformerCalibrationArtifact routing-threshold candidate metadata is inconsistent.");
+                }
+            }
         }
         if (normalized.FtTransformerWarmStartArtifact is null)
             issues.Add("FtTransformerWarmStartArtifact is missing.");
@@ -2436,6 +2530,80 @@ public sealed class MLTrainingWorker : BackgroundService
             normalized.FtTransformerTrainInferenceParityMaxError > 1e-6)
         {
             issues.Add($"FtTransformerTrainInferenceParityMaxError {normalized.FtTransformerTrainInferenceParityMaxError:G} exceeded the 1e-6 promotion limit.");
+        }
+
+        return (issues.Count == 0, string.Join("; ", issues.Distinct()));
+    }
+
+    private static (bool IsValid, string Issues) ValidateAdaBoostPromotionSnapshot(ModelSnapshot snapshot)
+    {
+        var normalized = AdaBoostSnapshotSupport.NormalizeSnapshotCopy(snapshot);
+        var validation = AdaBoostSnapshotSupport.ValidateSnapshot(normalized, allowLegacy: false);
+        var issues = new List<string>(validation.Issues);
+
+        if (normalized.TrainingSplitSummary is null)
+        {
+            issues.Add("TrainingSplitSummary is missing.");
+        }
+        else
+        {
+            if (normalized.TrainingSplitSummary.SelectionPruningCount <= 0 ||
+                normalized.TrainingSplitSummary.SelectionThresholdCount <= 0)
+            {
+                issues.Add("AdaBoost snapshots must persist non-empty selection pruning and threshold sub-splits.");
+            }
+        }
+
+        if (normalized.AdaBoostSelectionMetrics is null)
+            issues.Add("AdaBoostSelectionMetrics is missing.");
+        if (normalized.AdaBoostCalibrationMetrics is null)
+            issues.Add("AdaBoostCalibrationMetrics is missing.");
+        if (normalized.AdaBoostTestMetrics is null)
+            issues.Add("AdaBoostTestMetrics is missing.");
+
+        if (normalized.AdaBoostCalibrationArtifact is null)
+        {
+            issues.Add("AdaBoostCalibrationArtifact is missing.");
+        }
+        else if (normalized.TrainingSplitSummary is not null)
+        {
+            if (normalized.AdaBoostCalibrationArtifact.ThresholdSelectionSampleCount > 0 &&
+                normalized.AdaBoostCalibrationArtifact.ThresholdSelectionSampleCount !=
+                normalized.TrainingSplitSummary.SelectionThresholdCount)
+            {
+                issues.Add("AdaBoostCalibrationArtifact threshold-selection sample count does not match TrainingSplitSummary.");
+            }
+
+            if (normalized.AdaBoostCalibrationArtifact.MetaLabelSampleCount > 0 &&
+                normalized.AdaBoostCalibrationArtifact.MetaLabelSampleCount !=
+                normalized.TrainingSplitSummary.MetaLabelCount)
+            {
+                issues.Add("AdaBoostCalibrationArtifact meta-label sample count does not match TrainingSplitSummary.");
+            }
+
+            if (normalized.AdaBoostCalibrationArtifact.AbstentionSampleCount > 0 &&
+                normalized.AdaBoostCalibrationArtifact.AbstentionSampleCount !=
+                normalized.TrainingSplitSummary.AbstentionCount)
+            {
+                issues.Add("AdaBoostCalibrationArtifact abstention sample count does not match TrainingSplitSummary.");
+            }
+        }
+
+        if (normalized.AdaBoostAuditArtifact is null)
+        {
+            issues.Add("AdaBoostAuditArtifact is missing.");
+        }
+        else
+        {
+            if (!normalized.AdaBoostAuditArtifact.SnapshotContractValid)
+                issues.Add("AdaBoostAuditArtifact reported an invalid snapshot contract.");
+            if (normalized.AdaBoostAuditArtifact.ThresholdDecisionMismatchCount > 0)
+            {
+                issues.Add(
+                    $"AdaBoostAuditArtifact reported {normalized.AdaBoostAuditArtifact.ThresholdDecisionMismatchCount} threshold decision mismatches.");
+            }
+            if (normalized.AdaBoostAuditArtifact.Findings.Length > 0)
+                issues.Add($"AdaBoostAuditArtifact reported findings: {string.Join(" | ", normalized.AdaBoostAuditArtifact.Findings)}");
         }
 
         return (issues.Count == 0, string.Join("; ", issues.Distinct()));

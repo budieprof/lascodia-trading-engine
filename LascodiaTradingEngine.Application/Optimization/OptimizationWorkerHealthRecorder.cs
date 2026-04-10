@@ -51,6 +51,7 @@ public sealed class OptimizationWorkerHealthRecorder
                      && r.Status == OptimizationRunStatus.Queued
                      && r.DeferredUntilUtc != null
                      && r.DeferredUntilUtc > nowUtc);
+        var deferredRunsStartedCutoffUtc = nowUtc.AddHours(-1);
         var runningRunsQuery = writeDb.Set<OptimizationRun>()
             .Where(r => !r.IsDeleted
                      && r.Status == OptimizationRunStatus.Running);
@@ -77,6 +78,16 @@ public sealed class OptimizationWorkerHealthRecorder
                           || r.ExecutionLeaseExpiresAt == null, ct);
         int retryableFailedRuns = await retryReadyRunsQuery.CountAsync(ct);
         int starvedQueuedRuns = await starvedQueuedRunsQuery.CountAsync(ct);
+        int deferredRunsStartedLastHour = await writeDb.Set<OptimizationRun>()
+            .CountAsync(r => !r.IsDeleted
+                          && r.DeferredAtUtc != null
+                          && r.DeferredAtUtc >= deferredRunsStartedCutoffUtc, ct);
+        int deferredRunsResumedLastHour = await writeDb.Set<OptimizationRun>()
+            .CountAsync(r => !r.IsDeleted
+                          && r.LastResumedAtUtc != null
+                          && r.LastResumedAtUtc >= deferredRunsStartedCutoffUtc, ct);
+        int repeatedlyDeferredQueuedRuns = await deferredQueuedRunsQuery
+            .CountAsync(r => r.DeferralCount >= 2, ct);
         int abandonedRuns = await writeDb.Set<OptimizationRun>()
             .CountAsync(r => !r.IsDeleted && r.Status == OptimizationRunStatus.Abandoned, ct);
         int pendingFollowUps = await writeDb.Set<OptimizationRun>()
@@ -168,6 +179,15 @@ public sealed class OptimizationWorkerHealthRecorder
                 r.DeferredUntilUtc
             })
             .FirstOrDefaultAsync(ct);
+        var oldestActiveDeferral = await deferredQueuedRunsQuery
+            .Where(r => r.DeferredAtUtc != null)
+            .OrderBy(r => r.DeferredAtUtc)
+            .Select(r => new
+            {
+                r.Id,
+                r.DeferredAtUtc
+            })
+            .FirstOrDefaultAsync(ct);
         var deferredQueuedRunsByReason = await deferredQueuedRunsQuery
             .GroupBy(r => r.DeferralReason ?? OptimizationDeferralReason.Unknown)
             .Select(g => new OptimizationDeferralReasonCountSnapshot(g.Key, g.Count()))
@@ -249,6 +269,14 @@ public sealed class OptimizationWorkerHealthRecorder
             MostDeferredQueuedDeferralCount = mostDeferredQueuedRun?.DeferralCount ?? 0,
             MostRecentDeferredResumeRunId = mostRecentDeferredResume?.Id,
             MostRecentDeferredResumeAtUtc = mostRecentDeferredResume?.LastResumedAtUtc,
+            DeferredRunsStartedLastHour = deferredRunsStartedLastHour,
+            DeferredRunsResumedLastHour = deferredRunsResumedLastHour,
+            RepeatedlyDeferredQueuedRuns = repeatedlyDeferredQueuedRuns,
+            OldestActiveDeferralRunId = oldestActiveDeferral?.Id,
+            OldestActiveDeferralAtUtc = oldestActiveDeferral?.DeferredAtUtc,
+            OldestActiveDeferralAgeSeconds = oldestActiveDeferral?.DeferredAtUtc is DateTime oldestActiveDeferralAtUtc
+                ? Math.Max(0, (int)(nowUtc - oldestActiveDeferralAtUtc).TotalSeconds)
+                : 0,
             DeferredQueuedRunsByReason = deferredQueuedRunsByReason,
             StarvedQueuedRuns = starvedQueuedRuns,
             OldestStarvedQueuedRunId = oldestStarvedQueuedRun?.Id,

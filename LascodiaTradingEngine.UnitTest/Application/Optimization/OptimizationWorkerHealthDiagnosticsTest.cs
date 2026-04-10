@@ -28,6 +28,48 @@ public class OptimizationWorkerHealthDiagnosticsTest
     }
 
     [Fact]
+    public void PhaseFailureBackoff_TracksSkipAndRecovery()
+    {
+        var store = new OptimizationWorkerHealthStore();
+        var nowUtc = new DateTime(2026, 4, 9, 12, 0, 0, DateTimeKind.Utc);
+
+        store.RecordPhaseFailure(OptimizationWorkerHealthNames.Phases.AutoScheduling, "InvalidOperationException", "boom-1", 15, nowUtc);
+        store.RecordPhaseFailure(OptimizationWorkerHealthNames.Phases.AutoScheduling, "InvalidOperationException", "boom-2", 18, nowUtc.AddSeconds(30));
+        store.RecordPhaseFailure(OptimizationWorkerHealthNames.Phases.AutoScheduling, "InvalidOperationException", "boom-3", 20, nowUtc.AddSeconds(60));
+
+        var decision = store.GetPhaseExecutionDecision(
+            OptimizationWorkerHealthNames.Phases.AutoScheduling,
+            nowUtc.AddSeconds(75));
+
+        Assert.False(decision.ShouldExecute);
+        Assert.NotNull(decision.BackoffUntilUtc);
+
+        store.RecordPhaseSkipped(
+            OptimizationWorkerHealthNames.Phases.AutoScheduling,
+            decision.Reason ?? "phase degraded",
+            decision.BackoffUntilUtc,
+            nowUtc.AddSeconds(80));
+
+        var degradedPhase = Assert.Single(store.GetPhaseStates());
+        Assert.True(degradedPhase.IsDegraded);
+        Assert.Equal(3, degradedPhase.ConsecutiveFailures);
+        Assert.Equal(nowUtc.AddSeconds(80), degradedPhase.LastSkippedAtUtc);
+        Assert.Equal(1, degradedPhase.SkippedExecutionsLastHour);
+        Assert.Equal(decision.BackoffUntilUtc, degradedPhase.BackoffUntilUtc);
+
+        store.RecordPhaseSuccess(
+            OptimizationWorkerHealthNames.Phases.AutoScheduling,
+            22,
+            decision.BackoffUntilUtc!.Value.AddSeconds(1));
+
+        var recoveredPhase = Assert.Single(store.GetPhaseStates());
+        Assert.False(recoveredPhase.IsDegraded);
+        Assert.Equal(0, recoveredPhase.ConsecutiveFailures);
+        Assert.Null(recoveredPhase.BackoffUntilUtc);
+        Assert.Null(recoveredPhase.LastSkipReason);
+    }
+
+    [Fact]
     public async Task RecordAsync_ExcludesDeferredQueuedRunsFromBacklogAndOldestQueued()
     {
         var nowUtc = new DateTimeOffset(2026, 04, 09, 12, 0, 0, TimeSpan.Zero);
@@ -84,6 +126,69 @@ public class OptimizationWorkerHealthDiagnosticsTest
         var reasonCount = Assert.Single(snapshot.DeferredQueuedRunsByReason);
         Assert.Equal(OptimizationDeferralReason.SeasonalBlackout, reasonCount.Reason);
         Assert.Equal(1, reasonCount.Count);
+    }
+
+    [Fact]
+    public async Task RecordAsync_TracksDeferredChurnMetrics()
+    {
+        var nowUtc = new DateTimeOffset(2026, 04, 09, 12, 0, 0, TimeSpan.Zero);
+        var oldestDeferredAtUtc = nowUtc.UtcDateTime.AddHours(-2);
+        var recentDeferredAtUtc = nowUtc.UtcDateTime.AddMinutes(-20);
+        var runs = new List<OptimizationRun>
+        {
+            new()
+            {
+                Id = 7051,
+                StrategyId = 85,
+                Status = OptimizationRunStatus.Queued,
+                QueuedAt = nowUtc.UtcDateTime.AddHours(-3),
+                StartedAt = nowUtc.UtcDateTime.AddHours(-3),
+                DeferralReason = OptimizationDeferralReason.SeasonalBlackout,
+                DeferredAtUtc = oldestDeferredAtUtc,
+                DeferredUntilUtc = nowUtc.UtcDateTime.AddHours(2),
+                DeferralCount = 1,
+                IsDeleted = false
+            },
+            new()
+            {
+                Id = 7052,
+                StrategyId = 86,
+                Status = OptimizationRunStatus.Queued,
+                QueuedAt = nowUtc.UtcDateTime.AddHours(-1),
+                StartedAt = nowUtc.UtcDateTime.AddHours(-1),
+                DeferralReason = OptimizationDeferralReason.DataQuality,
+                DeferredAtUtc = recentDeferredAtUtc,
+                DeferredUntilUtc = nowUtc.UtcDateTime.AddHours(1),
+                DeferralCount = 3,
+                IsDeleted = false
+            },
+            new()
+            {
+                Id = 7053,
+                StrategyId = 87,
+                Status = OptimizationRunStatus.Completed,
+                LastResumedAtUtc = nowUtc.UtcDateTime.AddMinutes(-10),
+                IsDeleted = false
+            }
+        };
+
+        var recorder = CreateRecorder(runs, nowUtc, out var store);
+
+        await recorder.RecordAsync(
+            CreateOptimizationConfig(maxRetryAttempts: 2),
+            nowUtc.UtcDateTime.AddSeconds(-30),
+            nowUtc.UtcDateTime.AddSeconds(30),
+            staleRunningSummary: null,
+            reconciliationSummary: null,
+            CancellationToken.None);
+
+        var snapshot = store.GetMainWorkerState();
+        Assert.Equal(1, snapshot.DeferredRunsStartedLastHour);
+        Assert.Equal(1, snapshot.DeferredRunsResumedLastHour);
+        Assert.Equal(1, snapshot.RepeatedlyDeferredQueuedRuns);
+        Assert.Equal(7051, snapshot.OldestActiveDeferralRunId);
+        Assert.Equal(oldestDeferredAtUtc, snapshot.OldestActiveDeferralAtUtc);
+        Assert.Equal((int)(nowUtc.UtcDateTime - oldestDeferredAtUtc).TotalSeconds, snapshot.OldestActiveDeferralAgeSeconds);
     }
 
     [Fact]

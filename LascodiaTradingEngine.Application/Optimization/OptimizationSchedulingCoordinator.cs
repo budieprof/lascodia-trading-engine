@@ -197,8 +197,7 @@ public sealed class OptimizationSchedulingCoordinator
                     r.MaxDrawdownPct,
                     r.SharpeRatio,
                     r.FinalBalance,
-                    r.TotalReturn,
-                    r.ResultJson
+                    r.TotalReturn
                 })
                 .First())
             .ToListAsync(ct);
@@ -248,7 +247,6 @@ public sealed class OptimizationSchedulingCoordinator
                     backtestMetricsRow.SharpeRatio,
                     backtestMetricsRow.FinalBalance,
                     backtestMetricsRow.TotalReturn,
-                    backtestMetricsRow.ResultJson,
                     out var result))
                 continue;
 

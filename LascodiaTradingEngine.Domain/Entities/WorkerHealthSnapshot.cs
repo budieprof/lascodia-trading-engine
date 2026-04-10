@@ -48,6 +48,30 @@ public class WorkerHealthSnapshot : Entity<long>
     /// <summary>Number of items in the worker's processing queue (0 for poll-based workers).</summary>
     public int BacklogDepth { get; set; }
 
+    /// <summary>Queue latency in milliseconds observed for the most recently claimed item.</summary>
+    public long LastQueueLatencyMs { get; set; }
+
+    /// <summary>P50 queue latency over recent observations.</summary>
+    public long QueueLatencyP50Ms { get; set; }
+
+    /// <summary>P95 queue latency over recent observations.</summary>
+    public long QueueLatencyP95Ms { get; set; }
+
+    /// <summary>Execution duration in milliseconds observed for the most recently finished item.</summary>
+    public long LastExecutionDurationMs { get; set; }
+
+    /// <summary>P50 execution duration over recent observations.</summary>
+    public long ExecutionDurationP50Ms { get; set; }
+
+    /// <summary>P95 execution duration over recent observations.</summary>
+    public long ExecutionDurationP95Ms { get; set; }
+
+    /// <summary>Total validation retries observed in the last hour.</summary>
+    public int RetriesLastHour { get; set; }
+
+    /// <summary>Total recovery actions observed in the last hour.</summary>
+    public int RecoveriesLastHour { get; set; }
+
     /// <summary>Configured polling interval in seconds.</summary>
     public int ConfiguredIntervalSeconds { get; set; }
 

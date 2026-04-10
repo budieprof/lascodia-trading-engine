@@ -224,6 +224,7 @@ internal sealed record RunContext(
     Strategy Strategy,
     OptimizationConfig Config,
     decimal BaselineComparisonScore,
+    Guid ExpectedLeaseToken,
     DbContext Db,
     DbContext WriteDb,
     IWriteApplicationDbContext WriteCtx,

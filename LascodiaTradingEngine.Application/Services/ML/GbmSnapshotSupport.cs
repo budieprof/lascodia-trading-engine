@@ -15,6 +15,12 @@ internal static class GbmSnapshotSupport
 
     internal readonly record struct CompatibilityResult(bool IsCompatible, string[] Issues);
 
+    private const int MaxGbmTreeJsonBytes = 5 * 1024 * 1024;
+    private const int MaxFeaturePipelineDescriptorCount = 128;
+    private const int MaxFeaturePipelineSourceGroupCount = 16_384;
+    private const int MaxPartialDependencePairs = 4_096;
+    private const int MaxTreeDepth = 64;
+
     private static readonly JsonSerializerOptions CloneJsonOptions =
         new()
         {
@@ -502,12 +508,20 @@ internal static class GbmSnapshotSupport
         int rawFeatureCount = normalized.RawFeatureIndices.Length > 0
             ? normalized.RawFeatureIndices.Max() + 1
             : featureCount;
+        if (normalized.FeaturePipelineDescriptors.Length > MaxFeaturePipelineDescriptorCount)
+        {
+            issues.Add($"FeaturePipelineDescriptors cannot contain more than {MaxFeaturePipelineDescriptorCount} descriptors.");
+        }
+
+        int totalSourceGroups = 0;
         foreach (var descriptor in normalized.FeaturePipelineDescriptors)
         {
             if (descriptor.InputFeatureCount != rawFeatureCount)
                 issues.Add("Feature pipeline descriptor input count does not match raw feature count.");
             if (descriptor.SourceIndexGroups.Length == 0)
                 issues.Add("Feature pipeline descriptor must declare at least one source group.");
+
+            totalSourceGroups += descriptor.SourceIndexGroups.Length;
 
             if (string.Equals(descriptor.Operation, FeaturePipelineTransformSupport.GroupSumInPlaceOperation, StringComparison.OrdinalIgnoreCase))
             {
@@ -542,6 +556,35 @@ internal static class GbmSnapshotSupport
                 }
             }
         }
+        if (totalSourceGroups > MaxFeaturePipelineSourceGroupCount)
+        {
+            issues.Add($"Feature pipeline descriptors cannot declare more than {MaxFeaturePipelineSourceGroupCount} source groups in total.");
+        }
+
+        if (normalized.PartialDependenceData.Length > 0)
+        {
+            if (normalized.MetaLabelTopFeatureIndices.Length > 0 &&
+                normalized.PartialDependenceData.Length != normalized.MetaLabelTopFeatureIndices.Length)
+            {
+                issues.Add("PartialDependenceData length must match MetaLabelTopFeatureIndices when both are present.");
+            }
+
+            int totalPairs = 0;
+            for (int i = 0; i < normalized.PartialDependenceData.Length; i++)
+            {
+                var series = normalized.PartialDependenceData[i];
+                if (series is null || series.Length == 0)
+                    continue;
+                if (series.Length % 2 != 0)
+                    issues.Add("PartialDependenceData series must contain [x, y] pairs.");
+                if (series.Any(value => !double.IsFinite(value)))
+                    issues.Add("PartialDependenceData must contain only finite values.");
+                totalPairs += series.Length / 2;
+            }
+
+            if (totalPairs > MaxPartialDependencePairs)
+                issues.Add($"PartialDependenceData cannot exceed {MaxPartialDependencePairs} [x,y] pairs.");
+        }
 
         if (string.IsNullOrWhiteSpace(normalized.GbmTreesJson))
         {
@@ -549,6 +592,10 @@ internal static class GbmSnapshotSupport
         }
         else
         {
+            int treeJsonBytes = Encoding.UTF8.GetByteCount(normalized.GbmTreesJson);
+            if (treeJsonBytes > MaxGbmTreeJsonBytes)
+                issues.Add($"GbmTreesJson exceeds the {MaxGbmTreeJsonBytes}-byte safety limit.");
+
             try
             {
                 var trees = JsonSerializer.Deserialize<List<GbmTree>>(normalized.GbmTreesJson, CloneJsonOptions);
@@ -784,14 +831,30 @@ internal static class GbmSnapshotSupport
             return;
         }
 
-        var reachable = new bool[nodes.Count];
-        var queue = new Queue<int>();
-        queue.Enqueue(0);
-        reachable[0] = true;
+        var state = new byte[nodes.Count];
+        var indegree = new int[nodes.Count];
 
-        while (queue.Count > 0)
+        void Visit(int nodeIndex, int depth)
         {
-            int nodeIndex = queue.Dequeue();
+            if (nodeIndex < 0 || nodeIndex >= nodes.Count)
+                return;
+
+            if (depth > MaxTreeDepth)
+            {
+                issues.Add($"GbmTreesJson tree[{treeIndex}] exceeds the maximum supported depth of {MaxTreeDepth}.");
+                return;
+            }
+
+            if (state[nodeIndex] == 1)
+            {
+                issues.Add($"GbmTreesJson tree[{treeIndex}] contains a cycle involving node[{nodeIndex}].");
+                return;
+            }
+            if (state[nodeIndex] == 2)
+                return;
+
+            state[nodeIndex] = 1;
+
             var node = nodes[nodeIndex];
 
             if (!double.IsFinite(node.LeafValue))
@@ -805,7 +868,8 @@ internal static class GbmSnapshotSupport
             {
                 if (node.LeftChild >= 0 || node.RightChild >= 0)
                     issues.Add($"GbmTreesJson tree[{treeIndex}] leaf node[{nodeIndex}] cannot reference children.");
-                continue;
+                state[nodeIndex] = 2;
+                return;
             }
 
             if (node.SplitFeature < 0 || node.SplitFeature >= featureCount)
@@ -813,26 +877,33 @@ internal static class GbmSnapshotSupport
             if (node.LeftChild < 0 || node.LeftChild >= nodes.Count || node.RightChild < 0 || node.RightChild >= nodes.Count)
             {
                 issues.Add($"GbmTreesJson tree[{treeIndex}] node[{nodeIndex}] references an out-of-range child.");
-                continue;
+                state[nodeIndex] = 2;
+                return;
             }
 
             if (node.LeftChild == nodeIndex || node.RightChild == nodeIndex || node.LeftChild == node.RightChild)
                 issues.Add($"GbmTreesJson tree[{treeIndex}] node[{nodeIndex}] has an invalid child layout.");
 
-            if (!reachable[node.LeftChild])
-            {
-                reachable[node.LeftChild] = true;
-                queue.Enqueue(node.LeftChild);
-            }
+            indegree[node.LeftChild]++;
+            if (indegree[node.LeftChild] > 1)
+                issues.Add($"GbmTreesJson tree[{treeIndex}] node[{node.LeftChild}] has multiple parents.");
 
-            if (!reachable[node.RightChild])
-            {
-                reachable[node.RightChild] = true;
-                queue.Enqueue(node.RightChild);
-            }
+            indegree[node.RightChild]++;
+            if (indegree[node.RightChild] > 1)
+                issues.Add($"GbmTreesJson tree[{treeIndex}] node[{node.RightChild}] has multiple parents.");
+
+            Visit(node.LeftChild, depth + 1);
+            Visit(node.RightChild, depth + 1);
+
+            state[nodeIndex] = 2;
         }
 
-        if (reachable.Any(isReachable => !isReachable))
+        Visit(0, 1);
+
+        if (indegree[0] != 0)
+            issues.Add($"GbmTreesJson tree[{treeIndex}] root node must not have any parents.");
+
+        if (state.Any(value => value == 0))
             issues.Add($"GbmTreesJson tree[{treeIndex}] contains unreachable nodes after root traversal.");
     }
 

@@ -32,7 +32,7 @@ public sealed partial class FtTransformerModelTrainer
             ? normalized.ActiveFeatureMask.Count(active => active)
             : featureCount;
 
-        int auditCount = Math.Min(32, rawAuditSamples.Count);
+        int auditCount = rawAuditSamples.Count;
         if (auditCount == 0)
         {
             var emptyArtifact = new FtTransformerAuditArtifact
@@ -48,7 +48,6 @@ public sealed partial class FtTransformerModelTrainer
             return new FtTransformerAuditResult(emptyArtifact.Findings, 0.0, emptyArtifact);
         }
 
-        int auditStride = Math.Max(1, rawAuditSamples.Count / auditCount);
         var findings = new List<string>();
         if (!validation.IsValid)
             findings.AddRange(validation.Issues);
@@ -60,18 +59,14 @@ public sealed partial class FtTransformerModelTrainer
 
         var trainerBuf = new InferenceBuffers(featureCount, embedDim, numHeads, ffnDim);
         var engine = new FtTransformerInferenceEngine();
+        var replayedAuditSamples = ElmFeaturePipelineHelper.ReplaySnapshotPreprocessing(rawAuditSamples, normalized);
 
         for (int ai = 0; ai < auditCount; ai++)
         {
-            int sampleIndex = Math.Min(rawAuditSamples.Count - 1, ai * auditStride);
+            int sampleIndex = ai;
             try
             {
-                float[] rawProjected = MLSignalScorer.ProjectRawFeaturesForSnapshot(
-                    rawAuditSamples[sampleIndex].Features, normalized);
-                float[] features = MLSignalScorer.StandardiseFeatures(
-                    rawProjected, normalized.Means, normalized.Stds, featureCount);
-                InferenceHelpers.ApplyModelSpecificFeatureTransforms(features, normalized);
-                MLSignalScorer.ApplyFeatureMask(features, normalized.ActiveFeatureMask, featureCount);
+                float[] features = replayedAuditSamples[sampleIndex].Features;
 
                 double trainerRaw = ForwardPass(features, model, featureCount, trainerBuf);
                 var inference = engine.RunInference(

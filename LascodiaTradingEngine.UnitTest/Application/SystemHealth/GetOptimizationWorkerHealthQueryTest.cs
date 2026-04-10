@@ -26,6 +26,14 @@ public class GetOptimizationWorkerHealthQueryTest
                 ErrorsLastHour = 2,
                 SuccessesLastHour = 7,
                 BacklogDepth = 3,
+                LastQueueLatencyMs = 2500,
+                QueueLatencyP50Ms = 2000,
+                QueueLatencyP95Ms = 9000,
+                LastExecutionDurationMs = 1400,
+                ExecutionDurationP50Ms = 1200,
+                ExecutionDurationP95Ms = 2500,
+                RetriesLastHour = 2,
+                RecoveriesLastHour = 1,
                 ConfiguredIntervalSeconds = 30,
             },
             new()
@@ -73,6 +81,12 @@ public class GetOptimizationWorkerHealthQueryTest
             MostDeferredQueuedDeferralCount = 4,
             MostRecentDeferredResumeRunId = 80,
             MostRecentDeferredResumeAtUtc = DateTime.Parse("2026-04-06T10:13:30Z").ToUniversalTime(),
+            DeferredRunsStartedLastHour = 3,
+            DeferredRunsResumedLastHour = 2,
+            RepeatedlyDeferredQueuedRuns = 1,
+            OldestActiveDeferralRunId = 81,
+            OldestActiveDeferralAtUtc = DateTime.Parse("2026-04-06T09:40:00Z").ToUniversalTime(),
+            OldestActiveDeferralAgeSeconds = 2_100,
             DeferredQueuedRunsByReason =
             [
                 new OptimizationDeferralReasonCountSnapshot(OptimizationDeferralReason.SeasonalBlackout, 1),
@@ -143,7 +157,12 @@ public class GetOptimizationWorkerHealthQueryTest
                 ConsecutiveFailures = 2,
                 LastDurationMs = 45,
                 SuccessesLastHour = 1,
-                FailuresLastHour = 2
+                FailuresLastHour = 2,
+                IsDegraded = true,
+                BackoffUntilUtc = DateTime.Parse("2026-04-06T10:20:00Z").ToUniversalTime(),
+                LastSkippedAtUtc = DateTime.Parse("2026-04-06T10:15:00Z").ToUniversalTime(),
+                LastSkipReason = "phase degraded due to repeated scheduling failures",
+                SkippedExecutionsLastHour = 3
             }
         ]);
 
@@ -155,6 +174,14 @@ public class GetOptimizationWorkerHealthQueryTest
         Assert.NotNull(response.data);
         Assert.NotNull(response.data!.CoordinatorWorker);
         Assert.Equal(OptimizationWorkerHealthNames.CoordinatorWorker, response.data.CoordinatorWorker!.WorkerName);
+        Assert.Equal(2500, response.data.CoordinatorWorker.LastQueueLatencyMs);
+        Assert.Equal(2000, response.data.CoordinatorWorker.QueueLatencyP50Ms);
+        Assert.Equal(9000, response.data.CoordinatorWorker.QueueLatencyP95Ms);
+        Assert.Equal(1400, response.data.CoordinatorWorker.LastExecutionDurationMs);
+        Assert.Equal(1200, response.data.CoordinatorWorker.ExecutionDurationP50Ms);
+        Assert.Equal(2500, response.data.CoordinatorWorker.ExecutionDurationP95Ms);
+        Assert.Equal(2, response.data.CoordinatorWorker.RetriesLastHour);
+        Assert.Equal(1, response.data.CoordinatorWorker.RecoveriesLastHour);
         Assert.Equal(2, response.data.ActiveProcessingSlots);
         Assert.Equal(3, response.data.ConfiguredMaxConcurrentRuns);
         Assert.Equal(1, response.data.ProcessingSlotFailuresLastHour);
@@ -176,6 +203,12 @@ public class GetOptimizationWorkerHealthQueryTest
         Assert.Equal(4, response.data.MostDeferredQueuedDeferralCount);
         Assert.Equal(80, response.data.MostRecentDeferredResumeRunId);
         Assert.Equal(DateTime.Parse("2026-04-06T10:13:30Z").ToUniversalTime(), response.data.MostRecentDeferredResumeAtUtc);
+        Assert.Equal(3, response.data.DeferredRunsStartedLastHour);
+        Assert.Equal(2, response.data.DeferredRunsResumedLastHour);
+        Assert.Equal(1, response.data.RepeatedlyDeferredQueuedRuns);
+        Assert.Equal(81, response.data.OldestActiveDeferralRunId);
+        Assert.Equal(DateTime.Parse("2026-04-06T09:40:00Z").ToUniversalTime(), response.data.OldestActiveDeferralAtUtc);
+        Assert.Equal(2_100, response.data.OldestActiveDeferralAgeSeconds);
         Assert.Collection(
             response.data.DeferredQueuedRunsByReason,
             item =>
@@ -247,6 +280,11 @@ public class GetOptimizationWorkerHealthQueryTest
                 Assert.Equal(2, phase.ConsecutiveFailures);
                 Assert.Equal(1, phase.SuccessesLastHour);
                 Assert.Equal(2, phase.FailuresLastHour);
+                Assert.True(phase.IsDegraded);
+                Assert.Equal(DateTime.Parse("2026-04-06T10:20:00Z").ToUniversalTime(), phase.BackoffUntilUtc);
+                Assert.Equal(DateTime.Parse("2026-04-06T10:15:00Z").ToUniversalTime(), phase.LastSkippedAtUtc);
+                Assert.Equal("phase degraded due to repeated scheduling failures", phase.LastSkipReason);
+                Assert.Equal(3, phase.SkippedExecutionsLastHour);
             },
             phase =>
             {
@@ -258,6 +296,11 @@ public class GetOptimizationWorkerHealthQueryTest
                 Assert.Equal(18, phase.LastSuccessDurationMs);
                 Assert.Equal(5, phase.SuccessesLastHour);
                 Assert.Equal(0, phase.FailuresLastHour);
+                Assert.False(phase.IsDegraded);
+                Assert.Null(phase.BackoffUntilUtc);
+                Assert.Null(phase.LastSkippedAtUtc);
+                Assert.Null(phase.LastSkipReason);
+                Assert.Equal(0, phase.SkippedExecutionsLastHour);
             });
     }
 

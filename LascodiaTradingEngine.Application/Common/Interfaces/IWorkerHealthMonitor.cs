@@ -17,6 +17,18 @@ public interface IWorkerHealthMonitor
     /// <summary>Records the current backlog depth (e.g. pending items) for the worker.</summary>
     void RecordBacklogDepth(string workerName, int depth);
 
+    /// <summary>Records queue latency for the most recently claimed item.</summary>
+    void RecordQueueLatency(string workerName, long durationMs);
+
+    /// <summary>Records execution duration for the most recently completed item.</summary>
+    void RecordExecutionDuration(string workerName, long durationMs);
+
+    /// <summary>Records one or more retry events for the worker.</summary>
+    void RecordRetry(string workerName, int count = 1);
+
+    /// <summary>Records one or more recovery actions for the worker.</summary>
+    void RecordRecovery(string workerName, int count = 1);
+
     /// <summary>
     /// Records lightweight liveness for long-running workers that do not have a natural cycle boundary.
     /// </summary>

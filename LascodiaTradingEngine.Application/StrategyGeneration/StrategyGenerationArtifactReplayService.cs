@@ -14,6 +14,7 @@ namespace LascodiaTradingEngine.Application.StrategyGeneration;
 internal sealed class StrategyGenerationArtifactReplayService : IStrategyGenerationArtifactReplayService
 {
     private readonly ILogger<StrategyGenerationWorker> _logger;
+    private readonly IServiceScopeFactory _scopeFactory;
     private readonly IStrategyGenerationPendingArtifactStore _pendingArtifactStore;
     private readonly IStrategyGenerationEventFactory _eventFactory;
     private readonly IStrategyGenerationHealthStore _healthStore;
@@ -21,12 +22,14 @@ internal sealed class StrategyGenerationArtifactReplayService : IStrategyGenerat
 
     public StrategyGenerationArtifactReplayService(
         ILogger<StrategyGenerationWorker> logger,
+        IServiceScopeFactory scopeFactory,
         IStrategyGenerationPendingArtifactStore pendingArtifactStore,
         IStrategyGenerationEventFactory eventFactory,
         IStrategyGenerationHealthStore healthStore,
         TimeProvider timeProvider)
     {
         _logger = logger;
+        _scopeFactory = scopeFactory;
         _pendingArtifactStore = pendingArtifactStore;
         _eventFactory = eventFactory;
         _healthStore = healthStore;
@@ -61,18 +64,23 @@ internal sealed class StrategyGenerationArtifactReplayService : IStrategyGenerat
         CancellationToken ct)
     {
         var pendingLoad = await _pendingArtifactStore.LoadPendingArtifactsAsync(readDb, ct);
-        UpdatePendingArtifactBacklog(pendingLoad.PendingArtifacts, pendingLoad.CorruptArtifactIds.Count);
-        if (pendingLoad.CorruptArtifactIds.Count > 0)
+        UpdatePendingArtifactBacklog(pendingLoad.PendingArtifacts, pendingLoad.CorruptArtifacts.Count);
+        if (pendingLoad.CorruptArtifacts.Count > 0)
         {
             _logger.LogWarning(
                 "StrategyGenerationWorker: quarantining {Count} corrupt deferred post-persist artifact rows",
-                pendingLoad.CorruptArtifactIds.Count);
-            await PersistPendingPostPersistArtifactsAsync(writeCtx, pendingLoad.PendingArtifacts, ct);
+                pendingLoad.CorruptArtifacts.Count);
+            await _pendingArtifactStore.QuarantineCorruptArtifactsAsync(
+                writeCtx.GetDbContext(),
+                pendingLoad.CorruptArtifacts,
+                ct);
+            await writeCtx.SaveChangesAsync(ct);
+            RecordCorruptArtifactQuarantine(pendingLoad.CorruptArtifacts);
         }
 
         if (pendingLoad.PendingArtifacts.Count == 0)
         {
-            RecordReplayOutcome(0, pendingLoad.CorruptArtifactIds.Count, 0);
+            RecordReplayOutcome(0, pendingLoad.CorruptArtifacts.Count, 0);
             return;
         }
 
@@ -89,7 +97,7 @@ internal sealed class StrategyGenerationArtifactReplayService : IStrategyGenerat
             ct);
         RecordReplayOutcome(
             pendingLoad.PendingArtifacts.Count,
-            pendingLoad.CorruptArtifactIds.Count,
+            pendingLoad.CorruptArtifacts.Count,
             remainingCount);
     }
 
@@ -162,7 +170,7 @@ internal sealed class StrategyGenerationArtifactReplayService : IStrategyGenerat
                     pending,
                     ct);
 
-                if (!updated.NeedsCreationAudit && !updated.NeedsCreatedEvent && !updated.NeedsAutoPromoteEvent)
+                if (IsArtifactFullyProcessed(updated))
                 {
                     remaining.RemoveAt(i);
                     i--;
@@ -261,6 +269,12 @@ internal sealed class StrategyGenerationArtifactReplayService : IStrategyGenerat
         candidate.Strategy.StrategyType = strategy.StrategyType;
         candidate.Strategy.CreatedAt = strategy.CreatedAt;
         candidate.Strategy.ScreeningMetricsJson = strategy.ScreeningMetricsJson ?? candidate.Strategy.ScreeningMetricsJson;
+        pending = await ReconcileDeferredEventDispatchesAsync(pending, ct);
+        if (IsArtifactFullyProcessed(pending))
+        {
+            await PersistTrackedArtifactStateAsync(writeCtx, trackedArtifact, pending, ct);
+            return pending;
+        }
 
         try
         {
@@ -290,14 +304,14 @@ internal sealed class StrategyGenerationArtifactReplayService : IStrategyGenerat
                     {
                         NeedsCreatedEvent = false,
                         CandidateCreatedEventId = createdEvent.Id,
-                        CandidateCreatedEventDispatchedAtUtc = attemptTimestamp,
                     },
                     attemptTimestamp,
                     null,
                     ref attemptRecorded);
                 ApplyTrackedArtifactState(trackedArtifact, updatedPending);
                 await eventService.SaveAndPublish(writeCtx, createdEvent);
-                pending = updatedPending;
+                pending = await ReconcileDeferredEventDispatchesAsync(updatedPending, ct);
+                await PersistTrackedArtifactStateAsync(writeCtx, trackedArtifact, pending, ct);
             }
 
             if (pending.NeedsAutoPromoteEvent)
@@ -339,14 +353,14 @@ internal sealed class StrategyGenerationArtifactReplayService : IStrategyGenerat
                     {
                         NeedsAutoPromoteEvent = false,
                         AutoPromotedEventId = autoPromotedEvent.Id,
-                        AutoPromotedEventDispatchedAtUtc = attemptTimestamp,
                     },
                     attemptTimestamp,
                     null,
                     ref attemptRecorded);
                 ApplyTrackedArtifactState(trackedArtifact, updatedPending);
                 await eventService.SaveAndPublish(writeCtx, autoPromotedEvent);
-                pending = updatedPending;
+                pending = await ReconcileDeferredEventDispatchesAsync(updatedPending, ct);
+                await PersistTrackedArtifactStateAsync(writeCtx, trackedArtifact, pending, ct);
             }
         }
         catch (Exception ex)
@@ -357,6 +371,61 @@ internal sealed class StrategyGenerationArtifactReplayService : IStrategyGenerat
             RecordReplayFailure(ex.Message);
             pending = RecordAttempt(pending, attemptTimestamp, ex.Message, ref attemptRecorded);
             await PersistTrackedArtifactStateAsync(writeCtx, trackedArtifact, pending, ct);
+        }
+
+        return pending;
+    }
+
+    private async Task<StrategyGenerationPendingArtifactRecord> ReconcileDeferredEventDispatchesAsync(
+        StrategyGenerationPendingArtifactRecord pending,
+        CancellationToken ct)
+    {
+        var eventIds = new List<Guid>(2);
+        if (pending.CandidateCreatedEventId.HasValue && pending.CandidateCreatedEventDispatchedAtUtc == null)
+            eventIds.Add(pending.CandidateCreatedEventId.Value);
+        if (pending.AutoPromotedEventId.HasValue && pending.AutoPromotedEventDispatchedAtUtc == null)
+            eventIds.Add(pending.AutoPromotedEventId.Value);
+        if (eventIds.Count == 0)
+            return pending;
+
+        var statuses = await LoadEventStatusesAsync(eventIds, ct);
+        var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+
+        if (pending.CandidateCreatedEventId.HasValue
+            && pending.CandidateCreatedEventDispatchedAtUtc == null
+            && statuses.TryGetValue(pending.CandidateCreatedEventId.Value, out var createdStatus)
+            && createdStatus.State == Lascodia.Trading.Engine.IntegrationEventLogEF.EventStateEnum.Published)
+        {
+            pending = pending with
+            {
+                CandidateCreatedEventDispatchedAtUtc = nowUtc,
+                LastErrorMessage = null,
+            };
+        }
+
+        if (pending.AutoPromotedEventId.HasValue
+            && pending.AutoPromotedEventDispatchedAtUtc == null
+            && statuses.TryGetValue(pending.AutoPromotedEventId.Value, out var promotedStatus)
+            && promotedStatus.State == Lascodia.Trading.Engine.IntegrationEventLogEF.EventStateEnum.Published)
+        {
+            pending = pending with
+            {
+                AutoPromotedEventDispatchedAtUtc = nowUtc,
+                LastErrorMessage = null,
+            };
+        }
+
+        if (!IsArtifactFullyProcessed(pending))
+        {
+            string waitingMessage = BuildWaitingEventMessage(pending, statuses);
+            if (!string.IsNullOrWhiteSpace(waitingMessage))
+            {
+                pending = pending with
+                {
+                    LastAttemptAtUtc = nowUtc,
+                    LastErrorMessage = waitingMessage,
+                };
+            }
         }
 
         return pending;
@@ -538,4 +607,68 @@ internal sealed class StrategyGenerationArtifactReplayService : IStrategyGenerat
 
     private static string Truncate(string message)
         => message.Length <= 500 ? message : message[..500];
+
+    private async Task<IReadOnlyDictionary<Guid, IntegrationEventStatusSnapshot>> LoadEventStatusesAsync(
+        IReadOnlyCollection<Guid> eventIds,
+        CancellationToken ct)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var eventLogReader = scope.ServiceProvider.GetRequiredService<IEventLogReader>();
+        return await eventLogReader.GetEventStatusSnapshotsAsync(eventIds, ct);
+    }
+
+    private static bool IsArtifactFullyProcessed(StrategyGenerationPendingArtifactRecord pending)
+    {
+        bool createdPending = pending.CandidateCreatedEventId.HasValue && pending.CandidateCreatedEventDispatchedAtUtc == null;
+        bool autoPromotePending = pending.AutoPromotedEventId.HasValue && pending.AutoPromotedEventDispatchedAtUtc == null;
+        return !pending.NeedsCreationAudit
+            && !pending.NeedsCreatedEvent
+            && !pending.NeedsAutoPromoteEvent
+            && !createdPending
+            && !autoPromotePending;
+    }
+
+    private static string BuildWaitingEventMessage(
+        StrategyGenerationPendingArtifactRecord pending,
+        IReadOnlyDictionary<Guid, IntegrationEventStatusSnapshot> statuses)
+    {
+        var fragments = new List<string>(2);
+        if (pending.CandidateCreatedEventId.HasValue && pending.CandidateCreatedEventDispatchedAtUtc == null)
+            fragments.Add(BuildEventStatusFragment("candidate_created", pending.CandidateCreatedEventId.Value, statuses));
+        if (pending.AutoPromotedEventId.HasValue && pending.AutoPromotedEventDispatchedAtUtc == null)
+            fragments.Add(BuildEventStatusFragment("auto_promoted", pending.AutoPromotedEventId.Value, statuses));
+
+        fragments.RemoveAll(string.IsNullOrWhiteSpace);
+        return fragments.Count == 0 ? string.Empty : string.Join("; ", fragments);
+    }
+
+    private static string BuildEventStatusFragment(
+        string label,
+        Guid eventId,
+        IReadOnlyDictionary<Guid, IntegrationEventStatusSnapshot> statuses)
+    {
+        if (!statuses.TryGetValue(eventId, out var status))
+            return $"{label}:{eventId}:missing_from_event_log";
+
+        return $"{label}:{eventId}:{status.State}:attempts={status.TimesSent}";
+    }
+
+    private void RecordCorruptArtifactQuarantine(IReadOnlyCollection<StrategyGenerationCorruptArtifactRecord> corruptArtifacts)
+    {
+        if (corruptArtifacts.Count == 0)
+            return;
+
+        var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+        string? reason = corruptArtifacts
+            .Select(a => a.Reason)
+            .FirstOrDefault(r => !string.IsNullOrWhiteSpace(r));
+        _healthStore.UpdateState(state => state with
+        {
+            QuarantinedArtifacts = state.QuarantinedArtifacts + corruptArtifacts.Count,
+            LastArtifactQuarantinedAtUtc = nowUtc,
+            LastArtifactQuarantineReason = reason,
+            CapturedAtUtc = nowUtc,
+        });
+        _healthStore.RecordPhaseFailure("artifact_quarantine", reason ?? "Corrupt pending artifact quarantined", nowUtc);
+    }
 }

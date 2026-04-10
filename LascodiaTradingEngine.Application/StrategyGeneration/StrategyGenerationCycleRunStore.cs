@@ -60,12 +60,38 @@ internal sealed class StrategyGenerationCycleRunStore : IStrategyGenerationCycle
         cycle.LastUpdatedAtUtc = _timeProvider.GetUtcNow().UtcDateTime;
     }
 
-    public async Task StageSummaryDispatchSuccessAsync(
+    public async Task StageCompletionAsync(
+        DbContext writeDb,
+        string cycleId,
+        StrategyGenerationCycleRunCompletion completion,
+        CancellationToken ct)
+    {
+        var cycle = await LoadMutableAsync(writeDb, cycleId, ct);
+        if (cycle == null)
+            return;
+
+        var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+        cycle.Status = "Completed";
+        cycle.CompletedAtUtc = nowUtc;
+        cycle.DurationMs = completion.DurationMs;
+        cycle.CandidatesCreated = completion.CandidatesCreated;
+        cycle.ReserveCandidatesCreated = completion.ReserveCandidatesCreated;
+        cycle.CandidatesScreened = completion.CandidatesScreened;
+        cycle.SymbolsProcessed = completion.SymbolsProcessed;
+        cycle.SymbolsSkipped = completion.SymbolsSkipped;
+        cycle.StrategiesPruned = completion.StrategiesPruned;
+        cycle.PortfolioFilterRemoved = completion.PortfolioFilterRemoved;
+        cycle.LastUpdatedAtUtc = nowUtc;
+        cycle.FailureStage = null;
+        cycle.FailureMessage = null;
+    }
+
+    public async Task StageSummaryDispatchAttemptAsync(
         DbContext writeDb,
         string cycleId,
         Guid eventId,
         string payloadJson,
-        DateTime dispatchedAtUtc,
+        DateTime attemptedAtUtc,
         CancellationToken ct)
     {
         var cycle = await LoadMutableAsync(writeDb, cycleId, ct);
@@ -75,6 +101,22 @@ internal sealed class StrategyGenerationCycleRunStore : IStrategyGenerationCycle
         cycle.SummaryEventId = eventId;
         cycle.SummaryEventPayloadJson = payloadJson;
         cycle.SummaryEventDispatchAttempts++;
+        cycle.SummaryEventDispatchedAtUtc = null;
+        cycle.SummaryEventFailedAtUtc = null;
+        cycle.SummaryEventFailureMessage = null;
+        cycle.LastUpdatedAtUtc = attemptedAtUtc;
+    }
+
+    public async Task MarkSummaryDispatchPublishedAsync(
+        DbContext writeDb,
+        string cycleId,
+        DateTime dispatchedAtUtc,
+        CancellationToken ct)
+    {
+        var cycle = await LoadMutableAsync(writeDb, cycleId, ct);
+        if (cycle == null)
+            return;
+
         cycle.SummaryEventDispatchedAtUtc = dispatchedAtUtc;
         cycle.SummaryEventFailedAtUtc = null;
         cycle.SummaryEventFailureMessage = null;
@@ -170,6 +212,31 @@ internal sealed class StrategyGenerationCycleRunStore : IStrategyGenerationCycle
                      && c.CycleId != currentCycleId)
             .OrderByDescending(c => c.CompletedAtUtc ?? c.StartedAtUtc)
             .FirstOrDefaultAsync(ct);
+    }
+
+    public async Task<IReadOnlyList<StrategyGenerationSummaryDispatchRecord>> LoadPendingSummaryDispatchesAsync(
+        DbContext readDb,
+        CancellationToken ct)
+    {
+        var cycleSet = TryGetSet<StrategyGenerationCycleRun>(readDb);
+        if (cycleSet == null)
+            return [];
+
+        return await cycleSet
+            .AsNoTracking()
+            .Where(c => !c.IsDeleted
+                     && c.Status == "Completed"
+                     && c.SummaryEventId != null
+                     && c.SummaryEventDispatchedAtUtc == null)
+            .OrderBy(c => c.LastUpdatedAtUtc)
+            .Select(c => new StrategyGenerationSummaryDispatchRecord(
+                c.CycleId,
+                c.SummaryEventId!.Value,
+                c.SummaryEventFailedAtUtc,
+                c.SummaryEventDispatchedAtUtc,
+                c.SummaryEventFailureMessage,
+                c.SummaryEventPayloadJson))
+            .ToListAsync(ct);
     }
 
     private static async Task<StrategyGenerationCycleRun?> LoadMutableAsync(DbContext writeDb, string cycleId, CancellationToken ct)

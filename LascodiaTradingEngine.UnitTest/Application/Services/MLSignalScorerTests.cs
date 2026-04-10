@@ -21,7 +21,9 @@ public class MLSignalScorerTests
         {
             Type = "TCN",
             ConvWeightsJson = "{\"ConvW\":[]}",
-            Version = "5.0"
+            Version = "5.0",
+            SeqMeans = new float[MLFeatureHelper.SequenceChannelCount],
+            SeqStds = Enumerable.Repeat(1f, MLFeatureHelper.SequenceChannelCount).ToArray(),
         };
 
         Assert.True(new TcnInferenceEngine().CanHandle(snap));
@@ -42,7 +44,9 @@ public class MLSignalScorerTests
         {
             Type = "TCN",
             ConvWeightsJson = "{\"ConvW\":[]}",
-            Version = "4.9"
+            Version = "4.9",
+            SeqMeans = new float[MLFeatureHelper.SequenceChannelCount],
+            SeqStds = Enumerable.Repeat(1f, MLFeatureHelper.SequenceChannelCount).ToArray(),
         };
 
         Assert.False(new TcnInferenceEngine().CanHandle(snap));
@@ -68,7 +72,9 @@ public class MLSignalScorerTests
         {
             Type = "TCN",
             ConvWeightsJson = "{\"ConvW\":[]}",
-            Version = "10.0"
+            Version = "10.0",
+            SeqMeans = new float[MLFeatureHelper.SequenceChannelCount],
+            SeqStds = Enumerable.Repeat(1f, MLFeatureHelper.SequenceChannelCount).ToArray(),
         };
 
         Assert.True(new TcnInferenceEngine().CanHandle(snap));
@@ -334,6 +340,44 @@ public class MLSignalScorerTests
         Assert.Equal(0.0, result.Value.ModelSpaceValues[0], precision: 6);
     }
 
+    [Fact]
+    public void TcnInferenceEngine_RunInference_Returns_Null_For_Invalid_Lookback_Window()
+    {
+        var snapshot = CreateMinimalTcnSnapshot();
+        var candles = CreateCandleWindow();
+        candles.RemoveAt(candles.Count - 1);
+
+        var result = new TcnInferenceEngine().RunInference(
+            features: new float[MLFeatureHelper.FeatureCount],
+            featureCount: MLFeatureHelper.FeatureCount,
+            snapshot,
+            candles,
+            modelId: 1,
+            mcDropoutSamples: 0,
+            mcDropoutSeed: 0);
+
+        Assert.False(result.HasValue);
+    }
+
+    [Fact]
+    public void TcnInferenceEngine_RunInference_Returns_Null_For_Open_Candle_Window()
+    {
+        var snapshot = CreateMinimalTcnSnapshot();
+        var candles = CreateCandleWindow();
+        candles[^1].IsClosed = false;
+
+        var result = new TcnInferenceEngine().RunInference(
+            features: new float[MLFeatureHelper.FeatureCount],
+            featureCount: MLFeatureHelper.FeatureCount,
+            snapshot,
+            candles,
+            modelId: 1,
+            mcDropoutSamples: 0,
+            mcDropoutSeed: 0);
+
+        Assert.False(result.HasValue);
+    }
+
     // ────────────────────────────────────────────────────────────────────────
     //  ApplyBasicCalibration — edge cases
     // ────────────────────────────────────────────────────────────────────────
@@ -448,6 +492,29 @@ public class MLSignalScorerTests
         double expected = 0.4 + ((branchProb - 0.5) / 0.5) * 0.5;
 
         Assert.Equal(expected, result, 8);
+    }
+
+    [Fact]
+    public void ApplyDeployedCalibration_TcnSnapshot_Prefers_Typed_Calibration_Artifact()
+    {
+        var snap = new ModelSnapshot
+        {
+            Type = "TCN",
+            PlattA = 1.0,
+            PlattB = 0.0,
+            TcnCalibrationArtifact = new TcnCalibrationArtifact
+            {
+                GlobalPlattA = 2.0,
+                GlobalPlattB = -0.5,
+            }
+        };
+
+        double rawProb = 0.8;
+        double result = InferenceHelpers.ApplyDeployedCalibration(rawProb, snap);
+        double rawLogit = Math.Log(rawProb / (1.0 - rawProb));
+        double expected = 1.0 / (1.0 + Math.Exp(-(2.0 * rawLogit - 0.5)));
+
+        Assert.Equal(expected, result, precision: 8);
     }
 
     // ────────────────────────────────────────────────────────────────────────

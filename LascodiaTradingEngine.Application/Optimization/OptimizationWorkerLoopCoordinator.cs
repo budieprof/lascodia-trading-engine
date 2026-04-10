@@ -42,25 +42,25 @@ internal sealed class OptimizationWorkerLoopCoordinator : IOptimizationWorkerLoo
 
     public async Task ExecuteCycleAsync(OptimizationWorkerCycleContext cycleContext, CancellationToken ct)
     {
-        var staleRunningSummary = await ExecutePhaseAsync(
+        var staleRunningSummary = await ExecuteCyclePhaseAsync(
             OptimizationWorkerHealthNames.Phases.StaleRunningRecovery,
             () => _recoveryCoordinator.RecoverStaleRunningRunsAsync(ct));
-        await ExecutePhaseAsync(
+        await ExecuteCyclePhaseAsync(
             OptimizationWorkerHealthNames.Phases.StaleQueuedDetection,
             () => _recoveryCoordinator.RecoverStaleQueuedRunsAsync(ct));
-        await ExecutePhaseAsync(
+        await ExecuteCyclePhaseAsync(
             OptimizationWorkerHealthNames.Phases.RetryFailedRuns,
             () => _recoveryCoordinator.RetryFailedRunsAsync(cycleContext.Config, ct));
-        var reconciliationSummary = await ExecutePhaseAsync(
+        var reconciliationSummary = await ExecuteCyclePhaseAsync(
             OptimizationWorkerHealthNames.Phases.LifecycleReconciliation,
             () => _recoveryCoordinator.ReconcileLifecycleStateAsync(cycleContext.Config, ct));
-        await ExecutePhaseAsync(
+        await ExecuteCyclePhaseAsync(
             OptimizationWorkerHealthNames.Phases.FollowUpMonitoring,
             () => _followUpCoordinator.MonitorAsync(cycleContext.Config, ct));
 
         if (cycleContext.ShouldRunScheduling)
         {
-            await ExecutePhaseAsync(
+            await ExecuteCyclePhaseAsync(
                 OptimizationWorkerHealthNames.Phases.AutoScheduling,
                 async () =>
                 {
@@ -71,7 +71,7 @@ internal sealed class OptimizationWorkerLoopCoordinator : IOptimizationWorkerLoo
                 });
         }
 
-        await ExecutePhaseAsync(
+        await ExecuteCyclePhaseAsync(
             OptimizationWorkerHealthNames.Phases.HealthRecording,
             () => _healthRecorder.RecordAsync(
                 cycleContext.Config,
@@ -80,6 +80,60 @@ internal sealed class OptimizationWorkerLoopCoordinator : IOptimizationWorkerLoo
                 staleRunningSummary,
                 reconciliationSummary,
                 ct));
+    }
+
+    private async Task ExecuteCyclePhaseAsync(string phaseName, Func<Task> work)
+    {
+        var decision = _optimizationHealthStore.GetPhaseExecutionDecision(phaseName, UtcNow);
+        if (!decision.ShouldExecute)
+        {
+            _optimizationHealthStore.RecordPhaseSkipped(
+                phaseName,
+                decision.Reason ?? $"{phaseName} skipped because backoff is active",
+                decision.BackoffUntilUtc,
+                UtcNow);
+            return;
+        }
+
+        try
+        {
+            await ExecutePhaseAsync(phaseName, work);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            // Phase failure is already captured in the typed phase health snapshot.
+        }
+    }
+
+    private async Task<T?> ExecuteCyclePhaseAsync<T>(string phaseName, Func<Task<T>> work)
+    {
+        var decision = _optimizationHealthStore.GetPhaseExecutionDecision(phaseName, UtcNow);
+        if (!decision.ShouldExecute)
+        {
+            _optimizationHealthStore.RecordPhaseSkipped(
+                phaseName,
+                decision.Reason ?? $"{phaseName} skipped because backoff is active",
+                decision.BackoffUntilUtc,
+                UtcNow);
+            return default;
+        }
+
+        try
+        {
+            return await ExecutePhaseAsync(phaseName, work);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            return default;
+        }
     }
 
     private async Task ExecutePhaseAsync(string phaseName, Func<Task> work)

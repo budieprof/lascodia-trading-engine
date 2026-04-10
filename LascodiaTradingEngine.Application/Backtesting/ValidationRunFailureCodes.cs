@@ -10,6 +10,7 @@ internal static class ValidationRunFailureCodes
     internal const ValidationFailureCode InvalidCandleSeries = ValidationFailureCode.InvalidCandleSeries;
     internal const ValidationFailureCode InvalidWindow = ValidationFailureCode.InvalidWindow;
     internal const ValidationFailureCode InvalidOptionsSnapshot = ValidationFailureCode.InvalidOptionsSnapshot;
+    internal const ValidationFailureCode InvalidStrategySnapshot = ValidationFailureCode.InvalidStrategySnapshot;
     internal const ValidationFailureCode ExecutionFailed = ValidationFailureCode.ExecutionFailed;
     internal const ValidationFailureCode TransientInfrastructure = ValidationFailureCode.TransientInfrastructure;
 }

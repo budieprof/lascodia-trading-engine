@@ -2226,6 +2226,72 @@ public class ElmTrainerHelpersTests
     }
 
     [Fact]
+    public void RecalibrateOnline_Replays_FracDiff_Snapshots_From_Recent_History_Buffer()
+    {
+        var trainer = new ElmModelTrainer(NullLogger<ElmModelTrainer>.Instance);
+        var snapshot = new ModelSnapshot
+        {
+            Type = "elm",
+            Features = ["F0"],
+            Means = [0f],
+            Stds = [1f],
+            Weights = [[0.8]],
+            Biases = [0.0],
+            ElmInputWeights = [[1.0]],
+            ElmInputBiases = [[0.0]],
+            ElmHiddenDim = 1,
+            LearnerActivations = [(int)ElmActivation.Tanh],
+            FracDiffD = 0.35,
+            TrainSamples = 123,
+            FeatureSchemaFingerprint = ElmSnapshotSupport.ComputeFeatureSchemaFingerprint(["F0"], 1),
+            PreprocessingFingerprint = ElmSnapshotSupport.ComputePreprocessingFingerprint(1, 0.35, false),
+            TrainerFingerprint = "unit-test",
+        };
+
+        var recentSamples = Enumerable.Range(0, 48)
+            .Select(i =>
+            {
+                float value = (i - 24) / 8f;
+                int direction = i % 3 == 0 ? 1 : 0;
+                return new TrainingSample([value], direction, Math.Abs(value));
+            })
+            .ToList();
+
+        bool recalibrated = trainer.RecalibrateOnline(snapshot, recentSamples);
+
+        Assert.True(recalibrated);
+        Assert.Equal(123, snapshot.TrainSamplesAtLastCalibration);
+        Assert.True(double.IsFinite(snapshot.PlattA));
+        Assert.True(double.IsFinite(snapshot.PlattB));
+        Assert.NotEmpty(snapshot.IsotonicBreakpoints);
+    }
+
+    [Fact]
+    public void ElmInferenceEngine_Rejects_Structurally_Invalid_Snapshot()
+    {
+        var engine = new ElmInferenceEngine();
+        var snapshot = new ModelSnapshot
+        {
+            Type = "elm",
+            Features = ["F0"],
+            Means = [0f],
+            Stds = [1f],
+            Weights = [[0.0], [0.0]],
+            Biases = [0.0, 0.0],
+            ElmInputWeights = [[1.0]],
+            ElmInputBiases = [[0.0], [0.0]],
+            FeatureSubsetIndices = [[]],
+            ElmHiddenDim = 1,
+            FeatureSchemaFingerprint = ElmSnapshotSupport.ComputeFeatureSchemaFingerprint(["F0"], 1),
+            PreprocessingFingerprint = ElmSnapshotSupport.ComputePreprocessingFingerprint(1, 0.0, false),
+            TrainerFingerprint = "unit-test",
+        };
+
+        Assert.False(engine.CanHandle(snapshot));
+        Assert.Null(engine.RunInference([0f], 1, snapshot, new List<LascodiaTradingEngine.Domain.Entities.Candle>(), 1, 0, 0));
+    }
+
+    [Fact]
     public void BiasedBootstrap_Clamps_Mismatched_Weight_Arrays_To_Training_Count()
     {
         var train = new List<TrainingSample>

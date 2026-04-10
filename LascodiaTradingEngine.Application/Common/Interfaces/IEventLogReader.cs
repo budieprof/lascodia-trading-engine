@@ -2,6 +2,12 @@ using Lascodia.Trading.Engine.IntegrationEventLogEF;
 
 namespace LascodiaTradingEngine.Application.Common.Interfaces;
 
+public sealed record IntegrationEventStatusSnapshot(
+    Guid EventId,
+    EventStateEnum State,
+    int TimesSent,
+    DateTime CreationTime);
+
 /// <summary>
 /// Provides read/write access to the integration event log for the retry worker.
 /// Implemented in Infrastructure to avoid Application referencing concrete DbContexts.
@@ -17,6 +23,14 @@ public interface IEventLogReader
     /// <param name="ct">Cancellation token.</param>
     Task<List<IntegrationEventLogEntry>> GetRetryableEventsAsync(
         TimeSpan stuckThreshold, int maxRetries, int batchSize, CancellationToken ct);
+
+    /// <summary>
+    /// Returns current event-log state for a known set of integration event ids.
+    /// Missing ids are omitted from the result.
+    /// </summary>
+    Task<IReadOnlyDictionary<Guid, IntegrationEventStatusSnapshot>> GetEventStatusSnapshotsAsync(
+        IReadOnlyCollection<Guid> eventIds,
+        CancellationToken ct);
 
     /// <summary>Persists state changes to event log entries modified in-memory.</summary>
     Task SaveChangesAsync(CancellationToken ct);

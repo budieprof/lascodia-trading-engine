@@ -235,6 +235,7 @@ public class TrainerAuditTests
     private static List<TrainingSample> CreateSamples(string trainerId) => trainerId switch
     {
         "bagged" => GenerateSamples(400),
+        "adaboost" => GenerateSamples(300),
         "tcn" => GenerateTcnSamples(120),
         "fttransformer" => GenerateSamples(220),
         "tabnet" => GenerateSamples(220),
@@ -406,6 +407,19 @@ public class TrainerAuditTests
             Assert.NotEmpty(snapshot.ConvWeightsJson);
             Assert.NotEmpty(snapshot.SeqMeans);
             Assert.NotEmpty(snapshot.SeqStds);
+            Assert.NotNull(snapshot.TcnCalibrationArtifact);
+            Assert.NotNull(snapshot.TcnWarmStartArtifact);
+            Assert.NotNull(snapshot.TcnAuditArtifact);
+            Assert.False(string.IsNullOrWhiteSpace(snapshot.FeatureSchemaFingerprint));
+            Assert.False(string.IsNullOrWhiteSpace(snapshot.PreprocessingFingerprint));
+            Assert.False(string.IsNullOrWhiteSpace(snapshot.TrainerFingerprint));
+            Assert.True(snapshot.TrainingRandomSeed > 0);
+            Assert.True(snapshot.TcnAuditArtifact!.ActiveChannelCount > 0);
+            Assert.Equal(0, snapshot.TcnAuditArtifact.ThresholdDecisionMismatchCount);
+            Assert.True(snapshot.TcnTrainInferenceParityMaxError <= 1e-6);
+            var weights = JsonSerializer.Deserialize<TcnModelTrainer.TcnSnapshotWeights>(snapshot.ConvWeightsJson);
+            var validation = TcnSnapshotSupport.ValidateSnapshot(snapshot, weights);
+            Assert.True(validation.IsValid, string.Join("; ", validation.Issues));
         }
         else if (snapshot.Type == "GBM")
         {
@@ -415,6 +429,33 @@ public class TrainerAuditTests
         {
             Assert.False(string.IsNullOrWhiteSpace(snapshot.GbmTreesJson));
             Assert.NotEmpty(snapshot.Weights);
+            Assert.False(string.IsNullOrWhiteSpace(snapshot.FeatureSchemaFingerprint));
+            Assert.False(string.IsNullOrWhiteSpace(snapshot.PreprocessingFingerprint));
+            Assert.False(string.IsNullOrWhiteSpace(snapshot.TrainerFingerprint));
+            Assert.True(snapshot.TrainingRandomSeed > 0);
+            Assert.NotNull(snapshot.TrainingSplitSummary);
+            Assert.True(snapshot.TrainingSplitSummary!.SelectionCount > 0);
+            Assert.True(snapshot.TrainingSplitSummary.SelectionPruningCount > 0);
+            Assert.True(snapshot.TrainingSplitSummary.SelectionThresholdCount > 0);
+            Assert.True(snapshot.TrainingSplitSummary.SelectionKellyCount > 0);
+            Assert.True(snapshot.TrainingSplitSummary.CalibrationCount > 0);
+            Assert.True(snapshot.TrainingSplitSummary.CalibrationFitCount > 0);
+            Assert.True(snapshot.TrainingSplitSummary.CalibrationDiagnosticsCount > 0);
+            Assert.True(snapshot.TrainingSplitSummary.ConformalCount > 0);
+            Assert.True(snapshot.TrainingSplitSummary.TestCount > 0);
+            Assert.InRange(snapshot.ConformalQHatBuy, 0.0, 1.0);
+            Assert.InRange(snapshot.ConformalQHatSell, 0.0, 1.0);
+            Assert.NotNull(snapshot.AdaBoostSelectionMetrics);
+            Assert.NotNull(snapshot.AdaBoostCalibrationMetrics);
+            Assert.NotNull(snapshot.AdaBoostTestMetrics);
+            Assert.NotNull(snapshot.AdaBoostCalibrationArtifact);
+            Assert.NotNull(snapshot.AdaBoostAuditArtifact);
+            Assert.True(snapshot.AdaBoostAuditArtifact!.SnapshotContractValid);
+            Assert.Equal(0, snapshot.AdaBoostAuditArtifact.ThresholdDecisionMismatchCount);
+            Assert.Empty(snapshot.AdaBoostAuditArtifact.Findings);
+            Assert.All(snapshot.MetaLabelTopFeatureIndices, index => Assert.InRange(index, 0, snapshot.Features.Length - 1));
+            var validation = AdaBoostSnapshotSupport.ValidateSnapshot(snapshot, allowLegacy: false);
+            Assert.True(validation.IsValid, string.Join("; ", validation.Issues));
         }
         else if (snapshot.Type == "quantilerf")
         {
@@ -493,6 +534,7 @@ public class TrainerAuditTests
         }
         else if (snapshot.Type == "FTTRANSFORMER")
         {
+            Assert.Equal("8.0", snapshot.Version);
             Assert.NotNull(snapshot.FtTransformerEmbedWeights);
             Assert.NotNull(snapshot.FtTransformerClsToken);
             Assert.True(snapshot.FtTransformerEmbedDim > 0);
@@ -523,6 +565,16 @@ public class TrainerAuditTests
             Assert.Equal(snapshot.TrainingSplitSummary.AdaptiveHeadSplitMode, snapshot.FtTransformerCalibrationArtifact!.AdaptiveHeadMode, ignoreCase: true);
             Assert.Equal(snapshot.TrainingSplitSummary.AdaptiveHeadCrossFitFoldCount, snapshot.FtTransformerCalibrationArtifact.AdaptiveHeadCrossFitFoldCount);
             Assert.Equal(snapshot.TrainingSplitSummary.ConformalCount, snapshot.FtTransformerCalibrationArtifact.ConformalSampleCount);
+            Assert.True(snapshot.FtTransformerCalibrationArtifact.KellySelectionSampleCount > 0);
+            Assert.Equal(
+                snapshot.TrainingSplitSummary.CalibrationFitCount + snapshot.TrainingSplitSummary.CalibrationDiagnosticsCount,
+                snapshot.FtTransformerCalibrationArtifact.RefitSampleCount);
+            Assert.Equal(
+                snapshot.FtTransformerCalibrationArtifact.RoutingThresholdCandidateCount,
+                snapshot.FtTransformerCalibrationArtifact.RoutingThresholdCandidates.Length);
+            Assert.Equal(
+                snapshot.TrainingSplitSummary.AdaptiveHeadCrossFitFoldCount,
+                snapshot.FtTransformerCalibrationArtifact.SelectedStackCrossFitFoldNlls.Length);
             Assert.True(snapshot.FtTransformerTrainInferenceParityMaxError <= 1e-6);
             Assert.Equal(0, snapshot.FtTransformerAuditArtifact!.ThresholdDecisionMismatchCount);
             if (snapshot.RawFeatureIndices.Length > 0)
@@ -634,7 +686,7 @@ public class TrainerAuditTests
         return samples;
     }
 
-    private static List<Candle> CreateCandleWindow(int count = 64)
+    private static List<Candle> CreateCandleWindow(int count = MLFeatureHelper.LookbackWindow)
     {
         var candles = new List<Candle>(count);
         decimal price = 1.1000m;
@@ -697,4 +749,102 @@ public class TrainerAuditTests
         MinQualityRetentionRatio: 0.0, MultiTaskMagnitudeWeight: 0.3,
         CurriculumEasyFraction: 0.3, SelfDistillTemp: 3.0,
         FgsmEpsilon: 0.01, MinF1Score: 0.10, UseClassWeights: true);
+
+    private static string NormalizeTrainerId(string trainerId) => trainerId switch
+    {
+        "BaggedLogistic" => "bagged",
+        "AdaBoost" => "adaboost",
+        "Elm" => "elm",
+        "Gbm" => "gbm",
+        "Tcn" => "tcn",
+        "TabNet" => "tabnet",
+        "Dann" => "dann",
+        "FtTransformer" => "fttransformer",
+        "QuantileRf" => "quantilerf",
+        "Rocket" => "rocket",
+        "Smote" => "smote",
+        "Svgp" => "svgp",
+        _ => throw new ArgumentOutOfRangeException(nameof(trainerId), trainerId, null),
+    };
+
+    private static bool RequiresCandleWindow(string trainerId) => trainerId == "Tcn";
+
+    [Theory(Timeout = 180000)]
+    [InlineData("BaggedLogistic")]
+    [InlineData("AdaBoost")]
+    [InlineData("Elm")]
+    [InlineData("Gbm")]
+    [InlineData("Tcn")]
+    [InlineData("TabNet")]
+    [InlineData("Dann")]
+    [InlineData("FtTransformer")]
+    [InlineData("QuantileRf")]
+    [InlineData("Rocket")]
+    [InlineData("Smote")]
+    [InlineData("Svgp")]
+    public async Task Trainer_RuntimeParity_InferenceProbabilitiesAreFiniteAndConsistent(string trainerId)
+    {
+        var normalizedId = NormalizeTrainerId(trainerId);
+        var trainer = CreateTrainer(normalizedId);
+        var samples = CreateSamples(normalizedId);
+        var hp = CreateAuditHyperparams(normalizedId);
+
+        TrainingResult result;
+        try
+        {
+            result = await trainer.TrainAsync(samples, hp);
+        }
+        catch (ExternalException) when (normalizedId == "svgp")
+        {
+            return;
+        }
+
+        Assert.NotNull(result);
+        Assert.NotNull(result.ModelBytes);
+        Assert.NotEmpty(result.ModelBytes);
+
+        var snapshot = JsonSerializer.Deserialize<ModelSnapshot>(result.ModelBytes);
+        Assert.NotNull(snapshot);
+
+        var engine = CreateInferenceEngine(normalizedId);
+        Assert.True(engine.CanHandle(snapshot), $"Inference engine refused snapshot for trainer '{trainerId}'.");
+
+        int inferenceFeatureCount = snapshot.Features.Length > 0 ? snapshot.Features.Length : samples[0].Features.Length;
+        bool needsCandles = RequiresCandleWindow(trainerId);
+        var candleWindow = needsCandles ? CreateCandleWindow() : new List<Candle>();
+
+        var rng = new Random(123);
+        var testIndices = Enumerable.Range(0, samples.Count)
+            .OrderBy(_ => rng.Next())
+            .Take(10)
+            .ToList();
+
+        foreach (var idx in testIndices)
+        {
+            float[] inferenceFeatures = BuildInferenceFeatures(samples[idx].Features, snapshot, inferenceFeatureCount);
+
+            var inference = engine.RunInference(
+                inferenceFeatures,
+                inferenceFeatureCount,
+                snapshot,
+                candleWindow,
+                modelId: 1L,
+                mcDropoutSamples: 0,
+                mcDropoutSeed: 0);
+
+            Assert.NotNull(inference);
+
+            double rawP = inference.Value.Probability;
+            Assert.True(double.IsFinite(rawP), $"[{trainerId}] sample {idx}: raw probability is not finite ({rawP}).");
+            Assert.InRange(rawP, 0.0, 1.0);
+
+            double calibP = InferenceHelpers.ApplyDeployedCalibration(rawP, snapshot);
+            Assert.True(double.IsFinite(calibP), $"[{trainerId}] sample {idx}: calibrated probability is not finite ({calibP}).");
+            Assert.InRange(calibP, 0.0, 1.0);
+
+            bool expectedDecision = calibP >= snapshot.OptimalThreshold;
+            bool actualDecision = calibP >= snapshot.OptimalThreshold;
+            Assert.Equal(expectedDecision, actualDecision);
+        }
+    }
 }

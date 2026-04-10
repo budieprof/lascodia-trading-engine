@@ -21,6 +21,7 @@ internal interface IOptimizationRunExecutor
         IAlertDispatcher alertDispatcher,
         IIntegrationEventService eventService,
         Stopwatch sw,
+        Guid expectedLeaseToken,
         CancellationToken ct,
         CancellationToken runCt);
 }

@@ -27,6 +27,8 @@ public class BacktestWorker : BackgroundService
     private readonly IBacktestAutoScheduler _autoScheduler;
     private readonly IValidationRunFactory _validationRunFactory;
     private readonly IBacktestOptionsSnapshotBuilder _optionsSnapshotBuilder;
+    private readonly IStrategyExecutionSnapshotBuilder _strategySnapshotBuilder;
+    private readonly IValidationCandleSeriesGuard _candleSeriesGuard;
     private readonly IAutoWalkForwardWindowPolicy _autoWalkForwardWindowPolicy;
     private readonly IValidationWorkerIdentity _workerIdentity;
     private readonly TimeProvider _timeProvider;
@@ -46,6 +48,8 @@ public class BacktestWorker : BackgroundService
         IBacktestAutoScheduler autoScheduler,
         IValidationRunFactory validationRunFactory,
         IBacktestOptionsSnapshotBuilder optionsSnapshotBuilder,
+        IStrategyExecutionSnapshotBuilder strategySnapshotBuilder,
+        IValidationCandleSeriesGuard candleSeriesGuard,
         IAutoWalkForwardWindowPolicy autoWalkForwardWindowPolicy,
         IValidationWorkerIdentity workerIdentity,
         TimeProvider? timeProvider = null,
@@ -59,6 +63,8 @@ public class BacktestWorker : BackgroundService
         _autoScheduler = autoScheduler;
         _validationRunFactory = validationRunFactory;
         _optionsSnapshotBuilder = optionsSnapshotBuilder;
+        _strategySnapshotBuilder = strategySnapshotBuilder;
+        _candleSeriesGuard = candleSeriesGuard;
         _autoWalkForwardWindowPolicy = autoWalkForwardWindowPolicy;
         _workerIdentity = workerIdentity;
         _timeProvider = timeProvider ?? TimeProvider.System;
@@ -149,7 +155,7 @@ public class BacktestWorker : BackgroundService
         await _autoScheduler.ScheduleAsync(writeDb, settings, ct);
     }
 
-    private async Task ScheduleBacktestsForStaleStrategiesCoreAsync(
+    private Task ScheduleBacktestsForStaleStrategiesCoreAsync(
         DbContext writeDb,
         BacktestWorkerSettings settings,
         CancellationToken ct)
@@ -195,6 +201,7 @@ public class BacktestWorker : BackgroundService
         int totalRecovered = requeued + orphaned + legacyRunningRuns.Count;
         if (totalRecovered > 0)
         {
+            _healthMonitor?.RecordRecovery(nameof(BacktestWorker), totalRecovered);
             _logger.LogInformation(
                 "BacktestWorker: recovered {Count} run(s) ({Requeued} re-queued, {Orphaned} orphaned, {Legacy} legacy)",
                 totalRecovered,
@@ -213,8 +220,10 @@ public class BacktestWorker : BackgroundService
 
         var db = writeContext.GetDbContext();
         var settings = await _settingsProvider.GetBacktestSettingsAsync(db, _logger, ct);
+        int dueBacklogDepth = await db.Set<BacktestRun>()
+            .CountAsync(candidate => !candidate.IsDeleted && candidate.Status == RunStatus.Queued && candidate.AvailableAt <= UtcNow, ct);
+        _healthMonitor?.RecordBacklogDepth(nameof(BacktestWorker), dueBacklogDepth);
         var claimResult = await _runClaimService.ClaimNextRunAsync(db, UtcNow, _workerIdentity.InstanceId, ct);
-        _healthMonitor?.RecordBacklogDepth(nameof(BacktestWorker), claimResult.RunId.HasValue ? 1 : 0);
         if (!claimResult.RunId.HasValue)
             return;
 
@@ -231,6 +240,9 @@ public class BacktestWorker : BackgroundService
             "BacktestWorker: processing run {RunId} for strategy {StrategyId}",
             run.Id,
             run.StrategyId);
+        _healthMonitor?.RecordQueueLatency(
+            nameof(BacktestWorker),
+            (long)Math.Max(0, (UtcNow - run.QueuedAt).TotalMilliseconds));
 
         run.ExecutionStartedAt ??= UtcNow;
         run.LastAttemptAt ??= UtcNow;
@@ -265,20 +277,7 @@ public class BacktestWorker : BackgroundService
 
         try
         {
-            var strategy = await db.Set<Strategy>()
-                .FirstOrDefaultAsync(candidate => candidate.Id == run.StrategyId && !candidate.IsDeleted, ct);
-
-            if (strategy == null)
-            {
-                throw new ValidationRunException(
-                    ValidationRunFailureCodes.StrategyNotFound,
-                    $"Strategy {run.StrategyId} not found.",
-                    failureDetailsJson: ValidationRunException.SerializeDetails(new
-                    {
-                        run.Id,
-                        run.StrategyId
-                    }));
-            }
+            var evalStrategy = await ResolveStrategyForExecutionAsync(db, run, ct);
 
             var candles = await db.Set<Candle>()
                 .Where(candle =>
@@ -320,20 +319,27 @@ public class BacktestWorker : BackgroundService
                     }));
             }
 
-            var holidayDates = await LoadHolidayDatesAsync(db, run.Symbol, run.FromDate, run.ToDate, ct);
-            if (!ValidationCandleSeriesInspector.TryValidate(candles, run.Timeframe, settings.CandleGapMultiplier, holidayDates, out string candleIssue))
+            var candleAssessment = await _candleSeriesGuard.ValidateAsync(
+                db,
+                run.Symbol,
+                run.Timeframe,
+                candles,
+                run.FromDate,
+                run.ToDate,
+                settings.CandleGapMultiplier,
+                ct);
+            if (!candleAssessment.IsValid)
             {
                 throw new ValidationRunException(
                     ValidationRunFailureCodes.InvalidCandleSeries,
-                    $"Invalid candle series: {candleIssue}.",
+                    $"Invalid candle series: {candleAssessment.Issue}.",
                     failureDetailsJson: ValidationRunException.SerializeDetails(new
                     {
                         run.Id,
-                        Issue = candleIssue
+                        Issue = candleAssessment.Issue
                     }));
             }
 
-            var evalStrategy = CloneStrategy(strategy);
             if (!string.IsNullOrWhiteSpace(run.ParametersSnapshotJson))
                 evalStrategy.ParametersJson = run.ParametersSnapshotJson;
 
@@ -389,6 +395,7 @@ public class BacktestWorker : BackgroundService
                             Priority: run.Priority,
                             ReOptimizePerFold: false,
                             ParametersSnapshotJson: run.ParametersSnapshotJson,
+                            StrategySnapshotJson: run.StrategySnapshotJson,
                             ValidationQueueKey: validationQueueKey,
                             BacktestOptionsSnapshotJson: run.BacktestOptionsSnapshotJson),
                         ct);
@@ -438,6 +445,7 @@ public class BacktestWorker : BackgroundService
             {
                 var nextAvailableAtUtc = ValidationRetryPolicy.ComputeNextQueueTimeUtc(nowUtc, run.RetryCount, settings.RetryBackoffSeconds);
                 ValidationRetryPolicy.RequeueBacktestRunForRetry(run, nowUtc, nextAvailableAtUtc);
+                _healthMonitor?.RecordRetry(nameof(BacktestWorker));
                 _logger.LogWarning(
                     ex,
                     "BacktestWorker: run {RunId} hit transient failure {FailureCode}; re-queued for retry #{RetryCount} at {NextQueueTimeUtc:O}",
@@ -480,6 +488,13 @@ public class BacktestWorker : BackgroundService
             }
             catch (OperationCanceledException) when (leaseCts.IsCancellationRequested || ct.IsCancellationRequested)
             {
+            }
+
+            if (persisted && run.ExecutionStartedAt.HasValue && run.Status != RunStatus.Running)
+            {
+                _healthMonitor?.RecordExecutionDuration(
+                    nameof(BacktestWorker),
+                    (long)Math.Max(0, (UtcNow - run.ExecutionStartedAt.Value).TotalMilliseconds));
             }
         }
 
@@ -577,48 +592,48 @@ public class BacktestWorker : BackgroundService
                    && message.Contains("ValidationQueueKey", StringComparison.OrdinalIgnoreCase));
     }
 
-    private static async Task<HashSet<DateTime>> LoadHolidayDatesAsync(
+    private async Task<Strategy> ResolveStrategyForExecutionAsync(
         DbContext db,
-        string symbol,
-        DateTime fromUtc,
-        DateTime toUtc,
+        BacktestRun run,
         CancellationToken ct)
     {
-        var pairInfo = await db.Set<CurrencyPair>()
-            .AsNoTracking()
-            .FirstOrDefaultAsync(pair => pair.Symbol == symbol && !pair.IsDeleted, ct);
-        var strategyCurrencies = OptimizationRunMetadataService.ResolveStrategyCurrencies(symbol, pairInfo);
+        var snapshot = _strategySnapshotBuilder.Deserialize(run.StrategySnapshotJson);
+        if (snapshot is not null)
+            return snapshot.ToStrategy();
 
-        var holidayQuery = db.Set<EconomicEvent>()
+        var strategy = await db.Set<Strategy>()
             .AsNoTracking()
-            .Where(e => e.Impact == EconomicImpact.Holiday
-                     && e.ScheduledAt >= fromUtc
-                     && e.ScheduledAt <= toUtc
-                     && !e.IsDeleted);
-        if (strategyCurrencies.Count > 0)
-            holidayQuery = holidayQuery.Where(e => strategyCurrencies.Contains(e.Currency));
+            .FirstOrDefaultAsync(candidate => candidate.Id == run.StrategyId && !candidate.IsDeleted, ct);
+        if (strategy == null)
+        {
+            throw new ValidationRunException(
+                ValidationRunFailureCodes.StrategyNotFound,
+                $"Strategy {run.StrategyId} not found.",
+                failureDetailsJson: ValidationRunException.SerializeDetails(new
+                {
+                    run.Id,
+                    run.StrategyId
+                }));
+        }
 
-        return new HashSet<DateTime>(await holidayQuery
-            .Select(e => e.ScheduledAt.Date)
-            .Distinct()
-            .ToListAsync(ct));
+        run.StrategySnapshotJson = await _strategySnapshotBuilder.BuildSnapshotJsonAsync(
+            db,
+            run.StrategyId,
+            run.ParametersSnapshotJson,
+            ct);
+        snapshot = _strategySnapshotBuilder.Deserialize(run.StrategySnapshotJson);
+        if (snapshot is null)
+        {
+            throw new ValidationRunException(
+                ValidationRunFailureCodes.InvalidStrategySnapshot,
+                $"Strategy snapshot for run {run.Id} could not be built or deserialized.",
+                failureDetailsJson: ValidationRunException.SerializeDetails(new
+                {
+                    run.Id,
+                    run.StrategyId
+                }));
+        }
+
+        return snapshot.ToStrategy();
     }
-
-    private static Strategy CloneStrategy(Strategy source) => new()
-    {
-        Id = source.Id,
-        Name = source.Name,
-        Description = source.Description,
-        StrategyType = source.StrategyType,
-        Symbol = source.Symbol,
-        Timeframe = source.Timeframe,
-        ParametersJson = source.ParametersJson,
-        Status = source.Status,
-        RiskProfileId = source.RiskProfileId,
-        CreatedAt = source.CreatedAt,
-        LifecycleStage = source.LifecycleStage,
-        LifecycleStageEnteredAt = source.LifecycleStageEnteredAt,
-        EstimatedCapacityLots = source.EstimatedCapacityLots,
-        IsDeleted = source.IsDeleted
-    };
 }

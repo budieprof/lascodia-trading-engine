@@ -21,7 +21,19 @@ public sealed record StrategyGenerationPendingArtifactRecord(
 
 public sealed record StrategyGenerationPendingArtifactLoadResult(
     IReadOnlyList<StrategyGenerationPendingArtifactRecord> PendingArtifacts,
-    IReadOnlyList<long> CorruptArtifactIds);
+    IReadOnlyList<StrategyGenerationCorruptArtifactRecord> CorruptArtifacts);
+
+public sealed record StrategyGenerationCorruptArtifactRecord(
+    long ArtifactId,
+    string Reason);
+
+public sealed record StrategyGenerationSummaryDispatchRecord(
+    string CycleId,
+    Guid EventId,
+    DateTime? FailedAtUtc,
+    DateTime? DispatchedAtUtc,
+    string? FailureMessage,
+    string? PayloadJson);
 
 public sealed record StrategyGenerationFailureRecord(
     string CandidateId,

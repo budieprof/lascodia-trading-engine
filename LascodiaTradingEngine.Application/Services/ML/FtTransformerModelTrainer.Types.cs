@@ -159,24 +159,6 @@ public sealed partial class FtTransformerModelTrainer
 
     }
 
-    /// <summary>Serialised per-layer weights for additional layers (1..N-1).</summary>
-    private sealed class SerializedLayerWeights
-    {
-        public double[][]? Wq { get; set; }
-        public double[][]? Wk { get; set; }
-        public double[][]? Wv { get; set; }
-        public double[][]? Wo { get; set; }
-        public double[]? Gamma1 { get; set; }
-        public double[]? Beta1 { get; set; }
-        public double[][]? Wff1 { get; set; }
-        public double[]? Bff1 { get; set; }
-        public double[][]? Wff2 { get; set; }
-        public double[]? Bff2 { get; set; }
-        public double[]? Gamma2 { get; set; }
-        public double[]? Beta2 { get; set; }
-        public double[][]? PosBias { get; set; }
-    }
-
     /// <summary>Per-layer cached intermediates for backprop during training.</summary>
     private sealed class LayerForwardCache
     {

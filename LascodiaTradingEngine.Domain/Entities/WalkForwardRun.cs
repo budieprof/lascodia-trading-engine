@@ -149,6 +149,11 @@ public class WalkForwardRun : Entity<long>
     public string?  ParametersSnapshotJson      { get; set; }
 
     /// <summary>
+    /// Serialized immutable strategy snapshot resolved at queue time for deterministic replay.
+    /// </summary>
+    public string? StrategySnapshotJson         { get; set; }
+
+    /// <summary>
     /// Serialized transaction-cost model resolved at queue time for deterministic replay.
     /// </summary>
     public string? BacktestOptionsSnapshotJson  { get; set; }

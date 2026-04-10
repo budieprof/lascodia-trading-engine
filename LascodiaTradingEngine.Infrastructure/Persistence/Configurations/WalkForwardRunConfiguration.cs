@@ -30,6 +30,7 @@ public class WalkForwardRunConfiguration : IEntityTypeConfiguration<WalkForwardR
         builder.Property(x => x.AverageOutOfSampleScore).HasPrecision(18, 6);
         builder.Property(x => x.ScoreConsistency).HasPrecision(18, 6);
         builder.Property(x => x.ParametersSnapshotJson).HasColumnType("text");
+        builder.Property(x => x.StrategySnapshotJson).HasColumnType("text");
         builder.Property(x => x.BacktestOptionsSnapshotJson).HasColumnType("text");
         builder.Property(x => x.ErrorMessage).HasMaxLength(2000);
         builder.Property(x => x.FailureDetailsJson).HasColumnType("text");

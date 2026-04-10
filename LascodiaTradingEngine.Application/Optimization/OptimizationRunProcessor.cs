@@ -27,6 +27,7 @@ internal sealed class OptimizationRunProcessor : IOptimizationRunProcessor
     private readonly OptimizationRunPreflightService _preflightService;
     private readonly IOptimizationRunExecutor _runExecutor;
     private readonly OptimizationRunLeaseManager _leaseManager;
+    private readonly OptimizationRunOwnedMutationGuard _ownedMutationGuard;
     private readonly IOptimizationWorkerHealthStore _optimizationHealthStore;
     private readonly TimeProvider _timeProvider;
     private DateTime UtcNow => _timeProvider.GetUtcNow().UtcDateTime;
@@ -39,6 +40,7 @@ internal sealed class OptimizationRunProcessor : IOptimizationRunProcessor
         OptimizationRunPreflightService preflightService,
         IOptimizationRunExecutor runExecutor,
         OptimizationRunLeaseManager leaseManager,
+        OptimizationRunOwnedMutationGuard ownedMutationGuard,
         IOptimizationWorkerHealthStore optimizationHealthStore,
         TimeProvider timeProvider)
     {
@@ -49,6 +51,7 @@ internal sealed class OptimizationRunProcessor : IOptimizationRunProcessor
         _preflightService = preflightService;
         _runExecutor = runExecutor;
         _leaseManager = leaseManager;
+        _ownedMutationGuard = ownedMutationGuard;
         _optimizationHealthStore = optimizationHealthStore;
         _timeProvider = timeProvider;
     }
@@ -147,8 +150,16 @@ internal sealed class OptimizationRunProcessor : IOptimizationRunProcessor
                 alertDispatcher,
                 eventService,
                 sw,
+                claimedLeaseToken,
                 ct,
                 runCt);
+        }
+        catch (OptimizationLeaseOwnershipChangedException ex)
+        {
+            _logger.LogWarning(ex,
+                "OptimizationRunProcessor: stopping stale owner after lease ownership changed for run {RunId}",
+                run.Id);
+            return true;
         }
         catch (DataQualityException dqEx)
         {
@@ -164,7 +175,7 @@ internal sealed class OptimizationRunProcessor : IOptimizationRunProcessor
                 UtcNow);
             run.FailureCategory = OptimizationFailureCategory.DataQuality;
             SetRunStage(run, OptimizationExecutionStage.Queued, $"Deferred because source data is not yet usable: {dqEx.Message}", UtcNow);
-            if (!await TrySaveOwnedMutationAsync(writeDb, writeCtx, run, claimedLeaseToken, ct,
+            if (!await _ownedMutationGuard.TrySaveChangesAsync(writeDb, writeCtx, run, claimedLeaseToken, ct,
                     "OptimizationRunProcessor: lease ownership changed before persisting data-quality deferral for run {RunId}"))
                 return true;
         }
@@ -195,7 +206,9 @@ internal sealed class OptimizationRunProcessor : IOptimizationRunProcessor
                 OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Failed, UtcNow, ex.Message);
             }
 
-            await writeCtx.SaveChangesAsync(ct);
+            if (!await _ownedMutationGuard.TrySaveChangesAsync(writeDb, writeCtx, run, claimedLeaseToken, ct,
+                    "OptimizationRunProcessor: lease ownership changed before persisting concurrency failure for run {RunId}"))
+                return true;
             _metrics.OptimizationRunsFailed.Add(1);
 
             await TryLogDecisionAsync(
@@ -237,7 +250,7 @@ internal sealed class OptimizationRunProcessor : IOptimizationRunProcessor
                     UtcNow,
                     $"Aggregate timeout exceeded ({config?.MaxRunTimeoutMinutes ?? 0} minutes)");
             }
-            if (!await TrySaveOwnedMutationAsync(writeDb, writeCtx, run, claimedLeaseToken, ct,
+            if (!await _ownedMutationGuard.TrySaveChangesAsync(writeDb, writeCtx, run, claimedLeaseToken, ct,
                     "OptimizationRunProcessor: lease ownership changed before persisting timeout failure for run {RunId}"))
                 return true;
             _metrics.OptimizationRunsFailed.Add(1);
@@ -276,7 +289,7 @@ internal sealed class OptimizationRunProcessor : IOptimizationRunProcessor
             using var shutdownCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
             try
             {
-                if (!await TrySaveOwnedMutationAsync(writeDb, writeCtx, run, claimedLeaseToken, shutdownCts.Token,
+                if (!await _ownedMutationGuard.TrySaveChangesAsync(writeDb, writeCtx, run, claimedLeaseToken, shutdownCts.Token,
                         "OptimizationRunProcessor: lease ownership changed before persisting shutdown re-queue for run {RunId}"))
                     return true;
                 _logger.LogInformation(
@@ -315,7 +328,7 @@ internal sealed class OptimizationRunProcessor : IOptimizationRunProcessor
                     run.Status,
                     run.Id);
             }
-            if (!await TrySaveOwnedMutationAsync(writeDb, writeCtx, run, claimedLeaseToken, ct,
+            if (!await _ownedMutationGuard.TrySaveChangesAsync(writeDb, writeCtx, run, claimedLeaseToken, ct,
                     "OptimizationRunProcessor: lease ownership changed before persisting failure state for run {RunId}"))
                 return true;
 
@@ -376,35 +389,6 @@ internal sealed class OptimizationRunProcessor : IOptimizationRunProcessor
         catch (Exception ex)
         {
             _logger.LogWarning(ex, failureMessage, args);
-        }
-    }
-
-    private async Task<bool> TrySaveOwnedMutationAsync(
-        DbContext writeDb,
-        IWriteApplicationDbContext writeCtx,
-        OptimizationRun run,
-        Guid expectedLeaseToken,
-        CancellationToken ct,
-        string staleOwnerMessage)
-    {
-        try
-        {
-            await writeCtx.SaveChangesAsync(ct);
-            return true;
-        }
-        catch (DbUpdateConcurrencyException ex)
-        {
-            if (!await _leaseManager.HasLeaseOwnershipChangedAsync(
-                    writeDb,
-                    run.Id,
-                    expectedLeaseToken,
-                    CancellationToken.None))
-            {
-                throw;
-            }
-
-            _logger.LogWarning(ex, staleOwnerMessage, run.Id);
-            return false;
         }
     }
 

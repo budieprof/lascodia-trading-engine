@@ -241,6 +241,34 @@ internal static class ScoringEnrichmentCalculator
         return null;
     }
 
+    internal static (double AppliedAbstentionThreshold, bool Suppressed) ComputeSelectiveSuppression(
+        bool     predictedUp,
+        decimal? metaLabelScore,
+        int      metaLabelWeightCount,
+        double   metaLabelThreshold,
+        decimal? abstentionScore,
+        int      abstentionWeightCount,
+        double   abstentionThreshold,
+        double   abstentionThresholdBuy = 0.0,
+        double   abstentionThresholdSell = 0.0)
+    {
+        double appliedAbstentionThreshold = predictedUp
+            ? (abstentionThresholdBuy > 0.0 ? abstentionThresholdBuy : abstentionThreshold)
+            : (abstentionThresholdSell > 0.0 ? abstentionThresholdSell : abstentionThreshold);
+
+        bool suppressed =
+            metaLabelScore.HasValue &&
+            metaLabelWeightCount > 0 &&
+            metaLabelScore.Value < (decimal)metaLabelThreshold;
+
+        suppressed = suppressed || (
+            abstentionScore.HasValue &&
+            abstentionWeightCount > 0 &&
+            abstentionScore.Value < (decimal)appliedAbstentionThreshold);
+
+        return (appliedAbstentionThreshold, suppressed);
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // Regime routing decision
     // ═══════════════════════════════════════════════════════════════════════════

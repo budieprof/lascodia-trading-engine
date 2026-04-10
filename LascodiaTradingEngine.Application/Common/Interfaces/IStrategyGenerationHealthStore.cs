@@ -23,13 +23,17 @@ public sealed record StrategyGenerationPhaseStateSnapshot
 public sealed record StrategyGenerationHealthStateSnapshot
 {
     public int PendingArtifacts { get; init; }
+    public int QuarantinedArtifacts { get; init; }
     public DateTime? OldestPendingArtifactAttemptAtUtc { get; init; }
+    public DateTime? LastArtifactQuarantinedAtUtc { get; init; }
+    public string? LastArtifactQuarantineReason { get; init; }
     public int UnresolvedFailures { get; init; }
     public DateTime? LastReplayCompletedAtUtc { get; init; }
     public DateTime? LastReplayFailureAtUtc { get; init; }
     public string? LastReplayFailureMessage { get; init; }
     public int LastReplayArtifactCount { get; init; }
     public int LastReplayCorruptArtifactCount { get; init; }
+    public int PendingSummaryDispatches { get; init; }
     public string? LastSkipReason { get; init; }
     public DateTime? LastSkippedAtUtc { get; init; }
     public DateTime? LastCheckpointSavedAtUtc { get; init; }

@@ -53,7 +53,7 @@ public sealed partial class FtTransformerModelTrainer : IMLModelTrainer
     // ── Constants ────────────────────────────────────────────────────────────
 
     private const string ModelType    = "FTTRANSFORMER";
-    private const string ModelVersion = "7.0";
+    private const string ModelVersion = "8.0";
     private const int    DefaultEmbedDim   = 16;
     private const int    DefaultNumHeads   = 4;
     private const int    DefaultFfnDim     = 64; // 4 × EmbedDim
@@ -106,7 +106,8 @@ public sealed partial class FtTransformerModelTrainer : IMLModelTrainer
 
         const int MinSelectionSamples = 20;
         const int MinSelectionPruningSamples = 10;
-        const int MinSelectionThresholdSamples = 10;
+        const int MinSelectionThresholdSamples = 5;
+        const int MinSelectionKellySamples = 5;
         const int MinCalibrationSamples = 30;
         const int MinCalibrationFitSamples = 10;
         const int MinCalibrationDiagnosticsSamples = 10;
@@ -308,11 +309,19 @@ public sealed partial class FtTransformerModelTrainer : IMLModelTrainer
             throw new InvalidOperationException(
                 $"FT-Transformer selection split too small: {rawSelectionSet.Count} < {MinSelectionSamples}");
         int selectionPruningCount = rawSelectionSet.Count / 2;
-        int selectionThresholdCount = rawSelectionSet.Count - selectionPruningCount;
-        if (selectionPruningCount < MinSelectionPruningSamples || selectionThresholdCount < MinSelectionThresholdSamples)
+        int selectionDecisionCount = rawSelectionSet.Count - selectionPruningCount;
+        if (selectionPruningCount < MinSelectionPruningSamples || selectionDecisionCount < (MinSelectionThresholdSamples + MinSelectionKellySamples))
         {
             throw new InvalidOperationException(
-                $"FT-Transformer selection sub-splits too small: prune={selectionPruningCount}, threshold={selectionThresholdCount}.");
+                $"FT-Transformer selection sub-splits too small: prune={selectionPruningCount}, decision={selectionDecisionCount}.");
+        }
+        int selectionKellyCount = Math.Max(MinSelectionKellySamples, selectionDecisionCount / 2);
+        selectionKellyCount = Math.Min(selectionKellyCount, selectionDecisionCount - MinSelectionThresholdSamples);
+        int selectionThresholdCount = selectionDecisionCount - selectionKellyCount;
+        if (selectionThresholdCount < MinSelectionThresholdSamples || selectionKellyCount < MinSelectionKellySamples)
+        {
+            throw new InvalidOperationException(
+                $"FT-Transformer selection threshold/Kelly sub-splits too small: threshold={selectionThresholdCount}, kelly={selectionKellyCount}.");
         }
         if (rawCalSet.Count < MinCalibrationSamples)
             throw new InvalidOperationException(
@@ -344,7 +353,9 @@ public sealed partial class FtTransformerModelTrainer : IMLModelTrainer
                 $"FT-Transformer test split too small: {rawTestSet.Count} < {MinTestSamples}");
 
         var rawSelectionPruningSet = rawSelectionSet[..selectionPruningCount];
-        var rawSelectionThresholdSet = rawSelectionSet[selectionPruningCount..];
+        var rawSelectionDecisionSet = rawSelectionSet[selectionPruningCount..];
+        var rawSelectionThresholdSet = rawSelectionDecisionSet[..selectionThresholdCount];
+        var rawSelectionKellySet = rawSelectionDecisionSet[selectionThresholdCount..];
         int crossFitFoldCount = DetermineCalibrationCrossFitFoldCount(rawCalDiagnosticsSet.Count);
         var (crossFitFoldStarts, crossFitFoldCounts, crossFitFoldHashes) = BuildCrossFitFoldMetadata(
             calStart + calibrationFitCount,
@@ -365,6 +376,8 @@ public sealed partial class FtTransformerModelTrainer : IMLModelTrainer
             SelectionPruningCount = rawSelectionPruningSet.Count,
             SelectionThresholdStartIndex = selectionStart + rawSelectionPruningSet.Count,
             SelectionThresholdCount = rawSelectionThresholdSet.Count,
+            SelectionKellyStartIndex = selectionStart + rawSelectionPruningSet.Count + rawSelectionThresholdSet.Count,
+            SelectionKellyCount = rawSelectionKellySet.Count,
             CalibrationStartIndex = calStart,
             CalibrationCount = rawCalSet.Count,
             CalibrationFitStartIndex = calStart,
@@ -399,6 +412,7 @@ public sealed partial class FtTransformerModelTrainer : IMLModelTrainer
         var trainSet = StandardizeSamples(rawTrainSet, means, stds);
         var selectionPruningSet = StandardizeSamples(rawSelectionPruningSet, means, stds);
         var selectionSet = StandardizeSamples(rawSelectionThresholdSet, means, stds);
+        var kellySelectionSet = StandardizeSamples(rawSelectionKellySet, means, stds);
         var calSet   = StandardizeSamples(rawCalSet,   means, stds);
         var calFitSet = StandardizeSamples(rawCalFitSet, means, stds);
         var calDiagnosticsSet = StandardizeSamples(rawCalDiagnosticsSet, means, stds);
@@ -411,9 +425,41 @@ public sealed partial class FtTransformerModelTrainer : IMLModelTrainer
             : hp;
 
         _logger.LogInformation(
-            "FT-Transformer: n={N} F={F} dim={D} heads={H} ffn={Ffn} layers={L} train={Train} selectPrune={SelectPrune} selectThreshold={SelectThreshold} calFit={CalFit} calDiag={CalDiag} conformal={Conformal} test={Test} embargo={Embargo}",
+            "FT-Transformer: n={N} F={F} dim={D} heads={H} ffn={Ffn} layers={L} train={Train} selectPrune={SelectPrune} selectThreshold={SelectThreshold} selectKelly={SelectKelly} calFit={CalFit} calDiag={CalDiag} conformal={Conformal} test={Test} embargo={Embargo}",
             samples.Count, F, embedDim, numHeads, ffnDim, numLayers,
-            trainSet.Count, selectionPruningSet.Count, selectionSet.Count, calFitSet.Count, calDiagnosticsSet.Count, conformalSet.Count, testSet.Count, embargo);
+            trainSet.Count, selectionPruningSet.Count, selectionSet.Count, kellySelectionSet.Count, calFitSet.Count, calDiagnosticsSet.Count, conformalSet.Count, testSet.Count, embargo);
+
+        // ── 2b. Multi-signal drift diagnostics ──────────────────────────────
+        var driftArtifact = ComputeFtTransformerDriftDiagnostics(trainSet, F, rawFeatureNames, hp.FracDiffD);
+        if (driftArtifact.GateTriggered)
+        {
+            if (string.Equals(driftArtifact.GateAction, "REJECT", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException($"FT-Transformer drift gate rejected: {driftArtifact.NonStationaryFeatureCount}/{F} features flagged.");
+            _logger.LogWarning("FT-Transformer stationarity gate ({Action}): {NonStat}/{Total} features flagged.",
+                driftArtifact.GateAction, driftArtifact.NonStationaryFeatureCount, F);
+        }
+
+        // ── 2c. Class-imbalance gate ─────────────────────────────────────────
+        {
+            int posCount = 0;
+            foreach (var s in trainSet) if (s.Direction > 0) posCount++;
+            double buyRatio = (double)posCount / trainSet.Count;
+            if (buyRatio < 0.15 || buyRatio > 0.85)
+                throw new InvalidOperationException($"FT-Transformer: extreme class imbalance (Buy={buyRatio:P1}).");
+            if (buyRatio < 0.35 || buyRatio > 0.65)
+                _logger.LogWarning("FT-Transformer class imbalance: Buy={Buy:P1}, Sell={Sell:P1}.", buyRatio, 1.0 - buyRatio);
+        }
+
+        // ── 2d. Adversarial validation ───────────────────────────────────────
+        if (testSet.Count >= 20 && trainSet.Count >= 20)
+        {
+            double advAuc = TryComputeAdversarialAucGpu(trainSet, testSet, F, ct)
+                            ?? ComputeAdversarialAuc(trainSet, testSet, F);
+            _logger.LogInformation("FT-Transformer adversarial AUC={AUC:F3}", advAuc);
+            if (advAuc > 0.65) _logger.LogWarning("FT-Transformer adversarial AUC={AUC:F3} indicates covariate shift.", advAuc);
+            if (hp.FtTransformerMaxAdversarialAuc > 0.0 && advAuc > hp.FtTransformerMaxAdversarialAuc)
+                throw new InvalidOperationException($"FT-Transformer: adversarial AUC={advAuc:F3} exceeds threshold.");
+        }
 
         int trainingRandomSeed = ComputeDeterministicSeed(
             featureSchemaFingerprint,
@@ -471,9 +517,9 @@ public sealed partial class FtTransformerModelTrainer : IMLModelTrainer
             routingThreshold, isotonicBreakpoints, F, calBuf, thrMinBps, thrMaxBps, thrStepBps);
         _logger.LogInformation("EV-optimal threshold={Thr:F2} (default 0.50)", optimalThreshold);
 
-        // ── 7. Average Kelly fraction on threshold-selection set ─────────────
+        // ── 7. Average Kelly fraction on Kelly-selection set ─────────────────
         double avgKellyFraction = ComputeAvgKellyFraction(
-            selectionSet, model, plattA, plattB, temperatureScale,
+            kellySelectionSet, model, plattA, plattB, temperatureScale,
             plattABuy, plattBBuy, plattASell, plattBSell,
             routingThreshold, isotonicBreakpoints, F, calBuf);
         _logger.LogDebug("Average Kelly fraction (half-Kelly)={Kelly:F4}", avgKellyFraction);
@@ -543,6 +589,7 @@ public sealed partial class FtTransformerModelTrainer : IMLModelTrainer
             var maskedTrain = ApplyMask(trainSet, pruningMask);
             var maskedSelectionPruning = ApplyMask(selectionPruningSet, pruningMask);
             var maskedSelection = ApplyMask(selectionSet, pruningMask);
+            var maskedKellySelection = ApplyMask(kellySelectionSet, pruningMask);
             var maskedCalFit = ApplyMask(calFitSet, pruningMask);
             var maskedCalDiagnostics = ApplyMask(calDiagnosticsSet, pruningMask);
             var maskedConformal = ApplyMask(conformalSet, pruningMask);
@@ -609,7 +656,7 @@ public sealed partial class FtTransformerModelTrainer : IMLModelTrainer
                 pABuy, pBBuy, pASell, pBSell,
                 prunedRoutingThreshold, prunedIsotonicBreakpoints, activeF, prunedBuf, thrMinBps, thrMaxBps, thrStepBps);
             double prunedKelly = ComputeAvgKellyFraction(
-                maskedSelection, prunedModel, pA, pB, prunedTemperatureScale,
+                maskedKellySelection, prunedModel, pA, pB, prunedTemperatureScale,
                 pABuy, pBBuy, pASell, pBSell,
                 prunedRoutingThreshold, prunedIsotonicBreakpoints, activeF, prunedBuf);
             var prunedSelectionPruningMetrics = EvaluateModel(
@@ -666,6 +713,7 @@ public sealed partial class FtTransformerModelTrainer : IMLModelTrainer
                 trainSet         = maskedTrain;
                 selectionPruningSet = maskedSelectionPruning;
                 selectionSet     = maskedSelection;
+                kellySelectionSet = maskedKellySelection;
                 calFitSet        = maskedCalFit;
                 calDiagnosticsSet = maskedCalDiagnostics;
                 conformalSet     = maskedConformal;
@@ -777,7 +825,42 @@ public sealed partial class FtTransformerModelTrainer : IMLModelTrainer
         calibrationArtifact.DiagnosticsSampleCount = calDiagnosticsSet.Count;
         calibrationArtifact.ConformalSampleCount = conformalSet.Count;
         calibrationArtifact.ThresholdSelectionSampleCount = selectionSet.Count;
-        calibrationArtifact.KellySelectionSampleCount = selectionSet.Count;
+        calibrationArtifact.KellySelectionSampleCount = kellySelectionSet.Count;
+
+        // ── 16a. Calibrated probability function for diagnostics ─────────────
+        var diagBuf = new InferenceBuffers(F, embedDim, numHeads, ffnDim);
+        Func<float[], double> CalibratedProb = feats =>
+        {
+            double raw = ForwardPass(feats, model, F, diagBuf);
+            return ApplyTrainingCalibration(
+                raw,
+                plattA, plattB, temperatureScale,
+                plattABuy, plattBBuy, plattASell, plattBSell,
+                routingThreshold, isotonicBreakpoints);
+        };
+
+        // ── 16b. Murphy decomposition, calibration residuals, feature variances, stability ──
+        var (murphyCalLoss, murphyRefLoss) = ComputeMurphyDecomposition(testSet, CalibratedProb);
+        var (calResidualMean, calResidualStd, calResidualThreshold) =
+            ComputeCalibrationResidualStats(calSet, CalibratedProb);
+        double[] featureVariances = ComputeFeatureVariances(trainSet, F);
+        double predictionStability = ComputePredictionStabilityScore(testSet, CalibratedProb);
+
+        // ── 16c. Scalar sanitization ─────────────────────────────────────────
+        ece = SafeFt(ece, 1.0);
+        optimalThreshold = SafeFt(optimalThreshold, 0.5);
+        brierSkillScore = SafeFt(brierSkillScore, 0.0);
+        avgKellyFraction = SafeFt(avgKellyFraction, 0.0);
+        temperatureScale = SafeFt(temperatureScale, 0.0);
+        durbinWatson = SafeFt(durbinWatson, 2.0);
+        plattA = SafeFt(plattA, 1.0);
+        plattB = SafeFt(plattB, 0.0);
+        calResidualMean = SafeFt(calResidualMean, 0.0);
+        calResidualStd = SafeFt(calResidualStd, 0.0);
+        calResidualThreshold = SafeFt(calResidualThreshold, 1.0);
+        predictionStability = SafeFt(predictionStability, 0.0);
+        murphyCalLoss = SafeFt(murphyCalLoss, 0.0);
+        murphyRefLoss = SafeFt(murphyRefLoss, 0.0);
 
         // ── 17. Serialise model snapshot ─────────────────────────────────────
         var snapshot = new ModelSnapshot
@@ -856,7 +939,7 @@ public sealed partial class FtTransformerModelTrainer : IMLModelTrainer
             FtTransformerNumLayers      = model.NumLayers,
             FtTransformerAdditionalLayersJson = model.NumLayers > 1
                 ? JsonSerializer.Serialize(
-                    Enumerable.Range(1, model.NumLayers - 1).Select(l => new SerializedLayerWeights
+                    Enumerable.Range(1, model.NumLayers - 1).Select(l => new FtSerializedLayerWeights
                     {
                         Wq = model.Layers[l].Wq, Wk = model.Layers[l].Wk,
                         Wv = model.Layers[l].Wv, Wo = model.Layers[l].Wo,
@@ -865,10 +948,25 @@ public sealed partial class FtTransformerModelTrainer : IMLModelTrainer
                         Wff2 = model.Layers[l].Wff2, Bff2 = model.Layers[l].Bff2,
                         Gamma2 = model.Layers[l].Gamma2, Beta2 = model.Layers[l].Beta2,
                         PosBias = model.Layers[l].PosBias,
-                    }).ToList(), JsonOpts)
+                    }).ToList(), FtTransformerAdditionalLayerCodec.JsonOptions)
                 : null,
             FtTransformerAdditionalLayersBytes = model.NumLayers > 1
-                ? SerializeAdditionalLayersBinary(model)
+                ? FtTransformerAdditionalLayerCodec.SerializeBinary(
+                    Enumerable.Range(1, model.NumLayers - 1).Select(l => new FtSerializedLayerWeights
+                    {
+                        Wq = model.Layers[l].Wq, Wk = model.Layers[l].Wk,
+                        Wv = model.Layers[l].Wv, Wo = model.Layers[l].Wo,
+                        Gamma1 = model.Layers[l].Gamma1, Beta1 = model.Layers[l].Beta1,
+                        Wff1 = model.Layers[l].Wff1, Bff1 = model.Layers[l].Bff1,
+                        Wff2 = model.Layers[l].Wff2, Bff2 = model.Layers[l].Bff2,
+                        Gamma2 = model.Layers[l].Gamma2, Beta2 = model.Layers[l].Beta2,
+                        PosBias = model.Layers[l].PosBias,
+                    }).ToList(),
+                    model.EmbedDim,
+                    model.FfnDim,
+                    model.NumHeads,
+                    model.SeqLen,
+                    model.UsePositionalBias)
                 : null,
             FtTransformerPosBias = model.UsePositionalBias && model.Layers[0].PosBias is not null
                 ? model.Layers[0].PosBias.Select(h => (double[])h.Clone()).ToArray()
@@ -883,7 +981,17 @@ public sealed partial class FtTransformerModelTrainer : IMLModelTrainer
             HyperparamsJson             = JsonSerializer.Serialize(hp, JsonOpts),
             SanitizedLearnerCount       = sanitizedCount,
             ConformalCoverage           = hp.ConformalCoverage,
+            CalibrationLoss             = murphyCalLoss,
+            RefinementLoss              = murphyRefLoss,
+            PredictionStabilityScore    = predictionStability,
+            FeatureVariances            = featureVariances,
+            FtTransformerDriftArtifact  = driftArtifact,
+            FtTransformerCalibrationResidualMean      = calResidualMean,
+            FtTransformerCalibrationResidualStd       = calResidualStd,
+            FtTransformerCalibrationResidualThreshold  = calResidualThreshold,
         };
+
+        SanitizeFtTransformerSnapshotScalars(snapshot);
 
         snapshot = FtTransformerSnapshotSupport.NormalizeSnapshotCopy(snapshot);
         var snapshotValidation = FtTransformerSnapshotSupport.ValidateNormalizedSnapshot(snapshot);
@@ -1604,18 +1712,18 @@ public sealed partial class FtTransformerModelTrainer : IMLModelTrainer
         int loadedAdditionalLayerCount = 0;
         if (model.NumLayers > 1)
         {
-            List<SerializedLayerWeights>? additionalLayers = null;
+            List<FtSerializedLayerWeights>? additionalLayers = null;
             if (ws.FtTransformerAdditionalLayersBytes is { Length: > 4 })
             {
-                try { additionalLayers = DeserializeAdditionalLayers(ws.FtTransformerAdditionalLayersBytes, embedDim, ffnDim); }
+                try { additionalLayers = FtTransformerAdditionalLayerCodec.DeserializeBinary(ws.FtTransformerAdditionalLayersBytes, embedDim, ffnDim); }
                 catch { /* fall through to JSON */ }
             }
             if (additionalLayers is null && ws.FtTransformerAdditionalLayersJson is { Length: > 0 })
             {
                 try
                 {
-                    additionalLayers = JsonSerializer.Deserialize<List<SerializedLayerWeights>>(
-                        ws.FtTransformerAdditionalLayersJson, JsonOpts);
+                    additionalLayers = JsonSerializer.Deserialize<List<FtSerializedLayerWeights>>(
+                        ws.FtTransformerAdditionalLayersJson, FtTransformerAdditionalLayerCodec.JsonOptions);
                 }
                 catch (JsonException ex)
                 {
@@ -1711,8 +1819,6 @@ public sealed partial class FtTransformerModelTrainer : IMLModelTrainer
         }
     }
 
-    // SerializedLayerWeights → FtTransformerModelTrainer.Types.cs
-
     private static void LoadMatrix(double[][] dst, double[][]? src, int rows, int cols, Random rng, double std)
     {
         if (src is not { Length: > 0 } || src.Length != rows)
@@ -1772,19 +1878,27 @@ public sealed partial class FtTransformerModelTrainer : IMLModelTrainer
 
         // Build additional layers JSON from the full model
         string? additionalLayersJson = null;
+        byte[]? additionalLayersBytes = null;
         if (fullModel.NumLayers > 1)
         {
-            additionalLayersJson = JsonSerializer.Serialize(
-                Enumerable.Range(1, fullModel.NumLayers - 1).Select(l => new SerializedLayerWeights
-                {
-                    Wq = fullModel.Layers[l].Wq, Wk = fullModel.Layers[l].Wk,
-                    Wv = fullModel.Layers[l].Wv, Wo = fullModel.Layers[l].Wo,
-                    Gamma1 = fullModel.Layers[l].Gamma1, Beta1 = fullModel.Layers[l].Beta1,
-                    Wff1 = fullModel.Layers[l].Wff1, Bff1 = fullModel.Layers[l].Bff1,
-                    Wff2 = fullModel.Layers[l].Wff2, Bff2 = fullModel.Layers[l].Bff2,
-                    Gamma2 = fullModel.Layers[l].Gamma2, Beta2 = fullModel.Layers[l].Beta2,
-                    PosBias = fullModel.Layers[l].PosBias,
-                }).ToList(), JsonOpts);
+            var additionalLayers = Enumerable.Range(1, fullModel.NumLayers - 1).Select(l => new FtSerializedLayerWeights
+            {
+                Wq = fullModel.Layers[l].Wq, Wk = fullModel.Layers[l].Wk,
+                Wv = fullModel.Layers[l].Wv, Wo = fullModel.Layers[l].Wo,
+                Gamma1 = fullModel.Layers[l].Gamma1, Beta1 = fullModel.Layers[l].Beta1,
+                Wff1 = fullModel.Layers[l].Wff1, Bff1 = fullModel.Layers[l].Bff1,
+                Wff2 = fullModel.Layers[l].Wff2, Bff2 = fullModel.Layers[l].Bff2,
+                Gamma2 = fullModel.Layers[l].Gamma2, Beta2 = fullModel.Layers[l].Beta2,
+                PosBias = fullModel.Layers[l].PosBias,
+            }).ToList();
+            additionalLayersJson = JsonSerializer.Serialize(additionalLayers, FtTransformerAdditionalLayerCodec.JsonOptions);
+            additionalLayersBytes = FtTransformerAdditionalLayerCodec.SerializeBinary(
+                additionalLayers,
+                fullModel.EmbedDim,
+                fullModel.FfnDim,
+                fullModel.NumHeads,
+                fullModel.SeqLen,
+                fullModel.UsePositionalBias);
         }
 
         return new ModelSnapshot
@@ -1813,6 +1927,7 @@ public sealed partial class FtTransformerModelTrainer : IMLModelTrainer
             FtTransformerFfnDim               = fullModel.FfnDim,
             FtTransformerNumLayers            = fullModel.NumLayers,
             FtTransformerAdditionalLayersJson = additionalLayersJson,
+            FtTransformerAdditionalLayersBytes = additionalLayersBytes,
             FtTransformerPosBias              = fullModel.UsePositionalBias && fullModel.Layers[0].PosBias is not null
                 ? fullModel.Layers[0].PosBias.Select(h => (double[])h.Clone()).ToArray()
                 : null,
@@ -2603,10 +2718,28 @@ public sealed partial class FtTransformerModelTrainer : IMLModelTrainer
         double[] IsotonicBreakpoints,
         FtTransformerCalibrationArtifact Artifact);
 
+    private readonly record struct CalibrationFoldSplit(
+        List<TrainingSample> TrainSet,
+        List<TrainingSample> HoldoutSet);
+
+    private readonly record struct CalibrationMetricSummary(
+        double Nll,
+        double Ece);
+
+    private readonly record struct CrossFitMetricSummary(
+        double MeanNll,
+        double MeanEce,
+        double[] FoldNlls,
+        double[] FoldEces);
+
     private readonly record struct RoutingThresholdSelection(
         double Threshold,
         int CandidateCount,
-        double SelectedEvalNll);
+        double SelectedEvalNll,
+        double SelectedEvalEce,
+        double[] Candidates,
+        double[] CandidateNlls,
+        double[] CandidateEces);
 
     private static FtCalibrationFit FitCalibrationStack(
         List<TrainingSample> fitSet,
@@ -2624,189 +2757,465 @@ public sealed partial class FtTransformerModelTrainer : IMLModelTrainer
     {
         var evalSet = diagnosticsSet.Count > 0 ? diagnosticsSet : fitSet;
         int crossFitFoldCount = Math.Max(1, splitSummary.AdaptiveHeadCrossFitFoldCount);
-        var (plattA, plattB) = FitPlattScaling(fitSet, model, featureCount, buf, ct);
-        double globalPlattNll = ComputeCrossFitCalibrationNll(
-            evalSet,
-            crossFitFoldCount,
-            candidate => ComputeCalibrationNll(
-                candidate,
+        var foldSplits = BuildCalibrationFoldSplits(fitSet, diagnosticsSet, crossFitFoldCount);
+        var refitSet = diagnosticsSet.Count > 0 ? CombineSampleSets(fitSet, diagnosticsSet) : new List<TrainingSample>(fitSet);
+
+        var plattFoldNlls = new double[foldSplits.Count];
+        var plattFoldEces = new double[foldSplits.Count];
+        var temperatureFoldNlls = new double[foldSplits.Count];
+        var temperatureFoldEces = new double[foldSplits.Count];
+        var selectedGlobalFits = new (double PlattA, double PlattB, double TemperatureScale)[foldSplits.Count];
+
+        for (int fold = 0; fold < foldSplits.Count; fold++)
+        {
+            ct.ThrowIfCancellationRequested();
+            var foldTrainSet = foldSplits[fold].TrainSet;
+            var holdoutSet = foldSplits[fold].HoldoutSet;
+            var (foldPlattA, foldPlattB) = FitPlattScaling(foldTrainSet, model, featureCount, buf, ct);
+            var plattMetrics = EvaluateCalibrationMetrics(
+                holdoutSet,
                 model,
                 featureCount,
-                plattA, plattB, 0.0,
-                0.0, 0.0, 0.0, 0.0,
+                foldPlattA,
+                foldPlattB,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
                 0.5,
                 null,
-                buf));
+                buf);
+            plattFoldNlls[fold] = plattMetrics.Nll;
+            plattFoldEces[fold] = plattMetrics.Ece;
 
-        double temperatureScale = 0.0;
-        double temperatureNll = double.PositiveInfinity;
-        string selectedGlobalCalibration = "PLATT";
-        if (fitTemperatureScale && fitSet.Count >= minCalibrationSamples)
-        {
-            double candidateTemperature = FitTemperatureScaling(fitSet, model, featureCount, buf, ct);
-            temperatureNll = ComputeCrossFitCalibrationNll(
-                evalSet,
-                crossFitFoldCount,
-                candidate => ComputeCalibrationNll(
-                    candidate,
+            double foldTemperatureScale = 0.0;
+            if (fitTemperatureScale && foldTrainSet.Count >= minCalibrationSamples)
+            {
+                foldTemperatureScale = FitTemperatureScaling(foldTrainSet, model, featureCount, buf, ct);
+                var temperatureMetrics = EvaluateCalibrationMetrics(
+                    holdoutSet,
                     model,
                     featureCount,
-                    plattA, plattB, candidateTemperature,
-                    0.0, 0.0, 0.0, 0.0,
+                    foldPlattA,
+                    foldPlattB,
+                    foldTemperatureScale,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
                     0.5,
                     null,
-                    buf));
-            if (temperatureNll + 1e-6 < globalPlattNll)
-            {
-                temperatureScale = candidateTemperature;
-                selectedGlobalCalibration = "TEMPERATURE";
+                    buf);
+                temperatureFoldNlls[fold] = temperatureMetrics.Nll;
+                temperatureFoldEces[fold] = temperatureMetrics.Ece;
             }
+            else
+            {
+                temperatureFoldNlls[fold] = plattMetrics.Nll;
+                temperatureFoldEces[fold] = plattMetrics.Ece;
+            }
+
+            selectedGlobalFits[fold] = (foldPlattA, foldPlattB, foldTemperatureScale);
         }
 
-        var routingSelection = DetermineConditionalRoutingThreshold(
-            fitSet,
-            evalSet,
-            crossFitFoldCount,
+        double globalPlattNll = plattFoldNlls.Average();
+        double globalPlattEce = plattFoldEces.Average();
+        double temperatureNll = temperatureFoldNlls.Average();
+        double temperatureEce = temperatureFoldEces.Average();
+        string selectedGlobalCalibration =
+            fitTemperatureScale && temperatureNll + 1e-6 < globalPlattNll ? "TEMPERATURE" : "PLATT";
+
+        var globalRefit = selectedGlobalCalibration == "TEMPERATURE" && fitTemperatureScale && refitSet.Count >= minCalibrationSamples
+            ? FitTemperatureScaling(refitSet, model, featureCount, buf, ct)
+            : 0.0;
+        var (refitPlattA, refitPlattB) = FitPlattScaling(refitSet, model, featureCount, buf, ct);
+
+        double[] routingThresholdCandidates = BuildRoutingThresholdCandidates(
+            refitSet,
             model,
             featureCount,
+            refitPlattA,
+            refitPlattB,
+            string.Equals(selectedGlobalCalibration, "TEMPERATURE", StringComparison.Ordinal) ? globalRefit : 0.0,
             buf,
-            plattA,
-            plattB,
-            temperatureScale,
-            minCalibrationSamples,
-            calibrationEpochs,
-            calibrationLr,
             ct);
-        double routingThreshold = routingSelection.Threshold;
-        var conditionalFit = FitClassConditionalPlatt(
-            fitSet,
+        var routingCandidateNlls = new double[routingThresholdCandidates.Length];
+        var routingCandidateEces = new double[routingThresholdCandidates.Length];
+
+        for (int candidateIndex = 0; candidateIndex < routingThresholdCandidates.Length; candidateIndex++)
+        {
+            ct.ThrowIfCancellationRequested();
+            double threshold = routingThresholdCandidates[candidateIndex];
+            double nllSum = 0.0;
+            double eceSum = 0.0;
+
+            for (int fold = 0; fold < foldSplits.Count; fold++)
+            {
+                var foldTrainSet = foldSplits[fold].TrainSet;
+                var holdoutSet = foldSplits[fold].HoldoutSet;
+                double foldTemperatureScale = string.Equals(selectedGlobalCalibration, "TEMPERATURE", StringComparison.Ordinal)
+                    ? selectedGlobalFits[fold].TemperatureScale
+                    : 0.0;
+                var foldConditionalFit = FitClassConditionalPlatt(
+                    foldTrainSet,
+                    model,
+                    featureCount,
+                    buf,
+                    selectedGlobalFits[fold].PlattA,
+                    selectedGlobalFits[fold].PlattB,
+                    foldTemperatureScale,
+                    threshold,
+                    minCalibrationSamples,
+                    Math.Max(50, calibrationEpochs / 2),
+                    calibrationLr,
+                    ct);
+                var metrics = EvaluateCalibrationMetrics(
+                    holdoutSet,
+                    model,
+                    featureCount,
+                    selectedGlobalFits[fold].PlattA,
+                    selectedGlobalFits[fold].PlattB,
+                    foldTemperatureScale,
+                    foldConditionalFit.Buy.A,
+                    foldConditionalFit.Buy.B,
+                    foldConditionalFit.Sell.A,
+                    foldConditionalFit.Sell.B,
+                    threshold,
+                    null,
+                    buf);
+                nllSum += metrics.Nll;
+                eceSum += metrics.Ece;
+            }
+
+            routingCandidateNlls[candidateIndex] = nllSum / foldSplits.Count;
+            routingCandidateEces[candidateIndex] = eceSum / foldSplits.Count;
+        }
+
+        int selectedRoutingIndex = 0;
+        for (int i = 1; i < routingThresholdCandidates.Length; i++)
+        {
+            if (routingCandidateNlls[i] + 1e-6 < routingCandidateNlls[selectedRoutingIndex])
+                selectedRoutingIndex = i;
+        }
+
+        double routingThreshold = routingThresholdCandidates[selectedRoutingIndex];
+        var preIsotonicFoldNlls = new double[foldSplits.Count];
+        var preIsotonicFoldEces = new double[foldSplits.Count];
+        var postIsotonicFoldNlls = new double[foldSplits.Count];
+        var postIsotonicFoldEces = new double[foldSplits.Count];
+
+        for (int fold = 0; fold < foldSplits.Count; fold++)
+        {
+            ct.ThrowIfCancellationRequested();
+            var foldTrainSet = foldSplits[fold].TrainSet;
+            var holdoutSet = foldSplits[fold].HoldoutSet;
+            double foldTemperatureScale = string.Equals(selectedGlobalCalibration, "TEMPERATURE", StringComparison.Ordinal)
+                ? selectedGlobalFits[fold].TemperatureScale
+                : 0.0;
+            var foldConditionalFit = FitClassConditionalPlatt(
+                foldTrainSet,
+                model,
+                featureCount,
+                buf,
+                selectedGlobalFits[fold].PlattA,
+                selectedGlobalFits[fold].PlattB,
+                foldTemperatureScale,
+                routingThreshold,
+                minCalibrationSamples,
+                calibrationEpochs,
+                calibrationLr,
+                ct);
+            var preMetrics = EvaluateCalibrationMetrics(
+                holdoutSet,
+                model,
+                featureCount,
+                selectedGlobalFits[fold].PlattA,
+                selectedGlobalFits[fold].PlattB,
+                foldTemperatureScale,
+                foldConditionalFit.Buy.A,
+                foldConditionalFit.Buy.B,
+                foldConditionalFit.Sell.A,
+                foldConditionalFit.Sell.B,
+                routingThreshold,
+                null,
+                buf);
+            preIsotonicFoldNlls[fold] = preMetrics.Nll;
+            preIsotonicFoldEces[fold] = preMetrics.Ece;
+
+            double[] foldIsotonicBreakpoints = [];
+            if (foldTrainSet.Count >= minIsotonicCalibrationSamples)
+            {
+                var fitProbs = new float[foldTrainSet.Count];
+                for (int i = 0; i < foldTrainSet.Count; i++)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    double raw = ForwardPass(foldTrainSet[i].Features, model, featureCount, buf);
+                    fitProbs[i] = (float)ApplyTrainingCalibration(
+                        raw,
+                        selectedGlobalFits[fold].PlattA,
+                        selectedGlobalFits[fold].PlattB,
+                        foldTemperatureScale,
+                        foldConditionalFit.Buy.A,
+                        foldConditionalFit.Buy.B,
+                        foldConditionalFit.Sell.A,
+                        foldConditionalFit.Sell.B,
+                        routingThreshold);
+                }
+                foldIsotonicBreakpoints = MLTrainerHelpers.FitIsotonicCalibration(fitProbs, foldTrainSet);
+            }
+
+            var postMetrics = EvaluateCalibrationMetrics(
+                holdoutSet,
+                model,
+                featureCount,
+                selectedGlobalFits[fold].PlattA,
+                selectedGlobalFits[fold].PlattB,
+                foldTemperatureScale,
+                foldConditionalFit.Buy.A,
+                foldConditionalFit.Buy.B,
+                foldConditionalFit.Sell.A,
+                foldConditionalFit.Sell.B,
+                routingThreshold,
+                foldIsotonicBreakpoints.Length >= 4 ? foldIsotonicBreakpoints : null,
+                buf);
+            postIsotonicFoldNlls[fold] = postMetrics.Nll;
+            postIsotonicFoldEces[fold] = postMetrics.Ece;
+        }
+
+        double preIsotonicNll = preIsotonicFoldNlls.Average();
+        double preIsotonicEce = preIsotonicFoldEces.Average();
+        double postIsotonicNll = postIsotonicFoldNlls.Average();
+        double postIsotonicEce = postIsotonicFoldEces.Average();
+        bool isotonicAccepted = postIsotonicNll + 1e-6 < preIsotonicNll;
+
+        double selectedTemperatureScale = string.Equals(selectedGlobalCalibration, "TEMPERATURE", StringComparison.Ordinal)
+            ? globalRefit
+            : 0.0;
+        var finalConditionalFit = FitClassConditionalPlatt(
+            refitSet,
             model,
             featureCount,
             buf,
-            plattA,
-            plattB,
-            temperatureScale,
+            refitPlattA,
+            refitPlattB,
+            selectedTemperatureScale,
             routingThreshold,
             minCalibrationSamples,
             calibrationEpochs,
             calibrationLr,
             ct);
-        double selectedStackNll = ComputeCrossFitCalibrationNll(
-            evalSet,
-            crossFitFoldCount,
-            candidate => ComputeCalibrationNll(
-                candidate,
-                model,
-                featureCount,
-                plattA,
-                plattB,
-                temperatureScale,
-                conditionalFit.Buy.A,
-                conditionalFit.Buy.B,
-                conditionalFit.Sell.A,
-                conditionalFit.Sell.B,
-                routingThreshold,
-                null,
-                buf));
+
         double[] isotonicBreakpoints = [];
-        double postIsotonicNll = selectedStackNll;
-        if (fitSet.Count >= minIsotonicCalibrationSamples)
+        if (isotonicAccepted && refitSet.Count >= minIsotonicCalibrationSamples)
         {
-            var fitProbs = new float[fitSet.Count];
-            for (int i = 0; i < fitSet.Count; i++)
+            var refitProbs = new float[refitSet.Count];
+            for (int i = 0; i < refitSet.Count; i++)
             {
                 ct.ThrowIfCancellationRequested();
-                double raw = ForwardPass(fitSet[i].Features, model, featureCount, buf);
-                fitProbs[i] = (float)ApplyTrainingCalibration(
+                double raw = ForwardPass(refitSet[i].Features, model, featureCount, buf);
+                refitProbs[i] = (float)ApplyTrainingCalibration(
                     raw,
-                    plattA,
-                    plattB,
-                    temperatureScale,
-                    conditionalFit.Buy.A,
-                    conditionalFit.Buy.B,
-                    conditionalFit.Sell.A,
-                    conditionalFit.Sell.B,
+                    refitPlattA,
+                    refitPlattB,
+                    selectedTemperatureScale,
+                    finalConditionalFit.Buy.A,
+                    finalConditionalFit.Buy.B,
+                    finalConditionalFit.Sell.A,
+                    finalConditionalFit.Sell.B,
                     routingThreshold);
             }
-
-            double[] candidateIsotonic = MLTrainerHelpers.FitIsotonicCalibration(fitProbs, fitSet);
-            if (candidateIsotonic.Length >= 4)
-            {
-                double candidatePostIsotonicNll = ComputeCrossFitCalibrationNll(
-                    evalSet,
-                    crossFitFoldCount,
-                    candidate => ComputeCalibrationNll(
-                        candidate,
-                        model,
-                        featureCount,
-                        plattA,
-                        plattB,
-                        temperatureScale,
-                        conditionalFit.Buy.A,
-                        conditionalFit.Buy.B,
-                        conditionalFit.Sell.A,
-                        conditionalFit.Sell.B,
-                        routingThreshold,
-                        candidateIsotonic,
-                        buf));
-                if (candidatePostIsotonicNll + 1e-6 < selectedStackNll)
-                {
-                    isotonicBreakpoints = candidateIsotonic;
-                    postIsotonicNll = candidatePostIsotonicNll;
-                }
-            }
+            isotonicBreakpoints = MLTrainerHelpers.FitIsotonicCalibration(refitProbs, refitSet);
         }
 
         var artifact = new FtTransformerCalibrationArtifact
         {
             SelectedGlobalCalibration = selectedGlobalCalibration,
             CalibrationSelectionStrategy = diagnosticsSet.Count > 0
-                ? (crossFitFoldCount > 1 ? "FIT_ON_FIT_EVAL_ON_CROSSFIT_DIAGNOSTICS" : "FIT_ON_FIT_EVAL_ON_DIAGNOSTICS")
+                ? (crossFitFoldCount > 1
+                    ? "REFIT_ON_FIT_PLUS_DIAGNOSTICS_AFTER_TRUE_CROSSFIT_SELECTION"
+                    : "REFIT_ON_FIT_PLUS_DIAGNOSTICS_AFTER_DIAGNOSTICS_SELECTION")
                 : "FIT_AND_EVAL_ON_FIT",
             GlobalPlattNll = globalPlattNll,
-            TemperatureNll = double.IsFinite(temperatureNll) ? temperatureNll : globalPlattNll,
+            TemperatureNll = temperatureNll,
+            GlobalPlattEce = globalPlattEce,
+            TemperatureEce = temperatureEce,
             TemperatureSelected = string.Equals(selectedGlobalCalibration, "TEMPERATURE", StringComparison.Ordinal),
             AdaptiveHeadMode = splitSummary.AdaptiveHeadSplitMode,
             AdaptiveHeadCrossFitFoldCount = splitSummary.AdaptiveHeadCrossFitFoldCount,
             FitSampleCount = fitSet.Count,
             DiagnosticsSampleCount = evalSet.Count,
+            RefitSampleCount = refitSet.Count,
             DiagnosticsSelectedGlobalNll = string.Equals(selectedGlobalCalibration, "TEMPERATURE", StringComparison.Ordinal)
                 ? temperatureNll
                 : globalPlattNll,
-            DiagnosticsSelectedStackNll = postIsotonicNll,
+            DiagnosticsSelectedGlobalEce = string.Equals(selectedGlobalCalibration, "TEMPERATURE", StringComparison.Ordinal)
+                ? temperatureEce
+                : globalPlattEce,
+            DiagnosticsSelectedStackNll = isotonicAccepted ? postIsotonicNll : preIsotonicNll,
+            DiagnosticsSelectedStackEce = isotonicAccepted ? postIsotonicEce : preIsotonicEce,
             ConditionalRoutingThreshold = routingThreshold,
-            RoutingThresholdCandidateCount = routingSelection.CandidateCount,
-            RoutingThresholdSelectedNll = routingSelection.SelectedEvalNll,
+            RoutingThresholdCandidateCount = routingThresholdCandidates.Length,
+            RoutingThresholdSelectedNll = routingCandidateNlls[selectedRoutingIndex],
+            RoutingThresholdSelectedEce = routingCandidateEces[selectedRoutingIndex],
+            RoutingThresholdCandidates = routingThresholdCandidates,
+            RoutingThresholdCandidateNlls = routingCandidateNlls,
+            RoutingThresholdCandidateEces = routingCandidateEces,
             ConformalSelectionStrategy = splitSummary.ConformalStartIndex >=
                                          splitSummary.CalibrationDiagnosticsStartIndex + splitSummary.CalibrationDiagnosticsCount
                 ? "DISJOINT_HOLDOUT"
                 : "SHARED_DIAGNOSTICS",
-            BuyBranchSampleCount = conditionalFit.Buy.SampleCount,
-            BuyBranchBaselineNll = conditionalFit.Buy.BaselineLoss,
-            BuyBranchFittedNll = conditionalFit.Buy.FittedLoss,
-            BuyBranchAccepted = conditionalFit.Buy.Accepted,
-            SellBranchSampleCount = conditionalFit.Sell.SampleCount,
-            SellBranchBaselineNll = conditionalFit.Sell.BaselineLoss,
-            SellBranchFittedNll = conditionalFit.Sell.FittedLoss,
-            SellBranchAccepted = conditionalFit.Sell.Accepted,
-            IsotonicSampleCount = fitSet.Count,
+            BuyBranchSampleCount = finalConditionalFit.Buy.SampleCount,
+            BuyBranchBaselineNll = finalConditionalFit.Buy.BaselineLoss,
+            BuyBranchFittedNll = finalConditionalFit.Buy.FittedLoss,
+            BuyBranchAccepted = finalConditionalFit.Buy.Accepted,
+            SellBranchSampleCount = finalConditionalFit.Sell.SampleCount,
+            SellBranchBaselineNll = finalConditionalFit.Sell.BaselineLoss,
+            SellBranchFittedNll = finalConditionalFit.Sell.FittedLoss,
+            SellBranchAccepted = finalConditionalFit.Sell.Accepted,
+            IsotonicSampleCount = refitSet.Count,
             IsotonicBreakpointCount = isotonicBreakpoints.Length / 2,
-            PreIsotonicNll = selectedStackNll,
-            PostIsotonicNll = postIsotonicNll,
-            IsotonicAccepted = isotonicBreakpoints.Length >= 4,
+            PreIsotonicNll = preIsotonicNll,
+            PostIsotonicNll = isotonicAccepted ? postIsotonicNll : preIsotonicNll,
+            PreIsotonicEce = preIsotonicEce,
+            PostIsotonicEce = isotonicAccepted ? postIsotonicEce : preIsotonicEce,
+            IsotonicAccepted = isotonicAccepted && isotonicBreakpoints.Length >= 4,
+            SelectedStackCrossFitFoldNlls = isotonicAccepted ? postIsotonicFoldNlls : preIsotonicFoldNlls,
+            SelectedStackCrossFitFoldEces = isotonicAccepted ? postIsotonicFoldEces : preIsotonicFoldEces,
         };
 
         return new FtCalibrationFit(
-            plattA,
-            plattB,
-            temperatureScale,
-            conditionalFit.Buy.A,
-            conditionalFit.Buy.B,
-            conditionalFit.Sell.A,
-            conditionalFit.Sell.B,
+            refitPlattA,
+            refitPlattB,
+            selectedTemperatureScale,
+            finalConditionalFit.Buy.A,
+            finalConditionalFit.Buy.B,
+            finalConditionalFit.Sell.A,
+            finalConditionalFit.Sell.B,
             routingThreshold,
-            isotonicBreakpoints,
+            artifact.IsotonicAccepted ? isotonicBreakpoints : [],
             artifact);
+    }
+
+    private static List<CalibrationFoldSplit> BuildCalibrationFoldSplits(
+        List<TrainingSample> fitSet,
+        List<TrainingSample> diagnosticsSet,
+        int requestedFoldCount)
+    {
+        var folds = new List<CalibrationFoldSplit>();
+        if (diagnosticsSet.Count == 0 || requestedFoldCount <= 1 || diagnosticsSet.Count < requestedFoldCount)
+        {
+            folds.Add(new CalibrationFoldSplit(
+                new List<TrainingSample>(fitSet),
+                diagnosticsSet.Count > 0 ? new List<TrainingSample>(diagnosticsSet) : new List<TrainingSample>(fitSet)));
+            return folds;
+        }
+
+        int baseCount = diagnosticsSet.Count / requestedFoldCount;
+        int remainder = diagnosticsSet.Count % requestedFoldCount;
+        int cursor = 0;
+        for (int fold = 0; fold < requestedFoldCount; fold++)
+        {
+            int holdoutCount = baseCount + (fold < remainder ? 1 : 0);
+            var holdoutSet = diagnosticsSet.GetRange(cursor, holdoutCount);
+            var trainSet = new List<TrainingSample>(fitSet.Count + diagnosticsSet.Count - holdoutCount);
+            trainSet.AddRange(fitSet);
+            if (cursor > 0)
+                trainSet.AddRange(diagnosticsSet.GetRange(0, cursor));
+            int tailStart = cursor + holdoutCount;
+            if (tailStart < diagnosticsSet.Count)
+                trainSet.AddRange(diagnosticsSet.GetRange(tailStart, diagnosticsSet.Count - tailStart));
+            folds.Add(new CalibrationFoldSplit(trainSet, holdoutSet));
+            cursor += holdoutCount;
+        }
+
+        return folds;
+    }
+
+    private static List<TrainingSample> CombineSampleSets(
+        IReadOnlyList<TrainingSample> first,
+        IReadOnlyList<TrainingSample> second)
+    {
+        var combined = new List<TrainingSample>(first.Count + second.Count);
+        for (int i = 0; i < first.Count; i++)
+            combined.Add(first[i]);
+        for (int i = 0; i < second.Count; i++)
+            combined.Add(second[i]);
+        return combined;
+    }
+
+    private static CalibrationMetricSummary EvaluateCalibrationMetrics(
+        IReadOnlyList<TrainingSample> samples,
+        TransformerModel model,
+        int featureCount,
+        double plattA,
+        double plattB,
+        double temperatureScale,
+        double plattABuy,
+        double plattBBuy,
+        double plattASell,
+        double plattBSell,
+        double routingThreshold,
+        double[]? isotonicBreakpoints,
+        InferenceBuffers buf)
+    {
+        return new CalibrationMetricSummary(
+            ComputeCalibrationNll(
+                samples,
+                model,
+                featureCount,
+                plattA,
+                plattB,
+                temperatureScale,
+                plattABuy,
+                plattBBuy,
+                plattASell,
+                plattBSell,
+                routingThreshold,
+                isotonicBreakpoints,
+                buf),
+            ComputeCalibrationEce(
+                samples,
+                model,
+                featureCount,
+                plattA,
+                plattB,
+                temperatureScale,
+                plattABuy,
+                plattBBuy,
+                plattASell,
+                plattBSell,
+                routingThreshold,
+                isotonicBreakpoints,
+                buf));
+    }
+
+    private static double[] BuildRoutingThresholdCandidates(
+        IReadOnlyList<TrainingSample> calibrationSet,
+        TransformerModel model,
+        int featureCount,
+        double plattA,
+        double plattB,
+        double temperatureScale,
+        InferenceBuffers buf,
+        CancellationToken ct)
+    {
+        if (calibrationSet.Count == 0)
+            return [0.5];
+
+        var probs = new double[calibrationSet.Count];
+        for (int i = 0; i < calibrationSet.Count; i++)
+        {
+            ct.ThrowIfCancellationRequested();
+            double raw = Math.Clamp(ForwardPass(calibrationSet[i].Features, model, featureCount, buf), 1e-7, 1.0 - 1e-7);
+            probs[i] = ApplyGlobalCalibration(raw, plattA, plattB, temperatureScale);
+        }
+
+        var candidates = new SortedSet<double> { 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65 };
+        candidates.Add(Math.Clamp(Quantile(probs, 0.25), 0.30, 0.70));
+        candidates.Add(Math.Clamp(Quantile(probs, 0.50), 0.30, 0.70));
+        candidates.Add(Math.Clamp(Quantile(probs, 0.75), 0.30, 0.70));
+        return candidates.ToArray();
     }
 
     private static (double ABuy, double BBuy, double ASell, double BSell) FitClassConditionalPlatt(
@@ -2888,7 +3297,8 @@ public sealed partial class FtTransformerModelTrainer : IMLModelTrainer
         CancellationToken ct)
     {
         if (fitSet.Count < minCalibrationSamples * 2 || evalSet.Count < Math.Max(8, minCalibrationSamples / 2))
-            return new RoutingThresholdSelection(0.5, 1, ComputeCalibrationNll(
+        {
+            double fallbackNll = ComputeCalibrationNll(
                 evalSet,
                 model,
                 featureCount,
@@ -2896,7 +3306,18 @@ public sealed partial class FtTransformerModelTrainer : IMLModelTrainer
                 0.0, 0.0, 0.0, 0.0,
                 0.5,
                 null,
-                buf));
+                buf);
+            double fallbackEce = ComputeCalibrationEce(
+                evalSet,
+                model,
+                featureCount,
+                plattA, plattB, temperatureScale,
+                0.0, 0.0, 0.0, 0.0,
+                0.5,
+                null,
+                buf);
+            return new RoutingThresholdSelection(0.5, 1, fallbackNll, fallbackEce, [0.5], [fallbackNll], [fallbackEce]);
+        }
 
         var fitProbs = new double[fitSet.Count];
         for (int i = 0; i < fitSet.Count; i++)
@@ -2911,6 +3332,9 @@ public sealed partial class FtTransformerModelTrainer : IMLModelTrainer
         candidates.Add(Math.Clamp(Quantile(fitProbs, 0.50), 0.35, 0.65));
         candidates.Add(Math.Clamp(Quantile(fitProbs, 0.67), 0.35, 0.65));
 
+        double[] candidateArray = candidates.ToArray();
+        var candidateNlls = new double[candidateArray.Length];
+        var candidateEces = new double[candidateArray.Length];
         double bestThreshold = 0.5;
         double bestEvalNll = ComputeCrossFitCalibrationNll(
             evalSet,
@@ -2924,8 +3348,18 @@ public sealed partial class FtTransformerModelTrainer : IMLModelTrainer
                 0.5,
                 null,
                 buf));
-        foreach (double threshold in candidates)
+        double bestEvalEce = ComputeCalibrationEce(
+            evalSet,
+            model,
+            featureCount,
+            plattA, plattB, temperatureScale,
+            0.0, 0.0, 0.0, 0.0,
+            0.5,
+            null,
+            buf);
+        for (int candidateIndex = 0; candidateIndex < candidateArray.Length; candidateIndex++)
         {
+            double threshold = candidateArray[candidateIndex];
             ct.ThrowIfCancellationRequested();
             var conditionalFit = FitClassConditionalPlatt(
                 fitSet,
@@ -2957,14 +3391,38 @@ public sealed partial class FtTransformerModelTrainer : IMLModelTrainer
                     threshold,
                     null,
                     buf));
+            double evalEce = ComputeCalibrationEce(
+                evalSet,
+                model,
+                featureCount,
+                plattA,
+                plattB,
+                temperatureScale,
+                conditionalFit.Buy.A,
+                conditionalFit.Buy.B,
+                conditionalFit.Sell.A,
+                conditionalFit.Sell.B,
+                threshold,
+                null,
+                buf);
+            candidateNlls[candidateIndex] = evalNll;
+            candidateEces[candidateIndex] = evalEce;
             if (evalNll + 1e-6 < bestEvalNll)
             {
                 bestEvalNll = evalNll;
+                bestEvalEce = evalEce;
                 bestThreshold = threshold;
             }
         }
 
-        return new RoutingThresholdSelection(bestThreshold, candidates.Count, bestEvalNll);
+        return new RoutingThresholdSelection(
+            bestThreshold,
+            candidateArray.Length,
+            bestEvalNll,
+            bestEvalEce,
+            candidateArray,
+            candidateNlls,
+            candidateEces);
     }
 
     private static ConditionalPlattBranchFit FitConditionalPlattBranch(
@@ -3131,6 +3589,63 @@ public sealed partial class FtTransformerModelTrainer : IMLModelTrainer
         }
 
         return loss / samples.Count;
+    }
+
+    private static double ComputeCalibrationEce(
+        IReadOnlyList<TrainingSample> samples,
+        TransformerModel model,
+        int featureCount,
+        double plattA,
+        double plattB,
+        double temperatureScale,
+        double plattABuy,
+        double plattBBuy,
+        double plattASell,
+        double plattBSell,
+        double routingThreshold,
+        double[]? isotonicBreakpoints,
+        InferenceBuffers buf)
+    {
+        if (samples.Count == 0)
+            return 0.0;
+
+        int numBins = Math.Max(3, Math.Min(15, (int)Math.Ceiling(Math.Sqrt(samples.Count))));
+        var binConf = new double[numBins];
+        var binCorrect = new int[numBins];
+        var binCount = new int[numBins];
+
+        for (int i = 0; i < samples.Count; i++)
+        {
+            double raw = ForwardPass(samples[i].Features, model, featureCount, buf);
+            double p = ApplyTrainingCalibration(
+                raw,
+                plattA,
+                plattB,
+                temperatureScale,
+                plattABuy,
+                plattBBuy,
+                plattASell,
+                plattBSell,
+                routingThreshold,
+                isotonicBreakpoints);
+            int bin = Math.Clamp((int)(p * numBins), 0, numBins - 1);
+            binConf[bin] += p;
+            if (samples[i].Direction > 0)
+                binCorrect[bin]++;
+            binCount[bin]++;
+        }
+
+        double ece = 0.0;
+        for (int bin = 0; bin < numBins; bin++)
+        {
+            if (binCount[bin] == 0)
+                continue;
+            double avgConf = binConf[bin] / binCount[bin];
+            double avgAcc = binCorrect[bin] / (double)binCount[bin];
+            ece += Math.Abs(avgAcc - avgConf) * binCount[bin] / samples.Count;
+        }
+
+        return ece;
     }
 
     private static double Quantile(double[] values, double quantile)
@@ -3715,124 +4230,4 @@ public sealed partial class FtTransformerModelTrainer : IMLModelTrainer
         return dst;
     }
 
-    // ── Binary serialisation for additional layers (improvement 6+7) ─────────
-
-    private static byte[] SerializeAdditionalLayersBinary(TransformerModel model)
-    {
-        using var ms = new MemoryStream();
-        using var bw = new BinaryWriter(ms);
-
-        int numAdditional = model.NumLayers - 1;
-        int S = model.SeqLen;
-        bool hasPosBias = model.UsePositionalBias;
-
-        bw.Write(numAdditional);
-        bw.Write(model.NumHeads);
-        bw.Write(hasPosBias ? S * S : 0);
-
-        for (int l = 1; l < model.NumLayers; l++)
-        {
-            var layer = model.Layers[l];
-            WriteBinaryMatrix(bw, layer.Wq, model.EmbedDim, model.EmbedDim);
-            WriteBinaryMatrix(bw, layer.Wk, model.EmbedDim, model.EmbedDim);
-            WriteBinaryMatrix(bw, layer.Wv, model.EmbedDim, model.EmbedDim);
-            WriteBinaryMatrix(bw, layer.Wo, model.EmbedDim, model.EmbedDim);
-            WriteBinaryVector(bw, layer.Gamma1);
-            WriteBinaryVector(bw, layer.Beta1);
-            WriteBinaryMatrix(bw, layer.Wff1, model.EmbedDim, model.FfnDim);
-            WriteBinaryVector(bw, layer.Bff1);
-            WriteBinaryMatrix(bw, layer.Wff2, model.FfnDim, model.EmbedDim);
-            WriteBinaryVector(bw, layer.Bff2);
-            WriteBinaryVector(bw, layer.Gamma2);
-            WriteBinaryVector(bw, layer.Beta2);
-            if (hasPosBias && layer.PosBias is not null)
-                WriteBinaryMatrix(bw, layer.PosBias, model.NumHeads, S * S);
-        }
-
-        bw.Flush();
-        byte[] payload = ms.ToArray();
-
-        // Append CRC32 trailer
-        uint crc = ComputeCrc32(payload);
-        var result = new byte[payload.Length + 4];
-        Buffer.BlockCopy(payload, 0, result, 0, payload.Length);
-        BitConverter.TryWriteBytes(result.AsSpan(payload.Length), crc);
-        return result;
-    }
-
-    private static List<SerializedLayerWeights> DeserializeAdditionalLayers(byte[] data, int D, int Ff)
-    {
-        if (data.Length < 4) throw new InvalidOperationException("Binary blob too short");
-        int payloadLen = data.Length - 4;
-        uint storedCrc = BitConverter.ToUInt32(data, payloadLen);
-        uint computedCrc = ComputeCrc32(data[..payloadLen]);
-        if (storedCrc != computedCrc)
-            throw new InvalidOperationException("CRC32 mismatch");
-
-        var result = new List<SerializedLayerWeights>();
-        using var ms = new MemoryStream(data, 0, payloadLen);
-        using var br = new BinaryReader(ms);
-        int numLayers = br.ReadInt32();
-        int numHeads = br.ReadInt32();
-        int seqSq = br.ReadInt32();
-        for (int l = 0; l < numLayers; l++)
-        {
-            var lw = new SerializedLayerWeights
-            {
-                Wq = ReadBinaryMatrix(br, D, D), Wk = ReadBinaryMatrix(br, D, D),
-                Wv = ReadBinaryMatrix(br, D, D), Wo = ReadBinaryMatrix(br, D, D),
-                Gamma1 = ReadBinaryVector(br, D), Beta1 = ReadBinaryVector(br, D),
-                Wff1 = ReadBinaryMatrix(br, D, Ff), Bff1 = ReadBinaryVector(br, Ff),
-                Wff2 = ReadBinaryMatrix(br, Ff, D), Bff2 = ReadBinaryVector(br, D),
-                Gamma2 = ReadBinaryVector(br, D), Beta2 = ReadBinaryVector(br, D),
-            };
-            if (seqSq > 0 && numHeads > 0)
-                lw.PosBias = ReadBinaryMatrix(br, numHeads, seqSq);
-            result.Add(lw);
-        }
-        return result;
-    }
-
-    private static void WriteBinaryMatrix(BinaryWriter bw, double[][] m, int rows, int cols)
-    {
-        for (int r = 0; r < rows; r++)
-            for (int c = 0; c < cols; c++)
-                bw.Write(m[r][c]);
-    }
-
-    private static void WriteBinaryVector(BinaryWriter bw, double[] v)
-    {
-        for (int i = 0; i < v.Length; i++)
-            bw.Write(v[i]);
-    }
-
-    private static double[][] ReadBinaryMatrix(BinaryReader br, int rows, int cols)
-    {
-        var m = new double[rows][];
-        for (int r = 0; r < rows; r++)
-        {
-            m[r] = new double[cols];
-            for (int c = 0; c < cols; c++) m[r][c] = br.ReadDouble();
-        }
-        return m;
-    }
-
-    private static double[] ReadBinaryVector(BinaryReader br, int len)
-    {
-        var v = new double[len];
-        for (int i = 0; i < len; i++) v[i] = br.ReadDouble();
-        return v;
-    }
-
-    private static uint ComputeCrc32(byte[] data)
-    {
-        uint crc = 0xFFFFFFFF;
-        for (int i = 0; i < data.Length; i++)
-        {
-            crc ^= data[i];
-            for (int bit = 0; bit < 8; bit++)
-                crc = (crc >> 1) ^ (0xEDB88320 & ~((crc & 1) - 1));
-        }
-        return ~crc;
-    }
 }

@@ -68,8 +68,7 @@ public partial class StrategyWorker
                     r.MaxDrawdownPct,
                     r.SharpeRatio,
                     r.FinalBalance,
-                    r.TotalReturn,
-                    r.ResultJson
+                    r.TotalReturn
                 })
                 .First())
             .ToListAsync(ct);
@@ -86,7 +85,6 @@ public partial class StrategyWorker
                     bt.SharpeRatio,
                     bt.FinalBalance,
                     bt.TotalReturn,
-                    bt.ResultJson,
                     out var result))
             {
                 LoggerExtensions.LogWarning(

@@ -31,7 +31,7 @@ namespace LascodiaTradingEngine.Application.Services.ML;
 /// </list>
 /// </summary>
 [RegisterKeyedService(typeof(IMLModelTrainer), LearnerArchitecture.Svgp)]
-public sealed class SvgpModelTrainer : IMLModelTrainer
+public sealed partial class SvgpModelTrainer : IMLModelTrainer
 {
     // ── Constants ────────────────────────────────────────────────────────────
 
@@ -219,6 +219,17 @@ public sealed class SvgpModelTrainer : IMLModelTrainer
             trainSet = allStd[..trainStdEnd];
             calSet   = allStd[calStart..(calEnd < n ? calEnd : n)];
             testSet  = allStd[Math.Min(calEnd + embargo, n)..];
+        }
+
+        // ── 2c. Class-imbalance gate ─────────────────────────────────────────
+        {
+            int posCount = 0;
+            foreach (var s in trainSet) if (s.Direction > 0) posCount++;
+            double buyRatio = (double)posCount / trainSet.Count;
+            if (buyRatio < 0.15 || buyRatio > 0.85)
+                throw new InvalidOperationException($"SVGP: extreme class imbalance (Buy={buyRatio:P1}).");
+            if (buyRatio < 0.35 || buyRatio > 0.65)
+                _logger.LogWarning("SVGP class imbalance: Buy={Buy:P1}, Sell={Sell:P1}.", buyRatio, 1.0 - buyRatio);
         }
 
         var rng    = new Random(hp.ElmOuterSeed > 0 ? hp.ElmOuterSeed : 42);

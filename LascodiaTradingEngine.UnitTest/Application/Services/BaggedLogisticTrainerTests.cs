@@ -127,6 +127,31 @@ public class BaggedLogisticTrainerTests
         Assert.Equal(192, recentCount);
     }
 
+    [Fact]
+    public void ComputeHoldoutWindowPlan_Splits_Into_Selection_And_Calibration_Slices()
+    {
+        var plan = BaggedLogisticTrainer.ComputeHoldoutWindowPlan(sampleCount: 30);
+
+        Assert.Equal(0, plan.SelectionStart);
+        Assert.Equal(15, plan.SelectionCount);
+        Assert.Equal(15, plan.CalibrationStart);
+        Assert.Equal(15, plan.CalibrationCount);
+    }
+
+    [Fact]
+    public void ComputeWalkForwardInnerValidationBoundaries_Leaves_Leakage_Gap_Before_Holdout()
+    {
+        var (trainEnd, holdoutStart) = BaggedLogisticTrainer.ComputeWalkForwardInnerValidationBoundaries(
+            sampleCount: 100,
+            embargo: 5,
+            purgeHorizonBars: 3,
+            lookbackWindow: 10);
+
+        Assert.Equal(65, trainEnd);
+        Assert.Equal(79, holdoutStart);
+        Assert.True(holdoutStart > trainEnd);
+    }
+
     [Theory]
     [InlineData(1, 0.80, 0.40)]
     [InlineData(-1, 0.80, 1.60)]
@@ -263,6 +288,32 @@ public class BaggedLogisticTrainerTests
             maxRawFeatures: 5);
 
         Assert.Equal([0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 0.0], destination);
+    }
+
+    [Fact]
+    public void CopySelectedFeatureWindow_Uses_Requested_Raw_Feature_Indices()
+    {
+        double[] destination = new double[7];
+
+        BaggedLogisticTrainer.CopySelectedFeatureWindow(
+            destination,
+            source: [1f, 2f, 3f, 4f],
+            destinationOffset: 2,
+            selectedFeatureIndices: [3, 1, 9],
+            maxRawFeatures: 3);
+
+        Assert.Equal([0.0, 0.0, 4.0, 2.0, 0.0, 0.0, 0.0], destination);
+    }
+
+    [Fact]
+    public void ComputeTopFeatureIndices_Orders_By_Importance_Then_Index()
+    {
+        int[] top = BaggedLogisticTrainer.ComputeTopFeatureIndices(
+            importanceScores: [0.1, double.NaN, 0.5, 0.5, 0.3],
+            count: 3,
+            featureCount: 5);
+
+        Assert.Equal([2, 3, 4], top);
     }
 
     [Fact]

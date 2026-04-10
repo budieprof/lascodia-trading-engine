@@ -11,13 +11,20 @@ public interface IOptimizationWorkerHealthStore
     void UpdateMainWorkerState(OptimizationWorkerHealthStateSnapshot snapshot);
     void UpdateMainWorkerState(Func<OptimizationWorkerHealthStateSnapshot, OptimizationWorkerHealthStateSnapshot> updater);
     void RecordQueueWaitSample(long queueWaitMs);
+    OptimizationWorkerPhaseExecutionDecision GetPhaseExecutionDecision(string phaseName, DateTime utcNow);
     void RecordPhaseStarted(string phaseName, DateTime utcNow);
     void RecordPhaseSuccess(string phaseName, long durationMs, DateTime utcNow);
     void RecordPhaseFailure(string phaseName, string errorType, string errorMessage, long durationMs, DateTime utcNow);
+    void RecordPhaseSkipped(string phaseName, string reason, DateTime? backoffUntilUtc, DateTime utcNow);
     QueueWaitPercentileSnapshot GetQueueWaitPercentiles();
     OptimizationWorkerHealthStateSnapshot GetMainWorkerState();
     IReadOnlyList<OptimizationWorkerPhaseStateSnapshot> GetPhaseStates();
 }
+
+public readonly record struct OptimizationWorkerPhaseExecutionDecision(
+    bool ShouldExecute,
+    DateTime? BackoffUntilUtc,
+    string? Reason);
 
 public readonly record struct QueueWaitPercentileSnapshot(
     long P50Ms,
@@ -42,6 +49,11 @@ public sealed record OptimizationWorkerPhaseStateSnapshot
     public long LastSuccessDurationMs { get; init; }
     public int SuccessesLastHour { get; init; }
     public int FailuresLastHour { get; init; }
+    public bool IsDegraded { get; init; }
+    public DateTime? BackoffUntilUtc { get; init; }
+    public DateTime? LastSkippedAtUtc { get; init; }
+    public string? LastSkipReason { get; init; }
+    public int SkippedExecutionsLastHour { get; init; }
 }
 
 public sealed record OptimizationWorkerHealthStateSnapshot
@@ -90,6 +102,12 @@ public sealed record OptimizationWorkerHealthStateSnapshot
     public int MostDeferredQueuedDeferralCount { get; init; }
     public long? MostRecentDeferredResumeRunId { get; init; }
     public DateTime? MostRecentDeferredResumeAtUtc { get; init; }
+    public int DeferredRunsStartedLastHour { get; init; }
+    public int DeferredRunsResumedLastHour { get; init; }
+    public int RepeatedlyDeferredQueuedRuns { get; init; }
+    public long? OldestActiveDeferralRunId { get; init; }
+    public DateTime? OldestActiveDeferralAtUtc { get; init; }
+    public int OldestActiveDeferralAgeSeconds { get; init; }
     public IReadOnlyList<OptimizationDeferralReasonCountSnapshot> DeferredQueuedRunsByReason { get; init; } = [];
     public int StarvedQueuedRuns { get; init; }
     public long? OldestStarvedQueuedRunId { get; init; }

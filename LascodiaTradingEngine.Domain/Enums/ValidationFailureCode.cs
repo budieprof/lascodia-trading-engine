@@ -12,6 +12,7 @@ public enum ValidationFailureCode
     InvalidCandleSeries = 3,
     InvalidWindow = 4,
     InvalidOptionsSnapshot = 5,
-    ExecutionFailed = 6,
-    TransientInfrastructure = 7
+    InvalidStrategySnapshot = 6,
+    ExecutionFailed = 7,
+    TransientInfrastructure = 8
 }

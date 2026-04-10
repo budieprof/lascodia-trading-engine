@@ -345,15 +345,24 @@ public class OptimizationHelperServicesTest
 
         var writeCtx = new Mock<IWriteApplicationDbContext>();
         writeCtx.Setup(x => x.SaveChangesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(1);
+        var timeProvider = new FixedTimeProvider(nowUtc);
+        var scopeFactory = new ServiceCollection().BuildServiceProvider().GetRequiredService<IServiceScopeFactory>();
 
         var service = new OptimizationRunPersistenceService(
             NullLogger<OptimizationRunPersistenceService>.Instance,
             new OptimizationRunMetadataService(NullLogger<OptimizationRunMetadataService>.Instance),
-            new FixedTimeProvider(nowUtc));
+            new OptimizationRunOwnedMutationGuard(
+                new OptimizationRunLeaseManager(
+                    scopeFactory,
+                    NullLogger<OptimizationRunLeaseManager>.Instance,
+                    timeProvider),
+                NullLogger<OptimizationRunOwnedMutationGuard>.Instance),
+            timeProvider);
 
         await service.PersistAsync(
             new OptimizationRunPersistenceContext(
                 Run: run,
+                ExpectedLeaseToken: Guid.NewGuid(),
                 Strategy: strategy,
                 Candles: candles,
                 TrainCandles: candles.Take(6).ToList(),
@@ -775,13 +784,15 @@ public class OptimizationHelperServicesTest
         var optionsBuilder = new BacktestOptionsSnapshotBuilder(
             settingsProvider,
             NullLogger<BacktestOptionsSnapshotBuilder>.Instance);
-        var validationRunFactory = new ValidationRunFactory(optionsBuilder, timeProvider);
+        var snapshotBuilder = new StrategyExecutionSnapshotBuilder();
+        var validationRunFactory = new ValidationRunFactory(optionsBuilder, snapshotBuilder, timeProvider);
         var followUpCoordinator = new OptimizationFollowUpCoordinator(
             scopeFactory,
             Mock.Of<IAlertDispatcher>(),
             runScopedConfigService,
             validationRunFactory,
             optionsBuilder,
+            snapshotBuilder,
             NullLogger<OptimizationFollowUpCoordinator>.Instance,
             metrics,
             timeProvider);

@@ -28,6 +28,7 @@ public class BacktestRunConfiguration : IEntityTypeConfiguration<BacktestRun>
         builder.Property(x => x.FailureCode).HasConversion<string>().HasMaxLength(128);
         builder.Property(x => x.InitialBalance).HasPrecision(18, 2);
         builder.Property(x => x.ParametersSnapshotJson).HasColumnType("text");
+        builder.Property(x => x.StrategySnapshotJson).HasColumnType("text");
         builder.Property(x => x.BacktestOptionsSnapshotJson).HasColumnType("text");
         builder.Property(x => x.ErrorMessage).HasMaxLength(2000);
         builder.Property(x => x.FailureDetailsJson).HasColumnType("text");

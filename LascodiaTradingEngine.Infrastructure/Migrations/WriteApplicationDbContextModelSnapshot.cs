@@ -339,11 +339,11 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
 
                     NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
 
-                    b.Property<string>("BacktestOptionsSnapshotJson")
-                        .HasColumnType("text");
-
                     b.Property<DateTime>("AvailableAt")
                         .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("BacktestOptionsSnapshotJson")
+                        .HasColumnType("text");
 
                     b.Property<DateTime?>("ClaimedAt")
                         .HasColumnType("timestamp with time zone");
@@ -390,10 +390,10 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     b.Property<bool>("IsDeleted")
                         .HasColumnType("boolean");
 
-                    b.Property<DateTime?>("LastHeartbeatAt")
+                    b.Property<DateTime?>("LastAttemptAt")
                         .HasColumnType("timestamp with time zone");
 
-                    b.Property<DateTime?>("LastAttemptAt")
+                    b.Property<DateTime?>("LastHeartbeatAt")
                         .HasColumnType("timestamp with time zone");
 
                     b.Property<decimal?>("MaxDrawdownPct")
@@ -413,13 +413,13 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                         .HasPrecision(18, 6)
                         .HasColumnType("numeric(18,6)");
 
-                    b.Property<DateTime>("QueuedAt")
-                        .HasColumnType("timestamp with time zone");
-
                     b.Property<string>("QueueSource")
                         .IsRequired()
                         .HasMaxLength(64)
                         .HasColumnType("character varying(64)");
+
+                    b.Property<DateTime>("QueuedAt")
+                        .HasColumnType("timestamp with time zone");
 
                     b.Property<string>("ResultJson")
                         .HasColumnType("text");
@@ -444,6 +444,9 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
 
                     b.Property<long>("StrategyId")
                         .HasColumnType("bigint");
+
+                    b.Property<string>("StrategySnapshotJson")
+                        .HasColumnType("text");
 
                     b.Property<string>("Symbol")
                         .IsRequired()
@@ -478,18 +481,18 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                         .IsUnique()
                         .HasFilter("\"SourceOptimizationRunId\" IS NOT NULL AND \"IsDeleted\" = false");
 
-                    b.HasIndex("Status", "ExecutionLeaseExpiresAt");
-
-                    b.HasIndex("Status", "AvailableAt", "Priority", "QueuedAt", "Id");
-
                     b.HasIndex("StrategyId");
-
-                    b.HasIndex("StrategyId", "Status");
 
                     b.HasIndex("ValidationQueueKey")
                         .IsUnique()
                         .HasDatabaseName("IX_BacktestRun_ActiveValidationQueueKey")
                         .HasFilter("\"ValidationQueueKey\" IS NOT NULL AND \"Status\" IN ('Queued','Running') AND \"IsDeleted\" = false");
+
+                    b.HasIndex("Status", "ExecutionLeaseExpiresAt");
+
+                    b.HasIndex("StrategyId", "Status");
+
+                    b.HasIndex("Status", "AvailableAt", "Priority", "QueuedAt", "Id");
 
                     b.ToTable("BacktestRun", t =>
                         {
@@ -3571,18 +3574,18 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     b.Property<string>("ConfigSnapshotJson")
                         .HasColumnType("text");
 
-                    b.Property<DateTime?>("DeferredAtUtc")
-                        .HasColumnType("timestamp with time zone");
-
                     b.Property<int>("DeferralCount")
                         .HasColumnType("integer");
-
-                    b.Property<DateTime?>("DeferredUntilUtc")
-                        .HasColumnType("timestamp with time zone");
 
                     b.Property<string>("DeferralReason")
                         .HasMaxLength(40)
                         .HasColumnType("character varying(40)");
+
+                    b.Property<DateTime?>("DeferredAtUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTime?>("DeferredUntilUtc")
+                        .HasColumnType("timestamp with time zone");
 
                     b.Property<int>("DeterministicSeed")
                         .HasColumnType("integer");
@@ -3706,6 +3709,8 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
 
                     b.HasKey("Id");
 
+                    b.HasIndex("LastResumedAtUtc");
+
                     b.HasIndex("StrategyId")
                         .IsUnique()
                         .HasDatabaseName("IX_OptimizationRun_ActivePerStrategy")
@@ -3713,17 +3718,15 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
 
                     b.HasIndex("ValidationFollowUpsCreatedAt");
 
-                    b.HasIndex("LastResumedAtUtc");
-
-                    b.HasIndex("Status", "DeferralCount", "DeferredUntilUtc");
-
-                    b.HasIndex("Status", "DeferralReason", "DeferredUntilUtc");
-
                     b.HasIndex("Status", "DeferredUntilUtc");
 
                     b.HasIndex("Status", "ExecutionLeaseExpiresAt");
 
                     b.HasIndex("StrategyId", "Status");
+
+                    b.HasIndex("Status", "DeferralCount", "DeferredUntilUtc");
+
+                    b.HasIndex("Status", "DeferralReason", "DeferredUntilUtc");
 
                     b.ToTable("OptimizationRun", t =>
                         {
@@ -4666,8 +4669,8 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     b.HasIndex("Symbol");
 
                     b.HasIndex("StrategyType", "Symbol", "Timeframe")
-                        .HasDatabaseName("IX_Strategy_ActiveGenerationKey")
                         .IsUnique()
+                        .HasDatabaseName("IX_Strategy_ActiveGenerationKey")
                         .HasFilter("\"IsDeleted\" = false");
 
                     b.ToTable("Strategy");
@@ -4890,11 +4893,14 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                         .HasMaxLength(32)
                         .HasColumnType("character varying(32)");
 
-                    b.Property<DateTime?>("SummaryEventDispatchedAtUtc")
-                        .HasColumnType("timestamp with time zone");
+                    b.Property<int>("StrategiesPruned")
+                        .HasColumnType("integer");
 
                     b.Property<int>("SummaryEventDispatchAttempts")
                         .HasColumnType("integer");
+
+                    b.Property<DateTime?>("SummaryEventDispatchedAtUtc")
+                        .HasColumnType("timestamp with time zone");
 
                     b.Property<DateTime?>("SummaryEventFailedAtUtc")
                         .HasColumnType("timestamp with time zone");
@@ -4908,9 +4914,6 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
 
                     b.Property<string>("SummaryEventPayloadJson")
                         .HasColumnType("text");
-
-                    b.Property<int>("StrategiesPruned")
-                        .HasColumnType("integer");
 
                     b.Property<int>("SymbolsProcessed")
                         .HasColumnType("integer");
@@ -5065,16 +5068,16 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     b.Property<Guid?>("AutoPromotedEventId")
                         .HasColumnType("uuid");
 
-                    b.Property<string>("CandidateId")
-                        .IsRequired()
-                        .HasMaxLength(64)
-                        .HasColumnType("character varying(64)");
-
                     b.Property<DateTime?>("CandidateCreatedEventDispatchedAtUtc")
                         .HasColumnType("timestamp with time zone");
 
                     b.Property<Guid?>("CandidateCreatedEventId")
                         .HasColumnType("uuid");
+
+                    b.Property<string>("CandidateId")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
 
                     b.Property<string>("CandidatePayloadJson")
                         .IsRequired()
@@ -6122,15 +6125,15 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
 
                     NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
 
+                    b.Property<DateTime>("AvailableAt")
+                        .HasColumnType("timestamp with time zone");
+
                     b.Property<decimal?>("AverageOutOfSampleScore")
                         .HasPrecision(18, 6)
                         .HasColumnType("numeric(18,6)");
 
                     b.Property<string>("BacktestOptionsSnapshotJson")
                         .HasColumnType("text");
-
-                    b.Property<DateTime>("AvailableAt")
-                        .HasColumnType("timestamp with time zone");
 
                     b.Property<DateTime?>("ClaimedAt")
                         .HasColumnType("timestamp with time zone");
@@ -6176,10 +6179,10 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     b.Property<bool>("IsDeleted")
                         .HasColumnType("boolean");
 
-                    b.Property<DateTime?>("LastHeartbeatAt")
+                    b.Property<DateTime?>("LastAttemptAt")
                         .HasColumnType("timestamp with time zone");
 
-                    b.Property<DateTime?>("LastAttemptAt")
+                    b.Property<DateTime?>("LastHeartbeatAt")
                         .HasColumnType("timestamp with time zone");
 
                     b.Property<int>("OutOfSampleDays")
@@ -6194,13 +6197,13 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     b.Property<int>("Priority")
                         .HasColumnType("integer");
 
-                    b.Property<DateTime>("QueuedAt")
-                        .HasColumnType("timestamp with time zone");
-
                     b.Property<string>("QueueSource")
                         .IsRequired()
                         .HasMaxLength(64)
                         .HasColumnType("character varying(64)");
+
+                    b.Property<DateTime>("QueuedAt")
+                        .HasColumnType("timestamp with time zone");
 
                     b.Property<bool>("ReOptimizePerFold")
                         .HasColumnType("boolean");
@@ -6225,6 +6228,9 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
 
                     b.Property<long>("StrategyId")
                         .HasColumnType("bigint");
+
+                    b.Property<string>("StrategySnapshotJson")
+                        .HasColumnType("text");
 
                     b.Property<string>("Symbol")
                         .IsRequired()
@@ -6251,18 +6257,18 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                         .IsUnique()
                         .HasFilter("\"SourceOptimizationRunId\" IS NOT NULL AND \"IsDeleted\" = false");
 
-                    b.HasIndex("Status", "ExecutionLeaseExpiresAt");
-
-                    b.HasIndex("Status", "AvailableAt", "Priority", "QueuedAt", "Id");
-
                     b.HasIndex("StrategyId");
-
-                    b.HasIndex("StrategyId", "Status");
 
                     b.HasIndex("ValidationQueueKey")
                         .IsUnique()
                         .HasDatabaseName("IX_WalkForwardRun_ActiveValidationQueueKey")
                         .HasFilter("\"ValidationQueueKey\" IS NOT NULL AND \"Status\" IN ('Queued','Running') AND \"IsDeleted\" = false");
+
+                    b.HasIndex("Status", "ExecutionLeaseExpiresAt");
+
+                    b.HasIndex("StrategyId", "Status");
+
+                    b.HasIndex("Status", "AvailableAt", "Priority", "QueuedAt", "Id");
 
                     b.ToTable("WalkForwardRun", t =>
                         {
@@ -6302,6 +6308,12 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     b.Property<int>("ErrorsLastHour")
                         .HasColumnType("integer");
 
+                    b.Property<long>("ExecutionDurationP50Ms")
+                        .HasColumnType("bigint");
+
+                    b.Property<long>("ExecutionDurationP95Ms")
+                        .HasColumnType("bigint");
+
                     b.Property<bool>("IsDeleted")
                         .HasColumnType("boolean");
 
@@ -6318,11 +6330,29 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                         .HasMaxLength(500)
                         .HasColumnType("character varying(500)");
 
+                    b.Property<long>("LastExecutionDurationMs")
+                        .HasColumnType("bigint");
+
+                    b.Property<long>("LastQueueLatencyMs")
+                        .HasColumnType("bigint");
+
                     b.Property<DateTime?>("LastSuccessAt")
                         .HasColumnType("timestamp with time zone");
 
                     b.Property<Guid>("OutboxId")
                         .HasColumnType("uuid");
+
+                    b.Property<long>("QueueLatencyP50Ms")
+                        .HasColumnType("bigint");
+
+                    b.Property<long>("QueueLatencyP95Ms")
+                        .HasColumnType("bigint");
+
+                    b.Property<int>("RecoveriesLastHour")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("RetriesLastHour")
+                        .HasColumnType("integer");
 
                     b.Property<uint>("RowVersion")
                         .IsConcurrencyToken()

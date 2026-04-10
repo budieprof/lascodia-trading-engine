@@ -90,6 +90,8 @@ public class WalkForwardWorker : BackgroundService
     private readonly IWalkForwardRunClaimService _runClaimService;
     private readonly IValidationSettingsProvider _settingsProvider;
     private readonly IBacktestOptionsSnapshotBuilder _optionsSnapshotBuilder;
+    private readonly IStrategyExecutionSnapshotBuilder _strategySnapshotBuilder;
+    private readonly IValidationCandleSeriesGuard _candleSeriesGuard;
     private readonly IValidationWorkerIdentity _workerIdentity;
     private readonly TimeProvider _timeProvider;
 
@@ -129,6 +131,8 @@ public class WalkForwardWorker : BackgroundService
         IWalkForwardRunClaimService runClaimService,
         IValidationSettingsProvider settingsProvider,
         IBacktestOptionsSnapshotBuilder optionsSnapshotBuilder,
+        IStrategyExecutionSnapshotBuilder strategySnapshotBuilder,
+        IValidationCandleSeriesGuard candleSeriesGuard,
         IValidationWorkerIdentity workerIdentity,
         IWorkerHealthMonitor? healthMonitor = null,
         TimeProvider? timeProvider = null)
@@ -139,6 +143,8 @@ public class WalkForwardWorker : BackgroundService
         _runClaimService = runClaimService;
         _settingsProvider = settingsProvider;
         _optionsSnapshotBuilder = optionsSnapshotBuilder;
+        _strategySnapshotBuilder = strategySnapshotBuilder;
+        _candleSeriesGuard = candleSeriesGuard;
         _workerIdentity = workerIdentity;
         _healthMonitor  = healthMonitor;
         _timeProvider   = timeProvider ?? TimeProvider.System;
@@ -256,6 +262,7 @@ public class WalkForwardWorker : BackgroundService
         int totalRecovered = requeued + orphaned + legacyRunningRuns.Count;
         if (totalRecovered > 0)
         {
+            _healthMonitor?.RecordRecovery(nameof(WalkForwardWorker), totalRecovered);
             _logger.LogInformation(
                 "WalkForwardWorker: recovered {Count} run(s) ({Requeued} re-queued, {Orphaned} orphaned, {Legacy} legacy)",
                 totalRecovered,
@@ -268,7 +275,6 @@ public class WalkForwardWorker : BackgroundService
     private async Task<bool> ProcessBatchAsync(int maxRuns, CancellationToken ct)
     {
         var claimedRunIds = await ClaimQueuedRunsAsync(maxRuns, ct);
-        _healthMonitor?.RecordBacklogDepth(nameof(WalkForwardWorker), claimedRunIds.Count);
 
         if (claimedRunIds.Count == 0)
             return false;
@@ -290,6 +296,9 @@ public class WalkForwardWorker : BackgroundService
         await using var scope = _scopeFactory.CreateAsyncScope();
         var writeContext = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
         var db = writeContext.GetDbContext();
+        int dueBacklogDepth = await db.Set<WalkForwardRun>()
+            .CountAsync(run => !run.IsDeleted && run.Status == RunStatus.Queued && run.AvailableAt <= UtcNow, ct);
+        _healthMonitor?.RecordBacklogDepth(nameof(WalkForwardWorker), dueBacklogDepth);
         var ids = new List<long>(Math.Max(1, maxRuns));
         for (int i = 0; i < Math.Max(1, maxRuns); i++)
         {
@@ -334,6 +343,9 @@ public class WalkForwardWorker : BackgroundService
 
             _logger.LogInformation(
                 "WalkForwardWorker: processing run {RunId} for strategy {StrategyId}", run.Id, run.StrategyId);
+            _healthMonitor?.RecordQueueLatency(
+                nameof(WalkForwardWorker),
+                (long)Math.Max(0, (UtcNow - run.QueuedAt).TotalMilliseconds));
 
             if (!run.ExecutionLeaseToken.HasValue)
             {
@@ -372,22 +384,7 @@ public class WalkForwardWorker : BackgroundService
 
             try
             {
-                var strategy = await db.Set<Strategy>()
-                    .FirstOrDefaultAsync(candidate => candidate.Id == run.StrategyId && !candidate.IsDeleted, ct);
-
-                if (strategy == null)
-                {
-                    throw new ValidationRunException(
-                        ValidationRunFailureCodes.StrategyNotFound,
-                        $"Strategy {run.StrategyId} not found.",
-                        failureDetailsJson: ValidationRunException.SerializeDetails(new
-                        {
-                            run.Id,
-                            run.StrategyId
-                        }));
-                }
-
-                var baseStrategyForRun = CloneStrategy(strategy);
+                var baseStrategyForRun = await ResolveStrategyForExecutionAsync(db, run, ct);
                 if (!string.IsNullOrWhiteSpace(run.ParametersSnapshotJson))
                     baseStrategyForRun.ParametersJson = run.ParametersSnapshotJson;
 
@@ -454,16 +451,24 @@ public class WalkForwardWorker : BackgroundService
                         }));
                 }
 
-                var holidayDates = await LoadHolidayDatesAsync(db, run.Symbol, run.FromDate, run.ToDate, ct);
-                if (!ValidationCandleSeriesInspector.TryValidate(allCandles, run.Timeframe, settings.CandleGapMultiplier, holidayDates, out string candleIssue))
+                var candleAssessment = await _candleSeriesGuard.ValidateAsync(
+                    db,
+                    run.Symbol,
+                    run.Timeframe,
+                    allCandles,
+                    run.FromDate,
+                    run.ToDate,
+                    settings.CandleGapMultiplier,
+                    ct);
+                if (!candleAssessment.IsValid)
                 {
                     throw new ValidationRunException(
                         ValidationRunFailureCodes.InvalidCandleSeries,
-                        $"Invalid candle series: {candleIssue}.",
+                        $"Invalid candle series: {candleAssessment.Issue}.",
                         failureDetailsJson: ValidationRunException.SerializeDetails(new
                         {
                             run.Id,
-                            Issue = candleIssue
+                            Issue = candleAssessment.Issue
                         }));
                 }
 
@@ -583,6 +588,7 @@ public class WalkForwardWorker : BackgroundService
                 {
                     var nextAvailableAtUtc = ValidationRetryPolicy.ComputeNextQueueTimeUtc(nowUtc, run.RetryCount, settings.RetryBackoffSeconds);
                     ValidationRetryPolicy.RequeueWalkForwardRunForRetry(run, nowUtc, nextAvailableAtUtc);
+                    _healthMonitor?.RecordRetry(nameof(WalkForwardWorker));
                     _logger.LogWarning(
                         ex,
                         "WalkForwardWorker: run {RunId} hit transient failure {FailureCode}; re-queued for retry #{RetryCount} at {NextQueueTimeUtc:O}",
@@ -624,6 +630,13 @@ public class WalkForwardWorker : BackgroundService
                 }
                 catch (OperationCanceledException) when (leaseCts.IsCancellationRequested || ct.IsCancellationRequested)
                 {
+                }
+
+                if (persisted && run.ExecutionStartedAt.HasValue && run.Status != RunStatus.Running)
+                {
+                    _healthMonitor?.RecordExecutionDuration(
+                        nameof(WalkForwardWorker),
+                        (long)Math.Max(0, (UtcNow - run.ExecutionStartedAt.Value).TotalMilliseconds));
                 }
             }
 
@@ -822,31 +835,49 @@ public class WalkForwardWorker : BackgroundService
         return lo;
     }
 
-    private static async Task<HashSet<DateTime>> LoadHolidayDatesAsync(
+    private async Task<Strategy> ResolveStrategyForExecutionAsync(
         DbContext db,
-        string symbol,
-        DateTime fromUtc,
-        DateTime toUtc,
+        WalkForwardRun run,
         CancellationToken ct)
     {
-        var pairInfo = await db.Set<CurrencyPair>()
-            .AsNoTracking()
-            .FirstOrDefaultAsync(pair => pair.Symbol == symbol && !pair.IsDeleted, ct);
-        var strategyCurrencies = OptimizationRunMetadataService.ResolveStrategyCurrencies(symbol, pairInfo);
+        var snapshot = _strategySnapshotBuilder.Deserialize(run.StrategySnapshotJson);
+        if (snapshot is not null)
+            return snapshot.ToStrategy();
 
-        var holidayQuery = db.Set<EconomicEvent>()
+        var strategy = await db.Set<Strategy>()
             .AsNoTracking()
-            .Where(e => e.Impact == EconomicImpact.Holiday
-                     && e.ScheduledAt >= fromUtc
-                     && e.ScheduledAt <= toUtc
-                     && !e.IsDeleted);
-        if (strategyCurrencies.Count > 0)
-            holidayQuery = holidayQuery.Where(e => strategyCurrencies.Contains(e.Currency));
+            .FirstOrDefaultAsync(candidate => candidate.Id == run.StrategyId && !candidate.IsDeleted, ct);
+        if (strategy == null)
+        {
+            throw new ValidationRunException(
+                ValidationRunFailureCodes.StrategyNotFound,
+                $"Strategy {run.StrategyId} not found.",
+                failureDetailsJson: ValidationRunException.SerializeDetails(new
+                {
+                    run.Id,
+                    run.StrategyId
+                }));
+        }
 
-        return new HashSet<DateTime>(await holidayQuery
-            .Select(e => e.ScheduledAt.Date)
-            .Distinct()
-            .ToListAsync(ct));
+        run.StrategySnapshotJson = await _strategySnapshotBuilder.BuildSnapshotJsonAsync(
+            db,
+            run.StrategyId,
+            run.ParametersSnapshotJson,
+            ct);
+        snapshot = _strategySnapshotBuilder.Deserialize(run.StrategySnapshotJson);
+        if (snapshot is null)
+        {
+            throw new ValidationRunException(
+                ValidationRunFailureCodes.InvalidStrategySnapshot,
+                $"Strategy snapshot for walk-forward run {run.Id} could not be built or deserialized.",
+                failureDetailsJson: ValidationRunException.SerializeDetails(new
+                {
+                    run.Id,
+                    run.StrategyId
+                }));
+        }
+
+        return snapshot.ToStrategy();
     }
 
     /// <summary>
