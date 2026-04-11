@@ -2,6 +2,7 @@ using FluentValidation;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage;
+using Microsoft.Extensions.Logging;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.Common.Events;
@@ -85,15 +86,18 @@ public class RegisterEACommandHandler : IRequestHandler<RegisterEACommand, Respo
     private readonly IWriteApplicationDbContext _context;
     private readonly IIntegrationEventService _eventBus;
     private readonly IEAOwnershipGuard _ownershipGuard;
+    private readonly ILogger<RegisterEACommandHandler> _logger;
 
     public RegisterEACommandHandler(
         IWriteApplicationDbContext context,
         IIntegrationEventService eventBus,
-        IEAOwnershipGuard ownershipGuard)
+        IEAOwnershipGuard ownershipGuard,
+        ILogger<RegisterEACommandHandler> logger)
     {
         _context        = context;
         _eventBus       = eventBus;
         _ownershipGuard = ownershipGuard;
+        _logger         = logger;
     }
 
     public async Task<ResponseData<long>> Handle(RegisterEACommand request, CancellationToken cancellationToken)
@@ -119,18 +123,84 @@ public class RegisterEACommandHandler : IRequestHandler<RegisterEACommand, Respo
 
             try
             {
-                // ── Check for symbol overlap with other active instances on the same account ──
-                var activeInstances = await dbContext
+                // ── Load all other instances on this account for overlap/reclaim checks ──
+                var otherInstances = await dbContext
                     .Set<Domain.Entities.EAInstance>()
                     .Where(x => x.TradingAccountId == request.TradingAccountId
-                              && x.Status == EAInstanceStatus.Active
                               && x.InstanceId != request.InstanceId
                               && !x.IsDeleted)
                     .ToListAsync(ct);
 
+                var activeInstances = otherInstances
+                    .Where(x => x.Status == EAInstanceStatus.Active)
+                    .ToList();
+
+                // ── Reclaim symbols from Disconnected/ShuttingDown instances ────────
+                // When a previously-deregistered instance re-registers, reclaim its
+                // requested symbols from any inactive instance that was given them as
+                // standby during the deregistration/disconnect process.
+                // This MUST run before the overlap check so that symbols reassigned to
+                // active standby instances are reclaimed first, preventing false 409s.
+                var inactiveInstances = otherInstances
+                    .Where(x => x.Status == EAInstanceStatus.Disconnected
+                             || x.Status == EAInstanceStatus.ShuttingDown)
+                    .ToList();
+
+                foreach (var inactive in inactiveInstances)
+                {
+                    var inactiveSymbols = (inactive.Symbols ?? string.Empty)
+                        .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                        .Select(s => s.ToUpperInvariant())
+                        .ToList();
+
+                    var toReclaim = inactiveSymbols
+                        .Where(s => requestedSymbols.Contains(s))
+                        .ToList();
+
+                    if (toReclaim.Count > 0)
+                    {
+                        var remaining = inactiveSymbols
+                            .Where(s => !toReclaim.Contains(s))
+                            .ToList();
+                        inactive.Symbols = remaining.Count > 0 ? string.Join(",", remaining) : string.Empty;
+
+                        _logger.LogInformation(
+                            "RegisterEA: reclaimed symbols [{Symbols}] from inactive instance {FromInstance} for {ToInstance}",
+                            string.Join(", ", toReclaim), inactive.InstanceId, request.InstanceId);
+                    }
+                }
+
+                // Reclaim from active standby instances that were assigned these symbols
+                // during prior deregistration/disconnect of this instance.
                 foreach (var active in activeInstances)
                 {
-                    var existingSymbols = active.Symbols
+                    var activeSymbolList = (active.Symbols ?? string.Empty)
+                        .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                        .Select(s => s.ToUpperInvariant())
+                        .ToList();
+
+                    var toReclaim = activeSymbolList
+                        .Where(s => requestedSymbols.Contains(s))
+                        .ToList();
+
+                    if (toReclaim.Count > 0)
+                    {
+                        var remaining = activeSymbolList
+                            .Where(s => !toReclaim.Contains(s))
+                            .ToList();
+                        active.Symbols = remaining.Count > 0 ? string.Join(",", remaining) : string.Empty;
+
+                        _logger.LogInformation(
+                            "RegisterEA: reclaimed standby symbols [{Symbols}] from active instance {FromInstance} for {ToInstance}",
+                            string.Join(", ", toReclaim), active.InstanceId, request.InstanceId);
+                    }
+                }
+
+                // ── Check for symbol overlap with other active instances on the same account ──
+                // Run AFTER reclaim so that symbols returned from standby don't trigger false 409s.
+                foreach (var active in activeInstances)
+                {
+                    var existingSymbols = (active.Symbols ?? string.Empty)
                         .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
                         .Select(s => s.ToUpperInvariant())
                         .ToHashSet();

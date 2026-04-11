@@ -1,4 +1,5 @@
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 
@@ -11,6 +12,13 @@ namespace LascodiaTradingEngine.Application.Services;
 [RegisterService(ServiceLifetime.Singleton)]
 public class PartialFillRedistributor
 {
+    private readonly ILogger<PartialFillRedistributor>? _logger;
+
+    public PartialFillRedistributor(ILogger<PartialFillRedistributor>? logger = null)
+    {
+        _logger = logger;
+    }
+
     /// <summary>
     /// Given the original slice plan, the index of the partially filled slice,
     /// and the actually filled quantity, returns an updated plan for remaining slices.
@@ -21,7 +29,12 @@ public class PartialFillRedistributor
         decimal actualFilledQuantity)
     {
         if (partiallyFilledIndex < 0 || partiallyFilledIndex >= originalSlices.Count)
-            return originalSlices;
+        {
+            _logger?.LogWarning(
+                "Invalid partial fill index {Index} for {Count} slices",
+                partiallyFilledIndex, originalSlices.Count);
+            return originalSlices; // return unmodified
+        }
 
         var partialSlice = originalSlices[partiallyFilledIndex];
         decimal unfilled = partialSlice.Quantity - actualFilledQuantity;
@@ -51,7 +64,7 @@ public class PartialFillRedistributor
         decimal totalRemaining = remaining.Sum(s => s.Quantity);
         decimal distributed = 0;
 
-        return remaining.Select((s, i) =>
+        var result = remaining.Select((s, i) =>
         {
             decimal additionalQty;
             if (i == remaining.Count - 1)
@@ -72,5 +85,11 @@ public class PartialFillRedistributor
             distributed += additionalQty;
             return new ChildOrderSlice(s.SliceIndex, s.Quantity + additionalQty, s.LimitPrice, s.ScheduledAt);
         }).ToList();
+
+        // Reindex slices sequentially so downstream consumers see contiguous indices
+        for (int i = 0; i < result.Count; i++)
+            result[i] = result[i] with { SliceIndex = i };
+
+        return result;
     }
 }

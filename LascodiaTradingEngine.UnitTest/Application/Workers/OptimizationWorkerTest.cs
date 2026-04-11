@@ -4629,7 +4629,7 @@ public class OptimizationWorkerTest
             Symbol = "EURUSD",
             Timeframe = Timeframe.H1,
             FromDate = new DateTime(2026, 01, 01, 0, 0, 0, DateTimeKind.Utc),
-            ToDate = new DateTime(2026, 02, 20, 0, 0, 0, DateTimeKind.Utc),
+            ToDate = new DateTime(2026, 03, 01, 0, 0, 0, DateTimeKind.Utc),
             InSampleDays = 20,
             OutOfSampleDays = 10,
             InitialBalance = 10_000m,
@@ -4647,7 +4647,7 @@ public class OptimizationWorkerTest
             Status = StrategyStatus.Active,
             IsDeleted = false
         };
-        var candles = Enumerable.Range(0, 60)
+        var candles = Enumerable.Range(0, 70)
             .SelectMany(day => Enumerable.Range(0, 24).Select(hour => run.FromDate.AddDays(day).AddHours(hour)))
             .Where(ts => ts < run.ToDate)
             .Select(ts => new Candle

@@ -108,6 +108,7 @@ internal sealed class ValidationSettingsProvider : IValidationSettingsProvider
             CandleGapMultiplier: await GetIntAsync(ctx, logger, "WalkForward:MaxGapMultiplier", 5, ct, minInclusive: 1),
             MaxCandlesPerRun: await GetIntAsync(ctx, logger, "WalkForward:MaxCandlesPerRun", 150_000, ct, minInclusive: 100),
             MaxParallelRuns: await GetIntAsync(ctx, logger, "WalkForward:MaxParallelRuns", 4, ct, minInclusive: 1, maxInclusive: 32),
+            // Canonical config key shared with OptimizationConfigProvider — keep in sync.
             MaxCoefficientOfVariation: await GetDecimalAsync(ctx, logger, "Optimization:MaxCvCoefficientOfVariation", 0.50m, ct, minInclusive: 0m));
     }
 

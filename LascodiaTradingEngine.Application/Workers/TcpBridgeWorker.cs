@@ -6,10 +6,12 @@ using System.Text;
 using System.Text.Json;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using Microsoft.IdentityModel.Tokens;
 using LascodiaTradingEngine.Application.Bridge.DTOs;
 using LascodiaTradingEngine.Application.Bridge.Options;
 using LascodiaTradingEngine.Application.Common.Interfaces;
@@ -43,6 +45,7 @@ public class TcpBridgeWorker : BackgroundService
     private readonly ITcpBridgeSessionRegistry _registry;
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<TcpBridgeWorker> _logger;
+    private readonly TokenValidationParameters _tokenValidationParameters;
 
     /// <summary>
     /// Tracks command IDs already pushed in the current push-loop lifetime to
@@ -57,12 +60,32 @@ public class TcpBridgeWorker : BackgroundService
         IOptions<BridgeOptions> options,
         ITcpBridgeSessionRegistry registry,
         IServiceScopeFactory scopeFactory,
+        IConfiguration configuration,
         ILogger<TcpBridgeWorker> logger)
     {
         _options     = options.Value;
         _registry    = registry;
         _scopeFactory = scopeFactory;
         _logger      = logger;
+
+        // Build TokenValidationParameters using the same JWT signing key as the REST API
+        var jwtSection = configuration.GetSection("JwtSettings");
+        var secretKey  = jwtSection["SecretKey"]
+            ?? throw new InvalidOperationException("JwtSettings:SecretKey is not configured.");
+        var issuer   = jwtSection["Issuer"]   ?? "lascodia-trading-engine";
+        var audience = jwtSection["Audience"] ?? "lascodia-trading-engine-api";
+
+        _tokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuerSigningKey = true,
+            IssuerSigningKey         = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secretKey)),
+            ValidateIssuer           = true,
+            ValidIssuer              = issuer,
+            ValidateAudience         = true,
+            ValidAudience            = audience,
+            ValidateLifetime         = true,
+            ClockSkew                = TimeSpan.FromSeconds(30),
+        };
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -469,7 +492,9 @@ public class TcpBridgeWorker : BackgroundService
                 // after a command has just been acknowledged via ProcessCommandAckAsync.
                 var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
 
-                var commandAgeCutoff = DateTime.UtcNow.AddMinutes(-30);
+                // 24-hour cutoff aligned with EACommandPushWorker.CommandExpiryThreshold
+                // and GetPendingCommandsQuery TTL filter
+                var commandAgeCutoff = DateTime.UtcNow.AddHours(-24);
                 var commands = await writeCtx.GetDbContext()
                     .Set<Domain.Entities.EACommand>()
                     .Where(c => !c.Acknowledged && !c.IsDeleted
@@ -638,21 +663,26 @@ public class TcpBridgeWorker : BackgroundService
     // ── JWT validation ────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Validates the JWT and extracts the trading account ID from the "tradingAccountId" claim.
+    /// Validates the JWT with full cryptographic signature verification and extracts
+    /// the trading account ID from the "tradingAccountId" claim.
+    /// Uses the same signing key, issuer, and audience as the REST API.
     /// Returns the account ID on success, 0 on failure.
     /// </summary>
-    private static long ValidateBridgeAuth(string token)
+    private long ValidateBridgeAuth(string token)
     {
         try
         {
             var handler = new JwtSecurityTokenHandler();
             if (!handler.CanReadToken(token)) return 0;
 
-            var jwt = handler.ReadJwtToken(token);
-            if (jwt.ValidTo < DateTime.UtcNow) return 0;
+            var principal = handler.ValidateToken(token, _tokenValidationParameters, out var validatedToken);
 
-            // Claim name matches TradingAccountTokenGenerator.cs line 31: "tradingAccountId"
-            var claim = jwt.Claims.FirstOrDefault(c => c.Type == "tradingAccountId");
+            if (validatedToken is not JwtSecurityToken jwtToken
+                || !jwtToken.Header.Alg.Equals(SecurityAlgorithms.HmacSha256, StringComparison.InvariantCultureIgnoreCase))
+                return 0;
+
+            // Claim name matches TradingAccountTokenGenerator.cs: "tradingAccountId"
+            var claim = principal.FindFirst("tradingAccountId");
             if (claim is null) return 0;
 
             return long.TryParse(claim.Value, out var id) ? id : 0;
@@ -665,15 +695,34 @@ public class TcpBridgeWorker : BackgroundService
 
     // ── I/O helpers ───────────────────────────────────────────────────────────
 
+    // Write timeout (5s) disconnects slow readers. Residual risk: if the OS TCP
+    // send buffer fills (typically 64KB-256KB), WriteAsync blocks until timeout.
+    // For signal volume < 10/second with ~200B/message, this is well within
+    // buffer capacity. Document threshold for scaling consideration.
+    private static readonly TimeSpan WriteTimeout = TimeSpan.FromSeconds(5);
+
     private static async Task WriteLineAsync(
         NetworkStream stream, string json, CancellationToken ct)
     {
         var bytes = Encoding.UTF8.GetBytes(json + "\n");
-        await stream.WriteAsync(bytes, ct);
-        await stream.FlushAsync(ct);
+        using var writeCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        writeCts.CancelAfter(WriteTimeout);
+        await stream.WriteAsync(bytes, writeCts.Token);
+        await stream.FlushAsync(writeCts.Token);
     }
 
-    private static async Task<string?> ReadLineAsync(
+    private const int MaxMessageSize = 8192;
+
+    /// <summary>
+    /// Reads a single NDJSON (Newline-Delimited JSON) message from the stream.
+    /// </summary>
+    /// <remarks>
+    /// NDJSON protocol: each message is a single line terminated by \n (0x0A).
+    /// Standard JSON serializers escape literal newlines as \\n within strings,
+    /// so \n only appears as the message delimiter. Both the engine and EA MUST
+    /// use standard JSON serialization (no pretty-print).
+    /// </remarks>
+    private async Task<string?> ReadLineAsync(
         NetworkStream stream, CancellationToken ct)
     {
         var sb  = new StringBuilder(512);
@@ -684,9 +733,20 @@ public class TcpBridgeWorker : BackgroundService
             int read = await stream.ReadAsync(buf, ct);
             if (read == 0) return null; // EOF
             char c = (char)buf[0];
-            if (c == '\n') return sb.ToString();
+            if (c == '\n')
+            {
+                if (sb.Length > MaxMessageSize)
+                {
+                    // Oversized message — log and skip instead of disconnecting
+                    _logger.LogWarning("Oversized message ({Size} bytes) — skipped", sb.Length);
+                    sb.Clear();
+                    continue;
+                }
+                return sb.ToString();
+            }
             if (c != '\r') sb.Append(c);
-            if (sb.Length > 8192) return null; // Oversized message — disconnect
+            // If we exceed the limit mid-message, keep reading to the newline to drain the
+            // oversized frame, but we will skip it once the newline arrives (above).
         }
     }
 }

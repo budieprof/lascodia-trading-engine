@@ -59,13 +59,14 @@ public class RegimeCoherenceChecker
     /// <summary>
     /// Regimes that indicate a directional market — price is moving with momentum in one direction.
     /// Strategies designed for trend-following or breakout capture perform well in these regimes.
-    /// Trending and Breakout are grouped together because both favour the same class of strategies
-    /// (directional entries with wider TP targets), even though their entry timing differs.
+    /// Trending, Breakout, and HighVolatility are grouped together because all favour directional
+    /// strategies (strong moves, even if choppy in the HighVolatility case).
     /// </summary>
     private static readonly HashSet<MarketRegimeEnum> DirectionalRegimes = new()
     {
         MarketRegimeEnum.Trending,
-        MarketRegimeEnum.Breakout
+        MarketRegimeEnum.Breakout,
+        MarketRegimeEnum.HighVolatility
     };
 
     /// <summary>
@@ -163,6 +164,10 @@ public class RegimeCoherenceChecker
 
         if (allDirectional || allNonDirectional)
             coherence = Math.Min(1.0m, coherence + 0.1m); // Cap at 1.0 to stay within [0, 1] range
+
+        // Crisis gets its own treatment — coherence bonus if ALL timeframes agree on Crisis
+        if (regimes.All(r => r == MarketRegimeEnum.Crisis))
+            coherence = Math.Min(1.0m, coherence + 0.2m); // strong consensus bonus
 
         return coherence;
     }

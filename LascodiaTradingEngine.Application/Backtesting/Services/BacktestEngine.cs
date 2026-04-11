@@ -1,4 +1,5 @@
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Backtesting.Models;
 using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
@@ -79,10 +80,12 @@ public class BacktestOptions
 public class BacktestEngine : IBacktestEngine
 {
     private readonly IEnumerable<IStrategyEvaluator> _evaluators;
+    private readonly ILogger<BacktestEngine>? _logger;
 
-    public BacktestEngine(IEnumerable<IStrategyEvaluator> evaluators)
+    public BacktestEngine(IEnumerable<IStrategyEvaluator> evaluators, ILogger<BacktestEngine>? logger = null)
     {
         _evaluators = evaluators;
+        _logger = logger;
     }
 
     public async Task<BacktestResult> RunAsync(
@@ -136,6 +139,13 @@ public class BacktestEngine : IBacktestEngine
         {
             var bar = candles[i];
             ct.ThrowIfCancellationRequested();
+
+            // Skip bars with NaN/Infinity prices — corrupt or missing data
+            if (!IsFiniteCandle(bar))
+                continue;
+
+            if (bar.Volume <= 0)
+                _logger?.LogDebug("Zero-volume candle at {Time} — may represent non-trading period", bar.Timestamp);
 
             decimal halfSpread = useDynamicSpread
                 ? Math.Max(0m, options.SpreadFunction!(candles[i].Timestamp)) / 2m
@@ -358,30 +368,30 @@ public class BacktestEngine : IBacktestEngine
         {
             if (isStopLoss && barOpen < level)
             {
-                // Gap down through SL — unfavourable
+                // Gap down through SL — unfavourable: fill worse (lower) than SL
                 decimal gap = level - barOpen;
                 return level - gap * options.GapSlippagePct;
             }
             if (!isStopLoss && barOpen > level)
             {
-                // Gap up through TP — favourable
+                // Gap up through TP — slippage makes fill worse (lower) than TP
                 decimal gap = barOpen - level;
-                return level + gap * options.GapSlippagePct;
+                return level - gap * options.GapSlippagePct;
             }
         }
         else
         {
             if (isStopLoss && barOpen > level)
             {
-                // Gap up through SL — unfavourable
+                // Gap up through SL — unfavourable: fill worse (higher) than SL
                 decimal gap = barOpen - level;
                 return level + gap * options.GapSlippagePct;
             }
             if (!isStopLoss && barOpen < level)
             {
-                // Gap down through TP — favourable
+                // Gap down through TP — slippage makes fill worse (higher) than TP
                 decimal gap = level - barOpen;
-                return level - gap * options.GapSlippagePct;
+                return level + gap * options.GapSlippagePct;
             }
         }
 
@@ -602,6 +612,10 @@ public class BacktestEngine : IBacktestEngine
 
         return (decimal)(mean / downsideDev * Math.Sqrt(252));
     }
+
+    private static bool IsFiniteCandle(Candle c)
+        => double.IsFinite((double)c.Open) && double.IsFinite((double)c.High)
+        && double.IsFinite((double)c.Low) && double.IsFinite((double)c.Close);
 
     private static (int MaxConsecutiveWins, int MaxConsecutiveLosses) CalculateStreaks(List<BacktestTrade> trades)
     {

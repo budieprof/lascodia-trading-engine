@@ -31,7 +31,29 @@ dotnet ef migrations add <MigrationName> --project LascodiaTradingEngine.Infrast
 
 ## Architecture
 
-This is an **enterprise-grade autonomous algorithmic trading engine** built with **Clean Architecture + CQRS** targeting **.NET 10**. It supports autonomous strategy discovery and screening, ML-driven signal scoring (12 learner architectures), Bayesian parameter optimization, real-time market data via MQL5 EA, backtesting, walk-forward analysis, 5-layer defense-in-depth risk management, and regime-aware adaptation — all orchestrated via 135 background workers and an event-driven bus.
+This is an **enterprise-grade autonomous algorithmic trading engine** built with **Clean Architecture + CQRS** targeting **.NET 10**. It supports autonomous strategy discovery and screening (14-gate pipeline), ML-driven signal scoring (12 learner architectures, all A+ hardened), Bayesian parameter optimization (TPE/GP-UCB/EHVI + Hyperband), real-time market data via MQL5 EA (JWT-authenticated TCP bridge + REST), backtesting (corrected gap slippage, no look-ahead bias), walk-forward analysis (3-level anchored with terminal embargo), 5-layer defense-in-depth risk management (EVT tail modeling, correlated PCA stress testing), regime-aware adaptation (hybrid rule+HMM with k-means++ initialization), smart order routing (TWAP/VWAP with auto-selection), and signal-level A/B testing (SPRT on P&L) — all orchestrated via 147 background workers and an event-driven bus.
+
+### Engine Hardening Summary (April 2026 Review)
+
+A comprehensive multi-pass code review was conducted across 13 subsystems (~230,000 lines). **196 issues were found and fixed**, including 12 critical bugs. All 1,645 unit tests pass. Key improvements:
+
+| Subsystem | Issues Fixed | Key Changes |
+|---|---|---|
+| ML Trainers (12 arch.) | 22 | 4-way split, 5-signal drift gate, GPU acceleration, full sanitization, train/inference audit |
+| ML Pipeline | 18 | Promotion race fix, bulkhead sizing, inter-worker coordination, online learning |
+| Strategy Lifecycle | 16 | Configurable thresholds, per-strategy SaveChangesAsync, drift gate with REJECT |
+| Optimization Pipeline | 14 | Approval idempotency, per-phase timeouts, deferred run TTL, query batching |
+| Signal Generation | 24 | SL==Entry guard, isotonic monotonicity, Hawkes timezone fix, MTF ordering |
+| Risk Management | 19+4 features | EVT (GPD tail fit), correlated stress (PCA), RiskChecker circuit breaker, Tier 2 drawdown enforcement |
+| Worker Orchestration | 14 | Connection pool 200, stale event re-publish, state-aware idempotent handlers, crash alerts |
+| EA Integration | 13 | JWT signature verification (critical), NaN tick validation, symbol reassignment on deregister |
+| Backtesting | 7 | Gap slippage inversion fix, RSI swing look-ahead fix, NaN guards, terminal embargo |
+| Walk-Forward | 7 | Minimum 3 windows, sample stddev, IS+OOS validation, window sizing rounding |
+| Market Regime | 12+1 | Wilder's ADX, k-means++ HMM init, per-symbol state isolation, confidence floor |
+| Smart Order Routing | 10 | Thread-safe RNG, lot step rounding, auto-algorithm selection, pre-trade cost estimation |
+| Performance Attribution | 10+3 | TWRR, Sharpe/Sortino/Calmar, position-weighted benchmark, ML alpha/timing alpha decomposition |
+
+**New features implemented:** EVT tail modeling (GPD), correlated stress testing (PCA), RiskChecker circuit breaker, signal-level A/B testing (SPRT on P&L), versioned feature store, effective online learning, k-means++ HMM initialization.
 
 **Key architectural decisions are documented in [docs/adr/](docs/adr/README.md)** (12 ADRs covering EA integration, risk model, ML selection, optimization rollout, etc.).
 
@@ -215,7 +237,7 @@ Orders/
 | Infrastructure | `DeadLetterSink`, `IdempotencyGuard`, `DataRetentionManager`, `DegradationModeManager`, `ApprovalWorkflowService` |
 | Strategy Evaluators | `BreakoutScalperEvaluator`, `MovingAverageCrossoverEvaluator`, `RSIReversionEvaluator` |
 
-#### Background Workers (`Workers/`) — 135 workers
+#### Background Workers (`Workers/`) — 147 workers
 
 All workers run as hosted services registered in DI.
 
@@ -605,14 +627,20 @@ StrategyGenerationWorker → BacktestWorker → WalkForwardWorker → StrategyHe
 - **CQRS separation**: Commands use `IWriteApplicationDbContext`; queries use `IReadApplicationDbContext`. Never inject both into a single handler.
 - **Worker pattern**: All background workers implement `BackgroundService` and are registered as hosted services in Application DI.
 - **Strategy evaluators**: Implement `IStrategyEvaluator`; registered and resolved by strategy type enum.
-- **ML workflow**: Train → Quality gates (9 checks) → Shadow evaluation (SPRT) → Promotion decision → Activate (event triggers downstream workers). 82 monitoring workers continuously track drift, calibration, accuracy, and feature health.
-- **ML architecture selection**: `TrainerSelector` uses UCB1 bandit algorithm with regime affinity to auto-select from 12 architectures. Sample-count gates prevent complex architectures on small datasets.
+- **ML workflow**: Train → Quality gates (9 checks) → Shadow evaluation (SPRT + tournament groups) → Signal-level A/B testing (SPRT on P&L) → Promotion decision → Activate (event triggers downstream workers). 82 monitoring workers continuously track drift, calibration, accuracy, and feature health. Online learning with per-update validation and adaptive LR decay.
+- **ML architecture selection**: `TrainerSelector` uses UCB1 bandit algorithm with regime affinity to auto-select from 12 architectures. Sample-count gates prevent complex architectures on small datasets. All 12 trainers hardened with: 4-way data split (train/selection/calibration/test), 5-signal stationarity gate (ACF/PSI/CUSUM/ADF/KPSS with REJECT), GPU acceleration (CUDA + CPU fallback), class-imbalance rejection, adversarial validation, full snapshot sanitization, cross-fit adaptive heads, structured warm-start artifacts, train/inference parity audit, reliability diagram, Murphy decomposition, calibration residual stats.
+- **ML inference**: 23-step scoring pipeline with 5-layer calibration (temperature → global Platt → conditional Platt → isotonic → age decay), circuit breakers (inference failure + prediction quality), latency-aware SLA tracking, MC-dropout uncertainty, conformal prediction sets, meta-label abstention, multi-timeframe blending.
 - **Broker adapters**: Built-in adapters (`IBrokerOrderExecutor` + `IBrokerDataFeed`) are **disabled** when EA is active. The EA replaces them entirely. Set `WorkerGroups.BrokerAdapters = false`.
 - **Autonomous strategy lifecycle**: StrategyGenerationWorker discovers → BacktestWorker validates → WalkForwardWorker confirms → StrategyHealthWorker monitors → StrategyFeedbackWorker detects degradation → OptimizationWorker refines → cycle repeats.
-- **Defense-in-depth risk**: 5 independent layers (SignalValidator → RiskChecker → StrategyHealthWorker → DrawdownRecoveryWorker → ExecutionQualityCircuitBreaker) + EA-side safety (per-symbol + global circuit breakers).
-- **Regime awareness**: Cross-cutting concern permeating all subsystems — strategy evaluation, generation, optimization, ML training, and signal filtering all adapt to detected market regime.
-- **Gradual rollout**: Optimized parameters deploy at 25%→50%→75%→100% traffic with automatic rollback on degradation (see ADR-0007).
-- **Hot-reloadable config**: 200+ parameters stored in `EngineConfig` table, loaded via batch queries, with run-scoped snapshots for reproducibility (see ADR-0012).
+- **Defense-in-depth risk**: 5 independent layers (SignalValidator → RiskChecker → StrategyHealthWorker → DrawdownRecoveryWorker → ExecutionQualityCircuitBreaker) + EA-side safety (per-symbol + global circuit breakers). Tier 2 enforces drawdown recovery lot reduction for ALL order creation paths (not just autonomous). RiskCheckerPipeline has fail-closed circuit breaker (5 errors → block all orders). Portfolio risk: EVT tail modeling (GPD fit via MLE + Nelder-Mead), Monte Carlo VaR with Cholesky ridge regularization, correlated reverse stress testing (PCA shock direction). Gap risk model distinguishes weekends from holidays. VaR uses linear interpolation. Emergency flatten dedup persists across restarts.
+- **Regime awareness**: Cross-cutting concern permeating all subsystems — strategy evaluation, generation, optimization, ML training, and signal filtering all adapt to detected market regime. Hybrid rule-based + Hidden Markov Model classification with k-means++ initialization. Proper Wilder's ADX smoothing, aligned Bollinger Band Width formula. Per-symbol/timeframe state isolation. Confidence floor (0.15) with Ranging fallback. Cross-timeframe coherence (H1/H4/D1) with HighVolatility categorized as directional. Transition guard dampens ML confidence post-regime-change. Hot-swap activates regime-specific superseded models.
+- **Gradual rollout**: Optimized parameters deploy at configurable tiers (default 25%→50%→75%→100%) with statistical rollback detection (weighted linear regression on snapshots) and automatic reversion on degradation (see ADR-0007).
+- **Hot-reloadable config**: 200+ parameters stored in `EngineConfig` table, loaded via batch queries, with run-scoped snapshots for reproducibility (see ADR-0012). All screening thresholds (OOS relaxation, Kelly factor, walk-forward min candles), health score bands, margin levels, and execution quality thresholds are configurable.
+- **Backtesting correctness**: Gap slippage applies pessimistic fills on both SL and TP gap scenarios. RSI swing detection is backward-only (no look-ahead bias). NaN/Infinity candles filtered. Walk-forward requires minimum 3 windows with 10% terminal embargo and sample stddev (Bessel's correction).
+- **Smart order routing**: Auto-selects Direct/TWAP/VWAP based on order size vs average daily volume. TWAP with ±10% jitter and broker lot-step rounding. VWAP with tick-activity-weighted profiles (forex OTC proxy). Pre-trade and post-trade transaction cost analysis.
+- **Performance attribution**: Time-weighted returns (TWRR), rolling Sharpe/Sortino/Calmar (7/30-day), position-weighted benchmark, information ratio, ML alpha (ML-scored vs rule-based P&L), timing alpha (signal vs actual entry), per-strategy attribution via Order→Strategy FK.
+- **Worker orchestration**: 147 workers in 7 groups (CoreTrading, MarketData, RiskMonitoring, MLTraining, MLMonitoring, Backtesting, Alerts). 4-tier startup ordering. Connection pool sized to 200 with retry-on-failure. State-aware idempotent event handlers. Worker crash alerts via AlertDispatcher. EA all-disconnect triggers DataUnavailable degradation mode.
+- **EA integration**: JWT-authenticated TCP bridge with full signature verification. NaN/Infinity tick filtering. Idempotent tick batches via X-Request-Id. Symbol ownership enforced on registration with reassignment on deregister and re-claim on reconnect. Hard-reject unauthorized symbol snapshots. 24-hour command TTL on all delivery paths.
 - **EA as broker adapter**: All market data comes from EA instances via REST API. The engine has zero direct broker connectivity when EA mode is enabled.
 - **Trading account-centric**: The `Broker` entity has been removed. All broker info (name, server) lives on `TradingAccount`. Login is via AccountId + BrokerServer.
 - **Trader authentication**: `POST /auth/register` (self-registration + auto-login) and `POST /auth/login` (EA: passwordless, Web: password required). JWT tokens are scoped to a single TradingAccount.

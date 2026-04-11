@@ -4,6 +4,7 @@ using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
+using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.Services;
 
@@ -11,6 +12,8 @@ namespace LascodiaTradingEngine.Application.Services;
 /// Selects optimal execution venue by ranking active EA instances and eligible accounts
 /// using heartbeat freshness, account equity, and recent execution quality metrics
 /// (slippage and fill latency from ExecutionQualityLog).
+/// Also determines the optimal execution algorithm based on order size relative to
+/// average daily volume.
 /// </summary>
 [RegisterService]
 public class SmartOrderRouter : ISmartOrderRouter
@@ -25,6 +28,15 @@ public class SmartOrderRouter : ISmartOrderRouter
 
     /// <summary>Lookback period for execution quality metrics.</summary>
     private const int ExecQualityLookbackDays = 7;
+
+    /// <summary>Number of recent fills to use for spread/slippage estimates.</summary>
+    private const int CostEstimateLookbackCount = 50;
+
+    /// <summary>Order size threshold (fraction of ADV) below which Direct execution is used.</summary>
+    private const decimal DirectThreshold = 0.01m;
+
+    /// <summary>Order size threshold (fraction of ADV) above which VWAP is used instead of TWAP.</summary>
+    private const decimal VwapThreshold = 0.05m;
 
     public SmartOrderRouter(
         IServiceScopeFactory scopeFactory,
@@ -91,16 +103,25 @@ public class SmartOrderRouter : ISmartOrderRouter
             }
         }
 
+        // Compute expected execution costs from recent fills for this symbol
+        var (expectedSpread, expectedSlippage) = await EstimateExecutionCostsAsync(
+            signal.Symbol, cancellationToken);
+
+        // Determine optimal execution algorithm based on order size vs average daily volume
+        var algorithm = await DetermineAlgorithmAsync(
+            signal.Symbol, signal.SuggestedLotSize, cancellationToken);
+
         _logger.LogInformation(
-            "SOR: routed {Symbol} signal to instance={Instance}, account={Account}. {Reason}",
-            signal.Symbol, bestInstance, bestAccount, bestReason);
+            "SOR: routed {Symbol} signal to instance={Instance}, account={Account}, algo={Algorithm}. {Reason}",
+            signal.Symbol, bestInstance, bestAccount, algorithm, bestReason);
 
         return new OrderRoutingDecision(
             SelectedInstanceId: bestInstance,
             SelectedAccountId: bestAccount,
-            ExpectedSpread: 0m,
-            ExpectedSlippagePips: 0m,
-            RoutingReason: bestReason);
+            ExpectedSpread: expectedSpread,
+            ExpectedSlippagePips: expectedSlippage,
+            RoutingReason: bestReason,
+            ExpectedAlgorithm: algorithm);
     }
 
     /// <summary>
@@ -169,5 +190,101 @@ public class SmartOrderRouter : ISmartOrderRouter
 
         // Blend 60% slippage, 40% latency
         return slippageScore * 0.6m + latencyScore * 0.4m;
+    }
+
+    /// <summary>
+    /// Estimates expected spread and slippage for a symbol based on the last
+    /// <see cref="CostEstimateLookbackCount"/> fills from ExecutionQualityLog.
+    /// Falls back to 0 if no execution history is available.
+    /// </summary>
+    private async Task<(decimal ExpectedSpread, decimal ExpectedSlippagePips)> EstimateExecutionCostsAsync(
+        string symbol, CancellationToken ct)
+    {
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var readContext = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+
+            // Get average spread from SpreadProfile (most recent median spread for this symbol)
+            var latestSpreadProfile = await readContext.GetDbContext()
+                .Set<SpreadProfile>()
+                .Where(sp => sp.Symbol == symbol && !sp.IsDeleted)
+                .OrderByDescending(sp => sp.ComputedAt)
+                .Select(sp => sp.SpreadMean)
+                .FirstOrDefaultAsync(ct);
+
+            // Get average slippage from recent execution quality logs
+            var recentSlippage = await readContext.GetDbContext()
+                .Set<ExecutionQualityLog>()
+                .Where(e => e.Symbol == symbol && !e.IsDeleted)
+                .OrderByDescending(e => e.RecordedAt)
+                .Take(CostEstimateLookbackCount)
+                .Select(e => Math.Abs(e.SlippagePips))
+                .ToListAsync(ct);
+
+            decimal expectedSpread = latestSpreadProfile;
+            decimal expectedSlippage = recentSlippage.Count > 0
+                ? recentSlippage.Average()
+                : 0m;
+
+            return (expectedSpread, expectedSlippage);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "SOR: failed to estimate execution costs for {Symbol}, defaulting to 0", symbol);
+            return (0m, 0m);
+        }
+    }
+
+    /// <summary>
+    /// Determines the optimal execution algorithm based on order size relative to
+    /// average daily volume (ADV) estimated from recent tick data.
+    /// - Order size &lt; 1% of ADV: Direct (no slicing needed)
+    /// - Order size 1%-5% of ADV: TWAP (reduce timing risk)
+    /// - Order size &gt;= 5% of ADV: VWAP (minimize market impact)
+    /// </summary>
+    private async Task<ExecutionAlgorithmType> DetermineAlgorithmAsync(
+        string symbol, decimal orderSize, CancellationToken ct)
+    {
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var readContext = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+
+            // Estimate average daily volume from tick data over the last 7 days
+            var cutoff = DateTime.UtcNow.AddDays(-7);
+            var volumeStats = await readContext.GetDbContext()
+                .Set<TickRecord>()
+                .Where(t => t.Symbol == symbol && t.TickTimestamp >= cutoff && !t.IsDeleted)
+                .GroupBy(t => t.TickTimestamp.Date)
+                .Select(g => g.Sum(t => t.TickVolume))
+                .ToListAsync(ct);
+
+            if (volumeStats.Count == 0)
+            {
+                // No volume data available — default to TWAP for safety
+                _logger.LogDebug("SOR: no volume data for {Symbol}, defaulting to TWAP", symbol);
+                return ExecutionAlgorithmType.TWAP;
+            }
+
+            decimal avgDailyVolume = volumeStats.Average(v => (decimal)v);
+
+            if (avgDailyVolume <= 0)
+                return ExecutionAlgorithmType.TWAP;
+
+            decimal sizeRatio = orderSize / avgDailyVolume;
+
+            if (sizeRatio < DirectThreshold)
+                return ExecutionAlgorithmType.Direct;
+            else if (sizeRatio < VwapThreshold)
+                return ExecutionAlgorithmType.TWAP;
+            else
+                return ExecutionAlgorithmType.VWAP;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "SOR: failed to determine algorithm for {Symbol}, defaulting to TWAP", symbol);
+            return ExecutionAlgorithmType.TWAP;
+        }
     }
 }

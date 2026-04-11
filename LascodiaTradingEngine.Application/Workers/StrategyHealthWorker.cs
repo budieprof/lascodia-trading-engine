@@ -400,6 +400,10 @@ public class StrategyHealthWorker : BackgroundService
         decimal profitFactor = grossLoss > 0 ? grossProfit / grossLoss : grossProfit > 0 ? 2m : 0m;
 
         // Simple (unannualised) Sharpe estimate: mean PnL / standard deviation of PnL.
+        // NOTE: This is NOT annualized (no sqrt(252) multiplier) because it operates on
+        // a rolling trade window rather than daily returns. For annualized Sharpe ratios
+        // (using the sqrt(252) convention), see PerformanceAttributionWorker which computes
+        // SharpeRatio7d/30d from daily return series.
         // Stddev is clamped to 1 if zero (i.e. all trades had identical PnL) to prevent
         // division by zero and avoid a spuriously high Sharpe.
         decimal meanPnl  = pnlList.Average();

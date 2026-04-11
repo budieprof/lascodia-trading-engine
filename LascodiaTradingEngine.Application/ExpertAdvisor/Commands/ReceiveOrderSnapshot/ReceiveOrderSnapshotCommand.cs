@@ -125,9 +125,11 @@ public class ReceiveOrderSnapshotCommandHandler : IRequestHandler<ReceiveOrderSn
             var brokerTicket = snap.Ticket.ToString();
             var symbol = snap.Symbol.ToUpperInvariant();
 
-            // Validate that the reported symbol belongs to this EA instance
+            // Hard-reject snapshots for symbols not owned by this EA instance to
+            // prevent cross-instance data pollution and ensure strict symbol ownership.
             if (ownedSymbols.Count > 0 && !ownedSymbols.Contains(symbol))
-                continue;
+                return ResponseData<string>.Init(null, false,
+                    $"Symbol '{symbol}' is not owned by EA instance '{request.InstanceId}'", "-403");
 
             if (orderLookup.TryGetValue((brokerTicket, symbol), out var existing))
             {

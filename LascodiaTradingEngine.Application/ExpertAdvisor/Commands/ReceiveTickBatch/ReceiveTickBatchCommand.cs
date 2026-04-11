@@ -48,6 +48,13 @@ public class ReceiveTickBatchCommand : IRequest<ResponseData<string>>
 
     /// <summary>Ordered list of ticks captured by the EA since the last batch. May contain multiple symbols.</summary>
     public List<TickItem> Ticks { get; set; } = new();
+
+    /// <summary>
+    /// Optional idempotency key (typically from the X-Request-Id header). When provided,
+    /// duplicate batches with the same key are silently skipped to prevent double processing
+    /// during EA retries or network replays.
+    /// </summary>
+    public string? RequestId { get; set; }
 }
 
 /// <summary>
@@ -139,6 +146,7 @@ public class ReceiveTickBatchCommandHandler : IRequestHandler<ReceiveTickBatchCo
     private readonly IWriteApplicationDbContext _context;
     private readonly IIntegrationEventService _eventBus;
     private readonly IEAOwnershipGuard _ownershipGuard;
+    private readonly IIdempotencyGuard _idempotencyGuard;
     private readonly TradingMetrics _metrics;
 
     public ReceiveTickBatchCommandHandler(
@@ -146,18 +154,32 @@ public class ReceiveTickBatchCommandHandler : IRequestHandler<ReceiveTickBatchCo
         IWriteApplicationDbContext context,
         IIntegrationEventService eventBus,
         IEAOwnershipGuard ownershipGuard,
+        IIdempotencyGuard idempotencyGuard,
         TradingMetrics metrics)
     {
         _cache = cache;
         _context = context;
         _eventBus = eventBus;
         _ownershipGuard = ownershipGuard;
+        _idempotencyGuard = idempotencyGuard;
         _metrics = metrics;
     }
 
     public async Task<ResponseData<string>> Handle(ReceiveTickBatchCommand request, CancellationToken cancellationToken)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
+
+        // ── Step 0: Idempotency check ────────────────────────────────────────
+        // If the EA retries a batch (e.g. network timeout before receiving the response),
+        // skip duplicate processing to prevent double event publishing and cache overwrites
+        // with potentially stale data from the retried batch.
+        if (!string.IsNullOrEmpty(request.RequestId))
+        {
+            var idempotencyResult = await _idempotencyGuard.CheckAsync(request.RequestId, cancellationToken);
+            if (idempotencyResult.AlreadyProcessed)
+                return ResponseData<string>.Init(null, true, "Duplicate batch skipped", "00");
+        }
+
         // ── Step 1: Ownership check ──────────────────────────────────────────
         // Ensures the authenticated caller (JWT subject) actually owns the EA instance
         // they claim to be sending data for. Prevents cross-instance spoofing.
@@ -197,6 +219,16 @@ public class ReceiveTickBatchCommandHandler : IRequestHandler<ReceiveTickBatchCo
 
         foreach (var tick in request.Ticks)
         {
+            // Reject ticks with non-finite bid/ask values. While decimal cannot natively
+            // represent NaN/Infinity, the cast to double (used in downstream calculations,
+            // event publishing, and ML features) can produce non-finite values from extreme
+            // decimal magnitudes. This guard prevents poisoned data from propagating.
+            if (!double.IsFinite((double)tick.Bid) || !double.IsFinite((double)tick.Ask))
+            {
+                staleDropped++;
+                continue;
+            }
+
             // Reject ticks older than 60 seconds to prevent stale data from propagating.
             // This can happen if the EA buffers ticks during a network interruption and
             // sends them all at once upon reconnection.
@@ -254,6 +286,17 @@ public class ReceiveTickBatchCommandHandler : IRequestHandler<ReceiveTickBatchCo
         _metrics.TicksIngested.Add(request.Ticks.Count, new KeyValuePair<string, object?>("instance", request.InstanceId));
         _metrics.TickBatchSize.Record(request.Ticks.Count, new KeyValuePair<string, object?>("instance", request.InstanceId));
         _metrics.TickIngestionLatencyMs.Record(sw.Elapsed.TotalMilliseconds, new KeyValuePair<string, object?>("instance", request.InstanceId));
+
+        // ── Step 6: Record idempotency key ────���────────────────────────────
+        if (!string.IsNullOrEmpty(request.RequestId))
+        {
+            await _idempotencyGuard.RecordAsync(
+                request.RequestId,
+                "ReceiveTickBatch",
+                200,
+                string.Empty,
+                cancellationToken);
+        }
 
         string message = staleDropped > 0
             ? $"Successful ({staleDropped} stale/future tick(s) dropped)"

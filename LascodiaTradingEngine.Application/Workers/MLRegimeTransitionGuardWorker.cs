@@ -277,6 +277,10 @@ public sealed class MLRegimeTransitionGuardWorker : BackgroundService
         string                                  value,
         CancellationToken                       ct)
     {
+        // NOTE: Partial-write risk — if the process crashes between ExecuteUpdateAsync and
+        // SaveChangesAsync (insert path), the key may be missing or stale. This is safe because
+        // the next poll cycle will re-evaluate and upsert again (idempotent recovery).
+
         // Attempt an in-place update first — avoids a round-trip insert if the row exists.
         int rows = await writeCtx.Set<EngineConfig>()
             .Where(c => c.Key == key)

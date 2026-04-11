@@ -1,4 +1,5 @@
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Domain.Enums;
 using MarketRegimeEnum = LascodiaTradingEngine.Domain.Enums.MarketRegime;
@@ -69,8 +70,25 @@ public class RegimeStrategyMapper : IRegimeStrategyMapper
     /// <summary>Merged mapping: static baseline + feedback-promoted types. Thread-safe via volatile swap.</summary>
     private volatile IReadOnlyDictionary<MarketRegimeEnum, IReadOnlyList<StrategyType>> _effectiveMap = StaticMap;
 
+    /// <summary>Optional logger for diagnostics.</summary>
+    private readonly ILogger<RegimeStrategyMapper>? _logger;
+
+    public RegimeStrategyMapper() { }
+
+    public RegimeStrategyMapper(ILogger<RegimeStrategyMapper> logger)
+    {
+        _logger = logger;
+    }
+
     public IReadOnlyList<StrategyType> GetStrategyTypes(MarketRegimeEnum regime)
-        => _effectiveMap.TryGetValue(regime, out var types) ? types : Array.Empty<StrategyType>();
+    {
+        var types = _effectiveMap.TryGetValue(regime, out var mapped) ? mapped : Array.Empty<StrategyType>();
+
+        if (types.Count == 0)
+            _logger?.LogWarning("No strategy types mapped for regime {Regime} — generation will skip", regime);
+
+        return types;
+    }
 
     public void RefreshFromFeedback(
         IReadOnlyDictionary<(StrategyType, MarketRegimeEnum), double> feedbackRates,

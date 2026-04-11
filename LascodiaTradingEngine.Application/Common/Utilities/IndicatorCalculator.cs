@@ -415,21 +415,23 @@ public static class IndicatorCalculator
 
     /// <summary>
     /// Finds the nearest true swing low (pivot low) within the lookback window.
-    /// A pivot low has its Low lower than <paramref name="pivotRadius"/> bars on each side.
+    /// A pivot low at index i means candles[i] has the lowest Low in the range
+    /// [i - 2*pivotRadius .. i] (backward-only to avoid look-ahead bias).
     /// Falls back to the absolute minimum if no true pivot exists.
     /// </summary>
     public static decimal FindSwingLow(IReadOnlyList<Candle> candles, int endIndex, int lookbackBars, int pivotRadius = 3)
     {
-        int start = Math.Max(pivotRadius, endIndex - lookbackBars);
-        int end = endIndex - pivotRadius;
+        int doubleRadius = pivotRadius * 2;
+        int start = Math.Max(doubleRadius, endIndex - lookbackBars);
+        int end = endIndex;
 
         for (int i = end; i >= start; i--)
         {
             decimal low = candles[i].Low;
             bool isPivot = true;
-            for (int j = 1; j <= pivotRadius; j++)
+            for (int j = 1; j <= doubleRadius; j++)
             {
-                if (candles[i - j].Low <= low || candles[i + j].Low <= low)
+                if (candles[i - j].Low <= low)
                 {
                     isPivot = false;
                     break;
@@ -450,21 +452,23 @@ public static class IndicatorCalculator
 
     /// <summary>
     /// Finds the nearest true swing high (pivot high) within the lookback window.
-    /// A pivot high has its High higher than <paramref name="pivotRadius"/> bars on each side.
+    /// A pivot high at index i means candles[i] has the highest High in the range
+    /// [i - 2*pivotRadius .. i] (backward-only to avoid look-ahead bias).
     /// Falls back to the absolute maximum if no true pivot exists.
     /// </summary>
     public static decimal FindSwingHigh(IReadOnlyList<Candle> candles, int endIndex, int lookbackBars, int pivotRadius = 3)
     {
-        int start = Math.Max(pivotRadius, endIndex - lookbackBars);
-        int end = endIndex - pivotRadius;
+        int doubleRadius = pivotRadius * 2;
+        int start = Math.Max(doubleRadius, endIndex - lookbackBars);
+        int end = endIndex;
 
         for (int i = end; i >= start; i--)
         {
             decimal high = candles[i].High;
             bool isPivot = true;
-            for (int j = 1; j <= pivotRadius; j++)
+            for (int j = 1; j <= doubleRadius; j++)
             {
-                if (candles[i - j].High >= high || candles[i + j].High >= high)
+                if (candles[i - j].High >= high)
                 {
                     isPivot = false;
                     break;

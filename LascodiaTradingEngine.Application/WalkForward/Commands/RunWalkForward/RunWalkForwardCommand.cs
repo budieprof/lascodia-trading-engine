@@ -93,6 +93,16 @@ public class RunWalkForwardCommandHandler : IRequestHandler<RunWalkForwardComman
                 "-409");
         }
 
+        double totalDays = (request.ToDate - request.FromDate).TotalDays;
+        if (request.InSampleDays + request.OutOfSampleDays > totalDays)
+        {
+            return ResponseData<long>.Init(
+                0,
+                false,
+                $"WalkForward: IS ({request.InSampleDays}d) + OOS ({request.OutOfSampleDays}d) exceeds date range ({totalDays:F0}d)",
+                "-11");
+        }
+
         var entity = await _validationRunFactory.BuildWalkForwardRunAsync(
             db,
             new WalkForwardQueueRequest(

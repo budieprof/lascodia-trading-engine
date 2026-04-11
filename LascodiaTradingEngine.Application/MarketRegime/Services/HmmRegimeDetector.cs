@@ -132,7 +132,7 @@ public sealed class HmmRegimeDetector
                 // Compute log-likelihood from scaling factors
                 double logLikelihood = 0.0;
                 for (int t = 0; t < T; t++)
-                    logLikelihood += Math.Log(Math.Max(scalingFactors[t], double.Epsilon));
+                    logLikelihood += Math.Log(Math.Max(scalingFactors[t], 1e-200));
 
                 if (Math.Abs(logLikelihood - prevLogLikelihood) < ConvergenceThreshold)
                     break;
@@ -318,7 +318,9 @@ public sealed class HmmRegimeDetector
             sumSq += diff * diff;
         }
         double stdDev = Math.Sqrt(sumSq / count);
-        return 4.0 * stdDev / sma; // (upper - lower) / sma = 4 * stdDev / sma
+        double upper = sma + 2.0 * stdDev;
+        double lower = sma - 2.0 * stdDev;
+        return (upper - lower) / sma; // standard BBW formula aligned with MarketRegimeDetector
     }
 
     private static double ComputeReturnAutocorrelation(double[] returns, int endIdx, int window)
@@ -376,14 +378,140 @@ public sealed class HmmRegimeDetector
     }
 
     /// <summary>
-    /// Initializes emission means by dividing observations into NumStates segments
-    /// and computing the mean of each segment's features.
+    /// Initializes emission means using k-means++ clustering for better Baum-Welch
+    /// convergence. K-means++ selects initial centroids with probability proportional
+    /// to squared distance from nearest existing centroid, then refines via Lloyd's
+    /// algorithm (20 iterations, convergence threshold 1e-6).
+    /// Falls back to sequential segmentation if k-means fails to converge or
+    /// observations are too few.
     /// </summary>
     private static double[][] InitializeMeans(double[][] observations)
     {
         int T = observations.Length;
-        var means = new double[NumStates][];
 
+        // Fallback to sequential segmentation for very small datasets
+        if (T < NumStates * 3)
+            return InitializeMeansSequential(observations);
+
+        // ── K-means++ seeding ────────��────────────────────────────────────
+        var rng = new Random(42); // deterministic seed for reproducibility
+        var centroids = new double[NumStates][];
+
+        // First centroid: random observation
+        centroids[0] = (double[])observations[rng.Next(T)].Clone();
+
+        // Subsequent centroids: probability proportional to D(x)²
+        var minDistSq = new double[T];
+        for (int k = 1; k < NumStates; k++)
+        {
+            double totalDistSq = 0.0;
+            for (int t = 0; t < T; t++)
+            {
+                double nearest = double.MaxValue;
+                for (int c = 0; c < k; c++)
+                {
+                    double d = SquaredDistance(observations[t], centroids[c]);
+                    if (d < nearest) nearest = d;
+                }
+                minDistSq[t] = nearest;
+                totalDistSq += nearest;
+            }
+
+            if (totalDistSq < 1e-15)
+            {
+                // All observations are identical — fall back to sequential
+                return InitializeMeansSequential(observations);
+            }
+
+            // Weighted random selection
+            double threshold = rng.NextDouble() * totalDistSq;
+            double cumulative = 0.0;
+            int selected = T - 1; // fallback to last
+            for (int t = 0; t < T; t++)
+            {
+                cumulative += minDistSq[t];
+                if (cumulative >= threshold) { selected = t; break; }
+            }
+            centroids[k] = (double[])observations[selected].Clone();
+        }
+
+        // ── Lloyd's algorithm (k-means refinement) ────────────────────────
+        var assignments = new int[T];
+        const int MaxIterations = 20;
+        const double ConvergenceThreshold = 1e-6;
+
+        for (int iter = 0; iter < MaxIterations; iter++)
+        {
+            // Assignment step: assign each observation to nearest centroid
+            for (int t = 0; t < T; t++)
+            {
+                double bestDist = double.MaxValue;
+                int bestCluster = 0;
+                for (int k = 0; k < NumStates; k++)
+                {
+                    double d = SquaredDistance(observations[t], centroids[k]);
+                    if (d < bestDist) { bestDist = d; bestCluster = k; }
+                }
+                assignments[t] = bestCluster;
+            }
+
+            // Update step: recompute centroids
+            var newCentroids = new double[NumStates][];
+            var counts = new int[NumStates];
+            for (int k = 0; k < NumStates; k++)
+                newCentroids[k] = new double[NumFeatures];
+
+            for (int t = 0; t < T; t++)
+            {
+                int k = assignments[t];
+                counts[k]++;
+                for (int f = 0; f < NumFeatures; f++)
+                    newCentroids[k][f] += observations[t][f];
+            }
+
+            double maxShift = 0.0;
+            for (int k = 0; k < NumStates; k++)
+            {
+                if (counts[k] == 0)
+                {
+                    // Empty cluster — reinitialize from farthest point
+                    double maxDist = 0;
+                    int farthest = 0;
+                    for (int t = 0; t < T; t++)
+                    {
+                        double d = SquaredDistance(observations[t], centroids[k]);
+                        if (d > maxDist) { maxDist = d; farthest = t; }
+                    }
+                    newCentroids[k] = (double[])observations[farthest].Clone();
+                    counts[k] = 1;
+                }
+                else
+                {
+                    for (int f = 0; f < NumFeatures; f++)
+                        newCentroids[k][f] /= counts[k];
+                }
+
+                double shift = SquaredDistance(centroids[k], newCentroids[k]);
+                if (shift > maxShift) maxShift = shift;
+            }
+
+            centroids = newCentroids;
+
+            if (maxShift < ConvergenceThreshold)
+                break; // converged
+        }
+
+        return centroids;
+    }
+
+    /// <summary>
+    /// Fallback: sequential segmentation for very small datasets (T &lt; NumStates × 3).
+    /// Divides observations into NumStates equal segments and computes per-segment means.
+    /// </summary>
+    private static double[][] InitializeMeansSequential(double[][] observations)
+    {
+        int T = observations.Length;
+        var means = new double[NumStates][];
         int segLen = Math.Max(1, T / NumStates);
 
         for (int s = 0; s < NumStates; s++)
@@ -405,32 +533,81 @@ public sealed class HmmRegimeDetector
         return means;
     }
 
+    /// <summary>Squared Euclidean distance between two feature vectors.</summary>
+    private static double SquaredDistance(double[] a, double[] b)
+    {
+        double sum = 0.0;
+        int len = Math.Min(a.Length, b.Length);
+        for (int f = 0; f < len; f++)
+        {
+            double d = a[f] - b[f];
+            sum += d * d;
+        }
+        return sum;
+    }
+
     /// <summary>
-    /// Initializes emission variances from segment data around the segment means.
+    /// Initializes emission variances from k-means cluster assignments.
+    /// Each state's variance is computed from observations assigned to that cluster.
+    /// Falls back to global variance for empty clusters.
     /// </summary>
     private static double[][] InitializeVariances(double[][] observations, double[][] means)
     {
         int T = observations.Length;
         var variances = new double[NumStates][];
-        int segLen = Math.Max(1, T / NumStates);
+        var counts = new int[NumStates];
+
+        // Assign each observation to nearest mean (same as k-means final assignment)
+        for (int s = 0; s < NumStates; s++)
+            variances[s] = new double[NumFeatures];
+
+        for (int t = 0; t < T; t++)
+        {
+            double bestDist = double.MaxValue;
+            int bestState = 0;
+            for (int s = 0; s < NumStates; s++)
+            {
+                double d = SquaredDistance(observations[t], means[s]);
+                if (d < bestDist) { bestDist = d; bestState = s; }
+            }
+
+            counts[bestState]++;
+            for (int f = 0; f < NumFeatures; f++)
+            {
+                double diff = observations[t][f] - means[bestState][f];
+                variances[bestState][f] += diff * diff;
+            }
+        }
+
+        // Compute global variance as fallback for empty clusters
+        var globalVariance = new double[NumFeatures];
+        var globalMean = new double[NumFeatures];
+        for (int t = 0; t < T; t++)
+            for (int f = 0; f < NumFeatures; f++)
+                globalMean[f] += observations[t][f];
+        for (int f = 0; f < NumFeatures; f++)
+            globalMean[f] /= T;
+        for (int t = 0; t < T; t++)
+            for (int f = 0; f < NumFeatures; f++)
+            {
+                double diff = observations[t][f] - globalMean[f];
+                globalVariance[f] += diff * diff;
+            }
+        for (int f = 0; f < NumFeatures; f++)
+            globalVariance[f] = Math.Max(globalVariance[f] / T, VarianceFloor);
 
         for (int s = 0; s < NumStates; s++)
         {
-            variances[s] = new double[NumFeatures];
-            int start = s * segLen;
-            int end = (s == NumStates - 1) ? T : Math.Min((s + 1) * segLen, T);
-            int count = end - start;
-            if (count <= 0) { start = 0; end = T; count = T; }
-
-            for (int t = start; t < end; t++)
+            if (counts[s] < 2)
+            {
+                // Empty or singleton cluster — use global variance
+                variances[s] = (double[])globalVariance.Clone();
+            }
+            else
+            {
                 for (int f = 0; f < NumFeatures; f++)
-                {
-                    double diff = observations[t][f] - means[s][f];
-                    variances[s][f] += diff * diff;
-                }
-
-            for (int f = 0; f < NumFeatures; f++)
-                variances[s][f] = Math.Max(variances[s][f] / count, VarianceFloor);
+                    variances[s][f] = Math.Max(variances[s][f] / counts[s], VarianceFloor);
+            }
         }
 
         return variances;
@@ -452,6 +629,8 @@ public sealed class HmmRegimeDetector
             double var_ = Math.Max(variances[state][f], VarianceFloor);
             logProb += -0.5 * Math.Log(2.0 * Math.PI * var_) - 0.5 * diff * diff / var_;
         }
+
+        logProb = Math.Max(logProb, -500.0); // prevent -Infinity from zero-variance features
 
         return Math.Exp(logProb);
     }
@@ -692,6 +871,14 @@ public sealed class HmmRegimeDetector
         double[][] variances)
     {
         int T = observations.Length;
+
+        if (T < 2)
+        {
+            // Too few observations for Viterbi — return prior-based best state
+            int bestState = Enumerable.Range(0, NumStates).MaxBy(s => Math.Log(Math.Max(pi[s], double.Epsilon)));
+            return new[] { bestState };
+        }
+
         var delta = new double[T][];
         var psi = new int[T][];
 

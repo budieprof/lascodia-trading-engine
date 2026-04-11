@@ -48,12 +48,18 @@ public class GetPendingCommandsQueryHandler : IRequestHandler<GetPendingCommands
         if (!await _ownershipGuard.IsOwnerAsync(request.EAInstanceId, cancellationToken))
             return ResponseData<List<EACommandDto>>.Init(null, false, "Unauthorized: caller does not own this EA instance", "-403");
 
+        // Apply a 24-hour TTL to prevent stale commands from accumulating indefinitely.
+        // Commands older than this are effectively expired and should not be executed.
+        // Aligned with TcpBridgeWorker and EACommandPushWorker command age cutoffs.
+        var ttlCutoff = DateTime.UtcNow.AddHours(-24);
+
         var query = _context.GetDbContext()
             .Set<Domain.Entities.EACommand>()
             .AsNoTracking()
             .Where(x => x.TargetInstanceId == request.EAInstanceId
                       && !x.Acknowledged
-                      && !x.IsDeleted);
+                      && !x.IsDeleted
+                      && x.CreatedAt > ttlCutoff);
 
         if (request.Since.HasValue)
             query = query.Where(x => x.CreatedAt >= request.Since.Value);

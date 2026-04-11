@@ -105,6 +105,27 @@ public class ReceiveDealSnapshotCommandHandler : IRequestHandler<ReceiveDealSnap
 
         var dbContext = _context.GetDbContext();
 
+        // Load the EA instance's owned symbols to validate each deal entry
+        var eaInstance = await dbContext.Set<Domain.Entities.EAInstance>()
+            .FirstOrDefaultAsync(x => x.InstanceId == request.InstanceId && !x.IsDeleted, cancellationToken);
+
+        if (eaInstance is null)
+            return ResponseData<string>.Init(null, false, "EA instance not found", "-14");
+
+        var ownedSymbols = (eaInstance.Symbols ?? string.Empty)
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(s => s.ToUpperInvariant())
+            .ToHashSet();
+
+        // Hard-reject deals for symbols not owned by this EA instance
+        foreach (var deal in request.Deals)
+        {
+            var dealSymbol = deal.Symbol.ToUpperInvariant();
+            if (ownedSymbols.Count > 0 && !ownedSymbols.Contains(dealSymbol))
+                return ResponseData<string>.Init(null, false,
+                    $"Symbol '{dealSymbol}' is not owned by EA instance '{request.InstanceId}'", "-403");
+        }
+
         // Batch-load matching orders to avoid N+1 queries
         var orderTickets = request.Deals.Select(d => d.OrderTicket.ToString()).Distinct().ToList();
         var matchingOrders = await dbContext

@@ -17,6 +17,7 @@ internal static class WalkForwardRunLeaseMaintainer
         CancellationToken ct)
     {
         using var timer = new PeriodicTimer(WalkForwardExecutionLeasePolicy.GetHeartbeatInterval());
+        int consecutiveFailures = 0;
 
         try
         {
@@ -40,6 +41,8 @@ internal static class WalkForwardRunLeaseMaintainer
 
                     if (updated == 0)
                         break;
+
+                    consecutiveFailures = 0;
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
                 {
@@ -47,9 +50,14 @@ internal static class WalkForwardRunLeaseMaintainer
                 }
                 catch (Exception ex)
                 {
-                    logger.LogDebug(ex,
-                        "WalkForwardRunLeaseMaintainer: background lease heartbeat failed for run {RunId} (non-fatal)",
-                        runId);
+                    consecutiveFailures++;
+                    logger.LogWarning(ex,
+                        "WalkForwardRunLeaseMaintainer: lease heartbeat failed for run {RunId} ({Count} consecutive)",
+                        runId, consecutiveFailures);
+                    if (consecutiveFailures >= 3)
+                        logger.LogError(
+                            "WalkForwardRunLeaseMaintainer: heartbeat failed {Count}+ times for run {RunId} — lease may expire",
+                            consecutiveFailures, runId);
                 }
             }
         }

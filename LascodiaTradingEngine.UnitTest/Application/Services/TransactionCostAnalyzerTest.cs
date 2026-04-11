@@ -1,5 +1,7 @@
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Moq;
+using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Services;
 using LascodiaTradingEngine.Domain.Enums;
 using LascodiaTradingEngine.UnitTest.TestHelpers;
@@ -12,7 +14,10 @@ public class TransactionCostAnalyzerTest
 
     public TransactionCostAnalyzerTest()
     {
-        _analyzer = new TransactionCostAnalyzer(Mock.Of<ILogger<TransactionCostAnalyzer>>());
+        _analyzer = new TransactionCostAnalyzer(
+            Mock.Of<ILogger<TransactionCostAnalyzer>>(),
+            Mock.Of<IServiceScopeFactory>(),
+            Mock.Of<ILivePriceCache>());
     }
 
     [Fact]

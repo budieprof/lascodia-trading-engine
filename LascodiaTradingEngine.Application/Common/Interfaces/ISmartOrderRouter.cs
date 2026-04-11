@@ -1,4 +1,5 @@
 using LascodiaTradingEngine.Domain.Entities;
+using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.Common.Interfaces;
 
@@ -7,14 +8,16 @@ namespace LascodiaTradingEngine.Application.Common.Interfaces;
 /// Ranks by spread, latency histogram, fill-rate, and available margin.
 /// </summary>
 /// <summary>
-/// Result of smart order routing: the selected EA instance, account, and expected execution costs.
+/// Result of smart order routing: the selected EA instance, account, expected execution costs,
+/// and recommended execution algorithm.
 /// </summary>
 public record OrderRoutingDecision(
     string SelectedInstanceId,
     long SelectedAccountId,
     decimal ExpectedSpread,
     decimal ExpectedSlippagePips,
-    string RoutingReason);
+    string RoutingReason,
+    ExecutionAlgorithmType ExpectedAlgorithm = ExecutionAlgorithmType.Direct);
 
 public interface ISmartOrderRouter
 {

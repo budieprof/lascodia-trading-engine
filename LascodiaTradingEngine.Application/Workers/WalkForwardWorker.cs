@@ -65,7 +65,7 @@ namespace LascodiaTradingEngine.Application.Workers;
 /// After all windows have been processed, the worker computes:
 /// <list type="bullet">
 ///   <item><term>AverageOutOfSampleScore</term><description>Mean Sharpe across all OOS windows — the primary quality signal.</description></item>
-///   <item><term>ScoreConsistency</term><description>Population standard deviation of Sharpe scores — lower is more consistent.</description></item>
+///   <item><term>ScoreConsistency</term><description>Sample standard deviation (Bessel's correction, N-1 denominator) of Sharpe scores — lower is more consistent.</description></item>
 /// </list>
 /// Both values are persisted on the <see cref="WalkForwardRun"/> row alongside the full
 /// per-window breakdown in <c>WindowResultsJson</c>.
@@ -476,6 +476,10 @@ public class WalkForwardWorker : BackgroundService
                 int windowIndex = 0;
                 var windowStartUtc = run.FromDate;
 
+                // Reserve the final 10% of the total date range as a pure holdout (terminal embargo).
+                // No walk-forward window should include this data.
+                DateTime embargoStart = run.FromDate.AddDays((run.ToDate - run.FromDate).TotalDays * 0.90);
+
                 while (windowStartUtc < run.ToDate)
                 {
                     DateTime inSampleStartUtc = windowStartUtc;
@@ -485,11 +489,19 @@ public class WalkForwardWorker : BackgroundService
                     if (oosEndUtc > run.ToDate)
                         break;
 
+                    // Stop before terminal embargo — the last 10% of data is held out
+                    if (oosEndUtc > embargoStart)
+                        break;
+
                     var inSampleCandles = SliceCandles(allCandles, inSampleStartUtc, inSampleEndUtc);
                     var oosCandles = SliceCandles(allCandles, oosStartUtc, oosEndUtc);
 
                     if (inSampleCandles.Count == 0 || oosCandles.Count == 0)
                     {
+                        if (inSampleCandles.Count == 0)
+                            _logger.LogWarning("Empty candle slice for IS window {Start}→{End}", inSampleStartUtc, inSampleEndUtc);
+                        if (oosCandles.Count == 0)
+                            _logger.LogWarning("Empty candle slice for OOS window {Start}→{End}", oosStartUtc, oosEndUtc);
                         windowStartUtc = windowStartUtc.AddDays(run.OutOfSampleDays);
                         continue;
                     }
@@ -543,25 +555,40 @@ public class WalkForwardWorker : BackgroundService
                     windowIndex++;
                 }
 
-                if (windowResults.Count == 0)
+                const int MinWindowsForReliableCV = 3;
+
+                if (windowResults.Count < MinWindowsForReliableCV)
                 {
+                    _logger.LogWarning(
+                        "Walk-forward produced only {Count} windows (minimum {Min} required for reliable CV)",
+                        windowResults.Count, MinWindowsForReliableCV);
+
                     throw new ValidationRunException(
                         ValidationRunFailureCodes.InvalidWindow,
-                        "Not enough candle data to form any walk-forward windows.",
+                        $"Insufficient walk-forward windows: {windowResults.Count} < {MinWindowsForReliableCV}",
                         failureDetailsJson: ValidationRunException.SerializeDetails(new
                         {
                             run.Id,
                             run.FromDate,
                             run.ToDate,
                             run.InSampleDays,
-                            run.OutOfSampleDays
+                            run.OutOfSampleDays,
+                            WindowCount = windowResults.Count,
+                            MinWindowsForReliableCV
                         }));
                 }
 
                 var scores = windowResults.Select(result => result.OosHealthScore).ToList();
                 double avg = scores.Average();
                 double sumSq = scores.Sum(score => Math.Pow(score - avg, 2));
-                double stdDev = scores.Count > 1 ? Math.Sqrt(sumSq / scores.Count) : 0.0;
+
+                // Safety net: if fewer than MinWindowsForReliableCV windows, stddev is unreliable
+                // — force quality gate failure. This should be caught above but guards edge cases.
+                double stdDev;
+                if (scores.Count < MinWindowsForReliableCV)
+                    stdDev = double.MaxValue;
+                else
+                    stdDev = scores.Count > 1 ? Math.Sqrt(sumSq / Math.Max(1, scores.Count - 1)) : 0.0;
 
                 run.AverageOutOfSampleScore = (decimal)avg;
                 run.ScoreConsistency = (decimal)stdDev;
@@ -649,7 +676,10 @@ public class WalkForwardWorker : BackgroundService
                     bool followUpPassed = run.Status == RunStatus.Completed;
                     if (followUpPassed)
                     {
-                        if (!Optimization.OptimizationFollowUpQualityEvaluator.IsWalkForwardQualitySufficient(
+                        // MaxCoefficientOfVariation is loaded from the canonical key
+                    // "Optimization:MaxCvCoefficientOfVariation" via ValidationConfigReader — same
+                    // key used by OptimizationConfigProvider to keep thresholds in sync.
+                    if (!Optimization.OptimizationFollowUpQualityEvaluator.IsWalkForwardQualitySufficient(
                                 run, settings.MaxCoefficientOfVariation, out string reason))
                         {
                             followUpPassed = false;

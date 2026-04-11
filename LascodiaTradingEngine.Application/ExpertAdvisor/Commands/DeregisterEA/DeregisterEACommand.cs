@@ -1,6 +1,7 @@
 using FluentValidation;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.Common.Events;
@@ -49,15 +50,18 @@ public class DeregisterEACommandHandler : IRequestHandler<DeregisterEACommand, R
     private readonly IWriteApplicationDbContext _context;
     private readonly IEAOwnershipGuard _ownershipGuard;
     private readonly IIntegrationEventService _eventBus;
+    private readonly ILogger<DeregisterEACommandHandler> _logger;
 
     public DeregisterEACommandHandler(
         IWriteApplicationDbContext context,
         IEAOwnershipGuard ownershipGuard,
-        IIntegrationEventService eventBus)
+        IIntegrationEventService eventBus,
+        ILogger<DeregisterEACommandHandler> logger)
     {
         _context        = context;
         _ownershipGuard = ownershipGuard;
         _eventBus       = eventBus;
+        _logger         = logger;
     }
 
     public async Task<ResponseData<string>> Handle(DeregisterEACommand request, CancellationToken cancellationToken)
@@ -65,7 +69,9 @@ public class DeregisterEACommandHandler : IRequestHandler<DeregisterEACommand, R
         if (!await _ownershipGuard.IsOwnerAsync(request.InstanceId, cancellationToken))
             return ResponseData<string>.Init(null, false, "Unauthorized: caller does not own this EA instance", "-403");
 
-        var entity = await _context.GetDbContext()
+        var dbContext = _context.GetDbContext();
+
+        var entity = await dbContext
             .Set<Domain.Entities.EAInstance>()
             .FirstOrDefaultAsync(
                 x => x.InstanceId == request.InstanceId
@@ -78,6 +84,49 @@ public class DeregisterEACommandHandler : IRequestHandler<DeregisterEACommand, R
 
         entity.Status         = EAInstanceStatus.ShuttingDown;
         entity.DeregisteredAt = DateTime.UtcNow;
+
+        // ── Reassign orphaned symbols to active standby instances ────────────
+        // Same logic as EAHealthMonitorWorker's disconnect handling to ensure
+        // graceful deregistration doesn't leave symbols without coverage.
+        var orphanedSymbols = (entity.Symbols ?? string.Empty)
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+        var reassignedSymbols = new List<string>();
+
+        if (orphanedSymbols.Length > 0)
+        {
+            var activeInstances = await dbContext
+                .Set<Domain.Entities.EAInstance>()
+                .Where(e => e.TradingAccountId == entity.TradingAccountId
+                         && e.Status == EAInstanceStatus.Active
+                         && e.Id != entity.Id
+                         && !e.IsDeleted)
+                .ToListAsync(cancellationToken);
+
+            foreach (var sym in orphanedSymbols)
+            {
+                var candidate = activeInstances.FirstOrDefault(s =>
+                    s.Symbols is null || !s.Symbols.Split(',').Contains(sym, StringComparer.OrdinalIgnoreCase));
+
+                if (candidate is not null)
+                {
+                    candidate.Symbols = string.IsNullOrWhiteSpace(candidate.Symbols)
+                        ? sym
+                        : $"{candidate.Symbols},{sym}";
+
+                    reassignedSymbols.Add(sym);
+                    _logger.LogInformation(
+                        "DeregisterEA: reassigned symbol {Symbol} from {FromInstance} to {ToInstance}",
+                        sym, entity.InstanceId, candidate.InstanceId);
+                }
+                else
+                {
+                    _logger.LogWarning(
+                        "DeregisterEA: no active standby instance for symbol {Symbol} (instance {InstanceId})",
+                        sym, entity.InstanceId);
+                }
+            }
+        }
 
         await _eventBus.SaveAndPublish(_context, new EAInstanceDeregisteredIntegrationEvent
         {

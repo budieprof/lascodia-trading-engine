@@ -24,9 +24,11 @@ public interface IExecutionAlgorithm
     /// <summary>
     /// Splits a parent order into a sequence of child slices scheduled over the given duration.
     /// </summary>
+    /// <param name="lotStep">Broker lot step from CurrencyPair.VolumeStep (default 0.01).</param>
     IReadOnlyList<ChildOrderSlice> GenerateSlices(
         Order parentOrder,
         int sliceCount,
         int durationSeconds,
-        decimal currentPrice);
+        decimal currentPrice,
+        decimal lotStep = 0.01m);
 }

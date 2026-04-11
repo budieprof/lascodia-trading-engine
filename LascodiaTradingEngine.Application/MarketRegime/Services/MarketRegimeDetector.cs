@@ -1,7 +1,9 @@
+using System.Collections.Concurrent;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
 using MarketRegimeEnum = LascodiaTradingEngine.Domain.Enums.MarketRegime;
 
 namespace LascodiaTradingEngine.Application.MarketRegime.Services;
@@ -48,8 +50,14 @@ public class MarketRegimeDetector : IMarketRegimeDetector
     /// </summary>
     private const double DisagreementDampeningFactor = 0.85;
 
-    /// <summary>Tracks the previous detection result for transition smoothing.</summary>
-    private MarketRegimeEnum? _previousRegime;
+    /// <summary>Minimum confidence below which the detector falls back to Ranging.</summary>
+    private const double MinConfidenceThreshold = 0.15;
+
+    /// <summary>
+    /// Tracks the previous detection result per symbol/timeframe for transition smoothing.
+    /// Keyed by "{symbol}:{timeframe}" to prevent cross-symbol state pollution.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, MarketRegimeEnum> _previousRegimes = new();
 
     /// <summary>The HMM component used alongside the rule-based classifier.</summary>
     private readonly HmmRegimeDetector _hmm = new();
@@ -59,6 +67,9 @@ public class MarketRegimeDetector : IMarketRegimeDetector
     /// When null (e.g. in unit tests), default weights are used.
     /// </summary>
     private readonly IReadApplicationDbContext? _readDbContext;
+
+    /// <summary>Optional logger for diagnostic output.</summary>
+    private readonly ILogger<MarketRegimeDetector>? _logger;
 
     /// <summary>
     /// Creates a hybrid detector without database access (uses default weights).
@@ -73,6 +84,15 @@ public class MarketRegimeDetector : IMarketRegimeDetector
     public MarketRegimeDetector(IReadApplicationDbContext readDbContext)
     {
         _readDbContext = readDbContext;
+    }
+
+    /// <summary>
+    /// Creates a hybrid detector with database access and logging.
+    /// </summary>
+    public MarketRegimeDetector(IReadApplicationDbContext readDbContext, ILogger<MarketRegimeDetector> logger)
+    {
+        _readDbContext = readDbContext;
+        _logger = logger;
     }
 
     public async Task<MarketRegimeSnapshot> DetectAsync(
@@ -139,20 +159,33 @@ public class MarketRegimeDetector : IMarketRegimeDetector
             }
         }
 
-        // ── 4. Transition smoothing ───────────────────────────────────────
-        if (_previousRegime.HasValue && finalRegime != _previousRegime.Value)
+        // ── 4. Transition smoothing (per symbol/timeframe) ─────────────────
+        string regimeKey = $"{symbol}:{timeframe}";
+        var previousRegime = _previousRegimes.GetOrAdd(regimeKey, MarketRegimeEnum.Ranging);
+
+        if (finalRegime != previousRegime)
         {
             if (finalConfidence < transitionMinConfidence)
             {
                 // Confidence too low to justify the regime change — keep previous
-                finalRegime = _previousRegime.Value;
+                finalRegime = previousRegime;
             }
         }
 
-        _previousRegime = finalRegime;
+        _previousRegimes[regimeKey] = finalRegime;
 
         // Clamp confidence to [0, 1]
         finalConfidence = Math.Clamp(finalConfidence, 0.0, 1.0);
+
+        // ── 5. Minimum confidence floor ──────────────────────────────────
+        if (finalConfidence < MinConfidenceThreshold)
+        {
+            _logger?.LogDebug(
+                "Regime {Regime} confidence {Conf:F3} below floor — falling back to Ranging",
+                finalRegime, finalConfidence);
+            finalRegime = MarketRegimeEnum.Ranging;
+            finalConfidence = MinConfidenceThreshold;
+        }
 
         var snapshot = new MarketRegimeSnapshot
         {
@@ -297,8 +330,21 @@ public class MarketRegimeDetector : IMarketRegimeDetector
 
         if (dxList.Count == 0) return 0.0;
 
-        // ADX = simple average of last AdxPeriod DX values (Wilder would smooth, this is an approximation)
-        return dxList.TakeLast(AdxPeriod).Average();
+        // Wilder's smoothing: ADX[i] = ((ADX[i-1] * (period-1)) + DX[i]) / period
+        // First ADX = simple average of first 'period' DX values
+        // Subsequent ADX values use the recursive smoothing
+        var dxValues = dxList.ToArray();
+        int adxSeed = Math.Min(AdxPeriod, dxValues.Length);
+
+        double adx = 0;
+        for (int i = 0; i < adxSeed; i++)
+            adx += dxValues[i];
+        adx /= adxSeed; // initial seed
+
+        for (int i = adxSeed; i < dxValues.Length; i++)
+            adx = ((adx * (AdxPeriod - 1)) + dxValues[i]) / AdxPeriod;
+
+        return adx;
     }
 
     // ── ATR (Average True Range) ───────────────────────────────────────────────

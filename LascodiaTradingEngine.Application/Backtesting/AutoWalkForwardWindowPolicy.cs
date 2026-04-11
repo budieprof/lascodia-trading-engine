@@ -43,8 +43,10 @@ internal sealed class AutoWalkForwardWindowPolicy : IAutoWalkForwardWindowPolicy
         inSampleRatio /= ratioSum;
         outOfSampleRatio /= ratioSum;
 
-        int inSampleDays = Math.Max(settings.AutoWalkForwardMinInSampleDays, (int)Math.Round(totalWholeDays * inSampleRatio));
-        int outOfSampleDays = Math.Max(settings.AutoWalkForwardMinOutOfSampleDays, (int)Math.Round(totalWholeDays * outOfSampleRatio));
+        // Ensure ratio-based days are never less than the configured minimums.
+        // Use Floor (not Round) so window sizes are conservative and never overshoot.
+        int inSampleDays = Math.Max(settings.AutoWalkForwardMinInSampleDays, (int)Math.Floor(totalWholeDays * inSampleRatio));
+        int outOfSampleDays = Math.Max(settings.AutoWalkForwardMinOutOfSampleDays, (int)Math.Floor(totalWholeDays * outOfSampleRatio));
         int timeframeFloor = GetTimeframeMinimumDays(run.Timeframe);
         inSampleDays = Math.Max(inSampleDays, timeframeFloor * 2);
         outOfSampleDays = Math.Max(outOfSampleDays, timeframeFloor);

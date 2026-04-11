@@ -52,9 +52,13 @@ public class GetPendingSignalsByAccountQuery : IRequest<ResponseData<List<Accoun
 public class GetPendingSignalsByAccountQueryHandler
     : IRequestHandler<GetPendingSignalsByAccountQuery, ResponseData<List<AccountSignalItem>>>
 {
-    private readonly IReadApplicationDbContext _context;
+    // Use write context (primary) instead of read replica to avoid lag-induced
+    // duplicate or missed signal delivery. Signals are written by SignalOrderBridgeWorker
+    // on the primary, and the bridge polls immediately after — a read replica may not
+    // have replicated the new signal yet, causing missed or duplicate pushes.
+    private readonly IWriteApplicationDbContext _context;
 
-    public GetPendingSignalsByAccountQueryHandler(IReadApplicationDbContext context)
+    public GetPendingSignalsByAccountQueryHandler(IWriteApplicationDbContext context)
         => _context = context;
 
     public async Task<ResponseData<List<AccountSignalItem>>> Handle(

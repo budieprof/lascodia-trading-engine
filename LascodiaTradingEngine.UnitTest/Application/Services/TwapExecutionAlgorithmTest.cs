@@ -49,7 +49,7 @@ public class TwapExecutionAlgorithmTest
         for (int i = 1; i < slices.Count; i++)
         {
             var gap = (slices[i].ScheduledAt - slices[i - 1].ScheduledAt).TotalMilliseconds;
-            Assert.InRange(gap, 99000, 101000); // ~100 seconds per slice
+            Assert.InRange(gap, 89000, 111000); // ~100 seconds per slice ± 10% jitter
         }
     }
 }
