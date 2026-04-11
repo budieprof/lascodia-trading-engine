@@ -60,111 +60,66 @@ public class ExpertAdvisorController : AuthControllerBase<ExpertAdvisorControlle
 
     /// <summary>Deregister an EA instance</summary>
     [HttpPost("deregister")]
-    public async Task<ResponseData<string>> Deregister(DeregisterEACommand command)
-    {
-        if (!ModelState.IsValid)
-            return ResponseData<string>.Init(null, false, "Model state failed", "-11");
-
-        return await Mediator.Send(command);
-    }
+    public async Task<IActionResult> Deregister(DeregisterEACommand command)
+        => Ok(await Mediator.Send(command));
 
     /// <summary>Process a heartbeat from an EA instance</summary>
     [HttpPost("heartbeat")]
-    public async Task<ResponseData<HeartbeatResponse>> Heartbeat(ProcessHeartbeatCommand command)
-    {
-        if (!ModelState.IsValid)
-            return ResponseData<HeartbeatResponse>.Init(null, false, "Model state failed", "-11");
-
-        return await Mediator.Send(command);
-    }
+    public async Task<IActionResult> Heartbeat(ProcessHeartbeatCommand command)
+        => Ok(await Mediator.Send(command));
 
     /// <summary>Receive symbol specifications from the EA</summary>
     [HttpPost("symbol-specs")]
-    public async Task<ResponseData<string>> ReceiveSymbolSpecs(ReceiveSymbolSpecsCommand command)
-    {
-        if (!ModelState.IsValid)
-            return ResponseData<string>.Init(null, false, "Model state failed", "-11");
-
-        return await Mediator.Send(command);
-    }
+    public async Task<IActionResult> ReceiveSymbolSpecs(ReceiveSymbolSpecsCommand command)
+        => Ok(await Mediator.Send(command));
 
     /// <summary>Request the EA to refresh and re-send symbol specifications</summary>
     [HttpPut("symbol-specs/refresh")]
-    public async Task<ResponseData<string>> RefreshSymbolSpecs(RefreshSymbolSpecsCommand command)
-    {
-        if (!ModelState.IsValid)
-            return ResponseData<string>.Init(null, false, "Model state failed", "-11");
-
-        return await Mediator.Send(command);
-    }
+    public async Task<IActionResult> RefreshSymbolSpecs(RefreshSymbolSpecsCommand command)
+        => Ok(await Mediator.Send(command));
 
     /// <summary>Receive trading session schedule data from the EA</summary>
     [HttpPost("trading-sessions")]
-    public async Task<ResponseData<string>> ReceiveTradingSessions(ReceiveTradingSessionsCommand command)
-    {
-        if (!ModelState.IsValid)
-            return ResponseData<string>.Init(null, false, "Model state failed", "-11");
-
-        return await Mediator.Send(command);
-    }
+    public async Task<IActionResult> ReceiveTradingSessions(ReceiveTradingSessionsCommand command)
+        => Ok(await Mediator.Send(command));
 
     /// <summary>Receive a snapshot of open positions from the EA</summary>
     [HttpPost("positions/snapshot")]
-    public async Task<ResponseData<string>> ReceivePositionSnapshot(ReceivePositionSnapshotCommand command)
-    {
-        if (!ModelState.IsValid)
-            return ResponseData<string>.Init(null, false, "Model state failed", "-11");
-
-        return await Mediator.Send(command);
-    }
+    public async Task<IActionResult> ReceivePositionSnapshot(ReceivePositionSnapshotCommand command)
+        => Ok(await Mediator.Send(command));
 
     /// <summary>Receive a snapshot of pending orders from the EA</summary>
     [HttpPost("orders/snapshot")]
-    public async Task<ResponseData<string>> ReceiveOrderSnapshot(ReceiveOrderSnapshotCommand command)
-    {
-        if (!ModelState.IsValid)
-            return ResponseData<string>.Init(null, false, "Model state failed", "-11");
-
-        return await Mediator.Send(command);
-    }
+    public async Task<IActionResult> ReceiveOrderSnapshot(ReceiveOrderSnapshotCommand command)
+        => Ok(await Mediator.Send(command));
 
     /// <summary>Receive a snapshot of recent deals from the EA</summary>
     [HttpPost("deals/snapshot")]
-    public async Task<ResponseData<string>> ReceiveDealSnapshot(ReceiveDealSnapshotCommand command)
-    {
-        if (!ModelState.IsValid)
-            return ResponseData<string>.Init(null, false, "Model state failed", "-11");
-
-        return await Mediator.Send(command);
-    }
+    public async Task<IActionResult> ReceiveDealSnapshot(ReceiveDealSnapshotCommand command)
+        => Ok(await Mediator.Send(command));
 
     /// <summary>Process reconciliation between engine and broker state</summary>
     [HttpPost("reconciliation")]
-    public async Task<ResponseData<ReconciliationResult>> ProcessReconciliation(ProcessReconciliationCommand command)
-    {
-        if (!ModelState.IsValid)
-            return ResponseData<ReconciliationResult>.Init(null, false, "Model state failed", "-11");
-
-        return await Mediator.Send(command);
-    }
+    public async Task<IActionResult> ProcessReconciliation(ProcessReconciliationCommand command)
+        => Ok(await Mediator.Send(command));
 
     /// <summary>Get pending commands for an EA instance to execute</summary>
     [HttpGet("commands")]
-    public async Task<ResponseData<List<EACommandDto>>> GetPendingCommands(
+    public async Task<IActionResult> GetPendingCommands(
         [FromQuery] string eaInstanceId,
         [FromQuery] DateTime? since)
-        => await Mediator.Send(new GetPendingCommandsQuery
+        => Ok(await Mediator.Send(new GetPendingCommandsQuery
         {
             EAInstanceId = eaInstanceId,
             Since        = since
-        });
+        }));
 
     /// <summary>Acknowledge execution of a command by the EA</summary>
     [HttpPut("commands/{id}/ack")]
-    public async Task<ResponseData<string>> AcknowledgeCommand(long id, AcknowledgeCommandCommand command)
+    public async Task<IActionResult> AcknowledgeCommand(long id, AcknowledgeCommandCommand command)
     {
         command.Id = id;
-        return await Mediator.Send(command);
+        return Ok(await Mediator.Send(command));
     }
 
     /// <summary>
@@ -173,31 +128,21 @@ public class ExpertAdvisorController : AuthControllerBase<ExpertAdvisorControlle
     /// Zero values are ignored by the EA (keeps current value).
     /// </summary>
     [HttpPost("commands/update-config")]
-    public async Task<ResponseData<string>> UpdateEAConfig(UpdateEAConfigCommand command)
-        => await Mediator.Send(command);
+    public async Task<IActionResult> UpdateEAConfig(UpdateEAConfigCommand command)
+        => Ok(await Mediator.Send(command));
 
     /// <summary>Get all active EA instances</summary>
     [HttpGet("instances")]
-    public async Task<ResponseData<List<EAInstanceDto>>> GetActiveInstances()
-        => await Mediator.Send(new GetActiveInstancesQuery());
+    public async Task<IActionResult> GetActiveInstances()
+        => Ok(await Mediator.Send(new GetActiveInstancesQuery()));
 
     /// <summary>Receive signal feedback from EA (deferred, dropped, expired signals)</summary>
     [HttpPost("signal-feedback")]
-    public async Task<ResponseData<int>> ProcessSignalFeedback(ProcessSignalFeedbackCommand command)
-    {
-        if (!ModelState.IsValid)
-            return ResponseData<int>.Init(0, false, "Model state failed", "-11");
-
-        return await Mediator.Send(command);
-    }
+    public async Task<IActionResult> ProcessSignalFeedback(ProcessSignalFeedbackCommand command)
+        => Ok(await Mediator.Send(command));
 
     /// <summary>Receive incremental position changes (opened/closed/modified)</summary>
     [HttpPost("positions/delta")]
-    public async Task<ResponseData<int>> ReceivePositionDelta(ReceivePositionDeltaCommand command)
-    {
-        if (!ModelState.IsValid)
-            return ResponseData<int>.Init(0, false, "Model state failed", "-11");
-
-        return await Mediator.Send(command);
-    }
+    public async Task<IActionResult> ReceivePositionDelta(ReceivePositionDeltaCommand command)
+        => Ok(await Mediator.Send(command));
 }
