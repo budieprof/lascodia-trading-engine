@@ -20,7 +20,7 @@ public sealed class OptimizationDryRunSimulator
     private readonly TimeProvider _timeProvider;
     private DateTime UtcNow => _timeProvider.GetUtcNow().UtcDateTime;
 
-    internal OptimizationDryRunSimulator(
+    public OptimizationDryRunSimulator(
         OptimizationConfigProvider configProvider,
         TimeProvider timeProvider)
     {
