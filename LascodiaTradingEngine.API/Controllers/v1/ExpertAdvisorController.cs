@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using Lascodia.Trading.Engine.SharedApplication.Common.Services;
@@ -47,12 +48,14 @@ public class ExpertAdvisorController : AuthControllerBase<ExpertAdvisorControlle
 
     /// <summary>Register a new EA instance</summary>
     [HttpPost("register")]
-    public async Task<ResponseData<long>> Register(RegisterEACommand command)
+    [ProducesResponseType(typeof(ResponseData<long>), StatusCodes.Status200OK)]
+    public async Task<IActionResult> Register(RegisterEACommand command)
     {
         if (!ModelState.IsValid)
-            return ResponseData<long>.Init(0, false, "Model state failed", "-11");
+            return Ok(ResponseData<long>.Init(0, false, "Model state failed", "-11"));
 
-        return await Mediator.Send(command);
+        var result = await Mediator.Send(command);
+        return Ok(result);
     }
 
     /// <summary>Deregister an EA instance</summary>
