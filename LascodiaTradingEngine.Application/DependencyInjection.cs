@@ -40,6 +40,18 @@ public static class DependencyInjection
     {
         services.ConfigureAppServices(Assembly.GetExecutingAssembly());
         services.AutoRegisterAttributedServices(Assembly.GetExecutingAssembly());
+
+        // Remove abstract IHostedService registrations that the shared library's
+        // AutoRegisterBackgroundJobs incorrectly picks up (it doesn't filter IsAbstract).
+        // Autofac rejects abstract types at container build time.
+        var abstractHostedServices = services
+            .Where(d => d.ServiceType == typeof(Microsoft.Extensions.Hosting.IHostedService)
+                     && d.ImplementationType is not null
+                     && d.ImplementationType.IsAbstract)
+            .ToList();
+        foreach (var descriptor in abstractHostedServices)
+            services.Remove(descriptor);
+
         ConfigureInfrastructureServices(services, configuration);
         return services;
     }
