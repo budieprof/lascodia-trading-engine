@@ -1,7 +1,6 @@
 using FluentValidation;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.Logging;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
@@ -84,18 +83,16 @@ public class RegisterEACommandValidator : AbstractValidator<RegisterEACommand>
 public class RegisterEACommandHandler : IRequestHandler<RegisterEACommand, ResponseData<long>>
 {
     private readonly IWriteApplicationDbContext _context;
-    private readonly IIntegrationEventService _eventBus;
     private readonly IEAOwnershipGuard _ownershipGuard;
     private readonly ILogger<RegisterEACommandHandler> _logger;
 
     public RegisterEACommandHandler(
         IWriteApplicationDbContext context,
-        IIntegrationEventService eventBus,
+        IIntegrationEventService eventBus, // Retained in DI signature for compatibility
         IEAOwnershipGuard ownershipGuard,
         ILogger<RegisterEACommandHandler> logger)
     {
         _context        = context;
-        _eventBus       = eventBus;
         _ownershipGuard = ownershipGuard;
         _logger         = logger;
     }
@@ -115,185 +112,169 @@ public class RegisterEACommandHandler : IRequestHandler<RegisterEACommand, Respo
 
         // Use SERIALIZABLE isolation to prevent concurrent registrations from both passing
         // the overlap check and inserting conflicting symbol ownership.
-        var strategy = dbContext.Database.CreateExecutionStrategy();
-        return await strategy.ExecuteAsync(async (ct) =>
+        // NOTE: No ExecutionStrategy wrapper — the SERIALIZABLE transaction provides
+        // consistency, and the EA retries registration on the next OnTimer cycle.
+        // The previous strategy.ExecuteAsync caused silent data loss: on retry, the
+        // change tracker retained stale state from the first attempt, and the manually-
+        // managed transaction conflicted with the strategy's own retry semantics.
+        await using var transaction = await dbContext.Database.BeginTransactionAsync(
+            System.Data.IsolationLevel.Serializable, cancellationToken);
+
+        try
         {
-            await using var transaction = await dbContext.Database.BeginTransactionAsync(
-                System.Data.IsolationLevel.Serializable, ct);
+            // ── Load all other instances on this account for overlap/reclaim checks ──
+            var otherInstances = await dbContext
+                .Set<Domain.Entities.EAInstance>()
+                .Where(x => x.TradingAccountId == request.TradingAccountId
+                          && x.InstanceId != request.InstanceId
+                          && !x.IsDeleted)
+                .ToListAsync(cancellationToken);
 
-            try
+            var activeInstances = otherInstances
+                .Where(x => x.Status == EAInstanceStatus.Active)
+                .ToList();
+
+            // ── Reclaim symbols from Disconnected/ShuttingDown instances ────────
+            var inactiveInstances = otherInstances
+                .Where(x => x.Status == EAInstanceStatus.Disconnected
+                         || x.Status == EAInstanceStatus.ShuttingDown)
+                .ToList();
+
+            foreach (var inactive in inactiveInstances)
             {
-                // ── Load all other instances on this account for overlap/reclaim checks ──
-                var otherInstances = await dbContext
-                    .Set<Domain.Entities.EAInstance>()
-                    .Where(x => x.TradingAccountId == request.TradingAccountId
-                              && x.InstanceId != request.InstanceId
-                              && !x.IsDeleted)
-                    .ToListAsync(ct);
-
-                var activeInstances = otherInstances
-                    .Where(x => x.Status == EAInstanceStatus.Active)
+                var inactiveSymbols = (inactive.Symbols ?? string.Empty)
+                    .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                    .Select(s => s.ToUpperInvariant())
                     .ToList();
 
-                // ── Reclaim symbols from Disconnected/ShuttingDown instances ────────
-                // When a previously-deregistered instance re-registers, reclaim its
-                // requested symbols from any inactive instance that was given them as
-                // standby during the deregistration/disconnect process.
-                // This MUST run before the overlap check so that symbols reassigned to
-                // active standby instances are reclaimed first, preventing false 409s.
-                var inactiveInstances = otherInstances
-                    .Where(x => x.Status == EAInstanceStatus.Disconnected
-                             || x.Status == EAInstanceStatus.ShuttingDown)
+                var toReclaim = inactiveSymbols
+                    .Where(s => requestedSymbols.Contains(s))
                     .ToList();
 
-                foreach (var inactive in inactiveInstances)
+                if (toReclaim.Count > 0)
                 {
-                    var inactiveSymbols = (inactive.Symbols ?? string.Empty)
-                        .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                        .Select(s => s.ToUpperInvariant())
+                    var remaining = inactiveSymbols
+                        .Where(s => !toReclaim.Contains(s))
                         .ToList();
+                    inactive.Symbols = remaining.Count > 0 ? string.Join(",", remaining) : string.Empty;
 
-                    var toReclaim = inactiveSymbols
-                        .Where(s => requestedSymbols.Contains(s))
-                        .ToList();
-
-                    if (toReclaim.Count > 0)
-                    {
-                        var remaining = inactiveSymbols
-                            .Where(s => !toReclaim.Contains(s))
-                            .ToList();
-                        inactive.Symbols = remaining.Count > 0 ? string.Join(",", remaining) : string.Empty;
-
-                        _logger.LogInformation(
-                            "RegisterEA: reclaimed symbols [{Symbols}] from inactive instance {FromInstance} for {ToInstance}",
-                            string.Join(", ", toReclaim), inactive.InstanceId, request.InstanceId);
-                    }
+                    _logger.LogInformation(
+                        "RegisterEA: reclaimed symbols [{Symbols}] from inactive instance {FromInstance} for {ToInstance}",
+                        string.Join(", ", toReclaim), inactive.InstanceId, request.InstanceId);
                 }
-
-                // Reclaim from active standby instances that were assigned these symbols
-                // during prior deregistration/disconnect of this instance.
-                foreach (var active in activeInstances)
-                {
-                    var activeSymbolList = (active.Symbols ?? string.Empty)
-                        .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                        .Select(s => s.ToUpperInvariant())
-                        .ToList();
-
-                    var toReclaim = activeSymbolList
-                        .Where(s => requestedSymbols.Contains(s))
-                        .ToList();
-
-                    if (toReclaim.Count > 0)
-                    {
-                        var remaining = activeSymbolList
-                            .Where(s => !toReclaim.Contains(s))
-                            .ToList();
-                        active.Symbols = remaining.Count > 0 ? string.Join(",", remaining) : string.Empty;
-
-                        _logger.LogInformation(
-                            "RegisterEA: reclaimed standby symbols [{Symbols}] from active instance {FromInstance} for {ToInstance}",
-                            string.Join(", ", toReclaim), active.InstanceId, request.InstanceId);
-                    }
-                }
-
-                // ── Check for symbol overlap with other active instances on the same account ──
-                // Run AFTER reclaim so that symbols returned from standby don't trigger false 409s.
-                foreach (var active in activeInstances)
-                {
-                    var existingSymbols = (active.Symbols ?? string.Empty)
-                        .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                        .Select(s => s.ToUpperInvariant())
-                        .ToHashSet();
-
-                    var overlap = requestedSymbols.Intersect(existingSymbols).ToList();
-                    if (overlap.Count > 0)
-                    {
-                        await transaction.RollbackAsync(ct);
-                        return ResponseData<long>.Init(
-                            0, false,
-                            $"Symbol overlap with instance '{active.InstanceId}': {string.Join(", ", overlap)}",
-                            "-409");
-                    }
-                }
-
-                // ── Enforce coordinator uniqueness per trading account ──
-                if (request.IsCoordinator)
-                {
-                    var existingCoordinator = activeInstances
-                        .FirstOrDefault(a => a.IsCoordinator);
-
-                    if (existingCoordinator is not null)
-                    {
-                        // Demote the existing coordinator so only this instance is coordinator
-                        existingCoordinator.IsCoordinator = false;
-                    }
-                }
-
-                // ── Create or re-activate existing instance ──────────────────────────────
-                var existing = await dbContext
-                    .Set<Domain.Entities.EAInstance>()
-                    .FirstOrDefaultAsync(
-                        x => x.InstanceId == request.InstanceId && !x.IsDeleted,
-                        ct);
-
-                if (existing is not null)
-                {
-                    existing.TradingAccountId = request.TradingAccountId;
-                    existing.Symbols          = string.Join(",", requestedSymbols);
-                    existing.ChartSymbol      = request.ChartSymbol.ToUpperInvariant();
-                    existing.ChartTimeframe   = request.ChartTimeframe;
-                    existing.IsCoordinator    = request.IsCoordinator;
-                    existing.EAVersion        = request.EAVersion;
-                    existing.Status           = EAInstanceStatus.Active;
-                    existing.LastHeartbeat    = DateTime.UtcNow;
-                    existing.DeregisteredAt   = null;
-
-                    // SaveChanges within the existing SERIALIZABLE transaction.
-                    // Do NOT use _eventBus.SaveAndPublish() here — it opens its own
-                    // transaction via ResilientTransaction, causing:
-                    // "The connection is already in a transaction and cannot participate in another transaction."
-                    await dbContext.SaveChangesAsync(ct);
-                    await transaction.CommitAsync(ct);
-
-                    // Integration event deferred: SaveAndPublish opens its own transaction
-                    // which conflicts with the SERIALIZABLE transaction above. Downstream
-                    // consumers detect the instance via heartbeats regardless.
-
-                    return ResponseData<long>.Init(existing.Id, true, "Re-registered", "00");
-                }
-
-                var entity = new Domain.Entities.EAInstance
-                {
-                    InstanceId       = request.InstanceId,
-                    TradingAccountId = request.TradingAccountId,
-                    Symbols          = string.Join(",", requestedSymbols),
-                    ChartSymbol      = request.ChartSymbol.ToUpperInvariant(),
-                    ChartTimeframe   = request.ChartTimeframe,
-                    IsCoordinator    = request.IsCoordinator,
-                    EAVersion        = request.EAVersion,
-                    Status           = EAInstanceStatus.Active,
-                    LastHeartbeat    = DateTime.UtcNow,
-                    RegisteredAt     = DateTime.UtcNow,
-                };
-
-                await dbContext.Set<Domain.Entities.EAInstance>().AddAsync(entity, ct);
-
-                // SaveChanges within the existing SERIALIZABLE transaction — avoids nested
-                // transaction conflict from SaveAndPublish's internal ResilientTransaction.
-                await dbContext.SaveChangesAsync(ct);
-                await transaction.CommitAsync(ct);
-
-                // Integration event deferred: SaveAndPublish opens its own transaction
-                // which conflicts with the SERIALIZABLE transaction above. Downstream
-                // consumers detect the instance via heartbeats regardless.
-
-                return ResponseData<long>.Init(entity.Id, true, "Successful", "00");
             }
-            catch
+
+            // Reclaim from active standby instances
+            foreach (var active in activeInstances)
             {
-                await transaction.RollbackAsync(ct);
-                throw;
+                var activeSymbolList = (active.Symbols ?? string.Empty)
+                    .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                    .Select(s => s.ToUpperInvariant())
+                    .ToList();
+
+                var toReclaim = activeSymbolList
+                    .Where(s => requestedSymbols.Contains(s))
+                    .ToList();
+
+                if (toReclaim.Count > 0)
+                {
+                    var remaining = activeSymbolList
+                        .Where(s => !toReclaim.Contains(s))
+                        .ToList();
+                    active.Symbols = remaining.Count > 0 ? string.Join(",", remaining) : string.Empty;
+
+                    _logger.LogInformation(
+                        "RegisterEA: reclaimed standby symbols [{Symbols}] from active instance {FromInstance} for {ToInstance}",
+                        string.Join(", ", toReclaim), active.InstanceId, request.InstanceId);
+                }
             }
-        }, cancellationToken);
+
+            // ── Check for symbol overlap with other active instances on the same account ──
+            foreach (var active in activeInstances)
+            {
+                var existingSymbols = (active.Symbols ?? string.Empty)
+                    .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                    .Select(s => s.ToUpperInvariant())
+                    .ToHashSet();
+
+                var overlap = requestedSymbols.Intersect(existingSymbols).ToList();
+                if (overlap.Count > 0)
+                {
+                    await transaction.RollbackAsync(cancellationToken);
+                    return ResponseData<long>.Init(
+                        0, false,
+                        $"Symbol overlap with instance '{active.InstanceId}': {string.Join(", ", overlap)}",
+                        "-409");
+                }
+            }
+
+            // ── Enforce coordinator uniqueness per trading account ──
+            if (request.IsCoordinator)
+            {
+                var existingCoordinator = activeInstances
+                    .FirstOrDefault(a => a.IsCoordinator);
+
+                if (existingCoordinator is not null)
+                    existingCoordinator.IsCoordinator = false;
+            }
+
+            // ── Create or re-activate existing instance ──────────────────────────────
+            var existing = await dbContext
+                .Set<Domain.Entities.EAInstance>()
+                .FirstOrDefaultAsync(
+                    x => x.InstanceId == request.InstanceId && !x.IsDeleted,
+                    cancellationToken);
+
+            if (existing is not null)
+            {
+                existing.TradingAccountId = request.TradingAccountId;
+                existing.Symbols          = string.Join(",", requestedSymbols);
+                existing.ChartSymbol      = request.ChartSymbol.ToUpperInvariant();
+                existing.ChartTimeframe   = request.ChartTimeframe;
+                existing.IsCoordinator    = request.IsCoordinator;
+                existing.EAVersion        = request.EAVersion;
+                existing.Status           = EAInstanceStatus.Active;
+                existing.LastHeartbeat    = DateTime.UtcNow;
+                existing.DeregisteredAt   = null;
+
+                await dbContext.SaveChangesAsync(cancellationToken);
+                await transaction.CommitAsync(cancellationToken);
+
+                _logger.LogInformation(
+                    "RegisterEA: re-registered instance {InstanceId} (Id={Id}, Status=Active)",
+                    existing.InstanceId, existing.Id);
+
+                return ResponseData<long>.Init(existing.Id, true, "Re-registered", "00");
+            }
+
+            var entity = new Domain.Entities.EAInstance
+            {
+                InstanceId       = request.InstanceId,
+                TradingAccountId = request.TradingAccountId,
+                Symbols          = string.Join(",", requestedSymbols),
+                ChartSymbol      = request.ChartSymbol.ToUpperInvariant(),
+                ChartTimeframe   = request.ChartTimeframe,
+                IsCoordinator    = request.IsCoordinator,
+                EAVersion        = request.EAVersion,
+                Status           = EAInstanceStatus.Active,
+                LastHeartbeat    = DateTime.UtcNow,
+                RegisteredAt     = DateTime.UtcNow,
+            };
+
+            await dbContext.Set<Domain.Entities.EAInstance>().AddAsync(entity, cancellationToken);
+            await dbContext.SaveChangesAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+
+            _logger.LogInformation(
+                "RegisterEA: new instance {InstanceId} registered (Id={Id}, Status=Active)",
+                entity.InstanceId, entity.Id);
+
+            return ResponseData<long>.Init(entity.Id, true, "Successful", "00");
+        }
+        catch
+        {
+            await transaction.RollbackAsync(cancellationToken);
+            throw;
+        }
     }
 }
