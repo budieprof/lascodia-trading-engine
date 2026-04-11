@@ -1260,6 +1260,11 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     b.Property<DateTime>("ComputedAt")
                         .HasColumnType("timestamp with time zone");
 
+                    b.Property<int>("FeatureCount")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer")
+                        .HasDefaultValue(0);
+
                     b.Property<string>("FeatureNamesJson")
                         .IsRequired()
                         .HasMaxLength(4000)
@@ -1281,6 +1286,10 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                         .HasColumnType("xid")
                         .HasColumnName("xmin");
 
+                    b.Property<string>("SchemaHash")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
                     b.Property<int>("SchemaVersion")
                         .HasColumnType("integer");
 
@@ -1298,10 +1307,74 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
 
                     b.HasIndex("CandleId");
 
+                    b.HasIndex("SchemaHash", "ComputedAt")
+                        .HasDatabaseName("IX_FeatureVector_SchemaEviction");
+
                     b.HasIndex("Symbol", "Timeframe", "BarTimestamp")
                         .IsUnique();
 
+                    b.HasIndex("Symbol", "Timeframe", "BarTimestamp", "ComputedAt")
+                        .HasDatabaseName("IX_FeatureVector_PointInTime");
+
                     b.ToTable("FeatureVector");
+                });
+
+            modelBuilder.Entity("LascodiaTradingEngine.Domain.Entities.FeatureVectorLineage", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<int>("CandleCount")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("FeatureCount")
+                        .HasColumnType("integer");
+
+                    b.Property<bool>("IsDeleted")
+                        .HasColumnType("boolean");
+
+                    b.Property<DateTime>("NewestCandleUsed")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTime>("OldestCandleUsed")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<Guid>("OutboxId")
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTime>("RecordedAtUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<uint>("RowVersion")
+                        .IsConcurrencyToken()
+                        .ValueGeneratedOnAddOrUpdate()
+                        .HasColumnType("xid")
+                        .HasColumnName("xmin");
+
+                    b.Property<string>("SchemaHash")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<string>("Symbol")
+                        .IsRequired()
+                        .HasMaxLength(10)
+                        .HasColumnType("character varying(10)");
+
+                    b.Property<string>("Timeframe")
+                        .IsRequired()
+                        .HasMaxLength(5)
+                        .HasColumnType("character varying(5)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Symbol", "Timeframe", "SchemaHash")
+                        .HasDatabaseName("IX_FeatureVectorLineage_Lookup");
+
+                    b.ToTable("FeatureVectorLineage");
                 });
 
             modelBuilder.Entity("LascodiaTradingEngine.Domain.Entities.LivePrice", b =>
