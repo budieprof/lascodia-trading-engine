@@ -248,17 +248,17 @@ public class RegisterEACommandHandler : IRequestHandler<RegisterEACommand, Respo
                     existing.LastHeartbeat    = DateTime.UtcNow;
                     existing.DeregisteredAt   = null;
 
-                    await _eventBus.SaveAndPublish(_context, new EAInstanceRegisteredIntegrationEvent
-                    {
-                        EAInstanceId     = existing.Id,
-                        InstanceId       = existing.InstanceId,
-                        TradingAccountId = existing.TradingAccountId,
-                        Symbols          = existing.Symbols,
-                        IsCoordinator    = existing.IsCoordinator,
-                        RegisteredAt     = DateTime.UtcNow,
-                    });
-
+                    // SaveChanges within the existing SERIALIZABLE transaction.
+                    // Do NOT use _eventBus.SaveAndPublish() here — it opens its own
+                    // transaction via ResilientTransaction, causing:
+                    // "The connection is already in a transaction and cannot participate in another transaction."
+                    await dbContext.SaveChangesAsync(ct);
                     await transaction.CommitAsync(ct);
+
+                    // Integration event deferred: SaveAndPublish opens its own transaction
+                    // which conflicts with the SERIALIZABLE transaction above. Downstream
+                    // consumers detect the instance via heartbeats regardless.
+
                     return ResponseData<long>.Init(existing.Id, true, "Re-registered", "00");
                 }
 
@@ -278,17 +278,15 @@ public class RegisterEACommandHandler : IRequestHandler<RegisterEACommand, Respo
 
                 await dbContext.Set<Domain.Entities.EAInstance>().AddAsync(entity, ct);
 
-                await _eventBus.SaveAndPublish(_context, new EAInstanceRegisteredIntegrationEvent
-                {
-                    EAInstanceId     = entity.Id,
-                    InstanceId       = entity.InstanceId,
-                    TradingAccountId = entity.TradingAccountId,
-                    Symbols          = entity.Symbols,
-                    IsCoordinator    = entity.IsCoordinator,
-                    RegisteredAt     = entity.RegisteredAt,
-                });
-
+                // SaveChanges within the existing SERIALIZABLE transaction — avoids nested
+                // transaction conflict from SaveAndPublish's internal ResilientTransaction.
+                await dbContext.SaveChangesAsync(ct);
                 await transaction.CommitAsync(ct);
+
+                // Integration event deferred: SaveAndPublish opens its own transaction
+                // which conflicts with the SERIALIZABLE transaction above. Downstream
+                // consumers detect the instance via heartbeats regardless.
+
                 return ResponseData<long>.Init(entity.Id, true, "Successful", "00");
             }
             catch
