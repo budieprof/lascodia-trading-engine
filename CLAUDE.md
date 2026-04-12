@@ -27,6 +27,9 @@ dotnet ef database update --project LascodiaTradingEngine.Infrastructure/ --star
 dotnet ef migrations add <MigrationName> --project LascodiaTradingEngine.Infrastructure/ --startup-project LascodiaTradingEngine.API/
 ```
 
+> **IMPORTANT: EF Core Migration Rule**
+> All migration files MUST be created using `dotnet ef migrations add` — NEVER create or edit migration files manually. The EF Core tooling generates the migration designer snapshot and SQL from the current model state. Manual edits break the migration chain and cause schema drift. If a migration needs correction, use `dotnet ef migrations remove` to delete it and re-run `dotnet ef migrations add` with the corrected model.
+
 ---
 
 ## Architecture
