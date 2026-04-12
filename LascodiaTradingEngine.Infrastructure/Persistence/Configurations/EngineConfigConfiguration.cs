@@ -21,7 +21,7 @@ public class EngineConfigConfiguration : IEntityTypeConfiguration<EngineConfig>
 
         builder.Property(x => x.Value)
             .IsRequired()
-            .HasMaxLength(2000);
+            .HasColumnType("text"); // Unlimited — trading sessions JSON for 10+ symbols exceeds varchar(2000)
 
         builder.Property(x => x.Description)
             .HasMaxLength(500);
