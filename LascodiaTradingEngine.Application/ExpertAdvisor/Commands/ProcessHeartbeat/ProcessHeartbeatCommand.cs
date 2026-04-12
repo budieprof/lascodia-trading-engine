@@ -70,12 +70,18 @@ public class ProcessHeartbeatCommandHandler : IRequestHandler<ProcessHeartbeatCo
             .Set<Domain.Entities.EAInstance>()
             .FirstOrDefaultAsync(
                 x => x.InstanceId == request.InstanceId
-                  && x.Status == EAInstanceStatus.Active
+                  && (x.Status == EAInstanceStatus.Active || x.Status == EAInstanceStatus.Disconnected)
                   && !x.IsDeleted,
                 cancellationToken);
 
         if (entity == null)
             return ResponseData<HeartbeatResponse>.Init(null, false, "EA instance not found or not active", "-14");
+
+        // Re-activate disconnected instances: a valid heartbeat proves the EA is alive.
+        // The EAHealthMonitorWorker marks instances as Disconnected after missed heartbeats,
+        // but the EA may reconnect (e.g. after weekend, network outage, or MT5 restart).
+        if (entity.Status == EAInstanceStatus.Disconnected)
+            entity.Status = EAInstanceStatus.Active;
 
         entity.LastHeartbeat = DateTime.UtcNow;
         await _context.SaveChangesAsync(cancellationToken);
