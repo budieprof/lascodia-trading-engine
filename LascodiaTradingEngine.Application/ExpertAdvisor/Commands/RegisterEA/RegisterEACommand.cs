@@ -1,6 +1,7 @@
 using FluentValidation;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.Logging;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
@@ -112,13 +113,16 @@ public class RegisterEACommandHandler : IRequestHandler<RegisterEACommand, Respo
 
         // Use SERIALIZABLE isolation to prevent concurrent registrations from both passing
         // the overlap check and inserting conflicting symbol ownership.
-        // NOTE: No ExecutionStrategy wrapper — the SERIALIZABLE transaction provides
-        // consistency, and the EA retries registration on the next OnTimer cycle.
-        // The previous strategy.ExecuteAsync caused silent data loss: on retry, the
-        // change tracker retained stale state from the first attempt, and the manually-
-        // managed transaction conflicted with the strategy's own retry semantics.
+        // NpgsqlRetryingExecutionStrategy REQUIRES manual transactions to be wrapped in
+        // strategy.ExecuteAsync(). The change tracker is cleared before each retry attempt
+        // to prevent stale entity state from silently producing SaveChanges no-ops.
+        var strategy = dbContext.Database.CreateExecutionStrategy();
+        return await strategy.ExecuteAsync(async (ct) =>
+        {
+        dbContext.ChangeTracker.Clear(); // Prevent stale entities from prior retry attempts
+
         await using var transaction = await dbContext.Database.BeginTransactionAsync(
-            System.Data.IsolationLevel.Serializable, cancellationToken);
+            System.Data.IsolationLevel.Serializable, ct);
 
         try
         {
@@ -128,7 +132,7 @@ public class RegisterEACommandHandler : IRequestHandler<RegisterEACommand, Respo
                 .Where(x => x.TradingAccountId == request.TradingAccountId
                           && x.InstanceId != request.InstanceId
                           && !x.IsDeleted)
-                .ToListAsync(cancellationToken);
+                .ToListAsync(ct);
 
             var activeInstances = otherInstances
                 .Where(x => x.Status == EAInstanceStatus.Active)
@@ -200,7 +204,7 @@ public class RegisterEACommandHandler : IRequestHandler<RegisterEACommand, Respo
                 var overlap = requestedSymbols.Intersect(existingSymbols).ToList();
                 if (overlap.Count > 0)
                 {
-                    await transaction.RollbackAsync(cancellationToken);
+                    await transaction.RollbackAsync(ct);
                     return ResponseData<long>.Init(
                         0, false,
                         $"Symbol overlap with instance '{active.InstanceId}': {string.Join(", ", overlap)}",
@@ -223,7 +227,7 @@ public class RegisterEACommandHandler : IRequestHandler<RegisterEACommand, Respo
                 .Set<Domain.Entities.EAInstance>()
                 .FirstOrDefaultAsync(
                     x => x.InstanceId == request.InstanceId && !x.IsDeleted,
-                    cancellationToken);
+                    ct);
 
             if (existing is not null)
             {
@@ -237,8 +241,8 @@ public class RegisterEACommandHandler : IRequestHandler<RegisterEACommand, Respo
                 existing.LastHeartbeat    = DateTime.UtcNow;
                 existing.DeregisteredAt   = null;
 
-                await dbContext.SaveChangesAsync(cancellationToken);
-                await transaction.CommitAsync(cancellationToken);
+                await dbContext.SaveChangesAsync(ct);
+                await transaction.CommitAsync(ct);
 
                 _logger.LogInformation(
                     "RegisterEA: re-registered instance {InstanceId} (Id={Id}, Status=Active)",
@@ -261,7 +265,7 @@ public class RegisterEACommandHandler : IRequestHandler<RegisterEACommand, Respo
                 RegisteredAt     = DateTime.UtcNow,
             };
 
-            await dbContext.Set<Domain.Entities.EAInstance>().AddAsync(entity, cancellationToken);
+            await dbContext.Set<Domain.Entities.EAInstance>().AddAsync(entity, ct);
             await dbContext.SaveChangesAsync(cancellationToken);
             await transaction.CommitAsync(cancellationToken);
 
@@ -273,8 +277,9 @@ public class RegisterEACommandHandler : IRequestHandler<RegisterEACommand, Respo
         }
         catch
         {
-            await transaction.RollbackAsync(cancellationToken);
+            await transaction.RollbackAsync(ct);
             throw;
         }
+        }, cancellationToken);
     }
 }
