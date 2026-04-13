@@ -5,6 +5,7 @@ using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
+using LascodiaTradingEngine.Application.Services.Alerts;
 
 namespace LascodiaTradingEngine.Application.Workers;
 
@@ -140,6 +141,7 @@ public sealed class MLDirectionStreakWorker : BackgroundService
         int    windowSize   = await GetConfigAsync<int>   (readCtx, CK_Window,    30,      ct);
         double maxFraction  = await GetConfigAsync<double>(readCtx, CK_MaxFrac,   0.85,    ct);
         string alertDest    = await GetConfigAsync<string>(readCtx, CK_AlertDest, "ml-ops", ct);
+        int    alertCooldown = await GetConfigAsync<int>  (readCtx, AlertCooldownDefaults.CK_MLMonitoring, AlertCooldownDefaults.Default_MLMonitoring, ct);
 
         // Only select the columns needed for streak analysis — no need to load the
         // full model entity graph.
@@ -159,7 +161,7 @@ public sealed class MLDirectionStreakWorker : BackgroundService
             {
                 await CheckModelStreakAsync(
                     model.Id, model.Symbol, model.Timeframe,
-                    windowSize, maxFraction, alertDest,
+                    windowSize, maxFraction, alertDest, alertCooldown,
                     readCtx, writeCtx, ct);
             }
             catch (Exception ex)
@@ -185,6 +187,7 @@ public sealed class MLDirectionStreakWorker : BackgroundService
         int                                     windowSize,
         double                                  maxFraction,
         string                                  alertDest,
+        int                                     alertCooldown,
         Microsoft.EntityFrameworkCore.DbContext readCtx,
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
         CancellationToken                       ct)
@@ -294,11 +297,9 @@ public sealed class MLDirectionStreakWorker : BackgroundService
             {
                 AlertType        = AlertType.MLModelDegraded,
                 Symbol           = symbol,
-                Channel          = isSevere ? AlertChannel.Telegram : AlertChannel.Webhook,
-                Destination      = alertDest,
                 Severity         = isSevere ? AlertSeverity.High : AlertSeverity.Medium,
                 DeduplicationKey = dedupKey,
-                CooldownSeconds  = 3600,
+                CooldownSeconds  = alertCooldown,
                 ConditionJson    = System.Text.Json.JsonSerializer.Serialize(new
                 {
                     reason            = "direction_streak",

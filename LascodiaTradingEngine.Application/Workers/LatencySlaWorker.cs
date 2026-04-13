@@ -4,6 +4,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Options;
+using LascodiaTradingEngine.Application.Services.Alerts;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -246,12 +247,10 @@ public class LatencySlaWorker : BackgroundService
             var alert = new Alert
             {
                 AlertType        = AlertType.LatencySla,
-                Symbol           = slaName,
-                Channel          = severity >= AlertSeverity.High ? AlertChannel.Telegram : AlertChannel.Webhook,
-                Destination      = "ops-latency",
                 Severity         = severity,
                 DeduplicationKey = dedupKey,
-                CooldownSeconds  = 600,
+                CooldownSeconds  = await AlertCooldownDefaults.GetCooldownAsync(
+                    writeCtx.GetDbContext(), AlertCooldownDefaults.CK_Infrastructure, AlertCooldownDefaults.Default_Infrastructure, ct),
                 ConditionJson    = conditionJson,
                 IsActive         = true,
             };
@@ -260,7 +259,7 @@ public class LatencySlaWorker : BackgroundService
                              $"exceeds target {targetP99Ms}ms for {_options.ConsecutiveBreachMinutesBeforeAlert} " +
                              $"consecutive minutes. Severity={severity}.";
 
-            await alertDispatcher.DispatchBySeverityAsync(alert, message, ct);
+            await alertDispatcher.DispatchAsync(alert, message, ct);
         }
         catch (Exception ex)
         {

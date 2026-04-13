@@ -335,8 +335,6 @@ public sealed class MLFeaturePsiWorker : BackgroundService
         {
             Symbol        = model.Symbol,
             AlertType     = AlertType.MLModelDegraded,
-            Channel       = AlertChannel.Webhook,
-            Destination   = alertDest,
             ConditionJson = JsonSerializer.Serialize(new
             {
                 DetectorType     = "FeaturePSI",

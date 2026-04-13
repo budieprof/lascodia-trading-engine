@@ -9,13 +9,11 @@ using LascodiaTradingEngine.Domain.Enums;
 namespace LascodiaTradingEngine.Application.Services.Alerts.Channels;
 
 /// <summary>
-/// Delivers alert notifications via the Telegram Bot API to the chat_id stored in <see cref="Alert.Destination"/>.
-/// The bot token is read from <see cref="TelegramAlertOptions"/> (appsettings TelegramAlertOptions section).
-/// If the options are not configured (BotToken is empty) the sender logs a warning and skips delivery.
+/// Delivers alert notifications via the Telegram Bot API to the chat_id configured in
+/// <see cref="TelegramAlertOptions.ChatId"/>.
+/// If the options are not configured (BotToken or ChatId is empty) the sender logs a warning and skips delivery.
 /// </summary>
 /// <remarks>
-/// The Destination field on each Alert must contain the Telegram <c>chat_id</c>
-/// (numeric for users/groups, or @channelname for public channels).
 /// The bot must be invited to any group/channel before it can post.
 /// </remarks>
 [RegisterService(ServiceLifetime.Scoped, typeof(IAlertChannelSender))]
@@ -55,7 +53,7 @@ public class TelegramAlertSender : IAlertChannelSender
 
         var payload = new
         {
-            chat_id    = alert.Destination,
+            chat_id    = _options.ChatId,
             text       = text,
             parse_mode = "HTML"
         };
@@ -76,14 +74,14 @@ public class TelegramAlertSender : IAlertChannelSender
             {
                 _logger.LogDebug(
                     "TelegramAlertSender: alert {AlertId} delivered to chat_id={ChatId}",
-                    alert.Id, alert.Destination);
+                    alert.Id, _options.ChatId);
             }
         }
         catch (Exception ex)
         {
             _logger.LogError(ex,
                 "TelegramAlertSender: failed to send alert {AlertId} to chat_id={ChatId}",
-                alert.Id, alert.Destination);
+                alert.Id, _options.ChatId);
         }
     }
 

@@ -5,6 +5,7 @@ using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
+using LascodiaTradingEngine.Application.Services.Alerts;
 
 namespace LascodiaTradingEngine.Application.Workers;
 
@@ -74,6 +75,7 @@ public sealed class MLDriftAgreementWorker : BackgroundService
                 string alertDest = await GetConfigAsync<string>(ctx, CK_AlertDest, "ml-ops", stoppingToken);
                 int cusumWindowH = await GetConfigAsync<int>(ctx, CK_CusumWindowH, 24, stoppingToken);
                 int shiftWindowH = await GetConfigAsync<int>(ctx, CK_ShiftWindowH, 48, stoppingToken);
+                int alertCooldown = await GetConfigAsync<int>(ctx, AlertCooldownDefaults.CK_MLDrift, AlertCooldownDefaults.Default_MLDrift, stoppingToken);
 
                 var activeModels = await ctx.Set<MLModel>()
                     .Where(m => m.IsActive && !m.IsDeleted)
@@ -85,7 +87,7 @@ public sealed class MLDriftAgreementWorker : BackgroundService
                     stoppingToken.ThrowIfCancellationRequested();
                     await CheckAgreementAsync(
                         model, ctx, writeCtx, alertDest,
-                        cusumWindowH, shiftWindowH, stoppingToken);
+                        cusumWindowH, shiftWindowH, alertCooldown, stoppingToken);
                 }
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
@@ -113,6 +115,7 @@ public sealed class MLDriftAgreementWorker : BackgroundService
         string                                  alertDest,
         int                                     cusumWindowHours,
         int                                     shiftWindowHours,
+        int                                     alertCooldown,
         CancellationToken                       ct)
     {
         var symbol = model.Symbol;
@@ -179,8 +182,6 @@ public sealed class MLDriftAgreementWorker : BackgroundService
             {
                 Symbol        = symbol,
                 AlertType     = AlertType.MLModelDegraded,
-                Channel       = AlertChannel.Webhook,
-                Destination   = alertDest,
                 Severity      = AlertSeverity.Critical,
                 IsActive      = true,
                 ConditionJson = System.Text.Json.JsonSerializer.Serialize(new
@@ -192,7 +193,7 @@ public sealed class MLDriftAgreementWorker : BackgroundService
                     TotalDetectors    = 5,
                 }),
                 DeduplicationKey = $"drift-agreement:{symbol}:{tf}",
-                CooldownSeconds  = 21600, // 6 hours
+                CooldownSeconds  = alertCooldown,
             });
             await writeCtx.SaveChangesAsync(ct);
 
@@ -207,8 +208,6 @@ public sealed class MLDriftAgreementWorker : BackgroundService
             {
                 Symbol        = symbol,
                 AlertType     = AlertType.MLModelDegraded,
-                Channel       = AlertChannel.Webhook,
-                Destination   = alertDest,
                 Severity      = AlertSeverity.High,
                 IsActive      = true,
                 ConditionJson = System.Text.Json.JsonSerializer.Serialize(new
@@ -221,7 +220,7 @@ public sealed class MLDriftAgreementWorker : BackgroundService
                     Message           = "Model suppressed but no detectors firing — potential threshold miscalibration",
                 }),
                 DeduplicationKey = $"drift-agreement-anomaly:{symbol}:{tf}",
-                CooldownSeconds  = 43200, // 12 hours
+                CooldownSeconds  = alertCooldown * 2,
             });
             await writeCtx.SaveChangesAsync(ct);
 

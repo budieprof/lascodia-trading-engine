@@ -454,6 +454,7 @@ internal sealed class OptimizationApprovalCoordinator
                     alertDispatcher,
                     run.StrategyId,
                     strategy.Name,
+                    strategy.Symbol,
                     config.MaxConsecutiveFailuresBeforeEscalation,
                     config.CooldownDays,
                     ct);
@@ -475,6 +476,7 @@ internal sealed class OptimizationApprovalCoordinator
         IAlertDispatcher alertDispatcher,
         long strategyId,
         string strategyName,
+        string strategySymbol,
         int maxConsecutiveFailures,
         int baseCooldownDays,
         CancellationToken ct)
@@ -486,6 +488,7 @@ internal sealed class OptimizationApprovalCoordinator
             alertDispatcher,
             strategyId,
             strategyName,
+            strategySymbol,
             maxConsecutiveFailures,
             baseCooldownDays,
             ct);

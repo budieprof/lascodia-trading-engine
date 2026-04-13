@@ -436,7 +436,6 @@ public class OptimizationWorkerIntegrationTest : IClassFixture<PostgresFixture>
     private sealed class NoOpAlertDispatcher : IAlertDispatcher
     {
         public Task DispatchAsync(Alert alert, string message, CancellationToken ct) => Task.CompletedTask;
-        public Task DispatchBySeverityAsync(Alert alert, string message, CancellationToken ct) => Task.CompletedTask;
         public Task TryAutoResolveAsync(Alert alert, bool conditionStillActive, CancellationToken ct) => Task.CompletedTask;
     }
 

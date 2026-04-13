@@ -5,6 +5,7 @@ using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
+using LascodiaTradingEngine.Application.Services.Alerts;
 
 namespace LascodiaTradingEngine.Application.Workers;
 
@@ -67,6 +68,7 @@ public sealed class MLAlertFatigueWorker : BackgroundService
                 int minAlerts      = await GetConfigAsync<int>(ctx, CK_MinAlerts, 20, stoppingToken);
                 double minAction   = await GetConfigAsync<double>(ctx, CK_MinActionRatio, 0.20, stoppingToken);
                 string alertDest   = await GetConfigAsync<string>(ctx, CK_AlertDest, "ml-ops", stoppingToken);
+                int alertCooldown  = await GetConfigAsync<int>(ctx, AlertCooldownDefaults.CK_MLEscalation, AlertCooldownDefaults.Default_MLEscalation, stoppingToken);
 
                 var windowStart = DateTime.UtcNow.AddDays(-windowDays);
 
@@ -108,10 +110,7 @@ public sealed class MLAlertFatigueWorker : BackgroundService
 
                     writeCtx.Set<Alert>().Add(new Alert
                     {
-                        Symbol           = "SYSTEM",
                         AlertType        = AlertType.MLModelDegraded,
-                        Channel          = AlertChannel.Webhook,
-                        Destination      = alertDest,
                         Severity         = AlertSeverity.High,
                         IsActive         = true,
                         ConditionJson    = System.Text.Json.JsonSerializer.Serialize(new
@@ -123,7 +122,7 @@ public sealed class MLAlertFatigueWorker : BackgroundService
                             WindowDays        = windowDays,
                         }),
                         DeduplicationKey = "ml-alert-fatigue",
-                        CooldownSeconds  = 86400, // 24 hours
+                        CooldownSeconds  = alertCooldown,
                     });
                     await writeCtx.SaveChangesAsync(stoppingToken);
 

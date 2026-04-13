@@ -393,8 +393,6 @@ public sealed class MLDataQualityWorker : BackgroundService
         {
             AlertType     = AlertType.DataQualityIssue,
             Symbol        = symbol,
-            Channel       = AlertChannel.Webhook,
-            Destination   = alertDest,
             ConditionJson = conditionJson,
             IsActive      = true,
         });

@@ -9,9 +9,10 @@ using LascodiaTradingEngine.Domain.Enums;
 namespace LascodiaTradingEngine.Application.Services.Alerts.Channels;
 
 /// <summary>
-/// Delivers alert notifications by HTTP POST to the URL stored in <see cref="Alert.Destination"/>.
+/// Delivers alert notifications by HTTP POST to the URL configured in <see cref="WebhookAlertOptions.Url"/>.
 /// The request body is a JSON object with Symbol, AlertType, Message, and Timestamp.
 /// An optional <c>X-Lascodia-Secret</c> header is included when <see cref="WebhookAlertOptions.SharedSecret"/> is set.
+/// If the URL is not configured, the sender logs a warning and skips delivery.
 /// </summary>
 [RegisterService(ServiceLifetime.Scoped, typeof(IAlertChannelSender))]
 public class WebhookAlertSender : IAlertChannelSender
@@ -34,6 +35,15 @@ public class WebhookAlertSender : IAlertChannelSender
 
     public async Task SendAsync(Alert alert, string message, CancellationToken ct)
     {
+        if (!_options.IsConfigured)
+        {
+            _logger.LogWarning(
+                "WebhookAlertSender: Url is not configured — skipping delivery for alert {AlertId}. " +
+                "Set WebhookAlertOptions.Url in appsettings.json.",
+                alert.Id);
+            return;
+        }
+
         var client = _httpClientFactory.CreateClient("AlertWebhook");
 
         var payload = new
@@ -45,7 +55,7 @@ public class WebhookAlertSender : IAlertChannelSender
             Timestamp = DateTime.UtcNow
         };
 
-        using var request = new HttpRequestMessage(HttpMethod.Post, alert.Destination);
+        using var request = new HttpRequestMessage(HttpMethod.Post, _options.Url);
         request.Content = JsonContent.Create(payload);
 
         if (!string.IsNullOrWhiteSpace(_options.SharedSecret))
@@ -58,20 +68,20 @@ public class WebhookAlertSender : IAlertChannelSender
             {
                 _logger.LogWarning(
                     "WebhookAlertSender: POST to {Url} returned {StatusCode} for alert {AlertId}",
-                    alert.Destination, (int)response.StatusCode, alert.Id);
+                    _options.Url, (int)response.StatusCode, alert.Id);
             }
             else
             {
                 _logger.LogDebug(
                     "WebhookAlertSender: alert {AlertId} delivered to {Url}",
-                    alert.Id, alert.Destination);
+                    alert.Id, _options.Url);
             }
         }
         catch (Exception ex)
         {
             _logger.LogError(ex,
                 "WebhookAlertSender: failed to POST alert {AlertId} to {Url}",
-                alert.Id, alert.Destination);
+                alert.Id, _options.Url);
         }
     }
 }

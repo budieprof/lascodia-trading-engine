@@ -173,8 +173,6 @@ public sealed class LatencyAwareMLSignalScorer : IMLSignalScorer
             {
                 AlertType     = AlertType.MLModelDegraded,
                 Symbol        = symbol,
-                Channel       = AlertChannel.Webhook,
-                Destination   = string.Empty,
                 ConditionJson = JsonSerializer.Serialize(new
                 {
                     Reason          = "inference_latency_sla",

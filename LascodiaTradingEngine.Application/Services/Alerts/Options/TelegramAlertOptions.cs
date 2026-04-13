@@ -7,17 +7,19 @@ namespace LascodiaTradingEngine.Application.Services.Alerts.Options;
 /// Bound from the <c>TelegramAlertOptions</c> section in appsettings.json.
 /// </summary>
 /// <remarks>
-/// The <see cref="Alert.Destination"/> field on each alert stores the target <c>chat_id</c>
-/// (a user, group, or channel ID). The bot must be a member of any group/channel it posts to.
 /// Obtain a token from @BotFather on Telegram.
+/// The bot must be a member of any group/channel it posts to.
 /// </remarks>
 public class TelegramAlertOptions : ConfigurationOption<TelegramAlertOptions>
 {
     /// <summary>Telegram bot token issued by @BotFather (e.g. "123456:ABC-DEF...").</summary>
     public string BotToken { get; set; } = string.Empty;
 
+    /// <summary>Target chat_id (numeric for users/groups, or @channelname for public channels).</summary>
+    public string ChatId { get; set; } = string.Empty;
+
     /// <summary>Request timeout in seconds for Telegram API calls. Defaults to 10.</summary>
     public int TimeoutSeconds { get; set; } = 10;
 
-    public bool IsConfigured => !string.IsNullOrWhiteSpace(BotToken);
+    public bool IsConfigured => !string.IsNullOrWhiteSpace(BotToken) && !string.IsNullOrWhiteSpace(ChatId);
 }

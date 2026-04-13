@@ -314,8 +314,6 @@ public sealed class MLFeatureImportanceTrendWorker : BackgroundService
             {
                 AlertType     = AlertType.MLModelDegraded,
                 Symbol        = symbol,
-                Channel       = AlertChannel.Webhook,
-                Destination   = "ml-ops",
                 ConditionJson = System.Text.Json.JsonSerializer.Serialize(new
                 {
                     reason           = "feature_importance_monotone_decay",

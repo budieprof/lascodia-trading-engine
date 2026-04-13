@@ -538,7 +538,6 @@ public class SignalOrderBridgeWorker : BackgroundService, IIntegrationEventHandl
             var alert = new Domain.Entities.Alert
             {
                 AlertType = AlertType.DataQualityIssue,
-                Channel   = AlertChannel.Webhook,
                 IsActive  = true,
             };
 

@@ -23,11 +23,14 @@ public class EmailAlertOptions : ConfigurationOption<EmailAlertOptions>
     /// <summary>Whether to use SSL/TLS. Defaults to <c>true</c>.</summary>
     public bool EnableSsl { get; set; } = true;
 
+    /// <summary>The recipient email address for alert notifications.</summary>
+    public string ToAddress { get; set; } = string.Empty;
+
     /// <summary>The From address that appears in the email header.</summary>
     public string FromAddress { get; set; } = "alerts@lascodia.com";
 
     /// <summary>The display name that accompanies <see cref="FromAddress"/>.</summary>
     public string FromName { get; set; } = "Lascodia Trading Engine";
 
-    public bool IsConfigured => !string.IsNullOrWhiteSpace(Host) && !string.IsNullOrWhiteSpace(FromAddress);
+    public bool IsConfigured => !string.IsNullOrWhiteSpace(Host) && !string.IsNullOrWhiteSpace(FromAddress) && !string.IsNullOrWhiteSpace(ToAddress);
 }

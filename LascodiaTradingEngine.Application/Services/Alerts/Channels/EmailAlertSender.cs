@@ -10,9 +10,9 @@ using LascodiaTradingEngine.Domain.Enums;
 namespace LascodiaTradingEngine.Application.Services.Alerts.Channels;
 
 /// <summary>
-/// Delivers alert notifications by SMTP email to the address stored in <see cref="Alert.Destination"/>.
+/// Delivers alert notifications by SMTP email to the address configured in <see cref="EmailAlertOptions.ToAddress"/>.
 /// SMTP credentials are read from <see cref="EmailAlertOptions"/> (appsettings EmailAlertOptions section).
-/// If the options are not configured (Host is empty) the sender logs a warning and skips delivery.
+/// If the options are not configured (Host, FromAddress, or ToAddress is empty) the sender logs a warning and skips delivery.
 /// </summary>
 [RegisterService(ServiceLifetime.Scoped, typeof(IAlertChannelSender))]
 public class EmailAlertSender : IAlertChannelSender
@@ -61,20 +61,20 @@ public class EmailAlertSender : IAlertChannelSender
             Body       = body,
             IsBodyHtml = false
         };
-        mailMessage.To.Add(alert.Destination);
+        mailMessage.To.Add(_options.ToAddress);
 
         try
         {
             await smtpClient.SendMailAsync(mailMessage, ct);
             _logger.LogDebug(
                 "EmailAlertSender: alert {AlertId} delivered to {Destination}",
-                alert.Id, alert.Destination);
+                alert.Id, _options.ToAddress);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex,
                 "EmailAlertSender: failed to send alert {AlertId} to {Destination}",
-                alert.Id, alert.Destination);
+                alert.Id, _options.ToAddress);
         }
     }
 

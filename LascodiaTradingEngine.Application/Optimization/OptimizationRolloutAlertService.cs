@@ -4,6 +4,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Services.Alerts;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -52,14 +53,13 @@ public sealed class OptimizationRolloutAlertService
 
         var alert = existingAlert ?? new Alert();
         alert.AlertType = AlertType.OptimizationLifecycleIssue;
-        alert.Symbol = $"Strategy:{strategy.Id}:Rollout";
-        alert.Channel = AlertChannel.Webhook;
-        alert.Destination = string.Empty;
+        alert.Symbol = strategy.Symbol;
         alert.Severity = AlertSeverity.High;
         alert.IsActive = true;
         alert.LastTriggeredAt = nowUtc;
         alert.DeduplicationKey = deduplicationKey;
-        alert.CooldownSeconds = (int)TimeSpan.FromHours(6).TotalSeconds;
+        alert.CooldownSeconds = await AlertCooldownDefaults.GetCooldownAsync(
+            writeDb, AlertCooldownDefaults.CK_Optimization, AlertCooldownDefaults.Default_Optimization, ct);
         alert.ConditionJson = JsonSerializer.Serialize(new
         {
             Type = "RolloutEvaluationFailure",
@@ -77,7 +77,7 @@ public sealed class OptimizationRolloutAlertService
 
         try
         {
-            await _alertDispatcher.DispatchBySeverityAsync(alert, message, ct);
+            await _alertDispatcher.DispatchAsync(alert, message, ct);
         }
         catch (Exception dispatchEx)
         {

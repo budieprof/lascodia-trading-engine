@@ -3,19 +3,16 @@ using LascodiaTradingEngine.Domain.Entities;
 namespace LascodiaTradingEngine.Application.Common.Interfaces;
 
 /// <summary>
-/// Coordinates alert dispatch across configured channels (Webhook, Email, Telegram)
-/// with deduplication and severity-based routing.
+/// Coordinates alert dispatch across all registered channels (Webhook, Email, Telegram)
+/// with deduplication.
 /// </summary>
 public interface IAlertDispatcher
 {
-    /// <summary>Dispatches an alert to the channel configured on the alert entity.</summary>
-    Task DispatchAsync(Alert alert, string message, CancellationToken ct);
-
     /// <summary>
-    /// Dispatches an alert to channels determined by severity tier with deduplication.
-    /// Critical/High -> Telegram + Webhook; Medium -> Webhook; Info -> Webhook (low priority).
+    /// Broadcasts an alert to all registered <see cref="IAlertChannelSender"/> implementations
+    /// with deduplication based on <see cref="Alert.DeduplicationKey"/> and <see cref="Alert.CooldownSeconds"/>.
     /// </summary>
-    Task DispatchBySeverityAsync(Alert alert, string message, CancellationToken ct);
+    Task DispatchAsync(Alert alert, string message, CancellationToken ct);
 
     /// <summary>
     /// Auto-resolves an alert when the triggering condition clears. Sets AutoResolvedAt

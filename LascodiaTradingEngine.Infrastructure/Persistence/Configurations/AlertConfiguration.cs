@@ -16,9 +16,7 @@ public class AlertConfiguration : IEntityTypeConfiguration<Alert>
         builder.Property(x => x.Id).ValueGeneratedOnAdd();
 
         builder.Property(x => x.AlertType).HasConversion<string>().IsRequired().HasMaxLength(30);
-        builder.Property(x => x.Channel).HasConversion<string>().IsRequired().HasMaxLength(30);
-        builder.Property(x => x.Symbol).IsRequired().HasMaxLength(10);
-        builder.Property(x => x.Destination).IsRequired().HasMaxLength(500);
+        builder.Property(x => x.Symbol).HasMaxLength(10);
         builder.Property(x => x.ConditionJson).IsRequired().HasMaxLength(1000);
 
         builder.Property(x => x.Severity).HasConversion<string>().HasMaxLength(10);

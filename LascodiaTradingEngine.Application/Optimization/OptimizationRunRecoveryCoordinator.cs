@@ -264,7 +264,7 @@ internal sealed class OptimizationRunRecoveryCoordinator
         try
         {
                 bool recentAlertExists = await writeDb.Set<Alert>()
-                    .AnyAsync(a => a.Symbol == "OptimizationWorker:DeadLetter"
+                    .AnyAsync(a => a.DeduplicationKey == "OptimizationWorker:DeadLetter"
                                && a.LastTriggeredAt != null
                                && a.LastTriggeredAt >= alertCutoffUtc
                                && !a.IsDeleted, ct);
@@ -281,10 +281,8 @@ internal sealed class OptimizationRunRecoveryCoordinator
                 var alert = new Alert
                 {
                 AlertType = AlertType.OptimizationLifecycleIssue,
-                Symbol = "OptimizationWorker:DeadLetter",
-                Channel = AlertChannel.Webhook,
-                Destination = string.Empty,
                 Severity = AlertSeverity.High,
+                DeduplicationKey = "OptimizationWorker:DeadLetter",
                 IsActive = true,
                 LastTriggeredAt = nowUtc,
                 ConditionJson = JsonSerializer.Serialize(new
@@ -298,7 +296,7 @@ internal sealed class OptimizationRunRecoveryCoordinator
             writeDb.Set<Alert>().Add(alert);
             await writeCtx.SaveChangesAsync(ct);
 
-            await alertDispatcher.DispatchBySeverityAsync(
+            await alertDispatcher.DispatchAsync(
                 alert,
                 $"{abandoned} optimization run(s) permanently failed after {maxRetryAttempts} retries — moved to dead-letter queue",
                 ct);

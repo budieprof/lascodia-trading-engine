@@ -6,6 +6,7 @@ using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.AuditTrail.Commands.LogDecision;
 using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Services.Alerts;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -14,7 +15,6 @@ namespace LascodiaTradingEngine.Application.Optimization;
 [RegisterService(Microsoft.Extensions.DependencyInjection.ServiceLifetime.Singleton)]
 public sealed class OptimizationChronicFailureEscalator
 {
-    private const int ChronicFailureAlertCooldownSeconds = 24 * 60 * 60;
 
     private readonly ILogger<OptimizationChronicFailureEscalator> _logger;
     private readonly TimeProvider _timeProvider;
@@ -36,6 +36,7 @@ public sealed class OptimizationChronicFailureEscalator
         IAlertDispatcher alertDispatcher,
         long strategyId,
         string strategyName,
+        string strategySymbol,
         int maxConsecutiveFailures,
         int baseCooldownDays,
         CancellationToken ct)
@@ -74,8 +75,11 @@ public sealed class OptimizationChronicFailureEscalator
         var existingAlert = await writeDb.Set<Alert>()
             .FirstOrDefaultAsync(a => a.DeduplicationKey == deduplicationKey && !a.IsDeleted, ct);
 
+        int alertCooldown = await AlertCooldownDefaults.GetCooldownAsync(
+            writeDb, AlertCooldownDefaults.CK_OptimizationEscalation, AlertCooldownDefaults.Default_OptimizationEscalation, ct);
+
         if (existingAlert?.LastTriggeredAt is DateTime lastTriggeredAt
-            && lastTriggeredAt >= nowUtc.AddSeconds(-Math.Max(existingAlert.CooldownSeconds, ChronicFailureAlertCooldownSeconds)))
+            && lastTriggeredAt >= nowUtc.AddSeconds(-Math.Max(existingAlert.CooldownSeconds, alertCooldown)))
         {
             _logger.LogDebug(
                 "OptimizationWorker: suppressed duplicate chronic failure alert for strategy {Id} ({Name}) within cooldown window",
@@ -87,9 +91,7 @@ public sealed class OptimizationChronicFailureEscalator
         string alertMessage = $"Strategy '{strategyName}' (ID={strategyId}) has failed auto-approval {consecutiveFailures} consecutive times. Manual parameter review recommended. Cooldown extended to {baseCooldownDays * 2} days to reduce compute waste.";
         var alert = existingAlert ?? new Alert();
         alert.AlertType = AlertType.OptimizationLifecycleIssue;
-        alert.Symbol = $"Strategy:{strategyId}";
-        alert.Channel = AlertChannel.Webhook;
-        alert.Destination = string.Empty;
+        alert.Symbol = strategySymbol;
         alert.ConditionJson = JsonSerializer.Serialize(new
         {
             Type = "ChronicOptimizationFailure",
@@ -102,7 +104,7 @@ public sealed class OptimizationChronicFailureEscalator
         alert.IsActive = true;
         alert.LastTriggeredAt = nowUtc;
         alert.DeduplicationKey = deduplicationKey;
-        alert.CooldownSeconds = ChronicFailureAlertCooldownSeconds;
+        alert.CooldownSeconds = alertCooldown;
 
         if (existingAlert is null)
             writeDb.Set<Alert>().Add(alert);
@@ -111,7 +113,7 @@ public sealed class OptimizationChronicFailureEscalator
 
         try
         {
-            await alertDispatcher.DispatchBySeverityAsync(alert, alertMessage, ct);
+            await alertDispatcher.DispatchAsync(alert, alertMessage, ct);
         }
         catch (Exception ex)
         {

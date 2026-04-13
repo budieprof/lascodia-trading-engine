@@ -258,10 +258,7 @@ public class WorkerHealthMonitor : IWorkerHealthMonitor
                         var crashAlert = new Alert
                         {
                             AlertType     = AlertType.WorkerCrash,
-                            Channel       = AlertChannel.Webhook,
                             Severity      = AlertSeverity.Critical,
-                            Symbol        = "SYSTEM",
-                            Destination   = string.Empty,
                             IsActive      = true,
                             ConditionJson = JsonSerializer.Serialize(new
                             {
@@ -279,7 +276,7 @@ public class WorkerHealthMonitor : IWorkerHealthMonitor
 
                         var alertMessage = $"Worker {name} has crashed — no heartbeat for {elapsedSeconds:F0}s " +
                                            $"(threshold: {staleThresholdSecs}s, consecutive failures: {consecutiveFailures})";
-                        await _alertDispatcher.DispatchBySeverityAsync(crashAlert, alertMessage, cancellationToken);
+                        await _alertDispatcher.DispatchAsync(crashAlert, alertMessage, cancellationToken);
                     }
                     catch (Exception alertEx)
                     {

@@ -168,8 +168,6 @@ public sealed class MLTrainingRunHealthWorker : BackgroundService
                 {
                     AlertType     = AlertType.MLModelDegraded,
                     Symbol        = run.Symbol,
-                    Channel       = AlertChannel.Webhook,
-                    Destination   = alertDest,
                     ConditionJson = System.Text.Json.JsonSerializer.Serialize(new
                     {
                         reason         = "training_run_stalled",
@@ -299,8 +297,6 @@ public sealed class MLTrainingRunHealthWorker : BackgroundService
         {
             AlertType     = AlertType.MLModelDegraded,
             Symbol        = symbol,
-            Channel       = AlertChannel.Webhook,
-            Destination   = alertDest,
             ConditionJson = System.Text.Json.JsonSerializer.Serialize(new
             {
                 reason             = "training_run_high_failure_rate",

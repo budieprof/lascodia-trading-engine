@@ -6,12 +6,11 @@ namespace LascodiaTradingEngine.Application.Services.Alerts.Options;
 /// HTTP configuration for the Webhook alert channel.
 /// Bound from the <c>WebhookAlertOptions</c> section in appsettings.json.
 /// </summary>
-/// <remarks>
-/// The <see cref="Alert.Destination"/> field on each alert stores the full callback URL
-/// that will receive a POST request when the alert fires.
-/// </remarks>
 public class WebhookAlertOptions : ConfigurationOption<WebhookAlertOptions>
 {
+    /// <summary>The URL that will receive POST requests when alerts fire.</summary>
+    public string Url { get; set; } = string.Empty;
+
     /// <summary>Request timeout in seconds for outbound webhook calls. Defaults to 30.</summary>
     public int TimeoutSeconds { get; set; } = 30;
 
@@ -21,4 +20,6 @@ public class WebhookAlertOptions : ConfigurationOption<WebhookAlertOptions>
     /// Leave empty to omit the header.
     /// </summary>
     public string SharedSecret { get; set; } = string.Empty;
+
+    public bool IsConfigured => !string.IsNullOrWhiteSpace(Url);
 }

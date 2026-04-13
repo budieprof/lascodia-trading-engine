@@ -6,6 +6,7 @@ using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
+using LascodiaTradingEngine.Application.Services.Alerts;
 
 namespace LascodiaTradingEngine.Application.Workers;
 
@@ -72,8 +73,9 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
                 double maxEce          = await GetConfigAsync<double>(readCtx, CK_MaxEce,           0.15, stoppingToken);
                 double degradeDelta    = await GetConfigAsync<double>(readCtx, CK_DegradationDelta, 0.05, stoppingToken);
                 string alertDest       = await GetConfigAsync<string>(readCtx, CK_AlertDestination, "",   stoppingToken);
+                int    alertCooldown   = await GetConfigAsync<int>   (readCtx, AlertCooldownDefaults.CK_MLMonitoring, AlertCooldownDefaults.Default_MLMonitoring, stoppingToken);
 
-                await CheckAllModelsAsync(readCtx, writeCtx, windowDays, maxEce, degradeDelta, alertDest, stoppingToken);
+                await CheckAllModelsAsync(readCtx, writeCtx, windowDays, maxEce, degradeDelta, alertDest, alertCooldown, stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -99,6 +101,7 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
         double            maxEce,
         double            degradeDelta,
         string            alertDest,
+        int               alertCooldown,
         CancellationToken ct)
     {
         var activeModels = await readCtx.Set<MLModel>()
@@ -115,7 +118,7 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
         foreach (var model in activeModels)
         {
             ct.ThrowIfCancellationRequested();
-            anyChange |= await CheckModelEceAsync(model, readCtx, writeCtx, windowDays, maxEce, degradeDelta, alertDest, ct);
+            anyChange |= await CheckModelEceAsync(model, readCtx, writeCtx, windowDays, maxEce, degradeDelta, alertDest, alertCooldown, ct);
         }
 
         if (anyChange)
@@ -130,6 +133,7 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
         double            maxEce,
         double            degradeDelta,
         string            alertDest,
+        int               alertCooldown,
         CancellationToken ct)
     {
         var windowStart = DateTime.UtcNow.AddDays(-windowDays);
@@ -217,8 +221,6 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
             {
                 Symbol        = symbol,
                 AlertType     = AlertType.MLModelDegraded,
-                Channel       = AlertChannel.Webhook,
-                Destination   = alertDest,
                 ConditionJson = JsonSerializer.Serialize(new
                 {
                     ModelId   = model.Id,
@@ -229,7 +231,7 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
                     Reason    = "ECE exceeds threshold",
                 }),
                 DeduplicationKey = $"MLCalibration:ECE:{symbol}:{tf}",
-                CooldownSeconds  = 3600,
+                CooldownSeconds  = alertCooldown,
             });
 
             anyAlert = true;
@@ -249,8 +251,6 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
             {
                 Symbol        = symbol,
                 AlertType     = AlertType.MLModelDegraded,
-                Channel       = AlertChannel.Webhook,
-                Destination   = alertDest,
                 ConditionJson = JsonSerializer.Serialize(new
                 {
                     ModelId      = model.Id,
@@ -262,7 +262,7 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
                     Reason       = "Calibration degrading",
                 }),
                 DeduplicationKey = $"MLCalibration:Degrade:{symbol}:{tf}",
-                CooldownSeconds  = 3600,
+                CooldownSeconds  = alertCooldown,
             });
 
             anyAlert = true;

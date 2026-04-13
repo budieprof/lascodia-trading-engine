@@ -318,8 +318,6 @@ public sealed class MLSignalFunnelWorker : BackgroundService
         {
             AlertType     = AlertType.MLModelDegraded,
             Symbol        = symbol,
-            Channel       = AlertChannel.Webhook,
-            Destination   = alertDest,
             ConditionJson = System.Text.Json.JsonSerializer.Serialize(new
             {
                 reason,

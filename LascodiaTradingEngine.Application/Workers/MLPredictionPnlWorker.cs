@@ -269,8 +269,6 @@ public sealed class MLPredictionPnlWorker : BackgroundService
             {
                 AlertType     = AlertType.MLModelDegraded,
                 Symbol        = model.Symbol,
-                Channel       = AlertChannel.Webhook,
-                Destination   = "ml-ops",
                 ConditionJson = System.Text.Json.JsonSerializer.Serialize(new
                 {
                     reason           = "pnl_sharpe_degradation",

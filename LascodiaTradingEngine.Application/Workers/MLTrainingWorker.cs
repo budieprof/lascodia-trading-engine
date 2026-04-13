@@ -1728,8 +1728,6 @@ public sealed class MLTrainingWorker : BackgroundService
             {
                 AlertType     = AlertType.MLModelDegraded,
                 Symbol        = run.Symbol,
-                Channel       = AlertChannel.Webhook,
-                Destination   = destination,
                 ConditionJson = JsonSerializer.Serialize(new
                 {
                     reason    = "consecutive_training_failures",

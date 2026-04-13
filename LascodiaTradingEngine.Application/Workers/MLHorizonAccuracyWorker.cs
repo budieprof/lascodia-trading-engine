@@ -351,8 +351,6 @@ public sealed class MLHorizonAccuracyWorker : BackgroundService
                     {
                         AlertType     = AlertType.MLModelDegraded,
                         Symbol        = symbol,
-                        Channel       = AlertChannel.Webhook,
-                        Destination   = alertDest,
                         ConditionJson = System.Text.Json.JsonSerializer.Serialize(new
                         {
                             reason                = "horizon_accuracy_gap",

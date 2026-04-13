@@ -245,7 +245,6 @@ public sealed class MLCorrelatedFailureWorker : BackgroundService
                 writeCtx.Set<Alert>().Add(new Alert
                 {
                     AlertType      = AlertType.SystemicMLDegradation,
-                    Symbol         = string.Empty,
                     ConditionJson  = JsonSerializer.Serialize(new
                     {
                         Message  = $"Systemic ML degradation detected: {failingCount}/{modelsWithEnoughPredictions} models failing ({failureRatio:P1}). Training pause activated.",

@@ -379,8 +379,6 @@ public sealed class MLCusumDriftWorker : BackgroundService
         {
             Symbol        = model.Symbol,
             AlertType     = AlertType.MLModelDegraded,
-            Channel       = AlertChannel.Webhook,
-            Destination   = alertDest,
             ConditionJson = System.Text.Json.JsonSerializer.Serialize(new
             {
                 DetectorType   = "CUSUM",

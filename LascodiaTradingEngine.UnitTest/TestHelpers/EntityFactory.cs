@@ -118,8 +118,6 @@ public static class EntityFactory
             Id = NextId(),
             Symbol = symbol,
             AlertType = AlertType.PriceLevel,
-            Channel = AlertChannel.Webhook,
-            Destination = "https://example.com/webhook",
             Severity = severity,
             IsActive = true,
             ConditionJson = "{}"

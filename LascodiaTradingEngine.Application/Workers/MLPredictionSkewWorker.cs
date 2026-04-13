@@ -268,8 +268,6 @@ public sealed class MLPredictionSkewWorker : BackgroundService
             {
                 AlertType     = AlertType.MLModelDegraded,
                 Symbol        = model.Symbol,
-                Channel       = AlertChannel.Webhook,
-                Destination   = "ml-ops",
                 ConditionJson = System.Text.Json.JsonSerializer.Serialize(new
                 {
                     reason          = "prediction_direction_skew",

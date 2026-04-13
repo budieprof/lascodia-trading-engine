@@ -168,9 +168,7 @@ public sealed class RiskCheckerPipeline : IRiskChecker
             var alert = new Alert
             {
                 AlertType = AlertType.DrawdownBreached,
-                Channel   = AlertChannel.Webhook,
                 Severity  = AlertSeverity.Critical,
-                Symbol    = "SYSTEM",
                 ConditionJson = System.Text.Json.JsonSerializer.Serialize(new
                 {
                     source = "RiskCheckerCircuitBreaker",
@@ -181,7 +179,7 @@ public sealed class RiskCheckerPipeline : IRiskChecker
                 IsActive = true,
             };
 
-            await _alertDispatcher.DispatchBySeverityAsync(alert, message, ct);
+            await _alertDispatcher.DispatchAsync(alert, message, ct);
         }
         catch (Exception alertEx)
         {

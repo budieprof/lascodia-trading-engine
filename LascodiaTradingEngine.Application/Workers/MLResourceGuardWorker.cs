@@ -175,8 +175,6 @@ public sealed class MLResourceGuardWorker : BackgroundService
                     {
                         AlertType     = AlertType.MLModelDegraded,
                         Symbol        = run.Symbol,
-                        Channel       = AlertChannel.Webhook,
-                        Destination   = alertDest,
                         ConditionJson = JsonSerializer.Serialize(new
                         {
                             reason         = "resource_guard_timeout",
@@ -233,21 +231,17 @@ public sealed class MLResourceGuardWorker : BackgroundService
 
         // Deduplicate: only one active memory-pressure alert at a time.
         bool alertExists = await readCtx.Set<Alert>()
-            .AnyAsync(a => a.Symbol    == string.Empty                    &&
-                           a.AlertType == AlertType.MLModelDegraded       &&
-                           a.IsActive  && !a.IsDeleted                    &&
-                           a.ConditionJson.Contains("resource_guard_memory"), ct);
+            .AnyAsync(a => a.DeduplicationKey == "resource-guard-memory"  &&
+                           a.IsActive  && !a.IsDeleted, ct);
 
         if (alertExists)
             return;
 
         writeCtx.Set<Alert>().Add(new Alert
         {
-            AlertType     = AlertType.MLModelDegraded,
-            Symbol        = string.Empty,
-            Channel       = AlertChannel.Webhook,
-            Destination   = alertDest,
-            ConditionJson = JsonSerializer.Serialize(new
+            AlertType        = AlertType.MLModelDegraded,
+            DeduplicationKey = "resource-guard-memory",
+            ConditionJson    = JsonSerializer.Serialize(new
             {
                 reason      = "resource_guard_memory",
                 severity    = "warning",

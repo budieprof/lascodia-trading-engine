@@ -7,6 +7,7 @@ using LascodiaTradingEngine.Application.Backtesting.Models;
 using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Services.Alerts;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -74,6 +75,8 @@ public sealed class OptimizationFollowUpCoordinator
         var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
         var writeDb = writeCtx.GetDbContext();
         var nowUtc = UtcNow;
+        int alertCooldown = await AlertCooldownDefaults.GetCooldownAsync(
+            writeDb, AlertCooldownDefaults.CK_Optimization, AlertCooldownDefaults.Default_Optimization, ct);
         decimal defaultMinBacktestHealthScore = config.AutoApprovalMinHealthScore * 0.80m;
         int defaultMinCandidateTrades = config.MinCandidateTrades;
         decimal defaultMaxWalkForwardCv = (decimal)config.MaxCvCoefficientOfVariation;
@@ -218,7 +221,7 @@ public sealed class OptimizationFollowUpCoordinator
                     nowUtc);
                 _metrics.OptimizationFollowUpDeferredChecks.Add(1);
                 await DetectAndAlertOnStuckFollowUpsAsync(
-                    writeDb, writeCtx, run, backtestRun, wfRun, ct,
+                    writeDb, writeCtx, run, backtestRun, wfRun, alertCooldown, ct,
                     config.FollowUpStuckThresholdHours);
                 await writeCtx.SaveChangesAsync(ct);
                 continue;
@@ -254,7 +257,7 @@ public sealed class OptimizationFollowUpCoordinator
                 _metrics.OptimizationFollowUpFailures.Add(1);
 
                 followUpAlert = await writeDb.Set<Alert>()
-                    .FirstOrDefaultAsync(a => a.Symbol == BuildFollowUpFailureAlertSymbol(run.Id) && !a.IsDeleted, ct);
+                    .FirstOrDefaultAsync(a => a.DeduplicationKey == BuildFollowUpFailureDedupKey(run.Id) && !a.IsDeleted, ct);
 
                 if (followUpAlert is null)
                 {
@@ -264,8 +267,10 @@ public sealed class OptimizationFollowUpCoordinator
 
                 followUpAlertMessage = PopulateFollowUpFailureAlert(
                     followUpAlert,
+                    alertCooldown,
                     run.Id,
                     run.StrategyId,
+                    strategyLookup.GetValueOrDefault(run.StrategyId)?.Symbol,
                     backtestRun.Status,
                     wfRun.Status,
                     backtestQualityOk,
@@ -295,7 +300,7 @@ public sealed class OptimizationFollowUpCoordinator
             {
                 try
                 {
-                    await _alertDispatcher.DispatchBySeverityAsync(followUpAlert, followUpAlertMessage, ct);
+                    await _alertDispatcher.DispatchAsync(followUpAlert, followUpAlertMessage, ct);
                 }
                 catch (Exception ex)
                 {
@@ -516,7 +521,7 @@ public sealed class OptimizationFollowUpCoordinator
         _metrics.OptimizationFollowUpFailures.Add(1);
 
         var alert = await writeDb.Set<Alert>()
-            .FirstOrDefaultAsync(a => a.Symbol == BuildFollowUpFailureAlertSymbol(run.Id) && !a.IsDeleted, ct);
+            .FirstOrDefaultAsync(a => a.DeduplicationKey == BuildFollowUpFailureDedupKey(run.Id) && !a.IsDeleted, ct);
 
         if (alert is null)
         {
@@ -524,10 +529,18 @@ public sealed class OptimizationFollowUpCoordinator
             writeDb.Set<Alert>().Add(alert);
         }
 
+        int alertCooldown = await AlertCooldownDefaults.GetCooldownAsync(
+            writeDb, AlertCooldownDefaults.CK_Optimization, AlertCooldownDefaults.Default_Optimization, ct);
+        string? strategySymbol = await writeDb.Set<Strategy>()
+            .Where(s => s.Id == run.StrategyId && !s.IsDeleted)
+            .Select(s => s.Symbol)
+            .FirstOrDefaultAsync(ct);
         string alertMessage = PopulateFollowUpFailureAlert(
             alert,
+            alertCooldown,
             run.Id,
             run.StrategyId,
+            strategySymbol,
             RunStatus.Failed,
             RunStatus.Failed,
             backtestQualityOk: false,
@@ -544,7 +557,7 @@ public sealed class OptimizationFollowUpCoordinator
 
         try
         {
-            await _alertDispatcher.DispatchBySeverityAsync(alert, alertMessage, ct);
+            await _alertDispatcher.DispatchAsync(alert, alertMessage, ct);
         }
         catch (Exception ex)
         {
@@ -560,13 +573,15 @@ public sealed class OptimizationFollowUpCoordinator
         }
     }
 
-    internal static string BuildFollowUpFailureAlertSymbol(long optimizationRunId)
+    internal static string BuildFollowUpFailureDedupKey(long optimizationRunId)
         => $"OptimizationRun:{optimizationRunId}:FollowUp";
 
     internal static string PopulateFollowUpFailureAlert(
         Alert alert,
+        int alertCooldown,
         long optimizationRunId,
         long strategyId,
+        string? strategySymbol,
         RunStatus backtestStatus,
         RunStatus walkForwardStatus,
         bool backtestQualityOk,
@@ -581,14 +596,12 @@ public sealed class OptimizationFollowUpCoordinator
             $"BacktestReason={backtestReason}, WalkForwardReason={walkForwardReason}.";
 
         alert.AlertType = AlertType.OptimizationLifecycleIssue;
-        alert.Symbol = BuildFollowUpFailureAlertSymbol(optimizationRunId);
-        alert.Channel = AlertChannel.Webhook;
-        alert.Destination = string.Empty;
+        alert.Symbol = strategySymbol;
         alert.Severity = AlertSeverity.High;
         alert.IsActive = true;
         alert.LastTriggeredAt = utcNow;
-        alert.DeduplicationKey = alert.Symbol;
-        alert.CooldownSeconds = (int)TimeSpan.FromHours(1).TotalSeconds;
+        alert.DeduplicationKey = BuildFollowUpFailureDedupKey(optimizationRunId);
+        alert.CooldownSeconds = alertCooldown;
         alert.ConditionJson = JsonSerializer.Serialize(new
         {
             Type = "OptimizationFollowUpFailure",
@@ -736,7 +749,7 @@ public sealed class OptimizationFollowUpCoordinator
         _metrics.OptimizationFollowUpFailures.Add(1);
 
         var missingFollowUpAlert = await writeDb.Set<Alert>()
-            .FirstOrDefaultAsync(a => a.Symbol == BuildFollowUpFailureAlertSymbol(run.Id) && !a.IsDeleted, ct);
+            .FirstOrDefaultAsync(a => a.DeduplicationKey == BuildFollowUpFailureDedupKey(run.Id) && !a.IsDeleted, ct);
 
         if (missingFollowUpAlert is null)
         {
@@ -744,10 +757,14 @@ public sealed class OptimizationFollowUpCoordinator
             writeDb.Set<Alert>().Add(missingFollowUpAlert);
         }
 
+        int alertCooldown = await AlertCooldownDefaults.GetCooldownAsync(
+            writeDb, AlertCooldownDefaults.CK_Optimization, AlertCooldownDefaults.Default_Optimization, ct);
         string missingFollowUpAlertMessage = PopulateFollowUpFailureAlert(
             missingFollowUpAlert,
+            alertCooldown,
             run.Id,
             run.StrategyId,
+            strategy?.Symbol,
             backtestRun?.Status ?? RunStatus.Failed,
             wfRun?.Status ?? RunStatus.Failed,
             backtestQualityOk: false,
@@ -768,7 +785,7 @@ public sealed class OptimizationFollowUpCoordinator
 
         try
         {
-            await _alertDispatcher.DispatchBySeverityAsync(missingFollowUpAlert, missingFollowUpAlertMessage, ct);
+            await _alertDispatcher.DispatchAsync(missingFollowUpAlert, missingFollowUpAlertMessage, ct);
         }
         catch (Exception ex)
         {
@@ -790,6 +807,7 @@ public sealed class OptimizationFollowUpCoordinator
         OptimizationRun run,
         BacktestRun backtestRun,
         WalkForwardRun walkForwardRun,
+        int alertCooldown,
         CancellationToken ct,
         double followUpStuckThresholdHours = 0)
     {
@@ -813,9 +831,9 @@ public sealed class OptimizationFollowUpCoordinator
         if (!backtestStuck && !walkForwardStuck)
             return;
 
-        string alertSymbol = BuildFollowUpStuckAlertSymbol(run.Id);
+        string dedupKey = BuildFollowUpStuckDedupKey(run.Id);
         var alert = await writeDb.Set<Alert>()
-            .FirstOrDefaultAsync(a => a.Symbol == alertSymbol && !a.IsDeleted, ct);
+            .FirstOrDefaultAsync(a => a.DeduplicationKey == dedupKey && !a.IsDeleted, ct);
 
         bool suppressDispatch = alert?.LastTriggeredAt is DateTime lastTriggeredAt
             && lastTriggeredAt >= nowUtc.AddHours(-1);
@@ -830,13 +848,10 @@ public sealed class OptimizationFollowUpCoordinator
         bool isNewAlert = alert is null;
         alert ??= new Alert();
         alert.AlertType = AlertType.OptimizationLifecycleIssue;
-        alert.Symbol = alertSymbol;
-        alert.Channel = AlertChannel.Webhook;
-        alert.Destination = string.Empty;
         alert.Severity = AlertSeverity.High;
         alert.IsActive = true;
-        alert.DeduplicationKey = alertSymbol;
-        alert.CooldownSeconds = (int)TimeSpan.FromHours(1).TotalSeconds;
+        alert.DeduplicationKey = dedupKey;
+        alert.CooldownSeconds = alertCooldown;
         alert.LastTriggeredAt = nowUtc;
         alert.ConditionJson = JsonSerializer.Serialize(new
         {
@@ -864,7 +879,7 @@ public sealed class OptimizationFollowUpCoordinator
 
         try
         {
-            await _alertDispatcher.DispatchBySeverityAsync(alert, message, ct);
+            await _alertDispatcher.DispatchAsync(alert, message, ct);
         }
         catch (Exception ex)
         {
@@ -938,7 +953,7 @@ public sealed class OptimizationFollowUpCoordinator
                 ?? run.StartedAt;
     }
 
-    private static string BuildFollowUpStuckAlertSymbol(long optimizationRunId)
+    private static string BuildFollowUpStuckDedupKey(long optimizationRunId)
         => $"OptimizationRun:{optimizationRunId}:FollowUp:Stuck";
 
     private static string FormatFollowUpAge(double? ageHours)

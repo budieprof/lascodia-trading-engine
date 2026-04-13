@@ -13,6 +13,6 @@ public interface IAlertChannelSender
     /// <summary>The channel this sender handles.</summary>
     AlertChannel Channel { get; }
 
-    /// <summary>Send the notification to the address stored in <see cref="Alert.Destination"/>.</summary>
+    /// <summary>Send the notification to the destination configured in this channel's options.</summary>
     Task SendAsync(Alert alert, string message, CancellationToken ct);
 }

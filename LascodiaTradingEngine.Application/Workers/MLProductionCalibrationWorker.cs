@@ -292,8 +292,6 @@ public sealed class MLProductionCalibrationWorker : BackgroundService
         {
             Symbol        = model.Symbol,
             AlertType     = AlertType.MLModelDegraded,
-            Channel       = AlertChannel.Webhook,
-            Destination   = alertDest,
             ConditionJson = System.Text.Json.JsonSerializer.Serialize(new
             {
                 ModelId        = model.Id,

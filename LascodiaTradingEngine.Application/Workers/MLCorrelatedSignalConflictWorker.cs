@@ -266,8 +266,6 @@ public sealed class MLCorrelatedSignalConflictWorker : BackgroundService
                 {
                     AlertType     = AlertType.MLModelDegraded,
                     Symbol        = baseSymbol,
-                    Channel       = AlertChannel.Webhook,
-                    Destination   = alertDest,
                     ConditionJson = System.Text.Json.JsonSerializer.Serialize(new
                     {
                         reason         = "correlated_signal_conflict",

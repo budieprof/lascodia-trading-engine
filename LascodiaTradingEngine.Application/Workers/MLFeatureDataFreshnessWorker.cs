@@ -6,6 +6,7 @@ using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
+using LascodiaTradingEngine.Application.Services.Alerts;
 
 namespace LascodiaTradingEngine.Application.Workers;
 
@@ -80,18 +81,19 @@ public sealed class MLFeatureDataFreshnessWorker : BackgroundService
                 int    maxSentimentAgeHrs  = await GetConfigAsync<int>   (readCtx, CK_MaxSentimentAgeHrs, 24,   stoppingToken);
                 double candleStaleMult     = await GetConfigAsync<double>(readCtx, CK_CandleStaleMult,    3.0,  stoppingToken);
                 string alertDest           = await GetConfigAsync<string>(readCtx, CK_AlertDestination,   "",   stoppingToken);
+                int    alertCooldown       = await GetConfigAsync<int>   (readCtx, AlertCooldownDefaults.CK_MLMonitoring, AlertCooldownDefaults.Default_MLMonitoring, stoppingToken);
 
                 var now = DateTime.UtcNow;
                 bool anyStale = false;
 
                 // ── 1. COT data freshness ────────────────────────────────────────
-                anyStale |= await CheckCotFreshnessAsync(readCtx, writeCtx, now, maxCotAgeDays, alertDest, stoppingToken);
+                anyStale |= await CheckCotFreshnessAsync(readCtx, writeCtx, now, maxCotAgeDays, alertDest, alertCooldown, stoppingToken);
 
                 // ── 2. Sentiment data freshness ──────────────────────────────────
-                anyStale |= await CheckSentimentFreshnessAsync(readCtx, writeCtx, now, maxSentimentAgeHrs, alertDest, stoppingToken);
+                anyStale |= await CheckSentimentFreshnessAsync(readCtx, writeCtx, now, maxSentimentAgeHrs, alertDest, alertCooldown, stoppingToken);
 
                 // ── 3. Per-model candle data freshness ───────────────────────────
-                anyStale |= await CheckCandleFreshnessAsync(readCtx, writeCtx, now, candleStaleMult, alertDest, stoppingToken);
+                anyStale |= await CheckCandleFreshnessAsync(readCtx, writeCtx, now, candleStaleMult, alertDest, alertCooldown, stoppingToken);
 
                 if (anyStale)
                     await writeCtx.SaveChangesAsync(stoppingToken);
@@ -119,6 +121,7 @@ public sealed class MLFeatureDataFreshnessWorker : BackgroundService
         DateTime          now,
         int               maxAgeDays,
         string            alertDest,
+        int               alertCooldown,
         CancellationToken ct)
     {
         var latestCot = await readCtx.Set<COTReport>()
@@ -151,10 +154,7 @@ public sealed class MLFeatureDataFreshnessWorker : BackgroundService
 
             writeCtx.Set<Alert>().Add(new Alert
             {
-                Symbol        = "GLOBAL",
                 AlertType     = AlertType.MLModelDegraded,
-                Channel       = AlertChannel.Webhook,
-                Destination   = alertDest,
                 ConditionJson = JsonSerializer.Serialize(new
                 {
                     Source    = "COT",
@@ -162,7 +162,7 @@ public sealed class MLFeatureDataFreshnessWorker : BackgroundService
                     MaxAgeDays = maxAgeDays,
                 }),
                 DeduplicationKey = "MLFeatureStale:COT",
-                CooldownSeconds  = 3600,
+                CooldownSeconds  = alertCooldown,
             });
 
             return true;
@@ -179,6 +179,7 @@ public sealed class MLFeatureDataFreshnessWorker : BackgroundService
         DateTime          now,
         int               maxAgeHours,
         string            alertDest,
+        int               alertCooldown,
         CancellationToken ct)
     {
         var latestSentiment = await readCtx.Set<SentimentSnapshot>()
@@ -211,10 +212,7 @@ public sealed class MLFeatureDataFreshnessWorker : BackgroundService
 
             writeCtx.Set<Alert>().Add(new Alert
             {
-                Symbol        = "GLOBAL",
                 AlertType     = AlertType.MLModelDegraded,
-                Channel       = AlertChannel.Webhook,
-                Destination   = alertDest,
                 ConditionJson = JsonSerializer.Serialize(new
                 {
                     Source       = "Sentiment",
@@ -222,7 +220,7 @@ public sealed class MLFeatureDataFreshnessWorker : BackgroundService
                     MaxAgeHours  = maxAgeHours,
                 }),
                 DeduplicationKey = "MLFeatureStale:Sentiment",
-                CooldownSeconds  = 3600,
+                CooldownSeconds  = alertCooldown,
             });
 
             return true;
@@ -239,6 +237,7 @@ public sealed class MLFeatureDataFreshnessWorker : BackgroundService
         DateTime          now,
         double            staleMultiplier,
         string            alertDest,
+        int               alertCooldown,
         CancellationToken ct)
     {
         var activeModels = await readCtx.Set<MLModel>()
@@ -290,8 +289,6 @@ public sealed class MLFeatureDataFreshnessWorker : BackgroundService
                 {
                     Symbol        = model.Symbol,
                     AlertType     = AlertType.MLModelDegraded,
-                    Channel       = AlertChannel.Webhook,
-                    Destination   = alertDest,
                     ConditionJson = JsonSerializer.Serialize(new
                     {
                         Source     = "Candle",
@@ -301,7 +298,7 @@ public sealed class MLFeatureDataFreshnessWorker : BackgroundService
                         ThresholdMinutes = expectedIntervalMinutes,
                     }),
                     DeduplicationKey = $"MLFeatureStale:{sourceKey}",
-                    CooldownSeconds  = 3600,
+                    CooldownSeconds  = alertCooldown,
                 });
 
                 anyStale = true;

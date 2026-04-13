@@ -9,8 +9,7 @@ using LascodiaTradingEngine.Domain.Enums;
 namespace LascodiaTradingEngine.Application.Services.Alerts;
 
 /// <summary>
-/// Routes a triggered alert to the appropriate <see cref="IAlertChannelSender"/>
-/// based on <see cref="Alert.Channel"/> or severity-based routing.
+/// Broadcasts triggered alerts to all registered <see cref="IAlertChannelSender"/> implementations.
 /// Singleton lifetime to hold deduplication state across requests.
 /// Uses IServiceScopeFactory to resolve scoped senders on each dispatch.
 /// </summary>
@@ -48,6 +47,7 @@ public class AlertDispatcher : IAlertDispatcher, IDisposable
     }
 
     /// <remarks>
+    /// Broadcasts the alert to all registered <see cref="IAlertChannelSender"/> implementations.
     /// Sets <see cref="Alert.LastTriggeredAt"/> on the entity on successful dispatch.
     /// The caller is responsible for calling SaveChangesAsync afterwards,
     /// as the dispatcher (Singleton) does not own a DbContext.
@@ -58,71 +58,23 @@ public class AlertDispatcher : IAlertDispatcher, IDisposable
             return;
 
         using var scope = _scopeFactory.CreateScope();
-        var senders = scope.ServiceProvider.GetServices<IAlertChannelSender>()
-            .ToDictionary(s => s.Channel);
+        var senders = scope.ServiceProvider.GetServices<IAlertChannelSender>().ToList();
+        bool anySent = false;
 
-        if (senders.TryGetValue(alert.Channel, out var sender))
+        foreach (var sender in senders)
         {
             try
             {
                 await sender.SendAsync(alert, message, ct);
-                RecordDispatch(alert);
-                await PersistDispatchLogAsync(alert, alert.Channel, "Sent", message, null);
+                anySent = true;
+                await PersistDispatchLogAsync(alert, sender.Channel, "Sent", message, null);
             }
             catch (Exception ex)
             {
-                await PersistDispatchLogAsync(alert, alert.Channel, "Failed", message, ex.Message);
-                throw;
-            }
-        }
-        else
-        {
-            _logger.LogWarning(
-                "AlertDispatcher: no sender registered for channel {Channel} (alert {AlertId})",
-                alert.Channel, alert.Id);
-        }
-    }
-
-    /// <remarks>
-    /// Sets <see cref="Alert.LastTriggeredAt"/> on the entity on successful dispatch.
-    /// The caller is responsible for calling SaveChangesAsync afterwards,
-    /// as the dispatcher (Singleton) does not own a DbContext.
-    /// </remarks>
-    public async Task DispatchBySeverityAsync(Alert alert, string message, CancellationToken ct)
-    {
-        if (IsDeduplicated(alert))
-            return;
-
-        using var scope = _scopeFactory.CreateScope();
-        var senders = scope.ServiceProvider.GetServices<IAlertChannelSender>()
-            .ToDictionary(s => s.Channel);
-
-        var channels = GetChannelsForSeverity(alert.Severity);
-        bool anySent = false;
-
-        foreach (var channel in channels)
-        {
-            if (senders.TryGetValue(channel, out var sender))
-            {
-                try
-                {
-                    await sender.SendAsync(alert, message, ct);
-                    anySent = true;
-                    await PersistDispatchLogAsync(alert, channel, "Sent", message, null);
-                }
-                catch (Exception ex)
-                {
-                    await PersistDispatchLogAsync(alert, channel, "Failed", message, ex.Message);
-                    _logger.LogWarning(ex,
-                        "AlertDispatcher: failed to send alert {AlertId} via {Channel} (other channels may have succeeded)",
-                        alert.Id, channel);
-                }
-            }
-            else
-            {
-                _logger.LogDebug(
-                    "AlertDispatcher: no sender registered for channel {Channel} (alert {AlertId}, severity {Severity})",
-                    channel, alert.Id, alert.Severity);
+                await PersistDispatchLogAsync(alert, sender.Channel, "Failed", message, ex.Message);
+                _logger.LogWarning(ex,
+                    "AlertDispatcher: failed to send alert {AlertId} via {Channel} (other channels may have succeeded)",
+                    alert.Id, sender.Channel);
             }
         }
 
@@ -147,21 +99,8 @@ public class AlertDispatcher : IAlertDispatcher, IDisposable
         if (!string.IsNullOrEmpty(alert.DeduplicationKey))
             _dedup.TryRemove(alert.DeduplicationKey, out _);
 
-        return DispatchBySeverityAsync(alert, resolvedMessage, ct);
+        return DispatchAsync(alert, resolvedMessage, ct);
     }
-
-    /// <summary>
-    /// Maps severity to the set of channels to dispatch to.
-    /// Critical/High -> Telegram + Webhook; Medium -> Webhook; Info -> Webhook.
-    /// </summary>
-    private static AlertChannel[] GetChannelsForSeverity(AlertSeverity severity) => severity switch
-    {
-        AlertSeverity.Critical => [AlertChannel.Telegram, AlertChannel.Webhook],
-        AlertSeverity.High     => [AlertChannel.Telegram, AlertChannel.Webhook],
-        AlertSeverity.Medium   => [AlertChannel.Webhook],
-        AlertSeverity.Info     => [AlertChannel.Webhook],
-        _                      => [AlertChannel.Webhook],
-    };
 
     /// <summary>
     /// Checks whether this alert should be suppressed based on deduplication key and cooldown.

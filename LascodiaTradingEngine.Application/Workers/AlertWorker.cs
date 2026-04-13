@@ -86,7 +86,7 @@ namespace LascodiaTradingEngine.Application.Workers;
 ///
 /// <para>
 /// <b>Severity-based routing:</b>
-/// Alerts are dispatched via <see cref="IAlertDispatcher.DispatchBySeverityAsync"/>
+/// Alerts are dispatched via <see cref="IAlertDispatcher.DispatchAsync"/>
 /// which routes notifications to channels based on the alert's <see cref="AlertSeverity"/>:
 /// Critical/High → Telegram + Webhook, Medium/Info → Webhook.
 /// </para>
@@ -271,7 +271,7 @@ public class AlertWorker : BackgroundService
 
                 // Dispatch FIRST, then update the cursor. If dispatch throws, the cursor
                 // does not advance and the event will be retried on the next cycle.
-                await dispatcher.DispatchBySeverityAsync(alert, message, ct);
+                await dispatcher.DispatchAsync(alert, message, ct);
 
                 // For event-based types, set cursor to the event's own timestamp so
                 // subsequent events in the same batch are picked up on the next cycle.

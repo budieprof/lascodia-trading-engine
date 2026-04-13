@@ -233,8 +233,6 @@ public sealed class MLDeadLetterWorker : BackgroundService
                 {
                     AlertType     = AlertType.MLModelDegraded,
                     Symbol        = symbol,
-                    Channel       = AlertChannel.Webhook,
-                    Destination   = alertDest,
                     ConditionJson = JsonSerializer.Serialize(new
                     {
                         reason            = "dead_letter_retry_cap_exceeded",

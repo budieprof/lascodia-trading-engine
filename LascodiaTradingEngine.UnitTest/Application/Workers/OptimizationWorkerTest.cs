@@ -21,6 +21,7 @@ using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Utilities;
 using LascodiaTradingEngine.Application.Optimization;
 using LascodiaTradingEngine.Application.Services;
+using LascodiaTradingEngine.Application.Services.Alerts;
 using LascodiaTradingEngine.Application.SystemHealth.Queries.GetOptimizationWorkerHealth;
 using LascodiaTradingEngine.Application.Workers;
 using LascodiaTradingEngine.Domain.Entities;
@@ -2080,7 +2081,7 @@ public class OptimizationWorkerTest
         writeCtx.Setup(x => x.SaveChangesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(1);
 
         var alertDispatcher = new Mock<IAlertDispatcher>();
-        alertDispatcher.Setup(x => x.DispatchBySeverityAsync(It.IsAny<Alert>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+        alertDispatcher.Setup(x => x.DispatchAsync(It.IsAny<Alert>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
 
         await InvokeMonitorFollowUpResultsAsync(readCtx.Object, writeCtx.Object, alertDispatcher.Object);
@@ -2096,8 +2097,10 @@ public class OptimizationWorkerTest
 
         string message = OptimizationFollowUpCoordinator.PopulateFollowUpFailureAlert(
             alert,
+            AlertCooldownDefaults.Default_Optimization,
             optimizationRunId: 501,
             strategyId: 77,
+            strategySymbol: "EURUSD",
             backtestStatus: RunStatus.Completed,
             walkForwardStatus: RunStatus.Failed,
             backtestQualityOk: false,
@@ -2106,7 +2109,7 @@ public class OptimizationWorkerTest
             walkForwardReason: "walk-forward follow-up execution failed",
             utcNow: nowUtc);
 
-        Assert.Equal("OptimizationRun:501:FollowUp", alert.Symbol);
+        Assert.Equal("EURUSD", alert.Symbol);
         Assert.Equal(AlertSeverity.High, alert.Severity);
         Assert.True(alert.IsActive);
         Assert.Equal(nowUtc, alert.LastTriggeredAt);
@@ -2289,9 +2292,9 @@ public class OptimizationWorkerTest
             new()
             {
                 Id = 1,
-                Symbol = $"Strategy:{strategyId}",
+                Symbol = "EURUSD",
                 DeduplicationKey = $"Optimization:ChronicFailure:{strategyId}",
-                CooldownSeconds = 24 * 60 * 60,
+                CooldownSeconds = AlertCooldownDefaults.Default_OptimizationEscalation,
                 LastTriggeredAt = nowUtc.AddHours(-1),
                 IsDeleted = false
             }
@@ -2302,9 +2305,12 @@ public class OptimizationWorkerTest
         alertDbSet.Setup(d => d.Add(It.IsAny<Alert>()))
             .Callback<Alert>(alert => alerts.Add(alert));
 
+        var engineConfigs = new List<EngineConfig>().AsQueryable().BuildMockDbSet();
+
         var db = new Mock<DbContext>();
         db.Setup(c => c.Set<OptimizationRun>()).Returns(runDbSet.Object);
         db.Setup(c => c.Set<Alert>()).Returns(alertDbSet.Object);
+        db.Setup(c => c.Set<EngineConfig>()).Returns(engineConfigs.Object);
 
         var writeCtx = new Mock<IWriteApplicationDbContext>();
         writeCtx.Setup(x => x.GetDbContext()).Returns(db.Object);
@@ -2325,7 +2331,7 @@ public class OptimizationWorkerTest
         Assert.Single(alerts);
         writeCtx.Verify(x => x.SaveChangesAsync(It.IsAny<CancellationToken>()), Times.Never);
         alertDispatcher.Verify(
-            x => x.DispatchBySeverityAsync(It.IsAny<Alert>(), It.IsAny<string>(), It.IsAny<CancellationToken>()),
+            x => x.DispatchAsync(It.IsAny<Alert>(), It.IsAny<string>(), It.IsAny<CancellationToken>()),
             Times.Never);
     }
 
@@ -2488,7 +2494,8 @@ public class OptimizationWorkerTest
         string strategyName,
         int maxConsecutiveFailures,
         int baseCooldownDays,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        string strategySymbol = "EURUSD")
     {
         using var provider = CreateOptimizationServiceProvider(timeProvider: timeProvider);
         await using var scope = provider.CreateAsyncScope();
@@ -2501,6 +2508,7 @@ public class OptimizationWorkerTest
             alertDispatcher,
             strategyId,
             strategyName,
+            strategySymbol,
             maxConsecutiveFailures,
             baseCooldownDays,
             CancellationToken.None);

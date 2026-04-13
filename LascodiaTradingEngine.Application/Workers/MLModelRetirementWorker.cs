@@ -327,8 +327,6 @@ public sealed class MLModelRetirementWorker : BackgroundService
             {
                 AlertType     = AlertType.MLModelDegraded,
                 Symbol        = symbol,
-                Channel       = AlertChannel.Webhook,
-                Destination   = alertDest,
                 ConditionJson = System.Text.Json.JsonSerializer.Serialize(new
                 {
                     reason           = "model_decommissioned",

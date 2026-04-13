@@ -9,8 +9,8 @@ namespace LascodiaTradingEngine.Domain.Entities;
 /// </summary>
 /// <remarks>
 /// Alert conditions are evaluated by the alert-checking worker on every relevant price
-/// update or event. When triggered, the engine dispatches a notification to the configured
-/// <see cref="Destination"/> using the chosen <see cref="Channel"/> (Webhook, Email, SMS, etc.).
+/// update or event. When triggered, the engine dispatches notifications to all configured
+/// channels (Webhook, Email, Telegram). Channel destinations are configured in appsettings.
 /// <see cref="LastTriggeredAt"/> prevents duplicate firings during the same price level crossing.
 /// </remarks>
 public class Alert : Entity<long>
@@ -22,20 +22,11 @@ public class Alert : Entity<long>
     /// </summary>
     public AlertType  AlertType      { get; set; } = AlertType.PriceLevel;
 
-    /// <summary>The currency pair or instrument this alert monitors (e.g. "EURUSD").</summary>
-    public string  Symbol         { get; set; } = string.Empty;
-
     /// <summary>
-    /// Delivery channel for notifications when this alert fires.
-    /// e.g. <c>Webhook</c> (HTTP POST), <c>Email</c>, <c>Sms</c>, <c>Telegram</c>.
+    /// The currency pair or instrument this alert relates to (e.g. "EURUSD").
+    /// Null for system-wide alerts that are not specific to an instrument.
     /// </summary>
-    public AlertChannel  Channel        { get; set; } = AlertChannel.Webhook;
-
-    /// <summary>
-    /// The target address for delivery — a URL for webhooks, an email address,
-    /// a phone number for SMS, or a chat ID for Telegram.
-    /// </summary>
-    public string  Destination    { get; set; } = string.Empty;
+    public string?  Symbol         { get; set; }
 
     /// <summary>
     /// JSON object encoding the specific trigger condition for this alert.
@@ -61,9 +52,8 @@ public class Alert : Entity<long>
     // ── Alert severity & escalation (Improvement 15.2) ──────────────────────
 
     /// <summary>
-    /// Severity tier controlling escalation and notification channels:
-    /// Critical (SMS+Telegram+Webhook, immediate), High (Telegram+Webhook, 5min),
-    /// Medium (Webhook, 15min), Info (Webhook only, no escalation).
+    /// Severity tier for categorizing alert urgency. All alerts are broadcast to
+    /// every configured channel; severity is informational for triage and filtering.
     /// </summary>
     public AlertSeverity Severity { get; set; } = AlertSeverity.Medium;
 

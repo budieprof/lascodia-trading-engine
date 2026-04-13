@@ -297,8 +297,6 @@ public sealed class MLRewardToRiskWorker : BackgroundService
         {
             AlertType     = AlertType.MLModelDegraded,
             Symbol        = symbol,
-            Channel       = AlertChannel.Webhook,
-            Destination   = alertDest,
             ConditionJson = System.Text.Json.JsonSerializer.Serialize(new
             {
                 reason,

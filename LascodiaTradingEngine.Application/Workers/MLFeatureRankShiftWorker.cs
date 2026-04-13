@@ -303,8 +303,6 @@ public sealed class MLFeatureRankShiftWorker : BackgroundService
         {
             AlertType     = AlertType.MLModelDegraded,
             Symbol        = champion.Symbol,
-            Channel       = AlertChannel.Webhook,
-            Destination   = alertDest,
             ConditionJson = JsonSerializer.Serialize(new
             {
                 reason              = "feature_rank_shift",

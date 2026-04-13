@@ -220,8 +220,6 @@ public sealed class MLDegradationModeWorker : BackgroundService
             {
                 AlertType     = AlertType.MLModelDegraded,
                 Symbol        = symbol,
-                Channel       = AlertChannel.Webhook,
-                Destination   = alertDest,
                 ConditionJson = JsonSerializer.Serialize(new
                 {
                     reason   = "ml_degradation_mode_activated",
@@ -259,7 +257,6 @@ public sealed class MLDegradationModeWorker : BackgroundService
             bool escalationAlertExists = await readCtx.Set<Alert>()
                 .AnyAsync(a => a.Symbol      == symbol                    &&
                                a.AlertType   == AlertType.MLModelDegraded &&
-                               a.Destination == escalationDest            &&
                                a.IsActive    && !a.IsDeleted, ct);
 
             if (!escalationAlertExists)
@@ -268,8 +265,6 @@ public sealed class MLDegradationModeWorker : BackgroundService
                 {
                     AlertType     = AlertType.MLModelDegraded,
                     Symbol        = symbol,
-                    Channel       = AlertChannel.Webhook,
-                    Destination   = escalationDest,
                     ConditionJson = JsonSerializer.Serialize(new
                     {
                         reason          = "ml_degradation_mode_escalation",
@@ -308,8 +303,6 @@ public sealed class MLDegradationModeWorker : BackgroundService
                 {
                     AlertType     = AlertType.MLModelDegraded,
                     Symbol        = symbol,
-                    Channel       = AlertChannel.Webhook,
-                    Destination   = alertDest,
                     ConditionJson = JsonSerializer.Serialize(new
                     {
                         reason         = "ml_degradation_mode_critical",

@@ -203,10 +203,7 @@ public class EAHealthMonitorWorker : BackgroundService
                 var allDisconnectAlert = new Alert
                 {
                     AlertType     = AlertType.EADisconnected,
-                    Channel       = AlertChannel.Webhook,
                     Severity      = AlertSeverity.Critical,
-                    Symbol        = "SYSTEM",
-                    Destination   = string.Empty,
                     IsActive      = true,
                     ConditionJson = System.Text.Json.JsonSerializer.Serialize(new
                     {
@@ -219,7 +216,7 @@ public class EAHealthMonitorWorker : BackgroundService
                 db.Set<Alert>().Add(allDisconnectAlert);
                 await db.SaveChangesAsync(ct);
 
-                await _alertDispatcher.DispatchBySeverityAsync(
+                await _alertDispatcher.DispatchAsync(
                     allDisconnectAlert,
                     "ALL EA instances disconnected — engine entering DataUnavailable mode. " +
                     "No market data source available. Signal generation is blocked.",
