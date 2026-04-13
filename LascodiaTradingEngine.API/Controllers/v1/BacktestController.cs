@@ -24,16 +24,6 @@ public class BacktestController : AuthControllerBase<BacktestController>
         ICurrentUserService userService)
         : base(logger, config, userService) { }
 
-    /// <summary>Queue a new backtest run</summary>
-    [HttpPost]
-    public async Task<ResponseData<long>> RunBacktest(RunBacktestCommand command)
-    {
-        if (!ModelState.IsValid)
-            return ResponseData<long>.Init(0, false, "Model state failed", "-11");
-
-        return await Mediator.Send(command);
-    }
-
     /// <summary>Get backtest run by Id</summary>
     [HttpGet("{id}")]
     public async Task<ResponseData<BacktestRunDto>> GetById(long id)
