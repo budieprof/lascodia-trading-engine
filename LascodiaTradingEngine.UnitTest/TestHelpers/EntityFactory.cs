@@ -156,20 +156,4 @@ public static class EntityFactory
             MaxSymbolExposurePct = 10.0m
         };
 
-    public static ApprovalRequest CreateApprovalRequest(
-        ApprovalOperationType operationType = ApprovalOperationType.ModelPromotion,
-        ApprovalStatus status = ApprovalStatus.Pending)
-        => new()
-        {
-            Id = NextId(),
-            OperationType = operationType,
-            Status = status,
-            TargetEntityId = 1,
-            TargetEntityType = "MLModel",
-            Description = "Test approval",
-            ChangePayloadJson = "{}",
-            RequestedByAccountId = 1,
-            RequestedAt = DateTime.UtcNow,
-            ExpiresAt = DateTime.UtcNow.AddHours(24)
-        };
 }

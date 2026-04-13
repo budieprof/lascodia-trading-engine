@@ -10,7 +10,6 @@ using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.EngineConfiguration.Commands.UpsertEngineConfig;
 using LascodiaTradingEngine.Application.Optimization;
 using LascodiaTradingEngine.Domain.Entities;
-using ApprovalOperationType = LascodiaTradingEngine.Domain.Enums.ApprovalOperationType;
 
 namespace LascodiaTradingEngine.UnitTest.Application.EngineConfiguration;
 
@@ -18,7 +17,6 @@ public class UpdateEngineConfigCommandTest
 {
     private readonly Mock<IWriteApplicationDbContext> _mockWriteContext;
     private readonly Mock<IMediator> _mockMediator;
-    private readonly Mock<IApprovalWorkflow> _mockApprovalWorkflow;
     private readonly Mock<ICurrentUserService> _mockCurrentUser;
     private readonly UpsertEngineConfigCommandValidator _validator;
 
@@ -29,13 +27,6 @@ public class UpdateEngineConfigCommandTest
         _mockMediator
             .Setup(m => m.Send(It.IsAny<LogDecisionCommand>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(ResponseData<long>.Init(1, true, "Successful", "00"));
-        _mockApprovalWorkflow = new Mock<IApprovalWorkflow>();
-        _mockApprovalWorkflow
-            .Setup(a => a.IsApprovedAsync(It.IsAny<ApprovalOperationType>(), It.IsAny<long>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(true);
-        _mockApprovalWorkflow
-            .Setup(a => a.ConsumeApprovalAsync(It.IsAny<ApprovalOperationType>(), It.IsAny<long>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(true);
         _mockCurrentUser = new Mock<ICurrentUserService>();
         _mockCurrentUser.Setup(u => u.UserId).Returns("1");
         _validator = new UpsertEngineConfigCommandValidator();
@@ -215,7 +206,6 @@ public class UpdateEngineConfigCommandTest
         => new(
             _mockWriteContext.Object,
             _mockMediator.Object,
-            _mockApprovalWorkflow.Object,
             _mockCurrentUser.Object,
             configProvider ?? new OptimizationConfigProvider(
                 Microsoft.Extensions.Logging.Abstractions.NullLogger<OptimizationConfigProvider>.Instance,

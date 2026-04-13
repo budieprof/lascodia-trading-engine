@@ -2,20 +2,17 @@ using FluentValidation;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 using System.Text.Json.Serialization;
-using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.AuditTrail.Commands.LogDecision;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Utilities;
-using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.RiskProfiles.Commands.UpdateRiskProfile;
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
 /// <summary>
-/// Updates all fields of an existing risk profile. Loosening risk limits (increasing max lot size,
-/// drawdown, risk-per-trade, or symbol exposure) requires four-eyes approval.
+/// Updates all fields of an existing risk profile.
 /// </summary>
 public class UpdateRiskProfileCommand : IRequest<ResponseData<string>>
 {
@@ -82,26 +79,19 @@ public class UpdateRiskProfileCommandValidator : AbstractValidator<UpdateRiskPro
 // ── Handler ───────────────────────────────────────────────────────────────────
 
 /// <summary>
-/// Applies risk profile updates with four-eyes approval gating when limits are loosened.
-/// Records a before/after audit trail via <see cref="LogDecisionCommand"/>.
+/// Applies risk profile updates and records a before/after audit trail via <see cref="LogDecisionCommand"/>.
 /// </summary>
 public class UpdateRiskProfileCommandHandler : IRequestHandler<UpdateRiskProfileCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;
     private readonly IMediator _mediator;
-    private readonly IApprovalWorkflow _approvalWorkflow;
-    private readonly ICurrentUserService _currentUser;
 
     public UpdateRiskProfileCommandHandler(
         IWriteApplicationDbContext context,
-        IMediator mediator,
-        IApprovalWorkflow approvalWorkflow,
-        ICurrentUserService currentUser)
+        IMediator mediator)
     {
         _context = context;
         _mediator = mediator;
-        _approvalWorkflow = approvalWorkflow;
-        _currentUser = currentUser;
     }
 
     public async Task<ResponseData<string>> Handle(UpdateRiskProfileCommand request, CancellationToken cancellationToken)
@@ -112,33 +102,6 @@ public class UpdateRiskProfileCommandHandler : IRequestHandler<UpdateRiskProfile
 
         if (entity == null)
             return ResponseData<string>.Init(null, false, "Risk profile not found", "-14");
-
-        // ── Four-eyes approval gate (only when loosening limits) ──
-        bool isLoosenedRiskLimits =
-            request.MaxLotSizePerTrade > entity.MaxLotSizePerTrade ||
-            request.MaxDailyDrawdownPct > entity.MaxDailyDrawdownPct ||
-            request.MaxRiskPerTradePct > entity.MaxRiskPerTradePct ||
-            request.MaxSymbolExposurePct > entity.MaxSymbolExposurePct;
-
-        long currentAccountId = long.TryParse(_currentUser.UserId, out var parsedUid) ? parsedUid : 0;
-
-        if (isLoosenedRiskLimits &&
-            !await _approvalWorkflow.IsApprovedAsync(ApprovalOperationType.RiskLimitLoosening, request.Id, cancellationToken))
-        {
-            await _approvalWorkflow.RequestApprovalAsync(
-                ApprovalOperationType.RiskLimitLoosening,
-                request.Id,
-                "RiskProfile",
-                $"Loosen risk limits on profile '{entity.Name}'",
-                System.Text.Json.JsonSerializer.Serialize(new { request.Id }),
-                currentAccountId,
-                cancellationToken);
-            return ResponseData<string>.Init(null, false, "Pending four-eyes approval", "-202");
-        }
-
-        if (isLoosenedRiskLimits &&
-            !await _approvalWorkflow.ConsumeApprovalAsync(ApprovalOperationType.RiskLimitLoosening, request.Id, cancellationToken))
-            return ResponseData<string>.Init(null, false, "Approval was already consumed by a concurrent request", "-409");
 
         // Capture before-state for audit trail
         var beforeState = new

@@ -14,8 +14,8 @@ namespace LascodiaTradingEngine.Application.Strategies.Commands.ActivateStrategy
 // ── Command ───────────────────────────────────────────────────────────────────
 
 /// <summary>
-/// Activates a strategy that has reached the Approved lifecycle stage. Requires four-eyes
-/// approval, queues an initial backtest run, and publishes a <see cref="StrategyActivatedIntegrationEvent"/>.
+/// Activates a strategy that has reached the Approved lifecycle stage. Queues an initial
+/// backtest run and publishes a <see cref="StrategyActivatedIntegrationEvent"/>.
 /// </summary>
 public class ActivateStrategyCommand : IRequest<ResponseData<string>>
 {
@@ -37,30 +37,24 @@ public class ActivateStrategyCommandValidator : AbstractValidator<ActivateStrate
 // ── Handler ───────────────────────────────────────────────────────────────────
 
 /// <summary>
-/// Enforces lifecycle stage and four-eyes approval gates, transitions the strategy to Active
-/// status, queues a one-year initial backtest, and publishes a <see cref="StrategyActivatedIntegrationEvent"/>.
+/// Enforces lifecycle stage gate, transitions the strategy to Active status, queues a one-year
+/// initial backtest, and publishes a <see cref="StrategyActivatedIntegrationEvent"/>.
 /// </summary>
 public class ActivateStrategyCommandHandler : IRequestHandler<ActivateStrategyCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;
     private readonly IIntegrationEventService _eventBus;
-    private readonly IApprovalWorkflow _approvalWorkflow;
-    private readonly ICurrentUserService _currentUser;
     private readonly IValidationRunFactory _validationRunFactory;
     private readonly TimeProvider _timeProvider;
 
     public ActivateStrategyCommandHandler(
         IWriteApplicationDbContext context,
         IIntegrationEventService eventBus,
-        IApprovalWorkflow approvalWorkflow,
-        ICurrentUserService currentUser,
         IValidationRunFactory validationRunFactory,
         TimeProvider timeProvider)
     {
         _context  = context;
         _eventBus = eventBus;
-        _approvalWorkflow = approvalWorkflow;
-        _currentUser = currentUser;
         _validationRunFactory = validationRunFactory;
         _timeProvider = timeProvider;
     }
@@ -80,24 +74,6 @@ public class ActivateStrategyCommandHandler : IRequestHandler<ActivateStrategyCo
             return ResponseData<string>.Init(null, false,
                 $"Strategy must reach Approved lifecycle stage before activation. Current stage: {entity.LifecycleStage}", "-11");
         }
-
-        // ── Four-eyes approval gate ──
-        long currentAccountId = long.TryParse(_currentUser.UserId, out var parsedUid) ? parsedUid : 0;
-        if (!await _approvalWorkflow.IsApprovedAsync(ApprovalOperationType.StrategyActivation, request.Id, cancellationToken))
-        {
-            await _approvalWorkflow.RequestApprovalAsync(
-                ApprovalOperationType.StrategyActivation,
-                request.Id,
-                "Strategy",
-                $"Activate strategy '{entity.Name}' for {entity.Symbol}/{entity.Timeframe}",
-                System.Text.Json.JsonSerializer.Serialize(new { request.Id }),
-                currentAccountId,
-                cancellationToken);
-            return ResponseData<string>.Init(null, false, "Pending four-eyes approval", "-202");
-        }
-
-        if (!await _approvalWorkflow.ConsumeApprovalAsync(ApprovalOperationType.StrategyActivation, request.Id, cancellationToken))
-            return ResponseData<string>.Init(null, false, "Approval was already consumed by a concurrent request", "-409");
 
         var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
 

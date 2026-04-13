@@ -15,8 +15,7 @@ namespace LascodiaTradingEngine.Application.EngineConfiguration.Commands.UpsertE
 // ── Command ───────────────────────────────────────────────────────────────────
 
 /// <summary>
-/// Creates or updates an engine configuration key-value pair. Risk-related keys require
-/// four-eyes approval before the change is applied. All changes are audit-logged.
+/// Creates or updates an engine configuration key-value pair. All changes are audit-logged.
 /// </summary>
 public class UpsertEngineConfigCommand : IRequest<ResponseData<long>>
 {
@@ -50,32 +49,26 @@ public class UpsertEngineConfigCommandValidator : AbstractValidator<UpsertEngine
 // ── Handler ───────────────────────────────────────────────────────────────────
 
 /// <summary>
-/// Upserts an engine config entry. Risk-related keys (containing Risk, Max, Limit, VaR, Drawdown)
-/// gate behind four-eyes approval. Creates an <see cref="Domain.Entities.EngineConfigAuditLog"/>
+/// Upserts an engine config entry. Creates an <see cref="Domain.Entities.EngineConfigAuditLog"/>
 /// and a <see cref="Domain.Entities.DecisionLog"/> entry for every change.
 /// </summary>
 public class UpsertEngineConfigCommandHandler : IRequestHandler<UpsertEngineConfigCommand, ResponseData<long>>
 {
     private readonly IWriteApplicationDbContext _context;
     private readonly IMediator _mediator;
-    private readonly IApprovalWorkflow _approvalWorkflow;
     private readonly ICurrentUserService _currentUser;
     private readonly OptimizationConfigProvider _optimizationConfigProvider;
     private readonly TimeProvider _timeProvider;
 
-    private static readonly string[] RiskRelatedKeywords = ["Risk", "Max", "Limit", "VaR", "Drawdown"];
-
     public UpsertEngineConfigCommandHandler(
         IWriteApplicationDbContext context,
         IMediator mediator,
-        IApprovalWorkflow approvalWorkflow,
         ICurrentUserService currentUser,
         OptimizationConfigProvider optimizationConfigProvider,
         TimeProvider timeProvider)
     {
         _context = context;
         _mediator = mediator;
-        _approvalWorkflow = approvalWorkflow;
         _currentUser = currentUser;
         _optimizationConfigProvider = optimizationConfigProvider;
         _timeProvider = timeProvider;
@@ -90,33 +83,6 @@ public class UpsertEngineConfigCommandHandler : IRequestHandler<UpsertEngineConf
 
         var dataType = Enum.Parse<ConfigDataType>(request.DataType, ignoreCase: true);
         long currentAccountId = long.TryParse(_currentUser.UserId, out var parsedUid) ? parsedUid : 0;
-
-        // ── Four-eyes approval gate (risk-related config keys only) ──
-        bool isRiskRelatedKey = RiskRelatedKeywords.Any(kw =>
-            request.Key.Contains(kw, StringComparison.OrdinalIgnoreCase));
-
-        if (isRiskRelatedKey)
-        {
-            // Use a stable hash of the config key as the target entity ID so that
-            // new keys (where existing is null) don't all collapse to ID 0.
-            long targetEntityId = existing?.Id ?? ComputeStableKeyId(request.Key);
-            if (!await _approvalWorkflow.IsApprovedAsync(ApprovalOperationType.ConfigChange, targetEntityId, cancellationToken))
-            {
-                await _approvalWorkflow.RequestApprovalAsync(
-                    ApprovalOperationType.ConfigChange,
-                    targetEntityId,
-                    "EngineConfig",
-                    $"Update risk-related config '{request.Key}' to '{request.Value}'",
-                    System.Text.Json.JsonSerializer.Serialize(new { request.Key, request.Value }),
-                    currentAccountId,
-                    cancellationToken);
-                return ResponseData<long>.Init(0, false, "Pending four-eyes approval", "-202");
-            }
-
-            // Consume the approval so it cannot be re-used for a subsequent change
-            if (!await _approvalWorkflow.ConsumeApprovalAsync(ApprovalOperationType.ConfigChange, targetEntityId, cancellationToken))
-                return ResponseData<long>.Init(0, false, "Approval was already consumed by a concurrent request", "-409");
-        }
 
         if (existing is not null)
         {
@@ -213,28 +179,4 @@ public class UpsertEngineConfigCommandHandler : IRequestHandler<UpsertEngineConf
         }
     }
 
-    /// <summary>
-    /// Produces a stable negative ID from the config key so that approval requests for
-    /// not-yet-persisted keys are uniquely identified without colliding with real entity IDs.
-    /// Uses a deterministic hash (FNV-1a) because string.GetHashCode() is randomized per-process in .NET Core.
-    /// </summary>
-    private static long ComputeStableKeyId(string key)
-    {
-        // FNV-1a 64-bit hash — deterministic across process restarts.
-        // Note: operates on UTF-16 chars (2 bytes each) rather than byte-level FNV.
-        // This is fine for ASCII config keys; non-ASCII keys will still produce stable
-        // hashes but won't match reference byte-level FNV implementations.
-        const ulong fnvOffset = 14695981039346656037UL;
-        const ulong fnvPrime  = 1099511628211UL;
-
-        ulong hash = fnvOffset;
-        foreach (char c in key.ToUpperInvariant())
-        {
-            hash ^= c;
-            hash *= fnvPrime;
-        }
-
-        // Return as negative long to avoid collision with real auto-increment entity IDs
-        return -(long)(hash & 0x7FFFFFFFFFFFFFFFUL) - 1; // Always negative, never 0
-    }
 }

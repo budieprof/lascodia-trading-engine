@@ -90,7 +90,7 @@ Entities inherit `Entity<long>` from `SharedDomain`. All entities use a soft-del
 | ML Advanced | `MLAdwinDriftLog`, `MLCausalFeatureAudit`, `MLConformalCalibration`, `MLConformalBreakerLog`, `MLCorrelatedFailureLog`, `MLErgodicityLog`, `MLFeatureConsensusSnapshot`, `MLFeatureInteractionAudit`, `MLFeatureStalenessLog`, `MLHawkesKernelParams`, `MLKellyFractionLog`, `MLMrmrFeatureRanking`, `MLPeltChangePointLog`, `MLStackingMetaModel`, `MLTemperatureScalingLog`, `MLVaeEncoder`, `MLCpcEncoder` |
 | Backtesting | `BacktestRun`, `OptimizationRun`, `WalkForwardRun` |
 | Expert Advisor | `EAInstance`, `EACommand` |
-| Governance | `ApprovalRequest`, `ProcessedIdempotencyKey`, `EngineConfigAuditLog` |
+| Governance | `ProcessedIdempotencyKey`, `EngineConfigAuditLog` |
 | Infrastructure | `EconomicEvent`, `COTReport`, `EngineConfig`, `DecisionLog`, `DeadLetterEvent`, `FeatureVector`, `TradeRationale`, `WorkerHealthSnapshot` |
 
 **Enums (50):** `OrderType`, `OrderStatus`, `TradeDirection`, `TradeSignalStatus`, `StrategyType`, `StrategyStatus`, `PositionDirection`, `PositionStatus`, `ExecutionType`, `Timeframe`, `TradingSession`, `TrailingStopType`, `AlertType`, `AlertChannel`, `AlertSeverity`, `MLModelStatus`, `ModelRole`, `ShadowEvaluationStatus`, `PromotionDecision`, `OptimizationRunStatus`, `OptimizationFailureCategory`, `ValidationFollowUpStatus`, `RunStatus`, `MarketRegime`, `EconomicImpact`, `EconomicEventSource`, `SentimentSource`, `ScaleType`, `ScaleOrderStatus`, `ConfigDataType`, `RecoveryMode`, `StrategyHealthStatus`, `StrategyLifecycleStage`, `TriggerType`, `EACommandType`, `EAInstanceStatus`, `LearnerArchitecture`, `ElmActivation`, `TcnActivation`, `AccountType`, `MarginMode`, `TimeInForce`, `ExecutionAlgorithmType`, `ApprovalOperationType`, `ApprovalStatus`, `StressScenarioType`, `MarketDataAnomalyType`, `DegradationMode`, `TradeExitReason`
@@ -193,7 +193,6 @@ Orders/
 | `IStrategyCapacityEstimator` | Strategy capacity estimation |
 | `IStressTestEngine` | Stress test scenario execution |
 | `ITransactionCostAnalyzer` | Transaction cost analysis |
-| `IApprovalWorkflow` | Four-eyes approval workflow |
 | `IDeadLetterSink` | Dead letter event storage |
 | `IGapRiskModel` | Weekend/holiday gap risk model |
 | `ICorrelationRiskAnalyzer` | Cross-asset correlation analysis |
@@ -237,7 +236,7 @@ Orders/
 | ML Pre-trainers | `SelfSupervisedPretrainer`, `VaePretrainer`, `CpcPretrainer` |
 | Feature Store | `DatabaseFeatureStore` |
 | Monitoring | `LivePerformanceBenchmark`, `PortfolioEquityCurveProvider`, `WorkerHealthMonitor`, `EngineMonitoringService`, `StrategyCapacityEstimator` |
-| Infrastructure | `DeadLetterSink`, `IdempotencyGuard`, `DataRetentionManager`, `DegradationModeManager`, `ApprovalWorkflowService` |
+| Infrastructure | `DeadLetterSink`, `IdempotencyGuard`, `DataRetentionManager`, `DegradationModeManager` |
 | Strategy Evaluators | `BreakoutScalperEvaluator`, `MovingAverageCrossoverEvaluator`, `RSIReversionEvaluator` |
 
 #### Background Workers (`Workers/`) — 147 workers
@@ -624,6 +623,7 @@ StrategyGenerationWorker → BacktestWorker → WalkForwardWorker → StrategyHe
 
 ## Key Patterns & Rules
 
+- **No manual gates**: The engine is fully autonomous. Never introduce manual approval workflows, four-eyes gates, human-in-the-loop confirmation steps, or any mechanism that blocks the autonomous pipeline waiting for human action. Human oversight is achieved through monitoring, alerts, risk limits, circuit breakers, and kill switches — not synchronous approval gates.
 - **Soft delete**: All entities have `IsDeleted`; EF global query filters exclude deleted rows automatically.
 - **Pagination**: List queries take `PagerRequest`, return `Pager<TDto>`.
 - **Event bus**: After a successful command write, publish the relevant `IntegrationEvent` via `IEventBus`.
