@@ -18,6 +18,7 @@ namespace LascodiaTradingEngine.Application.Services.Alerts.Channels;
 public class EmailAlertSender : IAlertChannelSender
 {
     public AlertChannel Channel => AlertChannel.Email;
+    public string Destination => _options.ToAddress;
 
     private readonly EmailAlertOptions          _options;
     private readonly ILogger<EmailAlertSender>  _logger;

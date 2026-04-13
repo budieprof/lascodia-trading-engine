@@ -67,11 +67,11 @@ public class AlertDispatcher : IAlertDispatcher, IDisposable
             {
                 await sender.SendAsync(alert, message, ct);
                 anySent = true;
-                await PersistDispatchLogAsync(alert, sender.Channel, "Sent", message, null);
+                await PersistDispatchLogAsync(alert, sender.Channel, sender.Destination, AlertDispatchStatus.Sent, message, null);
             }
             catch (Exception ex)
             {
-                await PersistDispatchLogAsync(alert, sender.Channel, "Failed", message, ex.Message);
+                await PersistDispatchLogAsync(alert, sender.Channel, sender.Destination, AlertDispatchStatus.Failed, message, ex.Message);
                 _logger.LogWarning(ex,
                     "AlertDispatcher: failed to send alert {AlertId} via {Channel} (other channels may have succeeded)",
                     alert.Id, sender.Channel);
@@ -139,7 +139,7 @@ public class AlertDispatcher : IAlertDispatcher, IDisposable
     }
 
     /// <summary>Persists a dispatch log entry for dashboard display and delivery SLA tracking.</summary>
-    private async Task PersistDispatchLogAsync(Alert alert, AlertChannel channel, string status, string message, string? error)
+    private async Task PersistDispatchLogAsync(Alert alert, AlertChannel channel, string destination, AlertDispatchStatus status, string message, string? error)
     {
         try
         {
@@ -150,6 +150,7 @@ public class AlertDispatcher : IAlertDispatcher, IDisposable
             {
                 AlertId      = alert.Id,
                 Channel      = channel,
+                Destination  = destination,
                 Status       = status,
                 Message      = message.Length > 2000 ? message[..2000] : message,
                 DispatchedAt = DateTime.UtcNow,

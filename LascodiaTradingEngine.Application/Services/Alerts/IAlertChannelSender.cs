@@ -13,6 +13,9 @@ public interface IAlertChannelSender
     /// <summary>The channel this sender handles.</summary>
     AlertChannel Channel { get; }
 
+    /// <summary>The resolved destination for this channel (URL, email address, or chat ID).</summary>
+    string Destination { get; }
+
     /// <summary>Send the notification to the destination configured in this channel's options.</summary>
     Task SendAsync(Alert alert, string message, CancellationToken ct);
 }

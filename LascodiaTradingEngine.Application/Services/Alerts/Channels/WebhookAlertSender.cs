@@ -18,6 +18,7 @@ namespace LascodiaTradingEngine.Application.Services.Alerts.Channels;
 public class WebhookAlertSender : IAlertChannelSender
 {
     public AlertChannel Channel => AlertChannel.Webhook;
+    public string Destination => _options.Url;
 
     private readonly IHttpClientFactory     _httpClientFactory;
     private readonly WebhookAlertOptions    _options;

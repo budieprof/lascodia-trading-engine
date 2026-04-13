@@ -20,6 +20,7 @@ namespace LascodiaTradingEngine.Application.Services.Alerts.Channels;
 public class TelegramAlertSender : IAlertChannelSender
 {
     public AlertChannel Channel => AlertChannel.Telegram;
+    public string Destination => _options.ChatId;
 
     private readonly IHttpClientFactory             _httpClientFactory;
     private readonly TelegramAlertOptions           _options;

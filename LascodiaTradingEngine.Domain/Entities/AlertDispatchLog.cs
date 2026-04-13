@@ -15,8 +15,11 @@ public class AlertDispatchLog : Entity<long>
     /// <summary>Channel used for dispatch (Webhook, Email, Telegram).</summary>
     public AlertChannel Channel { get; set; }
 
+    /// <summary>Resolved destination at dispatch time (URL, email address, or chat ID).</summary>
+    public string Destination { get; set; } = string.Empty;
+
     /// <summary>Dispatch outcome: Sent, Failed, Retrying.</summary>
-    public string Status { get; set; } = "Sent";
+    public AlertDispatchStatus Status { get; set; } = AlertDispatchStatus.Sent;
 
     /// <summary>Alert message content (truncated to 2000 chars).</summary>
     public string Message { get; set; } = string.Empty;
