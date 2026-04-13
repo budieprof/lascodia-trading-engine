@@ -8,7 +8,6 @@ using LascodiaTradingEngine.Application.Strategies.Commands.AssignRiskProfile;
 using LascodiaTradingEngine.Application.Strategies.Commands.CreateStrategy;
 using LascodiaTradingEngine.Application.Strategies.Commands.DeleteStrategy;
 using LascodiaTradingEngine.Application.Strategies.Commands.PauseStrategy;
-using LascodiaTradingEngine.Application.Strategies.Commands.UpdateStrategy;
 using LascodiaTradingEngine.Application.Strategies.Queries.DTOs;
 using LascodiaTradingEngine.Application.Strategies.Queries.GetStrategy;
 using LascodiaTradingEngine.Application.Strategies.Queries.GetPagedStrategies;
@@ -16,7 +15,7 @@ using LascodiaTradingEngine.Application.Strategies.Queries.GetPagedStrategies;
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
 /// <summary>
-/// Manages trading strategy lifecycle: creation, updates, activation, pausing, deletion, and risk profile assignment.
+/// Manages trading strategy lifecycle: creation, activation, pausing, deletion, and risk profile assignment.
 /// Route: api/v1/lascodia-trading-engine/strategy
 /// </summary>
 [Route("api/v1/lascodia-trading-engine/strategy")]
@@ -36,17 +35,6 @@ public class StrategyController : AuthControllerBase<StrategyController>
         if (!ModelState.IsValid)
             return ResponseData<long>.Init(0, false, "Model state failed", "-11");
 
-        return await Mediator.Send(command);
-    }
-
-    /// <summary>Update a strategy</summary>
-    [HttpPut("{id}")]
-    public async Task<ResponseData<string>> Update(long id, UpdateStrategyCommand command)
-    {
-        if (!ModelState.IsValid)
-            return ResponseData<string>.Init(null, false, "Model state failed", "-11");
-
-        command.Id = id;
         return await Mediator.Send(command);
     }
 

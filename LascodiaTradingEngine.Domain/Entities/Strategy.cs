@@ -5,8 +5,8 @@ namespace LascodiaTradingEngine.Domain.Entities;
 
 /// <summary>
 /// Represents a named, configurable trading strategy that the engine monitors and executes.
-/// Each strategy is bound to a single symbol and timeframe and carries its own parameter set
-/// serialised as JSON so new strategy types can be added without schema changes.
+/// Each strategy is immutably bound to a single algorithm family, symbol, and timeframe; clone
+/// it as a new candidate to retarget. Tunable parameters live in <see cref="ParametersJson"/>.
 /// </summary>
 /// <remarks>
 /// Lifecycle: strategies start <see cref="StrategyStatus.Paused"/> and must be explicitly
@@ -25,20 +25,25 @@ public class Strategy : Entity<long>
     /// <summary>
     /// The algorithm family this strategy belongs to.
     /// Determines which <c>IStrategyEvaluator</c> is invoked at signal-generation time.
+    /// Immutable after creation: changing the evaluator would invalidate all historical
+    /// performance, ML calibration, and screening results tied to this strategy.
     /// </summary>
-    public StrategyType  StrategyType  { get; set; } = StrategyType.Custom;
+    public StrategyType  StrategyType  { get; init; } = StrategyType.Custom;
 
     /// <summary>
     /// The currency pair or instrument this strategy trades (e.g. "EURUSD", "GBPUSD").
     /// Must match the symbol used in <see cref="Candle"/> and <see cref="TradeSignal"/> records.
+    /// Immutable after creation so validation history and lifecycle decisions remain tied to a
+    /// stable market identity.
     /// </summary>
-    public string  Symbol        { get; set; } = string.Empty;
+    public string  Symbol        { get; init; } = string.Empty;
 
     /// <summary>
     /// The chart timeframe the strategy evaluates (e.g. H1, M15).
     /// Candle data is filtered by this value when building the indicator window.
+    /// Immutable after creation so queued validation runs and live qualification remain coherent.
     /// </summary>
-    public Timeframe  Timeframe     { get; set; } = Timeframe.H1;
+    public Timeframe  Timeframe     { get; init; } = Timeframe.H1;
 
     /// <summary>
     /// Strategy-specific tunable parameters stored as a JSON object.

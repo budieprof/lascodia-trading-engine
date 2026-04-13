@@ -260,15 +260,14 @@ internal sealed class StrategyGenerationArtifactReplayService : IStrategyGenerat
             Metrics = ScreeningMetrics.FromJson(strategy.ScreeningMetricsJson ?? pending.Candidate.ScreeningMetricsJson)
                 ?? pending.Candidate.ToOutcome().Metrics,
         };
+        // Strategy is loaded by Id, so Symbol/Timeframe/StrategyType already match the in-memory
+        // candidate by construction — only the DB-assigned and generation-linkage fields change.
         candidate.Strategy.Id = pending.StrategyId;
-        candidate.Strategy.GenerationCandidateId = pending.CandidateId;
-        candidate.Strategy.GenerationCycleId = pending.CycleId;
         candidate.Strategy.Name = strategy.Name;
-        candidate.Strategy.Symbol = strategy.Symbol;
-        candidate.Strategy.Timeframe = strategy.Timeframe;
-        candidate.Strategy.StrategyType = strategy.StrategyType;
         candidate.Strategy.CreatedAt = strategy.CreatedAt;
         candidate.Strategy.ScreeningMetricsJson = strategy.ScreeningMetricsJson ?? candidate.Strategy.ScreeningMetricsJson;
+        candidate.Strategy.GenerationCycleId = pending.CycleId;
+        candidate.Strategy.GenerationCandidateId = pending.CandidateId;
         pending = await ReconcileDeferredEventDispatchesAsync(pending, ct);
         if (IsArtifactFullyProcessed(pending))
         {

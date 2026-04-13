@@ -779,7 +779,6 @@ public interface ILivePriceCache
 | Command | Description |
 |---|---|
 | `CreateStrategyCommand` | Create a new strategy |
-| `UpdateStrategyCommand` | Update parameters, symbol, timeframe |
 | `DeleteStrategyCommand` | Soft-delete |
 | `ActivateStrategyCommand` | Set status to "Active" |
 | `PauseStrategyCommand` | Set status to "Paused" |
@@ -2809,7 +2808,6 @@ GET    /market-data/candles/{symbol}/latest → GetLatestCandleQuery?timeframe=H
 
 ```
 POST   /strategy                   → CreateStrategyCommand
-PUT    /strategy/{id}              → UpdateStrategyCommand
 DELETE /strategy/{id}              → DeleteStrategyCommand
 GET    /strategy/{id}              → GetStrategyQuery
 POST   /strategy/list              → GetPagedStrategiesQuery

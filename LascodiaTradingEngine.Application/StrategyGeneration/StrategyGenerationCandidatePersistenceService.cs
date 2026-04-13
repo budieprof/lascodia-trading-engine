@@ -500,11 +500,10 @@ internal sealed class StrategyGenerationCandidatePersistenceService : IStrategyG
                                 && r.Status == RunStatus.Queued
                                 && !r.IsDeleted, ct);
 
+                // Strategy was located by (StrategyType, Symbol, Timeframe, Name, ParametersJson),
+                // so those fields already match the in-memory candidate — only DB-assigned fields change.
                 candidate.Strategy.Id = persisted.Id;
                 candidate.Strategy.Name = persisted.Name;
-                candidate.Strategy.Symbol = persisted.Symbol;
-                candidate.Strategy.Timeframe = persisted.Timeframe;
-                candidate.Strategy.StrategyType = persisted.StrategyType;
                 candidate.Strategy.CreatedAt = persisted.CreatedAt;
                 candidate.Strategy.ScreeningMetricsJson = persisted.ScreeningMetricsJson ?? candidate.Strategy.ScreeningMetricsJson;
 
