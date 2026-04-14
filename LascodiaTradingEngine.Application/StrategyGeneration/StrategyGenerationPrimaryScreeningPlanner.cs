@@ -37,6 +37,7 @@ internal sealed class StrategyGenerationPrimaryScreeningPlanner : IStrategyGener
     private readonly IBacktestEngine _backtestEngine;
     private readonly IRegimeStrategyMapper _regimeMapper;
     private readonly IStrategyParameterTemplateProvider _templateProvider;
+    private readonly IScreeningSurrogateService _surrogateService;
     private readonly ILivePriceCache _livePriceCache;
     private readonly TradingMetrics _metrics;
     private readonly IStrategyCandidateSelectionPolicy _candidateSelectionPolicy;
@@ -52,6 +53,7 @@ internal sealed class StrategyGenerationPrimaryScreeningPlanner : IStrategyGener
         IBacktestEngine backtestEngine,
         IRegimeStrategyMapper regimeMapper,
         IStrategyParameterTemplateProvider templateProvider,
+        IScreeningSurrogateService surrogateService,
         ILivePriceCache livePriceCache,
         TradingMetrics metrics,
         IStrategyCandidateSelectionPolicy candidateSelectionPolicy,
@@ -66,6 +68,7 @@ internal sealed class StrategyGenerationPrimaryScreeningPlanner : IStrategyGener
         _backtestEngine = backtestEngine;
         _regimeMapper = regimeMapper;
         _templateProvider = templateProvider;
+        _surrogateService = surrogateService;
         _livePriceCache = livePriceCache;
         _metrics = metrics;
         _candidateSelectionPolicy = candidateSelectionPolicy;
@@ -547,6 +550,25 @@ internal sealed class StrategyGenerationPrimaryScreeningPlanner : IStrategyGener
             }
 
             var templates = _templateProvider.GetTemplates(strategyType);
+
+            // Blend TPE-surrogate proposals learned from past screening failures.
+            // Proposals are prepended so they get the best priority slots in the
+            // MaxTemplatesPerCombo-capped queue. The planner's dedup check below
+            // (failedParamsForCombo + normalizedParams) still applies so duplicates
+            // with prior rejections won't re-run within cooldown.
+            var surrogateProposals = _surrogateService.GetProposals(
+                strategyType, args.Symbol, args.Timeframe, count: args.MaxTemplates);
+            if (surrogateProposals.Count > 0)
+            {
+                var merged = new List<string>(surrogateProposals.Count + templates.Count);
+                var seenTemplates = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var p in surrogateProposals)
+                    if (seenTemplates.Add(p)) merged.Add(p);
+                foreach (var t in templates)
+                    if (seenTemplates.Add(t)) merged.Add(t);
+                templates = merged;
+            }
+
             if (templates.Count == 0)
                 continue;
 

@@ -47,6 +47,12 @@ public class ScreeningAuditLogger
             ? result.Regime.ToString()
             : null;
 
+        // Capture the IS-backtest metrics so ScreeningSurrogateService can mine
+        // past failures to fit a TPE surrogate and propose next-cycle params.
+        // Strategy may be null on very early failures (before tempStrategy is built).
+        var trainResult = result.TrainResult;
+        var hasMetrics  = trainResult is not null && result.Strategy is not null;
+
         await SendScopedAsync(new LogDecisionCommand
         {
             EntityType   = "Strategy",
@@ -57,13 +63,19 @@ public class ScreeningAuditLogger
             ContextJson  = JsonSerializer.Serialize(new
             {
                 failureReason = result.Failure.ToString(),
-                strategyType = result.Strategy.StrategyType.ToString(),
-                symbol = result.Strategy.Symbol,
-                timeframe = result.Strategy.Timeframe.ToString(),
+                strategyType = result.Strategy?.StrategyType.ToString(),
+                symbol = result.Strategy?.Symbol,
+                timeframe = result.Strategy?.Timeframe.ToString(),
                 regime = result.Regime.ToString(),
                 observedRegime = result.ObservedRegime.ToString(),
                 generationSource = result.GenerationSource,
                 reserveTargetRegime,
+                paramsJson = hasMetrics ? result.Strategy!.ParametersJson : null,
+                isWinRate = hasMetrics ? (double?)trainResult!.WinRate : null,
+                isProfitFactor = hasMetrics ? (double?)trainResult!.ProfitFactor : null,
+                isSharpeRatio = hasMetrics ? (double?)trainResult!.SharpeRatio : null,
+                isMaxDrawdownPct = hasMetrics ? (double?)trainResult!.MaxDrawdownPct : null,
+                isTotalTrades = hasMetrics ? (int?)trainResult!.TotalTrades : null,
             }, JsonOpts),
             Source       = "StrategyGenerationWorker"
         }, ct);

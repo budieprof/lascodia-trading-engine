@@ -146,6 +146,7 @@ public class StrategyGenerationCycleRunnerTest : IDisposable
             new FakeCheckpointStore(),
             new FakeCheckpointCoordinator(),
             healthStore,
+            Mock.Of<IScreeningSurrogateService>(),
             timeProvider);
 
         return runner;

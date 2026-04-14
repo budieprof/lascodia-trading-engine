@@ -178,18 +178,26 @@ public class StrategyScreeningEngine
         }
 
         // ── In-sample threshold gate ──
-        if ((double)trainResult.WinRate < thresholds.MinWinRate
-            || (double)trainResult.ProfitFactor < thresholds.MinProfitFactor
-            || trainResult.TotalTrades < thresholds.MinTotalTrades
-            || (double)trainResult.MaxDrawdownPct > thresholds.MaxDrawdownPct
-            || (double)trainResult.SharpeRatio < thresholds.MinSharpe)
+        var failedGates = new List<string>(5);
+        if ((double)trainResult.WinRate < thresholds.MinWinRate)
+            failedGates.Add($"WR={trainResult.WinRate:F3}<{thresholds.MinWinRate:F3}");
+        if ((double)trainResult.ProfitFactor < thresholds.MinProfitFactor)
+            failedGates.Add($"PF={trainResult.ProfitFactor:F2}<{thresholds.MinProfitFactor:F2}");
+        if (trainResult.TotalTrades < thresholds.MinTotalTrades)
+            failedGates.Add($"Trades={trainResult.TotalTrades}<{thresholds.MinTotalTrades}");
+        if ((double)trainResult.MaxDrawdownPct > thresholds.MaxDrawdownPct)
+            failedGates.Add($"DD={trainResult.MaxDrawdownPct:F3}>{thresholds.MaxDrawdownPct:F3}");
+        if ((double)trainResult.SharpeRatio < thresholds.MinSharpe)
+            failedGates.Add($"Sharpe={trainResult.SharpeRatio:F2}<{thresholds.MinSharpe:F2}");
+
+        if (failedGates.Count > 0)
         {
             gateTrace.Add(new("IS_Threshold", false, gateSw.Elapsed.TotalMilliseconds));
             _onGateRejection?.Invoke("is_threshold");
             return BuildFailedOutcome(
                 ScreeningFailureReason.IsThreshold,
                 "ScreeningFailed",
-                $"{strategyType} on {symbol}/{timeframe} IS gates failed",
+                $"{strategyType} on {symbol}/{timeframe} IS gates failed: {string.Join(", ", failedGates)}",
                 trainResult);
         }
 

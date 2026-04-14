@@ -41,6 +41,7 @@ internal sealed class StrategyGenerationCycleRunner : IStrategyGenerationCycleRu
     private readonly IStrategyGenerationCheckpointStore _checkpointStore;
     private readonly IStrategyGenerationCheckpointCoordinator _checkpointCoordinator;
     private readonly IStrategyGenerationHealthStore _healthStore;
+    private readonly IScreeningSurrogateService _surrogateService;
 
     public StrategyGenerationCycleRunner(
         ILogger<StrategyGenerationWorker> logger,
@@ -61,6 +62,7 @@ internal sealed class StrategyGenerationCycleRunner : IStrategyGenerationCycleRu
         IStrategyGenerationCheckpointStore checkpointStore,
         IStrategyGenerationCheckpointCoordinator checkpointCoordinator,
         IStrategyGenerationHealthStore healthStore,
+        IScreeningSurrogateService surrogateService,
         TimeProvider timeProvider)
     {
         _logger = logger;
@@ -81,6 +83,7 @@ internal sealed class StrategyGenerationCycleRunner : IStrategyGenerationCycleRu
         _checkpointStore = checkpointStore;
         _checkpointCoordinator = checkpointCoordinator;
         _healthStore = healthStore;
+        _surrogateService = surrogateService;
         _timeProvider = timeProvider;
     }
 
@@ -116,6 +119,7 @@ internal sealed class StrategyGenerationCycleRunner : IStrategyGenerationCycleRu
             await ReconcilePendingSummaryDispatchesAsync(db, writeCtx, eventLogReader, ct);
             await _persistenceCoordinator.ReplayPendingPostPersistArtifactsAsync(db, writeCtx, eventService, auditLogger, ct);
             await _feedbackCoordinator.RefreshDynamicTemplatesAsync(db, ct);
+            await _surrogateService.WarmupAsync(db, ct);
 
             var unreportedFailures = await _failureStore.LoadUnreportedFailuresAsync(db, ct);
             if (unreportedFailures.Count > 0)

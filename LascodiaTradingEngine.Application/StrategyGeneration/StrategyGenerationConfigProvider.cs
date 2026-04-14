@@ -82,7 +82,7 @@ public sealed class StrategyGenerationConfigProvider : IStrategyGenerationConfig
             BlackoutPeriods = Get("StrategyGeneration:BlackoutPeriods", "12/20-01/05"),
             ScreeningTimeoutSeconds = Get("StrategyGeneration:ScreeningTimeoutSeconds", 30),
             CandidateTimeframes = ParseTimeframes(Get("StrategyGeneration:CandidateTimeframes", "H1,H4")),
-            MaxTemplatesPerCombo = Get("StrategyGeneration:MaxTemplatesPerCombo", 2),
+            MaxTemplatesPerCombo = Get("StrategyGeneration:MaxTemplatesPerCombo", 5),
             StrategicReserveQuota = Get("StrategyGeneration:StrategicReserveQuota", 3),
             MaxCandidatesPerWeek = Get("StrategyGeneration:MaxCandidatesPerWeek", 150),
             MaxSpreadToRangeRatio = Get("StrategyGeneration:MaxSpreadToRangeRatio", 0.30),
