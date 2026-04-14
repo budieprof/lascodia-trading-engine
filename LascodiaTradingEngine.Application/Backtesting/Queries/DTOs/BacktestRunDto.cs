@@ -24,7 +24,7 @@ public class BacktestRunDto : IMapFrom<BacktestRun>
     public ValidationFailureCode? FailureCode { get; set; }
     public string?   FailureDetailsJson { get; set; }
     public ValidationQueueSource QueueSource { get; set; }
-    public DateTime  StartedAt      { get; set; }
+    public DateTime  CreatedAt      { get; set; }
     public DateTime  QueuedAt       { get; set; }
     public DateTime  AvailableAt    { get; set; }
     public DateTime? ClaimedAt      { get; set; }

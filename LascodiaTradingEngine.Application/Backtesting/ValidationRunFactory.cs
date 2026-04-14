@@ -206,7 +206,7 @@ internal sealed class ValidationRunFactory : IValidationRunFactory
             BacktestOptionsSnapshotJson = optionsSnapshotJson,
             ValidationQueueKey = request.ValidationQueueKey,
             QueueSource = request.QueueSource,
-            StartedAt = nowUtc,
+            CreatedAt = nowUtc,
             QueuedAt = nowUtc,
             AvailableAt = nowUtc,
             CompletedAt = null,

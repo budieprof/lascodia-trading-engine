@@ -184,7 +184,7 @@ public class BacktestWorker : BackgroundService
             .Where(run => !run.IsDeleted
                        && run.Status == RunStatus.Running
                        && run.ExecutionLeaseExpiresAt == null
-                       && (run.LastHeartbeatAt ?? run.ExecutionStartedAt ?? run.ClaimedAt ?? (DateTime?)run.StartedAt) < legacyCutoff)
+                       && (run.LastHeartbeatAt ?? run.ExecutionStartedAt ?? run.ClaimedAt ?? (DateTime?)run.CreatedAt) < legacyCutoff)
             .ToListAsync(ct);
 
         foreach (var run in legacyRunningRuns)

@@ -46,7 +46,7 @@ internal sealed class StrategyGenerationPruningCoordinator : IStrategyGeneration
             .Where(r => draftIds.Contains(r.StrategyId)
                      && !r.IsDeleted
                      && (r.Status == RunStatus.Failed || r.Status == RunStatus.Completed))
-            .Select(r => new { r.StrategyId, r.Status, r.CompletedAt, r.StartedAt, r.Id })
+            .Select(r => new { r.StrategyId, r.Status, r.CompletedAt, r.CreatedAt, r.Id })
             .ToListAsync(ct);
 
         var toPrune = new List<(long Id, string Name, int Failed)>();
@@ -58,7 +58,7 @@ internal sealed class StrategyGenerationPruningCoordinator : IStrategyGeneration
                 {
                     int consecutiveFailures = 0;
                     foreach (var run in g
-                        .OrderByDescending(r => r.CompletedAt ?? r.StartedAt)
+                        .OrderByDescending(r => r.CompletedAt ?? r.CreatedAt)
                         .ThenByDescending(r => r.Id))
                     {
                         if (run.Status != RunStatus.Failed)

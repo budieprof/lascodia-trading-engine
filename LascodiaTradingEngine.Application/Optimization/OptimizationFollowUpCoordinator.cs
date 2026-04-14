@@ -399,7 +399,6 @@ public sealed class OptimizationFollowUpCoordinator
                 existingBacktest.BacktestOptionsSnapshotJson = JsonSerializer.Serialize(
                     await _optionsSnapshotBuilder.BuildAsync(writeDb, strategy.Symbol, ct));
                 existingBacktest.QueueSource = ValidationRunQueueSources.OptimizationFollowUp;
-                existingBacktest.StartedAt = nowUtc;
                 existingBacktest.QueuedAt = nowUtc;
                 existingBacktest.AvailableAt = nowUtc;
                 existingBacktest.ClaimedAt = null;
@@ -654,7 +653,7 @@ public sealed class OptimizationFollowUpCoordinator
     {
         var anchors = new[]
         {
-            GetIncompleteFollowUpAnchorUtc(run, backtestRun.StartedAt, backtestRun.Status),
+            GetIncompleteFollowUpAnchorUtc(run, backtestRun.CreatedAt, backtestRun.Status),
             GetIncompleteFollowUpAnchorUtc(run, walkForwardRun.StartedAt, walkForwardRun.Status),
         }.Where(x => x.HasValue).Select(x => x!.Value).ToList();
 
@@ -811,7 +810,7 @@ public sealed class OptimizationFollowUpCoordinator
         CancellationToken ct,
         double followUpStuckThresholdHours = 0)
     {
-        DateTime? backtestAnchorUtc = GetIncompleteFollowUpAnchorUtc(run, backtestRun.StartedAt, backtestRun.Status);
+        DateTime? backtestAnchorUtc = GetIncompleteFollowUpAnchorUtc(run, backtestRun.CreatedAt, backtestRun.Status);
         DateTime? walkForwardAnchorUtc = GetIncompleteFollowUpAnchorUtc(run, walkForwardRun.StartedAt, walkForwardRun.Status);
 
         var nowUtc = UtcNow;

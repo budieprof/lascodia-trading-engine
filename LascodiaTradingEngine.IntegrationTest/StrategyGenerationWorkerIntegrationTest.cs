@@ -891,7 +891,7 @@ public class StrategyGenerationWorkerIntegrationTest : IClassFixture<PostgresFix
                 ToDate = DateTime.UtcNow.AddMonths(-2),
                 InitialBalance = 10_000m,
                 Status = RunStatus.Failed,
-                StartedAt = DateTime.UtcNow.AddDays(-(5 - i)),
+                CreatedAt = DateTime.UtcNow.AddDays(-(5 - i)),
                 CompletedAt = DateTime.UtcNow.AddDays(-(5 - i)).AddHours(1),
                 ErrorMessage = "Integration prune failure",
             }));

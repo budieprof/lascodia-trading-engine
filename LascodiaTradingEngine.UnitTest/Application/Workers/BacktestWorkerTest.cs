@@ -116,7 +116,7 @@ public class BacktestWorkerTest
             ToDate = DateTime.UtcNow.AddDays(-3),
             InitialBalance = 10_000m,
             Status = RunStatus.Failed,
-            StartedAt = DateTime.UtcNow.AddDays(-10),
+            CreatedAt = DateTime.UtcNow.AddDays(-10),
             CompletedAt = DateTime.UtcNow.AddHours(-1),
             IsDeleted = false,
         };
@@ -194,14 +194,14 @@ public class BacktestWorkerTest
             id: 5,
             fromDate: new DateTime(2026, 01, 01, 0, 0, 0, DateTimeKind.Utc),
             toDate: new DateTime(2026, 01, 06, 0, 0, 0, DateTimeKind.Utc));
-        defaultStartedAtRun.StartedAt = default;
+        defaultStartedAtRun.CreatedAt = default;
 
         var staleRun = BuildQueuedRun(
             id: 6,
             fromDate: new DateTime(2026, 01, 01, 0, 0, 0, DateTimeKind.Utc),
             toDate: new DateTime(2026, 01, 06, 0, 0, 0, DateTimeKind.Utc));
         staleRun.Status = RunStatus.Running;
-        staleRun.StartedAt = DateTime.UtcNow.AddHours(-5);
+        staleRun.CreatedAt = DateTime.UtcNow.AddHours(-5);
 
         var strategy = BuildStrategy(staleRun.StrategyId, """{"mode":"live"}""");
         var db = BuildDb(backtests: [defaultStartedAtRun, staleRun], strategies: [strategy]);
@@ -230,7 +230,7 @@ public class BacktestWorkerTest
             ToDate = toDate,
             InitialBalance = 10_000m,
             Status = RunStatus.Queued,
-            StartedAt = DateTime.UtcNow.AddMinutes(-10),
+            CreatedAt = DateTime.UtcNow.AddMinutes(-10),
             QueuedAt = DateTime.UtcNow.AddMinutes(-10),
             AvailableAt = DateTime.UtcNow.AddMinutes(-10),
             ParametersSnapshotJson = parametersSnapshotJson,

@@ -62,8 +62,8 @@ public class BacktestRun : Entity<long>
     /// <summary>Human-readable source of this queued run (Manual, AutoRefresh, OptimizationFollowUp, etc.).</summary>
     public ValidationQueueSource QueueSource { get; set; } = ValidationQueueSource.Manual;
 
-    /// <summary>UTC timestamp when this backtest row was originally created.</summary>
-    public DateTime StartedAt      { get; set; } = DateTime.UtcNow;
+    /// <summary>UTC timestamp when this backtest row was originally created. Immutable once set.</summary>
+    public DateTime CreatedAt      { get; set; } = DateTime.UtcNow;
 
     /// <summary>UTC timestamp when this run most recently entered the queue, including retries/recovery.</summary>
     public DateTime QueuedAt       { get; set; } = DateTime.UtcNow;
