@@ -132,7 +132,11 @@ public sealed class DatabaseSeeder
                 StrategyType = StrategyType.RSIReversion,
                 Symbol = "GBPUSD",
                 Timeframe = Timeframe.M15,
-                ParametersJson = """{"RsiPeriod":14,"OverboughtLevel":70,"OversoldLevel":30}""",
+                // Loosened from 70/30 to 60/40 so the seed strategy generates enough signal
+                // traffic to exercise the validator → bridge → order path end-to-end during
+                // bootstrap. The autonomous StrategyGenerationWorker will replace this with
+                // optimized params once it produces its first BacktestQualified candidate.
+                ParametersJson = """{"RsiPeriod":14,"OverboughtLevel":60,"OversoldLevel":40}""",
                 Status = StrategyStatus.Active,
                 RiskProfileId = defaultProfile.Id,
                 CreatedAt = DateTime.UtcNow,
@@ -144,7 +148,10 @@ public sealed class DatabaseSeeder
                 StrategyType = StrategyType.BreakoutScalper,
                 Symbol = "USDJPY",
                 Timeframe = Timeframe.M5,
-                ParametersJson = """{"LookbackPeriod":20,"BreakoutMultiplier":1.5,"ATRPeriod":14}""",
+                // BreakoutMultiplier lowered from 1.5 → 1.0: at 1.5×ATR the strategy rarely
+                // triggers on M5 in sideways conditions. 1.0 produces signals on moves
+                // of one full ATR, which is common enough to exercise the pipeline.
+                ParametersJson = """{"LookbackPeriod":20,"BreakoutMultiplier":1.0,"ATRPeriod":14}""",
                 Status = StrategyStatus.Active,
                 RiskProfileId = defaultProfile.Id,
                 CreatedAt = DateTime.UtcNow,

@@ -75,7 +75,13 @@ public sealed class StrategyGenerationConfigProvider : IStrategyGenerationConfig
             ScreeningSpreadPoints = Get("StrategyGeneration:ScreeningSpreadPoints", 20.0),
             ScreeningCommissionPerLot = Get("StrategyGeneration:ScreeningCommissionPerLot", 7.0),
             ScreeningSlippagePips = Get("StrategyGeneration:ScreeningSlippagePips", 1.0),
-            MinRegimeConfidence = Get("StrategyGeneration:MinRegimeConfidence", 0.60),
+            // Default lowered from 0.60 to 0.30: the regime classifier typically returns
+            // 0.34–0.55 confidence for most FX symbols in mixed / HighVolatility conditions,
+            // so a 0.60 floor excludes 7 of 10 pairs and leaves the generation cycle working
+            // the same 3 symbols every run. 0.30 lets the full pool flow through while still
+            // filtering out regimes the detector is genuinely uncertain about. Operators can
+            // retighten via the StrategyGeneration:MinRegimeConfidence hot-reload key.
+            MinRegimeConfidence = Get("StrategyGeneration:MinRegimeConfidence", 0.30),
             MaxOosDegradationPct = Get("StrategyGeneration:MaxOosDegradationPct", 0.60),
             SuppressDuringDrawdownRecovery = Get("StrategyGeneration:SuppressDuringDrawdownRecovery", true),
             SeasonalBlackoutEnabled = Get("StrategyGeneration:SeasonalBlackoutEnabled", true),
