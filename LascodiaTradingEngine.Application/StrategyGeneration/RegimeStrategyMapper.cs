@@ -24,45 +24,53 @@ namespace LascodiaTradingEngine.Application.StrategyGeneration;
 [RegisterService(ServiceLifetime.Singleton)]
 public class RegimeStrategyMapper : IRegimeStrategyMapper
 {
+    // CompositeML is listed first in every regime so it dominates the per-combo slot
+    // budget (MaxTemplatesPerCombo) after the regime-aware template ordering step.
+    // Rule-based archetypes are kept as fallbacks because classical TA still captures
+    // some micro-regime edges and serves as a baseline the ML model can be evaluated
+    // against. When the TPE surrogate and dynamic-template-refresh eventually produce
+    // enough observations to support an ML-first bandit, the rule-based types can be
+    // pruned entirely. Crisis stays empty to prevent any trading during flagged
+    // market stress.
     private static readonly IReadOnlyDictionary<MarketRegimeEnum, IReadOnlyList<StrategyType>> StaticMap =
         new Dictionary<MarketRegimeEnum, IReadOnlyList<StrategyType>>
         {
             [MarketRegimeEnum.Trending] = new[]
             {
+                StrategyType.CompositeML,
                 StrategyType.MovingAverageCrossover,
                 StrategyType.MACDDivergence,
                 StrategyType.MomentumTrend,
                 StrategyType.BreakoutScalper,
-                StrategyType.CompositeML,
             },
             [MarketRegimeEnum.Ranging] = new[]
             {
+                StrategyType.CompositeML,
                 StrategyType.RSIReversion,
                 StrategyType.BollingerBandReversion,
                 StrategyType.StatisticalArbitrage,
                 StrategyType.VwapReversion,
-                StrategyType.CompositeML,
             },
             [MarketRegimeEnum.HighVolatility] = new[]
             {
+                StrategyType.CompositeML,
                 StrategyType.BreakoutScalper,
                 StrategyType.MomentumTrend,
-                StrategyType.CompositeML,
             },
             [MarketRegimeEnum.LowVolatility] = new[]
             {
+                StrategyType.CompositeML,
                 StrategyType.RSIReversion,
                 StrategyType.BollingerBandReversion,
                 StrategyType.StatisticalArbitrage,
                 StrategyType.VwapReversion,
                 StrategyType.SessionBreakout,
-                StrategyType.CompositeML,
             },
             [MarketRegimeEnum.Breakout] = new[]
             {
+                StrategyType.CompositeML,
                 StrategyType.BreakoutScalper,
                 StrategyType.MomentumTrend,
-                StrategyType.CompositeML,
             },
             [MarketRegimeEnum.Crisis] = Array.Empty<StrategyType>(),
         };

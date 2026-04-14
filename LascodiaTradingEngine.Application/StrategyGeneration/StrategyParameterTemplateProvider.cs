@@ -112,11 +112,25 @@ public class StrategyParameterTemplateProvider : IStrategyParameterTemplateProvi
         },
         [StrategyType.CompositeML] = new[]
         {
+            // Aggressive / high-frequency
+            """{"ConfidenceThreshold":0.55,"ModelPreference":"Ensemble","StopLossAtrMultiplier":1.2,"TakeProfitAtrMultiplier":1.5,"AtrPeriod":10}""",
             """{"ConfidenceThreshold":0.55,"ModelPreference":"Ensemble","StopLossAtrMultiplier":1.5,"TakeProfitAtrMultiplier":2.0,"AtrPeriod":14}""",
+            """{"ConfidenceThreshold":0.58,"ModelPreference":"Ensemble","StopLossAtrMultiplier":1.5,"TakeProfitAtrMultiplier":2.5,"AtrPeriod":14}""",
+
+            // Balanced / standard
+            """{"ConfidenceThreshold":0.60,"ModelPreference":"Ensemble","StopLossAtrMultiplier":1.8,"TakeProfitAtrMultiplier":2.5,"AtrPeriod":14}""",
             """{"ConfidenceThreshold":0.60,"ModelPreference":"Ensemble","StopLossAtrMultiplier":2.0,"TakeProfitAtrMultiplier":3.0,"AtrPeriod":14}""",
+            """{"ConfidenceThreshold":0.62,"ModelPreference":"Ensemble","StopLossAtrMultiplier":2.0,"TakeProfitAtrMultiplier":2.5,"AtrPeriod":20}""",
             """{"ConfidenceThreshold":0.65,"ModelPreference":"Ensemble","StopLossAtrMultiplier":2.0,"TakeProfitAtrMultiplier":2.5,"AtrPeriod":14}""",
+            """{"ConfidenceThreshold":0.65,"ModelPreference":"Ensemble","StopLossAtrMultiplier":2.2,"TakeProfitAtrMultiplier":3.5,"AtrPeriod":14}""",
+            """{"ConfidenceThreshold":0.68,"ModelPreference":"Ensemble","StopLossAtrMultiplier":2.0,"TakeProfitAtrMultiplier":3.0,"AtrPeriod":20}""",
+
+            // Conservative / selective
             """{"ConfidenceThreshold":0.70,"ModelPreference":"Ensemble","StopLossAtrMultiplier":1.5,"TakeProfitAtrMultiplier":2.5,"AtrPeriod":14}""",
+            """{"ConfidenceThreshold":0.70,"ModelPreference":"Ensemble","StopLossAtrMultiplier":2.5,"TakeProfitAtrMultiplier":4.0,"AtrPeriod":20}""",
+            """{"ConfidenceThreshold":0.72,"ModelPreference":"Ensemble","StopLossAtrMultiplier":2.0,"TakeProfitAtrMultiplier":3.0,"AtrPeriod":14}""",
             """{"ConfidenceThreshold":0.75,"ModelPreference":"Ensemble","StopLossAtrMultiplier":2.5,"TakeProfitAtrMultiplier":3.5,"AtrPeriod":14}""",
+            """{"ConfidenceThreshold":0.78,"ModelPreference":"Ensemble","StopLossAtrMultiplier":2.0,"TakeProfitAtrMultiplier":3.5,"AtrPeriod":20}""",
             """{"ConfidenceThreshold":0.80,"ModelPreference":"Ensemble","StopLossAtrMultiplier":2.5,"TakeProfitAtrMultiplier":4.0,"AtrPeriod":14}""",
         },
     };

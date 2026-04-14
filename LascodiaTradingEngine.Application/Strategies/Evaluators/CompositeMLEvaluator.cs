@@ -321,6 +321,41 @@ public class CompositeMLEvaluator : IStrategyEvaluator
             return null;
         }
 
+        // ── 9b. Macro / positioning context modulation ────────────────────────
+        // Blend regime confidence, COT positioning deltas, recent economic surprise,
+        // and tick-pressure gradient into a signed alignment score for the proposed
+        // direction. The score multiplicatively adjusts the ML-derived confidence by
+        // up to ±30 %. We re-check the threshold afterwards so a directionally aligned
+        // macro context can rescue a marginal signal and an opposing one can reject
+        // an otherwise-qualifying one.
+        double macroAlignment = 0.0;
+        try
+        {
+            using var macroScope = _scopeFactory.CreateScope();
+            var macroProvider = macroScope.ServiceProvider.GetService<Services.ML.IMacroFeatureProvider>();
+            if (macroProvider is not null)
+            {
+                var macroContext = await macroProvider.GetAsync(strategy.Symbol, DateTime.UtcNow, cancellationToken);
+                macroAlignment = macroContext.AlignmentFor(direction == TradeDirection.Buy);
+                double adjustedConfidence = confidence * (1.0 + 0.30 * macroAlignment);
+                adjustedConfidence = Math.Clamp(adjustedConfidence, 0.0, 1.0);
+                if (adjustedConfidence < parameters.ConfidenceThreshold)
+                {
+                    _logger.LogDebug(
+                        "CompositeML {Symbol}: macro alignment {Align:+0.00;-0.00} pulled confidence {Raw:F3}\u2192{Adj:F3} below threshold {Thr:F3}",
+                        strategy.Symbol, macroAlignment, confidence, adjustedConfidence, parameters.ConfidenceThreshold);
+                    return null;
+                }
+                confidence = adjustedConfidence;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex,
+                "CompositeML {Symbol}: macro context unavailable, proceeding with raw confidence",
+                strategy.Symbol);
+        }
+
         // ── 10. Build signal ───────────────────────────────────────────────────
         decimal entryPrice = direction == TradeDirection.Buy ? currentPrice.Ask : currentPrice.Bid;
         decimal stopDistance   = atr * (decimal)parameters.StopLossAtrMultiplier;
