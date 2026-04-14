@@ -97,6 +97,28 @@ public static class DependencyInjection
         // ── Strategy Worker ──────────────────────────────────────────────────────
         // Registered as singleton so the same instance is used both as the hosted
         // service and as the IIntegrationEventHandler resolved by the event bus.
+        //
+        // The shared library's AutoRegisterEventHandler previously ran (via
+        // ConfigureAppServices) and added transient ServiceDescriptors for
+        // StrategyWorker/SignalOrderBridgeWorker because they implement
+        // IIntegrationEventHandler<T>. Those transient descriptors coexist with
+        // the singleton registration below and — depending on the DI container's
+        // last-registration semantics — can cause the event bus to resolve a
+        // FRESH transient instance for every Handle() call. The transient instance
+        // writes the event into ITS OWN private bounded channel, gets disposed
+        // at scope close, and the real singleton hosted-service instance waits
+        // forever on an empty channel. Result: every tick is silently dropped
+        // and zero trade signals are ever generated.
+        //
+        // Purge those transient descriptors before registering the singletons so
+        // the event bus always resolves the hosted-service instance.
+        RemoveDescriptors<StrategyWorker>(services);
+        RemoveDescriptors<SignalOrderBridgeWorker>(services);
+        RemoveHostedServiceDescriptorsByImpl<StrategyWorker>(services);
+        RemoveHostedServiceDescriptorsByImpl<SignalOrderBridgeWorker>(services);
+        RemoveDescriptorsByImpl<IIntegrationEventHandler<PriceUpdatedIntegrationEvent>, StrategyWorker>(services);
+        RemoveDescriptorsByImpl<IIntegrationEventHandler<TradeSignalCreatedIntegrationEvent>, SignalOrderBridgeWorker>(services);
+
         services.AddSingleton<StrategyWorker>();
         services.AddSingleton<IIntegrationEventHandler<PriceUpdatedIntegrationEvent>>(
             sp => sp.GetRequiredService<StrategyWorker>());
@@ -286,5 +308,41 @@ public static class DependencyInjection
             services.AddTransient(typeof(IPipelineBehavior<,>), typeof(ChaosTestingBehavior<,>));
 
         return services;
+    }
+
+    /// <summary>
+    /// Removes every ServiceDescriptor whose ServiceType matches <typeparamref name="T"/>.
+    /// Used to purge transient registrations added by the shared library's
+    /// <c>AutoRegisterEventHandler</c> before re-registering the same type as a singleton.
+    /// </summary>
+    private static void RemoveDescriptors<T>(IServiceCollection services)
+    {
+        var toRemove = services.Where(d => d.ServiceType == typeof(T)).ToList();
+        foreach (var d in toRemove)
+            services.Remove(d);
+    }
+
+    /// <summary>Removes IHostedService descriptors whose implementation is TImpl.</summary>
+    private static void RemoveHostedServiceDescriptorsByImpl<TImpl>(IServiceCollection services)
+    {
+        var toRemove = services.Where(d =>
+            d.ServiceType == typeof(Microsoft.Extensions.Hosting.IHostedService)
+            && (d.ImplementationType == typeof(TImpl)
+                || (d.ImplementationFactory != null && d.ImplementationFactory.Method.ReturnType == typeof(TImpl))
+                || d.ImplementationInstance?.GetType() == typeof(TImpl))).ToList();
+        foreach (var d in toRemove)
+            services.Remove(d);
+    }
+
+    /// <summary>Removes descriptors of TService whose implementation is TImpl.</summary>
+    private static void RemoveDescriptorsByImpl<TService, TImpl>(IServiceCollection services)
+    {
+        var toRemove = services.Where(d =>
+            d.ServiceType == typeof(TService)
+            && (d.ImplementationType == typeof(TImpl)
+                || (d.ImplementationFactory != null && d.ImplementationFactory.Method.ReturnType == typeof(TImpl))
+                || d.ImplementationInstance?.GetType() == typeof(TImpl))).ToList();
+        foreach (var d in toRemove)
+            services.Remove(d);
     }
 }
