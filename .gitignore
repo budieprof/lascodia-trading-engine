@@ -371,3 +371,5 @@ appsettings.Development.json
 .qodo
 qtc-core.API/appsettings.Production.json
 GEMINI.md
+.claude/scheduled_tasks.lock
+.claude/scheduled_tasks.lock
