@@ -83,27 +83,27 @@ public class GetPagedStrategiesQueryHandler
         if (!string.IsNullOrWhiteSpace(filter?.GenerationSource))
             query = query.Where(x =>
                 x.ScreeningMetricsJson != null &&
-                x.ScreeningMetricsJson.Contains($"\"GenerationSource\":\"{filter.GenerationSource}\""));
+                x.ScreeningMetricsJson.Contains($"\"generationSource\":\"{filter.GenerationSource}\""));
 
         if (!string.IsNullOrWhiteSpace(filter?.ObservedRegime))
             query = query.Where(x =>
                 x.ScreeningMetricsJson != null &&
-                x.ScreeningMetricsJson.Contains($"\"ObservedRegime\":\"{filter.ObservedRegime}\""));
+                x.ScreeningMetricsJson.Contains($"\"observedRegime\":\"{filter.ObservedRegime}\""));
 
         if (!string.IsNullOrWhiteSpace(filter?.ReserveTargetRegime))
             query = query.Where(x =>
                 x.ScreeningMetricsJson != null &&
-                x.ScreeningMetricsJson.Contains($"\"ReserveTargetRegime\":\"{filter.ReserveTargetRegime}\""));
+                x.ScreeningMetricsJson.Contains($"\"reserveTargetRegime\":\"{filter.ReserveTargetRegime}\""));
 
         if (filter?.AutoPromotedOnly is true)
             query = query.Where(x =>
                 x.ScreeningMetricsJson != null &&
-                x.ScreeningMetricsJson.Contains("\"IsAutoPromoted\":true"));
+                x.ScreeningMetricsJson.Contains("\"isAutoPromoted\":true"));
 
         if (filter?.AutoPromotedOnly is false)
             query = query.Where(x =>
                 x.ScreeningMetricsJson != null &&
-                x.ScreeningMetricsJson.Contains("\"IsAutoPromoted\":false"));
+                x.ScreeningMetricsJson.Contains("\"isAutoPromoted\":false"));
 
         var data = await pager.ExecuteQuery(query).ToListAsync(cancellationToken);
         var dtos = _mapper.Map<List<StrategyDto>>(data);

@@ -32,6 +32,7 @@ public class TradingPipelineIntegrationTest : IClassFixture<PostgresFixture>
     private async Task EnsureMigrated()
     {
         await using var context = CreateWriteContext();
+        await context.Database.EnsureDeletedAsync();
         await context.Database.MigrateAsync();
     }
 
@@ -249,7 +250,7 @@ public class TradingPipelineIntegrationTest : IClassFixture<PostgresFixture>
         await EnsureMigrated();
 
         // Seed
-        long accountId;
+        long accountId, strategyId;
         await using (var ctx = CreateWriteContext())
         {
             var account = new TradingAccount
@@ -268,8 +269,21 @@ public class TradingPipelineIntegrationTest : IClassFixture<PostgresFixture>
                 IsPaper = true
             };
             ctx.Set<TradingAccount>().Add(account);
+
+            var strategy = new Strategy
+            {
+                Name = "Partial Fill Strategy",
+                Description = "Partial fill integration test",
+                StrategyType = StrategyType.BreakoutScalper,
+                Symbol = "GBPUSD",
+                Timeframe = Timeframe.M15,
+                ParametersJson = "{}",
+                Status = StrategyStatus.Active
+            };
+            ctx.Set<Strategy>().Add(strategy);
             await ctx.SaveChangesAsync();
             accountId = account.Id;
+            strategyId = strategy.Id;
         }
 
         // Create order with 1.0 lot, fill only 0.6
@@ -279,6 +293,7 @@ public class TradingPipelineIntegrationTest : IClassFixture<PostgresFixture>
             var order = new Order
             {
                 TradingAccountId = accountId,
+                StrategyId = strategyId,
                 Symbol = "GBPUSD",
                 OrderType = OrderType.Buy,
                 ExecutionType = ExecutionType.Market,

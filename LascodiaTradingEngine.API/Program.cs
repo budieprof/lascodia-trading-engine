@@ -362,3 +362,5 @@ app.RunAppPipeline<Program, WriteApplicationDbContext, IWriteApplicationDbContex
 
     return true;
 });
+
+public partial class Program { }

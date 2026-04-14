@@ -23,8 +23,8 @@ public class OptimizationRunClaimerIntegrationTest : IClassFixture<PostgresFixtu
         await ResetDatabaseAsync();
 
         await using var seedCtx = CreateWriteContext();
-        long olderStrategyId = await SeedStrategyAsync(seedCtx, "OlderQueued");
-        long newerStrategyId = await SeedStrategyAsync(seedCtx, "NewerQueued");
+        long olderStrategyId = await SeedStrategyAsync(seedCtx, "OlderQueued", StrategyType.BreakoutScalper);
+        long newerStrategyId = await SeedStrategyAsync(seedCtx, "NewerQueued", StrategyType.RSIReversion);
 
         var olderQueuedAt = new DateTime(2026, 04, 07, 9, 0, 0, DateTimeKind.Utc);
         var newerQueuedAt = olderQueuedAt.AddHours(2);
@@ -72,8 +72,8 @@ public class OptimizationRunClaimerIntegrationTest : IClassFixture<PostgresFixtu
         await ResetDatabaseAsync();
 
         await using var seedCtx = CreateWriteContext();
-        long strategyAId = await SeedStrategyAsync(seedCtx, "ConcurrentA");
-        long strategyBId = await SeedStrategyAsync(seedCtx, "ConcurrentB");
+        long strategyAId = await SeedStrategyAsync(seedCtx, "ConcurrentA", StrategyType.BreakoutScalper);
+        long strategyBId = await SeedStrategyAsync(seedCtx, "ConcurrentB", StrategyType.RSIReversion);
 
         seedCtx.Set<OptimizationRun>().AddRange(
             new OptimizationRun
@@ -177,8 +177,8 @@ public class OptimizationRunClaimerIntegrationTest : IClassFixture<PostgresFixtu
         await ResetDatabaseAsync();
 
         await using var seedCtx = CreateWriteContext();
-        long staleStrategyId = await SeedStrategyAsync(seedCtx, "StaleRunning");
-        long queuedStrategyId = await SeedStrategyAsync(seedCtx, "QueuedCandidate");
+        long staleStrategyId = await SeedStrategyAsync(seedCtx, "StaleRunning", StrategyType.BreakoutScalper);
+        long queuedStrategyId = await SeedStrategyAsync(seedCtx, "QueuedCandidate", StrategyType.RSIReversion);
 
         seedCtx.Set<OptimizationRun>().AddRange(
             new OptimizationRun
@@ -274,13 +274,16 @@ public class OptimizationRunClaimerIntegrationTest : IClassFixture<PostgresFixtu
         await context.Database.MigrateAsync();
     }
 
-    private static async Task<long> SeedStrategyAsync(WriteApplicationDbContext context, string name)
+    private static async Task<long> SeedStrategyAsync(
+        WriteApplicationDbContext context,
+        string name,
+        StrategyType strategyType = StrategyType.BreakoutScalper)
     {
         var strategy = new Strategy
         {
             Name = name,
             Description = $"{name} strategy",
-            StrategyType = StrategyType.BreakoutScalper,
+            StrategyType = strategyType,
             Symbol = "EURUSD",
             Timeframe = Timeframe.H1,
             ParametersJson = """{"Fast":12,"Slow":26}""",

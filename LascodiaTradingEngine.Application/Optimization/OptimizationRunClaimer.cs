@@ -201,7 +201,7 @@ internal static class OptimizationRunClaimer
         AddParameter(command, "@runningStatus", OptimizationRunStatus.Running.ToString());
         AddParameter(command, "@queuedStatus", OptimizationRunStatus.Queued.ToString());
         AddParameter(command, "@failedStatus", OptimizationRunStatus.Failed.ToString());
-        AddParameter(command, "@strategyRemovedFailureCategory", OptimizationFailureCategory.StrategyRemoved.ToString());
+        AddParameter(command, "@strategyRemovedFailureCategory", (int)OptimizationFailureCategory.StrategyRemoved);
         AddParameter(command, "@nowUtc", nowUtc);
 
         await using var reader = await command.ExecuteReaderAsync(ct);

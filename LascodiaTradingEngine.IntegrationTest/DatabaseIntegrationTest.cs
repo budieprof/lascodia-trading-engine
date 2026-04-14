@@ -37,6 +37,7 @@ public class DatabaseIntegrationTest : IClassFixture<PostgresFixture>
     private async Task EnsureMigrated()
     {
         await using var context = CreateWriteContext();
+        await context.Database.EnsureDeletedAsync();
         await context.Database.MigrateAsync();
     }
 

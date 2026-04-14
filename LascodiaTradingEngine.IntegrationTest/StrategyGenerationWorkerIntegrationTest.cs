@@ -64,6 +64,7 @@ public class StrategyGenerationWorkerIntegrationTest : IClassFixture<PostgresFix
     private async Task EnsureMigratedAsync()
     {
         await using var context = CreateWriteContext();
+        await context.Database.EnsureDeletedAsync();
         await context.Database.MigrateAsync();
     }
 
