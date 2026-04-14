@@ -99,7 +99,7 @@ internal static class OptimizationApprovalReportParser
         return Serialize(report);
     }
 
-    internal static string SetManualReviewDiagnostics(
+    internal static string SetAutoRejectedDiagnostics(
         string? approvalReportJson,
         IReadOnlyList<FailedCandidateDiagnostic>? failedCandidates,
         string failureReason,
@@ -110,7 +110,7 @@ internal static class OptimizationApprovalReportParser
         report.Passed = false;
         report.FailureReason = failureReason;
         report.TopCandidateFailureReason = failureReason;
-        report.ApprovalBlockedReason = "ManualReview";
+        report.ApprovalBlockedReason = "AutoRejected";
         report.FailedCandidateScore = failedCandidateScore;
         report.FailedCandidateScoreSource = hasOosValidation ? "OutOfSample" : "InSample";
         report.HasOosValidation = hasOosValidation;

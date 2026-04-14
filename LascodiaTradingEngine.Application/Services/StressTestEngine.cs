@@ -17,17 +17,14 @@ namespace LascodiaTradingEngine.Application.Services;
 public class StressTestEngine : IStressTestEngine
 {
     private readonly IReadApplicationDbContext _readContext;
-    private readonly IPortfolioRiskCalculator _riskCalculator;
     private readonly ILogger<StressTestEngine> _logger;
 
     public StressTestEngine(
         IReadApplicationDbContext readContext,
-        IPortfolioRiskCalculator riskCalculator,
         ILogger<StressTestEngine> logger)
     {
-        _readContext     = readContext;
-        _riskCalculator = riskCalculator;
-        _logger          = logger;
+        _readContext = readContext;
+        _logger      = logger;
     }
 
     public async Task<StressTestResult> RunScenarioAsync(

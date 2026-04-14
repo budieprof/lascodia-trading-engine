@@ -558,11 +558,17 @@ internal sealed class OptimizationSearchCoordinator
             {
                 Interlocked.Increment(ref totalIters);
                 failureTracker.RecordFailure(OptimizationSearchFailureKind.Timeout);
+                _logger.LogWarning(
+                    "OptimizationWorker: seed candidate timed out for strategy {StrategyId} ({Symbol}) params={Params}",
+                    strategy.Id, strategy.Symbol, paramsJson);
             }
-            catch
+            catch (Exception ex)
             {
                 Interlocked.Increment(ref totalIters);
                 failureTracker.RecordFailure(OptimizationSearchFailureKind.Exception);
+                _logger.LogWarning(ex,
+                    "OptimizationWorker: seed candidate threw exception for strategy {StrategyId} ({Symbol}) params={Params}",
+                    strategy.Id, strategy.Symbol, paramsJson);
             }
         });
 
@@ -704,11 +710,17 @@ internal sealed class OptimizationSearchCoordinator
                 {
                     Interlocked.Increment(ref totalIters);
                     failureTracker.RecordFailure(OptimizationSearchFailureKind.Timeout);
+                    _logger.LogWarning(
+                        "OptimizationWorker: batch candidate timed out for strategy {StrategyId} ({Symbol}) params={Params}",
+                        strategy.Id, strategy.Symbol, paramsJson);
                 }
-                catch
+                catch (Exception ex)
                 {
                     Interlocked.Increment(ref totalIters);
                     failureTracker.RecordFailure(OptimizationSearchFailureKind.Exception);
+                    _logger.LogWarning(ex,
+                        "OptimizationWorker: batch candidate threw exception for strategy {StrategyId} ({Symbol}) params={Params}",
+                        strategy.Id, strategy.Symbol, paramsJson);
                 }
             });
             int spentThisBatch = Volatile.Read(ref batchSpent);

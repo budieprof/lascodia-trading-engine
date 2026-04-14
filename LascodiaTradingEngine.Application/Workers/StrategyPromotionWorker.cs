@@ -95,6 +95,11 @@ public sealed class StrategyPromotionWorker : InstrumentedBackgroundService
     {
         _logger.LogInformation("StrategyPromotionWorker starting");
 
+        _healthMonitor?.RecordWorkerMetadata(
+            nameof(StrategyPromotionWorker),
+            "Promotes BacktestQualified → Approved → Active strategies after observation window.",
+            TimeSpan.FromMinutes(DefaultPollMinutes));
+
         // Brief startup delay to let BacktestWorker/WalkForwardWorker populate initial data.
         await Task.Delay(TimeSpan.FromMinutes(1), stoppingToken);
 
@@ -103,6 +108,7 @@ public sealed class StrategyPromotionWorker : InstrumentedBackgroundService
             int pollMinutes = DefaultPollMinutes;
             try
             {
+                _healthMonitor?.RecordWorkerHeartbeat(nameof(StrategyPromotionWorker));
                 await RunPromotionCycleAsync(stoppingToken);
                 _consecutiveFailures = 0;
 

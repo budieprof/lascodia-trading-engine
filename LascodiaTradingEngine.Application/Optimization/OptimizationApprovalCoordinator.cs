@@ -72,7 +72,7 @@ internal sealed class OptimizationApprovalCoordinator
         var runCt = ctx.RunCt;
         var oosResult = vr.OosResult;
         decimal improvement = vr.OosHealthScore - ctx.BaselineComparisonScore;
-        string failureReason = vr.FailureReason ?? "manual review required";
+        string failureReason = vr.FailureReason ?? "validation failed";
 
         if (vr.Passed)
         {
@@ -401,7 +401,7 @@ internal sealed class OptimizationApprovalCoordinator
                     ];
                 }
 
-                run.ApprovalReportJson = OptimizationApprovalReportParser.SetManualReviewDiagnostics(
+                run.ApprovalReportJson = OptimizationApprovalReportParser.SetAutoRejectedDiagnostics(
                     run.ApprovalReportJson,
                     failedCandidates,
                     failureReason,
@@ -418,10 +418,10 @@ internal sealed class OptimizationApprovalCoordinator
             run.ApprovalEvaluatedAt = nowUtc;
             await SaveOwnedMutationAsync(
                 ctx,
-                "OptimizationApprovalCoordinator: lease ownership changed before persisting manual-review decision for run {RunId}");
+                "OptimizationApprovalCoordinator: lease ownership changed before persisting auto-rejection decision for run {RunId}");
 
             _logger.LogInformation(
-                "OptimizationApprovalCoordinator: run {RunId} requires manual review — {Reason}",
+                "OptimizationApprovalCoordinator: run {RunId} AUTO-REJECTED — {Reason}",
                 run.Id,
                 failureReason);
 
@@ -432,7 +432,7 @@ internal sealed class OptimizationApprovalCoordinator
                     EntityType = "OptimizationRun",
                     EntityId = run.Id,
                     DecisionType = "AutoApproval",
-                    Outcome = "ManualReviewRequired",
+                    Outcome = "Rejected",
                     Reason = failureReason,
                     Source = "OptimizationWorker"
                 }, ct);
@@ -440,7 +440,7 @@ internal sealed class OptimizationApprovalCoordinator
             catch (Exception ex)
             {
                 _logger.LogWarning(ex,
-                    "OptimizationApprovalCoordinator: manual-review audit log failed for run {RunId} (non-fatal)",
+                    "OptimizationApprovalCoordinator: auto-rejection audit log failed for run {RunId} (non-fatal)",
                     run.Id);
             }
 

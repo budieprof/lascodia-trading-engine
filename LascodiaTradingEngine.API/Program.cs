@@ -91,8 +91,6 @@ builder.Services.AddSingleton<Microsoft.Extensions.Caching.Memory.IMemoryCache>(
     new Microsoft.Extensions.Caching.Memory.MemoryCache(
         new Microsoft.Extensions.Caching.Memory.MemoryCacheOptions
         {
-            SizeLimit = 10_000,
-            CompactionPercentage = 0.25,
             ExpirationScanFrequency = TimeSpan.FromMinutes(5)
         }));
 

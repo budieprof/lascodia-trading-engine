@@ -137,7 +137,11 @@ public class FairEconomyCalendarFeed : IEconomicCalendarFeed
             "FairEconomyCalendarFeed: fetched and parsed {Count} events from API ({Raw} raw)",
             events.Count, rawEvents.Count);
 
-        _cache.Set(CacheKey, events, CacheDuration);
+        _cache.Set(CacheKey, events, new MemoryCacheEntryOptions
+        {
+            AbsoluteExpirationRelativeToNow = CacheDuration,
+            Size = 1
+        });
         return events;
     }
 

@@ -1924,7 +1924,7 @@ public class OptimizationWorkerTest
     }
 
     [Fact]
-    public async Task ApplyApprovalDecisionAsync_PersistsManualReviewDiagnostics_WhenCandidateFailsApproval()
+    public async Task ApplyApprovalDecisionAsync_PersistsAutoRejectedDiagnostics_WhenCandidateFailsApproval()
     {
         var run = new OptimizationRun
         {
@@ -2001,7 +2001,7 @@ public class OptimizationWorkerTest
         writeCtx.Verify(x => x.SaveChangesAsync(It.IsAny<CancellationToken>()), Times.Once);
         mediator.Verify(
             x => x.Send(
-                It.Is<LogDecisionCommand>(c => c.Outcome == "ManualReviewRequired"
+                It.Is<LogDecisionCommand>(c => c.Outcome == "Rejected"
                     && c.Reason == "Permutation test failed"),
                 It.IsAny<CancellationToken>()),
             Times.Once);
