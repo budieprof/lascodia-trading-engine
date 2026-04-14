@@ -30,6 +30,9 @@ public class WorkerHealthMonitor : IWorkerHealthMonitor
     /// duplicate alert spam. Cleared when the worker resumes (heartbeat received).
     /// </summary>
     private readonly ConcurrentDictionary<string, bool> _alertedWorkers = new();
+    // Workers that fired a WorkerCrash alert and have since recovered. The snapshot
+    // loop drains this dictionary and marks matching active alerts as auto-resolved.
+    private readonly ConcurrentDictionary<string, DateTime> _recoveredFromCrash = new();
 
     private class WorkerState
     {
@@ -77,7 +80,10 @@ public class WorkerHealthMonitor : IWorkerHealthMonitor
         state.LastSuccessAt = DateTime.UtcNow;
         state.LastCycleDurationMs = durationMs;
         state.IsStopped = false; // Reset stopped flag — worker is clearly alive
-        _alertedWorkers.TryRemove(workerName, out _); // Clear crash alert dedup — worker recovered
+        // Clear crash alert dedup — worker recovered. If we had previously fired a crash
+        // alert for this worker, queue it for auto-resolve in the snapshot loop.
+        if (_alertedWorkers.TryRemove(workerName, out _))
+            _recoveredFromCrash[workerName] = DateTime.UtcNow;
         Interlocked.Exchange(ref state.ConsecutiveFailures, 0);
         Interlocked.Increment(ref state.SuccessesLastHour);
 
@@ -283,6 +289,50 @@ public class WorkerHealthMonitor : IWorkerHealthMonitor
                         _logger.LogError(alertEx,
                             "WorkerHealthMonitor: failed to dispatch crash alert for worker {Worker}", name);
                     }
+                }
+            }
+        }
+
+        // ── Auto-resolve crash alerts for workers that have recovered ─────
+        // Drain the recovered queue. Match by AlertType=WorkerCrash and the worker name
+        // serialized into ConditionJson. Use a JSONB-aware substring filter to keep the
+        // query DB-side and avoid materializing all active alerts.
+        if (!_recoveredFromCrash.IsEmpty)
+        {
+            var recoveredNames = _recoveredFromCrash.Keys.ToList();
+            foreach (var workerName in recoveredNames)
+            {
+                try
+                {
+                    // ConditionJson contains "WorkerName":"<name>" — match defensively.
+                    var marker = "\"WorkerName\":\"" + workerName + "\"";
+                    var activeAlerts = await ctx.Set<Alert>()
+                        .Where(a => a.IsActive
+                                 && a.AlertType == AlertType.WorkerCrash
+                                 && a.ConditionJson.Contains(marker))
+                        .ToListAsync(cancellationToken);
+
+                    if (activeAlerts.Count > 0)
+                    {
+                        var resolvedAt = DateTime.UtcNow;
+                        foreach (var alert in activeAlerts)
+                        {
+                            alert.IsActive = false;
+                            alert.AutoResolvedAt = resolvedAt;
+                        }
+                        await ctx.SaveChangesAsync(cancellationToken);
+
+                        _logger.LogInformation(
+                            "WorkerHealthMonitor: auto-resolved {Count} WorkerCrash alert(s) for recovered worker {Worker}",
+                            activeAlerts.Count, workerName);
+                    }
+                    _recoveredFromCrash.TryRemove(workerName, out _);
+                }
+                catch (Exception resolveEx)
+                {
+                    _logger.LogError(resolveEx,
+                        "WorkerHealthMonitor: failed to auto-resolve crash alert for worker {Worker}", workerName);
+                    // Leave the entry in the queue so we retry next cycle.
                 }
             }
         }

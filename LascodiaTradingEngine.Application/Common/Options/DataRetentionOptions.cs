@@ -26,6 +26,10 @@ public class DataRetentionOptions : ConfigurationOption<DataRetentionOptions>
     /// <summary>Market data anomaly records retention in days.</summary>
     public int MarketDataAnomalyDays { get; set; } = 90;
 
+    /// <summary>Integration event log retention in days. Only Published (state=2) events are purged;
+    /// failed and in-progress events are kept for the retry worker.</summary>
+    public int IntegrationEventLogPublishedDays { get; set; } = 7;
+
     /// <summary>Batch size for each retention sweep cycle.</summary>
     public int BatchSize { get; set; } = 1000;
 

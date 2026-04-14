@@ -41,6 +41,7 @@ public class DataRetentionManager : IDataRetentionManager
         results.Add(await PurgeTickRecordsAsync(ctx, cancellationToken));
         results.Add(await PurgeWorkerHealthAsync(ctx, cancellationToken));
         results.Add(await PurgeAnomaliesAsync(ctx, cancellationToken));
+        results.Add(await PurgePublishedIntegrationEventsAsync(ctx, cancellationToken));
 
         var idempotencyPurged = await PurgeExpiredIdempotencyKeysAsync(cancellationToken);
         results.Add(new RetentionResult("ProcessedIdempotencyKey", 0, idempotencyPurged, DateTime.UtcNow));
@@ -152,5 +153,38 @@ public class DataRetentionManager : IDataRetentionManager
         }
 
         return new RetentionResult("MarketDataAnomaly", 0, batch.Count, cutoff);
+    }
+
+    /// <summary>
+    /// Purges Published (state=2) integration event log entries older than the configured retention.
+    /// Failed (state=3) and InProgress (state=1) events are retained for the retry worker / DLQ flow.
+    /// Uses raw SQL with a CTE-based batch delete because IntegrationEventLogEntry lives in a separate
+    /// assembly and isn't a project-level entity.
+    /// </summary>
+    private async Task<RetentionResult> PurgePublishedIntegrationEventsAsync(
+        DbContext ctx, CancellationToken ct)
+    {
+        var cutoff = DateTime.UtcNow.AddDays(-_options.IntegrationEventLogPublishedDays);
+        var batchSize = _options.BatchSize;
+
+        // CTE-based batch delete keeps the txn small and the lock window short on a hot table.
+        // State=2 = Published (see Lascodia.Trading.Engine.IntegrationEventLogEF.EventStateEnum).
+        const string sql = @"
+WITH victims AS (
+    SELECT ""EventId""
+    FROM ""IntegrationEventLog""
+    WHERE ""State"" = 2 AND ""CreationTime"" < {0}
+    ORDER BY ""CreationTime""
+    LIMIT {1}
+)
+DELETE FROM ""IntegrationEventLog""
+WHERE ""EventId"" IN (SELECT ""EventId"" FROM victims);";
+
+        var rowsDeleted = await ctx.Database.ExecuteSqlRawAsync(
+            sql.Replace("{0}", "{0}").Replace("{1}", "{1}"),
+            new object[] { cutoff, batchSize },
+            ct);
+
+        return new RetentionResult("IntegrationEventLog", 0, rowsDeleted, cutoff);
     }
 }

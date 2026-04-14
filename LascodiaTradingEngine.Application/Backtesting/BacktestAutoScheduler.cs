@@ -39,34 +39,77 @@ internal sealed class BacktestAutoScheduler : IBacktestAutoScheduler
         var cooldownThreshold = nowUtc.AddDays(-settings.CooldownDays);
         int candidateBatchSize = Math.Max(settings.MaxQueuedPerCycle, settings.MaxQueuedPerCycle * 8);
 
-        var candidateStrategies = await writeDb.Set<Strategy>()
+        // Materialize the two filter sets first as plain HashSets, then filter strategies
+        // against them. This avoids the EF Core / Npgsql translation failure caused by
+        // nested correlated subqueries with disjunctive enum predicates inside .Any() —
+        // the previous form produced "The LINQ expression ... could not be translated".
+
+        // 1) Strategies that already have a Queued or Running BacktestRun — must be skipped.
+        var blockingStatuses = new[] { RunStatus.Queued, RunStatus.Running };
+        var blockedStrategyIds = await writeDb.Set<BacktestRun>()
+            .Where(run => !run.IsDeleted && blockingStatuses.Contains(run.Status))
+            .Select(run => run.StrategyId)
+            .Distinct()
+            .ToListAsync(ct);
+        var blockedStrategyIdSet = new HashSet<long>(blockedStrategyIds);
+
+        // 2) Strategies that completed a run within the cooldown window — must be skipped.
+        var recentlyCompletedIds = await writeDb.Set<BacktestRun>()
+            .Where(run => !run.IsDeleted
+                       && run.Status == RunStatus.Completed
+                       && run.CompletedAt != null
+                       && run.CompletedAt >= cooldownThreshold)
+            .Select(run => run.StrategyId)
+            .Distinct()
+            .ToListAsync(ct);
+        var recentlyCompletedIdSet = new HashSet<long>(recentlyCompletedIds);
+
+        // 3) Eligible strategies: active, not blocked, not in cooldown.
+        var eligibleStrategies = await writeDb.Set<Strategy>()
             .Where(strategy => strategy.Status == StrategyStatus.Active && !strategy.IsDeleted)
-            .Where(strategy => !writeDb.Set<BacktestRun>().Any(run =>
-                !run.IsDeleted &&
-                run.StrategyId == strategy.Id &&
-                (run.Status == RunStatus.Queued || run.Status == RunStatus.Running)))
-            .Where(strategy => !writeDb.Set<BacktestRun>().Any(run =>
-                !run.IsDeleted &&
-                run.StrategyId == strategy.Id &&
-                run.Status == RunStatus.Completed &&
-                run.CompletedAt != null &&
-                run.CompletedAt >= cooldownThreshold))
-            .Select(strategy => new AutoRefreshCandidate(
+            .Where(strategy => !blockedStrategyIdSet.Contains(strategy.Id))
+            .Where(strategy => !recentlyCompletedIdSet.Contains(strategy.Id))
+            .Select(strategy => new
+            {
                 strategy.Id,
                 strategy.Symbol,
                 strategy.Timeframe,
                 strategy.Name,
-                strategy.ParametersJson,
-                writeDb.Set<BacktestRun>()
-                    .Where(run => !run.IsDeleted
-                               && run.StrategyId == strategy.Id
-                               && run.Status == RunStatus.Completed
-                               && run.CompletedAt != null)
-                    .Max(run => (DateTime?)run.CompletedAt)))
-            .OrderBy(candidate => candidate.LastCompletedAt ?? DateTime.MinValue)
-            .ThenBy(candidate => candidate.Id)
-            .Take(candidateBatchSize)
+                strategy.ParametersJson
+            })
             .ToListAsync(ct);
+
+        if (eligibleStrategies.Count == 0)
+        {
+            _logger.LogDebug(
+                "BacktestAutoScheduler: no strategies need auto-backtesting (all within {Cooldown}d cooldown).",
+                settings.CooldownDays);
+            return 0;
+        }
+
+        // 4) Last-completed-at per eligible strategy, fetched as a single batch query.
+        var eligibleIds = eligibleStrategies.Select(s => s.Id).ToList();
+        var lastCompletedMap = await writeDb.Set<BacktestRun>()
+            .Where(run => !run.IsDeleted
+                       && run.Status == RunStatus.Completed
+                       && run.CompletedAt != null
+                       && eligibleIds.Contains(run.StrategyId))
+            .GroupBy(run => run.StrategyId)
+            .Select(g => new { StrategyId = g.Key, LastCompletedAt = g.Max(r => r.CompletedAt) })
+            .ToDictionaryAsync(x => x.StrategyId, x => x.LastCompletedAt, ct);
+
+        var candidateStrategies = eligibleStrategies
+            .Select(s => new AutoRefreshCandidate(
+                s.Id,
+                s.Symbol,
+                s.Timeframe,
+                s.Name,
+                s.ParametersJson,
+                lastCompletedMap.TryGetValue(s.Id, out var last) ? last : null))
+            .OrderBy(c => c.LastCompletedAt ?? DateTime.MinValue)
+            .ThenBy(c => c.Id)
+            .Take(candidateBatchSize)
+            .ToList();
 
         if (candidateStrategies.Count == 0)
         {
