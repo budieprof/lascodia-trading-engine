@@ -21,9 +21,17 @@ public class LogDecisionCommandTest
     }
 
     [Fact]
-    public async Task Validator_Fails_When_EntityId_Zero()
+    public async Task Validator_Allows_EntityId_Zero_For_Pipeline_Level_Events()
     {
-        var cmd = new LogDecisionCommand { EntityType = "Order", EntityId = 0, DecisionType = "Test", Outcome = "Ok", Reason = "r", Source = "s" };
+        var cmd = new LogDecisionCommand { EntityType = "Strategy", EntityId = 0, DecisionType = "Test", Outcome = "Ok", Reason = "r", Source = "s" };
+        var result = await _validator.TestValidateAsync(cmd);
+        result.ShouldNotHaveValidationErrorFor(c => c.EntityId);
+    }
+
+    [Fact]
+    public async Task Validator_Fails_When_EntityId_Negative()
+    {
+        var cmd = new LogDecisionCommand { EntityType = "Order", EntityId = -1, DecisionType = "Test", Outcome = "Ok", Reason = "r", Source = "s" };
         var result = await _validator.TestValidateAsync(cmd);
         result.ShouldHaveValidationErrorFor(c => c.EntityId);
     }

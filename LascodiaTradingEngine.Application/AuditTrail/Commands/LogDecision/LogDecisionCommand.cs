@@ -15,7 +15,7 @@ public class LogDecisionCommand : IRequest<ResponseData<long>>
 {
     /// <summary>The type of entity the decision pertains to (e.g., "Order", "RiskProfile").</summary>
     public required string EntityType   { get; set; }
-    /// <summary>The ID of the entity involved in the decision.</summary>
+    /// <summary>The ID of the entity involved in the decision. Use 0 for pipeline-level events that have no entity yet (e.g. screening failures before a Strategy row is created).</summary>
     public long            EntityId     { get; set; }
     /// <summary>The category of decision made (e.g., "SignalApproved", "ConfigUpdated").</summary>
     public required string DecisionType { get; set; }
@@ -41,7 +41,7 @@ public class LogDecisionCommandValidator : AbstractValidator<LogDecisionCommand>
             .MaximumLength(50).WithMessage("EntityType cannot exceed 50 characters");
 
         RuleFor(x => x.EntityId)
-            .GreaterThan(0).WithMessage("EntityId must be greater than zero");
+            .GreaterThanOrEqualTo(0).WithMessage("EntityId cannot be negative");
 
         RuleFor(x => x.DecisionType)
             .NotEmpty().WithMessage("DecisionType cannot be empty")
