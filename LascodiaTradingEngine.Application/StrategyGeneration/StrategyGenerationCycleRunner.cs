@@ -96,7 +96,7 @@ internal sealed class StrategyGenerationCycleRunner : IStrategyGenerationCycleRu
         var eventLogReader = scope.ServiceProvider.GetRequiredService<IEventLogReader>();
         var db = readCtx.GetDbContext();
         var writeDb = writeCtx.GetDbContext();
-        var auditLogger = new ScreeningAuditLogger(mediator);
+        var auditLogger = new ScreeningAuditLogger(_scopeFactory);
 
         var spreadProfileProvider = scope.ServiceProvider.GetService<ISpreadProfileProvider>();
         var liveBenchmark = scope.ServiceProvider.GetService<ILivePerformanceBenchmark>();

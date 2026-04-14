@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Text.Json;
 using LascodiaTradingEngine.Application.AuditTrail.Commands.LogDecision;
 using MediatR;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
@@ -11,8 +12,10 @@ namespace LascodiaTradingEngine.Application.StrategyGeneration;
 /// candidate creation, and pruning events. Structured metrics are stored in
 /// <see cref="LogDecisionCommand.ContextJson"/> so they are queryable without string parsing.
 ///
-/// <b>Thread safety:</b> Stateless — safe to share across parallel screening tasks.
-/// The injected <see cref="IMediator"/> handles its own scoping.
+/// <b>Thread safety:</b> Every Send creates a fresh DI scope so the underlying
+/// IWriteApplicationDbContext is never shared across the planner's parallel
+/// screening tasks — a single shared context would throw
+/// <c>InvalidOperationException: A second operation was started on this context instance</c>.
 /// </summary>
 public class ScreeningAuditLogger
 {
@@ -22,11 +25,18 @@ public class ScreeningAuditLogger
         WriteIndented = false,
         DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull,
     };
-    private readonly IMediator _mediator;
+    private readonly IServiceScopeFactory _scopeFactory;
 
-    public ScreeningAuditLogger(IMediator mediator)
+    public ScreeningAuditLogger(IServiceScopeFactory scopeFactory)
     {
-        _mediator = mediator;
+        _scopeFactory = scopeFactory;
+    }
+
+    private async Task SendScopedAsync(LogDecisionCommand command, CancellationToken ct)
+    {
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        var mediator = scope.ServiceProvider.GetRequiredService<IMediator>();
+        await mediator.Send(command, ct);
     }
 
     /// <summary>Logs a screening failure with structured failure reason and metrics context.</summary>
@@ -37,7 +47,7 @@ public class ScreeningAuditLogger
             ? result.Regime.ToString()
             : null;
 
-        await _mediator.Send(new LogDecisionCommand
+        await SendScopedAsync(new LogDecisionCommand
         {
             EntityType   = "Strategy",
             EntityId     = 0,
@@ -62,7 +72,7 @@ public class ScreeningAuditLogger
     /// <summary>Logs a successful candidate creation with structured IS/OOS metrics in ContextJson.</summary>
     public async Task LogCreationAsync(ScreeningOutcome candidate, long strategyId, CancellationToken ct)
     {
-        await _mediator.Send(new LogDecisionCommand
+        await SendScopedAsync(new LogDecisionCommand
         {
             EntityType   = "Strategy",
             EntityId     = strategyId,
@@ -104,7 +114,7 @@ public class ScreeningAuditLogger
     /// <summary>Logs a Draft strategy being pruned after repeated backtest failures.</summary>
     public async Task LogPruningAsync(long strategyId, string name, int failedCount, CancellationToken ct)
     {
-        await _mediator.Send(new LogDecisionCommand
+        await SendScopedAsync(new LogDecisionCommand
         {
             EntityType   = "Strategy",
             EntityId     = strategyId,
@@ -132,7 +142,7 @@ public class ScreeningAuditLogger
         Domain.Enums.MarketRegime? reserveTargetRegime,
         CancellationToken ct)
     {
-        await _mediator.Send(new LogDecisionCommand
+        await SendScopedAsync(new LogDecisionCommand
         {
             EntityType = "Strategy",
             EntityId = 0,

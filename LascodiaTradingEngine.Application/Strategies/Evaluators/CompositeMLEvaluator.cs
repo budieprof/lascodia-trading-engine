@@ -40,20 +40,17 @@ public class CompositeMLEvaluator : IStrategyEvaluator
     private const double SignalExpiryMinutes = 60;
 
     private readonly IEnumerable<IModelInferenceEngine> _inferenceEngines;
-    private readonly IReadApplicationDbContext _readDb;
     private readonly IMemoryCache _cache;
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<CompositeMLEvaluator> _logger;
 
     public CompositeMLEvaluator(
         IEnumerable<IModelInferenceEngine> inferenceEngines,
-        IReadApplicationDbContext readDb,
         IMemoryCache cache,
         IServiceScopeFactory scopeFactory,
         ILogger<CompositeMLEvaluator> logger)
     {
         _inferenceEngines = inferenceEngines;
-        _readDb           = readDb;
         _cache            = cache;
         _scopeFactory     = scopeFactory;
         _logger           = logger;
@@ -149,7 +146,8 @@ public class CompositeMLEvaluator : IStrategyEvaluator
                 {
                     var baseCcy = strategy.Symbol[..3];
                     var quoteCcy = strategy.Symbol[3..6];
-                    var recentEvent = await _readDb.GetDbContext().Set<EconomicEvent>()
+                    var scopedReadDb = featureScope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+                    var recentEvent = await scopedReadDb.GetDbContext().Set<EconomicEvent>()
                         .Where(e => !e.IsDeleted && e.Impact == EconomicImpact.High
                                  && e.Actual != null
                                  && e.ScheduledAt >= DateTime.UtcNow.AddHours(-24)
@@ -173,7 +171,8 @@ public class CompositeMLEvaluator : IStrategyEvaluator
                 {
                     try
                     {
-                        var rawTicks = await _readDb.GetDbContext().Set<TickRecord>()
+                        var scopedTickDb = featureScope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+                        var rawTicks = await scopedTickDb.GetDbContext().Set<TickRecord>()
                             .Where(t => t.Symbol == strategy.Symbol && !t.IsDeleted
                                      && t.TickTimestamp >= DateTime.UtcNow.AddMinutes(-5))
                             .OrderByDescending(t => t.TickTimestamp)
@@ -195,7 +194,8 @@ public class CompositeMLEvaluator : IStrategyEvaluator
                     {
                         var baseCcy = strategy.Symbol[..3];
                         var quoteCcy = strategy.Symbol[3..6];
-                        upcomingEventCount = await _readDb.GetDbContext().Set<EconomicEvent>()
+                        var scopedEventDb = featureScope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+                        upcomingEventCount = await scopedEventDb.GetDbContext().Set<EconomicEvent>()
                             .Where(e => !e.IsDeleted
                                      && (e.Impact == EconomicImpact.High || e.Impact == EconomicImpact.Medium)
                                      && (e.Currency == baseCcy || e.Currency == quoteCcy)
@@ -377,7 +377,9 @@ public class CompositeMLEvaluator : IStrategyEvaluator
         if (_cache.TryGetValue<MLModel>(cacheKey, out var cached) && cached is not null)
             return cached;
 
-        var model = await _readDb.GetDbContext().Set<MLModel>()
+        using var scope = _scopeFactory.CreateScope();
+        var readDb = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+        var model = await readDb.GetDbContext().Set<MLModel>()
             .AsNoTracking()
             .Where(m => m.Symbol    == symbol &&
                         m.Timeframe == timeframe &&
