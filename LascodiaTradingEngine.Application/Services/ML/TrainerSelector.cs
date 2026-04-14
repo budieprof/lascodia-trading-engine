@@ -487,24 +487,20 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
         // ── 2b. Regime transition cooldown — attenuate affinity for very recent transitions
         double regimeConfidence = ComputeRegimeConfidence(effectiveRegime, regimeDetectedAt, regimeCooldownMins, timeframe);
 
-        // ── 2c. Pre-warm independent caches in parallel ───────────────────
-        // LoadRecentRunsAsync and BuildRawAffinityMapAsync are independent
-        // of each other (both only depend on config). Firing them concurrently
-        // eliminates the sequential lock convoy on cold cache — the subsequent
-        // calls inside RankedHistoricalArchitecturesAsync hit warm cache.
+        // ── 2c. Pre-warm independent caches ───────────────────────────────
+        // LoadRecentRunsAsync and BuildRawAffinityMapAsync read from the scoped
+        // IReadApplicationDbContext, so they must run sequentially — EF Core
+        // does not permit concurrent operations on a single DbContext instance
+        // ("A second operation was started on this context instance before a
+        // previous operation completed"). The subsequent calls inside
+        // RankedHistoricalArchitecturesAsync still benefit because both helpers
+        // populate IMemoryCache, so only the first run pays the DB cost.
+        await LoadRecentRunsAsync(ctx, symbol, timeframe, historyMaxDays, cacheTtl, ct).ConfigureAwait(false);
+        if (effectiveRegime.HasValue)
         {
-            var runsWarmup = LoadRecentRunsAsync(ctx, symbol, timeframe, historyMaxDays, cacheTtl, ct);
-
-            if (effectiveRegime.HasValue)
-            {
-                var affinityWarmup = BuildRawAffinityMapAsync(
-                    ctx, symbol, timeframe, effectiveRegime.Value, historyMaxDays, regimeWindowHours, cacheTtl, ct, shadowAffinityWt);
-                await Task.WhenAll(runsWarmup, affinityWarmup).ConfigureAwait(false);
-            }
-            else
-            {
-                await runsWarmup.ConfigureAwait(false);
-            }
+            await BuildRawAffinityMapAsync(
+                ctx, symbol, timeframe, effectiveRegime.Value, historyMaxDays, regimeWindowHours, cacheTtl, ct, shadowAffinityWt)
+                .ConfigureAwait(false);
         }
 
         // ── 3. Try historical best-performer with UCB1 + blended regime affinity

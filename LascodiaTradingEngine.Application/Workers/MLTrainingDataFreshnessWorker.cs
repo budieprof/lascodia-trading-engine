@@ -155,6 +155,86 @@ public sealed class MLTrainingDataFreshnessWorker : BackgroundService
                     model.Id, model.Symbol, model.Timeframe);
             }
         }
+
+        // Cold-start bootstrap: if an active strategy has no active model and no in-flight
+        // training run, queue one. Every other ML queueing worker only reacts to existing
+        // models, so without this hook the pipeline deadlocks when the initial
+        // DatabaseSeeder bootstrap fails (e.g. insufficient candles at first boot) because
+        // nothing ever re-attempts first training.
+        try
+        {
+            await BootstrapMissingModelsAsync(trainWindowDays, readCtx, writeCtx, ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Freshness: bootstrap scan for missing models failed");
+        }
+    }
+
+    /// <summary>
+    /// Finds active strategies whose (symbol, timeframe) has no active ML model and no
+    /// in-flight training run, and queues a fresh run for each. Runs at most one bootstrap
+    /// per (symbol, timeframe) per cycle.
+    /// </summary>
+    private async Task BootstrapMissingModelsAsync(
+        int trainWindowDays,
+        Microsoft.EntityFrameworkCore.DbContext readCtx,
+        Microsoft.EntityFrameworkCore.DbContext writeCtx,
+        CancellationToken ct)
+    {
+        var strategyKeys = await readCtx.Set<Strategy>()
+            .Where(s => s.Status == StrategyStatus.Active && !s.IsDeleted)
+            .Select(s => new { s.Symbol, s.Timeframe })
+            .Distinct()
+            .ToListAsync(ct);
+        if (strategyKeys.Count == 0) return;
+
+        var activeModelKeys = await readCtx.Set<MLModel>()
+            .Where(m => m.IsActive && !m.IsDeleted)
+            .Select(m => new { m.Symbol, m.Timeframe })
+            .Distinct()
+            .ToListAsync(ct);
+        var activeSet = new HashSet<(string, Timeframe)>(
+            activeModelKeys.Select(k => (k.Symbol, k.Timeframe)));
+
+        var inFlightKeys = await readCtx.Set<MLTrainingRun>()
+            .Where(r => (r.Status == RunStatus.Queued || r.Status == RunStatus.Running) && !r.IsDeleted)
+            .Select(r => new { r.Symbol, r.Timeframe })
+            .Distinct()
+            .ToListAsync(ct);
+        var inFlightSet = new HashSet<(string, Timeframe)>(
+            inFlightKeys.Select(k => (k.Symbol, k.Timeframe)));
+
+        int queued = 0;
+        var now = DateTime.UtcNow;
+        var fromDate = now.AddDays(-trainWindowDays);
+
+        foreach (var key in strategyKeys)
+        {
+            var tuple = (key.Symbol, key.Timeframe);
+            if (activeSet.Contains(tuple)) continue;  // already has a live model
+            if (inFlightSet.Contains(tuple)) continue; // already queued / running
+
+            writeCtx.Set<MLTrainingRun>().Add(new MLTrainingRun
+            {
+                Symbol      = key.Symbol,
+                Timeframe   = key.Timeframe,
+                TriggerType = TriggerType.Manual,
+                Status      = RunStatus.Queued,
+                FromDate    = fromDate,
+                ToDate      = now,
+                StartedAt   = now,
+            });
+            queued++;
+        }
+
+        if (queued > 0)
+        {
+            await writeCtx.SaveChangesAsync(ct);
+            _logger.LogInformation(
+                "Freshness: bootstrapped {Count} cold-start training run(s) for strategies without an active model",
+                queued);
+        }
     }
 
     /// <summary>

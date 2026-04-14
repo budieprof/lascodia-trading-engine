@@ -205,15 +205,37 @@ public sealed class DatabaseSeeder
     private async Task SeedInitialMLTrainingRunsAsync(DbContext db, CancellationToken ct)
     {
         var runs = db.Set<MLTrainingRun>();
-        if (await runs.AnyAsync(ct)) return;
+
+        // Re-seed the bootstrap queue until at least one successful run exists anywhere
+        // in the table. The original guard "if AnyAsync(ct) return" deadlocks the entire
+        // ML pipeline when the first bootstrap attempt fails (e.g. EA hadn't streamed
+        // history yet): the failed runs count as "rows exist" so no fresh bootstrap is
+        // ever queued, and every other ML worker only re-trains existing models.
+        // Gating on Completed ensures the seeder self-heals once the blocking condition
+        // (missing candles, feature store cold, etc.) has been resolved.
+        if (await runs.AnyAsync(r => r.Status == RunStatus.Completed && !r.IsDeleted, ct))
+            return;
 
         // Queue an initial training run for each active strategy's symbol/timeframe.
-        // The MLTrainingWorker will pick these up and train the first models.
+        // The MLTrainingWorker will pick these up and train the first models. Skip any
+        // (symbol, timeframe) that already has a Queued or Running run so re-boots
+        // don't enqueue duplicates.
         var activeStrategies = await db.Set<Strategy>()
             .Where(s => s.Status == StrategyStatus.Active && !s.IsDeleted)
             .Select(s => new { s.Symbol, s.Timeframe })
             .Distinct()
             .ToListAsync(ct);
+
+        var inFlightKeys = await runs
+            .Where(r => (r.Status == RunStatus.Queued || r.Status == RunStatus.Running) && !r.IsDeleted)
+            .Select(r => new { r.Symbol, r.Timeframe })
+            .Distinct()
+            .ToListAsync(ct);
+        var inFlightSet = new HashSet<(string, Timeframe)>(
+            inFlightKeys.Select(k => (k.Symbol, k.Timeframe)));
+        activeStrategies = activeStrategies
+            .Where(s => !inFlightSet.Contains((s.Symbol, s.Timeframe)))
+            .ToList();
 
         var now = DateTime.UtcNow;
         foreach (var s in activeStrategies)
