@@ -225,9 +225,9 @@ public class CompositeMLEvaluator : IStrategyEvaluator
         var model = await GetActiveModelAsync(strategy.Symbol, strategy.Timeframe, cancellationToken);
         if (model is null)
         {
-            _logger.LogDebug(
-                "No active MLModel for {Symbol}/{Timeframe} — CompositeML skipping",
-                strategy.Symbol, strategy.Timeframe);
+            _logger.LogInformation(
+                "No active MLModel for {Symbol}/{Timeframe} — CompositeML skipping (strategy {StrategyId})",
+                strategy.Symbol, strategy.Timeframe, strategy.Id);
             return null;
         }
 
@@ -334,7 +334,12 @@ public class CompositeMLEvaluator : IStrategyEvaluator
         }
 
         if (result is null)
+        {
+            _logger.LogWarning(
+                "Inference returned null for model {ModelId} ({Symbol}/{Timeframe}, engine={Engine}) — skipping",
+                model.Id, strategy.Symbol, strategy.Timeframe, engine.GetType().Name);
             return null;
+        }
 
         double rawProbability = result.Value.Probability;
         if (double.IsNaN(rawProbability) || double.IsInfinity(rawProbability))
