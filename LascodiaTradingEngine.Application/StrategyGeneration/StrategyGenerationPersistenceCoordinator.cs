@@ -7,9 +7,15 @@ using Microsoft.Extensions.DependencyInjection;
 
 namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
+/// <summary>
+/// Result of candidate persistence, split into total and reserve-only counts.
+/// </summary>
 internal sealed record PersistCandidatesResult(int PersistedCount, int ReservePersistedCount);
 
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyGenerationPersistenceCoordinator))]
+/// <summary>
+/// Facade over candidate persistence and deferred artifact replay services.
+/// </summary>
 internal sealed class StrategyGenerationPersistenceCoordinator : IStrategyGenerationPersistenceCoordinator
 {
     private readonly IStrategyGenerationCandidatePersistenceService _candidatePersistenceService;

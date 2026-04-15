@@ -9,6 +9,9 @@ using Microsoft.Extensions.DependencyInjection;
 namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyGenerationPruningCoordinator))]
+/// <summary>
+/// Prunes draft auto-generated strategies that repeatedly fail validation.
+/// </summary>
 internal sealed class StrategyGenerationPruningCoordinator : IStrategyGenerationPruningCoordinator
 {
     private readonly TradingMetrics _metrics;
@@ -27,6 +30,8 @@ internal sealed class StrategyGenerationPruningCoordinator : IStrategyGeneration
         int pruneAfterFailed,
         CancellationToken ct)
     {
+        // Only paused draft auto strategies are eligible here; active or already-promoted
+        // strategies are handled by other lifecycle paths.
         var db = readCtx.GetDbContext();
         var writeDb = writeCtx.GetDbContext();
 
@@ -101,6 +106,8 @@ internal sealed class StrategyGenerationPruningCoordinator : IStrategyGeneration
 
     public static void MarkStrategyAsPruned(Strategy strategy, DateTime prunedAtUtc)
     {
+        // Preserve the pruning timestamp inside screening metadata so later analytics can
+        // differentiate deliberate pruning from compensation cleanup.
         strategy.IsDeleted = true;
         strategy.PrunedAtUtc = prunedAtUtc;
 

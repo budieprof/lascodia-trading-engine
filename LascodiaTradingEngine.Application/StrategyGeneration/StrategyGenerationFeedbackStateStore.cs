@@ -6,6 +6,9 @@ using Microsoft.Extensions.DependencyInjection;
 namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyGenerationFeedbackStateStore))]
+/// <summary>
+/// Small EF-backed key/value store for durable feedback cache payloads.
+/// </summary>
 internal sealed class StrategyGenerationFeedbackStateStore : IStrategyGenerationFeedbackStateStore
 {
     private readonly TimeProvider _timeProvider;

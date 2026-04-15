@@ -16,6 +16,9 @@ using static LascodiaTradingEngine.Application.StrategyGeneration.StrategyGenera
 namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyGenerationReserveScreeningPlanner))]
+/// <summary>
+/// Screens reserve candidates that broaden coverage after the main pass has finished.
+/// </summary>
 internal sealed class StrategyGenerationReserveScreeningPlanner : IStrategyGenerationReserveScreeningPlanner
 {
     private sealed record CandleLoadResult(List<Candle>? Candles, string? SkipReason);
@@ -65,6 +68,8 @@ internal sealed class StrategyGenerationReserveScreeningPlanner : IStrategyGener
         Func<int, Task> saveCheckpointAsync,
         CancellationToken ct)
     {
+        // Reserve screening intentionally starts from symbols already known to have regime data
+        // but prioritizes under-covered combinations and missing strategy-type coverage.
         var config = context.Config;
         int reserveCreated = 0;
         int totalCreated = candidatesCreated;

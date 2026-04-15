@@ -1,5 +1,8 @@
 namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
+/// <summary>
+/// Durable representation of deferred post-persist work for one generated strategy.
+/// </summary>
 public sealed record StrategyGenerationPendingArtifactRecord(
     long StrategyId,
     string CandidateId,
@@ -19,14 +22,23 @@ public sealed record StrategyGenerationPendingArtifactRecord(
     DateTime? QuarantinedAtUtc = null,
     string? TerminalFailureReason = null);
 
+/// <summary>
+/// Pending-artifact load result split into valid replay items and corrupt rows.
+/// </summary>
 public sealed record StrategyGenerationPendingArtifactLoadResult(
     IReadOnlyList<StrategyGenerationPendingArtifactRecord> PendingArtifacts,
     IReadOnlyList<StrategyGenerationCorruptArtifactRecord> CorruptArtifacts);
 
+/// <summary>
+/// Corrupt pending-artifact row that should be quarantined from future replay attempts.
+/// </summary>
 public sealed record StrategyGenerationCorruptArtifactRecord(
     long ArtifactId,
     string Reason);
 
+/// <summary>
+/// Durable summary-event dispatch state used when reconciling cycle-summary publication.
+/// </summary>
 public sealed record StrategyGenerationSummaryDispatchRecord(
     string CycleId,
     Guid EventId,
@@ -35,6 +47,10 @@ public sealed record StrategyGenerationSummaryDispatchRecord(
     string? FailureMessage,
     string? PayloadJson);
 
+/// <summary>
+/// Durable failure payload recorded when candidate persistence or replay cannot be repaired
+/// inline during a generation cycle.
+/// </summary>
 public sealed record StrategyGenerationFailureRecord(
     string CandidateId,
     string? CycleId,

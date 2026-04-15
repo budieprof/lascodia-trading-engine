@@ -5,6 +5,9 @@ using Microsoft.Extensions.DependencyInjection;
 namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyGenerationCalendarPolicy))]
+/// <summary>
+/// Thin policy wrapper around calendar-related strategy-generation helper logic.
+/// </summary>
 internal sealed class StrategyGenerationCalendarPolicy : IStrategyGenerationCalendarPolicy
 {
     public bool IsWeekendForAssetMix(IEnumerable<(string Symbol, CurrencyPair? Pair)> symbols, DateTime utcNow)

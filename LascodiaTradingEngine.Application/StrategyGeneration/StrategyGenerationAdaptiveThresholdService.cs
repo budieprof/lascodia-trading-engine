@@ -12,6 +12,10 @@ using MarketRegimeEnum = LascodiaTradingEngine.Domain.Enums.MarketRegime;
 namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyGenerationAdaptiveThresholdService))]
+/// <summary>
+/// Computes adaptive screening-threshold adjustments from recent strategy outcomes and flags
+/// contradictions between historical survival and current gate tightening.
+/// </summary>
 internal sealed class StrategyGenerationAdaptiveThresholdService : IStrategyGenerationAdaptiveThresholdService
 {
     private readonly ILogger<StrategyGenerationWorker> _logger;
@@ -69,6 +73,8 @@ internal sealed class StrategyGenerationAdaptiveThresholdService : IStrategyGene
         GenerationConfig config,
         CancellationToken ct)
     {
+        // Adaptive thresholds intentionally look only at recent auto-generated strategies so
+        // the adjustments reflect the live behavior of the current generator, not stale history.
         var recentCutoff = _timeProvider.GetUtcNow().UtcDateTime.AddDays(-90);
 
         var recentStrategies = await db.Set<Strategy>()
@@ -81,6 +87,8 @@ internal sealed class StrategyGenerationAdaptiveThresholdService : IStrategyGene
 
         var byContext = new Dictionary<(MarketRegimeEnum, Timeframe), (List<double> WinRates, List<double> ProfitFactors, List<double> Sharpes)>();
 
+        // Bucket historical screening metrics by regime and timeframe so each context gets its
+        // own threshold relaxation/tightening signal.
         foreach (var strategy in recentStrategies)
         {
             var metrics = ScreeningMetrics.FromJson(strategy.ScreeningMetricsJson);
@@ -105,6 +113,8 @@ internal sealed class StrategyGenerationAdaptiveThresholdService : IStrategyGene
             if (values.WinRates.Count < config.AdaptiveThresholdsMinSamples)
                 continue;
 
+            // Median-based multipliers reduce sensitivity to outliers and keep one lucky or bad
+            // candidate from swinging thresholds too aggressively.
             double wrMult = ComputeAdaptiveMultiplier(Median(values.WinRates), config.MinWinRate);
             double pfMult = ComputeAdaptiveMultiplier(Median(values.ProfitFactors), config.MinProfitFactor);
             double shMult = ComputeAdaptiveMultiplier(Median(values.Sharpes), config.MinSharpe);

@@ -3,6 +3,9 @@ using MarketRegimeEnum = LascodiaTradingEngine.Domain.Enums.MarketRegime;
 
 namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
+/// <summary>
+/// Restored mutable screening state recovered from a saved checkpoint.
+/// </summary>
 internal sealed record StrategyGenerationCheckpointResumeState(
     HashSet<string> CompletedSymbolSet,
     int CandidatesCreated,
@@ -16,6 +19,9 @@ internal sealed record StrategyGenerationCheckpointResumeState(
     Dictionary<string, int> GeneratedCountBySymbol,
     Dictionary<string, Dictionary<StrategyType, int>> GeneratedTypeCountsBySymbol);
 
+/// <summary>
+/// Snapshot of screening progress persisted when saving a checkpoint.
+/// </summary>
 internal sealed record StrategyGenerationCheckpointProgressSnapshot(
     HashSet<string> CompletedSymbolSet,
     int CandidatesCreated,
@@ -28,6 +34,9 @@ internal sealed record StrategyGenerationCheckpointProgressSnapshot(
     Dictionary<MarketRegimeEnum, int> RegimeCandidatesCreated,
     Dictionary<int, int> CorrelationGroupCounts);
 
+/// <summary>
+/// Aggregate result returned by the primary screening planner.
+/// </summary>
 internal sealed record StrategyGenerationPrimaryScreeningResult(
     List<ScreeningOutcome> PendingCandidates,
     int CandidatesCreated,

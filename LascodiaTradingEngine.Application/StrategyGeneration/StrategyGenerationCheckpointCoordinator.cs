@@ -15,6 +15,14 @@ using MarketRegimeEnum = LascodiaTradingEngine.Domain.Enums.MarketRegime;
 namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyGenerationCheckpointCoordinator))]
+/// <summary>
+/// Restores and saves screening progress checkpoints for long-running generation cycles.
+/// </summary>
+/// <remarks>
+/// The coordinator converts between in-memory screening state and the durable
+/// <see cref="GenerationCheckpointStore.State"/> representation while also updating
+/// checkpoint-related health signals.
+/// </remarks>
 internal sealed class StrategyGenerationCheckpointCoordinator : IStrategyGenerationCheckpointCoordinator
 {
     private readonly ILogger<StrategyGenerationWorker> _logger;
@@ -47,6 +55,8 @@ internal sealed class StrategyGenerationCheckpointCoordinator : IStrategyGenerat
         Dictionary<MarketRegimeEnum, int> regimeCandidatesCreated,
         CancellationToken ct)
     {
+        // Start from an empty resume state and only overwrite pieces that the checkpoint can
+        // safely restore for the current context fingerprint.
         var completedSymbolSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         int candidatesCreated = 0;
         int reserveCreated = 0;
@@ -92,6 +102,8 @@ internal sealed class StrategyGenerationCheckpointCoordinator : IStrategyGenerat
                 .ToList();
             foreach (var pending in pendingCandidates)
             {
+                // Re-register pending candidates into the existing-combo set so resumed screening
+                // does not generate a second winner for the same slot.
                 context.ExistingSet.Add(_candidateSelectionPolicy.GetCombo(pending));
                 IncrementGeneratedCounts(
                     pending.Strategy.Symbol,
@@ -143,6 +155,8 @@ internal sealed class StrategyGenerationCheckpointCoordinator : IStrategyGenerat
         CancellationToken ct,
         string checkpointLabel)
     {
+        // Serialize a full snapshot of screening progress so the next cycle can resume from a
+        // coherent boundary rather than replaying partial in-memory state.
         var startedAt = Stopwatch.GetTimestamp();
         var checkpointState = new GenerationCheckpointStore.State
             {

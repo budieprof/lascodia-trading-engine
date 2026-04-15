@@ -10,6 +10,10 @@ using MarketRegimeEnum = LascodiaTradingEngine.Domain.Enums.MarketRegime;
 namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyGenerationFeedbackCoordinator))]
+/// <summary>
+/// Facade over feedback-driven generation services such as dynamic templates, historical
+/// survival summaries, and adaptive threshold computation.
+/// </summary>
 internal sealed class StrategyGenerationFeedbackCoordinator : IStrategyGenerationFeedbackCoordinator
 {
     private readonly IStrategyGenerationDynamicTemplateRefreshService _dynamicTemplateRefreshService;
@@ -49,6 +53,8 @@ internal sealed class StrategyGenerationFeedbackCoordinator : IStrategyGeneratio
         if (feedbackRates.Count == 0 || types.Count <= 1)
             return types;
 
+        // Only reorder when there is actual feedback for the current regime context; otherwise
+        // preserve the mapper's original ordering so unexplained drift does not creep in.
         if (!types.Any(t =>
                 feedbackRates.ContainsKey((t, regime, timeframe))
                 || feedbackRates.Keys.Any(k => k.Item1 == t && k.Item2 == regime)))
@@ -60,6 +66,8 @@ internal sealed class StrategyGenerationFeedbackCoordinator : IStrategyGeneratio
             {
                 if (feedbackRates.TryGetValue((t, regime, timeframe), out var exactRate))
                 {
+                    // Exact regime/timeframe matches are treated as stronger evidence than
+                    // same-regime fallback averages from other timeframes.
                     _metrics.StrategyGenFeedbackBoosted.Add(1,
                         new KeyValuePair<string, object?>("strategy_type", t.ToString()));
                     return exactRate;

@@ -16,6 +16,14 @@ using static LascodiaTradingEngine.Application.StrategyGeneration.StrategyGenera
 namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyGenerationCandidatePersistenceService))]
+/// <summary>
+/// Persists accepted screening candidates, queues their validation runs, and falls back to
+/// finer-grained recovery paths when batch persistence partially fails.
+/// </summary>
+/// <remarks>
+/// This is where the generation pipeline crosses from in-memory screening results into durable
+/// strategy and validation records, so it also owns compensation and duplicate-handling logic.
+/// </remarks>
 internal sealed class StrategyGenerationCandidatePersistenceService : IStrategyGenerationCandidatePersistenceService
 {
     private sealed record RecoveryAfterBatchFailureResult(
@@ -66,6 +74,8 @@ internal sealed class StrategyGenerationCandidatePersistenceService : IStrategyG
         if (candidates.Count == 0)
             return new PersistCandidatesResult(0, 0);
 
+        // Re-check for concurrently created strategies before saving so duplicate combos that
+        // arrived from another worker or prior recovery path are filtered out early.
         var db = readCtx.GetDbContext();
         var writeDb = writeCtx.GetDbContext();
 
@@ -95,6 +105,8 @@ internal sealed class StrategyGenerationCandidatePersistenceService : IStrategyG
         var walkForwardSplits = config.WalkForwardSplitPercentages;
         if (fastTrackSettings.Enabled)
         {
+            // Elite fast-track status is computed before persistence so initial validation queue
+            // priority already reflects the candidate's screening strength.
             foreach (var candidate in confirmed)
             {
                 if (_priorityResolver.IsEliteFastTrackCandidate(
@@ -116,6 +128,8 @@ internal sealed class StrategyGenerationCandidatePersistenceService : IStrategyG
 
         try
         {
+            // Prefer a batch save path for consistency and throughput, then degrade to
+            // candidate-by-candidate recovery only when the batch fails.
             await using var tx = await TryBeginTransactionAsync(writeDb, ct);
             foreach (var candidate in confirmed)
                 writeDb.Set<Strategy>().Add(candidate.Strategy);
@@ -146,6 +160,8 @@ internal sealed class StrategyGenerationCandidatePersistenceService : IStrategyG
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "StrategyGenerationWorker: batch save failed — falling back to individual saves");
+            // Batch failure can leave the DbContext tracking inconsistent state, so clean up
+            // aggressively before retrying on a per-candidate basis.
             foreach (var candidate in confirmed)
             {
                 bool compensated = await TryCompensateUnsafelyPersistedStrategyAsync(writeDb, writeCtx, candidate.Strategy, ct);

@@ -5,6 +5,9 @@ using Microsoft.Extensions.DependencyInjection;
 namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyGenerationEventFactory))]
+/// <summary>
+/// Builds integration events emitted by the strategy-generation persistence pipeline.
+/// </summary>
 internal sealed class StrategyGenerationEventFactory : IStrategyGenerationEventFactory
 {
     public StrategyCandidateCreatedIntegrationEvent BuildCandidateCreatedEvent(ScreeningOutcome candidate, long strategyId)
@@ -24,6 +27,8 @@ internal sealed class StrategyGenerationEventFactory : IStrategyGenerationEventF
 
     public StrategyAutoPromotedIntegrationEvent BuildAutoPromotedEvent(ScreeningOutcome candidate, long strategyId)
     {
+        // Fall back to a minimal metrics payload so auto-promotion events remain publishable even
+        // when the caller did not materialize a full ScreeningMetrics instance.
         var metrics = candidate.Metrics ?? new ScreeningMetrics
         {
             Regime = candidate.Regime.ToString(),

@@ -15,6 +15,13 @@ using static LascodiaTradingEngine.Application.StrategyGeneration.StrategyGenera
 namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyGenerationPrimaryScreeningPlanner))]
+/// <summary>
+/// Drives the main symbol-by-symbol candidate screening pass for a generation cycle.
+/// </summary>
+/// <remarks>
+/// This planner applies the majority of capacity limits, regime gating, template ordering,
+/// spread checks, and checkpoint-aware symbol traversal before reserve screening begins.
+/// </remarks>
 internal sealed class StrategyGenerationPrimaryScreeningPlanner : IStrategyGenerationPrimaryScreeningPlanner
 {
     private sealed record ScreeningTaskArgs(
@@ -95,6 +102,8 @@ internal sealed class StrategyGenerationPrimaryScreeningPlanner : IStrategyGener
         StrategyGenerationCheckpointResumeState resumeState,
         CancellationToken ct)
     {
+        // Restore mutable counters from checkpoint state so the planner can resume partway
+        // through a cycle without regenerating already-accepted candidates.
         var config = context.Config;
         int candidatesCreated = resumeState.CandidatesCreated;
         int candidatesScreened = resumeState.CandidatesScreened;
@@ -132,6 +141,8 @@ internal sealed class StrategyGenerationPrimaryScreeningPlanner : IStrategyGener
 
         foreach (var symbol in prioritisedSymbols)
         {
+            // All symbol-level skip gates are checked before candle loading to avoid expensive
+            // backtest setup for symbols that are already over budget or otherwise ineligible.
             if (candidatesCreated >= config.MaxCandidates || ct.IsCancellationRequested)
                 break;
 
@@ -218,6 +229,8 @@ internal sealed class StrategyGenerationPrimaryScreeningPlanner : IStrategyGener
             {
                 try
                 {
+                    // Spread profiles are optional enrichment; screening should continue with
+                    // static spread assumptions if profile lookup fails.
                     var profiles = await context.SpreadProfileProvider.GetProfilesAsync(symbol, ct);
                     var spreadFunc = context.SpreadProfileProvider.BuildSpreadFunction(symbol, profiles);
                     if (spreadFunc != null)

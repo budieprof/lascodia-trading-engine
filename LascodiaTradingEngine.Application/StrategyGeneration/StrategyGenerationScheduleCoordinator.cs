@@ -9,8 +9,16 @@ using Microsoft.Extensions.Logging;
 namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyGenerationScheduler))]
+/// <summary>
+/// Applies schedule-window, retry-budget, circuit-breaker, and distributed-lock rules to
+/// strategy-generation execution.
+/// </summary>
 internal sealed class StrategyGenerationScheduleCoordinator : IStrategyGenerationScheduler
 {
+    /// <summary>
+    /// In-memory scheduling state mirrored to durable storage so schedule decisions survive
+    /// process restarts.
+    /// </summary>
     private sealed class SchedulingState
     {
         private const int MaxRetriesPerWindow = 2;
@@ -138,6 +146,8 @@ internal sealed class StrategyGenerationScheduleCoordinator : IStrategyGeneratio
     {
         try
         {
+            // Scheduled polling uses durable schedule state so multiple process lifetimes still
+            // honor the once-per-day window and circuit-breaker behavior consistently.
             using var scope = _scopeFactory.CreateScope();
             var readCtx = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
             var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
@@ -158,6 +168,8 @@ internal sealed class StrategyGenerationScheduleCoordinator : IStrategyGeneratio
 
             if (nowUtc.Hour != schedule.ScheduleHourUtc || _state.HasRunToday(todayUtc))
             {
+                // Leaving the configured hour resets the retry window so tomorrow's run starts
+                // fresh instead of inheriting a stale in-window retry count.
                 if (nowUtc.Hour != schedule.ScheduleHourUtc)
                     _state.OnWindowPassed();
                 return;
@@ -252,6 +264,8 @@ internal sealed class StrategyGenerationScheduleCoordinator : IStrategyGeneratio
 
     public async Task ExecuteManualRunAsync(Func<CancellationToken, Task> runCycleAsync, CancellationToken stoppingToken)
     {
+        // Manual runs bypass the time-of-day gate but still serialize through the same
+        // distributed lock and success bookkeeping as scheduled execution.
         await using var generationLock = await TryAcquireGenerationLockAsync(stoppingToken);
         if (generationLock == null)
         {

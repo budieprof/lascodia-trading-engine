@@ -8,6 +8,9 @@ using Microsoft.Extensions.Logging;
 namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyGenerationPendingArtifactStore))]
+/// <summary>
+/// EF-backed durable store for deferred post-persist artifact replay backlog.
+/// </summary>
 internal sealed class StrategyGenerationPendingArtifactStore : IStrategyGenerationPendingArtifactStore
 {
     private readonly TimeProvider _timeProvider;
@@ -25,6 +28,8 @@ internal sealed class StrategyGenerationPendingArtifactStore : IStrategyGenerati
         DbContext readDb,
         CancellationToken ct)
     {
+        // Deserialization can fail independently of row loading, so return corrupt rows beside
+        // valid backlog items instead of aborting the whole replay pass.
         var pendingArtifactSet = TryGetSet<StrategyGenerationPendingArtifact>(readDb);
         if (pendingArtifactSet == null)
             return new StrategyGenerationPendingArtifactLoadResult([], []);
@@ -119,6 +124,8 @@ internal sealed class StrategyGenerationPendingArtifactStore : IStrategyGenerati
         IReadOnlyCollection<StrategyGenerationPendingArtifactRecord> pendingArtifacts,
         CancellationToken ct)
     {
+        // The store is treated as a full snapshot: rows omitted from the incoming set are
+        // tombstoned so replay state always reflects the latest durable backlog.
         var pendingArtifactSet = TryGetSet<StrategyGenerationPendingArtifact>(writeDb);
         if (pendingArtifactSet == null)
             return;

@@ -9,6 +9,9 @@ using MarketRegimeEnum = LascodiaTradingEngine.Domain.Enums.MarketRegime;
 namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyGenerationCycleDataService))]
+/// <summary>
+/// Loads the read-heavy snapshot required to start a strategy-generation cycle.
+/// </summary>
 internal sealed class StrategyGenerationCycleDataService : IStrategyGenerationCycleDataService
 {
     public async Task<int> CountRecentAutoCandidatesAsync(DbContext db, DateTime createdAfterUtc, CancellationToken ct)
@@ -34,6 +37,8 @@ internal sealed class StrategyGenerationCycleDataService : IStrategyGenerationCy
         DateTime nowUtc,
         CancellationToken ct)
     {
+        // Currency-pair metadata anchors symbol classification, cost modeling, and currency
+        // concentration checks for the rest of the screening cycle.
         var activePairEntities = await db.Set<CurrencyPair>()
             .Where(p => !p.IsDeleted && p.IsActive)
             .ToListAsync(ct);
@@ -60,6 +65,8 @@ internal sealed class StrategyGenerationCycleDataService : IStrategyGenerationCy
             .ToDictionary(g => g.Key, g => g.Count());
 
         var retryCutoff = nowUtc.AddDays(-config.RetryCooldownDays);
+        // Recently pruned auto strategies are tracked so the cycle can avoid recreating the same
+        // losing template too soon after it was already rejected.
         var recentlyPruned = await db.Set<Strategy>()
             .IncludingSoftDeleted()
             .Where(s => s.IsDeleted
@@ -112,6 +119,8 @@ internal sealed class StrategyGenerationCycleDataService : IStrategyGenerationCy
         var transitionSymbols = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var lowConfidenceSymbols = new List<string>();
 
+        // Keep only the freshest regime per symbol and annotate recent transitions so the
+        // downstream planners can switch into transition-aware strategy selection.
         foreach (var group in recentRegimeSnapshots.GroupBy(s => s.Symbol, StringComparer.OrdinalIgnoreCase))
         {
             var latest = group.First();

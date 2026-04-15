@@ -5,6 +5,9 @@ using Microsoft.Extensions.DependencyInjection;
 
 namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
+/// <summary>
+/// Durable snapshot of day-level strategy-generation scheduler state.
+/// </summary>
 internal sealed record StrategyGenerationScheduleStateSnapshot(
     DateTime LastRunDateUtc,
     int ConsecutiveFailures,
@@ -13,6 +16,9 @@ internal sealed record StrategyGenerationScheduleStateSnapshot(
     DateTime RetryWindowDateUtc);
 
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyGenerationScheduleStateStore))]
+/// <summary>
+/// EF-backed store for strategy-generation scheduler state.
+/// </summary>
 internal sealed class StrategyGenerationScheduleStateStore : IStrategyGenerationScheduleStateStore
 {
     private const string WorkerName = "StrategyGenerationWorker";

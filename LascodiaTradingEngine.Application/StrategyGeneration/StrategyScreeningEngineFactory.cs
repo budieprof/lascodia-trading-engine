@@ -7,6 +7,9 @@ using Microsoft.Extensions.Logging;
 namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyScreeningEngineFactory))]
+/// <summary>
+/// Produces fully configured <see cref="StrategyScreeningEngine"/> instances for a cycle.
+/// </summary>
 internal sealed class StrategyScreeningEngineFactory : IStrategyScreeningEngineFactory
 {
     private readonly IBacktestEngine _backtestEngine;

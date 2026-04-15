@@ -10,6 +10,9 @@ using Microsoft.Extensions.Logging;
 namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyGenerationDynamicTemplateRefreshService))]
+/// <summary>
+/// Refreshes the dynamic template pool from recently promoted or approved auto strategies.
+/// </summary>
 internal sealed class StrategyGenerationDynamicTemplateRefreshService : IStrategyGenerationDynamicTemplateRefreshService
 {
     private readonly ILogger<StrategyGenerationWorker> _logger;
@@ -30,6 +33,8 @@ internal sealed class StrategyGenerationDynamicTemplateRefreshService : IStrateg
     {
         try
         {
+            // Use recently promoted strategies as the source of dynamic templates so the
+            // generator can bias toward parameterizations that already survived validation.
             var promotedCutoff = _timeProvider.GetUtcNow().UtcDateTime.AddDays(-180);
 
             var qualifiedStrategies = await db.Set<Strategy>()

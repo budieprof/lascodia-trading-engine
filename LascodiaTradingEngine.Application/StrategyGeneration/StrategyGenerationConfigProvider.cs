@@ -9,6 +9,9 @@ using static LascodiaTradingEngine.Application.StrategyGeneration.StrategyGenera
 
 namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
+/// <summary>
+/// Loads hot-reloadable strategy-generation configuration from <see cref="EngineConfig"/>.
+/// </summary>
 public interface IStrategyGenerationConfigProvider
 {
     Task<StrategyGenerationConfigurationSnapshot> LoadAsync(DbContext db, CancellationToken ct);
@@ -20,10 +23,16 @@ public interface IStrategyGenerationConfigProvider
     List<double> ParseWalkForwardSplitPcts(string raw);
 }
 
+/// <summary>
+/// Lightweight scheduler settings used by the hosted worker's polling gate.
+/// </summary>
 public sealed record StrategyGenerationScheduleSettings(
     bool Enabled,
     int ScheduleHourUtc);
 
+/// <summary>
+/// Fast-track settings used to promote elite candidates in the validation queue.
+/// </summary>
 public sealed record StrategyGenerationFastTrackSettings(
     bool Enabled,
     double ThresholdMultiplier,
@@ -32,6 +41,14 @@ public sealed record StrategyGenerationFastTrackSettings(
     int PriorityBoost);
 
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyGenerationConfigProvider))]
+/// <summary>
+/// Central configuration provider for the strategy-generation subsystem.
+/// </summary>
+/// <remarks>
+/// This class normalizes raw engine-config values into a strongly typed
+/// <see cref="GenerationConfig"/> snapshot and derives secondary helper settings such as
+/// symbol overrides, scheduler configuration, and fast-track thresholds.
+/// </remarks>
 public sealed class StrategyGenerationConfigProvider : IStrategyGenerationConfigProvider
 {
     private readonly ILogger<StrategyGenerationConfigProvider> _logger;
@@ -43,6 +60,8 @@ public sealed class StrategyGenerationConfigProvider : IStrategyGenerationConfig
 
     public async Task<StrategyGenerationConfigurationSnapshot> LoadAsync(DbContext db, CancellationToken ct)
     {
+        // Load the whole namespace once so downstream consumers can reuse the same consistent
+        // snapshot rather than repeatedly re-querying individual keys.
         var allConfigs = await db.Set<EngineConfig>()
             .AsNoTracking()
             .Where(c => c.Key.StartsWith("StrategyGeneration:"))
@@ -131,6 +150,8 @@ public sealed class StrategyGenerationConfigProvider : IStrategyGenerationConfig
             KellyMaxLot = Get("ScreeningGate:KellyMaxLot", 0.10m),
         };
 
+        // Validate first so operators get warnings against the raw settings before we clamp or
+        // normalize them into safer runtime defaults.
         ValidateConfiguration(config);
         return new StrategyGenerationConfigurationSnapshot(NormalizeConfiguration(config), allConfigs, symbolOverrides);
     }
@@ -203,6 +224,8 @@ public sealed class StrategyGenerationConfigProvider : IStrategyGenerationConfig
 
     public List<double> ParseWalkForwardSplitPcts(string raw)
     {
+        // Require at least two valid splits; otherwise fall back to the engine defaults that
+        // the screening pipeline and tests already expect.
         var result = new List<double>();
         foreach (var part in raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {

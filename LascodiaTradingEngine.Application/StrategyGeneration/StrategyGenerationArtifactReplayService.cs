@@ -11,6 +11,14 @@ using Microsoft.Extensions.Logging;
 namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyGenerationArtifactReplayService))]
+/// <summary>
+/// Replays deferred post-persist strategy-generation artifacts such as audit rows and
+/// candidate-created integration events.
+/// </summary>
+/// <remarks>
+/// This service preserves forward progress after partial persistence failures by treating
+/// side effects as durable backlog rather than forcing the whole cycle to be retried.
+/// </remarks>
 internal sealed class StrategyGenerationArtifactReplayService : IStrategyGenerationArtifactReplayService
 {
     private readonly ILogger<StrategyGenerationWorker> _logger;
@@ -44,6 +52,8 @@ internal sealed class StrategyGenerationArtifactReplayService : IStrategyGenerat
         IReadOnlyCollection<StrategyGenerationPendingArtifactRecord> pendingArtifacts,
         CancellationToken ct)
     {
+        // Persist first so a crash between strategy-save success and artifact replay still
+        // leaves enough state behind for the next cycle to resume idempotently.
         UpdatePendingArtifactBacklog(pendingArtifacts, 0);
         await PersistPendingPostPersistArtifactsAsync(writeCtx, pendingArtifacts, ct);
         int remainingCount = await DrainPendingPostPersistArtifactsAsync(
@@ -63,6 +73,8 @@ internal sealed class StrategyGenerationArtifactReplayService : IStrategyGenerat
         ScreeningAuditLogger auditLogger,
         CancellationToken ct)
     {
+        // Recovery mode begins by loading durable backlog rather than assuming the in-memory
+        // caller still knows what work was left unfinished.
         var pendingLoad = await _pendingArtifactStore.LoadPendingArtifactsAsync(readDb, ct);
         UpdatePendingArtifactBacklog(pendingLoad.PendingArtifacts, pendingLoad.CorruptArtifacts.Count);
         if (pendingLoad.CorruptArtifacts.Count > 0)
@@ -129,6 +141,8 @@ internal sealed class StrategyGenerationArtifactReplayService : IStrategyGenerat
         {
             var pending = remaining[i];
 
+            // Quarantine artifacts that have failed too many times so one poisoned payload
+            // does not permanently block the rest of the replay queue.
             if (pending.AttemptCount >= maxArtifactRetries)
             {
                 var quarantinedAtUtc = _timeProvider.GetUtcNow().UtcDateTime;
@@ -162,6 +176,8 @@ internal sealed class StrategyGenerationArtifactReplayService : IStrategyGenerat
 
             try
             {
+                // Process one artifact at a time and persist the remaining backlog after every
+                // attempt so replay progress survives abrupt worker termination.
                 var updated = await ProcessPendingPostPersistArtifactAsync(
                     readDb,
                     writeCtx,
@@ -206,6 +222,8 @@ internal sealed class StrategyGenerationArtifactReplayService : IStrategyGenerat
         CancellationToken ct)
     {
         var writeDb = writeCtx.GetDbContext();
+        // Rehydrate the persisted strategy row rather than trusting the serialized candidate
+        // snapshot so replay operates on the canonical post-save entity state.
         var artifactSet = TryGetSet<StrategyGenerationPendingArtifact>(writeDb);
         StrategyGenerationPendingArtifact? trackedArtifact = artifactSet == null
             ? null

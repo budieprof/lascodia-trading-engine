@@ -5,6 +5,9 @@ using Microsoft.Extensions.DependencyInjection;
 namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyGenerationReservePlanner))]
+/// <summary>
+/// Thin orchestration wrapper for the reserve-screening implementation.
+/// </summary>
 internal sealed class StrategyGenerationReservePlanner : IStrategyGenerationReservePlanner
 {
     private readonly IStrategyGenerationReserveScreeningPlanner _reserveScreeningPlanner;

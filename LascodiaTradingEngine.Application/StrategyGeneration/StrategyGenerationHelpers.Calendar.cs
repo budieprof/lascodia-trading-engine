@@ -4,6 +4,12 @@ namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
 public static partial class StrategyGenerationHelpers
 {
+    // Calendar gating helpers used by the generation scheduler and cycle runner.
+
+    /// <summary>
+    /// Returns <c>true</c> when the current weekend should suppress generation for the active
+    /// asset mix. Crypto-only portfolios are allowed to continue through weekends.
+    /// </summary>
     public static bool IsWeekendForAssetMix(IEnumerable<(string Symbol, CurrencyPair? Pair)> symbols, DateTime utcNow)
     {
         if (utcNow.DayOfWeek != DayOfWeek.Saturday && utcNow.DayOfWeek != DayOfWeek.Sunday)
@@ -12,6 +18,9 @@ public static partial class StrategyGenerationHelpers
         return symbols.Any(s => ClassifyAsset(s.Symbol, s.Pair) != AssetClass.Crypto);
     }
 
+    /// <summary>
+    /// Evaluates whether the current timestamp falls inside a configured blackout window.
+    /// </summary>
     public static bool IsInBlackoutPeriod(string blackoutPeriods, string blackoutTimezone, DateTime utcNow)
     {
         if (string.IsNullOrWhiteSpace(blackoutPeriods))
@@ -30,6 +39,7 @@ public static partial class StrategyGenerationHelpers
 
         int todayOrdinal = now.Month * 100 + now.Day;
 
+        // Support multiple MM/DD-MM/DD ranges, including ranges that wrap across year-end.
         foreach (var period in blackoutPeriods.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
             var parts = period.Split('-');

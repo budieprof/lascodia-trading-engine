@@ -13,6 +13,9 @@ using MarketRegimeEnum = LascodiaTradingEngine.Domain.Enums.MarketRegime;
 
 namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
+/// <summary>
+/// Lightweight view of existing strategies used during cycle setup and screening decisions.
+/// </summary>
 internal sealed record StrategyGenerationExistingStrategyInfo(
     long Id,
     StrategyType StrategyType,
@@ -21,6 +24,9 @@ internal sealed record StrategyGenerationExistingStrategyInfo(
     StrategyStatus Status,
     StrategyLifecycleStage LifecycleStage);
 
+/// <summary>
+/// In-memory working context shared across screening planners during a single cycle.
+/// </summary>
 internal sealed class StrategyGenerationScreeningContext
 {
     public required string CycleId { get; init; }
@@ -54,6 +60,9 @@ internal sealed class StrategyGenerationScreeningContext
     public ISpreadProfileProvider? SpreadProfileProvider { get; init; }
 }
 
+/// <summary>
+/// Aggregate screening result returned to the cycle runner after primary and reserve passes.
+/// </summary>
 internal sealed record StrategyGenerationScreeningResult(
     List<ScreeningOutcome> Candidates,
     int ReserveCreated,
@@ -62,6 +71,10 @@ internal sealed record StrategyGenerationScreeningResult(
     int SymbolsSkipped);
 
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyGenerationScreeningCoordinator))]
+/// <summary>
+/// High-level coordinator for primary screening, reserve screening, checkpoint restore, and
+/// regime-budget setup.
+/// </summary>
 internal sealed class StrategyGenerationScreeningCoordinator : IStrategyGenerationScreeningCoordinator
 {
     private readonly ILogger<StrategyGenerationWorker> _logger;
@@ -99,6 +112,8 @@ internal sealed class StrategyGenerationScreeningCoordinator : IStrategyGenerati
         StrategyGenerationScreeningContext context,
         CancellationToken ct)
     {
+        // Build currency and regime budgets from the current active universe before screening
+        // so both primary and reserve planners work against the same capacity snapshot.
         var config = context.Config;
         var totalCountBySymbol = context.Existing
             .GroupBy(e => e.Symbol)
@@ -148,6 +163,8 @@ internal sealed class StrategyGenerationScreeningCoordinator : IStrategyGenerati
             regimeCandidatesCreated,
             ct);
 
+        // Warm the candle cache up-front by timeframe to reduce repeated DbContext round-trips
+        // during symbol-level screening.
         foreach (var timeframe in config.CandidateTimeframes)
         {
             await ChunkedCandleLoader.LoadChunkedAsync(
@@ -179,6 +196,8 @@ internal sealed class StrategyGenerationScreeningCoordinator : IStrategyGenerati
         int candidatesScreened = primaryResult.CandidatesScreened;
         if (primaryResult.CandidatesCreated < config.MaxCandidates && config.StrategicReserveQuota > 0)
         {
+            // Reserve screening reuses the same checkpoint fingerprint so its progress can be
+            // resumed consistently with the primary pass.
             string checkpointFingerprint = _checkpointCoordinator.ComputeFingerprint(context);
             reserveCreated += await _reservePlanner.ScreenReserveCandidatesAsync(
                 db,

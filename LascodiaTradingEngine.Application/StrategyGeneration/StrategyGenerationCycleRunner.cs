@@ -20,6 +20,10 @@ using static LascodiaTradingEngine.Application.StrategyGeneration.StrategyGenera
 namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyGenerationCycleRunner))]
+/// <summary>
+/// Orchestrates one complete strategy-generation cycle from recovery and feedback refresh
+/// through screening, persistence, pruning, and summary publication.
+/// </summary>
 internal sealed class StrategyGenerationCycleRunner : IStrategyGenerationCycleRunner
 {
     private readonly ILogger<StrategyGenerationWorker> _logger;
@@ -91,6 +95,8 @@ internal sealed class StrategyGenerationCycleRunner : IStrategyGenerationCycleRu
     {
         var sw = Stopwatch.StartNew();
 
+        // Resolve all scoped collaborators once per cycle so every phase operates against a
+        // consistent DI scope and DbContext lifetime.
         using var scope = _scopeFactory.CreateScope();
         var readCtx = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
         var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
@@ -116,6 +122,8 @@ internal sealed class StrategyGenerationCycleRunner : IStrategyGenerationCycleRu
 
         try
         {
+            // Recovery and warmup happen first so the cycle starts from a clean durable state
+            // before it attempts to screen new candidates.
             await ReconcilePendingSummaryDispatchesAsync(db, writeCtx, eventLogReader, ct);
             await _persistenceCoordinator.ReplayPendingPostPersistArtifactsAsync(db, writeCtx, eventService, auditLogger, ct);
             await _feedbackCoordinator.RefreshDynamicTemplatesAsync(db, ct);
@@ -147,6 +155,8 @@ internal sealed class StrategyGenerationCycleRunner : IStrategyGenerationCycleRu
 
             await UpdateUnresolvedFailureCountAsync(db, ct);
 
+            // Early skip gates protect the subsystem from generating strategies when the engine
+            // is already at its recent-candidate velocity cap or in a known blackout state.
             var velocityCutoff = nowUtc.AddDays(-7);
             var recentAutoCount = await _cycleDataService.CountRecentAutoCandidatesAsync(db, velocityCutoff, ct);
             if (recentAutoCount >= config.MaxCandidatesPerWeek)

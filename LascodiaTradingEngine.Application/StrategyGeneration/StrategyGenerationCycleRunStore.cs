@@ -5,6 +5,9 @@ using Microsoft.Extensions.DependencyInjection;
 
 namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
+/// <summary>
+/// Durable summary of a completed generation cycle.
+/// </summary>
 internal sealed record StrategyGenerationCycleRunCompletion(
     double DurationMs,
     int CandidatesCreated,
@@ -16,6 +19,9 @@ internal sealed record StrategyGenerationCycleRunCompletion(
     int PortfolioFilterRemoved);
 
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyGenerationCycleRunStore))]
+/// <summary>
+/// EF-backed persistence for the strategy-generation cycle audit trail.
+/// </summary>
 internal sealed class StrategyGenerationCycleRunStore : IStrategyGenerationCycleRunStore
 {
     private const string WorkerName = "StrategyGenerationWorker";
@@ -29,6 +35,8 @@ internal sealed class StrategyGenerationCycleRunStore : IStrategyGenerationCycle
 
     public async Task StartAsync(DbContext writeDb, string cycleId, string? fingerprint, CancellationToken ct)
     {
+        // Starting the cycle early gives later recovery paths a durable anchor even if the
+        // process crashes before screening or summary publication completes.
         var cycleSet = TryGetSet<StrategyGenerationCycleRun>(writeDb);
         if (cycleSet == null)
             return;
@@ -66,6 +74,8 @@ internal sealed class StrategyGenerationCycleRunStore : IStrategyGenerationCycle
         StrategyGenerationCycleRunCompletion completion,
         CancellationToken ct)
     {
+        // Stage completion before summary dispatch so the run is durably marked complete even
+        // if the outbound summary event needs to be retried separately.
         var cycle = await LoadMutableAsync(writeDb, cycleId, ct);
         if (cycle == null)
             return;
@@ -132,6 +142,8 @@ internal sealed class StrategyGenerationCycleRunStore : IStrategyGenerationCycle
         DateTime failedAtUtc,
         CancellationToken ct)
     {
+        // Preserve the payload that failed so replay logic can republish the exact same summary
+        // without reconstructing it from potentially changed runtime state.
         var cycle = await LoadMutableAsync(writeDb, cycleId, ct);
         if (cycle == null)
             return;

@@ -6,9 +6,15 @@ namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
 public static partial class StrategyGenerationHelpers
 {
+    // Market-data shaping helpers shared by screening and feedback paths.
+
     private static readonly TimeSpan TradingHoursStep = TimeSpan.FromMinutes(30);
     private static readonly TimeSpan LivePriceStalenessLimit = TimeSpan.FromHours(2);
 
+    /// <summary>
+    /// Measures candle staleness in market-open hours rather than raw wall-clock hours when
+    /// trading-session metadata is available.
+    /// </summary>
     public static double ComputeEffectiveCandleAgeHours(DateTime lastCandleTimestampUtc, string? tradingHoursJson, DateTime nowUtc)
     {
         if (lastCandleTimestampUtc >= nowUtc)
@@ -26,6 +32,8 @@ public static partial class StrategyGenerationHelpers
 
             double openHours = 0;
             var cursor = lastCandleTimestampUtc;
+            // Walk the interval in fixed steps so overnight and weekend gaps are counted only
+            // when the symbol's trading session is actually open.
             while (cursor < nowUtc)
             {
                 var next = cursor + TradingHoursStep;
@@ -47,6 +55,10 @@ public static partial class StrategyGenerationHelpers
         }
     }
 
+    /// <summary>
+    /// Builds screening backtest options from configured defaults, symbol metadata, and any
+    /// fresh live-price spread observation.
+    /// </summary>
     public static LascodiaTradingEngine.Application.Backtesting.Services.BacktestOptions BuildScreeningOptions(
         string symbol,
         CurrencyPair? pairInfo,
@@ -64,6 +76,8 @@ public static partial class StrategyGenerationHelpers
         decimal spreadPriceUnits = pointSize * (decimal)screeningSpreadPoints;
 
         var livePrice = livePriceCache.Get(symbol);
+        // Live spreads can be materially wider than static defaults during stressed periods, so
+        // prefer the fresher live observation whenever it is wider and still recent.
         if (livePrice.HasValue
             && livePrice.Value.Ask > livePrice.Value.Bid
             && (utcNow - livePrice.Value.Timestamp) < LivePriceStalenessLimit)

@@ -7,6 +7,9 @@ using Microsoft.Extensions.Logging;
 namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyGenerationCheckpointStore))]
+/// <summary>
+/// EF-backed store for the current strategy-generation checkpoint row.
+/// </summary>
 internal sealed class StrategyGenerationCheckpointStore : IStrategyGenerationCheckpointStore
 {
     private const string WorkerName = "StrategyGenerationWorker";
@@ -28,6 +31,7 @@ internal sealed class StrategyGenerationCheckpointStore : IStrategyGenerationChe
         string expectedFingerprint,
         CancellationToken ct)
     {
+        // Only the latest non-deleted checkpoint for the worker is eligible for restore.
         var checkpointSet = TryGetSet<StrategyGenerationCheckpoint>(readDb);
         if (checkpointSet == null)
             return null;
@@ -63,6 +67,8 @@ internal sealed class StrategyGenerationCheckpointStore : IStrategyGenerationChe
             return;
         }
 
+        // Persist the serialized checkpoint payload plus metadata that helps operators reason
+        // about restart-safe fallback mode and the exact cycle that produced the snapshot.
         var serialization = GenerationCheckpointStore.SerializeWithStatus(state, logger);
         var checkpoint = await checkpointSet
             .FirstOrDefaultAsync(c => c.WorkerName == WorkerName && !c.IsDeleted, ct);

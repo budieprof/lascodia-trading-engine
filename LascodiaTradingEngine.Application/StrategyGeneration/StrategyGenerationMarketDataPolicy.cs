@@ -7,6 +7,9 @@ using Microsoft.Extensions.DependencyInjection;
 namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyGenerationMarketDataPolicy))]
+/// <summary>
+/// Thin policy wrapper around strategy-generation market-data helper logic.
+/// </summary>
 internal sealed class StrategyGenerationMarketDataPolicy : IStrategyGenerationMarketDataPolicy
 {
     public double ComputeEffectiveCandleAgeHours(DateTime lastCandleTimestampUtc, string? tradingHoursJson, DateTime utcNow)

@@ -8,13 +8,22 @@ using static LascodiaTradingEngine.Application.StrategyGeneration.StrategyGenera
 
 namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
+/// <summary>
+/// Identifies a candidate slot by strategy type, symbol, and timeframe.
+/// </summary>
 public readonly record struct CandidateCombo(StrategyType StrategyType, string Symbol, Timeframe Timeframe);
 
+/// <summary>
+/// Stable identity for a screened candidate, including normalized parameter payload.
+/// </summary>
 public sealed record CandidateIdentity(
     string CandidateId,
     CandidateCombo Combo,
     string NormalizedParametersJson);
 
+/// <summary>
+/// Transparent score breakdown used to explain why one candidate won a combo slot over another.
+/// </summary>
 public sealed record CandidateSelectionScoreBreakdown
 {
     [JsonPropertyName("oosSharpeContribution")]
@@ -51,11 +60,18 @@ public sealed record CandidateSelectionScoreBreakdown
     public double TotalScore { get; init; }
 }
 
+/// <summary>
+/// Selection output pairing the candidate with its stable identity and ranking score.
+/// </summary>
 public sealed record CandidateSelectionResult(
     ScreeningOutcome Candidate,
     CandidateIdentity Identity,
     CandidateSelectionScoreBreakdown Score);
 
+/// <summary>
+/// Chooses the best surviving candidate per combo after screening has produced multiple
+/// variants or templates for the same slot.
+/// </summary>
 public interface IStrategyCandidateSelectionPolicy
 {
     CandidateCombo GetCombo(ScreeningOutcome candidate);
@@ -65,6 +81,10 @@ public interface IStrategyCandidateSelectionPolicy
 }
 
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyCandidateSelectionPolicy))]
+/// <summary>
+/// Deterministically ranks surviving screening outcomes and keeps only the strongest variant
+/// for each strategy-type/symbol/timeframe combo.
+/// </summary>
 public sealed class StrategyCandidateSelectionPolicy : IStrategyCandidateSelectionPolicy
 {
     public CandidateCombo GetCombo(ScreeningOutcome candidate)
@@ -82,6 +102,8 @@ public sealed class StrategyCandidateSelectionPolicy : IStrategyCandidateSelecti
     public CandidateSelectionScoreBreakdown Score(ScreeningOutcome candidate)
     {
         var metrics = candidate.Metrics;
+        // Favor out-of-sample quality most heavily while still rewarding in-sample robustness
+        // and penalizing candidates whose drawdown profile looks fragile.
         double oosSharpeContribution = (double)candidate.OosResult.SharpeRatio * 1_000d;
         double isSharpeContribution = (double)candidate.TrainResult.SharpeRatio * 250d;
         double oosProfitFactorContribution = (double)candidate.OosResult.ProfitFactor * 100d;
@@ -118,11 +140,17 @@ public sealed class StrategyCandidateSelectionPolicy : IStrategyCandidateSelecti
         };
     }
 
+    /// <summary>
+    /// Collapses a set of passing candidates into one best result per combo and returns the
+    /// winners ordered by descending total score.
+    /// </summary>
     public IReadOnlyList<CandidateSelectionResult> SelectBestCandidates(IEnumerable<ScreeningOutcome> passedCandidates)
         => passedCandidates
             .Select(candidate => new CandidateSelectionResult(candidate, BuildIdentity(candidate), Score(candidate)))
             .GroupBy(result => result.Identity.Combo)
             .Select(group => group
+                // Tie-break toward stronger walk-forward evidence, then stable name ordering
+                // so repeated runs produce deterministic winner selection.
                 .OrderByDescending(result => result.Score.TotalScore)
                 .ThenByDescending(result => result.Candidate.Metrics?.WalkForwardWindowsPassed ?? 0)
                 .ThenBy(result => result.Candidate.Strategy.Name, StringComparer.Ordinal)

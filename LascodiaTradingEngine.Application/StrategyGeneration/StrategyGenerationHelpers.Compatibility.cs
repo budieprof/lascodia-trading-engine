@@ -7,6 +7,9 @@ namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
 public static partial class StrategyGenerationHelpers
 {
+    // Backward-compatible overloads preserved for older callers and tests that still rely on
+    // DateTime.UtcNow-based helper signatures.
+
     public static double ComputeRecencyWeightedSurvivalRate(
         IEnumerable<(bool Survived, DateTime CreatedAt)> strategies)
         => ComputeRecencyWeightedSurvivalRate(strategies, 62.0, DateTime.UtcNow);
@@ -51,12 +54,19 @@ public static partial class StrategyGenerationHelpers
             ? string.Empty
             : global::LascodiaTradingEngine.Application.Optimization.CanonicalParameterJson.Normalize(parametersJson);
 
+    /// <summary>
+    /// Builds a stable key used to cache feedback for a normalized parameter template.
+    /// </summary>
     public static string BuildTemplateFeedbackKey(
         StrategyType strategyType,
         Timeframe timeframe,
         string normalizedParametersJson)
         => $"{strategyType}|{timeframe}|{normalizedParametersJson}";
 
+    /// <summary>
+    /// Orders candidate templates using feedback data when available, then falls back to the
+    /// regime-aware default template ordering.
+    /// </summary>
     public static IReadOnlyList<string> OrderTemplatesForRegime(
         IReadOnlyList<string> templates,
         MarketRegimeEnum regime,
@@ -86,6 +96,10 @@ public static partial class StrategyGenerationHelpers
         return ordered;
     }
 
+    /// <summary>
+    /// Maps a currently observed regime to the reserve regime that should diversify coverage
+    /// for a given strategy type.
+    /// </summary>
     public static MarketRegimeEnum GetReserveTargetRegime(MarketRegimeEnum currentRegime, StrategyType strategyType)
         => strategyType switch
         {

@@ -11,6 +11,9 @@ using MarketRegimeEnum = LascodiaTradingEngine.Domain.Enums.MarketRegime;
 namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyScreeningArtifactFactory))]
+/// <summary>
+/// Builds deterministic artifacts emitted by the screening engine.
+/// </summary>
 internal sealed class StrategyScreeningArtifactFactory : IStrategyScreeningArtifactFactory
 {
     public int ResolveMonteCarloSeed(
@@ -20,6 +23,8 @@ internal sealed class StrategyScreeningArtifactFactory : IStrategyScreeningArtif
         string enrichedParams,
         IReadOnlyList<Candle> allCandles,
         DateTime utcNow)
+        // Anchor the seed to the most recent candle date when available so Monte Carlo tests are
+        // reproducible for the same candidate and market slice.
         => ResolveDeterministicSeed(
             strategyType,
             symbol,
@@ -96,6 +101,8 @@ internal sealed class StrategyScreeningArtifactFactory : IStrategyScreeningArtif
         ScreeningMetrics metrics,
         DateTime createdAtUtc)
     {
+        // Reserve candidates keep a distinct name/description prefix so downstream operators and
+        // analytics can distinguish diversification candidates from primary ones at a glance.
         var inv = CultureInfo.InvariantCulture;
         var templateLabel = templateIndex > 0 ? $"-v{templateIndex + 1}" : "";
         var prefix = generationSource == "Reserve" ? "Auto-Reserve" : "Auto";

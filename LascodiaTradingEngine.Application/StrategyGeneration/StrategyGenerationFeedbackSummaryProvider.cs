@@ -15,6 +15,10 @@ using MarketRegimeEnum = LascodiaTradingEngine.Domain.Enums.MarketRegime;
 namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyGenerationFeedbackSummaryProvider))]
+/// <summary>
+/// Computes and caches historical survival-rate summaries used to bias future candidate
+/// generation toward strategies and parameter templates that have aged well.
+/// </summary>
 internal sealed class StrategyGenerationFeedbackSummaryProvider : IStrategyGenerationFeedbackSummaryProvider
 {
     private const string FeedbackSummaryStateKey = "feedback_summary";
@@ -52,11 +56,13 @@ internal sealed class StrategyGenerationFeedbackSummaryProvider : IStrategyGener
 
     public async Task<(Dictionary<(StrategyType, MarketRegimeEnum, Timeframe), double> TypeRates, Dictionary<string, double> TemplateRates)>
         LoadPerformanceFeedbackAsync(
-            DbContext db,
+        DbContext db,
             IWriteApplicationDbContext writeCtx,
-            double halfLifeDays,
-            CancellationToken ct)
+        double halfLifeDays,
+        CancellationToken ct)
     {
+        // Limit the feedback horizon so the generator reacts to recent behavior instead of
+        // overweighting stale candidates from older market regimes.
         var feedbackCutoff = _timeProvider.GetUtcNow().UtcDateTime.AddDays(-180);
 
         var allAutoStrategies = await db.Set<Strategy>()
@@ -93,6 +99,8 @@ internal sealed class StrategyGenerationFeedbackSummaryProvider : IStrategyGener
         {
             try
             {
+                // Cache reuse is allowed only when the candidate set fingerprint still matches;
+                // otherwise recompute to avoid serving rates for a different strategy population.
                 var cached = JsonSerializer.Deserialize<FeedbackSummaryCache>(cachedState.PayloadJson);
                 if (cached != null
                     && cached.StrategyCount == strategyCount

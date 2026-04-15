@@ -5,6 +5,9 @@ using Microsoft.Extensions.DependencyInjection;
 namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyGenerationCorrelationCoordinator))]
+/// <summary>
+/// Applies correlation-group capacity rules to strategy-generation candidate selection.
+/// </summary>
 internal sealed class StrategyGenerationCorrelationCoordinator : IStrategyGenerationCorrelationCoordinator
 {
     private readonly string[][] _correlationGroups;
@@ -16,6 +19,8 @@ internal sealed class StrategyGenerationCorrelationCoordinator : IStrategyGenera
 
     public Dictionary<int, int> BuildInitialCounts(IReadOnlyList<string> activeSymbols)
     {
+        // Seed occupancy from already-active symbols so the generator respects portfolio
+        // concentration limits before it starts proposing new candidates.
         var counts = new Dictionary<int, int>();
         foreach (var symbol in activeSymbols)
         {
@@ -42,6 +47,8 @@ internal sealed class StrategyGenerationCorrelationCoordinator : IStrategyGenera
 
     private int? FindCorrelationGroupIndex(string symbol)
     {
+        // Group matching is case-insensitive because symbols can arrive from multiple sources
+        // with inconsistent casing conventions.
         var upper = symbol.ToUpperInvariant();
         for (int i = 0; i < _correlationGroups.Length; i++)
         {

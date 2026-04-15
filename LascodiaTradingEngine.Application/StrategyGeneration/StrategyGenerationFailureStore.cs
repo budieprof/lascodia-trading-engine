@@ -6,6 +6,9 @@ using Microsoft.Extensions.DependencyInjection;
 namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyGenerationFailureStore))]
+/// <summary>
+/// EF-backed store for unresolved or operator-visible strategy-generation failures.
+/// </summary>
 internal sealed class StrategyGenerationFailureStore : IStrategyGenerationFailureStore
 {
     private readonly TimeProvider _timeProvider;
@@ -79,6 +82,8 @@ internal sealed class StrategyGenerationFailureStore : IStrategyGenerationFailur
         if (failures.Count == 0)
             return;
 
+        // Deduplicate by candidate and failure stage so repeated retries do not flood the
+        // failure table with copies of the same unresolved persistence problem.
         var failureSet = TryGetSet<StrategyGenerationFailure>(writeDb);
         if (failureSet == null)
             return;

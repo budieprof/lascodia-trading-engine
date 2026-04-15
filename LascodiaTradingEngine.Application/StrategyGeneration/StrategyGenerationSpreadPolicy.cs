@@ -7,6 +7,9 @@ using Microsoft.Extensions.DependencyInjection;
 namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyGenerationSpreadPolicy))]
+/// <summary>
+/// Applies spread-based gating and representative-spread estimation for screening runs.
+/// </summary>
 internal sealed class StrategyGenerationSpreadPolicy : IStrategyGenerationSpreadPolicy
 {
     public bool PassesSpreadFilter(
@@ -26,6 +29,8 @@ internal sealed class StrategyGenerationSpreadPolicy : IStrategyGenerationSpread
 
     public decimal ResolveRepresentativeSpread(BacktestOptions options, IReadOnlyList<Candle> candles)
     {
+        // Sample recent candles only; screening wants a representative current trading cost, not
+        // a whole-history average that hides the present spread environment.
         if (options.SpreadFunction == null || candles.Count == 0)
             return options.SpreadPriceUnits;
 

@@ -4,6 +4,9 @@ using Microsoft.Extensions.DependencyInjection;
 
 namespace LascodiaTradingEngine.Application.StrategyGeneration;
 
+/// <summary>
+/// Resolves validation-queue priority and queue-key identity for newly generated candidates.
+/// </summary>
 public interface IStrategyValidationPriorityResolver
 {
     bool IsEliteFastTrackCandidate(
@@ -25,6 +28,9 @@ public interface IStrategyValidationPriorityResolver
 }
 
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyValidationPriorityResolver))]
+/// <summary>
+/// Default priority resolver for backtest and walk-forward runs created by the generator.
+/// </summary>
 public sealed class StrategyValidationPriorityResolver : IStrategyValidationPriorityResolver
 {
     public bool IsEliteFastTrackCandidate(
@@ -52,6 +58,8 @@ public sealed class StrategyValidationPriorityResolver : IStrategyValidationPrio
         bool isElite,
         int fastTrackPriorityBoost)
     {
+        // Use the richer selection score when available, but never let the resulting priority
+        // fall below a simple Sharpe-derived baseline.
         int priority = (int)Math.Round(selectionScore.TotalScore, MidpointRounding.AwayFromZero);
         priority = Math.Max(priority, (int)Math.Round((double)candidate.TrainResult.SharpeRatio * 100d, MidpointRounding.AwayFromZero));
 
