@@ -196,6 +196,7 @@ public class SubmitExecutionReportBatchCommandHandler : IRequestHandler<SubmitEx
                     Commission         = report.Commission,
                     QueueDwellMs       = report.QueueDwellMs,
                     BrokerRetcode      = report.BrokerRetcode,
+                    BrokerOrderId      = entity.BrokerOrderId,
                 });
             }
 

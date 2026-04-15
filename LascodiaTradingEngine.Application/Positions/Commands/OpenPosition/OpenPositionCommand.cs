@@ -32,6 +32,8 @@ public class OpenPositionCommand : IRequest<ResponseData<long>>
     public bool            IsPaper           { get; set; }
     /// <summary>Identifier of the order that opened this position.</summary>
     public long?           OpenOrderId       { get; set; }
+    /// <summary>Broker-side position ticket. In MT5 hedging mode this equals the opening order ticket.</summary>
+    public string?         BrokerPositionId  { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
@@ -83,6 +85,7 @@ public class OpenPositionCommandHandler : IRequestHandler<OpenPositionCommand, R
             TakeProfit        = request.TakeProfit,
             IsPaper           = request.IsPaper,
             OpenOrderId       = request.OpenOrderId,
+            BrokerPositionId  = request.BrokerPositionId,
             Status            = PositionStatus.Open,
             OpenedAt          = DateTime.UtcNow
         };

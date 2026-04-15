@@ -118,6 +118,7 @@ public class SubmitExecutionReportCommandHandler : IRequestHandler<SubmitExecuti
                 Commission         = request.Commission,
                 QueueDwellMs       = request.QueueDwellMs,
                 BrokerRetcode      = request.BrokerRetcode,
+                BrokerOrderId      = entity.BrokerOrderId,
             });
         }
         else

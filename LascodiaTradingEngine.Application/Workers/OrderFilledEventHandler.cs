@@ -256,7 +256,12 @@ public sealed class OrderFilledEventHandler : IIntegrationEventHandler<OrderFill
             IsPaper           = order.IsPaper,
             // Link the position back to its originating order for idempotency checks and
             // for the audit trail (Position.OpenOrderId is the FK used by the guard above).
-            OpenOrderId       = order.Id
+            OpenOrderId       = order.Id,
+            // Carry the broker ticket so reconciliation against MT5 can match by
+            // BrokerPositionId. Without this, snapshot reconciliation creates duplicate
+            // Position rows (one with the ticket, one without) and the engine's
+            // per-symbol open-position cap trips on the duplicates.
+            BrokerPositionId  = @event.BrokerOrderId ?? order.BrokerOrderId,
         });
 
         if (result.responseCode != "00")

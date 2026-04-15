@@ -62,4 +62,7 @@ public record OrderFilledIntegrationEvent : IntegrationEvent
 
     /// <summary>Broker return code from OrderSend result.</summary>
     public int?          BrokerRetcode   { get; init; }
+
+    /// <summary>Broker-assigned order/position ticket from MT5. In hedging mode this doubles as the position ticket.</summary>
+    public string?       BrokerOrderId   { get; init; }
 }
