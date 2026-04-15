@@ -2740,6 +2740,15 @@ public class ModelSnapshot
     public string   Version       { get; set; } = string.Empty;
     public string[] Features      { get; set; } = [];
     /// <summary>
+    /// Number of raw feature values the scorer must supply to this snapshot.
+    /// 0 (legacy) = consumers should assume <see cref="MLFeatureHelper.FeatureCount"/> (33).
+    /// 37 = V2 vector with 4 appended cross-pair macro features (carry proxy, safe-haven
+    /// index, dollar-strength composite, correlation stress). Evaluators use this to
+    /// choose between <see cref="MLFeatureHelper.BuildFeatureVector"/> and
+    /// <see cref="MLFeatureHelper.BuildFeatureVectorV2"/> at inference time.
+    /// </summary>
+    public int      ExpectedInputFeatures { get; set; }
+    /// <summary>
     /// Optional mapping from this snapshot's feature-space positions back to the raw
     /// feature indices emitted by <see cref="MLFeatureHelper.BuildFeatureVector"/>.
     /// Empty means the snapshot consumes the raw feature order directly.

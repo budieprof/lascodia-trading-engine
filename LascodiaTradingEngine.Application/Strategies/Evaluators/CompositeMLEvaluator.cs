@@ -248,6 +248,61 @@ public class CompositeMLEvaluator : IStrategyEvaluator
             return null;
         }
 
+        // ── 4b. V2 feature-vector dispatch ─────────────────────────────────────
+        // If the model was trained with the 37-feature V2 vector, extend the 33-feature
+        // base vector by computing the 4 cross-pair macro features from a live basket
+        // of H1 closes. Falls back to V1 silently if the basket can't be loaded, so
+        // V2-tagged models keep scoring even on partial data (the 4 appended slots
+        // go to 0.0, which is the neutral value the trainer also sees for NaN).
+        int expectedFeatures = snapshot.ExpectedInputFeatures > 0
+            ? snapshot.ExpectedInputFeatures
+            : MLFeatureHelper.FeatureCount;
+
+        if (expectedFeatures == MLFeatureHelper.FeatureCountV2 &&
+            features.Length == MLFeatureHelper.FeatureCount)
+        {
+            try
+            {
+                using var basketScope = _scopeFactory.CreateScope();
+                var readDb = basketScope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+                var basketSymbols = new[] { "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD", "AUDUSD", "NZDUSD" };
+                var asOf = currentCandle.Timestamp;
+                var basketStart = asOf.AddDays(-7);
+
+                var raw = await readDb.GetDbContext().Set<Candle>()
+                    .AsNoTracking()
+                    .Where(c => basketSymbols.Contains(c.Symbol)
+                             && c.Timeframe == Timeframe.H1
+                             && c.IsClosed
+                             && !c.IsDeleted
+                             && c.Timestamp >= basketStart
+                             && c.Timestamp <= asOf)
+                    .OrderBy(c => c.Timestamp)
+                    .Select(c => new { c.Symbol, c.Timestamp, c.Close })
+                    .ToListAsync(cancellationToken);
+
+                var sliced = raw
+                    .GroupBy(c => c.Symbol)
+                    .ToDictionary(
+                        g => g.Key,
+                        g => g.OrderBy(x => x.Timestamp).Select(x => (double)x.Close).ToArray(),
+                        StringComparer.OrdinalIgnoreCase);
+
+                features = MLFeatureHelper.BuildFeatureVectorV2(
+                    windowCandles, currentCandle, previousCandle,
+                    sliced, strategy.Symbol, CotFeatureEntry.Zero);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "V2 feature extension failed for {Symbol} model {ModelId} — zero-padding",
+                    strategy.Symbol, model.Id);
+                var padded = new float[MLFeatureHelper.FeatureCountV2];
+                Array.Copy(features, padded, features.Length);
+                features = padded;
+            }
+        }
+
         // ── 5. Resolve inference engine ────────────────────────────────────────
         var engine = ResolveInferenceEngine(snapshot);
         if (engine is null)
@@ -264,7 +319,7 @@ public class CompositeMLEvaluator : IStrategyEvaluator
         {
             result = engine.RunInference(
                 features,
-                MLFeatureHelper.FeatureCount,
+                expectedFeatures,
                 snapshot,
                 windowCandles,
                 model.Id,

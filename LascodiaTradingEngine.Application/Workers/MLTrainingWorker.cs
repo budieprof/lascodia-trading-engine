@@ -122,6 +122,7 @@ public sealed class MLTrainingWorker : BackgroundService
     private const string CK_FeatureSampleRatio         = "MLTraining:FeatureSampleRatio";
     private const string CK_MaxEce                     = "MLTraining:MaxEce";
     private const string CK_UseTripleBarrier           = "MLTraining:UseTripleBarrier";
+    private const string CK_UseExtendedFeatureVector   = "MLTraining:UseExtendedFeatureVector";
     private const string CK_TripleBarrierProfitAtrMult = "MLTraining:TripleBarrierProfitAtrMult";
     private const string CK_TripleBarrierStopAtrMult   = "MLTraining:TripleBarrierStopAtrMult";
     private const string CK_TripleBarrierHorizonBars   = "MLTraining:TripleBarrierHorizonBars";
@@ -678,16 +679,89 @@ public sealed class MLTrainingWorker : BackgroundService
             }
 
             // ── Build training samples ───────────────────────────────────────
-            var samples = hp.UseTripleBarrier
-                ? MLFeatureHelper.BuildTrainingSamplesWithTripleBarrier(
-                    candles, CotLookup,
-                    (float)hp.TripleBarrierProfitAtrMult,
-                    (float)hp.TripleBarrierStopAtrMult,
-                    hp.TripleBarrierHorizonBars)
-                : MLFeatureHelper.BuildTrainingSamples(candles, CotLookup);
-            _logger.LogInformation(
-                "Built {Samples} training samples (features={Feat})",
-                samples.Count, MLFeatureHelper.FeatureCount);
+            // Option 1 (vector versioning): when MLTraining:UseExtendedFeatureVector
+            // is true, pre-load H1 closes for the G10 USD basket covering the
+            // training window so each sample can compute point-in-time macro
+            // features (carry, safe-haven, DXY, correlation stress) without
+            // per-sample DB round trips. The trainer then sees a 37-element
+            // vector instead of 33, and CompositeMLEvaluator dispatches on the
+            // model's stored feature count at inference time.
+            bool useExtendedVector = await GetConfigAsync<bool>(
+                ctx, CK_UseExtendedFeatureVector, false, stoppingToken);
+
+            Dictionary<string, (DateTime[] Times, double[] Closes)>? basket = null;
+            if (useExtendedVector && candles.Count > 0)
+            {
+                var basketSymbols = new[] { "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD", "AUDUSD", "NZDUSD" };
+                var windowStart = candles[0].Timestamp.AddDays(-7); // room for 120-bar warmup
+                var windowEnd   = candles[^1].Timestamp.AddHours(1);
+
+                var rawBasket = await ctx.Set<Candle>()
+                    .AsNoTracking()
+                    .Where(c => basketSymbols.Contains(c.Symbol)
+                             && c.Timeframe == Timeframe.H1
+                             && c.IsClosed
+                             && !c.IsDeleted
+                             && c.Timestamp >= windowStart
+                             && c.Timestamp <= windowEnd)
+                    .OrderBy(c => c.Timestamp)
+                    .Select(c => new { c.Symbol, c.Timestamp, c.Close })
+                    .ToListAsync(stoppingToken);
+
+                basket = rawBasket
+                    .GroupBy(c => c.Symbol)
+                    .ToDictionary(
+                        g => g.Key,
+                        g =>
+                        {
+                            var ordered = g.OrderBy(x => x.Timestamp).ToArray();
+                            return (
+                                Times:  ordered.Select(x => x.Timestamp).ToArray(),
+                                Closes: ordered.Select(x => (double)x.Close).ToArray()
+                            );
+                        },
+                        StringComparer.OrdinalIgnoreCase);
+
+                _logger.LogInformation(
+                    "Run {RunId}: V2 feature vector enabled — loaded {Pairs} basket pairs " +
+                    "({TotalBars} H1 bars) covering {Start:u}..{End:u}",
+                    run.Id, basket.Count, rawBasket.Count, windowStart, windowEnd);
+            }
+
+            List<TrainingSample> samples;
+            if (useExtendedVector && basket is not null && basket.Count >= 5)
+            {
+                samples = hp.UseTripleBarrier
+                    ? MLFeatureHelper.BuildTrainingSamplesWithTripleBarrierV2(
+                        candles, run.Symbol, basket, CotLookup,
+                        (float)hp.TripleBarrierProfitAtrMult,
+                        (float)hp.TripleBarrierStopAtrMult,
+                        hp.TripleBarrierHorizonBars)
+                    : MLFeatureHelper.BuildTrainingSamplesV2(candles, run.Symbol, basket, CotLookup);
+                _logger.LogInformation(
+                    "Built {Samples} V2 training samples (features={Feat})",
+                    samples.Count, MLFeatureHelper.FeatureCountV2);
+            }
+            else
+            {
+                if (useExtendedVector)
+                {
+                    _logger.LogWarning(
+                        "Run {RunId}: V2 requested but basket load returned {Count} pairs (<5) — " +
+                        "falling back to V1 33-feature vector.",
+                        run.Id, basket?.Count ?? 0);
+                }
+                samples = hp.UseTripleBarrier
+                    ? MLFeatureHelper.BuildTrainingSamplesWithTripleBarrier(
+                        candles, CotLookup,
+                        (float)hp.TripleBarrierProfitAtrMult,
+                        (float)hp.TripleBarrierStopAtrMult,
+                        hp.TripleBarrierHorizonBars)
+                    : MLFeatureHelper.BuildTrainingSamples(candles, CotLookup);
+                _logger.LogInformation(
+                    "Built {Samples} training samples (features={Feat})",
+                    samples.Count, MLFeatureHelper.FeatureCount);
+            }
 
             if (samples.Count < hp.MinSamples)
                 throw new InvalidOperationException(
@@ -1631,6 +1705,13 @@ public sealed class MLTrainingWorker : BackgroundService
             snap.CotNetNormMax = cotNetMax;
             snap.CotMomNormMin = cotMomMin;
             snap.CotMomNormMax = cotMomMax;
+
+            // Record the raw feature-vector dimension the trainer consumed so that
+            // CompositeMLEvaluator can dispatch between V1 (33) and V2 (37) builders
+            // at inference time. Derived from the actual first sample to stay
+            // authoritative regardless of which path built the samples.
+            if (samples.Count > 0 && samples[0].Features is { Length: > 0 })
+                snap.ExpectedInputFeatures = samples[0].Features.Length;
 
             // Compute per-feature empirical variances from the deployed feature pipeline.
             // This keeps OOD gating aligned with the exact feature layout inference consumes.

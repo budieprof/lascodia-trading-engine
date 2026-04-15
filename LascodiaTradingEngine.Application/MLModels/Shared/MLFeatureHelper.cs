@@ -22,6 +22,24 @@ public static class MLFeatureHelper
     /// <summary>Total number of features in every feature vector.</summary>
     public const int FeatureCount = 33;
 
+    /// <summary>
+    /// V2 vector length: 33 base features + 4 derived cross-pair macro features
+    /// (PairCarryProxy, SafeHavenIndex, DollarStrengthComposite, CrossPairCorrelationStress).
+    /// The V2 features are populated from pre-loaded basket closes; NaN/missing values
+    /// are zero-filled so the vector shape is stable and the trainer sees an explicit
+    /// neutral contribution rather than a sentinel.
+    /// </summary>
+    public const int FeatureCountV2 = 37;
+
+    /// <summary>Names of the 4 macro features appended in the V2 vector, in order.</summary>
+    public static readonly string[] MacroV2FeatureNames =
+    [
+        "PairCarryProxy",
+        "SafeHavenIndex",
+        "DollarStrengthComposite",
+        "CrossPairCorrelationStress",
+    ];
+
     /// <summary>Number of per-bar channels in the TCN sequence representation.</summary>
     public const int SequenceChannelCount = 9;
 
@@ -3924,5 +3942,167 @@ public static class MLFeatureHelper
         }
 
         return result;
+    }
+
+    // ── V2 feature vector (base 33 + 4 derived macro features) ───────────────
+    //
+    // These overloads give the trainer direct visibility into the four
+    // cross-pair macro scalars that previously only modulated inference-time
+    // confidence. By including them in the fitted feature vector we let the
+    // learner discover their interactions with the rest of the indicators
+    // rather than applying a post-hoc multiplicative haircut.
+
+    /// <summary>
+    /// Builds the 37-element V2 feature vector: the standard 33 features
+    /// followed by 4 derived cross-pair macro scalars (PairCarryProxy,
+    /// SafeHavenIndex, DollarStrengthComposite, CrossPairCorrelationStress),
+    /// computed from a pre-sliced basket of closed H1 candles for the major
+    /// G10 USD pairs. NaN values are zero-filled.
+    /// </summary>
+    public static float[] BuildFeatureVectorV2(
+        List<Candle>                          window,
+        Candle                                current,
+        Candle                                previous,
+        Dictionary<string, double[]>          basketSliceAtCurrentBar,
+        string                                symbol,
+        CotFeatureEntry?                      cotEntry = null)
+    {
+        var basePart = BuildFeatureVector(window, current, previous, cotEntry);
+        var result = new float[FeatureCountV2];
+        Array.Copy(basePart, 0, result, 0, FeatureCount);
+
+        double carry = basketSliceAtCurrentBar.TryGetValue(symbol, out var ownCloses)
+            ? global::LascodiaTradingEngine.Application.Services.ML.MacroFeatureCalculator.ComputePairCarryProxy(ownCloses)
+            : double.NaN;
+        double safeHaven = global::LascodiaTradingEngine.Application.Services.ML.MacroFeatureCalculator.ComputeSafeHavenIndex(basketSliceAtCurrentBar);
+        double dxy = global::LascodiaTradingEngine.Application.Services.ML.MacroFeatureCalculator.ComputeDollarStrengthComposite(basketSliceAtCurrentBar);
+        double stress = global::LascodiaTradingEngine.Application.Services.ML.MacroFeatureCalculator.ComputeCrossPairCorrelationStress(basketSliceAtCurrentBar);
+
+        result[FeatureCount + 0] = SanitizeMacro(carry);
+        result[FeatureCount + 1] = SanitizeMacro(safeHaven);
+        result[FeatureCount + 2] = SanitizeMacro(dxy);
+        result[FeatureCount + 3] = SanitizeMacro(stress);
+        return result;
+    }
+
+    private static float SanitizeMacro(double v)
+    {
+        if (double.IsNaN(v) || double.IsInfinity(v)) return 0f;
+        float f = (float)v;
+        return Clamp(f, -5f, 5f);
+    }
+
+    /// <summary>
+    /// V2 training sample builder: same as <see cref="BuildTrainingSamples"/> but
+    /// appends the 4 macro features, sliced point-in-time from
+    /// <paramref name="fullBasket"/> for the timestamp of each training bar.
+    /// </summary>
+    public static List<TrainingSample> BuildTrainingSamplesV2(
+        List<Candle>                                                   candles,
+        string                                                         symbol,
+        Dictionary<string, (DateTime[] Times, double[] Closes)>        fullBasket,
+        Func<DateTime, CotFeatureEntry>?                               cotLookup = null)
+    {
+        var samples = new List<TrainingSample>(candles.Count);
+
+        for (int i = LookbackWindow; i < candles.Count - 1; i++)
+        {
+            var window  = candles.GetRange(i - LookbackWindow, LookbackWindow);
+            var current = candles[i];
+            var prev    = window[^1];
+
+            var cotEntry = cotLookup?.Invoke(current.Timestamp) ?? CotFeatureEntry.Zero;
+            var slice = global::LascodiaTradingEngine.Application.Services.ML.MacroFeatureCalculator.SliceBasketAsOf(fullBasket, current.Timestamp);
+            var features = BuildFeatureVectorV2(window, current, prev, slice, symbol, cotEntry);
+
+            int direction = candles[i + 1].Close > candles[i].Close ? 1 : 0;
+            float atr = (float)CalculateATR(window, 14);
+            float magnitude = atr > 0
+                ? Clamp((float)((double)(candles[i + 1].Close - candles[i].Close) / (double)atr), -5f, 5f)
+                : 0f;
+
+            samples.Add(new TrainingSample(features, direction, magnitude));
+        }
+
+        return samples;
+    }
+
+    /// <summary>V2 triple-barrier training sample builder with appended macro features.</summary>
+    public static List<TrainingSample> BuildTrainingSamplesWithTripleBarrierV2(
+        List<Candle>                                                   candles,
+        string                                                         symbol,
+        Dictionary<string, (DateTime[] Times, double[] Closes)>        fullBasket,
+        Func<DateTime, CotFeatureEntry>?                               cotLookup     = null,
+        float                                                          profitAtrMult = 1.5f,
+        float                                                          stopAtrMult   = 1.0f,
+        int                                                            horizonBars   = 24)
+    {
+        var samples = new List<TrainingSample>(candles.Count);
+
+        for (int i = LookbackWindow; i < candles.Count - 1; i++)
+        {
+            var window  = candles.GetRange(i - LookbackWindow, LookbackWindow);
+            var current = candles[i];
+            var prev    = window[^1];
+
+            var cotEntry = cotLookup?.Invoke(current.Timestamp) ?? CotFeatureEntry.Zero;
+            var slice = global::LascodiaTradingEngine.Application.Services.ML.MacroFeatureCalculator.SliceBasketAsOf(fullBasket, current.Timestamp);
+            var features = BuildFeatureVectorV2(window, current, prev, slice, symbol, cotEntry);
+
+            float atr = (float)CalculateATR(window, 14);
+            if (atr <= 0f)
+            {
+                int fallbackDir = candles[i + 1].Close > candles[i].Close ? 1 : 0;
+                samples.Add(new TrainingSample(features, fallbackDir, 0f));
+                continue;
+            }
+
+            float profitTarget = atr * profitAtrMult;
+            float stopLoss     = atr * stopAtrMult;
+            float entry        = (float)current.Close;
+
+            int   label     = 0;
+            float magnitude = 0f;
+
+            int maxLook = Math.Min(i + 1 + horizonBars, candles.Count);
+            for (int j = i + 1; j < maxLook; j++)
+            {
+                float hi = (float)candles[j].High;
+                float lo = (float)candles[j].Low;
+
+                bool profitHit = hi - entry >= profitTarget;
+                bool stopHit   = entry - lo  >= stopLoss;
+
+                if (profitHit && stopHit)
+                {
+                    label = 1;
+                    magnitude = Clamp(profitTarget / atr, -5f, 5f);
+                    break;
+                }
+                if (profitHit)
+                {
+                    label = 1;
+                    magnitude = Clamp((hi - entry) / atr, -5f, 5f);
+                    break;
+                }
+                if (stopHit)
+                {
+                    label = 0;
+                    magnitude = Clamp((lo - entry) / atr, -5f, 5f);
+                    break;
+                }
+            }
+
+            if (label == 0 && magnitude == 0f && maxLook > i + 1)
+            {
+                float exitClose = (float)candles[maxLook - 1].Close;
+                magnitude = Clamp((exitClose - entry) / atr, -5f, 5f);
+                label     = exitClose > entry ? 1 : 0;
+            }
+
+            samples.Add(new TrainingSample(features, label, magnitude));
+        }
+
+        return samples;
     }
 }
