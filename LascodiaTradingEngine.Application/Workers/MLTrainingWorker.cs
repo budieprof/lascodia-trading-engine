@@ -92,6 +92,19 @@ public sealed class MLTrainingWorker : BackgroundService
     /// </summary>
     private const int StaleClaimMinutes = 60;
 
+    /// <summary>
+    /// Default starvation deadline in minutes. Any <see cref="RunStatus.Queued"/> run whose
+    /// <see cref="MLTrainingRun.StartedAt"/> is older than this horizon is claimed ahead of
+    /// the normal priority order, guaranteeing no run waits longer than the deadline
+    /// regardless of how many higher-priority runs keep arriving. Prevents the starvation
+    /// failure mode observed on 2026-04-15 where continuous Priority=1 AutoDegrading runs
+    /// for USDJPY/M5 starved Priority=5 runs for GBPUSD/M15 and EURUSD/H1 for 5+ hours.
+    /// Configurable via EngineConfig key <c>MLTraining:StarvationDeadlineMinutes</c>;
+    /// set the config value to 0 to disable starvation rescue entirely and revert to
+    /// strict priority ordering.
+    /// </summary>
+    private const int StarvationDeadlineMinutesDefault = 240;
+
     // ── EngineConfig keys ─────────────────────────────────────────────────────
     private const string CK_PollSecs                    = "MLTraining:PollIntervalSeconds";
     private const string CK_K                     = "MLTraining:K";
@@ -123,6 +136,7 @@ public sealed class MLTrainingWorker : BackgroundService
     private const string CK_MaxEce                     = "MLTraining:MaxEce";
     private const string CK_UseTripleBarrier           = "MLTraining:UseTripleBarrier";
     private const string CK_UseExtendedFeatureVector   = "MLTraining:UseExtendedFeatureVector";
+    private const string CK_StarvationDeadline         = "MLTraining:StarvationDeadlineMinutes";
     private const string CK_TripleBarrierProfitAtrMult = "MLTraining:TripleBarrierProfitAtrMult";
     private const string CK_TripleBarrierStopAtrMult   = "MLTraining:TripleBarrierStopAtrMult";
     private const string CK_TripleBarrierHorizonBars   = "MLTraining:TripleBarrierHorizonBars";
@@ -315,7 +329,7 @@ public sealed class MLTrainingWorker : BackgroundService
         return new Guid(bytes);
     }
 
-    private static async Task<MLTrainingRun?> ClaimNextRunAsync(
+    private async Task<MLTrainingRun?> ClaimNextRunAsync(
         Microsoft.EntityFrameworkCore.DbContext ctx,
         CancellationToken                       ct)
     {
@@ -346,7 +360,67 @@ public sealed class MLTrainingWorker : BackgroundService
             .Select(c => c.Value).FirstOrDefaultAsync(ct);
         bool isPaused = systemicPause == "true" || systemicPause == "1";
 
-        // ── Claim one queued run atomically ───────────────────────────────
+        // ── Starvation-aware first pass ──────────────────────────────────
+        // Runs with lower priorities can be starved indefinitely when a steady
+        // stream of high-priority runs keeps arriving (observed with USDJPY/M5
+        // AutoDegrading flooding the queue and locking out GBPUSD/M15 Scheduled
+        // runs for 5+ hours). Before the normal priority-ordered claim, do a
+        // separate pass that picks up any run whose StartedAt is older than the
+        // configured deadline, regardless of its priority. Guarantees no run
+        // waits longer than StarvationDeadlineMinutes no matter how busy the
+        // higher-priority lanes are.
+        //
+        // Setting the config value to 0 disables this rescue path entirely and
+        // reverts to strict priority ordering — useful if you want to
+        // deliberately pause low-priority lanes during an emergency.
+        var starvationMinutesStr = await ctx.Set<EngineConfig>()
+            .Where(c => c.Key == CK_StarvationDeadline && !c.IsDeleted)
+            .Select(c => c.Value)
+            .FirstOrDefaultAsync(ct);
+
+        int starvationMinutes = StarvationDeadlineMinutesDefault;
+        if (int.TryParse(starvationMinutesStr, out var parsedStarvation) && parsedStarvation >= 0)
+            starvationMinutes = parsedStarvation;
+
+        if (starvationMinutes > 0)
+        {
+            var starvationCutoff = DateTime.UtcNow.AddMinutes(-starvationMinutes);
+
+            var starvedRescued = await runSet
+                .Where(r => r.Status == RunStatus.Queued && r.WorkerInstanceId == null &&
+                            r.StartedAt < starvationCutoff &&
+                            (r.NextRetryAt == null || r.NextRetryAt <= DateTime.UtcNow) &&
+                            (!isPaused || r.Priority <= 1 || r.IsEmergencyRetrain))
+                .OrderBy(r => r.StartedAt)
+                .Take(1)
+                .ExecuteUpdateAsync(s => s
+                    .SetProperty(r => r.Status,           RunStatus.Running)
+                    .SetProperty(r => r.PickedUpAt,       DateTime.UtcNow)
+                    .SetProperty(r => r.WorkerInstanceId, _instanceId),
+                    ct);
+
+            if (starvedRescued > 0)
+            {
+                var rescued = await runSet.FirstOrDefaultAsync(
+                    r => r.WorkerInstanceId == _instanceId &&
+                         r.Status           == RunStatus.Running,
+                    ct);
+
+                if (rescued is not null)
+                {
+                    var waitedMinutes = (DateTime.UtcNow - rescued.StartedAt).TotalMinutes;
+                    _logger.LogInformation(
+                        "ClaimNextRunAsync: starvation rescue — claiming run {RunId} ({Symbol}/{Tf}, priority={Priority}) " +
+                        "after waiting {WaitedMin:F0}m (deadline {Deadline}m)",
+                        rescued.Id, rescued.Symbol, rescued.Timeframe, rescued.Priority,
+                        waitedMinutes, starvationMinutes);
+                }
+
+                return rescued;
+            }
+        }
+
+        // ── Normal priority-ordered claim ────────────────────────────────
         // Improvement #9: Order by Priority first (lower = higher priority),
         // then by StartedAt for FIFO within the same priority level.
         // During systemic pause, only claim fast-lane runs (Priority <= 1).
