@@ -333,11 +333,25 @@ public sealed class MLDirectionStreakWorker : BackgroundService
 
             if (!retrainExists)
             {
+                // Full 365-day window ending now. Previously this block omitted
+                // FromDate/ToDate, which caused them to default to DateTime.MinValue
+                // (persisted as PostgreSQL -infinity) and made MLTrainingWorker's
+                // candle query return zero rows, failing every run with
+                // "Insufficient candles: 0 (need 530)" after 3 retries. Matches the
+                // window used by MLPredictionPnlWorker, MLStructuralBreakWorker, and
+                // MLFeaturePsiWorker so all detection-triggered retrains train on
+                // the same amount of data.
+                var retrainNow      = DateTime.UtcNow;
+                var retrainFromDate = retrainNow.AddDays(-365);
+
                 writeCtx.Set<MLTrainingRun>().Add(new MLTrainingRun
                 {
                     Symbol               = symbol,
                     Timeframe            = timeframe,
                     Status               = RunStatus.Queued,
+                    TriggerType          = TriggerType.AutoDegrading,
+                    FromDate             = retrainFromDate,
+                    ToDate                = retrainNow,
                     ErrorMessage         = $"[DirectionStreak] Auto-retrain: {failCount}/4 tests failed " +
                                            $"(dominant={dominantDir} {dominantFrac:P0}, entropy={entropy:F3}, " +
                                            $"runsZ={runsZScore:F2}, longestRun={longestRun}). " +
