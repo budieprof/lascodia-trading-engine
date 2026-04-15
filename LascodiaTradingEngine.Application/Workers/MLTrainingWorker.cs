@@ -454,6 +454,61 @@ public sealed class MLTrainingWorker : BackgroundService
                 }
             }
 
+            // ── Cold-start quality gate relaxation ───────────────────────────
+            // When NO active MLModel exists for this (Symbol, Timeframe), the
+            // normal quality gates — tuned for beating an existing champion —
+            // are too strict to ever admit the first model. The strict gates
+            // (MinAccuracy 0.55, MinSharpe 0.50, MaxBrier 0.25, MinF1 0.10)
+            // reject weak baselines that are still useful as starting points
+            // the shadow-arbiter can subsequently challenge and improve.
+            // Relax to "barely above random" thresholds for the first model
+            // only — downstream SignalValidator + RiskChecker layers still
+            // catch any bad trades the weak baseline generates.
+            bool coldStartModeEnabled = await GetConfigAsync<bool>(
+                ctx, "MLTraining:ColdStart:Enabled", true, stoppingToken);
+
+            bool hasActiveModel = await ctx.Set<MLModel>()
+                .AsNoTracking()
+                .AnyAsync(m => m.Symbol    == run.Symbol
+                            && m.Timeframe == run.Timeframe
+                            && m.IsActive
+                            && !m.IsDeleted, stoppingToken);
+
+            bool coldStart = coldStartModeEnabled && !hasActiveModel;
+            if (coldStart)
+            {
+                double coldMinAccuracy    = await GetConfigAsync<double>(ctx, "MLTraining:ColdStart:MinAccuracy",    0.52, stoppingToken);
+                double coldMinSharpe      = await GetConfigAsync<double>(ctx, "MLTraining:ColdStart:MinSharpe",      0.30, stoppingToken);
+                double coldMaxBrier       = await GetConfigAsync<double>(ctx, "MLTraining:ColdStart:MaxBrier",       0.30, stoppingToken);
+                double coldMinEv          = await GetConfigAsync<double>(ctx, "MLTraining:ColdStart:MinExpectedValue", -0.005, stoppingToken);
+                double coldMinF1          = await GetConfigAsync<double>(ctx, "MLTraining:ColdStart:MinF1",          0.00, stoppingToken);
+                double coldMaxWfStdDev    = await GetConfigAsync<double>(ctx, "MLTraining:ColdStart:MaxWfStdDev",    0.25, stoppingToken);
+
+                var originalHp = hp;
+                hp = hp with
+                {
+                    MinAccuracyToPromote = Math.Min(originalHp.MinAccuracyToPromote, coldMinAccuracy),
+                    MinSharpeRatio       = Math.Min(originalHp.MinSharpeRatio,       coldMinSharpe),
+                    MaxBrierScore        = Math.Max(originalHp.MaxBrierScore,        coldMaxBrier),
+                    MinExpectedValue     = Math.Min(originalHp.MinExpectedValue,     coldMinEv),
+                    MinF1Score           = Math.Min(originalHp.MinF1Score,           coldMinF1),
+                    MaxWalkForwardStdDev = Math.Max(originalHp.MaxWalkForwardStdDev, coldMaxWfStdDev),
+                };
+
+                _logger.LogInformation(
+                    "Run {RunId} ({Symbol}/{Tf}): COLD START mode — no active model exists. " +
+                    "Gates relaxed: acc {OrigAcc:P1}→{NewAcc:P1}, sharpe {OrigSh:F2}→{NewSh:F2}, " +
+                    "brier {OrigBr:F2}→{NewBr:F2}, ev {OrigEv:F4}→{NewEv:F4}, f1 {OrigF1:F2}→{NewF1:F2}, " +
+                    "wfStd {OrigWf:P0}→{NewWf:P0}",
+                    run.Id, run.Symbol, run.Timeframe,
+                    originalHp.MinAccuracyToPromote, hp.MinAccuracyToPromote,
+                    originalHp.MinSharpeRatio, hp.MinSharpeRatio,
+                    originalHp.MaxBrierScore, hp.MaxBrierScore,
+                    originalHp.MinExpectedValue, hp.MinExpectedValue,
+                    originalHp.MinF1Score, hp.MinF1Score,
+                    originalHp.MaxWalkForwardStdDev, hp.MaxWalkForwardStdDev);
+            }
+
             // ── Guard: skip meta-learner runs with Symbol="ALL" ──────────────
             if (string.Equals(run.Symbol, "ALL", StringComparison.OrdinalIgnoreCase))
             {
