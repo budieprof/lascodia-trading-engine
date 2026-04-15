@@ -361,8 +361,16 @@ public class CompositeMLEvaluator : IStrategyEvaluator
         }
 
         // ── 8. Determine direction and confidence ──────────────────────────────
-        var direction = calibratedP >= 0.5 ? TradeDirection.Buy : TradeDirection.Sell;
-        double confidence = Math.Abs(calibratedP - 0.5) * 2.0; // 0..1
+        // Use the snapshot's stored decision threshold (which may diverge from 0.5
+        // when training calibration tunes it to maximise F1/Youden-J on imbalanced
+        // classes) so the evaluator's direction matches the downstream
+        // MLSignalScorer's direction. Otherwise the two compute opposing sides on
+        // the same model+tick and Tier 1 validation rejects the signal for "ML
+        // disagreement" — the exact bug observed in signals 1-3 (evaluator=Sell,
+        // scorer=Buy, threshold was calibrated below 0.4372).
+        double decisionThreshold = MLFeatureHelper.ResolveEffectiveDecisionThreshold(snapshot);
+        var direction = calibratedP >= decisionThreshold ? TradeDirection.Buy : TradeDirection.Sell;
+        double confidence = Math.Abs(calibratedP - decisionThreshold) * 2.0; // 0..1
 
         if (confidence < parameters.ConfidenceThreshold)
         {
