@@ -1,6 +1,9 @@
 using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using LascodiaTradingEngine.Application.AuditTrail.Commands.LogDecision;
+using LascodiaTradingEngine.Application.Common.Interfaces;
 using MediatR;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -39,6 +42,67 @@ public class ScreeningAuditLogger
         await mediator.Send(command, ct);
     }
 
+    /// <summary>
+    /// Dual-writes a screening failure: one row to the AuditTrail (via LogDecisionCommand)
+    /// and one row to StrategyGenerationFailure (via the failure store). Prior to this helper,
+    /// only the audit trail path existed, which made the failure table empty despite hundreds
+    /// of rejections per cycle and left operators unable to query "which gate fires most."
+    /// </summary>
+    private async Task SendFailureScopedAsync(
+        LogDecisionCommand command,
+        ScreeningOutcome result,
+        CancellationToken ct)
+    {
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        var mediator = scope.ServiceProvider.GetRequiredService<IMediator>();
+        await mediator.Send(command, ct);
+
+        if (result.Strategy is null)
+            return;
+
+        try
+        {
+            var failureStore = scope.ServiceProvider.GetService<IStrategyGenerationFailureStore>();
+            var writeCtx = scope.ServiceProvider.GetService<IWriteApplicationDbContext>();
+            if (failureStore is null || writeCtx is null)
+                return;
+
+            var candidateHash = ComputeCandidateHash(result.Strategy);
+            var record = new StrategyGenerationFailureRecord(
+                CandidateId: candidateHash,
+                CycleId: null,
+                CandidateHash: candidateHash,
+                StrategyType: result.Strategy.StrategyType,
+                Symbol: result.Strategy.Symbol,
+                Timeframe: result.Strategy.Timeframe,
+                ParametersJson: result.Strategy.ParametersJson ?? "",
+                FailureStage: result.Failure.ToString(),
+                FailureReason: result.FailureReason ?? result.FailureOutcome ?? "Unknown",
+                DetailsJson: command.ContextJson);
+
+            await failureStore.RecordFailuresAsync(writeCtx.GetDbContext(), new[] { record }, ct);
+            await writeCtx.GetDbContext().SaveChangesAsync(ct);
+        }
+        catch
+        {
+            // Best effort — the audit trail row is the authoritative record; the failure
+            // store is an observability aid. A failure here must not block the cycle.
+        }
+    }
+
+    private static string ComputeCandidateHash(Domain.Entities.Strategy strategy)
+    {
+        var payload = string.Concat(
+            strategy.Symbol, "|",
+            strategy.Timeframe, "|",
+            strategy.StrategyType, "|",
+            strategy.ParametersJson ?? "");
+        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(payload));
+        var sb = new StringBuilder(bytes.Length * 2);
+        foreach (var b in bytes) sb.Append(b.ToString("x2", Inv));
+        return sb.ToString();
+    }
+
     /// <summary>Logs a screening failure with structured failure reason and metrics context.</summary>
     public async Task LogFailureAsync(ScreeningOutcome result, CancellationToken ct)
     {
@@ -53,7 +117,7 @@ public class ScreeningAuditLogger
         var trainResult = result.TrainResult;
         var hasMetrics  = trainResult is not null && result.Strategy is not null;
 
-        await SendScopedAsync(new LogDecisionCommand
+        var command = new LogDecisionCommand
         {
             EntityType   = "Strategy",
             EntityId     = 0,
@@ -78,7 +142,8 @@ public class ScreeningAuditLogger
                 isTotalTrades = hasMetrics ? (int?)trainResult!.TotalTrades : null,
             }, JsonOpts),
             Source       = "StrategyGenerationWorker"
-        }, ct);
+        };
+        await SendFailureScopedAsync(command, result, ct);
     }
 
     /// <summary>Logs a successful candidate creation with structured IS/OOS metrics in ContextJson.</summary>
