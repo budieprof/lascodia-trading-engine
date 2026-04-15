@@ -514,14 +514,32 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
                 }
 
                 // ── Per-strategy signal cooldown ─────────────────────────────
-                if (_options.SignalCooldownSeconds > 0 &&
+                // Bar-aware floor: even when SignalCooldownSeconds is unset, prevent
+                // the same strategy from emitting more than one signal per candle by
+                // enforcing a minimum cooldown equal to the strategy's bar duration.
+                // Without this, a degenerate evaluator that always returns the same
+                // decision can fire 5+ signals within 400ms of ticks inside the same
+                // candle — we observed exactly this on the first live fills.
+                int barSeconds = strategy.Timeframe switch
+                {
+                    Timeframe.M1  => 60,
+                    Timeframe.M5  => 300,
+                    Timeframe.M15 => 900,
+                    Timeframe.H1  => 3600,
+                    Timeframe.H4  => 14400,
+                    Timeframe.D1  => 86400,
+                    _             => 300,
+                };
+                int effectiveCooldown = Math.Max(_options.SignalCooldownSeconds, barSeconds);
+                if (effectiveCooldown > 0 &&
                     _lastSignalTime.TryGetValue(strategy.Id, out var lastTime) &&
-                    (DateTime.UtcNow - lastTime).TotalSeconds < _options.SignalCooldownSeconds)
+                    (DateTime.UtcNow - lastTime).TotalSeconds < effectiveCooldown)
                 {
                     _logger.LogDebug(
-                        "Strategy {Id} ({Symbol}): cooldown active — {Remaining:F0}s remaining",
-                        strategy.Id, strategy.Symbol,
-                        _options.SignalCooldownSeconds - (DateTime.UtcNow - lastTime).TotalSeconds);
+                        "Strategy {Id} ({Symbol}/{Tf}): cooldown active — {Remaining:F0}s of {Total}s remaining",
+                        strategy.Id, strategy.Symbol, strategy.Timeframe,
+                        effectiveCooldown - (DateTime.UtcNow - lastTime).TotalSeconds,
+                        effectiveCooldown);
                     _metrics.SignalCooldownSkips.Add(1, new("symbol", strategy.Symbol), new("strategy_id", strategy.Id));
                     return;
                 }

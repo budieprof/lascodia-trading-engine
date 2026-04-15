@@ -42,6 +42,7 @@ public class DataRetentionManager : IDataRetentionManager
         results.Add(await PurgeWorkerHealthAsync(ctx, cancellationToken));
         results.Add(await PurgeAnomaliesAsync(ctx, cancellationToken));
         results.Add(await PurgePublishedIntegrationEventsAsync(ctx, cancellationToken));
+        results.Add(await PurgeDecisionLogsAsync(ctx, cancellationToken));
 
         var idempotencyPurged = await PurgeExpiredIdempotencyKeysAsync(cancellationToken);
         results.Add(new RetentionResult("ProcessedIdempotencyKey", 0, idempotencyPurged, DateTime.UtcNow));
@@ -93,6 +94,30 @@ public class DataRetentionManager : IDataRetentionManager
         }
 
         return new RetentionResult("MLModelPredictionLog", 0, batch.Count, cutoff);
+    }
+
+    private async Task<RetentionResult> PurgeDecisionLogsAsync(
+        DbContext ctx, CancellationToken ct)
+    {
+        // DecisionLog is written on every signal-filter rejection and every audit-worthy
+        // pipeline decision. At observed peak rates (~400 rows per 5 minutes during heavy
+        // signal generation) the table can grow ~120k rows/day, so pruning past the hot
+        // retention window is essential to keep the table queryable.
+        var cutoff = DateTime.UtcNow.AddDays(-_options.DecisionLogHotDays);
+
+        var batch = await ctx.Set<DecisionLog>()
+            .Where(e => e.CreatedAt < cutoff)
+            .OrderBy(e => e.CreatedAt)
+            .Take(_options.BatchSize)
+            .ToListAsync(ct);
+
+        if (batch.Count > 0)
+        {
+            ctx.Set<DecisionLog>().RemoveRange(batch);
+            await ctx.SaveChangesAsync(ct);
+        }
+
+        return new RetentionResult("DecisionLog", 0, batch.Count, cutoff);
     }
 
     private async Task<RetentionResult> PurgeTickRecordsAsync(

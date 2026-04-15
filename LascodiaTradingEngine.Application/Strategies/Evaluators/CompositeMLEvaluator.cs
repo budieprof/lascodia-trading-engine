@@ -70,7 +70,12 @@ public class CompositeMLEvaluator : IStrategyEvaluator
         var parameters = ParseParameters(strategy.ParametersJson);
 
         if (candles.Count < MinCandles)
+        {
+            _logger.LogDebug(
+                "CompositeML insufficient candles for {Symbol}/{Timeframe} strategy {StrategyId}: {Actual}/{Required}",
+                strategy.Symbol, strategy.Timeframe, strategy.Id, candles.Count, MinCandles);
             return null;
+        }
 
         int lastIdx = candles.Count - 1;
 
