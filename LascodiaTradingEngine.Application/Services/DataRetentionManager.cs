@@ -4,6 +4,7 @@ using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Options;
 using LascodiaTradingEngine.Domain.Entities;
+using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.Services;
 
@@ -43,6 +44,7 @@ public class DataRetentionManager : IDataRetentionManager
         results.Add(await PurgeAnomaliesAsync(ctx, cancellationToken));
         results.Add(await PurgePublishedIntegrationEventsAsync(ctx, cancellationToken));
         results.Add(await PurgeDecisionLogsAsync(ctx, cancellationToken));
+        results.Add(await PurgePendingModelStrategiesAsync(ctx, cancellationToken));
 
         var idempotencyPurged = await PurgeExpiredIdempotencyKeysAsync(cancellationToken);
         results.Add(new RetentionResult("ProcessedIdempotencyKey", 0, idempotencyPurged, DateTime.UtcNow));
@@ -118,6 +120,42 @@ public class DataRetentionManager : IDataRetentionManager
         }
 
         return new RetentionResult("DecisionLog", 0, batch.Count, cutoff);
+    }
+
+    private async Task<RetentionResult> PurgePendingModelStrategiesAsync(
+        DbContext ctx, CancellationToken ct)
+    {
+        // Strategies parked in LifecycleStage = PendingModel by DeferredCompositeMLRegistrar
+        // are waiting for an MLTrainingRun to complete. If the training never succeeds
+        // (bad data, repeated quality-gate failures, etc.) the strategy sits forever.
+        // TTL sweep prunes them past the configured horizon so the generation pipeline
+        // doesn't accumulate zombie rows. Setting the option to 0 disables pruning.
+        if (_options.PendingModelStrategyTtlDays <= 0)
+            return new RetentionResult("Strategy.PendingModel", 0, 0, DateTime.UtcNow);
+
+        var cutoff = DateTime.UtcNow.AddDays(-_options.PendingModelStrategyTtlDays);
+        var now = DateTime.UtcNow;
+
+        var stuck = await ctx.Set<Strategy>()
+            .Where(s => !s.IsDeleted
+                     && s.LifecycleStage == StrategyLifecycleStage.PendingModel
+                     && s.LifecycleStageEnteredAt != null
+                     && s.LifecycleStageEnteredAt < cutoff)
+            .Take(_options.BatchSize)
+            .ToListAsync(ct);
+
+        if (stuck.Count > 0)
+        {
+            foreach (var s in stuck)
+            {
+                s.IsDeleted = true;
+                s.PrunedAtUtc = now;
+                s.PauseReason = $"PendingModel TTL expired ({_options.PendingModelStrategyTtlDays} days) — training run never completed.";
+            }
+            await ctx.SaveChangesAsync(ct);
+        }
+
+        return new RetentionResult("Strategy.PendingModel", 0, stuck.Count, cutoff);
     }
 
     private async Task<RetentionResult> PurgeTickRecordsAsync(

@@ -46,6 +46,7 @@ internal sealed class StrategyGenerationPrimaryScreeningPlanner : IStrategyGener
     private readonly IStrategyGenerationMarketDataPolicy _marketDataPolicy;
     private readonly IStrategyGenerationCorrelationCoordinator _correlationCoordinator;
     private readonly IStrategyGenerationSpreadPolicy _spreadPolicy;
+    private readonly IDeferredCompositeMLRegistrar _deferredCompositeMLRegistrar;
     private readonly TimeProvider _timeProvider;
 
     public StrategyGenerationPrimaryScreeningPlanner(
@@ -62,6 +63,7 @@ internal sealed class StrategyGenerationPrimaryScreeningPlanner : IStrategyGener
         IStrategyGenerationMarketDataPolicy marketDataPolicy,
         IStrategyGenerationCorrelationCoordinator correlationCoordinator,
         IStrategyGenerationSpreadPolicy spreadPolicy,
+        IDeferredCompositeMLRegistrar deferredCompositeMLRegistrar,
         TimeProvider timeProvider)
     {
         _logger = logger;
@@ -77,6 +79,7 @@ internal sealed class StrategyGenerationPrimaryScreeningPlanner : IStrategyGener
         _marketDataPolicy = marketDataPolicy;
         _correlationCoordinator = correlationCoordinator;
         _spreadPolicy = spreadPolicy;
+        _deferredCompositeMLRegistrar = deferredCompositeMLRegistrar;
         _timeProvider = timeProvider;
     }
 
@@ -634,6 +637,32 @@ internal sealed class StrategyGenerationPrimaryScreeningPlanner : IStrategyGener
                             new KeyValuePair<string, object?>("strategy_type", capturedType.ToString()));
                         if (result != null && !result.Passed)
                         {
+                            // ── Chicken-and-egg deferral for CompositeML ──
+                            // A CompositeML candidate rejected for zero IS trades when no
+                            // active MLModel exists is actually a "waiting for model"
+                            // state, not a genuine failure. Park it as a PendingModel
+                            // strategy and queue a training run; the event handler on
+                            // MLModelActivatedIntegrationEvent will re-screen it once
+                            // the model is ready. Only zero-trade rejections are eligible
+                            // for deferral — every other gate failure is a real rejection.
+                            if (result.Failure == ScreeningFailureReason.ZeroTradesIS
+                                && capturedType == StrategyType.CompositeML)
+                            {
+                                bool deferred = await _deferredCompositeMLRegistrar.TryDeferAsync(
+                                    args.Symbol,
+                                    args.Timeframe,
+                                    result.Strategy?.ParametersJson ?? "{}",
+                                    context.CycleId,
+                                    candidateHash: null,
+                                    taskCts.Token);
+                                if (deferred)
+                                {
+                                    _metrics.StrategyGenScreeningRejections.Add(1,
+                                        new KeyValuePair<string, object?>("gate", "deferred_pending_model"));
+                                    return null;
+                                }
+                            }
+
                             await context.AuditLogger.LogFailureAsync(result, ct);
                             return null;
                         }

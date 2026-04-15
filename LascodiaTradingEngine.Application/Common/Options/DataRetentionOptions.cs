@@ -14,6 +14,14 @@ public class DataRetentionOptions : ConfigurationOption<DataRetentionOptions>
     /// <summary>Decision logs hot retention in days.</summary>
     public int DecisionLogHotDays { get; set; } = 365;
 
+    /// <summary>
+    /// TTL in days for strategies parked in <c>LifecycleStage = PendingModel</c>.
+    /// A strategy that has been waiting for its MLModel to train for longer than
+    /// this horizon is pruned (soft-deleted + marked <c>PrunedAtUtc</c>) to prevent
+    /// zombie rows in the generation pipeline. Default 7 days. Set 0 to disable.
+    /// </summary>
+    public int PendingModelStrategyTtlDays { get; set; } = 7;
+
     /// <summary>Candle data hot retention in days.</summary>
     public int CandleHotDays { get; set; } = 730;
 

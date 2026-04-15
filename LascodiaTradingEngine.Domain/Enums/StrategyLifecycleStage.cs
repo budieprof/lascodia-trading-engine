@@ -17,7 +17,15 @@ public enum StrategyLifecycleStage
     /// <summary>Passed human review of paper + shadow results; awaiting activation.</summary>
     Approved = 4,
     /// <summary>Fully active with standard lot sizing.</summary>
-    Active = 5
+    Active = 5,
+    /// <summary>
+    /// CompositeML candidate deferred by <c>StrategyGenerationWorker</c> because no active
+    /// MLModel exists for its (Symbol, Timeframe). An MLTrainingRun has been queued, and
+    /// an event handler subscribed to <c>MLModelActivatedIntegrationEvent</c> will re-run
+    /// screening once the model is trained. Parked strategies in this stage also have
+    /// <c>Status = Paused</c> so they never fire live signals before re-screening.
+    /// </summary>
+    PendingModel = 6
 }
 
 public static class StrategyLifecycleTransitions
@@ -30,6 +38,10 @@ public static class StrategyLifecycleTransitions
         [StrategyLifecycleStage.ShadowLive]         = [StrategyLifecycleStage.Approved, StrategyLifecycleStage.Draft],
         [StrategyLifecycleStage.Approved]            = [StrategyLifecycleStage.Active, StrategyLifecycleStage.Draft],
         [StrategyLifecycleStage.Active]              = [StrategyLifecycleStage.Draft],
+        // PendingModel → Draft on successful re-screening + promotion, or → Draft on
+        // TTL expiry / prune. There's no direct path to live stages without going
+        // through the normal Draft → PaperTrading → ... → Active lifecycle.
+        [StrategyLifecycleStage.PendingModel]        = [StrategyLifecycleStage.Draft],
     };
 
     public static bool CanTransitionTo(this StrategyLifecycleStage current, StrategyLifecycleStage target)
