@@ -954,28 +954,41 @@ public sealed class MLTrainingWorker : BackgroundService
                 brierBypassed = true;
             }
 
-            // ── Cold-start F1-conditional accuracy bypass ──────────────────
-            // In cold-start mode (no active model exists for this combo), the flat
-            // MinAccuracyToPromote floor punishes class-imbalance-aware models that
-            // legitimately predict the minority class well. A model with F1 above a
-            // reasonable floor but accuracy below 50 % typically means the model is
-            // predicting the minority class (which is rare in the test set) with
-            // high precision/recall while the majority class drives overall accuracy
-            // down. For the first model per combo, we want to accept these models as
-            // baselines — the shadow-arbiter can subsequently challenge them with
-            // models that fix the imbalance.
+            // ── F1-conditional accuracy bypass (class-imbalance rescue) ──────────
+            // The flat MinAccuracyToPromote floor punishes class-imbalance-aware
+            // models that legitimately predict the minority class well. A model with
+            // F1 above a reasonable floor but accuracy below 50 % typically means the
+            // model predicts the minority class with high precision/recall while the
+            // majority class drives overall accuracy down. Two tiers:
             //
-            // Conditions to bypass the accuracy floor:
-            //   1. Cold-start mode is active (no active model for this combo)
-            //   2. F1 is above the bypass threshold (default 0.40 — genuinely strong signal)
-            //   3. Accuracy is within an imbalance-plausible band (default [0.40, 0.60])
-            //      so we don't admit models that are arbitrarily bad
-            //   4. Brier score is still under the (already relaxed) ceiling, so the
-            //      model's probability calibration is at least reasonable
+            // COLD-START tier (first model per combo):
+            //   F1 ≥ ColdStart:F1BypassMinF1 (default 0.40) AND accuracy in
+            //   [0.50-band, 0.50+band] (default ±0.10) AND Brier under ceiling.
+            //   Relaxed so any reasonable class-imbalance-aware baseline is admitted.
+            //
+            // STRICT tier (champion exists):
+            //   F1 ≥ Strict:F1BypassMinF1 (default 0.50) AND Sharpe ≥
+            //   Strict:F1BypassMinSharpe (default 0.50) AND accuracy in
+            //   [0.50-band, 0.50+band] AND Brier under ceiling. Tighter because
+            //   admitting a class-imbalance model into an existing champion's
+            //   combo means the shadow arbiter will SPRT-compare them; we want
+            //   the challenger to be genuinely strong, not just different.
+            //
+            // Today's run 106 (GBPUSD/M15 SVGP, F1=0.643, acc=47.4%, Sharpe=0.97)
+            // is exactly the class the strict tier is built to rescue — a real
+            // class-imbalance-aware model that the cold-start-only bypass missed
+            // because Model 26 already existed for that combo.
             double coldStartF1Bypass_MinF1 = await GetConfigAsync<double>(
                 ctx, "MLTraining:ColdStart:F1BypassMinF1", 0.40, stoppingToken);
             double coldStartF1Bypass_AccBand = await GetConfigAsync<double>(
                 ctx, "MLTraining:ColdStart:F1BypassAccBand", 0.10, stoppingToken);
+            double strictF1Bypass_MinF1 = await GetConfigAsync<double>(
+                ctx, "MLTraining:F1Bypass:MinF1", 0.50, stoppingToken);
+            double strictF1Bypass_MinSharpe = await GetConfigAsync<double>(
+                ctx, "MLTraining:F1Bypass:MinSharpe", 0.50, stoppingToken);
+            double strictF1Bypass_AccBand = await GetConfigAsync<double>(
+                ctx, "MLTraining:F1Bypass:AccBand", 0.10, stoppingToken);
+
             bool coldStartAccuracyBypass =
                 coldStart
                 && m.F1 >= coldStartF1Bypass_MinF1
@@ -983,7 +996,17 @@ public sealed class MLTrainingWorker : BackgroundService
                 && m.Accuracy <= (0.50 + coldStartF1Bypass_AccBand)
                 && m.BrierScore <= brierCeiling;
 
-            bool accuracyOk = m.Accuracy >= hp.MinAccuracyToPromote || coldStartAccuracyBypass;
+            bool strictAccuracyBypass =
+                !coldStart
+                && m.F1 >= strictF1Bypass_MinF1
+                && m.SharpeRatio >= strictF1Bypass_MinSharpe
+                && m.Accuracy >= (0.50 - strictF1Bypass_AccBand)
+                && m.Accuracy <= (0.50 + strictF1Bypass_AccBand)
+                && m.BrierScore <= brierCeiling;
+
+            bool accuracyOk = m.Accuracy >= hp.MinAccuracyToPromote
+                           || coldStartAccuracyBypass
+                           || strictAccuracyBypass;
 
             if (coldStartAccuracyBypass)
             {
@@ -992,6 +1015,16 @@ public sealed class MLTrainingWorker : BackgroundService
                     "below floor {MinAcc:P1} but F1 {F1:F3} \u2265 {MinF1:F3} (class-imbalance rescue)",
                     run.Id, run.Symbol, run.Timeframe,
                     m.Accuracy, hp.MinAccuracyToPromote, m.F1, coldStartF1Bypass_MinF1);
+            }
+            else if (strictAccuracyBypass)
+            {
+                _logger.LogInformation(
+                    "Run {RunId} ({Symbol}/{Tf}): strict-mode F1 bypass — accuracy {Acc:P1} " +
+                    "below floor {MinAcc:P1} but F1 {F1:F3} \u2265 {MinF1:F3} and Sharpe {Sh:F2} \u2265 {MinSh:F2} " +
+                    "(class-imbalance challenger rescue)",
+                    run.Id, run.Symbol, run.Timeframe,
+                    m.Accuracy, hp.MinAccuracyToPromote, m.F1, strictF1Bypass_MinF1,
+                    m.SharpeRatio, strictF1Bypass_MinSharpe);
             }
 
             bool passed =
@@ -2110,7 +2143,16 @@ public sealed class MLTrainingWorker : BackgroundService
             EnableRegimeSpecificModels:  Cfg<bool>  (CK_EnableRegimeModels,          false),
             FeatureSampleRatio:          Cfg<double>(CK_FeatureSampleRatio,          0.0),
             MaxEce:                      Cfg<double>(CK_MaxEce,                      0.0),
-            UseTripleBarrier:            Cfg<bool>  (CK_UseTripleBarrier,            false),
+            // Default flipped from false to true: triple-barrier labels align targets
+            // with actual trading P&L (did a profitable move happen before a losing one
+            // within N bars) rather than next-bar direction, which is noise-dominated
+            // on short timeframes. The existing BuildTrainingSamplesWithTripleBarrier
+            // implementation has been production-ready but disabled by default. On
+            // M5/M15 FX, where we empirically can't train next-bar direction above
+            // 55 % accuracy, triple-barrier should substantially raise the quality
+            // ceiling by denoising the training labels themselves. Operators can
+            // revert via MLTraining:UseTripleBarrier=false.
+            UseTripleBarrier:            Cfg<bool>  (CK_UseTripleBarrier,            true),
             TripleBarrierProfitAtrMult:  Cfg<double>(CK_TripleBarrierProfitAtrMult,  1.5),
             TripleBarrierStopAtrMult:    Cfg<double>(CK_TripleBarrierStopAtrMult,    1.0),
             TripleBarrierHorizonBars:    Cfg<int>   (CK_TripleBarrierHorizonBars,    24),
