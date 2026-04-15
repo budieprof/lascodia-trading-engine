@@ -132,11 +132,14 @@ public sealed class DatabaseSeeder
                 StrategyType = StrategyType.RSIReversion,
                 Symbol = "GBPUSD",
                 Timeframe = Timeframe.M15,
-                // Loosened from 70/30 to 60/40 so the seed strategy generates enough signal
-                // traffic to exercise the validator → bridge → order path end-to-end during
-                // bootstrap. The autonomous StrategyGenerationWorker will replace this with
-                // optimized params once it produces its first BacktestQualified candidate.
-                ParametersJson = """{"RsiPeriod":14,"OverboughtLevel":60,"OversoldLevel":40}""",
+                // Property names MUST match RSIReversionEvaluator.ParseParameters:
+                // "Period" / "Oversold" / "Overbought" — the original seeder used
+                // "RsiPeriod" / "OversoldLevel" / "OverboughtLevel" which the
+                // evaluator silently ignored, falling back to defaults 14 / 30 / 70
+                // and making the "loosened 60/40" tuning a no-op. Using the correct
+                // names here and a loose 40/60 band to generate enough signal
+                // traffic during bootstrap.
+                ParametersJson = """{"Period":14,"Oversold":40,"Overbought":60}""",
                 Status = StrategyStatus.Active,
                 RiskProfileId = defaultProfile.Id,
                 CreatedAt = DateTime.UtcNow,
@@ -148,10 +151,13 @@ public sealed class DatabaseSeeder
                 StrategyType = StrategyType.BreakoutScalper,
                 Symbol = "USDJPY",
                 Timeframe = Timeframe.M5,
-                // BreakoutMultiplier lowered from 1.5 → 1.0: at 1.5×ATR the strategy rarely
-                // triggers on M5 in sideways conditions. 1.0 produces signals on moves
-                // of one full ATR, which is common enough to exercise the pipeline.
-                ParametersJson = """{"LookbackPeriod":20,"BreakoutMultiplier":1.0,"ATRPeriod":14}""",
+                // Property names MUST match BreakoutScalperEvaluator.ParseParameters:
+                // "LookbackBars" / "BreakoutMultiplier". The original seeder used
+                // "LookbackPeriod" (plus an unused "ATRPeriod"), which the evaluator
+                // silently ignored and fell back to default lookback=20. Using the
+                // correct name here with BreakoutMultiplier 1.0 so the scalper
+                // triggers on single-ATR moves.
+                ParametersJson = """{"LookbackBars":20,"BreakoutMultiplier":1.0}""",
                 Status = StrategyStatus.Active,
                 RiskProfileId = defaultProfile.Id,
                 CreatedAt = DateTime.UtcNow,

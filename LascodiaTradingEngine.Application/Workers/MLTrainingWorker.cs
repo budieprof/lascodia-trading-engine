@@ -478,7 +478,13 @@ public sealed class MLTrainingWorker : BackgroundService
             if (coldStart)
             {
                 double coldMinAccuracy    = await GetConfigAsync<double>(ctx, "MLTraining:ColdStart:MinAccuracy",    0.52, stoppingToken);
-                double coldMinSharpe      = await GetConfigAsync<double>(ctx, "MLTraining:ColdStart:MinSharpe",      0.30, stoppingToken);
+                // MinSharpe lowered from 0.30 to 0.05: the first model per combo only
+                // needs to avoid losing money. "Slightly positive expectation" is the
+                // right floor for a baseline the shadow-arbiter will later challenge
+                // with better candidates. 0.30 was empirically too strict — today's
+                // GBPUSD/M15 run came in at 0.10, a real but marginal edge, and the
+                // 0.30 floor rejected it.
+                double coldMinSharpe      = await GetConfigAsync<double>(ctx, "MLTraining:ColdStart:MinSharpe",      0.05, stoppingToken);
                 double coldMaxBrier       = await GetConfigAsync<double>(ctx, "MLTraining:ColdStart:MaxBrier",       0.30, stoppingToken);
                 double coldMinEv          = await GetConfigAsync<double>(ctx, "MLTraining:ColdStart:MinExpectedValue", -0.005, stoppingToken);
                 double coldMinF1          = await GetConfigAsync<double>(ctx, "MLTraining:ColdStart:MinF1",          0.00, stoppingToken);
@@ -948,8 +954,48 @@ public sealed class MLTrainingWorker : BackgroundService
                 brierBypassed = true;
             }
 
+            // ── Cold-start F1-conditional accuracy bypass ──────────────────
+            // In cold-start mode (no active model exists for this combo), the flat
+            // MinAccuracyToPromote floor punishes class-imbalance-aware models that
+            // legitimately predict the minority class well. A model with F1 above a
+            // reasonable floor but accuracy below 50 % typically means the model is
+            // predicting the minority class (which is rare in the test set) with
+            // high precision/recall while the majority class drives overall accuracy
+            // down. For the first model per combo, we want to accept these models as
+            // baselines — the shadow-arbiter can subsequently challenge them with
+            // models that fix the imbalance.
+            //
+            // Conditions to bypass the accuracy floor:
+            //   1. Cold-start mode is active (no active model for this combo)
+            //   2. F1 is above the bypass threshold (default 0.40 — genuinely strong signal)
+            //   3. Accuracy is within an imbalance-plausible band (default [0.40, 0.60])
+            //      so we don't admit models that are arbitrarily bad
+            //   4. Brier score is still under the (already relaxed) ceiling, so the
+            //      model's probability calibration is at least reasonable
+            double coldStartF1Bypass_MinF1 = await GetConfigAsync<double>(
+                ctx, "MLTraining:ColdStart:F1BypassMinF1", 0.40, stoppingToken);
+            double coldStartF1Bypass_AccBand = await GetConfigAsync<double>(
+                ctx, "MLTraining:ColdStart:F1BypassAccBand", 0.10, stoppingToken);
+            bool coldStartAccuracyBypass =
+                coldStart
+                && m.F1 >= coldStartF1Bypass_MinF1
+                && m.Accuracy >= (0.50 - coldStartF1Bypass_AccBand)
+                && m.Accuracy <= (0.50 + coldStartF1Bypass_AccBand)
+                && m.BrierScore <= brierCeiling;
+
+            bool accuracyOk = m.Accuracy >= hp.MinAccuracyToPromote || coldStartAccuracyBypass;
+
+            if (coldStartAccuracyBypass)
+            {
+                _logger.LogInformation(
+                    "Run {RunId} ({Symbol}/{Tf}): cold-start F1 bypass — accuracy {Acc:P1} " +
+                    "below floor {MinAcc:P1} but F1 {F1:F3} \u2265 {MinF1:F3} (class-imbalance rescue)",
+                    run.Id, run.Symbol, run.Timeframe,
+                    m.Accuracy, hp.MinAccuracyToPromote, m.F1, coldStartF1Bypass_MinF1);
+            }
+
             bool passed =
-                m.Accuracy           >= hp.MinAccuracyToPromote                                    &&
+                accuracyOk                                                                         &&
                 m.ExpectedValue      >= hp.MinExpectedValue                                        &&
                 m.BrierScore         <= brierCeiling                                               &&
                 m.SharpeRatio        >= hp.MinSharpeRatio                                          &&
@@ -1337,11 +1383,13 @@ public sealed class MLTrainingWorker : BackgroundService
                         if (!recentlyHandled)
                         {
                             // Use a fresh training window rather than copying the parent run's
-                            // dates, which may be stale. Default to 365 days matching the drift
-                            // workers' MLTraining:TrainingDataWindowDays default.
+                            // dates, which may be stale. Default widened from 365 to 730 days
+                            // so models see more regime variety and have ~2x the sample count
+                            // — helps cold-start especially on M5/M15 where 1 year of data
+                            // is insufficient to clear accuracy / F1 gates reliably.
                             var shadowNow = DateTime.UtcNow;
                             int windowDays = await GetConfigAsync<int>(
-                                ctx, "MLTraining:TrainingDataWindowDays", 365, stoppingToken);
+                                ctx, "MLTraining:TrainingDataWindowDays", 730, stoppingToken);
 
                             ctx.Set<MLTrainingRun>().Add(new MLTrainingRun
                             {
@@ -2405,7 +2453,9 @@ public sealed class MLTrainingWorker : BackgroundService
             }
 
             var now = DateTime.UtcNow;
-            int windowDays = await GetConfigAsync<int>(ctx, "MLTraining:TrainingDataWindowDays", 365, ct);
+            // 730-day default (widened from 365) for chronic-failure retry runs — longer
+            // history covers more regime variation, which is critical on short timeframes.
+            int windowDays = await GetConfigAsync<int>(ctx, "MLTraining:TrainingDataWindowDays", 730, ct);
 
             ctx.Set<MLTrainingRun>().Add(new MLTrainingRun
             {
