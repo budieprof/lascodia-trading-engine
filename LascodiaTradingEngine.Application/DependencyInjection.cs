@@ -296,7 +296,12 @@ public static class DependencyInjection
         services.AddScoped<IRiskCheckStep, MarginRiskCheckStep>();
         services.AddScoped<IRiskCheckStep, ExposureRiskCheckStep>();
         services.AddScoped<IRiskCheckStep, DrawdownRiskCheckStep>();
-        services.AddScoped<IRiskCheckStep, SpreadRiskCheckStep>();
+        // SpreadRiskCheckStep takes a primitive `decimal maxSpreadPips` constructor
+        // parameter that Autofac cannot autowire from the container. Resolve the
+        // singleton-bound RiskCheckerOptions (auto-registered via
+        // AutoRegisterConfigurationOptions) and pass MaxSpreadPips explicitly.
+        services.AddScoped<IRiskCheckStep>(sp => new SpreadRiskCheckStep(
+            sp.GetRequiredService<RiskCheckerOptions>().MaxSpreadPips));
         services.AddScoped<IRiskChecker, RiskCheckerPipeline>();
 
         // ── Chaos Testing pipeline behavior (open generic — cannot use [RegisterService]) ──
