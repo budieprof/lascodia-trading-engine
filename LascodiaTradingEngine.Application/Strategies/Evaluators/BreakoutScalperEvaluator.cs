@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.Json;
 using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Interfaces;
@@ -19,9 +20,15 @@ namespace LascodiaTradingEngine.Application.Strategies.Evaluators;
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyEvaluator))]
 public class BreakoutScalperEvaluator : IStrategyEvaluator
 {
+    private static readonly HashSet<string> KnownParameterKeys = new(StringComparer.Ordinal)
+    {
+        "LookbackBars", "BreakoutMultiplier",
+    };
+
     private readonly StrategyEvaluatorOptions _options;
     private readonly ILogger<BreakoutScalperEvaluator> _logger;
     private readonly TradingMetrics _metrics;
+    private readonly ConcurrentDictionary<long, bool> _warnedStrategyIds = new();
 
     private static readonly KeyValuePair<string, object?> EvaluatorTag = new("evaluator", "BreakoutScalper");
 
@@ -57,7 +64,7 @@ public class BreakoutScalperEvaluator : IStrategyEvaluator
         (decimal Bid, decimal Ask) currentPrice,
         CancellationToken cancellationToken)
     {
-        var (lookbackBars, breakoutMultiplier) = ParseParameters(strategy.ParametersJson);
+        var (lookbackBars, breakoutMultiplier) = ParseParameters(strategy.ParametersJson, strategy.Id);
         int lastIdx = candles.Count - 1;
 
         // ── 1. Candle ordering sanity check ──────────────────────────────────
@@ -315,7 +322,8 @@ public class BreakoutScalperEvaluator : IStrategyEvaluator
     // Parameter parsing
     // ═════════════════════════════════════════════════════════════════════════
 
-    private static (int LookbackBars, decimal BreakoutMultiplier) ParseParameters(string? json)
+    private (int LookbackBars, decimal BreakoutMultiplier) ParseParameters(
+        string? json, long strategyIdForDiagnostics = 0)
     {
         int     lookbackBars       = 20;
         decimal breakoutMultiplier = 1.5m;
@@ -325,6 +333,31 @@ public class BreakoutScalperEvaluator : IStrategyEvaluator
             var root = doc.RootElement;
             if (root.TryGetProperty("LookbackBars",       out var lb) && lb.TryGetInt32(out var lbVal))   lookbackBars       = lbVal;
             if (root.TryGetProperty("BreakoutMultiplier", out var bm) && bm.TryGetDecimal(out var bmVal)) breakoutMultiplier = bmVal;
+
+            // Observability: warn once per strategy ID when ParametersJson contains
+            // unknown keys. Prevents silent default-fallback bugs like the seeded
+            // USDJPY Breakout Scalper whose seeder used "LookbackPeriod" and "ATRPeriod"
+            // instead of "LookbackBars" — the evaluator read defaults for a full week
+            // before the bug was caught.
+            if (strategyIdForDiagnostics > 0 && root.ValueKind == JsonValueKind.Object
+                && _warnedStrategyIds.TryAdd(strategyIdForDiagnostics, true))
+            {
+                var unknown = new List<string>();
+                foreach (var prop in root.EnumerateObject())
+                {
+                    if (!KnownParameterKeys.Contains(prop.Name))
+                        unknown.Add(prop.Name);
+                }
+                if (unknown.Count > 0)
+                {
+                    _logger.LogWarning(
+                        "BreakoutScalperEvaluator: strategy {StrategyId} ParametersJson contains unknown keys [{Unknown}] — " +
+                        "evaluator will use defaults for those parameters. Expected keys: [{Expected}]",
+                        strategyIdForDiagnostics,
+                        string.Join(", ", unknown),
+                        string.Join(", ", KnownParameterKeys));
+                }
+            }
         }
         catch (JsonException) { }
 

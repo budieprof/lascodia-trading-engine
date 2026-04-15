@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.Json;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Options;
@@ -5,6 +6,7 @@ using LascodiaTradingEngine.Application.Common.Utilities;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Attributes;
 
 namespace LascodiaTradingEngine.Application.Strategies.Evaluators;
@@ -32,11 +34,21 @@ namespace LascodiaTradingEngine.Application.Strategies.Evaluators;
 [RegisterService(ServiceLifetime.Singleton, typeof(IStrategyEvaluator))]
 public class RSIReversionEvaluator : IStrategyEvaluator
 {
-    private readonly StrategyEvaluatorOptions _options;
+    private static readonly HashSet<string> KnownParameterKeys = new(StringComparer.Ordinal)
+    {
+        "Period", "Oversold", "Overbought",
+    };
 
-    public RSIReversionEvaluator(StrategyEvaluatorOptions options)
+    private readonly StrategyEvaluatorOptions _options;
+    private readonly ILogger<RSIReversionEvaluator>? _logger;
+    private readonly ConcurrentDictionary<long, bool> _warnedStrategyIds = new();
+
+    public RSIReversionEvaluator(
+        StrategyEvaluatorOptions options,
+        ILogger<RSIReversionEvaluator>? logger = null)
     {
         _options = options;
+        _logger = logger;
     }
 
     public StrategyType StrategyType => StrategyType.RSIReversion;
@@ -66,7 +78,7 @@ public class RSIReversionEvaluator : IStrategyEvaluator
         int     period     = 14;
         decimal oversold   = 30m;
         decimal overbought = 70m;
-        ParseParameters(strategy.ParametersJson, ref period, out oversold, out overbought);
+        ParseParameters(strategy.ParametersJson, ref period, out oversold, out overbought, strategy.Id);
 
         period     = Math.Clamp(period, 2, 500);
         oversold   = Math.Clamp(oversold, 1m, 49m);
@@ -332,7 +344,9 @@ public class RSIReversionEvaluator : IStrategyEvaluator
         return false;
     }
 
-    private static void ParseParameters(string? json, ref int period, out decimal oversold, out decimal overbought)
+    private void ParseParameters(
+        string? json, ref int period, out decimal oversold, out decimal overbought,
+        long strategyIdForDiagnostics = 0)
     {
         oversold   = 30m;
         overbought = 70m;
@@ -343,6 +357,32 @@ public class RSIReversionEvaluator : IStrategyEvaluator
             if (root.TryGetProperty("Period",     out var p)  && p.TryGetInt32(out var pVal))       period     = pVal;
             if (root.TryGetProperty("Oversold",   out var os) && os.TryGetDecimal(out var osVal))   oversold   = osVal;
             if (root.TryGetProperty("Overbought", out var ob) && ob.TryGetDecimal(out var obVal))   overbought = obVal;
+
+            // Observability: warn once per strategy ID when ParametersJson contains
+            // keys this evaluator doesn't recognise (typo, stale key name, schema
+            // drift). Without this, misconfigured strategies silently run on defaults
+            // — a full-session bug we debugged yesterday on the seeded GBPUSD RSI
+            // Reversion strategy whose seeder used "RsiPeriod"/"OversoldLevel"/
+            // "OverboughtLevel" instead of the expected "Period"/"Oversold"/"Overbought".
+            if (strategyIdForDiagnostics > 0 && _logger is not null && root.ValueKind == JsonValueKind.Object
+                && _warnedStrategyIds.TryAdd(strategyIdForDiagnostics, true))
+            {
+                var unknown = new List<string>();
+                foreach (var prop in root.EnumerateObject())
+                {
+                    if (!KnownParameterKeys.Contains(prop.Name))
+                        unknown.Add(prop.Name);
+                }
+                if (unknown.Count > 0)
+                {
+                    _logger.LogWarning(
+                        "RSIReversionEvaluator: strategy {StrategyId} ParametersJson contains unknown keys [{Unknown}] — " +
+                        "evaluator will use defaults for those parameters. Expected keys: [{Expected}]",
+                        strategyIdForDiagnostics,
+                        string.Join(", ", unknown),
+                        string.Join(", ", KnownParameterKeys));
+                }
+            }
         }
         catch (Exception ex) when (ex is JsonException or FormatException or InvalidOperationException)
         {

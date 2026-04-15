@@ -127,11 +127,10 @@ public sealed class MLTrainingDataFreshnessWorker : BackgroundService
     {
         // Read staleness policy values once per cycle.
         int stalenessDays   = await GetConfigAsync<int>(readCtx, CK_Staleness,   60,  ct);
-        // Default widened from 180 to 730 so the cold-start bootstrap path
-        // (BootstrapMissingModelsAsync) trains first models on 2 years of data rather
-        // than 6 months. 6 months often misses enough regime variety to clear the
-        // 14-gate quality check on short timeframes.
-        int trainWindowDays = await GetConfigAsync<int>(readCtx, CK_TrainWindow, 730, ct);
+        // Default widened from 180 → 730 → 1825 days so the cold-start bootstrap
+        // captures at least one full rate-hike-to-cut cycle. Effective window is
+        // bounded by actual candle history.
+        int trainWindowDays = await GetConfigAsync<int>(readCtx, CK_TrainWindow, 1825, ct);
 
         // Load all active models — project to minimal fields to reduce bandwidth.
         var activeModels = await readCtx.Set<MLModel>()

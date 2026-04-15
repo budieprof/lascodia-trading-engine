@@ -1416,13 +1416,16 @@ public sealed class MLTrainingWorker : BackgroundService
                         if (!recentlyHandled)
                         {
                             // Use a fresh training window rather than copying the parent run's
-                            // dates, which may be stale. Default widened from 365 to 730 days
-                            // so models see more regime variety and have ~2x the sample count
-                            // — helps cold-start especially on M5/M15 where 1 year of data
-                            // is insufficient to clear accuracy / F1 gates reliably.
+                            // dates, which may be stale. Default widened from 730 to 1825
+                            // days (5 years) so training samples capture at least one full
+                            // rate-hike-to-cut cycle. The effective window is bounded by
+                            // min(1825, actual_candle_history_days) — on a fresh database
+                            // with only a few months of EA-streamed candles, this reduces
+                            // to "use all available candles". Once the EA accumulates more
+                            // history the default starts hitting its intended ceiling.
                             var shadowNow = DateTime.UtcNow;
                             int windowDays = await GetConfigAsync<int>(
-                                ctx, "MLTraining:TrainingDataWindowDays", 730, stoppingToken);
+                                ctx, "MLTraining:TrainingDataWindowDays", 1825, stoppingToken);
 
                             ctx.Set<MLTrainingRun>().Add(new MLTrainingRun
                             {
@@ -2495,9 +2498,9 @@ public sealed class MLTrainingWorker : BackgroundService
             }
 
             var now = DateTime.UtcNow;
-            // 730-day default (widened from 365) for chronic-failure retry runs — longer
-            // history covers more regime variation, which is critical on short timeframes.
-            int windowDays = await GetConfigAsync<int>(ctx, "MLTraining:TrainingDataWindowDays", 730, ct);
+            // 1825-day default (widened from 730 and originally 365) for chronic-failure
+            // retries — bounded by actual candle history available.
+            int windowDays = await GetConfigAsync<int>(ctx, "MLTraining:TrainingDataWindowDays", 1825, ct);
 
             ctx.Set<MLTrainingRun>().Add(new MLTrainingRun
             {
