@@ -43,6 +43,7 @@ public sealed class MLCorrelatedFailureWorker : BackgroundService
     private const string CK_PollSecs           = "MLCorrelated:PollIntervalSeconds";
     private const string CK_AlarmRatio         = "MLCorrelated:AlarmRatio";
     private const string CK_RecoveryRatio      = "MLCorrelated:RecoveryRatio";
+    private const string CK_MinModelsForAlarm  = "MLCorrelated:MinModelsForAlarm";
     private const string CK_AccThreshold       = "MLTraining:DriftAccuracyThreshold";
     private const string CK_WindowDays         = "MLTraining:DriftWindowDays";
     private const string CK_MinPredictions     = "MLTraining:DriftMinPredictions";
@@ -98,13 +99,14 @@ public sealed class MLCorrelatedFailureWorker : BackgroundService
                     pollSecs = await GetConfigAsync<int>   (readCtx, CK_PollSecs,       600,  stoppingToken);
                     double alarmRatio     = await GetConfigAsync<double>(readCtx, CK_AlarmRatio,     0.40, stoppingToken);
                     double recoveryRatio  = await GetConfigAsync<double>(readCtx, CK_RecoveryRatio,  0.20, stoppingToken);
+                    int    minModels      = await GetConfigAsync<int>   (readCtx, CK_MinModelsForAlarm, 3, stoppingToken);
                     double accThreshold   = await GetConfigAsync<double>(readCtx, CK_AccThreshold,   0.50, stoppingToken);
                     int    windowDays     = await GetConfigAsync<int>   (readCtx, CK_WindowDays,     14,   stoppingToken);
                     int    minPredictions = await GetConfigAsync<int>   (readCtx, CK_MinPredictions,  30,   stoppingToken);
 
                     await EvaluateCorrelatedFailureAsync(
                         readCtx, writeCtx,
-                        alarmRatio, recoveryRatio, accThreshold, windowDays, minPredictions,
+                        alarmRatio, recoveryRatio, minModels, accThreshold, windowDays, minPredictions,
                         stoppingToken);
                 }
                 finally
@@ -147,6 +149,7 @@ public sealed class MLCorrelatedFailureWorker : BackgroundService
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
         double                                  alarmRatio,
         double                                  recoveryRatio,
+        int                                     minModelsForAlarm,
         double                                  accThreshold,
         int                                     windowDays,
         int                                     minPredictions,
@@ -210,6 +213,25 @@ public sealed class MLCorrelatedFailureWorker : BackgroundService
             _logger.LogDebug(
                 "MLCorrelatedFailureWorker: no models have >= {Min} predictions in window — skipping.",
                 minPredictions);
+            return;
+        }
+
+        // ── Guard: require a minimum sample of evaluated models ────────────
+        // Without this, a single degenerate model (1/1 = 100% failure ratio)
+        // can trigger systemic pause and create a deadlock: pause blocks
+        // training → no new models accumulate predictions → ratio stays 100%
+        // → pause never lifts. Requiring ≥ N evaluated models ensures the
+        // alarm only fires on genuinely correlated failure, not sampling noise.
+        // Observed 2026-04-15: GBPUSD/M15 (model 26, 13% accuracy) was the
+        // sole evaluated model, triggering 100% ratio and blocking all training
+        // for the entire queue of 23 runs.
+        if (modelsWithEnoughPredictions < minModelsForAlarm)
+        {
+            _logger.LogInformation(
+                "MLCorrelatedFailureWorker: only {Evaluated}/{Required} models evaluated " +
+                "(need {Required} for alarm). Skipping alarm check. Failing: {Failing} ({FailSymbols}).",
+                modelsWithEnoughPredictions, minModelsForAlarm, minModelsForAlarm,
+                failingSymbols.Count, string.Join(", ", failingSymbols));
             return;
         }
 
