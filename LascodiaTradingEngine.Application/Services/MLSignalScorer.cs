@@ -1283,6 +1283,57 @@ public sealed class MLSignalScorer : IMLSignalScorer
         var (window, current, previous) = sliced.Value;
 
         float[] builtRawFeatures = MLFeatureHelper.BuildFeatureVector(window, current, previous, cotEntry);
+
+        // V2 dispatch: when the model was trained on the 37-feature V2 vector (33 base
+        // + 4 cross-pair macro), build the macro slots from a live H1 basket of the G10
+        // USD pairs. Failures fall back to zero-padding so the scorer stays online —
+        // V2 models then see neutral macro inputs, which degrades calibration but
+        // avoids a hard scoring failure. Mirrors CompositeMLEvaluator's V2 dispatch.
+        int expectedInputFeatures = snap.ExpectedInputFeatures > 0
+            ? snap.ExpectedInputFeatures
+            : MLFeatureHelper.FeatureCount;
+        if (expectedInputFeatures == MLFeatureHelper.FeatureCountV2 &&
+            builtRawFeatures.Length == MLFeatureHelper.FeatureCount)
+        {
+            try
+            {
+                var basketSymbols = new[] { "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD", "AUDUSD", "NZDUSD" };
+                var asOf = current.Timestamp;
+                var basketStart = asOf.AddDays(-7);
+                using var basketCts = CreateLinkedTimeout(cancellationToken);
+                var basketRows = await db.Set<Candle>()
+                    .AsNoTracking()
+                    .Where(c => basketSymbols.Contains(c.Symbol)
+                             && c.Timeframe == Timeframe.H1
+                             && c.IsClosed
+                             && !c.IsDeleted
+                             && c.Timestamp >= basketStart
+                             && c.Timestamp <= asOf)
+                    .OrderBy(c => c.Timestamp)
+                    .Select(c => new { c.Symbol, c.Timestamp, c.Close })
+                    .ToListAsync(basketCts.Token);
+
+                var basketSlice = basketRows
+                    .GroupBy(c => c.Symbol)
+                    .ToDictionary(
+                        g => g.Key,
+                        g => g.OrderBy(x => x.Timestamp).Select(x => (double)x.Close).ToArray(),
+                        StringComparer.OrdinalIgnoreCase);
+
+                builtRawFeatures = MLFeatureHelper.BuildFeatureVectorV2(
+                    window, current, previous, basketSlice, signal.Symbol, cotEntry);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "V2 macro basket load failed for model {ModelId} ({Symbol}) — zero-padding macro features",
+                    modelId, signal.Symbol);
+                var padded = new float[MLFeatureHelper.FeatureCountV2];
+                Array.Copy(builtRawFeatures, padded, builtRawFeatures.Length);
+                builtRawFeatures = padded;
+            }
+        }
+
         var prepared = ElmFeaturePipelineHelper.PrepareSnapshotFeatures(
             builtRawFeatures,
             snap,
