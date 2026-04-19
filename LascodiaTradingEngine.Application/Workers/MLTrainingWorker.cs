@@ -2545,8 +2545,16 @@ public sealed class MLTrainingWorker : BackgroundService
             // ceiling by denoising the training labels themselves. Operators can
             // revert via MLTraining:UseTripleBarrier=false.
             UseTripleBarrier:            Cfg<bool>  (CK_UseTripleBarrier,            true),
+            // Symmetric multipliers (ratio 1.0) — required by the symmetric-barrier
+            // guardrail in ProcessRunAsync, which rejects anything outside [0.9, 1.1].
+            // The previous 1.5 / 1.0 defaults gave ratio=1.5 and caused every
+            // triple-barrier-enabled run to fail on attempt 1 with "Triple-barrier
+            // multipliers asymmetric". Symmetric multipliers are also correct on
+            // statistical grounds: asymmetric ratios bias the label prior so Sharpe
+            // reflects the ratio rather than real directional edge (López de Prado
+            // "Advances in Financial ML" §3 meta-labelling discussion).
             TripleBarrierProfitAtrMult:  Cfg<double>(CK_TripleBarrierProfitAtrMult,  1.5),
-            TripleBarrierStopAtrMult:    Cfg<double>(CK_TripleBarrierStopAtrMult,    1.0),
+            TripleBarrierStopAtrMult:    Cfg<double>(CK_TripleBarrierStopAtrMult,    1.5),
             TripleBarrierHorizonBars:    Cfg<int>   (CK_TripleBarrierHorizonBars,    24),
             NoiseSigma:                  Cfg<double>(CK_NoiseSigma,                  0.0),
             FpCostWeight:                Cfg<double>(CK_FpCostWeight,                0.5),
