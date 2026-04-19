@@ -299,7 +299,10 @@ public sealed class MLFeaturePsiWorker : BackgroundService
                 // from its training-time shape — the model may no longer "see" this feature
                 // in the way it was trained to expect.
                 highPsiCount++;
-                _logger.LogWarning(
+                // Per-feature detail logged at Debug — the aggregated summary below captures
+                // "N/M features drifted" and the downstream alert path fires the actionable
+                // warning. Per-feature at Warn produced ~10 log lines per model per cycle.
+                _logger.LogDebug(
                     "PSI model {Id} ({Symbol}/{Tf}) feature [{Name}]: PSI={Psi:F4} >= threshold={Thr:F4}",
                     model.Id, model.Symbol, model.Timeframe, featureName, psi, psiAlertThresh);
             }

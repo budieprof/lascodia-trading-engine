@@ -317,16 +317,24 @@ public sealed class MLCovariateShiftWorker : BackgroundService
                     : $"feature[{j}]";
 
                 driftedFeatures.Add((fname, perFeaturePsiValues[j]));
-
-                _logger.LogWarning(
-                    "Feature {Name} PSI={Psi:F4} exceeds per-feature threshold for {Symbol}/{Tf}",
-                    fname, perFeaturePsiValues[j], model.Symbol, model.Timeframe);
             }
         }
 
-        // Write drifted features to EngineConfig as a JSON array
+        // Emit ONE aggregated warning per model per cycle instead of N per-feature warnings.
+        // Persist the full per-feature JSON to EngineConfig for downstream workers that need
+        // the detail (e.g. MLFeatureRankShiftWorker). Previously this loop produced ~20
+        // warnings per model per cycle, dominating log volume.
         if (driftedFeatures.Count > 0)
         {
+            var topDrifted = driftedFeatures
+                .OrderByDescending(f => f.Psi)
+                .Take(3)
+                .Select(f => $"{f.Name}(PSI={f.Psi:F2})");
+            _logger.LogWarning(
+                "Covariate drift for {Symbol}/{Tf}: {Count}/{Total} features above PSI threshold (top: {Top})",
+                model.Symbol, model.Timeframe, driftedFeatures.Count, featureCount,
+                string.Join(", ", topDrifted));
+
             string driftedJson = System.Text.Json.JsonSerializer.Serialize(
                 driftedFeatures.Select(f => new { featureName = f.Name, psi = f.Psi }));
 
