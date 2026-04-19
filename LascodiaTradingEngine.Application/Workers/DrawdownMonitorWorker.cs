@@ -206,6 +206,20 @@ public class DrawdownMonitorWorker : BackgroundService, IIntegrationEventHandler
 
         decimal currentEquity = account.Equity;
 
+        // Zero/negative equity is virtually always a stale or stub account reading —
+        // real drawdowns approach zero but don't hit exactly 0.00000000. Recording a
+        // snapshot with a zero currentEquity against a positive historical peakEquity
+        // synthesises DrawdownPct=100.00%, which trips the Halted threshold and causes
+        // DrawdownRecoveryWorker to pause every active strategy on bogus data. Skip
+        // the snapshot entirely until a real equity value arrives.
+        if (currentEquity <= 0)
+        {
+            _logger.LogDebug(
+                "DrawdownMonitorWorker: current equity is zero/negative for account {Id} — skipping snapshot (stale or stub reading)",
+                account.Id);
+            return;
+        }
+
         var latestSnapshot = await readContext.GetDbContext()
             .Set<DrawdownSnapshot>()
             .OrderByDescending(x => x.RecordedAt)
