@@ -167,7 +167,14 @@ public static class MLFeatureHelper
         Func<DateTime, CotFeatureEntry>? cotLookup  = null,
         float                           profitAtrMult = 1.5f,
         float                           stopAtrMult   = 1.0f,
-        int                             horizonBars   = 24)
+        int                             horizonBars   = 24,
+        // Cost buffer added to the profit target in price units. Forces the model to
+        // label "1" (profit) only when the net move clears transaction costs, not
+        // just the raw TP distance. Callers pass (spread + commission_as_price + slippage)
+        // so labels reflect realised-PnL-after-costs rather than raw direction.
+        // Zero preserves legacy behaviour. See StrategyGenerationHelpers.BuildScreeningOptions
+        // and MLTrainingWorker for the per-pair cost derivation.
+        float                           costBufferPriceUnits = 0f)
     {
         var samples = new List<TrainingSample>(candles.Count);
 
@@ -189,7 +196,12 @@ public static class MLFeatureHelper
                 continue;
             }
 
-            float profitTarget = atr * profitAtrMult;
+            // Profit target includes the cost buffer so the label represents a trade
+            // that would have *netted* a gain after paying spread/commission/slippage.
+            // Stop-loss is left unchanged — the loss barrier should still fire at the
+            // undampened risk threshold because costs amplify the loss on stopped-out
+            // trades rather than offset them.
+            float profitTarget = atr * profitAtrMult + costBufferPriceUnits;
             float stopLoss     = atr * stopAtrMult;
             float entry        = (float)current.Close;
 
@@ -4035,7 +4047,10 @@ public static class MLFeatureHelper
         Func<DateTime, CotFeatureEntry>?                               cotLookup     = null,
         float                                                          profitAtrMult = 1.5f,
         float                                                          stopAtrMult   = 1.0f,
-        int                                                            horizonBars   = 24)
+        int                                                            horizonBars   = 24,
+        // See V1 overload — adds a cost buffer to the profit barrier so the label
+        // reflects realised-PnL-after-costs. Zero preserves legacy behaviour.
+        float                                                          costBufferPriceUnits = 0f)
     {
         var samples = new List<TrainingSample>(candles.Count);
 
@@ -4057,7 +4072,7 @@ public static class MLFeatureHelper
                 continue;
             }
 
-            float profitTarget = atr * profitAtrMult;
+            float profitTarget = atr * profitAtrMult + costBufferPriceUnits;
             float stopLoss     = atr * stopAtrMult;
             float entry        = (float)current.Close;
 

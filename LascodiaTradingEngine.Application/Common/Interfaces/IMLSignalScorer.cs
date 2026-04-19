@@ -200,4 +200,27 @@ public interface IMLSignalScorer
         TradeSignal signal,
         IReadOnlyList<Candle> candles,
         CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Scores a batch of signals. Group-by-model-id batching gives inference engines
+    /// (ONNX runtime, TorchSharp bagged logistic) the opportunity to run a single
+    /// forward pass over all same-model inputs — typically 2–5× throughput vs N
+    /// sequential <see cref="ScoreAsync"/> calls on an active-market tick.
+    ///
+    /// <para>Default implementation falls back to per-signal scoring so callers can
+    /// start using the batch API without breaking existing scorers. Performance
+    /// implementations should override.</para>
+    /// </summary>
+    async Task<IReadOnlyList<MLScoreResult>> ScoreBatchAsync(
+        IReadOnlyList<(TradeSignal Signal, IReadOnlyList<Candle> Candles)> batch,
+        CancellationToken cancellationToken)
+    {
+        var results = new MLScoreResult[batch.Count];
+        for (int i = 0; i < batch.Count; i++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            results[i] = await ScoreAsync(batch[i].Signal, batch[i].Candles, cancellationToken);
+        }
+        return results;
+    }
 }

@@ -107,6 +107,7 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
     private readonly ISignalConflictResolver _signalConflictResolver;
     private readonly RegimeCoherenceChecker _regimeCoherenceChecker;
     private readonly DrawdownRecoveryModeProvider _drawdownRecoveryModeProvider;
+    private readonly PortfolioCorrelationSizer _portfolioCorrelationSizer;
 
     /// <summary>Tracks the last signal creation time per strategy to enforce cooldown.</summary>
     private readonly ConcurrentDictionary<long, DateTime> _lastSignalTime = new();
@@ -163,7 +164,8 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
         TradingMetrics metrics,
         ISignalConflictResolver signalConflictResolver,
         RegimeCoherenceChecker regimeCoherenceChecker,
-        DrawdownRecoveryModeProvider drawdownRecoveryModeProvider)
+        DrawdownRecoveryModeProvider drawdownRecoveryModeProvider,
+        PortfolioCorrelationSizer portfolioCorrelationSizer)
     {
         _logger                       = logger;
         _scopeFactory                 = scopeFactory;    // Creates per-event/per-strategy DI scopes
@@ -175,6 +177,7 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
         _signalConflictResolver       = signalConflictResolver;  // Resolves opposing/duplicate signals from competing strategies
         _regimeCoherenceChecker       = regimeCoherenceChecker;  // Cross-timeframe regime alignment scoring
         _drawdownRecoveryModeProvider = drawdownRecoveryModeProvider;  // Cached access to DrawdownRecovery config
+        _portfolioCorrelationSizer    = portfolioCorrelationSizer;  // Correlation-aware lot-size multiplier
     }
 
     /// <summary>
@@ -1029,6 +1032,66 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
                         signal.SuggestedLotSize, adjustedLotSize, recoverySnapshot.ReducedLotMultiplier, signal.Symbol);
                 }
 
+                // ── Vol-targeted position sizing: scale inversely to realized volatility ──
+                // Goal: target constant P&L variance. High-vol regimes → smaller position;
+                // low-vol regimes → larger. Ratio = avg-ATR / current-ATR clamped to
+                // [0.5, 2.0] so extreme regimes don't 10× the position. This is applied
+                // AFTER DrawdownRecovery so both can compound: the drawdown mode caps the
+                // overall scale, and vol-target rebalances within that scale.
+                try
+                {
+                    if (candles.Count >= 60)
+                    {
+                        var recentWindow = candles.Skip(candles.Count - 15).Take(15).ToList();
+                        var longWindow   = candles.Skip(candles.Count - 60).Take(60).ToList();
+                        double shortAtr = MLModels.Shared.MLFeatureHelper.CalculateATR(recentWindow, 14);
+                        double longAtr  = MLModels.Shared.MLFeatureHelper.CalculateATR(longWindow, 14);
+                        if (shortAtr > 0 && longAtr > 0)
+                        {
+                            decimal volScale = (decimal)Math.Clamp(longAtr / shortAtr, 0.5, 2.0);
+                            adjustedLotSize *= volScale;
+                        }
+                    }
+                }
+                catch { /* best-effort — fall through unchanged */ }
+
+                // ── Portfolio correlation adjustment ───────────────────────────
+                // Shrink lot size when same-direction correlated positions are already
+                // open (e.g. new BUY EURUSD when BUY GBPUSD is already open). Prevents
+                // two independent strategies from piling into what is effectively one
+                // bet. Multiplier = 1/sqrt(1 + Σ ρ) across same-direction peers.
+                decimal correlationMult = await _portfolioCorrelationSizer.ComputeMultiplierAsync(
+                    signal.Symbol, signal.Direction, ct);
+                if (correlationMult < 1.0m)
+                {
+                    adjustedLotSize *= correlationMult;
+                }
+
+                // ── Vol-conditional TTL: shorten expiry in HighVol, extend in LowVol ─
+                // Information rot scales with realized volatility. A signal that lives
+                // 60 minutes in a quiet market might be stale in 10 minutes during a
+                // high-vol regime. Ratio = long-window ATR / short-window ATR, clamped
+                // to [0.3, 3.0] so extreme spikes don't pathologically shorten TTL.
+                DateTime adjustedExpiry = signal.ExpiresAt;
+                try
+                {
+                    if (candles.Count >= 60)
+                    {
+                        var recentWindow = candles.Skip(candles.Count - 15).Take(15).ToList();
+                        var longWindow   = candles.Skip(candles.Count - 60).Take(60).ToList();
+                        double shortAtr = MLModels.Shared.MLFeatureHelper.CalculateATR(recentWindow, 14);
+                        double longAtr  = MLModels.Shared.MLFeatureHelper.CalculateATR(longWindow, 14);
+                        if (shortAtr > 0 && longAtr > 0)
+                        {
+                            double ratio = Math.Clamp(longAtr / shortAtr, 0.3, 3.0);
+                            TimeSpan originalDuration = signal.ExpiresAt - DateTime.UtcNow;
+                            if (originalDuration > TimeSpan.Zero)
+                                adjustedExpiry = DateTime.UtcNow.Add(TimeSpan.FromTicks((long)(originalDuration.Ticks * ratio)));
+                        }
+                    }
+                }
+                catch { /* best-effort; fall through with unadjusted expiry */ }
+
                 // ── Collect candidate signal for conflict resolution ─────────
                 // Instead of persisting immediately, add to the candidate bag.
                 // After all strategies evaluate, the conflict resolver will pick
@@ -1050,7 +1113,7 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
                         MLModelId:            mlScore.MLModelId,
                         EstimatedCapacityLots: strategy.EstimatedCapacityLots,
                         StrategySharpeRatio:  stratSharpe != 0 ? stratSharpe : null,
-                        ExpiresAt:            signal.ExpiresAt),
+                        ExpiresAt:            adjustedExpiry),
                     MlScore: mlScore,
                     MlScoringLatencyMs: mlScoringLatencyMs));
 

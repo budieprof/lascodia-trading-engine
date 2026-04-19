@@ -178,7 +178,7 @@ public class StrategyScreeningEngine
         }
 
         // ── In-sample threshold gate ──
-        var failedGates = new List<string>(5);
+        var failedGates = new List<string>(6);
         if ((double)trainResult.WinRate < thresholds.MinWinRate)
             failedGates.Add($"WR={trainResult.WinRate:F3}<{thresholds.MinWinRate:F3}");
         if ((double)trainResult.ProfitFactor < thresholds.MinProfitFactor)
@@ -189,6 +189,20 @@ public class StrategyScreeningEngine
             failedGates.Add($"DD={trainResult.MaxDrawdownPct:F3}>{thresholds.MaxDrawdownPct:F3}");
         if ((double)trainResult.SharpeRatio < thresholds.MinSharpe)
             failedGates.Add($"Sharpe={trainResult.SharpeRatio:F2}<{thresholds.MinSharpe:F2}");
+
+        // Cost-margin gate: reject strategies whose avg win is too close to avg cost
+        // per trade. BacktestEngine already applies spread+commission+slippage, so PF
+        // is net — but a PF barely above MinProfitFactor (e.g. 1.11 vs 1.10) can flip
+        // negative on a spread-widening event. Require the edge to clearly beat the
+        // friction floor before approving.
+        if (trainResult.TotalTrades > 0 && trainResult.AverageWin > 0)
+        {
+            decimal totalCosts = trainResult.TotalCommission + trainResult.TotalSlippage + Math.Abs(trainResult.TotalSwap);
+            decimal avgCostPerTrade = totalCosts / trainResult.TotalTrades;
+            decimal costToWinRatio = avgCostPerTrade / trainResult.AverageWin;
+            if ((double)costToWinRatio > thresholds.MaxCostToWinRatio)
+                failedGates.Add($"Cost/AvgWin={costToWinRatio:F3}>{thresholds.MaxCostToWinRatio:F3}");
+        }
 
         if (failedGates.Count > 0)
         {
@@ -1007,7 +1021,12 @@ public sealed record ScreeningThresholds(
     double MinProfitFactor,
     double MinSharpe,
     double MaxDrawdownPct,
-    int MinTotalTrades);
+    int MinTotalTrades,
+    // Upper bound on (avg total cost per trade) / (avg win). Reject strategies whose
+    // costs eat too much of the winning trade; these strategies are dangerously close
+    // to the friction floor and typically flip negative on spread-widening events.
+    // 0.35 = costs must be less than 35% of an average winning trade.
+    double MaxCostToWinRatio = 0.35);
 
 /// <summary>Screening configuration subset needed by the screening engine.</summary>
 public sealed record ScreeningConfig

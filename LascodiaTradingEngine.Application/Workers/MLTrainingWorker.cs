@@ -806,6 +806,27 @@ public sealed class MLTrainingWorker : BackgroundService
                     run.Id, basket.Count, rawBasket.Count, windowStart, windowEnd);
             }
 
+            // Cost-baked labelling: derive a per-pair cost buffer (in price units) from
+            // the symbol's DecimalPlaces and a conservative "typical round-trip friction"
+            // estimate of 3 pips. This shifts the profit-target barrier up by cost, so a
+            // label=1 means the trade would have cleared its friction floor, not just
+            // moved in the favourable direction. Zero cost preserves legacy behaviour.
+            float costBufferPriceUnits = 0f;
+            try
+            {
+                var pairInfo = await ctx.Set<Domain.Entities.CurrencyPair>()
+                    .AsNoTracking()
+                    .Where(p => p.Symbol == run.Symbol && !p.IsDeleted)
+                    .FirstOrDefaultAsync(stoppingToken);
+                if (pairInfo is not null && pairInfo.DecimalPlaces > 0)
+                {
+                    double pointSize = 1.0 / Math.Pow(10, pairInfo.DecimalPlaces);
+                    double pipSize   = pointSize * 10.0;      // 4-decimal USD pair: 0.0001; 3-decimal JPY: 0.01
+                    costBufferPriceUnits = (float)(pipSize * 3.0);  // 3-pip round-trip friction buffer
+                }
+            }
+            catch { /* best-effort; legacy zero-cost label if metadata missing */ }
+
             List<TrainingSample> samples;
             if (useExtendedVector && basket is not null && basket.Count >= 5)
             {
@@ -814,11 +835,12 @@ public sealed class MLTrainingWorker : BackgroundService
                         candles, run.Symbol, basket, CotLookup,
                         (float)hp.TripleBarrierProfitAtrMult,
                         (float)hp.TripleBarrierStopAtrMult,
-                        hp.TripleBarrierHorizonBars)
+                        hp.TripleBarrierHorizonBars,
+                        costBufferPriceUnits)
                     : MLFeatureHelper.BuildTrainingSamplesV2(candles, run.Symbol, basket, CotLookup);
                 _logger.LogInformation(
-                    "Built {Samples} V2 training samples (features={Feat})",
-                    samples.Count, MLFeatureHelper.FeatureCountV2);
+                    "Built {Samples} V2 training samples (features={Feat}, costBuffer={Buf:F5})",
+                    samples.Count, MLFeatureHelper.FeatureCountV2, costBufferPriceUnits);
             }
             else
             {
@@ -834,11 +856,12 @@ public sealed class MLTrainingWorker : BackgroundService
                         candles, CotLookup,
                         (float)hp.TripleBarrierProfitAtrMult,
                         (float)hp.TripleBarrierStopAtrMult,
-                        hp.TripleBarrierHorizonBars)
+                        hp.TripleBarrierHorizonBars,
+                        costBufferPriceUnits)
                     : MLFeatureHelper.BuildTrainingSamples(candles, CotLookup);
                 _logger.LogInformation(
-                    "Built {Samples} training samples (features={Feat})",
-                    samples.Count, MLFeatureHelper.FeatureCount);
+                    "Built {Samples} training samples (features={Feat}, costBuffer={Buf:F5})",
+                    samples.Count, MLFeatureHelper.FeatureCount, costBufferPriceUnits);
             }
 
             if (samples.Count < hp.MinSamples)

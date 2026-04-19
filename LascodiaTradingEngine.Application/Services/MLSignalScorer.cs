@@ -1282,7 +1282,22 @@ public sealed class MLSignalScorer : IMLSignalScorer
         }
         var (window, current, previous) = sliced.Value;
 
-        float[] builtRawFeatures = MLFeatureHelper.BuildFeatureVector(window, current, previous, cotEntry);
+        // Feature-vector cache — the 33-feature V1 vector is fully deterministic from
+        // (window, current, previous, cotEntry). Keyed by (symbol, timeframe, bar timestamp,
+        // COT content hash) so multiple strategies firing on the same bar share a single
+        // compute. Cached for 5 min, shorter than the smallest bar we trade (M5).
+        int cotHash = HashCode.Combine(cotEntry.NetNorm, cotEntry.Momentum, cotEntry.HasData);
+        string featureCacheKey = $"MlFeat:V1:{signal.Symbol}:{signalTimeframe}:{current.Timestamp:O}:{cotHash}";
+        float[] builtRawFeatures;
+        if (_cache.TryGetValue<float[]>(featureCacheKey, out var cachedFeatures) && cachedFeatures is not null)
+        {
+            builtRawFeatures = cachedFeatures;
+        }
+        else
+        {
+            builtRawFeatures = MLFeatureHelper.BuildFeatureVector(window, current, previous, cotEntry);
+            _cache.Set(featureCacheKey, builtRawFeatures, TimeSpan.FromMinutes(5));
+        }
 
         // V2 dispatch: when the model was trained on the 37-feature V2 vector (33 base
         // + 4 cross-pair macro), build the macro slots from a live H1 basket of the G10

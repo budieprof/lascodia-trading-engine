@@ -235,6 +235,40 @@ public sealed class MLCalibrationMonitorWorker : BackgroundService
             });
 
             anyAlert = true;
+
+            // ── Emergency retrain when ECE is severe (≥ 2× threshold) ─────────
+            // Alerts alone let a miscalibrated model keep scoring for days. If the
+            // drift is extreme, queue a priority retrain immediately (deduplicated
+            // against existing queued emergency retrains for the same model).
+            if (ece > maxEce * 2.0)
+            {
+                bool emergencyAlreadyQueued = await writeCtx.Set<MLTrainingRun>()
+                    .AsNoTracking()
+                    .AnyAsync(r => r.Symbol == model.Symbol
+                                && r.Timeframe == model.Timeframe
+                                && r.IsEmergencyRetrain
+                                && r.Status == RunStatus.Queued
+                                && !r.IsDeleted, ct);
+
+                if (!emergencyAlreadyQueued)
+                {
+                    writeCtx.Set<MLTrainingRun>().Add(new MLTrainingRun
+                    {
+                        Symbol              = model.Symbol,
+                        Timeframe           = model.Timeframe,
+                        TriggerType         = TriggerType.AutoDegrading,
+                        Status              = RunStatus.Queued,
+                        IsEmergencyRetrain  = true,
+                        FromDate            = DateTime.UtcNow.AddDays(-365),
+                        ToDate              = DateTime.UtcNow,
+                        LearnerArchitecture = model.LearnerArchitecture,
+                        StartedAt           = DateTime.UtcNow,
+                    });
+                    _logger.LogWarning(
+                        "Model {Id} ({Symbol}/{Tf}): queued emergency retrain — ECE={Ece:F4} ≥ 2× threshold {Max:F2}",
+                        model.Id, symbol, tf, ece, maxEce);
+                }
+            }
         }
 
         // ── ECE trend degradation alert ──────────────────────────────────────
