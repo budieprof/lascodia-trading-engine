@@ -275,12 +275,13 @@ public sealed class MLCusumDriftWorker : BackgroundService
         if (logs.Count < 30)
         {
             // CUSUM needs enough data to estimate a stable reference accuracy in the first half.
-            // With fewer than 30 points the reference would be too noisy to be meaningful.
-            // Log at Warning level (not Debug) so operators know the drift detector is
-            // ineffective for this model due to data starvation.
-            _logger.LogWarning(
+            // Logged at Debug because insufficient resolved-prediction history is the normal
+            // bootstrap state for a fresh model and does not warrant per-cycle warning-level
+            // noise. Sustained starvation (a mature model still below 30 resolved logs) is
+            // surfaced by separate prediction-resolution health workers.
+            _logger.LogDebug(
                 "CUSUM skipped model {Id} ({Symbol}/{Tf}) — only {N} resolved logs (need 30). " +
-                "Drift detection is INACTIVE for this model until sufficient prediction data accumulates.",
+                "Drift detection will activate once prediction data accumulates.",
                 model.Id, model.Symbol, model.Timeframe, logs.Count);
             return;
         }

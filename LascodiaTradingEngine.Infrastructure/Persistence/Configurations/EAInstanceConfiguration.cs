@@ -21,8 +21,10 @@ public class EAInstanceConfiguration : IEntityTypeConfiguration<EAInstance>
         builder.Property(x => x.ChartTimeframe).IsRequired();
         builder.Property(x => x.EAVersion).IsRequired();
 
+        // Explicitly bind the inverse collection on TradingAccount so EF does not
+        // create a second shadow FK ("TradingAccountId1") for TradingAccount.EAInstances.
         builder.HasOne(x => x.TradingAccount)
-            .WithMany()
+            .WithMany(a => a.EAInstances)
             .HasForeignKey(x => x.TradingAccountId)
             .OnDelete(DeleteBehavior.Cascade);
 
