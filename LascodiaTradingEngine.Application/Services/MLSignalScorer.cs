@@ -1297,28 +1297,39 @@ public sealed class MLSignalScorer : IMLSignalScorer
         {
             try
             {
-                var basketSymbols = new[] { "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD", "AUDUSD", "NZDUSD" };
+                // Cache the basket slice by the current bar's timestamp — all signals
+                // arriving at the same bar share the slice. On H1 bars this caches for
+                // up to an hour; on M15 up to 15 min. Avoids N DB queries per bar when
+                // multiple V2 strategies score concurrently.
                 var asOf = current.Timestamp;
-                var basketStart = asOf.AddDays(-7);
-                using var basketCts = CreateLinkedTimeout(cancellationToken);
-                var basketRows = await db.Set<Candle>()
-                    .AsNoTracking()
-                    .Where(c => basketSymbols.Contains(c.Symbol)
-                             && c.Timeframe == Timeframe.H1
-                             && c.IsClosed
-                             && !c.IsDeleted
-                             && c.Timestamp >= basketStart
-                             && c.Timestamp <= asOf)
-                    .OrderBy(c => c.Timestamp)
-                    .Select(c => new { c.Symbol, c.Timestamp, c.Close })
-                    .ToListAsync(basketCts.Token);
+                var basketCacheKey = $"MlV2Basket:{asOf:O}";
+                Dictionary<string, double[]>? basketSlice;
+                if (!_cache.TryGetValue(basketCacheKey, out basketSlice) || basketSlice is null)
+                {
+                    var basketSymbols = new[] { "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD", "AUDUSD", "NZDUSD" };
+                    var basketStart = asOf.AddDays(-7);
+                    using var basketCts = CreateLinkedTimeout(cancellationToken);
+                    var basketRows = await db.Set<Candle>()
+                        .AsNoTracking()
+                        .Where(c => basketSymbols.Contains(c.Symbol)
+                                 && c.Timeframe == Timeframe.H1
+                                 && c.IsClosed
+                                 && !c.IsDeleted
+                                 && c.Timestamp >= basketStart
+                                 && c.Timestamp <= asOf)
+                        .OrderBy(c => c.Timestamp)
+                        .Select(c => new { c.Symbol, c.Timestamp, c.Close })
+                        .ToListAsync(basketCts.Token);
 
-                var basketSlice = basketRows
-                    .GroupBy(c => c.Symbol)
-                    .ToDictionary(
-                        g => g.Key,
-                        g => g.OrderBy(x => x.Timestamp).Select(x => (double)x.Close).ToArray(),
-                        StringComparer.OrdinalIgnoreCase);
+                    basketSlice = basketRows
+                        .GroupBy(c => c.Symbol)
+                        .ToDictionary(
+                            g => g.Key,
+                            g => g.OrderBy(x => x.Timestamp).Select(x => (double)x.Close).ToArray(),
+                            StringComparer.OrdinalIgnoreCase);
+
+                    _cache.Set(basketCacheKey, basketSlice, TimeSpan.FromMinutes(5));
+                }
 
                 builtRawFeatures = MLFeatureHelper.BuildFeatureVectorV2(
                     window, current, previous, basketSlice, signal.Symbol, cotEntry);

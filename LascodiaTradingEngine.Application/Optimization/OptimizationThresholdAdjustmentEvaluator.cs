@@ -96,6 +96,7 @@ internal sealed class OptimizationThresholdAdjustmentEvaluator
                         SlippagePriceUnits = screeningOptions.SlippagePriceUnits,
                         SwapPerLotPerDay = screeningOptions.SwapPerLotPerDay,
                         ContractSize = screeningOptions.ContractSize,
+                        PipSizeInPriceUnits = screeningOptions.PipSizeInPriceUnits,
                         GapSlippagePct = screeningOptions.GapSlippagePct,
                         FillRatio = screeningOptions.FillRatio,
                         PositionSizer = (balance, signal) =>

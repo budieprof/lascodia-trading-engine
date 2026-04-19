@@ -14,6 +14,12 @@ public sealed class BacktestOptionsSnapshot
     public decimal SlippagePriceUnits { get; init; }
     public decimal SwapPerLotPerDay { get; init; }
     public decimal ContractSize { get; init; } = 100_000m;
+    /// <summary>
+    /// Pip size in price units for PnL normalisation. Defaults to 0.0001 (EURUSD-style 4-decimal
+    /// pairs). JPY pairs need 0.01. Without this, JPY-pair PnL is ~100× inflated because 1 pip
+    /// ≠ 0.0001 for those pairs — see <c>BacktestEngine.CalculatePnL</c>.
+    /// </summary>
+    public decimal PipSizeInPriceUnits { get; init; } = 0.0001m;
     public decimal GapSlippagePct { get; init; }
     public decimal FillRatio { get; init; } = 1.0m;
     public List<SpreadBucketSnapshot> SpreadBuckets { get; init; } = [];
@@ -27,6 +33,7 @@ public sealed class BacktestOptionsSnapshot
             SlippagePriceUnits = SlippagePriceUnits,
             SwapPerLotPerDay = SwapPerLotPerDay,
             ContractSize = ContractSize,
+            PipSizeInPriceUnits = PipSizeInPriceUnits <= 0m ? 0.0001m : PipSizeInPriceUnits,
             GapSlippagePct = GapSlippagePct,
             FillRatio = FillRatio <= 0m ? 1.0m : FillRatio,
         };

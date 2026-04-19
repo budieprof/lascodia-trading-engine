@@ -279,6 +279,7 @@ internal sealed class OptimizationValidator
             SlippagePriceUnits = baseOptions.SlippagePriceUnits * multiplier,
             SwapPerLotPerDay   = baseOptions.SwapPerLotPerDay,
             ContractSize       = baseOptions.ContractSize,
+            PipSizeInPriceUnits = baseOptions.PipSizeInPriceUnits,
             GapSlippagePct     = baseOptions.GapSlippagePct,
             FillRatio          = baseOptions.FillRatio,
             PositionSizer      = baseOptions.PositionSizer,

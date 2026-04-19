@@ -166,6 +166,9 @@ internal sealed class OptimizationDataLoader
             CommissionPerLot = (decimal)config.ScreeningCommissionPerLot,
             SlippagePriceUnits = pointSize * (decimal)config.ScreeningSlippagePips * 10,
             ContractSize = pairInfo.ContractSize,
+            // Pip = 10 × point size so JPY pairs (3-decimal, pip=0.01) don't produce
+            // 100× inflated PnL. Falls back to USD-pair default when DecimalPlaces=0.
+            PipSizeInPriceUnits = pairInfo.DecimalPlaces > 0 ? pointSize * 10m : 0.0001m,
         };
 
         await TryApplySpreadProfileAsync(strategy.Symbol, screeningOptions, ct);

@@ -142,6 +142,10 @@ internal sealed class BacktestOptionsSnapshotBuilder : IBacktestOptionsSnapshotB
             CommissionPerLot = StrategyGenerationHelpers.ScaleCommissionForAssetClass(commissionPerLot, assetClass),
             SlippagePriceUnits = pointSize * slippagePips * 10m,
             ContractSize = pairInfo?.ContractSize ?? StrategyGenerationHelpers.GetDefaultContractSize(assetClass),
+            // Pip = 10 × point size so JPY pairs (3-decimal) don't produce 100× inflated PnL.
+            PipSizeInPriceUnits = pairInfo is not null && pairInfo.DecimalPlaces > 0
+                ? pointSize * 10m
+                : 0.0001m,
             SpreadBuckets = spreadBuckets,
         };
     }
