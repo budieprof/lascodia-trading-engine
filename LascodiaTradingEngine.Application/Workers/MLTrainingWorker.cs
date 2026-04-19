@@ -592,13 +592,19 @@ public sealed class MLTrainingWorker : BackgroundService
             }
 
             // ── Guard: skip meta-learner runs with Symbol="ALL" ──────────────
+            // These are queued by drift/PSI/calibration workers that blindly mirror
+            // the MLModel.Symbol of every model they monitor, including MAML cross-
+            // symbol initialisers whose Symbol="ALL" is a sentinel rather than a real
+            // instrument. Mark as Completed (not Failed) so they don't pollute the
+            // MLTrainingRunHealthWorker 100%-failure-rate alerts, and log at Debug
+            // since the skip is expected and non-actionable.
             if (string.Equals(run.Symbol, "ALL", StringComparison.OrdinalIgnoreCase))
             {
-                run.Status       = RunStatus.Failed;
+                run.Status       = RunStatus.Completed;
                 run.CompletedAt  = DateTime.UtcNow;
-                run.ErrorMessage = "Symbol 'ALL' is a meta-learner artifact — cannot be trained by the regular pipeline.";
+                run.ErrorMessage = "Skipped: Symbol 'ALL' is a meta-learner sentinel; MAML models are rebuilt by MLAverageWeightInitWorker.";
                 await db.SaveChangesAsync(stoppingToken);
-                _logger.LogWarning("Run {RunId}: skipping meta-learner run with Symbol='ALL'.", run.Id);
+                _logger.LogDebug("Run {RunId}: skipping meta-learner run with Symbol='ALL'.", run.Id);
                 return;
             }
 
