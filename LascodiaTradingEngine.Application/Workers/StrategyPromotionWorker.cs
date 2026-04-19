@@ -32,15 +32,30 @@ namespace LascodiaTradingEngine.Application.Workers;
 ///   <item>At least <c>MinHealthySnapshots</c> (default 3) recent <see cref="StrategyPerformanceSnapshot"/>
 ///         records exist with <c>HealthScore ≥ MinHealthScore</c> (default 0.55).</item>
 ///   <item>No snapshot in the observation window shows <c>Critical</c> health status.</item>
+///   <item><b>Live/backtest Sharpe ratio gate:</b> when
+///         <c>MinLiveVsBacktestSharpeRatio</c> &gt; 0 (default 0.5) and the strategy has a
+///         completed backtest with positive Sharpe, the average Sharpe across recent
+///         snapshots must be at least that fraction of the best backtest Sharpe. Blocks
+///         backtest-overfit strategies whose live edge has silently collapsed.</item>
 /// </list>
 /// </para>
 ///
 /// <para>
-/// <b>Auto-activation (Approved → Active):</b>
-/// When <c>StrategyPromotion:AutoActivateEnabled</c> is true (default), strategies that
-/// reach <c>Approved</c> are automatically activated with <c>Status = Active</c>. This
-/// bypasses the four-eyes approval gate in <c>ActivateStrategyCommand</c>, which remains
-/// available for manually created strategies that require human sign-off.
+/// <b>Auto-activation (Approved → Active) and the human-vs-auto boundary:</b>
+/// Auto-generated strategies are identified by their <c>Auto-</c> name prefix and ONLY
+/// they are eligible for this worker. When
+/// <c>StrategyPromotion:AutoActivateEnabled</c> is true (default), auto-generated
+/// strategies that reach <c>Approved</c> are automatically activated. This is the
+/// controlled bypass of the <c>IPromotionGateValidator</c> (Deflated Sharpe / PBO /
+/// TCA EV / paper-trade duration / regime coverage / max pairwise correlation) in
+/// <c>ActivateStrategyCommand</c>. The gate still runs for <b>human-introduced</b>
+/// strategies (operator-created, imported from research notebooks, etc.) that have
+/// not passed the generation pipeline's 12-gate screening. In short: the CLAUDE.md
+/// "no manual gates" rule applies to the autonomous generation/optimization pipeline;
+/// <c>IPromotionGateValidator</c> is retained purely for strategies that never ran
+/// through that pipeline. Set <c>AutoActivateEnabled</c> to false to force ALL
+/// strategies (including auto-generated) back through the manual command path — used
+/// for emergency lockdown or during pipeline debugging.
 /// </para>
 ///
 /// <para>
@@ -68,6 +83,7 @@ public sealed class StrategyPromotionWorker : InstrumentedBackgroundService
     private const string CK_MinHealthySnapshots = "StrategyPromotion:MinHealthySnapshots";
     private const string CK_AutoActivate        = "StrategyPromotion:AutoActivateEnabled";
     private const string CK_MaxActivePerSymbol  = "StrategyPromotion:MaxActivePerSymbol";
+    private const string CK_MinLiveVsBacktestSharpeRatio = "StrategyPromotion:MinLiveVsBacktestSharpeRatio";
 
     private const int DefaultPollMinutes = 60;
 
@@ -161,6 +177,14 @@ public sealed class StrategyPromotionWorker : InstrumentedBackgroundService
         int minHealthySnapshots  = Math.Max(1, await GetConfigAsync(db, CK_MinHealthySnapshots, 3, ct));
         bool autoActivateEnabled = await GetConfigAsync(db, CK_AutoActivate, true, ct);
         int maxActivePerSymbol   = Math.Max(1, await GetConfigAsync(db, CK_MaxActivePerSymbol, 5, ct));
+        // Live-vs-backtest Sharpe ratio floor. When >0, promotion requires the average Sharpe
+        // across recent healthy snapshots to be at least this fraction of the strategy's best
+        // completed backtest Sharpe. Guards against strategies that looked good in backtest
+        // but are quietly decaying live — they would still pass the health-score floor but
+        // their realised Sharpe has collapsed. Default 0.5 (live must retain at least 50%
+        // of backtested edge). Set to 0 to disable the gate entirely.
+        decimal minLiveVsBacktestSharpeRatio =
+            Math.Max(0m, await GetConfigAsync(db, CK_MinLiveVsBacktestSharpeRatio, 0.5m, ct));
 
         int promoted = 0;
         int activated = 0;
@@ -190,10 +214,34 @@ public sealed class StrategyPromotionWorker : InstrumentedBackgroundService
                 {
                     StrategyId = g.Key,
                     Snapshots = g.OrderByDescending(s => s.EvaluatedAt)
-                        .Select(s => new { s.HealthScore, s.HealthStatus })
+                        .Select(s => new { s.HealthScore, s.HealthStatus, s.SharpeRatio })
                         .ToList()
                 })
                 .ToDictionaryAsync(g => g.StrategyId, g => g.Snapshots, ct);
+
+            // Batch-load the best completed backtest Sharpe per candidate for the
+            // live-vs-backtest ratio gate. A nullable result lets us distinguish
+            // "no backtest Sharpe available" (gate not applicable) from "Sharpe == 0".
+            Dictionary<long, decimal?> bestBacktestSharpeByStrategy;
+            if (minLiveVsBacktestSharpeRatio > 0m)
+            {
+                bestBacktestSharpeByStrategy = await db.Set<BacktestRun>()
+                    .Where(b => candidateIds.Contains(b.StrategyId)
+                             && !b.IsDeleted
+                             && b.Status == RunStatus.Completed
+                             && b.SharpeRatio != null)
+                    .GroupBy(b => b.StrategyId)
+                    .Select(g => new
+                    {
+                        StrategyId = g.Key,
+                        BestSharpe = g.Max(b => b.SharpeRatio)
+                    })
+                    .ToDictionaryAsync(g => g.StrategyId, g => g.BestSharpe, ct);
+            }
+            else
+            {
+                bestBacktestSharpeByStrategy = new Dictionary<long, decimal?>();
+            }
 
             foreach (var strategy in candidates)
             {
@@ -224,6 +272,49 @@ public sealed class StrategyPromotionWorker : InstrumentedBackgroundService
                         "StrategyPromotionWorker: strategy {Id} ({Name}) has {Healthy}/{Required} healthy snapshots (score >= {Threshold}) — skipping",
                         strategy.Id, strategy.Name, healthyCount, minHealthySnapshots, minHealthScore);
                     continue;
+                }
+
+                // ── Live-vs-backtest Sharpe ratio gate ─────────────────────
+                // Only enforced when (a) the ratio threshold is configured above zero, and
+                // (b) the strategy has a completed backtest with positive Sharpe to compare
+                // against. A nonpositive backtest Sharpe means the gate would divide by zero
+                // or compare to a negative baseline — we fall through rather than reject, so
+                // strategies without usable backtest data aren't penalised.
+                if (minLiveVsBacktestSharpeRatio > 0m
+                    && bestBacktestSharpeByStrategy.TryGetValue(strategy.Id, out var backtestSharpeNullable)
+                    && backtestSharpeNullable is decimal backtestSharpe
+                    && backtestSharpe > 0m)
+                {
+                    decimal liveSharpe = snapshots.Average(s => s.SharpeRatio);
+                    decimal ratio = liveSharpe / backtestSharpe;
+                    if (ratio < minLiveVsBacktestSharpeRatio)
+                    {
+                        _logger.LogInformation(
+                            "StrategyPromotionWorker: strategy {Id} ({Name}) live/backtest Sharpe ratio " +
+                            "{Ratio:F2} (live={Live:F2}, backtest={Backtest:F2}) below {Min:F2} — skipping",
+                            strategy.Id, strategy.Name, ratio, liveSharpe, backtestSharpe, minLiveVsBacktestSharpeRatio);
+                        try
+                        {
+                            await mediator.Send(new LogDecisionCommand
+                            {
+                                EntityType   = "Strategy",
+                                EntityId     = strategy.Id,
+                                DecisionType = "PromotionGate",
+                                Outcome      = "Rejected",
+                                Reason       = $"Live/backtest Sharpe ratio {ratio:F2} " +
+                                               $"(live={liveSharpe:F2}, backtest={backtestSharpe:F2}) " +
+                                               $"< floor {minLiveVsBacktestSharpeRatio:F2}",
+                                Source       = "StrategyPromotionWorker"
+                            }, ct);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogDebug(ex,
+                                "StrategyPromotionWorker: audit log failed for strategy {Id} Sharpe-gate rejection (non-fatal)",
+                                strategy.Id);
+                        }
+                        continue;
+                    }
                 }
 
                 // Promote to Approved

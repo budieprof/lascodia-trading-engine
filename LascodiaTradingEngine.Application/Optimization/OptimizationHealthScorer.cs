@@ -2,13 +2,22 @@ using LascodiaTradingEngine.Application.Backtesting.Models;
 
 namespace LascodiaTradingEngine.Application.Optimization;
 
+using MarketRegime = LascodiaTradingEngine.Domain.Enums.MarketRegime;
+
 /// <summary>
 /// Composite health score computation for optimization candidates.
-/// Weights: WinRate 25%, ProfitFactor 20%, Drawdown 20%, Sharpe 15%, SampleSize 20%.
+/// Default weights: WinRate 25%, ProfitFactor 20%, Drawdown 20%, Sharpe 15%, SampleSize 20%.
 /// Guards against NaN/Infinity from degenerate backtest results.
 ///
 /// This is the SINGLE SOURCE OF TRUTH for the health score formula. All other classes
 /// (BootstrapAnalyzer, PermutationTestAnalyzer) must delegate here — never duplicate.
+///
+/// <para>
+/// <b>Regime-aware weighting:</b> the <c>ComputeHealthScore(..., MarketRegime?)</c> overload
+/// rebalances the 5-factor weights so that the metrics that matter most in a given regime
+/// carry more of the score. Bootstrap/permutation analysers still use the regime-neutral
+/// default because they test statistical properties of a trade stream, not live suitability.
+/// </para>
 /// </summary>
 internal static class OptimizationHealthScorer
 {
@@ -21,11 +30,88 @@ internal static class OptimizationHealthScorer
     /// <summary>Overload for manual metric values (used by health/feedback workers).</summary>
     internal static decimal ComputeHealthScore(decimal winRate, decimal profitFactor, decimal maxDrawdownPct, decimal sharpeRatio, int totalTrades = 50)
     {
-        return 0.25m * Sanitize(winRate)
-             + 0.20m * Math.Min(1m, Sanitize(profitFactor) / 2m)
-             + 0.20m * Math.Max(0m, 1m - Sanitize(maxDrawdownPct) / 20m)
-             + 0.15m * Math.Min(1m, Math.Max(0m, Sanitize(sharpeRatio)) / 2m)
-             + 0.20m * Math.Min(1m, totalTrades / 50m);
+        return ComputeHealthScoreWithWeights(winRate, profitFactor, maxDrawdownPct, sharpeRatio, totalTrades, DefaultWeights);
+    }
+
+    /// <summary>
+    /// Regime-aware health score. When <paramref name="regime"/> is null, falls back to the
+    /// default weights (identical to the regime-neutral overload). When a regime is supplied,
+    /// the weight vector is selected from <see cref="RegimeWeights"/>.
+    ///
+    /// <para>
+    /// Why regime-aware: a strategy tuned for Trending markets will naturally show lower win
+    /// rate but higher profit factor; scored with the default weights during a Trending
+    /// period it may trip the Degrading threshold even while performing exactly as designed.
+    /// Rebalancing toward profit factor in Trending and toward drawdown preservation in
+    /// Crisis keeps the score interpretable across regimes.
+    /// </para>
+    /// </summary>
+    internal static decimal ComputeHealthScore(
+        decimal winRate,
+        decimal profitFactor,
+        decimal maxDrawdownPct,
+        decimal sharpeRatio,
+        int totalTrades,
+        MarketRegime? regime)
+    {
+        HealthWeights weights = regime.HasValue ? RegimeWeights[regime.Value] : DefaultWeights;
+        return ComputeHealthScoreWithWeights(winRate, profitFactor, maxDrawdownPct, sharpeRatio, totalTrades, weights);
+    }
+
+    /// <summary>
+    /// 5-factor weight vector for the composite health score. The five weights must sum to
+    /// <c>1.0</c> so the score stays in [0, 1].
+    /// </summary>
+    internal readonly record struct HealthWeights(
+        decimal WinRate,
+        decimal ProfitFactor,
+        decimal Drawdown,
+        decimal Sharpe,
+        decimal SampleSize);
+
+    /// <summary>Default (regime-neutral) weights — matches the historical formula.</summary>
+    internal static readonly HealthWeights DefaultWeights = new(
+        WinRate:      0.25m,
+        ProfitFactor: 0.20m,
+        Drawdown:     0.20m,
+        Sharpe:       0.15m,
+        SampleSize:   0.20m);
+
+    /// <summary>
+    /// Per-regime weight vectors. Each row sums to 1.0. Rationale:
+    /// <list type="bullet">
+    ///   <item><b>Trending</b>: PF is the dominant signal (few big wins, contained losses); WR naturally lower.</item>
+    ///   <item><b>Ranging</b>: mean-reversion strategies win often with thin margins — WR weighted highest.</item>
+    ///   <item><b>HighVolatility</b>: risk control is paramount — DD weighted heaviest, sample size softer.</item>
+    ///   <item><b>LowVolatility</b>: returns are consistent and small — Sharpe is the best discriminator.</item>
+    ///   <item><b>Crisis</b>: survival dominates; DD + sample size (avoid single-regime noise) matter most.</item>
+    ///   <item><b>Breakout</b>: rewards PF and sample size; WR naturally low on false-breakout noise.</item>
+    /// </list>
+    /// </summary>
+    internal static readonly IReadOnlyDictionary<MarketRegime, HealthWeights> RegimeWeights =
+        new Dictionary<MarketRegime, HealthWeights>
+        {
+            [MarketRegime.Trending]       = new(0.15m, 0.30m, 0.15m, 0.20m, 0.20m),
+            [MarketRegime.Ranging]        = new(0.30m, 0.15m, 0.20m, 0.15m, 0.20m),
+            [MarketRegime.HighVolatility] = new(0.20m, 0.15m, 0.30m, 0.20m, 0.15m),
+            [MarketRegime.LowVolatility]  = new(0.20m, 0.15m, 0.20m, 0.30m, 0.15m),
+            [MarketRegime.Crisis]         = new(0.15m, 0.15m, 0.30m, 0.15m, 0.25m),
+            [MarketRegime.Breakout]       = new(0.20m, 0.25m, 0.15m, 0.15m, 0.25m),
+        };
+
+    private static decimal ComputeHealthScoreWithWeights(
+        decimal winRate,
+        decimal profitFactor,
+        decimal maxDrawdownPct,
+        decimal sharpeRatio,
+        int totalTrades,
+        HealthWeights w)
+    {
+        return w.WinRate      * Sanitize(winRate)
+             + w.ProfitFactor * Math.Min(1m, Sanitize(profitFactor) / 2m)
+             + w.Drawdown     * Math.Max(0m, 1m - Sanitize(maxDrawdownPct) / 20m)
+             + w.Sharpe       * Math.Min(1m, Math.Max(0m, Sanitize(sharpeRatio)) / 2m)
+             + w.SampleSize   * Math.Min(1m, totalTrades / 50m);
 
         // Clamp NaN/Infinity to 0 to prevent nonsensical health scores
         static decimal Sanitize(decimal v)

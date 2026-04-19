@@ -111,14 +111,36 @@ public class SignalValidator : ISignalValidator
             return Fail("StopLoss equals TakeProfit — zero profit target.");
 
         // ── 10. ML agreement check ──────────────────────────────────────────
-        if (signal.MLPredictedDirection.HasValue &&
-            signal.MLConfidenceScore.HasValue &&
-            signal.MLPredictedDirection != signal.Direction)
+        // Three cases, gated on MLModelId to distinguish "ML was active" from "no ML configured":
+        //   (a) MLModelId == null                         → no ML model for symbol/timeframe; skip.
+        //   (b) MLModelId set + both direction/confidence → enforce direction agreement.
+        //   (c) MLModelId set + direction OR confidence missing → partial ML state. Previously
+        //       this case silently passed, letting non-ML signals through during ML outages. Now
+        //       require the disagreement-override confidence floor before allowing.
+        if (signal.MLModelId.HasValue)
         {
-            if (signal.Confidence < _options.MLDisagreementMinConfidence)
-                return Fail(
-                    $"ML model predicts {signal.MLPredictedDirection} but signal direction is {signal.Direction}; " +
-                    $"signal confidence {signal.Confidence:P0} is below required {_options.MLDisagreementMinConfidence:P0} for a disagreement override.");
+            bool hasFullPrediction =
+                signal.MLPredictedDirection.HasValue && signal.MLConfidenceScore.HasValue;
+
+            if (!hasFullPrediction)
+            {
+                // Case (c): partial ML data — fail-closed unless confidence exceeds override floor.
+                if (signal.Confidence < _options.MLDisagreementMinConfidence)
+                    return Fail(
+                        $"ML model {signal.MLModelId} is active but prediction is incomplete " +
+                        $"(direction={signal.MLPredictedDirection?.ToString() ?? "null"}, " +
+                        $"confidence={(signal.MLConfidenceScore.HasValue ? signal.MLConfidenceScore.Value.ToString("P0") : "null")}); " +
+                        $"signal confidence {signal.Confidence:P0} is below required " +
+                        $"{_options.MLDisagreementMinConfidence:P0} for an override.");
+            }
+            else if (signal.MLPredictedDirection != signal.Direction)
+            {
+                // Case (b, disagree): strategy and ML point opposite ways — require confidence override.
+                if (signal.Confidence < _options.MLDisagreementMinConfidence)
+                    return Fail(
+                        $"ML model predicts {signal.MLPredictedDirection} but signal direction is {signal.Direction}; " +
+                        $"signal confidence {signal.Confidence:P0} is below required {_options.MLDisagreementMinConfidence:P0} for a disagreement override.");
+            }
         }
 
         return Pass();

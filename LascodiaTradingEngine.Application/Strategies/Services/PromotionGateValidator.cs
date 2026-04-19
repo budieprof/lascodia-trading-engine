@@ -39,15 +39,18 @@ public sealed class PromotionGateValidator : IPromotionGateValidator
     private readonly IReadApplicationDbContext _readCtx;
     private readonly ICpcvValidator _cpcv;
     private readonly IEdgePosterior _edgePosterior;
+    private readonly IAdversarialValidator? _adversarial;
 
     public PromotionGateValidator(
         IReadApplicationDbContext readCtx,
         ICpcvValidator cpcv,
-        IEdgePosterior edgePosterior)
+        IEdgePosterior edgePosterior,
+        IAdversarialValidator? adversarial = null)
     {
-        _readCtx = readCtx;
-        _cpcv = cpcv;
+        _readCtx       = readCtx;
+        _cpcv          = cpcv;
         _edgePosterior = edgePosterior;
+        _adversarial   = adversarial;
     }
 
     public async Task<PromotionGateResult> EvaluateAsync(
@@ -347,6 +350,24 @@ public sealed class PromotionGateValidator : IPromotionGateValidator
                 failures.Add(
                     $"P&L correlation {observedCorr:F3} > max {maxCorr:F2} with an existing Active " +
                     "strategy — promotion blocked to avoid portfolio concentration masquerading as diversification");
+        }
+
+        // ── Gate 9 (A+ roadmap #4): Adversarial validation ──────────────────
+        // Run the strategy against synthetic stress scenarios (slippage spike,
+        // spread blowout, news shock, regime flip). A strategy whose Sharpe
+        // collapses entirely under any of these will surrender PnL on the first
+        // real broker hiccup — block promotion. Skipped when the validator is
+        // not registered (e.g. legacy DI graphs or unit-test setups).
+        if (_adversarial is not null && !disabledGates.Contains("adversarial"))
+        {
+            var adv = await _adversarial.ValidateAsync(strategyId, latestBacktest.FromDate, latestBacktest.ToDate, ct);
+            diagnostics.AddRange(adv.Diagnostics);
+            if (!adv.Passed)
+            {
+                failures.Add(
+                    $"Adversarial worst-case Sharpe {adv.WorstCaseSharpe:F3} (degradation {adv.SharpeDegradationPct:F1}% from baseline) " +
+                    "— strategy is fragile to slippage spikes / news shocks / regime flips");
+            }
         }
 
         return failures.Count == 0

@@ -30,7 +30,11 @@ public sealed record WalkForwardWorkerSettings(
     int CandleGapMultiplier,
     int MaxCandlesPerRun,
     int MaxParallelRuns,
-    decimal MaxCoefficientOfVariation);
+    decimal MaxCoefficientOfVariation,
+    int MinInSampleDays,
+    int MinOutOfSampleDays,
+    int MinCandlesPerFold,
+    int MinTradesPerFold);
 
 public interface IValidationSettingsProvider
 {
@@ -109,7 +113,18 @@ internal sealed class ValidationSettingsProvider : IValidationSettingsProvider
             MaxCandlesPerRun: await GetIntAsync(ctx, logger, "WalkForward:MaxCandlesPerRun", 150_000, ct, minInclusive: 100),
             MaxParallelRuns: await GetIntAsync(ctx, logger, "WalkForward:MaxParallelRuns", 4, ct, minInclusive: 1, maxInclusive: 32),
             // Canonical config key shared with OptimizationConfigProvider — keep in sync.
-            MaxCoefficientOfVariation: await GetDecimalAsync(ctx, logger, "Optimization:MaxCvCoefficientOfVariation", 0.50m, ct, minInclusive: 0m));
+            MaxCoefficientOfVariation: await GetDecimalAsync(ctx, logger, "Optimization:MaxCvCoefficientOfVariation", 0.50m, ct, minInclusive: 0m),
+            // Per-fold minimums. Defaults sized for H1 data (≥14 days ≈ 336 candles per IS fold
+            // before weekends, ≥7 days OOS). Tiny folds (e.g. 5-day IS / 2-day OOS) produce
+            // unreliable stddev on the OOS CV gate even when the 3-window minimum is met, so
+            // we reject below a hard minimum floor.
+            MinInSampleDays: await GetIntAsync(ctx, logger, "WalkForward:MinInSampleDays", 14, ct, minInclusive: 1),
+            MinOutOfSampleDays: await GetIntAsync(ctx, logger, "WalkForward:MinOutOfSampleDays", 7, ct, minInclusive: 1),
+            // Per-fold candle and trade floors. Fewer than 60 candles per fold cannot support
+            // 14-period indicators (ATR/ADX) with meaningful warmup. Fewer than 5 trades per
+            // fold produces a Sharpe estimate with >100% standard error.
+            MinCandlesPerFold: await GetIntAsync(ctx, logger, "WalkForward:MinCandlesPerFold", 60, ct, minInclusive: 1),
+            MinTradesPerFold: await GetIntAsync(ctx, logger, "WalkForward:MinTradesPerFold", 5, ct, minInclusive: 0));
     }
 
     public async Task<int> GetIntAsync(

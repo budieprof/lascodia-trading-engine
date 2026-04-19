@@ -1428,6 +1428,14 @@ public class StrategyEvaluatorOptions : ConfigurationOption<StrategyEvaluatorOpt
     public int NewsBlackoutMinutesAfter { get; set; } = 15;
 
     /// <summary>
+    /// Per-tick timeout in seconds for the <see cref="Common.Interfaces.INewsFilter"/>
+    /// query. If the filter does not respond within this window the tick is dropped
+    /// (fail-closed) — an unknown news state is treated as "might be in blackout"
+    /// rather than "safe to trade". Defaults to 5.
+    /// </summary>
+    public int NewsFilterTimeoutSeconds { get; set; } = 5;
+
+    /// <summary>
     /// Trading sessions allowed for signal generation.
     /// Defaults to London, LondonNYOverlap, NewYork. Empty list disables the filter.
     /// </summary>

@@ -216,45 +216,75 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
         _logger.LogInformation("StrategyWorker: waiting for event bus readiness before subscribing...");
         await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
 
-        // Hydrate per-strategy cooldown / circuit-breaker state from DB before subscribing.
-        // Without this, every process restart gave all strategies a fresh zero-cooldown
-        // window, producing a thundering herd of signals until the 5-min warmup rebuilt
-        // state. Persisted fields added to Strategy (LastSignalAt, ConsecutiveEvaluationFailures,
-        // CircuitOpenedAt). Tolerant of up to ~5 min of staleness (the sweep cadence).
-        try
+        // Hydrate per-strategy cooldown / circuit-breaker state from DB BEFORE subscribing.
+        // Subscription is gated on successful hydration: without the in-memory cache warmed,
+        // every active strategy would appear to have a zero cooldown, producing a thundering
+        // herd of signals on the first tick after restart. Persisted fields live on Strategy
+        // (LastSignalAt, ConsecutiveEvaluationFailures, CircuitOpenedAt).
+        //
+        // Retry policy: up to 5 attempts with exponential backoff (1s, 2s, 4s, 8s, 16s). If
+        // all attempts fail we refuse to subscribe — this is fail-closed: better to emit zero
+        // signals and alert than to emit a cooldown-less burst. On terminal failure the worker
+        // returns, the host will log the unhealthy state, and the operator must investigate.
+        const int maxHydrationAttempts = 5;
+        bool hydrated = false;
+        for (int attempt = 1; attempt <= maxHydrationAttempts && !stoppingToken.IsCancellationRequested; attempt++)
         {
-            using var scope = _scopeFactory.CreateScope();
-            var readCtx = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
-            var activeStrategies = await readCtx.GetDbContext()
-                .Set<Domain.Entities.Strategy>()
-                .AsNoTracking()
-                .Where(s => s.Status == StrategyStatus.Active && !s.IsDeleted)
-                .Select(s => new { s.Id, s.LastSignalAt, s.ConsecutiveEvaluationFailures, s.CircuitOpenedAt })
-                .ToListAsync(stoppingToken);
-
-            int hydratedCooldowns = 0, hydratedCircuits = 0;
-            foreach (var s in activeStrategies)
+            try
             {
-                if (s.LastSignalAt is { } lastAt)
+                using var scope = _scopeFactory.CreateScope();
+                var readCtx = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+                var activeStrategies = await readCtx.GetDbContext()
+                    .Set<Domain.Entities.Strategy>()
+                    .AsNoTracking()
+                    .Where(s => s.Status == StrategyStatus.Active && !s.IsDeleted)
+                    .Select(s => new { s.Id, s.LastSignalAt, s.ConsecutiveEvaluationFailures, s.CircuitOpenedAt })
+                    .ToListAsync(stoppingToken);
+
+                int hydratedCooldowns = 0, hydratedCircuits = 0;
+                foreach (var s in activeStrategies)
                 {
-                    _lastSignalTime[s.Id] = lastAt;
-                    hydratedCooldowns++;
+                    if (s.LastSignalAt is { } lastAt)
+                    {
+                        _lastSignalTime[s.Id] = lastAt;
+                        hydratedCooldowns++;
+                    }
+                    if (s.ConsecutiveEvaluationFailures > 0)
+                        _consecutiveFailures[s.Id] = s.ConsecutiveEvaluationFailures;
+                    if (s.CircuitOpenedAt is { } openedAt)
+                    {
+                        _circuitOpenedAt[s.Id] = openedAt;
+                        hydratedCircuits++;
+                    }
                 }
-                if (s.ConsecutiveEvaluationFailures > 0)
-                    _consecutiveFailures[s.Id] = s.ConsecutiveEvaluationFailures;
-                if (s.CircuitOpenedAt is { } openedAt)
-                {
-                    _circuitOpenedAt[s.Id] = openedAt;
-                    hydratedCircuits++;
-                }
+                _logger.LogInformation(
+                    "StrategyWorker: hydrated runtime state for {Count} strategies (cooldowns={Cooldowns}, open circuits={Circuits}) on attempt {Attempt}/{Max}",
+                    activeStrategies.Count, hydratedCooldowns, hydratedCircuits, attempt, maxHydrationAttempts);
+                hydrated = true;
+                break;
             }
-            _logger.LogInformation(
-                "StrategyWorker: hydrated runtime state for {Count} strategies (cooldowns={Cooldowns}, open circuits={Circuits})",
-                activeStrategies.Count, hydratedCooldowns, hydratedCircuits);
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                var backoff = TimeSpan.FromSeconds(Math.Pow(2, attempt - 1));
+                _logger.LogWarning(ex,
+                    "StrategyWorker: cooldown hydration attempt {Attempt}/{Max} failed — retrying in {Backoff}s",
+                    attempt, maxHydrationAttempts, backoff.TotalSeconds);
+                try { await Task.Delay(backoff, stoppingToken); }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { return; }
+            }
         }
-        catch (Exception ex)
+
+        if (!hydrated)
         {
-            _logger.LogWarning(ex, "StrategyWorker: failed to hydrate runtime state from DB — starting cold");
+            _logger.LogCritical(
+                "StrategyWorker: cooldown hydration failed after {Max} attempts — refusing to subscribe to price events. No signals will be emitted until the next worker start with a reachable database.",
+                maxHydrationAttempts);
+            _metrics.WorkerErrors.Add(1, new("worker", "StrategyWorker"), new("operation", "hydration_failed"));
+            return;
         }
 
         // Subscribe to the event bus so Handle() is invoked on every price tick
@@ -376,12 +406,43 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
         }
 
         // ── News filter (applied once per tick for this symbol) ─────────────
+        // Bounded with a per-tick timeout so a slow upstream news provider cannot
+        // stall every tick for this symbol. On timeout or error we FAIL CLOSED —
+        // drop the tick — because an unknown news state is indistinguishable from
+        // "might be in blackout" and we should not trade blind. The timeout is
+        // conservative (NewsFilterTimeoutSeconds, default 5s) since this runs on
+        // the hot tick path.
         if (_options.NewsBlackoutMinutesBefore > 0 || _options.NewsBlackoutMinutesAfter > 0)
         {
-            bool safeToTrade = await newsFilter.IsSafeToTradeAsync(
-                @event.Symbol, @event.Timestamp,
-                _options.NewsBlackoutMinutesBefore, _options.NewsBlackoutMinutesAfter,
-                _stoppingToken);
+            int timeoutSeconds = Math.Max(1, _options.NewsFilterTimeoutSeconds);
+            bool safeToTrade;
+            using (var newsCts = CancellationTokenSource.CreateLinkedTokenSource(_stoppingToken))
+            {
+                newsCts.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
+                try
+                {
+                    safeToTrade = await newsFilter.IsSafeToTradeAsync(
+                        @event.Symbol, @event.Timestamp,
+                        _options.NewsBlackoutMinutesBefore, _options.NewsBlackoutMinutesAfter,
+                        newsCts.Token);
+                }
+                catch (OperationCanceledException) when (!_stoppingToken.IsCancellationRequested)
+                {
+                    _logger.LogWarning(
+                        "StrategyWorker: news filter timed out after {Timeout}s for {Symbol} — skipping tick (fail-closed)",
+                        timeoutSeconds, @event.Symbol);
+                    _metrics.SignalsFiltered.Add(1, new("symbol", @event.Symbol), new("stage", "news_filter_timeout"));
+                    return;
+                }
+                catch (Exception ex) when (!_stoppingToken.IsCancellationRequested)
+                {
+                    _logger.LogError(ex,
+                        "StrategyWorker: news filter failed for {Symbol} — skipping tick (fail-closed)",
+                        @event.Symbol);
+                    _metrics.SignalsFiltered.Add(1, new("symbol", @event.Symbol), new("stage", "news_filter_error"));
+                    return;
+                }
+            }
 
             if (!safeToTrade)
             {
@@ -493,35 +554,51 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
         // score is low and all signals for the symbol may be suppressed.
         //
         // Bounded with a per-tick timeout so a slow DB query cannot stall every
-        // strategy for this symbol. On timeout we default to 1.0 (full coherence)
-        // — the per-strategy regime filter later in the loop still applies, so
-        // failing open here does not bypass regime protection entirely.
-        decimal regimeCoherence;
-        using (var coherenceCts = CancellationTokenSource.CreateLinkedTokenSource(_stoppingToken))
+        // strategy for this symbol. On timeout or query failure we FAIL CLOSED —
+        // suppress all signals for the symbol on this tick. Previously we defaulted
+        // to 1.0 (full coherence), which masked data-plane outages: a slow DB made
+        // every symbol look perfectly coherent and all regime-based filtering was
+        // bypassed. Fail-closed surfaces the issue via the suppression metric and
+        // ensures no signal is emitted without the coherence signal actually being
+        // verified. When MinRegimeCoherence is zero (filter disabled), we skip the
+        // check entirely — no point failing closed on a disabled gate.
+        if (_options.MinRegimeCoherence > 0)
         {
-            coherenceCts.CancelAfter(TimeSpan.FromSeconds(10));
-            try
+            decimal regimeCoherence;
+            using (var coherenceCts = CancellationTokenSource.CreateLinkedTokenSource(_stoppingToken))
             {
-                regimeCoherence = await _regimeCoherenceChecker.GetCoherenceScoreAsync(
-                    @event.Symbol, coherenceCts.Token);
+                coherenceCts.CancelAfter(TimeSpan.FromSeconds(10));
+                try
+                {
+                    regimeCoherence = await _regimeCoherenceChecker.GetCoherenceScoreAsync(
+                        @event.Symbol, coherenceCts.Token);
+                }
+                catch (OperationCanceledException) when (!_stoppingToken.IsCancellationRequested)
+                {
+                    _logger.LogWarning(
+                        "StrategyWorker: regime coherence query timed out for {Symbol} — suppressing all signals (fail-closed)",
+                        @event.Symbol);
+                    _metrics.SignalsFiltered.Add(1, new("symbol", @event.Symbol), new("stage", "regime_coherence_timeout"));
+                    return;
+                }
+                catch (Exception ex) when (!_stoppingToken.IsCancellationRequested)
+                {
+                    _logger.LogError(ex,
+                        "StrategyWorker: regime coherence query failed for {Symbol} — suppressing all signals (fail-closed)",
+                        @event.Symbol);
+                    _metrics.SignalsFiltered.Add(1, new("symbol", @event.Symbol), new("stage", "regime_coherence_error"));
+                    return;
+                }
             }
-            catch (OperationCanceledException) when (!_stoppingToken.IsCancellationRequested)
-            {
-                _logger.LogWarning(
-                    "StrategyWorker: regime coherence query timed out for {Symbol} — defaulting to 1.0",
-                    @event.Symbol);
-                _metrics.SignalsFiltered.Add(1, new("symbol", @event.Symbol), new("stage", "regime_coherence_timeout"));
-                regimeCoherence = 1.0m;
-            }
-        }
 
-        if (_options.MinRegimeCoherence > 0 && regimeCoherence < _options.MinRegimeCoherence)
-        {
-            _logger.LogInformation(
-                "StrategyWorker: regime coherence for {Symbol} is {Coherence:F2} (< {Threshold:F2}) — suppressing all signals",
-                @event.Symbol, regimeCoherence, _options.MinRegimeCoherence);
-            _metrics.SignalsFiltered.Add(1, new("symbol", @event.Symbol), new("stage", "regime_coherence"));
-            return;
+            if (regimeCoherence < _options.MinRegimeCoherence)
+            {
+                _logger.LogInformation(
+                    "StrategyWorker: regime coherence for {Symbol} is {Coherence:F2} (< {Threshold:F2}) — suppressing all signals",
+                    @event.Symbol, regimeCoherence, _options.MinRegimeCoherence);
+                _metrics.SignalsFiltered.Add(1, new("symbol", @event.Symbol), new("stage", "regime_coherence"));
+                return;
+            }
         }
 
         // ── Candidate signal collection bag ──────────────────────────────────
@@ -1021,12 +1098,54 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
                 // Stopwatch captures end-to-end scorer latency (including internal calibration
                 // and ensemble steps) so MLModelPredictionLog.LatencyMs can drive P50/P95/P99
                 // SLA dashboards.
+                //
+                // Circuit-breaker scope: ML-stack exceptions (inference crashes, calibration
+                // worker outages, ONNX runtime errors, etc.) are NOT the strategy's fault.
+                // We fail closed on the signal (drop it) but do NOT increment the strategy's
+                // consecutive-failure counter — otherwise a transient infra issue would open
+                // every strategy's circuit breaker. The outer catch (evaluator-level) still
+                // handles strategy-logic exceptions and opens the circuit normally.
+                MLScoreResult mlScore;
+                int? mlScoringLatencyMs;
                 var mlScoringStopwatch = Stopwatch.StartNew();
-                var mlScore = await strategyMlScorer.ScoreAsync(signal, candles, ct);
-                mlScoringStopwatch.Stop();
-                int? mlScoringLatencyMs = mlScore.MLModelId.HasValue
-                    ? (int)Math.Min(int.MaxValue, mlScoringStopwatch.ElapsedMilliseconds)
-                    : null;
+                try
+                {
+                    mlScore = await strategyMlScorer.ScoreAsync(signal, candles, ct);
+                    mlScoringStopwatch.Stop();
+                    mlScoringLatencyMs = mlScore.MLModelId.HasValue
+                        ? (int)Math.Min(int.MaxValue, mlScoringStopwatch.ElapsedMilliseconds)
+                        : null;
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception mlEx)
+                {
+                    mlScoringStopwatch.Stop();
+                    _logger.LogError(mlEx,
+                        "Strategy {Id}: ML scorer failed for {Symbol}/{Tf} — suppressing signal (fail-closed); strategy circuit breaker NOT incremented",
+                        strategy.Id, signal.Symbol, strategy.Timeframe);
+
+                    _metrics.SignalsSuppressed.Add(1,
+                        new("symbol", signal.Symbol),
+                        new("reason", "ml_scorer_error"));
+
+                    await strategyMediator.Send(new LogDecisionCommand
+                    {
+                        EntityType   = "TradeSignal",
+                        EntityId     = strategy.Id,
+                        DecisionType = "SignalGeneration",
+                        Outcome      = "Suppressed",
+                        Reason       = $"ML scorer threw {mlEx.GetType().Name}: {mlEx.Message}",
+                        Source       = "StrategyWorker"
+                    }, ct);
+
+                    // Fail-closed: drop the signal. The rule signal is discarded — we never
+                    // send unscored signals downstream. Strategy circuit state is left alone:
+                    // this was an infra/ML failure, not a strategy failure.
+                    return;
+                }
 
                 // ML suppression: when the scorer returns a model ID but null predicted
                 // direction, it means the model actively chose NOT to score (cooldown period,

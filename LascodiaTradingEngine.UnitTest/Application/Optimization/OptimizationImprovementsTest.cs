@@ -132,6 +132,97 @@ public class OptimizationImprovementsTest
         Assert.True(score >= 0m && score <= 1m, $"Score {score} should be in [0, 1]");
     }
 
+    [Fact]
+    public void ComputeHealthScore_RegimeAware_NullRegime_MatchesDefault()
+    {
+        // When no regime is known the regime-aware overload must produce the
+        // same score as the default (regime-neutral) formula, otherwise existing
+        // thresholds calibrated against historical data would drift silently.
+        decimal defaultScore = OptimizationHealthScorer.ComputeHealthScore(
+            winRate: 0.55m, profitFactor: 1.5m, maxDrawdownPct: 8m, sharpeRatio: 1.2m, totalTrades: 40);
+
+        decimal nullRegimeScore = OptimizationHealthScorer.ComputeHealthScore(
+            winRate: 0.55m, profitFactor: 1.5m, maxDrawdownPct: 8m, sharpeRatio: 1.2m, totalTrades: 40,
+            regime: null);
+
+        Assert.Equal(defaultScore, nullRegimeScore);
+    }
+
+    [Fact]
+    public void ComputeHealthScore_Trending_RewardsProfitFactor_OverWinRate()
+    {
+        // A Trending-tuned strategy has low WR but high PF.
+        // Under default weights it looks mediocre; under Trending weights PF dominates
+        // and the score should be measurably higher.
+        decimal defaultScore = OptimizationHealthScorer.ComputeHealthScore(
+            winRate: 0.40m, profitFactor: 3.0m, maxDrawdownPct: 8m, sharpeRatio: 1.5m, totalTrades: 50);
+
+        decimal trendingScore = OptimizationHealthScorer.ComputeHealthScore(
+            winRate: 0.40m, profitFactor: 3.0m, maxDrawdownPct: 8m, sharpeRatio: 1.5m, totalTrades: 50,
+            regime: MarketRegime.Trending);
+
+        Assert.True(trendingScore > defaultScore,
+            $"Trending score {trendingScore} should exceed default {defaultScore} when WR is low and PF is high.");
+    }
+
+    [Fact]
+    public void ComputeHealthScore_Ranging_RewardsWinRate_OverProfitFactor()
+    {
+        // A Ranging mean-reversion strategy has high WR but thin PF.
+        // Under Ranging weights WR dominates and the score should exceed the default.
+        decimal defaultScore = OptimizationHealthScorer.ComputeHealthScore(
+            winRate: 0.75m, profitFactor: 1.1m, maxDrawdownPct: 10m, sharpeRatio: 1.0m, totalTrades: 50);
+
+        decimal rangingScore = OptimizationHealthScorer.ComputeHealthScore(
+            winRate: 0.75m, profitFactor: 1.1m, maxDrawdownPct: 10m, sharpeRatio: 1.0m, totalTrades: 50,
+            regime: MarketRegime.Ranging);
+
+        Assert.True(rangingScore > defaultScore,
+            $"Ranging score {rangingScore} should exceed default {defaultScore} when WR is high and PF is thin.");
+    }
+
+    [Fact]
+    public void ComputeHealthScore_Crisis_PenalisesDrawdown_HeavilierThanDefault()
+    {
+        // Two strategies with identical metrics except drawdown: one safe (DD=5), one risky (DD=18).
+        // In Crisis the penalty on the risky one should be larger than under default weights.
+        decimal riskyDefault = OptimizationHealthScorer.ComputeHealthScore(
+            winRate: 0.55m, profitFactor: 1.5m, maxDrawdownPct: 18m, sharpeRatio: 1.0m, totalTrades: 50);
+        decimal safeDefault = OptimizationHealthScorer.ComputeHealthScore(
+            winRate: 0.55m, profitFactor: 1.5m, maxDrawdownPct: 5m, sharpeRatio: 1.0m, totalTrades: 50);
+
+        decimal riskyCrisis = OptimizationHealthScorer.ComputeHealthScore(
+            winRate: 0.55m, profitFactor: 1.5m, maxDrawdownPct: 18m, sharpeRatio: 1.0m, totalTrades: 50,
+            regime: MarketRegime.Crisis);
+        decimal safeCrisis = OptimizationHealthScorer.ComputeHealthScore(
+            winRate: 0.55m, profitFactor: 1.5m, maxDrawdownPct: 5m, sharpeRatio: 1.0m, totalTrades: 50,
+            regime: MarketRegime.Crisis);
+
+        decimal defaultGap = safeDefault - riskyDefault;
+        decimal crisisGap = safeCrisis - riskyCrisis;
+
+        Assert.True(crisisGap > defaultGap,
+            $"Crisis DD gap {crisisGap} should exceed default DD gap {defaultGap}.");
+    }
+
+    [Fact]
+    public void ComputeHealthScore_AllRegimeWeights_StayWithin_ZeroOne()
+    {
+        // Perfect metrics under every regime must still clamp to <= 1, and zero metrics to >= 0.
+        foreach (MarketRegime regime in Enum.GetValues<MarketRegime>())
+        {
+            decimal perfect = OptimizationHealthScorer.ComputeHealthScore(
+                winRate: 1.0m, profitFactor: 3.0m, maxDrawdownPct: 0m, sharpeRatio: 3.0m, totalTrades: 100,
+                regime: regime);
+            decimal zero = OptimizationHealthScorer.ComputeHealthScore(
+                winRate: 0m, profitFactor: 0m, maxDrawdownPct: 100m, sharpeRatio: 0m, totalTrades: 0,
+                regime: regime);
+
+            Assert.True(perfect >= 0m && perfect <= 1m, $"{regime} perfect score {perfect} out of [0,1]");
+            Assert.True(zero >= 0m && zero <= 1m, $"{regime} zero score {zero} out of [0,1]");
+        }
+    }
+
     // ── 4. OptimizationValidator.ImputeMinorGaps ────────────────────────
 
     [Fact]

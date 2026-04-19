@@ -85,6 +85,7 @@ public class SignalValidatorTest
     public async Task Should_Pass_When_ML_Disagrees_But_Confidence_Is_High()
     {
         var signal = CreateValidBuySignal();
+        signal.MLModelId = 7L;
         signal.MLPredictedDirection = TradeDirection.Sell;
         signal.MLConfidenceScore = 0.90m;
         signal.Confidence = 0.80m; // above default 0.70 threshold
@@ -259,6 +260,7 @@ public class SignalValidatorTest
     public async Task Should_Reject_When_ML_Disagrees_And_Confidence_Below_Threshold()
     {
         var signal = CreateValidBuySignal();
+        signal.MLModelId = 7L;
         signal.MLPredictedDirection = TradeDirection.Sell;
         signal.MLConfidenceScore = 0.90m;
         signal.Confidence = 0.50m; // below default 0.70 threshold
@@ -266,5 +268,65 @@ public class SignalValidatorTest
         var result = await _validator.ValidateAsync(signal, CreateContext(), CancellationToken.None);
         Assert.False(result.Passed);
         Assert.Contains("ML model predicts", result.BlockReason);
+    }
+
+    [Fact]
+    public async Task Should_Pass_When_NoMLModel_Active()
+    {
+        // Case (a): MLModelId null → no ML configured; agreement gate is skipped entirely.
+        var signal = CreateValidBuySignal();
+        signal.MLModelId = null;
+        signal.MLPredictedDirection = null;
+        signal.MLConfidenceScore = null;
+        signal.Confidence = 0.50m; // below override floor, but irrelevant when ML isn't active
+
+        var result = await _validator.ValidateAsync(signal, CreateContext(), CancellationToken.None);
+        Assert.True(result.Passed);
+    }
+
+    [Fact]
+    public async Task Should_Reject_When_MLModel_Active_But_Direction_Missing_And_Low_Confidence()
+    {
+        // Case (c): the scorer attached a model ID but no direction — previously passed silently.
+        // Now fails closed when confidence is below the disagreement-override floor.
+        var signal = CreateValidBuySignal();
+        signal.MLModelId = 42L;
+        signal.MLPredictedDirection = null;
+        signal.MLConfidenceScore = null;
+        signal.Confidence = 0.50m; // below default 0.70 threshold
+
+        var result = await _validator.ValidateAsync(signal, CreateContext(), CancellationToken.None);
+        Assert.False(result.Passed);
+        Assert.Contains("prediction is incomplete", result.BlockReason);
+    }
+
+    [Fact]
+    public async Task Should_Pass_When_MLModel_Active_But_Direction_Missing_With_High_Confidence()
+    {
+        // Case (c) with override: strategy confidence clears the disagreement floor,
+        // so a partial-ML state is tolerated. Matches the existing disagreement-override contract.
+        var signal = CreateValidBuySignal();
+        signal.MLModelId = 42L;
+        signal.MLPredictedDirection = null;
+        signal.MLConfidenceScore = null;
+        signal.Confidence = 0.80m; // above default 0.70
+
+        var result = await _validator.ValidateAsync(signal, CreateContext(), CancellationToken.None);
+        Assert.True(result.Passed);
+    }
+
+    [Fact]
+    public async Task Should_Reject_When_MLModel_Active_And_Confidence_Missing_And_Low_Confidence()
+    {
+        // Edge of case (c): direction present but MLConfidenceScore null — also partial.
+        var signal = CreateValidBuySignal();
+        signal.MLModelId = 42L;
+        signal.MLPredictedDirection = TradeDirection.Buy;
+        signal.MLConfidenceScore = null;
+        signal.Confidence = 0.50m;
+
+        var result = await _validator.ValidateAsync(signal, CreateContext(), CancellationToken.None);
+        Assert.False(result.Passed);
+        Assert.Contains("prediction is incomplete", result.BlockReason);
     }
 }

@@ -3,6 +3,7 @@ using System;
 using LascodiaTradingEngine.Infrastructure.Persistence.DbContexts;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 
@@ -11,9 +12,11 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace LascodiaTradingEngine.Infrastructure.Migrations
 {
     [DbContext(typeof(WriteApplicationDbContext))]
-    partial class WriteApplicationDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260419223834_AddPortfolioWeightSnapshot")]
+    partial class AddPortfolioWeightSnapshot
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -4783,9 +4786,6 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                         .HasPrecision(18, 2)
                         .HasColumnType("numeric(18,2)");
 
-                    b.Property<int>("Generation")
-                        .HasColumnType("integer");
-
                     b.Property<string>("GenerationCandidateId")
                         .HasColumnType("text");
 
@@ -4817,9 +4817,6 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     b.Property<string>("ParametersJson")
                         .IsRequired()
                         .HasColumnType("text");
-
-                    b.Property<long?>("ParentStrategyId")
-                        .HasColumnType("bigint");
 
                     b.Property<string>("PauseReason")
                         .HasColumnType("text");

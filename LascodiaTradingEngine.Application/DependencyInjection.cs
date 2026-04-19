@@ -158,6 +158,24 @@ public static class DependencyInjection
         // backtest-trade proxy. Router is [RegisterService]-auto-wired.
         services.AddHostedService<PaperExecutionMonitorWorker>();
 
+        // ── ML model auto-rollback ─────────────────────────────────────────────
+        // Live-degradation reactor: on detected calibration drift / accuracy floor /
+        // retrain-failure breach, swaps the failing active model for its
+        // PreviousChampionModelId fallback. Closes the loop drift workers opened.
+        services.AddHostedService<MLModelAutoRollbackWorker>();
+
+        // ── Portfolio-level optimisation (daily Kelly / HRP) ───────────────────
+        // Computes per-strategy allocation weights from realised returns and
+        // persists them as PortfolioWeightSnapshot rows. Position sizing reads
+        // the latest snapshot per strategy.
+        services.AddHostedService<PortfolioOptimizationWorker>();
+
+        // ── Evolutionary strategy generator (daily) ────────────────────────────
+        // Mutates the highest-Sharpe Active/Approved strategies and feeds the
+        // offspring into the standard screening pipeline. Closes the loop where
+        // generation could only ever produce template-driven candidates.
+        services.AddHostedService<EvolutionaryGeneratorWorker>();
+
         // ── Promotion Gate Validator ───────────────────────────────────────────
         // Hard gate between Approved → Active. Enforces DSR, PBO-proxy, TCA-adjusted
         // EV, paper-trade duration, regime-coverage proxy, and max-correlation checks.

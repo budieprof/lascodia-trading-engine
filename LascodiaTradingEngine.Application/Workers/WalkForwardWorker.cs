@@ -411,6 +411,36 @@ public class WalkForwardWorker : BackgroundService
                         }));
                 }
 
+                // Per-fold minimum day guards. Positive-only checks above don't prevent tiny
+                // folds (e.g. 5-day IS / 2-day OOS) from producing unreliable CV stddev even
+                // when the 3-window minimum is met. Both minimums are configurable via
+                // WalkForward:MinInSampleDays / :MinOutOfSampleDays.
+                if (run.InSampleDays < settings.MinInSampleDays)
+                {
+                    throw new ValidationRunException(
+                        ValidationRunFailureCodes.InvalidWindow,
+                        $"In-sample window of {run.InSampleDays} days is below the minimum of {settings.MinInSampleDays}.",
+                        failureDetailsJson: ValidationRunException.SerializeDetails(new
+                        {
+                            run.Id,
+                            run.InSampleDays,
+                            settings.MinInSampleDays
+                        }));
+                }
+
+                if (run.OutOfSampleDays < settings.MinOutOfSampleDays)
+                {
+                    throw new ValidationRunException(
+                        ValidationRunFailureCodes.InvalidWindow,
+                        $"Out-of-sample window of {run.OutOfSampleDays} days is below the minimum of {settings.MinOutOfSampleDays}.",
+                        failureDetailsJson: ValidationRunException.SerializeDetails(new
+                        {
+                            run.Id,
+                            run.OutOfSampleDays,
+                            settings.MinOutOfSampleDays
+                        }));
+                }
+
                 var allCandles = await db.Set<Candle>()
                     .Where(candle =>
                         candle.Symbol == run.Symbol &&
@@ -506,6 +536,27 @@ public class WalkForwardWorker : BackgroundService
                         continue;
                     }
 
+                    // Per-fold candle floor: indicator warmup needs a minimum to produce a
+                    // meaningful backtest. Below the threshold we reject the whole run rather
+                    // than quietly skipping the fold and pretending the CV is based on 3+
+                    // reliable scores.
+                    if (inSampleCandles.Count < settings.MinCandlesPerFold ||
+                        oosCandles.Count < settings.MinCandlesPerFold)
+                    {
+                        throw new ValidationRunException(
+                            ValidationRunFailureCodes.InvalidWindow,
+                            $"Walk-forward fold {windowIndex} has too few candles " +
+                            $"(IS={inSampleCandles.Count}, OOS={oosCandles.Count}, min={settings.MinCandlesPerFold}).",
+                            failureDetailsJson: ValidationRunException.SerializeDetails(new
+                            {
+                                run.Id,
+                                WindowIndex = windowIndex,
+                                InSampleCandles = inSampleCandles.Count,
+                                OutOfSampleCandles = oosCandles.Count,
+                                settings.MinCandlesPerFold
+                            }));
+                    }
+
                     Strategy evalStrategy = baseStrategyForRun;
                     if (run.ReOptimizePerFold
                         && string.IsNullOrWhiteSpace(run.ParametersSnapshotJson)
@@ -532,6 +583,26 @@ public class WalkForwardWorker : BackgroundService
                         run.InitialBalance,
                         ct,
                         backtestOptions);
+
+                    // Per-fold trade floor: a Sharpe computed on fewer than MinTradesPerFold
+                    // trades has very wide confidence intervals and should not be averaged into
+                    // the cross-fold CV. MinTradesPerFold = 0 disables this gate for backfill/
+                    // smoke-test runs; the default (5) is a pragmatic floor that excludes
+                    // degenerate folds without blocking genuinely low-turnover strategies.
+                    if (settings.MinTradesPerFold > 0 && oosResult.TotalTrades < settings.MinTradesPerFold)
+                    {
+                        throw new ValidationRunException(
+                            ValidationRunFailureCodes.InvalidWindow,
+                            $"Walk-forward fold {windowIndex} produced {oosResult.TotalTrades} OOS trades " +
+                            $"(min={settings.MinTradesPerFold}). Sharpe on this fold is unreliable.",
+                            failureDetailsJson: ValidationRunException.SerializeDetails(new
+                            {
+                                run.Id,
+                                WindowIndex = windowIndex,
+                                OosTrades = oosResult.TotalTrades,
+                                settings.MinTradesPerFold
+                            }));
+                    }
 
                     windowResults.Add(new WindowResult
                     {

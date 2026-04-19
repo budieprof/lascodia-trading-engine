@@ -40,9 +40,13 @@ namespace LascodiaTradingEngine.Application.Workers;
 ///   <item><description>Simplified Sharpe ratio (mean PnL / stddev PnL, unannualised)</description></item>
 ///   <item><description>Max peak-to-trough drawdown on the cumulative PnL series</description></item>
 ///   <item><description>
-///     <b>Health score</b>: composite score in [0, 1] computed as
+///     <b>Health score</b>: composite score in [0, 1] with regime-aware weights.
+///     Default (regime-neutral) formula:
 ///     <c>0.25×WinRate + 0.20×min(1, PF/2) + 0.20×max(0, 1−DD/20) + 0.15×min(1, max(0, Sharpe)/2) + 0.20×min(1, Trades/50)</c>.
 ///     Five factors: edge (win rate), reward-risk ratio, drawdown resilience, consistency (Sharpe), and sample size.
+///     When the latest classified regime for the strategy's symbol/timeframe is known, the weight vector is
+///     rebalanced to favour the factor that matters most in that regime (e.g. PF in Trending, DD in Crisis).
+///     See <c>Optimization.OptimizationHealthScorer.RegimeWeights</c> for the full table.
 ///   </description></item>
 /// </list>
 /// </para>
@@ -288,15 +292,14 @@ public class StrategyHealthWorker : BackgroundService
     /// </para>
     ///
     /// <para>
-    /// <b>Health score formula (5-factor, aligned with OptimizationHealthScorer):</b>
-    /// <c>HealthScore = 0.25×WinRate + 0.20×min(1, PF/2) + 0.20×max(0, 1−DD/20) + 0.15×min(1, max(0, Sharpe)/2) + 0.20×min(1, Trades/50)</c>
-    /// <list type="bullet">
-    ///   <item><description>Win rate (25 %): rewards strategies that win more often than they lose.</description></item>
-    ///   <item><description>Profit factor (20 %): normalised by dividing by 2; a PF of 2.0+ contributes the full 0.20.</description></item>
-    ///   <item><description>Drawdown (20 %): penalises deep drawdowns; zero contribution at 20 % drawdown.</description></item>
-    ///   <item><description>Sharpe (15 %): rewards consistency of returns; capped at Sharpe = 2.0.</description></item>
-    ///   <item><description>Sample size (20 %): penalises too-few-trades — reaches full contribution at 50 trades.</description></item>
-    /// </list>
+    /// <b>Health score formula (5-factor, regime-aware):</b>
+    /// Default (regime-neutral) weights: WR 25 %, PF 20 %, DD 20 %, Sharpe 15 %, N 20 %. Normalisers:
+    /// PF is divided by 2 and capped at 1; DD is mapped to <c>max(0, 1 − DD/20)</c> so 20 % drawdown
+    /// contributes zero; Sharpe is clamped to [0, 2] and divided by 2; sample size reaches full
+    /// contribution at 50 trades. The worker looks up the latest classified regime for the strategy's
+    /// symbol/timeframe and delegates to
+    /// <c>Optimization.OptimizationHealthScorer.ComputeHealthScore(..., regime)</c>, which applies
+    /// regime-specific weights (see <c>RegimeWeights</c>).
     /// </para>
     ///
     /// <para>
@@ -427,24 +430,12 @@ public class StrategyHealthWorker : BackgroundService
 
         decimal totalPnL = pnlList.Sum();
 
-        // ── Health score (5-factor, aligned with OptimizationWorker) ─────────
-        // Formula: 0.25*WinRate + 0.20*min(1, PF/2) + 0.20*max(0, 1 - DD/20) + 0.15*min(1, max(0, Sharpe)/2) + 0.20*min(1, Trades/50)
-        //   Win rate (25%): rewards strategies that win more often than they lose.
-        //   Profit factor (20%): rewards strategies with a high reward-risk ratio.
-        //   Drawdown (20%): penalises deep drawdowns; zero contribution at 20%.
-        //   Sharpe (15%): rewards consistency of returns; capped at Sharpe = 2.0.
-        //   Sample size (20%): penalises too-few-trades — noise vs edge.
-        decimal healthScore = Optimization.OptimizationHealthScorer.ComputeHealthScore(winRate, profitFactor, maxDrawdown, sharpe, totalTrades);
-
-        // Classify into three bands used to drive automated responses.
-        StrategyHealthStatus healthStatus = healthScore >= healthyThreshold ? StrategyHealthStatus.Healthy
-            : healthScore >= criticalThreshold ? StrategyHealthStatus.Degrading
-            : StrategyHealthStatus.Critical;
-
         // Pull the latest classified regime for this symbol+timeframe so the
-        // regime-stratified promotion gate can later count distinct regimes
-        // over the snapshot history. Falls through to null if no regime snapshot
-        // has been captured yet — the gate treats nullable regime as unknown.
+        // health score can be weighted to match the regime. The same value is
+        // stored on the snapshot for the regime-stratified promotion gate.
+        // Falls through to null if no regime snapshot has been captured yet —
+        // downstream consumers treat null as "unknown" and scoring falls back
+        // to the regime-neutral default weights.
         var latestRegime = await writeContext.GetDbContext()
             .Set<MarketRegimeSnapshot>()
             .AsNoTracking()
@@ -454,6 +445,20 @@ public class StrategyHealthWorker : BackgroundService
             .OrderByDescending(r => r.DetectedAt)
             .Select(r => (LascodiaTradingEngine.Domain.Enums.MarketRegime?)r.Regime)
             .FirstOrDefaultAsync(ct);
+
+        // ── Health score (5-factor, regime-aware) ─────────────────────────────
+        // Default weights: 0.25*WR + 0.20*min(1, PF/2) + 0.20*max(0, 1 - DD/20) + 0.15*min(1, max(0, Sharpe)/2) + 0.20*min(1, N/50).
+        // With a regime, the weight vector rebalances (e.g. Trending weights PF higher, Crisis weights DD higher).
+        // See OptimizationHealthScorer.RegimeWeights for the full table. Bootstrap/permutation analyses
+        // continue to use the regime-neutral overload because they test trade-stream statistics, not live
+        // suitability.
+        decimal healthScore = Optimization.OptimizationHealthScorer.ComputeHealthScore(
+            winRate, profitFactor, maxDrawdown, sharpe, totalTrades, latestRegime);
+
+        // Classify into three bands used to drive automated responses.
+        StrategyHealthStatus healthStatus = healthScore >= healthyThreshold ? StrategyHealthStatus.Healthy
+            : healthScore >= criticalThreshold ? StrategyHealthStatus.Degrading
+            : StrategyHealthStatus.Critical;
 
         // Persist the snapshot for dashboard queries and StrategyFeedbackWorker
         // consecutive-degrading detection.
