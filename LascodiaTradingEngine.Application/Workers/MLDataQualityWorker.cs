@@ -235,7 +235,13 @@ public sealed class MLDataQualityWorker : BackgroundService
 
             if (secondsSinceLast > gapThreshold)
             {
-                _logger.LogWarning(
+                // Logged at Debug for the same reason stale-live-price was downgraded —
+                // MLFeatureDataFreshnessWorker and PriceCacheFreshnessCheck already surface
+                // the underlying data-feed-stale condition to operators. The per-symbol-per-
+                // timeframe Warning from this worker was producing ~100/30min of redundant
+                // output during EA outages. The DB alert row below still fires so downstream
+                // alerting is unchanged.
+                _logger.LogDebug(
                     "DataQuality: {Symbol}/{Tf} — CANDLE GAP: {S:F0}s since last bar (threshold {G:F0}s).",
                     symbol, timeframe, secondsSinceLast, gapThreshold);
 
