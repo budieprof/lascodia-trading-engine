@@ -20,7 +20,7 @@ dotnet ef migrations add <Name> --project LascodiaTradingEngine.Infrastructure/ 
 
 ## Architecture
 
-Enterprise autonomous algorithmic trading engine. **Clean Architecture + CQRS** on **.NET 10**. Autonomous strategy discovery (14-gate pipeline), ML-driven scoring (12 learner architectures), Bayesian optimization (TPE/GP-UCB/EHVI + Hyperband), real-time data via MQL5 EA (JWT TCP bridge + REST), backtesting, 3-level walk-forward with terminal embargo, 5-layer defense-in-depth risk, regime-aware adaptation (rule+HMM), smart order routing (TWAP/VWAP), signal-level A/B (SPRT on P&L). Orchestrated via **147 background workers** and an event-driven bus. ~230k LOC, 1,645 unit tests.
+Enterprise autonomous algorithmic trading engine. **Clean Architecture + CQRS** on **.NET 10**. Autonomous strategy discovery (12-gate screening pipeline — see `StrategyScreeningEngine`), plus a distinct 14-gate approval policy for optimization candidates in `OptimizationSearchEngine`. ML-driven scoring (12 learner architectures), Bayesian optimization (TPE/GP-UCB/EHVI + Hyperband), real-time data via MQL5 EA (JWT TCP bridge + REST), backtesting, 3-level walk-forward with terminal embargo, 5-layer defense-in-depth risk, regime-aware adaptation (rule+HMM), smart order routing (TWAP/VWAP), signal-level A/B (SPRT on P&L). Orchestrated via **147 background workers** and an event-driven bus. ~230k LOC, 1,645 unit tests.
 
 **Key ADRs:** see `docs/adr/` (12 ADRs).
 
@@ -229,7 +229,7 @@ Flow: `StrategyWorker` → signal → `SignalOrderBridgeWorker` (Tier 1) → EA/
 
 ## Key Patterns & Rules
 
-- **No manual gates.** Engine is fully autonomous. Never introduce manual approval workflows, four-eyes gates, or synchronous human-in-the-loop. Oversight is via monitoring, alerts, risk limits, circuit breakers, kill switches.
+- **No manual gates for auto-generated strategies.** Engine is fully autonomous for strategies produced by the generation / optimization pipeline. Never introduce manual approval workflows, four-eyes gates, or synchronous human-in-the-loop on that path. Oversight is via monitoring, alerts, risk limits, circuit breakers, kill switches. The one retained human path is `ActivateStrategyCommand` + `IPromotionGateValidator` for **human-introduced** strategies (operator-created, imported from research notebooks, etc.); `StrategyPromotionWorker` enforces this boundary via `StrategyPromotion:AutoActivateEnabled` (default true) — auto-generated strategies whose name starts with `Auto-` bypass the gate; others still must pass it.
 - **Soft delete.** All entities have `IsDeleted`; EF global filters exclude automatically.
 - **Pagination.** List queries → `PagerRequest` in, `Pager<TDto>` out.
 - **Event bus.** After successful writes, publish the relevant `IntegrationEvent`.
