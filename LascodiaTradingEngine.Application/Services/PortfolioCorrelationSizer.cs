@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Attributes;
@@ -32,12 +33,15 @@ public sealed class PortfolioCorrelationSizer
 {
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<PortfolioCorrelationSizer> _logger;
+    private readonly IMemoryCache _cache;
 
     public PortfolioCorrelationSizer(
         IServiceScopeFactory scopeFactory,
+        IMemoryCache cache,
         ILogger<PortfolioCorrelationSizer> logger)
     {
         _scopeFactory = scopeFactory;
+        _cache        = cache;
         _logger       = logger;
     }
 
@@ -82,7 +86,8 @@ public sealed class PortfolioCorrelationSizer
                 if (string.Equals(open.Symbol, newSymbol, StringComparison.OrdinalIgnoreCase))
                     totalCorrelation += 1.0;       // same pair = perfect correlation
                 else
-                    totalCorrelation += HeuristicCorrelation(newSymbol, open.Symbol);
+                    totalCorrelation += await GetHistoricalCorrelationAsync(
+                        readCtx.GetDbContext(), newSymbol, open.Symbol, ct);
             }
 
             if (totalCorrelation <= 0.0)
@@ -97,6 +102,94 @@ public sealed class PortfolioCorrelationSizer
             _logger.LogDebug(ex, "PortfolioCorrelationSizer: failed for {Sym}/{Dir} — returning 1.0", newSymbol, newDirection);
             return 1.0m;
         }
+    }
+
+    /// <summary>
+    /// Returns the Pearson correlation of daily returns over the last 60 trading days,
+    /// cached for 12 hours per ordered-symbol pair. Falls back to the currency-code
+    /// heuristic when history is missing or degenerate. This is strictly better than
+    /// the heuristic across G10 FX: actual co-movement captures regime-conditional
+    /// relationships the currency-code view can't model (e.g. EURUSD vs AUDUSD's
+    /// risk-on correlation weakens during rate-cycle divergence).
+    /// </summary>
+    private async Task<double> GetHistoricalCorrelationAsync(
+        DbContext db, string symbolA, string symbolB, CancellationToken ct)
+    {
+        // Canonical cache key so ρ(A,B) and ρ(B,A) share one slot.
+        string low  = string.CompareOrdinal(symbolA, symbolB) < 0 ? symbolA : symbolB;
+        string high = string.CompareOrdinal(symbolA, symbolB) < 0 ? symbolB : symbolA;
+        string key  = $"PortfolioCorrel:D1:60:{low}:{high}";
+
+        if (_cache.TryGetValue<double>(key, out var cached))
+            return cached;
+
+        try
+        {
+            double? rho = await ComputePearsonAsync(db, low, high, 60, ct);
+            double value = rho ?? HeuristicCorrelation(symbolA, symbolB);
+            _cache.Set(key, value, TimeSpan.FromHours(12));
+            return value;
+        }
+        catch
+        {
+            double fallback = HeuristicCorrelation(symbolA, symbolB);
+            _cache.Set(key, fallback, TimeSpan.FromMinutes(30)); // shorter TTL on error
+            return fallback;
+        }
+    }
+
+    private static async Task<double?> ComputePearsonAsync(
+        DbContext db, string a, string b, int daysNeeded, CancellationToken ct)
+    {
+        var cutoff = DateTime.UtcNow.AddDays(-(daysNeeded * 2));   // over-fetch for weekends
+        var rows = await db.Set<Candle>()
+            .AsNoTracking()
+            .Where(c => (c.Symbol == a || c.Symbol == b)
+                     && c.Timeframe == Timeframe.D1
+                     && c.IsClosed
+                     && !c.IsDeleted
+                     && c.Timestamp >= cutoff)
+            .OrderBy(c => c.Timestamp)
+            .Select(c => new { c.Symbol, c.Timestamp, c.Close })
+            .ToListAsync(ct);
+
+        var byDay = rows.GroupBy(r => r.Timestamp.Date)
+                        .Where(g => g.Count() == 2)
+                        .OrderBy(g => g.Key)
+                        .ToList();
+        if (byDay.Count < 20) return null;
+
+        var retA = new List<double>(byDay.Count);
+        var retB = new List<double>(byDay.Count);
+        decimal? prevA = null, prevB = null;
+        foreach (var g in byDay)
+        {
+            var closeA = (decimal)g.First(r => r.Symbol == a).Close;
+            var closeB = (decimal)g.First(r => r.Symbol == b).Close;
+            if (prevA.HasValue && prevA.Value != 0m && prevB.HasValue && prevB.Value != 0m)
+            {
+                retA.Add((double)((closeA - prevA.Value) / prevA.Value));
+                retB.Add((double)((closeB - prevB.Value) / prevB.Value));
+            }
+            prevA = closeA;
+            prevB = closeB;
+        }
+        if (retA.Count < 20) return null;
+
+        double meanA = retA.Average();
+        double meanB = retB.Average();
+        double num = 0, denomA = 0, denomB = 0;
+        for (int i = 0; i < retA.Count; i++)
+        {
+            double dA = retA[i] - meanA;
+            double dB = retB[i] - meanB;
+            num    += dA * dB;
+            denomA += dA * dA;
+            denomB += dB * dB;
+        }
+        if (denomA <= 0 || denomB <= 0) return null;
+        double rho = num / Math.Sqrt(denomA * denomB);
+        return Math.Clamp(rho, -1.0, 1.0);
     }
 
     /// <summary>

@@ -23,6 +23,15 @@ services:
 
   postgres:
     image: postgres:17-alpine
+    # Raise max_connections well above the combined Npgsql pool ceiling
+    # (Write pool 200 + Read pool 200 = 400, plus superuser reserve and
+    # pg_stat headroom). Default is 100, which caused 53300 "too many
+    # clients already" under 135 background workers + EA + migrations.
+    # shared_buffers tuned conservatively for Dev; revisit for prod sizing.
+    command: >
+      postgres
+      -c max_connections=500
+      -c shared_buffers=256MB
     ports:
       - "5432:5432"
     environment:

@@ -154,7 +154,7 @@ public class StrategyWorkerTest : IDisposable
             new SignalConflictResolver(new Mock<ILogger<SignalConflictResolver>>().Object),
             new RegimeCoherenceChecker(_mockScopeFactory.Object, memoryCache, new Mock<ILogger<RegimeCoherenceChecker>>().Object),
             new DrawdownRecoveryModeProvider(_mockScopeFactory.Object, memoryCache),
-            new PortfolioCorrelationSizer(_mockScopeFactory.Object, new Mock<ILogger<PortfolioCorrelationSizer>>().Object));
+            new PortfolioCorrelationSizer(_mockScopeFactory.Object, memoryCache, new Mock<ILogger<PortfolioCorrelationSizer>>().Object));
     }
 
     public void Dispose() => _meterFactory.Dispose();

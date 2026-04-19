@@ -136,6 +136,7 @@ public sealed class MLTrainingWorker : BackgroundService
     private const string CK_MaxEce                     = "MLTraining:MaxEce";
     private const string CK_UseTripleBarrier           = "MLTraining:UseTripleBarrier";
     private const string CK_UseExtendedFeatureVector   = "MLTraining:UseExtendedFeatureVector";
+    private const string CK_UseEventFeatureVector      = "MLTraining:UseEventFeatureVector";
     private const string CK_StarvationDeadline         = "MLTraining:StarvationDeadlineMinutes";
     private const string CK_TripleBarrierProfitAtrMult = "MLTraining:TripleBarrierProfitAtrMult";
     private const string CK_TripleBarrierStopAtrMult   = "MLTraining:TripleBarrierStopAtrMult";
@@ -766,6 +767,12 @@ public sealed class MLTrainingWorker : BackgroundService
             // opt out via MLTraining:UseExtendedFeatureVector=false.
             bool useExtendedVector = await GetConfigAsync<bool>(
                 ctx, CK_UseExtendedFeatureVector, true, stoppingToken);
+            // V3 adds cross-asset (DXY/US10Y/VIX) + event-proximity features on top of V2.
+            // Off by default because V3 expects DXY/US10Y/VIX candles to be ingested; zero-fill
+            // when missing still produces a valid vector but sacrifices the signal quality
+            // that motivated the extension.
+            bool useEventFeatureVector = await GetConfigAsync<bool>(
+                ctx, CK_UseEventFeatureVector, false, stoppingToken);
 
             Dictionary<string, (DateTime[] Times, double[] Closes)>? basket = null;
             if (useExtendedVector && candles.Count > 0)
@@ -806,11 +813,15 @@ public sealed class MLTrainingWorker : BackgroundService
                     run.Id, basket.Count, rawBasket.Count, windowStart, windowEnd);
             }
 
-            // Cost-baked labelling: derive a per-pair cost buffer (in price units) from
-            // the symbol's DecimalPlaces and a conservative "typical round-trip friction"
-            // estimate of 3 pips. This shifts the profit-target barrier up by cost, so a
-            // label=1 means the trade would have cleared its friction floor, not just
-            // moved in the favourable direction. Zero cost preserves legacy behaviour.
+            // Cost-baked labelling: derive a precise per-pair cost buffer from the symbol's
+            // actual spread and screening cost config rather than a flat 3-pip default.
+            //   buffer = spread_price_units + slippage_price_units + commission_per_pip_equiv
+            // Each component:
+            //   spread   = pair.SpreadPoints × pointSize  (configured pair spread in price)
+            //   slippage = 2 × pointSize                   (fixed small friction)
+            //   commission = $7/lot / ($10/pip) × pipSize  (rough pip equivalent for standard FX)
+            // This makes labels represent net-profit-after-actual-costs rather than a
+            // conservative constant. Zero-buffer fallback preserves legacy behaviour.
             float costBufferPriceUnits = 0f;
             try
             {
@@ -821,14 +832,65 @@ public sealed class MLTrainingWorker : BackgroundService
                 if (pairInfo is not null && pairInfo.DecimalPlaces > 0)
                 {
                     double pointSize = 1.0 / Math.Pow(10, pairInfo.DecimalPlaces);
-                    double pipSize   = pointSize * 10.0;      // 4-decimal USD pair: 0.0001; 3-decimal JPY: 0.01
-                    costBufferPriceUnits = (float)(pipSize * 3.0);  // 3-pip round-trip friction buffer
+                    double pipSize   = pointSize * 10.0;
+                    double spreadPriceUnits     = (pairInfo.SpreadPoints > 0 ? pairInfo.SpreadPoints : 20.0) * pointSize;
+                    double slippagePriceUnits   = 2.0 * pointSize;
+                    double commissionPipEquiv   = 0.7 * pipSize; // $7/lot ≈ 0.7 pips on standard FX
+                    costBufferPriceUnits = (float)(spreadPriceUnits + slippagePriceUnits + commissionPipEquiv);
                 }
             }
             catch { /* best-effort; legacy zero-cost label if metadata missing */ }
 
             List<TrainingSample> samples;
-            if (useExtendedVector && basket is not null && basket.Count >= 5)
+            if (useEventFeatureVector && useExtendedVector && basket is not null && basket.Count >= 5
+                && hp.UseTripleBarrier && candles.Count > 0)
+            {
+                // Pre-load cross-asset + event series for the training window so the
+                // per-bar lookups are in-memory O(log N) rather than N DB hits.
+                var crossAssetProvider = sp.GetRequiredService<global::LascodiaTradingEngine.Application.Services.ML.CrossAssetFeatureProvider>();
+                var eventProvider      = sp.GetRequiredService<global::LascodiaTradingEngine.Application.Services.ML.EconomicEventFeatureProvider>();
+
+                var eventLookup = await eventProvider.LoadForSymbolAsync(
+                    run.Symbol,
+                    candles[0].Timestamp,
+                    candles[^1].Timestamp,
+                    stoppingToken);
+
+                // Cross-asset currently fetches fresh per-timestamp. Cache per-day so the
+                // training loop doesn't issue thousands of DB hits for the same D1 bar.
+                var crossAssetCache = new Dictionary<DateTime, global::LascodiaTradingEngine.Application.Services.ML.CrossAssetSnapshot>();
+                async Task<global::LascodiaTradingEngine.Application.Services.ML.CrossAssetSnapshot> CrossAssetAsOf(DateTime ts)
+                {
+                    var day = new DateTime(ts.Year, ts.Month, ts.Day, 0, 0, 0, DateTimeKind.Utc);
+                    if (!crossAssetCache.TryGetValue(day, out var snap))
+                    {
+                        snap = await crossAssetProvider.GetAsync(day, stoppingToken);
+                        crossAssetCache[day] = snap;
+                    }
+                    return snap;
+                }
+
+                // Prewarm the cache for every distinct D1 in the window (one pass = bounded
+                // DB hits) so the training hot loop becomes fully in-memory.
+                foreach (var c in candles)
+                    _ = await CrossAssetAsOf(c.Timestamp);
+
+                samples = MLFeatureHelper.BuildTrainingSamplesWithTripleBarrierV3(
+                    candles, run.Symbol, basket,
+                    ts => crossAssetCache.TryGetValue(
+                        new DateTime(ts.Year, ts.Month, ts.Day, 0, 0, 0, DateTimeKind.Utc),
+                        out var s) ? s : default,
+                    eventLookup.SnapshotAt,
+                    CotLookup,
+                    (float)hp.TripleBarrierProfitAtrMult,
+                    (float)hp.TripleBarrierStopAtrMult,
+                    hp.TripleBarrierHorizonBars,
+                    costBufferPriceUnits);
+                _logger.LogInformation(
+                    "Built {Samples} V3 training samples (features={Feat}, costBuffer={Buf:F5})",
+                    samples.Count, MLFeatureHelper.FeatureCountV3, costBufferPriceUnits);
+            }
+            else if (useExtendedVector && basket is not null && basket.Count >= 5)
             {
                 samples = hp.UseTripleBarrier
                     ? MLFeatureHelper.BuildTrainingSamplesWithTripleBarrierV2(

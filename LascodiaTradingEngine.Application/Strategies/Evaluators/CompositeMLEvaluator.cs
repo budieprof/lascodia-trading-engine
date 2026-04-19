@@ -308,6 +308,43 @@ public class CompositeMLEvaluator : IStrategyEvaluator
             }
         }
 
+        // ── 4c. V3 dispatch: cross-asset + event features appended to V2 ───────
+        if (expectedFeatures == MLFeatureHelper.FeatureCountV3 &&
+            features.Length == MLFeatureHelper.FeatureCountV2)
+        {
+            var v3 = new float[MLFeatureHelper.FeatureCountV3];
+            Array.Copy(features, v3, features.Length);
+            try
+            {
+                var asOfDay = new DateTime(currentCandle.Timestamp.Year, currentCandle.Timestamp.Month, currentCandle.Timestamp.Day, 0, 0, 0, DateTimeKind.Utc);
+                using var v3Scope = _scopeFactory.CreateScope();
+                var crossProvider = v3Scope.ServiceProvider.GetRequiredService<
+                    global::LascodiaTradingEngine.Application.Services.ML.CrossAssetFeatureProvider>();
+                var eventProvider = v3Scope.ServiceProvider.GetRequiredService<
+                    global::LascodiaTradingEngine.Application.Services.ML.EconomicEventFeatureProvider>();
+
+                var crossAsset = await crossProvider.GetAsync(asOfDay, cancellationToken);
+                var eventLookup = await eventProvider.LoadForSymbolAsync(
+                    strategy.Symbol, asOfDay.AddDays(-1), asOfDay.AddDays(1), cancellationToken);
+                var eventSnap = eventLookup.SnapshotAt(currentCandle.Timestamp);
+
+                static float S(float v) => float.IsNaN(v) || float.IsInfinity(v) ? 0f : Math.Clamp(v, -5f, 5f);
+                v3[MLFeatureHelper.FeatureCountV2 + 0] = S(crossAsset.DxyReturn5d);
+                v3[MLFeatureHelper.FeatureCountV2 + 1] = S(crossAsset.Us10YYieldChange5d);
+                v3[MLFeatureHelper.FeatureCountV2 + 2] = S(crossAsset.VixLevelNormalized);
+                v3[MLFeatureHelper.FeatureCountV2 + 3] = S(eventSnap.HoursToNextHighNormalized);
+                v3[MLFeatureHelper.FeatureCountV2 + 4] = S(eventSnap.HoursSinceLastHighNormalized);
+                v3[MLFeatureHelper.FeatureCountV2 + 5] = S(eventSnap.HighMedPending6hNormalized);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "V3 cross-asset/event load failed for {Symbol} model {ModelId} — zero-padding",
+                    strategy.Symbol, model.Id);
+            }
+            features = v3;
+        }
+
         // ── 5. Resolve inference engine ────────────────────────────────────────
         var engine = ResolveInferenceEngine(snapshot);
         if (engine is null)

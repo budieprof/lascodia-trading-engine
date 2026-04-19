@@ -31,6 +31,28 @@ public static class MLFeatureHelper
     /// </summary>
     public const int FeatureCountV2 = 37;
 
+    /// <summary>
+    /// V3 vector length: 37 V2 features + 3 cross-asset slots (DxyReturn5d,
+    /// Us10YYieldChange5d, VixLevelNormalized) + 3 event-proximity slots
+    /// (HoursToNextHighNorm, HoursSinceLastHighNorm, HighMedPending6hNorm). The
+    /// 6 new features are populated point-in-time; NaN/missing slots zero-fill.
+    /// Enabled via <c>MLTraining:UseEventFeatureVector=true</c>; inference dispatch
+    /// in <c>CompositeMLEvaluator</c> and <c>MLSignalScorer</c> routes on
+    /// <c>snapshot.ExpectedInputFeatures == FeatureCountV3</c>.
+    /// </summary>
+    public const int FeatureCountV3 = 43;
+
+    /// <summary>Names of the 6 new V3 features appended after the V2 slots, in order.</summary>
+    public static readonly string[] V3FeatureNames =
+    [
+        "DxyReturn5d",
+        "Us10YYieldChange5d",
+        "VixLevelNormalized",
+        "HoursToNextHighImpactNorm",
+        "HoursSinceLastHighImpactNorm",
+        "HighMedPendingNext6hNorm",
+    ];
+
     /// <summary>Names of the 4 macro features appended in the V2 vector, in order.</summary>
     public static readonly string[] MacroV2FeatureNames =
     [
@@ -4063,6 +4085,130 @@ public static class MLFeatureHelper
             var cotEntry = cotLookup?.Invoke(current.Timestamp) ?? CotFeatureEntry.Zero;
             var slice = global::LascodiaTradingEngine.Application.Services.ML.MacroFeatureCalculator.SliceBasketAsOf(fullBasket, current.Timestamp);
             var features = BuildFeatureVectorV2(window, current, prev, slice, symbol, cotEntry);
+
+            float atr = (float)CalculateATR(window, 14);
+            if (atr <= 0f)
+            {
+                int fallbackDir = candles[i + 1].Close > candles[i].Close ? 1 : 0;
+                samples.Add(new TrainingSample(features, fallbackDir, 0f));
+                continue;
+            }
+
+            float profitTarget = atr * profitAtrMult + costBufferPriceUnits;
+            float stopLoss     = atr * stopAtrMult;
+            float entry        = (float)current.Close;
+
+            int   label     = 0;
+            float magnitude = 0f;
+
+            int maxLook = Math.Min(i + 1 + horizonBars, candles.Count);
+            for (int j = i + 1; j < maxLook; j++)
+            {
+                float hi = (float)candles[j].High;
+                float lo = (float)candles[j].Low;
+
+                bool profitHit = hi - entry >= profitTarget;
+                bool stopHit   = entry - lo  >= stopLoss;
+
+                if (profitHit && stopHit)
+                {
+                    label = 1;
+                    magnitude = Clamp(profitTarget / atr, -5f, 5f);
+                    break;
+                }
+                if (profitHit)
+                {
+                    label = 1;
+                    magnitude = Clamp((hi - entry) / atr, -5f, 5f);
+                    break;
+                }
+                if (stopHit)
+                {
+                    label = 0;
+                    magnitude = Clamp((lo - entry) / atr, -5f, 5f);
+                    break;
+                }
+            }
+
+            if (label == 0 && magnitude == 0f && maxLook > i + 1)
+            {
+                float exitClose = (float)candles[maxLook - 1].Close;
+                magnitude = Clamp((exitClose - entry) / atr, -5f, 5f);
+                label     = exitClose > entry ? 1 : 0;
+            }
+
+            samples.Add(new TrainingSample(features, label, magnitude));
+        }
+
+        return samples;
+    }
+
+    // ── V3: cross-asset + event-proximity extensions over V2 ─────────────────
+
+    /// <summary>
+    /// Builds the 43-element V3 feature vector: V2 37 features + 3 cross-asset
+    /// scalars (DxyReturn5d, Us10YYieldChange5d, VixLevelNormalized) + 3 event
+    /// proximity scalars. All new slots are sanitised; NaN → 0 (neutral).
+    /// </summary>
+    public static float[] BuildFeatureVectorV3(
+        List<Candle>                          window,
+        Candle                                current,
+        Candle                                previous,
+        Dictionary<string, double[]>          basketSliceAtCurrentBar,
+        string                                symbol,
+        global::LascodiaTradingEngine.Application.Services.ML.CrossAssetSnapshot crossAsset,
+        global::LascodiaTradingEngine.Application.Services.ML.EventFeatureSnapshot eventFeatures,
+        CotFeatureEntry?                      cotEntry = null)
+    {
+        float[] v2 = BuildFeatureVectorV2(window, current, previous, basketSliceAtCurrentBar, symbol, cotEntry);
+        var result = new float[FeatureCountV3];
+        Array.Copy(v2, 0, result, 0, FeatureCountV2);
+
+        result[FeatureCountV2 + 0] = SanitizeScalar(crossAsset.DxyReturn5d);
+        result[FeatureCountV2 + 1] = SanitizeScalar(crossAsset.Us10YYieldChange5d);
+        result[FeatureCountV2 + 2] = SanitizeScalar(crossAsset.VixLevelNormalized);
+        result[FeatureCountV2 + 3] = SanitizeScalar(eventFeatures.HoursToNextHighNormalized);
+        result[FeatureCountV2 + 4] = SanitizeScalar(eventFeatures.HoursSinceLastHighNormalized);
+        result[FeatureCountV2 + 5] = SanitizeScalar(eventFeatures.HighMedPending6hNormalized);
+        return result;
+    }
+
+    private static float SanitizeScalar(float v)
+    {
+        if (float.IsNaN(v) || float.IsInfinity(v)) return 0f;
+        return Clamp(v, -5f, 5f);
+    }
+
+    /// <summary>
+    /// V3 training sample builder with triple-barrier labels and the full 43-feature
+    /// vector. The cross-asset + event providers are passed as functions so the caller
+    /// can inject pre-loaded lookups — per-bar DB hits would dominate training time.
+    /// </summary>
+    public static List<TrainingSample> BuildTrainingSamplesWithTripleBarrierV3(
+        List<Candle>                                            candles,
+        string                                                  symbol,
+        Dictionary<string, (DateTime[] Times, double[] Closes)> fullBasket,
+        Func<DateTime, global::LascodiaTradingEngine.Application.Services.ML.CrossAssetSnapshot> crossAssetLookup,
+        Func<DateTime, global::LascodiaTradingEngine.Application.Services.ML.EventFeatureSnapshot> eventLookup,
+        Func<DateTime, CotFeatureEntry>?                        cotLookup     = null,
+        float                                                   profitAtrMult = 1.5f,
+        float                                                   stopAtrMult   = 1.0f,
+        int                                                     horizonBars   = 24,
+        float                                                   costBufferPriceUnits = 0f)
+    {
+        var samples = new List<TrainingSample>(candles.Count);
+
+        for (int i = LookbackWindow; i < candles.Count - 1; i++)
+        {
+            var window  = candles.GetRange(i - LookbackWindow, LookbackWindow);
+            var current = candles[i];
+            var prev    = window[^1];
+
+            var cotEntry = cotLookup?.Invoke(current.Timestamp) ?? CotFeatureEntry.Zero;
+            var slice = global::LascodiaTradingEngine.Application.Services.ML.MacroFeatureCalculator.SliceBasketAsOf(fullBasket, current.Timestamp);
+            var crossAsset = crossAssetLookup(current.Timestamp);
+            var eventFeat  = eventLookup(current.Timestamp);
+            var features = BuildFeatureVectorV3(window, current, prev, slice, symbol, crossAsset, eventFeat, cotEntry);
 
             float atr = (float)CalculateATR(window, 14);
             if (atr <= 0f)

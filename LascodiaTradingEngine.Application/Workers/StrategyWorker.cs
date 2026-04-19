@@ -1032,12 +1032,10 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
                         signal.SuggestedLotSize, adjustedLotSize, recoverySnapshot.ReducedLotMultiplier, signal.Symbol);
                 }
 
-                // ── Vol-targeted position sizing: scale inversely to realized volatility ──
-                // Goal: target constant P&L variance. High-vol regimes → smaller position;
-                // low-vol regimes → larger. Ratio = avg-ATR / current-ATR clamped to
-                // [0.5, 2.0] so extreme regimes don't 10× the position. This is applied
-                // AFTER DrawdownRecovery so both can compound: the drawdown mode caps the
-                // overall scale, and vol-target rebalances within that scale.
+                // ── Compute the long/short ATR ratio once; shared by vol-target sizing
+                //    and vol-conditional TTL below. Null when the candle window is thin
+                //    or ATR is degenerate — both consumers then skip their adjustments.
+                double? atrRatio = null;
                 try
                 {
                     if (candles.Count >= 60)
@@ -1047,19 +1045,24 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
                         double shortAtr = MLModels.Shared.MLFeatureHelper.CalculateATR(recentWindow, 14);
                         double longAtr  = MLModels.Shared.MLFeatureHelper.CalculateATR(longWindow, 14);
                         if (shortAtr > 0 && longAtr > 0)
-                        {
-                            decimal volScale = (decimal)Math.Clamp(longAtr / shortAtr, 0.5, 2.0);
-                            adjustedLotSize *= volScale;
-                        }
+                            atrRatio = longAtr / shortAtr;
                     }
                 }
-                catch { /* best-effort — fall through unchanged */ }
+                catch { /* atrRatio stays null; consumers no-op */ }
+
+                // ── Vol-targeted position sizing: scale inversely to realized volatility ──
+                // Goal: target constant P&L variance. High-vol → smaller; low-vol → larger.
+                // Clamped [0.5, 2.0] so extreme regimes don't 10× the position. Applied
+                // AFTER DrawdownRecovery so both compound.
+                if (atrRatio is double r)
+                {
+                    decimal volScale = (decimal)Math.Clamp(r, 0.5, 2.0);
+                    adjustedLotSize *= volScale;
+                }
 
                 // ── Portfolio correlation adjustment ───────────────────────────
                 // Shrink lot size when same-direction correlated positions are already
-                // open (e.g. new BUY EURUSD when BUY GBPUSD is already open). Prevents
-                // two independent strategies from piling into what is effectively one
-                // bet. Multiplier = 1/sqrt(1 + Σ ρ) across same-direction peers.
+                // open. Multiplier = 1/sqrt(1 + Σ ρ) across same-direction peers.
                 decimal correlationMult = await _portfolioCorrelationSizer.ComputeMultiplierAsync(
                     signal.Symbol, signal.Direction, ct);
                 if (correlationMult < 1.0m)
@@ -1068,29 +1071,16 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
                 }
 
                 // ── Vol-conditional TTL: shorten expiry in HighVol, extend in LowVol ─
-                // Information rot scales with realized volatility. A signal that lives
-                // 60 minutes in a quiet market might be stale in 10 minutes during a
-                // high-vol regime. Ratio = long-window ATR / short-window ATR, clamped
-                // to [0.3, 3.0] so extreme spikes don't pathologically shorten TTL.
+                // Information rot scales with realized volatility. Clamped [0.3, 3.0]
+                // so extreme spikes don't pathologically shorten TTL.
                 DateTime adjustedExpiry = signal.ExpiresAt;
-                try
+                if (atrRatio is double r2)
                 {
-                    if (candles.Count >= 60)
-                    {
-                        var recentWindow = candles.Skip(candles.Count - 15).Take(15).ToList();
-                        var longWindow   = candles.Skip(candles.Count - 60).Take(60).ToList();
-                        double shortAtr = MLModels.Shared.MLFeatureHelper.CalculateATR(recentWindow, 14);
-                        double longAtr  = MLModels.Shared.MLFeatureHelper.CalculateATR(longWindow, 14);
-                        if (shortAtr > 0 && longAtr > 0)
-                        {
-                            double ratio = Math.Clamp(longAtr / shortAtr, 0.3, 3.0);
-                            TimeSpan originalDuration = signal.ExpiresAt - DateTime.UtcNow;
-                            if (originalDuration > TimeSpan.Zero)
-                                adjustedExpiry = DateTime.UtcNow.Add(TimeSpan.FromTicks((long)(originalDuration.Ticks * ratio)));
-                        }
-                    }
+                    double ttlMult = Math.Clamp(r2, 0.3, 3.0);
+                    TimeSpan originalDuration = signal.ExpiresAt - DateTime.UtcNow;
+                    if (originalDuration > TimeSpan.Zero)
+                        adjustedExpiry = DateTime.UtcNow.Add(TimeSpan.FromTicks((long)(originalDuration.Ticks * ttlMult)));
                 }
-                catch { /* best-effort; fall through with unadjusted expiry */ }
 
                 // ── Collect candidate signal for conflict resolution ─────────
                 // Instead of persisting immediately, add to the candidate bag.

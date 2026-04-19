@@ -123,19 +123,25 @@ public sealed class MLSignalScorer : IMLSignalScorer
     private readonly IEnumerable<IModelInferenceEngine> _inferenceEngines;
     private readonly MLModelResolver                   _modelResolver;
     private readonly MLConfigService                   _configService;
+    private readonly global::LascodiaTradingEngine.Application.Services.ML.CrossAssetFeatureProvider _crossAssetProvider;
+    private readonly global::LascodiaTradingEngine.Application.Services.ML.EconomicEventFeatureProvider _eventProvider;
 
     public MLSignalScorer(
         IReadApplicationDbContext          context,
         IMemoryCache                      cache,
         ILogger<MLSignalScorer>           logger,
-        IEnumerable<IModelInferenceEngine> inferenceEngines)
+        IEnumerable<IModelInferenceEngine> inferenceEngines,
+        global::LascodiaTradingEngine.Application.Services.ML.CrossAssetFeatureProvider crossAssetProvider,
+        global::LascodiaTradingEngine.Application.Services.ML.EconomicEventFeatureProvider eventProvider)
     {
-        _context          = context;
-        _cache            = cache;
-        _logger           = logger;
-        _inferenceEngines = inferenceEngines;
-        _modelResolver    = new MLModelResolver(context, logger);
-        _configService    = new MLConfigService(cache, logger);
+        _context           = context;
+        _cache             = cache;
+        _logger            = logger;
+        _inferenceEngines  = inferenceEngines;
+        _modelResolver     = new MLModelResolver(context, logger);
+        _configService     = new MLConfigService(cache, logger);
+        _crossAssetProvider = crossAssetProvider;
+        _eventProvider     = eventProvider;
     }
 
     private IModelInferenceEngine? ResolveEngine(ModelSnapshot snap)
@@ -1358,6 +1364,61 @@ public sealed class MLSignalScorer : IMLSignalScorer
                 Array.Copy(builtRawFeatures, padded, builtRawFeatures.Length);
                 builtRawFeatures = padded;
             }
+        }
+
+        // V3 dispatch: when the snapshot expects the 43-feature V3 vector (V2 + 3
+        // cross-asset + 3 event slots), append the additional slots. Zero-fill on
+        // partial failures so the scorer stays online with degraded calibration
+        // rather than a hard failure.
+        if (expectedInputFeatures == MLFeatureHelper.FeatureCountV3 &&
+            builtRawFeatures.Length == MLFeatureHelper.FeatureCountV2)
+        {
+            var padded = new float[MLFeatureHelper.FeatureCountV3];
+            Array.Copy(builtRawFeatures, padded, builtRawFeatures.Length);
+
+            try
+            {
+                var asOfDay = new DateTime(current.Timestamp.Year, current.Timestamp.Month, current.Timestamp.Day, 0, 0, 0, DateTimeKind.Utc);
+                var crossAssetKey = $"MlV3Cross:{asOfDay:yyyy-MM-dd}";
+                global::LascodiaTradingEngine.Application.Services.ML.CrossAssetSnapshot crossAsset;
+                if (!_cache.TryGetValue(crossAssetKey, out crossAsset))
+                {
+                    crossAsset = await _crossAssetProvider.GetAsync(asOfDay, cancellationToken);
+                    _cache.Set(crossAssetKey, crossAsset, TimeSpan.FromMinutes(60));
+                }
+
+                var eventCacheKey = $"MlV3Events:{signal.Symbol}:{asOfDay:yyyy-MM-dd}";
+                global::LascodiaTradingEngine.Application.Services.ML.EconomicEventFeatureProvider.EventLookup eventLookup;
+                if (!_cache.TryGetValue(eventCacheKey, out eventLookup!) || eventLookup is null)
+                {
+                    eventLookup = await _eventProvider.LoadForSymbolAsync(
+                        signal.Symbol,
+                        asOfDay.AddDays(-1),
+                        asOfDay.AddDays(1),
+                        cancellationToken);
+                    _cache.Set(eventCacheKey, eventLookup, TimeSpan.FromMinutes(10));
+                }
+
+                var eventSnap = eventLookup.SnapshotAt(current.Timestamp);
+
+                padded[MLFeatureHelper.FeatureCountV2 + 0] = Sanitize(crossAsset.DxyReturn5d);
+                padded[MLFeatureHelper.FeatureCountV2 + 1] = Sanitize(crossAsset.Us10YYieldChange5d);
+                padded[MLFeatureHelper.FeatureCountV2 + 2] = Sanitize(crossAsset.VixLevelNormalized);
+                padded[MLFeatureHelper.FeatureCountV2 + 3] = Sanitize(eventSnap.HoursToNextHighNormalized);
+                padded[MLFeatureHelper.FeatureCountV2 + 4] = Sanitize(eventSnap.HoursSinceLastHighNormalized);
+                padded[MLFeatureHelper.FeatureCountV2 + 5] = Sanitize(eventSnap.HighMedPending6hNormalized);
+
+                static float Sanitize(float v) =>
+                    float.IsNaN(v) || float.IsInfinity(v) ? 0f : Math.Clamp(v, -5f, 5f);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "V3 cross-asset/event load failed for model {ModelId} ({Symbol}) — zero-padding",
+                    modelId, signal.Symbol);
+            }
+
+            builtRawFeatures = padded;
         }
 
         var prepared = ElmFeaturePipelineHelper.PrepareSnapshotFeatures(
