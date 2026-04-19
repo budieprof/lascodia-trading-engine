@@ -160,6 +160,21 @@ public static class DependencyInjection
         services.AddScoped<LascodiaTradingEngine.Application.Services.ITcaCostModelProvider,
                            LascodiaTradingEngine.Application.Services.TcaCostModelProvider>();
 
+        // ── CPCV Validator (minimum-viable: trade-resampling) ──────────────────
+        // Produces a Sharpe distribution from C(N, K) chronological-partition
+        // resamples of existing trades. Used by PromotionGateValidator to gate on
+        // the 25th-percentile Sharpe — a strategy whose fold-Sharpes go deeply
+        // negative in some partitions is probably overfit to lucky windows.
+        services.AddScoped<LascodiaTradingEngine.Application.Strategies.Services.ICpcvValidator,
+                           LascodiaTradingEngine.Application.Strategies.Services.CpcvValidator>();
+
+        // ── Bayesian Edge Posterior ────────────────────────────────────────────
+        // Reframes each metric as "posterior P(live Sharpe > 0 | observed)" rather
+        // than "observed Sharpe > threshold". Consumed as an additional promotion
+        // gate; callers can also query directly for decision-theoretic sizing.
+        services.AddScoped<LascodiaTradingEngine.Application.Strategies.Services.IEdgePosterior,
+                           LascodiaTradingEngine.Application.Strategies.Services.EdgePosterior>();
+
         // ── HTTP Clients ─────────────────────────────────────────────────────────
         services.AddHttpClient();
 

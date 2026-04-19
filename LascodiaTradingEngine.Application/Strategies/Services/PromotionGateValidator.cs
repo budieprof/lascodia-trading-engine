@@ -37,10 +37,17 @@ namespace LascodiaTradingEngine.Application.Strategies.Services;
 public sealed class PromotionGateValidator : IPromotionGateValidator
 {
     private readonly IReadApplicationDbContext _readCtx;
+    private readonly ICpcvValidator _cpcv;
+    private readonly IEdgePosterior _edgePosterior;
 
-    public PromotionGateValidator(IReadApplicationDbContext readCtx)
+    public PromotionGateValidator(
+        IReadApplicationDbContext readCtx,
+        ICpcvValidator cpcv,
+        IEdgePosterior edgePosterior)
     {
         _readCtx = readCtx;
+        _cpcv = cpcv;
+        _edgePosterior = edgePosterior;
     }
 
     public async Task<PromotionGateResult> EvaluateAsync(
@@ -183,6 +190,65 @@ public sealed class PromotionGateValidator : IPromotionGateValidator
                 failures.Add(
                     $"Backtest duration {coveredDays:F0}d < min {minBacktestDays}d " +
                     "— too short to cover multiple regimes, strategy may be fragile to regime change");
+        }
+
+        // ── Gate 7 (#3 on pipeline roadmap): CPCV P25 Sharpe ≥ threshold ────
+        // A strategy's median Sharpe can be inflated by a few lucky windows; CPCV
+        // re-partitions the realised trades and checks that the 25th-percentile
+        // Sharpe across C(N,K) resamples is still positive. If it isn't, the
+        // strategy's edge is concentrated rather than robust.
+        if (!disabledGates.Contains("cpcv"))
+        {
+            double minP25Sharpe = await GetConfigDoubleAsync(db, "Promotion:MinCpcvP25Sharpe", 0.0, ct);
+            var cpcv = await _cpcv.ValidateAsync(
+                strategyId, latestBacktest.FromDate, latestBacktest.ToDate, ct);
+            diagnostics.Add(
+                $"CPCV(N={cpcv.NGroups},K={cpcv.KTestGroups}): median={cpcv.MedianSharpe:F3} " +
+                $"P25={cpcv.P25Sharpe:F3} P75={cpcv.P75Sharpe:F3} DSR={cpcv.DeflatedSharpe:F3} " +
+                $"PBO={cpcv.ProbabilityOfOverfitting:F3}");
+
+            if (cpcv.SharpeDistribution.Count == 0)
+            {
+                failures.Add(
+                    "CPCV: no trades available for partition resampling " +
+                    "— need ≥60 closed positions before promotion");
+            }
+            else if (cpcv.P25Sharpe < minP25Sharpe)
+            {
+                failures.Add(
+                    $"CPCV P25 Sharpe {cpcv.P25Sharpe:F3} < min {minP25Sharpe:F2} " +
+                    "— edge is concentrated in lucky windows rather than robust");
+            }
+        }
+
+        // ── Gate 8 (#9 on pipeline roadmap): Posterior P(live Sharpe > 0) ───
+        // Reframes "observed Sharpe > X" as the properly-updated belief given
+        // selection bias. Deflates the observation by √log(trials) before the
+        // Bayesian update, so cherry-picked winners need stronger evidence than
+        // a-priori hypotheses.
+        if (!disabledGates.Contains("edge_posterior"))
+        {
+            double minEdgeProb = await GetConfigDoubleAsync(db, "Promotion:MinEdgeProbability", 0.70, ct);
+            int trialsCount = await db.Set<Domain.Entities.Strategy>()
+                .AsNoTracking()
+                .CountAsync(s => s.Symbol == strategy.Symbol
+                              && s.Timeframe == strategy.Timeframe
+                              && !s.IsDeleted, ct);
+            double rawSharpe = (double)(latestBacktest.SharpeRatio ?? 0m);
+            int trades = latestBacktest.TotalTrades ?? 0;
+            var post = _edgePosterior.Compute(new EdgeObservation(
+                ObservedSharpe: rawSharpe,
+                NumberOfTrades: trades,
+                NumberOfTrials: trialsCount));
+            diagnostics.Add(
+                $"EdgePosterior: μ={post.PosteriorMean:F3} σ={post.PosteriorStdDev:F3} " +
+                $"P(edge>0)={post.ProbabilityOfPositiveEdge:F3}");
+
+            if (post.ProbabilityOfPositiveEdge < minEdgeProb)
+                failures.Add(
+                    $"P(true edge > 0) = {post.ProbabilityOfPositiveEdge:F3} < min {minEdgeProb:F2} " +
+                    "— after accounting for selection bias and observation precision, " +
+                    "the strategy's posterior probability of real edge is too low");
         }
 
         // ── Gate 6 (#6 on pipeline roadmap): Correlation to existing actives ─
