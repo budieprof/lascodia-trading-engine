@@ -4377,4 +4377,86 @@ public static class MLFeatureHelper
 
         return samples;
     }
+
+    /// <summary>
+    /// V4 training-sample builder. Same triple-barrier labelling as V3 but emits the
+    /// 48-feature vector including minute-level news proximity and tick-microstructure
+    /// slots. <paramref name="minuteLevelEventLookup"/> is an additional point-in-time
+    /// function returning the (MinutesToNextHighNorm, MinutesToNextMedHighNorm) tuple;
+    /// <paramref name="tickFlowLookup"/> returns the current <see cref="global::LascodiaTradingEngine.Application.Services.TickFlowSnapshot"/>
+    /// or <c>null</c> when no ticks have been persisted for the symbol yet at that time
+    /// (the builder zero-fills those slots rather than dropping the sample — zero is
+    /// the neutral value the model was trained to expect).
+    /// </summary>
+    public static List<TrainingSample> BuildTrainingSamplesWithTripleBarrierV4(
+        List<Candle>                                                                                             candles,
+        string                                                                                                    symbol,
+        Dictionary<string, (DateTime[] Times, double[] Closes)>                                                   fullBasket,
+        Func<DateTime, global::LascodiaTradingEngine.Application.Services.ML.CrossAssetSnapshot>                   crossAssetLookup,
+        Func<DateTime, global::LascodiaTradingEngine.Application.Services.ML.EventFeatureSnapshot>                 eventLookup,
+        Func<DateTime, (float MinutesToNextHighNorm, float MinutesToNextMedHighNorm)>                              minuteLevelEventLookup,
+        Func<DateTime, global::LascodiaTradingEngine.Application.Services.TickFlowSnapshot?>                       tickFlowLookup,
+        Func<DateTime, CotFeatureEntry>?                                                                           cotLookup     = null,
+        float                                                                                                     profitAtrMult = 1.5f,
+        float                                                                                                     stopAtrMult   = 1.5f,
+        int                                                                                                       horizonBars   = 24,
+        float                                                                                                     costBufferPriceUnits = 0f)
+    {
+        var samples = new List<TrainingSample>(candles.Count);
+
+        for (int i = LookbackWindow; i < candles.Count - 1; i++)
+        {
+            var window  = candles.GetRange(i - LookbackWindow, LookbackWindow);
+            var current = candles[i];
+            var prev    = window[^1];
+
+            var cotEntry      = cotLookup?.Invoke(current.Timestamp) ?? CotFeatureEntry.Zero;
+            var slice         = global::LascodiaTradingEngine.Application.Services.ML.MacroFeatureCalculator.SliceBasketAsOf(fullBasket, current.Timestamp);
+            var crossAsset    = crossAssetLookup(current.Timestamp);
+            var eventFeat     = eventLookup(current.Timestamp);
+            var minuteEvents  = minuteLevelEventLookup(current.Timestamp);
+            var tickFlow      = tickFlowLookup(current.Timestamp);
+            var features      = BuildFeatureVectorV4(window, current, prev, slice, symbol, crossAsset, eventFeat, minuteEvents, tickFlow, cotEntry);
+
+            float atr = (float)CalculateATR(window, 14);
+            if (atr <= 0f)
+            {
+                int fallbackDir = candles[i + 1].Close > candles[i].Close ? 1 : 0;
+                samples.Add(new TrainingSample(features, fallbackDir, 0f));
+                continue;
+            }
+
+            float profitTarget = atr * profitAtrMult + costBufferPriceUnits;
+            float stopLoss     = atr * stopAtrMult;
+            float entry        = (float)current.Close;
+
+            int   label     = 0;
+            float magnitude = 0f;
+
+            int maxLook = Math.Min(i + 1 + horizonBars, candles.Count);
+            for (int j = i + 1; j < maxLook; j++)
+            {
+                float hi = (float)candles[j].High;
+                float lo = (float)candles[j].Low;
+
+                bool profitHit = hi - entry >= profitTarget;
+                bool stopHit   = entry - lo  >= stopLoss;
+
+                if (profitHit && stopHit) { label = 1; magnitude = Clamp(profitTarget / atr, -5f, 5f); break; }
+                if (profitHit)            { label = 1; magnitude = Clamp((hi - entry) / atr, -5f, 5f); break; }
+                if (stopHit)              { label = 0; magnitude = Clamp((lo - entry) / atr, -5f, 5f); break; }
+            }
+
+            if (label == 0 && magnitude == 0f && maxLook > i + 1)
+            {
+                float exitClose = (float)candles[maxLook - 1].Close;
+                magnitude = Clamp((exitClose - entry) / atr, -5f, 5f);
+                label     = exitClose > entry ? 1 : 0;
+            }
+
+            samples.Add(new TrainingSample(features, label, magnitude));
+        }
+
+        return samples;
+    }
 }

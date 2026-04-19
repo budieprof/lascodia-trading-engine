@@ -131,4 +131,93 @@ public class LookAheadAuditTest
         for (int i = 0; i < a.Length; i++)
             Assert.Equal(a[i], b[i]);
     }
+
+    [Fact]
+    public void V4_FeatureVector_IsIndependentOfCurrentCandleFuture()
+    {
+        // Same redaction principle applied to the full 48-feature V4 vector.
+        // Tick-flow snapshot and event lookup are passed as deterministic stubs so
+        // a shift in the V3→V4 extension slots (43..47) can't mask regressions
+        // in the V3 base (0..42) either.
+        var all     = BuildDeterministicCandles(MLFeatureHelper.LookbackWindow + 2);
+        var window  = all.GetRange(0, MLFeatureHelper.LookbackWindow);
+        var prev    = all[MLFeatureHelper.LookbackWindow - 1];
+        var current = all[MLFeatureHelper.LookbackWindow];
+
+        var crossAsset = new global::LascodiaTradingEngine.Application.Services.ML.CrossAssetSnapshot(
+            DxyReturn5d: 0.01f, Us10YYieldChange5d: 0.002f, VixLevelNormalized: 0.3f);
+        var eventFeat = new global::LascodiaTradingEngine.Application.Services.ML.EventFeatureSnapshot(
+            HoursToNextHighNormalized: 0.5f,
+            HoursSinceLastHighNormalized: 0.2f,
+            HighMedPending6hNormalized: 0.1f);
+        (float, float) minuteEvents = (0.4f, 0.3f);
+        var tickFlow = new global::LascodiaTradingEngine.Application.Services.TickFlowSnapshot(
+            TickDelta: 0.2m, CurrentSpread: 0.00012m, SpreadMean: 0.00010m, SpreadStdDev: 0.00002m,
+            SpreadPercentileRank: 0.6m, SpreadRelVolatility: 0.2m, TickVolumeImbalance: 0.1m);
+
+        float[] baseline = MLFeatureHelper.BuildFeatureVectorV4(
+            window, current, prev, new Dictionary<string, double[]>(), "EURUSD",
+            crossAsset, eventFeat, minuteEvents, tickFlow);
+
+        var redactedCurrent = new Candle
+        {
+            Symbol    = current.Symbol,
+            Timeframe = current.Timeframe,
+            Timestamp = current.Timestamp,
+            Open      = current.Open,
+            High      = current.Open,
+            Low       = current.Open,
+            Close     = current.Open,
+            Volume    = 0,
+            IsClosed  = false,
+            IsDeleted = false,
+        };
+
+        float[] redacted = MLFeatureHelper.BuildFeatureVectorV4(
+            window, redactedCurrent, prev, new Dictionary<string, double[]>(), "EURUSD",
+            crossAsset, eventFeat, minuteEvents, tickFlow);
+
+        Assert.Equal(MLFeatureHelper.FeatureCountV4, baseline.Length);
+        Assert.Equal(MLFeatureHelper.FeatureCountV4, redacted.Length);
+
+        var contaminatedIndices = new List<int>();
+        for (int i = 0; i < baseline.Length; i++)
+        {
+            if (Math.Abs(baseline[i] - redacted[i]) > 1e-6f)
+                contaminatedIndices.Add(i);
+        }
+
+        Assert.True(
+            contaminatedIndices.Count == 0,
+            $"V4 look-ahead contamination in feature indices: [{string.Join(", ", contaminatedIndices)}]. " +
+            "These consumed current.Close/High/Low/Volume at decision time. Shift the input by +1 bar.");
+    }
+
+    [Fact]
+    public void V4_FeatureVector_ZeroFillsMicrostructureWhenTickFlowNull()
+    {
+        // Contract: V4 inference runs on symbols with no persisted ticks yet
+        // (TickFlowProvider returns null). The last three slots must zero-fill so a
+        // V4-trained model can still score on cold-tick symbols without NaN explosion.
+        var all     = BuildDeterministicCandles(MLFeatureHelper.LookbackWindow + 2);
+        var window  = all.GetRange(0, MLFeatureHelper.LookbackWindow);
+        var prev    = all[MLFeatureHelper.LookbackWindow - 1];
+        var current = all[MLFeatureHelper.LookbackWindow];
+
+        var crossAsset = new global::LascodiaTradingEngine.Application.Services.ML.CrossAssetSnapshot(
+            DxyReturn5d: 0.01f, Us10YYieldChange5d: 0.002f, VixLevelNormalized: 0.3f);
+        var eventFeat = new global::LascodiaTradingEngine.Application.Services.ML.EventFeatureSnapshot(
+            HoursToNextHighNormalized: 0.5f,
+            HoursSinceLastHighNormalized: 0.2f,
+            HighMedPending6hNormalized: 0.1f);
+
+        float[] v4 = MLFeatureHelper.BuildFeatureVectorV4(
+            window, current, prev, new Dictionary<string, double[]>(), "EURUSD",
+            crossAsset, eventFeat, (1.0f, 1.0f), tickFlow: null);
+
+        Assert.Equal(MLFeatureHelper.FeatureCountV4, v4.Length);
+        Assert.Equal(0f, v4[MLFeatureHelper.FeatureCountV3 + 2]);
+        Assert.Equal(0f, v4[MLFeatureHelper.FeatureCountV3 + 3]);
+        Assert.Equal(0f, v4[MLFeatureHelper.FeatureCountV3 + 4]);
+    }
 }

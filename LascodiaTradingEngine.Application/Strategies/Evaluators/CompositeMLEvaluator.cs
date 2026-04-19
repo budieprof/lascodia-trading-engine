@@ -345,6 +345,49 @@ public class CompositeMLEvaluator : IStrategyEvaluator
             features = v3;
         }
 
+        // ── 4d. V4 dispatch: minute-level news + tick microstructure on top of V3 ──
+        if (expectedFeatures == MLFeatureHelper.FeatureCountV4 &&
+            features.Length == MLFeatureHelper.FeatureCountV3)
+        {
+            var v4 = new float[MLFeatureHelper.FeatureCountV4];
+            Array.Copy(features, v4, features.Length);
+            try
+            {
+                using var v4Scope = _scopeFactory.CreateScope();
+                var eventProvider = v4Scope.ServiceProvider.GetRequiredService<
+                    global::LascodiaTradingEngine.Application.Services.ML.EconomicEventFeatureProvider>();
+                var tickProvider  = v4Scope.ServiceProvider.GetRequiredService<
+                    global::LascodiaTradingEngine.Application.Services.ITickFlowProvider>();
+
+                var eventLookup = await eventProvider.LoadForSymbolAsync(
+                    strategy.Symbol,
+                    currentCandle.Timestamp.AddDays(-1),
+                    currentCandle.Timestamp.AddDays(1),
+                    cancellationToken);
+                var minuteEvents = eventLookup.SnapshotMinuteLevel(currentCandle.Timestamp);
+                var tickFlow     = await tickProvider.GetSnapshotAsync(
+                    strategy.Symbol, currentCandle.Timestamp, cancellationToken);
+
+                static float S(float v) => float.IsNaN(v) || float.IsInfinity(v) ? 0f : Math.Clamp(v, -5f, 5f);
+                v4[MLFeatureHelper.FeatureCountV3 + 0] = S(minuteEvents.MinutesToNextHighNorm);
+                v4[MLFeatureHelper.FeatureCountV3 + 1] = S(minuteEvents.MinutesToNextMedHighNorm);
+                if (tickFlow is not null)
+                {
+                    v4[MLFeatureHelper.FeatureCountV3 + 2] = S((float)(tickFlow.SpreadRelVolatility / 3m));
+                    v4[MLFeatureHelper.FeatureCountV3 + 3] = S((float)tickFlow.SpreadPercentileRank);
+                    v4[MLFeatureHelper.FeatureCountV3 + 4] = S((float)tickFlow.TickVolumeImbalance);
+                }
+                // tickFlow null → last three slots stay 0 (neutral value the model was trained against).
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "V4 minute-event/tick-flow load failed for {Symbol} model {ModelId} — zero-padding",
+                    strategy.Symbol, model.Id);
+            }
+            features = v4;
+        }
+
         // ── 5. Resolve inference engine ────────────────────────────────────────
         var engine = ResolveInferenceEngine(snapshot);
         if (engine is null)

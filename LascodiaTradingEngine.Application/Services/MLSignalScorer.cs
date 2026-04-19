@@ -126,6 +126,7 @@ public sealed class MLSignalScorer : IMLSignalScorer
     private readonly global::LascodiaTradingEngine.Application.Services.ML.CrossAssetFeatureProvider _crossAssetProvider;
     private readonly global::LascodiaTradingEngine.Application.Services.ML.EconomicEventFeatureProvider _eventProvider;
     private readonly global::LascodiaTradingEngine.Application.Services.ML.IOnnxInferenceEngine _onnxEngine;
+    private readonly global::LascodiaTradingEngine.Application.Services.ITickFlowProvider? _tickFlowProvider;
 
     /// <summary>
     /// Tracks models already loaded into <see cref="_onnxEngine"/> so repeat scoring
@@ -141,7 +142,8 @@ public sealed class MLSignalScorer : IMLSignalScorer
         IEnumerable<IModelInferenceEngine> inferenceEngines,
         global::LascodiaTradingEngine.Application.Services.ML.CrossAssetFeatureProvider crossAssetProvider,
         global::LascodiaTradingEngine.Application.Services.ML.EconomicEventFeatureProvider eventProvider,
-        global::LascodiaTradingEngine.Application.Services.ML.IOnnxInferenceEngine onnxEngine)
+        global::LascodiaTradingEngine.Application.Services.ML.IOnnxInferenceEngine onnxEngine,
+        global::LascodiaTradingEngine.Application.Services.ITickFlowProvider? tickFlowProvider = null)
     {
         _context           = context;
         _cache             = cache;
@@ -152,6 +154,7 @@ public sealed class MLSignalScorer : IMLSignalScorer
         _crossAssetProvider = crossAssetProvider;
         _eventProvider     = eventProvider;
         _onnxEngine        = onnxEngine;
+        _tickFlowProvider  = tickFlowProvider;
     }
 
     private IModelInferenceEngine? ResolveEngine(ModelSnapshot snap)
@@ -1611,6 +1614,53 @@ public sealed class MLSignalScorer : IMLSignalScorer
             }
 
             builtRawFeatures = padded;
+        }
+
+        // V4 dispatch: minute-level news proximity + tick-microstructure slots layered
+        // on top of V3. Fires when the model expects 48 features but the incoming vector
+        // is 43 (V3). Zero-fills any of the 5 new slots whose provider returns null.
+        if (expectedInputFeatures == MLFeatureHelper.FeatureCountV4 &&
+            builtRawFeatures.Length == MLFeatureHelper.FeatureCountV3)
+        {
+            var paddedV4 = new float[MLFeatureHelper.FeatureCountV4];
+            Array.Copy(builtRawFeatures, paddedV4, builtRawFeatures.Length);
+            try
+            {
+                var asOfDayV4 = new DateTime(current.Timestamp.Year, current.Timestamp.Month, current.Timestamp.Day, 0, 0, 0, DateTimeKind.Utc);
+                var eventCacheKeyV4 = $"MlV3Events:{signal.Symbol}:{asOfDayV4:yyyy-MM-dd}";
+                global::LascodiaTradingEngine.Application.Services.ML.EconomicEventFeatureProvider.EventLookup? eventLookupV4;
+                if (!_cache.TryGetValue(eventCacheKeyV4, out eventLookupV4) || eventLookupV4 is null)
+                {
+                    eventLookupV4 = await _eventProvider.LoadForSymbolAsync(
+                        signal.Symbol, asOfDayV4.AddDays(-1), asOfDayV4.AddDays(1), cancellationToken);
+                    _cache.Set(eventCacheKeyV4, eventLookupV4, TimeSpan.FromMinutes(10));
+                }
+                var minuteEvents = eventLookupV4.SnapshotMinuteLevel(current.Timestamp);
+
+                global::LascodiaTradingEngine.Application.Services.TickFlowSnapshot? tickFlow = null;
+                if (_tickFlowProvider is not null)
+                    tickFlow = await _tickFlowProvider.GetSnapshotAsync(signal.Symbol, current.Timestamp, cancellationToken);
+
+                static float SanitizeV4(float v) =>
+                    float.IsNaN(v) || float.IsInfinity(v) ? 0f : Math.Clamp(v, -5f, 5f);
+
+                paddedV4[MLFeatureHelper.FeatureCountV3 + 0] = SanitizeV4(minuteEvents.MinutesToNextHighNorm);
+                paddedV4[MLFeatureHelper.FeatureCountV3 + 1] = SanitizeV4(minuteEvents.MinutesToNextMedHighNorm);
+                if (tickFlow is not null)
+                {
+                    paddedV4[MLFeatureHelper.FeatureCountV3 + 2] = SanitizeV4((float)(tickFlow.SpreadRelVolatility / 3m));
+                    paddedV4[MLFeatureHelper.FeatureCountV3 + 3] = SanitizeV4((float)tickFlow.SpreadPercentileRank);
+                    paddedV4[MLFeatureHelper.FeatureCountV3 + 4] = SanitizeV4((float)tickFlow.TickVolumeImbalance);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "V4 minute-event/tick-flow load failed for model {ModelId} ({Symbol}) — zero-padding",
+                    modelId, signal.Symbol);
+            }
+
+            builtRawFeatures = paddedV4;
         }
 
         var prepared = ElmFeaturePipelineHelper.PrepareSnapshotFeatures(

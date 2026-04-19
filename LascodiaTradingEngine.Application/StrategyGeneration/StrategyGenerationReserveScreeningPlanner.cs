@@ -212,11 +212,17 @@ internal sealed class StrategyGenerationReserveScreeningPlanner : IStrategyGener
                         baseSh,
                         baseDD,
                         context.Haircuts);
+                    // Reserve-pass threshold relaxation — configurable via
+                    // StrategyGeneration:ArchetypeReserveThresholdMultiplier (default 0.75).
+                    // Applied to MinWinRate/MinProfitFactor/MinSharpe directly; inverse
+                    // applied to MaxDrawdownPct so lower multiplier ↔ more permissive gate.
+                    double mul = Math.Clamp(config.ArchetypeReserveThresholdMultiplier, 0.50, 1.00);
+                    double ddRelax = 1.0 + (1.0 - mul);
                     var thresholds = new ScreeningThresholds(
-                        primaryThresholds.MinWinRate * 0.85,
-                        primaryThresholds.MinProfitFactor * 0.85,
-                        primaryThresholds.MinSharpe * 0.85,
-                        primaryThresholds.MaxDrawdownPct * 1.15,
+                        primaryThresholds.MinWinRate * mul,
+                        primaryThresholds.MinProfitFactor * mul,
+                        primaryThresholds.MinSharpe * mul,
+                        primaryThresholds.MaxDrawdownPct * ddRelax,
                         primaryThresholds.MinTotalTrades);
                     var orderedTemplates = OrderTemplatesForRegime(
                         templates,

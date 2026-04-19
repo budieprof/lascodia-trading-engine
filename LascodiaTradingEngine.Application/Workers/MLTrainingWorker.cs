@@ -774,6 +774,13 @@ public sealed class MLTrainingWorker : BackgroundService
             bool useEventFeatureVector = await GetConfigAsync<bool>(
                 ctx, CK_UseEventFeatureVector, false, stoppingToken);
 
+            // V4 layers minute-level news proximity + tick-microstructure features on top
+            // of V3. Requires persistent TickRecord (ReceiveTickBatch now writes them) —
+            // without ticks, the 3 microstructure slots zero-fill and V4 degrades to V3
+            // plus 2 calendar features. Only enable once ticks have accumulated (~days).
+            bool useTickMicrostructureFeatureVector = await GetConfigAsync<bool>(
+                ctx, "MLTraining:UseTickMicrostructureFeatureVector", false, stoppingToken);
+
             Dictionary<string, (DateTime[] Times, double[] Closes)>? basket = null;
             if (useExtendedVector && candles.Count > 0)
             {
@@ -842,7 +849,63 @@ public sealed class MLTrainingWorker : BackgroundService
             catch { /* best-effort; legacy zero-cost label if metadata missing */ }
 
             List<TrainingSample> samples;
-            if (useEventFeatureVector && useExtendedVector && basket is not null && basket.Count >= 5
+            if (useTickMicrostructureFeatureVector && useEventFeatureVector && useExtendedVector
+                && basket is not null && basket.Count >= 5
+                && hp.UseTripleBarrier && candles.Count > 0)
+            {
+                // ── V4 path: V3 + minute-level news + tick microstructure ──────────────
+                // Preload event + cross-asset + per-bar tick snapshots so the per-bar
+                // inner loop does O(log N) lookups rather than DB round-trips.
+                var crossAssetProvider = sp.GetRequiredService<global::LascodiaTradingEngine.Application.Services.ML.CrossAssetFeatureProvider>();
+                var eventProvider      = sp.GetRequiredService<global::LascodiaTradingEngine.Application.Services.ML.EconomicEventFeatureProvider>();
+                var tickFlowProvider   = sp.GetRequiredService<global::LascodiaTradingEngine.Application.Services.ITickFlowProvider>();
+
+                var eventLookup = await eventProvider.LoadForSymbolAsync(
+                    run.Symbol, candles[0].Timestamp, candles[^1].Timestamp, stoppingToken);
+
+                var crossAssetCache = new Dictionary<DateTime, global::LascodiaTradingEngine.Application.Services.ML.CrossAssetSnapshot>();
+                async Task<global::LascodiaTradingEngine.Application.Services.ML.CrossAssetSnapshot> CrossAsOfV4(DateTime ts)
+                {
+                    var day = new DateTime(ts.Year, ts.Month, ts.Day, 0, 0, 0, DateTimeKind.Utc);
+                    if (!crossAssetCache.TryGetValue(day, out var snap))
+                    {
+                        snap = await crossAssetProvider.GetAsync(day, stoppingToken);
+                        crossAssetCache[day] = snap;
+                    }
+                    return snap;
+                }
+                foreach (var c in candles) _ = await CrossAsOfV4(c.Timestamp);
+
+                // Tick-flow cache: per-bar snapshot. TickFlowProvider already caches internally
+                // with 1-min TTL — fine for the hot loop. Null tolerance built into V4 builder.
+                var tickFlowCache = new Dictionary<DateTime, global::LascodiaTradingEngine.Application.Services.TickFlowSnapshot?>();
+                foreach (var c in candles)
+                {
+                    if (tickFlowCache.ContainsKey(c.Timestamp)) continue;
+                    tickFlowCache[c.Timestamp] = await tickFlowProvider.GetSnapshotAsync(
+                        run.Symbol, c.Timestamp, stoppingToken);
+                }
+
+                samples = MLFeatureHelper.BuildTrainingSamplesWithTripleBarrierV4(
+                    candles, run.Symbol, basket,
+                    ts => crossAssetCache.TryGetValue(
+                        new DateTime(ts.Year, ts.Month, ts.Day, 0, 0, 0, DateTimeKind.Utc),
+                        out var s) ? s : default,
+                    eventLookup.SnapshotAt,
+                    eventLookup.SnapshotMinuteLevel,
+                    ts => tickFlowCache.TryGetValue(ts, out var tf) ? tf : null,
+                    CotLookup,
+                    (float)hp.TripleBarrierProfitAtrMult,
+                    (float)hp.TripleBarrierStopAtrMult,
+                    hp.TripleBarrierHorizonBars,
+                    costBufferPriceUnits);
+
+                int tickFlowHits = tickFlowCache.Values.Count(v => v is not null);
+                _logger.LogInformation(
+                    "Built {Samples} V4 training samples (features={Feat}, tickFlowCoverage={Hit}/{Total}, costBuffer={Buf:F5})",
+                    samples.Count, MLFeatureHelper.FeatureCountV4, tickFlowHits, tickFlowCache.Count, costBufferPriceUnits);
+            }
+            else if (useEventFeatureVector && useExtendedVector && basket is not null && basket.Count >= 5
                 && hp.UseTripleBarrier && candles.Count > 0)
             {
                 // Pre-load cross-asset + event series for the training window so the
@@ -2966,19 +3029,26 @@ public sealed class MLTrainingWorker : BackgroundService
 
             if (patterns.Contains("ev"))
             {
+                // Widen barriers symmetrically so the retry still satisfies the
+                // symmetric-barrier guard in ProcessRunAsync. Previous asymmetric
+                // tweak (profit × 1.2, stop × 0.8) produced a 1.5× ratio that
+                // tripped the guard on attempt 1 and kept the run in a retry loop.
+                // Symmetric widening raises the signal-to-noise on labels without
+                // introducing directional bias — same correction direction, safer math.
+                const double symmetricWiden = 1.1;
                 if (refHp?.UseTripleBarrier == true)
                 {
                     overrides.UseTripleBarrier = true;
                     overrides.TripleBarrierProfitAtrMult = refHp.TripleBarrierProfitAtrMult
-                        ?? hp.TripleBarrierProfitAtrMult * 1.2;
+                        ?? hp.TripleBarrierProfitAtrMult * symmetricWiden;
                     overrides.TripleBarrierStopAtrMult = refHp.TripleBarrierStopAtrMult
-                        ?? hp.TripleBarrierStopAtrMult * 0.8;
+                        ?? hp.TripleBarrierStopAtrMult * symmetricWiden;
                 }
                 else
                 {
                     overrides.UseTripleBarrier = true;
-                    overrides.TripleBarrierProfitAtrMult = hp.TripleBarrierProfitAtrMult * 1.2;
-                    overrides.TripleBarrierStopAtrMult = hp.TripleBarrierStopAtrMult * 0.8;
+                    overrides.TripleBarrierProfitAtrMult = hp.TripleBarrierProfitAtrMult * symmetricWiden;
+                    overrides.TripleBarrierStopAtrMult = hp.TripleBarrierStopAtrMult * symmetricWiden;
                 }
             }
 
