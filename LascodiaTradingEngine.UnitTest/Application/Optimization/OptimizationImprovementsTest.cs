@@ -450,6 +450,11 @@ public class OptimizationImprovementsTest
     [InlineData(OptimizationRunStatus.Running, OptimizationRunStatus.Queued)]
     [InlineData(OptimizationRunStatus.Failed, OptimizationRunStatus.Queued)]
     [InlineData(OptimizationRunStatus.Failed, OptimizationRunStatus.Abandoned)]
+    // Deferral-budget exhaustion transitions — OptimizationRunDeferralTracker needs
+    // to move Running / Queued straight to Abandoned when MaxDeferralCount or TTL is
+    // exceeded. Without these the worker throws "Illegal transition" at runtime.
+    [InlineData(OptimizationRunStatus.Running, OptimizationRunStatus.Abandoned)]
+    [InlineData(OptimizationRunStatus.Queued, OptimizationRunStatus.Abandoned)]
     [InlineData(OptimizationRunStatus.Completed, OptimizationRunStatus.Approved)]
     [InlineData(OptimizationRunStatus.Completed, OptimizationRunStatus.Rejected)]
     public void CanTransition_AllowsValidTransitions(OptimizationRunStatus from, OptimizationRunStatus to)
@@ -471,6 +476,48 @@ public class OptimizationImprovementsTest
     {
         Assert.False(OptimizationRunStateMachine.CanTransition(from, to),
             $"Expected transition {from} -> {to} to be invalid");
+    }
+
+    [Fact]
+    public void Transition_RunningToAbandoned_SetsTerminalFields()
+    {
+        var run = new OptimizationRun
+        {
+            Id = 42,
+            Status = OptimizationRunStatus.Running,
+            StartedAt = DateTime.UtcNow.AddMinutes(-30),
+            ExecutionLeaseExpiresAt = DateTime.UtcNow.AddMinutes(5),
+            ExecutionLeaseToken = Guid.NewGuid(),
+        };
+        var now = DateTime.UtcNow;
+
+        OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Abandoned, now,
+            errorMessage: "Deferral budget exhausted");
+
+        Assert.Equal(OptimizationRunStatus.Abandoned, run.Status);
+        Assert.NotNull(run.CompletedAt);
+        Assert.Equal("Deferral budget exhausted", run.ErrorMessage);
+        Assert.Null(run.ExecutionLeaseExpiresAt);
+        Assert.Null(run.ExecutionLeaseToken);
+    }
+
+    [Fact]
+    public void Transition_QueuedToAbandoned_SetsTerminalFields()
+    {
+        // Deferral path: Queued run exhausts its TTL before ever running → straight to Abandoned.
+        var run = new OptimizationRun
+        {
+            Id = 43,
+            Status = OptimizationRunStatus.Queued,
+            QueuedAt = DateTime.UtcNow.AddDays(-8),
+            DeferralCount = 6,
+        };
+        OptimizationRunStateMachine.Transition(run, OptimizationRunStatus.Abandoned, DateTime.UtcNow,
+            errorMessage: "Exceeded max deferral TTL (7 days)");
+
+        Assert.Equal(OptimizationRunStatus.Abandoned, run.Status);
+        Assert.NotNull(run.CompletedAt);
+        Assert.Contains("TTL", run.ErrorMessage);
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────
