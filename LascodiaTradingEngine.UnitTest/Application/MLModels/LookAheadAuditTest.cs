@@ -61,11 +61,7 @@ public class LookAheadAuditTest
         return list;
     }
 
-    [Fact(Skip = "Known contamination — see ADR-0013. V1 BuildFeatureVector consumes " +
-                 "current.Close/High/Low/Volume which is future information at decision time. " +
-                 "Un-skip when the feature vector is refactored to shift future-dependent " +
-                 "features by +1 bar OR drop them. DO NOT delete this test — it's the only " +
-                 "regression guard against re-introducing look-ahead after the fix.")]
+    [Fact]
     public void V1_FeatureVector_IsIndependentOfCurrentCandleFuture()
     {
         // Arrange: build a clean lookback window + current + prev.

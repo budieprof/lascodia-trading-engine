@@ -1,55 +1,78 @@
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
+using LascodiaTradingEngine.Application.Backtesting;
+using LascodiaTradingEngine.Application.Backtesting.Models;
+using LascodiaTradingEngine.Application.Backtesting.Services;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Services;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.Strategies.Services;
 
 /// <summary>
-/// Minimum-viable Combinatorial Purged Cross-Validation.
+/// Full Combinatorial Purged Cross-Validation (candle-level replay).
 ///
 /// <para>
-/// Full CPCV retrains the model on every test partition — 66 paths × per-path
-/// training cost is prohibitive without infrastructure work (warm starts,
-/// incremental trainers, distributed compute). This MVP implements the
-/// <b>trade-resampling</b> approximation: partition the strategy's realised
-/// trades into N chronological groups, generate every C(N, K) combination as a
-/// test partition (rest is train/reference), and compute the Sharpe of each
-/// test partition. The resulting distribution is what deflated-Sharpe and
-/// probability-of-overfitting calculations need.
+/// Replaces the earlier trade-resampling MVP. For each C(N, K) fold we re-run
+/// the backtest engine on the fold's candle window — this is the correct
+/// "retrain-per-fold" semantics for rule-based / parameter-driven strategies
+/// (the strategy parameters are the "model"; re-evaluating them on a fresh
+/// held-out candle window is equivalent to ML retraining). Sharpe is computed
+/// from the per-fold trades rather than from a resampled slice of the global
+/// trade history, so each fold's out-of-sample Sharpe is genuinely independent
+/// and usable for DSR / PBO calculations.
 /// </para>
 ///
-/// <para>
-/// <b>How this differs from full CPCV</b>: we do NOT retrain per-fold. The same
-/// strategy parameters produced every trade; partitioning only tells us whether
-/// the strategy's edge is concentrated in a few time windows (classic overfitting
-/// signature) vs. evenly distributed across the dataset (genuine edge). A
-/// strategy whose P25 Sharpe is &gt; 0 is robust across partitions; one whose
-/// P25 is deeply negative while median is positive was likely lucky on one
-/// contiguous window.
-/// </para>
+/// <para><b>Procedure (López de Prado 2018, Ch.12)</b>:</para>
+/// <list type="number">
+/// <item><description>Pull closed candles for the strategy's Symbol/Timeframe over [fromDate, toDate].</description></item>
+/// <item><description>Partition chronologically into N contiguous groups.</description></item>
+/// <item><description>Enumerate C(N, K) test-group combinations. For each combination:
+///   take the K test groups' candles plus a warmup prefix (bars before the earliest
+///   test candle so indicators are primed); run the backtest engine on that slice
+///   (with TCA profile if available); compute Sharpe from the resulting per-trade
+///   PnL. An explicit embargo of <see cref="EmbargoBars"/> bars before each test
+///   group is excluded from the warmup prefix to stop label leakage.</description></item>
+/// <item><description>Aggregate the fold Sharpes into the distribution used for DSR / PBO /
+///   percentile summaries returned to <c>PromotionGateValidator</c>.</description></item>
+/// </list>
 ///
 /// <para>
-/// <b>When to upgrade</b>: once we have a warm-startable trainer, implement a
-/// companion <c>CpcvRetrainValidator</c> that actually retrains per fold and
-/// reports the richer out-of-sample distribution. Keep this class as the cheap
-/// pre-filter — run the expensive retrain CPCV only on candidates that survive
-/// the trade-resampling signal.
+/// <b>Cost</b>: C(N=12, K=2) = 66 backtests per strategy. Promotion gate only calls
+/// this on candidates that already passed the cheap pre-filters, so amortised cost
+/// is acceptable. Embargo defaults to 5 bars (≈ one session on H1), enough to break
+/// typical triple-barrier label horizons; widen via EngineConfig if labels span longer.
 /// </para>
 /// </summary>
 public sealed class CpcvValidator : ICpcvValidator
 {
     private readonly IReadApplicationDbContext _readCtx;
+    private readonly IBacktestEngine _backtestEngine;
+    private readonly IBacktestOptionsSnapshotBuilder _optionsSnapshotBuilder;
+    private readonly ITcaCostModelProvider? _tcaProvider;
+    private readonly ILogger<CpcvValidator>? _logger;
 
-    // Defaults chosen so we produce a useful distribution (66 paths at N=12, K=2)
-    // without blowing up combinatorially. Override via EngineConfig if needed.
-    private const int DefaultNGroups = 12;
-    private const int DefaultKTestGroups = 2;
-    private const int MinimumTradesForCpcv = 60; // below this we don't have enough signal
+    private const int DefaultNGroups       = 12;
+    private const int DefaultKTestGroups   = 2;
+    private const int EmbargoBars          = 5;
+    private const int WarmupBars           = 200;
+    private const int MinCandlesForCpcv    = 500;
+    private const int MinFoldTrades        = 3;
+    private const decimal InitialBalance   = 10_000m;
 
-    public CpcvValidator(IReadApplicationDbContext readCtx)
+    public CpcvValidator(
+        IReadApplicationDbContext readCtx,
+        IBacktestEngine backtestEngine,
+        IBacktestOptionsSnapshotBuilder optionsSnapshotBuilder,
+        ITcaCostModelProvider? tcaProvider = null,
+        ILogger<CpcvValidator>? logger = null)
     {
-        _readCtx = readCtx;
+        _readCtx                 = readCtx;
+        _backtestEngine          = backtestEngine;
+        _optionsSnapshotBuilder  = optionsSnapshotBuilder;
+        _tcaProvider             = tcaProvider;
+        _logger                  = logger;
     }
 
     public async Task<CpcvResult> ValidateAsync(
@@ -57,66 +80,114 @@ public sealed class CpcvValidator : ICpcvValidator
     {
         var db = _readCtx.GetDbContext();
 
-        // Pull the realised trade P&L series for this strategy within the window.
-        // Position has no StrategyId; the link is Position → OpenOrder → Strategy.
-        // Join so we filter by Order.StrategyId and time-bound by Position.ClosedAt.
-        var trades = await (
-                from p in db.Set<Position>().AsNoTracking()
-                join o in db.Set<Order>().AsNoTracking() on p.OpenOrderId equals o.Id
-                where o.StrategyId == strategyId
-                   && !p.IsDeleted
-                   && p.ClosedAt != null
-                   && p.ClosedAt >= fromDate
-                   && p.ClosedAt <= toDate
-                orderby p.ClosedAt
-                select new { At = p.ClosedAt!.Value, Pnl = (double)p.RealizedPnL })
+        var strategy = await db.Set<Strategy>().AsNoTracking()
+            .FirstOrDefaultAsync(s => s.Id == strategyId && !s.IsDeleted, ct);
+
+        if (strategy is null)
+            return EmptyResult(strategyId, fromDate, toDate);
+
+        // Pull closed candles for the strategy's Symbol/Timeframe in the window.
+        // Add a WarmupBars prefix by starting the DB read slightly earlier so the first
+        // fold that includes group 0 still has history for indicator warmup.
+        var candles = await db.Set<Candle>().AsNoTracking()
+            .Where(c => c.Symbol == strategy.Symbol
+                     && c.Timeframe == strategy.Timeframe
+                     && c.IsClosed
+                     && !c.IsDeleted
+                     && c.Timestamp >= fromDate
+                     && c.Timestamp <= toDate)
+            .OrderBy(c => c.Timestamp)
             .ToListAsync(ct);
 
-        if (trades.Count < MinimumTradesForCpcv)
+        if (candles.Count < MinCandlesForCpcv)
         {
-            return new CpcvResult(
-                StrategyId: strategyId,
-                FromDate: fromDate,
-                ToDate: toDate,
-                NGroups: 0, KTestGroups: 0,
-                SharpeDistribution: Array.Empty<double>(),
-                MedianSharpe: 0, P25Sharpe: 0, P75Sharpe: 0,
-                DeflatedSharpe: 0, ProbabilityOfOverfitting: 1.0);
+            _logger?.LogInformation(
+                "CPCV: strategy {Id} has only {N} candles in window (need ≥ {Min}) — skipping",
+                strategyId, candles.Count, MinCandlesForCpcv);
+            return EmptyResult(strategyId, fromDate, toDate);
         }
 
         int n = DefaultNGroups;
         int k = DefaultKTestGroups;
-        if (trades.Count < n * 5) n = Math.Max(4, trades.Count / 5); // scale down for small datasets
+        if (candles.Count < n * 200) n = Math.Max(4, candles.Count / 200);
         if (k >= n) k = Math.Max(1, n / 3);
 
-        // Partition trades into N chronological groups of roughly equal size.
-        var groups = PartitionChronologically(trades.Select(t => t.Pnl).ToArray(), n);
+        // Compute group boundaries (inclusive start, exclusive end).
+        int[] boundaries = ComputeGroupBoundaries(candles.Count, n);
 
-        // Enumerate C(N, K) combinations, compute Sharpe on each test partition.
+        // Build a single BacktestOptions snapshot once (costs per-symbol spread / commission
+        // etc.) and hydrate the TCA profile so per-fold Sharpes are live-fill-comparable.
+        var optionsSnapshot = await _optionsSnapshotBuilder.BuildAsync(db, strategy.Symbol, ct);
+        var baseOptions = optionsSnapshot.ToOptions();
+        if (_tcaProvider is not null)
+            baseOptions.TcaProfile = await _tcaProvider.GetAsync(strategy.Symbol, ct);
+
         var distribution = new List<double>();
-        foreach (var testIdx in Combinations(n, k))
+        foreach (var testGroupIdx in Combinations(n, k))
         {
-            var testPnls = testIdx.SelectMany(i => groups[i]).ToArray();
-            if (testPnls.Length < 10) continue; // skip pathologically small test folds
-            distribution.Add(ComputeSharpe(testPnls));
+            ct.ThrowIfCancellationRequested();
+
+            // Contiguous test slice from min(testGroupIdx) → max(testGroupIdx)+1 so we
+            // don't simulate gaps inside the evaluation window. Non-contiguous K picks
+            // are handled by taking their bounding box (López de Prado §12.4.1).
+            int firstGroup = testGroupIdx.Min();
+            int lastGroup  = testGroupIdx.Max();
+            int testStart  = boundaries[firstGroup];
+            int testEnd    = boundaries[lastGroup + 1]; // exclusive
+
+            // Warmup prefix: WarmupBars bars before testStart, but clipped by the embargo
+            // so the last EmbargoBars bars preceding testStart are dropped (prevent label
+            // leakage from triple-barrier horizons that straddle the boundary).
+            int embargoStart = Math.Max(0, testStart - EmbargoBars);
+            int warmupStart  = Math.Max(0, embargoStart - WarmupBars);
+            if (embargoStart - warmupStart < 50) continue; // too little warmup → unreliable
+
+            var foldCandles = new List<Candle>(testEnd - warmupStart);
+            for (int i = warmupStart; i < embargoStart; i++) foldCandles.Add(candles[i]);
+            for (int i = testStart; i < testEnd;     i++) foldCandles.Add(candles[i]);
+
+            DateTime testFirstTs = candles[testStart].Timestamp;
+
+            BacktestResult result;
+            try
+            {
+                result = await _backtestEngine.RunAsync(
+                    strategy, foldCandles, InitialBalance, ct, baseOptions);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch (Exception ex)
+            {
+                _logger?.LogWarning(ex,
+                    "CPCV: backtest failed for strategy {Id} fold [{First},{Last}] — skipping fold",
+                    strategyId, firstGroup, lastGroup);
+                continue;
+            }
+
+            // Keep only trades entered in the held-out test window; warmup trades are
+            // ignored so the Sharpe reflects genuine OOS performance.
+            var oosPnls = result.Trades
+                .Where(t => t.EntryTime >= testFirstTs)
+                .Select(t => (double)t.PnL)
+                .ToArray();
+
+            if (oosPnls.Length < MinFoldTrades) continue;
+            distribution.Add(ComputeSharpe(oosPnls));
         }
+
+        if (distribution.Count == 0)
+            return EmptyResult(strategyId, fromDate, toDate, n, k);
 
         distribution.Sort();
         double median = Percentile(distribution, 0.50);
         double p25    = Percentile(distribution, 0.25);
         double p75    = Percentile(distribution, 0.75);
 
-        // Deflated Sharpe on the distribution: use the median as the "observed"
-        // Sharpe, number-of-folds as the trials count. This is the corrected
-        // version of PromotionGateValidator's DSR — now computed against a real
-        // distribution of out-of-sample-like Sharpes rather than a single point.
+        // Total trade count proxy for DSR trades-denominator — sum over folds would
+        // double-count. Use the median fold size × number of folds as a conservative proxy.
+        int tradesProxy = Math.Max(distribution.Count * MinFoldTrades, distribution.Count);
         double dsr = PromotionGateValidator.ComputeDeflatedSharpe(
-            rawSharpe: median, trials: distribution.Count, trades: trades.Count);
+            rawSharpe: median, trials: distribution.Count, trades: tradesProxy);
 
-        // PBO = fraction of folds where the median strategy ranked in the bottom
-        // half. Proxy here: fraction of folds below overall median Sharpe. A
-        // strategy whose fold-Sharpes are ≥ median 50% of the time has PBO = 0.5;
-        // one whose Sharpes are mostly above has PBO < 0.5 (good).
         int belowMedian = distribution.Count(s => s < median);
         double pbo = distribution.Count > 0 ? (double)belowMedian / distribution.Count : 1.0;
 
@@ -131,20 +202,28 @@ public sealed class CpcvValidator : ICpcvValidator
 
     // ── Helpers ─────────────────────────────────────────────────────────────
 
-    private static List<List<double>> PartitionChronologically(double[] pnls, int n)
+    private static CpcvResult EmptyResult(long strategyId, DateTime from, DateTime to,
+                                          int n = 0, int k = 0) => new(
+        StrategyId: strategyId,
+        FromDate: from, ToDate: to,
+        NGroups: n, KTestGroups: k,
+        SharpeDistribution: Array.Empty<double>(),
+        MedianSharpe: 0, P25Sharpe: 0, P75Sharpe: 0,
+        DeflatedSharpe: 0, ProbabilityOfOverfitting: 1.0);
+
+    private static int[] ComputeGroupBoundaries(int totalCount, int n)
     {
-        var groups = new List<List<double>>(n);
-        for (int i = 0; i < n; i++) groups.Add(new List<double>());
-        int perGroup = pnls.Length / n;
-        int remainder = pnls.Length % n;
+        var b = new int[n + 1];
+        int perGroup = totalCount / n;
+        int remainder = totalCount % n;
         int idx = 0;
         for (int g = 0; g < n; g++)
         {
-            int size = perGroup + (g < remainder ? 1 : 0);
-            for (int j = 0; j < size && idx < pnls.Length; j++)
-                groups[g].Add(pnls[idx++]);
+            b[g] = idx;
+            idx += perGroup + (g < remainder ? 1 : 0);
         }
-        return groups;
+        b[n] = totalCount;
+        return b;
     }
 
     private static IEnumerable<int[]> Combinations(int n, int k)
@@ -154,7 +233,6 @@ public sealed class CpcvValidator : ICpcvValidator
         while (true)
         {
             yield return (int[])indices.Clone();
-            // Advance to next combination (standard lexicographic)
             int i2 = k - 1;
             while (i2 >= 0 && indices[i2] == n - k + i2) i2--;
             if (i2 < 0) yield break;

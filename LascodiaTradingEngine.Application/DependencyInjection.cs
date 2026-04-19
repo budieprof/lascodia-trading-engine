@@ -146,6 +146,12 @@ public static class DependencyInjection
         // of capacity exhaustion, catching edge decay 2-6 weeks before Sharpe does.
         services.AddHostedService<SlippageDriftWorker>();
 
+        // ── Feature-schema-version backfill (one-shot migration) ───────────────
+        // Sets ModelSnapshot.FeatureSchemaVersion on legacy JSON blobs that predate
+        // the field, removing the runtime inference-by-count dependency. Idempotent —
+        // guarded by an EngineConfig flag; subsequent startups are no-ops.
+        services.AddHostedService<FeatureSchemaVersionBackfillWorker>();
+
         // ── Promotion Gate Validator ───────────────────────────────────────────
         // Hard gate between Approved → Active. Enforces DSR, PBO-proxy, TCA-adjusted
         // EV, paper-trade duration, regime-coverage proxy, and max-correlation checks.

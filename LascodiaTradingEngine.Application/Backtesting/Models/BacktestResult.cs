@@ -46,6 +46,12 @@ public record BacktestResult
     public decimal TotalSwap       { get; init; }
     public decimal TotalSlippage   { get; init; }
 
+    /// <summary>
+    /// Aggregate realised-cost deductions sourced from TCA (spread + commission + market
+    /// impact measured on live fills). Zero when no TCA profile is supplied.
+    /// </summary>
+    public decimal TotalTcaCost    { get; init; }
+
     // ── Recovery ─────────────────────────────────────────────────────────────
     public decimal RecoveryFactor  { get; init; }  // Net profit / MaxDrawdown (absolute)
 
@@ -66,6 +72,8 @@ public record BacktestTrade
     public decimal  Commission   { get; init; }
     public decimal  Swap         { get; init; }
     public decimal  Slippage     { get; init; }
+    /// <summary>Realised TCA cost deducted from this trade (0 when no TCA profile).</summary>
+    public decimal  TcaCost      { get; init; }
     public decimal  GrossPnL     { get; init; }
     public DateTime EntryTime    { get; init; }
     public DateTime ExitTime     { get; init; }

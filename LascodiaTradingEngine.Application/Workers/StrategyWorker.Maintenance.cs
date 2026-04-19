@@ -156,15 +156,102 @@ public partial class StrategyWorker
         try
         {
             _expirySweepTimer?.Change(Timeout.Infinite, Timeout.Infinite);
+            _stateFlushTimer?.Change(Timeout.Infinite, Timeout.Infinite);
             using var flushCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             flushCts.CancelAfter(TimeSpan.FromSeconds(10));
+            // Persist dirty runtime state before shutdown so restart losses are
+            // bounded by seconds, not the fast-flush cadence.
+            await FlushDirtyStrategyStateAsync(flushCts.Token);
             await PerformExpirySweepAsync(flushCts.Token);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            _logger.LogWarning(ex, "StrategyWorker: final expiry sweep at shutdown failed");
+            _logger.LogWarning(ex, "StrategyWorker: final flush/sweep at shutdown failed");
         }
 
         await base.StopAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Timer callback: periodically flush dirty runtime state (lastSignalAt /
+    /// consecutiveFailures / circuitOpenedAt) to the <c>Strategy</c> table so
+    /// cooldown / circuit state survives restarts with sub-minute staleness.
+    /// Companion to the 5-min expiry sweep; the sweep remains as a safety net for
+    /// any state change the flusher missed (e.g. dropped dirty flag under error).
+    /// </summary>
+    private void RunStateFlush(object? state)
+    {
+        _ = Task.Run(async () =>
+        {
+            if (_stoppingToken.IsCancellationRequested) return;
+            await FlushDirtyStrategyStateAsync(_stoppingToken);
+        }, CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Core flush body. Snaps the current set of dirty strategy IDs, clears them,
+    /// and writes each one's in-memory state (<see cref="_lastSignalTime"/> /
+    /// <see cref="_consecutiveFailures"/> / <see cref="_circuitOpenedAt"/>) to the
+    /// DB via a bulk ExecuteUpdate. Per-strategy errors log but don't abort the
+    /// whole flush — a corrupt row shouldn't block the rest of the fleet.
+    /// </summary>
+    private async Task FlushDirtyStrategyStateAsync(CancellationToken ct)
+    {
+        if (!await _stateFlushLock.WaitAsync(0, ct)) return;
+        try
+        {
+            // Snapshot-and-clear: drain the current dirty set. Any writes that
+            // happen while we're persisting will flag the strategy dirty again
+            // for the next tick, so we never drop a real change.
+            var dirtyIds = _dirtyStrategyIds.Keys.ToArray();
+            foreach (var id in dirtyIds) _dirtyStrategyIds.TryRemove(id, out _);
+            if (dirtyIds.Length == 0) return;
+
+            using var scope = _scopeFactory.CreateScope();
+            var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+            var writeDb  = writeCtx.GetDbContext();
+
+            int errors = 0;
+            foreach (var id in dirtyIds)
+            {
+                if (ct.IsCancellationRequested) break;
+                _lastSignalTime.TryGetValue(id, out var lastSignalAt);
+                _consecutiveFailures.TryGetValue(id, out var consecFailures);
+                _circuitOpenedAt.TryGetValue(id, out var circuitOpenedAt);
+                DateTime? lastSignalAtNullable    = lastSignalAt == default ? null : lastSignalAt;
+                DateTime? circuitOpenedAtNullable = circuitOpenedAt == default ? null : circuitOpenedAt;
+
+                try
+                {
+                    await writeDb.Set<Domain.Entities.Strategy>()
+                        .Where(s => s.Id == id)
+                        .ExecuteUpdateAsync(u => u
+                            .SetProperty(s => s.LastSignalAt, lastSignalAtNullable)
+                            .SetProperty(s => s.ConsecutiveEvaluationFailures, consecFailures)
+                            .SetProperty(s => s.CircuitOpenedAt, circuitOpenedAtNullable),
+                            ct);
+                }
+                catch (Exception ex)
+                {
+                    errors++;
+                    if (errors <= 3)
+                        _logger.LogWarning(ex, "StrategyWorker: state flush failed for strategy {Id}", id);
+                    // Put the ID back in the dirty set so the next tick retries it.
+                    _dirtyStrategyIds[id] = 1;
+                }
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // graceful shutdown
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "StrategyWorker: runtime-state flush failed");
+        }
+        finally
+        {
+            _stateFlushLock.Release();
+        }
     }
 }

@@ -40,6 +40,22 @@ jobs:
       - name: Build
         run: dotnet build LascodiaTradingEngine.slnx --no-restore --configuration Release
 
+      # Catch schema drift at PR time instead of at deploy. If the DbContext model
+      # has accumulated changes without a corresponding migration, the deploy will
+      # fail (startup migration throws). `has-pending-model-changes` was added in
+      # EF 9 and is the canonical way to detect this. The Infrastructure project
+      # owns the DbContext; the --startup-project points at the API so the normal
+      # host DI graph loads.
+      - name: Install dotnet-ef
+        run: dotnet tool install --global dotnet-ef --version 10.*
+      - name: Detect pending EF Core migrations
+        run: |
+          dotnet ef migrations has-pending-model-changes \
+            --project LascodiaTradingEngine.Infrastructure/LascodiaTradingEngine.Infrastructure.csproj \
+            --startup-project LascodiaTradingEngine.API/LascodiaTradingEngine.API.csproj \
+            --no-build \
+            --configuration Release
+
       - name: Unit Tests
         run: >
           dotnet test LascodiaTradingEngine.UnitTest/LascodiaTradingEngine.UnitTest.csproj

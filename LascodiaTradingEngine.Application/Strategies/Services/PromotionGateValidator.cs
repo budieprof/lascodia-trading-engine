@@ -81,6 +81,31 @@ public sealed class PromotionGateValidator : IPromotionGateValidator
         var failures = new List<string>();
         var diagnostics = new List<string>();
 
+        // ── Consolidate DSR + PBO under the Bayesian edge posterior ────────
+        // The posterior gate (gate 8) already incorporates selection-bias deflation
+        // and is informed by CPCV's real out-of-sample Sharpe distribution (gate 7),
+        // so running the single-path DSR (gate 1) and PBO-proxy (gate 2) alongside
+        // it is belt-and-braces: same signal, double-counted. Auto-skip the single-
+        // path proxies whenever both the posterior and CPCV gates are active. An
+        // operator can still force the legacy behaviour by setting
+        // Promotion:ConsolidateDsrPbo = false in EngineConfig.
+        bool consolidate = await GetConfigBoolAsync(db, "Promotion:ConsolidateDsrPbo", true, ct);
+        bool cpcvActive  = !disabledGates.Contains("cpcv");
+        bool postActive  = !disabledGates.Contains("edge_posterior");
+        if (consolidate && cpcvActive && postActive)
+        {
+            if (!disabledGates.Contains("dsr"))
+            {
+                disabledGates.Add("dsr");
+                diagnostics.Add("DSR gate auto-skipped: consolidated under edge_posterior + CPCV");
+            }
+            if (!disabledGates.Contains("pbo"))
+            {
+                disabledGates.Add("pbo");
+                diagnostics.Add("PBO-proxy gate auto-skipped: consolidated under edge_posterior + CPCV");
+            }
+        }
+
         // ── Gate 1: Deflated Sharpe Ratio ───────────────────────────────────
         if (!disabledGates.Contains("dsr"))
         {
@@ -448,6 +473,13 @@ public sealed class PromotionGateValidator : IPromotionGateValidator
     {
         var raw = await GetConfigAsync(db, key, string.Empty, ct);
         return int.TryParse(raw, System.Globalization.CultureInfo.InvariantCulture, out var v) ? v : defaultValue;
+    }
+
+    private static async Task<bool> GetConfigBoolAsync(
+        DbContext db, string key, bool defaultValue, CancellationToken ct)
+    {
+        var raw = await GetConfigAsync(db, key, string.Empty, ct);
+        return bool.TryParse(raw, out var v) ? v : defaultValue;
     }
 }
 

@@ -106,8 +106,13 @@ public class ReceiveSymbolSpecsCommandHandler : IRequestHandler<ReceiveSymbolSpe
 
         var dbContext = _context.GetDbContext();
 
-        // Batch-load existing currency pairs to avoid N+1 queries
-        var symbols = request.Specs.Select(s => s.Symbol.ToUpperInvariant()).Distinct().ToList();
+        // Batch-load existing currency pairs to avoid N+1 queries.
+        // Canonicalize via SymbolNormalizer so broker suffixes don't produce
+        // duplicate CurrencyPair rows (one for "EURUSD", another for "EURUSD.a").
+        var symbols = request.Specs
+            .Select(s => LascodiaTradingEngine.Application.Common.Utilities.SymbolNormalizer.Normalize(s.Symbol))
+            .Distinct()
+            .ToList();
         var existingPairs = await dbContext
             .Set<Domain.Entities.CurrencyPair>()
             .Where(x => symbols.Contains(x.Symbol) && !x.IsDeleted)
@@ -116,7 +121,7 @@ public class ReceiveSymbolSpecsCommandHandler : IRequestHandler<ReceiveSymbolSpe
 
         foreach (var spec in request.Specs)
         {
-            var symbol = spec.Symbol.ToUpperInvariant();
+            var symbol = LascodiaTradingEngine.Application.Common.Utilities.SymbolNormalizer.Normalize(spec.Symbol);
 
             if (pairBySymbol.TryGetValue(symbol, out var existing))
             {

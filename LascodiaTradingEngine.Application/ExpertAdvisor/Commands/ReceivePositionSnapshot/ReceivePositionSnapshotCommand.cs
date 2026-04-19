@@ -132,7 +132,11 @@ public class ReceivePositionSnapshotCommandHandler : IRequestHandler<ReceivePosi
         foreach (var snap in request.Positions)
         {
             var brokerTicket = snap.Ticket.ToString();
-            var symbol = snap.Symbol.ToUpperInvariant();
+            // Canonicalize via SymbolNormalizer so broker suffixes (EURUSD.a,
+            // EURUSD-pro, EUR/USD) collapse to the same key used by candles and
+            // specs. Previously used raw ToUpperInvariant() — left broker-suffixed
+            // symbols in the DB that silently failed downstream spec lookups.
+            var symbol = LascodiaTradingEngine.Application.Common.Utilities.SymbolNormalizer.Normalize(snap.Symbol);
 
             // Hard-reject snapshots for symbols not owned by this EA instance to
             // prevent cross-instance data pollution and ensure strict symbol ownership.

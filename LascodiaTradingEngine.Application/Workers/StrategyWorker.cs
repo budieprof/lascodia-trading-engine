@@ -123,6 +123,22 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
     private readonly ConcurrentDictionary<long, int> _halfOpenProbeFailures = new();
     private const int MaxHalfOpenProbeFailures = 5;
 
+    /// <summary>
+    /// Strategy IDs whose runtime state (lastSignalAt / consecutiveFailures /
+    /// circuitOpenedAt) has changed since the last DB write-back. Populated by
+    /// each write to <see cref="_lastSignalTime"/> / <see cref="_consecutiveFailures"/>
+    /// / <see cref="_circuitOpenedAt"/>. Drained by the fast persistence loop so
+    /// restarts only lose seconds of state rather than the previous 5-minute
+    /// sweep cadence.
+    /// </summary>
+    private readonly ConcurrentDictionary<long, byte> _dirtyStrategyIds = new();
+
+    /// <summary>Timer for fast, dirty-flag-driven runtime-state persistence.</summary>
+    private Timer? _stateFlushTimer;
+
+    /// <summary>Serialises concurrent state flushes.</summary>
+    private readonly SemaphoreSlim _stateFlushLock = new(1, 1);
+
     /// <summary>Prevents concurrent expiry sweep executions from the timer.</summary>
     private readonly SemaphoreSlim _expirySweepLock = new(1, 1);
 
@@ -247,10 +263,15 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
         // Start the periodic sweep that expires stale pending trade signals
         _expirySweepTimer = new Timer(RunExpirySweep, null, TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(5));
 
+        // Fast-flush dirty runtime state (lastSignalAt / consecutiveFailures / circuitOpenedAt)
+        // so cooldown + circuit-breaker state survives restart with sub-minute staleness.
+        _stateFlushTimer = new Timer(RunStateFlush, null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
+
         // Clean up subscriptions and timer when the host signals shutdown
         stoppingToken.Register(() =>
         {
             _expirySweepTimer?.Dispose();
+            _stateFlushTimer?.Dispose();
             _tickChannel.Writer.TryComplete();
             _eventBus.Unsubscribe<PriceUpdatedIntegrationEvent, StrategyWorker>();
         });
@@ -854,6 +875,7 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
                             strategy.Id, strategy.Symbol, _options.EvaluatorTimeoutSeconds);
                         _metrics.WorkerErrors.Add(1, new("worker", "StrategyWorker"), new("reason", "evaluator_timeout"));
                         _consecutiveFailures.AddOrUpdate(strategy.Id, 1, (_, count) => count + 1);
+                        _dirtyStrategyIds[strategy.Id] = 1;
                         return;
                     }
                 }
@@ -1176,6 +1198,7 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
                     if (newCount >= _options.MaxConsecutiveFailures)
                         _circuitOpenedAt[strategy.Id] = DateTime.UtcNow;
                 }
+                _dirtyStrategyIds[strategy.Id] = 1;
 
                 // Dead-letter audit trail for failed signal evaluations
                 try
@@ -1298,6 +1321,7 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
                 // set by a parallel winner for the same strategy on a different timeframe)
                 var now = DateTime.UtcNow;
                 _lastSignalTime.AddOrUpdate(pending.StrategyId, now, (_, existing) => existing >= now ? existing : now);
+                _dirtyStrategyIds[pending.StrategyId] = 1;
 
                 _metrics.SignalsGenerated.Add(1, new("symbol", pending.Symbol), new("strategy_type", pending.StrategyType.ToString()));
 

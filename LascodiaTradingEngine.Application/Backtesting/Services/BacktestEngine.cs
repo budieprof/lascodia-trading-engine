@@ -4,6 +4,7 @@ using LascodiaTradingEngine.Application.Backtesting.Models;
 using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Utilities;
+using LascodiaTradingEngine.Application.Services;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -82,6 +83,14 @@ public class BacktestOptions
     /// <see cref="TradeSignal.SuggestedLotSize"/> is used (falling back to 0.01 if zero).
     /// </summary>
     public Func<decimal, TradeSignal, decimal>? PositionSizer { get; set; }
+
+    /// <summary>
+    /// Realised transaction-cost profile from live TCA (spread, commission, market impact
+    /// measured against real fills). When set, the engine deducts these on every simulated
+    /// trade on top of the baseline Commission/Slippage/Spread inputs — closing the gap
+    /// between backtest PnL and live PnL. Leave null to keep legacy behaviour.
+    /// </summary>
+    public SymbolCostProfile? TcaProfile { get; set; }
 }
 
 // ── Implementation ────────────────────────────────────────────────────────────
@@ -130,6 +139,7 @@ public class BacktestEngine : IBacktestEngine
         decimal totalCommission = 0m;
         decimal totalSwap       = 0m;
         decimal totalSlippage   = 0m;
+        decimal totalTcaCost    = 0m;
 
         // State for the open position
         bool          inTrade    = false;
@@ -184,12 +194,14 @@ public class BacktestEngine : IBacktestEngine
                     decimal swap = lotSize * options.SwapPerLotPerDay * Math.Max(daysHeldExact, 0m);
 
                     decimal slippageCost = (entrySlippage + exitSlip) * lotSize * options.ContractSize;
-                    decimal pnl = grossPnl - commission - swap;
+                    decimal tcaCost = ComputeTcaCost(options.TcaProfile, lotSize, options.ContractSize);
+                    decimal pnl = grossPnl - commission - swap - tcaCost;
                     balance += pnl;
 
                     totalCommission += commission;
                     totalSwap       += swap;
                     totalSlippage   += slippageCost;
+                    totalTcaCost    += tcaCost;
 
                     trades.Add(new BacktestTrade
                     {
@@ -202,6 +214,7 @@ public class BacktestEngine : IBacktestEngine
                         Commission = commission,
                         Swap       = swap,
                         Slippage   = slippageCost,
+                        TcaCost    = tcaCost,
                         EntryTime  = entryTime,
                         ExitTime   = bar.Timestamp,
                         ExitReason = exitReason
@@ -289,12 +302,14 @@ public class BacktestEngine : IBacktestEngine
             decimal daysHeldExact = (decimal)(lastBar.Timestamp - entryTime).TotalDays;
             decimal swap = lotSize * options.SwapPerLotPerDay * Math.Max(daysHeldExact, 0m);
             decimal slippageCost = (entrySlippage + exitSlip) * lotSize * options.ContractSize;
-            decimal pnl = grossPnl - commission - swap;
+            decimal tcaCost = ComputeTcaCost(options.TcaProfile, lotSize, options.ContractSize);
+            decimal pnl = grossPnl - commission - swap - tcaCost;
             balance += pnl;
 
             totalCommission += commission;
             totalSwap       += swap;
             totalSlippage   += slippageCost;
+            totalTcaCost    += tcaCost;
 
             // Update final equity point (replace the last M2M point with realised)
             equityCurve[^1] = balance;
@@ -310,6 +325,7 @@ public class BacktestEngine : IBacktestEngine
                 Commission = commission,
                 Swap       = swap,
                 Slippage   = slippageCost,
+                TcaCost    = tcaCost,
                 EntryTime  = entryTime,
                 ExitTime   = lastBar.Timestamp,
                 ExitReason = TradeExitReason.EndOfData
@@ -318,7 +334,20 @@ public class BacktestEngine : IBacktestEngine
 
         // ── Compute statistics ───────────────────────────────────────────
         return ComputeResult(trades, equityCurve, initialBalance, balance, candles.Count,
-                             barsInTrade, totalCommission, totalSwap, totalSlippage);
+                             barsInTrade, totalCommission, totalSwap, totalSlippage, totalTcaCost);
+    }
+
+    /// <summary>
+    /// Converts a realised <see cref="SymbolCostProfile"/> into account-currency cost per trade.
+    /// Spread / market-impact fields are in price units → multiply by lotSize × contractSize.
+    /// Commission is already in account currency → scaled by lotSize × contractSize to match
+    /// the rest of the cost math (treat the profile value as a per-base-unit cost).
+    /// </summary>
+    private static decimal ComputeTcaCost(SymbolCostProfile? profile, decimal lotSize, decimal contractSize)
+    {
+        if (profile is null) return 0m;
+        decimal notional = lotSize * contractSize;
+        return (profile.AvgSpreadCostInPrice + profile.AvgMarketImpactInPrice + profile.AvgCommissionCostInAccountCcy) * notional;
     }
 
     // ── SL/TP Resolution ────────────────────────────────────────────────────
@@ -414,7 +443,8 @@ public class BacktestEngine : IBacktestEngine
         List<BacktestTrade> trades, List<decimal> equityCurve,
         decimal initialBalance, decimal finalBalance,
         int totalBars, int barsInTrade,
-        decimal totalCommission, decimal totalSwap, decimal totalSlippage)
+        decimal totalCommission, decimal totalSwap, decimal totalSlippage,
+        decimal totalTcaCost)
     {
         int totalTrades   = trades.Count;
         int winningTrades = trades.Count(t => t.PnL > 0);
@@ -492,6 +522,7 @@ public class BacktestEngine : IBacktestEngine
             TotalCommission = Math.Round(totalCommission, 2),
             TotalSwap       = Math.Round(totalSwap, 2),
             TotalSlippage   = Math.Round(totalSlippage, 2),
+            TotalTcaCost    = Math.Round(totalTcaCost, 2),
             RecoveryFactor  = Math.Round(recoveryFactor, 4),
             Trades          = trades
         };

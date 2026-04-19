@@ -123,7 +123,8 @@ public class ReceiveOrderSnapshotCommandHandler : IRequestHandler<ReceiveOrderSn
         foreach (var snap in request.Orders)
         {
             var brokerTicket = snap.Ticket.ToString();
-            var symbol = snap.Symbol.ToUpperInvariant();
+            // Canonicalize via SymbolNormalizer (see ReceivePositionSnapshotCommand).
+            var symbol = LascodiaTradingEngine.Application.Common.Utilities.SymbolNormalizer.Normalize(snap.Symbol);
 
             // Hard-reject snapshots for symbols not owned by this EA instance to
             // prevent cross-instance data pollution and ensure strict symbol ownership.

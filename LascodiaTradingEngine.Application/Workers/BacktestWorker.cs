@@ -351,12 +351,20 @@ public class BacktestWorker : BackgroundService
 
             var optionsSnapshot = JsonSerializer.Deserialize<BacktestOptionsSnapshot>(run.BacktestOptionsSnapshotJson!)
                 ?? throw new JsonException("Backtest options snapshot could not be deserialized.");
+            var backtestOptions = optionsSnapshot.ToOptions();
+            //--- Inject realised TCA profile so backtest PnL matches live-fill economics.
+            //--- Provider returns a conservative default when no TCA samples yet exist, so
+            //--- untested symbols still get penalised rather than looking free in backtest.
+            var tcaProvider = scope.ServiceProvider.GetService<LascodiaTradingEngine.Application.Services.ITcaCostModelProvider>();
+            if (tcaProvider is not null)
+                backtestOptions.TcaProfile = await tcaProvider.GetAsync(run.Symbol, ct);
+
             var result = await _backtestEngine.RunAsync(
                 evalStrategy,
                 candles,
                 run.InitialBalance,
                 ct,
-                optionsSnapshot.ToOptions());
+                backtestOptions);
 
             BacktestRunStateMachine.Transition(run, RunStatus.Completed, UtcNow);
             run.ResultJson = JsonSerializer.Serialize(result);

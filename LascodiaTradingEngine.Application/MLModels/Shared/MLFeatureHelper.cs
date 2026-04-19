@@ -328,9 +328,20 @@ public static class MLFeatureHelper
     {
         cotEntry ??= CotFeatureEntry.Zero;
 
+        // ── Look-ahead discipline (roadmap #7) ────────────────────────────────
+        // At decision time (the open of `current`), we know everything up to and
+        // including `previous` (fully closed) and `current.Open` (the price we
+        // would execute at). We DO NOT know `current.Close/High/Low/Volume` —
+        // those are the bar's future. Every feature below must source from:
+        //   • any bar in `window` (includes previous)
+        //   • `previous.*` in full
+        //   • `current.Open` and `current.Timestamp`
+        // Reading anything else from `current` is look-ahead contamination; the
+        // audit test LookAheadAuditTest catches it.
         var closes  = window.Select(c => c.Close).ToList();
         var lag1Win = window.Take(window.Count - 1).ToList();          // 29 bars ending at i-2
         var lag2Win = window.Take(window.Count - 2).ToList();          // 28 bars ending at i-3
+        var beforePrevious = window.Count >= 2 ? window[window.Count - 2] : previous;
 
         // ── SMA5 / SMA20 ──────────────────────────────────────────────────────
         float sma5     = (float)window.TakeLast(5).Average(c => (double)c.Close);
@@ -345,38 +356,46 @@ public static class MLFeatureHelper
         // ── RSI(14) [0, 1] ────────────────────────────────────────────────────
         float rsi = (float)CalculateRSI(closes, 14) / 100f;
 
-        // ── % distance from SMA20, clipped to [-3, 3] ────────────────────────
+        // ── % distance from SMA20 (uses current.Open — known at decision time) ──
         float pctVsSma = sma20 > 0
-            ? Clamp((float)((double)(current.Close - (decimal)sma20) / (double)sma20 * 100) / 5f, -3f, 3f)
+            ? Clamp((float)((double)(current.Open - (decimal)sma20) / (double)sma20 * 100) / 5f, -3f, 3f)
             : 0f;
 
         // ── MACD histogram normalised by SMA20 ────────────────────────────────
         float macdLine = (float)(CalculateEMA(closes, 12) - CalculateEMA(closes, 26));
         float macdNorm = sma20 > 0 ? Clamp(macdLine / sma20 * 100f, -3f, 3f) : 0f;
 
-        // ── Bollinger %B [0, 1] ───────────────────────────────────────────────
+        // ── Bollinger %B (uses current.Open; the band edges are from window) ──
         float stdDev    = (float)Math.Sqrt(window.Average(c => Math.Pow((double)c.Close - sma20, 2)));
         float upperBand = sma20 + 2 * stdDev;
         float lowerBand = sma20 - 2 * stdDev;
         float bollPctB  = (upperBand - lowerBand) > 0
-            ? Clamp((float)((double)current.Close - lowerBand) / (upperBand - lowerBand), 0f, 1f)
+            ? Clamp((float)((double)current.Open - lowerBand) / (upperBand - lowerBand), 0f, 1f)
             : 0.5f;
 
-        // ── ATR(14)-normalised 1-bar return ───────────────────────────────────
+        // ── ATR-normalised gap return (current.Open − previous.Close) ─────────
+        // The overnight / weekend gap is fully known at decision time and is the
+        // single piece of "what has happened to price since the last bar closed"
+        // that we're allowed to use. Captures roughly the same signal as the
+        // prior (contaminated) (current.Close − previous.Close) feature.
         float atr     = (float)CalculateATR(window, 14);
         float atrNorm = atr > 0
-            ? Clamp((float)((double)(current.Close - previous.Close) / (double)atr), -3f, 3f)
+            ? Clamp((float)((double)(current.Open - previous.Close) / (double)atr), -3f, 3f)
             : 0f;
 
-        // ── Candle body ratio [0, 1] ──────────────────────────────────────────
-        float highLow   = (float)(current.High - current.Low);
-        float bodyAbs   = (float)Math.Abs((double)(current.Close - current.Open));
-        float bodyRatio = highLow > 0 ? Clamp(bodyAbs / highLow, 0f, 1f) : 0.5f;
+        // ── Previous-bar candle body ratio [0, 1] ─────────────────────────────
+        // Shifted from `current` to `previous` (the most recently closed bar).
+        // Body-shape features inherently need OHLC, which is only available post-close.
+        float prevHighLow = (float)(previous.High - previous.Low);
+        float prevBodyAbs = (float)Math.Abs((double)(previous.Close - previous.Open));
+        float bodyRatio   = prevHighLow > 0 ? Clamp(prevBodyAbs / prevHighLow, 0f, 1f) : 0.5f;
 
-        // ── Volume ratio (log-scaled, [-3, 3]) ────────────────────────────────
+        // ── Volume ratio — previous bar's volume vs window average ────────────
+        // current.Volume is future at decision time; previous bar's volume is the
+        // freshest legitimate signal about participation.
         float avgVol      = (float)window.Average(c => (double)c.Volume);
         float volumeRatio = avgVol > 0
-            ? Clamp((float)Math.Log((double)current.Volume / avgVol + 0.01), -3f, 3f)
+            ? Clamp((float)Math.Log((double)previous.Volume / avgVol + 0.01), -3f, 3f)
             : 0f;
 
         // ── ADX(14) [0, 1] ────────────────────────────────────────────────────
@@ -398,28 +417,35 @@ public static class MLFeatureHelper
         float dowSin  = (float)Math.Sin(2 * Math.PI * dow  /  7.0);
         float dowCos  = (float)Math.Cos(2 * Math.PI * dow  /  7.0);
 
-        // ── Candle pattern flags ──────────────────────────────────────────────
+        // ── Candle pattern flags (shifted: read the PREVIOUS bar, not current) ──
+        // All pattern features (pin-bar, doji, engulfing) need the full OHLC of a
+        // closed bar — they cannot be computed at `current.Open` time without
+        // look-ahead. Shifted by 1 bar: we detect patterns on `previous` and
+        // `beforePrevious`, which is what a discretionary trader would see at
+        // decision time anyway.
         float longestWick = Math.Max(
-            (float)(current.High - Math.Max(current.Open, current.Close)),
-            (float)(Math.Min(current.Open, current.Close) - current.Low));
-        float isPinBar = (highLow > 0 && bodyAbs < 0.3f * highLow && longestWick > 0.6f * highLow) ? 1f : 0f;
+            (float)(previous.High - Math.Max(previous.Open, previous.Close)),
+            (float)(Math.Min(previous.Open, previous.Close) - previous.Low));
+        float isPinBar = (prevHighLow > 0 && prevBodyAbs < 0.3f * prevHighLow && longestWick > 0.6f * prevHighLow) ? 1f : 0f;
 
-        float prevBodyDir = (float)(previous.Close - previous.Open);
-        float currBodyDir = (float)(current.Close  - current.Open);
+        float beforePrevBodyDir = (float)(beforePrevious.Close - beforePrevious.Open);
+        float prevBodyDir       = (float)(previous.Close       - previous.Open);
         float isEngulfing = 0f;
-        if (Math.Abs(currBodyDir) > 0 && Math.Abs(prevBodyDir) > 0)
+        if (Math.Abs(prevBodyDir) > 0 && Math.Abs(beforePrevBodyDir) > 0)
         {
-            bool bullEngulf = currBodyDir > 0 && prevBodyDir < 0
-                && current.Open  <= Math.Min(previous.Open, previous.Close)
-                && current.Close >= Math.Max(previous.Open, previous.Close);
-            bool bearEngulf = currBodyDir < 0 && prevBodyDir > 0
-                && current.Open  >= Math.Max(previous.Open, previous.Close)
-                && current.Close <= Math.Min(previous.Open, previous.Close);
+            bool bullEngulf = prevBodyDir > 0 && beforePrevBodyDir < 0
+                && previous.Open  <= Math.Min(beforePrevious.Open, beforePrevious.Close)
+                && previous.Close >= Math.Max(beforePrevious.Open, beforePrevious.Close);
+            bool bearEngulf = prevBodyDir < 0 && beforePrevBodyDir > 0
+                && previous.Open  >= Math.Max(beforePrevious.Open, beforePrevious.Close)
+                && previous.Close <= Math.Min(beforePrevious.Open, beforePrevious.Close);
             isEngulfing = bullEngulf ? 1f : bearEngulf ? -1f : 0f;
         }
 
-        float isDoji       = (highLow > 0 && bodyAbs < 0.1f * highLow) ? 1f : 0f;
-        float spreadProxy  = atr > 0 ? Clamp(highLow / atr, 0f, 3f) : 0f;
+        float isDoji       = (prevHighLow > 0 && prevBodyAbs < 0.1f * prevHighLow) ? 1f : 0f;
+        // spreadProxy: previous bar's range normalised by ATR. current.High/Low
+        // unknown at decision time; previous is the freshest legitimate signal.
+        float spreadProxy  = atr > 0 ? Clamp(prevHighLow / atr, 0f, 3f) : 0f;
 
         // ── Lagged indicator values (t-1, t-2 windows) ───────────────────────
         var lag1Closes = lag1Win.Select(c => c.Close).ToList();
@@ -453,9 +479,10 @@ public static class MLFeatureHelper
         float totalCO = window.Sum(c => Math.Abs((float)(c.Close - c.Open)));
         float cdaMixRatio = totalHL > 0 ? Clamp(totalCO / totalHL, 0f, 1f) : 0.5f;
 
-        // CdaRangeNorm: current bar range normalised by the window average range.
+        // CdaRangeNorm: previous bar's range normalised by the window average range.
+        // Shifted from `current` — current.High/Low are future at decision time.
         float avgRange = totalHL / window.Count;
-        float cdaRangeNorm = avgRange > 0 ? Clamp(highLow / avgRange, 0f, 3f) : 1f;
+        float cdaRangeNorm = avgRange > 0 ? Clamp(prevHighLow / avgRange, 0f, 3f) : 1f;
 
         // ── Rec #263: Feature grouping ──────────────────────────────────────
         // FeatureGroupCorr: correlation proxy between momentum group (smaRatio, emaRatio, rsi)

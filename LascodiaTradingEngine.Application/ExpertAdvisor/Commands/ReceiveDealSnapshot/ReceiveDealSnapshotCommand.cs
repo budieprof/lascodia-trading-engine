@@ -120,7 +120,8 @@ public class ReceiveDealSnapshotCommandHandler : IRequestHandler<ReceiveDealSnap
         // Hard-reject deals for symbols not owned by this EA instance
         foreach (var deal in request.Deals)
         {
-            var dealSymbol = deal.Symbol.ToUpperInvariant();
+            // Canonicalize via SymbolNormalizer (see ReceivePositionSnapshotCommand).
+            var dealSymbol = LascodiaTradingEngine.Application.Common.Utilities.SymbolNormalizer.Normalize(deal.Symbol);
             if (ownedSymbols.Count > 0 && !ownedSymbols.Contains(dealSymbol))
                 return ResponseData<string>.Init(null, false,
                     $"Symbol '{dealSymbol}' is not owned by EA instance '{request.InstanceId}'", "-403");
