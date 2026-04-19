@@ -760,8 +760,12 @@ public sealed class MLTrainingWorker : BackgroundService
             // per-sample DB round trips. The trainer then sees a 37-element
             // vector instead of 33, and CompositeMLEvaluator dispatches on the
             // model's stored feature count at inference time.
+            // Default flipped to true: V2 (37 features with cross-pair macro: PairCarryProxy,
+            // SafeHavenIndex, DollarStrengthComposite, CrossPairCorrelationStress) strictly
+            // enriches V1 without semantic change. Operators wanting V1-only behaviour can
+            // opt out via MLTraining:UseExtendedFeatureVector=false.
             bool useExtendedVector = await GetConfigAsync<bool>(
-                ctx, CK_UseExtendedFeatureVector, false, stoppingToken);
+                ctx, CK_UseExtendedFeatureVector, true, stoppingToken);
 
             Dictionary<string, (DateTime[] Times, double[] Closes)>? basket = null;
             if (useExtendedVector && candles.Count > 0)
