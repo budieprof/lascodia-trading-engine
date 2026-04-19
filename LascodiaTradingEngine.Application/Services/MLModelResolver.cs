@@ -141,6 +141,169 @@ internal sealed class MLModelResolver
         return (model, currentRegime);
     }
 
+    // ── Improvement #2: Bulk model resolution for batch scoring ──────────
+
+    /// <summary>
+    /// Resolves active models for a batch of (symbol, timeframe) pairs in a small,
+    /// fixed number of DB round-trips (3 queries: regime snapshots, active models,
+    /// fallback champions for the suppressed subset) instead of <c>N × 2</c> per-
+    /// signal round-trips.
+    /// </summary>
+    /// <remarks>
+    /// Follows the same precedence rules as <see cref="ResolveActiveModelAsync"/>:
+    /// regime-scoped model preferred over global, suppressed primary routed to the
+    /// fallback champion. Signals that resolve to no model (or to a suppressed model
+    /// with no fallback) are returned with <c>Model = null</c>.
+    /// </remarks>
+    internal async Task<IReadOnlyDictionary<(string Symbol, Timeframe Tf), (MLModel? Model, string? CurrentRegime)>>
+        ResolveActiveModelsBatchAsync(
+            IReadOnlyList<(TradeSignal Signal, Timeframe Tf)> inputs,
+            CancellationToken cancellationToken)
+    {
+        var result = new Dictionary<(string, Timeframe), (MLModel?, string?)>();
+        if (inputs.Count == 0) return result;
+
+        var db = _context.GetDbContext();
+
+        var distinctPairs = inputs
+            .Select(i => (i.Signal.Symbol, i.Tf))
+            .Distinct()
+            .ToList();
+        var symbols = distinctPairs.Select(p => p.Symbol).Distinct().ToArray();
+        var tfs     = distinctPairs.Select(p => p.Tf).Distinct().ToArray();
+
+        // Step 1: latest regime snapshot per (symbol, tf). One query.
+        var regimeMap = new Dictionary<(string, Timeframe), string?>();
+        try
+        {
+            using var regimeCts = CreateLinkedTimeout(cancellationToken);
+            var regimeRows = await db.Set<MarketRegimeSnapshot>()
+                .AsNoTracking()
+                .Where(r => symbols.Contains(r.Symbol) &&
+                            tfs.Contains(r.Timeframe) &&
+                            !r.IsDeleted)
+                .GroupBy(r => new { r.Symbol, r.Timeframe })
+                .Select(g => g.OrderByDescending(x => x.DetectedAt).First())
+                .Select(r => new { r.Symbol, r.Timeframe, r.Regime })
+                .ToListAsync(regimeCts.Token);
+
+            foreach (var row in regimeRows)
+                regimeMap[(row.Symbol, row.Timeframe)] = row.Regime.ToString();
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            _logger.LogDebug("Batch regime lookup timed out — using global models for batch");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Batch regime lookup failed — using global models for batch");
+        }
+
+        // Step 2: all active candidate models for the input symbols/timeframes. One query.
+        // Filter in-memory per-pair by regime-scope precedence. The upper bound
+        // (count ≤ distinctPairs.Count × 4) keeps the payload small.
+        var candidates = await db.Set<MLModel>()
+            .AsNoTracking()
+            .Where(x => symbols.Contains(x.Symbol) &&
+                        tfs.Contains(x.Timeframe) &&
+                        x.IsActive &&
+                        !x.IsFallbackChampion &&
+                        !x.IsDeleted &&
+                        x.ModelBytes != null)
+            .OrderByDescending(x => x.ExpectedValue ?? -1m)
+            .ThenByDescending(x => x.ActivatedAt)
+            .ToListAsync(cancellationToken);
+
+        var suppressedPrimaries = new List<(string Symbol, Timeframe Tf, MLModel Primary)>();
+
+        foreach (var (symbol, tf) in distinctPairs)
+        {
+            regimeMap.TryGetValue((symbol, tf), out var currentRegime);
+
+            // Prefer regime-scoped match; fall back to RegimeScope==null (global).
+            MLModel? picked = null;
+            if (currentRegime is not null)
+            {
+                picked = candidates.FirstOrDefault(x =>
+                    x.Symbol == symbol && x.Timeframe == tf && x.RegimeScope == currentRegime);
+            }
+            picked ??= candidates.FirstOrDefault(x =>
+                x.Symbol == symbol && x.Timeframe == tf && x.RegimeScope == null);
+
+            if (picked is null)
+            {
+                result[(symbol, tf)] = (null, currentRegime);
+                continue;
+            }
+
+            if (picked.IsSuppressed)
+            {
+                suppressedPrimaries.Add((symbol, tf, picked));
+                // Placeholder; step 3 fills in fallback or null.
+                result[(symbol, tf)] = (null, currentRegime);
+            }
+            else
+            {
+                result[(symbol, tf)] = (picked, currentRegime);
+            }
+        }
+
+        // Step 3: fallback champions for the suppressed subset. One query (skipped when empty).
+        if (suppressedPrimaries.Count > 0)
+        {
+            var suppSyms = suppressedPrimaries.Select(s => s.Symbol).Distinct().ToArray();
+            var suppTfs  = suppressedPrimaries.Select(s => s.Tf).Distinct().ToArray();
+
+            List<MLModel> fallbacks = [];
+            try
+            {
+                using var fbCts = CreateLinkedTimeout(cancellationToken);
+                fallbacks = await db.Set<MLModel>()
+                    .AsNoTracking()
+                    .Where(x => suppSyms.Contains(x.Symbol) &&
+                                suppTfs.Contains(x.Timeframe) &&
+                                x.IsFallbackChampion &&
+                                x.IsActive &&
+                                !x.IsSuppressed &&
+                                !x.IsDeleted &&
+                                x.ModelBytes != null)
+                    .OrderByDescending(x => x.ExpectedValue ?? -1m)
+                    .ThenByDescending(x => x.ActivatedAt)
+                    .ToListAsync(fbCts.Token);
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                _logger.LogDebug("Batch fallback champion lookup timed out");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Batch fallback champion lookup failed");
+            }
+
+            foreach (var (symbol, tf, primary) in suppressedPrimaries)
+            {
+                regimeMap.TryGetValue((symbol, tf), out var currentRegime);
+                var fb = fallbacks.FirstOrDefault(x => x.Symbol == symbol && x.Timeframe == tf);
+                if (fb is null)
+                {
+                    _logger.LogDebug(
+                        "Batch: scoring suppressed for {Symbol}/{Tf} model {Id} — no fallback champion",
+                        symbol, tf, primary.Id);
+                    result[(symbol, tf)] = (null, currentRegime);
+                }
+                else
+                {
+                    _logger.LogDebug(
+                        "Batch: suppressed primary {Id} for {Symbol}/{Tf} → fallback {FbId}",
+                        primary.Id, symbol, tf, fb.Id);
+                    result[(symbol, tf)] = (fb, currentRegime);
+                }
+            }
+        }
+
+        return result;
+    }
+
     // ── Improvement #1: Ensemble scoring committee ────────────────────────
 
     /// <summary>

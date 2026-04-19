@@ -81,6 +81,16 @@ public class MLModel : Entity<long>
     /// </summary>
     public byte[]? ModelBytes              { get; set; }
 
+    /// <summary>
+    /// Optional ONNX-format serialisation of this model's inference graph, populated
+    /// by <c>IOnnxModelExporter</c> after training when the architecture is supported.
+    /// When present, <c>MLSignalScorer</c> routes inference through
+    /// <c>IOnnxInferenceEngine</c> (GPU-accelerated CUDA or optimised CPU) instead of
+    /// the pure-C# forward pass — typically 2–10× faster. Null means ONNX is not
+    /// available for this model and the legacy inference engines handle scoring.
+    /// </summary>
+    public byte[]? OnnxBytes               { get; set; }
+
     /// <summary>F1 score achieved on the final held-out evaluation set.</summary>
     public decimal? F1Score                { get; set; }
 

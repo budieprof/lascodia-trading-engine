@@ -125,6 +125,14 @@ public sealed class MLSignalScorer : IMLSignalScorer
     private readonly MLConfigService                   _configService;
     private readonly global::LascodiaTradingEngine.Application.Services.ML.CrossAssetFeatureProvider _crossAssetProvider;
     private readonly global::LascodiaTradingEngine.Application.Services.ML.EconomicEventFeatureProvider _eventProvider;
+    private readonly global::LascodiaTradingEngine.Application.Services.ML.IOnnxInferenceEngine _onnxEngine;
+
+    /// <summary>
+    /// Tracks models already loaded into <see cref="_onnxEngine"/> so repeat scoring
+    /// doesn't re-upload bytes to the runtime. Entry removed when <see cref="IOnnxInferenceEngine.LoadModel"/>
+    /// is called with fresh bytes (on model promotion / retraining).
+    /// </summary>
+    private static readonly ConcurrentDictionary<long, bool> _onnxLoaded = new();
 
     public MLSignalScorer(
         IReadApplicationDbContext          context,
@@ -132,7 +140,8 @@ public sealed class MLSignalScorer : IMLSignalScorer
         ILogger<MLSignalScorer>           logger,
         IEnumerable<IModelInferenceEngine> inferenceEngines,
         global::LascodiaTradingEngine.Application.Services.ML.CrossAssetFeatureProvider crossAssetProvider,
-        global::LascodiaTradingEngine.Application.Services.ML.EconomicEventFeatureProvider eventProvider)
+        global::LascodiaTradingEngine.Application.Services.ML.EconomicEventFeatureProvider eventProvider,
+        global::LascodiaTradingEngine.Application.Services.ML.IOnnxInferenceEngine onnxEngine)
     {
         _context           = context;
         _cache             = cache;
@@ -142,10 +151,107 @@ public sealed class MLSignalScorer : IMLSignalScorer
         _configService     = new MLConfigService(cache, logger);
         _crossAssetProvider = crossAssetProvider;
         _eventProvider     = eventProvider;
+        _onnxEngine        = onnxEngine;
     }
 
     private IModelInferenceEngine? ResolveEngine(ModelSnapshot snap)
         => _inferenceEngines.FirstOrDefault(e => e.CanHandle(snap));
+
+    /// <summary>
+    /// Batch-scores a set of signals. Pre-resolves active models for all
+    /// <c>(symbol, timeframe)</c> pairs in one bulk DB round-trip, pre-warms
+    /// snapshot deserialization in parallel, then scores each signal through
+    /// the shared <see cref="ScoreForModelAsync"/> pipeline.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Committee scoring (<c>MLScoring:CommitteeSize &gt; 1</c>) falls back to
+    /// per-signal <see cref="ScoreAsync"/> because bulk-resolving committees is
+    /// non-trivial and K=1 is the common configuration.
+    /// </para>
+    /// <para>
+    /// Per-signal <see cref="ScoreForModelAsync"/> calls remain sequential to
+    /// respect scoped <see cref="IReadApplicationDbContext"/> thread-safety.
+    /// Matrix-batched engine-level inference is a separate future optimisation
+    /// aligned with the ONNX migration (item #3).
+    /// </para>
+    /// </remarks>
+    public async Task<IReadOnlyList<MLScoreResult>> ScoreBatchAsync(
+        IReadOnlyList<(TradeSignal Signal, IReadOnlyList<Candle> Candles)> batch,
+        CancellationToken cancellationToken)
+    {
+        if (batch.Count == 0) return Array.Empty<MLScoreResult>();
+        if (batch.Count == 1)
+        {
+            return new[] { await ScoreAsync(batch[0].Signal, batch[0].Candles, cancellationToken) };
+        }
+
+        var scoringStart = Stopwatch.GetTimestamp();
+        if (Interlocked.Increment(ref _evictionCounter) % 100 == 0)
+            EvictStaleCircuitBreakerEntries();
+
+        var db = _context.GetDbContext();
+        int committeeSize = await _configService.GetCommitteeSizeAsync(db, cancellationToken);
+
+        // Committee mode falls through to sequential per-signal scoring — still
+        // benefits from shared snapshot cache but without bulk model resolution.
+        if (committeeSize > 1)
+        {
+            var seq = new MLScoreResult[batch.Count];
+            for (int i = 0; i < batch.Count; i++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                seq[i] = await ScoreAsync(batch[i].Signal, batch[i].Candles, cancellationToken);
+            }
+            return seq;
+        }
+
+        // Precompute timeframes once.
+        var timeframes = new Timeframe[batch.Count];
+        for (int i = 0; i < batch.Count; i++)
+            timeframes[i] = batch[i].Candles.Count > 0 ? batch[i].Candles[0].Timeframe : Timeframe.H1;
+
+        // Bulk-resolve models for all (symbol, timeframe) pairs in the batch.
+        var pairs = new List<(TradeSignal Signal, Timeframe Tf)>(batch.Count);
+        for (int i = 0; i < batch.Count; i++)
+            pairs.Add((batch[i].Signal, timeframes[i]));
+
+        var resolved = await _modelResolver.ResolveActiveModelsBatchAsync(pairs, cancellationToken);
+
+        // Pre-warm unique snapshots in parallel. The inflight guard dedupes any
+        // same-id races, and GetOrDeserializeSnapshotAsync is idempotent & cached.
+        var uniqueModels = resolved.Values
+            .Where(v => v.Model is not null)
+            .Select(v => v.Model!)
+            .GroupBy(m => m.Id)
+            .Select(g => g.First())
+            .ToList();
+        if (uniqueModels.Count > 0)
+        {
+            var warmupTasks = uniqueModels.Select(m => GetOrDeserializeSnapshotAsync(m));
+            await Task.WhenAll(warmupTasks);
+        }
+
+        var results = new MLScoreResult[batch.Count];
+        for (int i = 0; i < batch.Count; i++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var (signal, candles) = batch[i];
+            var tf = timeframes[i];
+
+            if (!resolved.TryGetValue((signal.Symbol, tf), out var r) || r.Model is null)
+            {
+                results[i] = new MLScoreResult(null, null, null, null);
+                continue;
+            }
+
+            results[i] = await ScoreForModelAsync(
+                r.Model, r.CurrentRegime, signal, candles, tf,
+                scoringStart, cancellationToken);
+        }
+
+        return results;
+    }
 
     public async Task<MLScoreResult> ScoreAsync(
         TradeSignal           signal,
@@ -161,11 +267,69 @@ public sealed class MLSignalScorer : IMLSignalScorer
         var signalTimeframe = candles.Count > 0 ? candles[0].Timeframe : Timeframe.H1;
         var db              = _context.GetDbContext();
 
-        // ── 1. Find active model (regime-aware, falls back to global) ────────
-        var (model, currentRegime) = await _modelResolver.ResolveActiveModelAsync(
-            signal, signalTimeframe, cancellationToken);
-        if (model is null)
+        // ── Committee size — hot-reloadable. Default 1 preserves single-model behaviour. ──
+        int committeeSize = await _configService.GetCommitteeSizeAsync(db, cancellationToken);
+
+        if (committeeSize <= 1)
+        {
+            var (primary, primaryRegime) = await _modelResolver.ResolveActiveModelAsync(
+                signal, signalTimeframe, cancellationToken);
+            if (primary is null)
+                return new MLScoreResult(null, null, null, null);
+
+            return await ScoreForModelAsync(
+                primary, primaryRegime, signal, candles, signalTimeframe,
+                scoringStart, cancellationToken);
+        }
+
+        // ── Committee scoring ─────────────────────────────────────────────────
+        // Resolve K models across distinct families, score each in turn, blend via
+        // accuracy-weighted probability averaging. Members with open circuit breakers
+        // or suppression results (null MLModelId on return) are dropped; survivors blend.
+        var members = await _modelResolver.ResolveCommitteeModelsAsync(
+            signal, signalTimeframe, committeeSize, cancellationToken);
+        if (members.Count == 0)
             return new MLScoreResult(null, null, null, null);
+
+        var blendInputs = new List<(MLScoreResult Result, decimal TrainingAccuracy)>(members.Count);
+        foreach (var (member, memberRegime) in members)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var memberResult = await ScoreForModelAsync(
+                member, memberRegime, signal, candles, signalTimeframe,
+                scoringStart, cancellationToken);
+
+            // A valid member contribution has MLModelId set (breaker-skipped or
+            // suppressed results return with null model id and are discarded).
+            if (memberResult.MLModelId.HasValue && memberResult.PredictedDirection.HasValue)
+                blendInputs.Add((memberResult, member.DirectionAccuracy ?? 0.5m));
+        }
+
+        if (blendInputs.Count == 0)
+            return new MLScoreResult(null, null, null, null);
+
+        return EnsembleCommitteeBlender.Blend(blendInputs);
+    }
+
+    /// <summary>
+    /// Core single-model scoring pipeline. Extracted from <see cref="ScoreAsync"/> so
+    /// both the standard path and the committee-ensembled path can share identical
+    /// feature-building, inference, calibration, enrichment, and suppression logic.
+    ///
+    /// Circuit breakers (inference + prediction quality) are evaluated per-model at
+    /// entry so the committee path can skip individual degraded members without
+    /// aborting the entire ensemble.
+    /// </summary>
+    private async Task<MLScoreResult> ScoreForModelAsync(
+        MLModel               model,
+        string?               currentRegime,
+        TradeSignal           signal,
+        IReadOnlyList<Candle> candles,
+        Timeframe             signalTimeframe,
+        long                  scoringStart,
+        CancellationToken     cancellationToken)
+    {
+        var db = _context.GetDbContext();
 
         // ── 1b. Circuit breaker — skip models with repeated inference failures ──
         if (_inferenceFailures.TryGetValue(model.Id, out var failure) &&
@@ -219,13 +383,19 @@ public sealed class MLSignalScorer : IMLSignalScorer
         // threadpool thread to avoid threadpool starvation under concurrent scoring.
         // The semaphore caps concurrent inference to Environment.ProcessorCount so
         // a burst of scoring requests doesn't saturate the threadpool.
+
+        // Resolve ONNX routing preference once per scoring call so RunInferencePipeline
+        // stays fully synchronous inside the semaphore-guarded Task.Run block.
+        bool useOnnx = model.OnnxBytes is { Length: > 0 } &&
+                       await _configService.GetPreferOnnxAsync(db, cancellationToken);
+
         await _inferenceSemaphore.WaitAsync(cancellationToken);
         InferencePipelineResult? inferenceResult;
         try
         {
             inferenceResult = await Task.Run(() => RunInferencePipeline(
                 features, featureCount, snap, window, signal, model,
-                currentRegime, signalTimeframe), cancellationToken);
+                currentRegime, signalTimeframe, useOnnx), cancellationToken);
         }
         finally
         {
@@ -1640,25 +1810,71 @@ public sealed class MLSignalScorer : IMLSignalScorer
     private InferencePipelineResult? RunInferencePipeline(
         float[] features, int featureCount, ModelSnapshot snap,
         List<Candle> window, TradeSignal signal, MLModel model,
-        string? currentRegime, Timeframe signalTimeframe)
+        string? currentRegime, Timeframe signalTimeframe, bool useOnnx)
     {
-        // ── 8. Model inference (delegated to IModelInferenceEngine) ──────────
-        var engine = ResolveEngine(snap);
-        if (engine is null)
-        {
-            _logger.LogWarning("No inference engine found for model {Id} (type={Type})", model.Id, snap.Type);
-            return null;
-        }
-
         int mcSamples = snap.McDropoutVarianceThreshold > 0.0 ? DefaultMcDropoutSamples : 0;
         int mcSeed = HashCode.Combine(signal.Id, signal.Symbol, signal.GeneratedAt);
 
-        var engineResult = engine.RunInference(
-            features, featureCount, snap, window, model.Id, mcSamples, mcSeed);
+        InferenceResult? engineResult = null;
+
+        // ── 8a. ONNX fast-path (opt-in via MLScoring:PreferOnnx) ─────────────
+        // Skipped when OnnxBytes are absent, the runtime rejects the graph, or the
+        // config flag is off. On any failure we transparently fall through to the
+        // legacy IModelInferenceEngine path — so toggling this flag on a misconfigured
+        // model degrades to current behaviour rather than blocking scoring.
+        if (useOnnx && model.OnnxBytes is { Length: > 0 })
+        {
+            try
+            {
+                // Lazy-load the session the first time we see this model. On subsequent
+                // calls the session is already cached inside _onnxEngine.
+                if (!_onnxLoaded.ContainsKey(model.Id))
+                {
+                    if (_onnxEngine.LoadModel(model.Id, model.OnnxBytes))
+                        _onnxLoaded[model.Id] = true;
+                }
+
+                if (_onnxLoaded.ContainsKey(model.Id))
+                {
+                    var (onnxProb, onnxMag) = _onnxEngine.Infer(model.Id, features);
+                    // The ONNX graph intentionally omits Platt calibration so the existing
+                    // C# calibration stack downstream applies uniformly across paths.
+                    // EnsembleStd and MC-Dropout are not emitted by the MVP graph — set
+                    // to neutral values. Magnitude is taken when the graph has a 2nd head.
+                    engineResult = new InferenceResult(
+                        Probability:       onnxProb,
+                        EnsembleStd:       0.0,
+                        McDropoutMean:     null,
+                        McDropoutVariance: null,
+                        Magnitude:         onnxMag > 0 ? onnxMag : null,
+                        ModelSpaceValues:  null);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex,
+                    "ONNX fast-path failed for model {Id} — falling back to legacy engine", model.Id);
+                engineResult = null;
+            }
+        }
+
+        // ── 8. Model inference (delegated to IModelInferenceEngine) ──────────
         if (engineResult is null)
         {
-            _logger.LogWarning("Inference engine returned null for model {Id}", model.Id);
-            return null;
+            var engine = ResolveEngine(snap);
+            if (engine is null)
+            {
+                _logger.LogWarning("No inference engine found for model {Id} (type={Type})", model.Id, snap.Type);
+                return null;
+            }
+
+            engineResult = engine.RunInference(
+                features, featureCount, snap, window, model.Id, mcSamples, mcSeed);
+            if (engineResult is null)
+            {
+                _logger.LogWarning("Inference engine returned null for model {Id}", model.Id);
+                return null;
+            }
         }
 
         double rawProb              = ClampProbabilityOrNeutral(engineResult.Value.Probability);

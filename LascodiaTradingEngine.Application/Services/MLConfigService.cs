@@ -39,6 +39,12 @@ internal sealed class MLConfigService
     private const string ConsensusCacheKey = "MLScoring:ConsensusMinModels";
     private static readonly TimeSpan ConsensusCacheDuration = TimeSpan.FromMinutes(5);
 
+    private const string CommitteeSizeCacheKey = "MLScoring:CommitteeSize";
+    private static readonly TimeSpan CommitteeSizeCacheDuration = TimeSpan.FromMinutes(5);
+
+    private const string PreferOnnxCacheKey = "MLScoring:PreferOnnx";
+    private static readonly TimeSpan PreferOnnxCacheDuration = TimeSpan.FromMinutes(5);
+
     private const string MultiTfWeightsCacheKey = "MLScoring:MultiTfWeights";
     private static readonly TimeSpan MultiTfWeightsCacheDuration = TimeSpan.FromMinutes(10);
 
@@ -124,6 +130,46 @@ internal sealed class MLConfigService
             ConsensusCacheKey, "MLScoring:ConsensusMinModels", 1,
             s => int.TryParse(s, out var v) && v >= 1 ? v : (int?)null,
             ConsensusCacheDuration, db, cancellationToken);
+    }
+
+    /// <summary>
+    /// Returns the committee size used by <c>MLSignalScorer.ScoreAsync</c>. When
+    /// the value is 1 (default) scoring uses a single model; values in [2, 5]
+    /// enable accuracy-weighted ensemble blending across the top-K models of
+    /// distinct families for the signal's symbol/timeframe.
+    /// </summary>
+    /// <remarks>
+    /// Values outside [1, 5] are clamped. Values under 2 silently fall back to the
+    /// single-model path. Reads <c>MLScoring:CommitteeSize</c> from EngineConfig.
+    /// </remarks>
+    internal async Task<int> GetCommitteeSizeAsync(
+        DbContext db, CancellationToken cancellationToken)
+    {
+        var raw = await GetCachedConfigAsync(
+            CommitteeSizeCacheKey, "MLScoring:CommitteeSize", 1,
+            s => int.TryParse(s, out var v) ? v : (int?)null,
+            CommitteeSizeCacheDuration, db, cancellationToken);
+        return Math.Clamp(raw, 1, 5);
+    }
+
+    /// <summary>
+    /// Returns whether <c>MLSignalScorer</c> should prefer the ONNX inference path
+    /// when a model has ONNX bytes persisted. Default <c>false</c> — legacy engines
+    /// remain primary until the ONNX exporter is fully wired and validated. Reads
+    /// <c>MLScoring:PreferOnnx</c> from EngineConfig (accepts "true"/"1"/"yes").
+    /// </summary>
+    internal async Task<bool> GetPreferOnnxAsync(
+        DbContext db, CancellationToken cancellationToken)
+    {
+        return await GetCachedConfigAsync(
+            PreferOnnxCacheKey, "MLScoring:PreferOnnx", false,
+            s => bool.TryParse(s, out var b)
+                ? b
+                : (s.Equals("1", StringComparison.OrdinalIgnoreCase) ||
+                   s.Equals("yes", StringComparison.OrdinalIgnoreCase)
+                      ? true
+                      : (bool?)null),
+            PreferOnnxCacheDuration, db, cancellationToken);
     }
 
     internal async Task<double> ApplyLiveKellyMultiplierAsync(

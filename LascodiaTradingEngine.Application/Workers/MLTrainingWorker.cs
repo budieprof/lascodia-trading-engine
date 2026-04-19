@@ -1503,6 +1503,16 @@ public sealed class MLTrainingWorker : BackgroundService
                 imbalanceRatio, cotNetMin, cotNetMax, cotMomMin, cotMomMax,
                 ctx, stoppingToken);
 
+            // ── ONNX export (opt-in) ───────────────────────────────────────────
+            // Attempts to serialise the trained snapshot into an ONNX inference graph so
+            // MLSignalScorer can route scoring through IOnnxInferenceEngine (GPU-accelerated
+            // or optimised CPU) once MLScoring:PreferOnnx is enabled. Returns null when no
+            // registered exporter can handle this snapshot, or when a concrete exporter
+            // signals a dependency gap (NotSupportedException). Failures are intentionally
+            // non-fatal — the model still promotes without ONNX bytes and scoring falls
+            // back to the legacy pure-C# engine.
+            byte[]? onnxBytes = await TryExportOnnxBytesAsync(sp, finalModelBytes, stoppingToken);
+
             // ── Safety: ensure no other active models remain for this symbol/timeframe ──
             // This catches edge cases where the FirstOrDefaultAsync above returned null
             // (no champion found) but orphaned active models still exist from prior bugs.
@@ -1548,6 +1558,7 @@ public sealed class MLTrainingWorker : BackgroundService
                 Status                 = MLModelStatus.Active,
                 IsActive               = true,
                 ModelBytes             = finalModelBytes,
+                OnnxBytes              = onnxBytes,
                 TrainingSamples        = samples.Count,
                 TrainedAt              = DateTime.UtcNow,
                 ActivatedAt            = DateTime.UtcNow,
@@ -1822,6 +1833,45 @@ public sealed class MLTrainingWorker : BackgroundService
     }
 
     // ── Snapshot patching ──────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Attempts to export the final trained snapshot to ONNX bytes using any registered
+    /// <see cref="LascodiaTradingEngine.Application.Services.Inference.IOnnxModelExporter"/>
+    /// that claims it can handle the snapshot. Returns null when no exporter matches,
+    /// when the exporter throws <see cref="NotSupportedException"/> (dependency-gap
+    /// indicator), or when snapshot deserialisation fails. Never throws — callers rely
+    /// on this being a strictly optional, best-effort optimisation.
+    /// </summary>
+    private async Task<byte[]?> TryExportOnnxBytesAsync(
+        IServiceProvider sp, byte[] finalModelBytes, CancellationToken ct)
+    {
+        try
+        {
+            var snapshot = System.Text.Json.JsonSerializer.Deserialize<ModelSnapshot>(
+                finalModelBytes,
+                new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+            if (snapshot is null) return null;
+
+            var exporters = sp.GetServices<
+                LascodiaTradingEngine.Application.Services.Inference.IOnnxModelExporter>();
+            var exporter = exporters.FirstOrDefault(e => e.CanExport(snapshot));
+            if (exporter is null) return null;
+
+            var onnxBytes = await exporter.ExportToBytesAsync(snapshot, ct);
+            return onnxBytes is { Length: > 0 } ? onnxBytes : null;
+        }
+        catch (NotSupportedException)
+        {
+            // Exporter signalled a known dependency gap (e.g. Onnx proto builder not
+            // installed yet). Fall back to no ONNX bytes; legacy path handles scoring.
+            return null;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "ONNX export failed — continuing without ONNX bytes");
+            return null;
+        }
+    }
 
     /// <summary>
     /// Patches the trainer-produced <see cref="ModelSnapshot"/> with COT normalisation

@@ -22,6 +22,7 @@ public class MLModelConfiguration : IEntityTypeConfiguration<MLModel>
         builder.Property(x => x.Status).HasConversion<string>().IsRequired().HasMaxLength(20);
 
         builder.Property(x => x.ModelBytes); // varbinary(max) / bytea — stored in DB
+        builder.Property(x => x.OnnxBytes);  // varbinary(max) / bytea — optional ONNX inference graph
 
         builder.Property(x => x.DirectionAccuracy).HasPrecision(5, 4);
         builder.Property(x => x.MagnitudeRMSE).HasPrecision(18, 8);
