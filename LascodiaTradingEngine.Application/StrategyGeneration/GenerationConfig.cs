@@ -72,6 +72,22 @@ public sealed record GenerationConfig
     public bool AdaptiveThresholdsEnabled { get; init; }
     public int AdaptiveThresholdsMinSamples { get; init; }
 
+    // ── Archetype diversity floor ────────────────────────────────────────
+    // Minimum candidates to produce per StrategyType per cycle when that
+    // archetype is regime-compatible for at least one active symbol.
+    // Default 2: ensures the validator ecosystem sees diverse archetypes
+    // even when the cheap-to-screen ones saturate MaxCandidates.
+    public int MinCandidatesPerArchetype { get; init; } = 2;
+
+    /// <summary>Master switch for the archetype-diversity floor; disable for
+    /// bootstrap or when intentionally monocultured to a single archetype.</summary>
+    public bool EnforceArchetypeDiversity { get; init; } = true;
+
+    /// <summary>Relaxation factor applied to screening thresholds when running
+    /// the archetype-reserve pass. Lower = lets in more candidates from
+    /// starved archetypes; 0.75 is conservative.</summary>
+    public double ArchetypeReserveThresholdMultiplier { get; init; } = 0.75;
+
     public int CircuitBreakerMaxFailures { get; init; }
     public int CircuitBreakerBackoffDays { get; init; }
     public int MaxFaultsPerStrategyType { get; init; }

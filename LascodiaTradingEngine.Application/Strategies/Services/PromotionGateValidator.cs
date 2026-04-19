@@ -171,31 +171,58 @@ public sealed class PromotionGateValidator : IPromotionGateValidator
                 failures.Add($"TCA-adjusted EV/trade {adjustedEv:F5} ≤ 0 — unprofitable after real costs");
         }
 
-        // ── Gate 4: Paper-trade duration ─────────────────────────────────────
+        // ── Gate 4: Paper-trade duration + count (real forward-test data) ────
+        // Replaces the earlier backtest-trade proxy: reads actual PaperExecution rows
+        // produced by approved-but-not-active strategies routed through the paper
+        // simulator. Forces any candidate for Active status to prove its edge on
+        // live-TCA-adjusted forward data, not just historical backtest.
         if (!disabledGates.Contains("paper"))
         {
-            int minPaperDays = await GetConfigIntAsync(db, "Promotion:MinPaperTradeDays", 60, ct);
-            int minPaperTrades = await GetConfigIntAsync(db, "Promotion:MinPaperTradeCount", 100, ct);
-            DateTime now = DateTime.UtcNow;
+            int minPaperDays   = await GetConfigIntAsync(db, "Promotion:MinPaperTradeDays", 60, ct);
+            int minPaperFills  = await GetConfigIntAsync(db, "Promotion:MinPaperTradeCount", 100, ct);
+            DateTime now       = DateTime.UtcNow;
 
-            // Paper duration = days in current lifecycle stage (Approved implies it
-            // was previously PaperTrading or similar). LifecycleStageEnteredAt
-            // becomes the proxy; if null, strategy is brand-new and fails.
-            double daysInStage = strategy.LifecycleStageEnteredAt is { } enteredAt
-                ? (now - enteredAt).TotalDays
-                : 0.0;
+            // Grandfather clause: strategies approved before the paper pipeline was
+            // live can't have retroactive paper fills. Set Promotion:PaperGateGrandfather
+            // BeforeUtc to a cutoff timestamp to auto-pass gate 4 for pre-cutoff strategies.
+            var grandfatherRaw = await GetConfigAsync(db, "Promotion:PaperGateGrandfatherBeforeUtc", "", ct);
+            DateTime? grandfatherCutoff = DateTime.TryParse(
+                grandfatherRaw, System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal,
+                out var cutoff) ? cutoff : null;
 
-            // Count paper-mode trades via any ExecutionQualityLog or Trade entity
-            // associated with the strategy. Kept simple: use BacktestRun trades as
-            // the proxy until a first-class PaperTrade entity exists.
-            int paperTrades = latestBacktest.TotalTrades ?? 0;
+            bool grandfathered = grandfatherCutoff is { } cut
+                              && strategy.LifecycleStageEnteredAt is { } enteredAt
+                              && enteredAt < cut;
 
-            diagnostics.Add($"Paper={daysInStage:F1}d, trades={paperTrades}");
+            if (grandfathered)
+            {
+                diagnostics.Add(
+                    $"Paper gate grandfathered (LifecycleStageEnteredAt={strategy.LifecycleStageEnteredAt:u} < cutoff={grandfatherCutoff:u})");
+            }
+            else
+            {
+                var earliestFill = await db.Set<Domain.Entities.PaperExecution>()
+                    .AsNoTracking()
+                    .Where(p => p.StrategyId == strategyId && !p.IsDeleted)
+                    .OrderBy(p => p.SignalGeneratedAt)
+                    .Select(p => (DateTime?)p.SignalGeneratedAt)
+                    .FirstOrDefaultAsync(ct);
 
-            if (daysInStage < minPaperDays)
-                failures.Add($"Paper-trade duration {daysInStage:F1}d < min {minPaperDays}d");
-            if (paperTrades < minPaperTrades)
-                failures.Add($"Paper-trade count {paperTrades} < min {minPaperTrades}");
+                int paperFillCount = await db.Set<Domain.Entities.PaperExecution>()
+                    .AsNoTracking()
+                    .CountAsync(p => p.StrategyId == strategyId
+                                  && !p.IsDeleted
+                                  && p.Status == Domain.Enums.PaperExecutionStatus.Closed, ct);
+
+                double daysOfPaperData = earliestFill is { } t ? (now - t).TotalDays : 0.0;
+                diagnostics.Add($"PaperFills={paperFillCount}, earliest={earliestFill?.ToString("u") ?? "none"}, days={daysOfPaperData:F1}");
+
+                if (daysOfPaperData < minPaperDays)
+                    failures.Add($"Paper-trade duration {daysOfPaperData:F1}d < min {minPaperDays}d (real PaperExecution data)");
+                if (paperFillCount < minPaperFills)
+                    failures.Add($"Paper-fill count {paperFillCount} < min {minPaperFills} (closed PaperExecution rows)");
+            }
         }
 
         // ── Gate 5 (#5 on pipeline roadmap): Regime-stratified performance ──

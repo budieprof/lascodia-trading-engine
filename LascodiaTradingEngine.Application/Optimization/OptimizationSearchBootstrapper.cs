@@ -24,7 +24,8 @@ internal sealed class OptimizationSearchBootstrapper
         decimal? BestSharpeRatio,
         decimal? BestMaxDrawdownPct,
         decimal? BestWinRate,
-        string? RunMetadataJson);
+        string? RunMetadataJson,
+        bool IsCrossStrategy = false);
 
     internal sealed record SearchBootstrapState(
         List<Dictionary<string, object>> ParameterGrid,
@@ -373,7 +374,9 @@ internal sealed class OptimizationSearchBootstrapper
         DbContext db,
         Strategy strategy,
         CancellationToken runCt)
-        => await db.Set<OptimizationRun>()
+    {
+        // Primary: same-strategy approved runs (highest-signal priors).
+        var primary = await db.Set<OptimizationRun>()
             .Where(r => r.StrategyId == strategy.Id
                      && r.Status == OptimizationRunStatus.Approved
                      && r.BestParametersJson != null
@@ -390,8 +393,45 @@ internal sealed class OptimizationSearchBootstrapper
                 r.BestSharpeRatio,
                 r.BestMaxDrawdownPct,
                 r.BestWinRate,
-                r.RunMetadataJson))
+                r.RunMetadataJson,
+                false))
             .ToListAsync(runCt);
+
+        // When same-strategy history is thin (<3 approved runs), fall back to
+        // cross-strategy priors from siblings with the same StrategyType —
+        // gives TPE/GP a warm start on brand-new strategies instead of a pure
+        // LHS cold start. These are down-weighted in WarmStartSurrogatesAsync
+        // (IsCrossStrategy=true → half decay factor).
+        if (primary.Count >= 3) return primary;
+
+        var crossStrategy = await (
+                from r in db.Set<OptimizationRun>().AsNoTracking()
+                join s in db.Set<Strategy>().AsNoTracking() on r.StrategyId equals s.Id
+                where r.StrategyId != strategy.Id
+                   && s.StrategyType == strategy.StrategyType
+                   && r.Status == OptimizationRunStatus.Approved
+                   && r.BestParametersJson != null
+                   && r.BestHealthScore.HasValue
+                   && !r.IsDeleted
+                   && !s.IsDeleted
+                orderby r.CompletedAt descending
+                select new PriorRunSeed(
+                    r.BestParametersJson,
+                    r.BestHealthScore,
+                    r.BaselineParametersJson,
+                    r.BaselineHealthScore,
+                    r.CompletedAt,
+                    r.BestSharpeRatio,
+                    r.BestMaxDrawdownPct,
+                    r.BestWinRate,
+                    r.RunMetadataJson,
+                    true))
+            .Take(10 - primary.Count)
+            .ToListAsync(runCt);
+
+        primary.AddRange(crossStrategy);
+        return primary;
+    }
 
     private async Task<int> WarmStartSurrogatesAsync(
         IReadOnlyList<PriorRunSeed> priorRuns,
@@ -434,6 +474,10 @@ internal sealed class OptimizationSearchBootstrapper
                 ? (nowUtcForDecay - prior.CompletedAt.Value).TotalDays
                 : 90.0;
             double decayFactor = Math.Pow(0.5, ageDays / decayHalfLifeDays);
+            // Cross-strategy priors get half weight so same-strategy signal
+            // dominates whenever both are available; they only "warm" the
+            // surrogate through the cold-start phase.
+            if (prior.IsCrossStrategy) decayFactor *= 0.5;
 
             foreach (var (json, score) in new[] { (prior.BestParametersJson, prior.BestHealthScore), (prior.BaselineParametersJson, prior.BaselineHealthScore) })
             {

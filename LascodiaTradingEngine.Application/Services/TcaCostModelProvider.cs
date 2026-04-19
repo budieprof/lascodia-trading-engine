@@ -74,7 +74,8 @@ public sealed class TcaCostModelProvider : ITcaCostModelProvider
             return cached;
 
         var cutoff = DateTime.UtcNow.AddDays(-RollingWindowDays);
-        var samples = await _readCtx.GetDbContext()
+        var db     = _readCtx.GetDbContext();
+        var samples = await db
             .Set<TransactionCostAnalysis>()
             .AsNoTracking()
             .Where(t => t.Symbol == symbol && !t.IsDeleted && t.AnalyzedAt >= cutoff)
@@ -84,7 +85,7 @@ public sealed class TcaCostModelProvider : ITcaCostModelProvider
         SymbolCostProfile profile;
         if (samples.Count < MinSamplesForRealProfile)
         {
-            profile = ConservativeDefault with { Symbol = symbol, SampleSize = samples.Count, IsDefault = true };
+            profile = await BuildSymbolSpecDefaultAsync(db, symbol, samples.Count, ct);
         }
         else
         {
@@ -99,5 +100,39 @@ public sealed class TcaCostModelProvider : ITcaCostModelProvider
 
         _cache.Set(cacheKey, profile, CacheTtl);
         return profile;
+    }
+
+    /// <summary>
+    /// Seed a starter cost profile from the symbol's broker-reported spec when TCA
+    /// samples haven't accumulated yet. Takes the broker's reported spread (points ×
+    /// 10^-DecimalPlaces = price units) over the global 1-pip guess so a 0.1-pip major
+    /// doesn't look as expensive to backtest as a 5-pip exotic. Commission and market
+    /// impact stay at conservative constants — there's no symbol-level broker hint
+    /// for those, and under-estimating them is the failure mode we want to avoid.
+    /// </summary>
+    private async Task<SymbolCostProfile> BuildSymbolSpecDefaultAsync(
+        DbContext db, string symbol, int sampleCount, CancellationToken ct)
+    {
+        var pair = await db
+            .Set<Domain.Entities.CurrencyPair>()
+            .AsNoTracking()
+            .Where(p => p.Symbol == symbol && !p.IsDeleted)
+            .Select(p => new { p.SpreadPoints, p.DecimalPlaces })
+            .FirstOrDefaultAsync(ct);
+
+        if (pair is null || pair.SpreadPoints <= 0 || pair.DecimalPlaces <= 0)
+            return ConservativeDefault with { Symbol = symbol, SampleSize = sampleCount, IsDefault = true };
+
+        // Spread in price units = broker-reported points × 10^-DecimalPlaces.
+        decimal pointSize  = (decimal)Math.Pow(10, -pair.DecimalPlaces);
+        decimal spreadCost = (decimal)pair.SpreadPoints * pointSize;
+
+        return ConservativeDefault with
+        {
+            Symbol               = symbol,
+            AvgSpreadCostInPrice = spreadCost,
+            SampleSize           = sampleCount,
+            IsDefault            = true,
+        };
     }
 }

@@ -692,7 +692,14 @@ public class MLTrainingWorkerTest
         existingModels ??= new List<MLModel>();
 
         SetupTrainingRuns(new List<MLTrainingRun> { run });
-        SetupEngineConfigs(new List<EngineConfig>());
+        // Drop the production MinTrainingSamples=3000 / symmetric-barrier guards for the
+        // unit suite. The worker added these as hard gates post-training; leaving them on
+        // defaults makes the 600-candle test fixture throw before metrics are written.
+        SetupEngineConfigs(new List<EngineConfig>
+        {
+            new() { Key = "MLTraining:MinTrainingSamples",           Value = "10"    },
+            new() { Key = "MLTraining:RequireSymmetricTripleBarrier", Value = "false" },
+        });
         SetupModels(existingModels);
         SetupCandles(candles);
         SetupCOTReports(new List<COTReport>());

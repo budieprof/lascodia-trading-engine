@@ -213,6 +213,11 @@ public class ReceiveTickBatchCommandHandler : IRequestHandler<ReceiveTickBatchCo
         // This deduplication is critical — a batch of 1000 EURUSD ticks should trigger one event,
         // not 1000, to avoid overwhelming downstream consumers.
         var latestBySymbol = new Dictionary<string, TickItem>(StringComparer.OrdinalIgnoreCase);
+        // Collect accepted ticks for batch persistence to the TickRecord table. Microstructure
+        // features (spread volatility, tick-volume imbalance) read from this table at candle
+        // close; without persistence they zero-fill. Cap at 5000 to match the request cap —
+        // spam-protection on any caller that ignores the batch contract.
+        var persistTicks = new List<TickRecord>(Math.Min(request.Ticks.Count, 5_000));
         var now = DateTime.UtcNow;
         const int maxTickAgeSeconds = 60; // Ticks older than this are considered stale
         int staleDropped = 0;
@@ -255,10 +260,34 @@ public class ReceiveTickBatchCommandHandler : IRequestHandler<ReceiveTickBatchCo
             // any mid-batch reads see progressively fresher data.
             _cache.Update(symbol, tick.Bid, tick.Ask, tick.Timestamp);
 
+            // Accumulate for batch persistence — consumed by TickFlowProvider + TCA.
+            if (persistTicks.Count < 5_000)
+            {
+                persistTicks.Add(new TickRecord
+                {
+                    Symbol        = symbol,
+                    Bid           = tick.Bid,
+                    Ask           = tick.Ask,
+                    Mid           = (tick.Bid + tick.Ask) / 2m,
+                    SpreadPoints  = (decimal)tick.SpreadPoints,
+                    TickVolume    = tick.TickVolume ?? 0,
+                    InstanceId    = request.InstanceId,
+                    TickTimestamp = tick.Timestamp,
+                    ReceivedAt    = now,
+                });
+            }
+
             // Keep only the latest tick per symbol for event publishing
             if (!latestBySymbol.TryGetValue(symbol, out var existing) || tick.Timestamp > existing.Timestamp)
                 latestBySymbol[symbol] = tick;
         }
+
+        // Persist the accepted ticks. Piggy-backs on the heartbeat SaveChangesAsync in step 2 —
+        // we don't call SaveChangesAsync again here because the next step publishes integration
+        // events which also saves (outbox pattern). A single transactional write keeps the EA →
+        // engine round-trip at one DB round-trip rather than two.
+        if (persistTicks.Count > 0)
+            await _context.GetDbContext().Set<TickRecord>().AddRangeAsync(persistTicks, cancellationToken);
 
         // ── Step 4: Publish integration events ──────────────────────────────
         // One PriceUpdatedIntegrationEvent per symbol — consumers (StrategyWorker,

@@ -294,6 +294,23 @@ internal sealed class StrategyGenerationPrimaryScreeningPlanner : IStrategyGener
                     regime,
                     timeframe,
                     context.FeedbackRates);
+
+                // Archetype rotation: when the diversity floor is enabled, sort suitable
+                // types by current cycle-wide count ascending so starved archetypes get
+                // first crack at the remaining MaxCandidates budget. Preserves relative
+                // mapper priority as tiebreaker. Without this, the mapper's static order
+                // starves later archetypes whenever the budget saturates early.
+                if (config.EnforceArchetypeDiversity)
+                {
+                    var cycleCounts = AggregateCycleArchetypeCounts(generatedTypeCountsBySymbol);
+                    var baseOrder = suitableTypesForTimeframe
+                        .Select((t, i) => (Type: t, Priority: i))
+                        .ToDictionary(x => x.Type, x => x.Priority);
+                    suitableTypesForTimeframe = suitableTypesForTimeframe
+                        .OrderBy(t => cycleCounts.GetValueOrDefault(t, 0))
+                        .ThenBy(t => baseOrder[t])
+                        .ToList();
+                }
                 var adaptiveAdjustments = ResolveAdaptiveAdjustments(context.AdaptiveAdjustmentsByContext, regime, timeframe);
                 var thresholds = BuildThresholdsForTimeframe(
                     config,
@@ -422,6 +439,35 @@ internal sealed class StrategyGenerationPrimaryScreeningPlanner : IStrategyGener
             _logger.LogInformation(
                 "StrategyGenerationWorker: per-type faults — {Faults}",
                 string.Join(", ", faultCounts.Select(kv => $"{kv.Key}={kv.Value}")));
+        }
+
+        // Archetype diversity floor diagnostic: surface any StrategyType that
+        // is regime-compatible with at least one active symbol but fell below
+        // MinCandidatesPerArchetype for the cycle. We log + metric; reserve
+        // planner is responsible for attempting to close the gap with relaxed
+        // thresholds. Keeping this as observability-only here preserves
+        // MaxCandidates as a hard cap.
+        if (context.Config.EnforceArchetypeDiversity)
+        {
+            var cycleCounts = AggregateCycleArchetypeCounts(generatedTypeCountsBySymbol);
+            var compatibleTypes = context.RegimeBySymbol.Values
+                .SelectMany(r => _regimeMapper.GetStrategyTypes(r))
+                .ToHashSet();
+            var shortfalls = compatibleTypes
+                .Select(t => (Type: t, Count: cycleCounts.GetValueOrDefault(t, 0)))
+                .Where(x => x.Count < context.Config.MinCandidatesPerArchetype)
+                .ToList();
+            if (shortfalls.Count > 0)
+            {
+                _logger.LogWarning(
+                    "StrategyGenerationWorker: archetype-diversity floor unmet — {Shortfalls} (floor={Floor})",
+                    string.Join(", ", shortfalls.Select(s => $"{s.Type}:{s.Count}")),
+                    context.Config.MinCandidatesPerArchetype);
+                foreach (var shortfall in shortfalls)
+                    _metrics.StrategyGenSymbolsSkipped.Add(1,
+                        new KeyValuePair<string, object?>("reason", "archetype_floor_unmet"),
+                        new KeyValuePair<string, object?>("archetype", shortfall.Type.ToString()));
+            }
         }
 
         return new StrategyGenerationPrimaryScreeningResult(
@@ -786,6 +832,18 @@ internal sealed class StrategyGenerationPrimaryScreeningPlanner : IStrategyGener
         => adjustmentsByContext.TryGetValue((regime, timeframe), out var exact)
             ? exact
             : AdaptiveThresholdAdjustments.Neutral;
+
+    private static Dictionary<StrategyType, int> AggregateCycleArchetypeCounts(
+        Dictionary<string, Dictionary<StrategyType, int>> generatedTypeCountsBySymbol)
+    {
+        var result = new Dictionary<StrategyType, int>();
+        foreach (var perSymbol in generatedTypeCountsBySymbol.Values)
+        {
+            foreach (var (type, count) in perSymbol)
+                result[type] = result.GetValueOrDefault(type) + count;
+        }
+        return result;
+    }
 
     private static Dictionary<StrategyType, int> MergeTypeCounts(
         Dictionary<StrategyType, int>? existingCounts,

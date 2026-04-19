@@ -392,11 +392,19 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
             }
         }
 
-        // Load all active, non-deleted strategies whose symbol matches the price tick.
-        // Each strategy will be independently evaluated through the filter pipeline.
+        // Load strategies eligible for evaluation: production Active strategies plus
+        // Approved-but-Paused ones that are in the forward-test window (Approved =
+        // passed promotion screens, Paused = not yet routed to live). The latter set
+        // feeds the PaperExecution pipeline so the paper gate has real forward-fill
+        // data before Active status is granted. Branching happens downstream at
+        // signal-publication time — same evaluation pipeline, divergent persistence.
         var strategies = await context.GetDbContext()
             .Set<Domain.Entities.Strategy>()
-            .Where(x => x.Symbol == @event.Symbol && x.Status == StrategyStatus.Active && !x.IsDeleted)
+            .Where(x => x.Symbol == @event.Symbol
+                     && !x.IsDeleted
+                     && (x.Status == StrategyStatus.Active
+                         || (x.Status == StrategyStatus.Paused
+                             && x.LifecycleStage == StrategyLifecycleStage.Approved)))
             .ToListAsync(_stoppingToken);
 
         // ── Pre-fetch strategy health snapshots ─────────────────────────────
@@ -1269,6 +1277,12 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
         // because CreateTradeSignalCommand writes to the DB and SaveAndPublish emits an
         // integration event — both require scoped write contexts with independent transactions.
         var winnerCandidates = allCandidates.Where(c => winnerSet.Contains(c.Pending)).ToList();
+
+        // Build StrategyId → (Status, Entity) lookup so the publish loop can route
+        // Approved-but-Paused winners to the paper pipeline instead of creating a real
+        // TradeSignal. The lookup is built once from the already-loaded strategies list.
+        var strategyById = strategies.ToDictionary(s => s.Id);
+
         var publishOptions = new ParallelOptions
         {
             MaxDegreeOfParallelism = Math.Min(winnerCandidates.Count, 4),
@@ -1281,6 +1295,34 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
             var mediator     = publishScope.ServiceProvider.GetRequiredService<IMediator>();
             var writeContext  = publishScope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
             var eventService = publishScope.ServiceProvider.GetRequiredService<IIntegrationEventService>();
+
+            // Paper-mode branch: approved-but-not-active strategies route their signals
+            // through PaperExecutionRouter instead of creating a real TradeSignal. No
+            // integration event is published (no EA consumer) and no real Order follows.
+            if (strategyById.TryGetValue(pending.StrategyId, out var owningStrategy)
+                && owningStrategy.Status == StrategyStatus.Paused
+                && owningStrategy.LifecycleStage == StrategyLifecycleStage.Approved)
+            {
+                var paperRouter = publishScope.ServiceProvider
+                    .GetRequiredService<PaperTrading.Services.IPaperExecutionRouter>();
+                await paperRouter.EnqueueAsync(owningStrategy,
+                    new PaperTrading.Services.PaperSignalIntent(
+                        Direction:            pending.Direction,
+                        RequestedEntryPrice:  pending.EntryPrice,
+                        LotSize:              pending.SuggestedLotSize > 0 ? pending.SuggestedLotSize : 0.01m,
+                        StopLoss:             pending.StopLoss,
+                        TakeProfit:           pending.TakeProfit,
+                        GeneratedAtUtc:       DateTime.UtcNow,
+                        TradeSignalId:        null),
+                    (owningStrategy.Symbol is var sym ? @event.Bid : 0m,
+                     @event.Ask),
+                    ct);
+                _metrics.SignalsGenerated.Add(1,
+                    new("symbol", pending.Symbol),
+                    new("strategy_type", pending.StrategyType.ToString()),
+                    new("mode", "paper"));
+                return;
+            }
 
             var result = await mediator.Send(new CreateTradeSignalCommand
             {

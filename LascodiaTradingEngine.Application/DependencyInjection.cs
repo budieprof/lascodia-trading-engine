@@ -152,6 +152,12 @@ public static class DependencyInjection
         // guarded by an EngineConfig flag; subsequent startups are no-ops.
         services.AddHostedService<FeatureSchemaVersionBackfillWorker>();
 
+        // ── Paper-execution monitor (forward-test fill resolution) ─────────────
+        // Resolves SL/TP/Timeout on open PaperExecution rows every 5 s. The promotion
+        // gate reads closed rows to enforce real-data promotion instead of a
+        // backtest-trade proxy. Router is [RegisterService]-auto-wired.
+        services.AddHostedService<PaperExecutionMonitorWorker>();
+
         // ── Promotion Gate Validator ───────────────────────────────────────────
         // Hard gate between Approved → Active. Enforces DSR, PBO-proxy, TCA-adjusted
         // EV, paper-trade duration, regime-coverage proxy, and max-correlation checks.
