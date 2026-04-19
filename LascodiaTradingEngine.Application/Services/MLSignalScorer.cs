@@ -744,12 +744,32 @@ public sealed class MLSignalScorer : IMLSignalScorer
                 }
             })));
 
-        snap = await lazy.Value;
-        _snapshotInflight.TryRemove(model.Id, out var removed);
-        // Only removed if it was the same Lazy instance we awaited — prevents
-        // discarding a newer Lazy added by a concurrent caller after cache expiry.
-        if (removed != null && !ReferenceEquals(removed, lazy))
-            _snapshotInflight.TryAdd(model.Id, removed);
+        // Guarantee removal even on uncaught exceptions (e.g. an OOM propagating
+        // through the deserializer, or future refactors that remove the inner
+        // catch). Without a finally, a faulted Lazy<Task> stays in the inflight
+        // dict indefinitely and every subsequent call for this model awaits the
+        // already-faulted task, producing the same exception on every scoring
+        // attempt until process restart. Expunge-on-error semantics let the
+        // next call retry cleanly.
+        try
+        {
+            snap = await lazy.Value;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "ModelSnapshot deserialization faulted for model {Id} — evicting cached Lazy so the next call can retry",
+                model.Id);
+            snap = null;
+        }
+        finally
+        {
+            _snapshotInflight.TryRemove(model.Id, out var removed);
+            // Only removed if it was the same Lazy instance we awaited — prevents
+            // discarding a newer Lazy added by a concurrent caller after cache expiry.
+            if (removed != null && !ReferenceEquals(removed, lazy))
+                _snapshotInflight.TryAdd(model.Id, removed);
+        }
 
         if (snap is not null)
             _cache.Set(cacheKey, snap, SnapshotCacheDuration);

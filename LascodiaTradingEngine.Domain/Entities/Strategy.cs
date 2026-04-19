@@ -183,4 +183,26 @@ public class Strategy : Entity<long>
 
     /// <summary>Execution quality measurements (slippage, fill rate) for orders tied to this strategy.</summary>
     public virtual ICollection<ExecutionQualityLog> ExecutionQualityLogs { get; set; } = new List<ExecutionQualityLog>();
+
+    // ── Runtime operational state (persisted by StrategyWorker) ─────────────────
+    // These fields shadow in-memory ConcurrentDictionaries in StrategyWorker so that
+    // cooldown / circuit-breaker state survives process restarts. Without them, every
+    // engine restart gave all strategies a zero-cooldown window, producing a thundering
+    // herd of fresh signals in the first 5 minutes while the warm-up timer rebuilt
+    // state. Written back periodically by the expiry-sweep; tolerant of ≤5 min staleness.
+
+    /// <summary>UTC timestamp of the most recent TradeSignal emitted by this strategy.
+    /// Null if the strategy has never emitted a signal. Used to enforce per-strategy
+    /// cooldown across process restarts.</summary>
+    public DateTime? LastSignalAt { get; set; }
+
+    /// <summary>Consecutive failed evaluations (exceptions / timeouts) since the last
+    /// successful evaluation. When this crosses the worker's configured threshold, the
+    /// circuit opens and is reflected in <see cref="CircuitOpenedAt"/>.</summary>
+    public int ConsecutiveEvaluationFailures { get; set; }
+
+    /// <summary>UTC timestamp when the evaluation circuit breaker opened for this
+    /// strategy. Null while the circuit is closed. Set when consecutive failures
+    /// exceed the threshold; cleared on successful probe recovery.</summary>
+    public DateTime? CircuitOpenedAt { get; set; }
 }

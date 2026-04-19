@@ -26,7 +26,11 @@ public class MLTrainingRunConfiguration : IEntityTypeConfiguration<MLTrainingRun
         builder.Property(x => x.ExpectedValue).HasPrecision(18, 8);
         builder.Property(x => x.BrierScore).HasPrecision(5, 4);
         builder.Property(x => x.SharpeRatio).HasPrecision(10, 4);
-        builder.Property(x => x.HyperparamConfigJson).HasMaxLength(2048);
+        // Unlimited text — the hyperparam config JSON routinely exceeds 2500 chars when
+        // all self-tuning/adversarial/regularization knobs are populated, which triggered
+        // 22001 "value too long for character varying(2048)" on every MLTrainingRun insert
+        // during AutoDegrading retrains. Mirrors the EngineConfig.Value fix.
+        builder.Property(x => x.HyperparamConfigJson).HasColumnType("text");
 
         builder.HasQueryFilter(x => !x.IsDeleted);
 

@@ -4,6 +4,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Utilities;
 using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ReceiveCandle;
@@ -161,7 +162,10 @@ public class ReceiveCandleCommandHandler : IRequestHandler<ReceiveCandleCommand,
     public async Task<ResponseData<long>> Handle(ReceiveCandleCommand request, CancellationToken cancellationToken)
     {
         var dbContext  = _context.GetDbContext();
-        var symbol    = request.Symbol.ToUpperInvariant();
+        // Canonicalize at ingestion so every downstream lookup (CurrencyPair,
+        // SymbolSpec, RiskChecker) hits the same key regardless of broker suffix
+        // ("EURUSD.a" / "EURUSD.i" / "EUR/USD" / "EUR_USD" all → "EURUSD").
+        var symbol    = SymbolNormalizer.Normalize(request.Symbol);
         var timeframe = Enum.Parse<Timeframe>(request.Timeframe, ignoreCase: true);
 
         // ── Step 1: Candle quality validation ────────────────────────────────

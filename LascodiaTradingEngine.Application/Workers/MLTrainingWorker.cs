@@ -942,12 +942,13 @@ public sealed class MLTrainingWorker : BackgroundService
             run.LabelImbalanceRatio  = imbalanceRatio;
 
             double maxImbalance = await GetConfigAsync<double>(ctx, CK_MaxLabelImbalance, 0.65, stoppingToken);
-            if ((double)imbalanceRatio > maxImbalance || (double)imbalanceRatio < 1.0 - maxImbalance)
+            double minImbalance = 1.0 - maxImbalance;
+            if ((double)imbalanceRatio > maxImbalance || (double)imbalanceRatio < minImbalance)
             {
                 throw new InvalidOperationException(
-                    $"Label imbalance {imbalanceRatio:P1} exceeds threshold {maxImbalance:P0} " +
-                    $"(buy={buyCount} sell={sellCount} total={samples.Count}). " +
-                    $"Expand the training window or review label logic.");
+                    $"Label imbalance out of bounds: buy fraction {imbalanceRatio:P1} outside " +
+                    $"[{minImbalance:P1}, {maxImbalance:P1}] (buy={buyCount} sell={sellCount} " +
+                    $"total={samples.Count}). Expand the training window or review label logic.");
             }
 
             _logger.LogInformation(

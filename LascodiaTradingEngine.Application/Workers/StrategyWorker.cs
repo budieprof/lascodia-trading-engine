@@ -200,6 +200,47 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
         _logger.LogInformation("StrategyWorker: waiting for event bus readiness before subscribing...");
         await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
 
+        // Hydrate per-strategy cooldown / circuit-breaker state from DB before subscribing.
+        // Without this, every process restart gave all strategies a fresh zero-cooldown
+        // window, producing a thundering herd of signals until the 5-min warmup rebuilt
+        // state. Persisted fields added to Strategy (LastSignalAt, ConsecutiveEvaluationFailures,
+        // CircuitOpenedAt). Tolerant of up to ~5 min of staleness (the sweep cadence).
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var readCtx = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+            var activeStrategies = await readCtx.GetDbContext()
+                .Set<Domain.Entities.Strategy>()
+                .AsNoTracking()
+                .Where(s => s.Status == StrategyStatus.Active && !s.IsDeleted)
+                .Select(s => new { s.Id, s.LastSignalAt, s.ConsecutiveEvaluationFailures, s.CircuitOpenedAt })
+                .ToListAsync(stoppingToken);
+
+            int hydratedCooldowns = 0, hydratedCircuits = 0;
+            foreach (var s in activeStrategies)
+            {
+                if (s.LastSignalAt is { } lastAt)
+                {
+                    _lastSignalTime[s.Id] = lastAt;
+                    hydratedCooldowns++;
+                }
+                if (s.ConsecutiveEvaluationFailures > 0)
+                    _consecutiveFailures[s.Id] = s.ConsecutiveEvaluationFailures;
+                if (s.CircuitOpenedAt is { } openedAt)
+                {
+                    _circuitOpenedAt[s.Id] = openedAt;
+                    hydratedCircuits++;
+                }
+            }
+            _logger.LogInformation(
+                "StrategyWorker: hydrated runtime state for {Count} strategies (cooldowns={Cooldowns}, open circuits={Circuits})",
+                activeStrategies.Count, hydratedCooldowns, hydratedCircuits);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "StrategyWorker: failed to hydrate runtime state from DB — starting cold");
+        }
+
         // Subscribe to the event bus so Handle() is invoked on every price tick
         _eventBus.Subscribe<PriceUpdatedIntegrationEvent, StrategyWorker>();
 
