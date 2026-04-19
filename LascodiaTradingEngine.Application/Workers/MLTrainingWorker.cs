@@ -1920,11 +1920,19 @@ public sealed class MLTrainingWorker : BackgroundService
             snap.CotMomNormMax = cotMomMax;
 
             // Record the raw feature-vector dimension the trainer consumed so that
-            // CompositeMLEvaluator can dispatch between V1 (33) and V2 (37) builders
-            // at inference time. Derived from the actual first sample to stay
-            // authoritative regardless of which path built the samples.
+            // CompositeMLEvaluator can dispatch between V1 (33), V2 (37), and V3 (43)
+            // builders at inference time. Derived from the actual first sample to stay
+            // authoritative regardless of which path built the samples. Also persist
+            // FeatureSchemaVersion explicitly so future schema collisions on the raw
+            // count (e.g. a V4 that happens to be 43) stay distinguishable.
             if (samples.Count > 0 && samples[0].Features is { Length: > 0 })
+            {
                 snap.ExpectedInputFeatures = samples[0].Features.Length;
+                snap.FeatureSchemaVersion =
+                    snap.ExpectedInputFeatures == MLFeatureHelper.FeatureCountV3 ? 3 :
+                    snap.ExpectedInputFeatures == MLFeatureHelper.FeatureCountV2 ? 2 :
+                    1;
+            }
 
             // Compute per-feature empirical variances from the deployed feature pipeline.
             // This keeps OOD gating aligned with the exact feature layout inference consumes.

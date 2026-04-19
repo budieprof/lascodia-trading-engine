@@ -259,9 +259,9 @@ public class CompositeMLEvaluator : IStrategyEvaluator
         // of H1 closes. Falls back to V1 silently if the basket can't be loaded, so
         // V2-tagged models keep scoring even on partial data (the 4 appended slots
         // go to 0.0, which is the neutral value the trainer also sees for NaN).
-        int expectedFeatures = snapshot.ExpectedInputFeatures > 0
-            ? snapshot.ExpectedInputFeatures
-            : MLFeatureHelper.FeatureCount;
+        // Use the snapshot's resolver so legacy models backfill from ActiveFeatureMask/
+        // Features rather than collapsing to V1 when ExpectedInputFeatures wasn't persisted.
+        int expectedFeatures = snapshot.ResolveExpectedInputFeatures();
 
         if (expectedFeatures == MLFeatureHelper.FeatureCountV2 &&
             features.Length == MLFeatureHelper.FeatureCount)

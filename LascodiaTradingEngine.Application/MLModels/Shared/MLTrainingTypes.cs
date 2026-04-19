@@ -2741,13 +2741,58 @@ public class ModelSnapshot
     public string[] Features      { get; set; } = [];
     /// <summary>
     /// Number of raw feature values the scorer must supply to this snapshot.
-    /// 0 (legacy) = consumers should assume <see cref="MLFeatureHelper.FeatureCount"/> (33).
-    /// 37 = V2 vector with 4 appended cross-pair macro features (carry proxy, safe-haven
-    /// index, dollar-strength composite, correlation stress). Evaluators use this to
-    /// choose between <see cref="MLFeatureHelper.BuildFeatureVector"/> and
-    /// <see cref="MLFeatureHelper.BuildFeatureVectorV2"/> at inference time.
+    /// 0 (legacy) = backfilled at read time by <see cref="ResolveExpectedInputFeatures"/>
+    /// from <see cref="ActiveFeatureMask"/> / <see cref="Features"/> / <see cref="Means"/>.
+    /// 33 = V1, 37 = V2 (V1 + 4 cross-pair macro), 43 = V3 (V2 + 6 cross-asset/event).
+    /// Evaluators use this to route between <see cref="MLFeatureHelper.BuildFeatureVector"/>,
+    /// <see cref="MLFeatureHelper.BuildFeatureVectorV2"/>, and the V3 append path at inference time.
     /// </summary>
     public int      ExpectedInputFeatures { get; set; }
+
+    /// <summary>
+    /// Explicit feature-schema version tag set at training time.
+    /// 0 (legacy) = unknown; infer via <see cref="ResolveFeatureSchemaVersion"/>.
+    /// 1 = V1 (33 features), 2 = V2 (37 features), 3 = V3 (43 features).
+    /// Version-aware inference routes to the correct feature-vector builder using this
+    /// in preference to <see cref="ExpectedInputFeatures"/>, so future feature schemas
+    /// with colliding counts (e.g. a V4 that still has 43 features but different semantics)
+    /// remain distinguishable.
+    /// </summary>
+    public int      FeatureSchemaVersion { get; set; }
+
+    /// <summary>
+    /// Resolve the authoritative raw-feature-vector length for this snapshot, backfilling
+    /// from dependent fields when <see cref="ExpectedInputFeatures"/> was not persisted.
+    /// Legacy snapshots (trained before the field was saved) would otherwise default to 33
+    /// at inference and mismatch their own 37/43-length <see cref="ActiveFeatureMask"/>,
+    /// crashing <c>ElmFeaturePipelineHelper.ApplyFeatureMask</c>. Call this at every site
+    /// that previously read <see cref="ExpectedInputFeatures"/> directly.
+    /// </summary>
+    public int ResolveExpectedInputFeatures()
+    {
+        if (ExpectedInputFeatures > 0) return ExpectedInputFeatures;
+        if (ActiveFeatureMask is { Length: > 0 }) return ActiveFeatureMask.Length;
+        if (Features is { Length: > 0 }) return Features.Length;
+        if (Means is { Length: > 0 }) return Means.Length;
+        if (Stds is { Length: > 0 }) return Stds.Length;
+        return MLFeatureHelper.FeatureCount; // V1 default
+    }
+
+    /// <summary>
+    /// Resolve the feature-schema version for this snapshot, preferring the explicit
+    /// <see cref="FeatureSchemaVersion"/> tag when set and falling back to a best-effort
+    /// inference from the resolved feature count. Use this for semantic routing decisions
+    /// (e.g. whether to load the V3 cross-asset basket); use <see cref="ResolveExpectedInputFeatures"/>
+    /// for raw-length arithmetic. Returns 1 (V1) for anything that doesn't match a known count.
+    /// </summary>
+    public int ResolveFeatureSchemaVersion()
+    {
+        if (FeatureSchemaVersion > 0) return FeatureSchemaVersion;
+        int count = ResolveExpectedInputFeatures();
+        if (count == MLFeatureHelper.FeatureCountV3) return 3;
+        if (count == MLFeatureHelper.FeatureCountV2) return 2;
+        return 1;
+    }
     /// <summary>
     /// Optional mapping from this snapshot's feature-space positions back to the raw
     /// feature indices emitted by <see cref="MLFeatureHelper.BuildFeatureVector"/>.

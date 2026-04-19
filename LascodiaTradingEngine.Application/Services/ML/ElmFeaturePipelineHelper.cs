@@ -246,9 +246,15 @@ internal static class ElmFeaturePipelineHelper
     {
         float[] projectedRawFeatures = ProjectRawFeaturesForSnapshot(rawFeatures, snapshot);
         float[] replayedRawFeatures = CloneAndWinsorize(projectedRawFeatures, snapshot);
-        int featureCount = snapshot.Features.Length > 0
-            ? snapshot.Features.Length
-            : replayedRawFeatures.Length;
+        // Route featureCount through the snapshot's own resolver so legacy V2/V3 models
+        // (saved before ExpectedInputFeatures/FeatureSchemaVersion were persisted) still
+        // validate against their own ActiveFeatureMask length. Previously this fell back
+        // to replayedRawFeatures.Length, which could be 33 for a V2 model — causing
+        // ApplyFeatureMask to throw "length 37 does not match feature count 33".
+        int resolved = snapshot.ResolveExpectedInputFeatures();
+        int featureCount = resolved > 0
+            ? resolved
+            : (snapshot.Features.Length > 0 ? snapshot.Features.Length : replayedRawFeatures.Length);
 
         (float[] means, float[] stds) = meansOverride is { Length: > 0 } && stdsOverride is { Length: > 0 }
             ? (meansOverride, stdsOverride)

@@ -1480,9 +1480,11 @@ public sealed class MLSignalScorer : IMLSignalScorer
         // USD pairs. Failures fall back to zero-padding so the scorer stays online —
         // V2 models then see neutral macro inputs, which degrades calibration but
         // avoids a hard scoring failure. Mirrors CompositeMLEvaluator's V2 dispatch.
-        int expectedInputFeatures = snap.ExpectedInputFeatures > 0
-            ? snap.ExpectedInputFeatures
-            : MLFeatureHelper.FeatureCount;
+        // Route through the snapshot's own resolver so legacy models (saved with
+        // ExpectedInputFeatures=0 but a populated ActiveFeatureMask/Features/Means)
+        // correctly dispatch to their original feature schema instead of defaulting
+        // to V1. This is what stops the "mask length 37 != feature count 33" crash.
+        int expectedInputFeatures = snap.ResolveExpectedInputFeatures();
         if (expectedInputFeatures == MLFeatureHelper.FeatureCountV2 &&
             builtRawFeatures.Length == MLFeatureHelper.FeatureCount)
         {
