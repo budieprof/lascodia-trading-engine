@@ -22,6 +22,16 @@ public static class EngineConfigUpsert
     /// Atomically upserts a single <c>EngineConfig</c> key/value via a single
     /// parameterised SQL statement. Safe to call concurrently from multiple
     /// workers on the same key without coordination.
+    ///
+    /// <para>
+    /// <b>Soft-delete resurrection:</b> if the row exists with <c>IsDeleted=true</c>
+    /// (e.g. archived by a cleanup worker), the <c>DO UPDATE</c> branch resets
+    /// <c>IsDeleted</c> to <c>false</c> so the new value is visible to readers that
+    /// apply the standard soft-delete filter. Without this, every subsequent upsert
+    /// silently updated the <c>Value</c> but the row stayed invisible, causing
+    /// write-then-read-nothing loops (observed in MLDegradationModeWorker
+    /// "DetectedAt is missing or invalid" firing every cycle).
+    /// </para>
     /// </summary>
     public static Task UpsertAsync(
         DbContext ctx,
@@ -41,7 +51,8 @@ public static class EngineConfigUpsert
                 ({key}, {value}, {dataTypeName}, {description}, {isHotReloadable}, {now}, gen_random_uuid(), false)
             ON CONFLICT (""Key"") DO UPDATE SET
                 ""Value"" = EXCLUDED.""Value"",
-                ""LastUpdatedAt"" = EXCLUDED.""LastUpdatedAt""",
+                ""LastUpdatedAt"" = EXCLUDED.""LastUpdatedAt"",
+                ""IsDeleted"" = false",
             ct);
     }
 }
