@@ -340,7 +340,12 @@ public sealed class MLDataQualityWorker : BackgroundService
 
             if (livePriceAge > livePriceStalenessSeconds)
             {
-                _logger.LogWarning(
+                // Logged at Debug because operator-facing visibility already comes from
+                // PriceCacheFreshnessCheck (health endpoint) and InDatabaseLivePriceCache's
+                // simultaneous-staleness CRITICAL alert. Per-symbol duplicate Warnings
+                // here were producing ~8/min of redundant log output during EA outage.
+                // The DB alert row is still written so downstream alerting is unaffected.
+                _logger.LogDebug(
                     "DataQuality: {Symbol} — STALE LIVE PRICE: {A:F0}s old (threshold {T}s).",
                     symbol, livePriceAge, livePriceStalenessSeconds);
 
