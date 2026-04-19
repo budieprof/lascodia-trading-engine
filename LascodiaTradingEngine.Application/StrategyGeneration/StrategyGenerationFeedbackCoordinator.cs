@@ -44,6 +44,16 @@ internal sealed class StrategyGenerationFeedbackCoordinator : IStrategyGeneratio
             CancellationToken ct)
         => _feedbackSummaryProvider.LoadPerformanceFeedbackAsync(db, writeCtx, halfLifeDays, ct);
 
+    public Task<(Dictionary<(StrategyType, MarketRegimeEnum, Timeframe), double> TypeRates,
+                 Dictionary<string, double> TemplateRates,
+                 Dictionary<string, int> TemplateSampleCounts)>
+        LoadPerformanceFeedbackWithCountsAsync(
+            DbContext db,
+            IWriteApplicationDbContext writeCtx,
+            double halfLifeDays,
+            CancellationToken ct)
+        => _feedbackSummaryProvider.LoadPerformanceFeedbackWithCountsAsync(db, writeCtx, halfLifeDays, ct);
+
     public IReadOnlyList<StrategyType> ApplyPerformanceFeedback(
         IReadOnlyList<StrategyType> types,
         MarketRegimeEnum regime,

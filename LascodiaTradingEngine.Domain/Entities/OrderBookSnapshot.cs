@@ -27,6 +27,17 @@ public class OrderBookSnapshot : Entity<long>
     /// <summary>Computed spread in points at snapshot time.</summary>
     public decimal SpreadPoints { get; set; }
 
+    /// <summary>
+    /// JSON-serialised array of depth levels beyond the top-of-book, ordered from
+    /// best to worst price on each side. Shape:
+    /// <c>{"bids":[{"p":1.0998,"v":2_500_000},...],"asks":[{"p":1.1002,"v":3_100_000},...]}</c>.
+    /// Null when the broker doesn't expose <c>MarketBookGet</c> (most retail brokers
+    /// only return top-of-book, in which case the existing Bid/Ask/BidVolume/AskVolume
+    /// columns are the full picture). Tier-1 ECN-style retail brokers (ICMarkets,
+    /// Pepperstone, FP Markets) typically return 5–10 levels per side here.
+    /// </summary>
+    public string? LevelsJson { get; set; }
+
     /// <summary>EA instance that provided this snapshot.</summary>
     public string InstanceId { get; set; } = string.Empty;
 

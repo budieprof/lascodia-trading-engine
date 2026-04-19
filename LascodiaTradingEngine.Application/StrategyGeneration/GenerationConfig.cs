@@ -102,6 +102,32 @@ public sealed record GenerationConfig
     public decimal KellyFactor { get; init; } = 0.5m;
     public decimal KellyMinLot { get; init; } = 0.01m;
     public decimal KellyMaxLot { get; init; } = 0.10m;
+
+    // ── Deflated Sharpe gate (Bailey/López de Prado) ────────────────────
+    /// <summary>
+    /// Minimum DSR required on the combined IS+OOS Sharpe. Deflates raw Sharpe for
+    /// multiple-testing burden (number of trials in this generation cycle). Zero
+    /// (default) disables the gate; 1.0 is the common "meaningful edge" floor.
+    /// Hot-reloadable via <c>StrategyGeneration:MinDeflatedSharpe</c>.
+    /// </summary>
+    public double MinDeflatedSharpe { get; init; } = 0.0;
+
+    // ── UCB1 template selection ─────────────────────────────────────────
+    /// <summary>
+    /// When true, template ordering uses UCB1 (survival rate + exploration bonus
+    /// proportional to sqrt(ln(total) / n_i)) rather than raw survival-rate sort.
+    /// Prevents the engine from locking in on the first lucky template.
+    /// Hot-reloadable via <c>StrategyGeneration:UseUcb1TemplateSelection</c>.
+    /// </summary>
+    public bool UseUcb1TemplateSelection { get; init; } = true;
+
+    /// <summary>
+    /// UCB1 exploration constant. Defaults to √2 (≈1.414), the classic UCB1 tuning.
+    /// Higher = more varied template selection; lower = faster exploit of known winners.
+    /// Zero disables the exploration term (equivalent to pure survival-rate ordering).
+    /// Hot-reloadable via <c>StrategyGeneration:Ucb1ExplorationConstant</c>.
+    /// </summary>
+    public double Ucb1ExplorationConstant { get; init; } = 1.41421356237;
 }
 
 /// <summary>Adaptive threshold multipliers computed from recent screening distributions.</summary>

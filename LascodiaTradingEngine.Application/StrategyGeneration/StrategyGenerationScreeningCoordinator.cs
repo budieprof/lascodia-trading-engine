@@ -51,6 +51,12 @@ internal sealed class StrategyGenerationScreeningContext
     public required Dictionary<string, double> RegimeConfidenceBySymbol { get; init; }
     public required StrategyGenerationFaultTracker FaultTracker { get; init; }
     public required IReadOnlyDictionary<string, double> TemplateSurvivalRates { get; init; }
+    /// <summary>
+    /// Per-template trial counts captured alongside <see cref="TemplateSurvivalRates"/>.
+    /// Populated when available so the UCB1 template selector can compute an exploration
+    /// bonus; null/empty falls back to survival-rate-only ordering for backward compatibility.
+    /// </summary>
+    public IReadOnlyDictionary<string, int>? TemplateSampleCounts { get; init; }
     public required Dictionary<string, MarketRegimeEnum> RegimeTransitions { get; init; }
     public required Dictionary<string, DateTime> RegimeDetectedAtBySymbol { get; init; }
     public required HashSet<string> TransitionSymbols { get; init; }
@@ -310,6 +316,11 @@ internal sealed class StrategyGenerationScreeningCoordinator : IStrategyGenerati
             KellyFactor = config.KellyFactor,
             KellyMinLot = config.KellyMinLot,
             KellyMaxLot = config.KellyMaxLot,
+            MinDeflatedSharpe = config.MinDeflatedSharpe,
+            // ActiveStrategyCount is the best approximation we have for "strategies tried"
+            // when deflating the Sharpe. A floor of 10 keeps the gate meaningful on a fresh
+            // engine where ActiveStrategyCount starts near zero.
+            DeflatedSharpeTrials = Math.Max(10, config.ActiveStrategyCount),
         };
     }
 }

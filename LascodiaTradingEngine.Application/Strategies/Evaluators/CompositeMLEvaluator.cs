@@ -388,6 +388,72 @@ public class CompositeMLEvaluator : IStrategyEvaluator
             features = v4;
         }
 
+        // ── 4e. V5 dispatch: synthetic-microstructure proxies on top of V4 ────
+        if (expectedFeatures == MLFeatureHelper.FeatureCountV5 &&
+            features.Length == MLFeatureHelper.FeatureCountV4)
+        {
+            var v5 = new float[MLFeatureHelper.FeatureCountV5];
+            Array.Copy(features, v5, features.Length);
+            try
+            {
+                using var v5Scope = _scopeFactory.CreateScope();
+                var tickProvider = v5Scope.ServiceProvider.GetRequiredService<
+                    global::LascodiaTradingEngine.Application.Services.ITickFlowProvider>();
+                var tickFlow = await tickProvider.GetSnapshotAsync(
+                    strategy.Symbol, currentCandle.Timestamp, cancellationToken);
+
+                static float S(float v) => float.IsNaN(v) || float.IsInfinity(v) ? 0f : Math.Clamp(v, -5f, 5f);
+                if (tickFlow is not null)
+                {
+                    v5[MLFeatureHelper.FeatureCountV4 + 0] = S((float)(tickFlow.EffectiveSpread    * 1000m));
+                    v5[MLFeatureHelper.FeatureCountV4 + 1] = S((float)tickFlow.AmihudIlliquidity);
+                    v5[MLFeatureHelper.FeatureCountV4 + 2] = S((float)(tickFlow.RollSpreadEstimate * 1000m));
+                    v5[MLFeatureHelper.FeatureCountV4 + 3] = S((float)(tickFlow.VarianceRatio - 1m));
+                }
+                // tickFlow null → last 4 slots stay 0 (matches V5 builder's null-fill contract).
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "V5 tick-flow load failed for {Symbol} model {ModelId} — zero-padding",
+                    strategy.Symbol, model.Id);
+            }
+            features = v5;
+        }
+
+        // ── 4f. V6 dispatch: real-DOM features layered on top of V5 ────────
+        if (expectedFeatures == MLFeatureHelper.FeatureCountV6 &&
+            features.Length == MLFeatureHelper.FeatureCountV5)
+        {
+            var v6 = new float[MLFeatureHelper.FeatureCountV6];
+            Array.Copy(features, v6, features.Length);
+            try
+            {
+                using var v6Scope = _scopeFactory.CreateScope();
+                var bookProvider = v6Scope.ServiceProvider.GetRequiredService<
+                    global::LascodiaTradingEngine.Application.Services.IOrderBookFeatureProvider>();
+                var orderBook = await bookProvider.GetSnapshotAsync(
+                    strategy.Symbol, currentCandle.Timestamp, cancellationToken);
+
+                static float S(float v) => float.IsNaN(v) || float.IsInfinity(v) ? 0f : Math.Clamp(v, -5f, 5f);
+                if (orderBook is not null)
+                {
+                    v6[MLFeatureHelper.FeatureCountV5 + 0] = S((float)(orderBook.BookImbalanceTop1 - 0.5m) * 2f);
+                    v6[MLFeatureHelper.FeatureCountV5 + 1] = S((float)(orderBook.BookImbalanceTop5 - 0.5m) * 2f);
+                    v6[MLFeatureHelper.FeatureCountV5 + 2] = S((float)orderBook.TotalLiquidityNorm);
+                    v6[MLFeatureHelper.FeatureCountV5 + 3] = S((float)orderBook.BookSlopeBid);
+                    v6[MLFeatureHelper.FeatureCountV5 + 4] = S((float)orderBook.BookSlopeAsk);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "V6 order-book load failed for {Symbol} model {ModelId} — zero-padding",
+                    strategy.Symbol, model.Id);
+            }
+            features = v6;
+        }
+
         // ── 5. Resolve inference engine ────────────────────────────────────────
         var engine = ResolveInferenceEngine(snapshot);
         if (engine is null)

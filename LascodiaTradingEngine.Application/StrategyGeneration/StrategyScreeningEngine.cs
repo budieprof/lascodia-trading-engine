@@ -453,6 +453,42 @@ public class StrategyScreeningEngine
         gateTrace.Add(new("MonteCarloShuffle", true, gateSw.Elapsed.TotalMilliseconds));
         gateSw.Restart();
 
+        // ── Deflated Sharpe gate (Bailey/López de Prado) ──
+        // Deflates the combined IS+OOS Sharpe by the number of strategy-parameter trials
+        // in this generation cycle. A raw Sharpe of 1.2 drawn from 1 of 100 trials is
+        // much less informative than a Sharpe of 1.2 from a single trial — DSR corrects
+        // for that multiple-testing burden. MinDeflatedSharpe = 0 (default) disables the
+        // gate so existing runs are unchanged; a common López de Prado floor is 1.0.
+        //
+        // Delegated to PromotionGateValidator.ComputeDeflatedSharpe — same implementation
+        // the manual four-eyes gate uses, so screening and promotion agree on the formula.
+        double deflatedSharpe = 0.0;
+        if (config.MinDeflatedSharpe > 0.0
+            && config.DeflatedSharpeTrials > 0
+            && combinedTrades.Count > 1)
+        {
+            double combinedSharpe = (double)oosResult.SharpeRatio;
+            deflatedSharpe = Strategies.Services.PromotionGateValidator.ComputeDeflatedSharpe(
+                rawSharpe: combinedSharpe,
+                trials: Math.Max(1, config.DeflatedSharpeTrials),
+                trades: combinedTrades.Count);
+
+            if (deflatedSharpe < config.MinDeflatedSharpe)
+            {
+                gateTrace.Add(new("DeflatedSharpe", false, gateSw.Elapsed.TotalMilliseconds));
+                _onGateRejection?.Invoke("deflated_sharpe");
+                return BuildFailedOutcome(
+                    ScreeningFailureReason.DeflatedSharpe,
+                    "DeflatedSharpeRejected",
+                    $"{strategyType} on {symbol}/{timeframe} DSR={deflatedSharpe:F3} < {config.MinDeflatedSharpe:F2} (raw Sharpe={combinedSharpe:F2}, trials={config.DeflatedSharpeTrials}, trades={combinedTrades.Count})",
+                    trainResult,
+                    oosResult);
+            }
+        }
+
+        gateTrace.Add(new("DeflatedSharpe", true, gateSw.Elapsed.TotalMilliseconds));
+        gateSw.Restart();
+
         // ── Marginal Sharpe contribution gate (P3) ──
         double? marginalSharpeContribution = null;
         if (portfolioEquityCurve != null && portfolioEquityCurve.Count >= 20)
@@ -1076,6 +1112,23 @@ public sealed record ScreeningConfig
 
     /// <summary>Total number of active strategies in the portfolio. Used by the marginal Sharpe gate.</summary>
     public int ActiveStrategyCount { get; init; }
+
+    /// <summary>
+    /// Minimum Deflated Sharpe Ratio (Bailey/López de Prado 2014) required on the
+    /// combined IS+OOS trade sequence. DSR adjusts the raw Sharpe for the number of
+    /// strategies the engine has tried in the same generation context — a high raw
+    /// Sharpe from a single candidate out of many trials may still be insignificant.
+    /// Zero (default) disables the gate so historical behaviour is preserved; 1.0 is
+    /// the López de Prado "meaningful" floor.
+    /// </summary>
+    public double MinDeflatedSharpe { get; init; } = 0.0;
+
+    /// <summary>
+    /// Number of strategy-parameter trials to pass to the DSR formula. Typically set
+    /// from the generation cycle's candidate count so DSR deflates proportionally to
+    /// the multiple-testing burden. Minimum 1 — zero/negative short-circuits the gate.
+    /// </summary>
+    public int DeflatedSharpeTrials { get; init; } = 1;
 }
 
 /// <summary>Result of screening a single candidate.</summary>

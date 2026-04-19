@@ -347,7 +347,8 @@ internal sealed class StrategyGenerationCycleRunner : IStrategyGenerationCycleRu
                 _metrics.StrategyGenRegimeTransitionSkipped.Add(1);
 
             var halfLifeDays = _feedbackDecayMonitor.GetEffectiveHalfLifeDays();
-            var (feedbackRates, templateSurvivalRates) = await _feedbackCoordinator.LoadPerformanceFeedbackAsync(db, writeCtx, halfLifeDays, ct);
+            var (feedbackRates, templateSurvivalRates, templateSampleCounts) =
+                await _feedbackCoordinator.LoadPerformanceFeedbackWithCountsAsync(db, writeCtx, halfLifeDays, ct);
 
             _regimeMapper.RefreshFromFeedback(StrategyGenerationFeedbackCoordinator.AggregateFeedbackRatesForMapper(feedbackRates));
 
@@ -445,6 +446,7 @@ internal sealed class StrategyGenerationCycleRunner : IStrategyGenerationCycleRu
                 RegimeConfidenceBySymbol = cycleData.RegimeConfidenceBySymbol,
                 FaultTracker = new StrategyGenerationFaultTracker(config.MaxFaultsPerStrategyType),
                 TemplateSurvivalRates = templateSurvivalRates,
+                TemplateSampleCounts = templateSampleCounts,
                 RegimeTransitions = cycleData.RegimeTransitions,
                 RegimeDetectedAtBySymbol = cycleData.RegimeDetectedAtBySymbol,
                 TransitionSymbols = cycleData.TransitionSymbols,

@@ -634,12 +634,29 @@ internal sealed class StrategyGenerationPrimaryScreeningPlanner : IStrategyGener
             if (templates.Count == 0)
                 continue;
 
-            var orderedTemplates = OrderTemplatesForRegime(
-                templates,
-                args.Regime,
-                context.TemplateSurvivalRates,
-                strategyType,
-                args.Timeframe);
+            // UCB1-aware template ordering when the config flag is on and sample counts are
+            // available; falls back to the pure survival-rate ordering otherwise so unit
+            // tests and older deployments behave exactly as before.
+            IReadOnlyList<string> orderedTemplates;
+            if (config.UseUcb1TemplateSelection
+                && context.TemplateSampleCounts is { Count: > 0 })
+            {
+                orderedTemplates = StrategyGenerationHelpers.OrderTemplatesForRegimeUcb1(
+                    templates,
+                    args.Regime,
+                    context.TemplateSurvivalRates,
+                    context.TemplateSampleCounts,
+                    config.Ucb1ExplorationConstant);
+            }
+            else
+            {
+                orderedTemplates = OrderTemplatesForRegime(
+                    templates,
+                    args.Regime,
+                    context.TemplateSurvivalRates,
+                    strategyType,
+                    args.Timeframe);
+            }
             context.PrunedTemplates.TryGetValue(combo, out var failedParamsForCombo);
             int templatesQueued = 0;
 

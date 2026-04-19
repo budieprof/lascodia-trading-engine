@@ -104,29 +104,123 @@ public sealed class TickFlowProvider : ITickFlowProvider
             ? Math.Clamp((decimal)strictlyLess / ticks.Count, 0m, 1m)
             : 0m;
 
-        // Tick-volume imbalance: signed count of mid-price moves up vs down, weighted
-        // by tick volume. Closest proxy to aggressor-side we have without real DOM.
-        long upVol = 0L, downVol = 0L;
-        for (int i = ticks.Count - 1; i > 0; i--)
+        // ── Lee-Ready order-flow imbalance (V5 quality upgrade) ──────────
+        // Classify each tick as buyer- or seller-initiated using the Lee-Ready
+        // (1991) algorithm: a trade above the prior quote midpoint is buyer-
+        // initiated, below is seller-initiated, equal-to ("tick test") inherits
+        // the previous classification. Bid/Ask isn't a real "trade", so we use
+        // the mid as the trade price proxy; this is the canonical retail-data
+        // approximation. Output replaces the simpler "sign(Δmid)" version.
+        long buyVol = 0L, sellVol = 0L;
+        int  prevClass = 0; // -1 sell, +1 buy, 0 unknown
+        for (int i = ticks.Count - 2; i >= 0; i--) // newest=0 → oldest; iterate older→newer
         {
-            int dir = Math.Sign(ticks[i - 1].Mid - ticks[i].Mid);
-            long vol = Math.Max(1L, ticks[i - 1].TickVolume);
-            if (dir > 0) upVol += vol;
-            else if (dir < 0) downVol += vol;
+            decimal priorMid = (ticks[i + 1].Ask + ticks[i + 1].Bid) / 2m;
+            decimal nowMid   = (ticks[i].Ask + ticks[i].Bid) / 2m;
+            int sign = nowMid > priorMid ? 1 : nowMid < priorMid ? -1 : prevClass;
+            if (sign == 0) continue;
+            long vol = Math.Max(1L, ticks[i].TickVolume);
+            if (sign > 0) buyVol  += vol;
+            else          sellVol += vol;
+            prevClass = sign;
         }
-        long totalVol = upVol + downVol;
+        long totalVol = buyVol + sellVol;
         decimal tickVolumeImbalance = totalVol > 0
-            ? Math.Clamp((decimal)(upVol - downVol) / totalVol, -1m, 1m)
+            ? Math.Clamp((decimal)(buyVol - sellVol) / totalVol, -1m, 1m)
             : 0m;
+
+        // ── V5 microstructure features ──────────────────────────────────
+        // Build the tick-return series (oldest → newest) once for Roll, Amihud,
+        // VarianceRatio, and EffectiveSpread.
+        var midReturns = new List<decimal>(Math.Max(0, ticks.Count - 1));
+        var absReturnsPerVol = new List<decimal>(Math.Max(0, ticks.Count - 1));
+        decimal effectiveSpreadSum = 0m;
+        int effectiveSpreadCount = 0;
+        for (int i = ticks.Count - 2; i >= 0; i--)
+        {
+            decimal priorMid = (ticks[i + 1].Ask + ticks[i + 1].Bid) / 2m;
+            decimal nowMid   = (ticks[i].Ask + ticks[i].Bid) / 2m;
+            if (priorMid == 0m) continue;
+            decimal ret = (nowMid - priorMid) / priorMid;
+            midReturns.Add(ret);
+            long vol = Math.Max(1L, ticks[i].TickVolume);
+            absReturnsPerVol.Add(Math.Abs(ret) / vol);
+
+            // Effective spread: use the trade-side estimate |trade − mid| × 2 / mid.
+            // For mid-based ticks the trade price is approximated as the prior-side quote
+            // (Bid for sell-initiated, Ask for buy-initiated trades).
+            decimal tradePrice = nowMid > priorMid ? ticks[i].Ask : ticks[i].Bid;
+            decimal effSpread = priorMid > 0m
+                ? 2m * Math.Abs(tradePrice - priorMid) / priorMid
+                : 0m;
+            effectiveSpreadSum += effSpread;
+            effectiveSpreadCount++;
+        }
+        decimal effectiveSpread = effectiveSpreadCount > 0
+            ? Math.Clamp(effectiveSpreadSum / effectiveSpreadCount, 0m, 0.01m) // cap at 1% as sanity floor
+            : 0m;
+        decimal amihudIlliquidity = absReturnsPerVol.Count > 0
+            ? Math.Clamp(absReturnsPerVol.Average(), 0m, 1m)
+            : 0m;
+
+        // Roll's spread estimator: 2×√(−Cov(Δp_t, Δp_{t−1})). Bid-ask bounce makes
+        // adjacent returns negatively correlated; the magnitude of that covariance
+        // recovers the implicit spread. When the autocovariance is positive (trending
+        // returns), the estimator is undefined and we return 0 — explicit signal that
+        // the symbol is not currently in bid-ask-bounce regime.
+        decimal rollSpreadEstimate = 0m;
+        if (midReturns.Count >= 3)
+        {
+            decimal mean = midReturns.Average();
+            decimal cov = 0m;
+            for (int i = 1; i < midReturns.Count; i++)
+                cov += (midReturns[i] - mean) * (midReturns[i - 1] - mean);
+            cov /= (midReturns.Count - 1);
+            if (cov < 0m) rollSpreadEstimate = 2m * (decimal)Math.Sqrt((double)(-cov));
+            rollSpreadEstimate = Math.Clamp(rollSpreadEstimate, 0m, 0.01m);
+        }
+
+        // Variance ratio at k=2: Var(2-period returns) / (2 × Var(1-period returns)).
+        // Equals 1.0 under random walk; >1 indicates positive autocorr (momentum),
+        // <1 indicates negative autocorr (mean reversion). Captures whether tick-level
+        // returns have exploitable serial structure.
+        decimal varianceRatio = 1m;
+        if (midReturns.Count >= 4)
+        {
+            var twoPeriod = new List<decimal>(midReturns.Count / 2);
+            for (int i = 0; i + 1 < midReturns.Count; i += 2)
+                twoPeriod.Add(midReturns[i] + midReturns[i + 1]);
+            decimal var1 = SampleVariance(midReturns);
+            decimal var2 = SampleVariance(twoPeriod);
+            if (var1 > 0m)
+                varianceRatio = Math.Clamp(var2 / (2m * var1), 0m, 5m);
+        }
 
         var snapshot = new TickFlowSnapshot(
             tickDelta, currentSpread, spreadMean, spreadStdDev,
             SpreadPercentileRank: spreadPercentile,
             SpreadRelVolatility:  spreadRelVol,
-            TickVolumeImbalance:  tickVolumeImbalance);
+            TickVolumeImbalance:  tickVolumeImbalance,
+            EffectiveSpread:      effectiveSpread,
+            AmihudIlliquidity:    amihudIlliquidity,
+            RollSpreadEstimate:   rollSpreadEstimate,
+            VarianceRatio:        varianceRatio);
 
         _cache.Set(cacheKey, snapshot, CacheTtl);
 
         return snapshot;
+    }
+
+    private static decimal SampleVariance(IReadOnlyList<decimal> values)
+    {
+        if (values.Count < 2) return 0m;
+        decimal mean = values.Average();
+        decimal sumSq = 0m;
+        foreach (var v in values)
+        {
+            decimal d = v - mean;
+            sumSq += d * d;
+        }
+        return sumSq / (values.Count - 1);
     }
 }

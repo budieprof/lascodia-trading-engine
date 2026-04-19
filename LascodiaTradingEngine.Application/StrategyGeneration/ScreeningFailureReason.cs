@@ -50,4 +50,10 @@ public enum ScreeningFailureReason
 
     /// <summary>Strategy performance is too sensitive to position sizing parameter changes.</summary>
     PositionSizingSensitivity,
+
+    /// <summary>
+    /// Deflated Sharpe Ratio below threshold — raw Sharpe is not significant after
+    /// deflating for the number of strategies tried (Bailey/López de Prado 2014).
+    /// </summary>
+    DeflatedSharpe,
 }

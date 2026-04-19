@@ -56,17 +56,45 @@ public static class MLFeatureHelper
     public const int FeatureCountV4 = 48;
 
     /// <summary>
+    /// V5 vector length: 48 V4 features + 4 tick-microstructure proxies that approximate
+    /// the order-flow signal a real DOM feed would provide. EffectiveSpread, AmihudIlliquidity,
+    /// RollSpreadEstimate, VarianceRatio are computed by <see cref="Services.TickFlowProvider"/>
+    /// from the same persisted tick stream the V4 microstructure slots use — no additional
+    /// data source. Together these capture the "synthetic DOM" envelope: realised spread cost,
+    /// market-impact per dollar, bid-ask bounce signature, and serial-correlation regime.
+    /// Enabled via <c>MLTraining:UseTickMicrostructureFeatureVector=true</c> AND
+    /// <c>MLTraining:UseV5SyntheticMicrostructure=true</c>; inference dispatch routes on
+    /// <c>snapshot.ExpectedInputFeatures == FeatureCountV5</c>.
+    /// </summary>
+    public const int FeatureCountV5 = 52;
+
+    /// <summary>
+    /// V6 vector length: 52 V5 features + 5 real-DOM features computed by
+    /// <see cref="Services.OrderBookFeatureProvider"/> from
+    /// <see cref="Domain.Entities.OrderBookSnapshot"/> rows streamed by EA instances
+    /// running on tier-1 brokers that expose <c>MarketBookAdd</c>. Slots:
+    /// 52 = BookImbalanceTop1, 53 = BookImbalanceTop5, 54 = TotalLiquidityNorm,
+    /// 55 = BookSlopeBid, 56 = BookSlopeAsk. Zero-fills when the broker doesn't
+    /// expose DOM (the existing V5 schema covers retail-only deployments).
+    /// </summary>
+    public const int FeatureCountV6 = 57;
+
+    /// <summary>
     /// Hard cap on production feature-vector length. Enforced by
     /// <see cref="AssertFeatureCountWithinCap"/> at training and inference time.
     ///
     /// Rationale: feature creep (V1=33 → V2=37 → V3=43 in weeks) is the single
     /// biggest silent overfit driver. Every added feature consumes a degree of
-    /// freedom — a 50-feature vector trained on 2k samples is ~40 samples per
-    /// feature, deep in curse-of-dimensionality territory for financial labels.
-    /// Adding a feature must mean removing one OR proving permutation-importance
-    /// > 0.01 on a held-out slice that did not influence its construction.
+    /// freedom; adding a feature must mean removing one OR proving permutation-
+    /// importance > 0.01 on a held-out slice that did not influence its construction.
+    ///
+    /// Bumped from 50 to 60 in 2026-04 when V5 (synthetic microstructure proxies) and
+    /// the upcoming V6 (real DOM features when MarketBookAdd is supported by the broker)
+    /// needed room. Justification: V5/V6 features capture order-flow dimension that
+    /// V1–V4 OHLCV-derived features fundamentally cannot — orthogonal information
+    /// warrants the additional capacity.
     /// </summary>
-    public const int MaxAllowedFeatureCount = 50;
+    public const int MaxAllowedFeatureCount = 60;
 
     /// <summary>
     /// Assert a feature vector length is within the production cap. Call from
@@ -4417,6 +4445,239 @@ public static class MLFeatureHelper
             var minuteEvents  = minuteLevelEventLookup(current.Timestamp);
             var tickFlow      = tickFlowLookup(current.Timestamp);
             var features      = BuildFeatureVectorV4(window, current, prev, slice, symbol, crossAsset, eventFeat, minuteEvents, tickFlow, cotEntry);
+
+            float atr = (float)CalculateATR(window, 14);
+            if (atr <= 0f)
+            {
+                int fallbackDir = candles[i + 1].Close > candles[i].Close ? 1 : 0;
+                samples.Add(new TrainingSample(features, fallbackDir, 0f));
+                continue;
+            }
+
+            float profitTarget = atr * profitAtrMult + costBufferPriceUnits;
+            float stopLoss     = atr * stopAtrMult;
+            float entry        = (float)current.Close;
+
+            int   label     = 0;
+            float magnitude = 0f;
+
+            int maxLook = Math.Min(i + 1 + horizonBars, candles.Count);
+            for (int j = i + 1; j < maxLook; j++)
+            {
+                float hi = (float)candles[j].High;
+                float lo = (float)candles[j].Low;
+
+                bool profitHit = hi - entry >= profitTarget;
+                bool stopHit   = entry - lo  >= stopLoss;
+
+                if (profitHit && stopHit) { label = 1; magnitude = Clamp(profitTarget / atr, -5f, 5f); break; }
+                if (profitHit)            { label = 1; magnitude = Clamp((hi - entry) / atr, -5f, 5f); break; }
+                if (stopHit)              { label = 0; magnitude = Clamp((lo - entry) / atr, -5f, 5f); break; }
+            }
+
+            if (label == 0 && magnitude == 0f && maxLook > i + 1)
+            {
+                float exitClose = (float)candles[maxLook - 1].Close;
+                magnitude = Clamp((exitClose - entry) / atr, -5f, 5f);
+                label     = exitClose > entry ? 1 : 0;
+            }
+
+            samples.Add(new TrainingSample(features, label, magnitude));
+        }
+
+        return samples;
+    }
+
+    /// <summary>
+    /// V5 feature vector: 48 V4 features + 4 synthetic-microstructure proxies derived
+    /// from the same persisted tick stream. Slot order:
+    /// 48 = EffectiveSpreadNorm    (clamped × 1000 then sanitised)
+    /// 49 = AmihudIlliquidityNorm  (capped at 1.0)
+    /// 50 = RollSpreadNorm         (clamped × 1000 then sanitised)
+    /// 51 = VarianceRatioCentered  (varianceRatio − 1.0; 0 = random walk, ±1 = strong serial corr)
+    /// All four zero-fill when <paramref name="tickFlow"/> is null (no ticks persisted yet).
+    /// </summary>
+    public static float[] BuildFeatureVectorV5(
+        List<Candle>                          window,
+        Candle                                current,
+        Candle                                previous,
+        Dictionary<string, double[]>          basketSliceAtCurrentBar,
+        string                                symbol,
+        global::LascodiaTradingEngine.Application.Services.ML.CrossAssetSnapshot crossAsset,
+        global::LascodiaTradingEngine.Application.Services.ML.EventFeatureSnapshot eventFeatures,
+        (float MinutesToNextHighNorm, float MinutesToNextMedHighNorm) minuteLevelEvents,
+        global::LascodiaTradingEngine.Application.Services.TickFlowSnapshot? tickFlow,
+        CotFeatureEntry?                      cotEntry = null)
+    {
+        float[] v4 = BuildFeatureVectorV4(window, current, previous, basketSliceAtCurrentBar, symbol,
+            crossAsset, eventFeatures, minuteLevelEvents, tickFlow, cotEntry);
+        var result = new float[FeatureCountV5];
+        Array.Copy(v4, 0, result, 0, FeatureCountV4);
+
+        if (tickFlow is null)
+        {
+            // Last 4 slots already zero (default(float)).
+            return result;
+        }
+
+        // EffectiveSpread is in fractional return-scale (e.g. 0.0001 = 1 bp). Scale by
+        // 1000 before sanitising so the model sees a value in roughly [0, 10] rather than
+        // [0, 0.01] which the standardiser would compress into the noise floor.
+        result[FeatureCountV4 + 0] = SanitizeScalar((float)(tickFlow.EffectiveSpread    * 1000m));
+        result[FeatureCountV4 + 1] = SanitizeScalar((float)tickFlow.AmihudIlliquidity);
+        result[FeatureCountV4 + 2] = SanitizeScalar((float)(tickFlow.RollSpreadEstimate * 1000m));
+        // Center variance ratio at 0 so "random walk" maps to a neutral feature value.
+        result[FeatureCountV4 + 3] = SanitizeScalar((float)(tickFlow.VarianceRatio - 1m));
+        return result;
+    }
+
+    /// <summary>
+    /// V5 training-sample builder. Emits the 52-feature vector — same triple-barrier
+    /// labelling as V4. Tick-flow lookup must be supplied; null per-bar values are
+    /// allowed (V5 builder zero-fills the 4 microstructure slots).
+    /// </summary>
+    public static List<TrainingSample> BuildTrainingSamplesWithTripleBarrierV5(
+        List<Candle>                                                                                             candles,
+        string                                                                                                    symbol,
+        Dictionary<string, (DateTime[] Times, double[] Closes)>                                                   fullBasket,
+        Func<DateTime, global::LascodiaTradingEngine.Application.Services.ML.CrossAssetSnapshot>                   crossAssetLookup,
+        Func<DateTime, global::LascodiaTradingEngine.Application.Services.ML.EventFeatureSnapshot>                 eventLookup,
+        Func<DateTime, (float MinutesToNextHighNorm, float MinutesToNextMedHighNorm)>                              minuteLevelEventLookup,
+        Func<DateTime, global::LascodiaTradingEngine.Application.Services.TickFlowSnapshot?>                       tickFlowLookup,
+        Func<DateTime, CotFeatureEntry>?                                                                           cotLookup     = null,
+        float                                                                                                     profitAtrMult = 1.5f,
+        float                                                                                                     stopAtrMult   = 1.5f,
+        int                                                                                                       horizonBars   = 24,
+        float                                                                                                     costBufferPriceUnits = 0f)
+    {
+        var samples = new List<TrainingSample>(candles.Count);
+
+        for (int i = LookbackWindow; i < candles.Count - 1; i++)
+        {
+            var window  = candles.GetRange(i - LookbackWindow, LookbackWindow);
+            var current = candles[i];
+            var prev    = window[^1];
+
+            var cotEntry      = cotLookup?.Invoke(current.Timestamp) ?? CotFeatureEntry.Zero;
+            var slice         = global::LascodiaTradingEngine.Application.Services.ML.MacroFeatureCalculator.SliceBasketAsOf(fullBasket, current.Timestamp);
+            var crossAsset    = crossAssetLookup(current.Timestamp);
+            var eventFeat     = eventLookup(current.Timestamp);
+            var minuteEvents  = minuteLevelEventLookup(current.Timestamp);
+            var tickFlow      = tickFlowLookup(current.Timestamp);
+            var features      = BuildFeatureVectorV5(window, current, prev, slice, symbol, crossAsset, eventFeat, minuteEvents, tickFlow, cotEntry);
+
+            float atr = (float)CalculateATR(window, 14);
+            if (atr <= 0f)
+            {
+                int fallbackDir = candles[i + 1].Close > candles[i].Close ? 1 : 0;
+                samples.Add(new TrainingSample(features, fallbackDir, 0f));
+                continue;
+            }
+
+            float profitTarget = atr * profitAtrMult + costBufferPriceUnits;
+            float stopLoss     = atr * stopAtrMult;
+            float entry        = (float)current.Close;
+
+            int   label     = 0;
+            float magnitude = 0f;
+
+            int maxLook = Math.Min(i + 1 + horizonBars, candles.Count);
+            for (int j = i + 1; j < maxLook; j++)
+            {
+                float hi = (float)candles[j].High;
+                float lo = (float)candles[j].Low;
+
+                bool profitHit = hi - entry >= profitTarget;
+                bool stopHit   = entry - lo  >= stopLoss;
+
+                if (profitHit && stopHit) { label = 1; magnitude = Clamp(profitTarget / atr, -5f, 5f); break; }
+                if (profitHit)            { label = 1; magnitude = Clamp((hi - entry) / atr, -5f, 5f); break; }
+                if (stopHit)              { label = 0; magnitude = Clamp((lo - entry) / atr, -5f, 5f); break; }
+            }
+
+            if (label == 0 && magnitude == 0f && maxLook > i + 1)
+            {
+                float exitClose = (float)candles[maxLook - 1].Close;
+                magnitude = Clamp((exitClose - entry) / atr, -5f, 5f);
+                label     = exitClose > entry ? 1 : 0;
+            }
+
+            samples.Add(new TrainingSample(features, label, magnitude));
+        }
+
+        return samples;
+    }
+
+    /// <summary>
+    /// V6 feature vector: 52 V5 features + 5 real-DOM features (BookImbalanceTop1,
+    /// BookImbalanceTop5, TotalLiquidityNorm, BookSlopeBid, BookSlopeAsk). All five
+    /// zero-fill when <paramref name="orderBook"/> is null (no DOM data for the symbol).
+    /// </summary>
+    public static float[] BuildFeatureVectorV6(
+        List<Candle>                          window,
+        Candle                                current,
+        Candle                                previous,
+        Dictionary<string, double[]>          basketSliceAtCurrentBar,
+        string                                symbol,
+        global::LascodiaTradingEngine.Application.Services.ML.CrossAssetSnapshot crossAsset,
+        global::LascodiaTradingEngine.Application.Services.ML.EventFeatureSnapshot eventFeatures,
+        (float MinutesToNextHighNorm, float MinutesToNextMedHighNorm) minuteLevelEvents,
+        global::LascodiaTradingEngine.Application.Services.TickFlowSnapshot? tickFlow,
+        global::LascodiaTradingEngine.Application.Services.OrderBookFeatureSnapshot? orderBook,
+        CotFeatureEntry?                      cotEntry = null)
+    {
+        float[] v5 = BuildFeatureVectorV5(window, current, previous, basketSliceAtCurrentBar, symbol,
+            crossAsset, eventFeatures, minuteLevelEvents, tickFlow, cotEntry);
+        var result = new float[FeatureCountV6];
+        Array.Copy(v5, 0, result, 0, FeatureCountV5);
+
+        if (orderBook is null) return result;
+
+        // Imbalance features are already in [0,1]; centre at 0 so the model sees neutral-flow
+        // as 0 rather than 0.5 (matches downstream sanitiser convention).
+        result[FeatureCountV5 + 0] = SanitizeScalar((float)(orderBook.BookImbalanceTop1 - 0.5m) * 2f);
+        result[FeatureCountV5 + 1] = SanitizeScalar((float)(orderBook.BookImbalanceTop5 - 0.5m) * 2f);
+        result[FeatureCountV5 + 2] = SanitizeScalar((float)orderBook.TotalLiquidityNorm);
+        result[FeatureCountV5 + 3] = SanitizeScalar((float)orderBook.BookSlopeBid);
+        result[FeatureCountV5 + 4] = SanitizeScalar((float)orderBook.BookSlopeAsk);
+        return result;
+    }
+
+    /// <summary>
+    /// V6 training-sample builder. Adds DOM lookup to the V5 pipeline; null lookup
+    /// returns means the symbol's broker doesn't expose DOM (the 5 V6 slots zero-fill).
+    /// </summary>
+    public static List<TrainingSample> BuildTrainingSamplesWithTripleBarrierV6(
+        List<Candle>                                                                                                           candles,
+        string                                                                                                                  symbol,
+        Dictionary<string, (DateTime[] Times, double[] Closes)>                                                                 fullBasket,
+        Func<DateTime, global::LascodiaTradingEngine.Application.Services.ML.CrossAssetSnapshot>                                 crossAssetLookup,
+        Func<DateTime, global::LascodiaTradingEngine.Application.Services.ML.EventFeatureSnapshot>                               eventLookup,
+        Func<DateTime, (float MinutesToNextHighNorm, float MinutesToNextMedHighNorm)>                                            minuteLevelEventLookup,
+        Func<DateTime, global::LascodiaTradingEngine.Application.Services.TickFlowSnapshot?>                                     tickFlowLookup,
+        Func<DateTime, global::LascodiaTradingEngine.Application.Services.OrderBookFeatureSnapshot?>                             orderBookLookup,
+        Func<DateTime, CotFeatureEntry>?                                                                                         cotLookup     = null,
+        float                                                                                                                   profitAtrMult = 1.5f,
+        float                                                                                                                   stopAtrMult   = 1.5f,
+        int                                                                                                                     horizonBars   = 24,
+        float                                                                                                                   costBufferPriceUnits = 0f)
+    {
+        var samples = new List<TrainingSample>(candles.Count);
+
+        for (int i = LookbackWindow; i < candles.Count - 1; i++)
+        {
+            var window  = candles.GetRange(i - LookbackWindow, LookbackWindow);
+            var current = candles[i];
+            var prev    = window[^1];
+
+            var cotEntry      = cotLookup?.Invoke(current.Timestamp) ?? CotFeatureEntry.Zero;
+            var slice         = global::LascodiaTradingEngine.Application.Services.ML.MacroFeatureCalculator.SliceBasketAsOf(fullBasket, current.Timestamp);
+            var crossAsset    = crossAssetLookup(current.Timestamp);
+            var eventFeat     = eventLookup(current.Timestamp);
+            var minuteEvents  = minuteLevelEventLookup(current.Timestamp);
+            var tickFlow      = tickFlowLookup(current.Timestamp);
+            var orderBook     = orderBookLookup(current.Timestamp);
+            var features      = BuildFeatureVectorV6(window, current, prev, slice, symbol, crossAsset, eventFeat, minuteEvents, tickFlow, orderBook, cotEntry);
 
             float atr = (float)CalculateATR(window, 14);
             if (atr <= 0f)

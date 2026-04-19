@@ -109,9 +109,20 @@ public class SignalOrderBridgeWorker : BackgroundService, IIntegrationEventHandl
 
     public async Task Handle(TradeSignalCreatedIntegrationEvent @event)
     {
+        // Dedup latency clock starts the instant we enter the handler so the
+        // histogram captures both in-process and cross-instance cost on the hot
+        // path — this is what an SLO alert would fire on if the DB-backed
+        // tracker starts thrashing under load.
+        var dedupSw = System.Diagnostics.Stopwatch.StartNew();
+
         // ── In-process deduplication ──────────────────────────────────────────
         if (!_inFlight.TryAdd(@event.TradeSignalId, 0))
         {
+            dedupSw.Stop();
+            _metrics.SignalDedupDuplicates.Add(1, new KeyValuePair<string, object?>("layer", "in_process"));
+            _metrics.SignalDedupLatencyMs.Record(dedupSw.Elapsed.TotalMilliseconds,
+                new KeyValuePair<string, object?>("outcome", "duplicate"),
+                new KeyValuePair<string, object?>("layer", "in_process"));
             _logger.LogDebug(
                 "SignalOrderBridgeWorker: signal {Id} is already being processed — skipping duplicate delivery",
                 @event.TradeSignalId);
@@ -128,7 +139,12 @@ public class SignalOrderBridgeWorker : BackgroundService, IIntegrationEventHandl
             var tracker = dedupScope.ServiceProvider.GetRequiredService<IProcessedEventTracker>();
             if (!await tracker.TryMarkAsProcessedAsync(@event.Id, nameof(SignalOrderBridgeWorker), _shutdownCts.Token))
             {
+                dedupSw.Stop();
                 _inFlight.TryRemove(@event.TradeSignalId, out _);
+                _metrics.SignalDedupDuplicates.Add(1, new KeyValuePair<string, object?>("layer", "cross_instance"));
+                _metrics.SignalDedupLatencyMs.Record(dedupSw.Elapsed.TotalMilliseconds,
+                    new KeyValuePair<string, object?>("outcome", "duplicate"),
+                    new KeyValuePair<string, object?>("layer", "cross_instance"));
                 return;
             }
         }
@@ -137,6 +153,12 @@ public class SignalOrderBridgeWorker : BackgroundService, IIntegrationEventHandl
             _inFlight.TryRemove(@event.TradeSignalId, out _);
             return;
         }
+
+        // Signal survived both dedup layers; record the accepted-path latency.
+        dedupSw.Stop();
+        _metrics.SignalDedupLatencyMs.Record(dedupSw.Elapsed.TotalMilliseconds,
+            new KeyValuePair<string, object?>("outcome", "accepted"),
+            new KeyValuePair<string, object?>("layer", "cross_instance"));
 
         try
         {

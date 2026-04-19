@@ -59,6 +59,38 @@ internal static class OptimizationHealthScorer
     }
 
     /// <summary>
+    /// Regime-aware health score with caller-supplied weight overrides. Callers (e.g.
+    /// <c>StrategyHealthWorker</c> via <c>RegimeHealthWeightsProvider</c>) that need
+    /// hot-reloadable, per-environment tuning pass their resolved dictionary here. On
+    /// lookup miss, falls back to the static <see cref="RegimeWeights"/> defaults so a
+    /// partial override (e.g. only Trending configured) doesn't break the other regimes.
+    /// </summary>
+    internal static decimal ComputeHealthScore(
+        decimal winRate,
+        decimal profitFactor,
+        decimal maxDrawdownPct,
+        decimal sharpeRatio,
+        int totalTrades,
+        MarketRegime? regime,
+        IReadOnlyDictionary<MarketRegime, HealthWeights>? weightOverrides)
+    {
+        HealthWeights weights;
+        if (!regime.HasValue)
+        {
+            weights = DefaultWeights;
+        }
+        else if (weightOverrides is not null && weightOverrides.TryGetValue(regime.Value, out var overrideWeights))
+        {
+            weights = overrideWeights;
+        }
+        else
+        {
+            weights = RegimeWeights[regime.Value];
+        }
+        return ComputeHealthScoreWithWeights(winRate, profitFactor, maxDrawdownPct, sharpeRatio, totalTrades, weights);
+    }
+
+    /// <summary>
     /// 5-factor weight vector for the composite health score. The five weights must sum to
     /// <c>1.0</c> so the score stays in [0, 1].
     /// </summary>

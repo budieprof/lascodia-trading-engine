@@ -249,6 +249,23 @@ internal interface IStrategyGenerationFeedbackCoordinator
             double halfLifeDays,
             CancellationToken ct);
 
+    /// <summary>
+    /// Extended variant that also returns per-template sample counts for UCB1 template
+    /// selection. Default implementation delegates to <see cref="LoadPerformanceFeedbackAsync"/>.
+    /// </summary>
+    async Task<(Dictionary<(StrategyType, MarketRegimeEnum, Timeframe), double> TypeRates,
+                Dictionary<string, double> TemplateRates,
+                Dictionary<string, int> TemplateSampleCounts)>
+        LoadPerformanceFeedbackWithCountsAsync(
+            DbContext db,
+            IWriteApplicationDbContext writeCtx,
+            double halfLifeDays,
+            CancellationToken ct)
+    {
+        var (typeRates, templateRates) = await LoadPerformanceFeedbackAsync(db, writeCtx, halfLifeDays, ct);
+        return (typeRates, templateRates, new Dictionary<string, int>(StringComparer.Ordinal));
+    }
+
     IReadOnlyList<StrategyType> ApplyPerformanceFeedback(
         IReadOnlyList<StrategyType> types,
         MarketRegimeEnum regime,
@@ -285,6 +302,25 @@ internal interface IStrategyGenerationFeedbackSummaryProvider
             IWriteApplicationDbContext writeCtx,
             double halfLifeDays,
             CancellationToken ct);
+
+    /// <summary>
+    /// Extended variant that also returns per-template sample counts. Used by the UCB1
+    /// template selector in <c>StrategyGenerationHelpers.OrderTemplatesForRegimeUcb1</c>.
+    /// Default implementation delegates to <see cref="LoadPerformanceFeedbackAsync"/> and
+    /// returns an empty counts dictionary so existing fakes/tests don't need to change.
+    /// </summary>
+    async Task<(Dictionary<(StrategyType, MarketRegimeEnum, Timeframe), double> TypeRates,
+                Dictionary<string, double> TemplateRates,
+                Dictionary<string, int> TemplateSampleCounts)>
+        LoadPerformanceFeedbackWithCountsAsync(
+            DbContext db,
+            IWriteApplicationDbContext writeCtx,
+            double halfLifeDays,
+            CancellationToken ct)
+    {
+        var (typeRates, templateRates) = await LoadPerformanceFeedbackAsync(db, writeCtx, halfLifeDays, ct);
+        return (typeRates, templateRates, new Dictionary<string, int>(StringComparer.Ordinal));
+    }
 }
 
 /// <summary>

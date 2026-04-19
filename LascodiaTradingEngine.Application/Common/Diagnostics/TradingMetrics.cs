@@ -38,6 +38,16 @@ public sealed class TradingMetrics
     public Counter<long>     TicksSkippedNoLivePrice { get; }
     public Counter<long>     StrategiesCircuitBroken { get; }
     public Histogram<double> StrategyEvaluationMs   { get; }
+    public Histogram<double> SignalDedupLatencyMs   { get; }
+    public Counter<long>     SignalDedupDuplicates  { get; }
+
+    // ── Validation / promotion defaults telemetry ────────────────────────────
+    // Tagged counters that let operators calibrate the new default floors added in
+    // WalkForwardWorker (MinInSampleDays, MinOutOfSampleDays, MinCandlesPerFold,
+    // MinTradesPerFold) and StrategyPromotionWorker (MinLiveVsBacktestSharpeRatio).
+    // If these fire a lot, the floors are probably too aggressive.
+    public Counter<long>     WalkForwardFoldRejections     { get; }
+    public Counter<long>     PromotionGateRejections       { get; }
 
     // ── Positions ───────────────────────────────────────────────────────────
     public Counter<long>     PositionsOpened        { get; }
@@ -232,6 +242,11 @@ public sealed class TradingMetrics
         TicksSkippedNoLivePrice = _meter.CreateCounter<long>("trading.signals.ticks_skipped_no_live_price", "ticks", "Per-strategy evaluations skipped because live price cache had no entry for the symbol");
         StrategiesCircuitBroken = _meter.CreateCounter<long>("trading.signals.strategies_circuit_broken", "strategies", "Strategies temporarily disabled due to consecutive evaluation failures");
         StrategyEvaluationMs = _meter.CreateHistogram<double>("trading.strategy.evaluation_duration", "ms", "Strategy evaluation pipeline duration per tick");
+        SignalDedupLatencyMs = _meter.CreateHistogram<double>("trading.signals.dedup_latency", "ms", "Tier 1 signal dedup latency (in-process + DB atomic mark). Tagged with outcome=accepted|duplicate.");
+        SignalDedupDuplicates = _meter.CreateCounter<long>("trading.signals.dedup_duplicates", "signals", "Duplicate signal deliveries caught by Tier 1 dedup. Tagged with layer=in_process|cross_instance.");
+
+        WalkForwardFoldRejections = _meter.CreateCounter<long>("trading.walk_forward.fold_rejections", "runs", "Walk-forward runs rejected. Tagged with reason=min_in_sample_days|min_out_of_sample_days|min_candles_per_fold|min_trades_per_fold.");
+        PromotionGateRejections = _meter.CreateCounter<long>("trading.strategy_promotion.gate_rejections", "strategies", "Strategies rejected by promotion gates. Tagged with gate=live_vs_backtest_sharpe|critical_snapshot|insufficient_snapshots|insufficient_healthy.");
 
         // Positions
         PositionsOpened = _meter.CreateCounter<long>("trading.positions.opened", "positions", "Positions opened");

@@ -213,6 +213,76 @@ public static partial class StrategyGenerationHelpers
         return OrderTemplatesByRegimeLogic(templates, regime);
     }
 
+    /// <summary>
+    /// UCB1-ordered variant of <see cref="OrderTemplatesForRegime"/>. Unlike pure survival-rate
+    /// sorting (which collapses to "always pick the early winner"), UCB1 blends each template's
+    /// observed success rate with an exploration bonus proportional to
+    /// <c>sqrt(2·ln(totalTrials) / n_i)</c> so under-tried templates keep getting chances.
+    ///
+    /// <para>
+    /// Template scoring:
+    /// <list type="bullet">
+    ///   <item>Templates with data: <c>UCB1 = rate + explorationConstant * sqrt(ln(totalTrials) / n_i)</c>.</item>
+    ///   <item>Templates without data: infinite UCB1 score — always placed first (pure exploration of the unknown).</item>
+    ///   <item>When no template has data at all (cold start), delegates to the regime heuristic.</item>
+    /// </list>
+    /// </para>
+    ///
+    /// <para>
+    /// <paramref name="explorationConstant"/> defaults to √2 (≈1.414), the classic UCB1 tuning.
+    /// Higher values favour exploration (more varied template selection); lower values lock in
+    /// on known winners faster. Set to 0 to get pure survival-rate ordering with no exploration.
+    /// </para>
+    /// </summary>
+    public static IReadOnlyList<string> OrderTemplatesForRegimeUcb1(
+        IReadOnlyList<string> templates,
+        MarketRegimeEnum regime,
+        IReadOnlyDictionary<string, double>? templateSurvivalRates,
+        IReadOnlyDictionary<string, int>? templateSampleCounts,
+        double explorationConstant = 1.41421356237)
+    {
+        if (templates.Count <= 1) return templates;
+
+        if (templateSurvivalRates is null or { Count: 0 } || templateSampleCounts is null or { Count: 0 })
+        {
+            // Cold start: no rate data → fall back to regime ordering (existing behaviour).
+            return OrderTemplatesByRegimeLogic(templates, regime);
+        }
+
+        // Total trials across every template that has sample-count data. This is the "t" in
+        // the UCB1 formula — larger t means a stronger exploration push for under-explored arms.
+        int totalTrials = 0;
+        foreach (var count in templateSampleCounts.Values)
+            totalTrials += count;
+
+        if (totalTrials <= 0)
+            return OrderTemplatesByRegimeLogic(templates, regime);
+
+        double lnTotal = Math.Log(Math.Max(1, totalTrials));
+
+        var scored = new List<(string Template, double Score, bool Unknown)>(templates.Count);
+        foreach (var t in templates)
+        {
+            if (!templateSurvivalRates.TryGetValue(t, out var rate)
+                || !templateSampleCounts.TryGetValue(t, out var n)
+                || n <= 0)
+            {
+                // No data — treat as maximum priority so the engine explores unknowns.
+                scored.Add((t, double.PositiveInfinity, Unknown: true));
+                continue;
+            }
+
+            double exploration = explorationConstant * Math.Sqrt(lnTotal / n);
+            double ucb1 = rate + exploration;
+            scored.Add((t, ucb1, Unknown: false));
+        }
+
+        return scored
+            .OrderByDescending(x => x.Score)
+            .Select(x => x.Template)
+            .ToList();
+    }
+
     private static IReadOnlyList<string> OrderTemplatesByRegimeLogic(IReadOnlyList<string> templates, MarketRegimeEnum regime)
     {
         if (templates.Count <= 1) return templates;

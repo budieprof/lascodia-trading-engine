@@ -523,6 +523,8 @@ internal sealed class StrategyGenerationReserveScreeningPlanner : IStrategyGener
             KellyFactor = config.KellyFactor,
             KellyMinLot = config.KellyMinLot,
             KellyMaxLot = config.KellyMaxLot,
+            MinDeflatedSharpe = config.MinDeflatedSharpe,
+            DeflatedSharpeTrials = Math.Max(10, config.ActiveStrategyCount),
         };
     }
 

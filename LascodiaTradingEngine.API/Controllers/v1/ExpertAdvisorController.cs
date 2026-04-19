@@ -98,6 +98,13 @@ public class ExpertAdvisorController : AuthControllerBase<ExpertAdvisorControlle
     public async Task<IActionResult> ReceiveDealSnapshot(ReceiveDealSnapshotCommand command)
         => Ok(await Mediator.Send(command));
 
+    /// <summary>Receive an order-book (DOM) snapshot from the EA — top of book plus
+    /// optional multi-level depth via MarketBookGet when the broker exposes it.</summary>
+    [HttpPost("orderbook/snapshot")]
+    public async Task<IActionResult> ReceiveOrderBookSnapshot(
+        LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ReceiveOrderBookSnapshot.ReceiveOrderBookSnapshotCommand command)
+        => Ok(await Mediator.Send(command));
+
     /// <summary>Process reconciliation between engine and broker state</summary>
     [HttpPost("reconciliation")]
     public async Task<IActionResult> ProcessReconciliation(ProcessReconciliationCommand command)

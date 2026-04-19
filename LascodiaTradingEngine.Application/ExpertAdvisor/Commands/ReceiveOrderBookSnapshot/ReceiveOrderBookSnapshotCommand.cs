@@ -26,6 +26,12 @@ public class ReceiveOrderBookSnapshotCommand : IRequest<ResponseData<long>>
     /// <summary>Total volume available at the best ask level.</summary>
     public decimal AskVolume { get; set; }
 
+    /// <summary>
+    /// JSON-serialised depth beyond top-of-book. See <c>OrderBookSnapshot.LevelsJson</c>
+    /// for the schema. Null when the broker doesn't expose multi-level DOM.
+    /// </summary>
+    public string? LevelsJson { get; set; }
+
     /// <summary>EA instance that captured this order book snapshot.</summary>
     public string InstanceId { get; set; } = string.Empty;
 
@@ -75,6 +81,7 @@ public class ReceiveOrderBookSnapshotCommandHandler : IRequestHandler<ReceiveOrd
             BidVolume    = request.BidVolume,
             AskVolume    = request.AskVolume,
             SpreadPoints = request.AskPrice - request.BidPrice,
+            LevelsJson   = request.LevelsJson,
             InstanceId   = request.InstanceId,
             CapturedAt   = DateTime.UtcNow
         };

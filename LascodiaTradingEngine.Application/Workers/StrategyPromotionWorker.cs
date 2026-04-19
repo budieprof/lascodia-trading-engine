@@ -250,6 +250,7 @@ public sealed class StrategyPromotionWorker : InstrumentedBackgroundService
                 if (!snapshotsByStrategy.TryGetValue(strategy.Id, out var snapshots)
                     || snapshots.Count < minHealthySnapshots)
                 {
+                    _metrics.PromotionGateRejections.Add(1, new KeyValuePair<string, object?>("gate", "insufficient_snapshots"));
                     _logger.LogDebug(
                         "StrategyPromotionWorker: strategy {Id} ({Name}) has insufficient snapshots ({Count}/{Required}) — skipping",
                         strategy.Id, strategy.Name, snapshots?.Count ?? 0, minHealthySnapshots);
@@ -259,6 +260,7 @@ public sealed class StrategyPromotionWorker : InstrumentedBackgroundService
                 // Reject if any snapshot in the window was Critical
                 if (snapshots.Any(s => s.HealthStatus == StrategyHealthStatus.Critical))
                 {
+                    _metrics.PromotionGateRejections.Add(1, new KeyValuePair<string, object?>("gate", "critical_snapshot"));
                     _logger.LogDebug(
                         "StrategyPromotionWorker: strategy {Id} ({Name}) had Critical health during observation — skipping",
                         strategy.Id, strategy.Name);
@@ -268,6 +270,7 @@ public sealed class StrategyPromotionWorker : InstrumentedBackgroundService
                 int healthyCount = snapshots.Count(s => s.HealthScore >= minHealthScore);
                 if (healthyCount < minHealthySnapshots)
                 {
+                    _metrics.PromotionGateRejections.Add(1, new KeyValuePair<string, object?>("gate", "insufficient_healthy"));
                     _logger.LogDebug(
                         "StrategyPromotionWorker: strategy {Id} ({Name}) has {Healthy}/{Required} healthy snapshots (score >= {Threshold}) — skipping",
                         strategy.Id, strategy.Name, healthyCount, minHealthySnapshots, minHealthScore);
@@ -289,6 +292,7 @@ public sealed class StrategyPromotionWorker : InstrumentedBackgroundService
                     decimal ratio = liveSharpe / backtestSharpe;
                     if (ratio < minLiveVsBacktestSharpeRatio)
                     {
+                        _metrics.PromotionGateRejections.Add(1, new KeyValuePair<string, object?>("gate", "live_vs_backtest_sharpe"));
                         _logger.LogInformation(
                             "StrategyPromotionWorker: strategy {Id} ({Name}) live/backtest Sharpe ratio " +
                             "{Ratio:F2} (live={Live:F2}, backtest={Backtest:F2}) below {Min:F2} — skipping",

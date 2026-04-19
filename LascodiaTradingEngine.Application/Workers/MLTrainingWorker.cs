@@ -787,6 +787,19 @@ public sealed class MLTrainingWorker : BackgroundService
             bool useTickMicrostructureFeatureVector = await GetConfigAsync<bool>(
                 ctx, "MLTraining:UseTickMicrostructureFeatureVector", false, stoppingToken);
 
+            // V5 adds 4 synthetic-microstructure proxies on top of V4 — EffectiveSpread,
+            // AmihudIlliquidity, RollSpreadEstimate, VarianceRatio. Computed from the same
+            // tick stream V4 uses (no extra data source). Implies V4 + event-vector + ticks.
+            bool useV5SyntheticMicrostructure = await GetConfigAsync<bool>(
+                ctx, "MLTraining:UseV5SyntheticMicrostructure", false, stoppingToken);
+
+            // V6 adds 5 real-DOM features on top of V5 — BookImbalance{Top1,Top5},
+            // TotalLiquidityNorm, BookSlopeBid/Ask. Requires the EA to stream depth
+            // via MarketBookAdd → ReceiveOrderBookSnapshot. Symbols where the broker
+            // doesn't expose DOM still get a vector; the DOM slots zero-fill.
+            bool useV6OrderBook = await GetConfigAsync<bool>(
+                ctx, "MLTraining:UseV6OrderBookFeatures", false, stoppingToken);
+
             Dictionary<string, (DateTime[] Times, double[] Closes)>? basket = null;
             if (useExtendedVector && candles.Count > 0)
             {
@@ -892,6 +905,59 @@ public sealed class MLTrainingWorker : BackgroundService
                         run.Symbol, c.Timestamp, stoppingToken);
                 }
 
+                if (useV5SyntheticMicrostructure || useV6OrderBook)
+                {
+                    if (useV6OrderBook)
+                    {
+                        var orderBookProvider = sp.GetRequiredService<global::LascodiaTradingEngine.Application.Services.IOrderBookFeatureProvider>();
+                        var orderBookCache = new Dictionary<DateTime, global::LascodiaTradingEngine.Application.Services.OrderBookFeatureSnapshot?>();
+                        foreach (var c in candles)
+                        {
+                            if (orderBookCache.ContainsKey(c.Timestamp)) continue;
+                            orderBookCache[c.Timestamp] = await orderBookProvider.GetSnapshotAsync(
+                                run.Symbol, c.Timestamp, stoppingToken);
+                        }
+
+                        samples = MLFeatureHelper.BuildTrainingSamplesWithTripleBarrierV6(
+                            candles, run.Symbol, basket,
+                            ts => crossAssetCache.TryGetValue(
+                                new DateTime(ts.Year, ts.Month, ts.Day, 0, 0, 0, DateTimeKind.Utc),
+                                out var s) ? s : default,
+                            eventLookup.SnapshotAt,
+                            eventLookup.SnapshotMinuteLevel,
+                            ts => tickFlowCache.TryGetValue(ts, out var tf) ? tf : null,
+                            ts => orderBookCache.TryGetValue(ts, out var ob) ? ob : null,
+                            CotLookup,
+                            (float)hp.TripleBarrierProfitAtrMult,
+                            (float)hp.TripleBarrierStopAtrMult,
+                            hp.TripleBarrierHorizonBars,
+                            costBufferPriceUnits);
+                        int v6BookHits  = orderBookCache.Values.Count(v => v is not null);
+                        int v6TickHits  = tickFlowCache.Values.Count(v => v is not null);
+                        _logger.LogInformation(
+                            "Built {Samples} V6 training samples (features={Feat}, tickFlowCoverage={Th}/{Total}, orderBookCoverage={Bh}/{Total}, costBuffer={Buf:F5})",
+                            samples.Count, MLFeatureHelper.FeatureCountV6, v6TickHits, tickFlowCache.Count, v6BookHits, costBufferPriceUnits);
+                        goto trainingSamplesBuilt;
+                    }
+                    samples = MLFeatureHelper.BuildTrainingSamplesWithTripleBarrierV5(
+                        candles, run.Symbol, basket,
+                        ts => crossAssetCache.TryGetValue(
+                            new DateTime(ts.Year, ts.Month, ts.Day, 0, 0, 0, DateTimeKind.Utc),
+                            out var s) ? s : default,
+                        eventLookup.SnapshotAt,
+                        eventLookup.SnapshotMinuteLevel,
+                        ts => tickFlowCache.TryGetValue(ts, out var tf) ? tf : null,
+                        CotLookup,
+                        (float)hp.TripleBarrierProfitAtrMult,
+                        (float)hp.TripleBarrierStopAtrMult,
+                        hp.TripleBarrierHorizonBars,
+                        costBufferPriceUnits);
+                    int v5TickFlowHits = tickFlowCache.Values.Count(v => v is not null);
+                    _logger.LogInformation(
+                        "Built {Samples} V5 training samples (features={Feat}, tickFlowCoverage={Hit}/{Total}, costBuffer={Buf:F5})",
+                        samples.Count, MLFeatureHelper.FeatureCountV5, v5TickFlowHits, tickFlowCache.Count, costBufferPriceUnits);
+                    goto trainingSamplesBuilt;
+                }
                 samples = MLFeatureHelper.BuildTrainingSamplesWithTripleBarrierV4(
                     candles, run.Symbol, basket,
                     ts => crossAssetCache.TryGetValue(
@@ -905,6 +971,7 @@ public sealed class MLTrainingWorker : BackgroundService
                     (float)hp.TripleBarrierStopAtrMult,
                     hp.TripleBarrierHorizonBars,
                     costBufferPriceUnits);
+trainingSamplesBuilt:;
 
                 int tickFlowHits = tickFlowCache.Values.Count(v => v is not null);
                 _logger.LogInformation(
@@ -2080,6 +2147,8 @@ public sealed class MLTrainingWorker : BackgroundService
             {
                 snap.ExpectedInputFeatures = samples[0].Features.Length;
                 snap.FeatureSchemaVersion =
+                    snap.ExpectedInputFeatures == MLFeatureHelper.FeatureCountV6 ? 6 :
+                    snap.ExpectedInputFeatures == MLFeatureHelper.FeatureCountV5 ? 5 :
                     snap.ExpectedInputFeatures == MLFeatureHelper.FeatureCountV4 ? 4 :
                     snap.ExpectedInputFeatures == MLFeatureHelper.FeatureCountV3 ? 3 :
                     snap.ExpectedInputFeatures == MLFeatureHelper.FeatureCountV2 ? 2 :

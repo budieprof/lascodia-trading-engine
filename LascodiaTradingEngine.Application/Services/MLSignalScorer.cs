@@ -127,6 +127,7 @@ public sealed class MLSignalScorer : IMLSignalScorer
     private readonly global::LascodiaTradingEngine.Application.Services.ML.EconomicEventFeatureProvider _eventProvider;
     private readonly global::LascodiaTradingEngine.Application.Services.ML.IOnnxInferenceEngine _onnxEngine;
     private readonly global::LascodiaTradingEngine.Application.Services.ITickFlowProvider? _tickFlowProvider;
+    private readonly global::LascodiaTradingEngine.Application.Services.IOrderBookFeatureProvider? _orderBookProvider;
 
     /// <summary>
     /// Tracks models already loaded into <see cref="_onnxEngine"/> so repeat scoring
@@ -143,7 +144,8 @@ public sealed class MLSignalScorer : IMLSignalScorer
         global::LascodiaTradingEngine.Application.Services.ML.CrossAssetFeatureProvider crossAssetProvider,
         global::LascodiaTradingEngine.Application.Services.ML.EconomicEventFeatureProvider eventProvider,
         global::LascodiaTradingEngine.Application.Services.ML.IOnnxInferenceEngine onnxEngine,
-        global::LascodiaTradingEngine.Application.Services.ITickFlowProvider? tickFlowProvider = null)
+        global::LascodiaTradingEngine.Application.Services.ITickFlowProvider? tickFlowProvider = null,
+        global::LascodiaTradingEngine.Application.Services.IOrderBookFeatureProvider? orderBookProvider = null)
     {
         _context           = context;
         _cache             = cache;
@@ -155,6 +157,7 @@ public sealed class MLSignalScorer : IMLSignalScorer
         _eventProvider     = eventProvider;
         _onnxEngine        = onnxEngine;
         _tickFlowProvider  = tickFlowProvider;
+        _orderBookProvider = orderBookProvider;
     }
 
     private IModelInferenceEngine? ResolveEngine(ModelSnapshot snap)
@@ -1661,6 +1664,75 @@ public sealed class MLSignalScorer : IMLSignalScorer
             }
 
             builtRawFeatures = paddedV4;
+        }
+
+        // V5 dispatch: 4 synthetic-microstructure proxies on top of V4. Fires when
+        // model expects 52 features but the incoming vector is 48 (V4). Zero-fills
+        // when the tick-flow provider returns null.
+        if (expectedInputFeatures == MLFeatureHelper.FeatureCountV5 &&
+            builtRawFeatures.Length == MLFeatureHelper.FeatureCountV4)
+        {
+            var paddedV5 = new float[MLFeatureHelper.FeatureCountV5];
+            Array.Copy(builtRawFeatures, paddedV5, builtRawFeatures.Length);
+            try
+            {
+                global::LascodiaTradingEngine.Application.Services.TickFlowSnapshot? tickFlow = null;
+                if (_tickFlowProvider is not null)
+                    tickFlow = await _tickFlowProvider.GetSnapshotAsync(signal.Symbol, current.Timestamp, cancellationToken);
+
+                static float SanitizeV5(float v) =>
+                    float.IsNaN(v) || float.IsInfinity(v) ? 0f : Math.Clamp(v, -5f, 5f);
+
+                if (tickFlow is not null)
+                {
+                    paddedV5[MLFeatureHelper.FeatureCountV4 + 0] = SanitizeV5((float)(tickFlow.EffectiveSpread    * 1000m));
+                    paddedV5[MLFeatureHelper.FeatureCountV4 + 1] = SanitizeV5((float)tickFlow.AmihudIlliquidity);
+                    paddedV5[MLFeatureHelper.FeatureCountV4 + 2] = SanitizeV5((float)(tickFlow.RollSpreadEstimate * 1000m));
+                    paddedV5[MLFeatureHelper.FeatureCountV4 + 3] = SanitizeV5((float)(tickFlow.VarianceRatio - 1m));
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "V5 tick-flow load failed for model {ModelId} ({Symbol}) — zero-padding",
+                    modelId, signal.Symbol);
+            }
+            builtRawFeatures = paddedV5;
+        }
+
+        // V6 dispatch: 5 real-DOM features layered on top of V5. Fires when model expects
+        // 57 features but the incoming vector is 52 (V5). Zero-fills when no fresh
+        // OrderBookSnapshot exists for the symbol.
+        if (expectedInputFeatures == MLFeatureHelper.FeatureCountV6 &&
+            builtRawFeatures.Length == MLFeatureHelper.FeatureCountV5)
+        {
+            var paddedV6 = new float[MLFeatureHelper.FeatureCountV6];
+            Array.Copy(builtRawFeatures, paddedV6, builtRawFeatures.Length);
+            try
+            {
+                global::LascodiaTradingEngine.Application.Services.OrderBookFeatureSnapshot? orderBook = null;
+                if (_orderBookProvider is not null)
+                    orderBook = await _orderBookProvider.GetSnapshotAsync(signal.Symbol, current.Timestamp, cancellationToken);
+
+                static float SanitizeV6(float v) =>
+                    float.IsNaN(v) || float.IsInfinity(v) ? 0f : Math.Clamp(v, -5f, 5f);
+
+                if (orderBook is not null)
+                {
+                    paddedV6[MLFeatureHelper.FeatureCountV5 + 0] = SanitizeV6((float)(orderBook.BookImbalanceTop1 - 0.5m) * 2f);
+                    paddedV6[MLFeatureHelper.FeatureCountV5 + 1] = SanitizeV6((float)(orderBook.BookImbalanceTop5 - 0.5m) * 2f);
+                    paddedV6[MLFeatureHelper.FeatureCountV5 + 2] = SanitizeV6((float)orderBook.TotalLiquidityNorm);
+                    paddedV6[MLFeatureHelper.FeatureCountV5 + 3] = SanitizeV6((float)orderBook.BookSlopeBid);
+                    paddedV6[MLFeatureHelper.FeatureCountV5 + 4] = SanitizeV6((float)orderBook.BookSlopeAsk);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "V6 order-book load failed for model {ModelId} ({Symbol}) — zero-padding",
+                    modelId, signal.Symbol);
+            }
+            builtRawFeatures = paddedV6;
         }
 
         var prepared = ElmFeaturePipelineHelper.PrepareSnapshotFeatures(

@@ -54,6 +54,28 @@ internal sealed class StrategyGenerationFeedbackSummaryProvider : IStrategyGener
         _timeProvider = timeProvider;
     }
 
+    public async Task<(Dictionary<(StrategyType, MarketRegimeEnum, Timeframe), double> TypeRates,
+                       Dictionary<string, double> TemplateRates,
+                       Dictionary<string, int> TemplateSampleCounts)>
+        LoadPerformanceFeedbackWithCountsAsync(
+            DbContext db,
+            IWriteApplicationDbContext writeCtx,
+            double halfLifeDays,
+            CancellationToken ct)
+    {
+        var (typeRates, templateRates) = await LoadPerformanceFeedbackAsync(db, writeCtx, halfLifeDays, ct);
+        var counts = _lastTemplateSampleCounts ?? new Dictionary<string, int>(StringComparer.Ordinal);
+        return (typeRates, templateRates, counts);
+    }
+
+    /// <summary>
+    /// Snapshot of per-template sample counts from the most recent
+    /// <see cref="LoadPerformanceFeedbackAsync"/> call. Populated in the same code path
+    /// that computes the rates so the UCB1 ordering reads consistent counts. Nullable
+    /// because the first call has no prior state.
+    /// </summary>
+    private Dictionary<string, int>? _lastTemplateSampleCounts;
+
     public async Task<(Dictionary<(StrategyType, MarketRegimeEnum, Timeframe), double> TypeRates, Dictionary<string, double> TemplateRates)>
         LoadPerformanceFeedbackAsync(
         DbContext db,
@@ -108,7 +130,8 @@ internal sealed class StrategyGenerationFeedbackSummaryProvider : IStrategyGener
                     && (_timeProvider.GetUtcNow().UtcDateTime - cached.ComputedAtUtc).TotalHours < 24)
                 {
                     var cachedTypeRates = DeserializeFeedbackRates(cached.Entries);
-                    var freshTemplateRates = ComputeTemplateFeedbackRates(evaluableStrategies, halfLifeDays);
+                    var (freshTemplateRates, freshCounts) = ComputeTemplateFeedbackRatesAndCounts(evaluableStrategies, halfLifeDays);
+                    _lastTemplateSampleCounts = freshCounts;
                     return (cachedTypeRates, freshTemplateRates);
                 }
             }
@@ -172,7 +195,8 @@ internal sealed class StrategyGenerationFeedbackSummaryProvider : IStrategyGener
         ComputeFeedbackRates(IReadOnlyList<FeedbackStrategySnapshot> allAutoStrategies, double halfLifeDays)
     {
         var rates = new Dictionary<(StrategyType, MarketRegimeEnum, Timeframe), double>();
-        var templateRates = ComputeTemplateFeedbackRates(allAutoStrategies, halfLifeDays);
+        var (templateRates, templateCounts) = ComputeTemplateFeedbackRatesAndCounts(allAutoStrategies, halfLifeDays);
+        _lastTemplateSampleCounts = templateCounts;
 
         if (allAutoStrategies.Count == 0)
             return (rates, templateRates);
@@ -220,6 +244,24 @@ internal sealed class StrategyGenerationFeedbackSummaryProvider : IStrategyGener
         IReadOnlyList<FeedbackStrategySnapshot> allAutoStrategies,
         double halfLifeDays)
     {
+        var (rates, _) = ComputeTemplateFeedbackRatesAndCounts(allAutoStrategies, halfLifeDays);
+        return rates;
+    }
+
+    /// <summary>
+    /// Computes per-template survival rates alongside the raw sample counts used to derive
+    /// them. The counts power the UCB1 exploration term in
+    /// <c>StrategyGenerationHelpers.OrderTemplatesForRegimeUcb1</c>: a template with 2/2
+    /// successes and one with 40/50 have the same raw rate variance but very different
+    /// confidence intervals, and UCB1 rewards the under-explored one with an exploration
+    /// bonus proportional to sqrt(ln(total)/n). Templates with fewer than 2 observations
+    /// appear in neither dictionary; UCB1 treats them as infinite-bonus (always tried).
+    /// </summary>
+    private (Dictionary<string, double> Rates, Dictionary<string, int> Counts)
+        ComputeTemplateFeedbackRatesAndCounts(
+            IReadOnlyList<FeedbackStrategySnapshot> allAutoStrategies,
+            double halfLifeDays)
+    {
         var templateGroups = new Dictionary<string, List<(bool Survived, DateTime CreatedAt)>>(StringComparer.Ordinal);
 
         foreach (var strategy in allAutoStrategies)
@@ -243,16 +285,20 @@ internal sealed class StrategyGenerationFeedbackSummaryProvider : IStrategyGener
         }
 
         var templateRates = new Dictionary<string, double>(StringComparer.Ordinal);
+        var templateCounts = new Dictionary<string, int>(StringComparer.Ordinal);
         foreach (var (templateKey, samples) in templateGroups)
         {
             if (samples.Count >= 2)
+            {
                 templateRates[templateKey] = _marketDataPolicy.ComputeRecencyWeightedSurvivalRate(
                     samples,
                     halfLifeDays,
                     _timeProvider.GetUtcNow().UtcDateTime);
+                templateCounts[templateKey] = samples.Count;
+            }
         }
 
-        return templateRates;
+        return (templateRates, templateCounts);
     }
 
     private static bool IsResolvedFeedbackOutcome(FeedbackStrategySnapshot strategy)

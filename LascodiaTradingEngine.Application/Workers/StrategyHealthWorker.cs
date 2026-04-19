@@ -83,10 +83,18 @@ public class StrategyHealthWorker : BackgroundService
     private const string CK_RebalanceDays = "StrategyHealth:RebalanceIntervalDays";
     private const string CK_HealthyThreshold = "StrategyHealth:HealthyThreshold";
     private const string CK_CriticalThreshold = "StrategyHealth:CriticalThreshold";
+    private const string CK_EvaluationWindowSize = "StrategyHealth:EvaluationWindowSize";
+    private const string CK_MinTradesForCritical = "StrategyHealth:MinTradesForCritical";
     private const int DefaultPollSeconds = 60;
     private const int DefaultRebalanceDays = 7;
     private const decimal DefaultHealthyThreshold = 0.6m;
     private const decimal DefaultCriticalThreshold = 0.3m;
+    private const int DefaultEvaluationWindowSize = 50;
+    // Default floor on the number of filled-order signals in the window before a
+    // strategy can be classified Critical (and auto-paused). A single 10-loss
+    // streak on a 5-sample window used to be enough; requiring ~20 filled orders
+    // lets Degrading-band signals accumulate before any hard action is taken.
+    private const int DefaultMinTradesForCritical = 20;
 
     /// <summary>
     /// In-process timestamp of the last successful ensemble rebalance. Initialised from
@@ -243,6 +251,22 @@ public class StrategyHealthWorker : BackgroundService
         var readContext  = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
 
         var mediator = scope.ServiceProvider.GetRequiredService<IMediator>();
+        // Optional resolve — when the provider isn't registered (older test fixtures) we
+        // fall through to the hardcoded RegimeWeights defaults inside OptimizationHealthScorer.
+        var weightsProvider = scope.ServiceProvider.GetService<Optimization.RegimeHealthWeightsProvider>();
+        IReadOnlyDictionary<LascodiaTradingEngine.Domain.Enums.MarketRegime,
+            Optimization.OptimizationHealthScorer.HealthWeights>? regimeWeightOverrides = null;
+        if (weightsProvider is not null)
+        {
+            try
+            {
+                regimeWeightOverrides = await weightsProvider.GetAsync(ct);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "StrategyHealthWorker: regime weight overrides load failed; using defaults");
+            }
+        }
 
         // Read configurable health band thresholds from EngineConfig
         decimal healthyThreshold = await GetConfigAsync<decimal>(readContext, CK_HealthyThreshold, DefaultHealthyThreshold, ct);
@@ -250,6 +274,11 @@ public class StrategyHealthWorker : BackgroundService
         // Sanity: ensure healthy > critical, both in [0, 1]
         healthyThreshold = Math.Clamp(healthyThreshold, 0.01m, 1.0m);
         criticalThreshold = Math.Clamp(criticalThreshold, 0.01m, healthyThreshold);
+
+        int evaluationWindowSize = Math.Max(5,
+            await GetConfigAsync<int>(readContext, CK_EvaluationWindowSize, DefaultEvaluationWindowSize, ct));
+        int minTradesForCritical = Math.Max(0,
+            await GetConfigAsync<int>(readContext, CK_MinTradesForCritical, DefaultMinTradesForCritical, ct));
 
         var strategies = await readContext.GetDbContext()
             .Set<Strategy>()
@@ -262,7 +291,9 @@ public class StrategyHealthWorker : BackgroundService
         {
             try
             {
-                await EvaluateStrategyAsync(strategy, writeContext, readContext, mediator, ct, healthyThreshold, criticalThreshold);
+                await EvaluateStrategyAsync(strategy, writeContext, readContext, mediator, ct,
+                    healthyThreshold, criticalThreshold, evaluationWindowSize, minTradesForCritical,
+                    regimeWeightOverrides);
                 evaluated++;
             }
             catch (Exception ex)
@@ -320,11 +351,15 @@ public class StrategyHealthWorker : BackgroundService
         IMediator mediator,
         CancellationToken ct,
         decimal healthyThreshold = 0.6m,
-        decimal criticalThreshold = 0.3m)
+        decimal criticalThreshold = 0.3m,
+        int evaluationWindowSize = DefaultEvaluationWindowSize,
+        int minTradesForCritical = DefaultMinTradesForCritical,
+        IReadOnlyDictionary<LascodiaTradingEngine.Domain.Enums.MarketRegime, Optimization.OptimizationHealthScorer.HealthWeights>? regimeWeightOverrides = null)
     {
-        // Load the last 50 executed signals for this strategy.
-        // Only signals with an OrderId are useful — they represent signals that
-        // resulted in actual market executions.
+        // Load the last N executed signals for this strategy (configurable via
+        // StrategyHealth:EvaluationWindowSize, default 50). Only signals with an
+        // OrderId are useful — they represent signals that resulted in actual
+        // market executions.
         var signals = await readContext.GetDbContext()
             .Set<TradeSignal>()
             .Where(x => x.StrategyId == strategy.Id
@@ -332,7 +367,7 @@ public class StrategyHealthWorker : BackgroundService
                      && x.OrderId != null
                      && !x.IsDeleted)
             .OrderByDescending(x => x.GeneratedAt)
-            .Take(50)
+            .Take(evaluationWindowSize)
             .ToListAsync(ct);
 
         if (signals.Count == 0)
@@ -446,19 +481,37 @@ public class StrategyHealthWorker : BackgroundService
             .Select(r => (LascodiaTradingEngine.Domain.Enums.MarketRegime?)r.Regime)
             .FirstOrDefaultAsync(ct);
 
-        // ── Health score (5-factor, regime-aware) ─────────────────────────────
+        // ── Health score (5-factor, regime-aware, config-tunable) ─────────────
         // Default weights: 0.25*WR + 0.20*min(1, PF/2) + 0.20*max(0, 1 - DD/20) + 0.15*min(1, max(0, Sharpe)/2) + 0.20*min(1, N/50).
         // With a regime, the weight vector rebalances (e.g. Trending weights PF higher, Crisis weights DD higher).
-        // See OptimizationHealthScorer.RegimeWeights for the full table. Bootstrap/permutation analyses
-        // continue to use the regime-neutral overload because they test trade-stream statistics, not live
-        // suitability.
+        // See OptimizationHealthScorer.RegimeWeights for the full table. The weightOverrides map is
+        // populated once per cycle by RegimeHealthWeightsProvider from EngineConfig
+        // (StrategyHealth:RegimeWeights:<Regime> JSON), so operators can rebalance live without a
+        // redeploy. Bootstrap/permutation analyses continue to use the regime-neutral overload because
+        // they test trade-stream statistics, not live suitability.
         decimal healthScore = Optimization.OptimizationHealthScorer.ComputeHealthScore(
-            winRate, profitFactor, maxDrawdown, sharpe, totalTrades, latestRegime);
+            winRate, profitFactor, maxDrawdown, sharpe, totalTrades, latestRegime, regimeWeightOverrides);
 
         // Classify into three bands used to drive automated responses.
+        // Sample-size gate: a single unlucky streak on a tiny window (e.g. 10 losses
+        // out of 15) should not be enough to classify Critical and auto-pause. If
+        // the window hasn't accumulated MinTradesForCritical filled orders yet, we
+        // cap the classification at Degrading so more evidence accrues before any
+        // hard action (pause + optimization queue) is taken. Set MinTradesForCritical
+        // to 0 to restore the old behaviour.
         StrategyHealthStatus healthStatus = healthScore >= healthyThreshold ? StrategyHealthStatus.Healthy
             : healthScore >= criticalThreshold ? StrategyHealthStatus.Degrading
             : StrategyHealthStatus.Critical;
+        if (healthStatus == StrategyHealthStatus.Critical
+            && minTradesForCritical > 0
+            && totalTrades < minTradesForCritical)
+        {
+            _logger.LogInformation(
+                "StrategyHealthWorker: strategy {StrategyId} scored {Score:F2} but only {Trades} filled orders in window " +
+                "(min {MinTrades} for Critical) — downgrading to Degrading until more samples accumulate",
+                strategy.Id, healthScore, totalTrades, minTradesForCritical);
+            healthStatus = StrategyHealthStatus.Degrading;
+        }
 
         // Persist the snapshot for dashboard queries and StrategyFeedbackWorker
         // consecutive-degrading detection.

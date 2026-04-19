@@ -223,6 +223,87 @@ public class OptimizationImprovementsTest
         }
     }
 
+    // ── Regime weight overrides (Pending 3) ─────────────────────────────────────
+
+    [Fact]
+    public void ComputeHealthScore_RegimeOverride_WhenPresent_TakesPrecedence()
+    {
+        // When the caller supplies an override for the relevant regime, that override wins
+        // over the static RegimeWeights default. Simulate: push the entire weight into the
+        // win-rate term and verify a 100% win-rate strategy gets the maximum possible score.
+        var overrides = new Dictionary<MarketRegime, OptimizationHealthScorer.HealthWeights>
+        {
+            [MarketRegime.Trending] = new(WinRate: 1.0m, ProfitFactor: 0m, Drawdown: 0m, Sharpe: 0m, SampleSize: 0m)
+        };
+
+        decimal score = OptimizationHealthScorer.ComputeHealthScore(
+            winRate: 1.0m, profitFactor: 0m, maxDrawdownPct: 100m, sharpeRatio: 0m, totalTrades: 0,
+            regime: MarketRegime.Trending,
+            weightOverrides: overrides);
+
+        Assert.Equal(1.0m, score);
+    }
+
+    [Fact]
+    public void ComputeHealthScore_RegimeOverride_MissingRegime_FallsBackToStaticDefault()
+    {
+        // Override only Crisis; a Trending score must still use the static Trending weights.
+        var overrides = new Dictionary<MarketRegime, OptimizationHealthScorer.HealthWeights>
+        {
+            [MarketRegime.Crisis] = new(WinRate: 1.0m, ProfitFactor: 0m, Drawdown: 0m, Sharpe: 0m, SampleSize: 0m)
+        };
+
+        decimal overridden = OptimizationHealthScorer.ComputeHealthScore(
+            0.5m, 1.5m, 8m, 1.0m, 50,
+            regime: MarketRegime.Trending,
+            weightOverrides: overrides);
+        decimal noOverride = OptimizationHealthScorer.ComputeHealthScore(
+            0.5m, 1.5m, 8m, 1.0m, 50,
+            regime: MarketRegime.Trending);
+
+        Assert.Equal(noOverride, overridden);
+    }
+
+    [Fact]
+    public void RegimeHealthWeightsProvider_TryParseWeights_ValidJson_Returns_Parsed()
+    {
+        string json = "{\"WinRate\":0.20,\"ProfitFactor\":0.20,\"Drawdown\":0.20,\"Sharpe\":0.20,\"SampleSize\":0.20}";
+        bool ok = RegimeHealthWeightsProvider.TryParseWeights(json, out var weights, out var reason);
+
+        Assert.True(ok, $"Expected parse success; reason={reason}");
+        Assert.Equal(0.20m, weights.WinRate);
+        Assert.Equal(0.20m, weights.SampleSize);
+    }
+
+    [Fact]
+    public void RegimeHealthWeightsProvider_TryParseWeights_SumDoesNotEqualOne_Fails()
+    {
+        string json = "{\"WinRate\":0.5,\"ProfitFactor\":0.3,\"Drawdown\":0.1,\"Sharpe\":0.05,\"SampleSize\":0.02}";
+        bool ok = RegimeHealthWeightsProvider.TryParseWeights(json, out _, out var reason);
+
+        Assert.False(ok);
+        Assert.Contains("sum", reason, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void RegimeHealthWeightsProvider_TryParseWeights_NegativeWeight_Fails()
+    {
+        string json = "{\"WinRate\":-0.10,\"ProfitFactor\":0.30,\"Drawdown\":0.30,\"Sharpe\":0.25,\"SampleSize\":0.25}";
+        bool ok = RegimeHealthWeightsProvider.TryParseWeights(json, out _, out var reason);
+
+        Assert.False(ok);
+        Assert.Contains("outside", reason, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void RegimeHealthWeightsProvider_TryParseWeights_MalformedJson_Fails()
+    {
+        bool ok = RegimeHealthWeightsProvider.TryParseWeights("{not json", out _, out var reason);
+
+        Assert.False(ok);
+        Assert.Contains("malformed", reason, StringComparison.OrdinalIgnoreCase);
+    }
+
     // ── 4. OptimizationValidator.ImputeMinorGaps ────────────────────────
 
     [Fact]

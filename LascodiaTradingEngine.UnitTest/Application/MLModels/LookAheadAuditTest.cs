@@ -194,6 +194,137 @@ public class LookAheadAuditTest
     }
 
     [Fact]
+    public void V5_FeatureVector_IsIndependentOfCurrentCandleFuture()
+    {
+        // V5 = V4 + 4 synthetic-microstructure proxies derived from tick data.
+        // The new slots must also be redaction-safe under the same audit principle.
+        var all     = BuildDeterministicCandles(MLFeatureHelper.LookbackWindow + 2);
+        var window  = all.GetRange(0, MLFeatureHelper.LookbackWindow);
+        var prev    = all[MLFeatureHelper.LookbackWindow - 1];
+        var current = all[MLFeatureHelper.LookbackWindow];
+
+        var crossAsset = new global::LascodiaTradingEngine.Application.Services.ML.CrossAssetSnapshot(
+            DxyReturn5d: 0.01f, Us10YYieldChange5d: 0.002f, VixLevelNormalized: 0.3f);
+        var eventFeat = new global::LascodiaTradingEngine.Application.Services.ML.EventFeatureSnapshot(
+            HoursToNextHighNormalized: 0.5f,
+            HoursSinceLastHighNormalized: 0.2f,
+            HighMedPending6hNormalized: 0.1f);
+        (float, float) minuteEvents = (0.4f, 0.3f);
+        var tickFlow = new global::LascodiaTradingEngine.Application.Services.TickFlowSnapshot(
+            TickDelta: 0.2m, CurrentSpread: 0.00012m, SpreadMean: 0.00010m, SpreadStdDev: 0.00002m,
+            SpreadPercentileRank: 0.6m, SpreadRelVolatility: 0.2m, TickVolumeImbalance: 0.1m,
+            EffectiveSpread: 0.00015m, AmihudIlliquidity: 0.4m,
+            RollSpreadEstimate: 0.00009m, VarianceRatio: 1.05m);
+
+        float[] baseline = MLFeatureHelper.BuildFeatureVectorV5(
+            window, current, prev, new Dictionary<string, double[]>(), "EURUSD",
+            crossAsset, eventFeat, minuteEvents, tickFlow);
+
+        var redactedCurrent = new Candle
+        {
+            Symbol = current.Symbol, Timeframe = current.Timeframe, Timestamp = current.Timestamp,
+            Open = current.Open, High = current.Open, Low = current.Open,
+            Close = current.Open, Volume = 0, IsClosed = false, IsDeleted = false,
+        };
+
+        float[] redacted = MLFeatureHelper.BuildFeatureVectorV5(
+            window, redactedCurrent, prev, new Dictionary<string, double[]>(), "EURUSD",
+            crossAsset, eventFeat, minuteEvents, tickFlow);
+
+        Assert.Equal(MLFeatureHelper.FeatureCountV5, baseline.Length);
+        var contaminated = new List<int>();
+        for (int i = 0; i < baseline.Length; i++)
+            if (Math.Abs(baseline[i] - redacted[i]) > 1e-6f) contaminated.Add(i);
+        Assert.True(contaminated.Count == 0,
+            $"V5 look-ahead contamination at indices [{string.Join(", ", contaminated)}].");
+    }
+
+    [Fact]
+    public void V5_FeatureVector_ZeroFillsMicrostructureWhenTickFlowNull()
+    {
+        var all     = BuildDeterministicCandles(MLFeatureHelper.LookbackWindow + 2);
+        var window  = all.GetRange(0, MLFeatureHelper.LookbackWindow);
+        var prev    = all[MLFeatureHelper.LookbackWindow - 1];
+        var current = all[MLFeatureHelper.LookbackWindow];
+        var crossAsset = new global::LascodiaTradingEngine.Application.Services.ML.CrossAssetSnapshot(
+            0.01f, 0.002f, 0.3f);
+        var eventFeat = new global::LascodiaTradingEngine.Application.Services.ML.EventFeatureSnapshot(
+            0.5f, 0.2f, 0.1f);
+
+        float[] v5 = MLFeatureHelper.BuildFeatureVectorV5(
+            window, current, prev, new Dictionary<string, double[]>(), "EURUSD",
+            crossAsset, eventFeat, (1.0f, 1.0f), tickFlow: null);
+
+        Assert.Equal(MLFeatureHelper.FeatureCountV5, v5.Length);
+        // V4 microstructure (45,46,47) AND V5 microstructure (48,49,50,51) all zero.
+        for (int i = MLFeatureHelper.FeatureCountV3 + 2; i < v5.Length; i++)
+            Assert.Equal(0f, v5[i]);
+    }
+
+    [Fact]
+    public void V6_FeatureVector_IsIndependentOfCurrentCandleFuture()
+    {
+        // V6 = V5 + 5 real-DOM features. Order-book data is keyed by symbol+timestamp,
+        // not by candle OHLCV — so the redaction test must show V6 also passes.
+        var all     = BuildDeterministicCandles(MLFeatureHelper.LookbackWindow + 2);
+        var window  = all.GetRange(0, MLFeatureHelper.LookbackWindow);
+        var prev    = all[MLFeatureHelper.LookbackWindow - 1];
+        var current = all[MLFeatureHelper.LookbackWindow];
+
+        var crossAsset = new global::LascodiaTradingEngine.Application.Services.ML.CrossAssetSnapshot(0.01f, 0.002f, 0.3f);
+        var eventFeat  = new global::LascodiaTradingEngine.Application.Services.ML.EventFeatureSnapshot(0.5f, 0.2f, 0.1f);
+        var tickFlow   = new global::LascodiaTradingEngine.Application.Services.TickFlowSnapshot(
+            TickDelta: 0.2m, CurrentSpread: 0.00012m, SpreadMean: 0.00010m, SpreadStdDev: 0.00002m,
+            SpreadPercentileRank: 0.6m, SpreadRelVolatility: 0.2m, TickVolumeImbalance: 0.1m,
+            EffectiveSpread: 0.00015m, AmihudIlliquidity: 0.4m,
+            RollSpreadEstimate: 0.00009m, VarianceRatio: 1.05m);
+        var orderBook = new global::LascodiaTradingEngine.Application.Services.OrderBookFeatureSnapshot(
+            BookImbalanceTop1: 0.55m, BookImbalanceTop5: 0.52m,
+            TotalLiquidityNorm: 0.7m, BookSlopeBid: 0.1m, BookSlopeAsk: -0.05m);
+
+        float[] baseline = MLFeatureHelper.BuildFeatureVectorV6(
+            window, current, prev, new Dictionary<string, double[]>(), "EURUSD",
+            crossAsset, eventFeat, (0.4f, 0.3f), tickFlow, orderBook);
+
+        var redactedCurrent = new Candle
+        {
+            Symbol = current.Symbol, Timeframe = current.Timeframe, Timestamp = current.Timestamp,
+            Open = current.Open, High = current.Open, Low = current.Open,
+            Close = current.Open, Volume = 0, IsClosed = false, IsDeleted = false,
+        };
+        float[] redacted = MLFeatureHelper.BuildFeatureVectorV6(
+            window, redactedCurrent, prev, new Dictionary<string, double[]>(), "EURUSD",
+            crossAsset, eventFeat, (0.4f, 0.3f), tickFlow, orderBook);
+
+        Assert.Equal(MLFeatureHelper.FeatureCountV6, baseline.Length);
+        var contaminated = new List<int>();
+        for (int i = 0; i < baseline.Length; i++)
+            if (Math.Abs(baseline[i] - redacted[i]) > 1e-6f) contaminated.Add(i);
+        Assert.True(contaminated.Count == 0,
+            $"V6 look-ahead contamination at indices [{string.Join(", ", contaminated)}].");
+    }
+
+    [Fact]
+    public void V6_FeatureVector_ZeroFillsDomWhenOrderBookNull()
+    {
+        var all     = BuildDeterministicCandles(MLFeatureHelper.LookbackWindow + 2);
+        var window  = all.GetRange(0, MLFeatureHelper.LookbackWindow);
+        var prev    = all[MLFeatureHelper.LookbackWindow - 1];
+        var current = all[MLFeatureHelper.LookbackWindow];
+        var crossAsset = new global::LascodiaTradingEngine.Application.Services.ML.CrossAssetSnapshot(0.01f, 0.002f, 0.3f);
+        var eventFeat  = new global::LascodiaTradingEngine.Application.Services.ML.EventFeatureSnapshot(0.5f, 0.2f, 0.1f);
+
+        float[] v6 = MLFeatureHelper.BuildFeatureVectorV6(
+            window, current, prev, new Dictionary<string, double[]>(), "EURUSD",
+            crossAsset, eventFeat, (1.0f, 1.0f), tickFlow: null, orderBook: null);
+
+        Assert.Equal(MLFeatureHelper.FeatureCountV6, v6.Length);
+        // Last 5 slots (DOM) all zero when order book absent.
+        for (int i = MLFeatureHelper.FeatureCountV5; i < v6.Length; i++)
+            Assert.Equal(0f, v6[i]);
+    }
+
+    [Fact]
     public void V4_FeatureVector_ZeroFillsMicrostructureWhenTickFlowNull()
     {
         // Contract: V4 inference runs on symbols with no persisted ticks yet

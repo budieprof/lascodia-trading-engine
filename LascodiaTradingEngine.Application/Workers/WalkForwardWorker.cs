@@ -7,6 +7,7 @@ using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Backtesting;
 using LascodiaTradingEngine.Application.Backtesting.Models;
 using LascodiaTradingEngine.Application.Backtesting.Services;
+using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Optimization;
 using LascodiaTradingEngine.Domain.Entities;
@@ -94,6 +95,7 @@ public class WalkForwardWorker : BackgroundService
     private readonly IValidationCandleSeriesGuard _candleSeriesGuard;
     private readonly IValidationWorkerIdentity _workerIdentity;
     private readonly TimeProvider _timeProvider;
+    private readonly TradingMetrics? _metrics;
 
     /// <summary>
     /// Used to create per-iteration DI scopes so that scoped services such as
@@ -135,7 +137,8 @@ public class WalkForwardWorker : BackgroundService
         IValidationCandleSeriesGuard candleSeriesGuard,
         IValidationWorkerIdentity workerIdentity,
         IWorkerHealthMonitor? healthMonitor = null,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        TradingMetrics? metrics = null)
     {
         _logger         = logger;
         _scopeFactory   = scopeFactory;
@@ -148,6 +151,7 @@ public class WalkForwardWorker : BackgroundService
         _workerIdentity = workerIdentity;
         _healthMonitor  = healthMonitor;
         _timeProvider   = timeProvider ?? TimeProvider.System;
+        _metrics        = metrics;
     }
 
     /// <summary>
@@ -417,6 +421,7 @@ public class WalkForwardWorker : BackgroundService
                 // WalkForward:MinInSampleDays / :MinOutOfSampleDays.
                 if (run.InSampleDays < settings.MinInSampleDays)
                 {
+                    _metrics?.WalkForwardFoldRejections.Add(1, new KeyValuePair<string, object?>("reason", "min_in_sample_days"));
                     throw new ValidationRunException(
                         ValidationRunFailureCodes.InvalidWindow,
                         $"In-sample window of {run.InSampleDays} days is below the minimum of {settings.MinInSampleDays}.",
@@ -430,6 +435,7 @@ public class WalkForwardWorker : BackgroundService
 
                 if (run.OutOfSampleDays < settings.MinOutOfSampleDays)
                 {
+                    _metrics?.WalkForwardFoldRejections.Add(1, new KeyValuePair<string, object?>("reason", "min_out_of_sample_days"));
                     throw new ValidationRunException(
                         ValidationRunFailureCodes.InvalidWindow,
                         $"Out-of-sample window of {run.OutOfSampleDays} days is below the minimum of {settings.MinOutOfSampleDays}.",
@@ -543,6 +549,7 @@ public class WalkForwardWorker : BackgroundService
                     if (inSampleCandles.Count < settings.MinCandlesPerFold ||
                         oosCandles.Count < settings.MinCandlesPerFold)
                     {
+                        _metrics?.WalkForwardFoldRejections.Add(1, new KeyValuePair<string, object?>("reason", "min_candles_per_fold"));
                         throw new ValidationRunException(
                             ValidationRunFailureCodes.InvalidWindow,
                             $"Walk-forward fold {windowIndex} has too few candles " +
@@ -591,6 +598,7 @@ public class WalkForwardWorker : BackgroundService
                     // degenerate folds without blocking genuinely low-turnover strategies.
                     if (settings.MinTradesPerFold > 0 && oosResult.TotalTrades < settings.MinTradesPerFold)
                     {
+                        _metrics?.WalkForwardFoldRejections.Add(1, new KeyValuePair<string, object?>("reason", "min_trades_per_fold"));
                         throw new ValidationRunException(
                             ValidationRunFailureCodes.InvalidWindow,
                             $"Walk-forward fold {windowIndex} produced {oosResult.TotalTrades} OOS trades " +

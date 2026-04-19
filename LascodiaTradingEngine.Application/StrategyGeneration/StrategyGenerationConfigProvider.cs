@@ -151,6 +151,9 @@ public sealed class StrategyGenerationConfigProvider : IStrategyGenerationConfig
             KellyFactor = Get("ScreeningGate:KellyFactor", 0.5m),
             KellyMinLot = Get("ScreeningGate:KellyMinLot", 0.01m),
             KellyMaxLot = Get("ScreeningGate:KellyMaxLot", 0.10m),
+            MinDeflatedSharpe = Get("StrategyGeneration:MinDeflatedSharpe", 0.0),
+            UseUcb1TemplateSelection = Get("StrategyGeneration:UseUcb1TemplateSelection", true),
+            Ucb1ExplorationConstant = Get("StrategyGeneration:Ucb1ExplorationConstant", 1.41421356237),
         };
 
         // Validate first so operators get warnings against the raw settings before we clamp or
