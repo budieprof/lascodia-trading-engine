@@ -72,26 +72,26 @@ public class FeatureStoreBackfillWorker : BackgroundService
         var readCtx      = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
         var featureStore = scope.ServiceProvider.GetRequiredService<IFeatureStore>();
 
-        // Find closed candles that don't have a feature vector at the current schema version
-        var existingBarKeys = await readCtx.GetDbContext()
-            .Set<FeatureVector>()
-            .Where(f => f.SchemaVersion == featureStore.CurrentSchemaVersion && !f.IsDeleted)
-            .Select(f => f.CandleId)
-            .ToListAsync(ct);
+        // Find closed candles that don't have a feature vector at the current schema version.
+        // Previously this loaded every FeatureVector.CandleId into an in-memory HashSet
+        // then loaded the first MaxCandlesPerRun closed Candles across ALL symbols/timeframes
+        // and filtered in-app — a full-table scan on Candle (806 ms logged) that could return
+        // zero unprocessed rows when the leading timestamps were already backfilled. This now
+        // uses a NOT EXISTS / anti-join so Postgres rejects already-backfilled candles at the
+        // query planner stage, letting the index on Timestamp short-circuit once enough
+        // unprocessed rows are found.
+        var schemaVersion = featureStore.CurrentSchemaVersion;
+        var readDb = readCtx.GetDbContext();
 
-        var existingSet = new HashSet<long>(existingBarKeys);
-
-        var candlesNeedingFeatures = await readCtx.GetDbContext()
-            .Set<Candle>()
-            .Where(c => c.IsClosed && !c.IsDeleted)
+        var toProcess = await readDb.Set<Candle>()
+            .Where(c => c.IsClosed && !c.IsDeleted &&
+                        !readDb.Set<FeatureVector>().Any(f =>
+                            f.CandleId == c.Id &&
+                            f.SchemaVersion == schemaVersion &&
+                            !f.IsDeleted))
             .OrderBy(c => c.Timestamp)
-            .Take(_options.MaxCandlesPerRun)
-            .ToListAsync(ct);
-
-        var toProcess = candlesNeedingFeatures
-            .Where(c => !existingSet.Contains(c.Id))
             .Take(_options.BackfillBatchSize)
-            .ToList();
+            .ToListAsync(ct);
 
         if (toProcess.Count == 0)
         {
