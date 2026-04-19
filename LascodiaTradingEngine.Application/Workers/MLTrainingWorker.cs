@@ -1811,7 +1811,17 @@ public sealed class MLTrainingWorker : BackgroundService
         catch (Exception ex)
         {
             run.AttemptCount++;
-            bool canRetry = run.AttemptCount < run.MaxAttempts;
+
+            // Terminal-error classifier — errors that retry cannot resolve. Triple-barrier
+            // asymmetric-multiplier is a config error (profit/stop mults in EngineConfig):
+            // four minutes of backoff won't rewrite the config, and the operator needs to
+            // act. Marking terminal frees the queue slot and stops the per-attempt warning
+            // spam. Sample-count failures remain retryable because data can accumulate or
+            // the window can be widened between attempts.
+            bool isTerminalError =
+                ex.Message.Contains("Triple-barrier multipliers asymmetric", StringComparison.OrdinalIgnoreCase);
+
+            bool canRetry = !isTerminalError && run.AttemptCount < run.MaxAttempts;
 
             if (canRetry)
             {

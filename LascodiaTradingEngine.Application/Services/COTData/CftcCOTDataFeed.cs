@@ -93,8 +93,23 @@ public class CftcCOTDataFeed : ICOTDataFeed
         }
 
         var yearRecords = await GetYearRecordsAsync(reportDate.Year, ct);
+
+        // CFTC publishes the year-to-date ZIP on a weekly lag — early in a new calendar
+        // year the {YYYY}.zip file simply doesn't exist yet and GetYearRecordsAsync
+        // returns null. Silently fall back to the previous year's full archive so ML
+        // features keep seeing the last known COT positioning instead of suddenly going
+        // null across every pair on Jan 1 / Apr 1 / etc.
         if (yearRecords == null)
-            return null;
+        {
+            yearRecords = await GetYearRecordsAsync(reportDate.Year - 1, ct);
+            if (yearRecords == null)
+            {
+                _logger.LogDebug(
+                    "CftcCOTDataFeed: neither {Year} nor {PrevYear} archive available for {Currency}",
+                    reportDate.Year, reportDate.Year - 1, currency);
+                return null;
+            }
+        }
 
         // Find the record matching the contract name and report date.
         // CFTC report dates are Tuesdays; match by exact date.
@@ -113,10 +128,22 @@ public class CftcCOTDataFeed : ICOTDataFeed
                     r.ReportDate.Date == reportDate.Date);
             }
 
+            // Exact-date match failed — fall back to the most recent record on or before
+            // reportDate (CFTC publishes weekly; the caller's reportDate may not align with
+            // a publication Tuesday). This is strictly more useful than returning null.
+            if (match == null)
+            {
+                match = yearRecords
+                    .Where(r => r.ContractName.Contains(contractName, StringComparison.OrdinalIgnoreCase) &&
+                                r.ReportDate.Date <= reportDate.Date)
+                    .OrderByDescending(r => r.ReportDate)
+                    .FirstOrDefault();
+            }
+
             if (match == null)
             {
                 _logger.LogDebug(
-                    "CftcCOTDataFeed: no COT record found for {Currency} ({Contract}) on {Date:yyyy-MM-dd}",
+                    "CftcCOTDataFeed: no COT record found for {Currency} ({Contract}) on or before {Date:yyyy-MM-dd}",
                     currency, contractName, reportDate);
                 return null;
             }
@@ -205,7 +232,12 @@ public class CftcCOTDataFeed : ICOTDataFeed
             }
         }
 
-        _logger.LogError("CftcCOTDataFeed: could not download COT data for year {Year} from any URL", year);
+        // Downgraded from Error to Debug — this commonly occurs for the current year
+        // before CFTC has published the first ZIP (release lag is typically 1–2 weeks
+        // into January) and the caller in GetPositioningAsync now falls back to year-1.
+        // An unhandled download failure is still surfaced via the LogWarning at each URL
+        // attempt, so operators retain visibility without one Error-level line per symbol.
+        _logger.LogDebug("CftcCOTDataFeed: no COT archive available for year {Year} — caller will fall back", year);
         return null;
     }
 
