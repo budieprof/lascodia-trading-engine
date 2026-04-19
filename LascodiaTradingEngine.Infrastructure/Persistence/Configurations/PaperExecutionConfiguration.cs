@@ -46,6 +46,8 @@ public class PaperExecutionConfiguration : IEntityTypeConfiguration<PaperExecuti
         builder.HasIndex(x => new { x.StrategyId, x.Status });
         // Monitor worker scans open rows by symbol on every tick.
         builder.HasIndex(x => new { x.Symbol, x.Status });
+        // Promotion gate filters synthetic vs. live-sourced rows; index the combined key.
+        builder.HasIndex(x => new { x.StrategyId, x.IsSynthetic });
 
         builder.HasOne(x => x.Strategy)
                .WithMany()

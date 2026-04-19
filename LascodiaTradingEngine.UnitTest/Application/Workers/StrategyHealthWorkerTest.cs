@@ -117,6 +117,13 @@ public class StrategyHealthWorkerTest : IDisposable
             .ReturnsAsync((OptimizationRun r, CancellationToken _) => null!);
         writeDbContext.Setup(c => c.Set<OptimizationRun>()).Returns(optRunDbSet.Object);
 
+        // MarketRegimeSnapshot set — read by the health worker to tag performance
+        // snapshots with current regime (powers the regime-stratified promotion gate).
+        // Empty list → snapshot.MarketRegime stays null, gate falls back to the
+        // cold-start proxy. That's the intended behaviour under test.
+        var regimeSnapshotDbSet = new List<MarketRegimeSnapshot>().AsQueryable().BuildMockDbSet();
+        writeDbContext.Setup(c => c.Set<MarketRegimeSnapshot>()).Returns(regimeSnapshotDbSet.Object);
+
         _mockWriteContext.Setup(c => c.GetDbContext()).Returns(writeDbContext.Object);
     }
 
@@ -503,6 +510,10 @@ public class StrategyHealthWorkerTest : IDisposable
             .Callback<OptimizationRun, CancellationToken>((r, _) => _addedOptimizationRuns.Add(r))
             .ReturnsAsync((OptimizationRun r, CancellationToken _) => null!);
         writeDbContext.Setup(c => c.Set<OptimizationRun>()).Returns(optRunDbSet.Object);
+
+        // Empty MarketRegimeSnapshot set — regime-tagging read returns null, fine for this test.
+        writeDbContext.Setup(c => c.Set<MarketRegimeSnapshot>()).Returns(
+            new List<MarketRegimeSnapshot>().AsQueryable().BuildMockDbSet().Object);
 
         _mockWriteContext.Setup(c => c.GetDbContext()).Returns(writeDbContext.Object);
 

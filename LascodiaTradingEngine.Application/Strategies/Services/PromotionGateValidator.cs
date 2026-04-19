@@ -202,9 +202,12 @@ public sealed class PromotionGateValidator : IPromotionGateValidator
             }
             else
             {
+                // Exclude synthetic backfill rows from the hard count — they're replayed from
+                // historical candles via BacktestEngine, not genuine forward-test evidence.
+                // They're still available as observability data in the table itself.
                 var earliestFill = await db.Set<Domain.Entities.PaperExecution>()
                     .AsNoTracking()
-                    .Where(p => p.StrategyId == strategyId && !p.IsDeleted)
+                    .Where(p => p.StrategyId == strategyId && !p.IsDeleted && !p.IsSynthetic)
                     .OrderBy(p => p.SignalGeneratedAt)
                     .Select(p => (DateTime?)p.SignalGeneratedAt)
                     .FirstOrDefaultAsync(ct);
@@ -213,6 +216,7 @@ public sealed class PromotionGateValidator : IPromotionGateValidator
                     .AsNoTracking()
                     .CountAsync(p => p.StrategyId == strategyId
                                   && !p.IsDeleted
+                                  && !p.IsSynthetic
                                   && p.Status == Domain.Enums.PaperExecutionStatus.Closed, ct);
 
                 double daysOfPaperData = earliestFill is { } t ? (now - t).TotalDays : 0.0;
@@ -225,23 +229,52 @@ public sealed class PromotionGateValidator : IPromotionGateValidator
             }
         }
 
-        // ── Gate 5 (#5 on pipeline roadmap): Regime-stratified performance ──
-        // Deferred: StrategyPerformanceSnapshot currently has no regime column, so
-        // we cannot verify "positive Sharpe in ≥ N distinct regimes" without schema
-        // work. Once MarketRegimeSnapshot + per-regime StrategyPerformanceSnapshot
-        // are joined, re-enable this gate. For now use a weaker proxy: require the
-        // most-recent backtest to have covered at least 6 months (≥180 days) of data,
-        // which likely spans multiple regimes in live markets.
+        // ── Gate 5: Regime-stratified performance ────────────────────────────
+        // A strategy that prints positive Sharpe exclusively in trending regimes
+        // is fragile — it blows up the first time the tape chops. Require positive
+        // Sharpe in ≥ MinDistinctRegimes classified regimes from its own live
+        // performance snapshot history, which is now tagged with MarketRegime.
+        // Falls back to the backtest-duration proxy when no regime-tagged snapshots
+        // exist yet (cold start, before the next StrategyHealthWorker cycle).
         if (!disabledGates.Contains("regime"))
         {
-            int minBacktestDays = await GetConfigIntAsync(db, "Promotion:MinBacktestDurationDays", 180, ct);
-            double coveredDays = (latestBacktest.ToDate - latestBacktest.FromDate).TotalDays;
-            diagnostics.Add($"BacktestCoverage={coveredDays:F0}d (regime proxy)");
+            int minDistinctRegimes = await GetConfigIntAsync(db, "Promotion:MinDistinctProfitableRegimes", 2, ct);
+            int minBacktestDays    = await GetConfigIntAsync(db, "Promotion:MinBacktestDurationDays", 180, ct);
 
-            if (coveredDays < minBacktestDays)
-                failures.Add(
-                    $"Backtest duration {coveredDays:F0}d < min {minBacktestDays}d " +
-                    "— too short to cover multiple regimes, strategy may be fragile to regime change");
+            var regimePerf = await db.Set<StrategyPerformanceSnapshot>()
+                .AsNoTracking()
+                .Where(s => s.StrategyId == strategyId
+                         && !s.IsDeleted
+                         && s.MarketRegime != null)
+                .GroupBy(s => s.MarketRegime)
+                .Select(g => new { Regime = g.Key, AvgSharpe = g.Average(s => s.SharpeRatio) })
+                .ToListAsync(ct);
+
+            if (regimePerf.Count > 0)
+            {
+                int profitableRegimes = regimePerf.Count(r => r.AvgSharpe > 0);
+                diagnostics.Add(
+                    $"Regime coverage: observed={regimePerf.Count}, profitable={profitableRegimes} " +
+                    $"({string.Join(", ", regimePerf.Select(r => $"{r.Regime}:{r.AvgSharpe:F2}"))})");
+
+                if (profitableRegimes < minDistinctRegimes)
+                    failures.Add(
+                        $"Profitable regime count {profitableRegimes} < min {minDistinctRegimes} " +
+                        "— strategy edge is regime-concentrated, will blow up on regime shift");
+            }
+            else
+            {
+                // Cold-start fallback: no regime-tagged snapshots exist (first cycle
+                // after the MarketRegime column was added). Fall back to the coverage
+                // proxy until the health worker has had time to capture regime-tagged
+                // snapshots across multiple regimes.
+                double coveredDays = (latestBacktest.ToDate - latestBacktest.FromDate).TotalDays;
+                diagnostics.Add($"BacktestCoverage={coveredDays:F0}d (regime cold-start proxy — no tagged snapshots yet)");
+                if (coveredDays < minBacktestDays)
+                    failures.Add(
+                        $"Backtest duration {coveredDays:F0}d < min {minBacktestDays}d " +
+                        "— no regime-tagged snapshots and backtest too short to cover multiple regimes");
+            }
         }
 
         // ── Gate 7 (#3 on pipeline roadmap): CPCV P25 Sharpe ≥ threshold ────

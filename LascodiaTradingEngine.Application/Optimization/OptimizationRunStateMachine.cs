@@ -18,6 +18,11 @@ internal static class OptimizationRunStateMachine
         (OptimizationRunStatus.Completed, OptimizationRunStatus.Failed) => true, // approval persistence failure → retry
         (OptimizationRunStatus.Failed, OptimizationRunStatus.Queued) => true, // retry path
         (OptimizationRunStatus.Failed, OptimizationRunStatus.Abandoned) => true, // dead-letter after retries exhausted
+        // Deferral-budget exhaustion: OptimizationRunDeferralTracker moves a Running
+        // or Queued run straight to Abandoned when MaxDeferralCount / MaxDeferralTtlDays
+        // is breached without an intervening failure. Without these, the worker throws.
+        (OptimizationRunStatus.Running, OptimizationRunStatus.Abandoned) => true,
+        (OptimizationRunStatus.Queued, OptimizationRunStatus.Abandoned) => true,
         (OptimizationRunStatus.Completed, OptimizationRunStatus.Approved) => true,
         (OptimizationRunStatus.Completed, OptimizationRunStatus.Rejected) => true,
         _ when from == to => true,

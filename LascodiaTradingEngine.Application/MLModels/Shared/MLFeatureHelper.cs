@@ -43,6 +43,19 @@ public static class MLFeatureHelper
     public const int FeatureCountV3 = 43;
 
     /// <summary>
+    /// V4 vector length: 43 V3 features + 2 minute-resolution news proximity slots
+    /// (MinutesToNextHighImpact / MinutesToNextMedHighImpact over a 3h horizon) +
+    /// 3 tick-microstructure slots (SpreadRelVolatility, SpreadPercentileRank,
+    /// TickVolumeImbalance). All five are populated from providers that return
+    /// zero on missing data, so a V4-trained model still runs on partial live data
+    /// — it just sees the missing slots as "neutral / no signal" rather than crashing.
+    /// Enabled via <c>MLTraining:UseTickMicrostructureFeatureVector=true</c>;
+    /// inference dispatch in <c>CompositeMLEvaluator</c> / <c>MLSignalScorer</c>
+    /// routes on <c>snapshot.ExpectedInputFeatures == FeatureCountV4</c>.
+    /// </summary>
+    public const int FeatureCountV4 = 48;
+
+    /// <summary>
     /// Hard cap on production feature-vector length. Enforced by
     /// <see cref="AssertFeatureCountWithinCap"/> at training and inference time.
     ///
@@ -4229,6 +4242,45 @@ public static class MLFeatureHelper
         result[FeatureCountV2 + 3] = SanitizeScalar(eventFeatures.HoursToNextHighNormalized);
         result[FeatureCountV2 + 4] = SanitizeScalar(eventFeatures.HoursSinceLastHighNormalized);
         result[FeatureCountV2 + 5] = SanitizeScalar(eventFeatures.HighMedPending6hNormalized);
+        return result;
+    }
+
+    /// <summary>
+    /// Builds the 48-element V4 feature vector: V3 43 features + 2 minute-resolution
+    /// news-proximity scalars + 3 tick-microstructure scalars. Tick flow may be null
+    /// (no ticks persisted yet for this symbol) — in that case the last 3 slots zero-fill.
+    /// </summary>
+    public static float[] BuildFeatureVectorV4(
+        List<Candle>                          window,
+        Candle                                current,
+        Candle                                previous,
+        Dictionary<string, double[]>          basketSliceAtCurrentBar,
+        string                                symbol,
+        global::LascodiaTradingEngine.Application.Services.ML.CrossAssetSnapshot crossAsset,
+        global::LascodiaTradingEngine.Application.Services.ML.EventFeatureSnapshot eventFeatures,
+        (float MinutesToNextHighNorm, float MinutesToNextMedHighNorm) minuteLevelEvents,
+        global::LascodiaTradingEngine.Application.Services.TickFlowSnapshot? tickFlow,
+        CotFeatureEntry?                      cotEntry = null)
+    {
+        float[] v3 = BuildFeatureVectorV3(window, current, previous, basketSliceAtCurrentBar, symbol, crossAsset, eventFeatures, cotEntry);
+        var result = new float[FeatureCountV4];
+        Array.Copy(v3, 0, result, 0, FeatureCountV3);
+
+        result[FeatureCountV3 + 0] = SanitizeScalar(minuteLevelEvents.MinutesToNextHighNorm);
+        result[FeatureCountV3 + 1] = SanitizeScalar(minuteLevelEvents.MinutesToNextMedHighNorm);
+
+        if (tickFlow is null)
+        {
+            result[FeatureCountV3 + 2] = 0f;
+            result[FeatureCountV3 + 3] = 0f;
+            result[FeatureCountV3 + 4] = 0f;
+        }
+        else
+        {
+            result[FeatureCountV3 + 2] = SanitizeScalar((float)(tickFlow.SpreadRelVolatility / 3m));
+            result[FeatureCountV3 + 3] = SanitizeScalar((float)tickFlow.SpreadPercentileRank);
+            result[FeatureCountV3 + 4] = SanitizeScalar((float)tickFlow.TickVolumeImbalance);
+        }
         return result;
     }
 

@@ -12,7 +12,7 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace LascodiaTradingEngine.Infrastructure.Migrations
 {
     [DbContext(typeof(WriteApplicationDbContext))]
-    [Migration("20260419185911_AddPaperExecution")]
+    [Migration("20260419194444_AddPaperExecution")]
     partial class AddPaperExecution
     {
         /// <inheritdoc />
@@ -3957,6 +3957,142 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     b.ToTable("OrderBookSnapshot");
                 });
 
+            modelBuilder.Entity("LascodiaTradingEngine.Domain.Entities.PaperExecution", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<DateTime?>("ClosedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<decimal>("ContractSize")
+                        .HasPrecision(18, 4)
+                        .HasColumnType("numeric(18,4)");
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("Direction")
+                        .IsRequired()
+                        .HasMaxLength(10)
+                        .HasColumnType("character varying(10)");
+
+                    b.Property<bool>("IsDeleted")
+                        .HasColumnType("boolean");
+
+                    b.Property<decimal>("LotSize")
+                        .HasPrecision(18, 4)
+                        .HasColumnType("numeric(18,4)");
+
+                    b.Property<Guid>("OutboxId")
+                        .HasColumnType("uuid");
+
+                    b.Property<decimal>("PipSize")
+                        .HasPrecision(18, 8)
+                        .HasColumnType("numeric(18,8)");
+
+                    b.Property<decimal>("RequestedEntryPrice")
+                        .HasPrecision(18, 8)
+                        .HasColumnType("numeric(18,8)");
+
+                    b.Property<long>("RowVersion")
+                        .IsConcurrencyToken()
+                        .HasColumnType("bigint");
+
+                    b.Property<DateTime>("SignalGeneratedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<decimal>("SimulatedCommissionAccountCcy")
+                        .HasPrecision(18, 4)
+                        .HasColumnType("numeric(18,4)");
+
+                    b.Property<decimal?>("SimulatedExitPrice")
+                        .HasPrecision(18, 8)
+                        .HasColumnType("numeric(18,8)");
+
+                    b.Property<string>("SimulatedExitReason")
+                        .HasMaxLength(30)
+                        .HasColumnType("character varying(30)");
+
+                    b.Property<DateTime>("SimulatedFillAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<decimal>("SimulatedFillPrice")
+                        .HasPrecision(18, 8)
+                        .HasColumnType("numeric(18,8)");
+
+                    b.Property<decimal?>("SimulatedGrossPnL")
+                        .HasPrecision(18, 4)
+                        .HasColumnType("numeric(18,4)");
+
+                    b.Property<decimal?>("SimulatedMaeAbsolute")
+                        .HasPrecision(18, 8)
+                        .HasColumnType("numeric(18,8)");
+
+                    b.Property<decimal?>("SimulatedMfeAbsolute")
+                        .HasPrecision(18, 8)
+                        .HasColumnType("numeric(18,8)");
+
+                    b.Property<decimal?>("SimulatedNetPnL")
+                        .HasPrecision(18, 4)
+                        .HasColumnType("numeric(18,4)");
+
+                    b.Property<decimal>("SimulatedSlippagePriceUnits")
+                        .HasPrecision(18, 8)
+                        .HasColumnType("numeric(18,8)");
+
+                    b.Property<decimal>("SimulatedSpreadCostPriceUnits")
+                        .HasPrecision(18, 8)
+                        .HasColumnType("numeric(18,8)");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasMaxLength(20)
+                        .HasColumnType("character varying(20)");
+
+                    b.Property<decimal?>("StopLoss")
+                        .HasPrecision(18, 8)
+                        .HasColumnType("numeric(18,8)");
+
+                    b.Property<long>("StrategyId")
+                        .HasColumnType("bigint");
+
+                    b.Property<string>("Symbol")
+                        .IsRequired()
+                        .HasMaxLength(20)
+                        .HasColumnType("character varying(20)");
+
+                    b.Property<decimal?>("TakeProfit")
+                        .HasPrecision(18, 8)
+                        .HasColumnType("numeric(18,8)");
+
+                    b.Property<string>("TcaProfileSnapshotJson")
+                        .HasColumnType("text");
+
+                    b.Property<string>("Timeframe")
+                        .IsRequired()
+                        .HasMaxLength(10)
+                        .HasColumnType("character varying(10)");
+
+                    b.Property<long?>("TradeSignalId")
+                        .HasColumnType("bigint");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("TradeSignalId");
+
+                    b.HasIndex("StrategyId", "SignalGeneratedAt");
+
+                    b.HasIndex("StrategyId", "Status");
+
+                    b.HasIndex("Symbol", "Status");
+
+                    b.ToTable("PaperExecution");
+                });
+
             modelBuilder.Entity("LascodiaTradingEngine.Domain.Entities.Position", b =>
                 {
                     b.Property<long>("Id")
@@ -6715,6 +6851,24 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     b.Navigation("TradeSignal");
 
                     b.Navigation("TradingAccount");
+                });
+
+            modelBuilder.Entity("LascodiaTradingEngine.Domain.Entities.PaperExecution", b =>
+                {
+                    b.HasOne("LascodiaTradingEngine.Domain.Entities.Strategy", "Strategy")
+                        .WithMany()
+                        .HasForeignKey("StrategyId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+
+                    b.HasOne("LascodiaTradingEngine.Domain.Entities.TradeSignal", "TradeSignal")
+                        .WithMany()
+                        .HasForeignKey("TradeSignalId")
+                        .OnDelete(DeleteBehavior.SetNull);
+
+                    b.Navigation("Strategy");
+
+                    b.Navigation("TradeSignal");
                 });
 
             modelBuilder.Entity("LascodiaTradingEngine.Domain.Entities.PositionLifecycleEvent", b =>

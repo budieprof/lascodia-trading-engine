@@ -2011,6 +2011,7 @@ public sealed class MLTrainingWorker : BackgroundService
             {
                 snap.ExpectedInputFeatures = samples[0].Features.Length;
                 snap.FeatureSchemaVersion =
+                    snap.ExpectedInputFeatures == MLFeatureHelper.FeatureCountV4 ? 4 :
                     snap.ExpectedInputFeatures == MLFeatureHelper.FeatureCountV3 ? 3 :
                     snap.ExpectedInputFeatures == MLFeatureHelper.FeatureCountV2 ? 2 :
                     1;

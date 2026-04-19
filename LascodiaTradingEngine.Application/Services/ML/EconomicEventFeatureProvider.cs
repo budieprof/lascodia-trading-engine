@@ -160,6 +160,38 @@ public sealed class EconomicEventFeatureProvider
                 pending6h / 5f);
         }
 
+        /// <summary>
+        /// V4 fine-grained proximity: minutes-to-next-high and minutes-to-next-med-or-high
+        /// over a 3-hour horizon. The 24h version in SnapshotAt is too coarse for intraday
+        /// models — a 45-min-away NFP looks identical to a 23-hour-away event under the
+        /// hour/24 normalization. 180-minute window captures the pre-event risk-off window
+        /// when models should typically size down.
+        /// </summary>
+        public (float MinutesToNextHighNorm, float MinutesToNextMedHighNorm) SnapshotMinuteLevel(DateTime asOfUtc)
+        {
+            if (_events.Length == 0) return (1f, 1f);
+
+            int idx = Array.BinarySearch(
+                _events,
+                new EventRow(asOfUtc, false),
+                EventRowComparer.Instance);
+            if (idx < 0) idx = ~idx;
+
+            float minutesToNextHigh    = 180f;
+            float minutesToNextMedHigh = 180f;
+            bool gotHigh = false, gotMedHigh = false;
+            for (int j = idx; j < _events.Length; j++)
+            {
+                double mins = (_events[j].ScheduledAt - asOfUtc).TotalMinutes;
+                if (mins < 0) continue;
+                if (mins > 180) break;
+                if (!gotMedHigh) { minutesToNextMedHigh = (float)mins; gotMedHigh = true; }
+                if (!gotHigh && _events[j].IsHigh) { minutesToNextHigh = (float)mins; gotHigh = true; }
+                if (gotHigh && gotMedHigh) break;
+            }
+            return (minutesToNextHigh / 180f, minutesToNextMedHigh / 180f);
+        }
+
         private sealed class EventRowComparer : IComparer<EventRow>
         {
             public static readonly EventRowComparer Instance = new();

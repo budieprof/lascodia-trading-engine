@@ -194,7 +194,34 @@ internal sealed class StrategyGenerationScreeningCoordinator : IStrategyGenerati
 
         int reserveCreated = resumeState.ReserveCreated;
         int candidatesScreened = primaryResult.CandidatesScreened;
-        if (primaryResult.CandidatesCreated < config.MaxCandidates && config.StrategicReserveQuota > 0)
+
+        // Archetype-diversity trigger: even when MaxCandidates is saturated, run the
+        // reserve planner if any archetype that appeared at all this cycle fell below
+        // MinCandidatesPerArchetype. The reserve planner already prioritises missing
+        // types; letting it run here closes the loop between rotation (primary pass)
+        // and the floor diagnostic (end-of-primary).
+        bool archetypeShortfallPresent = false;
+        if (config.EnforceArchetypeDiversity)
+        {
+            var cycleArchetypeCounts = new Dictionary<StrategyType, int>();
+            foreach (var perSymbol in primaryResult.GeneratedTypeCountsBySymbol.Values)
+            {
+                foreach (var (type, count) in perSymbol)
+                    cycleArchetypeCounts[type] = cycleArchetypeCounts.GetValueOrDefault(type) + count;
+            }
+            // Any archetype that appeared at least once this cycle — or is flagged as
+            // existing in the DB — but below the floor triggers a reserve pass. We
+            // deliberately don't filter by regime-compatibility here: the reserve
+            // planner handles regime checks internally, and over-triggering is harmless.
+            var observedArchetypes = cycleArchetypeCounts.Keys
+                .Union(context.Existing.Select(e => e.StrategyType))
+                .ToHashSet();
+            archetypeShortfallPresent = observedArchetypes
+                .Any(t => cycleArchetypeCounts.GetValueOrDefault(t, 0) < config.MinCandidatesPerArchetype);
+        }
+
+        if ((primaryResult.CandidatesCreated < config.MaxCandidates || archetypeShortfallPresent)
+            && config.StrategicReserveQuota > 0)
         {
             // Reserve screening reuses the same checkpoint fingerprint so its progress can be
             // resumed consistently with the primary pass.

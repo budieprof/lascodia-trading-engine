@@ -3,6 +3,7 @@ using System;
 using LascodiaTradingEngine.Infrastructure.Persistence.DbContexts;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 
@@ -11,9 +12,11 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace LascodiaTradingEngine.Infrastructure.Migrations
 {
     [DbContext(typeof(WriteApplicationDbContext))]
-    partial class WriteApplicationDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260419195151_AddPaperExecutionIsSynthetic")]
+    partial class AddPaperExecutionIsSynthetic
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -5364,9 +5367,6 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                         .HasColumnType("boolean");
 
                     b.Property<int>("LosingTrades")
-                        .HasColumnType("integer");
-
-                    b.Property<int?>("MarketRegime")
                         .HasColumnType("integer");
 
                     b.Property<decimal>("MaxDrawdownPct")

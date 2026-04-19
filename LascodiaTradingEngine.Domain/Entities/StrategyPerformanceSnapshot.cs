@@ -76,6 +76,14 @@ public class StrategyPerformanceSnapshot : Entity<long>
     /// <summary>UTC timestamp when this snapshot was computed by the health worker.</summary>
     public DateTime EvaluatedAt   { get; set; } = DateTime.UtcNow;
 
+    /// <summary>
+    /// Market regime at the time this snapshot was captured. Lets the promotion gate
+    /// verify "strategy posts positive Sharpe in ≥ N distinct regimes" without having
+    /// to re-join MarketRegimeSnapshot by timestamp after the fact. Nullable so
+    /// pre-regime-aware snapshots stay queryable under the new gate.
+    /// </summary>
+    public MarketRegime? MarketRegime { get; set; }
+
     /// <summary>Soft-delete flag. Filtered out by the global EF Core query filter.</summary>
     public bool    IsDeleted      { get; set; }
 

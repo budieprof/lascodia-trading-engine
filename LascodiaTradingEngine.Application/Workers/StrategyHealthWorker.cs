@@ -441,6 +441,20 @@ public class StrategyHealthWorker : BackgroundService
             : healthScore >= criticalThreshold ? StrategyHealthStatus.Degrading
             : StrategyHealthStatus.Critical;
 
+        // Pull the latest classified regime for this symbol+timeframe so the
+        // regime-stratified promotion gate can later count distinct regimes
+        // over the snapshot history. Falls through to null if no regime snapshot
+        // has been captured yet — the gate treats nullable regime as unknown.
+        var latestRegime = await writeContext.GetDbContext()
+            .Set<MarketRegimeSnapshot>()
+            .AsNoTracking()
+            .Where(r => r.Symbol == strategy.Symbol
+                     && r.Timeframe == strategy.Timeframe
+                     && !r.IsDeleted)
+            .OrderByDescending(r => r.DetectedAt)
+            .Select(r => (LascodiaTradingEngine.Domain.Enums.MarketRegime?)r.Regime)
+            .FirstOrDefaultAsync(ct);
+
         // Persist the snapshot for dashboard queries and StrategyFeedbackWorker
         // consecutive-degrading detection.
         var snapshot = new StrategyPerformanceSnapshot
@@ -456,6 +470,7 @@ public class StrategyHealthWorker : BackgroundService
             TotalPnL       = totalPnL,
             HealthScore    = healthScore,
             HealthStatus   = healthStatus,
+            MarketRegime   = latestRegime,
             EvaluatedAt    = DateTime.UtcNow
         };
 

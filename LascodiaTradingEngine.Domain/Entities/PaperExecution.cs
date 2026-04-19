@@ -59,6 +59,14 @@ public class PaperExecution : Entity<long>
 
     public PaperExecutionStatus Status { get; set; } = PaperExecutionStatus.Open;
 
+    /// <summary>
+    /// True when this row was backfilled by replaying historical candles through
+    /// BacktestEngine instead of coming from live tick data. Gate 4 of the promotion
+    /// validator excludes synthetic rows from the hard minimum-count — they are for
+    /// observability / operator backfill, not forward-test evidence.
+    /// </summary>
+    public bool IsSynthetic { get; set; }
+
     public bool IsDeleted  { get; set; }
     public uint RowVersion { get; set; }
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;

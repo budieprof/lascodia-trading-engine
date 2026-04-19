@@ -2789,6 +2789,7 @@ public class ModelSnapshot
     {
         if (FeatureSchemaVersion > 0) return FeatureSchemaVersion;
         int count = ResolveExpectedInputFeatures();
+        if (count == MLFeatureHelper.FeatureCountV4) return 4;
         if (count == MLFeatureHelper.FeatureCountV3) return 3;
         if (count == MLFeatureHelper.FeatureCountV2) return 2;
         return 1;
