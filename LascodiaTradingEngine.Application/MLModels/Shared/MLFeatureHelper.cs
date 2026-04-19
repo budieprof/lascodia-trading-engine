@@ -42,6 +42,38 @@ public static class MLFeatureHelper
     /// </summary>
     public const int FeatureCountV3 = 43;
 
+    /// <summary>
+    /// Hard cap on production feature-vector length. Enforced by
+    /// <see cref="AssertFeatureCountWithinCap"/> at training and inference time.
+    ///
+    /// Rationale: feature creep (V1=33 → V2=37 → V3=43 in weeks) is the single
+    /// biggest silent overfit driver. Every added feature consumes a degree of
+    /// freedom — a 50-feature vector trained on 2k samples is ~40 samples per
+    /// feature, deep in curse-of-dimensionality territory for financial labels.
+    /// Adding a feature must mean removing one OR proving permutation-importance
+    /// > 0.01 on a held-out slice that did not influence its construction.
+    /// </summary>
+    public const int MaxAllowedFeatureCount = 50;
+
+    /// <summary>
+    /// Assert a feature vector length is within the production cap. Call from
+    /// training/inference sites that accept a feature-count parameter. Throws
+    /// <see cref="InvalidOperationException"/> rather than clamping — a schema
+    /// that exceeds the cap is a design error, not a runtime condition to recover
+    /// from. Should surface in dev/staging well before production.
+    /// </summary>
+    public static void AssertFeatureCountWithinCap(int featureCount, string context)
+    {
+        if (featureCount > MaxAllowedFeatureCount)
+        {
+            throw new InvalidOperationException(
+                $"Feature count {featureCount} exceeds production cap of {MaxAllowedFeatureCount} " +
+                $"(context={context}). See MLFeatureHelper.MaxAllowedFeatureCount rationale — " +
+                "adding a feature requires removing one OR validating permutation-importance > 0.01 " +
+                "on out-of-sample data that did not influence the feature's construction.");
+        }
+    }
+
     /// <summary>Names of the 6 new V3 features appended after the V2 slots, in order.</summary>
     public static readonly string[] V3FeatureNames =
     [

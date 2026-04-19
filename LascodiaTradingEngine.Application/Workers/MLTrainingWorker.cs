@@ -932,6 +932,49 @@ public sealed class MLTrainingWorker : BackgroundService
 
             run.TotalSamples = samples.Count;
 
+            // ── Minimum sample count guard ───────────────────────────────────
+            // Training on a small dataset produces labels whose buy/sell ratio is noisy —
+            // the 28-35% imbalance we see in live logs for ~1800-sample runs is almost
+            // entirely label-sampling noise, not true directional asymmetry. Under-sized
+            // datasets also systematically fail the imbalance check below, wasting compute.
+            // Reject up-front when sample count is below the floor so the operator expands
+            // the window instead of burning cycles on retries.
+            int minSamples = await GetConfigAsync<int>(
+                ctx, "MLTraining:MinTrainingSamples", 3000, stoppingToken);
+            if (samples.Count < minSamples)
+            {
+                throw new InvalidOperationException(
+                    $"Training sample count {samples.Count} below minimum {minSamples}. " +
+                    "Expand the training window (MLTraining:TrainingLookbackDays) — small datasets " +
+                    "produce noisy label ratios that fail imbalance guards and overfit to sampling artefacts.");
+            }
+
+            // ── Symmetric triple-barrier guard ───────────────────────────────
+            // Triple-barrier labels with asymmetric profit/stop multipliers introduce a
+            // directional bias into the label prior (e.g. 2x profit vs 1x stop yields ~66%
+            // buy-labels on random walks). That bias is then falsely attributed to
+            // "strategy edge" by downstream metrics. Enforce symmetric multipliers so the
+            // model has to find real asymmetry in the data to beat a 50/50 prior.
+            bool useTripleBarrier = await GetConfigAsync<bool>(
+                ctx, CK_UseTripleBarrier, false, stoppingToken);
+            bool requireSymmetric = await GetConfigAsync<bool>(
+                ctx, "MLTraining:RequireSymmetricTripleBarrier", true, stoppingToken);
+            if (useTripleBarrier && requireSymmetric)
+            {
+                double profitMult = hp.TripleBarrierProfitAtrMult;
+                double stopMult   = hp.TripleBarrierStopAtrMult;
+                double ratio = stopMult > 0 ? profitMult / stopMult : double.PositiveInfinity;
+                if (ratio < 0.9 || ratio > 1.1)
+                {
+                    throw new InvalidOperationException(
+                        $"Triple-barrier multipliers asymmetric (profit={profitMult:F2}, stop={stopMult:F2}, ratio={ratio:F2}). " +
+                        "Must be within [0.9, 1.1] so the label prior is 50/50 by construction — asymmetric barriers " +
+                        "bake directional bias into labels and produce fake Sharpe from the prior rather than real edge. " +
+                        "Disable via MLTraining:RequireSymmetricTripleBarrier=false only if you have explicit evidence that " +
+                        "asymmetric barriers produce live P&L above the symmetric baseline.");
+                }
+            }
+
             // ── Class imbalance guard ────────────────────────────────────────
             // A heavily skewed label distribution silently biases the model toward the majority
             // direction. Reject the run if imbalance exceeds the configurable ceiling so we only
@@ -943,7 +986,29 @@ public sealed class MLTrainingWorker : BackgroundService
 
             double maxImbalance = await GetConfigAsync<double>(ctx, CK_MaxLabelImbalance, 0.65, stoppingToken);
             double minImbalance = 1.0 - maxImbalance;
-            if ((double)imbalanceRatio > maxImbalance || (double)imbalanceRatio < minImbalance)
+
+            // SMOTE retries are selected specifically because the prior run tripped this
+            // very gate — applying the same gate again guarantees the retry fails and the
+            // self-healer exhausts its attempts. SMOTE synthesises minority-class samples
+            // during training, so the strict 35%/65% floor is counter-productive. Require
+            // just a 15 % minority floor so the synthetic-neighbourhood search has enough
+            // real examples to interpolate between — below that, SMOTE's k-NN basis is
+            // unreliable and we still want the operator to expand the training window.
+            bool isSmote = run.LearnerArchitecture == LearnerArchitecture.Smote;
+            if (isSmote)
+            {
+                const double smoteMinMinority = 0.15;
+                double minorityFraction = Math.Min((double)imbalanceRatio, 1.0 - (double)imbalanceRatio);
+                if (minorityFraction < smoteMinMinority)
+                {
+                    throw new InvalidOperationException(
+                        $"Label imbalance too severe for SMOTE: minority fraction {minorityFraction:P1} " +
+                        $"below SMOTE floor {smoteMinMinority:P0} (buy={buyCount} sell={sellCount} " +
+                        $"total={samples.Count}). Expand the training window — SMOTE k-NN neighbourhoods " +
+                        $"are unreliable below this threshold.");
+                }
+            }
+            else if ((double)imbalanceRatio > maxImbalance || (double)imbalanceRatio < minImbalance)
             {
                 throw new InvalidOperationException(
                     $"Label imbalance out of bounds: buy fraction {imbalanceRatio:P1} outside " +
@@ -1350,6 +1415,12 @@ public sealed class MLTrainingWorker : BackgroundService
                 sp.GetRequiredService<ITrainerSelector>()
                     .InvalidateCache(run.Symbol, run.Timeframe);
                 _logger.LogWarning("Run {RunId} did not pass quality gates — model not promoted", run.Id);
+                // Increment consecutive-retrain-failure count on the outgoing champion model
+                // (if any). After N consecutive failed retrains, retire the model instead of
+                // looping retrain attempts indefinitely. This stops the "infinite retrain on a
+                // strategy whose edge is gone" pattern where drift monitoring repeatedly
+                // triggers retrains that each fail to beat the degraded baseline.
+                await TrackRetrainOutcomeAsync(ctx, db, run, promoted: false, stoppingToken);
                 await MaybeCreateTrainingFailureAlertAsync(ctx, run, stoppingToken);
                 await MaybeQueueSelfTuningRetryAsync(ctx, db, run, m, hp, stoppingToken);
                 return;
@@ -1933,6 +2004,11 @@ public sealed class MLTrainingWorker : BackgroundService
                     snap.ExpectedInputFeatures == MLFeatureHelper.FeatureCountV3 ? 3 :
                     snap.ExpectedInputFeatures == MLFeatureHelper.FeatureCountV2 ? 2 :
                     1;
+                // Guardrail: reject feature creep at the training boundary so a bloated
+                // schema cannot enter the snapshot cache and contaminate live scoring.
+                MLFeatureHelper.AssertFeatureCountWithinCap(
+                    snap.ExpectedInputFeatures,
+                    $"MLTrainingWorker snapshot persist (model={run.MLModelId})");
             }
 
             // Compute per-feature empirical variances from the deployed feature pipeline.
@@ -2566,6 +2642,77 @@ public sealed class MLTrainingWorker : BackgroundService
     /// <param name="parentOobAccuracy">OOB accuracy of the previous champion (for regression guard).</param>
     // ── Self-tuning retry: analyze failure and queue adjusted run ──────────
 
+    /// <summary>
+    /// Track the outcome of a retrain attempt on the current-champion model for the
+    /// symbol+timeframe of the failed run. On a failed retrain, increments
+    /// <see cref="MLModel.ConsecutiveRetrainFailures"/>; when the count exceeds the
+    /// configured threshold, retires the champion (Status=Failed, DegradationRetiredAt=now,
+    /// lifecycle log). This prevents an infinite retrain loop for a strategy that has
+    /// lost its edge — the drift monitor triggers a retrain, the new model fails to beat
+    /// the degraded baseline, drift fires again, repeat. After N such failures the edge
+    /// is almost certainly gone; retire the model and alert for human review.
+    /// </summary>
+    private async Task TrackRetrainOutcomeAsync(
+        DbContext                  ctx,
+        IWriteApplicationDbContext db,
+        MLTrainingRun              run,
+        bool                       promoted,
+        CancellationToken          ct)
+    {
+        try
+        {
+            if (promoted) return; // Success path: new champion created fresh with counter=0; nothing to do on outgoing.
+
+            int maxFailures = await GetConfigAsync<int>(ctx, "MLTraining:MaxConsecutiveRetrainFailures", 3, ct);
+            if (maxFailures <= 0) return; // disabled
+
+            // Find the current active champion for this symbol+timeframe
+            var champion = await ctx.Set<MLModel>()
+                .Where(m => m.Symbol == run.Symbol
+                         && m.Timeframe == run.Timeframe
+                         && m.Status == MLModelStatus.Active
+                         && !m.IsDeleted)
+                .FirstOrDefaultAsync(ct);
+
+            if (champion is null) return; // No champion to track against (first-ever train for this pair)
+
+            champion.ConsecutiveRetrainFailures++;
+            _logger.LogWarning(
+                "Retrain failure tracked: model {ModelId} ({Symbol}/{Tf}) now at {Count}/{Max} consecutive failures",
+                champion.Id, champion.Symbol, champion.Timeframe,
+                champion.ConsecutiveRetrainFailures, maxFailures);
+
+            if (champion.ConsecutiveRetrainFailures >= maxFailures)
+            {
+                // Retire the champion — its edge is gone. A new strategy/model must be
+                // generated via StrategyGenerationCycleRunner rather than another retrain
+                // of the same architecture on the same (now-unprofitable) regime.
+                champion.Status               = MLModelStatus.Failed;
+                champion.IsActive             = false;
+                champion.DegradationRetiredAt = DateTime.UtcNow;
+
+                db.GetDbContext().Add(new MLModelLifecycleLog
+                {
+                    MLModelId = champion.Id,
+                    EventType = "DegradationRetirement",
+                    OccurredAt = DateTime.UtcNow,
+                    Reason = $"Retired after {champion.ConsecutiveRetrainFailures} consecutive failed retrains — edge likely gone, generate a new strategy rather than retrain",
+                });
+
+                _logger.LogError(
+                    "Model {ModelId} ({Symbol}/{Tf}) retired due to degradation — {Count} consecutive failed retrains exceeded threshold {Max}",
+                    champion.Id, champion.Symbol, champion.Timeframe,
+                    champion.ConsecutiveRetrainFailures, maxFailures);
+            }
+
+            await db.SaveChangesAsync(ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "TrackRetrainOutcomeAsync failed for run {RunId} — retirement path skipped", run.Id);
+        }
+    }
+
     private async Task MaybeQueueSelfTuningRetryAsync(
         DbContext                  ctx,
         IWriteApplicationDbContext db,
@@ -2620,8 +2767,38 @@ public sealed class MLTrainingWorker : BackgroundService
                 return;
             }
 
-            // Analyze failure patterns from error message
+            // Analyze failure patterns from error message.
+            //
+            // CRITICAL: distinguish TECHNICAL failures (retry sensibly) from PERFORMANCE
+            // failures (don't retry — you're chasing noise). A NaN loss or CUDA OOM is
+            // a compute problem: different hyperparams may actually help. A low Sharpe
+            // or poor F1 is the data telling you "this strategy has no edge" — retrying
+            // with tweaked hyperparams overfits to whatever validation-fold coincidence
+            // gave the best metric, producing a model that looks good in CV but has no
+            // predictive power out-of-sample. This is the #1 operational foot-gun in
+            // retail quant pipelines.
+            //
+            // Gate by MLTraining:SelfTuningRetryOnPerformanceFailure (default false).
+            // Leave false unless you have explicit evidence that retry-on-performance
+            // actually lifts live P&L over baseline. Most teams do not.
             var error = failedRun.ErrorMessage ?? "";
+
+            bool isTechnicalFailure =
+                   error.Contains("NaN", StringComparison.OrdinalIgnoreCase)
+                || error.Contains("Infinity", StringComparison.OrdinalIgnoreCase)
+                || error.Contains("OutOfMemory", StringComparison.OrdinalIgnoreCase)
+                || error.Contains("OOM", StringComparison.OrdinalIgnoreCase)
+                || error.Contains("CUDA", StringComparison.OrdinalIgnoreCase)
+                || error.Contains("divergence", StringComparison.OrdinalIgnoreCase)
+                || error.Contains("diverged", StringComparison.OrdinalIgnoreCase)
+                || error.Contains("singular", StringComparison.OrdinalIgnoreCase)
+                || error.Contains("timeout", StringComparison.OrdinalIgnoreCase)
+                || error.Contains("cancelled", StringComparison.OrdinalIgnoreCase)
+                || error.Contains("connection", StringComparison.OrdinalIgnoreCase);
+
+            bool retryOnPerfFailure = await GetConfigAsync<bool>(
+                ctx, "MLTraining:SelfTuningRetryOnPerformanceFailure", false, ct);
+
             var overrides = new HyperparamOverrides
             {
                 TriggeredBy          = "SelfTuningRetry",
@@ -2631,17 +2808,35 @@ public sealed class MLTrainingWorker : BackgroundService
 
             var patterns = new List<string>();
 
-            if (error.Contains("f1", StringComparison.OrdinalIgnoreCase))
-                patterns.Add("f1");
-            if (error.Contains("accuracy", StringComparison.OrdinalIgnoreCase))
-                patterns.Add("accuracy");
-            if (error.Contains("sharpe", StringComparison.OrdinalIgnoreCase))
-                patterns.Add("sharpe");
-            if (error.Contains("ev ", StringComparison.OrdinalIgnoreCase) ||
-                error.Contains("ev -", StringComparison.OrdinalIgnoreCase))
-                patterns.Add("ev");
-            if (error.Contains("brier", StringComparison.OrdinalIgnoreCase))
-                patterns.Add("brier");
+            // Always honour technical-failure patterns — they legitimately benefit from retry
+            if (error.Contains("nan",      StringComparison.OrdinalIgnoreCase)) patterns.Add("nan");
+            if (error.Contains("oom",      StringComparison.OrdinalIgnoreCase)) patterns.Add("oom");
+            if (error.Contains("diverge",  StringComparison.OrdinalIgnoreCase)) patterns.Add("divergence");
+
+            // Performance-metric patterns — only honour when the operator has explicitly
+            // opted in. The legacy behaviour (always retry) is now opt-in.
+            if (retryOnPerfFailure)
+            {
+                if (error.Contains("f1", StringComparison.OrdinalIgnoreCase))
+                    patterns.Add("f1");
+                if (error.Contains("accuracy", StringComparison.OrdinalIgnoreCase))
+                    patterns.Add("accuracy");
+                if (error.Contains("sharpe", StringComparison.OrdinalIgnoreCase))
+                    patterns.Add("sharpe");
+                if (error.Contains("ev ", StringComparison.OrdinalIgnoreCase) ||
+                    error.Contains("ev -", StringComparison.OrdinalIgnoreCase))
+                    patterns.Add("ev");
+                if (error.Contains("brier", StringComparison.OrdinalIgnoreCase))
+                    patterns.Add("brier");
+            }
+            else if (!isTechnicalFailure)
+            {
+                // Performance-only failure AND retry-on-performance is disabled — abandon.
+                _logger.LogInformation(
+                    "Run {RunId}: performance-only failure ({Error}) — abandoning per SelfTuningRetryOnPerformanceFailure=false",
+                    failedRun.Id, error.Length > 120 ? error[..120] : error);
+                return;
+            }
 
             if (patterns.Count == 0)
             {

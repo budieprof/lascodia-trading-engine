@@ -356,6 +356,28 @@ public class MLModel : Entity<long>
     /// </summary>
     public string? DatasetHash { get; set; }
 
+    // ── Degradation tracking (set by MLTrainingWorker on retrain outcomes) ──
+
+    /// <summary>
+    /// Count of consecutive retrain attempts that produced a worse or equal-quality
+    /// model. Reset to 0 when a retrain actually improves the model (by DSR, Sharpe,
+    /// or EV — see <c>MLTraining:RetrainImprovementMetric</c>). When this exceeds
+    /// <c>MLTraining:MaxConsecutiveRetrainFailures</c> the model is retired rather
+    /// than retrained again, preventing infinite compute on a strategy that has
+    /// lost its edge. "Failed retrain" here means the new model's key metric did
+    /// not improve on the outgoing champion — the strategy's edge is gone, not the
+    /// training pipeline.
+    /// </summary>
+    public int ConsecutiveRetrainFailures { get; set; }
+
+    /// <summary>
+    /// UTC timestamp when this model was retired due to exhausted retrain attempts.
+    /// Null for active / non-retired models. Set alongside <c>Status = Failed</c> +
+    /// a lifecycle log entry with the "DegradationRetirement" reason so operators
+    /// can distinguish edge-lost retirement from training failure.
+    /// </summary>
+    public DateTime? DegradationRetiredAt { get; set; }
+
     // ── Navigation: lifecycle log ────────────────────────────────────────────
 
     /// <summary>Immutable lifecycle transition log (promotions, rollbacks, suppressions).</summary>

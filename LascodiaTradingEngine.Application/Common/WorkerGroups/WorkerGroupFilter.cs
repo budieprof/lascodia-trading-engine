@@ -50,6 +50,7 @@ public static class WorkerGroupFilter
         typeof(StrategyHealthWorker),
         typeof(StrategyFeedbackWorker),
         typeof(CorrelationMatrixWorker),
+        typeof(SlippageDriftWorker),
     ];
 
     private static readonly Type[] MLTrainingWorkers =

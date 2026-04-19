@@ -140,6 +140,12 @@ public static class DependencyInjection
             sp => sp.GetRequiredService<DrawdownMonitorWorker>());
         services.AddHostedService(sp => sp.GetRequiredService<DrawdownMonitorWorker>());
 
+        // ── Slippage Drift Monitor ─────────────────────────────────────────────
+        // Detects strategy crowding by comparing recent-window (7d) vs baseline-window
+        // (30d) average slippage per symbol. Rising slippage is a leading indicator
+        // of capacity exhaustion, catching edge decay 2-6 weeks before Sharpe does.
+        services.AddHostedService<SlippageDriftWorker>();
+
         // ── HTTP Clients ─────────────────────────────────────────────────────────
         services.AddHttpClient();
 
