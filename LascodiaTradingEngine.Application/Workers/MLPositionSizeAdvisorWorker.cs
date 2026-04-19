@@ -237,33 +237,12 @@ public sealed class MLPositionSizeAdvisorWorker : BackgroundService
     /// <param name="key">Config key (e.g. <c>MLKelly:EURUSD:H1:LiveMultiplier</c>).</param>
     /// <param name="value">Four-decimal string representation of the multiplier.</param>
     /// <param name="ct">Cancellation token.</param>
-    private static async Task UpsertConfigAsync(
+    private static Task UpsertConfigAsync(
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
         string                                  key,
         string                                  value,
         CancellationToken                       ct)
-    {
-        int rows = await writeCtx.Set<EngineConfig>()
-            .Where(c => c.Key == key)
-            .ExecuteUpdateAsync(s => s
-                .SetProperty(c => c.Value,         value)
-                .SetProperty(c => c.LastUpdatedAt, DateTime.UtcNow),
-                ct);
-
-        if (rows == 0)
-        {
-            writeCtx.Set<EngineConfig>().Add(new EngineConfig
-            {
-                Key             = key,
-                Value           = value,
-                DataType        = ConfigDataType.Decimal,
-                Description     = "Live-accuracy-based Kelly fraction multiplier. Written by MLPositionSizeAdvisorWorker.",
-                IsHotReloadable = true,
-                LastUpdatedAt   = DateTime.UtcNow,
-            });
-            await writeCtx.SaveChangesAsync(ct);
-        }
-    }
+        => LascodiaTradingEngine.Application.Common.Utilities.EngineConfigUpsert.UpsertAsync(writeCtx, key, value, dataType: LascodiaTradingEngine.Domain.Enums.ConfigDataType.Decimal, ct: ct);
 
     // ── Config helper ─────────────────────────────────────────────────────────
 

@@ -39,6 +39,16 @@ public class BacktestOptions
     public decimal ContractSize { get; set; } = 100_000m;
 
     /// <summary>
+    /// Pip size in price units for the instrument under test, used to normalise PnL across
+    /// pairs with different quote precisions. Defaults to 0.0001 (EUR/USD-style pairs). For
+    /// JPY-quoted pairs use 0.01. Without this normalisation a 50-pip move on GBPJPY produces
+    /// a raw PnL 100× larger than the same 50-pip move on EURUSD, which inflates the equity
+    /// curve and every downstream metric (drawdown, Sharpe, etc.) for JPY pairs. Value of
+    /// 0.0001 is a safe default because the normalisation factor becomes 1.0.
+    /// </summary>
+    public decimal PipSizeInPriceUnits { get; set; } = 0.0001m;
+
+    /// <summary>
     /// Simulated bid-ask spread in price units. Applied to entry (buy at ask = mid + half spread)
     /// and exit prices. Defaults to 0.
     /// </summary>
@@ -168,7 +178,7 @@ public class BacktestEngine : IBacktestEngine
                         ? exitPrice - exitSlip   // Long exit: bid side, slip down
                         : exitPrice + exitSlip;  // Short exit: ask side, slip up
 
-                    decimal grossPnl = CalculatePnL(direction, entryPrice, slippedExit, lotSize, options.ContractSize);
+                    decimal grossPnl = CalculatePnL(direction, entryPrice, slippedExit, lotSize, options.ContractSize, options.PipSizeInPriceUnits);
                     decimal commission = lotSize * options.CommissionPerLot;
                     decimal daysHeldExact = (decimal)(bar.Timestamp - entryTime).TotalDays;
                     decimal swap = lotSize * options.SwapPerLotPerDay * Math.Max(daysHeldExact, 0m);
@@ -206,7 +216,7 @@ public class BacktestEngine : IBacktestEngine
                     decimal mtmExit = direction == TradeDirection.Buy
                         ? bar.Close - halfSpread
                         : bar.Close + halfSpread;
-                    decimal unrealised = CalculatePnL(direction, entryPrice, mtmExit, lotSize, options.ContractSize);
+                    decimal unrealised = CalculatePnL(direction, entryPrice, mtmExit, lotSize, options.ContractSize, options.PipSizeInPriceUnits);
                     equityCurve.Add(balance + unrealised);
                 }
                 else
@@ -274,7 +284,7 @@ public class BacktestEngine : IBacktestEngine
                 ? lastBar.Close - exitSlip
                 : lastBar.Close + exitSlip;
 
-            decimal grossPnl = CalculatePnL(direction, entryPrice, exitPrice, lotSize, options.ContractSize);
+            decimal grossPnl = CalculatePnL(direction, entryPrice, exitPrice, lotSize, options.ContractSize, options.PipSizeInPriceUnits);
             decimal commission = lotSize * options.CommissionPerLot;
             decimal daysHeldExact = (decimal)(lastBar.Timestamp - entryTime).TotalDays;
             decimal swap = lotSize * options.SwapPerLotPerDay * Math.Max(daysHeldExact, 0m);
@@ -506,11 +516,19 @@ public class BacktestEngine : IBacktestEngine
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
+    private const decimal StandardPipSize = 0.0001m;
+
     private static decimal CalculatePnL(
-        TradeDirection direction, decimal entry, decimal exit, decimal lots, decimal contractSize = 100_000m)
+        TradeDirection direction, decimal entry, decimal exit, decimal lots,
+        decimal contractSize = 100_000m, decimal pipSize = StandardPipSize)
     {
         decimal priceDiff = direction == TradeDirection.Buy ? exit - entry : entry - exit;
-        return priceDiff * lots * contractSize;
+        // Normalise by pip size so a 50-pip move produces comparable PnL across pairs with
+        // different quote precisions. Without this, JPY pairs (pipSize=0.01) would yield a
+        // raw PnL 100× the equivalent move on USD pairs (pipSize=0.0001), inflating the
+        // equity curve and every dependent metric (drawdown, Sharpe, Calmar).
+        decimal normalisation = pipSize > 0 ? StandardPipSize / pipSize : 1m;
+        return priceDiff * normalisation * lots * contractSize;
     }
 
     private static decimal CalculateMaxDrawdownPct(List<decimal> equityCurve)

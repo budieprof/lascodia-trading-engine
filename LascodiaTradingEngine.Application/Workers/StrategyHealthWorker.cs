@@ -562,23 +562,7 @@ public class StrategyHealthWorker : BackgroundService
         catch { return defaultValue; }
     }
 
-    private static async Task UpsertConfigAsync(
+    private static Task UpsertConfigAsync(
         IWriteApplicationDbContext writeCtx, string key, string value, CancellationToken ct)
-    {
-        var db = writeCtx.GetDbContext();
-        int rows = await db.Set<EngineConfig>()
-            .Where(c => c.Key == key)
-            .ExecuteUpdateAsync(s => s.SetProperty(c => c.Value, value), ct);
-
-        if (rows == 0)
-        {
-            db.Set<EngineConfig>().Add(new EngineConfig
-            {
-                Key      = key,
-                Value    = value,
-                DataType = ConfigDataType.String,
-            });
-            await writeCtx.SaveChangesAsync(ct);
-        }
-    }
+        => LascodiaTradingEngine.Application.Common.Utilities.EngineConfigUpsert.UpsertAsync(writeCtx.GetDbContext(), key, value, ct: ct);
 }

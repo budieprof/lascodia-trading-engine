@@ -391,32 +391,12 @@ public sealed class MLDegradationModeWorker : BackgroundService
     /// updates its value and <see cref="EngineConfig.LastUpdatedAt"/> timestamp. Otherwise
     /// creates a new record with <see cref="ConfigDataType.String"/> and hot-reload enabled.
     /// </summary>
-    private static async Task UpsertConfigAsync(
+    private static Task UpsertConfigAsync(
         DbContext         writeCtx,
         string            key,
         string            value,
         string            description,
         CancellationToken ct)
-    {
-        var existing = await writeCtx.Set<EngineConfig>()
-            .FirstOrDefaultAsync(c => c.Key == key, ct);
-
-        if (existing is not null)
-        {
-            existing.Value         = value;
-            existing.LastUpdatedAt = DateTime.UtcNow;
-        }
-        else
-        {
-            writeCtx.Set<EngineConfig>().Add(new EngineConfig
-            {
-                Key             = key,
-                Value           = value,
-                Description     = description,
-                DataType        = ConfigDataType.String,
-                IsHotReloadable = true,
-                LastUpdatedAt   = DateTime.UtcNow,
-            });
-        }
-    }
+        => LascodiaTradingEngine.Application.Common.Utilities.EngineConfigUpsert.UpsertAsync(
+            writeCtx, key, value, description: description, ct: ct);
 }

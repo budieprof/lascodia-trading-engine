@@ -526,31 +526,12 @@ public sealed class MLCovariateShiftWorker : BackgroundService
     /// Upserts an <see cref="EngineConfig"/> entry. Updates the existing row if the key
     /// already exists, otherwise inserts a new one.
     /// </summary>
-    private static async Task UpsertConfigAsync(
+    private static Task UpsertConfigAsync(
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
         string                                  key,
         string                                  value,
         CancellationToken                       ct)
-    {
-        int rows = await writeCtx.Set<EngineConfig>()
-            .Where(c => c.Key == key)
-            .ExecuteUpdateAsync(s => s
-                .SetProperty(c => c.Value, value)
-                .SetProperty(c => c.LastUpdatedAt, DateTime.UtcNow), ct);
-
-        if (rows == 0)
-        {
-            writeCtx.Set<EngineConfig>().Add(new EngineConfig
-            {
-                Key             = key,
-                Value           = value,
-                DataType        = Domain.Enums.ConfigDataType.Json,
-                Description     = "Per-feature PSI drift data written by MLCovariateShiftWorker.",
-                IsHotReloadable = true,
-                LastUpdatedAt   = DateTime.UtcNow,
-            });
-        }
-    }
+        => LascodiaTradingEngine.Application.Common.Utilities.EngineConfigUpsert.UpsertAsync(writeCtx, key, value, dataType: LascodiaTradingEngine.Domain.Enums.ConfigDataType.Json, ct: ct);
 
     /// <summary>
     /// Reads a typed value from <see cref="EngineConfig"/> or returns <paramref name="defaultValue"/>

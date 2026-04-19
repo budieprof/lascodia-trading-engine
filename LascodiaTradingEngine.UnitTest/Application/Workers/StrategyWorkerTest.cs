@@ -2,6 +2,7 @@ using System.Diagnostics.Metrics;
 using System.Reflection;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Moq;
@@ -141,6 +142,7 @@ public class StrategyWorkerTest : IDisposable
         mockScope.Setup(s => s.ServiceProvider).Returns(mockProvider.Object);
         _mockScopeFactory.Setup(f => f.CreateScope()).Returns(mockScope.Object);
 
+        var memoryCache = new MemoryCache(new MemoryCacheOptions());
         _worker = new StrategyWorker(
             _mockLogger.Object,
             _mockScopeFactory.Object,
@@ -150,7 +152,8 @@ public class StrategyWorkerTest : IDisposable
             _options,
             _metrics,
             new SignalConflictResolver(new Mock<ILogger<SignalConflictResolver>>().Object),
-            new RegimeCoherenceChecker(_mockScopeFactory.Object, new Mock<ILogger<RegimeCoherenceChecker>>().Object));
+            new RegimeCoherenceChecker(_mockScopeFactory.Object, memoryCache, new Mock<ILogger<RegimeCoherenceChecker>>().Object),
+            new DrawdownRecoveryModeProvider(_mockScopeFactory.Object, memoryCache));
     }
 
     public void Dispose() => _meterFactory.Dispose();

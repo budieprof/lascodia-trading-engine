@@ -95,12 +95,21 @@ public static partial class StrategyGenerationHelpers
                 commissionPerLot *= pipSizeRatio;
         }
 
+        // Pip size = 10 × point size (0.0001 for 5-decimal USD pairs, 0.01 for 3-decimal JPY pairs).
+        // Falls back to 0.0001 when the pair has no DecimalPlaces so USD-pair defaults keep working.
+        // Without this, JPY-pair equity curves are ~100× inflated and every downstream metric
+        // (MaxDrawdownPct, Sharpe, Calmar) comes out on a wrong scale.
+        decimal pipSizeInPriceUnits = pairInfo != null && pairInfo.DecimalPlaces > 0
+            ? pointSize * 10m
+            : 0.0001m;
+
         return new LascodiaTradingEngine.Application.Backtesting.Services.BacktestOptions
         {
             SpreadPriceUnits = spreadPriceUnits,
             CommissionPerLot = commissionPerLot,
             SlippagePriceUnits = pointSize * (decimal)screeningSlippagePips * 10,
             ContractSize = pairInfo?.ContractSize ?? GetDefaultContractSize(assetClass),
+            PipSizeInPriceUnits = pipSizeInPriceUnits,
         };
     }
 

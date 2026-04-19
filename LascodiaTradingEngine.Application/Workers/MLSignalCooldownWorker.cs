@@ -308,38 +308,12 @@ public sealed class MLSignalCooldownWorker : BackgroundService
     /// <param name="key">The EngineConfig key to create or update.</param>
     /// <param name="value">The new value to store (ISO-8601 timestamp string for cooldown expiry keys).</param>
     /// <param name="ct">Cancellation token.</param>
-    private static async Task UpsertConfigAsync(
+    private static Task UpsertConfigAsync(
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
         string                                  key,
         string                                  value,
         CancellationToken                       ct)
-    {
-        // Attempt bulk update — returns 0 if the key doesn't exist yet.
-        int rows = await writeCtx.Set<EngineConfig>()
-            .Where(c => c.Key == key)
-            .ExecuteUpdateAsync(s => s
-                .SetProperty(c => c.Value,         value)
-                .SetProperty(c => c.LastUpdatedAt, DateTime.UtcNow),
-                ct);
-
-        if (rows == 0)
-        {
-            // Key does not exist — insert a new EngineConfig row.
-            // IsHotReloadable = true allows the cooldown expiry to be manually overridden
-            // via the EngineConfiguration API without restarting the worker.
-            writeCtx.Set<EngineConfig>().Add(new EngineConfig
-            {
-                Key             = key,
-                Value           = value,
-                DataType        = ConfigDataType.String,
-                Description     = "Cooldown expiry ISO-8601 timestamp for consecutive-miss suppression. " +
-                                  "Written by MLSignalCooldownWorker.",
-                IsHotReloadable = true,
-                LastUpdatedAt   = DateTime.UtcNow,
-            });
-            await writeCtx.SaveChangesAsync(ct);
-        }
-    }
+        => LascodiaTradingEngine.Application.Common.Utilities.EngineConfigUpsert.UpsertAsync(writeCtx, key, value, ct: ct);
 
     // ── Config helper ─────────────────────────────────────────────────────────
 

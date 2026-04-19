@@ -15,6 +15,29 @@ public sealed partial class AdaBoostModelTrainer
         catch { return false; }
     }
 
+    // Distinguishes "torch native library loaded at all" from "CUDA available".
+    // AdaBoost uses torch unconditionally in its AdaptiveHeads / CovariateShift
+    // partials (unlike other trainers that gate torch behind IsGpuAvailable).
+    // On containers/hosts where libtorch fails to initialise — e.g. missing
+    // native deps on some arm64 runtimes — those partial methods would throw
+    // a type-initializer exception that escapes the whole training run. This
+    // cached probe lets each torch-using method short-circuit to a pure-C#
+    // fallback instead of failing the run.
+    private static readonly Lazy<bool> _torchCpuAvailable = new(() =>
+    {
+        try
+        {
+            using var t = zeros(1);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    });
+
+    internal static bool IsTorchCpuAvailable => _torchCpuAvailable.Value;
+
     /// <summary>
     /// GPU-accelerated density-ratio weight computation. Moves the logistic discriminator
     /// to CUDA for vectorised forward/backward passes. Falls back to CPU on failure.

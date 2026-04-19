@@ -3,6 +3,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Services;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 using MarketRegimeEnum = LascodiaTradingEngine.Domain.Enums.MarketRegime;
@@ -61,6 +62,13 @@ public class RegimeDetectionWorker : BackgroundService
     /// </summary>
     private readonly IMarketRegimeDetector _regimeDetector;
 
+    /// <summary>
+    /// Coherence checker whose per-symbol score cache must be invalidated when a new
+    /// snapshot changes the regime — otherwise StrategyWorker could suppress signals
+    /// (or fail to suppress) based on a stale coherence value until the TTL expires.
+    /// </summary>
+    private readonly RegimeCoherenceChecker _coherenceChecker;
+
     /// <summary>How frequently the worker wakes up to run a full regime detection pass.</summary>
     private static readonly TimeSpan PollingInterval = TimeSpan.FromSeconds(60);
 
@@ -100,11 +108,13 @@ public class RegimeDetectionWorker : BackgroundService
     public RegimeDetectionWorker(
         ILogger<RegimeDetectionWorker> logger,
         IServiceScopeFactory scopeFactory,
-        IMarketRegimeDetector regimeDetector)
+        IMarketRegimeDetector regimeDetector,
+        RegimeCoherenceChecker coherenceChecker)
     {
-        _logger         = logger;
-        _scopeFactory   = scopeFactory;
-        _regimeDetector = regimeDetector;
+        _logger           = logger;
+        _scopeFactory     = scopeFactory;
+        _regimeDetector   = regimeDetector;
+        _coherenceChecker = coherenceChecker;
     }
 
     /// <summary>
@@ -225,6 +235,17 @@ public class RegimeDetectionWorker : BackgroundService
                 return;
             }
 
+            // Read the most-recent prior snapshot on the same (symbol, timeframe) so we
+            // can detect a regime change and invalidate the coherence cache only when
+            // the new snapshot would actually shift coherence.
+            var priorRegime = await readContext.GetDbContext()
+                .Set<MarketRegimeSnapshot>()
+                .AsNoTracking()
+                .Where(r => r.Symbol == symbol && r.Timeframe == timeframe && !r.IsDeleted)
+                .OrderByDescending(r => r.DetectedAt)
+                .Select(r => (MarketRegimeEnum?)r.Regime)
+                .FirstOrDefaultAsync(ct);
+
             // Delegate to the injected detector for the actual classification logic.
             // The returned snapshot contains the regime label, a confidence score (0–1),
             // and the raw ADX value used for classification.
@@ -237,6 +258,11 @@ public class RegimeDetectionWorker : BackgroundService
                 .AddAsync(snapshot, ct);
 
             await writeContext.SaveChangesAsync(ct);
+
+            // Invalidate the coherence cache when the regime flipped. A no-op save
+            // (same regime as before) is left alone — the cached score is still correct.
+            if (priorRegime != snapshot.Regime)
+                _coherenceChecker.Invalidate(symbol);
 
             // Track the latest detected regime for dynamic interval adjustment
             _latestDetectedRegime = snapshot.Regime;

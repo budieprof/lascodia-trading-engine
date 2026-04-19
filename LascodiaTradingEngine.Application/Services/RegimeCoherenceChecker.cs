@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Attributes;
@@ -54,7 +55,13 @@ namespace LascodiaTradingEngine.Application.Services;
 public class RegimeCoherenceChecker
 {
     private readonly IServiceScopeFactory _scopeFactory;
+    private readonly IMemoryCache _cache;
     private readonly ILogger<RegimeCoherenceChecker> _logger;
+
+    // Cache TTL matches RegimeDetectionWorker polling cadence (60s). Bounds staleness
+    // to one detection cycle — coherence cannot shift faster than the underlying
+    // snapshots are refreshed, so a value older than this is guaranteed fresh.
+    private static readonly TimeSpan CacheTtl = TimeSpan.FromSeconds(30);
 
     /// <summary>
     /// Regimes that indicate a directional market — price is moving with momentum in one direction.
@@ -83,11 +90,22 @@ public class RegimeCoherenceChecker
 
     public RegimeCoherenceChecker(
         IServiceScopeFactory scopeFactory,
+        IMemoryCache cache,
         ILogger<RegimeCoherenceChecker> logger)
     {
         _scopeFactory = scopeFactory;
+        _cache        = cache;
         _logger       = logger;
     }
+
+    /// <summary>
+    /// Drops the cached coherence score for a symbol so the next call recomputes.
+    /// Intended for use from <see cref="Workers.RegimeDetectionWorker"/> when a new
+    /// snapshot is persisted with a different regime than the previous one.
+    /// </summary>
+    public void Invalidate(string symbol) => _cache.Remove(BuildCacheKey(symbol));
+
+    private static string BuildCacheKey(string symbol) => $"regime-coherence:{symbol}";
 
     /// <summary>
     /// Computes the cross-timeframe regime coherence score for a symbol.
@@ -106,6 +124,10 @@ public class RegimeCoherenceChecker
         string symbol,
         CancellationToken cancellationToken)
     {
+        var cacheKey = BuildCacheKey(symbol);
+        if (_cache.TryGetValue(cacheKey, out decimal cached))
+            return cached;
+
         // Create a scoped DB context because this singleton is called from the singleton
         // StrategyWorker — we can't inject a scoped IReadApplicationDbContext directly.
         using var scope = _scopeFactory.CreateScope();
@@ -132,7 +154,10 @@ public class RegimeCoherenceChecker
         // the RegimeDetectionWorker hasn't processed all timeframes yet (e.g. on startup
         // before H4/D1 candles have closed for the first time).
         if (regimes.Count <= 1)
+        {
+            _cache.Set(cacheKey, 1.0m, CacheTtl);
             return 1.0m;
+        }
 
         // ── Step 3: Majority-based coherence calculation ────────────────────
         // Find the most common regime among the timeframes. The coherence score is the
@@ -169,6 +194,7 @@ public class RegimeCoherenceChecker
         if (regimes.All(r => r == MarketRegimeEnum.Crisis))
             coherence = Math.Min(1.0m, coherence + 0.2m); // strong consensus bonus
 
+        _cache.Set(cacheKey, coherence, CacheTtl);
         return coherence;
     }
 }

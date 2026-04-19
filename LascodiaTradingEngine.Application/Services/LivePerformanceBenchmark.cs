@@ -257,29 +257,10 @@ public class LivePerformanceBenchmark : ILivePerformanceBenchmark
             : values[mid];
     }
 
-    private static async Task UpsertConfigAsync(
+    private static Task UpsertConfigAsync(
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
         string key,
         string value,
         CancellationToken ct)
-    {
-        int rows = await writeCtx.Set<EngineConfig>()
-            .Where(c => c.Key == key)
-            .ExecuteUpdateAsync(s => s
-                .SetProperty(c => c.Value, value)
-                .SetProperty(c => c.LastUpdatedAt, DateTime.UtcNow), ct);
-
-        if (rows == 0)
-        {
-            writeCtx.Set<EngineConfig>().Add(new EngineConfig
-            {
-                Key             = key,
-                Value           = value,
-                DataType        = ConfigDataType.Decimal,
-                Description     = $"Live performance benchmark haircut ratio computed by LivePerformanceBenchmark.",
-                IsHotReloadable = true,
-                LastUpdatedAt   = DateTime.UtcNow,
-            });
-        }
-    }
+        => LascodiaTradingEngine.Application.Common.Utilities.EngineConfigUpsert.UpsertAsync(writeCtx, key, value, dataType: LascodiaTradingEngine.Domain.Enums.ConfigDataType.Decimal, ct: ct);
 }

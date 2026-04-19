@@ -1,5 +1,6 @@
 # ── Stage 1: Build ────────────────────────────────────────────────────────────
 FROM mcr.microsoft.com/dotnet/sdk:10.0-preview AS build
+ARG TARGETARCH
 WORKDIR /src
 
 # Copy solution and all project files first for layer caching
@@ -27,9 +28,18 @@ RUN dotnet restore
 
 # Copy everything and build
 COPY . .
-RUN dotnet publish LascodiaTradingEngine.API/LascodiaTradingEngine.API.csproj \
+# --runtime linux-<arch> --self-contained false flattens RID-specific native binaries
+# (libtorch.so, libLibTorchSharp.so, etc.) from runtimes/<rid>/native/ into the
+# publish root. Without this, TorchSharp's runtime loader searches only /app/ and
+# fails to find libtorch, making every non-BaggedLogistic ML trainer (AdaBoost, TCN,
+# GBM, TabNet, SVGP, FT-Transformer, ELM, Rocket, QuantileRF, DANN, SMOTE) fall over
+# at init with "type initializer for 'TorchSharp.torch' threw an exception".
+# TARGETARCH comes from buildx (amd64|arm64); mapped to the matching linux RID.
+RUN RID="linux-$([ "$TARGETARCH" = "arm64" ] && echo arm64 || echo x64)" && \
+    dotnet publish LascodiaTradingEngine.API/LascodiaTradingEngine.API.csproj \
     --configuration Release \
-    --no-restore \
+    --runtime "$RID" \
+    --self-contained false \
     --output /app/publish
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────────

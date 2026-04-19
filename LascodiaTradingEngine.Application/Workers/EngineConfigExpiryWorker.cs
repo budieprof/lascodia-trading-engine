@@ -154,11 +154,15 @@ public sealed class EngineConfigExpiryWorker : BackgroundService
         if (expiredIds.Count == 0)
             return 0;
 
-        // Bulk-update expired entries to null.
+        // Soft-delete expired entries. Previously we nullified Value, but EngineConfig.Value
+        // is NOT NULL (see EngineConfigConfiguration.cs) so that raised a 23502 constraint
+        // violation every cycle and took the engine down. Soft-delete keeps the last known
+        // value intact, honours the existing IsDeleted query filter, and matches how other
+        // config rows are logically removed.
         int updated = await writeCtx.Set<EngineConfig>()
             .Where(c => expiredIds.Contains(c.Id))
             .ExecuteUpdateAsync(s => s
-                .SetProperty(c => c.Value, (string?)null)
+                .SetProperty(c => c.IsDeleted, true)
                 .SetProperty(c => c.LastUpdatedAt, now), ct);
 
         return updated;
@@ -223,10 +227,11 @@ public sealed class EngineConfigExpiryWorker : BackgroundService
         {
             ct.ThrowIfCancellationRequested();
 
+            // Soft-delete stale metrics blocks (Value is NOT NULL — see CleanExpiredEntriesAsync).
             int cleaned = await writeCtx.Set<EngineConfig>()
                 .Where(c => c.Key.StartsWith(prefix) && !c.IsDeleted)
                 .ExecuteUpdateAsync(s => s
-                    .SetProperty(c => c.Value, (string?)null)
+                    .SetProperty(c => c.IsDeleted, true)
                     .SetProperty(c => c.LastUpdatedAt, now), ct);
 
             totalCleaned += cleaned;

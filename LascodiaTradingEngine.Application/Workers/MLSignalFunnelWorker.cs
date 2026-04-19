@@ -351,35 +351,12 @@ public sealed class MLSignalFunnelWorker : BackgroundService
     /// <param name="key">The EngineConfig key to create or update (e.g. <c>MLFunnel:EURUSD:FillRate</c>).</param>
     /// <param name="value">The string value to store (numeric metric as fixed-precision string).</param>
     /// <param name="ct">Cancellation token.</param>
-    private static async Task UpsertConfigAsync(
+    private static Task UpsertConfigAsync(
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
         string                                  key,
         string                                  value,
         CancellationToken                       ct)
-    {
-        // Bulk update path — efficient when the key already exists from a previous cycle.
-        int rows = await writeCtx.Set<EngineConfig>()
-            .Where(c => c.Key == key)
-            .ExecuteUpdateAsync(s => s
-                .SetProperty(c => c.Value,         value)
-                .SetProperty(c => c.LastUpdatedAt, DateTime.UtcNow),
-                ct);
-
-        if (rows == 0)
-        {
-            // Key does not exist yet — first cycle or new symbol. Insert a new row.
-            writeCtx.Set<EngineConfig>().Add(new EngineConfig
-            {
-                Key             = key,
-                Value           = value,
-                DataType        = ConfigDataType.String,
-                Description     = "ML signal funnel metric. Written by MLSignalFunnelWorker.",
-                IsHotReloadable = true,
-                LastUpdatedAt   = DateTime.UtcNow,
-            });
-            await writeCtx.SaveChangesAsync(ct);
-        }
-    }
+        => LascodiaTradingEngine.Application.Common.Utilities.EngineConfigUpsert.UpsertAsync(writeCtx, key, value, ct: ct);
 
     // ── Config helper ─────────────────────────────────────────────────────────
 

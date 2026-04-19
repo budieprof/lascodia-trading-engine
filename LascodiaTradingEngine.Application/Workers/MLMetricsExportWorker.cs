@@ -212,29 +212,10 @@ public sealed class MLMetricsExportWorker : BackgroundService
         catch { return defaultValue; }
     }
 
-    private static async Task UpsertConfigAsync(
+    private static Task UpsertConfigAsync(
         Microsoft.EntityFrameworkCore.DbContext ctx,
         string                                  key,
         string                                  value,
         CancellationToken                       ct)
-    {
-        int updated = await ctx.Set<EngineConfig>()
-            .Where(c => c.Key == key)
-            .ExecuteUpdateAsync(s => s
-                .SetProperty(c => c.Value, value)
-                .SetProperty(c => c.LastUpdatedAt, DateTime.UtcNow), ct);
-
-        if (updated == 0)
-        {
-            ctx.Set<EngineConfig>().Add(new EngineConfig
-            {
-                Key             = key,
-                Value           = value,
-                DataType        = ConfigDataType.String,
-                IsHotReloadable = true,
-                LastUpdatedAt   = DateTime.UtcNow,
-            });
-            await ctx.SaveChangesAsync(ct);
-        }
-    }
+        => LascodiaTradingEngine.Application.Common.Utilities.EngineConfigUpsert.UpsertAsync(ctx, key, value, ct: ct);
 }

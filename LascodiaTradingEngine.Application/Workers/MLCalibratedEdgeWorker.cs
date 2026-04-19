@@ -330,35 +330,12 @@ public sealed class MLCalibratedEdgeWorker : BackgroundService
     /// <param name="key">Config key (e.g. <c>MLEdge:EURUSD:H1:ExpectedValue</c>).</param>
     /// <param name="value">String value to persist (four-decimal EV).</param>
     /// <param name="ct">Cancellation token.</param>
-    private static async Task UpsertConfigAsync(
+    private static Task UpsertConfigAsync(
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
         string                                  key,
         string                                  value,
         CancellationToken                       ct)
-    {
-        int rows = await writeCtx.Set<EngineConfig>()
-            .Where(c => c.Key == key)
-            .ExecuteUpdateAsync(s => s
-                .SetProperty(c => c.Value,         value)
-                .SetProperty(c => c.LastUpdatedAt, DateTime.UtcNow),
-                ct);
-
-        if (rows == 0)
-        {
-            // First write for this symbol/timeframe pair — create the row with
-            // descriptive metadata so operators can identify its purpose.
-            writeCtx.Set<EngineConfig>().Add(new EngineConfig
-            {
-                Key             = key,
-                Value           = value,
-                DataType        = ConfigDataType.String,
-                Description     = "Expected value per trade (pips). Written by MLCalibratedEdgeWorker.",
-                IsHotReloadable = true,
-                LastUpdatedAt   = DateTime.UtcNow,
-            });
-            await writeCtx.SaveChangesAsync(ct);
-        }
-    }
+        => LascodiaTradingEngine.Application.Common.Utilities.EngineConfigUpsert.UpsertAsync(writeCtx, key, value, ct: ct);
 
     // ── Config helper ─────────────────────────────────────────────────────────
 

@@ -106,6 +106,7 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
     private readonly TradingMetrics _metrics;
     private readonly ISignalConflictResolver _signalConflictResolver;
     private readonly RegimeCoherenceChecker _regimeCoherenceChecker;
+    private readonly DrawdownRecoveryModeProvider _drawdownRecoveryModeProvider;
 
     /// <summary>Tracks the last signal creation time per strategy to enforce cooldown.</summary>
     private readonly ConcurrentDictionary<long, DateTime> _lastSignalTime = new();
@@ -161,17 +162,19 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
         StrategyEvaluatorOptions options,
         TradingMetrics metrics,
         ISignalConflictResolver signalConflictResolver,
-        RegimeCoherenceChecker regimeCoherenceChecker)
+        RegimeCoherenceChecker regimeCoherenceChecker,
+        DrawdownRecoveryModeProvider drawdownRecoveryModeProvider)
     {
-        _logger                  = logger;
-        _scopeFactory            = scopeFactory;    // Creates per-event/per-strategy DI scopes
-        _eventBus                = eventBus;         // Event bus for subscribing to PriceUpdatedIntegrationEvent
-        _evaluators              = evaluators;       // All registered IStrategyEvaluator implementations (one per StrategyType)
-        _distributedLock         = distributedLock;  // Prevents concurrent evaluation of the same strategy
-        _options                 = options;          // Configurable thresholds (cooldowns, circuit breaker, regime blocking, etc.)
-        _metrics                 = metrics;          // OpenTelemetry metrics for observability
-        _signalConflictResolver  = signalConflictResolver;  // Resolves opposing/duplicate signals from competing strategies
-        _regimeCoherenceChecker  = regimeCoherenceChecker;  // Cross-timeframe regime alignment scoring
+        _logger                       = logger;
+        _scopeFactory                 = scopeFactory;    // Creates per-event/per-strategy DI scopes
+        _eventBus                     = eventBus;         // Event bus for subscribing to PriceUpdatedIntegrationEvent
+        _evaluators                   = evaluators;       // All registered IStrategyEvaluator implementations (one per StrategyType)
+        _distributedLock              = distributedLock;  // Prevents concurrent evaluation of the same strategy
+        _options                      = options;          // Configurable thresholds (cooldowns, circuit breaker, regime blocking, etc.)
+        _metrics                      = metrics;          // OpenTelemetry metrics for observability
+        _signalConflictResolver       = signalConflictResolver;  // Resolves opposing/duplicate signals from competing strategies
+        _regimeCoherenceChecker       = regimeCoherenceChecker;  // Cross-timeframe regime alignment scoring
+        _drawdownRecoveryModeProvider = drawdownRecoveryModeProvider;  // Cached access to DrawdownRecovery config
     }
 
     /// <summary>
@@ -415,8 +418,29 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
         // ── Regime coherence check (cross-timeframe alignment) ───────────────
         // If regimes across H1/H4/D1 disagree for this symbol, the coherence
         // score is low and all signals for the symbol may be suppressed.
-        decimal regimeCoherence = await _regimeCoherenceChecker.GetCoherenceScoreAsync(
-            @event.Symbol, _stoppingToken);
+        //
+        // Bounded with a per-tick timeout so a slow DB query cannot stall every
+        // strategy for this symbol. On timeout we default to 1.0 (full coherence)
+        // — the per-strategy regime filter later in the loop still applies, so
+        // failing open here does not bypass regime protection entirely.
+        decimal regimeCoherence;
+        using (var coherenceCts = CancellationTokenSource.CreateLinkedTokenSource(_stoppingToken))
+        {
+            coherenceCts.CancelAfter(TimeSpan.FromSeconds(10));
+            try
+            {
+                regimeCoherence = await _regimeCoherenceChecker.GetCoherenceScoreAsync(
+                    @event.Symbol, coherenceCts.Token);
+            }
+            catch (OperationCanceledException) when (!_stoppingToken.IsCancellationRequested)
+            {
+                _logger.LogWarning(
+                    "StrategyWorker: regime coherence query timed out for {Symbol} — defaulting to 1.0",
+                    @event.Symbol);
+                _metrics.SignalsFiltered.Add(1, new("symbol", @event.Symbol), new("stage", "regime_coherence_timeout"));
+                regimeCoherence = 1.0m;
+            }
+        }
 
         if (_options.MinRegimeCoherence > 0 && regimeCoherence < _options.MinRegimeCoherence)
         {
@@ -434,7 +458,7 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
         // enables cross-strategy conflict detection: e.g. if Strategy A says BUY EURUSD
         // and Strategy B says SELL EURUSD on the same tick, the conflict resolver picks
         // the winner based on Sharpe ratio, ML confidence, and estimated capacity.
-        var candidateSignals = new ConcurrentBag<(PendingSignal Pending, MLScoreResult MlScore)>();
+        var candidateSignals = new ConcurrentBag<(PendingSignal Pending, MLScoreResult MlScore, int? MlScoringLatencyMs)>();
 
         // ── Parallel strategy evaluation ─────────────────────────────────────
         // Each strategy gets its own DI scope so scoped services (DbContext, ML scorer,
@@ -621,9 +645,19 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
                     return;
                 }
 
-                // Skip if no live price is available in the cache
+                // Skip if no live price is available in the cache. This can happen when
+                // the EA has not yet streamed a tick for the symbol, or during a brief
+                // reconnect window — emitting a metric + debug log keeps the gap visible
+                // in operational dashboards rather than failing silently.
                 var price = strategyCache.Get(strategy.Symbol);
-                if (price is null) return;
+                if (price is null)
+                {
+                    _metrics.TicksSkippedNoLivePrice.Add(1, new("symbol", strategy.Symbol), new("strategy_id", strategy.Id));
+                    _logger.LogDebug(
+                        "Strategy {Id}: live price not in cache for {Symbol} — skipping evaluation",
+                        strategy.Id, strategy.Symbol);
+                    return;
+                }
 
                 // ── Market regime filter (uses pre-fetched cache) ────────────
                 if (regimeCache.TryGetValue(strategy.Timeframe, out var latestRegime) &&
@@ -909,7 +943,16 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
                 //   3. Determine if the model should abstain (low-confidence environments)
                 //   4. Check ensemble disagreement across bagged learners
                 // The ML score enriches the signal and can veto it entirely.
+                //
+                // Stopwatch captures end-to-end scorer latency (including internal calibration
+                // and ensemble steps) so MLModelPredictionLog.LatencyMs can drive P50/P95/P99
+                // SLA dashboards.
+                var mlScoringStopwatch = Stopwatch.StartNew();
                 var mlScore = await strategyMlScorer.ScoreAsync(signal, candles, ct);
+                mlScoringStopwatch.Stop();
+                int? mlScoringLatencyMs = mlScore.MLModelId.HasValue
+                    ? (int)Math.Min(int.MaxValue, mlScoringStopwatch.ElapsedMilliseconds)
+                    : null;
 
                 // ML suppression: when the scorer returns a model ID but null predicted
                 // direction, it means the model actively chose NOT to score (cooldown period,
@@ -972,33 +1015,18 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
 
                 // ── DrawdownRecovery: reduce lot size when in Reduced mode ────
                 // When the DrawdownRecoveryWorker has placed the portfolio into
-                // "Reduced" mode, halve the suggested lot size to limit further
-                // drawdown. The multiplier is configurable via EngineConfig.
-                var recoveryMode = await strategyContext.GetDbContext()
-                    .Set<Domain.Entities.EngineConfig>()
-                    .AsNoTracking()
-                    .Where(c => c.Key == "DrawdownRecovery:ActiveMode" && !c.IsDeleted)
-                    .Select(c => c.Value)
-                    .FirstOrDefaultAsync(ct) ?? "Normal";
+                // "Reduced" mode, scale the suggested lot size down. The cached
+                // provider avoids a two-query DB hit per signal on this hot path;
+                // DrawdownRecoveryWorker invalidates the cache when the mode flips.
+                var recoverySnapshot = await _drawdownRecoveryModeProvider.GetAsync(ct);
 
                 decimal adjustedLotSize = signal.SuggestedLotSize;
-                if (string.Equals(recoveryMode, "Reduced", StringComparison.OrdinalIgnoreCase))
+                if (recoverySnapshot.IsReduced)
                 {
-                    var lotMultiplierStr = await strategyContext.GetDbContext()
-                        .Set<Domain.Entities.EngineConfig>()
-                        .AsNoTracking()
-                        .Where(c => c.Key == "DrawdownRecovery:ReducedLotMultiplier" && !c.IsDeleted)
-                        .Select(c => c.Value)
-                        .FirstOrDefaultAsync(ct);
-
-                    decimal lotMultiplier = 0.5m;
-                    if (lotMultiplierStr is not null && decimal.TryParse(lotMultiplierStr, out var parsed) && parsed > 0)
-                        lotMultiplier = parsed;
-
-                    adjustedLotSize = signal.SuggestedLotSize * lotMultiplier;
+                    adjustedLotSize = signal.SuggestedLotSize * recoverySnapshot.ReducedLotMultiplier;
                     _logger.LogInformation(
                         "StrategyWorker: DrawdownRecovery Reduced mode active — lot size reduced {Original} → {Adjusted} (×{Mult}) for {Symbol}",
-                        signal.SuggestedLotSize, adjustedLotSize, lotMultiplier, signal.Symbol);
+                        signal.SuggestedLotSize, adjustedLotSize, recoverySnapshot.ReducedLotMultiplier, signal.Symbol);
                 }
 
                 // ── Collect candidate signal for conflict resolution ─────────
@@ -1007,7 +1035,7 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
                 // the best signal per symbol and suppress opposing-direction conflicts.
                 strategySharpeCache.TryGetValue(strategy.Id, out var stratSharpe);
                 candidateSignals.Add((
-                    new PendingSignal(
+                    Pending: new PendingSignal(
                         StrategyId:           signal.StrategyId,
                         Symbol:               signal.Symbol,
                         Timeframe:            strategy.Timeframe,
@@ -1023,7 +1051,8 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
                         EstimatedCapacityLots: strategy.EstimatedCapacityLots,
                         StrategySharpeRatio:  stratSharpe != 0 ? stratSharpe : null,
                         ExpiresAt:            signal.ExpiresAt),
-                    mlScore));
+                    MlScore: mlScore,
+                    MlScoringLatencyMs: mlScoringLatencyMs));
 
                 // Reset all circuit breaker state on any successful evaluation (no exception).
                 // Previously this only reset failure counters and deferred the full circuit
@@ -1130,7 +1159,7 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
         };
         await Parallel.ForEachAsync(winnerCandidates, publishOptions, async (candidate, ct) =>
         {
-            var (pending, mlScore) = candidate;
+            var (pending, mlScore, mlScoringLatencyMs) = candidate;
             using var publishScope = _scopeFactory.CreateScope();
             var mediator     = publishScope.ServiceProvider.GetRequiredService<IMediator>();
             var writeContext  = publishScope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
@@ -1155,6 +1184,7 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
                 MLServedCalibratedProbability = mlScore.ServedCalibratedProbability,
                 MLDecisionThresholdUsed = mlScore.DecisionThresholdUsed,
                 MLEnsembleDisagreement = mlScore.EnsembleDisagreement,
+                MLScoringLatencyMs     = mlScoringLatencyMs,
                 Timeframe              = pending.Timeframe,
                 ExpiresAt              = pending.ExpiresAt
             }, ct);

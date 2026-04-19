@@ -351,31 +351,10 @@ public sealed class MLCorrelatedFailureWorker : BackgroundService
     /// <param name="key">The configuration key to upsert.</param>
     /// <param name="value">The new string value.</param>
     /// <param name="ct">Cancellation token.</param>
-    private static async Task UpsertConfigAsync(
+    private static Task UpsertConfigAsync(
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
         string                                  key,
         string                                  value,
         CancellationToken                       ct)
-    {
-        var existing = await writeCtx.Set<EngineConfig>()
-            .FirstOrDefaultAsync(c => c.Key == key, ct);
-
-        if (existing is not null)
-        {
-            existing.Value         = value;
-            existing.LastUpdatedAt = DateTime.UtcNow;
-        }
-        else
-        {
-            writeCtx.Set<EngineConfig>().Add(new EngineConfig
-            {
-                Key             = key,
-                Value           = value,
-                Description     = "Systemic training pause flag — managed by MLCorrelatedFailureWorker.",
-                DataType        = ConfigDataType.Bool,
-                IsHotReloadable = true,
-                LastUpdatedAt   = DateTime.UtcNow,
-            });
-        }
-    }
+        => LascodiaTradingEngine.Application.Common.Utilities.EngineConfigUpsert.UpsertAsync(writeCtx, key, value, dataType: LascodiaTradingEngine.Domain.Enums.ConfigDataType.Bool, ct: ct);
 }

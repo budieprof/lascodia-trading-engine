@@ -2395,31 +2395,12 @@ public sealed class MLTrainingWorker : BackgroundService
     /// Upserts a value into <see cref="EngineConfig"/>. If the key already exists, updates
     /// the value; otherwise inserts a new row. Used for training cost tracking metrics.
     /// </summary>
-    private static async Task UpsertConfigAsync(
+    private static Task UpsertConfigAsync(
         Microsoft.EntityFrameworkCore.DbContext ctx,
         string                                  key,
         string                                  value,
         CancellationToken                       ct)
-    {
-        int updated = await ctx.Set<EngineConfig>()
-            .Where(c => c.Key == key)
-            .ExecuteUpdateAsync(s => s
-                .SetProperty(c => c.Value, value)
-                .SetProperty(c => c.LastUpdatedAt, DateTime.UtcNow), ct);
-
-        if (updated == 0)
-        {
-            ctx.Set<EngineConfig>().Add(new EngineConfig
-            {
-                Key             = key,
-                Value           = value,
-                DataType        = ConfigDataType.String,
-                IsHotReloadable = true,
-                LastUpdatedAt   = DateTime.UtcNow,
-            });
-            await ctx.SaveChangesAsync(ct);
-        }
-    }
+        => LascodiaTradingEngine.Application.Common.Utilities.EngineConfigUpsert.UpsertAsync(ctx, key, value, ct: ct);
 
     // ── Quality gate failure message ──────────────────────────────────────────
 

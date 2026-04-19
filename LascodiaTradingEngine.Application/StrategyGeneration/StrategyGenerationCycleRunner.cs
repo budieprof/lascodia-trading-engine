@@ -693,7 +693,20 @@ internal sealed class StrategyGenerationCycleRunner : IStrategyGenerationCycleRu
                 ct);
             await eventService.SaveAndPublish(writeCtx, evt);
 
-            var statuses = await eventLogReader.GetEventStatusSnapshotsAsync([evt.Id], ct);
+            // SaveAndPublish runs inside ResilientTransaction (BeginTransaction wrapped in
+            // the execution strategy). The EventLogDbContext shares its connection with the
+            // write context, and the retry strategy sees lingering CurrentTransaction state
+            // on this scope's contexts after commit, causing subsequent reads on the same
+            // EventLogDbContext to throw "does not support user-initiated transactions".
+            // Reading event status via a fresh scope gives us a clean EventLogDbContext with
+            // no enlisted transaction, matching the pattern used by
+            // StrategyGenerationArtifactReplayService.GetEventStatusSnapshotsAsync.
+            IReadOnlyDictionary<Guid, IntegrationEventStatusSnapshot> statuses;
+            using (var statusScope = _scopeFactory.CreateScope())
+            {
+                var scopedReader = statusScope.ServiceProvider.GetRequiredService<IEventLogReader>();
+                statuses = await scopedReader.GetEventStatusSnapshotsAsync([evt.Id], ct);
+            }
             if (statuses.TryGetValue(evt.Id, out var status)
                 && status.State == Lascodia.Trading.Engine.IntegrationEventLogEF.EventStateEnum.Published)
             {

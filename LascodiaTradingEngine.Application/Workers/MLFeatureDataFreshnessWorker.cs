@@ -339,29 +339,10 @@ public sealed class MLFeatureDataFreshnessWorker : BackgroundService
         catch { return defaultValue; }
     }
 
-    private static async Task UpsertConfigAsync(
+    private static Task UpsertConfigAsync(
         DbContext         writeCtx,
         string            key,
         string            value,
         CancellationToken ct)
-    {
-        int rows = await writeCtx.Set<EngineConfig>()
-            .Where(c => c.Key == key)
-            .ExecuteUpdateAsync(s => s
-                .SetProperty(c => c.Value, value)
-                .SetProperty(c => c.LastUpdatedAt, DateTime.UtcNow), ct);
-
-        if (rows == 0)
-        {
-            writeCtx.Set<EngineConfig>().Add(new EngineConfig
-            {
-                Key             = key,
-                Value           = value,
-                DataType        = ConfigDataType.String,
-                Description     = $"Feature staleness flag written by MLFeatureDataFreshnessWorker.",
-                IsHotReloadable = true,
-                LastUpdatedAt   = DateTime.UtcNow,
-            });
-        }
-    }
+        => LascodiaTradingEngine.Application.Common.Utilities.EngineConfigUpsert.UpsertAsync(writeCtx, key, value, ct: ct);
 }

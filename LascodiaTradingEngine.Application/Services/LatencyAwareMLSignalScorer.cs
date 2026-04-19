@@ -249,33 +249,9 @@ public sealed class LatencyAwareMLSignalScorer : IMLSignalScorer
     /// <summary>
     /// Upserts an EngineConfig entry — updates if it exists, inserts if not.
     /// </summary>
-    private async Task UpsertConfigAsync(
+    private Task UpsertConfigAsync(
         string key, string value, string description,
         ConfigDataType dataType, CancellationToken ct)
-    {
-        var writeCtx = _writeContext.GetDbContext();
-
-        var existing = await writeCtx.Set<EngineConfig>()
-            .FirstOrDefaultAsync(c => c.Key == key && !c.IsDeleted, ct);
-
-        if (existing is not null)
-        {
-            existing.Value         = value;
-            existing.LastUpdatedAt = DateTime.UtcNow;
-        }
-        else
-        {
-            writeCtx.Set<EngineConfig>().Add(new EngineConfig
-            {
-                Key             = key,
-                Value           = value,
-                Description     = description,
-                DataType        = dataType,
-                IsHotReloadable = true,
-                LastUpdatedAt   = DateTime.UtcNow
-            });
-        }
-
-        await _writeContext.SaveChangesAsync(ct);
-    }
+        => LascodiaTradingEngine.Application.Common.Utilities.EngineConfigUpsert.UpsertAsync(
+            _writeContext.GetDbContext(), key, value, dataType, description, ct: ct);
 }

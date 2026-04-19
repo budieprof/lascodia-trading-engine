@@ -215,7 +215,7 @@ public sealed partial class AdaBoostModelTrainer : IMLModelTrainer
                 $"Insufficient training samples after splits: {trainSet.Count} < {hp.MinSamples}");
 
         // ── 4a. Adversarial validation (train vs test covariate shift) ────────
-        if (testSet.Count >= 20 && trainSet.Count >= 20)
+        if (testSet.Count >= 20 && trainSet.Count >= 20 && IsTorchCpuAvailable)
         {
             double advAuc = TryComputeAdversarialAucGpu(trainSet, testSet, F, _logger, ct)
                             ?? ComputeAdversarialAuc(trainSet, testSet, F, _logger, ct);
@@ -256,7 +256,7 @@ public sealed partial class AdaBoostModelTrainer : IMLModelTrainer
 
         // ── 4d. Density-ratio importance weights (GPU if available) ───────────
         double[]? densityWeights = null;
-        if (hp.DensityRatioWindowDays > 0 && trainSet.Count >= 50)
+        if (hp.DensityRatioWindowDays > 0 && trainSet.Count >= 50 && IsTorchCpuAvailable)
         {
             densityWeights = TryComputeDensityRatioWeightsGpu(trainSet, F, hp.DensityRatioWindowDays, hp.BarsPerDay, ct)
                              ?? ComputeDensityRatioWeights(trainSet, F, hp.DensityRatioWindowDays, hp.BarsPerDay, ct);
@@ -264,7 +264,7 @@ public sealed partial class AdaBoostModelTrainer : IMLModelTrainer
         }
 
         // ── 4e. Covariate shift weights ───────────────────────────────────────
-        if (hp.UseCovariateShiftWeights &&
+        if (hp.UseCovariateShiftWeights && IsTorchCpuAvailable &&
             warmStart?.FeatureQuantileBreakpoints is { Length: > 0 } parentBp)
         {
             var csWeights = ComputeCovariateShiftWeights(trainSet, parentBp, F);
@@ -537,12 +537,26 @@ public sealed partial class AdaBoostModelTrainer : IMLModelTrainer
         _logger.LogInformation("EV-optimal threshold={Thr:F2} (default 0.50)", optimalThreshold);
 
         // ── 12. Magnitude linear regressor (Adam + Huber loss) ────────────────
-        var (magWeights, magBias) = FitLinearRegressor(trainSet, F, hp, ct);
+        // Gated on torch availability because the regressor is torch-backed and would
+        // otherwise fail the whole training run on containers where libtorch fails to
+        // initialise. Without torch, the magnitude head is zero-weight — predictions
+        // have no magnitude signal but direction still works.
+        double[] magWeights;
+        double   magBias;
+        if (IsTorchCpuAvailable)
+        {
+            (magWeights, magBias) = FitLinearRegressor(trainSet, F, hp, ct);
+        }
+        else
+        {
+            magWeights = new double[F];
+            magBias    = 0.0;
+        }
 
         // ── 12-pre. Quantile magnitude regressor ──────────────────────────────
         double[] magQ90Weights = [];
         double   magQ90Bias    = 0.0;
-        if (hp.MagnitudeQuantileTau > 0.0 && trainSet.Count >= 10)
+        if (hp.MagnitudeQuantileTau > 0.0 && trainSet.Count >= 10 && IsTorchCpuAvailable)
         {
             (magQ90Weights, magQ90Bias) = FitQuantileRegressor(trainSet, F, hp.MagnitudeQuantileTau, ct);
             _logger.LogDebug("Quantile regressor fitted (τ={Tau}).", hp.MagnitudeQuantileTau);
@@ -681,38 +695,64 @@ public sealed partial class AdaBoostModelTrainer : IMLModelTrainer
         double sumAlphaFinal = 0.0;
         foreach (var a in alphas) sumAlphaFinal += a;
 
-        var crossFit = CrossFitAdaptiveHeads(
-            calSet, stumps, alphas, plattA, plattB, temperatureScale, isotonicBp,
-            optimalThreshold, metaLabelTopFeatureIndices, F,
-            plattABuy, plattBBuy, plattASell, plattBSell, DefaultConditionalRoutingThreshold,
-            minSamples: MinimumCalibrationSampleCount, ct: ct);
-
         double[] metaLabelWeights;
         double   metaLabelBias;
         double[] abstentionWeights;
         double   abstentionBias;
         double   abstentionThreshold;
+        // Downstream telemetry references crossFitUsed/FoldCount regardless of which
+        // path produced the heads, so surface those as locals that default to the
+        // non-crossfit fallback when torch is unavailable.
+        bool crossFitUsed = false;
+        int  crossFitFoldCount = 0;
 
-        if (crossFit.Used)
+        if (IsTorchCpuAvailable)
         {
-            metaLabelWeights    = crossFit.MetaLabelWeights;
-            metaLabelBias       = crossFit.MetaLabelBias;
-            abstentionWeights   = crossFit.AbstentionWeights;
-            abstentionBias      = crossFit.AbstentionBias;
-            abstentionThreshold = crossFit.AbstentionThreshold;
-            _logger.LogDebug("Cross-fit adaptive heads: {Folds} folds.", crossFit.FoldCount);
+            var crossFit = CrossFitAdaptiveHeads(
+                calSet, stumps, alphas, plattA, plattB, temperatureScale, isotonicBp,
+                optimalThreshold, metaLabelTopFeatureIndices, F,
+                plattABuy, plattBBuy, plattASell, plattBSell, DefaultConditionalRoutingThreshold,
+                minSamples: MinimumCalibrationSampleCount, ct: ct);
+
+            crossFitUsed      = crossFitUsed;
+            crossFitFoldCount = crossFitFoldCount;
+
+            if (crossFitUsed)
+            {
+                metaLabelWeights    = crossFit.MetaLabelWeights;
+                metaLabelBias       = crossFit.MetaLabelBias;
+                abstentionWeights   = crossFit.AbstentionWeights;
+                abstentionBias      = crossFit.AbstentionBias;
+                abstentionThreshold = crossFit.AbstentionThreshold;
+                _logger.LogDebug("Cross-fit adaptive heads: {Folds} folds.", crossFitFoldCount);
+            }
+            else
+            {
+                (metaLabelWeights, metaLabelBias) = FitMetaLabelModel(
+                    calSet, stumps, alphas, plattA, plattB, temperatureScale, isotonicBp,
+                    optimalThreshold, metaLabelTopFeatureIndices, F,
+                    plattABuy, plattBBuy, plattASell, plattBSell, DefaultConditionalRoutingThreshold, ct);
+
+                (abstentionWeights, abstentionBias, abstentionThreshold) = FitAbstentionModel(
+                    calSet, stumps, alphas, plattA, plattB, temperatureScale, isotonicBp,
+                    metaLabelWeights, metaLabelBias, optimalThreshold, metaLabelTopFeatureIndices, F,
+                    plattABuy, plattBBuy, plattASell, plattBSell, DefaultConditionalRoutingThreshold, ct);
+            }
         }
         else
         {
-            (metaLabelWeights, metaLabelBias) = FitMetaLabelModel(
-                calSet, stumps, alphas, plattA, plattB, temperatureScale, isotonicBp,
-                optimalThreshold, metaLabelTopFeatureIndices, F,
-                plattABuy, plattBBuy, plattASell, plattBSell, DefaultConditionalRoutingThreshold, ct);
-
-            (abstentionWeights, abstentionBias, abstentionThreshold) = FitAbstentionModel(
-                calSet, stumps, alphas, plattA, plattB, temperatureScale, isotonicBp,
-                metaLabelWeights, metaLabelBias, optimalThreshold, metaLabelTopFeatureIndices, F,
-                plattABuy, plattBBuy, plattASell, plattBSell, DefaultConditionalRoutingThreshold, ct);
+            // Torch native library not available — skip adaptive heads and fall back to
+            // empty-weight models. AdaBoost will still train its core stumps via the
+            // pure-C# path; only the torch-based meta-label / abstention heads are
+            // bypassed. The snapshot audit accepts empty weights (length 0 bypasses the
+            // shape check), so empty arrays are the correct "no-op head" signal here.
+            _logger.LogWarning(
+                "AdaBoost: TorchSharp CPU backend unavailable — skipping adaptive heads (meta-label + abstention).");
+            metaLabelWeights    = [];
+            metaLabelBias       = 0.0;
+            abstentionWeights   = [];
+            abstentionBias      = 0.0;
+            abstentionThreshold = 0.5;
         }
 
         // ── 18b. Decision boundary stats ──────────────────────────────────────
@@ -795,11 +835,11 @@ public sealed partial class AdaBoostModelTrainer : IMLModelTrainer
             ConformalStartIndex = calStart,
             ConformalCount = calSet.Count,
             MetaLabelStartIndex = calStart,
-            MetaLabelCount = crossFit.Used ? calSet.Count : metaLabelWeights.Length > 0 ? calSet.Count : 0,
+            MetaLabelCount = crossFitUsed ? calSet.Count : metaLabelWeights.Length > 0 ? calSet.Count : 0,
             AbstentionStartIndex = calStart,
-            AbstentionCount = crossFit.Used ? calSet.Count : abstentionWeights.Length > 0 ? calSet.Count : 0,
-            AdaptiveHeadSplitMode = crossFit.Used ? "CROSSFIT" : "SHARED",
-            AdaptiveHeadCrossFitFoldCount = crossFit.FoldCount,
+            AbstentionCount = crossFitUsed ? calSet.Count : abstentionWeights.Length > 0 ? calSet.Count : 0,
+            AdaptiveHeadSplitMode = crossFitUsed ? "CROSSFIT" : "SHARED",
+            AdaptiveHeadCrossFitFoldCount = crossFitFoldCount,
             TestStartIndex = testStart,
             TestCount = testSet.Count,
             EmbargoCount = embargo,
@@ -845,10 +885,10 @@ public sealed partial class AdaBoostModelTrainer : IMLModelTrainer
             ConformalSampleCount = calSet.Count,
             BuyConformalSampleCount = calSet.Count(sample => sample.Direction > 0),
             SellConformalSampleCount = calSet.Count(sample => sample.Direction <= 0),
-            MetaLabelSampleCount = crossFit.Used ? calSet.Count : metaLabelWeights.Length > 0 ? calSet.Count : 0,
-            AbstentionSampleCount = crossFit.Used ? calSet.Count : abstentionWeights.Length > 0 ? calSet.Count : 0,
-            AdaptiveHeadMode = crossFit.Used ? "CROSSFIT" : "SHARED",
-            AdaptiveHeadCrossFitFoldCount = crossFit.FoldCount,
+            MetaLabelSampleCount = crossFitUsed ? calSet.Count : metaLabelWeights.Length > 0 ? calSet.Count : 0,
+            AbstentionSampleCount = crossFitUsed ? calSet.Count : abstentionWeights.Length > 0 ? calSet.Count : 0,
+            AdaptiveHeadMode = crossFitUsed ? "CROSSFIT" : "SHARED",
+            AdaptiveHeadCrossFitFoldCount = crossFitFoldCount,
             ConditionalRoutingThreshold = DefaultConditionalRoutingThreshold,
             BuyBranchSampleCount = buyBranchStats.SampleCount,
             BuyBranchBaselineNll = buyBranchStats.BaselineNll,

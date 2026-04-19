@@ -271,42 +271,12 @@ public sealed class MLRegimeTransitionGuardWorker : BackgroundService
     /// <param name="key">The unique config key (e.g. <c>MLRegimeTransition:EURUSD:H1:PenaltyFactor</c>).</param>
     /// <param name="value">String representation of the penalty factor (e.g. "0.8000" or "1.0").</param>
     /// <param name="ct">Cancellation token.</param>
-    private static async Task UpsertConfigAsync(
+    private static Task UpsertConfigAsync(
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
         string                                  key,
         string                                  value,
         CancellationToken                       ct)
-    {
-        // NOTE: Partial-write risk — if the process crashes between ExecuteUpdateAsync and
-        // SaveChangesAsync (insert path), the key may be missing or stale. This is safe because
-        // the next poll cycle will re-evaluate and upsert again (idempotent recovery).
-
-        // Attempt an in-place update first — avoids a round-trip insert if the row exists.
-        int rows = await writeCtx.Set<EngineConfig>()
-            .Where(c => c.Key == key)
-            .ExecuteUpdateAsync(s => s
-                .SetProperty(c => c.Value,         value)
-                .SetProperty(c => c.LastUpdatedAt, DateTime.UtcNow),
-                ct);
-
-        if (rows == 0)
-        {
-            // Row does not exist yet — create it with descriptive metadata so operators
-            // understand where this config key originated.
-            writeCtx.Set<EngineConfig>().Add(new EngineConfig
-            {
-                Key             = key,
-                Value           = value,
-                DataType        = Domain.Enums.ConfigDataType.Decimal,
-                Description     = "Regime-transition confidence penalty factor for MLSignalScorer. " +
-                                  "Written by MLRegimeTransitionGuardWorker.",
-                // Mark as hot-reloadable so the scorer picks up changes without restart.
-                IsHotReloadable = true,
-                LastUpdatedAt   = DateTime.UtcNow,
-            });
-            await writeCtx.SaveChangesAsync(ct);
-        }
-    }
+        => LascodiaTradingEngine.Application.Common.Utilities.EngineConfigUpsert.UpsertAsync(writeCtx, key, value, dataType: LascodiaTradingEngine.Domain.Enums.ConfigDataType.Decimal, ct: ct);
 
     // ── Timeframe helper ──────────────────────────────────────────────────────
 

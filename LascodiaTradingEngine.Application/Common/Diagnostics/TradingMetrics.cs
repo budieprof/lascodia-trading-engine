@@ -35,6 +35,7 @@ public sealed class TradingMetrics
     public Counter<long>     TicksSkippedNoEA       { get; }
     public Counter<long>     TicksSkippedHealthCritical { get; }
     public Counter<long>     TicksSkippedStale      { get; }
+    public Counter<long>     TicksSkippedNoLivePrice { get; }
     public Counter<long>     StrategiesCircuitBroken { get; }
     public Histogram<double> StrategyEvaluationMs   { get; }
 
@@ -228,6 +229,7 @@ public sealed class TradingMetrics
         TicksSkippedNoEA = _meter.CreateCounter<long>("trading.signals.ticks_skipped_no_ea", "ticks", "Ticks skipped because no active EA instance owns the symbol");
         TicksSkippedHealthCritical = _meter.CreateCounter<long>("trading.signals.ticks_skipped_health_critical", "ticks", "Strategies skipped because health status is Critical");
         TicksSkippedStale = _meter.CreateCounter<long>("trading.signals.ticks_skipped_stale", "ticks", "Ticks dropped because event timestamp exceeded MaxTickAgeSeconds");
+        TicksSkippedNoLivePrice = _meter.CreateCounter<long>("trading.signals.ticks_skipped_no_live_price", "ticks", "Per-strategy evaluations skipped because live price cache had no entry for the symbol");
         StrategiesCircuitBroken = _meter.CreateCounter<long>("trading.signals.strategies_circuit_broken", "strategies", "Strategies temporarily disabled due to consecutive evaluation failures");
         StrategyEvaluationMs = _meter.CreateHistogram<double>("trading.strategy.evaluation_duration", "ms", "Strategy evaluation pipeline duration per tick");
 

@@ -666,27 +666,12 @@ public sealed class MLDriftMonitorWorker : BackgroundService
     /// the value; otherwise inserts a new row. Used to persist the consecutive failure counter
     /// across worker restarts.
     /// </summary>
-    private static async Task UpsertConfigAsync(
+    private static Task UpsertConfigAsync(
         Microsoft.EntityFrameworkCore.DbContext ctx,
         string                                  key,
         string                                  value,
         CancellationToken                       ct)
-    {
-        int updated = await ctx.Set<EngineConfig>()
-            .Where(c => c.Key == key)
-            .ExecuteUpdateAsync(s => s.SetProperty(c => c.Value, value), ct);
-
-        if (updated == 0)
-        {
-            ctx.Set<EngineConfig>().Add(new EngineConfig
-            {
-                Key      = key,
-                Value    = value,
-                DataType = ConfigDataType.Int,
-            });
-            await ctx.SaveChangesAsync(ct);
-        }
-    }
+        => LascodiaTradingEngine.Application.Common.Utilities.EngineConfigUpsert.UpsertAsync(ctx, key, value, dataType: LascodiaTradingEngine.Domain.Enums.ConfigDataType.Int, ct: ct);
 
     /// <summary>
     /// Resets (or removes) the persisted consecutive failure counter for a model that is healthy.

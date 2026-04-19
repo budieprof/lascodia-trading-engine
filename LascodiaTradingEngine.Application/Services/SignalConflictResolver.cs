@@ -7,10 +7,11 @@ using LascodiaTradingEngine.Domain.Enums;
 namespace LascodiaTradingEngine.Application.Services;
 
 /// <summary>
-/// Resolves signal conflicts per symbol using a priority scoring system.
+/// Resolves signal conflicts per (symbol, timeframe) using a priority scoring system.
 /// <list type="bullet">
-///   <item>Groups pending signals by symbol.</item>
-///   <item>Within each group, if signals conflict (opposing directions), suppresses all for that symbol.</item>
+///   <item>Groups pending signals by (symbol, timeframe) — an H1 scalp and a D1 trend on
+///         the same symbol operate at different horizons and are not in conflict.</item>
+///   <item>Within each group, if signals conflict (opposing directions), suppresses all for that group.</item>
 ///   <item>Within each group of same-direction signals, keeps only the highest-scoring signal.</item>
 ///   <item>Score = ML confidence (40%) + strategy Sharpe (30%) + capacity headroom (30%).</item>
 /// </list>
@@ -39,11 +40,15 @@ public class SignalConflictResolver : ISignalConflictResolver
 
         var winners = new List<PendingSignal>();
 
-        // Group by symbol — conflicts only matter within the same symbol
-        var bySymbol = pendingSignals.GroupBy(s => s.Symbol);
+        // Group by (symbol, timeframe). Same-symbol signals on different timeframes
+        // are not in conflict — a BUY EURUSD on H1 (scalp) can coexist with a SELL
+        // EURUSD on D1 (trend). Collapsing them would force one strategy family to
+        // defer to another despite operating at independent horizons.
+        var byGroup = pendingSignals.GroupBy(s => (s.Symbol, s.Timeframe));
 
-        foreach (var group in bySymbol)
+        foreach (var group in byGroup)
         {
+            var (symbol, timeframe) = group.Key;
             var signals = group.ToList();
 
             if (signals.Count == 1)
@@ -52,14 +57,14 @@ public class SignalConflictResolver : ISignalConflictResolver
                 continue;
             }
 
-            // Check for opposing directions — suppress entire symbol
+            // Check for opposing directions — suppress entire (symbol, timeframe) group
             var directions = signals.Select(s => s.Direction).Distinct().ToList();
             if (directions.Count > 1)
             {
                 _logger.LogInformation(
-                    "SignalConflict: opposing directions for {Symbol} ({Count} signals) — suppressing all",
-                    group.Key, signals.Count);
-                continue; // Drop all signals for this symbol
+                    "SignalConflict: opposing directions for {Symbol}/{Timeframe} ({Count} signals) — suppressing all",
+                    symbol, timeframe, signals.Count);
+                continue;
             }
 
             // Same direction — keep highest scoring signal
@@ -76,8 +81,8 @@ public class SignalConflictResolver : ISignalConflictResolver
             if (scored.Count > 1)
             {
                 _logger.LogInformation(
-                    "SignalConflict: {Count} same-direction signals for {Symbol} {Dir} — winner strategy {WinnerId} (score={Score:F4}), suppressed {Suppressed}",
-                    signals.Count, group.Key, directions[0],
+                    "SignalConflict: {Count} same-direction signals for {Symbol}/{Timeframe} {Dir} — winner strategy {WinnerId} (score={Score:F4}), suppressed {Suppressed}",
+                    signals.Count, symbol, timeframe, directions[0],
                     winner.Signal.StrategyId, winner.Score,
                     string.Join(",", scored.Skip(1).Select(s => s.Signal.StrategyId)));
             }

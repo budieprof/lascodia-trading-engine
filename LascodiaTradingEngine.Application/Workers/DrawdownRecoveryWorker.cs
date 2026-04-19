@@ -5,6 +5,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.AuditTrail.Commands.LogDecision;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Services;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 using MediatR;
@@ -68,18 +69,22 @@ public sealed class DrawdownRecoveryWorker : BackgroundService
 
     private readonly IServiceScopeFactory            _scopeFactory;
     private readonly ILogger<DrawdownRecoveryWorker> _logger;
+    private readonly DrawdownRecoveryModeProvider _modeProvider;
     private int _consecutiveErrors;
 
     /// <summary>
     /// Initialises the worker.
     /// </summary>
     /// <param name="scopeFactory">Factory for creating scoped DI contexts per polling cycle.</param>
+    /// <param name="modeProvider">Cached provider invalidated whenever this worker persists a mode change.</param>
     /// <param name="logger">Structured logger for this worker.</param>
     public DrawdownRecoveryWorker(
         IServiceScopeFactory             scopeFactory,
+        DrawdownRecoveryModeProvider     modeProvider,
         ILogger<DrawdownRecoveryWorker>  logger)
     {
         _scopeFactory = scopeFactory;
+        _modeProvider = modeProvider;
         _logger       = logger;
     }
 
@@ -254,6 +259,11 @@ public sealed class DrawdownRecoveryWorker : BackgroundService
         // read the current drawdown state without querying the snapshot table.
         await UpsertConfigAsync(writeCtx, CK_ActiveMode, currentMode.ToString(), ct);
 
+        // Drop the cached snapshot in DrawdownRecoveryModeProvider so hot-path callers
+        // (StrategyWorker) pick up the new mode on their next signal rather than
+        // waiting for the TTL to expire.
+        _modeProvider.Invalidate();
+
         // Record the transition in the audit trail for compliance and post-incident review.
         await mediator.Send(new LogDecisionCommand
         {
@@ -406,32 +416,12 @@ public sealed class DrawdownRecoveryWorker : BackgroundService
     /// <param name="key">The EngineConfig key to upsert.</param>
     /// <param name="value">The new string value to store.</param>
     /// <param name="ct">Propagated cancellation token.</param>
-    private static async Task UpsertConfigAsync(
+    private static Task UpsertConfigAsync(
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
         string                                  key,
         string                                  value,
         CancellationToken                       ct)
-    {
-        // Attempt a bulk update first — zero allocations if the row already exists.
-        int rows = await writeCtx.Set<EngineConfig>()
-            .Where(c => c.Key == key)
-            .ExecuteUpdateAsync(s => s.SetProperty(c => c.Value, value), ct);
-
-        if (rows == 0)
-        {
-            // Row does not yet exist — insert it. This happens only on the first
-            // mode transition after a fresh deployment.
-            writeCtx.Set<EngineConfig>().Add(new EngineConfig
-            {
-                Key           = key,
-                Value         = value,
-                DataType      = ConfigDataType.String,
-                Description   = $"Managed by DrawdownRecoveryWorker — {key}",
-                LastUpdatedAt = DateTime.UtcNow
-            });
-            await writeCtx.SaveChangesAsync(ct);
-        }
-    }
+        => LascodiaTradingEngine.Application.Common.Utilities.EngineConfigUpsert.UpsertAsync(writeCtx, key, value, ct: ct);
 
     // ── Config helper ─────────────────────────────────────────────────────────
 
