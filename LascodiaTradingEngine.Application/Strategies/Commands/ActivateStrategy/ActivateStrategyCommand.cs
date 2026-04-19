@@ -6,8 +6,10 @@ using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.Backtesting;
 using LascodiaTradingEngine.Application.Common.Events;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Strategies.Services;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
+using Microsoft.Extensions.Logging;
 
 namespace LascodiaTradingEngine.Application.Strategies.Commands.ActivateStrategy;
 
@@ -46,17 +48,23 @@ public class ActivateStrategyCommandHandler : IRequestHandler<ActivateStrategyCo
     private readonly IIntegrationEventService _eventBus;
     private readonly IValidationRunFactory _validationRunFactory;
     private readonly TimeProvider _timeProvider;
+    private readonly IPromotionGateValidator _promotionGate;
+    private readonly ILogger<ActivateStrategyCommandHandler> _logger;
 
     public ActivateStrategyCommandHandler(
         IWriteApplicationDbContext context,
         IIntegrationEventService eventBus,
         IValidationRunFactory validationRunFactory,
-        TimeProvider timeProvider)
+        TimeProvider timeProvider,
+        IPromotionGateValidator promotionGate,
+        ILogger<ActivateStrategyCommandHandler> logger)
     {
         _context  = context;
         _eventBus = eventBus;
         _validationRunFactory = validationRunFactory;
         _timeProvider = timeProvider;
+        _promotionGate = promotionGate;
+        _logger = logger;
     }
 
     public async Task<ResponseData<string>> Handle(ActivateStrategyCommand request, CancellationToken cancellationToken)
@@ -73,6 +81,28 @@ public class ActivateStrategyCommandHandler : IRequestHandler<ActivateStrategyCo
         {
             return ResponseData<string>.Init(null, false,
                 $"Strategy must reach Approved lifecycle stage before activation. Current stage: {entity.LifecycleStage}", "-11");
+        }
+
+        // ── Promotion gate stack (items #1/#5/#6 of the pipeline-quality roadmap) ──
+        // Deflated Sharpe + PBO-proxy + TCA-adjusted EV + paper-trade duration +
+        // backtest-coverage regime proxy + max pairwise correlation. Skip re-checking
+        // if the strategy is already Active (idempotent activation path).
+        if (entity.Status != StrategyStatus.Active)
+        {
+            var gate = await _promotionGate.EvaluateAsync(request.Id, cancellationToken);
+            if (!gate.Passed)
+            {
+                _logger.LogWarning(
+                    "Activation of strategy {Id} blocked by promotion gates: {Reason}. Diagnostics: {Diagnostics}",
+                    request.Id, gate.FailureSummary, string.Join(" | ", gate.Diagnostics));
+                return ResponseData<string>.Init(
+                    null, false,
+                    $"Promotion gates failed: {gate.FailureSummary}. Diagnostics: {string.Join(" | ", gate.Diagnostics)}",
+                    "-12");
+            }
+            _logger.LogInformation(
+                "Strategy {Id} cleared promotion gates. {Diagnostics}",
+                request.Id, string.Join(" | ", gate.Diagnostics));
         }
 
         var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;

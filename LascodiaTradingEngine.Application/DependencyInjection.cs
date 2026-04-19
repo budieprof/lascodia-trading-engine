@@ -146,6 +146,20 @@ public static class DependencyInjection
         // of capacity exhaustion, catching edge decay 2-6 weeks before Sharpe does.
         services.AddHostedService<SlippageDriftWorker>();
 
+        // ── Promotion Gate Validator ───────────────────────────────────────────
+        // Hard gate between Approved → Active. Enforces DSR, PBO-proxy, TCA-adjusted
+        // EV, paper-trade duration, regime-coverage proxy, and max-correlation checks.
+        services.AddScoped<LascodiaTradingEngine.Application.Strategies.Services.IPromotionGateValidator,
+                           LascodiaTradingEngine.Application.Strategies.Services.PromotionGateValidator>();
+
+        // ── TCA Cost Model Provider ────────────────────────────────────────────
+        // Feeds realised per-symbol slippage + spread + commission back into any
+        // strategy-evaluation path (backtester, promotion gate, shadow scorer) so
+        // the costs used in paper simulation match what live fills actually incur.
+        // Closes the #1 "profitable in backtest, bleeds in live" gap.
+        services.AddScoped<LascodiaTradingEngine.Application.Services.ITcaCostModelProvider,
+                           LascodiaTradingEngine.Application.Services.TcaCostModelProvider>();
+
         // ── HTTP Clients ─────────────────────────────────────────────────────────
         services.AddHttpClient();
 

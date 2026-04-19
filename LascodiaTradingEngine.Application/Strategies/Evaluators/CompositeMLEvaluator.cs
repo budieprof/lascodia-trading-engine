@@ -442,7 +442,7 @@ public class CompositeMLEvaluator : IStrategyEvaluator
         try
         {
             using var macroScope = _scopeFactory.CreateScope();
-            var macroProvider = macroScope.ServiceProvider.GetService<Services.ML.IMacroFeatureProvider>();
+            var macroProvider = macroScope.ServiceProvider.GetService<global::LascodiaTradingEngine.Application.Services.ML.IMacroFeatureProvider>();
             if (macroProvider is not null)
             {
                 var macroContext = await macroProvider.GetAsync(strategy.Symbol, DateTime.UtcNow, cancellationToken);
