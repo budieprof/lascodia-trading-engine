@@ -24,8 +24,8 @@ namespace LascodiaTradingEngine.Application.Services.COTData;
 /// <b>Known CFTC currency contract mappings:</b>
 /// EUR → "EURO FX", GBP → "BRITISH POUND", JPY → "JAPANESE YEN",
 /// AUD → "AUSTRALIAN DOLLAR", CAD → "CANADIAN DOLLAR", CHF → "SWISS FRANC",
-/// NZD → "NEW ZEALAND DOLLAR", MXN → "MEXICAN PESO", ZAR → "SOUTH AFRICAN RAND",
-/// BRL → "BRAZILIAN REAL", RUB → "RUSSIAN RUBLE", USD → "U.S. DOLLAR INDEX".
+/// NZD → "NZ DOLLAR", MXN → "MEXICAN PESO", ZAR → "SOUTH AFRICAN RAND",
+/// BRL → "BRAZILIAN REAL", RUB → "RUSSIAN RUBLE", USD → "USD INDEX".
 ///
 /// <b>Caching:</b> The entire year's CSV is cached in memory for 6 hours after download,
 /// so multiple currency lookups within the same ingestion cycle do not re-download.
@@ -51,12 +51,12 @@ public class CftcCOTDataFeed : ICOTDataFeed
         ["AUD"] = "AUSTRALIAN DOLLAR",
         ["CAD"] = "CANADIAN DOLLAR",
         ["CHF"] = "SWISS FRANC",
-        ["NZD"] = "NEW ZEALAND DOLLAR",
+        ["NZD"] = "NZ DOLLAR",
         ["MXN"] = "MEXICAN PESO",
         ["ZAR"] = "SOUTH AFRICAN RAND",
         ["BRL"] = "BRAZILIAN REAL",
         ["RUB"] = "RUSSIAN RUBLE",
-        ["USD"] = "U.S. DOLLAR INDEX",
+        ["USD"] = "USD INDEX",
         ["SEK"] = "SWEDISH KRONA",
         ["NOK"] = "NORWEGIAN KRONE",
         ["SGD"] = "SINGAPORE DOLLAR",
