@@ -62,4 +62,13 @@ public enum LearnerArchitecture
 
     /// <summary>Quantile Regression Random Forest trainer.</summary>
     QuantileRf = 90,
+
+    /// <summary>
+    /// Stacked meta-learner: splits the V5/V6 raw feature vector into per-family blocks
+    /// (OHLCV / macro / calendar / microstructure / synthetic-DOM / real-DOM), trains one
+    /// logistic sub-model per family using K-fold out-of-fold predictions, then fits a
+    /// logistic meta-combiner over the K sub-model Buy-probabilities. Captures distinct
+    /// signals per feature family without letting any single family dominate the gradient.
+    /// </summary>
+    Stacked = 92,
 }

@@ -192,6 +192,7 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
         LearnerArchitecture.TabNet,
         LearnerArchitecture.Svgp,
         LearnerArchitecture.Dann,
+        LearnerArchitecture.Stacked,
     ];
 
     private static readonly HashSet<LearnerArchitecture> DeepTier =
@@ -215,6 +216,7 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
         LearnerArchitecture.Svgp,
         LearnerArchitecture.Dann,
         LearnerArchitecture.TemporalConvNet,
+        LearnerArchitecture.Stacked,
     ];
 
     // ── Model-family grouping for shadow diversity ──────────────────────────
@@ -227,6 +229,7 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
         Transformer,      // FtTransformer, TabNet
         GaussianProcess,  // SVGP
         DomainAdaptation, // DANN
+        Stacking,         // Stacked
     }
 
     private static readonly Dictionary<LearnerArchitecture, ModelFamily> ArchitectureFamily = new()
@@ -243,6 +246,7 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
         [LearnerArchitecture.TabNet]          = ModelFamily.Transformer,
         [LearnerArchitecture.Svgp]            = ModelFamily.GaussianProcess,
         [LearnerArchitecture.Dann]            = ModelFamily.DomainAdaptation,
+        [LearnerArchitecture.Stacked]         = ModelFamily.Stacking,
     };
 
     // ── Static regime-conditional affinity matrix (prior) ──────────────────
@@ -263,6 +267,7 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
             [LearnerArchitecture.Smote]            = RegimePenalty,
             [LearnerArchitecture.Elm]              = RegimePenalty,
             [LearnerArchitecture.Svgp]             = RegimePenalty,
+            [LearnerArchitecture.Stacked]          = RegimeNeutral,
         },
         [MarketRegimeEnum.Ranging] = new()
         {
@@ -278,6 +283,7 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
             [LearnerArchitecture.AdaBoost]         = RegimePenalty,
             [LearnerArchitecture.Gbm]              = RegimePenalty,
             [LearnerArchitecture.TemporalConvNet]  = RegimePenalty,
+            [LearnerArchitecture.Stacked]          = RegimeNeutral,
         },
         [MarketRegimeEnum.HighVolatility] = new()
         {
@@ -293,6 +299,7 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
             [LearnerArchitecture.Svgp]             = RegimeNeutral,
             [LearnerArchitecture.Elm]              = RegimePenalty,
             [LearnerArchitecture.Rocket]           = RegimePenalty,
+            [LearnerArchitecture.Stacked]          = RegimeBoost,
         },
         [MarketRegimeEnum.LowVolatility] = new()
         {
@@ -308,6 +315,7 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
             [LearnerArchitecture.FtTransformer]    = RegimePenalty,
             [LearnerArchitecture.TabNet]           = RegimePenalty,
             [LearnerArchitecture.TemporalConvNet]  = RegimePenalty,
+            [LearnerArchitecture.Stacked]          = RegimeNeutral,
         },
         [MarketRegimeEnum.Crisis] = new()
         {
@@ -323,6 +331,7 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
             [LearnerArchitecture.Elm]              = RegimePenalty,
             [LearnerArchitecture.Rocket]           = RegimePenalty,
             [LearnerArchitecture.TemporalConvNet]  = RegimePenalty,
+            [LearnerArchitecture.Stacked]          = RegimeNeutral,
         },
         [MarketRegimeEnum.Breakout] = new()
         {
@@ -338,6 +347,7 @@ public sealed class TrainerSelector : ITrainerSelector, IDisposable
             [LearnerArchitecture.Smote]            = RegimePenalty,
             [LearnerArchitecture.Elm]              = RegimePenalty,
             [LearnerArchitecture.Svgp]             = RegimePenalty,
+            [LearnerArchitecture.Stacked]          = RegimeNeutral,
         },
     };
 

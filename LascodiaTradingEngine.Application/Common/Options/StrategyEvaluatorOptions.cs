@@ -1261,6 +1261,28 @@ public class StrategyEvaluatorOptions : ConfigurationOption<StrategyEvaluatorOpt
     /// <summary>Maximum confidence boost from momentum magnitude. Defaults to 0.15.</summary>
     public decimal CalendarEffectConfidenceMomentumBoostMax { get; set; } = 0.15m;
 
+    // ── News Fade ──────────────────────────────────────────────────────────
+
+    /// <summary>Base confidence for news-fade signals before overshoot boost. Defaults to 0.62.</summary>
+    public decimal NewsFadeConfidence { get; set; } = 0.62m;
+
+    /// <summary>Signal expiry in minutes for news-fade. Defaults to 45 (events typically priced within ~30m).</summary>
+    public int NewsFadeExpiryMinutes { get; set; } = 45;
+
+    /// <summary>
+    /// Maximum spread as a fraction of ATR during post-news window. News releases cause
+    /// abnormal spread widening — signals must be rejected when the spread alone eats half
+    /// the edge. Defaults to 0.6 (60% of ATR) — higher than non-news strategies because
+    /// post-news spreads widen structurally for several minutes. Set to 0 to disable.
+    /// </summary>
+    public decimal NewsFadeMaxSpreadAtrFraction { get; set; } = 0.6m;
+
+    /// <summary>Per-ATR overshoot magnitude → confidence boost scale. Defaults to 0.05.</summary>
+    public decimal NewsFadeConfidenceOvershootScale { get; set; } = 0.05m;
+
+    /// <summary>Maximum confidence boost from overshoot magnitude. Defaults to 0.18.</summary>
+    public decimal NewsFadeConfidenceOvershootMax { get; set; } = 0.18m;
+
     // ── Momentum Trend ─────────────────────────────────────────────────────
 
     /// <summary>Default confidence for momentum trend signals. Defaults to 0.70.</summary>

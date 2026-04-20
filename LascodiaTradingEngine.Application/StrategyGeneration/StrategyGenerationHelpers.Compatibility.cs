@@ -109,6 +109,8 @@ public static partial class StrategyGenerationHelpers
                 => currentRegime is MarketRegimeEnum.HighVolatility ? MarketRegimeEnum.HighVolatility : MarketRegimeEnum.Breakout,
             StrategyType.RSIReversion or StrategyType.BollingerBandReversion or StrategyType.StatisticalArbitrage or StrategyType.VwapReversion or StrategyType.CalendarEffect
                 => currentRegime is MarketRegimeEnum.HighVolatility ? MarketRegimeEnum.LowVolatility : MarketRegimeEnum.Ranging,
+            StrategyType.NewsFade
+                => MarketRegimeEnum.HighVolatility,
             _ => currentRegime,
         };
 }

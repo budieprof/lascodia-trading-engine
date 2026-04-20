@@ -3732,6 +3732,14 @@ public class ModelSnapshot
     public string? GbmTreesJson { get; set; }
 
     /// <summary>
+    /// Serialised <see cref="StackedMetaLearnerArtifact"/> produced by <c>StackedModelTrainer</c>:
+    /// per-feature-family logistic sub-model weights + the meta-combiner weights over sub-model
+    /// Buy-probabilities. Null for models trained by other architectures. Consumed by
+    /// <c>StackedInferenceEngine</c>.
+    /// </summary>
+    public string? StackedMetaJson { get; set; }
+
+    /// <summary>
     /// Base log-odds intercept for GBM inference: logit(basePositiveRate).
     /// The GBM score is computed as <c>GbmBaseLogOdds + GbmLearningRate × Σ tree predictions</c>.
     /// Defaults to 0.0 (logit of 0.5) for snapshots serialised before this field was added.

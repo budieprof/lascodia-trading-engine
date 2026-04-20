@@ -57,6 +57,7 @@ public class RegimeStrategyMapper : IRegimeStrategyMapper
                 StrategyType.CompositeML,
                 StrategyType.BreakoutScalper,
                 StrategyType.MomentumTrend,
+                StrategyType.NewsFade,
             },
             [MarketRegimeEnum.LowVolatility] = new[]
             {
@@ -73,6 +74,7 @@ public class RegimeStrategyMapper : IRegimeStrategyMapper
                 StrategyType.CompositeML,
                 StrategyType.BreakoutScalper,
                 StrategyType.MomentumTrend,
+                StrategyType.NewsFade,
             },
             [MarketRegimeEnum.Crisis] = Array.Empty<StrategyType>(),
         };

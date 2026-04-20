@@ -110,6 +110,21 @@ public class StrategyParameterTemplateProvider : IStrategyParameterTemplateProvi
             """{"SessionStartHour":13,"SessionEndHour":21,"EntryAtrThreshold":1.5,"StopLossAtrMultiplier":2.0,"TakeProfitAtrMultiplier":1.2,"AtrPeriod":14,"MaxAdx":40,"MinVolumeRatio":1.1}""",
             """{"SessionStartHour":13,"SessionEndHour":21,"EntryAtrThreshold":2.0,"StopLossAtrMultiplier":2.5,"TakeProfitAtrMultiplier":1.5,"AtrPeriod":14,"MaxAdx":35,"MinVolumeRatio":1.0}""",
         },
+        [StrategyType.NewsFade] = new[]
+        {
+            // Conservative — requires strong overshoot, tight post-event window.
+            """{"MinMinutesSinceEvent":3,"MaxMinutesSinceEvent":15,"MomentumAtrThreshold":1.0}""",
+            """{"MinMinutesSinceEvent":5,"MaxMinutesSinceEvent":20,"MomentumAtrThreshold":1.2}""",
+            """{"MinMinutesSinceEvent":2,"MaxMinutesSinceEvent":15,"MomentumAtrThreshold":0.8}""",
+
+            // Balanced — standard post-NFP/FOMC fade setup.
+            """{"MinMinutesSinceEvent":3,"MaxMinutesSinceEvent":20,"MomentumAtrThreshold":0.8}""",
+            """{"MinMinutesSinceEvent":5,"MaxMinutesSinceEvent":30,"MomentumAtrThreshold":1.0}""",
+
+            // Wider window — catches slower CPI-style reactions.
+            """{"MinMinutesSinceEvent":10,"MaxMinutesSinceEvent":45,"MomentumAtrThreshold":0.7}""",
+            """{"MinMinutesSinceEvent":10,"MaxMinutesSinceEvent":60,"MomentumAtrThreshold":1.2}""",
+        },
         [StrategyType.CalendarEffect] = new[]
         {
             // MonthEnd — fade rebalancing pressure. Conservative threshold first.

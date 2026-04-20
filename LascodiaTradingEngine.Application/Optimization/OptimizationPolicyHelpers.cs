@@ -31,6 +31,9 @@ internal static class OptimizationPolicyHelpers
         if (strategyType is StrategyType.CalendarEffect)
             return higherTfRegime is MarketRegimeEnum.Ranging or MarketRegimeEnum.LowVolatility;
 
+        if (strategyType is StrategyType.NewsFade)
+            return higherTfRegime is MarketRegimeEnum.HighVolatility or MarketRegimeEnum.Breakout or MarketRegimeEnum.Trending;
+
         return true;
     }
 

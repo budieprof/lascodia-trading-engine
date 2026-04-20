@@ -247,6 +247,23 @@ internal sealed class OptimizationGridBuilder
                 break;
             }
 
+            case StrategyType.NewsFade:
+            {
+                foreach (var minMin in new[] { 2, 5, 10 })
+                foreach (var maxMin in new[] { 15, 30, 45 })
+                foreach (var threshold in new[] { 0.7, 1.0, 1.3 })
+                {
+                    if (minMin >= maxMin) continue;
+                    grid.Add(new Dictionary<string, object>
+                    {
+                        ["MinMinutesSinceEvent"] = minMin,
+                        ["MaxMinutesSinceEvent"] = maxMin,
+                        ["MomentumAtrThreshold"] = threshold,
+                    });
+                }
+                break;
+            }
+
             case StrategyType.CalendarEffect:
             {
                 // ModeId is an integer-coded CalendarEffectMode (0=MonthEnd, 1=LondonNyOverlap)

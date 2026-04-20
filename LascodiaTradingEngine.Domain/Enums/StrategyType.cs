@@ -43,5 +43,14 @@ public enum StrategyType
     /// fade short-horizon momentum) and London-NY session overlap (continuation during the
     /// 13:00-16:00 UTC liquidity peak).
     /// </summary>
-    CalendarEffect         = 11
+    CalendarEffect         = 11,
+
+    /// <summary>
+    /// Fades overreactions following high-impact economic releases. When a scheduled
+    /// EconomicEvent for the symbol's base/quote currency fires and the current candle
+    /// shows a large intracandle move, the evaluator takes the opposite side to capture
+    /// the well-documented post-news mean-reversion (news effects are typically priced
+    /// within 15-30 minutes).
+    /// </summary>
+    NewsFade               = 12
 }
