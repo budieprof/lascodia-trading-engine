@@ -111,6 +111,8 @@ public static partial class StrategyGenerationHelpers
                 => currentRegime is MarketRegimeEnum.HighVolatility ? MarketRegimeEnum.LowVolatility : MarketRegimeEnum.Ranging,
             StrategyType.NewsFade
                 => MarketRegimeEnum.HighVolatility,
+            StrategyType.CarryTrade
+                => currentRegime is MarketRegimeEnum.HighVolatility ? MarketRegimeEnum.LowVolatility : MarketRegimeEnum.Trending,
             _ => currentRegime,
         };
 }

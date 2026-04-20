@@ -81,6 +81,11 @@ public sealed class ScreeningSurrogateService : IScreeningSurrogateService
             ["MomentumPeriod"] = (5, 40,  true),
             ["TrendMaPeriod"]  = (15, 250, true),
         },
+        [StrategyType.CarryTrade] = new()
+        {
+            ["MinCarryStrength"]   = (0.3, 3.0, false),
+            ["HorizonMultiplier"]  = (0.5, 5.0, false),
+        },
         [StrategyType.NewsFade] = new()
         {
             ["MinMinutesSinceEvent"]  = (0, 30, true),

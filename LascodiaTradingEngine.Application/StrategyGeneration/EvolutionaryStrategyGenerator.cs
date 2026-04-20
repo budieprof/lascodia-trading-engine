@@ -41,19 +41,31 @@ public interface IEvolutionaryStrategyGenerator
 public sealed class EvolutionaryStrategyGenerator : IEvolutionaryStrategyGenerator
 {
     private readonly IReadApplicationDbContext _readCtx;
+    private readonly IRejectionReasonAggregator _rejectionAggregator;
     private readonly ILogger<EvolutionaryStrategyGenerator> _logger;
 
     private const int     MaxGenerationDepth          = 5;
     private const decimal MinParentSharpe             = 0.5m;
     private const int     ParentPoolSize              = 8;
     private const int     OffspringPerParent          = 3;
-    private const double  MutationStrength            = 0.15;   // ±15% Gaussian-ish perturbation
+
+    // Baseline mutation strength and rejection-reason-biased overrides. When the dominant
+    // rejection class for a strategy type is Underfit (zero trades, marginal Sharpe), the
+    // search widens its step so it can leave dead zones; when it's Overfit (degradation,
+    // MC-shuffle fragility), it narrows so it can refine near a surviving optimum instead
+    // of re-sampling the same overfit peak. Mixed/Unknown fall back to baseline.
+    private const double  MutationStrengthBaseline    = 0.15;
+    private const double  MutationStrengthUnderfit    = 0.25;
+    private const double  MutationStrengthOverfit     = 0.08;
 
     public EvolutionaryStrategyGenerator(
-        IReadApplicationDbContext readCtx, ILogger<EvolutionaryStrategyGenerator> logger)
+        IReadApplicationDbContext readCtx,
+        IRejectionReasonAggregator rejectionAggregator,
+        ILogger<EvolutionaryStrategyGenerator> logger)
     {
-        _readCtx = readCtx;
-        _logger  = logger;
+        _readCtx              = readCtx;
+        _rejectionAggregator  = rejectionAggregator;
+        _logger               = logger;
     }
 
     public async Task<IReadOnlyList<EvolutionaryCandidate>> ProposeOffspringAsync(
@@ -106,12 +118,18 @@ public sealed class EvolutionaryStrategyGenerator : IEvolutionaryStrategyGenerat
         int rngSeed = (int)((DateTime.UtcNow.Ticks / TimeSpan.TicksPerMinute) & int.MaxValue);
         var rng = new Random(rngSeed);
 
+        // Load rolling rejection-class distribution and bias mutation strength per strategy
+        // type. When recent rejections are dominated by Underfit patterns we widen the step;
+        // when they're dominated by Overfit patterns we narrow it. Unknown/Mixed → baseline.
+        var rejectionClasses = await _rejectionAggregator.LoadAsync(ct);
+
         var candidates = new List<EvolutionaryCandidate>();
         foreach (var parent in parents)
         {
+            double strength = ResolveMutationStrength(parent.StrategyType, rejectionClasses);
             for (int i = 0; i < OffspringPerParent && candidates.Count < maxOffspring; i++)
             {
-                var mutated = MutateParameters(parent.ParametersJson, rng, out string description);
+                var mutated = MutateParameters(parent.ParametersJson, rng, strength, out string description);
                 if (mutated is null) continue;
 
                 candidates.Add(new EvolutionaryCandidate(
@@ -132,13 +150,28 @@ public sealed class EvolutionaryStrategyGenerator : IEvolutionaryStrategyGenerat
         return candidates;
     }
 
+    internal static double ResolveMutationStrength(
+        StrategyType strategyType,
+        IReadOnlyDictionary<StrategyType, RejectionClass> rejectionClasses)
+    {
+        if (!rejectionClasses.TryGetValue(strategyType, out var cls))
+            return MutationStrengthBaseline;
+
+        return cls switch
+        {
+            RejectionClass.Underfit => MutationStrengthUnderfit,
+            RejectionClass.Overfit  => MutationStrengthOverfit,
+            _                       => MutationStrengthBaseline,
+        };
+    }
+
     /// <summary>
     /// Mutate every numeric parameter in <paramref name="parametersJson"/> by a
-    /// uniform random factor in [1−MutationStrength, 1+MutationStrength]. Integer-
-    /// typed values are rounded; non-numeric values pass through unchanged. Returns
+    /// uniform random factor in [1−<paramref name="strength"/>, 1+<paramref name="strength"/>].
+    /// Integer-typed values are rounded; non-numeric values pass through unchanged. Returns
     /// the new JSON + a human-readable description of which keys mutated.
     /// </summary>
-    private static string? MutateParameters(string parametersJson, Random rng, out string description)
+    internal static string? MutateParameters(string parametersJson, Random rng, double strength, out string description)
     {
         description = "no-op";
         if (string.IsNullOrWhiteSpace(parametersJson)) return null;
@@ -157,7 +190,7 @@ public sealed class EvolutionaryStrategyGenerator : IEvolutionaryStrategyGenerat
             if (!val.TryGetValue<double>(out var d)) continue;
             if (d == 0) continue; // can't multiply zero meaningfully
 
-            double factor = 1.0 + (rng.NextDouble() * 2 - 1) * MutationStrength;
+            double factor = 1.0 + (rng.NextDouble() * 2 - 1) * strength;
             double newValue = d * factor;
 
             // Preserve int-ness for parameters that look like counts (period, lookback, etc.).
@@ -175,7 +208,7 @@ public sealed class EvolutionaryStrategyGenerator : IEvolutionaryStrategyGenerat
         }
 
         if (mutatedKeys.Count == 0) return null;
-        description = $"perturb({string.Join(",", mutatedKeys)}, ±{MutationStrength * 100:F0}%)";
+        description = $"perturb({string.Join(",", mutatedKeys)}, ±{strength * 100:F0}%)";
         return obj.ToJsonString(new JsonSerializerOptions { WriteIndented = false });
     }
 }

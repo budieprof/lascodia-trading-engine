@@ -42,6 +42,7 @@ public class RegimeStrategyMapper : IRegimeStrategyMapper
                 StrategyType.MACDDivergence,
                 StrategyType.MomentumTrend,
                 StrategyType.BreakoutScalper,
+                StrategyType.CarryTrade,
             },
             [MarketRegimeEnum.Ranging] = new[]
             {
@@ -68,6 +69,7 @@ public class RegimeStrategyMapper : IRegimeStrategyMapper
                 StrategyType.VwapReversion,
                 StrategyType.SessionBreakout,
                 StrategyType.CalendarEffect,
+                StrategyType.CarryTrade,
             },
             [MarketRegimeEnum.Breakout] = new[]
             {

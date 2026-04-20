@@ -1283,6 +1283,23 @@ public class StrategyEvaluatorOptions : ConfigurationOption<StrategyEvaluatorOpt
     /// <summary>Maximum confidence boost from overshoot magnitude. Defaults to 0.18.</summary>
     public decimal NewsFadeConfidenceOvershootMax { get; set; } = 0.18m;
 
+    // ── Carry Trade ────────────────────────────────────────────────────────
+
+    /// <summary>Base confidence for carry-trade signals before carry-magnitude boost. Defaults to 0.62.</summary>
+    public decimal CarryTradeConfidence { get; set; } = 0.62m;
+
+    /// <summary>Signal expiry in minutes for carry-trade signals. Defaults to 720 (12h), reflecting the long-horizon nature of IRD trades.</summary>
+    public int CarryTradeExpiryMinutes { get; set; } = 720;
+
+    /// <summary>Maximum spread as a fraction of ATR for carry-trade entries. Defaults to 0.4 (40% of ATR). Set to 0 to disable.</summary>
+    public decimal CarryTradeMaxSpreadAtrFraction { get; set; } = 0.4m;
+
+    /// <summary>Per-unit carry-strength confidence boost scale. Defaults to 0.08.</summary>
+    public decimal CarryTradeConfidenceStrengthScale { get; set; } = 0.08m;
+
+    /// <summary>Maximum confidence boost from carry magnitude. Defaults to 0.18.</summary>
+    public decimal CarryTradeConfidenceStrengthMax { get; set; } = 0.18m;
+
     // ── Momentum Trend ─────────────────────────────────────────────────────
 
     /// <summary>Default confidence for momentum trend signals. Defaults to 0.70.</summary>

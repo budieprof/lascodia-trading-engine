@@ -110,6 +110,20 @@ public class StrategyParameterTemplateProvider : IStrategyParameterTemplateProvi
             """{"SessionStartHour":13,"SessionEndHour":21,"EntryAtrThreshold":1.5,"StopLossAtrMultiplier":2.0,"TakeProfitAtrMultiplier":1.2,"AtrPeriod":14,"MaxAdx":40,"MinVolumeRatio":1.1}""",
             """{"SessionStartHour":13,"SessionEndHour":21,"EntryAtrThreshold":2.0,"StopLossAtrMultiplier":2.5,"TakeProfitAtrMultiplier":1.5,"AtrPeriod":14,"MaxAdx":35,"MinVolumeRatio":1.0}""",
         },
+        [StrategyType.CarryTrade] = new[]
+        {
+            // Conservative — strong drift required, wider SL/TP.
+            """{"MinCarryStrength":1.5,"HorizonMultiplier":2.5}""",
+            """{"MinCarryStrength":1.2,"HorizonMultiplier":2.0}""",
+
+            // Balanced — typical IRD-driven drift.
+            """{"MinCarryStrength":1.0,"HorizonMultiplier":2.0}""",
+            """{"MinCarryStrength":0.8,"HorizonMultiplier":1.5}""",
+
+            // Aggressive — catches earlier drift builds.
+            """{"MinCarryStrength":0.6,"HorizonMultiplier":1.2}""",
+            """{"MinCarryStrength":0.5,"HorizonMultiplier":1.0}""",
+        },
         [StrategyType.NewsFade] = new[]
         {
             // Conservative — requires strong overshoot, tight post-event window.

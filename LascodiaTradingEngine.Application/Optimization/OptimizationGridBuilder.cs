@@ -247,6 +247,20 @@ internal sealed class OptimizationGridBuilder
                 break;
             }
 
+            case StrategyType.CarryTrade:
+            {
+                foreach (var minCarry in new[] { 0.5, 0.8, 1.0, 1.5 })
+                foreach (var horizon in new[] { 1.0, 1.5, 2.0, 2.5 })
+                {
+                    grid.Add(new Dictionary<string, object>
+                    {
+                        ["MinCarryStrength"] = minCarry,
+                        ["HorizonMultiplier"] = horizon,
+                    });
+                }
+                break;
+            }
+
             case StrategyType.NewsFade:
             {
                 foreach (var minMin in new[] { 2, 5, 10 })

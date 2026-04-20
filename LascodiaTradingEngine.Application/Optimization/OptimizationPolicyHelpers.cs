@@ -34,6 +34,9 @@ internal static class OptimizationPolicyHelpers
         if (strategyType is StrategyType.NewsFade)
             return higherTfRegime is MarketRegimeEnum.HighVolatility or MarketRegimeEnum.Breakout or MarketRegimeEnum.Trending;
 
+        if (strategyType is StrategyType.CarryTrade)
+            return higherTfRegime is MarketRegimeEnum.Trending or MarketRegimeEnum.LowVolatility;
+
         return true;
     }
 

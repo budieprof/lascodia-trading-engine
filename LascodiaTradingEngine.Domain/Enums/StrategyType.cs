@@ -52,5 +52,14 @@ public enum StrategyType
     /// the well-documented post-news mean-reversion (news effects are typically priced
     /// within 15-30 minutes).
     /// </summary>
-    NewsFade               = 12
+    NewsFade               = 12,
+
+    /// <summary>
+    /// Carry-style long-horizon persistent-drift follower. Uses the 90-bar drift-vs-volatility
+    /// ratio (the existing PairCarryProxy signal) as a stand-in for true interest-rate
+    /// differentials; fires long/short when drift is persistently strong. Intentionally
+    /// distinct from short-horizon trend-following — only fires on multi-month-scale drift.
+    /// Upgrades cleanly to real swap-rate IRD weighting when that data becomes available.
+    /// </summary>
+    CarryTrade             = 13
 }
