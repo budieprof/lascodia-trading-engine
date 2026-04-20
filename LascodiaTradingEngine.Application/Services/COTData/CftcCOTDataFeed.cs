@@ -10,12 +10,12 @@ namespace LascodiaTradingEngine.Application.Services.COTData;
 /// Fetches COT positioning data from the CFTC's public bulk CSV files.
 /// </summary>
 /// <remarks>
-/// The CFTC publishes legacy COT reports as downloadable ZIP files containing CSV data at:
-/// <list type="bullet">
-///   <item><c>deacom{year}.zip</c> — Commodities (includes currency futures) for a given year</item>
-///   <item><c>dea_com_txt_{year}.zip</c> — Current year format variant</item>
-/// </list>
-/// URL: <c>https://www.cftc.gov/files/dea/history/deacom{year}.zip</c>
+/// The CFTC publishes the Legacy COT report as a yearly ZIP archive containing a single
+/// <c>annual.txt</c> CSV file at:
+/// <c>https://www.cftc.gov/files/dea/history/deacot{year}.zip</c>.
+/// The archive contains currency futures rows (e.g. "EURO FX - CHICAGO MERCANTILE EXCHANGE")
+/// with the Legacy column layout this class parses (<c>Open Interest (All)</c>,
+/// <c>Noncommercial Positions-Long (All)</c>, etc).
 ///
 /// Each row in the CSV represents one commodity/date combination. Currency futures rows are
 /// identified by the "FOREX" market code in the <c>Market_and_Exchange_Names</c> column or
@@ -104,7 +104,7 @@ public class CftcCOTDataFeed : ICOTDataFeed
             yearRecords = await GetYearRecordsAsync(reportDate.Year - 1, ct);
             if (yearRecords == null)
             {
-                _logger.LogDebug(
+                _logger.LogWarning(
                     "CftcCOTDataFeed: neither {Year} nor {PrevYear} archive available for {Currency}",
                     reportDate.Year, reportDate.Year - 1, currency);
                 return null;
@@ -183,18 +183,13 @@ public class CftcCOTDataFeed : ICOTDataFeed
     }
 
     /// <summary>
-    /// Downloads the CFTC ZIP file for the given year and parses its CSV contents.
-    /// Tries the current-year URL format first, then falls back to the historical format.
+    /// Downloads the CFTC Legacy COT ZIP for the given year and parses its CSV contents.
     /// </summary>
     private async Task<List<CftcCsvRecord>?> DownloadAndParseAsync(int year, CancellationToken ct)
     {
-        // CFTC uses two URL patterns:
-        // Current year: https://www.cftc.gov/files/dea/history/dea_com_txt_{year}.zip
-        // Historical:   https://www.cftc.gov/files/dea/history/deacom{year}.zip
         var urls = new[]
         {
-            $"https://www.cftc.gov/files/dea/history/dea_com_txt_{year}.zip",
-            $"https://www.cftc.gov/files/dea/history/deacom{year}.zip"
+            $"https://www.cftc.gov/files/dea/history/deacot{year}.zip"
         };
 
         var client = _httpClientFactory.CreateClient("CftcCOT");
