@@ -172,6 +172,20 @@ public class MarketDataAnomalyDetector : IMarketDataAnomalyDetector
                 $"Non-positive price: O={open}, H={high}, L={low}, C={close}");
         }
 
+        // Magnitude guard: the Candle price columns are numeric(18,8), which caps the
+        // integer portion at ~10 billion. A bogus EA payload with a very large price
+        // (broker connectivity error, EA sending a float-infinity cast, instrument
+        // mis-scale) passes all the consistency checks above but overflows the column
+        // at INSERT time with PostgreSQL 22003. Quarantine such candles here so the
+        // audit trail captures the root cause instead of a generic DbUpdateException.
+        const decimal MaxPriceMagnitude = 1_000_000_000m; // 1e9, well above any real instrument
+        if (open  > MaxPriceMagnitude || high > MaxPriceMagnitude ||
+            low   > MaxPriceMagnitude || close > MaxPriceMagnitude)
+        {
+            return new CandleQualityResult(false, MarketDataAnomalyType.InvalidOhlc,
+                $"Price magnitude exceeds column precision: O={open}, H={high}, L={low}, C={close} (max {MaxPriceMagnitude:F0})");
+        }
+
         return new CandleQualityResult(true, null, null);
     }
 }
