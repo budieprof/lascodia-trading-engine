@@ -55,6 +55,14 @@ public sealed class TradingMetrics
     public Counter<long>     EngineConfigCacheHits  { get; }
     public Counter<long>     EngineConfigCacheMisses { get; }
     public Counter<long>     KillSwitchTriggered    { get; }
+    public Counter<long>     CircuitBreakerTransitions { get; }
+    public Counter<long>     CircuitBreakerShortCircuits { get; }
+    public Counter<long>     DbBulkheadWaits        { get; }
+    public Histogram<double> DbBulkheadWaitMs       { get; }
+    public Counter<long>     MLScoringBatchCalls    { get; }
+    public Histogram<double> MLScoringBatchSize     { get; }
+    public Counter<long>     ConflictResolutionEarlyExits { get; }
+    public Counter<long>     EaReconciliationDrift  { get; }
     public Histogram<double> StrategyLockAcquisitionMs { get; }
     public Counter<long>     RegimeParamsCacheHits  { get; }
     public Counter<long>     RegimeParamsCacheMisses { get; }
@@ -83,6 +91,11 @@ public sealed class TradingMetrics
     public Counter<long>     MLArchitectureSelected { get; }
     public Counter<long>     MLSelectorFallbackDepth { get; }
     public Counter<long>     MLSelectorTrendPenalty  { get; }
+    public Counter<long>     MLConformalBreakerModelsEvaluated { get; }
+    public Counter<long>     MLConformalBreakerModelsSkipped { get; }
+    public Counter<long>     MLConformalBreakerTrips { get; }
+    public Histogram<double> MLConformalBreakerEmpiricalCoverage { get; }
+    public Histogram<double> MLConformalBreakerActive { get; }
 
     // ── Workers ─────────────────────────────────────────────────────────────
     public Histogram<double> WorkerCycleDurationMs  { get; }
@@ -279,6 +292,14 @@ public sealed class TradingMetrics
         EngineConfigCacheHits = _meter.CreateCounter<long>("trading.engine_config_cache.hits", "lookups", "EngineConfig cache hits on the hot tick path.");
         EngineConfigCacheMisses = _meter.CreateCounter<long>("trading.engine_config_cache.misses", "lookups", "EngineConfig cache misses that triggered a DB refresh.");
         KillSwitchTriggered = _meter.CreateCounter<long>("trading.kill_switch.triggered", "events", "Decisions short-circuited by an active kill switch. Tagged with scope={global|strategy} and site={strategy_worker|signal_bridge}.");
+        CircuitBreakerTransitions = _meter.CreateCounter<long>("trading.circuit_breaker.transitions", "transitions", "External-service circuit breaker state transitions. Tagged with service and state.");
+        CircuitBreakerShortCircuits = _meter.CreateCounter<long>("trading.circuit_breaker.short_circuits", "events", "Calls skipped because the circuit breaker was open. Tagged with service.");
+        DbBulkheadWaits = _meter.CreateCounter<long>("trading.db_bulkhead.waits", "events", "Callers that had to wait for an IDbOperationBulkhead slot. Tagged with group.");
+        DbBulkheadWaitMs = _meter.CreateHistogram<double>("trading.db_bulkhead.wait_ms", "ms", "Time spent waiting for a DB-bulkhead slot. Tagged with group.");
+        MLScoringBatchCalls = _meter.CreateCounter<long>("trading.ml.scoring_batch_calls", "calls", "IMLSignalScorer.ScoreBatchAsync invocations by StrategyWorker. Tagged with batch_size={1..N}.");
+        MLScoringBatchSize = _meter.CreateHistogram<double>("trading.ml.scoring_batch_size", "signals", "Number of signals per batched ML scoring call.");
+        ConflictResolutionEarlyExits = _meter.CreateCounter<long>("trading.signals.conflict_resolution_early_exits", "candidates", "Candidate signals skipped by pre-score filtering before expensive per-strategy work ran.");
+        EaReconciliationDrift = _meter.CreateCounter<long>("trading.ea.reconciliation_drift", "events", "Non-zero drift findings persisted by the ReconciliationMonitor. Tagged with kind={orphaned_engine|unknown_broker|mismatched}.");
         StrategyLockAcquisitionMs = _meter.CreateHistogram<double>("trading.strategy.lock_acquisition_ms", "ms", "Wall-clock time spent inside IDistributedLock.TryAcquireAsync for strategy evaluation. Tagged with outcome={acquired|busy}.");
         RegimeParamsCacheHits = _meter.CreateCounter<long>("trading.strategy.regime_params_cache.hits", "lookups", "StrategyRegimeParams cache hits on the hot tick path.");
         RegimeParamsCacheMisses = _meter.CreateCounter<long>("trading.strategy.regime_params_cache.misses", "lookups", "StrategyRegimeParams cache misses that triggered a DB refresh.");
@@ -302,6 +323,11 @@ public sealed class TradingMetrics
         MLArchitectureSelected  = _meter.CreateCounter<long>("trading.ml.architecture_selected", "selections", "ML architecture selections by TrainerSelector");
         MLSelectorFallbackDepth = _meter.CreateCounter<long>("trading.ml.selector_fallback_depth", "selections", "TrainerSelector fallback depth reached per selection");
         MLSelectorTrendPenalty  = _meter.CreateCounter<long>("trading.ml.selector_trend_penalty", "penalties", "Architecture score penalised due to declining performance trend");
+        MLConformalBreakerModelsEvaluated = _meter.CreateCounter<long>("trading.ml.conformal_breaker.models_evaluated", "models", "Active ML models evaluated by the conformal breaker");
+        MLConformalBreakerModelsSkipped = _meter.CreateCounter<long>("trading.ml.conformal_breaker.models_skipped", "models", "ML models skipped by the conformal breaker, tagged by reason");
+        MLConformalBreakerTrips = _meter.CreateCounter<long>("trading.ml.conformal_breaker.trips", "breakers", "Conformal breaker suppressions, tagged by trip reason");
+        MLConformalBreakerEmpiricalCoverage = _meter.CreateHistogram<double>("trading.ml.conformal_breaker.empirical_coverage", "ratio", "Empirical conformal coverage observed by the breaker");
+        MLConformalBreakerActive = _meter.CreateHistogram<double>("trading.ml.conformal_breaker.active", "breakers", "Active conformal breaker count");
 
         // Workers
         WorkerCycleDurationMs = _meter.CreateHistogram<double>("trading.workers.cycle_duration", "ms", "Worker poll cycle duration");

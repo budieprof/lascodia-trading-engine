@@ -20,4 +20,20 @@ public interface IDistributedLock
     /// </summary>
     Task<IAsyncDisposable?> TryAcquireAsync(string lockKey, TimeSpan timeout, CancellationToken ct = default)
         => TryAcquireAsync(lockKey, ct);
+
+    /// <summary>
+    /// Struct-keyed overload for high-frequency callers that don't want to
+    /// allocate a fresh string per acquisition (e.g. per-tick parallel
+    /// strategy evaluation). The backing implementation uses the 64-bit key
+    /// directly — PostgreSQL advisory locks natively take a <c>bigint</c> — so
+    /// the string-to-hash roundtrip is skipped.
+    /// <para>
+    /// Callers must namespace their lock IDs so they do not collide with the
+    /// SHA256-derived IDs used by the string overload. The recommended pattern
+    /// is to OR a well-known 48-bit prefix into the lower half of the entity
+    /// ID, e.g. <c>((long)0x5374_5261_7400 &lt;&lt; 16) | strategyId</c>.
+    /// </para>
+    /// </summary>
+    Task<IAsyncDisposable?> TryAcquireAsync(long lockId, TimeSpan timeout, CancellationToken ct = default)
+        => TryAcquireAsync($"lock:{lockId:X}", timeout, ct);
 }

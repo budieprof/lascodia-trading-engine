@@ -55,6 +55,8 @@ public class StrategyWorkerTest : IDisposable
     private readonly EngineConfigCache _engineConfigCache;
     private readonly Mock<IKillSwitchService> _mockKillSwitch;
     private readonly Mock<IDegradationModeManager> _mockDegradationManager;
+    private readonly Mock<IExternalServiceCircuitBreaker> _mockCircuitBreaker;
+    private readonly DbOperationBulkhead _bulkhead;
 
     public StrategyWorkerTest()
     {
@@ -112,6 +114,9 @@ public class StrategyWorkerTest : IDisposable
             .ReturnsAsync(mockHandle.Object);
         _mockDistributedLock
             .Setup(l => l.TryAcquireAsync(It.IsAny<string>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(mockHandle.Object);
+        _mockDistributedLock
+            .Setup(l => l.TryAcquireAsync(It.IsAny<long>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(mockHandle.Object);
 
         // Default ML scorer returns neutral result
@@ -175,6 +180,13 @@ public class StrategyWorkerTest : IDisposable
             .Returns(ValueTask.FromResult(false));
         _mockDegradationManager = new Mock<IDegradationModeManager>();
         _mockDegradationManager.Setup(d => d.CurrentMode).Returns(DegradationMode.Normal);
+        _mockCircuitBreaker = new Mock<IExternalServiceCircuitBreaker>();
+        _mockCircuitBreaker.Setup(c => c.IsOpen(It.IsAny<string>())).Returns(false);
+        // Use the real bulkhead — mocking a ValueTask-returning method through
+        // Moq is fiddly and the real bulkhead's per-group semaphores are
+        // plentiful (60+ slots) so tests never block on acquisition.
+        _bulkhead = new DbOperationBulkhead(_metrics,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<DbOperationBulkhead>.Instance);
 
         _worker = new StrategyWorker(
             _mockLogger.Object,
@@ -195,7 +207,9 @@ public class StrategyWorkerTest : IDisposable
             _marketRegimeCache,
             _engineConfigCache,
             _mockKillSwitch.Object,
-            _mockDegradationManager.Object);
+            _mockDegradationManager.Object,
+            _mockCircuitBreaker.Object,
+            _bulkhead);
     }
 
     public void Dispose() => _meterFactory.Dispose();

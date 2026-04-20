@@ -192,6 +192,31 @@ public class ProcessReconciliationCommandHandler : IRequestHandler<ProcessReconc
                 result.UnknownBrokerOrders++;
         }
 
+        // ── Persist an audit row so the EaReconciliationMonitorWorker can
+        //    aggregate drift over time and alert on sustained divergence.
+        //    A single insert per EA snapshot — trivial cost vs. the much more
+        //    expensive comparisons just performed.
+        int totalDrift = result.OrphanedEnginePositions
+                       + result.UnknownBrokerPositions
+                       + result.MismatchedPositions
+                       + result.OrphanedEngineOrders
+                       + result.UnknownBrokerOrders;
+
+        dbContext.Set<Domain.Entities.ReconciliationRun>().Add(new Domain.Entities.ReconciliationRun
+        {
+            InstanceId               = request.InstanceId,
+            RunAt                    = DateTime.UtcNow,
+            OrphanedEnginePositions  = result.OrphanedEnginePositions,
+            UnknownBrokerPositions   = result.UnknownBrokerPositions,
+            MismatchedPositions      = result.MismatchedPositions,
+            OrphanedEngineOrders     = result.OrphanedEngineOrders,
+            UnknownBrokerOrders      = result.UnknownBrokerOrders,
+            TotalDrift               = totalDrift,
+            BrokerPositionCount      = request.BrokerPositions.Count,
+            BrokerOrderCount         = request.BrokerOrders.Count,
+        });
+        await _context.SaveChangesAsync(cancellationToken);
+
         return ResponseData<ReconciliationResult>.Init(result, true, "Successful", "00");
     }
 }

@@ -3,6 +3,7 @@ using System;
 using LascodiaTradingEngine.Infrastructure.Persistence.DbContexts;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 
@@ -11,9 +12,11 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace LascodiaTradingEngine.Infrastructure.Migrations
 {
     [DbContext(typeof(WriteApplicationDbContext))]
-    partial class WriteApplicationDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260420191044_AddReconciliationRun")]
+    partial class AddReconciliationRun
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -1537,21 +1540,6 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     b.Property<int>("ConsecutivePoorCoverageBars")
                         .HasColumnType("integer");
 
-                    b.Property<double?>("CoverageLowerBound")
-                        .HasPrecision(18, 8)
-                        .HasColumnType("double precision");
-
-                    b.Property<double?>("CoveragePValue")
-                        .HasPrecision(18, 12)
-                        .HasColumnType("double precision");
-
-                    b.Property<double>("CoverageThreshold")
-                        .HasPrecision(10, 8)
-                        .HasColumnType("double precision");
-
-                    b.Property<int>("CoveredCount")
-                        .HasColumnType("integer");
-
                     b.Property<double>("EmpiricalCoverage")
                         .HasPrecision(18, 8)
                         .HasColumnType("double precision");
@@ -1571,9 +1559,6 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     b.Property<DateTime>("ResumeAt")
                         .HasColumnType("timestamp with time zone");
 
-                    b.Property<int>("SampleCount")
-                        .HasColumnType("integer");
-
                     b.Property<DateTime>("SuspendedAt")
                         .HasColumnType("timestamp with time zone");
 
@@ -1585,27 +1570,14 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                         .HasMaxLength(20)
                         .HasColumnType("character varying(20)");
 
-                    b.Property<double>("TargetCoverage")
-                        .HasPrecision(5, 4)
-                        .HasColumnType("double precision");
-
                     b.Property<string>("Timeframe")
                         .IsRequired()
                         .HasMaxLength(10)
                         .HasColumnType("character varying(10)");
 
-                    b.Property<string>("TripReason")
-                        .IsRequired()
-                        .HasMaxLength(40)
-                        .HasColumnType("character varying(40)");
-
                     b.HasKey("Id");
 
                     b.HasIndex("MLModelId");
-
-                    b.HasIndex("MLModelId", "Symbol", "Timeframe")
-                        .IsUnique()
-                        .HasFilter("\"IsActive\" = TRUE AND \"IsDeleted\" = FALSE");
 
                     b.ToTable("MLConformalBreakerLog");
                 });
@@ -2547,19 +2519,6 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                         .HasColumnType("numeric(5,4)");
 
                     b.Property<double?>("ConformalNonConformityScore")
-                        .HasPrecision(10, 8)
-                        .HasColumnType("double precision");
-
-                    b.Property<string>("ConformalPredictionSetJson")
-                        .HasMaxLength(100)
-                        .HasColumnType("character varying(100)");
-
-                    b.Property<double?>("ConformalTargetCoverageUsed")
-                        .HasPrecision(5, 4)
-                        .HasColumnType("double precision");
-
-                    b.Property<double?>("ConformalThresholdUsed")
-                        .HasPrecision(10, 8)
                         .HasColumnType("double precision");
 
                     b.Property<string>("ContributionsJson")
@@ -2600,9 +2559,6 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
 
                     b.Property<int?>("LatencyMs")
                         .HasColumnType("integer");
-
-                    b.Property<long?>("MLConformalCalibrationId")
-                        .HasColumnType("bigint");
 
                     b.Property<long>("MLModelId")
                         .HasColumnType("bigint");
@@ -2682,27 +2638,17 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     b.Property<long>("TradeSignalId")
                         .HasColumnType("bigint");
 
-                    b.Property<bool?>("WasConformalCovered")
-                        .HasColumnType("boolean");
-
                     b.Property<bool?>("WasProfitable")
                         .HasColumnType("boolean");
 
                     b.HasKey("Id");
 
-                    b.HasIndex("MLConformalCalibrationId");
-
                     b.HasIndex("TradeSignalId");
 
                     b.HasIndex("MLModelId", "ModelRole");
 
-                    b.HasIndex("MLModelId", "OutcomeRecordedAt");
-
                     b.HasIndex("TradeSignalId", "MLModelId")
                         .IsUnique();
-
-                    b.HasIndex("MLModelId", "WasConformalCovered", "OutcomeRecordedAt")
-                        .HasFilter("\"OutcomeRecordedAt\" IS NOT NULL AND \"IsDeleted\" = FALSE");
 
                     b.ToTable("MLModelPredictionLog");
                 });
@@ -7037,11 +6983,6 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
 
             modelBuilder.Entity("LascodiaTradingEngine.Domain.Entities.MLModelPredictionLog", b =>
                 {
-                    b.HasOne("LascodiaTradingEngine.Domain.Entities.MLConformalCalibration", "MLConformalCalibration")
-                        .WithMany()
-                        .HasForeignKey("MLConformalCalibrationId")
-                        .OnDelete(DeleteBehavior.SetNull);
-
                     b.HasOne("LascodiaTradingEngine.Domain.Entities.MLModel", "MLModel")
                         .WithMany("PredictionLogs")
                         .HasForeignKey("MLModelId")
@@ -7053,8 +6994,6 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                         .HasForeignKey("TradeSignalId")
                         .OnDelete(DeleteBehavior.Restrict)
                         .IsRequired();
-
-                    b.Navigation("MLConformalCalibration");
 
                     b.Navigation("MLModel");
 

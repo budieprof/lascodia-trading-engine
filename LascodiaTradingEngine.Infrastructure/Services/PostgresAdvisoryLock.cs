@@ -34,17 +34,28 @@ public sealed class PostgresAdvisoryLock : IDistributedLock
 
     public async Task<IAsyncDisposable?> TryAcquireAsync(string lockKey, CancellationToken ct = default)
     {
-        return await TryAcquireCoreAsync(lockKey, timeout: null, ct);
+        return await TryAcquireCoreAsync(lockKey, HashToLong(lockKey), timeout: null, ct);
     }
 
     public async Task<IAsyncDisposable?> TryAcquireAsync(string lockKey, TimeSpan timeout, CancellationToken ct = default)
     {
-        return await TryAcquireCoreAsync(lockKey, timeout, ct);
+        return await TryAcquireCoreAsync(lockKey, HashToLong(lockKey), timeout, ct);
     }
 
-    private async Task<IAsyncDisposable?> TryAcquireCoreAsync(string lockKey, TimeSpan? timeout, CancellationToken ct)
+    /// <summary>
+    /// Overrides the default string-hashing path with a direct bigint lookup —
+    /// PostgreSQL's <c>pg_try_advisory_lock(bigint)</c> accepts the integer
+    /// natively, so we skip both the SHA256 + the per-call string allocation.
+    /// Callers supplying the long directly must namespace their IDs; see
+    /// <see cref="IDistributedLock.TryAcquireAsync(long, TimeSpan, CancellationToken)"/>.
+    /// </summary>
+    public async Task<IAsyncDisposable?> TryAcquireAsync(long lockId, TimeSpan timeout, CancellationToken ct = default)
     {
-        long lockId = HashToLong(lockKey);
+        return await TryAcquireCoreAsync($"#{lockId:X}", lockId, timeout, ct);
+    }
+
+    private async Task<IAsyncDisposable?> TryAcquireCoreAsync(string lockKey, long lockId, TimeSpan? timeout, CancellationToken ct)
+    {
 
         var scope   = _scopeFactory.CreateAsyncScope();
         var writeDb = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();

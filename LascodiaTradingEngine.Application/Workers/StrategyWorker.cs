@@ -120,6 +120,26 @@ public partial class StrategyWorker :
     private readonly EngineConfigCache _engineConfigCache;
     private readonly IKillSwitchService _killSwitch;
     private readonly IDegradationModeManager _degradationManager;
+    private readonly IExternalServiceCircuitBreaker _circuitBreaker;
+    private readonly IDbOperationBulkhead _dbBulkhead;
+
+    // Named service keys for circuit-breaker bookkeeping — kept in one place so
+    // dashboards can filter by the canonical string without typo-driven splits.
+    private const string CbNewsFilter        = "NewsFilter";
+    private const string CbMLSignalScorer    = "MLSignalScorer";
+    private const string CbRegimeCoherence   = "RegimeCoherenceChecker";
+
+    // Namespace prefix for strategy-evaluation advisory lock IDs. Upper 8 bits
+    // reserved so the remaining 56 bits can carry a realistic strategy.Id
+    // range. Collision with a SHA256-hashed string key requires both matching
+    // top byte (1/256) AND matching lower 56 bits to the exact strategyId —
+    // effectively impossible. Top byte = 0x54 so hex dumps show the prefix
+    // distinctly from arbitrary lock IDs.
+    private const long StrategyEvalLockNamespace = 0x5400_0000_0000_0000L;
+    private const long StrategyEvalIdMask        = 0x00FF_FFFF_FFFF_FFFFL;
+
+    private static long StrategyEvalLockId(long strategyId)
+        => StrategyEvalLockNamespace | (strategyId & StrategyEvalIdMask);
 
     /// <summary>Tracks the last signal creation time per strategy to enforce cooldown.</summary>
     private readonly ConcurrentDictionary<long, DateTime> _lastSignalTime = new();
@@ -201,7 +221,9 @@ public partial class StrategyWorker :
         MarketRegimeCache marketRegimeCache,
         EngineConfigCache engineConfigCache,
         IKillSwitchService killSwitch,
-        IDegradationModeManager degradationManager)
+        IDegradationModeManager degradationManager,
+        IExternalServiceCircuitBreaker circuitBreaker,
+        IDbOperationBulkhead dbBulkhead)
     {
         _logger                       = logger;
         _scopeFactory                 = scopeFactory;    // Creates per-event/per-strategy DI scopes
@@ -222,6 +244,8 @@ public partial class StrategyWorker :
         _engineConfigCache            = engineConfigCache;          // Raw EngineConfig value cache, invalidated on upsert
         _killSwitch                   = killSwitch;                  // Global + per-strategy kill switches
         _degradationManager           = degradationManager;          // Engine degradation state machine
+        _circuitBreaker               = circuitBreaker;              // Per-service circuit breakers for hot-path externals
+        _dbBulkhead                   = dbBulkhead;                  // Per-worker-group DB-operation bulkhead
     }
 
     /// <summary>
@@ -407,6 +431,14 @@ public partial class StrategyWorker :
     /// </summary>
     internal async Task ProcessPriceUpdateAsync(PriceUpdatedIntegrationEvent @event)
     {
+        // ── DB-operation bulkhead (signal-path group) ─────────────────────
+        // Cap concurrent signal-path DB operations so a runaway ML or
+        // backtest worker on the same connection pool cannot starve tick
+        // evaluation. Slot acquired here is released by the `using var`
+        // block's Dispose at method exit — including the exceptional paths.
+        using var _bulkheadSlot = await _dbBulkhead.AcquireAsync(
+            DbOperationBulkhead.GroupSignalPath, _stoppingToken);
+
         // ── Global kill switch (first check, before any work) ─────────────
         // A positive kill-switch state short-circuits the entire tick. Cached
         // so the check is effectively free on the hot path; propagation is
@@ -502,6 +534,17 @@ public partial class StrategyWorker :
         // the hot tick path.
         if (_options.NewsBlackoutMinutesBefore > 0 || _options.NewsBlackoutMinutesAfter > 0)
         {
+            // Circuit-breaker short-circuit: a persistently broken news filter
+            // (repeated timeouts / exceptions) opens the circuit so every tick
+            // stops paying the per-call timeout before fail-closing.
+            if (_circuitBreaker.IsOpen(CbNewsFilter))
+            {
+                _metrics.CircuitBreakerShortCircuits.Add(1,
+                    new KeyValuePair<string, object?>("service", CbNewsFilter));
+                _metrics.SignalsFiltered.Add(1, new("symbol", @event.Symbol), new("stage", "news_filter_circuit_open"));
+                return;
+            }
+
             int timeoutSeconds = Math.Max(1, _options.NewsFilterTimeoutSeconds);
             bool safeToTrade;
             using (var newsCts = CancellationTokenSource.CreateLinkedTokenSource(_stoppingToken))
@@ -513,9 +556,11 @@ public partial class StrategyWorker :
                         @event.Symbol, @event.Timestamp,
                         _options.NewsBlackoutMinutesBefore, _options.NewsBlackoutMinutesAfter,
                         newsCts.Token);
+                    _circuitBreaker.RecordSuccess(CbNewsFilter);
                 }
                 catch (OperationCanceledException) when (!_stoppingToken.IsCancellationRequested)
                 {
+                    _circuitBreaker.RecordFailure(CbNewsFilter);
                     _logger.LogWarning(
                         "StrategyWorker: news filter timed out after {Timeout}s for {Symbol} — skipping tick (fail-closed)",
                         timeoutSeconds, @event.Symbol);
@@ -524,6 +569,7 @@ public partial class StrategyWorker :
                 }
                 catch (Exception ex) when (!_stoppingToken.IsCancellationRequested)
                 {
+                    _circuitBreaker.RecordFailure(CbNewsFilter);
                     _logger.LogError(ex,
                         "StrategyWorker: news filter failed for {Symbol} — skipping tick (fail-closed)",
                         @event.Symbol);
@@ -734,6 +780,18 @@ public partial class StrategyWorker :
         // check entirely — no point failing closed on a disabled gate.
         if (_options.MinRegimeCoherence > 0)
         {
+            // Circuit-breaker short-circuit: a persistently failing regime
+            // coherence checker (DB outage or misconfiguration) opens the
+            // circuit so we stop paying the per-call 10s timeout cost on
+            // every tick. Fail-closed matches the existing timeout path.
+            if (_circuitBreaker.IsOpen(CbRegimeCoherence))
+            {
+                _metrics.CircuitBreakerShortCircuits.Add(1,
+                    new KeyValuePair<string, object?>("service", CbRegimeCoherence));
+                _metrics.SignalsFiltered.Add(1, new("symbol", @event.Symbol), new("stage", "regime_coherence_circuit_open"));
+                return;
+            }
+
             decimal regimeCoherence;
             using (var coherenceCts = CancellationTokenSource.CreateLinkedTokenSource(_stoppingToken))
             {
@@ -742,9 +800,11 @@ public partial class StrategyWorker :
                 {
                     regimeCoherence = await _regimeCoherenceChecker.GetCoherenceScoreAsync(
                         @event.Symbol, coherenceCts.Token);
+                    _circuitBreaker.RecordSuccess(CbRegimeCoherence);
                 }
                 catch (OperationCanceledException) when (!_stoppingToken.IsCancellationRequested)
                 {
+                    _circuitBreaker.RecordFailure(CbRegimeCoherence);
                     _logger.LogWarning(
                         "StrategyWorker: regime coherence query timed out for {Symbol} — suppressing all signals (fail-closed)",
                         @event.Symbol);
@@ -756,6 +816,7 @@ public partial class StrategyWorker :
                 }
                 catch (Exception ex) when (!_stoppingToken.IsCancellationRequested)
                 {
+                    _circuitBreaker.RecordFailure(CbRegimeCoherence);
                     _logger.LogError(ex,
                         "StrategyWorker: regime coherence query failed for {Symbol} — suppressing all signals (fail-closed)",
                         @event.Symbol);
@@ -963,10 +1024,15 @@ public partial class StrategyWorker :
                 // on lock-contention creep BEFORE it manifests as dropped ticks:
                 // a p95 that steadily climbs toward LockTimeoutSeconds is the
                 // leading indicator, dropped ticks are the lagging one.
-                var lockKey = $"strategy:eval:{strategy.Id}";
+                //
+                // Long-keyed overload: skips the per-tick string allocation and
+                // the SHA256 roundtrip. The 48-bit prefix 0x5374_5261_7400_0000
+                // ('S'hrategy'Ra'luation lock) namespaces the IDs well away from
+                // the SHA256 output space used by string-keyed locks.
+                var lockId = StrategyEvalLockId(strategy.Id);
                 var lockTimeout = TimeSpan.FromSeconds(_options.LockTimeoutSeconds);
                 var lockSw = Stopwatch.StartNew();
-                var evalLock = await _distributedLock.TryAcquireAsync(lockKey, lockTimeout, ct);
+                var evalLock = await _distributedLock.TryAcquireAsync(lockId, lockTimeout, ct);
                 lockSw.Stop();
                 if (evalLock is null)
                 {
@@ -1434,11 +1500,34 @@ public partial class StrategyWorker :
                 int? mlScoringLatencyMs;
                 var mlScoringStopwatch = Stopwatch.StartNew();
                 int mlTimeoutSeconds = Math.Max(1, _options.MLScoringTimeoutSeconds);
+
+                // Circuit breaker: a persistently failing ML scorer (ONNX
+                // crashes, calibration worker outage, inference queue backlog)
+                // opens the circuit so we stop issuing scoring calls that will
+                // just timeout or throw. When open we treat it as a suppression
+                // with reason=ml_circuit_open — same fail-closed path as a
+                // scorer error but with explicit telemetry.
+                if (_circuitBreaker.IsOpen(CbMLSignalScorer))
+                {
+                    _metrics.CircuitBreakerShortCircuits.Add(1,
+                        new KeyValuePair<string, object?>("service", CbMLSignalScorer));
+                    _metrics.SignalsSuppressed.Add(1,
+                        new("symbol", signal.Symbol),
+                        new("reason", "ml_circuit_open"));
+                    await _rejectionAuditor.RecordAsync("MLScoring", "ml_circuit_open",
+                        signal.Symbol, nameof(StrategyWorker),
+                        strategyId: strategy.Id,
+                        detail: "ML scorer circuit breaker open — scoring skipped",
+                        ct: ct);
+                    return;
+                }
+
                 using var mlCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 mlCts.CancelAfter(TimeSpan.FromSeconds(mlTimeoutSeconds));
                 try
                 {
                     mlScore = await strategyMlScorer.ScoreAsync(signal, candles, mlCts.Token);
+                    _circuitBreaker.RecordSuccess(CbMLSignalScorer);
                     mlScoringStopwatch.Stop();
                     mlScoringLatencyMs = mlScore.MLModelId.HasValue
                         ? (int)Math.Min(int.MaxValue, mlScoringStopwatch.ElapsedMilliseconds)
@@ -1453,7 +1542,10 @@ public partial class StrategyWorker :
                     // ML scoring exceeded its per-call timeout. Same fail-closed path
                     // as a scorer exception: drop the signal but do NOT open the
                     // strategy circuit breaker — a slow ONNX runtime / backed-up
-                    // scorer queue is infra, not strategy-logic failure.
+                    // scorer queue is infra, not strategy-logic failure. Feed the
+                    // service-level circuit breaker so repeated timeouts eventually
+                    // short-circuit the call altogether.
+                    _circuitBreaker.RecordFailure(CbMLSignalScorer);
                     mlScoringStopwatch.Stop();
                     _logger.LogError(
                         "Strategy {Id}: ML scoring timed out after {Timeout}s for {Symbol}/{Tf} — suppressing signal (fail-closed); strategy circuit breaker NOT incremented",
@@ -1485,6 +1577,7 @@ public partial class StrategyWorker :
                 }
                 catch (Exception mlEx)
                 {
+                    _circuitBreaker.RecordFailure(CbMLSignalScorer);
                     mlScoringStopwatch.Stop();
                     _logger.LogError(mlEx,
                         "Strategy {Id}: ML scorer failed for {Symbol}/{Tf} — suppressing signal (fail-closed); strategy circuit breaker NOT incremented",
@@ -1919,6 +2012,10 @@ public partial class StrategyWorker :
                 MLCalibratedProbability = mlScore.CalibratedProbability,
                 MLServedCalibratedProbability = mlScore.ServedCalibratedProbability,
                 MLDecisionThresholdUsed = mlScore.DecisionThresholdUsed,
+                MLConformalCalibrationId = mlScore.MLConformalCalibrationId,
+                MLConformalThresholdUsed = mlScore.ConformalThresholdUsed,
+                MLConformalTargetCoverageUsed = mlScore.ConformalTargetCoverageUsed,
+                MLConformalPredictionSetJson = mlScore.ConformalPredictionSetJson,
                 MLEnsembleDisagreement = mlScore.EnsembleDisagreement,
                 MLScoringLatencyMs     = mlScoringLatencyMs,
                 Timeframe              = pending.Timeframe,
