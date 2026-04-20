@@ -219,16 +219,21 @@ internal static class ElmFeaturePipelineHelper
         if (mask.Length == 0)
             return;
 
-        if (mask.Length != featureCount)
-        {
-            throw new InvalidOperationException(
-                $"ActiveFeatureMask length {mask.Length} does not match feature count {featureCount}.");
-        }
+        // Historically this threw on length mismatch. That surfaced legitimate training-
+        // time schema errors but also crashed *inference* on legacy snapshots that had
+        // ExpectedInputFeatures persisted at a different schema version than their
+        // ActiveFeatureMask (corruption or cross-version write). Inference-time recovery:
+        // iterate only the common prefix. Slots outside that prefix stay active by default,
+        // which is the correct "unknown → permissive" semantic for a best-effort mask.
+        int applyLen = Math.Min(mask.Length, featureCount);
 
-        if (!mask.Any(v => v))
+        // Fail closed only when the mask would disable every slot we can actually reach.
+        bool anyActive = false;
+        for (int j = 0; j < applyLen; j++) { if (mask[j]) { anyActive = true; break; } }
+        if (!anyActive)
             throw new InvalidOperationException("ActiveFeatureMask cannot disable every feature.");
 
-        for (int j = 0; j < featureCount; j++)
+        for (int j = 0; j < applyLen; j++)
         {
             if (!mask[j])
                 features[j] = 0f;
