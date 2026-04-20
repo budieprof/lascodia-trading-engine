@@ -8,6 +8,7 @@ using LascodiaTradingEngine.Application.Calibration.Queries.GetCalibrationTrendR
 using LascodiaTradingEngine.Application.Calibration.Queries.GetPagedCalibrationSnapshots;
 using LascodiaTradingEngine.Application.SignalRejectionAuditNs.Queries.DTOs;
 using LascodiaTradingEngine.Application.SignalRejectionAuditNs.Queries.GetPagedSignalRejections;
+using LascodiaTradingEngine.Application.StrategyGeneration.Queries.GetScreeningGateBindingReport;
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
@@ -75,6 +76,27 @@ public class CalibrationAdminController : AuthControllerBase<CalibrationAdminCon
             BaselineMonths      = baselineMonths,
             AnomalyThresholdPct = anomalyThresholdPct,
             MinBaselineCount    = minBaselineCount,
+        };
+        return await Mediator.Send(query);
+    }
+
+    /// <summary>
+    /// Screening gate binding-constraint diagnostic. Identifies which gate
+    /// rejected the most candidates in the lookback window and suggests a
+    /// targeted tuning direction. Primary consumer: operator-driven
+    /// threshold tuning decisions — "which gate do I loosen first?"
+    /// </summary>
+    [HttpGet("screening-gate-binding-report")]
+    public async Task<ResponseData<ScreeningGateBindingReportDto>> GetScreeningGateBindingReport(
+        [FromQuery] int lookbackDays = 30,
+        [FromQuery] int minBindingCount = 50,
+        [FromQuery] decimal dominanceThreshold = 0.55m)
+    {
+        var query = new GetScreeningGateBindingReportQuery
+        {
+            LookbackDays       = lookbackDays,
+            MinBindingCount    = minBindingCount,
+            DominanceThreshold = dominanceThreshold,
         };
         return await Mediator.Send(query);
     }
