@@ -1300,6 +1300,9 @@ public class StrategyEvaluatorOptions : ConfigurationOption<StrategyEvaluatorOpt
     /// <summary>Maximum confidence boost from carry magnitude. Defaults to 0.18.</summary>
     public decimal CarryTradeConfidenceStrengthMax { get; set; } = 0.18m;
 
+    /// <summary>Maximum confidence boost when the broker swap is favourable on the entry direction. Defaults to 0.10.</summary>
+    public decimal CarryTradeConfidenceSwapFavorMax { get; set; } = 0.10m;
+
     // ── Momentum Trend ─────────────────────────────────────────────────────
 
     /// <summary>Default confidence for momentum trend signals. Defaults to 0.70.</summary>

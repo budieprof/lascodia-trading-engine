@@ -90,6 +90,31 @@ public class CurrencyPair : Entity<long>
     /// </summary>
     public double SpreadPoints   { get; set; }
 
+    /// <summary>
+    /// Swap interest applied per night when holding a <b>long</b> position, in the units
+    /// defined by <see cref="SwapMode"/>. Populated by the EA from
+    /// <c>SymbolInfoDouble(SYMBOL_SWAP_LONG)</c>. A positive value means the broker pays
+    /// you on long positions (favourable carry); negative means you pay the broker.
+    /// Used by <c>CarryTradeEvaluator</c> to weight the drift-based proxy with the actual
+    /// signed interest-rate differential so a pair with a disadvantageous swap is filtered
+    /// out even when persistent drift would otherwise suggest entering.
+    /// </summary>
+    public double SwapLong       { get; set; }
+
+    /// <summary>
+    /// Swap interest applied per night when holding a <b>short</b> position; see
+    /// <see cref="SwapLong"/> for semantics. Populated from <c>SymbolInfoDouble(SYMBOL_SWAP_SHORT)</c>.
+    /// </summary>
+    public double SwapShort      { get; set; }
+
+    /// <summary>
+    /// Broker-defined swap calculation mode (<c>SYMBOL_SWAP_MODE</c> on MT5 — points,
+    /// currency, interest, etc.). Persisted as an int so the engine doesn't depend on an
+    /// MT5-specific enum; consumers that need semantic interpretation can map it back
+    /// against the EA's <c>ENUM_SWAP_MODE_TYPE</c>.
+    /// </summary>
+    public int SwapMode          { get; set; }
+
     /// <summary>Soft-delete flag. Filtered out by the global EF Core query filter.</summary>
     public bool   IsDeleted     { get; set; }
 }

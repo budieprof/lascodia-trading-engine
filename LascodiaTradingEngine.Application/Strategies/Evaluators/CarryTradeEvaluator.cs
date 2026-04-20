@@ -1,4 +1,7 @@
 using System.Text.Json;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Interfaces;
@@ -7,8 +10,6 @@ using LascodiaTradingEngine.Application.Common.Utilities;
 using LascodiaTradingEngine.Application.Services.ML;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Logging;
 
 namespace LascodiaTradingEngine.Application.Strategies.Evaluators;
 
@@ -38,6 +39,7 @@ namespace LascodiaTradingEngine.Application.Strategies.Evaluators;
 public class CarryTradeEvaluator : IStrategyEvaluator
 {
     private const int    CarryProxyLookback = 91; // MacroFeatureCalculator requires >= 91 closes
+    private readonly IServiceScopeFactory _scopeFactory;
     private readonly StrategyEvaluatorOptions _options;
     private readonly ILogger<CarryTradeEvaluator> _logger;
     private readonly TradingMetrics _metrics;
@@ -45,13 +47,15 @@ public class CarryTradeEvaluator : IStrategyEvaluator
     private static readonly KeyValuePair<string, object?> EvaluatorTag = new("evaluator", "CarryTrade");
 
     public CarryTradeEvaluator(
+        IServiceScopeFactory scopeFactory,
         StrategyEvaluatorOptions options,
         ILogger<CarryTradeEvaluator> logger,
         TradingMetrics metrics)
     {
-        _options = options;
-        _logger  = logger;
-        _metrics = metrics;
+        _scopeFactory = scopeFactory;
+        _options      = options;
+        _logger       = logger;
+        _metrics      = metrics;
     }
 
     public StrategyType StrategyType => StrategyType.CarryTrade;
@@ -59,7 +63,7 @@ public class CarryTradeEvaluator : IStrategyEvaluator
     public int MinRequiredCandles(Strategy strategy)
         => Math.Max(CarryProxyLookback + _options.AtrPeriodForSlTp, 100);
 
-    public Task<TradeSignal?> EvaluateAsync(
+    public async Task<TradeSignal?> EvaluateAsync(
         Strategy strategy,
         IReadOnlyList<Candle> candles,
         (decimal Bid, decimal Ask) currentPrice,
@@ -73,11 +77,11 @@ public class CarryTradeEvaluator : IStrategyEvaluator
             _logger.LogWarning(
                 "Candles for {Symbol} (strategy {StrategyId}) are not in ascending timestamp order — skipping evaluation",
                 strategy.Symbol, strategy.Id);
-            return Task.FromResult<TradeSignal?>(null);
+            return null;
         }
 
         if (candles.Count < MinRequiredCandles(strategy))
-            return Task.FromResult<TradeSignal?>(null);
+            return null;
 
         int lastIdx = candles.Count - 1;
 
@@ -91,14 +95,14 @@ public class CarryTradeEvaluator : IStrategyEvaluator
         if (double.IsNaN(carry))
         {
             LogRejection(strategy, "ProxyNaN", "Carry proxy returned NaN (invalid closes window)");
-            return Task.FromResult<TradeSignal?>(null);
+            return null;
         }
 
         if (Math.Abs(carry) < parameters.MinCarryStrength)
         {
             LogRejection(strategy, "InsufficientCarry",
                 $"|carry| {Math.Abs(carry):F3} < threshold {parameters.MinCarryStrength:F3} — drift too weak to fire");
-            return Task.FromResult<TradeSignal?>(null);
+            return null;
         }
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -108,7 +112,7 @@ public class CarryTradeEvaluator : IStrategyEvaluator
         if (atr <= 0)
         {
             LogRejection(strategy, "DegenerateATR", "ATR is zero — degenerate price data");
-            return Task.FromResult<TradeSignal?>(null);
+            return null;
         }
 
         // ── 4. Direction decision ──────────────────────────────────────────
@@ -116,16 +120,30 @@ public class CarryTradeEvaluator : IStrategyEvaluator
         TradeDirection direction = carry > 0 ? TradeDirection.Buy : TradeDirection.Sell;
         decimal entryPrice = direction == TradeDirection.Buy ? currentPrice.Ask : currentPrice.Bid;
 
-        // ── 5. Spread guard ────────────────────────────────────────────────
+        // ── 5. Swap-rate gating ────────────────────────────────────────────
+        // Look up the broker's actual per-night swap for the signal direction. When the
+        // swap is adversely priced (negative on the direction we'd enter), reject the
+        // signal — a persistent-drift strategy that bleeds swap every night turns into
+        // a losing trade on a long enough horizon. Only gate when swap data is present
+        // (both fields zero = EA build predates swap sync or broker disables swaps).
+        (double swapForDirection, bool hasSwap) = await LookupSwapAsync(strategy.Symbol, direction, cancellationToken);
+        if (hasSwap && parameters.RequireFavorableSwap && swapForDirection < 0)
+        {
+            LogRejection(strategy, "AdverseSwap",
+                $"Broker swap for {direction} is {swapForDirection:F3} (negative) — carry would be eaten by nightly financing");
+            return null;
+        }
+
+        // ── 6. Spread guard ────────────────────────────────────────────────
         decimal spread = currentPrice.Ask - currentPrice.Bid;
         if (_options.CarryTradeMaxSpreadAtrFraction > 0 && spread > atr * _options.CarryTradeMaxSpreadAtrFraction)
         {
             LogRejection(strategy, "Spread",
                 $"Spread {spread:F6} > {_options.CarryTradeMaxSpreadAtrFraction:P0} of ATR ({atr:F6})");
-            return Task.FromResult<TradeSignal?>(null);
+            return null;
         }
 
-        // ── 6. SL/TP — carry positions use wider ATR multiples to accommodate the long horizon ─
+        // ── 7. SL/TP — carry positions use wider ATR multiples to accommodate the long horizon ─
         decimal stopDistance   = atr * _options.StopLossAtrMultiplier * parameters.HorizonMultiplier;
         decimal profitDistance = atr * _options.TakeProfitAtrMultiplier * parameters.HorizonMultiplier;
 
@@ -141,12 +159,22 @@ public class CarryTradeEvaluator : IStrategyEvaluator
             takeProfit = entryPrice - profitDistance;
         }
 
-        // ── 7. Confidence scales with carry magnitude ──────────────────────
+        // ── 8. Confidence scales with carry magnitude AND favorable swap ───
         decimal carryBoost = Math.Min(
             (decimal)((Math.Abs(carry) - parameters.MinCarryStrength)
                       * (double)_options.CarryTradeConfidenceStrengthScale),
             _options.CarryTradeConfidenceStrengthMax);
-        decimal confidence = Math.Clamp(_options.CarryTradeConfidence + carryBoost, 0m, 1m);
+
+        // Add a bonus when the broker pays us positive swap on the chosen direction.
+        // The magnitude is arbitrary broker-scaled — we bucket it into three tiers rather
+        // than trying to interpret SwapMode units here. Range: [0, SwapFavorBoost].
+        decimal swapBoost = 0m;
+        if (hasSwap && swapForDirection > 0)
+        {
+            double normalized = Math.Min(Math.Abs(swapForDirection) / parameters.SwapFavorBoostScale, 1.0);
+            swapBoost = (decimal)normalized * _options.CarryTradeConfidenceSwapFavorMax;
+        }
+        decimal confidence = Math.Clamp(_options.CarryTradeConfidence + carryBoost + swapBoost, 0m, 1m);
 
         var now = DateTime.UtcNow;
         var signal = new TradeSignal
@@ -165,7 +193,31 @@ public class CarryTradeEvaluator : IStrategyEvaluator
         };
 
         _metrics.SignalsGenerated.Add(1, EvaluatorTag);
-        return Task.FromResult<TradeSignal?>(signal);
+        return signal;
+    }
+
+    /// <summary>
+    /// Resolve the broker's signed swap rate for the given direction from the CurrencyPair
+    /// row. Opens a scoped read DB context (following the CompositeML pattern so the
+    /// evaluator stays singleton). Returns (rate, <c>false</c>) when no row exists or both
+    /// swap fields are zero — indicating cold-start / unavailable data.
+    /// </summary>
+    private async Task<(double Rate, bool HasData)> LookupSwapAsync(
+        string symbol, TradeDirection direction, CancellationToken ct)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var readDb = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+        var pair = await readDb.GetDbContext().Set<CurrencyPair>()
+            .AsNoTracking()
+            .Where(p => p.Symbol == symbol && !p.IsDeleted)
+            .Select(p => new { p.SwapLong, p.SwapShort })
+            .FirstOrDefaultAsync(ct);
+
+        if (pair is null) return (0.0, false);
+        if (pair.SwapLong == 0.0 && pair.SwapShort == 0.0) return (0.0, false);
+
+        double rate = direction == TradeDirection.Buy ? pair.SwapLong : pair.SwapShort;
+        return (rate, true);
     }
 
     // ═════════════════════════════════════════════════════════════════════════
@@ -187,21 +239,27 @@ public class CarryTradeEvaluator : IStrategyEvaluator
 
     private static CarryTradeParameters ParseParameters(string? json)
     {
-        double  minCarryStrength  = 0.8;   // drift must exceed ±0.8 ATR-normalised units
-        decimal horizonMultiplier = 2.0m;  // SL/TP multiples vs baseline
+        double  minCarryStrength    = 0.8;   // drift must exceed ±0.8 ATR-normalised units
+        decimal horizonMultiplier   = 2.0m;  // SL/TP multiples vs baseline
+        bool    requireFavorableSwap = true; // reject when broker swap is adverse on the direction
+        double  swapFavorBoostScale = 2.0;   // |swap| value at which confidence gets the full bonus
 
         try
         {
             using var doc = JsonDocument.Parse(json ?? "{}");
             var root = doc.RootElement;
-            if (root.TryGetProperty("MinCarryStrength",  out var mcs) && mcs.TryGetDouble(out var mcsv))  minCarryStrength  = mcsv;
-            if (root.TryGetProperty("HorizonMultiplier", out var hm) && hm.TryGetDecimal(out var hmv))    horizonMultiplier = hmv;
+            if (root.TryGetProperty("MinCarryStrength",      out var mcs) && mcs.TryGetDouble(out var mcsv))     minCarryStrength     = mcsv;
+            if (root.TryGetProperty("HorizonMultiplier",     out var hm)  && hm.TryGetDecimal(out var hmv))      horizonMultiplier    = hmv;
+            if (root.TryGetProperty("RequireFavorableSwap",  out var rfs) && rfs.ValueKind == JsonValueKind.False) requireFavorableSwap = false;
+            if (root.TryGetProperty("SwapFavorBoostScale",   out var sfs) && sfs.TryGetDouble(out var sfsv))     swapFavorBoostScale  = sfsv;
         }
         catch (JsonException) { }
 
         return new CarryTradeParameters(
             Math.Clamp(minCarryStrength, 0.0, 3.0),
-            Math.Clamp(horizonMultiplier, 0.5m, 5.0m));
+            Math.Clamp(horizonMultiplier, 0.5m, 5.0m),
+            requireFavorableSwap,
+            Math.Clamp(swapFavorBoostScale, 0.1, 100.0));
     }
 
     private static bool IsCandleOrderValid(IReadOnlyList<Candle> candles)
@@ -217,5 +275,7 @@ public class CarryTradeEvaluator : IStrategyEvaluator
 
     private readonly record struct CarryTradeParameters(
         double MinCarryStrength,
-        decimal HorizonMultiplier);
+        decimal HorizonMultiplier,
+        bool RequireFavorableSwap,
+        double SwapFavorBoostScale);
 }

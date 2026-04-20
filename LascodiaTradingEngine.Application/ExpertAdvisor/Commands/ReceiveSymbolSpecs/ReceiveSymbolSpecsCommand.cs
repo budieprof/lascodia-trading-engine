@@ -51,6 +51,24 @@ public class SymbolSpecItem
 
     /// <summary>Quote currency of the pair (e.g. "USD" for EURUSD).</summary>
     public string  QuoteCurrency      { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Per-night swap interest for <b>long</b> positions as reported by the broker
+    /// (<c>SymbolInfoDouble(SYMBOL_SWAP_LONG)</c>). Units depend on <see cref="SwapMode"/>.
+    /// Positive = broker pays you; negative = you pay broker. Defaults to 0 when the EA
+    /// build pre-dates the swap-sync rollout; downstream carry logic treats 0 as "no data".
+    /// </summary>
+    public double SwapLong            { get; set; }
+
+    /// <summary>Counterpart of <see cref="SwapLong"/> for <b>short</b> positions.</summary>
+    public double SwapShort           { get; set; }
+
+    /// <summary>
+    /// Broker swap calculation mode (MT5 <c>SYMBOL_SWAP_MODE</c>: 0=Disabled, 1=Points,
+    /// 2=Currency-Symbol, 3=Interest-Current, 4=Interest-Open, 5=Reopen-Current,
+    /// 6=Reopen-Bid). Persisted as int so the engine stays MT5-agnostic.
+    /// </summary>
+    public int SwapMode               { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
@@ -132,6 +150,9 @@ public class ReceiveSymbolSpecsCommandHandler : IRequestHandler<ReceiveSymbolSpe
                 existing.LotStep       = spec.VolumeStep;
                 existing.BaseCurrency  = spec.BaseCurrency;
                 existing.QuoteCurrency = spec.QuoteCurrency;
+                existing.SwapLong      = spec.SwapLong;
+                existing.SwapShort     = spec.SwapShort;
+                existing.SwapMode      = spec.SwapMode;
             }
             else
             {
@@ -145,6 +166,9 @@ public class ReceiveSymbolSpecsCommandHandler : IRequestHandler<ReceiveSymbolSpe
                     LotStep       = spec.VolumeStep,
                     BaseCurrency  = spec.BaseCurrency,
                     QuoteCurrency = spec.QuoteCurrency,
+                    SwapLong      = spec.SwapLong,
+                    SwapShort     = spec.SwapShort,
+                    SwapMode      = spec.SwapMode,
                     IsActive      = true,
                 };
                 await dbContext.Set<Domain.Entities.CurrencyPair>().AddAsync(newPair, cancellationToken);
