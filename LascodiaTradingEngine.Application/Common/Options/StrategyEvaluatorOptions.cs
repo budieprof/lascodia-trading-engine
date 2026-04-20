@@ -1677,4 +1677,36 @@ public class StrategyEvaluatorOptions : ConfigurationOption<StrategyEvaluatorOpt
     /// freshness mechanism. Zero disables the cache.
     /// </summary>
     public int MarketRegimeCacheTtlSeconds { get; set; } = 60;
+
+    /// <summary>
+    /// Enables the pre-score early-exit gate in the parallel evaluator loop.
+    /// When enabled, each candidate's static pre-score (Sharpe + rule
+    /// confidence) is compared against the highest pre-score already observed
+    /// for the same <c>(Symbol, Timeframe, Direction)</c> group in the current
+    /// tick. Candidates whose pre-score is less than
+    /// <see cref="PreScoreHopelessRatio"/> × group-best are dropped before the
+    /// expensive ML / MTF / correlation stages run — they can't beat the
+    /// leader at conflict resolution anyway, so paying for the ML call is
+    /// wasted work. Defaults to true.
+    /// </summary>
+    public bool PreScoreEarlyExitEnabled { get; set; } = true;
+
+    /// <summary>
+    /// Ratio floor used by the pre-score early-exit gate. A candidate is
+    /// considered hopeless when its static pre-score is less than
+    /// <c>groupBest × this</c>. Defaults to 0.70 — loose enough that only
+    /// genuinely-lost candidates are dropped; tighten toward 0.90 for
+    /// more aggressive filtering or reduce to 0.50 for a safety valve.
+    /// </summary>
+    public decimal PreScoreHopelessRatio { get; set; } = 0.70m;
+
+    /// <summary>
+    /// When true (default) the parallel evaluator processes strategies in
+    /// descending order of cached Sharpe ratio. Combined with the pre-score
+    /// early-exit gate, this maximises the chance that the highest-scoring
+    /// candidate in each group runs first and establishes the group-best
+    /// baseline that later candidates compare against. No effect when
+    /// <see cref="PreScoreEarlyExitEnabled"/> is false.
+    /// </summary>
+    public bool PreScoreSortBySharpeDescending { get; set; } = true;
 }

@@ -889,20 +889,47 @@ public partial class StrategyWorker :
         // the winner based on Sharpe ratio, ML confidence, and estimated capacity.
         var candidateSignals = new ConcurrentBag<(PendingSignal Pending, MLScoreResult MlScore, int? MlScoringLatencyMs)>();
 
+        // ── Pre-score early-exit state (Fix #22) ─────────────────────────────
+        // Tracks the highest static pre-score (Sharpe-weighted + rule
+        // confidence) seen so far for each (symbol, timeframe, direction)
+        // group in the current tick. Strategies whose pre-score falls
+        // substantially below the observed leader are dropped before the
+        // ML / MTF / correlation work runs — they can't win conflict
+        // resolution, so paying the expensive path is wasted. Scoped
+        // strictly to this tick so group-bests don't leak across ticks.
+        var tickGroupBest = new ConcurrentDictionary<(string Symbol, Timeframe Tf, TradeDirection Dir), decimal>();
+
+        // ── Evaluation order (Fix #22) ───────────────────────────────────────
+        // Running highest-Sharpe strategies first maximises the chance the
+        // leader establishes the group-best baseline before lower-ranked
+        // candidates reach the pre-score gate. The parallel scheduler may
+        // still dispatch out of order, but the initial batch honours this
+        // ordering. No effect when PreScoreEarlyExitEnabled is false.
+        var orderedStrategies = _options.PreScoreEarlyExitEnabled && _options.PreScoreSortBySharpeDescending
+            ? [.. strategies
+                .Select(s => (Strategy: s, Sharpe: strategySharpeCache.TryGetValue(s.Id, out var sh) ? sh : 0m))
+                .OrderByDescending(x => x.Sharpe)
+                .Select(x => x.Strategy)]
+            : strategies;
+
         // ── Parallel strategy evaluation ─────────────────────────────────────
         // Each strategy gets its own DI scope so scoped services (DbContext, ML scorer,
         // filters) have independent lifetimes. The pre-fetched regimeCache,
         // criticalStrategyIds, and backtestQualifiedIds are read-only and safe to share
         // across parallel iterations without synchronisation.
         // MaxDegreeOfParallelism caps CPU utilisation to prevent thread pool starvation
-        // when many strategies are active on a single symbol.
+        // when many strategies are active on a single symbol. We also cap at the actual
+        // work size (Fix #21) so Parallel.ForEachAsync doesn't spin up more tasks than
+        // it has strategies to evaluate — task-creation overhead dominates at small N.
         var parallelOptions = new ParallelOptions
         {
-            MaxDegreeOfParallelism = Math.Max(1, _options.MaxParallelStrategies),
+            MaxDegreeOfParallelism = Math.Min(
+                Math.Max(1, _options.MaxParallelStrategies),
+                Math.Max(1, orderedStrategies.Count)),
             CancellationToken      = _stoppingToken
         };
 
-        await Parallel.ForEachAsync(strategies, parallelOptions, async (strategy, ct) =>
+        await Parallel.ForEachAsync(orderedStrategies, parallelOptions, async (strategy, ct) =>
         {
             var evalStopwatch = Stopwatch.StartNew();
             try
@@ -1476,6 +1503,48 @@ public partial class StrategyWorker :
 
                         return;
                     }
+                }
+
+                // ── Pre-score early-exit gate (Fix #22) ─────────────────────
+                // Compute a cheap static score from the cached Sharpe and the
+                // rule-layer confidence, then compare against the leader in
+                // this (Symbol, Timeframe, Direction) group. If we can't
+                // plausibly beat the leader, skip ML scoring + collection
+                // entirely — the conflict resolver would drop us anyway.
+                // Atomically update the group's best so later candidates see
+                // our score. Races that let both threads pass are benign: the
+                // worst case is we do a few extra ML calls, which is exactly
+                // the pre-gate behaviour.
+                if (_options.PreScoreEarlyExitEnabled)
+                {
+                    strategySharpeCache.TryGetValue(strategy.Id, out var preSharpe);
+                    decimal normSharpe = Math.Clamp(preSharpe / 3.0m, 0m, 1.0m);
+                    decimal preScore = 0.70m * normSharpe + 0.30m * signal.Confidence;
+
+                    var preGroupKey = (signal.Symbol, strategy.Timeframe, signal.Direction);
+                    if (tickGroupBest.TryGetValue(preGroupKey, out var leaderScore)
+                        && preScore < leaderScore * _options.PreScoreHopelessRatio)
+                    {
+                        _logger.LogDebug(
+                            "Strategy {Id}: pre-score {Pre:F3} < {Ratio:P0} × group-best {Best:F3} for {Sym}/{Tf}/{Dir} — early-exit before ML",
+                            strategy.Id, preScore, _options.PreScoreHopelessRatio, leaderScore,
+                            signal.Symbol, strategy.Timeframe, signal.Direction);
+
+                        _metrics.ConflictResolutionEarlyExits.Add(1,
+                            new KeyValuePair<string, object?>("symbol", signal.Symbol),
+                            new KeyValuePair<string, object?>("strategy_id", strategy.Id));
+                        await _rejectionAuditor.RecordAsync("PreScore", "pre_score_hopeless",
+                            signal.Symbol, nameof(StrategyWorker),
+                            strategyId: strategy.Id,
+                            detail: $"pre-score {preScore:F3} below {_options.PreScoreHopelessRatio:P0} of group-best {leaderScore:F3}",
+                            ct: ct);
+                        return;
+                    }
+
+                    // Not hopeless — record our score as the new group best (max).
+                    tickGroupBest.AddOrUpdate(preGroupKey,
+                        preScore,
+                        (_, existing) => Math.Max(existing, preScore));
                 }
 
                 // ── ML scoring ──────────────────────────────────────────────

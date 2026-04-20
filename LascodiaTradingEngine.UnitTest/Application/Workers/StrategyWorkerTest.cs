@@ -956,6 +956,136 @@ public class StrategyWorkerTest : IDisposable
             Times.Once);
     }
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  Pre-score early-exit gate (Fix 22)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    [Fact]
+    public async Task Handle_LowSharpeStrategy_InSameGroup_AsHighSharpeLeader_IsEarlyExited()
+    {
+        // Two strategies in the SAME (Symbol, Timeframe, Direction) group. One
+        // has a strong cached Sharpe (0.9) → high pre-score; the other has a
+        // weak Sharpe (0.1) → below the 70% ratio of the leader. The weak
+        // candidate should early-exit before ML scoring runs and the ML
+        // scorer should be invoked at most once — for the winner only.
+        _options.PreScoreEarlyExitEnabled = true;
+        _options.PreScoreHopelessRatio = 0.70m;
+        _options.PreScoreSortBySharpeDescending = true;
+        _options.SignalCooldownSeconds = 0;
+        _options.MaxParallelStrategies = 1; // serialise so the leader runs first
+
+        var leader = new Strategy
+        {
+            Id = 101, Symbol = "EURUSD", Status = StrategyStatus.Active,
+            StrategyType = StrategyType.MovingAverageCrossover, Timeframe = Timeframe.H1,
+        };
+        var laggard = new Strategy
+        {
+            Id = 102, Symbol = "EURUSD", Status = StrategyStatus.Active,
+            StrategyType = StrategyType.MovingAverageCrossover, Timeframe = Timeframe.H1,
+        };
+
+        var candles = Enumerable.Range(0, 10).Select(i => new Candle
+        {
+            Symbol = "EURUSD", Timeframe = Timeframe.H1, IsClosed = true,
+            Timestamp = DateTime.UtcNow.AddHours(-i),
+            Open = 1.1m, High = 1.11m, Low = 1.09m, Close = 1.1m,
+        }).ToList();
+
+        SetupDbSets(
+            strategies: new List<Strategy> { leader, laggard },
+            candles: candles,
+            snapshots: new List<StrategyPerformanceSnapshot>
+            {
+                new() { StrategyId = 101, SharpeRatio = 2.7m, HealthStatus = StrategyHealthStatus.Healthy, EvaluatedAt = DateTime.UtcNow },
+                new() { StrategyId = 102, SharpeRatio = 0.3m, HealthStatus = StrategyHealthStatus.Healthy, EvaluatedAt = DateTime.UtcNow },
+            });
+
+        int evaluatorCalls = 0;
+        _mockEvaluator
+            .Setup(e => e.EvaluateAsync(It.IsAny<Strategy>(), It.IsAny<IReadOnlyList<Candle>>(),
+                It.IsAny<(decimal, decimal)>(), It.IsAny<CancellationToken>()))
+            .Returns<Strategy, IReadOnlyList<Candle>, (decimal, decimal), CancellationToken>((s, _, _, _) =>
+            {
+                Interlocked.Increment(ref evaluatorCalls);
+                return Task.FromResult<TradeSignal?>(new TradeSignal
+                {
+                    StrategyId = s.Id, Symbol = "EURUSD", Direction = TradeDirection.Buy,
+                    EntryPrice = 1.1001m, StopLoss = 1.0950m, TakeProfit = 1.1100m,
+                    SuggestedLotSize = 0.01m, Confidence = 0.70m,
+                    ExpiresAt = DateTime.UtcNow.AddMinutes(30),
+                });
+            });
+
+        using var earlyExitCounter = new CounterProbe(_meterFactory, "trading.signals.conflict_resolution_early_exits");
+
+        await _worker.ProcessPriceUpdateAsync(CreatePriceEvent());
+
+        // Both strategies were evaluated (early-exit fires AFTER evaluate so
+        // we can still compare signal.Confidence). But the laggard must have
+        // been dropped before ML scoring ran, so the ML scorer was called at
+        // most once (for the leader).
+        Assert.Equal(2, evaluatorCalls);
+        _mockMlScorer.Verify(
+            s => s.ScoreAsync(It.IsAny<TradeSignal>(), It.IsAny<IReadOnlyList<Candle>>(), It.IsAny<CancellationToken>()),
+            Times.AtMostOnce());
+        Assert.True(earlyExitCounter.Total >= 1,
+            "Pre-score early-exit counter did not fire even though the laggard's score is clearly below the 70% ratio.");
+
+        _mockRejectionAuditor.Verify(
+            a => a.RecordAsync("PreScore", "pre_score_hopeless",
+                "EURUSD", "StrategyWorker", 102L, null,
+                It.IsAny<string>(), It.IsAny<CancellationToken>()),
+            Times.AtLeastOnce);
+    }
+
+    [Fact]
+    public async Task Handle_PreScoreGate_Disabled_LetsBothCandidatesReachMLScoring()
+    {
+        // Same setup as above but with the gate disabled — both strategies
+        // should reach ML scoring (neither is dropped).
+        _options.PreScoreEarlyExitEnabled = false;
+        _options.SignalCooldownSeconds = 0;
+        _options.MaxParallelStrategies = 1;
+
+        var leader  = new Strategy { Id = 201, Symbol = "EURUSD", Status = StrategyStatus.Active, StrategyType = StrategyType.MovingAverageCrossover, Timeframe = Timeframe.H1 };
+        var laggard = new Strategy { Id = 202, Symbol = "EURUSD", Status = StrategyStatus.Active, StrategyType = StrategyType.MovingAverageCrossover, Timeframe = Timeframe.H1 };
+
+        var candles = Enumerable.Range(0, 10).Select(i => new Candle
+        {
+            Symbol = "EURUSD", Timeframe = Timeframe.H1, IsClosed = true,
+            Timestamp = DateTime.UtcNow.AddHours(-i),
+            Open = 1.1m, High = 1.11m, Low = 1.09m, Close = 1.1m,
+        }).ToList();
+
+        SetupDbSets(
+            strategies: new List<Strategy> { leader, laggard },
+            candles: candles,
+            snapshots: new List<StrategyPerformanceSnapshot>
+            {
+                new() { StrategyId = 201, SharpeRatio = 2.7m, HealthStatus = StrategyHealthStatus.Healthy, EvaluatedAt = DateTime.UtcNow },
+                new() { StrategyId = 202, SharpeRatio = 0.3m, HealthStatus = StrategyHealthStatus.Healthy, EvaluatedAt = DateTime.UtcNow },
+            });
+
+        _mockEvaluator
+            .Setup(e => e.EvaluateAsync(It.IsAny<Strategy>(), It.IsAny<IReadOnlyList<Candle>>(),
+                It.IsAny<(decimal, decimal)>(), It.IsAny<CancellationToken>()))
+            .Returns<Strategy, IReadOnlyList<Candle>, (decimal, decimal), CancellationToken>((s, _, _, _) =>
+                Task.FromResult<TradeSignal?>(new TradeSignal
+                {
+                    StrategyId = s.Id, Symbol = "EURUSD", Direction = TradeDirection.Buy,
+                    EntryPrice = 1.1001m, StopLoss = 1.0950m, TakeProfit = 1.1100m,
+                    SuggestedLotSize = 0.01m, Confidence = 0.70m,
+                    ExpiresAt = DateTime.UtcNow.AddMinutes(30),
+                }));
+
+        await _worker.ProcessPriceUpdateAsync(CreatePriceEvent());
+
+        _mockMlScorer.Verify(
+            s => s.ScoreAsync(It.IsAny<TradeSignal>(), It.IsAny<IReadOnlyList<Candle>>(), It.IsAny<CancellationToken>()),
+            Times.Exactly(2));
+    }
+
     private sealed class TestMeterFactory : IMeterFactory
     {
         private readonly List<Meter> _meters = new();
