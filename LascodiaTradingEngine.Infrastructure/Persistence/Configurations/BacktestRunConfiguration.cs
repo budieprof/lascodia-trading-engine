@@ -47,6 +47,16 @@ public class BacktestRunConfiguration : IEntityTypeConfiguration<BacktestRun>
         builder.HasIndex(x => new { x.StrategyId, x.Status });
         builder.HasIndex(x => new { x.Status, x.ExecutionLeaseExpiresAt });
         builder.HasIndex(x => new { x.Status, x.AvailableAt, x.Priority, x.QueuedAt, x.Id });
+
+        // Backtest qualification gate lookup: per-strategy latest-completed run.
+        // Partial index scoped to Completed, non-deleted rows so the gate scan
+        // skips Queued/Running/Failed history and the soft-deleted graveyard.
+        // DESC on CompletedAt lets the planner serve ORDER BY / GROUP BY from
+        // an index scan without an extra sort step.
+        builder.HasIndex(x => new { x.StrategyId, x.CompletedAt })
+            .IsDescending(false, true)
+            .HasDatabaseName("IX_BacktestRun_StrategyId_CompletedAtDesc")
+            .HasFilter("\"Status\" = 'Completed' AND \"IsDeleted\" = false");
         builder.HasIndex(x => x.SourceOptimizationRunId)
             .IsUnique()
             .HasFilter("\"SourceOptimizationRunId\" IS NOT NULL AND \"IsDeleted\" = false");

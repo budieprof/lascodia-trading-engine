@@ -114,6 +114,8 @@ public partial class StrategyWorker :
     private readonly PortfolioCorrelationSizer _portfolioCorrelationSizer;
     private readonly StrategyMetricsCache _strategyMetricsCache;
     private readonly IMarketHoursCalendar _marketHoursCalendar;
+    private readonly StrategyRegimeParamsCache _regimeParamsCache;
+    private readonly ISignalRejectionAuditor _rejectionAuditor;
 
     /// <summary>Tracks the last signal creation time per strategy to enforce cooldown.</summary>
     private readonly ConcurrentDictionary<long, DateTime> _lastSignalTime = new();
@@ -189,7 +191,9 @@ public partial class StrategyWorker :
         DrawdownRecoveryModeProvider drawdownRecoveryModeProvider,
         PortfolioCorrelationSizer portfolioCorrelationSizer,
         StrategyMetricsCache strategyMetricsCache,
-        IMarketHoursCalendar marketHoursCalendar)
+        IMarketHoursCalendar marketHoursCalendar,
+        StrategyRegimeParamsCache regimeParamsCache,
+        ISignalRejectionAuditor rejectionAuditor)
     {
         _logger                       = logger;
         _scopeFactory                 = scopeFactory;    // Creates per-event/per-strategy DI scopes
@@ -204,6 +208,8 @@ public partial class StrategyWorker :
         _portfolioCorrelationSizer    = portfolioCorrelationSizer;  // Correlation-aware lot-size multiplier
         _strategyMetricsCache         = strategyMetricsCache;       // Process-lifetime cache for per-strategy Sharpe + health
         _marketHoursCalendar          = marketHoursCalendar;        // Market-closed detection for adaptive signal TTL
+        _regimeParamsCache            = regimeParamsCache;          // Per-(strategy,regime) parameter cache, TTL-driven
+        _rejectionAuditor             = rejectionAuditor;           // Structured rejection audit stream for operator dashboards
     }
 
     /// <summary>
@@ -607,6 +613,9 @@ public partial class StrategyWorker :
                     new("symbol", @event.Symbol),
                     new("query", "regime"));
                 _metrics.SignalsFiltered.Add(1, new("symbol", @event.Symbol), new("stage", "regime_prefetch_timeout"));
+                await _rejectionAuditor.RecordAsync("Prefetch", "regime_prefetch_timeout",
+                    @event.Symbol, nameof(StrategyWorker),
+                    detail: $"Regime pre-fetch exceeded {prefetchTimeoutSeconds}s timeout");
                 return;
             }
             catch (Exception ex) when (!_stoppingToken.IsCancellationRequested)
@@ -618,6 +627,9 @@ public partial class StrategyWorker :
                     new("symbol", @event.Symbol),
                     new("query", "regime"));
                 _metrics.SignalsFiltered.Add(1, new("symbol", @event.Symbol), new("stage", "regime_prefetch_error"));
+                await _rejectionAuditor.RecordAsync("Prefetch", "regime_prefetch_error",
+                    @event.Symbol, nameof(StrategyWorker),
+                    detail: $"Regime pre-fetch failed: {ex.GetType().Name}");
                 return;
             }
         }
@@ -690,6 +702,9 @@ public partial class StrategyWorker :
                         "StrategyWorker: regime coherence query timed out for {Symbol} — suppressing all signals (fail-closed)",
                         @event.Symbol);
                     _metrics.SignalsFiltered.Add(1, new("symbol", @event.Symbol), new("stage", "regime_coherence_timeout"));
+                    await _rejectionAuditor.RecordAsync("Regime", "regime_coherence_timeout",
+                        @event.Symbol, nameof(StrategyWorker),
+                        detail: "Regime coherence query timed out — fail-closed");
                     return;
                 }
                 catch (Exception ex) when (!_stoppingToken.IsCancellationRequested)
@@ -698,6 +713,9 @@ public partial class StrategyWorker :
                         "StrategyWorker: regime coherence query failed for {Symbol} — suppressing all signals (fail-closed)",
                         @event.Symbol);
                     _metrics.SignalsFiltered.Add(1, new("symbol", @event.Symbol), new("stage", "regime_coherence_error"));
+                    await _rejectionAuditor.RecordAsync("Regime", "regime_coherence_error",
+                        @event.Symbol, nameof(StrategyWorker),
+                        detail: $"Regime coherence query failed: {ex.GetType().Name}");
                     return;
                 }
             }
@@ -708,6 +726,9 @@ public partial class StrategyWorker :
                     "StrategyWorker: regime coherence for {Symbol} is {Coherence:F2} (< {Threshold:F2}) — suppressing all signals",
                     @event.Symbol, regimeCoherence, _options.MinRegimeCoherence);
                 _metrics.SignalsFiltered.Add(1, new("symbol", @event.Symbol), new("stage", "regime_coherence"));
+                await _rejectionAuditor.RecordAsync("Regime", "regime_coherence_low",
+                    @event.Symbol, nameof(StrategyWorker),
+                    detail: $"Coherence {regimeCoherence:F2} < threshold {_options.MinRegimeCoherence:F2}");
                 return;
             }
         }
@@ -832,17 +853,30 @@ public partial class StrategyWorker :
                 // ── Concurrency guard ─────────────────────────────────────────
                 // Prevent duplicate evaluation if price events arrive faster than
                 // evaluation completes — only one evaluation per strategy at a time.
+                // We wrap the acquisition in a Stopwatch so dashboards can alert
+                // on lock-contention creep BEFORE it manifests as dropped ticks:
+                // a p95 that steadily climbs toward LockTimeoutSeconds is the
+                // leading indicator, dropped ticks are the lagging one.
                 var lockKey = $"strategy:eval:{strategy.Id}";
                 var lockTimeout = TimeSpan.FromSeconds(_options.LockTimeoutSeconds);
-                await using var evalLock = await _distributedLock.TryAcquireAsync(lockKey, lockTimeout, ct);
+                var lockSw = Stopwatch.StartNew();
+                var evalLock = await _distributedLock.TryAcquireAsync(lockKey, lockTimeout, ct);
+                lockSw.Stop();
                 if (evalLock is null)
                 {
+                    _metrics.StrategyLockAcquisitionMs.Record(lockSw.Elapsed.TotalMilliseconds,
+                        new("outcome", "busy"),
+                        new("symbol", strategy.Symbol));
                     _logger.LogDebug(
-                        "Strategy {Id} ({Symbol}) evaluation already in progress — skipping this tick",
-                        strategy.Id, strategy.Symbol);
+                        "Strategy {Id} ({Symbol}) evaluation already in progress — skipping this tick (waited {WaitMs:F0}ms)",
+                        strategy.Id, strategy.Symbol, lockSw.Elapsed.TotalMilliseconds);
                     _metrics.TicksDroppedLockBusy.Add(1, new("symbol", strategy.Symbol), new("strategy_id", strategy.Id));
                     return;
                 }
+                _metrics.StrategyLockAcquisitionMs.Record(lockSw.Elapsed.TotalMilliseconds,
+                    new("outcome", "acquired"),
+                    new("symbol", strategy.Symbol));
+                await using var evalLockScope = evalLock;
 
                 // Resolve the strategy-specific evaluator by matching the StrategyType enum.
                 // Each evaluator implements the trading logic for one strategy type:
@@ -936,6 +970,11 @@ public partial class StrategyWorker :
                         strategy.Id, latestRegime, strategy.Symbol, strategy.Timeframe);
 
                     _metrics.SignalsFiltered.Add(1, new("symbol", strategy.Symbol), new("stage", "regime"));
+                    await _rejectionAuditor.RecordAsync("Regime", "regime_blocked",
+                        strategy.Symbol, nameof(StrategyWorker),
+                        strategyId: strategy.Id,
+                        detail: $"Regime {latestRegime} is in BlockedRegimes for {strategy.Timeframe}",
+                        ct: ct);
 
                     await strategyMediator.Send(new LogDecisionCommand
                     {
@@ -993,13 +1032,15 @@ public partial class StrategyWorker :
                 // fallback is evalStrategy (which already has rollout modifications).
                 if (regimeCache.TryGetValue(strategy.Timeframe, out var currentRegime))
                 {
-                    var regimeParams = await strategyContext.GetDbContext()
-                        .Set<Domain.Entities.StrategyRegimeParams>()
-                        .Where(p => p.StrategyId == strategy.Id
-                                 && p.Regime == currentRegime
-                                 && !p.IsDeleted)
-                        .Select(p => p.ParametersJson)
-                        .FirstOrDefaultAsync(ct);
+                    // Cached lookup: regime-conditional parameters only change when
+                    // the OptimizationWorker promotes a new set, so repeated DB
+                    // queries per tick are wasteful. TTL-bounded (default 120s).
+                    var regimeParams = await _regimeParamsCache.GetAsync(
+                        strategyContext.GetDbContext(),
+                        strategy.Id,
+                        currentRegime,
+                        _options.RegimeParamsCacheTtlSeconds,
+                        ct);
 
                     if (regimeParams is not null)
                     {
@@ -1125,6 +1166,11 @@ public partial class StrategyWorker :
                             strategy.Id, signal.Direction, signal.Symbol);
 
                         _metrics.SignalsFiltered.Add(1, new("symbol", signal.Symbol), new("stage", "mtf"));
+                        await _rejectionAuditor.RecordAsync("MTF", "mtf_not_confirmed",
+                            signal.Symbol, nameof(StrategyWorker),
+                            strategyId: strategy.Id,
+                            detail: $"Higher-timeframe confirmation failed for {signal.Direction}",
+                            ct: ct);
 
                         await strategyMediator.Send(new LogDecisionCommand
                         {
@@ -1154,6 +1200,11 @@ public partial class StrategyWorker :
                             strategy.Id, signal.Symbol, signal.Direction);
 
                         _metrics.SignalsFiltered.Add(1, new("symbol", signal.Symbol), new("stage", "correlation"));
+                        await _rejectionAuditor.RecordAsync("Correlation", "correlation_breached",
+                            signal.Symbol, nameof(StrategyWorker),
+                            strategyId: strategy.Id,
+                            detail: $"Max correlated positions ({_options.MaxCorrelatedPositions}) breached",
+                            ct: ct);
 
                         await strategyMediator.Send(new LogDecisionCommand
                         {
@@ -1190,6 +1241,11 @@ public partial class StrategyWorker :
                             strategy.Id, signal.Symbol, strategy.Timeframe);
 
                         _metrics.SignalsFiltered.Add(1, new("symbol", signal.Symbol), new("stage", "hawkes"));
+                        await _rejectionAuditor.RecordAsync("Hawkes", "hawkes_burst",
+                            signal.Symbol, nameof(StrategyWorker),
+                            strategyId: strategy.Id,
+                            detail: "Hawkes process detected signal-clustering episode",
+                            ct: ct);
 
                         await strategyMediator.Send(new LogDecisionCommand
                         {
@@ -1226,9 +1282,12 @@ public partial class StrategyWorker :
                 MLScoreResult mlScore;
                 int? mlScoringLatencyMs;
                 var mlScoringStopwatch = Stopwatch.StartNew();
+                int mlTimeoutSeconds = Math.Max(1, _options.MLScoringTimeoutSeconds);
+                using var mlCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                mlCts.CancelAfter(TimeSpan.FromSeconds(mlTimeoutSeconds));
                 try
                 {
-                    mlScore = await strategyMlScorer.ScoreAsync(signal, candles, ct);
+                    mlScore = await strategyMlScorer.ScoreAsync(signal, candles, mlCts.Token);
                     mlScoringStopwatch.Stop();
                     mlScoringLatencyMs = mlScore.MLModelId.HasValue
                         ? (int)Math.Min(int.MaxValue, mlScoringStopwatch.ElapsedMilliseconds)
@@ -1237,6 +1296,41 @@ public partial class StrategyWorker :
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
                 {
                     throw;
+                }
+                catch (OperationCanceledException) when (mlCts.IsCancellationRequested)
+                {
+                    // ML scoring exceeded its per-call timeout. Same fail-closed path
+                    // as a scorer exception: drop the signal but do NOT open the
+                    // strategy circuit breaker — a slow ONNX runtime / backed-up
+                    // scorer queue is infra, not strategy-logic failure.
+                    mlScoringStopwatch.Stop();
+                    _logger.LogError(
+                        "Strategy {Id}: ML scoring timed out after {Timeout}s for {Symbol}/{Tf} — suppressing signal (fail-closed); strategy circuit breaker NOT incremented",
+                        strategy.Id, mlTimeoutSeconds, signal.Symbol, strategy.Timeframe);
+
+                    _metrics.MLScoringTimeouts.Add(1,
+                        new("symbol", signal.Symbol),
+                        new("strategy_id", strategy.Id));
+                    _metrics.SignalsSuppressed.Add(1,
+                        new("symbol", signal.Symbol),
+                        new("reason", "ml_scoring_timeout"));
+                    await _rejectionAuditor.RecordAsync("MLScoring", "ml_scoring_timeout",
+                        signal.Symbol, nameof(StrategyWorker),
+                        strategyId: strategy.Id,
+                        detail: $"IMLSignalScorer.ScoreAsync exceeded {mlTimeoutSeconds}s",
+                        ct: ct);
+
+                    await strategyMediator.Send(new LogDecisionCommand
+                    {
+                        EntityType   = "TradeSignal",
+                        EntityId     = strategy.Id,
+                        DecisionType = "SignalGeneration",
+                        Outcome      = "Suppressed",
+                        Reason       = $"ML scorer timed out after {mlTimeoutSeconds}s",
+                        Source       = "StrategyWorker"
+                    }, ct);
+
+                    return;
                 }
                 catch (Exception mlEx)
                 {
@@ -1248,6 +1342,12 @@ public partial class StrategyWorker :
                     _metrics.SignalsSuppressed.Add(1,
                         new("symbol", signal.Symbol),
                         new("reason", "ml_scorer_error"));
+
+                    await _rejectionAuditor.RecordAsync("MLScoring", "ml_scorer_error",
+                        signal.Symbol, nameof(StrategyWorker),
+                        strategyId: strategy.Id,
+                        detail: $"{mlEx.GetType().Name}: {mlEx.Message}",
+                        ct: ct);
 
                     await strategyMediator.Send(new LogDecisionCommand
                     {
@@ -1276,6 +1376,11 @@ public partial class StrategyWorker :
                         strategy.Id, signal.Symbol, strategy.Timeframe, mlScore.MLModelId);
 
                     _metrics.SignalsSuppressed.Add(1, new("symbol", signal.Symbol), new("reason", "ml_suppression"));
+                    await _rejectionAuditor.RecordAsync("MLScoring", "ml_suppression",
+                        signal.Symbol, nameof(StrategyWorker),
+                        strategyId: strategy.Id,
+                        detail: $"ML model {mlScore.MLModelId} suppressed scoring (cooldown/consensus/selective)",
+                        ct: ct);
 
                     await strategyMediator.Send(new LogDecisionCommand
                     {
@@ -1301,6 +1406,11 @@ public partial class StrategyWorker :
                         strategy.Id, mlScore.AbstentionScore, _options.MinAbstentionScore, signal.Symbol);
 
                     _metrics.SignalsSuppressed.Add(1, new("symbol", signal.Symbol), new("reason", "abstention"));
+                    await _rejectionAuditor.RecordAsync("Abstention", "abstention_below_threshold",
+                        signal.Symbol, nameof(StrategyWorker),
+                        strategyId: strategy.Id,
+                        detail: $"Score {mlScore.AbstentionScore:F3} < threshold {_options.MinAbstentionScore:F3}",
+                        ct: ct);
 
                     await strategyMediator.Send(new LogDecisionCommand
                     {
@@ -1534,6 +1644,18 @@ public partial class StrategyWorker :
                 "SignalConflictResolver: {Total} candidates → {Winners} winners, {Suppressed} suppressed for {Symbol}",
                 allCandidates.Count, winners.Count, suppressedCount, @event.Symbol);
             _metrics.SignalsFiltered.Add(suppressedCount, new("symbol", @event.Symbol), new("stage", "conflict_resolution"));
+
+            // Emit one audit row per suppressed candidate so operators can see which
+            // strategies lost the tick-level conflict even when only the winner's
+            // StrategyId appears on the persisted TradeSignal row.
+            foreach (var loser in allCandidates.Where(c => !winnerSet.Contains(c.Pending)))
+            {
+                await _rejectionAuditor.RecordAsync("ConflictResolution", "suppressed_by_conflict",
+                    @event.Symbol, nameof(StrategyWorker),
+                    strategyId: loser.Pending.StrategyId,
+                    detail: $"Lost tick-level conflict resolution on {@event.Symbol}/{loser.Pending.Timeframe} {loser.Pending.Direction}",
+                    ct: _stoppingToken);
+            }
         }
 
         // Persist and publish winning signals concurrently. Each winner gets its own DI scope

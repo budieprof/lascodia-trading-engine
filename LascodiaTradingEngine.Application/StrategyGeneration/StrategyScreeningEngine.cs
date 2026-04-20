@@ -763,15 +763,21 @@ public class StrategyScreeningEngine
     {
         // Anchored-forward: IS expands from start, OOS slides forward.
         // Split points are configurable via ScreeningConfig.WalkForwardSplitPcts.
+        // An embargo gap between IS end and OOS start prevents last-bar state
+        // (an open position or an indicator spanning the boundary) from leaking
+        // into the OOS evaluation — that is a classic purged-k-fold adaptation
+        // of López de Prado's approach to walk-forward validation.
         int n = allCandles.Count;
         var splitPcts = config.EffectiveSplitPcts;
         int windowCount = splitPcts.Count;
-        var windows = new (int IsEnd, int OosEnd)[windowCount];
+        int embargo = (int)Math.Max(0, Math.Round(n * Math.Clamp(config.WalkForwardEmbargoPct, 0.0, 0.25)));
+        var windows = new (int IsEnd, int OosStart, int OosEnd)[windowCount];
         for (int i = 0; i < windowCount; i++)
         {
-            int isEnd = (int)(n * splitPcts[i]);
-            int oosEnd = i + 1 < windowCount ? (int)(n * splitPcts[i + 1]) : n;
-            windows[i] = (isEnd, oosEnd);
+            int isEnd   = (int)(n * splitPcts[i]);
+            int oosEnd  = i + 1 < windowCount ? (int)(n * splitPcts[i + 1]) : n;
+            int oosStart = Math.Min(isEnd + embargo, oosEnd);
+            windows[i]  = (isEnd, oosStart, oosEnd);
         }
 
         int windowsPassed = 0;
@@ -780,11 +786,11 @@ public class StrategyScreeningEngine
 
         for (int w = 0; w < windowCount; w++)
         {
-            var (isEnd, oosEnd) = windows[w];
-            if (isEnd < 40 || oosEnd - isEnd < 20) continue;
+            var (isEnd, oosStart, oosEnd) = windows[w];
+            if (isEnd < 40 || oosEnd - oosStart < 20) continue;
 
             var wfTrain = allCandles.Take(isEnd).ToList();
-            var wfTest = allCandles.Skip(isEnd).Take(oosEnd - isEnd).ToList();
+            var wfTest = allCandles.Skip(oosStart).Take(oosEnd - oosStart).ToList();
 
             try
             {
@@ -1228,6 +1234,15 @@ public sealed record ScreeningConfig
     /// bounds are enforced.
     /// </summary>
     public double LookaheadAuditMaxPnlDelta { get; init; } = 0.50;
+
+    /// <summary>
+    /// Fraction of the full candle range to skip between each walk-forward
+    /// window's IS end and OOS start. Prevents PnL bleed-through from the
+    /// last IS bar's open position influencing the first OOS bar's entry
+    /// conditions. Defaults to 0.02 (2% of the full range). Set to 0 to
+    /// disable the embargo and match the pre-embargo behaviour.
+    /// </summary>
+    public double WalkForwardEmbargoPct { get; init; } = 0.02;
 }
 
 /// <summary>Result of screening a single candidate.</summary>

@@ -91,13 +91,23 @@ public class SignalOrderBridgeWorkerTest : IDisposable
         mockScope.Setup(s => s.ServiceProvider).Returns(mockProvider.Object);
         _mockScopeFactory.Setup(f => f.CreateScope()).Returns(mockScope.Object);
 
+        _mockRejectionAuditor = new Mock<ISignalRejectionAuditor>();
+        _mockRejectionAuditor
+            .Setup(a => a.RecordAsync(
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(),
+                It.IsAny<long>(), It.IsAny<long?>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+
         _worker = new SignalOrderBridgeWorker(
             _mockLogger.Object,
             _mockScopeFactory.Object,
             _mockEventBus.Object,
             _metrics,
-            TimeProvider.System);
+            TimeProvider.System,
+            _mockRejectionAuditor.Object);
     }
+
+    private readonly Mock<ISignalRejectionAuditor> _mockRejectionAuditor;
 
     public void Dispose() => _meterFactory.Dispose();
 
@@ -107,7 +117,8 @@ public class SignalOrderBridgeWorkerTest : IDisposable
         List<TradeSignal>? signals = null,
         List<EAInstance>? eaInstances = null,
         List<RiskProfile>? riskProfiles = null,
-        List<CurrencyPair>? currencyPairs = null)
+        List<CurrencyPair>? currencyPairs = null,
+        List<MLModel>? mlModels = null)
     {
         signals ??= new List<TradeSignal>();
         eaInstances ??= new List<EAInstance>
@@ -122,11 +133,13 @@ public class SignalOrderBridgeWorkerTest : IDisposable
         {
             new() { Symbol = "EURUSD", BaseCurrency = "EUR", QuoteCurrency = "USD", ContractSize = 100_000m, DecimalPlaces = 5 }
         };
+        mlModels ??= new List<MLModel>();
 
         _mockDbContext.Setup(c => c.Set<TradeSignal>()).Returns(signals.AsQueryable().BuildMockDbSet().Object);
         _mockDbContext.Setup(c => c.Set<EAInstance>()).Returns(eaInstances.AsQueryable().BuildMockDbSet().Object);
         _mockDbContext.Setup(c => c.Set<RiskProfile>()).Returns(riskProfiles.AsQueryable().BuildMockDbSet().Object);
         _mockDbContext.Setup(c => c.Set<CurrencyPair>()).Returns(currencyPairs.AsQueryable().BuildMockDbSet().Object);
+        _mockDbContext.Setup(c => c.Set<MLModel>()).Returns(mlModels.AsQueryable().BuildMockDbSet().Object);
     }
 
     private static TradeSignalCreatedIntegrationEvent CreateEvent(long signalId = 1) => new()
@@ -289,6 +302,121 @@ public class SignalOrderBridgeWorkerTest : IDisposable
         _mockMediator.Verify(
             m => m.Send(It.IsAny<ApproveTradeSignalCommand>(), It.IsAny<CancellationToken>()),
             Times.Exactly(2));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  ML model staleness gate (Fix 6)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    [Fact]
+    public async Task Handle_MLModelRetired_RejectsSignalBeforeTier1Validation()
+    {
+        var signal = CreatePendingSignal();
+        signal.MLModelId = 42;
+        SetupDbSets(
+            signals: new List<TradeSignal> { signal },
+            mlModels: new List<MLModel>
+            {
+                new()
+                {
+                    Id = 42, Symbol = "EURUSD", Status = MLModelStatus.Active, IsActive = true,
+                    DegradationRetiredAt = DateTime.UtcNow.AddDays(-1), // <-- Retired
+                }
+            });
+
+        await _worker.Handle(CreateEvent());
+
+        _mockMediator.Verify(
+            m => m.Send(It.Is<RejectTradeSignalCommand>(c => c.Reason.Contains("no longer live")), It.IsAny<CancellationToken>()),
+            Times.Once);
+        _mockSignalValidator.Verify(
+            v => v.ValidateAsync(It.IsAny<TradeSignal>(), It.IsAny<SignalValidationContext>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+        _mockRejectionAuditor.Verify(
+            a => a.RecordAsync("MLModelStale", "ml_model_stale",
+                "EURUSD", "SignalOrderBridgeWorker",
+                1L, signal.Id, It.IsAny<string>(), It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task Handle_MLModelSuperseded_RejectsSignal()
+    {
+        var signal = CreatePendingSignal();
+        signal.MLModelId = 42;
+        SetupDbSets(
+            signals: new List<TradeSignal> { signal },
+            mlModels: new List<MLModel>
+            {
+                new() { Id = 42, Symbol = "EURUSD", Status = MLModelStatus.Superseded, IsActive = false },
+            });
+
+        await _worker.Handle(CreateEvent());
+
+        _mockSignalValidator.Verify(
+            v => v.ValidateAsync(It.IsAny<TradeSignal>(), It.IsAny<SignalValidationContext>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task Handle_MLModelSuppressed_RejectsSignal()
+    {
+        var signal = CreatePendingSignal();
+        signal.MLModelId = 42;
+        SetupDbSets(
+            signals: new List<TradeSignal> { signal },
+            mlModels: new List<MLModel>
+            {
+                new() { Id = 42, Symbol = "EURUSD", Status = MLModelStatus.Active, IsActive = true, IsSuppressed = true },
+            });
+
+        await _worker.Handle(CreateEvent());
+
+        _mockSignalValidator.Verify(
+            v => v.ValidateAsync(It.IsAny<TradeSignal>(), It.IsAny<SignalValidationContext>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task Handle_MLModelLive_AllowsValidationToProceed()
+    {
+        var signal = CreatePendingSignal();
+        signal.MLModelId = 42;
+        _mockSignalValidator
+            .Setup(v => v.ValidateAsync(It.IsAny<TradeSignal>(), It.IsAny<SignalValidationContext>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new RiskCheckResult(Passed: true, BlockReason: null));
+
+        SetupDbSets(
+            signals: new List<TradeSignal> { signal },
+            mlModels: new List<MLModel>
+            {
+                new() { Id = 42, Symbol = "EURUSD", Status = MLModelStatus.Active, IsActive = true },
+            });
+
+        await _worker.Handle(CreateEvent());
+
+        // Tier 1 validation should run when the model is live.
+        _mockSignalValidator.Verify(
+            v => v.ValidateAsync(It.IsAny<TradeSignal>(), It.IsAny<SignalValidationContext>(), It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task Handle_NoMLModelId_SkipsStalenessCheck()
+    {
+        var signal = CreatePendingSignal();
+        signal.MLModelId = null; // No ML attached
+        _mockSignalValidator
+            .Setup(v => v.ValidateAsync(It.IsAny<TradeSignal>(), It.IsAny<SignalValidationContext>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new RiskCheckResult(Passed: true, BlockReason: null));
+
+        SetupDbSets(signals: new List<TradeSignal> { signal });
+
+        await _worker.Handle(CreateEvent());
+
+        _mockSignalValidator.Verify(
+            v => v.ValidateAsync(It.IsAny<TradeSignal>(), It.IsAny<SignalValidationContext>(), It.IsAny<CancellationToken>()),
+            Times.Once);
     }
 
     private sealed class TestMeterFactory : IMeterFactory

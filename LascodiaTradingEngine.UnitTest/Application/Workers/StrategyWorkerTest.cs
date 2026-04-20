@@ -49,6 +49,8 @@ public class StrategyWorkerTest : IDisposable
     private readonly StrategyWorker _worker;
     private readonly StrategyMetricsCache _strategyMetricsCache;
     private readonly Mock<IMarketHoursCalendar> _mockMarketHoursCalendar;
+    private readonly StrategyRegimeParamsCache _regimeParamsCache;
+    private readonly Mock<ISignalRejectionAuditor> _mockRejectionAuditor;
 
     public StrategyWorkerTest()
     {
@@ -153,6 +155,14 @@ public class StrategyWorkerTest : IDisposable
         _mockMarketHoursCalendar
             .Setup(c => c.NextMarketOpen(It.IsAny<string>(), It.IsAny<DateTime>()))
             .Returns<string, DateTime>((_, t) => t);
+        _regimeParamsCache = new StrategyRegimeParamsCache(_metrics, TimeProvider.System);
+        _mockRejectionAuditor = new Mock<ISignalRejectionAuditor>();
+        _mockRejectionAuditor
+            .Setup(a => a.RecordAsync(
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(),
+                It.IsAny<long>(), It.IsAny<long?>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+
         _worker = new StrategyWorker(
             _mockLogger.Object,
             _mockScopeFactory.Object,
@@ -166,7 +176,9 @@ public class StrategyWorkerTest : IDisposable
             new DrawdownRecoveryModeProvider(_mockScopeFactory.Object, memoryCache),
             new PortfolioCorrelationSizer(_mockScopeFactory.Object, memoryCache, new Mock<ILogger<PortfolioCorrelationSizer>>().Object),
             _strategyMetricsCache,
-            _mockMarketHoursCalendar.Object);
+            _mockMarketHoursCalendar.Object,
+            _regimeParamsCache,
+            _mockRejectionAuditor.Object);
     }
 
     public void Dispose() => _meterFactory.Dispose();
@@ -837,6 +849,80 @@ public class StrategyWorkerTest : IDisposable
         _mockEvaluator.Verify(
             e => e.EvaluateAsync(It.IsAny<Strategy>(), It.IsAny<IReadOnlyList<Candle>>(), It.IsAny<(decimal, decimal)>(), It.IsAny<CancellationToken>()),
             Times.Never);
+    }
+
+    [Fact]
+    public async Task Handle_MLScoringTimeout_FailsClosed_NoSignalCreated_NoCircuitIncrement()
+    {
+        // Fix 7: ML scoring on the hot evaluator loop is bounded by
+        // MLScoringTimeoutSeconds. On timeout we drop the signal but leave the
+        // strategy's circuit-breaker counter alone.
+        _options.MLScoringTimeoutSeconds = 1;
+        _options.SignalCooldownSeconds = 0;
+        _options.MinRegimeCoherence = 0;
+        _options.NewsBlackoutMinutesBefore = 0;
+        _options.NewsBlackoutMinutesAfter = 0;
+
+        var strategy = new Strategy
+        {
+            Id = 1, Symbol = "EURUSD", Status = StrategyStatus.Active,
+            StrategyType = StrategyType.MovingAverageCrossover,
+            Timeframe = Timeframe.H1,
+        };
+        var candles = Enumerable.Range(0, 10).Select(i => new Candle
+        {
+            Symbol = "EURUSD", Timeframe = Timeframe.H1, IsClosed = true,
+            Timestamp = DateTime.UtcNow.AddHours(-i),
+            Open = 1.1m, High = 1.11m, Low = 1.09m, Close = 1.1m,
+        }).ToList();
+        SetupDbSets(strategies: new List<Strategy> { strategy }, candles: candles);
+
+        _mockEvaluator
+            .Setup(e => e.EvaluateAsync(It.IsAny<Strategy>(), It.IsAny<IReadOnlyList<Candle>>(),
+                It.IsAny<(decimal, decimal)>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new TradeSignal
+            {
+                StrategyId = 1, Symbol = "EURUSD", Direction = TradeDirection.Buy,
+                EntryPrice = 1.1001m, StopLoss = 1.0950m, TakeProfit = 1.1100m,
+                SuggestedLotSize = 0.01m, Confidence = 0.70m,
+                ExpiresAt = DateTime.UtcNow.AddMinutes(30),
+            });
+
+        // ML scorer hangs longer than the 1s timeout, but honours its CT.
+        _mockMlScorer
+            .Setup(s => s.ScoreAsync(It.IsAny<TradeSignal>(), It.IsAny<IReadOnlyList<Candle>>(), It.IsAny<CancellationToken>()))
+            .Returns(async (TradeSignal _, IReadOnlyList<Candle> _, CancellationToken ct) =>
+            {
+                await Task.Delay(TimeSpan.FromSeconds(10), ct);
+                return new MLScoreResult(null, null, null, null);
+            });
+
+        using var counter = new CounterProbe(_meterFactory, "trading.ml.scoring_timeouts");
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await _worker.ProcessPriceUpdateAsync(CreatePriceEvent());
+        sw.Stop();
+
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(5),
+            $"ML scoring timeout did not short-circuit — took {sw.Elapsed.TotalSeconds:F1}s.");
+        Assert.True(counter.Total >= 1, "MLScoringTimeouts counter did not fire.");
+        _mockMediator.Verify(
+            m => m.Send(It.IsAny<CreateTradeSignalCommand>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+
+        // Strategy's consecutive-failure counter stays at 0 — infra failure must not
+        // open the strategy circuit breaker.
+        var failuresField = typeof(StrategyWorker)
+            .GetField("_consecutiveFailures", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var failures = failuresField.GetValue(_worker) as System.Collections.Concurrent.ConcurrentDictionary<long, int>;
+        Assert.NotNull(failures);
+        Assert.False(failures!.ContainsKey(1L) && failures[1L] > 0,
+            "Strategy circuit breaker incremented on ML timeout — it must not.");
+
+        _mockRejectionAuditor.Verify(
+            a => a.RecordAsync("MLScoring", "ml_scoring_timeout",
+                "EURUSD", "StrategyWorker", 1L, null,
+                It.IsAny<string>(), It.IsAny<CancellationToken>()),
+            Times.Once);
     }
 
     private sealed class TestMeterFactory : IMeterFactory

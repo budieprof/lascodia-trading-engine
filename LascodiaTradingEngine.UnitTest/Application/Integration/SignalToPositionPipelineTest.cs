@@ -143,12 +143,19 @@ public class SignalToPositionPipelineTest : IDisposable
                 .Returns(Options.Create(new LascodiaTradingEngine.Application.Common.Options.StrategyEvaluatorOptions()));
         });
 
+        var mockBridgeAuditor = new Mock<ISignalRejectionAuditor>();
+        mockBridgeAuditor
+            .Setup(a => a.RecordAsync(
+                It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(),
+                It.IsAny<long>(), It.IsAny<long?>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
         _bridgeWorker = new SignalOrderBridgeWorker(
             _bridgeLogger.Object,
             _bridgeScopeFactory.Object,
             _mockEventBus.Object,
             _metrics,
-            TimeProvider.System);
+            TimeProvider.System,
+            mockBridgeAuditor.Object);
 
         // ── OrderFilledEventHandler setup ─────────────────────────────────────
 

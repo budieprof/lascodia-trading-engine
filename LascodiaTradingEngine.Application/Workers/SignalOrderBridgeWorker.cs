@@ -40,6 +40,7 @@ public class SignalOrderBridgeWorker : BackgroundService, IIntegrationEventHandl
     private readonly IEventBus _eventBus;
     private readonly TradingMetrics _metrics;
     private readonly TimeProvider _timeProvider;
+    private readonly ISignalRejectionAuditor _rejectionAuditor;
 
     /// <summary>
     /// Caps the number of signals processed concurrently to protect the DB connection pool
@@ -64,13 +65,15 @@ public class SignalOrderBridgeWorker : BackgroundService, IIntegrationEventHandl
         IServiceScopeFactory scopeFactory,
         IEventBus eventBus,
         TradingMetrics metrics,
-        TimeProvider timeProvider)
+        TimeProvider timeProvider,
+        ISignalRejectionAuditor rejectionAuditor)
     {
-        _logger       = logger;
-        _scopeFactory = scopeFactory;
-        _eventBus     = eventBus;
-        _metrics      = metrics;
-        _timeProvider = timeProvider;
+        _logger           = logger;
+        _scopeFactory     = scopeFactory;
+        _eventBus         = eventBus;
+        _metrics          = metrics;
+        _timeProvider     = timeProvider;
+        _rejectionAuditor = rejectionAuditor;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -322,6 +325,15 @@ public class SignalOrderBridgeWorker : BackgroundService, IIntegrationEventHandl
                 signal.Id, signal.Strategy.Id, signal.Strategy.Status);
 
             _metrics.SignalsRejected.Add(1, new KeyValuePair<string, object?>("reason", "strategy_inactive"));
+            await _rejectionAuditor.RecordAsync(
+                stage: "Tier1",
+                reason: "strategy_inactive",
+                symbol: signal.Symbol,
+                source: nameof(SignalOrderBridgeWorker),
+                strategyId: signal.StrategyId,
+                tradeSignalId: signal.Id,
+                detail: $"Strategy status is {signal.Strategy.Status}",
+                ct: ct);
             await RejectSignalAsync(mediator, signal.Id,
                 $"Strategy {signal.Strategy.Id} is {signal.Strategy.Status} — only Active strategies can produce valid signals", ct);
 
@@ -336,6 +348,69 @@ public class SignalOrderBridgeWorker : BackgroundService, IIntegrationEventHandl
             }, ct);
 
             return;
+        }
+
+        // ── Guard: ML model liveness (if the signal claims ML scoring) ────
+        // The MLModelId on a TradeSignal is frozen at generation time. Between
+        // then and Tier-1 validation the model may have been retired,
+        // suppressed, or superseded by MLTrainingWorker / MLShadowArbiter /
+        // MLSignalSuppressionWorker. Acting on a signal whose model is no
+        // longer serving inference means we are either executing on a stale
+        // prediction or bypassing the current champion's veto — either way
+        // fail-closed is safer than guessing.
+        if (signal.MLModelId.HasValue)
+        {
+            var mlModel = await db.Set<Domain.Entities.MLModel>()
+                .AsNoTracking()
+                .FirstOrDefaultAsync(m => m.Id == signal.MLModelId.Value && !m.IsDeleted, ct);
+
+            bool mlStale = mlModel is null
+                || mlModel.Status != MLModelStatus.Active
+                || !mlModel.IsActive
+                || mlModel.IsSuppressed
+                || mlModel.DegradationRetiredAt.HasValue;
+
+            if (mlStale)
+            {
+                var reasonDetail = mlModel is null
+                    ? "model row not found"
+                    : $"status={mlModel.Status}, isActive={mlModel.IsActive}, isSuppressed={mlModel.IsSuppressed}, degradationRetiredAt={mlModel.DegradationRetiredAt:u}";
+
+                _logger.LogWarning(
+                    "SignalOrderBridgeWorker: signal {Id} references ML model {ModelId} which is no longer live ({Detail}) — rejecting",
+                    signal.Id, signal.MLModelId.Value, reasonDetail);
+
+                _metrics.MLModelStaleRejections.Add(1,
+                    new KeyValuePair<string, object?>("symbol", signal.Symbol),
+                    new KeyValuePair<string, object?>("ml_model_id", signal.MLModelId.Value));
+                _metrics.SignalsRejected.Add(1,
+                    new KeyValuePair<string, object?>("reason", "ml_model_stale"),
+                    new KeyValuePair<string, object?>("symbol", signal.Symbol));
+                await _rejectionAuditor.RecordAsync(
+                    stage: "MLModelStale",
+                    reason: "ml_model_stale",
+                    symbol: signal.Symbol,
+                    source: nameof(SignalOrderBridgeWorker),
+                    strategyId: signal.StrategyId,
+                    tradeSignalId: signal.Id,
+                    detail: $"ML model {signal.MLModelId.Value} not live: {reasonDetail}",
+                    ct: ct);
+
+                await RejectSignalAsync(mediator, signal.Id,
+                    $"ML model {signal.MLModelId.Value} is no longer live ({reasonDetail})", ct);
+
+                await mediator.Send(new LogDecisionCommand
+                {
+                    EntityType   = "TradeSignal",
+                    EntityId     = signal.Id,
+                    DecisionType = "SignalValidation",
+                    Outcome      = "Rejected",
+                    Reason       = $"ML model stale: {reasonDetail}",
+                    Source       = "SignalOrderBridgeWorker"
+                }, ct);
+
+                return;
+            }
         }
 
         // ── Guard: EA data availability for this symbol ───────────────────────
@@ -415,6 +490,15 @@ public class SignalOrderBridgeWorker : BackgroundService, IIntegrationEventHandl
             _metrics.SignalsRejected.Add(1,
                 new KeyValuePair<string, object?>("reason", "news_blackout"),
                 new KeyValuePair<string, object?>("symbol", signal.Symbol));
+            await _rejectionAuditor.RecordAsync(
+                stage: "News",
+                reason: "news_blackout",
+                symbol: signal.Symbol,
+                source: nameof(SignalOrderBridgeWorker),
+                strategyId: signal.StrategyId,
+                tradeSignalId: signal.Id,
+                detail: "High-impact news event within blackout window",
+                ct: ct);
 
             await RejectSignalAsync(mediator, signal.Id,
                 $"High-impact news event within blackout window for {signal.Symbol}", ct);
@@ -451,6 +535,15 @@ public class SignalOrderBridgeWorker : BackgroundService, IIntegrationEventHandl
                 new KeyValuePair<string, object?>("reason", "signal_validation"),
                 new KeyValuePair<string, object?>("symbol", signal.Symbol),
                 new KeyValuePair<string, object?>("strategy_id", signal.StrategyId.ToString()));
+            await _rejectionAuditor.RecordAsync(
+                stage: "Tier1",
+                reason: "signal_validation",
+                symbol: signal.Symbol,
+                source: nameof(SignalOrderBridgeWorker),
+                strategyId: signal.StrategyId,
+                tradeSignalId: signal.Id,
+                detail: result.BlockReason,
+                ct: ct);
 
             await RejectSignalAsync(mediator, signal.Id, result.BlockReason!, ct);
 

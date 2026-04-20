@@ -1649,4 +1649,21 @@ public class StrategyEvaluatorOptions : ConfigurationOption<StrategyEvaluatorOpt
     /// Defaults to 30 minutes.
     /// </summary>
     public int MarketClosedGracePeriodMinutes { get; set; } = 30;
+
+    /// <summary>
+    /// Per-call timeout in seconds for <c>IMLSignalScorer.ScoreAsync</c> on the
+    /// hot evaluator loop. On timeout the signal is dropped via the existing
+    /// fail-closed ML-error path and the strategy's circuit breaker is NOT
+    /// incremented — infra slowness should not retire strategies. Defaults to 5.
+    /// </summary>
+    public int MLScoringTimeoutSeconds { get; set; } = 5;
+
+    /// <summary>
+    /// TTL in seconds for the per-strategy regime-params cache. Misses and
+    /// expired entries are refilled by a single batch DB query per tick.
+    /// Defaults to 120 — regime params only change when the OptimizationWorker
+    /// promotes a new set, so a minute or two of staleness is benign. Set to
+    /// zero to disable the cache entirely (fall back to per-tick DB query).
+    /// </summary>
+    public int RegimeParamsCacheTtlSeconds { get; set; } = 120;
 }

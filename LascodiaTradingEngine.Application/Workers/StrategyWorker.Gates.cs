@@ -36,6 +36,12 @@ public partial class StrategyWorker
         double maxDrawdownPct  = await GetConfigAsync<double>(ctx, "Backtest:Gate:MaxDrawdownPct",  0.25, ct);
         double minSharpe       = await GetConfigAsync<double>(ctx, "Backtest:Gate:MinSharpe",       0.0,  ct);
 
+        // Max age (in days) of a completed backtest that still qualifies as
+        // recent evidence for live trading. Beyond this window the strategy
+        // hasn't been re-validated against current market conditions and we
+        // treat it as unqualified until a fresh run completes. Defaults to 180.
+        int maxAgeDays = await GetConfigAsync<int>(ctx, "Backtest:Gate:MaxAgeDays", 180, ct);
+
         // Timeframe-adaptive MinTotalTrades: higher timeframes produce fewer signals,
         // so they need a lower trade threshold to avoid permanently blocking profitable
         // H4/D1 strategies that only generate 5-8 trades in a 365-day backtest window.
@@ -52,10 +58,17 @@ public partial class StrategyWorker
             .ToListAsync(ct);
         var timeframeMap = strategyTimeframes.ToDictionary(s => s.Id, s => s.Timeframe);
 
-        // Load the most recent completed backtest per strategy (only for strategies in scope)
+        // Load the most recent completed backtest per strategy (only for strategies
+        // in scope). The age filter narrows the grouping set to recent runs only,
+        // so on a 1,000-run history the DB no longer has to sort the whole table
+        // just to pick the latest. Strategies with no run in the window appear as
+        // "not qualified" — the same treatment as never-backtested strategies.
+        DateTime minCompletedAt = DateTime.UtcNow.AddDays(-Math.Max(1, maxAgeDays));
         var recentBacktests = await ctx.Set<Domain.Entities.BacktestRun>()
             .Where(r => strategyIds.Contains(r.StrategyId)
                         && r.Status == RunStatus.Completed
+                        && r.CompletedAt != null
+                        && r.CompletedAt > minCompletedAt
                         && !r.IsDeleted)
             .GroupBy(r => r.StrategyId)
             .Select(g => g.OrderByDescending(r => r.CompletedAt)

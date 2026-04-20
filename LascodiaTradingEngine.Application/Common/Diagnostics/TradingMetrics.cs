@@ -46,6 +46,13 @@ public sealed class TradingMetrics
     public Counter<long>     StrategyMetricsCacheMisses { get; }
     public Counter<long>     StrategyMetricsCacheInvalidations { get; }
     public Counter<long>     SignalTtlExtendedMarketClosed { get; }
+    public Counter<long>     MLModelStaleRejections { get; }
+    public Counter<long>     MLScoringTimeouts      { get; }
+    public Histogram<double> StrategyLockAcquisitionMs { get; }
+    public Counter<long>     RegimeParamsCacheHits  { get; }
+    public Counter<long>     RegimeParamsCacheMisses { get; }
+    public Counter<long>     SignalRejectionsAudited { get; }
+    public Counter<long>     CalibrationSnapshotsWritten { get; }
 
     // ── Validation / promotion defaults telemetry ────────────────────────────
     // Tagged counters that let operators calibrate the new default floors added in
@@ -256,6 +263,13 @@ public sealed class TradingMetrics
         StrategyMetricsCacheMisses = _meter.CreateCounter<long>("trading.strategy_metrics_cache.misses", "lookups", "In-memory strategy-metrics cache misses that triggered a DB refresh.");
         StrategyMetricsCacheInvalidations = _meter.CreateCounter<long>("trading.strategy_metrics_cache.invalidations", "events", "Strategy-metrics cache entries invalidated by integration events. Tagged with trigger={backtest_completed|strategy_activated}.");
         SignalTtlExtendedMarketClosed = _meter.CreateCounter<long>("trading.signals.ttl_extended_market_closed", "signals", "Signals whose ExpiresAt was extended to cover a market-closed window before the next open. Tagged with symbol.");
+        MLModelStaleRejections = _meter.CreateCounter<long>("trading.signals.ml_model_stale_rejections", "signals", "Signals rejected because their associated MLModel is no longer live (retired, suppressed, or inactive). Tagged with ml_model_id|symbol.");
+        MLScoringTimeouts = _meter.CreateCounter<long>("trading.ml.scoring_timeouts", "events", "IMLSignalScorer.ScoreAsync invocations that exceeded MLScoringTimeoutSeconds and were treated as a fail-closed ML error. Tagged with symbol|strategy_id.");
+        StrategyLockAcquisitionMs = _meter.CreateHistogram<double>("trading.strategy.lock_acquisition_ms", "ms", "Wall-clock time spent inside IDistributedLock.TryAcquireAsync for strategy evaluation. Tagged with outcome={acquired|busy}.");
+        RegimeParamsCacheHits = _meter.CreateCounter<long>("trading.strategy.regime_params_cache.hits", "lookups", "StrategyRegimeParams cache hits on the hot tick path.");
+        RegimeParamsCacheMisses = _meter.CreateCounter<long>("trading.strategy.regime_params_cache.misses", "lookups", "StrategyRegimeParams cache misses that triggered a DB refresh.");
+        SignalRejectionsAudited = _meter.CreateCounter<long>("trading.signals.rejections_audited", "rejections", "Rejections written to the SignalRejectionAudit table. Tagged with stage and reason.");
+        CalibrationSnapshotsWritten = _meter.CreateCounter<long>("trading.calibration.snapshots_written", "snapshots", "CalibrationSnapshot rows written by CalibrationSnapshotWorker. Tagged with period.");
 
         WalkForwardFoldRejections = _meter.CreateCounter<long>("trading.walk_forward.fold_rejections", "runs", "Walk-forward runs rejected. Tagged with reason=min_in_sample_days|min_out_of_sample_days|min_candles_per_fold|min_trades_per_fold.");
         PromotionGateRejections = _meter.CreateCounter<long>("trading.strategy_promotion.gate_rejections", "strategies", "Strategies rejected by promotion gates. Tagged with gate=live_vs_backtest_sharpe|critical_snapshot|insufficient_snapshots|insufficient_healthy.");

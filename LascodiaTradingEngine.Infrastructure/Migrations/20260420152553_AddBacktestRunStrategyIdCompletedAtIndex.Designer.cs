@@ -3,6 +3,7 @@ using System;
 using LascodiaTradingEngine.Infrastructure.Persistence.DbContexts;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 
@@ -11,9 +12,11 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace LascodiaTradingEngine.Infrastructure.Migrations
 {
     [DbContext(typeof(WriteApplicationDbContext))]
-    partial class WriteApplicationDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260420152553_AddBacktestRunStrategyIdCompletedAtIndex")]
+    partial class AddBacktestRunStrategyIdCompletedAtIndex
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -530,61 +533,6 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                         .IsUnique();
 
                     b.ToTable("COTReport");
-                });
-
-            modelBuilder.Entity("LascodiaTradingEngine.Domain.Entities.CalibrationSnapshot", b =>
-                {
-                    b.Property<long>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("bigint");
-
-                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
-
-                    b.Property<DateTime>("ComputedAt")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<int>("DistinctStrategies")
-                        .HasColumnType("integer");
-
-                    b.Property<int>("DistinctSymbols")
-                        .HasColumnType("integer");
-
-                    b.Property<Guid>("OutboxId")
-                        .HasColumnType("uuid");
-
-                    b.Property<DateTime>("PeriodEnd")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<string>("PeriodGranularity")
-                        .IsRequired()
-                        .HasMaxLength(10)
-                        .HasColumnType("character varying(10)");
-
-                    b.Property<DateTime>("PeriodStart")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<string>("Reason")
-                        .IsRequired()
-                        .HasMaxLength(64)
-                        .HasColumnType("character varying(64)");
-
-                    b.Property<long>("RejectionCount")
-                        .HasColumnType("bigint");
-
-                    b.Property<string>("Stage")
-                        .IsRequired()
-                        .HasMaxLength(32)
-                        .HasColumnType("character varying(32)");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("PeriodStart");
-
-                    b.HasIndex("PeriodStart", "PeriodGranularity", "Stage", "Reason")
-                        .IsUnique()
-                        .HasDatabaseName("IX_CalibrationSnapshot_Period_Stage_Reason_Unique");
-
-                    b.ToTable("CalibrationSnapshot");
                 });
 
             modelBuilder.Entity("LascodiaTradingEngine.Domain.Entities.Candle", b =>
@@ -4751,65 +4699,6 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     b.HasIndex("TradingAccountId");
 
                     b.ToTable("SignalAllocation");
-                });
-
-            modelBuilder.Entity("LascodiaTradingEngine.Domain.Entities.SignalRejectionAudit", b =>
-                {
-                    b.Property<long>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("bigint");
-
-                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
-
-                    b.Property<string>("Detail")
-                        .HasMaxLength(2000)
-                        .HasColumnType("character varying(2000)");
-
-                    b.Property<Guid>("OutboxId")
-                        .HasColumnType("uuid");
-
-                    b.Property<string>("Reason")
-                        .IsRequired()
-                        .HasMaxLength(64)
-                        .HasColumnType("character varying(64)");
-
-                    b.Property<DateTime>("RejectedAt")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<string>("Source")
-                        .IsRequired()
-                        .HasMaxLength(50)
-                        .HasColumnType("character varying(50)");
-
-                    b.Property<string>("Stage")
-                        .IsRequired()
-                        .HasMaxLength(32)
-                        .HasColumnType("character varying(32)");
-
-                    b.Property<long>("StrategyId")
-                        .HasColumnType("bigint");
-
-                    b.Property<string>("Symbol")
-                        .IsRequired()
-                        .HasMaxLength(10)
-                        .HasColumnType("character varying(10)");
-
-                    b.Property<long?>("TradeSignalId")
-                        .HasColumnType("bigint");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("RejectedAt");
-
-                    b.HasIndex("TradeSignalId");
-
-                    b.HasIndex("StrategyId", "RejectedAt");
-
-                    b.HasIndex("Symbol", "RejectedAt");
-
-                    b.HasIndex("Stage", "Reason", "RejectedAt");
-
-                    b.ToTable("SignalRejectionAudit");
                 });
 
             modelBuilder.Entity("LascodiaTradingEngine.Domain.Entities.SpreadProfile", b =>
