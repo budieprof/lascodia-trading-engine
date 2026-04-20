@@ -203,7 +203,7 @@ public sealed class MLConformalCalibrationWorker : BackgroundService
                     // Store the full sorted nonconformity score array for future recalibration.
                     NonConformityScoresJson  = JsonSerializer.Serialize(scores),
                     CalibrationSamples       = n,
-                    CoverageAlpha            = 1 - alpha,    // nominal coverage level = 0.90
+                    TargetCoverage            = 1 - alpha,    // nominal coverage level = 0.90
                     CoverageThreshold        = threshold,    // τ: the quantile threshold
                     EmpiricalCoverage        = empCoverage,
                     AmbiguousRate            = (double)ambiguousN / calLogs.Count,

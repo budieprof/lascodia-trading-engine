@@ -76,6 +76,7 @@ public static class WorkerGroupFilter
         typeof(MLCalibratedEdgeWorker),
         typeof(MLCausalFeatureWorker),
         typeof(MLConformalBreakerWorker),
+        typeof(MLConformalCoverageBackfillWorker),
         typeof(MLConformalCalibrationWorker),
         typeof(MLConformalRecalibrationWorker),
         typeof(MLCorrelatedSignalConflictWorker),

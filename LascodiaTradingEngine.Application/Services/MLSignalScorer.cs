@@ -503,7 +503,10 @@ public sealed class MLSignalScorer : IMLSignalScorer
             signal, model, currentRegime, signalTimeframe, cotEntry,
             scoringStart, db);
         var enrichments = await ComputeEnrichmentsAsync(ctx, cancellationToken);
-        var (conformalSet, conformalSetSize, metaLabelScore, jackknifeInterval,
+        var (conformalSet, conformalSetSize,
+             mlConformalCalibrationId, conformalThresholdUsed,
+             conformalTargetCoverageUsed, conformalPredictionSetJson,
+             metaLabelScore, jackknifeInterval,
              entropyScore, oodMahalanobisScore, isOod, abstentionScore,
              regimeRoutingDecision, minTReconciledProbability,
              estimatedTimeToTargetBars, survivalHazardRate, counterfactualJson) = enrichments;
@@ -539,6 +542,10 @@ public sealed class MLSignalScorer : IMLSignalScorer
                 AbstentionScore: abstentionScore,
                 ConformalSet: conformalSet,
                 ConformalSetSize: conformalSetSize,
+                MLConformalCalibrationId: mlConformalCalibrationId,
+                ConformalThresholdUsed: conformalThresholdUsed,
+                ConformalTargetCoverageUsed: conformalTargetCoverageUsed,
+                ConformalPredictionSetJson: conformalPredictionSetJson,
                 EntropyScore: (decimal)entropyScore);
         }
 
@@ -561,6 +568,10 @@ public sealed class MLSignalScorer : IMLSignalScorer
                 AbstentionScore: abstentionScore,
                 ConformalSet: conformalSet,
                 ConformalSetSize: conformalSetSize,
+                MLConformalCalibrationId: mlConformalCalibrationId,
+                ConformalThresholdUsed: conformalThresholdUsed,
+                ConformalTargetCoverageUsed: conformalTargetCoverageUsed,
+                ConformalPredictionSetJson: conformalPredictionSetJson,
                 EntropyScore: (decimal)entropyScore);
         }
 
@@ -598,6 +609,10 @@ public sealed class MLSignalScorer : IMLSignalScorer
             JackknifeInterval:            jackknifeInterval,
             AbstentionScore:              abstentionScore,
             ConformalSetSize:             conformalSetSize,
+            MLConformalCalibrationId:     mlConformalCalibrationId,
+            ConformalThresholdUsed:       conformalThresholdUsed,
+            ConformalTargetCoverageUsed:  conformalTargetCoverageUsed,
+            ConformalPredictionSetJson:   conformalPredictionSetJson,
             EntropyScore:                 (decimal)entropyScore,
             MagnitudeUncertaintyPips:     magnitudeUncertaintyPips,
             McDropoutVariance:            mcDropoutVariance,
@@ -1766,6 +1781,10 @@ public sealed class MLSignalScorer : IMLSignalScorer
     private readonly record struct ScoringEnrichments(
         string? ConformalSet,
         int? ConformalSetSize,
+        long? MLConformalCalibrationId,
+        double? ConformalThresholdUsed,
+        double? ConformalTargetCoverageUsed,
+        string? ConformalPredictionSetJson,
         decimal? MetaLabelScore,
         string? JackknifeInterval,
         double EntropyScore,
@@ -1807,6 +1826,21 @@ public sealed class MLSignalScorer : IMLSignalScorer
                 snap.ConformalQHat,
                 snap.ConformalQHatBuy,
                 snap.ConformalQHatSell);
+        var conformalCalibration = await db.Set<MLConformalCalibration>()
+            .AsNoTracking()
+            .Where(c => c.MLModelId == model.Id && !c.IsDeleted)
+            .OrderByDescending(c => c.CalibratedAt)
+            .ThenByDescending(c => c.Id)
+            .Select(c => new { c.Id, c.TargetCoverage })
+            .FirstOrDefaultAsync(cancellationToken);
+        double? conformalThresholdUsed = double.IsFinite(snap.ConformalQHat)
+            && snap.ConformalQHat > 0.0
+            && snap.ConformalQHat < 1.0
+                ? snap.ConformalQHat
+                : null;
+        double? conformalTargetCoverageUsed = conformalCalibration?.TargetCoverage
+            ?? (double.IsFinite(snap.ConformalCoverage) ? Math.Clamp(snap.ConformalCoverage, 0.0, 1.0) : null);
+        string? conformalPredictionSetJson = MLFeatureHelper.BuildConformalPredictionSetJson(conformalSet);
 
         var metaLabelScore = ScoringEnrichmentCalculator.ComputeMetaLabelScore(
             calibP, ensembleStd, features, featureCount,
@@ -1901,7 +1935,14 @@ public sealed class MLSignalScorer : IMLSignalScorer
         }
 
         return new ScoringEnrichments(
-            conformalSet, conformalSetSize, metaLabelScore, jackknifeInterval,
+            conformalSet,
+            conformalSetSize,
+            conformalCalibration?.Id,
+            conformalThresholdUsed,
+            conformalTargetCoverageUsed,
+            conformalPredictionSetJson,
+            metaLabelScore,
+            jackknifeInterval,
             entropyScore, oodMahalanobisScore, isOod, abstentionScore,
             regimeRoutingDecision, minTReconciledProbability,
             estimatedTimeToTargetBars, survivalHazardRate, counterfactualJson);

@@ -52,6 +52,14 @@ public class CreateTradeSignalCommand : IRequest<ResponseData<long>>
     public decimal?      MLServedCalibratedProbability { get; set; }
     /// <summary>Decision threshold used to convert probability to a trade/no-trade decision.</summary>
     public decimal?      MLDecisionThresholdUsed { get; set; }
+    /// <summary>Conformal calibration record active when this prediction was served.</summary>
+    public long?         MLConformalCalibrationId { get; set; }
+    /// <summary>Prediction-time conformal threshold used to create the served prediction set.</summary>
+    public double?       MLConformalThresholdUsed { get; set; }
+    /// <summary>Prediction-time conformal target coverage.</summary>
+    public double?       MLConformalTargetCoverageUsed { get; set; }
+    /// <summary>JSON array containing labels in the served conformal prediction set.</summary>
+    public string?       MLConformalPredictionSetJson { get; set; }
     /// <summary>
     /// Standard deviation of individual ensemble learner probabilities at scoring time.
     /// Stored on <c>MLModelPredictionLog</c> for live disagreement monitoring.
@@ -175,6 +183,10 @@ public class CreateTradeSignalCommandHandler : IRequestHandler<CreateTradeSignal
                 CalibratedProbability  = request.MLCalibratedProbability,
                 ServedCalibratedProbability = request.MLServedCalibratedProbability,
                 DecisionThresholdUsed  = request.MLDecisionThresholdUsed,
+                MLConformalCalibrationId = request.MLConformalCalibrationId,
+                ConformalThresholdUsed = request.MLConformalThresholdUsed,
+                ConformalTargetCoverageUsed = request.MLConformalTargetCoverageUsed,
+                ConformalPredictionSetJson = request.MLConformalPredictionSetJson,
                 EnsembleDisagreement   = request.MLEnsembleDisagreement,
                 LatencyMs              = request.MLScoringLatencyMs,
                 PredictedAt            = DateTime.UtcNow,

@@ -95,6 +95,8 @@ public sealed class TradingMetrics
     public Counter<long>     MLConformalBreakerModelsEvaluated { get; }
     public Counter<long>     MLConformalBreakerModelsSkipped { get; }
     public Counter<long>     MLConformalBreakerTrips { get; }
+    public Counter<long>     MLConformalBreakerRecoveries { get; }
+    public Counter<long>     MLConformalBreakerRefreshes { get; }
     public Histogram<double> MLConformalBreakerEmpiricalCoverage { get; }
     public Histogram<double> MLConformalBreakerActive { get; }
 
@@ -328,6 +330,8 @@ public sealed class TradingMetrics
         MLConformalBreakerModelsEvaluated = _meter.CreateCounter<long>("trading.ml.conformal_breaker.models_evaluated", "models", "Active ML models evaluated by the conformal breaker");
         MLConformalBreakerModelsSkipped = _meter.CreateCounter<long>("trading.ml.conformal_breaker.models_skipped", "models", "ML models skipped by the conformal breaker, tagged by reason");
         MLConformalBreakerTrips = _meter.CreateCounter<long>("trading.ml.conformal_breaker.trips", "breakers", "Conformal breaker suppressions, tagged by trip reason");
+        MLConformalBreakerRecoveries = _meter.CreateCounter<long>("trading.ml.conformal_breaker.recoveries", "breakers", "Conformal breaker recoveries that lifted active breaker state");
+        MLConformalBreakerRefreshes = _meter.CreateCounter<long>("trading.ml.conformal_breaker.refreshes", "breakers", "Active conformal breaker diagnostic refreshes without extending suspension");
         MLConformalBreakerEmpiricalCoverage = _meter.CreateHistogram<double>("trading.ml.conformal_breaker.empirical_coverage", "ratio", "Empirical conformal coverage observed by the breaker");
         MLConformalBreakerActive = _meter.CreateHistogram<double>("trading.ml.conformal_breaker.active", "breakers", "Active conformal breaker count");
 

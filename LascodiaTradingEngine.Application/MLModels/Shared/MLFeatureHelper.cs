@@ -2,6 +2,7 @@ using LascodiaTradingEngine.Application.Common.Utilities;
 using LascodiaTradingEngine.Application.Services;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
+using System.Text.Json;
 
 namespace LascodiaTradingEngine.Application.MLModels.Shared;
 
@@ -993,6 +994,57 @@ public static class MLFeatureHelper
             return Math.Clamp((double)log.ServedCalibratedProbability.Value, 0.0, 1.0);
 
         return ResolveLoggedCalibratedBuyProbability(log, fallbackThreshold);
+    }
+
+    /// <summary>
+    /// Computes the conformal nonconformity score for a resolved binary prediction log:
+    /// <c>1 - P(true class)</c>. Lower scores are better; a score is covered when it is
+    /// less than or equal to the model's conformal coverage threshold.
+    /// </summary>
+    public static double ComputeLoggedConformalNonConformityScore(
+        MLModelPredictionLog log,
+        TradeDirection       actualDirection,
+        double               fallbackThreshold = 0.5)
+    {
+        double pBuy = ResolveLoggedServedBuyProbability(log, fallbackThreshold);
+        double pTrue = actualDirection == TradeDirection.Buy ? pBuy : 1.0 - pBuy;
+        return Math.Clamp(1.0 - pTrue, 0.0, 1.0);
+    }
+
+    public static string? BuildConformalPredictionSetJson(string? conformalSet)
+    {
+        if (string.IsNullOrWhiteSpace(conformalSet))
+            return null;
+
+        string[]? labels = conformalSet.Trim() switch
+        {
+            var s when string.Equals(s, "Buy", StringComparison.OrdinalIgnoreCase)       => ["Buy"],
+            var s when string.Equals(s, "Sell", StringComparison.OrdinalIgnoreCase)      => ["Sell"],
+            var s when string.Equals(s, "Ambiguous", StringComparison.OrdinalIgnoreCase) => ["Buy", "Sell"],
+            var s when string.Equals(s, "None", StringComparison.OrdinalIgnoreCase)      => [],
+            _                                                                            => null,
+        };
+
+        return labels is null ? null : JsonSerializer.Serialize(labels);
+    }
+
+    public static bool? WasActualDirectionInConformalSet(
+        string? conformalPredictionSetJson,
+        TradeDirection actualDirection)
+    {
+        if (string.IsNullOrWhiteSpace(conformalPredictionSetJson))
+            return null;
+
+        try
+        {
+            var labels = JsonSerializer.Deserialize<string[]>(conformalPredictionSetJson) ?? [];
+            string actual = actualDirection.ToString();
+            return labels.Any(label => string.Equals(label, actual, StringComparison.OrdinalIgnoreCase));
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
     }
 
     // ── Math primitives ───────────────────────────────────────────────────────

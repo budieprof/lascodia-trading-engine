@@ -21,7 +21,9 @@ using LascodiaTradingEngine.Application.Backtesting;
 using LascodiaTradingEngine.Application.RiskProfiles.Services;
 using LascodiaTradingEngine.Application.RiskProfiles.Services.Steps;
 using MediatR;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using Polly;
 using Polly.Extensions.Http;
 
@@ -94,6 +96,13 @@ public static class DependencyInjection
     /// </summary>
     public static IServiceCollection ConfigureInfrastructureServices(this IServiceCollection services, IConfiguration configuration)
     {
+        services.RemoveAll<MLConformalBreakerOptions>();
+        services.AddSingleton<IValidateOptions<MLConformalBreakerOptions>, MLConformalBreakerOptionsValidator>();
+        services.AddOptions<MLConformalBreakerOptions>()
+            .Bind(configuration.GetSection(nameof(MLConformalBreakerOptions)))
+            .ValidateOnStart();
+        services.AddSingleton(sp => sp.GetRequiredService<IOptions<MLConformalBreakerOptions>>().Value);
+
         // ── Strategy Worker ──────────────────────────────────────────────────────
         // Registered as singleton so the same instance is used both as the hosted
         // service and as the IIntegrationEventHandler resolved by the event bus.
@@ -182,6 +191,9 @@ public static class DependencyInjection
         // retrain-failure breach, swaps the failing active model for its
         // PreviousChampionModelId fallback. Closes the loop drift workers opened.
         services.AddHostedService<MLModelAutoRollbackWorker>();
+        services.AddSingleton<IMLConformalCoverageEvaluator, MLConformalCoverageEvaluator>();
+        services.AddSingleton<IMLConformalPredictionLogReader, MLConformalPredictionLogReader>();
+        services.AddSingleton<IMLConformalBreakerStateStore, MLConformalBreakerStateStore>();
 
         // ── Portfolio-level optimisation (daily Kelly / HRP) ───────────────────
         // Computes per-strategy allocation weights from realised returns and

@@ -48,6 +48,21 @@ public class MLModelPredictionLogDto : IMapFrom<MLModelPredictionLog>
     /// <summary>Calibrated probability at the time this prediction was served to the signal pipeline.</summary>
     public decimal?       ServedCalibratedProbability { get; set; }
 
+    /// <summary>Decision threshold used to serve this prediction.</summary>
+    public decimal?       DecisionThresholdUsed  { get; set; }
+
+    /// <summary>Conformal calibration active when this prediction was served.</summary>
+    public long?          MLConformalCalibrationId { get; set; }
+
+    /// <summary>Prediction-time conformal threshold used to build the served set.</summary>
+    public double?        ConformalThresholdUsed { get; set; }
+
+    /// <summary>Prediction-time target coverage.</summary>
+    public double?        ConformalTargetCoverageUsed { get; set; }
+
+    /// <summary>JSON array of labels in the served conformal prediction set.</summary>
+    public string?        ConformalPredictionSetJson { get; set; }
+
     /// <summary>Actual market direction observed after the signal (populated by RecordPredictionOutcome).</summary>
     public TradeDirection? ActualDirection        { get; set; }
 
@@ -59,6 +74,12 @@ public class MLModelPredictionLogDto : IMapFrom<MLModelPredictionLog>
 
     /// <summary>Whether the predicted direction matched the actual direction.</summary>
     public bool?          DirectionCorrect        { get; set; }
+
+    /// <summary>Nonconformity score computed once the actual direction is known.</summary>
+    public double?        ConformalNonConformityScore { get; set; }
+
+    /// <summary>Whether the served conformal set contained the actual direction.</summary>
+    public bool?          WasConformalCovered     { get; set; }
 
     /// <summary>UTC time when the prediction was made.</summary>
     public DateTime       PredictedAt             { get; set; }

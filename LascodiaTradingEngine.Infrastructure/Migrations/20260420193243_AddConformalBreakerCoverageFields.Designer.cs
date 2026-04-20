@@ -3,6 +3,7 @@ using System;
 using LascodiaTradingEngine.Infrastructure.Persistence.DbContexts;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 
@@ -11,9 +12,11 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace LascodiaTradingEngine.Infrastructure.Migrations
 {
     [DbContext(typeof(WriteApplicationDbContext))]
-    partial class WriteApplicationDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260420193243_AddConformalBreakerCoverageFields")]
+    partial class AddConformalBreakerCoverageFields
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -1549,10 +1552,6 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                         .HasPrecision(10, 8)
                         .HasColumnType("double precision");
 
-                    b.Property<double?>("CoverageUpperBound")
-                        .HasPrecision(18, 8)
-                        .HasColumnType("double precision");
-
                     b.Property<int>("CoveredCount")
                         .HasColumnType("integer");
 
@@ -1560,17 +1559,11 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                         .HasPrecision(18, 8)
                         .HasColumnType("double precision");
 
-                    b.Property<int>("FreshSampleCount")
-                        .HasColumnType("integer");
-
                     b.Property<bool>("IsActive")
                         .HasColumnType("boolean");
 
                     b.Property<bool>("IsDeleted")
                         .HasColumnType("boolean");
-
-                    b.Property<DateTime?>("LastEvaluatedOutcomeAt")
-                        .HasColumnType("timestamp with time zone");
 
                     b.Property<long>("MLModelId")
                         .HasColumnType("bigint");
@@ -1638,6 +1631,10 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     b.Property<int>("CalibrationSamples")
                         .HasColumnType("integer");
 
+                    b.Property<double>("CoverageAlpha")
+                        .HasPrecision(5, 4)
+                        .HasColumnType("double precision");
+
                     b.Property<double>("CoverageThreshold")
                         .HasPrecision(10, 8)
                         .HasColumnType("double precision");
@@ -1663,11 +1660,6 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                         .IsRequired()
                         .HasMaxLength(10)
                         .HasColumnType("character varying(10)");
-
-                    b.Property<double>("TargetCoverage")
-                        .HasPrecision(5, 4)
-                        .HasColumnType("double precision")
-                        .HasColumnName("CoverageAlpha");
 
                     b.Property<string>("Timeframe")
                         .IsRequired()
@@ -2711,10 +2703,6 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
 
                     b.HasIndex("TradeSignalId", "MLModelId")
                         .IsUnique();
-
-                    b.HasIndex("MLModelId", "OutcomeRecordedAt", "Id")
-                        .HasDatabaseName("IX_MLModelPredictionLog_ConformalBreakerRecent")
-                        .HasFilter("\"OutcomeRecordedAt\" IS NOT NULL AND \"ActualDirection\" IS NOT NULL AND \"IsDeleted\" = FALSE");
 
                     b.HasIndex("MLModelId", "WasConformalCovered", "OutcomeRecordedAt")
                         .HasFilter("\"OutcomeRecordedAt\" IS NOT NULL AND \"IsDeleted\" = FALSE");

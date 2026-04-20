@@ -18,7 +18,9 @@ public class MLConformalCalibrationConfiguration : IEntityTypeConfiguration<MLCo
         builder.Property(x => x.Symbol).IsRequired().HasMaxLength(10);
         builder.Property(x => x.Timeframe).HasConversion<string>().IsRequired().HasMaxLength(10);
         builder.Property(x => x.NonConformityScoresJson).IsRequired();
-        builder.Property(x => x.CoverageAlpha).HasPrecision(5, 4);
+        builder.Property(x => x.TargetCoverage)
+               .HasColumnName("CoverageAlpha")
+               .HasPrecision(5, 4);
         builder.Property(x => x.CoverageThreshold).HasPrecision(10, 8);
         builder.Property(x => x.EmpiricalCoverage).HasPrecision(5, 4);
         builder.Property(x => x.AmbiguousRate).HasPrecision(5, 4);

@@ -3,6 +3,7 @@ using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.MLEvaluation.Commands.RecordPredictionOutcome;
@@ -86,6 +87,15 @@ public class RecordPredictionOutcomeCommandHandler : IRequestHandler<RecordPredi
             log.ActualMagnitudePips = request.ActualMagnitudePips;
             log.WasProfitable       = request.WasProfitable;
             log.DirectionCorrect    = log.PredictedDirection == actualDirection;
+            log.ConformalNonConformityScore = MLFeatureHelper.ComputeLoggedConformalNonConformityScore(
+                log,
+                actualDirection,
+                log.ConformalThresholdUsed ?? 0.5);
+            log.WasConformalCovered =
+                MLFeatureHelper.WasActualDirectionInConformalSet(log.ConformalPredictionSetJson, actualDirection)
+                ?? (log.ConformalThresholdUsed.HasValue
+                    ? log.ConformalNonConformityScore <= log.ConformalThresholdUsed.Value
+                    : null);
             log.OutcomeRecordedAt   = now;
         }
 

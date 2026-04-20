@@ -209,10 +209,39 @@ public class MLModelPredictionLog : Entity<long>
 
     /// <summary>
     /// The nonconformity score (1 − ŷ_{true class}) for this prediction,
-    /// computed against the conformal calibration set.
-    /// Used post-hoc to audit whether the coverage guarantee was met.
+    /// computed once the true outcome is known. Used post-hoc to audit whether
+    /// the coverage guarantee was met.
     /// </summary>
     public double?  ConformalNonConformityScore { get; set; }
+
+    /// <summary>
+    /// Foreign key to the conformal calibration record whose threshold/prediction-set
+    /// semantics were active when this prediction was served. Null for legacy rows.
+    /// </summary>
+    public long? MLConformalCalibrationId { get; set; }
+
+    /// <summary>
+    /// Prediction-time conformal nonconformity threshold used to form the served
+    /// prediction set. This is the canonical threshold for later coverage auditing.
+    /// </summary>
+    public double? ConformalThresholdUsed { get; set; }
+
+    /// <summary>
+    /// Prediction-time target coverage level, e.g. 0.90 for 90% marginal coverage.
+    /// </summary>
+    public double? ConformalTargetCoverageUsed { get; set; }
+
+    /// <summary>
+    /// JSON array of class labels included in the served conformal prediction set.
+    /// Examples: <c>["Buy"]</c>, <c>["Sell"]</c>, <c>["Buy","Sell"]</c>, or <c>[]</c>.
+    /// </summary>
+    public string? ConformalPredictionSetJson { get; set; }
+
+    /// <summary>
+    /// Canonical realised conformal coverage result. Set when the true outcome is known:
+    /// <c>true</c> when the served prediction set contained the actual direction.
+    /// </summary>
+    public bool? WasConformalCovered { get; set; }
 
     // ── Rec #19: Approximate SHAP feature attribution ─────────────────────────
 
@@ -308,4 +337,7 @@ public class MLModelPredictionLog : Entity<long>
 
     /// <summary>The ML model that produced this prediction.</summary>
     public virtual MLModel MLModel { get; set; } = null!;
+
+    /// <summary>Conformal calibration active when this prediction was served, if recorded.</summary>
+    public virtual MLConformalCalibration? MLConformalCalibration { get; set; }
 }

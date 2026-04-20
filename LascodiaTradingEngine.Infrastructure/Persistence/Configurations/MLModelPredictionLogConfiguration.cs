@@ -31,11 +31,22 @@ public class MLModelPredictionLogConfiguration : IEntityTypeConfiguration<MLMode
         builder.Property(x => x.ResolutionSource).HasMaxLength(30);
         builder.Property(x => x.EnsembleDisagreement).HasPrecision(5, 4);
         builder.Property(x => x.ContributionsJson).HasMaxLength(500);
+        builder.Property(x => x.ConformalNonConformityScore).HasPrecision(10, 8);
+        builder.Property(x => x.ConformalThresholdUsed).HasPrecision(10, 8);
+        builder.Property(x => x.ConformalTargetCoverageUsed).HasPrecision(5, 4);
+        builder.Property(x => x.ConformalPredictionSetJson).HasMaxLength(100);
 
         builder.HasQueryFilter(x => !x.IsDeleted);
 
         builder.HasIndex(x => x.TradeSignalId);
         builder.HasIndex(x => new { x.MLModelId, x.ModelRole });
+        builder.HasIndex(x => new { x.MLModelId, x.OutcomeRecordedAt });
+        builder.HasIndex(x => new { x.MLModelId, x.WasConformalCovered, x.OutcomeRecordedAt })
+               .HasFilter("\"OutcomeRecordedAt\" IS NOT NULL AND \"IsDeleted\" = FALSE");
+        builder.HasIndex(x => new { x.MLModelId, x.OutcomeRecordedAt, x.Id })
+               .HasDatabaseName("IX_MLModelPredictionLog_ConformalBreakerRecent")
+               .HasFilter("\"OutcomeRecordedAt\" IS NOT NULL AND \"ActualDirection\" IS NOT NULL AND \"IsDeleted\" = FALSE");
+        builder.HasIndex(x => x.MLConformalCalibrationId);
         // Deduplication guard: one prediction log per (signal, model) pair.
         builder.HasIndex(x => new { x.TradeSignalId, x.MLModelId }).IsUnique();
 
@@ -48,5 +59,10 @@ public class MLModelPredictionLogConfiguration : IEntityTypeConfiguration<MLMode
                .WithMany(x => x.PredictionLogs)
                .HasForeignKey(x => x.MLModelId)
                .OnDelete(DeleteBehavior.Restrict);
+
+        builder.HasOne(x => x.MLConformalCalibration)
+               .WithMany()
+               .HasForeignKey(x => x.MLConformalCalibrationId)
+               .OnDelete(DeleteBehavior.SetNull);
     }
 }

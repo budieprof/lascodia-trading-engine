@@ -67,6 +67,14 @@ public record MLScoreResult(
     /// Null when no conformal threshold is available in the snapshot.
     /// </summary>
     int?            ConformalSetSize = null,
+    /// <summary>Conformal calibration record active when this prediction was served.</summary>
+    long?           MLConformalCalibrationId = null,
+    /// <summary>Prediction-time conformal threshold used to create the served prediction set.</summary>
+    double?         ConformalThresholdUsed = null,
+    /// <summary>Prediction-time conformal target coverage.</summary>
+    double?         ConformalTargetCoverageUsed = null,
+    /// <summary>JSON array containing the labels in the served conformal prediction set.</summary>
+    string?         ConformalPredictionSetJson = null,
     /// <summary>
     /// Binary prediction entropy H = −p·log₂(p) − (1−p)·log₂(1−p), normalised to [0, 1].
     /// 0.0 = certain prediction (p→0 or p→1); 1.0 = maximum uncertainty (p = 0.5).

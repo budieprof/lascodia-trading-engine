@@ -44,7 +44,7 @@ public class MLConformalCalibration : Entity<long>
     /// Target marginal coverage level (0–1). Default 0.90 means the prediction set
     /// contains the true label at least 90 % of the time over calibration samples.
     /// </summary>
-    public double   CoverageAlpha        { get; set; } = 0.90;
+    public double   TargetCoverage       { get; set; } = 0.90;
 
     /// <summary>
     /// The coverage threshold τ derived from <see cref="NonConformityScoresJson"/>.
@@ -54,7 +54,7 @@ public class MLConformalCalibration : Entity<long>
 
     /// <summary>
     /// Empirical coverage measured on a held-out test set after calibration.
-    /// Should be ≥ <see cref="CoverageAlpha"/> if the calibration is valid.
+    /// Should be ≥ <see cref="TargetCoverage"/> if the calibration is valid.
     /// Null until post-calibration evaluation is run.
     /// </summary>
     public double?  EmpiricalCoverage    { get; set; }
