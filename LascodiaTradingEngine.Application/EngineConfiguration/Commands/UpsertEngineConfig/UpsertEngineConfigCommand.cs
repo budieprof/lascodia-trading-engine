@@ -59,19 +59,22 @@ public class UpsertEngineConfigCommandHandler : IRequestHandler<UpsertEngineConf
     private readonly ICurrentUserService _currentUser;
     private readonly OptimizationConfigProvider _optimizationConfigProvider;
     private readonly TimeProvider _timeProvider;
+    private readonly Services.EngineConfigCache _engineConfigCache;
 
     public UpsertEngineConfigCommandHandler(
         IWriteApplicationDbContext context,
         IMediator mediator,
         ICurrentUserService currentUser,
         OptimizationConfigProvider optimizationConfigProvider,
-        TimeProvider timeProvider)
+        TimeProvider timeProvider,
+        Services.EngineConfigCache engineConfigCache)
     {
         _context = context;
         _mediator = mediator;
         _currentUser = currentUser;
         _optimizationConfigProvider = optimizationConfigProvider;
         _timeProvider = timeProvider;
+        _engineConfigCache = engineConfigCache;
     }
 
     public async Task<ResponseData<long>> Handle(UpsertEngineConfigCommand request, CancellationToken cancellationToken)
@@ -172,6 +175,12 @@ public class UpsertEngineConfigCommandHandler : IRequestHandler<UpsertEngineConf
 
     private void InvalidateOptimizationConfigCacheIfNeeded(string key)
     {
+        // Always invalidate the generic engine-config cache so in-process
+        // readers see the new value on the very next lookup. The
+        // OptimizationConfigProvider has its own memoization layer which is
+        // invalidated selectively for its key prefixes.
+        _engineConfigCache.Invalidate(key);
+
         if (key.StartsWith("Optimization:", StringComparison.OrdinalIgnoreCase)
             || key.StartsWith("Backtest:Gate:", StringComparison.OrdinalIgnoreCase))
         {

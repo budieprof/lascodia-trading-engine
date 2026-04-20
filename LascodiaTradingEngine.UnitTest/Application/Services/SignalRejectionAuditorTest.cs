@@ -11,6 +11,16 @@ using LascodiaTradingEngine.Domain.Entities;
 
 namespace LascodiaTradingEngine.UnitTest.Application.Services;
 
+/// <summary>
+/// Exercises the batched <see cref="SignalRejectionAuditor"/>:
+/// <list type="bullet">
+///   <item>RecordAsync is non-blocking — rows land in the channel, not the DB.</item>
+///   <item>The SignalRejectionsAudited metric increments at enqueue, not at flush.</item>
+///   <item>A test-only <c>FlushForTestsAsync</c> drains the channel synchronously
+///         so tests can assert on the DB insert without depending on the
+///         BackgroundService flush loop.</item>
+/// </list>
+/// </summary>
 public class SignalRejectionAuditorTest : IDisposable
 {
     private readonly TestMeterFactory _meterFactory = new();
@@ -18,6 +28,8 @@ public class SignalRejectionAuditorTest : IDisposable
     private readonly Mock<IServiceScopeFactory> _scopeFactory = new();
     private readonly Mock<IWriteApplicationDbContext> _writeCtx = new();
     private readonly Mock<DbContext> _db = new();
+    private readonly Mock<DbSet<SignalRejectionAudit>> _set = new();
+    private readonly List<SignalRejectionAudit> _captured = new();
     private readonly SignalRejectionAuditor _auditor;
 
     public SignalRejectionAuditorTest()
@@ -26,8 +38,15 @@ public class SignalRejectionAuditorTest : IDisposable
 
         _writeCtx.Setup(w => w.GetDbContext()).Returns(_db.Object);
         _writeCtx.Setup(w => w.SaveChangesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(1);
-        _db.Setup(d => d.Set<SignalRejectionAudit>())
-            .Returns(new List<SignalRejectionAudit>().AsQueryable().BuildMockDbSet().Object);
+
+        // Capture AddRangeAsync into a list so tests can assert shape/truncation.
+        _set.Setup(s => s.AddRangeAsync(It.IsAny<IEnumerable<SignalRejectionAudit>>(), It.IsAny<CancellationToken>()))
+            .Returns<IEnumerable<SignalRejectionAudit>, CancellationToken>((rows, _) =>
+            {
+                _captured.AddRange(rows);
+                return Task.CompletedTask;
+            });
+        _db.Setup(d => d.Set<SignalRejectionAudit>()).Returns(_set.Object);
 
         var scope = new Mock<IServiceScope>();
         var provider = new Mock<IServiceProvider>();
@@ -41,83 +60,85 @@ public class SignalRejectionAuditorTest : IDisposable
     public void Dispose() => _meterFactory.Dispose();
 
     [Fact]
-    public async Task RecordAsync_PersistsRowAndIncrementsMetric()
+    public async Task RecordAsync_IsNonBlocking_AndCountsMetricOnEnqueue()
     {
         using var counter = new CounterProbe(_meterFactory, "trading.signals.rejections_audited");
 
         await _auditor.RecordAsync(
-            stage: "MTF",
-            reason: "mtf_not_confirmed",
-            symbol: "EURUSD",
-            source: "StrategyWorker",
-            strategyId: 42,
-            tradeSignalId: 99,
-            detail: "H4 disagreed with H1");
+            stage: "MTF", reason: "mtf_not_confirmed",
+            symbol: "EURUSD", source: "StrategyWorker",
+            strategyId: 42, tradeSignalId: 99);
 
-        _db.Verify(d => d.Set<SignalRejectionAudit>(), Times.AtLeastOnce);
-        _writeCtx.Verify(w => w.SaveChangesAsync(It.IsAny<CancellationToken>()), Times.Once);
+        // Metric incremented on enqueue (immediate visibility on dashboards).
         Assert.Equal(1L, counter.Total);
         Assert.Contains("MTF", counter.TagValues("stage"));
         Assert.Contains("mtf_not_confirmed", counter.TagValues("reason"));
+
+        // Nothing should have hit the DB yet — that happens on flush.
+        _set.Verify(s => s.AddRangeAsync(It.IsAny<IEnumerable<SignalRejectionAudit>>(), It.IsAny<CancellationToken>()),
+            Times.Never);
     }
 
     [Fact]
-    public async Task RecordAsync_SwallowsDbFailures_DoesNotRethrow()
+    public async Task FlushForTestsAsync_PersistsBatchedRows()
     {
-        // Make SaveChangesAsync throw — the auditor must NOT surface this to callers.
-        _writeCtx
-            .Setup(w => w.SaveChangesAsync(It.IsAny<CancellationToken>()))
-            .ThrowsAsync(new InvalidOperationException("simulated DB crash"));
+        await _auditor.RecordAsync("Regime", "regime_blocked", "EURUSD", "StrategyWorker", strategyId: 1);
+        await _auditor.RecordAsync("MTF",    "mtf_not_confirmed", "EURUSD", "StrategyWorker", strategyId: 1);
 
-        using var counter = new CounterProbe(_meterFactory, "trading.signals.rejections_audited");
+        await _auditor.FlushForTestsAsync();
 
-        await _auditor.RecordAsync("Tier1", "some_reason", "EURUSD", "SignalOrderBridgeWorker");
-
-        // Counter must NOT fire on failure — we never claimed to have written the row.
-        Assert.Equal(0L, counter.Total);
+        Assert.Equal(2, _captured.Count);
+        _writeCtx.Verify(w => w.SaveChangesAsync(It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [Fact]
-    public async Task RecordAsync_TruncatesOverlongFields()
+    public async Task RecordAsync_TruncatesOverlongFields_BeforeEnqueue()
     {
-        // Capture the row the auditor adds so we can inspect it.
-        SignalRejectionAudit? captured = null;
-        var set = new Mock<DbSet<SignalRejectionAudit>>();
-        set.Setup(s => s.Add(It.IsAny<SignalRejectionAudit>()))
-            .Callback<SignalRejectionAudit>(r => captured = r);
-        _db.Setup(d => d.Set<SignalRejectionAudit>()).Returns(set.Object);
-
         var longStage  = new string('s', 100);
         var longReason = new string('r', 200);
         var longDetail = new string('d', 5000);
 
         await _auditor.RecordAsync(
-            stage: longStage,
-            reason: longReason,
-            symbol: "EURUSD",
-            source: "worker",
+            stage: longStage, reason: longReason,
+            symbol: "EURUSD", source: "worker",
             detail: longDetail);
 
-        Assert.NotNull(captured);
-        Assert.Equal(32, captured!.Stage.Length);
-        Assert.Equal(64, captured.Reason.Length);
-        Assert.Equal(2000, captured.Detail!.Length);
+        await _auditor.FlushForTestsAsync();
+
+        var row = Assert.Single(_captured);
+        Assert.Equal(32, row.Stage.Length);
+        Assert.Equal(64, row.Reason.Length);
+        Assert.Equal(2000, row.Detail!.Length);
     }
 
     [Fact]
-    public async Task RecordAsync_CallerCancellation_Propagates()
+    public async Task FlushFailure_DoesNotEscapeToCaller_AndIncrementsWorkerError()
     {
+        _writeCtx.Setup(w => w.SaveChangesAsync(It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("simulated DB crash"));
+
+        using var workerErrCounter = new CounterProbe(_meterFactory, "trading.workers.errors");
+
+        await _auditor.RecordAsync("Tier1", "some_reason", "EURUSD", "SignalOrderBridgeWorker");
+        await _auditor.FlushForTestsAsync(); // would throw if the error leaked
+
+        Assert.True(workerErrCounter.Total >= 1, "FlushBatchAsync should increment WorkerErrors on DB failure.");
+    }
+
+    [Fact]
+    public async Task RecordAsync_CallerCancellationDoesNotThrow_BatchedWriterIsNonBlocking()
+    {
+        // In the batched design RecordAsync doesn't await DB, so a pre-cancelled
+        // token from the caller has nothing to cancel — the enqueue still
+        // succeeds. This is intentional: callers must never have their
+        // rejection decision contaminated by audit-plumbing failures.
         using var cts = new CancellationTokenSource();
         cts.Cancel();
 
-        _writeCtx
-            .Setup(w => w.SaveChangesAsync(It.IsAny<CancellationToken>()))
-            .Returns<CancellationToken>(ct => ct.IsCancellationRequested
-                ? Task.FromException<int>(new OperationCanceledException(ct))
-                : Task.FromResult(1));
+        var ex = await Record.ExceptionAsync(() => _auditor.RecordAsync(
+            "Test", "test_reason", "EURUSD", "Test", ct: cts.Token));
 
-        await Assert.ThrowsAsync<OperationCanceledException>(() =>
-            _auditor.RecordAsync("Test", "test_reason", "EURUSD", "Test", ct: cts.Token));
+        Assert.Null(ex);
     }
 
     private sealed class TestMeterFactory : IMeterFactory

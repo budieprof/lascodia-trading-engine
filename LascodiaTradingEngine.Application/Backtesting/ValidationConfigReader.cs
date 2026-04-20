@@ -34,7 +34,8 @@ public sealed record WalkForwardWorkerSettings(
     int MinInSampleDays,
     int MinOutOfSampleDays,
     int MinCandlesPerFold,
-    int MinTradesPerFold);
+    int MinTradesPerFold,
+    decimal EmbargoPct);
 
 public interface IValidationSettingsProvider
 {
@@ -124,7 +125,13 @@ internal sealed class ValidationSettingsProvider : IValidationSettingsProvider
             // 14-period indicators (ATR/ADX) with meaningful warmup. Fewer than 5 trades per
             // fold produces a Sharpe estimate with >100% standard error.
             MinCandlesPerFold: await GetIntAsync(ctx, logger, "WalkForward:MinCandlesPerFold", 60, ct, minInclusive: 1),
-            MinTradesPerFold: await GetIntAsync(ctx, logger, "WalkForward:MinTradesPerFold", 5, ct, minInclusive: 0));
+            MinTradesPerFold: await GetIntAsync(ctx, logger, "WalkForward:MinTradesPerFold", 5, ct, minInclusive: 0),
+            // Per-fold embargo: inserts a gap between IS end and OOS start within each
+            // fold to prevent last-bar state (open positions, indicator warmup spanning
+            // the boundary) from leaking forward. Expressed as a fraction of the
+            // OOS window; default 0.05 → on a 7-day OOS fold this is ~8.4 hours.
+            // 0 disables; capped at 0.50 to avoid degenerate zero-OOS windows.
+            EmbargoPct: await GetDecimalAsync(ctx, logger, "WalkForward:EmbargoPct", 0.05m, ct, minInclusive: 0m, maxInclusive: 0.50m));
     }
 
     public async Task<int> GetIntAsync(

@@ -97,6 +97,11 @@ public class SignalOrderBridgeWorkerTest : IDisposable
                 It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(),
                 It.IsAny<long>(), It.IsAny<long?>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
+        _mockKillSwitch = new Mock<IKillSwitchService>();
+        _mockKillSwitch.Setup(k => k.IsGlobalKilledAsync(It.IsAny<CancellationToken>()))
+            .Returns(ValueTask.FromResult(false));
+        _mockKillSwitch.Setup(k => k.IsStrategyKilledAsync(It.IsAny<long>(), It.IsAny<CancellationToken>()))
+            .Returns(ValueTask.FromResult(false));
 
         _worker = new SignalOrderBridgeWorker(
             _mockLogger.Object,
@@ -104,10 +109,12 @@ public class SignalOrderBridgeWorkerTest : IDisposable
             _mockEventBus.Object,
             _metrics,
             TimeProvider.System,
-            _mockRejectionAuditor.Object);
+            _mockRejectionAuditor.Object,
+            _mockKillSwitch.Object);
     }
 
     private readonly Mock<ISignalRejectionAuditor> _mockRejectionAuditor;
+    private readonly Mock<IKillSwitchService> _mockKillSwitch;
 
     public void Dispose() => _meterFactory.Dispose();
 

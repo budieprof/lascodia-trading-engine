@@ -55,6 +55,21 @@ public class EACommand : Entity<long>
     public DateTime? AcknowledgedAt { get; set; }
 
     /// <summary>
+    /// Client-supplied idempotency token. The EA generates a GUID when it first
+    /// executes a command and includes it on every subsequent acknowledgement
+    /// retry for that execution. A second ACK arriving with the same
+    /// <see cref="ClientAckToken"/> on an already-acknowledged command is a
+    /// network retry — the engine returns the stored <see cref="AckResult"/>
+    /// instead of a 409 so the EA treats the duplicate as benign.
+    /// A different token on an already-acknowledged command would indicate a
+    /// different execution attempt on the same command ID — an unusual case
+    /// that the engine still rejects as a conflict to preserve the invariant
+    /// that one command is acted on at most once.
+    /// Max 64 chars (GUID strings need 36; the slack allows for broker/version prefixes).
+    /// </summary>
+    public string? ClientAckToken { get; set; }
+
+    /// <summary>
     /// Result or error message returned by the EA after executing the command.
     /// Null until acknowledged.
     /// </summary>

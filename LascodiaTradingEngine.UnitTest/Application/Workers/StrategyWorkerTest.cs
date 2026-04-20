@@ -51,6 +51,10 @@ public class StrategyWorkerTest : IDisposable
     private readonly Mock<IMarketHoursCalendar> _mockMarketHoursCalendar;
     private readonly StrategyRegimeParamsCache _regimeParamsCache;
     private readonly Mock<ISignalRejectionAuditor> _mockRejectionAuditor;
+    private readonly MarketRegimeCache _marketRegimeCache;
+    private readonly EngineConfigCache _engineConfigCache;
+    private readonly Mock<IKillSwitchService> _mockKillSwitch;
+    private readonly Mock<IDegradationModeManager> _mockDegradationManager;
 
     public StrategyWorkerTest()
     {
@@ -162,6 +166,15 @@ public class StrategyWorkerTest : IDisposable
                 It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(),
                 It.IsAny<long>(), It.IsAny<long?>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
+        _marketRegimeCache = new MarketRegimeCache(_metrics, TimeProvider.System);
+        _engineConfigCache = new EngineConfigCache(_metrics, TimeProvider.System);
+        _mockKillSwitch = new Mock<IKillSwitchService>();
+        _mockKillSwitch.Setup(k => k.IsGlobalKilledAsync(It.IsAny<CancellationToken>()))
+            .Returns(ValueTask.FromResult(false));
+        _mockKillSwitch.Setup(k => k.IsStrategyKilledAsync(It.IsAny<long>(), It.IsAny<CancellationToken>()))
+            .Returns(ValueTask.FromResult(false));
+        _mockDegradationManager = new Mock<IDegradationModeManager>();
+        _mockDegradationManager.Setup(d => d.CurrentMode).Returns(DegradationMode.Normal);
 
         _worker = new StrategyWorker(
             _mockLogger.Object,
@@ -178,7 +191,11 @@ public class StrategyWorkerTest : IDisposable
             _strategyMetricsCache,
             _mockMarketHoursCalendar.Object,
             _regimeParamsCache,
-            _mockRejectionAuditor.Object);
+            _mockRejectionAuditor.Object,
+            _marketRegimeCache,
+            _engineConfigCache,
+            _mockKillSwitch.Object,
+            _mockDegradationManager.Object);
     }
 
     public void Dispose() => _meterFactory.Dispose();

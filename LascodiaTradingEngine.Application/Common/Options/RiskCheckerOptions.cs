@@ -15,6 +15,26 @@ public class RiskCheckerOptions : ConfigurationOption<RiskCheckerOptions>
     public decimal MLDisagreementMinConfidence { get; set; } = 0.70m;
 
     /// <summary>
+    /// Allowable clock skew (seconds) applied when checking <c>TradeSignal.ExpiresAt</c>
+    /// against "now". A positive value means a signal is treated as still valid for up
+    /// to N seconds past its nominal expiry — protects against false-positive expiry
+    /// rejections when the engine and EA clocks drift by a few seconds (NTP skew,
+    /// container scheduling delay, bursty queue wait). Defaults to 5. Zero disables.
+    /// </summary>
+    public int ClockSkewToleranceSeconds { get; set; } = 5;
+
+    /// <summary>
+    /// Maximum allowed relative drift between the live bid/ask mid-price and the
+    /// signal's <c>EntryPrice</c> at Tier-2 time. Computed as
+    /// <c>|liveMid − EntryPrice| / EntryPrice</c>. Signals exceeding this are
+    /// rejected because the market has moved too far since the signal was generated
+    /// — filling at the stale price would mean entering at an entirely different
+    /// risk/reward profile than the evaluator analysed. Defaults to 0.0050 (50 bps).
+    /// Zero disables the check.
+    /// </summary>
+    public decimal MaxEntryPriceDriftPct { get; set; } = 0.0050m;
+
+    /// <summary>
     /// Margin level percentage below which new trades are rejected.
     /// Protects against margin call by keeping a safety buffer. Defaults to 150%.
     /// </summary>

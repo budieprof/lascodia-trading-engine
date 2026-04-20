@@ -116,6 +116,10 @@ public partial class StrategyWorker :
     private readonly IMarketHoursCalendar _marketHoursCalendar;
     private readonly StrategyRegimeParamsCache _regimeParamsCache;
     private readonly ISignalRejectionAuditor _rejectionAuditor;
+    private readonly MarketRegimeCache _marketRegimeCache;
+    private readonly EngineConfigCache _engineConfigCache;
+    private readonly IKillSwitchService _killSwitch;
+    private readonly IDegradationModeManager _degradationManager;
 
     /// <summary>Tracks the last signal creation time per strategy to enforce cooldown.</summary>
     private readonly ConcurrentDictionary<long, DateTime> _lastSignalTime = new();
@@ -193,7 +197,11 @@ public partial class StrategyWorker :
         StrategyMetricsCache strategyMetricsCache,
         IMarketHoursCalendar marketHoursCalendar,
         StrategyRegimeParamsCache regimeParamsCache,
-        ISignalRejectionAuditor rejectionAuditor)
+        ISignalRejectionAuditor rejectionAuditor,
+        MarketRegimeCache marketRegimeCache,
+        EngineConfigCache engineConfigCache,
+        IKillSwitchService killSwitch,
+        IDegradationModeManager degradationManager)
     {
         _logger                       = logger;
         _scopeFactory                 = scopeFactory;    // Creates per-event/per-strategy DI scopes
@@ -210,6 +218,10 @@ public partial class StrategyWorker :
         _marketHoursCalendar          = marketHoursCalendar;        // Market-closed detection for adaptive signal TTL
         _regimeParamsCache            = regimeParamsCache;          // Per-(strategy,regime) parameter cache, TTL-driven
         _rejectionAuditor             = rejectionAuditor;           // Structured rejection audit stream for operator dashboards
+        _marketRegimeCache            = marketRegimeCache;          // Cross-tick regime cache, invalidated on regime change
+        _engineConfigCache            = engineConfigCache;          // Raw EngineConfig value cache, invalidated on upsert
+        _killSwitch                   = killSwitch;                  // Global + per-strategy kill switches
+        _degradationManager           = degradationManager;          // Engine degradation state machine
     }
 
     /// <summary>
@@ -395,6 +407,35 @@ public partial class StrategyWorker :
     /// </summary>
     internal async Task ProcessPriceUpdateAsync(PriceUpdatedIntegrationEvent @event)
     {
+        // ── Global kill switch (first check, before any work) ─────────────
+        // A positive kill-switch state short-circuits the entire tick. Cached
+        // so the check is effectively free on the hot path; propagation is
+        // sub-second via EngineConfigCache invalidation when the switch flips.
+        if (await _killSwitch.IsGlobalKilledAsync(_stoppingToken))
+        {
+            _metrics.KillSwitchTriggered.Add(1,
+                new("scope", "global"),
+                new("site", "strategy_worker"));
+            return;
+        }
+
+        // ── Degradation-mode gate ─────────────────────────────────────────
+        // Modes that explicitly halt signal generation: EmergencyHalt (all
+        // trading suspended), ReadDbDegraded (read DB unreachable — gates
+        // would be unreliable), and DataUnavailable (all EAs disconnected —
+        // tick cannot be trusted). Other modes (MLDegraded, EventBusDegraded)
+        // allow degraded operation and are handled elsewhere in the pipeline.
+        var currentMode = _degradationManager.CurrentMode;
+        if (currentMode == DegradationMode.EmergencyHalt
+            || currentMode == DegradationMode.ReadDbDegraded
+            || currentMode == DegradationMode.DataUnavailable)
+        {
+            _metrics.SignalsFiltered.Add(1,
+                new("symbol", @event.Symbol),
+                new("stage", "degradation_mode"));
+            return;
+        }
+
         // Create a DI scope for the pre-loop checks (EA health, session, news, strategy loading).
         // Each parallel strategy iteration creates its own scope for scoped services.
         using var scope = _scopeFactory.CreateScope();
@@ -593,15 +634,21 @@ public partial class StrategyWorker :
             regimeCts.CancelAfter(TimeSpan.FromSeconds(prefetchTimeoutSeconds));
             try
             {
+                // Use the process-lifetime MarketRegimeCache. Regime detection
+                // runs every minute to hour, so the per-tick DB query this used
+                // to issue was almost always re-fetching the same value. Misses
+                // (fresh entries, cold start, TTL expiry) still hit the DB but
+                // each tick after that is served from memory until the
+                // RegimeDetectionWorker invalidates on a regime flip.
                 foreach (var tf in timeframes)
                 {
-                    var symbolLatestRegimePerTimeframe = await context.GetDbContext()
-                        .Set<Domain.Entities.MarketRegimeSnapshot>()
-                        .Where(x => x.Symbol == @event.Symbol && x.Timeframe == tf && !x.IsDeleted)
-                        .OrderByDescending(x => x.DetectedAt)
-                        .Select(x => x.Regime)
-                        .FirstOrDefaultAsync(regimeCts.Token);
-                    regimeCache[tf] = symbolLatestRegimePerTimeframe;
+                    var regime = await _marketRegimeCache.GetAsync(
+                        context.GetDbContext(),
+                        @event.Symbol,
+                        tf,
+                        _options.MarketRegimeCacheTtlSeconds,
+                        regimeCts.Token);
+                    if (regime.HasValue) regimeCache[tf] = regime.Value;
                 }
             }
             catch (OperationCanceledException) when (!_stoppingToken.IsCancellationRequested)
@@ -733,6 +780,45 @@ public partial class StrategyWorker :
             }
         }
 
+        // ── Hoisted candle fetch (one query per distinct Timeframe per tick) ──
+        // Before this change the parallel loop issued one candle query PER STRATEGY,
+        // so 50 strategies on EURUSD/H1 = 50 identical queries. By fetching max(
+        // MinRequiredCandles) per (Symbol, Timeframe) once and slicing in-memory we
+        // drop those to N queries where N = distinct timeframes (typically 1–3).
+        // Strategies needing fewer candles simply slice from the shared ascending
+        // list; strategies whose evaluator isn't registered are handled later in
+        // the parallel loop via the existing null-guard metric and are excluded here.
+        var maxCandlesByTimeframe = new Dictionary<Timeframe, int>();
+        foreach (var s in strategies)
+        {
+            var evForMax = _evaluators.FirstOrDefault(e => e.StrategyType == s.StrategyType);
+            if (evForMax is null) continue;
+            int need = evForMax.MinRequiredCandles(s);
+            if (need <= 0) continue;
+            maxCandlesByTimeframe[s.Timeframe] =
+                maxCandlesByTimeframe.TryGetValue(s.Timeframe, out var existing)
+                    ? Math.Max(existing, need)
+                    : need;
+        }
+
+        var candleCache = new Dictionary<Timeframe, List<Domain.Entities.Candle>>();
+        foreach (var kv in maxCandlesByTimeframe)
+        {
+            if (_stoppingToken.IsCancellationRequested) break;
+            var rows = await context.GetDbContext()
+                .Set<Domain.Entities.Candle>()
+                .Where(x => x.Symbol == @event.Symbol
+                         && x.Timeframe == kv.Key
+                         && x.IsClosed
+                         && !x.IsDeleted)
+                .OrderByDescending(x => x.Timestamp)
+                .Take(kv.Value)
+                .ToListAsync(_stoppingToken);
+            // Restore ascending order so evaluators can index most-recent via tail.
+            rows.Reverse();
+            candleCache[kv.Key] = rows;
+        }
+
         // ── Candidate signal collection bag ──────────────────────────────────
         // Instead of publishing signals immediately inside the parallel loop,
         // we collect candidates here and resolve conflicts after all strategies
@@ -767,6 +853,26 @@ public partial class StrategyWorker :
                         "Strategy {Id} ({Symbol}): health status is Critical — skipping evaluation",
                         strategy.Id, strategy.Symbol);
                     _metrics.TicksSkippedHealthCritical.Add(1, new("symbol", strategy.Symbol), new("strategy_id", strategy.Id));
+                    return;
+                }
+
+                // ── Per-strategy kill switch ────────────────────────────────
+                // Operator can disable a single strategy without a restart. Checked
+                // after the cheap health filter but before any DB / ML work so a
+                // killed strategy imposes zero ongoing cost.
+                if (await _killSwitch.IsStrategyKilledAsync(strategy.Id, ct))
+                {
+                    _metrics.KillSwitchTriggered.Add(1,
+                        new("scope", "strategy"),
+                        new("site", "strategy_worker"));
+                    await _rejectionAuditor.RecordAsync(
+                        stage: "KillSwitch",
+                        reason: "strategy_killed",
+                        symbol: strategy.Symbol,
+                        source: nameof(StrategyWorker),
+                        strategyId: strategy.Id,
+                        detail: "Per-strategy kill switch active",
+                        ct: ct);
                     return;
                 }
 
@@ -925,18 +1031,25 @@ public partial class StrategyWorker :
                 var strategyCorrelation   = strategyScope.ServiceProvider.GetRequiredService<IPortfolioCorrelationChecker>();
                 var strategyHawkesFilter  = strategyScope.ServiceProvider.GetRequiredService<IHawkesSignalFilter>();
 
-                // ── Dynamic candle fetch based on evaluator requirements ────
-                // Each evaluator declares how many historical candles it needs
-                // (e.g., MA crossover needs 200+, RSI needs 14+). We fetch only
-                // what's required to avoid unnecessary DB load.
+                // ── Candle slice from shared per-tick cache ────────────────────
+                // The candle cache (hoisted above the parallel loop) contains the
+                // max(MinRequiredCandles) for this Symbol × Timeframe. Each strategy
+                // just slices the tail of the shared ascending list so there is no
+                // per-strategy DB round-trip. Note: we allocate a small sublist per
+                // strategy so evaluators can freely mutate / sort without racing
+                // the shared buffer — the cost is negligible (few hundred refs)
+                // versus a DB query.
                 int requiredCandles = evaluator.MinRequiredCandles(strategy);
-                var candles = await strategyContext.GetDbContext()
-                    .Set<Domain.Entities.Candle>()
-                    .Where(x => x.Symbol == strategy.Symbol && x.Timeframe == strategy.Timeframe && x.IsClosed && !x.IsDeleted)
-                    .OrderByDescending(x => x.Timestamp)
-                    .Take(requiredCandles)
-                    .OrderBy(x => x.Timestamp)      // Re-order ascending for indicator calculations
-                    .ToListAsync(ct);
+                List<Domain.Entities.Candle> candles;
+                if (candleCache.TryGetValue(strategy.Timeframe, out var tfCandles) && tfCandles.Count >= requiredCandles)
+                {
+                    int start = tfCandles.Count - requiredCandles;
+                    candles = tfCandles.GetRange(start, requiredCandles);
+                }
+                else
+                {
+                    candles = tfCandles is null ? new List<Domain.Entities.Candle>() : [.. tfCandles];
+                }
 
                 // Skip if insufficient historical candles for the evaluator
                 if (candles.Count < requiredCandles)
@@ -1044,9 +1157,15 @@ public partial class StrategyWorker :
 
                     if (regimeParams is not null)
                     {
-                        // Validate regime params before applying — reject malformed JSON
-                        // or params with invalid values (negative lots, NaN, etc.)
+                        // Validate regime params before applying. Two layers:
+                        //   (1) structural — parses cleanly, no NaN/Infinity in numbers
+                        //   (2) schema    — every key the evaluator declared as required
+                        //                   (RequiredParameterKeys) is present. A regime
+                        //                   blob that omits e.g. "SlowPeriod" would silently
+                        //                   inherit it from parent params — usually not
+                        //                   what the optimizer intended.
                         bool regimeParamsValid = true;
+                        string? validationReason = null;
                         try
                         {
                             var parsed = System.Text.Json.JsonDocument.Parse(regimeParams);
@@ -1056,21 +1175,53 @@ public partial class StrategyWorker :
                                     && (double.IsNaN(prop.Value.GetDouble()) || double.IsInfinity(prop.Value.GetDouble())))
                                 {
                                     regimeParamsValid = false;
+                                    validationReason = $"non-finite number on key '{prop.Name}'";
                                     break;
                                 }
                             }
+
+                            if (regimeParamsValid)
+                            {
+                                var required = evaluator.RequiredParameterKeys;
+                                if (required.Count > 0)
+                                {
+                                    var present = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                                    foreach (var prop in parsed.RootElement.EnumerateObject())
+                                        present.Add(prop.Name);
+                                    foreach (var key in required)
+                                    {
+                                        if (!present.Contains(key))
+                                        {
+                                            regimeParamsValid = false;
+                                            validationReason = $"missing required key '{key}'";
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
                         }
-                        catch
+                        catch (Exception parseEx)
                         {
                             regimeParamsValid = false;
+                            validationReason = $"JSON parse: {parseEx.GetType().Name}";
                         }
 
                         if (!regimeParamsValid)
                         {
                             _logger.LogWarning(
-                                "Strategy {Id}: regime params for {Regime} failed validation — using evalStrategy params (rollout may be active)",
-                                strategy.Id, currentRegime);
-                            _metrics.WorkerErrors.Add(1, new("worker", "StrategyWorker"), new("reason", "regime_param_validation"));
+                                "Strategy {Id}: regime params for {Regime} failed validation ({Reason}) — using evalStrategy params (rollout may be active)",
+                                strategy.Id, currentRegime, validationReason ?? "unknown");
+                            _metrics.WorkerErrors.Add(1,
+                                new("worker", "StrategyWorker"),
+                                new("reason", "regime_param_validation"));
+                            await _rejectionAuditor.RecordAsync(
+                                stage: "Regime",
+                                reason: "regime_params_invalid",
+                                symbol: strategy.Symbol,
+                                source: nameof(StrategyWorker),
+                                strategyId: strategy.Id,
+                                detail: $"Regime={currentRegime}: {validationReason}",
+                                ct: ct);
                         }
                         else
                         {

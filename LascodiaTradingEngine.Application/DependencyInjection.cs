@@ -138,6 +138,19 @@ public static class DependencyInjection
             sp => sp.GetRequiredService<SignalOrderBridgeWorker>());
         services.AddHostedService(sp => sp.GetRequiredService<SignalOrderBridgeWorker>());
 
+        // ── Signal Rejection Auditor (batched) ───────────────────────────────────
+        // Single instance forwards to three registrations: the concrete type, the
+        // interface binding consumed by callers, and the hosted-service that runs
+        // the batched flush loop. A new instance per registration would fragment
+        // the bounded channel and drop audit rows on shutdown.
+        RemoveDescriptors<Services.SignalRejectionAuditor>(services);
+        RemoveDescriptorsByImpl<Common.Interfaces.ISignalRejectionAuditor, Services.SignalRejectionAuditor>(services);
+        RemoveHostedServiceDescriptorsByImpl<Services.SignalRejectionAuditor>(services);
+        services.AddSingleton<Services.SignalRejectionAuditor>();
+        services.AddSingleton<Common.Interfaces.ISignalRejectionAuditor>(
+            sp => sp.GetRequiredService<Services.SignalRejectionAuditor>());
+        services.AddHostedService(sp => sp.GetRequiredService<Services.SignalRejectionAuditor>());
+
         // ── Drawdown Monitor ────────────────────────────────────────────────────
         // Hybrid polling + event-driven: regular 60s snapshots + emergency snapshot
         // on large position loss via PositionClosedIntegrationEvent.

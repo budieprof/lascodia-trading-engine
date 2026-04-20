@@ -27,4 +27,21 @@ public interface IStrategyEvaluator
         IReadOnlyList<Candle> candles,
         (decimal Bid, decimal Ask) currentPrice,
         CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Parameter keys that MUST be present on a regime-conditional
+    /// <c>ParametersJson</c> payload for this evaluator to use the overridden
+    /// parameter set. When the OptimizationWorker promotes a regime-specific
+    /// parameter blob that omits one of these keys, the evaluator would silently
+    /// inherit the strategy's default — usually not what was intended. The
+    /// StrategyWorker checks this list before swapping in regime params; when
+    /// any required key is missing the params blob is rejected and the
+    /// parent params are used instead, with a <c>regime_param_validation</c>
+    /// metric + audit entry for operator visibility.
+    ///
+    /// <para>Default: empty (no required keys). Evaluators with schema
+    /// expectations override to tighten — e.g. the MA-crossover evaluator
+    /// returns <c>[ "FastPeriod", "SlowPeriod" ]</c>.</para>
+    /// </summary>
+    IReadOnlyList<string> RequiredParameterKeys => Array.Empty<string>();
 }

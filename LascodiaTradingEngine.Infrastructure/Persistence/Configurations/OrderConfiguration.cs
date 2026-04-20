@@ -42,6 +42,18 @@ public class OrderConfiguration : IEntityTypeConfiguration<Order>
         builder.HasIndex(x => x.StrategyId);
         builder.HasIndex(x => x.TradingAccountId);
 
+        // Tier-2 retry idempotency: at most one live Order per (signal, account)
+        // pair. A duplicate CreateOrderFromSignalCommand — from network retry,
+        // dead-letter re-delivery, or manual retry by an operator — can race the
+        // existing alreadyAttempted check via SignalAccountAttempt, so we enforce
+        // the invariant at the DB layer too. Filtered on non-null TradeSignalId
+        // (manual / backfill orders are exempt) and on non-deleted rows so a
+        // soft-deleted failed order doesn't block a corrected retry.
+        builder.HasIndex(x => new { x.TradeSignalId, x.TradingAccountId })
+            .IsUnique()
+            .HasDatabaseName("IX_Order_TradeSignalId_TradingAccountId_Unique")
+            .HasFilter("\"TradeSignalId\" IS NOT NULL AND \"IsDeleted\" = false");
+
         builder.HasOne(x => x.TradeSignal)
                .WithMany(x => x.Orders)
                .HasForeignKey(x => x.TradeSignalId)

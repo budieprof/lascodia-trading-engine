@@ -1666,4 +1666,15 @@ public class StrategyEvaluatorOptions : ConfigurationOption<StrategyEvaluatorOpt
     /// zero to disable the cache entirely (fall back to per-tick DB query).
     /// </summary>
     public int RegimeParamsCacheTtlSeconds { get; set; } = 120;
+
+    /// <summary>
+    /// TTL in seconds for the cross-tick market-regime cache. Regime detection
+    /// runs on minute-to-hour cadences, so caching the most-recent detected
+    /// regime per (Symbol, Timeframe) for 60 s by default eliminates the
+    /// per-tick regime query without introducing measurable staleness. The
+    /// cache is event-invalidated by <c>RegimeDetectionWorker</c> the instant
+    /// a regime flips, so the TTL is a safety net rather than the primary
+    /// freshness mechanism. Zero disables the cache.
+    /// </summary>
+    public int MarketRegimeCacheTtlSeconds { get; set; } = 60;
 }

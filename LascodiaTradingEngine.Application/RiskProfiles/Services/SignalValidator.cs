@@ -43,8 +43,14 @@ public class SignalValidator : ISignalValidator
             return Fail($"EntryPrice must be greater than zero (got {signal.EntryPrice}).");
 
         // ── 2. Signal expiry ────────────────────────────────────────────────
-        if (signal.ExpiresAt <= _timeProvider.GetUtcNow().UtcDateTime)
-            return Fail($"Signal {signal.Id} has expired (ExpiresAt={signal.ExpiresAt:u}).");
+        // Apply a small clock-skew tolerance: the engine and the EA (and any other
+        // upstream producer of ExpiresAt) do not share a clock. Without this, a 3s
+        // NTP drift or a bursty queue wait is enough to false-reject a signal that
+        // is real-time still valid. ClockSkewToleranceSeconds = 0 disables.
+        var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+        var toleranceSeconds = Math.Max(0, _options.ClockSkewToleranceSeconds);
+        if (signal.ExpiresAt <= nowUtc.AddSeconds(-toleranceSeconds))
+            return Fail($"Signal {signal.Id} has expired (ExpiresAt={signal.ExpiresAt:u}, skewTol={toleranceSeconds}s).");
 
         // ── 3. Lot size must be positive ────────────────────────────────────
         if (signal.SuggestedLotSize <= 0)

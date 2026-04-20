@@ -23,6 +23,16 @@ public class AcknowledgeCommandCommand : IRequest<ResponseData<string>>
 
     /// <summary>Optional result details or error message from the EA's execution attempt.</summary>
     public string? Result { get; set; }
+
+    /// <summary>
+    /// Client-supplied idempotency token (usually a GUID) that stays constant
+    /// across EA retries of the same execution. The handler returns the stored
+    /// result on duplicate submissions with the same token on an already-
+    /// acknowledged command, preventing the EA from treating a legitimate
+    /// retry as a hard failure when the network drops the first ACK response.
+    /// Null → the legacy (non-idempotent) path: a second ACK returns 409.
+    /// </summary>
+    public string? ClientAckToken { get; set; }
 }
 
 // ── Validator ─────────────────────────────────────────────────────────────────
@@ -68,8 +78,28 @@ public class AcknowledgeCommandCommandHandler : IRequestHandler<AcknowledgeComma
         if (entity == null)
             return ResponseData<string>.Init(null, false, "Command not found", "-14");
 
+        // Idempotency: a duplicate ACK carrying the same ClientAckToken on an
+        // already-acknowledged command is a network retry from the EA side —
+        // return the stored result (success, not 409) so the EA treats the
+        // duplicate as benign. A different token on an already-acknowledged
+        // command still conflicts because it implies a different execution
+        // attempt on the same command ID, which the engine must refuse.
         if (entity.Acknowledged)
+        {
+            bool tokensMatch =
+                !string.IsNullOrWhiteSpace(request.ClientAckToken)
+                && string.Equals(entity.ClientAckToken, request.ClientAckToken, StringComparison.Ordinal);
+
+            if (tokensMatch)
+                return ResponseData<string>.Init(entity.AckResult, true,
+                    "Acknowledged (idempotent replay)", "00");
+
             return ResponseData<string>.Init(null, false, "Command already acknowledged", "-409");
+        }
+
+        // First-time ACK: record the token so subsequent retries can match.
+        if (!string.IsNullOrWhiteSpace(request.ClientAckToken))
+            entity.ClientAckToken = request.ClientAckToken;
 
         bool wasRequeued = entity.ProcessAck(request.Status, request.Result);
 

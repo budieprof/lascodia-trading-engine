@@ -516,11 +516,17 @@ public class WalkForwardWorker : BackgroundService
                 // No walk-forward window should include this data.
                 DateTime embargoStart = run.FromDate.AddDays((run.ToDate - run.FromDate).TotalDays * 0.90);
 
+                // Per-fold embargo: gap between IS end and OOS start within each window.
+                // Prevents last-bar state (open positions, indicator warmup) from leaking
+                // across the boundary and inflating OOS scores. Expressed as a fraction of
+                // the OOS window length, so a 7-day OOS with EmbargoPct=0.05 yields ~8.4h.
+                double foldEmbargoDays = Math.Max(0, (double)settings.EmbargoPct) * Math.Max(1, run.OutOfSampleDays);
+
                 while (windowStartUtc < run.ToDate)
                 {
                     DateTime inSampleStartUtc = windowStartUtc;
                     DateTime inSampleEndUtc = inSampleStartUtc.AddDays(run.InSampleDays);
-                    DateTime oosStartUtc = inSampleEndUtc;
+                    DateTime oosStartUtc = inSampleEndUtc.AddDays(foldEmbargoDays);
                     DateTime oosEndUtc = oosStartUtc.AddDays(run.OutOfSampleDays);
                     if (oosEndUtc > run.ToDate)
                         break;

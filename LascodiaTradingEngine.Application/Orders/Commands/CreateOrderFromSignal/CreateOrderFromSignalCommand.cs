@@ -5,7 +5,9 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.AuditTrail.Commands.LogDecision;
+using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Options;
 using LascodiaTradingEngine.Application.Common.Utilities;
 using LascodiaTradingEngine.Application.Orders.Commands.CreateOrder;
 using LascodiaTradingEngine.Domain.Entities;
@@ -54,6 +56,10 @@ public class CreateOrderFromSignalCommandHandler
     private readonly IMediator _mediator;
     private readonly ILivePriceCache _livePriceCache;
     private readonly ILogger<CreateOrderFromSignalCommandHandler> _logger;
+    private readonly RiskCheckerOptions _riskOptions;
+    private readonly TradingMetrics _metrics;
+    private readonly IDegradationModeManager _degradationManager;
+    private readonly IKillSwitchService _killSwitch;
 
     public CreateOrderFromSignalCommandHandler(
         IReadApplicationDbContext readContext,
@@ -61,20 +67,71 @@ public class CreateOrderFromSignalCommandHandler
         IRiskChecker riskChecker,
         IMediator mediator,
         ILivePriceCache livePriceCache,
-        ILogger<CreateOrderFromSignalCommandHandler> logger)
+        ILogger<CreateOrderFromSignalCommandHandler> logger,
+        RiskCheckerOptions riskOptions,
+        TradingMetrics metrics,
+        IDegradationModeManager degradationManager,
+        IKillSwitchService killSwitch)
     {
-        _readContext    = readContext;
-        _writeContext   = writeContext;
-        _riskChecker   = riskChecker;
-        _mediator      = mediator;
-        _livePriceCache = livePriceCache;
-        _logger        = logger;
+        _readContext         = readContext;
+        _writeContext        = writeContext;
+        _riskChecker         = riskChecker;
+        _mediator            = mediator;
+        _livePriceCache      = livePriceCache;
+        _logger              = logger;
+        _riskOptions         = riskOptions;
+        _metrics             = metrics;
+        _degradationManager  = degradationManager;
+        _killSwitch          = killSwitch;
+    }
+
+    /// <summary>
+    /// Returns <c>true</c> if <paramref name="expiresAt"/> is past <c>UtcNow</c> by
+    /// more than <see cref="RiskCheckerOptions.ClockSkewToleranceSeconds"/>.
+    /// Protects against false-positive expiry when the engine and upstream
+    /// producer clocks drift by a few seconds.
+    /// </summary>
+    private bool IsExpired(DateTime expiresAt, string stage)
+    {
+        var nowUtc = DateTime.UtcNow;
+        var tolerance = Math.Max(0, _riskOptions.ClockSkewToleranceSeconds);
+        bool expiredStrict = expiresAt <= nowUtc;
+        bool expiredAfterTolerance = expiresAt <= nowUtc.AddSeconds(-tolerance);
+
+        if (expiredStrict && !expiredAfterTolerance)
+        {
+            // The signal would have been rejected absent the tolerance window.
+            _metrics.SignalExpirySkewToleranceApplied.Add(1,
+                new KeyValuePair<string, object?>("stage", stage));
+        }
+        return expiredAfterTolerance;
     }
 
     public async Task<ResponseData<long>> Handle(
         CreateOrderFromSignalCommand request,
         CancellationToken cancellationToken)
     {
+        // ── Degradation mode / kill switch gate ───────────────────────────
+        // EmergencyHalt aborts every new order regardless of Tier-2 risk
+        // results. The global kill switch is a softer operator override
+        // (same effect for new orders, but existing positions unaffected).
+        if (_degradationManager.CurrentMode == DegradationMode.EmergencyHalt)
+        {
+            _metrics.SignalsRejected.Add(1,
+                new KeyValuePair<string, object?>("reason", "degradation_emergency_halt"));
+            return ResponseData<long>.Init(0, false,
+                "Engine is in EmergencyHalt — new orders suspended", "-11");
+        }
+
+        if (await _killSwitch.IsGlobalKilledAsync(cancellationToken))
+        {
+            _metrics.KillSwitchTriggered.Add(1,
+                new KeyValuePair<string, object?>("scope", "global"),
+                new KeyValuePair<string, object?>("site", "create_order_from_signal"));
+            return ResponseData<long>.Init(0, false,
+                "Global kill switch is active — new orders suspended", "-11");
+        }
+
         var db = _readContext.GetDbContext();
 
         // ── Load signal ──────────────────────────────────────────────────────
@@ -90,8 +147,59 @@ public class CreateOrderFromSignalCommandHandler
             return ResponseData<long>.Init(0, false,
                 $"Signal is not in Approved status (current: {signal.Status})", "-11");
 
-        if (signal.ExpiresAt <= DateTime.UtcNow)
+        if (IsExpired(signal.ExpiresAt, stage: "tier2"))
             return ResponseData<long>.Init(0, false, "Signal has expired", "-11");
+
+        // Per-strategy kill switch: honour operator actions that happened
+        // between signal creation and Tier-2 execution.
+        if (await _killSwitch.IsStrategyKilledAsync(signal.StrategyId, cancellationToken))
+        {
+            _metrics.KillSwitchTriggered.Add(1,
+                new KeyValuePair<string, object?>("scope", "strategy"),
+                new KeyValuePair<string, object?>("site", "create_order_from_signal"));
+            return ResponseData<long>.Init(0, false,
+                $"Strategy {signal.StrategyId} kill switch is active", "-11");
+        }
+
+        // ── Tier-2 price staleness check ─────────────────────────────────────
+        // Between signal generation and Tier-2 execution the market may have
+        // moved far enough that filling at the stale EntryPrice would land the
+        // trade in a different risk/reward profile than the evaluator analysed.
+        // Compare live mid vs EntryPrice; reject when the drift exceeds the
+        // configured cap (default 50 bps). Disabled when MaxEntryPriceDriftPct
+        // == 0, when no live price is cached, or when EntryPrice is zero
+        // (would imply divide-by-zero and is separately invalid).
+        if (_riskOptions.MaxEntryPriceDriftPct > 0m && signal.EntryPrice > 0m)
+        {
+            var livePrice = _livePriceCache.Get(signal.Symbol);
+            if (livePrice is not null)
+            {
+                decimal liveMid = (livePrice.Value.Bid + livePrice.Value.Ask) / 2m;
+                decimal drift = Math.Abs(liveMid - signal.EntryPrice) / signal.EntryPrice;
+                if (drift > _riskOptions.MaxEntryPriceDriftPct)
+                {
+                    _metrics.Tier2PriceDriftRejections.Add(1,
+                        new KeyValuePair<string, object?>("symbol", signal.Symbol));
+                    _logger.LogInformation(
+                        "CreateOrderFromSignal: signal {SignalId} rejected — price drift {Drift:P3} > {Max:P3} (liveMid={Live}, entry={Entry})",
+                        signal.Id, drift, _riskOptions.MaxEntryPriceDriftPct, liveMid, signal.EntryPrice);
+
+                    await _mediator.Send(new LogDecisionCommand
+                    {
+                        EntityType   = "TradeSignal",
+                        EntityId     = signal.Id,
+                        DecisionType = "OrderCreation",
+                        Outcome      = "Rejected",
+                        Reason       = $"Price drift {drift:P3} exceeds max {_riskOptions.MaxEntryPriceDriftPct:P3}",
+                        Source       = "CreateOrderFromSignalCommand"
+                    }, cancellationToken);
+
+                    return ResponseData<long>.Init(0, false,
+                        $"Live price has drifted {drift:P2} from signal entry price (max {_riskOptions.MaxEntryPriceDriftPct:P2}) — signal is stale",
+                        "-11");
+                }
+            }
+        }
 
         // ── Load trading account ─────────────────────────────────────────────
         var account = await db.Set<TradingAccount>()
@@ -257,8 +365,11 @@ public class CreateOrderFromSignalCommandHandler
 
         // ── Re-validate signal expiry after risk checks + timing delay ──────
         // Signal could have expired during the risk check and entry timing evaluation
-        // window. Re-check before committing to order creation.
-        if (signal.ExpiresAt <= DateTime.UtcNow)
+        // window. Re-check before committing to order creation. Clock-skew tolerance
+        // applies here too — the same signal accepted at Tier-2 entry shouldn't flip
+        // to "expired" a few hundred milliseconds later just because the engine
+        // clock rolled past the nominal ExpiresAt during risk/timing work.
+        if (IsExpired(signal.ExpiresAt, stage: "reentry"))
             return ResponseData<long>.Init(0, false,
                 "Signal expired during risk check processing (expiry race)", "-11");
 

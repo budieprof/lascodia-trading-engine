@@ -203,12 +203,31 @@ public class UpdateEngineConfigCommandTest
     private UpsertEngineConfigCommandHandler CreateHandler(
         OptimizationConfigProvider? configProvider = null,
         TimeProvider? timeProvider = null)
-        => new(
+    {
+        var meterFactory = new UpdateEngineConfigCommandTestMeterFactory();
+        var metrics = new LascodiaTradingEngine.Application.Common.Diagnostics.TradingMetrics(meterFactory);
+        var engineConfigCache = new LascodiaTradingEngine.Application.Services.EngineConfigCache(
+            metrics, timeProvider ?? TimeProvider.System);
+        return new(
             _mockWriteContext.Object,
             _mockMediator.Object,
             _mockCurrentUser.Object,
             configProvider ?? new OptimizationConfigProvider(
                 Microsoft.Extensions.Logging.Abstractions.NullLogger<OptimizationConfigProvider>.Instance,
                 timeProvider ?? TimeProvider.System),
-            timeProvider ?? TimeProvider.System);
+            timeProvider ?? TimeProvider.System,
+            engineConfigCache);
+    }
+
+    private sealed class UpdateEngineConfigCommandTestMeterFactory : System.Diagnostics.Metrics.IMeterFactory
+    {
+        private readonly List<System.Diagnostics.Metrics.Meter> _meters = new();
+        public System.Diagnostics.Metrics.Meter Create(System.Diagnostics.Metrics.MeterOptions options)
+        {
+            var m = new System.Diagnostics.Metrics.Meter(options);
+            _meters.Add(m);
+            return m;
+        }
+        public void Dispose() { foreach (var m in _meters) m.Dispose(); }
+    }
 }

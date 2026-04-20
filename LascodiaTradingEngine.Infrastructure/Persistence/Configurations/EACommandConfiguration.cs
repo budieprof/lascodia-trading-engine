@@ -19,6 +19,7 @@ public class EACommandConfiguration : IEntityTypeConfiguration<EACommand>
         builder.Property(x => x.Symbol).IsRequired();
         builder.Property(x => x.CommandType).IsRequired();
         builder.Property(x => x.CreatedAt).IsRequired();
+        builder.Property(x => x.ClientAckToken).HasMaxLength(64);
 
         // Soft-delete query filter — automatically excludes deleted commands from queries
         builder.HasQueryFilter(x => !x.IsDeleted);

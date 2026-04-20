@@ -329,4 +329,52 @@ public class SignalValidatorTest
         Assert.False(result.Passed);
         Assert.Contains("prediction is incomplete", result.BlockReason);
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  Clock-skew tolerance on expiry (Fix 7)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    [Fact]
+    public async Task ExpiresAt_JustPast_WithTolerance_IsStillAccepted()
+    {
+        // Signal expired 2 s ago. Default ClockSkewToleranceSeconds = 5 → should pass.
+        var validator = new SignalValidator(
+            new RiskCheckerOptions { ClockSkewToleranceSeconds = 5 },
+            TimeProvider.System);
+
+        var signal = CreateValidBuySignal();
+        signal.ExpiresAt = DateTime.UtcNow.AddSeconds(-2);
+
+        var result = await validator.ValidateAsync(signal, CreateContext(), CancellationToken.None);
+        Assert.True(result.Passed);
+    }
+
+    [Fact]
+    public async Task ExpiresAt_BeyondTolerance_IsRejected()
+    {
+        var validator = new SignalValidator(
+            new RiskCheckerOptions { ClockSkewToleranceSeconds = 5 },
+            TimeProvider.System);
+
+        var signal = CreateValidBuySignal();
+        signal.ExpiresAt = DateTime.UtcNow.AddSeconds(-30); // Well past tolerance
+
+        var result = await validator.ValidateAsync(signal, CreateContext(), CancellationToken.None);
+        Assert.False(result.Passed);
+        Assert.Contains("expired", result.BlockReason);
+    }
+
+    [Fact]
+    public async Task ExpiresAt_ToleranceZero_IsStrictExpiry()
+    {
+        var validator = new SignalValidator(
+            new RiskCheckerOptions { ClockSkewToleranceSeconds = 0 },
+            TimeProvider.System);
+
+        var signal = CreateValidBuySignal();
+        signal.ExpiresAt = DateTime.UtcNow.AddSeconds(-1);
+
+        var result = await validator.ValidateAsync(signal, CreateContext(), CancellationToken.None);
+        Assert.False(result.Passed);
+    }
 }

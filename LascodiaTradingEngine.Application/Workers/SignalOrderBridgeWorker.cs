@@ -41,6 +41,7 @@ public class SignalOrderBridgeWorker : BackgroundService, IIntegrationEventHandl
     private readonly TradingMetrics _metrics;
     private readonly TimeProvider _timeProvider;
     private readonly ISignalRejectionAuditor _rejectionAuditor;
+    private readonly IKillSwitchService _killSwitch;
 
     /// <summary>
     /// Caps the number of signals processed concurrently to protect the DB connection pool
@@ -66,7 +67,8 @@ public class SignalOrderBridgeWorker : BackgroundService, IIntegrationEventHandl
         IEventBus eventBus,
         TradingMetrics metrics,
         TimeProvider timeProvider,
-        ISignalRejectionAuditor rejectionAuditor)
+        ISignalRejectionAuditor rejectionAuditor,
+        IKillSwitchService killSwitch)
     {
         _logger           = logger;
         _scopeFactory     = scopeFactory;
@@ -74,6 +76,7 @@ public class SignalOrderBridgeWorker : BackgroundService, IIntegrationEventHandl
         _metrics          = metrics;
         _timeProvider     = timeProvider;
         _rejectionAuditor = rejectionAuditor;
+        _killSwitch       = killSwitch;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -112,6 +115,18 @@ public class SignalOrderBridgeWorker : BackgroundService, IIntegrationEventHandl
 
     public async Task Handle(TradeSignalCreatedIntegrationEvent @event)
     {
+        // ── Global kill switch (before dedup / DB work) ───────────────────
+        // When the global switch is on we drop signals silently — they'll
+        // eventually expire via the sweep. Record the hit so operators can
+        // see how much traffic was blocked.
+        if (await _killSwitch.IsGlobalKilledAsync(_shutdownCts.Token))
+        {
+            _metrics.KillSwitchTriggered.Add(1,
+                new KeyValuePair<string, object?>("scope", "global"),
+                new KeyValuePair<string, object?>("site", "signal_bridge"));
+            return;
+        }
+
         // Dedup latency clock starts the instant we enter the handler so the
         // histogram captures both in-process and cross-instance cost on the hot
         // path — this is what an SLO alert would fire on if the DB-backed

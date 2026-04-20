@@ -157,6 +157,37 @@ public sealed class OrderFilledEventHandler : IIntegrationEventHandler<OrderFill
         FormatException);
 
     /// <summary>
+    /// Returns <c>true</c> when <paramref name="ex"/> wraps a PostgreSQL unique-
+    /// constraint violation (SQLSTATE 23505) on the OpenOrderId unique index.
+    /// Used to distinguish the idempotent-race case (another concurrent delivery
+    /// already inserted a Position for this order) from genuinely unexpected DB
+    /// failures. Defensive — we accept any unique-violation exception here
+    /// because if multiple handlers race the only index that can fire is
+    /// <c>IX_Position_OpenOrderId</c>, and we still want the same idempotent
+    /// treatment if the index name ever changes.
+    /// </summary>
+    private static bool IsUniqueOpenOrderIdViolation(DbUpdateException ex)
+    {
+        for (Exception? cur = ex; cur is not null; cur = cur.InnerException)
+        {
+            // Npgsql's PostgresException exposes SqlState; detect by the portable
+            // SQLSTATE code for unique_violation rather than by type name so this
+            // works with provider wrappers (ResilientTransaction, retry proxies).
+            var sqlState = cur.GetType().GetProperty("SqlState")?.GetValue(cur) as string;
+            if (sqlState == "23505") return true;
+
+            // Fallback: message-based detection for test doubles that don't
+            // surface SqlState. Keep narrow so we don't swallow unrelated errors.
+            var msg = cur.Message ?? string.Empty;
+            if (msg.Contains("23505", StringComparison.Ordinal)
+                || msg.Contains("unique constraint", StringComparison.OrdinalIgnoreCase)
+                || msg.Contains("IX_Position_OpenOrderId", StringComparison.Ordinal))
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
     /// Core logic executed on each retry attempt. Creates a DI scope, loads the filled
     /// order, performs an idempotency check, then opens a <see cref="Position"/> and writes
     /// an audit log entry via MediatR.
@@ -213,6 +244,13 @@ public sealed class OrderFilledEventHandler : IIntegrationEventHandler<OrderFill
         // Prevents duplicate positions when the event bus retries delivery.
         // The check uses OpenOrderId (a foreign key on Position) rather than a dedicated
         // idempotency key table to keep the schema lightweight.
+        //
+        // NOTE: this AnyAsync is a best-effort fast path. Two concurrent deliveries can
+        // both observe "no position" and both dispatch OpenPositionCommand, at which
+        // point the unique index IX_Position_OpenOrderId enforces the invariant at the
+        // DB layer — one insert wins, the other hits a unique-constraint violation.
+        // The handler must catch that race below and treat it as "another delivery
+        // won" rather than a permanent failure.
         bool positionExists = await readContext.GetDbContext()
             .Set<Position>()
             .AsNoTracking()
@@ -243,26 +281,42 @@ public sealed class OrderFilledEventHandler : IIntegrationEventHandler<OrderFill
         // Dispatch via MediatR so that the OpenPositionCommandValidator runs first
         // (FluentValidation pipeline behaviour) and the write goes through
         // OpenPositionCommandHandler using the write DbContext.
-        var result = await mediator.Send(new OpenPositionCommand
+        Lascodia.Trading.Engine.SharedApplication.Common.Models.ResponseData<long> result;
+        try
         {
-            Symbol            = order.Symbol,
-            Direction         = direction,
-            OpenLots          = lots,
-            // Use the actual broker fill price (which may differ from the requested price
-            // due to slippage or market gap) so that P&L calculations are accurate.
-            AverageEntryPrice = @event.FilledPrice,
-            StopLoss          = order.StopLoss,
-            TakeProfit        = order.TakeProfit,
-            IsPaper           = order.IsPaper,
-            // Link the position back to its originating order for idempotency checks and
-            // for the audit trail (Position.OpenOrderId is the FK used by the guard above).
-            OpenOrderId       = order.Id,
-            // Carry the broker ticket so reconciliation against MT5 can match by
-            // BrokerPositionId. Without this, snapshot reconciliation creates duplicate
-            // Position rows (one with the ticket, one without) and the engine's
-            // per-symbol open-position cap trips on the duplicates.
-            BrokerPositionId  = @event.BrokerOrderId ?? order.BrokerOrderId,
-        });
+            result = await mediator.Send(new OpenPositionCommand
+            {
+                Symbol            = order.Symbol,
+                Direction         = direction,
+                OpenLots          = lots,
+                // Use the actual broker fill price (which may differ from the requested price
+                // due to slippage or market gap) so that P&L calculations are accurate.
+                AverageEntryPrice = @event.FilledPrice,
+                StopLoss          = order.StopLoss,
+                TakeProfit        = order.TakeProfit,
+                IsPaper           = order.IsPaper,
+                // Link the position back to its originating order for idempotency checks and
+                // for the audit trail (Position.OpenOrderId is the FK used by the guard above).
+                OpenOrderId       = order.Id,
+                // Carry the broker ticket so reconciliation against MT5 can match by
+                // BrokerPositionId. Without this, snapshot reconciliation creates duplicate
+                // Position rows (one with the ticket, one without) and the engine's
+                // per-symbol open-position cap trips on the duplicates.
+                BrokerPositionId  = @event.BrokerOrderId ?? order.BrokerOrderId,
+            });
+        }
+        catch (DbUpdateException ex) when (IsUniqueOpenOrderIdViolation(ex))
+        {
+            // Race: another concurrent delivery of the same OrderFilledIntegrationEvent
+            // already inserted a Position for this OpenOrderId and the unique index
+            // (IX_Position_OpenOrderId) rejected our duplicate insert. This is the DESIRED
+            // outcome of the invariant — treat it as success and move on, so the retry
+            // loop does not dead-letter a genuinely idempotent race.
+            _logger.LogInformation(
+                "OrderFilledEventHandler: OpenOrderId unique-constraint race won by another delivery for order {OrderId} — treating as already-handled",
+                @event.OrderId);
+            return;
+        }
 
         if (result.responseCode != "00")
         {

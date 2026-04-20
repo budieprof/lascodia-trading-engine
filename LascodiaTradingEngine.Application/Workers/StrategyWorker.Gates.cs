@@ -161,19 +161,22 @@ public partial class StrategyWorker
     //  Configuration helper
     // ════════════════════════════════════════════════════════════════════════════
 
-    private static async Task<T> GetConfigAsync<T>(
+    // TTL for the EngineConfig raw-value cache consulted by the backtest gate.
+    // 300 s is the safety-net window for multi-instance deployments; in single-
+    // instance the UpsertEngineConfigCommandHandler invalidates the cache
+    // directly on every write so readers see new values on the very next tick.
+    private const int ConfigCacheTtlSeconds = 300;
+
+    private async Task<T> GetConfigAsync<T>(
         Microsoft.EntityFrameworkCore.DbContext ctx,
         string key,
         T defaultValue,
         CancellationToken ct)
     {
-        var entry = await ctx.Set<Domain.Entities.EngineConfig>()
-            .AsNoTracking()
-            .FirstOrDefaultAsync(c => c.Key == key, ct);
+        var raw = await _engineConfigCache.GetRawAsync(ctx, key, ConfigCacheTtlSeconds, ct);
+        if (raw is null) return defaultValue;
 
-        if (entry?.Value is null) return defaultValue;
-
-        try   { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
+        try   { return (T)Convert.ChangeType(raw, typeof(T), System.Globalization.CultureInfo.InvariantCulture); }
         catch { return defaultValue; }
     }
 

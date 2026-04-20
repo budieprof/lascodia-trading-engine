@@ -149,13 +149,19 @@ public class SignalToPositionPipelineTest : IDisposable
                 It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(),
                 It.IsAny<long>(), It.IsAny<long?>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
+        var mockBridgeKillSwitch = new Mock<IKillSwitchService>();
+        mockBridgeKillSwitch.Setup(k => k.IsGlobalKilledAsync(It.IsAny<CancellationToken>()))
+            .Returns(ValueTask.FromResult(false));
+        mockBridgeKillSwitch.Setup(k => k.IsStrategyKilledAsync(It.IsAny<long>(), It.IsAny<CancellationToken>()))
+            .Returns(ValueTask.FromResult(false));
         _bridgeWorker = new SignalOrderBridgeWorker(
             _bridgeLogger.Object,
             _bridgeScopeFactory.Object,
             _mockEventBus.Object,
             _metrics,
             TimeProvider.System,
-            mockBridgeAuditor.Object);
+            mockBridgeAuditor.Object,
+            mockBridgeKillSwitch.Object);
 
         // ── OrderFilledEventHandler setup ─────────────────────────────────────
 

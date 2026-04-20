@@ -48,6 +48,13 @@ public sealed class TradingMetrics
     public Counter<long>     SignalTtlExtendedMarketClosed { get; }
     public Counter<long>     MLModelStaleRejections { get; }
     public Counter<long>     MLScoringTimeouts      { get; }
+    public Counter<long>     Tier2PriceDriftRejections { get; }
+    public Counter<long>     SignalExpirySkewToleranceApplied { get; }
+    public Counter<long>     MarketRegimeCacheHits  { get; }
+    public Counter<long>     MarketRegimeCacheMisses { get; }
+    public Counter<long>     EngineConfigCacheHits  { get; }
+    public Counter<long>     EngineConfigCacheMisses { get; }
+    public Counter<long>     KillSwitchTriggered    { get; }
     public Histogram<double> StrategyLockAcquisitionMs { get; }
     public Counter<long>     RegimeParamsCacheHits  { get; }
     public Counter<long>     RegimeParamsCacheMisses { get; }
@@ -265,6 +272,13 @@ public sealed class TradingMetrics
         SignalTtlExtendedMarketClosed = _meter.CreateCounter<long>("trading.signals.ttl_extended_market_closed", "signals", "Signals whose ExpiresAt was extended to cover a market-closed window before the next open. Tagged with symbol.");
         MLModelStaleRejections = _meter.CreateCounter<long>("trading.signals.ml_model_stale_rejections", "signals", "Signals rejected because their associated MLModel is no longer live (retired, suppressed, or inactive). Tagged with ml_model_id|symbol.");
         MLScoringTimeouts = _meter.CreateCounter<long>("trading.ml.scoring_timeouts", "events", "IMLSignalScorer.ScoreAsync invocations that exceeded MLScoringTimeoutSeconds and were treated as a fail-closed ML error. Tagged with symbol|strategy_id.");
+        Tier2PriceDriftRejections = _meter.CreateCounter<long>("trading.signals.tier2_price_drift_rejections", "signals", "Tier-2 rejections because |live_mid − signal.EntryPrice| / EntryPrice exceeded MaxEntryPriceDriftPct. Tagged with symbol.");
+        SignalExpirySkewToleranceApplied = _meter.CreateCounter<long>("trading.signals.expiry_skew_tolerance_applied", "signals", "Signals that would have been rejected as expired absent ClockSkewToleranceSeconds but were preserved by the tolerance window. Tagged with stage={tier1|tier2|reentry}.");
+        MarketRegimeCacheHits = _meter.CreateCounter<long>("trading.market_regime_cache.hits", "lookups", "Cross-tick market regime cache hits.");
+        MarketRegimeCacheMisses = _meter.CreateCounter<long>("trading.market_regime_cache.misses", "lookups", "Cross-tick market regime cache misses that triggered a DB refresh.");
+        EngineConfigCacheHits = _meter.CreateCounter<long>("trading.engine_config_cache.hits", "lookups", "EngineConfig cache hits on the hot tick path.");
+        EngineConfigCacheMisses = _meter.CreateCounter<long>("trading.engine_config_cache.misses", "lookups", "EngineConfig cache misses that triggered a DB refresh.");
+        KillSwitchTriggered = _meter.CreateCounter<long>("trading.kill_switch.triggered", "events", "Decisions short-circuited by an active kill switch. Tagged with scope={global|strategy} and site={strategy_worker|signal_bridge}.");
         StrategyLockAcquisitionMs = _meter.CreateHistogram<double>("trading.strategy.lock_acquisition_ms", "ms", "Wall-clock time spent inside IDistributedLock.TryAcquireAsync for strategy evaluation. Tagged with outcome={acquired|busy}.");
         RegimeParamsCacheHits = _meter.CreateCounter<long>("trading.strategy.regime_params_cache.hits", "lookups", "StrategyRegimeParams cache hits on the hot tick path.");
         RegimeParamsCacheMisses = _meter.CreateCounter<long>("trading.strategy.regime_params_cache.misses", "lookups", "StrategyRegimeParams cache misses that triggered a DB refresh.");

@@ -68,6 +68,7 @@ public class RegimeDetectionWorker : BackgroundService
     /// (or fail to suppress) based on a stale coherence value until the TTL expires.
     /// </summary>
     private readonly RegimeCoherenceChecker _coherenceChecker;
+    private readonly Services.MarketRegimeCache _marketRegimeCache;
 
     /// <summary>How frequently the worker wakes up to run a full regime detection pass.</summary>
     private static readonly TimeSpan PollingInterval = TimeSpan.FromSeconds(60);
@@ -109,12 +110,14 @@ public class RegimeDetectionWorker : BackgroundService
         ILogger<RegimeDetectionWorker> logger,
         IServiceScopeFactory scopeFactory,
         IMarketRegimeDetector regimeDetector,
-        RegimeCoherenceChecker coherenceChecker)
+        RegimeCoherenceChecker coherenceChecker,
+        Services.MarketRegimeCache marketRegimeCache)
     {
-        _logger           = logger;
-        _scopeFactory     = scopeFactory;
-        _regimeDetector   = regimeDetector;
-        _coherenceChecker = coherenceChecker;
+        _logger            = logger;
+        _scopeFactory      = scopeFactory;
+        _regimeDetector    = regimeDetector;
+        _coherenceChecker  = coherenceChecker;
+        _marketRegimeCache = marketRegimeCache;
     }
 
     /// <summary>
@@ -259,10 +262,16 @@ public class RegimeDetectionWorker : BackgroundService
 
             await writeContext.SaveChangesAsync(ct);
 
-            // Invalidate the coherence cache when the regime flipped. A no-op save
-            // (same regime as before) is left alone — the cached score is still correct.
+            // Invalidate the coherence cache and the per-(Symbol, Timeframe) regime
+            // cache when the regime flipped. A no-op save (same regime as before) is
+            // left alone — the cached score is still correct. The regime cache
+            // invalidation is what lets StrategyWorker's hot path skip the per-tick
+            // DB query without serving stale data.
             if (priorRegime != snapshot.Regime)
+            {
                 _coherenceChecker.Invalidate(symbol);
+                _marketRegimeCache.Invalidate(symbol, timeframe);
+            }
 
             // Track the latest detected regime for dynamic interval adjustment
             _latestDetectedRegime = snapshot.Regime;
