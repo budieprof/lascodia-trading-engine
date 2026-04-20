@@ -278,18 +278,29 @@ public sealed class MLTrainingRunHealthWorker : BackgroundService
         // Failure rate is within acceptable bounds — no action required.
         if (failRate <= failRateThreshold) return;
 
-        _logger.LogWarning(
-            "RunHealth: {Symbol}/{Tf} — {Rate:P1} failure rate over last {N} runs " +
-            "(threshold {Thr:P0}).",
-            symbol, timeframe, failRate, recentStatuses.Count, failRateThreshold);
-
-        // Deduplication: skip alert creation if one already exists for this symbol.
+        // Deduplication: skip both the Warning log and the alert when an
+        // MLModelDegraded alert already exists for this symbol. The operator has
+        // seen the initial warning; repeating it every poll produces ~8 identical
+        // log lines per (symbol, tf) per 30 min for each persistently-failing pair.
+        // Escalation via the critical-severity alert path still fires when the
+        // degradation persists.
         bool alertExists = await readCtx.Set<Alert>()
             .AnyAsync(a => a.Symbol    == symbol                  &&
                            a.AlertType == AlertType.MLModelDegraded &&
                            a.IsActive  && !a.IsDeleted, ct);
 
-        if (alertExists) return;
+        if (alertExists)
+        {
+            _logger.LogDebug(
+                "RunHealth: {Symbol}/{Tf} — {Rate:P1} failure rate (alert already active, log suppressed).",
+                symbol, timeframe, failRate);
+            return;
+        }
+
+        _logger.LogWarning(
+            "RunHealth: {Symbol}/{Tf} — {Rate:P1} failure rate over last {N} runs " +
+            "(threshold {Thr:P0}).",
+            symbol, timeframe, failRate, recentStatuses.Count, failRateThreshold);
 
         // Warning severity: models are not being refreshed but the pipeline is not
         // completely down — other symbols may still be training successfully.
