@@ -1040,6 +1040,127 @@ public class StrategyWorkerTest : IDisposable
     }
 
     [Fact]
+    public async Task Handle_UseBatchedMLScoring_RoutesThroughScoreBatchAsync_NotScoreAsync()
+    {
+        // Fix #16: when UseBatchedMLScoring is on, the parallel loop deposits
+        // pre-ML candidates and Phase 2 calls ScoreBatchAsync ONCE for the
+        // whole tick. ScoreAsync (the per-signal call) must NOT fire — that
+        // was the whole point of batching. The final signal still lands in
+        // the CreateTradeSignal pipeline with ML fields attached.
+        _options.UseBatchedMLScoring = true;
+        _options.SignalCooldownSeconds = 0;
+        _options.PreScoreEarlyExitEnabled = false;  // focus the test on #16
+        _options.MinAbstentionScore = 0;
+
+        var strategy = new Strategy
+        {
+            Id = 301, Symbol = "EURUSD", Status = StrategyStatus.Active,
+            StrategyType = StrategyType.MovingAverageCrossover, Timeframe = Timeframe.H1,
+        };
+        var candles = Enumerable.Range(0, 10).Select(i => new Candle
+        {
+            Symbol = "EURUSD", Timeframe = Timeframe.H1, IsClosed = true,
+            Timestamp = DateTime.UtcNow.AddHours(-i),
+            Open = 1.1m, High = 1.11m, Low = 1.09m, Close = 1.1m,
+        }).ToList();
+        SetupDbSets(strategies: new List<Strategy> { strategy }, candles: candles);
+
+        _mockEvaluator
+            .Setup(e => e.EvaluateAsync(It.IsAny<Strategy>(), It.IsAny<IReadOnlyList<Candle>>(),
+                It.IsAny<(decimal, decimal)>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new TradeSignal
+            {
+                StrategyId = 301, Symbol = "EURUSD", Direction = TradeDirection.Buy,
+                EntryPrice = 1.1001m, StopLoss = 1.0950m, TakeProfit = 1.1100m,
+                SuggestedLotSize = 0.01m, Confidence = 0.70m,
+                ExpiresAt = DateTime.UtcNow.AddMinutes(30),
+            });
+
+        int scoreBatchCalls = 0;
+        _mockMlScorer
+            .Setup(s => s.ScoreBatchAsync(
+                It.IsAny<IReadOnlyList<(TradeSignal, IReadOnlyList<Candle>)>>(),
+                It.IsAny<CancellationToken>()))
+            .Returns<IReadOnlyList<(TradeSignal, IReadOnlyList<Candle>)>, CancellationToken>((b, _) =>
+            {
+                Interlocked.Increment(ref scoreBatchCalls);
+                var results = b.Select(x => new MLScoreResult(
+                    PredictedDirection: x.Item1.Direction,
+                    PredictedMagnitudePips: 12m,
+                    ConfidenceScore: 0.9m,
+                    MLModelId: 7)).ToList();
+                return Task.FromResult<IReadOnlyList<MLScoreResult>>(results);
+            });
+
+        CreateTradeSignalCommand? captured = null;
+        _mockMediator
+            .Setup(m => m.Send(It.IsAny<CreateTradeSignalCommand>(), It.IsAny<CancellationToken>()))
+            .Callback<IRequest<ResponseData<long>>, CancellationToken>((cmd, _) => { captured = cmd as CreateTradeSignalCommand; })
+            .ReturnsAsync(ResponseData<long>.Init(1L, true, "Successful", "00"));
+
+        await _worker.ProcessPriceUpdateAsync(CreatePriceEvent());
+
+        Assert.Equal(1, scoreBatchCalls);
+        _mockMlScorer.Verify(
+            s => s.ScoreAsync(It.IsAny<TradeSignal>(), It.IsAny<IReadOnlyList<Candle>>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+        Assert.NotNull(captured);
+        Assert.Equal(7L, captured!.MLModelId);
+    }
+
+    [Fact]
+    public async Task Handle_UseBatchedMLScoring_CircuitOpen_SuppressesAllCandidates()
+    {
+        // When the ML circuit is open, the batched path short-circuits the
+        // entire batch without attempting ScoreBatchAsync at all and
+        // produces one suppression audit per candidate.
+        _options.UseBatchedMLScoring = true;
+        _options.PreScoreEarlyExitEnabled = false;
+        _options.SignalCooldownSeconds = 0;
+        _mockCircuitBreaker
+            .Setup(c => c.IsOpen("MLSignalScorer"))
+            .Returns(true);
+
+        var strategy = new Strategy
+        {
+            Id = 311, Symbol = "EURUSD", Status = StrategyStatus.Active,
+            StrategyType = StrategyType.MovingAverageCrossover, Timeframe = Timeframe.H1,
+        };
+        var candles = Enumerable.Range(0, 10).Select(i => new Candle
+        {
+            Symbol = "EURUSD", Timeframe = Timeframe.H1, IsClosed = true,
+            Timestamp = DateTime.UtcNow.AddHours(-i),
+            Open = 1.1m, High = 1.11m, Low = 1.09m, Close = 1.1m,
+        }).ToList();
+        SetupDbSets(strategies: new List<Strategy> { strategy }, candles: candles);
+
+        _mockEvaluator
+            .Setup(e => e.EvaluateAsync(It.IsAny<Strategy>(), It.IsAny<IReadOnlyList<Candle>>(),
+                It.IsAny<(decimal, decimal)>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new TradeSignal
+            {
+                StrategyId = 311, Symbol = "EURUSD", Direction = TradeDirection.Buy,
+                EntryPrice = 1.1001m, StopLoss = 1.0950m, TakeProfit = 1.1100m,
+                SuggestedLotSize = 0.01m, Confidence = 0.70m,
+                ExpiresAt = DateTime.UtcNow.AddMinutes(30),
+            });
+
+        await _worker.ProcessPriceUpdateAsync(CreatePriceEvent());
+
+        _mockMlScorer.Verify(
+            s => s.ScoreBatchAsync(It.IsAny<IReadOnlyList<(TradeSignal, IReadOnlyList<Candle>)>>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+        _mockMediator.Verify(
+            m => m.Send(It.IsAny<CreateTradeSignalCommand>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+        _mockRejectionAuditor.Verify(
+            a => a.RecordAsync("MLScoring", "ml_circuit_open",
+                "EURUSD", "StrategyWorker", 311L, null,
+                It.IsAny<string>(), It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    [Fact]
     public async Task Handle_PreScoreGate_Disabled_LetsBothCandidatesReachMLScoring()
     {
         // Same setup as above but with the gate disabled — both strategies

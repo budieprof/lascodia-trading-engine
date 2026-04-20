@@ -1709,4 +1709,22 @@ public class StrategyEvaluatorOptions : ConfigurationOption<StrategyEvaluatorOpt
     /// <see cref="PreScoreEarlyExitEnabled"/> is false.
     /// </summary>
     public bool PreScoreSortBySharpeDescending { get; set; } = true;
+
+    /// <summary>
+    /// When true, ML scoring is hoisted OUT of the parallel evaluator loop
+    /// and run ONCE per tick via <c>IMLSignalScorer.ScoreBatchAsync</c> over
+    /// all surviving pre-ML candidates. A concrete batched scorer (single
+    /// ONNX forward pass over N inputs, TorchSharp bagged-logistic batched
+    /// path) then sees every candidate in one shot instead of N individual
+    /// calls — typically 3-10× throughput at tick-level fanout.
+    ///
+    /// <para>
+    /// When false (default), the hot path keeps its existing inline
+    /// <c>ScoreAsync</c> calls inside the parallel loop. The two paths have
+    /// identical outcomes on the same inputs; the flag is a migration aid
+    /// for rolling out a concrete batched scorer without disturbing the
+    /// backward-compat path.
+    /// </para>
+    /// </summary>
+    public bool UseBatchedMLScoring { get; set; } = false;
 }

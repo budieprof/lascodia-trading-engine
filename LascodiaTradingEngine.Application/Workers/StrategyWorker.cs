@@ -889,6 +889,16 @@ public partial class StrategyWorker :
         // the winner based on Sharpe ratio, ML confidence, and estimated capacity.
         var candidateSignals = new ConcurrentBag<(PendingSignal Pending, MLScoreResult MlScore, int? MlScoringLatencyMs)>();
 
+        // ── Pre-ML candidates (Fix #16, only used when UseBatchedMLScoring) ─
+        // When batched ML scoring is enabled, the parallel loop stops at the
+        // pre-ML point and deposits the candidate here. After the loop, a
+        // single ScoreBatchAsync call scores every candidate in one pass, then
+        // each result feeds back through the ML suppression / abstention gates
+        // and sizing / TTL computations before joining candidateSignals.
+        // When disabled (default) this bag stays empty and the inline ML path
+        // in the parallel loop is used as before.
+        var preMLCandidates = new ConcurrentBag<PreMLCandidate>();
+
         // ── Pre-score early-exit state (Fix #22) ─────────────────────────────
         // Tracks the highest static pre-score (Sharpe-weighted + rule
         // confidence) seen so far for each (symbol, timeframe, direction)
@@ -1547,6 +1557,24 @@ public partial class StrategyWorker :
                         (_, existing) => Math.Max(existing, preScore));
                 }
 
+                // ── Batched ML branch (Fix #16) ─────────────────────────────
+                // When batched scoring is enabled, defer ML + post-ML work to
+                // the post-parallel phase (ProcessMLBatchAsync) so a single
+                // ScoreBatchAsync call can run one forward pass over every
+                // surviving candidate. Reset the strategy's consecutive-
+                // failure state here because the evaluator completed
+                // successfully — ML is infra and its outcome must not open
+                // the per-strategy circuit breaker.
+                if (_options.UseBatchedMLScoring)
+                {
+                    strategySharpeCache.TryGetValue(strategy.Id, out var stratSharpeBatched);
+                    preMLCandidates.Add(new PreMLCandidate(strategy, signal, candles, stratSharpeBatched));
+                    _consecutiveFailures.TryRemove(strategy.Id, out _);
+                    _halfOpenProbeFailures.TryRemove(strategy.Id, out _);
+                    _circuitOpenedAt.TryRemove(strategy.Id, out _);
+                    return;
+                }
+
                 // ── ML scoring ──────────────────────────────────────────────
                 // The ML pipeline runs the active model (if any) to:
                 //   1. Predict the likely direction (Buy/Sell) and magnitude in pips
@@ -1925,6 +1953,19 @@ public partial class StrategyWorker :
         });
 
         // ══════════════════════════════════════════════════════════════════════
+        //  Phase 2 — batched ML scoring (Fix #16)
+        // ══════════════════════════════════════════════════════════════════════
+        // When UseBatchedMLScoring is enabled, the parallel loop deposited
+        // pre-ML candidates into preMLCandidates instead of running the
+        // inline ML path. Now score every survivor in one ScoreBatchAsync
+        // call, apply the ML / abstention / sizing / TTL steps per result,
+        // and feed the final signals into the conflict-resolution stream.
+        if (_options.UseBatchedMLScoring && !preMLCandidates.IsEmpty)
+        {
+            await ProcessMLBatchAsync(preMLCandidates, candidateSignals, @event, _stoppingToken);
+        }
+
+        // ══════════════════════════════════════════════════════════════════════
         //  Post-loop: Signal conflict resolution and publishing
         // ══════════════════════════════════════════════════════════════════════
         // At this point, all strategies have been evaluated in parallel and their
@@ -2127,4 +2168,294 @@ public partial class StrategyWorker :
 
     // ── Expiry sweep, backtest gates, config helper, and Dispose are in
     //    StrategyWorker.Maintenance.cs and StrategyWorker.Gates.cs ──
+
+    /// <summary>
+    /// State deposited by the parallel loop when <c>UseBatchedMLScoring</c> is
+    /// enabled. Everything <see cref="ProcessMLBatchAsync"/> needs to run the
+    /// ML step + sizing/TTL for one candidate.
+    /// </summary>
+    private readonly record struct PreMLCandidate(
+        Domain.Entities.Strategy Strategy,
+        Domain.Entities.TradeSignal Signal,
+        List<Domain.Entities.Candle> Candles,
+        decimal StratSharpe);
+
+    /// <summary>
+    /// Phase 2 of the batched-ML pipeline. Scores every pre-ML candidate in a
+    /// single <c>ScoreBatchAsync</c> call, then applies the per-candidate ML
+    /// suppression / abstention gates, sizing, and TTL logic — the same work
+    /// the inline ML path does, just centralised here so a concrete batched
+    /// scorer can run one forward pass over N inputs instead of N individual
+    /// forward passes.
+    ///
+    /// <para>
+    /// Error handling mirrors the inline path: circuit-breaker open ⇒ all
+    /// candidates suppressed with <c>ml_circuit_open</c>; batch timeout ⇒
+    /// <c>ml_scoring_timeout</c>; batch throws ⇒ <c>ml_scorer_error</c>. In
+    /// every failure case the service-level circuit breaker sees
+    /// <c>RecordFailure</c> so repeated failures eventually short-circuit.
+    /// </para>
+    /// </summary>
+    private async Task ProcessMLBatchAsync(
+        System.Collections.Concurrent.ConcurrentBag<PreMLCandidate> preMLCandidates,
+        System.Collections.Concurrent.ConcurrentBag<(PendingSignal Pending, MLScoreResult MlScore, int? MlScoringLatencyMs)> candidateSignals,
+        PriceUpdatedIntegrationEvent @event,
+        CancellationToken ct)
+    {
+        var list = preMLCandidates.ToList();
+        if (list.Count == 0) return;
+
+        // Circuit-breaker fast path: if the ML scorer has been flagged as
+        // failing, don't even attempt the batch. Every candidate gets the
+        // same fail-closed suppression the inline path would produce.
+        if (_circuitBreaker.IsOpen(CbMLSignalScorer))
+        {
+            foreach (var c in list)
+            {
+                _metrics.CircuitBreakerShortCircuits.Add(1,
+                    new KeyValuePair<string, object?>("service", CbMLSignalScorer));
+                _metrics.SignalsSuppressed.Add(1,
+                    new KeyValuePair<string, object?>("symbol", c.Signal.Symbol),
+                    new KeyValuePair<string, object?>("reason", "ml_circuit_open"));
+                await _rejectionAuditor.RecordAsync("MLScoring", "ml_circuit_open",
+                    c.Signal.Symbol, nameof(StrategyWorker),
+                    strategyId: c.Strategy.Id,
+                    detail: "ML scorer circuit breaker open — batch skipped",
+                    ct: ct);
+            }
+            return;
+        }
+
+        var batch = new List<(Domain.Entities.TradeSignal Signal, IReadOnlyList<Domain.Entities.Candle> Candles)>(list.Count);
+        foreach (var c in list) batch.Add((c.Signal, c.Candles));
+
+        int timeoutSeconds = Math.Max(1, _options.MLScoringTimeoutSeconds);
+        var batchSw = System.Diagnostics.Stopwatch.StartNew();
+        IReadOnlyList<MLScoreResult> results;
+
+        using var batchCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        batchCts.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var mlScorer = scope.ServiceProvider.GetRequiredService<IMLSignalScorer>();
+
+            results = await mlScorer.ScoreBatchAsync(batch, batchCts.Token);
+            _circuitBreaker.RecordSuccess(CbMLSignalScorer);
+            batchSw.Stop();
+
+            _metrics.MLScoringBatchCalls.Add(1,
+                new KeyValuePair<string, object?>("batch_size", list.Count.ToString()));
+            _metrics.MLScoringBatchSize.Record(list.Count);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (OperationCanceledException) when (batchCts.IsCancellationRequested)
+        {
+            _circuitBreaker.RecordFailure(CbMLSignalScorer);
+            batchSw.Stop();
+            _logger.LogError(
+                "StrategyWorker: batched ML scoring timed out after {Timeout}s for {Count} candidates on {Symbol}",
+                timeoutSeconds, list.Count, @event.Symbol);
+
+            foreach (var c in list)
+            {
+                _metrics.MLScoringTimeouts.Add(1,
+                    new KeyValuePair<string, object?>("symbol", c.Signal.Symbol),
+                    new KeyValuePair<string, object?>("strategy_id", c.Strategy.Id));
+                _metrics.SignalsSuppressed.Add(1,
+                    new KeyValuePair<string, object?>("symbol", c.Signal.Symbol),
+                    new KeyValuePair<string, object?>("reason", "ml_scoring_timeout"));
+                await _rejectionAuditor.RecordAsync("MLScoring", "ml_scoring_timeout",
+                    c.Signal.Symbol, nameof(StrategyWorker),
+                    strategyId: c.Strategy.Id,
+                    detail: $"Batched ScoreBatchAsync timed out after {timeoutSeconds}s",
+                    ct: ct);
+            }
+            return;
+        }
+        catch (Exception mlEx)
+        {
+            _circuitBreaker.RecordFailure(CbMLSignalScorer);
+            batchSw.Stop();
+            _logger.LogError(mlEx,
+                "StrategyWorker: batched ML scoring failed for {Count} candidates on {Symbol} — suppressing batch (fail-closed)",
+                list.Count, @event.Symbol);
+
+            foreach (var c in list)
+            {
+                _metrics.SignalsSuppressed.Add(1,
+                    new KeyValuePair<string, object?>("symbol", c.Signal.Symbol),
+                    new KeyValuePair<string, object?>("reason", "ml_scorer_error"));
+                await _rejectionAuditor.RecordAsync("MLScoring", "ml_scorer_error",
+                    c.Signal.Symbol, nameof(StrategyWorker),
+                    strategyId: c.Strategy.Id,
+                    detail: $"Batch failed: {mlEx.GetType().Name}: {mlEx.Message}",
+                    ct: ct);
+            }
+            return;
+        }
+
+        if (results.Count != list.Count)
+        {
+            _logger.LogError(
+                "StrategyWorker: ML scorer returned {Returned} results for batch of {Expected} — treating as scorer error",
+                results.Count, list.Count);
+            foreach (var c in list)
+            {
+                _metrics.SignalsSuppressed.Add(1,
+                    new KeyValuePair<string, object?>("symbol", c.Signal.Symbol),
+                    new KeyValuePair<string, object?>("reason", "ml_scorer_error"));
+            }
+            return;
+        }
+
+        // Per-signal latency: the batch cost divided by the number of inputs.
+        // Less precise than inline (which clocks each call individually) but
+        // correct on average — a concrete batched scorer's forward pass costs
+        // roughly the same whether it processes 1 or N inputs, so the divided
+        // cost reflects real per-signal attribution better than total time.
+        int perSignalLatencyMs = list.Count > 0
+            ? (int)Math.Min(int.MaxValue, batchSw.ElapsedMilliseconds / list.Count)
+            : 0;
+
+        for (int i = 0; i < list.Count; i++)
+        {
+            await ApplyMLAndCollectAsync(list[i], results[i], perSignalLatencyMs, candidateSignals, ct);
+        }
+    }
+
+    /// <summary>
+    /// Runs the per-candidate ML suppression / abstention gates, sizing, and
+    /// TTL adjustments on one ScoreBatchAsync result. Mirrors the inline path
+    /// from the parallel loop — any behaviour change here must also land in
+    /// the inline block to keep the two paths interchangeable at the
+    /// conflict-resolution hand-off.
+    /// </summary>
+    private async Task ApplyMLAndCollectAsync(
+        PreMLCandidate c,
+        MLScoreResult mlScore,
+        int mlScoringLatencyMs,
+        System.Collections.Concurrent.ConcurrentBag<(PendingSignal Pending, MLScoreResult MlScore, int? MlScoringLatencyMs)> candidateSignals,
+        CancellationToken ct)
+    {
+        var strategy = c.Strategy;
+        var signal = c.Signal;
+        var candles = c.Candles;
+
+        // ML suppression: model active but predicted null direction.
+        if (mlScore.MLModelId.HasValue && !mlScore.PredictedDirection.HasValue)
+        {
+            _metrics.SignalsSuppressed.Add(1,
+                new KeyValuePair<string, object?>("symbol", signal.Symbol),
+                new KeyValuePair<string, object?>("reason", "ml_suppression"));
+            await _rejectionAuditor.RecordAsync("MLScoring", "ml_suppression",
+                signal.Symbol, nameof(StrategyWorker),
+                strategyId: strategy.Id,
+                detail: $"ML model {mlScore.MLModelId} suppressed scoring (batched)",
+                ct: ct);
+            return;
+        }
+
+        // Abstention gate: environment classified untradeable.
+        if (_options.MinAbstentionScore > 0
+            && mlScore.AbstentionScore.HasValue
+            && mlScore.AbstentionScore.Value < _options.MinAbstentionScore)
+        {
+            _metrics.SignalsSuppressed.Add(1,
+                new KeyValuePair<string, object?>("symbol", signal.Symbol),
+                new KeyValuePair<string, object?>("reason", "abstention"));
+            await _rejectionAuditor.RecordAsync("Abstention", "abstention_below_threshold",
+                signal.Symbol, nameof(StrategyWorker),
+                strategyId: strategy.Id,
+                detail: $"Score {mlScore.AbstentionScore:F3} < threshold {_options.MinAbstentionScore:F3} (batched)",
+                ct: ct);
+            return;
+        }
+
+        // Attach ML predictions.
+        signal.MLPredictedDirection = mlScore.PredictedDirection;
+        signal.MLPredictedMagnitude = mlScore.PredictedMagnitudePips;
+        signal.MLConfidenceScore    = mlScore.ConfidenceScore;
+        signal.MLModelId            = mlScore.MLModelId;
+
+        // Drawdown-recovery lot reduction.
+        var recoverySnapshot = await _drawdownRecoveryModeProvider.GetAsync(ct);
+        decimal adjustedLotSize = signal.SuggestedLotSize;
+        if (recoverySnapshot.IsReduced)
+            adjustedLotSize = signal.SuggestedLotSize * recoverySnapshot.ReducedLotMultiplier;
+
+        // atrRatio computation (shared by vol-target sizing and vol-conditional TTL).
+        double? atrRatio = null;
+        try
+        {
+            if (candles.Count >= 60)
+            {
+                var recentWindow = candles.Skip(candles.Count - 15).Take(15).ToList();
+                var longWindow   = candles.Skip(candles.Count - 60).Take(60).ToList();
+                double shortAtr = MLModels.Shared.MLFeatureHelper.CalculateATR(recentWindow, 14);
+                double longAtr  = MLModels.Shared.MLFeatureHelper.CalculateATR(longWindow, 14);
+                if (shortAtr > 0 && longAtr > 0)
+                    atrRatio = longAtr / shortAtr;
+            }
+        }
+        catch { /* atrRatio stays null; consumers no-op */ }
+
+        if (atrRatio is double r)
+            adjustedLotSize *= (decimal)Math.Clamp(r, 0.5, 2.0);
+
+        decimal correlationMult = await _portfolioCorrelationSizer.ComputeMultiplierAsync(
+            signal.Symbol, signal.Direction, ct);
+        if (correlationMult < 1.0m)
+            adjustedLotSize *= correlationMult;
+
+        // Vol-conditional TTL.
+        DateTime adjustedExpiry = signal.ExpiresAt;
+        if (atrRatio is double r2)
+        {
+            double ttlMult = Math.Clamp(r2, 0.3, 3.0);
+            TimeSpan originalDuration = signal.ExpiresAt - DateTime.UtcNow;
+            if (originalDuration > TimeSpan.Zero)
+                adjustedExpiry = DateTime.UtcNow.Add(TimeSpan.FromTicks((long)(originalDuration.Ticks * ttlMult)));
+        }
+
+        // Market-closed TTL extension.
+        if (_options.AdaptiveSignalTtlEnabled)
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (_marketHoursCalendar.IsMarketClosed(signal.Symbol, nowUtc))
+            {
+                var reopen = _marketHoursCalendar.NextMarketOpen(signal.Symbol, nowUtc);
+                var graceExpiry = reopen.AddMinutes(Math.Max(0, _options.MarketClosedGracePeriodMinutes));
+                if (adjustedExpiry < graceExpiry)
+                {
+                    adjustedExpiry = graceExpiry;
+                    _metrics.SignalTtlExtendedMarketClosed.Add(1,
+                        new KeyValuePair<string, object?>("symbol", signal.Symbol));
+                }
+            }
+        }
+
+        candidateSignals.Add((
+            Pending: new PendingSignal(
+                StrategyId:            signal.StrategyId,
+                Symbol:                signal.Symbol,
+                Timeframe:             strategy.Timeframe,
+                StrategyType:          strategy.StrategyType,
+                Direction:             signal.Direction,
+                EntryPrice:            signal.EntryPrice,
+                StopLoss:              signal.StopLoss,
+                TakeProfit:            signal.TakeProfit,
+                SuggestedLotSize:      adjustedLotSize,
+                Confidence:            signal.Confidence,
+                MLConfidenceScore:     mlScore.ConfidenceScore,
+                MLModelId:             mlScore.MLModelId,
+                EstimatedCapacityLots: strategy.EstimatedCapacityLots,
+                StrategySharpeRatio:   c.StratSharpe != 0 ? c.StratSharpe : null,
+                ExpiresAt:             adjustedExpiry),
+            MlScore: mlScore,
+            MlScoringLatencyMs: mlScore.MLModelId.HasValue ? mlScoringLatencyMs : null));
+    }
 }
