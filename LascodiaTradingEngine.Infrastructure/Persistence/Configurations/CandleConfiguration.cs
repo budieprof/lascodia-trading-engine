@@ -21,7 +21,11 @@ public class CandleConfiguration : IEntityTypeConfiguration<Candle>
         builder.Property(x => x.High).HasPrecision(18, 8);
         builder.Property(x => x.Low).HasPrecision(18, 8);
         builder.Property(x => x.Close).HasPrecision(18, 8);
-        builder.Property(x => x.Volume).HasPrecision(18, 8);
+        // Volume precision raised from 18,8 to 28,8: the prior cap (~10^10 ≈ 10B) is
+        // exceeded by aggregated tick-volume rows on heavy D1 candles for real-volume
+        // symbols (indices / metals), causing Postgres 22003 overflow on insert. 28,8
+        // gives ~10^20 headroom — above int64 max so a pathological broker tick still fits.
+        builder.Property(x => x.Volume).HasPrecision(28, 8);
 
         builder.HasQueryFilter(x => !x.IsDeleted);
 
