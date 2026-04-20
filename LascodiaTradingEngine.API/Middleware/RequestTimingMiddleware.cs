@@ -41,11 +41,19 @@ public class RequestTimingMiddleware
             var statusCode = context.Response.StatusCode;
             var method = context.Request.Method;
 
-            // Use appropriate log level based on response status and latency
+            // Log level ladder:
+            //   5xx (server error)           → Error — operator must act
+            //   Slow 2xx/3xx (>2000 ms)       → Warning — performance issue worth surfacing
+            //   4xx (client error, incl 401)  → Information — client-side issue; not noise-worthy
+            //   Fast success                  → Debug
+            // Previously 4xx was escalated to Warning, which flooded the log at ~5/min
+            // during EA authentication retry cycles (POST /ea/orderbook/snapshot → 401 in 0ms).
             if (statusCode >= 500)
                 _logger.LogError("HTTP {Method} {Path} → {StatusCode} in {ElapsedMs}ms", method, path, statusCode, elapsedMs);
-            else if (statusCode >= 400 || elapsedMs > 2000)
-                _logger.LogWarning("HTTP {Method} {Path} → {StatusCode} in {ElapsedMs}ms", method, path, statusCode, elapsedMs);
+            else if (elapsedMs > 2000)
+                _logger.LogWarning("HTTP {Method} {Path} → {StatusCode} in {ElapsedMs}ms (slow)", method, path, statusCode, elapsedMs);
+            else if (statusCode >= 400)
+                _logger.LogInformation("HTTP {Method} {Path} → {StatusCode} in {ElapsedMs}ms", method, path, statusCode, elapsedMs);
             else
                 _logger.LogDebug("HTTP {Method} {Path} → {StatusCode} in {ElapsedMs}ms", method, path, statusCode, elapsedMs);
         }
