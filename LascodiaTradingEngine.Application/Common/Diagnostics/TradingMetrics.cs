@@ -63,6 +63,7 @@ public sealed class TradingMetrics
     public Histogram<double> MLScoringBatchSize     { get; }
     public Counter<long>     ConflictResolutionEarlyExits { get; }
     public Counter<long>     EaReconciliationDrift  { get; }
+    public Counter<long>     RetentionRowsDeleted   { get; }
     public Histogram<double> StrategyLockAcquisitionMs { get; }
     public Counter<long>     RegimeParamsCacheHits  { get; }
     public Counter<long>     RegimeParamsCacheMisses { get; }
@@ -300,6 +301,7 @@ public sealed class TradingMetrics
         MLScoringBatchSize = _meter.CreateHistogram<double>("trading.ml.scoring_batch_size", "signals", "Number of signals per batched ML scoring call.");
         ConflictResolutionEarlyExits = _meter.CreateCounter<long>("trading.signals.conflict_resolution_early_exits", "candidates", "Candidate signals skipped by pre-score filtering before expensive per-strategy work ran.");
         EaReconciliationDrift = _meter.CreateCounter<long>("trading.ea.reconciliation_drift", "events", "Non-zero drift findings persisted by the ReconciliationMonitor. Tagged with kind={orphaned_engine|unknown_broker|mismatched}.");
+        RetentionRowsDeleted = _meter.CreateCounter<long>("trading.retention.rows_deleted", "rows", "Rows deleted by AuditRetentionWorker. Tagged with table.");
         StrategyLockAcquisitionMs = _meter.CreateHistogram<double>("trading.strategy.lock_acquisition_ms", "ms", "Wall-clock time spent inside IDistributedLock.TryAcquireAsync for strategy evaluation. Tagged with outcome={acquired|busy}.");
         RegimeParamsCacheHits = _meter.CreateCounter<long>("trading.strategy.regime_params_cache.hits", "lookups", "StrategyRegimeParams cache hits on the hot tick path.");
         RegimeParamsCacheMisses = _meter.CreateCounter<long>("trading.strategy.regime_params_cache.misses", "lookups", "StrategyRegimeParams cache misses that triggered a DB refresh.");
