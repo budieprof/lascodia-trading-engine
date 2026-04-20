@@ -2856,7 +2856,10 @@ trainingSamplesBuilt:;
                     Reason = $"Retired after {champion.ConsecutiveRetrainFailures} consecutive failed retrains — edge likely gone, generate a new strategy rather than retrain",
                 });
 
-                _logger.LogError(
+                // Log at Warning rather than Error: retirement is the intended terminal
+                // state of the degradation-retry policy, not a fault. Using Error triggers
+                // operator error alerts for an outcome the policy is deliberately producing.
+                _logger.LogWarning(
                     "Model {ModelId} ({Symbol}/{Tf}) retired due to degradation — {Count} consecutive failed retrains exceeded threshold {Max}",
                     champion.Id, champion.Symbol, champion.Timeframe,
                     champion.ConsecutiveRetrainFailures, maxFailures);
