@@ -3,6 +3,7 @@ using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using Lascodia.Trading.Engine.SharedApplication.Common.Services;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.SystemHealth.Queries.GetDefaultsCalibrationReport;
 using LascodiaTradingEngine.Application.SystemHealth.Queries.GetEngineStatus;
 using LascodiaTradingEngine.Application.SystemHealth.Queries.GetStrategyGenerationWorkerHealth;
 using LascodiaTradingEngine.Domain.Entities;
@@ -49,4 +50,22 @@ public class SystemHealthController : AuthControllerBase<SystemHealthController>
         var snapshots = _workerHealthMonitor.GetCurrentSnapshots();
         return Ok(snapshots);
     }
+
+    /// <summary>
+    /// Builds a calibration report for the default floors introduced by the pipeline
+    /// improvements (walk-forward minimums, live-vs-backtest Sharpe gate, health
+    /// min-trades guard, DSR threshold, evaluation-window size). Read-only — does NOT
+    /// mutate config. Review the recommendations and apply via <c>PUT /config</c>.
+    /// </summary>
+    /// <param name="lookbackDays">History window in days. Defaults to 180. Clamped to [30, 3650].</param>
+    /// <param name="minSamples">Min sample count before a distribution-based recommendation is emitted. Clamped to [5, 1000].</param>
+    [HttpGet("defaults-calibration")]
+    public async Task<ResponseData<DefaultsCalibrationReportDto>> GetDefaultsCalibration(
+        [FromQuery] int lookbackDays = 180,
+        [FromQuery] int minSamples = 30)
+        => await Mediator.Send(new GetDefaultsCalibrationReportQuery
+        {
+            LookbackDays = lookbackDays,
+            MinSamplesForRecommendation = minSamples,
+        });
 }
