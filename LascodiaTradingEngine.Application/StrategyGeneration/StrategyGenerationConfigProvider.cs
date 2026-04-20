@@ -106,7 +106,13 @@ public sealed class StrategyGenerationConfigProvider : IStrategyGenerationConfig
             SeasonalBlackoutEnabled = Get("StrategyGeneration:SeasonalBlackoutEnabled", true),
             BlackoutPeriods = Get("StrategyGeneration:BlackoutPeriods", "12/20-01/05"),
             ScreeningTimeoutSeconds = Get("StrategyGeneration:ScreeningTimeoutSeconds", 30),
-            CandidateTimeframes = ParseTimeframes(Get("StrategyGeneration:CandidateTimeframes", "H1,H4")),
+            // Cost-tier-aware default: generate candidates only on H4/D1 timeframes
+            // where the typical move per bar comfortably exceeds retail broker spreads.
+            // Past cycles on H1 showed Cost/AvgWin ratios of 3–7× — the template was
+            // paying several dollars in spread for every dollar of edge. H4/D1 keeps
+            // the ratio sub-1. Operators can reintroduce H1/M15 once a strategy type
+            // demonstrates edge at higher TFs first, via the hot-reload config key.
+            CandidateTimeframes = ParseTimeframes(Get("StrategyGeneration:CandidateTimeframes", "H4,D1")),
             MaxTemplatesPerCombo = Get("StrategyGeneration:MaxTemplatesPerCombo", 5),
             StrategicReserveQuota = Get("StrategyGeneration:StrategicReserveQuota", 3),
             MaxCandidatesPerWeek = Get("StrategyGeneration:MaxCandidatesPerWeek", 150),
@@ -291,7 +297,7 @@ public sealed class StrategyGenerationConfigProvider : IStrategyGenerationConfig
         RetryCooldownDays = Math.Max(1, config.RetryCooldownDays),
         RegimeTransitionCooldownHours = Math.Max(0, config.RegimeTransitionCooldownHours),
         ScreeningTimeoutSeconds = Math.Max(1, config.ScreeningTimeoutSeconds),
-        CandidateTimeframes = config.CandidateTimeframes.Count > 0 ? config.CandidateTimeframes : [Timeframe.H1, Timeframe.H4],
+        CandidateTimeframes = config.CandidateTimeframes.Count > 0 ? config.CandidateTimeframes : [Timeframe.H4, Timeframe.D1],
         MaxTemplatesPerCombo = Math.Max(1, config.MaxTemplatesPerCombo),
         MaxParallelBacktests = Math.Max(1, config.MaxParallelBacktests),
         MaxCandleCacheSize = Math.Max(10_000, config.MaxCandleCacheSize),

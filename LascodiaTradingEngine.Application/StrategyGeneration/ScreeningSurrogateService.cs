@@ -81,6 +81,15 @@ public sealed class ScreeningSurrogateService : IScreeningSurrogateService
             ["MomentumPeriod"] = (5, 40,  true),
             ["TrendMaPeriod"]  = (15, 250, true),
         },
+        [StrategyType.CalendarEffect] = new()
+        {
+            ["ModeId"]                = (0, 1, true),
+            ["LookbackBars"]          = (2, 20, true),
+            ["MomentumAtrThreshold"]  = (0.5, 3.0, false),
+            ["MonthEndBusinessDays"]  = (1, 5, true),
+            ["OverlapStartHourUtc"]   = (10, 15, true),
+            ["OverlapEndHourUtc"]     = (14, 20, true),
+        },
     };
 
     private const int MinObservationsForSurrogate = 5;

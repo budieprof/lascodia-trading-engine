@@ -1415,6 +1415,47 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
             var writeContext  = publishScope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
             var eventService = publishScope.ServiceProvider.GetRequiredService<IIntegrationEventService>();
 
+            // Multi-timeframe confirmation gate: reject the signal when the next-higher
+            // timeframe regime is hostile. Hot-reloadable via MultiTimeframeConfirmation:Enabled.
+            // Applies to both live and paper branches so paper-fill data stays honest.
+            var mtfFilter = publishScope.ServiceProvider
+                .GetService<Strategies.Services.IMultiTimeframeConfirmationFilter>();
+            if (mtfFilter is not null)
+            {
+                var mtf = await mtfFilter.CheckAsync(
+                    pending.Symbol, pending.Timeframe, pending.Direction, DateTime.UtcNow, ct);
+                if (!mtf.Allowed)
+                {
+                    _logger.LogDebug(
+                        "StrategyWorker: MTF confirmation rejected signal — {Reason}", mtf.RejectionReason);
+                    _metrics.SignalsFiltered.Add(1,
+                        new("symbol", pending.Symbol),
+                        new("stage", "mtf_confirmation"));
+                    return;
+                }
+            }
+
+            // Regime-archetype compatibility gate: reject signals whose strategy type
+            // isn't in the current regime's compatible list per IRegimeStrategyMapper.
+            // Stops trend-followers firing in Ranging, mean-reversion firing in Trending,
+            // anyone firing in Crisis. Hot-reloadable via RegimeArchetypeGate:Enabled.
+            var regimeGate = publishScope.ServiceProvider
+                .GetService<Strategies.Services.IRegimeArchetypeGateFilter>();
+            if (regimeGate is not null)
+            {
+                var rg = await regimeGate.CheckAsync(
+                    pending.Symbol, pending.Timeframe, pending.StrategyType, DateTime.UtcNow, ct);
+                if (!rg.Allowed)
+                {
+                    _logger.LogDebug(
+                        "StrategyWorker: regime-archetype gate rejected signal — {Reason}", rg.RejectionReason);
+                    _metrics.SignalsFiltered.Add(1,
+                        new("symbol", pending.Symbol),
+                        new("stage", "regime_archetype"));
+                    return;
+                }
+            }
+
             // Paper-mode branch: approved-but-not-active strategies route their signals
             // through PaperExecutionRouter instead of creating a real TradeSignal. No
             // integration event is published (no EA consumer) and no real Order follows.

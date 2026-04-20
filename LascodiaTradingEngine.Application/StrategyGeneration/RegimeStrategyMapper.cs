@@ -50,6 +50,7 @@ public class RegimeStrategyMapper : IRegimeStrategyMapper
                 StrategyType.BollingerBandReversion,
                 StrategyType.StatisticalArbitrage,
                 StrategyType.VwapReversion,
+                StrategyType.CalendarEffect,
             },
             [MarketRegimeEnum.HighVolatility] = new[]
             {
@@ -65,6 +66,7 @@ public class RegimeStrategyMapper : IRegimeStrategyMapper
                 StrategyType.StatisticalArbitrage,
                 StrategyType.VwapReversion,
                 StrategyType.SessionBreakout,
+                StrategyType.CalendarEffect,
             },
             [MarketRegimeEnum.Breakout] = new[]
             {

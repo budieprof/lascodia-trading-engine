@@ -110,6 +110,20 @@ public class StrategyParameterTemplateProvider : IStrategyParameterTemplateProvi
             """{"SessionStartHour":13,"SessionEndHour":21,"EntryAtrThreshold":1.5,"StopLossAtrMultiplier":2.0,"TakeProfitAtrMultiplier":1.2,"AtrPeriod":14,"MaxAdx":40,"MinVolumeRatio":1.1}""",
             """{"SessionStartHour":13,"SessionEndHour":21,"EntryAtrThreshold":2.0,"StopLossAtrMultiplier":2.5,"TakeProfitAtrMultiplier":1.5,"AtrPeriod":14,"MaxAdx":35,"MinVolumeRatio":1.0}""",
         },
+        [StrategyType.CalendarEffect] = new[]
+        {
+            // MonthEnd — fade rebalancing pressure. Conservative threshold first.
+            """{"Mode":"MonthEnd","LookbackBars":5,"MomentumAtrThreshold":1.0,"MonthEndBusinessDays":3}""",
+            """{"Mode":"MonthEnd","LookbackBars":5,"MomentumAtrThreshold":1.5,"MonthEndBusinessDays":3}""",
+            """{"Mode":"MonthEnd","LookbackBars":3,"MomentumAtrThreshold":1.0,"MonthEndBusinessDays":2}""",
+            """{"Mode":"MonthEnd","LookbackBars":10,"MomentumAtrThreshold":1.5,"MonthEndBusinessDays":4}""",
+
+            // LondonNyOverlap — continuation during 13:00-16:00 UTC liquidity peak.
+            """{"Mode":"LondonNyOverlap","LookbackBars":4,"MomentumAtrThreshold":0.8,"OverlapStartHourUtc":13,"OverlapEndHourUtc":16}""",
+            """{"Mode":"LondonNyOverlap","LookbackBars":6,"MomentumAtrThreshold":1.0,"OverlapStartHourUtc":13,"OverlapEndHourUtc":16}""",
+            """{"Mode":"LondonNyOverlap","LookbackBars":4,"MomentumAtrThreshold":1.2,"OverlapStartHourUtc":13,"OverlapEndHourUtc":17}""",
+            """{"Mode":"LondonNyOverlap","LookbackBars":8,"MomentumAtrThreshold":0.8,"OverlapStartHourUtc":12,"OverlapEndHourUtc":16}""",
+        },
         [StrategyType.CompositeML] = new[]
         {
             // Aggressive / high-frequency

@@ -1237,6 +1237,30 @@ public class StrategyEvaluatorOptions : ConfigurationOption<StrategyEvaluatorOpt
     /// </summary>
     public decimal SessionBreakoutMinRangeSizeAtrFraction { get; set; } = 0.3m;
 
+    // ── Calendar Effect ───────────────────────────────────────────────────
+
+    /// <summary>Default base confidence for calendar-effect signals before momentum boost. Defaults to 0.60.</summary>
+    public decimal CalendarEffectConfidence { get; set; } = 0.60m;
+
+    /// <summary>Signal expiry in minutes for calendar-effect signals. Defaults to 120.</summary>
+    public int CalendarEffectExpiryMinutes { get; set; } = 120;
+
+    /// <summary>
+    /// Maximum spread as a fraction of ATR. Calendar-effect trades are relatively low-frequency
+    /// so wide spreads erode edge quickly. Defaults to 0.4 (40% of ATR). Set to 0 to disable.
+    /// </summary>
+    public decimal CalendarEffectMaxSpreadAtrFraction { get; set; } = 0.4m;
+
+    /// <summary>
+    /// Per-ATR multiplier converting momentum-above-threshold into a confidence boost. The
+    /// excess-ATR magnitude is multiplied by this scale and clamped by
+    /// <see cref="CalendarEffectConfidenceMomentumBoostMax"/>. Defaults to 0.05.
+    /// </summary>
+    public decimal CalendarEffectConfidenceMomentumBoostScale { get; set; } = 0.05m;
+
+    /// <summary>Maximum confidence boost from momentum magnitude. Defaults to 0.15.</summary>
+    public decimal CalendarEffectConfidenceMomentumBoostMax { get; set; } = 0.15m;
+
     // ── Momentum Trend ─────────────────────────────────────────────────────
 
     /// <summary>Default confidence for momentum trend signals. Defaults to 0.70.</summary>

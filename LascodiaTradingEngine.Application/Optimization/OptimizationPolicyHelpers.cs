@@ -28,6 +28,9 @@ internal static class OptimizationPolicyHelpers
         if (strategyType is StrategyType.BreakoutScalper or StrategyType.SessionBreakout)
             return higherTfRegime is MarketRegimeEnum.Trending or MarketRegimeEnum.HighVolatility or MarketRegimeEnum.Breakout;
 
+        if (strategyType is StrategyType.CalendarEffect)
+            return higherTfRegime is MarketRegimeEnum.Ranging or MarketRegimeEnum.LowVolatility;
+
         return true;
     }
 

@@ -150,6 +150,9 @@ public static partial class StrategyGenerationHelpers
         if (strategyType is StrategyType.StatisticalArbitrage or StrategyType.VwapReversion)
             return higherTfRegime is MarketRegimeEnum.Ranging or MarketRegimeEnum.LowVolatility;
 
+        if (strategyType is StrategyType.CalendarEffect)
+            return higherTfRegime is MarketRegimeEnum.Ranging or MarketRegimeEnum.LowVolatility;
+
         return true; // Unknown — don't block
     }
 

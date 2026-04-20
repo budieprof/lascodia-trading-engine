@@ -247,6 +247,37 @@ internal sealed class OptimizationGridBuilder
                 break;
             }
 
+            case StrategyType.CalendarEffect:
+            {
+                // ModeId is an integer-coded CalendarEffectMode (0=MonthEnd, 1=LondonNyOverlap)
+                // so TPE bound-extraction (int/double only) can tune the mode choice alongside
+                // numeric params. Evaluator accepts either "Mode" (string) or "ModeId" (int).
+                foreach (var modeId in new[] { 0, 1 })
+                foreach (var lookback in new[] { 3, 5, 8 })
+                foreach (var threshold in new[] { 0.8, 1.0, 1.5 })
+                foreach (var secondary in new[] { 2, 3, 4 })
+                {
+                    var entry = new Dictionary<string, object>
+                    {
+                        ["ModeId"] = modeId,
+                        ["LookbackBars"] = lookback,
+                        ["MomentumAtrThreshold"] = threshold,
+                    };
+                    if (modeId == 0)
+                    {
+                        entry["MonthEndBusinessDays"] = secondary;
+                    }
+                    else
+                    {
+                        // OverlapStartHourUtc 12 or 13, OverlapEndHourUtc 16 or 17 — map secondary
+                        entry["OverlapStartHourUtc"] = secondary <= 2 ? 12 : 13;
+                        entry["OverlapEndHourUtc"]   = secondary <= 3 ? 16 : 17;
+                    }
+                    grid.Add(entry);
+                }
+                break;
+            }
+
             default:
                 throw new InvalidOperationException(
                     $"No parameter grid defined for StrategyType={strategyType}. " +

@@ -36,5 +36,12 @@ public enum StrategyType
     StatisticalArbitrage   = 9,
 
     /// <summary>Mean-reversion to session VWAP when price deviates beyond ATR threshold.</summary>
-    VwapReversion          = 10
+    VwapReversion          = 10,
+
+    /// <summary>
+    /// Captures institutional calendar flows: month-end rebalancing (last N business days
+    /// fade short-horizon momentum) and London-NY session overlap (continuation during the
+    /// 13:00-16:00 UTC liquidity peak).
+    /// </summary>
+    CalendarEffect         = 11
 }
