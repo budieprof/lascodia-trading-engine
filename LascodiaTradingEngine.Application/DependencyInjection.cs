@@ -117,10 +117,16 @@ public static class DependencyInjection
         RemoveHostedServiceDescriptorsByImpl<StrategyWorker>(services);
         RemoveHostedServiceDescriptorsByImpl<SignalOrderBridgeWorker>(services);
         RemoveDescriptorsByImpl<IIntegrationEventHandler<PriceUpdatedIntegrationEvent>, StrategyWorker>(services);
+        RemoveDescriptorsByImpl<IIntegrationEventHandler<BacktestCompletedIntegrationEvent>, StrategyWorker>(services);
+        RemoveDescriptorsByImpl<IIntegrationEventHandler<StrategyActivatedIntegrationEvent>, StrategyWorker>(services);
         RemoveDescriptorsByImpl<IIntegrationEventHandler<TradeSignalCreatedIntegrationEvent>, SignalOrderBridgeWorker>(services);
 
         services.AddSingleton<StrategyWorker>();
         services.AddSingleton<IIntegrationEventHandler<PriceUpdatedIntegrationEvent>>(
+            sp => sp.GetRequiredService<StrategyWorker>());
+        services.AddSingleton<IIntegrationEventHandler<BacktestCompletedIntegrationEvent>>(
+            sp => sp.GetRequiredService<StrategyWorker>());
+        services.AddSingleton<IIntegrationEventHandler<StrategyActivatedIntegrationEvent>>(
             sp => sp.GetRequiredService<StrategyWorker>());
         services.AddHostedService(sp => sp.GetRequiredService<StrategyWorker>());
 

@@ -47,6 +47,8 @@ public class StrategyWorkerTest : IDisposable
     private readonly TradingMetrics _metrics;
     private readonly TestMeterFactory _meterFactory;
     private readonly StrategyWorker _worker;
+    private readonly StrategyMetricsCache _strategyMetricsCache;
+    private readonly Mock<IMarketHoursCalendar> _mockMarketHoursCalendar;
 
     public StrategyWorkerTest()
     {
@@ -143,6 +145,14 @@ public class StrategyWorkerTest : IDisposable
         _mockScopeFactory.Setup(f => f.CreateScope()).Returns(mockScope.Object);
 
         var memoryCache = new MemoryCache(new MemoryCacheOptions());
+        _strategyMetricsCache = new StrategyMetricsCache(_metrics, TimeProvider.System);
+        _mockMarketHoursCalendar = new Mock<IMarketHoursCalendar>();
+        _mockMarketHoursCalendar
+            .Setup(c => c.IsMarketClosed(It.IsAny<string>(), It.IsAny<DateTime>()))
+            .Returns(false);
+        _mockMarketHoursCalendar
+            .Setup(c => c.NextMarketOpen(It.IsAny<string>(), It.IsAny<DateTime>()))
+            .Returns<string, DateTime>((_, t) => t);
         _worker = new StrategyWorker(
             _mockLogger.Object,
             _mockScopeFactory.Object,
@@ -154,7 +164,9 @@ public class StrategyWorkerTest : IDisposable
             new SignalConflictResolver(new Mock<ILogger<SignalConflictResolver>>().Object),
             new RegimeCoherenceChecker(_mockScopeFactory.Object, memoryCache, new Mock<ILogger<RegimeCoherenceChecker>>().Object),
             new DrawdownRecoveryModeProvider(_mockScopeFactory.Object, memoryCache),
-            new PortfolioCorrelationSizer(_mockScopeFactory.Object, memoryCache, new Mock<ILogger<PortfolioCorrelationSizer>>().Object));
+            new PortfolioCorrelationSizer(_mockScopeFactory.Object, memoryCache, new Mock<ILogger<PortfolioCorrelationSizer>>().Object),
+            _strategyMetricsCache,
+            _mockMarketHoursCalendar.Object);
     }
 
     public void Dispose() => _meterFactory.Dispose();
@@ -582,10 +594,306 @@ public class StrategyWorkerTest : IDisposable
             Times.Once);
     }
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  Pipeline evaluation fixes (Fix #1, #2, #3, #5)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    [Fact]
+    public async Task Handle_MissingEvaluator_EmitsEvaluatorMissingMetric()
+    {
+        // Fix #2: a StrategyType with no registered evaluator must surface on
+        // dashboards, not only in the decision log, so DI misconfiguration is
+        // caught in minutes rather than after an audit trail trawl.
+        var strategy = new Strategy
+        {
+            Id = 42, Symbol = "EURUSD", Status = StrategyStatus.Active,
+            StrategyType = StrategyType.CarryTrade, // Registered evaluator is MovingAverageCrossover only.
+            Timeframe = Timeframe.H1,
+        };
+        SetupDbSets(strategies: new List<Strategy> { strategy });
+
+        using var counter = new CounterProbe(_meterFactory, "trading.signals.evaluator_missing");
+        await _worker.ProcessPriceUpdateAsync(CreatePriceEvent());
+
+        Assert.True(counter.Total >= 1,
+            "EvaluatorMissing counter was not incremented when the dispatcher had no match.");
+        Assert.Contains("CarryTrade", counter.TagValues("strategy_type"));
+    }
+
+    [Fact]
+    public async Task Handle_MarketClosed_ExtendsSignalExpiryAndEmitsMetric()
+    {
+        // Fix #5: a signal generated during the weekend closure must have its
+        // TTL extended to cover at least the next open + grace period, otherwise
+        // it expires before Monday fill.
+        _options.SignalCooldownSeconds = 0;
+        _options.AdaptiveSignalTtlEnabled = true;
+        _options.MarketClosedGracePeriodMinutes = 30;
+        _options.NewsBlackoutMinutesBefore = 0;
+        _options.NewsBlackoutMinutesAfter = 0;
+        _options.MinRegimeCoherence = 0;
+
+        var reopenUtc = DateTime.UtcNow.AddDays(2);
+        _mockMarketHoursCalendar
+            .Setup(c => c.IsMarketClosed(It.IsAny<string>(), It.IsAny<DateTime>()))
+            .Returns(true);
+        _mockMarketHoursCalendar
+            .Setup(c => c.NextMarketOpen(It.IsAny<string>(), It.IsAny<DateTime>()))
+            .Returns(reopenUtc);
+
+        var strategy = new Strategy
+        {
+            Id = 1, Symbol = "EURUSD", Status = StrategyStatus.Active,
+            StrategyType = StrategyType.MovingAverageCrossover,
+            Timeframe = Timeframe.H1,
+        };
+        var candles = Enumerable.Range(0, 10).Select(i => new Candle
+        {
+            Symbol = "EURUSD", Timeframe = Timeframe.H1, IsClosed = true,
+            Timestamp = DateTime.UtcNow.AddHours(-i),
+            Open = 1.1m, High = 1.11m, Low = 1.09m, Close = 1.1m,
+        }).ToList();
+        SetupDbSets(strategies: new List<Strategy> { strategy }, candles: candles);
+
+        // Evaluator emits a signal with a short 30-min TTL that would otherwise
+        // expire well before the (mocked) reopen two days out.
+        _mockEvaluator
+            .Setup(e => e.EvaluateAsync(It.IsAny<Strategy>(), It.IsAny<IReadOnlyList<Candle>>(), It.IsAny<(decimal, decimal)>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new TradeSignal
+            {
+                StrategyId = 1, Symbol = "EURUSD", Direction = TradeDirection.Buy,
+                EntryPrice = 1.1001m, StopLoss = 1.0950m, TakeProfit = 1.1100m,
+                SuggestedLotSize = 0.01m, Confidence = 0.70m,
+                ExpiresAt = DateTime.UtcNow.AddMinutes(30),
+            });
+
+        CreateTradeSignalCommand? captured = null;
+        _mockMediator
+            .Setup(m => m.Send(It.IsAny<CreateTradeSignalCommand>(), It.IsAny<CancellationToken>()))
+            .Callback<IRequest<ResponseData<long>>, CancellationToken>((cmd, _) =>
+            {
+                captured = cmd as CreateTradeSignalCommand;
+            })
+            .ReturnsAsync(ResponseData<long>.Init(1L, true, "Successful", "00"));
+
+        using var counter = new CounterProbe(_meterFactory, "trading.signals.ttl_extended_market_closed");
+
+        await _worker.ProcessPriceUpdateAsync(CreatePriceEvent());
+
+        Assert.NotNull(captured);
+        Assert.True(captured!.ExpiresAt >= reopenUtc.AddMinutes(29),
+            $"Expected ExpiresAt to be at least reopen+30min ({reopenUtc.AddMinutes(30):u}) but was {captured.ExpiresAt:u}.");
+        Assert.True(counter.Total >= 1, "SignalTtlExtendedMarketClosed counter did not fire.");
+    }
+
+    [Fact]
+    public async Task Handle_MarketOpen_DoesNotExtendSignalExpiry()
+    {
+        // Sanity check for Fix #5: when the calendar reports "open", the adaptive
+        // TTL path must not touch the signal's ExpiresAt.
+        _options.SignalCooldownSeconds = 0;
+        _options.AdaptiveSignalTtlEnabled = true;
+        _options.NewsBlackoutMinutesBefore = 0;
+        _options.NewsBlackoutMinutesAfter = 0;
+        _options.MinRegimeCoherence = 0;
+
+        _mockMarketHoursCalendar
+            .Setup(c => c.IsMarketClosed(It.IsAny<string>(), It.IsAny<DateTime>()))
+            .Returns(false);
+
+        var strategy = new Strategy
+        {
+            Id = 1, Symbol = "EURUSD", Status = StrategyStatus.Active,
+            StrategyType = StrategyType.MovingAverageCrossover,
+            Timeframe = Timeframe.H1,
+        };
+        var candles = Enumerable.Range(0, 10).Select(i => new Candle
+        {
+            Symbol = "EURUSD", Timeframe = Timeframe.H1, IsClosed = true,
+            Timestamp = DateTime.UtcNow.AddHours(-i),
+            Open = 1.1m, High = 1.11m, Low = 1.09m, Close = 1.1m,
+        }).ToList();
+        SetupDbSets(strategies: new List<Strategy> { strategy }, candles: candles);
+
+        var signalExpiry = DateTime.UtcNow.AddMinutes(30);
+        _mockEvaluator
+            .Setup(e => e.EvaluateAsync(It.IsAny<Strategy>(), It.IsAny<IReadOnlyList<Candle>>(), It.IsAny<(decimal, decimal)>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new TradeSignal
+            {
+                StrategyId = 1, Symbol = "EURUSD", Direction = TradeDirection.Buy,
+                EntryPrice = 1.1001m, StopLoss = 1.0950m, TakeProfit = 1.1100m,
+                SuggestedLotSize = 0.01m, Confidence = 0.70m,
+                ExpiresAt = signalExpiry,
+            });
+
+        CreateTradeSignalCommand? captured = null;
+        _mockMediator
+            .Setup(m => m.Send(It.IsAny<CreateTradeSignalCommand>(), It.IsAny<CancellationToken>()))
+            .Callback<IRequest<ResponseData<long>>, CancellationToken>((cmd, _) => { captured = cmd as CreateTradeSignalCommand; })
+            .ReturnsAsync(ResponseData<long>.Init(1L, true, "Successful", "00"));
+
+        using var counter = new CounterProbe(_meterFactory, "trading.signals.ttl_extended_market_closed");
+        await _worker.ProcessPriceUpdateAsync(CreatePriceEvent());
+
+        Assert.NotNull(captured);
+        // The vol-conditional TTL path may adjust by small amounts when ATR is degenerate —
+        // assert we stay within 5 minutes of the original, not that the market-closed
+        // extension fired.
+        Assert.True(Math.Abs((captured!.ExpiresAt - signalExpiry).TotalMinutes) < 5,
+            $"Expires drifted more than 5 min without market-closed extension (got {captured.ExpiresAt:u}, expected ~{signalExpiry:u}).");
+        Assert.Equal(0L, counter.Total);
+    }
+
+    [Fact]
+    public async Task BacktestCompletedIntegrationEvent_Handler_InvalidatesMetricsCache()
+    {
+        // Fix #3: the BacktestCompleted handler must drop the strategy's cached
+        // metrics so the very next tick re-queries the DB and picks up the
+        // updated Sharpe / health status.
+        var snap = new StrategyPerformanceSnapshot
+        {
+            StrategyId = 7, SharpeRatio = 0.8m, HealthStatus = StrategyHealthStatus.Healthy,
+            EvaluatedAt = DateTime.UtcNow,
+        };
+        _mockDbContext.Setup(c => c.Set<StrategyPerformanceSnapshot>())
+            .Returns(new List<StrategyPerformanceSnapshot> { snap }.AsQueryable().BuildMockDbSet().Object);
+
+        // Prime the cache.
+        _ = await _strategyMetricsCache.GetManyAsync(_mockDbContext.Object, new long[] { 7 }, 60, CancellationToken.None);
+        _mockDbContext.Invocations.Clear();
+
+        await _worker.Handle(new BacktestCompletedIntegrationEvent
+        {
+            BacktestRunId = 11, StrategyId = 7, Symbol = "EURUSD", Timeframe = Timeframe.H1,
+        });
+
+        // Next lookup should hit DB again.
+        _ = await _strategyMetricsCache.GetManyAsync(_mockDbContext.Object, new long[] { 7 }, 60, CancellationToken.None);
+        _mockDbContext.Verify(c => c.Set<StrategyPerformanceSnapshot>(), Times.AtLeastOnce);
+    }
+
+    [Fact]
+    public async Task StrategyActivatedIntegrationEvent_Handler_InvalidatesMetricsCache()
+    {
+        // Parallel check for the second cache-invalidation event: when a strategy
+        // flips to Active its cached 0-Sharpe sentinel must be purged so the
+        // next tick fetches the real snapshot.
+        var snap = new StrategyPerformanceSnapshot
+        {
+            StrategyId = 9, SharpeRatio = 1.6m, HealthStatus = StrategyHealthStatus.Healthy,
+            EvaluatedAt = DateTime.UtcNow,
+        };
+        _mockDbContext.Setup(c => c.Set<StrategyPerformanceSnapshot>())
+            .Returns(new List<StrategyPerformanceSnapshot> { snap }.AsQueryable().BuildMockDbSet().Object);
+
+        _ = await _strategyMetricsCache.GetManyAsync(_mockDbContext.Object, new long[] { 9 }, 60, CancellationToken.None);
+        _mockDbContext.Invocations.Clear();
+
+        await _worker.Handle(new StrategyActivatedIntegrationEvent
+        {
+            StrategyId = 9, Name = "sma-9", Symbol = "EURUSD", Timeframe = Timeframe.H1,
+            ActivatedAt = DateTime.UtcNow,
+        });
+
+        _ = await _strategyMetricsCache.GetManyAsync(_mockDbContext.Object, new long[] { 9 }, 60, CancellationToken.None);
+        _mockDbContext.Verify(c => c.Set<StrategyPerformanceSnapshot>(), Times.AtLeastOnce);
+    }
+
+    [Fact]
+    public async Task Handle_BacktestQualificationQueryFails_FailsClosed_NoSignalsEmitted()
+    {
+        // Fix #1: a failing BacktestRun query must fail-closed (no qualified
+        // strategies this tick, PrefetchQueryTimeouts incremented) rather than
+        // bubbling up into the tick loop. We verify the fail-closed path with a
+        // throwing EngineConfig query — the gate's wrapper catches it, logs,
+        // emits the metric, and treats the qualified set as empty.
+        _options.PrefetchQueryTimeoutSeconds = 1;
+        _options.MinRegimeCoherence = 0;
+        _options.NewsBlackoutMinutesBefore = 0;
+        _options.NewsBlackoutMinutesAfter = 0;
+
+        var strategy = new Strategy
+        {
+            Id = 1, Symbol = "EURUSD", Status = StrategyStatus.Active,
+            StrategyType = StrategyType.MovingAverageCrossover,
+            Timeframe = Timeframe.H1,
+        };
+        SetupDbSets(strategies: new List<Strategy> { strategy });
+
+        // Force the EngineConfig query to throw the same way a stalled query
+        // finally surfaces. Our timeout wrapper treats failed + timed-out
+        // identically: increment the metric and fail closed. This exercises the
+        // catch-all branch without depending on EF's async cancellation plumbing.
+        var throwingConfig = new Mock<Microsoft.EntityFrameworkCore.DbSet<EngineConfig>>();
+        throwingConfig.As<IQueryable<EngineConfig>>()
+            .Setup(q => q.Provider)
+            .Throws(new InvalidOperationException("simulated DB failure during backtest gate"));
+        _mockDbContext.Setup(c => c.Set<EngineConfig>()).Returns(throwingConfig.Object);
+
+        using var counter = new CounterProbe(_meterFactory, "trading.signals.prefetch_query_timeouts");
+        await _worker.ProcessPriceUpdateAsync(CreatePriceEvent());
+
+        Assert.True(counter.Total >= 1, "PrefetchQueryTimeouts counter was not incremented on failure.");
+        _mockEvaluator.Verify(
+            e => e.EvaluateAsync(It.IsAny<Strategy>(), It.IsAny<IReadOnlyList<Candle>>(), It.IsAny<(decimal, decimal)>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
     private sealed class TestMeterFactory : IMeterFactory
     {
         private readonly List<Meter> _meters = new();
         public Meter Create(MeterOptions options) { var m = new Meter(options); _meters.Add(m); return m; }
         public void Dispose() { foreach (var m in _meters) m.Dispose(); }
+    }
+
+    /// <summary>
+    /// Minimal in-process probe for a single counter. Installs a MeterListener
+    /// scoped to this probe's lifetime, captures <c>long</c> increments against
+    /// the named instrument, and tallies their tag values so assertions can read
+    /// both totals and per-tag slices without touching exporter infrastructure.
+    /// </summary>
+    private sealed class CounterProbe : IDisposable
+    {
+        private readonly MeterListener _listener = new();
+        private long _total;
+        private readonly List<KeyValuePair<string, object?>[]> _tagSnapshots = new();
+        private readonly object _lock = new();
+
+        public CounterProbe(IMeterFactory factory, string instrumentName)
+        {
+            _listener.InstrumentPublished = (instrument, listener) =>
+            {
+                if (instrument.Name == instrumentName)
+                    listener.EnableMeasurementEvents(instrument);
+            };
+            _listener.SetMeasurementEventCallback<long>((_, value, tags, _) =>
+            {
+                lock (_lock)
+                {
+                    _total += value;
+                    _tagSnapshots.Add(tags.ToArray());
+                }
+            });
+            _listener.Start();
+        }
+
+        public long Total
+        {
+            get { lock (_lock) return _total; }
+        }
+
+        public IEnumerable<string> TagValues(string tagKey)
+        {
+            lock (_lock)
+            {
+                return _tagSnapshots
+                    .SelectMany(s => s)
+                    .Where(kv => kv.Key == tagKey)
+                    .Select(kv => kv.Value?.ToString() ?? string.Empty)
+                    .ToList();
+            }
+        }
+
+        public void Dispose() => _listener.Dispose();
     }
 }

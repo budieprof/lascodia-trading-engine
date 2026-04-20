@@ -56,4 +56,12 @@ public enum ScreeningFailureReason
     /// deflating for the number of strategies tried (Bailey/López de Prado 2014).
     /// </summary>
     DeflatedSharpe,
+
+    /// <summary>
+    /// Post-walk-forward lookahead audit failed: running the strategy on the
+    /// combined IS+OOS range produces a trade list that diverges materially from
+    /// the concatenation of the IS and OOS backtests, suggesting the evaluator
+    /// or backtest engine is consuming future candles at the IS→OOS boundary.
+    /// </summary>
+    LookaheadAudit,
 }

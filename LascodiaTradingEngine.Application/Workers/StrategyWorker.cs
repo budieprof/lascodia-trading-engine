@@ -95,7 +95,11 @@ namespace LascodiaTradingEngine.Application.Workers;
 /// <see cref="IServiceScope"/> instances for each price event and each parallel strategy iteration
 /// to isolate scoped services (DbContext, ML scorer, filters).
 /// </summary>
-public partial class StrategyWorker : BackgroundService, IIntegrationEventHandler<PriceUpdatedIntegrationEvent>
+public partial class StrategyWorker :
+    BackgroundService,
+    IIntegrationEventHandler<PriceUpdatedIntegrationEvent>,
+    IIntegrationEventHandler<BacktestCompletedIntegrationEvent>,
+    IIntegrationEventHandler<StrategyActivatedIntegrationEvent>
 {
     private readonly ILogger<StrategyWorker> _logger;
     private readonly IServiceScopeFactory _scopeFactory;
@@ -108,6 +112,8 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
     private readonly RegimeCoherenceChecker _regimeCoherenceChecker;
     private readonly DrawdownRecoveryModeProvider _drawdownRecoveryModeProvider;
     private readonly PortfolioCorrelationSizer _portfolioCorrelationSizer;
+    private readonly StrategyMetricsCache _strategyMetricsCache;
+    private readonly IMarketHoursCalendar _marketHoursCalendar;
 
     /// <summary>Tracks the last signal creation time per strategy to enforce cooldown.</summary>
     private readonly ConcurrentDictionary<long, DateTime> _lastSignalTime = new();
@@ -181,7 +187,9 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
         ISignalConflictResolver signalConflictResolver,
         RegimeCoherenceChecker regimeCoherenceChecker,
         DrawdownRecoveryModeProvider drawdownRecoveryModeProvider,
-        PortfolioCorrelationSizer portfolioCorrelationSizer)
+        PortfolioCorrelationSizer portfolioCorrelationSizer,
+        StrategyMetricsCache strategyMetricsCache,
+        IMarketHoursCalendar marketHoursCalendar)
     {
         _logger                       = logger;
         _scopeFactory                 = scopeFactory;    // Creates per-event/per-strategy DI scopes
@@ -194,6 +202,8 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
         _regimeCoherenceChecker       = regimeCoherenceChecker;  // Cross-timeframe regime alignment scoring
         _drawdownRecoveryModeProvider = drawdownRecoveryModeProvider;  // Cached access to DrawdownRecovery config
         _portfolioCorrelationSizer    = portfolioCorrelationSizer;  // Correlation-aware lot-size multiplier
+        _strategyMetricsCache         = strategyMetricsCache;       // Process-lifetime cache for per-strategy Sharpe + health
+        _marketHoursCalendar          = marketHoursCalendar;        // Market-closed detection for adaptive signal TTL
     }
 
     /// <summary>
@@ -290,6 +300,12 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
         // Subscribe to the event bus so Handle() is invoked on every price tick
         _eventBus.Subscribe<PriceUpdatedIntegrationEvent, StrategyWorker>();
 
+        // Additional subscriptions drive event-invalidation of the per-strategy
+        // metrics cache so conflict resolution always uses fresh Sharpe / health
+        // after a backtest completes or a strategy is activated.
+        _eventBus.Subscribe<BacktestCompletedIntegrationEvent, StrategyWorker>();
+        _eventBus.Subscribe<StrategyActivatedIntegrationEvent, StrategyWorker>();
+
         // Start the periodic sweep that expires stale pending trade signals
         _expirySweepTimer = new Timer(RunExpirySweep, null, TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(5));
 
@@ -304,6 +320,8 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
             _stateFlushTimer?.Dispose();
             _tickChannel.Writer.TryComplete();
             _eventBus.Unsubscribe<PriceUpdatedIntegrationEvent, StrategyWorker>();
+            _eventBus.Unsubscribe<BacktestCompletedIntegrationEvent, StrategyWorker>();
+            _eventBus.Unsubscribe<StrategyActivatedIntegrationEvent, StrategyWorker>();
         });
 
         // Consume ticks from the bounded channel — this is the main evaluation loop
@@ -338,6 +356,29 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
             _metrics.TicksDroppedBackpressure.Add(1, new KeyValuePair<string, object?>("symbol", @event.Symbol));
         }
         await Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Invalidates the per-strategy metrics cache for the strategy whose backtest
+    /// just completed so the next tick reloads its Sharpe and health from the DB.
+    /// Keeping this handler lightweight — no DB I/O — lets the event bus deliver
+    /// the completion broadcast without queue buildup.
+    /// </summary>
+    public Task Handle(BacktestCompletedIntegrationEvent @event)
+    {
+        _strategyMetricsCache.Invalidate(@event.StrategyId, trigger: "backtest_completed");
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Invalidates the per-strategy metrics cache when a strategy flips to Active.
+    /// The first tick after activation will then fetch the fresh snapshot rather
+    /// than the stale null sentinel the worker may have cached earlier.
+    /// </summary>
+    public Task Handle(StrategyActivatedIntegrationEvent @event)
+    {
+        _strategyMetricsCache.Invalidate(@event.StrategyId, trigger: "strategy_activated");
+        return Task.CompletedTask;
     }
 
     /// <summary>
@@ -480,42 +521,104 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
         }
 
         var strategyIds = strategies.Select(s => s.Id).ToList();
+        int prefetchTimeoutSeconds = Math.Max(1, _options.PrefetchQueryTimeoutSeconds);
+
+        // ── Pre-fetch per-strategy metrics (Sharpe + health) via cache ──────
+        // Single source for both the Critical-health filter and the Sharpe
+        // lookup used by conflict resolution. The cache batches DB refreshes
+        // across ticks (TTL = StrategyMetricsCacheTtlSeconds) and is invalidated
+        // on BacktestCompletedIntegrationEvent / StrategyActivatedIntegrationEvent
+        // so meaningful state changes propagate within one tick.
+        //
+        // Fail-closed on timeout: skip health filtering AND Sharpe ranking for
+        // this tick. Evaluation still runs — a slow DB should not starve the
+        // whole symbol — but conflict resolution degrades to a tiebreak without
+        // Sharpe. The PrefetchQueryTimeouts counter surfaces the regression.
         var criticalStrategyIds = new HashSet<long>();
+        var strategySharpeCache = new Dictionary<long, decimal>();
         if (strategyIds.Count > 0)
         {
-            // Get the latest health snapshot per strategy using a grouped query
-            var latestSnapshotsCriticalStrategyIds = await context.GetDbContext()
-                .Set<Domain.Entities.StrategyPerformanceSnapshot>()
-                .Where(x => strategyIds.Contains(x.StrategyId) && !x.IsDeleted)
-                .GroupBy(x => x.StrategyId)
-                .Select(g => new
+            using var metricsCts = CancellationTokenSource.CreateLinkedTokenSource(_stoppingToken);
+            metricsCts.CancelAfter(TimeSpan.FromSeconds(prefetchTimeoutSeconds));
+            try
+            {
+                var metricsSnapshot = await _strategyMetricsCache.GetManyAsync(
+                    context.GetDbContext(), strategyIds, _options.StrategyMetricsCacheTtlSeconds, metricsCts.Token);
+                foreach (var kv in metricsSnapshot)
                 {
-                    StrategyId = g.Key,
-                    HealthStatus = g.OrderByDescending(x => x.EvaluatedAt).First().HealthStatus
-                })
-                .Where(x => x.HealthStatus == StrategyHealthStatus.Critical)
-                .Select(x => x.StrategyId)
-                .ToListAsync(_stoppingToken);
-
-            criticalStrategyIds = [.. latestSnapshotsCriticalStrategyIds];
+                    if (kv.Value.HealthStatus == StrategyHealthStatus.Critical)
+                        criticalStrategyIds.Add(kv.Key);
+                    if (kv.Value.Sharpe != 0m)
+                        strategySharpeCache[kv.Key] = kv.Value.Sharpe;
+                }
+            }
+            catch (OperationCanceledException) when (!_stoppingToken.IsCancellationRequested)
+            {
+                _logger.LogWarning(
+                    "StrategyWorker: strategy-metrics pre-fetch timed out after {Timeout}s for {Symbol} — skipping health filter and Sharpe ranking this tick",
+                    prefetchTimeoutSeconds, @event.Symbol);
+                _metrics.PrefetchQueryTimeouts.Add(1,
+                    new("symbol", @event.Symbol),
+                    new("query", "strategy_metrics"));
+            }
+            catch (Exception ex) when (!_stoppingToken.IsCancellationRequested)
+            {
+                _logger.LogError(ex,
+                    "StrategyWorker: strategy-metrics pre-fetch failed for {Symbol} — skipping health filter and Sharpe ranking this tick",
+                    @event.Symbol);
+                _metrics.PrefetchQueryTimeouts.Add(1,
+                    new("symbol", @event.Symbol),
+                    new("query", "strategy_metrics"));
+            }
         }
 
         // ── Pre-fetch regime snapshots for all distinct timeframes ───────────
         // Hoisted above the loop so that multiple strategies sharing the same
-        // symbol/timeframe don't each trigger a separate DB query.
+        // symbol/timeframe don't each trigger a separate DB query. Bounded by a
+        // per-tick timeout — a slow regime table would otherwise make every
+        // symbol look unblocked (DB stall reads as "no blocked regime found")
+        // and bypass the whole regime filter silently. Fail-closed: drop the
+        // tick so the regime filter can never be implicitly bypassed.
         var regimeCache = new Dictionary<Timeframe, MarketRegimeEnum>();
         if (_options.BlockedRegimes.Count > 0)
         {
-            var timeframes = strategies.Select(s => s.Timeframe).Distinct();
-            foreach (var tf in timeframes)
+            var timeframes = strategies.Select(s => s.Timeframe).Distinct().ToList();
+            using var regimeCts = CancellationTokenSource.CreateLinkedTokenSource(_stoppingToken);
+            regimeCts.CancelAfter(TimeSpan.FromSeconds(prefetchTimeoutSeconds));
+            try
             {
-                var symbolLatestRegimePerTimeframe = await context.GetDbContext()
-                    .Set<Domain.Entities.MarketRegimeSnapshot>()
-                    .Where(x => x.Symbol == @event.Symbol && x.Timeframe == tf && !x.IsDeleted)
-                    .OrderByDescending(x => x.DetectedAt)
-                    .Select(x => x.Regime)
-                    .FirstOrDefaultAsync(_stoppingToken);
-                regimeCache[tf] = symbolLatestRegimePerTimeframe;
+                foreach (var tf in timeframes)
+                {
+                    var symbolLatestRegimePerTimeframe = await context.GetDbContext()
+                        .Set<Domain.Entities.MarketRegimeSnapshot>()
+                        .Where(x => x.Symbol == @event.Symbol && x.Timeframe == tf && !x.IsDeleted)
+                        .OrderByDescending(x => x.DetectedAt)
+                        .Select(x => x.Regime)
+                        .FirstOrDefaultAsync(regimeCts.Token);
+                    regimeCache[tf] = symbolLatestRegimePerTimeframe;
+                }
+            }
+            catch (OperationCanceledException) when (!_stoppingToken.IsCancellationRequested)
+            {
+                _logger.LogWarning(
+                    "StrategyWorker: regime pre-fetch timed out after {Timeout}s for {Symbol} — dropping tick (fail-closed)",
+                    prefetchTimeoutSeconds, @event.Symbol);
+                _metrics.PrefetchQueryTimeouts.Add(1,
+                    new("symbol", @event.Symbol),
+                    new("query", "regime"));
+                _metrics.SignalsFiltered.Add(1, new("symbol", @event.Symbol), new("stage", "regime_prefetch_timeout"));
+                return;
+            }
+            catch (Exception ex) when (!_stoppingToken.IsCancellationRequested)
+            {
+                _logger.LogError(ex,
+                    "StrategyWorker: regime pre-fetch failed for {Symbol} — dropping tick (fail-closed)",
+                    @event.Symbol);
+                _metrics.PrefetchQueryTimeouts.Add(1,
+                    new("symbol", @event.Symbol),
+                    new("query", "regime"));
+                _metrics.SignalsFiltered.Add(1, new("symbol", @event.Symbol), new("stage", "regime_prefetch_error"));
+                return;
             }
         }
 
@@ -523,30 +626,38 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
         // Strategies must have at least one successful backtest that meets minimum
         // quality thresholds before they can generate live signals. This prevents
         // untested or poorly-performing strategies from producing real trades.
-        var backtestQualifiedIds = await GetBacktestQualifiedStrategyIdsAsync(
-            context.GetDbContext(), strategyIds, _stoppingToken);
-
-        // ── Pre-fetch Sharpe ratios for conflict resolution scoring ──────────
-        // Used by the SignalConflictResolver to rank competing signals from the
-        // same symbol. Fetched once before the parallel loop to avoid N+1 queries.
-        var strategySharpeCache = new Dictionary<long, decimal>();
-        if (strategyIds.Count > 0)
+        // Wrapped in a per-call timeout: if the gate query stalls (large
+        // BacktestRun table or DB contention) we treat nothing as qualified
+        // rather than blocking the whole symbol indefinitely.
+        HashSet<long> backtestQualifiedIds;
+        using (var gateCts = CancellationTokenSource.CreateLinkedTokenSource(_stoppingToken))
         {
-            var sharpeData = await context.GetDbContext()
-                .Set<Domain.Entities.StrategyPerformanceSnapshot>()
-                .Where(x => strategyIds.Contains(x.StrategyId) && !x.IsDeleted)
-                .GroupBy(x => x.StrategyId)
-                .Select(g => new
-                {
-                    StrategyId = g.Key,
-                    SharpeRatio = g.OrderByDescending(x => x.EvaluatedAt).First().SharpeRatio
-                })
-                .ToListAsync(_stoppingToken);
-
-            strategySharpeCache = sharpeData.ToDictionary(s => s.StrategyId, s => s.SharpeRatio);
-
-            //foreach (var s in sharpeData)
-            //    strategySharpeCache[s.StrategyId] = s.SharpeRatio;
+            gateCts.CancelAfter(TimeSpan.FromSeconds(prefetchTimeoutSeconds));
+            try
+            {
+                backtestQualifiedIds = await GetBacktestQualifiedStrategyIdsAsync(
+                    context.GetDbContext(), strategyIds, gateCts.Token);
+            }
+            catch (OperationCanceledException) when (!_stoppingToken.IsCancellationRequested)
+            {
+                _logger.LogWarning(
+                    "StrategyWorker: backtest-qualification query timed out after {Timeout}s for {Symbol} — no strategies qualify on this tick",
+                    prefetchTimeoutSeconds, @event.Symbol);
+                _metrics.PrefetchQueryTimeouts.Add(1,
+                    new("symbol", @event.Symbol),
+                    new("query", "backtest_qualification"));
+                backtestQualifiedIds = [];
+            }
+            catch (Exception ex) when (!_stoppingToken.IsCancellationRequested)
+            {
+                _logger.LogError(ex,
+                    "StrategyWorker: backtest-qualification query failed for {Symbol} — no strategies qualify on this tick",
+                    @event.Symbol);
+                _metrics.PrefetchQueryTimeouts.Add(1,
+                    new("symbol", @event.Symbol),
+                    new("query", "backtest_qualification"));
+                backtestQualifiedIds = [];
+            }
         }
 
         // ── Regime coherence check (cross-timeframe alignment) ───────────────
@@ -742,6 +853,13 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
                 var evaluator = _evaluators.FirstOrDefault(e => e.StrategyType == strategy.StrategyType);
                 if (evaluator is null)
                 {
+                    // Missing-evaluator registrations previously went unnoticed until
+                    // someone traced the decision log. Emit a tagged metric so a
+                    // broken DI binding surfaces on dashboards within seconds, not
+                    // after an operator digs through audit rows.
+                    _metrics.EvaluatorMissing.Add(1,
+                        new("strategy_type", strategy.StrategyType.ToString()),
+                        new("symbol", strategy.Symbol));
                     _logger.LogWarning("No evaluator found for StrategyType={Type}", strategy.StrategyType);
 
                     // Per-iteration scope for scoped services (DbContext, mediator, filters)
@@ -1270,6 +1388,32 @@ public partial class StrategyWorker : BackgroundService, IIntegrationEventHandle
                     TimeSpan originalDuration = signal.ExpiresAt - DateTime.UtcNow;
                     if (originalDuration > TimeSpan.Zero)
                         adjustedExpiry = DateTime.UtcNow.Add(TimeSpan.FromTicks((long)(originalDuration.Ticks * ttlMult)));
+                }
+
+                // ── Adaptive TTL across market closures ─────────────────────────
+                // Without this, a signal generated late Friday or during the
+                // weekend closure would typically expire before Monday's open
+                // and contribute nothing but noise. When the market is closed
+                // and the current expiry would fall during that closure, extend
+                // to <NextMarketOpen> + MarketClosedGracePeriodMinutes so the
+                // signal has a real chance to fill on reopen.
+                if (_options.AdaptiveSignalTtlEnabled)
+                {
+                    var nowUtc = DateTime.UtcNow;
+                    if (_marketHoursCalendar.IsMarketClosed(signal.Symbol, nowUtc))
+                    {
+                        var reopen = _marketHoursCalendar.NextMarketOpen(signal.Symbol, nowUtc);
+                        var graceExpiry = reopen.AddMinutes(Math.Max(0, _options.MarketClosedGracePeriodMinutes));
+                        if (adjustedExpiry < graceExpiry)
+                        {
+                            _logger.LogInformation(
+                                "StrategyWorker: market closed for {Symbol} at {Now:u} — extending signal expiry {OldExpiry:u} → {NewExpiry:u} (reopen {Reopen:u} + {Grace}m grace)",
+                                signal.Symbol, nowUtc, adjustedExpiry, graceExpiry, reopen, _options.MarketClosedGracePeriodMinutes);
+                            adjustedExpiry = graceExpiry;
+                            _metrics.SignalTtlExtendedMarketClosed.Add(1,
+                                new KeyValuePair<string, object?>("symbol", signal.Symbol));
+                        }
+                    }
                 }
 
                 // ── Collect candidate signal for conflict resolution ─────────

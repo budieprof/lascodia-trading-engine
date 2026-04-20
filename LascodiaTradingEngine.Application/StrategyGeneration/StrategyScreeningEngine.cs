@@ -394,6 +394,76 @@ public class StrategyScreeningEngine
         gateTrace.Add(new("WalkForward", true, gateSw.Elapsed.TotalMilliseconds));
         gateSw.Restart();
 
+        // ── Lookahead audit (continuity check) ─────────────────────────────
+        // Runs the same strategy on the full IS+OOS candle range as ONE
+        // continuous backtest and compares the aggregate result to the
+        // concatenation of the IS and OOS backtests. If the evaluator or
+        // backtest engine is silently consuming future candles around the
+        // IS→OOS boundary (a common lookahead failure mode), the full-range
+        // run will produce a materially different trade count / PnL. Tolerances
+        // are deliberately generous (50% defaults) because legitimate warmup
+        // differences exist — this gate is tuned to catch gross leakage,
+        // not millimetre precision. Audit failures are unlikely false positives
+        // but easy false negatives, so the generous threshold is by design.
+        if (config.LookaheadAuditEnabled && allCandles.Count >= 200)
+        {
+            BacktestResult? fullResult = null;
+            try
+            {
+                using var auditCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                auditCts.CancelAfter(TimeSpan.FromSeconds(config.ScreeningTimeoutSeconds));
+                fullResult = await _backtestEngine.RunAsync(tempStrategy, allCandles,
+                    config.ScreeningInitialBalance, auditCts.Token, screeningOptions);
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                _logger.LogDebug(
+                    "StrategyScreening: lookahead audit full-range backtest timed out for {Type} on {Symbol}/{Tf} — skipping gate",
+                    strategyType, symbol, timeframe);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex,
+                    "StrategyScreening: lookahead audit full-range backtest failed for {Type} on {Symbol}/{Tf} — skipping gate",
+                    strategyType, symbol, timeframe);
+            }
+
+            if (fullResult != null)
+            {
+                int splitTradeCount = trainResult.TotalTrades + oosResult.TotalTrades;
+                decimal splitPnl = (trainResult.FinalBalance - trainResult.InitialBalance)
+                                 + (oosResult.FinalBalance - oosResult.InitialBalance);
+                decimal fullPnl = fullResult.FinalBalance - fullResult.InitialBalance;
+
+                double tradeCountDelta = splitTradeCount <= 0
+                    ? 0.0
+                    : Math.Abs(fullResult.TotalTrades - splitTradeCount) / (double)splitTradeCount;
+
+                decimal pnlDenominator = Math.Max(1m, Math.Abs(splitPnl));
+                double pnlDelta = (double)(Math.Abs(fullPnl - splitPnl) / pnlDenominator);
+
+                bool tradeDivergence = tradeCountDelta > config.LookaheadAuditMaxTradeCountDelta;
+                bool pnlDivergence   = pnlDelta > config.LookaheadAuditMaxPnlDelta;
+
+                if (tradeDivergence || pnlDivergence)
+                {
+                    gateTrace.Add(new("LookaheadAudit", false, gateSw.Elapsed.TotalMilliseconds));
+                    _onGateRejection?.Invoke("lookahead_audit");
+                    return BuildFailedOutcome(
+                        ScreeningFailureReason.LookaheadAudit,
+                        "LookaheadAuditRejected",
+                        $"{strategyType} on {symbol}/{timeframe} lookahead audit failed: " +
+                        $"trades is+oos={splitTradeCount} vs full={fullResult.TotalTrades} (Δ={tradeCountDelta:P1} > {config.LookaheadAuditMaxTradeCountDelta:P0}); " +
+                        $"pnl is+oos={splitPnl:F2} vs full={fullPnl:F2} (Δ={pnlDelta:P1} > {config.LookaheadAuditMaxPnlDelta:P0})",
+                        trainResult,
+                        oosResult);
+                }
+            }
+        }
+
+        gateTrace.Add(new("LookaheadAudit", true, gateSw.Elapsed.TotalMilliseconds));
+        gateSw.Restart();
+
         // ── Monte Carlo permutation test (#6: variable seed) ──
         // Fix #10: Include date ordinal so different runs on new data produce different random trials
         var utcNow = _timeProvider.GetUtcNow().UtcDateTime;
@@ -1129,6 +1199,35 @@ public sealed record ScreeningConfig
     /// the multiple-testing burden. Minimum 1 — zero/negative short-circuits the gate.
     /// </summary>
     public int DeflatedSharpeTrials { get; init; } = 1;
+
+    /// <summary>
+    /// When true (default), runs a post-walk-forward lookahead audit: the same
+    /// strategy is replayed on the full IS+OOS candle range and the aggregate
+    /// trade count / PnL is compared to the concatenation of the IS and OOS
+    /// backtests. A large divergence signals the evaluator or backtest engine is
+    /// peeking at future candles around the IS→OOS boundary — the candidate is
+    /// rejected with <see cref="ScreeningFailureReason.LookaheadAudit"/>.
+    /// Disabling is intended for offline tooling only; leave enabled in production.
+    /// </summary>
+    public bool LookaheadAuditEnabled { get; init; } = true;
+
+    /// <summary>
+    /// Maximum allowed relative delta between the full-range trade count and
+    /// (IS + OOS) trade counts. Defaults to 0.50 (50%). A perfectly-warmed-up
+    /// evaluator typically sits within ~10–20%; 50% leaves room for legitimate
+    /// warmup effects while still catching gross lookahead. Delta computed as
+    /// <c>|full − (is + oos)| / max(1, is + oos)</c>.
+    /// </summary>
+    public double LookaheadAuditMaxTradeCountDelta { get; init; } = 0.50;
+
+    /// <summary>
+    /// Maximum allowed relative delta between the full-range net profit and
+    /// (IS + OOS) combined net profit, using the IS+OOS magnitude as the
+    /// denominator. Defaults to 0.50 (50%). Trade count alone can match while
+    /// PnL diverges when lookahead produces different exit timings, so both
+    /// bounds are enforced.
+    /// </summary>
+    public double LookaheadAuditMaxPnlDelta { get; init; } = 0.50;
 }
 
 /// <summary>Result of screening a single candidate.</summary>

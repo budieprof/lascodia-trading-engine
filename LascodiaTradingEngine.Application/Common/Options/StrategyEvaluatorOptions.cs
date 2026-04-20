@@ -1616,4 +1616,37 @@ public class StrategyEvaluatorOptions : ConfigurationOption<StrategyEvaluatorOpt
     /// Defaults to 10.
     /// </summary>
     public int LockTimeoutSeconds { get; set; } = 10;
+
+    /// <summary>
+    /// Per-call timeout in seconds for the hot-path pre-fetch DB queries
+    /// (backtest qualification gate, per-strategy metrics snapshot, per-timeframe
+    /// regime snapshot). On timeout the worker fails closed — unqualified strategies
+    /// are excluded, regime pre-fetch aborts the tick — and increments
+    /// <c>PrefetchQueryTimeouts</c>. Prevents a slow database from starving every
+    /// symbol on the tick. Defaults to 5.
+    /// </summary>
+    public int PrefetchQueryTimeoutSeconds { get; set; } = 5;
+
+    /// <summary>
+    /// TTL in seconds for the in-memory per-strategy metrics cache (Sharpe and
+    /// health status). Misses and expired entries are refilled by a single batch
+    /// DB query. Event-driven invalidation on <c>BacktestCompletedIntegrationEvent</c>
+    /// and <c>StrategyActivatedIntegrationEvent</c> guarantees freshness across
+    /// state changes that affect conflict resolution. Defaults to 60.
+    /// </summary>
+    public int StrategyMetricsCacheTtlSeconds { get; set; } = 60;
+
+    /// <summary>
+    /// When true (default), the worker extends <c>ExpiresAt</c> on signals generated
+    /// during a market-closed window so they survive to the next open plus
+    /// <see cref="MarketClosedGracePeriodMinutes"/>. Prevents bulk Friday-evening
+    /// expirations and signals dying over weekends / holidays.
+    /// </summary>
+    public bool AdaptiveSignalTtlEnabled { get; set; } = true;
+
+    /// <summary>
+    /// Grace window after market reopen during which extended signals remain valid.
+    /// Defaults to 30 minutes.
+    /// </summary>
+    public int MarketClosedGracePeriodMinutes { get; set; } = 30;
 }

@@ -40,6 +40,12 @@ public sealed class TradingMetrics
     public Histogram<double> StrategyEvaluationMs   { get; }
     public Histogram<double> SignalDedupLatencyMs   { get; }
     public Counter<long>     SignalDedupDuplicates  { get; }
+    public Counter<long>     EvaluatorMissing       { get; }
+    public Counter<long>     PrefetchQueryTimeouts  { get; }
+    public Counter<long>     StrategyMetricsCacheHits { get; }
+    public Counter<long>     StrategyMetricsCacheMisses { get; }
+    public Counter<long>     StrategyMetricsCacheInvalidations { get; }
+    public Counter<long>     SignalTtlExtendedMarketClosed { get; }
 
     // ── Validation / promotion defaults telemetry ────────────────────────────
     // Tagged counters that let operators calibrate the new default floors added in
@@ -244,6 +250,12 @@ public sealed class TradingMetrics
         StrategyEvaluationMs = _meter.CreateHistogram<double>("trading.strategy.evaluation_duration", "ms", "Strategy evaluation pipeline duration per tick");
         SignalDedupLatencyMs = _meter.CreateHistogram<double>("trading.signals.dedup_latency", "ms", "Tier 1 signal dedup latency (in-process + DB atomic mark). Tagged with outcome=accepted|duplicate.");
         SignalDedupDuplicates = _meter.CreateCounter<long>("trading.signals.dedup_duplicates", "signals", "Duplicate signal deliveries caught by Tier 1 dedup. Tagged with layer=in_process|cross_instance.");
+        EvaluatorMissing = _meter.CreateCounter<long>("trading.signals.evaluator_missing", "events", "Tick-time dispatches where no IStrategyEvaluator is registered for the strategy's StrategyType. Tagged with strategy_type.");
+        PrefetchQueryTimeouts = _meter.CreateCounter<long>("trading.signals.prefetch_query_timeouts", "events", "Per-tick pre-fetch DB queries that exceeded their timeout (fail-closed path). Tagged with query={backtest_qualification|strategy_metrics|regime}.");
+        StrategyMetricsCacheHits = _meter.CreateCounter<long>("trading.strategy_metrics_cache.hits", "lookups", "In-memory strategy-metrics cache hits on the hot tick path.");
+        StrategyMetricsCacheMisses = _meter.CreateCounter<long>("trading.strategy_metrics_cache.misses", "lookups", "In-memory strategy-metrics cache misses that triggered a DB refresh.");
+        StrategyMetricsCacheInvalidations = _meter.CreateCounter<long>("trading.strategy_metrics_cache.invalidations", "events", "Strategy-metrics cache entries invalidated by integration events. Tagged with trigger={backtest_completed|strategy_activated}.");
+        SignalTtlExtendedMarketClosed = _meter.CreateCounter<long>("trading.signals.ttl_extended_market_closed", "signals", "Signals whose ExpiresAt was extended to cover a market-closed window before the next open. Tagged with symbol.");
 
         WalkForwardFoldRejections = _meter.CreateCounter<long>("trading.walk_forward.fold_rejections", "runs", "Walk-forward runs rejected. Tagged with reason=min_in_sample_days|min_out_of_sample_days|min_candles_per_fold|min_trades_per_fold.");
         PromotionGateRejections = _meter.CreateCounter<long>("trading.strategy_promotion.gate_rejections", "strategies", "Strategies rejected by promotion gates. Tagged with gate=live_vs_backtest_sharpe|critical_snapshot|insufficient_snapshots|insufficient_healthy.");
