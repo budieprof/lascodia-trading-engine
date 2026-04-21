@@ -27,6 +27,10 @@ public class InDatabaseLivePriceCache : ILivePriceCache
     private Timer? _evictionTimer;
     private int _persistFailures;        // Consecutive persist failures (for alerting)
     private DateTime _lastPersistWarn = DateTime.MinValue;
+    // Count of consecutive eviction cycles in which ≥3 symbols went stale. Used to
+    // distinguish a transient broker-connection flap (one cycle) from a sustained data
+    // feed interruption (multiple consecutive cycles). Only the latter deserves a CRIT.
+    private int _consecutiveMassEvictionCycles;
 
     public InDatabaseLivePriceCache(
         IServiceScopeFactory scopeFactory,
@@ -87,12 +91,30 @@ public class InDatabaseLivePriceCache : ILivePriceCache
                 "Evicted {Count} stale prices from live price cache (TTL={Ttl}). Symbols: {Symbols}",
                 evicted, StalePriceTtl, string.Join(",", staleSymbols));
 
-            // Multiple symbols going stale simultaneously indicates price feed interruption
+            // Escalate to CRIT only when mass evictions persist across two consecutive
+            // cycles (≈2 × TTL ≈ 10 min of no ticks). A single mass-evict is usually a
+            // broker-side connection flap that resolves within minutes — CRIT on every
+            // one spams operator alerts with transient events.
             if (evicted >= 3)
-                _logger.LogCritical(
-                    "PRICE FEED ALERT: {Count} symbols simultaneously stale — possible EA disconnect or " +
-                    "data feed interruption. Stale symbols: {Symbols}",
-                    evicted, string.Join(",", staleSymbols));
+            {
+                _consecutiveMassEvictionCycles++;
+                if (_consecutiveMassEvictionCycles >= 2)
+                {
+                    _logger.LogCritical(
+                        "PRICE FEED ALERT: {Count} symbols simultaneously stale across {Cycles} cycles — " +
+                        "likely EA disconnect or data feed interruption. Stale symbols: {Symbols}",
+                        evicted, _consecutiveMassEvictionCycles, string.Join(",", staleSymbols));
+                }
+            }
+            else
+            {
+                _consecutiveMassEvictionCycles = 0;
+            }
+        }
+        else
+        {
+            // Any cycle with zero evictions means feed is healthy again — reset the counter.
+            _consecutiveMassEvictionCycles = 0;
         }
     }
 
