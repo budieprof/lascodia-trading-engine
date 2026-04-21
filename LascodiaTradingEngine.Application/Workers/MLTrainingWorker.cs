@@ -1954,8 +1954,14 @@ trainingSamplesBuilt:;
             // act. Marking terminal frees the queue slot and stops the per-attempt warning
             // spam. Sample-count failures remain retryable because data can accumulate or
             // the window can be widened between attempts.
+            //
+            // Drift-gate rejection from TabNet is also policy-terminal: the training window
+            // is non-stationary, and retrying immediately won't fix it — the window has to
+            // age out and new data has to arrive. Retry loops there just spam fail-level logs.
+            bool isDriftGateRejection = ex.Message.Contains("drift gate rejected training", StringComparison.OrdinalIgnoreCase);
             bool isTerminalError =
-                ex.Message.Contains("Triple-barrier multipliers asymmetric", StringComparison.OrdinalIgnoreCase);
+                ex.Message.Contains("Triple-barrier multipliers asymmetric", StringComparison.OrdinalIgnoreCase)
+                || isDriftGateRejection;
 
             bool canRetry = !isTerminalError && run.AttemptCount < run.MaxAttempts;
 
@@ -1980,8 +1986,21 @@ trainingSamplesBuilt:;
                 run.ErrorMessage       = $"[Permanently failed after {run.AttemptCount} attempt(s)] {ex.Message}";
                 run.TrainingDurationMs = sw.ElapsedMilliseconds;
 
-                _logger.LogError(ex,
-                    "Run {RunId} permanently failed after {Attempts} attempt(s).", run.Id, run.AttemptCount);
+                // Policy-driven terminal outcomes (drift gate refusing to fit a non-stationary
+                // window, etc.) are expected operational events rather than faults. Log them
+                // at Warning with a one-line summary instead of a full Error + stack trace so
+                // the operator error stream stays focused on genuine exceptions.
+                if (isDriftGateRejection)
+                {
+                    _logger.LogWarning(
+                        "Run {RunId} terminated by TabNet drift gate after {Attempts} attempt(s): {Reason}",
+                        run.Id, run.AttemptCount, ex.Message);
+                }
+                else
+                {
+                    _logger.LogError(ex,
+                        "Run {RunId} permanently failed after {Attempts} attempt(s).", run.Id, run.AttemptCount);
+                }
             }
 
             try
