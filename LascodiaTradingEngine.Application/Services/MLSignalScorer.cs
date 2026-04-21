@@ -128,6 +128,8 @@ public sealed class MLSignalScorer : IMLSignalScorer
     private readonly global::LascodiaTradingEngine.Application.Services.ML.IOnnxInferenceEngine _onnxEngine;
     private readonly global::LascodiaTradingEngine.Application.Services.ITickFlowProvider? _tickFlowProvider;
     private readonly global::LascodiaTradingEngine.Application.Services.IOrderBookFeatureProvider? _orderBookProvider;
+    private readonly global::LascodiaTradingEngine.Application.Common.Interfaces.IActiveCpcEncoderProvider? _cpcEncoderProvider;
+    private readonly global::LascodiaTradingEngine.Application.Common.Interfaces.ICpcEncoderProjection? _cpcProjection;
 
     /// <summary>
     /// Tracks models already loaded into <see cref="_onnxEngine"/> so repeat scoring
@@ -145,7 +147,9 @@ public sealed class MLSignalScorer : IMLSignalScorer
         global::LascodiaTradingEngine.Application.Services.ML.EconomicEventFeatureProvider eventProvider,
         global::LascodiaTradingEngine.Application.Services.ML.IOnnxInferenceEngine onnxEngine,
         global::LascodiaTradingEngine.Application.Services.ITickFlowProvider? tickFlowProvider = null,
-        global::LascodiaTradingEngine.Application.Services.IOrderBookFeatureProvider? orderBookProvider = null)
+        global::LascodiaTradingEngine.Application.Services.IOrderBookFeatureProvider? orderBookProvider = null,
+        global::LascodiaTradingEngine.Application.Common.Interfaces.IActiveCpcEncoderProvider? cpcEncoderProvider = null,
+        global::LascodiaTradingEngine.Application.Common.Interfaces.ICpcEncoderProjection? cpcProjection = null)
     {
         _context           = context;
         _cache             = cache;
@@ -158,6 +162,8 @@ public sealed class MLSignalScorer : IMLSignalScorer
         _onnxEngine        = onnxEngine;
         _tickFlowProvider  = tickFlowProvider;
         _orderBookProvider = orderBookProvider;
+        _cpcEncoderProvider = cpcEncoderProvider;
+        _cpcProjection     = cpcProjection;
     }
 
     private IModelInferenceEngine? ResolveEngine(ModelSnapshot snap)
@@ -630,7 +636,8 @@ public sealed class MLSignalScorer : IMLSignalScorer
             RawProbability:               (decimal)baseRawProb,
             CalibratedProbability:        (decimal)baseCalibP,
             ServedCalibratedProbability:  (decimal)effectiveCalibP,
-            DecisionThresholdUsed:        (decimal)threshold);
+            DecisionThresholdUsed:        (decimal)threshold,
+            RawFeaturesJson:              JsonSerializer.Serialize(rawFeatures));
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1526,7 +1533,12 @@ public sealed class MLSignalScorer : IMLSignalScorer
         // correctly dispatch to their original feature schema instead of defaulting
         // to V1. This is what stops the "mask length 37 != feature count 33" crash.
         int expectedInputFeatures = snap.ResolveExpectedInputFeatures();
-        if (expectedInputFeatures == MLFeatureHelper.FeatureCountV2 &&
+        int baseExpectedInputFeatures =
+            snap.FeatureInteractionPairs.Length > 0 && snap.InteractionBaseFeatureCount > 0
+                ? snap.InteractionBaseFeatureCount
+                : expectedInputFeatures;
+
+        if (baseExpectedInputFeatures == MLFeatureHelper.FeatureCountV2 &&
             builtRawFeatures.Length == MLFeatureHelper.FeatureCount)
         {
             try
@@ -1583,7 +1595,7 @@ public sealed class MLSignalScorer : IMLSignalScorer
         // cross-asset + 3 event slots), append the additional slots. Zero-fill on
         // partial failures so the scorer stays online with degraded calibration
         // rather than a hard failure.
-        if (expectedInputFeatures == MLFeatureHelper.FeatureCountV3 &&
+        if (baseExpectedInputFeatures == MLFeatureHelper.FeatureCountV3 &&
             builtRawFeatures.Length == MLFeatureHelper.FeatureCountV2)
         {
             var padded = new float[MLFeatureHelper.FeatureCountV3];
@@ -1637,7 +1649,7 @@ public sealed class MLSignalScorer : IMLSignalScorer
         // V4 dispatch: minute-level news proximity + tick-microstructure slots layered
         // on top of V3. Fires when the model expects 48 features but the incoming vector
         // is 43 (V3). Zero-fills any of the 5 new slots whose provider returns null.
-        if (expectedInputFeatures == MLFeatureHelper.FeatureCountV4 &&
+        if (baseExpectedInputFeatures == MLFeatureHelper.FeatureCountV4 &&
             builtRawFeatures.Length == MLFeatureHelper.FeatureCountV3)
         {
             var paddedV4 = new float[MLFeatureHelper.FeatureCountV4];
@@ -1684,7 +1696,7 @@ public sealed class MLSignalScorer : IMLSignalScorer
         // V5 dispatch: 4 synthetic-microstructure proxies on top of V4. Fires when
         // model expects 52 features but the incoming vector is 48 (V4). Zero-fills
         // when the tick-flow provider returns null.
-        if (expectedInputFeatures == MLFeatureHelper.FeatureCountV5 &&
+        if (baseExpectedInputFeatures == MLFeatureHelper.FeatureCountV5 &&
             builtRawFeatures.Length == MLFeatureHelper.FeatureCountV4)
         {
             var paddedV5 = new float[MLFeatureHelper.FeatureCountV5];
@@ -1718,7 +1730,7 @@ public sealed class MLSignalScorer : IMLSignalScorer
         // V6 dispatch: 5 real-DOM features layered on top of V5. Fires when model expects
         // 57 features but the incoming vector is 52 (V5). Zero-fills when no fresh
         // OrderBookSnapshot exists for the symbol.
-        if (expectedInputFeatures == MLFeatureHelper.FeatureCountV6 &&
+        if (baseExpectedInputFeatures == MLFeatureHelper.FeatureCountV6 &&
             builtRawFeatures.Length == MLFeatureHelper.FeatureCountV5)
         {
             var paddedV6 = new float[MLFeatureHelper.FeatureCountV6];
@@ -1748,6 +1760,63 @@ public sealed class MLSignalScorer : IMLSignalScorer
                     modelId, signal.Symbol);
             }
             builtRawFeatures = paddedV6;
+        }
+
+        // V7 dispatch: CpcEmbeddingBlockSize CPC-embedding slots appended to the V6 vector.
+        // Fires when model expects 73 features but the incoming vector is 57 (V6). Zero-fills
+        // the block when no active encoder exists — live scoring keeps producing finite outputs,
+        // but the pair underperforms until CpcPretrainerWorker produces one. V7 is strictly
+        // additive and trained in lockstep with this dispatch so parity audits hold.
+        if (baseExpectedInputFeatures == MLFeatureHelper.FeatureCountV7 &&
+            builtRawFeatures.Length == MLFeatureHelper.FeatureCountV6)
+        {
+            float[]? cpcEmbedding = null;
+            if (_cpcEncoderProvider is not null && _cpcProjection is not null)
+            {
+                try
+                {
+                    LascodiaTradingEngine.Domain.Enums.MarketRegime? regimeEnum = null;
+                    if (!string.IsNullOrEmpty(currentRegime) &&
+                        Enum.TryParse<LascodiaTradingEngine.Domain.Enums.MarketRegime>(currentRegime, ignoreCase: true, out var parsed))
+                    {
+                        regimeEnum = parsed;
+                    }
+
+                    var encoder = await _cpcEncoderProvider.GetAsync(
+                        signal.Symbol, signalTimeframe, regimeEnum, cancellationToken);
+                    if (encoder is not null)
+                    {
+                        // seqLen = window.Count - 1 because MLCpcSequenceBuilder consumes the
+                        // first candle as the prior-close reference for log-return normalisation.
+                        // Producing a (N-1)-step sequence from the N-candle lookback window is
+                        // the correct sizing and yields exactly one sequence whose last row —
+                        // the context embedding input — corresponds to the most recent candle.
+                        int seqLen = Math.Max(2, window.Count - 1);
+                        var seqs = global::LascodiaTradingEngine.Application.Services.ML.MLCpcSequenceBuilder.Build(
+                            window,
+                            seqLen: seqLen,
+                            stride: seqLen,
+                            maxSequences: 1);
+                        if (seqs.Count > 0)
+                            cpcEmbedding = _cpcProjection.ProjectLatest(encoder, seqs[0]);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex,
+                        "V7 CPC projection failed for model {ModelId} ({Symbol}) — zero-padding embedding block",
+                        modelId, signal.Symbol);
+                }
+            }
+
+            builtRawFeatures = MLFeatureHelper.BuildFeatureVectorV7(builtRawFeatures, cpcEmbedding);
+        }
+
+        if (snap.FeatureInteractionPairs.Length > 0)
+        {
+            builtRawFeatures = MLFeatureHelper.AppendInteractionFeatures(
+                builtRawFeatures,
+                snap.FeatureInteractionPairs);
         }
 
         var prepared = ElmFeaturePipelineHelper.PrepareSnapshotFeatures(

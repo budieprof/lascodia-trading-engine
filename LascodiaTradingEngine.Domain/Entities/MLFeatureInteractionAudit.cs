@@ -5,13 +5,13 @@ namespace LascodiaTradingEngine.Domain.Entities;
 
 /// <summary>
 /// Records the top-K pairwise feature interaction scores detected by
-/// <c>MLFeatureInteractionWorker</c> using random-forest H-statistic or ANOVA (Rec #34).
+/// <c>MLFeatureInteractionWorker</c> (Rec #34).
 /// </summary>
 /// <remarks>
-/// For each pair of features (i, j), the H-statistic measures what fraction of the
-/// variance in the model's predictions is attributable to the interaction term x_i × x_j
-/// (vs the individual main effects).  Pairs with high H-statistics are added as product
-/// features in subsequent training runs.
+/// The production worker scores each pair with a partial F-test: it compares a reduced
+/// model using each feature's individual contribution against a full model that also
+/// includes their product term. Pairs that pass the configured evidence thresholds can
+/// be appended as replayable product features in subsequent training runs.
 /// </remarks>
 public class MLFeatureInteractionAudit : Entity<long>
 {
@@ -36,11 +36,32 @@ public class MLFeatureInteractionAudit : Entity<long>
     /// <summary>Human-readable name of the second feature.</summary>
     public string    FeatureNameB         { get; set; } = string.Empty;
 
+    /// <summary>Feature schema version of the model snapshot that produced this audit.</summary>
+    public int       FeatureSchemaVersion { get; set; }
+
+    /// <summary>Base feature count before any interaction features are appended.</summary>
+    public int       BaseFeatureCount     { get; set; }
+
+    /// <summary>Number of finite, schema-compatible prediction rows used for the test.</summary>
+    public int       SampleCount          { get; set; }
+
+    /// <summary>Statistical method used to compute the score.</summary>
+    public string    Method               { get; set; } = string.Empty;
+
     /// <summary>
-    /// H-statistic (Friedman) or ANOVA F-ratio measuring the interaction strength.
-    /// Higher values indicate a stronger interaction requiring a product feature.
+    /// Partial F-ratio measuring the incremental value of the product term after
+    /// controlling for the two individual feature contributions.
     /// </summary>
     public double    InteractionScore     { get; set; }
+
+    /// <summary>Incremental R² gained by adding the product term.</summary>
+    public double    EffectSize           { get; set; }
+
+    /// <summary>Approximate p-value for the interaction term.</summary>
+    public double    PValue               { get; set; } = 1.0;
+
+    /// <summary>Benjamini-Hochberg false-discovery-adjusted p-value across tested pairs.</summary>
+    public double    QValue               { get; set; } = 1.0;
 
     /// <summary>Rank of this pair among all pairs tested (1 = strongest).</summary>
     public int       Rank                 { get; set; }

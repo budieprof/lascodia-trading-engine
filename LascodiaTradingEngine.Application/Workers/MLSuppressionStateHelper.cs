@@ -18,13 +18,16 @@ internal static class MLSuppressionStateHelper
         DbContext db,
         MLModel model,
         CancellationToken ct,
-        long? ignoreConformalBreakerId = null)
+        long? ignoreConformalBreakerId = null,
+        IReadOnlyCollection<long>? ignoreConformalBreakerIds = null)
     {
+        var ignoredBreakerIds = ignoreConformalBreakerIds ?? Array.Empty<long>();
         bool breakerStillActive = await db.Set<MLConformalBreakerLog>()
             .AnyAsync(b => b.MLModelId == model.Id
                         && b.IsActive
                         && !b.IsDeleted
-                        && (!ignoreConformalBreakerId.HasValue || b.Id != ignoreConformalBreakerId.Value), ct);
+                        && (!ignoreConformalBreakerId.HasValue || b.Id != ignoreConformalBreakerId.Value)
+                        && !ignoredBreakerIds.Contains(b.Id), ct);
         if (breakerStillActive)
             return false;
 

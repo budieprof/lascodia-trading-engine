@@ -262,8 +262,12 @@ public class CompositeMLEvaluator : IStrategyEvaluator
         // Use the snapshot's resolver so legacy models backfill from ActiveFeatureMask/
         // Features rather than collapsing to V1 when ExpectedInputFeatures wasn't persisted.
         int expectedFeatures = snapshot.ResolveExpectedInputFeatures();
+        int baseExpectedFeatures =
+            snapshot.FeatureInteractionPairs.Length > 0 && snapshot.InteractionBaseFeatureCount > 0
+                ? snapshot.InteractionBaseFeatureCount
+                : expectedFeatures;
 
-        if (expectedFeatures == MLFeatureHelper.FeatureCountV2 &&
+        if (baseExpectedFeatures == MLFeatureHelper.FeatureCountV2 &&
             features.Length == MLFeatureHelper.FeatureCount)
         {
             try
@@ -309,7 +313,7 @@ public class CompositeMLEvaluator : IStrategyEvaluator
         }
 
         // ── 4c. V3 dispatch: cross-asset + event features appended to V2 ───────
-        if (expectedFeatures == MLFeatureHelper.FeatureCountV3 &&
+        if (baseExpectedFeatures == MLFeatureHelper.FeatureCountV3 &&
             features.Length == MLFeatureHelper.FeatureCountV2)
         {
             var v3 = new float[MLFeatureHelper.FeatureCountV3];
@@ -346,7 +350,7 @@ public class CompositeMLEvaluator : IStrategyEvaluator
         }
 
         // ── 4d. V4 dispatch: minute-level news + tick microstructure on top of V3 ──
-        if (expectedFeatures == MLFeatureHelper.FeatureCountV4 &&
+        if (baseExpectedFeatures == MLFeatureHelper.FeatureCountV4 &&
             features.Length == MLFeatureHelper.FeatureCountV3)
         {
             var v4 = new float[MLFeatureHelper.FeatureCountV4];
@@ -389,7 +393,7 @@ public class CompositeMLEvaluator : IStrategyEvaluator
         }
 
         // ── 4e. V5 dispatch: synthetic-microstructure proxies on top of V4 ────
-        if (expectedFeatures == MLFeatureHelper.FeatureCountV5 &&
+        if (baseExpectedFeatures == MLFeatureHelper.FeatureCountV5 &&
             features.Length == MLFeatureHelper.FeatureCountV4)
         {
             var v5 = new float[MLFeatureHelper.FeatureCountV5];
@@ -422,7 +426,7 @@ public class CompositeMLEvaluator : IStrategyEvaluator
         }
 
         // ── 4f. V6 dispatch: real-DOM features layered on top of V5 ────────
-        if (expectedFeatures == MLFeatureHelper.FeatureCountV6 &&
+        if (baseExpectedFeatures == MLFeatureHelper.FeatureCountV6 &&
             features.Length == MLFeatureHelper.FeatureCountV5)
         {
             var v6 = new float[MLFeatureHelper.FeatureCountV6];
@@ -452,6 +456,54 @@ public class CompositeMLEvaluator : IStrategyEvaluator
                     strategy.Symbol, model.Id);
             }
             features = v6;
+        }
+
+        // ── 4g. V7 dispatch: CPC context-embedding block layered on top of V6 ───
+        // Fires when model expects 73 features but the incoming vector is 57 (V6).
+        // Zero-fills the block when no active MLCpcEncoder exists for (symbol, timeframe).
+        if (baseExpectedFeatures == MLFeatureHelper.FeatureCountV7 &&
+            features.Length == MLFeatureHelper.FeatureCountV6)
+        {
+            float[]? cpcEmbedding = null;
+            try
+            {
+                using var v7Scope = _scopeFactory.CreateScope();
+                var encoderProvider = v7Scope.ServiceProvider.GetRequiredService<
+                    global::LascodiaTradingEngine.Application.Common.Interfaces.IActiveCpcEncoderProvider>();
+                var projection = v7Scope.ServiceProvider.GetRequiredService<
+                    global::LascodiaTradingEngine.Application.Common.Interfaces.ICpcEncoderProjection>();
+                // CompositeMLEvaluator has no regime in scope — pass null and rely on the
+                // provider's fallback to the global encoder. Regime-aware scoring is reserved
+                // for MLSignalScorer's V7 dispatch, which already threads currentRegime.
+                var encoder = await encoderProvider.GetAsync(strategy.Symbol, strategy.Timeframe, regime: null, cancellationToken);
+                if (encoder is not null)
+                {
+                    // seqLen = count - 1 (first candle is consumed as the prior-close reference).
+                    int seqLen = Math.Max(2, windowCandles.Count - 1);
+                    var seqs = global::LascodiaTradingEngine.Application.Services.ML.MLCpcSequenceBuilder.Build(
+                        windowCandles,
+                        seqLen: seqLen,
+                        stride: seqLen,
+                        maxSequences: 1);
+                    if (seqs.Count > 0)
+                        cpcEmbedding = projection.ProjectLatest(encoder, seqs[0]);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "V7 CPC projection failed for {Symbol} model {ModelId} — zero-padding embedding block",
+                    strategy.Symbol, model.Id);
+            }
+
+            features = MLFeatureHelper.BuildFeatureVectorV7(features, cpcEmbedding);
+        }
+
+        if (snapshot.FeatureInteractionPairs.Length > 0)
+        {
+            features = MLFeatureHelper.AppendInteractionFeatures(
+                features,
+                snapshot.FeatureInteractionPairs);
         }
 
         // ── 5. Resolve inference engine ────────────────────────────────────────

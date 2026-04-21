@@ -2761,6 +2761,16 @@ public class ModelSnapshot
     public int      FeatureSchemaVersion { get; set; }
 
     /// <summary>
+    /// Replayable product-feature pairs appended after the base schema. The scorer rebuilds
+    /// the base feature vector for <see cref="InteractionBaseFeatureCount"/> and then appends
+    /// each <c>x[A] * x[B]</c> term in this order.
+    /// </summary>
+    public FeatureInteractionPairDescriptor[] FeatureInteractionPairs { get; set; } = [];
+
+    /// <summary>Base feature count before <see cref="FeatureInteractionPairs"/> were appended.</summary>
+    public int      InteractionBaseFeatureCount { get; set; }
+
+    /// <summary>
     /// Resolve the authoritative raw-feature-vector length for this snapshot, backfilling
     /// from dependent fields when <see cref="ExpectedInputFeatures"/> was not persisted.
     /// Legacy snapshots (trained before the field was saved) would otherwise default to 33
@@ -2789,6 +2799,7 @@ public class ModelSnapshot
     {
         if (FeatureSchemaVersion > 0) return FeatureSchemaVersion;
         int count = ResolveExpectedInputFeatures();
+        if (count == MLFeatureHelper.FeatureCountV7) return 7;
         if (count == MLFeatureHelper.FeatureCountV6) return 6;
         if (count == MLFeatureHelper.FeatureCountV5) return 5;
         if (count == MLFeatureHelper.FeatureCountV4) return 4;
@@ -4752,4 +4763,17 @@ public class ModelSnapshot
     public double RocketCalibrationResidualMean { get; set; }
     public double RocketCalibrationResidualStd { get; set; }
     public double RocketCalibrationResidualThreshold { get; set; }
+}
+
+public sealed class FeatureInteractionPairDescriptor
+{
+    public int    A     { get; set; }
+    public int    B     { get; set; }
+    public string NameA { get; set; } = string.Empty;
+    public string NameB { get; set; } = string.Empty;
+
+    public string FeatureName =>
+        string.IsNullOrWhiteSpace(NameA) || string.IsNullOrWhiteSpace(NameB)
+            ? $"Interaction_{A}_{B}"
+            : $"{NameA}x{NameB}";
 }

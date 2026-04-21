@@ -2128,6 +2128,7 @@ public partial class StrategyWorker :
                 MLConformalPredictionSetJson = mlScore.ConformalPredictionSetJson,
                 MLEnsembleDisagreement = mlScore.EnsembleDisagreement,
                 MLScoringLatencyMs     = mlScoringLatencyMs,
+                MLRawFeaturesJson      = mlScore.RawFeaturesJson,
                 Timeframe              = pending.Timeframe,
                 ExpiresAt              = pending.ExpiresAt
             }, ct);

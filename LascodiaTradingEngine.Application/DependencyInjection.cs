@@ -103,6 +103,20 @@ public static class DependencyInjection
             .ValidateOnStart();
         services.AddSingleton(sp => sp.GetRequiredService<IOptions<MLConformalBreakerOptions>>().Value);
 
+        services.RemoveAll<MLCorrelatedFailureOptions>();
+        services.AddSingleton<IValidateOptions<MLCorrelatedFailureOptions>, MLCorrelatedFailureOptionsValidator>();
+        services.AddOptions<MLCorrelatedFailureOptions>()
+            .Bind(configuration.GetSection(nameof(MLCorrelatedFailureOptions)))
+            .ValidateOnStart();
+        services.AddSingleton(sp => sp.GetRequiredService<IOptions<MLCorrelatedFailureOptions>>().Value);
+
+        services.RemoveAll<MLErgodicityOptions>();
+        services.AddSingleton<IValidateOptions<MLErgodicityOptions>, MLErgodicityOptionsValidator>();
+        services.AddOptions<MLErgodicityOptions>()
+            .Bind(configuration.GetSection(nameof(MLErgodicityOptions)))
+            .ValidateOnStart();
+        services.AddSingleton(sp => sp.GetRequiredService<IOptions<MLErgodicityOptions>>().Value);
+
         // ── Strategy Worker ──────────────────────────────────────────────────────
         // Registered as singleton so the same instance is used both as the hosted
         // service and as the IIntegrationEventHandler resolved by the event bus.
@@ -193,6 +207,7 @@ public static class DependencyInjection
         services.AddHostedService<MLModelAutoRollbackWorker>();
         services.AddSingleton<IMLConformalCoverageEvaluator, MLConformalCoverageEvaluator>();
         services.AddSingleton<IMLConformalPredictionLogReader, MLConformalPredictionLogReader>();
+        services.AddSingleton<IMLConformalCalibrationReader, MLConformalCalibrationReader>();
         services.AddSingleton<IMLConformalBreakerStateStore, MLConformalBreakerStateStore>();
 
         // ── Portfolio-level optimisation (daily Kelly / HRP) ───────────────────

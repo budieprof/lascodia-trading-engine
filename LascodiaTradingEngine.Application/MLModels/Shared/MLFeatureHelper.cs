@@ -81,6 +81,27 @@ public static class MLFeatureHelper
     public const int FeatureCountV6 = 57;
 
     /// <summary>
+    /// Size of the Contrastive Predictive Coding (CPC) embedding block appended to the V6
+    /// vector in the V7 schema. Pinned so trainers and inference see a fixed input length;
+    /// <c>CpcPretrainerWorker</c> refuses to promote an encoder whose <c>EmbeddingDim</c>
+    /// differs from this value.
+    /// </summary>
+    public const int CpcEmbeddingBlockSize = 16;
+
+    /// <summary>
+    /// V7 vector length: 57 V6 features + 16 CPC context-embedding slots produced by
+    /// <see cref="Domain.Entities.MLCpcEncoder"/> (projected through
+    /// <see cref="Application.Services.ML.CpcEncoderProjection"/> at both training
+    /// and inference time). Slots 57..72 are the E-dim embedding of the latest candle
+    /// in the lookback window; zero-fill when no active encoder exists for the
+    /// (symbol, timeframe) — models trained on V7 should still produce finite scores
+    /// under that degradation, just without the self-supervised context signal.
+    /// Enabled via <c>MLTraining:UseV7CpcFeatureVector=true</c>; inference dispatch
+    /// routes on <c>snapshot.ExpectedInputFeatures == FeatureCountV7</c>.
+    /// </summary>
+    public const int FeatureCountV7 = FeatureCountV6 + CpcEmbeddingBlockSize;
+
+    /// <summary>
     /// Hard cap on production feature-vector length. Enforced by
     /// <see cref="AssertFeatureCountWithinCap"/> at training and inference time.
     ///
@@ -90,12 +111,13 @@ public static class MLFeatureHelper
     /// importance > 0.01 on a held-out slice that did not influence its construction.
     ///
     /// Bumped from 50 to 60 in 2026-04 when V5 (synthetic microstructure proxies) and
-    /// the upcoming V6 (real DOM features when MarketBookAdd is supported by the broker)
-    /// needed room. Justification: V5/V6 features capture order-flow dimension that
-    /// V1–V4 OHLCV-derived features fundamentally cannot — orthogonal information
-    /// warrants the additional capacity.
+    /// V6 (real DOM features when MarketBookAdd is supported by the broker) needed room.
+    /// Bumped from 60 to 80 in 2026-04 when V7 added a fixed CPC context-embedding block
+    /// (see <see cref="CpcEmbeddingBlockSize"/>). The extra capacity is earmarked for
+    /// this single block; adding more conventional features still requires the permutation-
+    /// importance justification.
     /// </summary>
-    public const int MaxAllowedFeatureCount = 60;
+    public const int MaxAllowedFeatureCount = 80;
 
     /// <summary>
     /// Assert a feature vector length is within the production cap. Call from
@@ -1547,6 +1569,67 @@ public static class MLFeatureHelper
             result[features.Length + i] = features[a] * features[b];
         }
         return result;
+    }
+
+    public static float[] AppendInteractionFeatures(
+        float[] features,
+        IReadOnlyList<FeatureInteractionPairDescriptor> pairs)
+    {
+        if (pairs.Count == 0) return features;
+        var result = new float[features.Length + pairs.Count];
+        Array.Copy(features, result, features.Length);
+        for (int i = 0; i < pairs.Count; i++)
+        {
+            var pair = pairs[i];
+            if (pair.A < 0 || pair.B < 0 || pair.A >= features.Length || pair.B >= features.Length)
+                throw new InvalidOperationException(
+                    $"Interaction pair ({pair.A},{pair.B}) is outside feature vector length {features.Length}.");
+
+            result[features.Length + i] = SanitizeScalar(features[pair.A] * features[pair.B]);
+        }
+
+        AssertFeatureCountWithinCap(result.Length, "AppendInteractionFeatures");
+        return result;
+    }
+
+    public static string[] ResolveFeatureNames(int featureCount)
+    {
+        var names = new string[featureCount];
+        for (int i = 0; i < featureCount; i++)
+        {
+            names[i] =
+                i < FeatureNames.Length ? FeatureNames[i] :
+                i < FeatureCountV2 ? MacroV2FeatureNames[i - FeatureCount] :
+                i < FeatureCountV3 ? V3FeatureNames[i - FeatureCountV2] :
+                i < FeatureCountV4 ? $"V4Feature{i}" :
+                i < FeatureCountV5 ? $"V5Feature{i}" :
+                i < FeatureCountV6 ? $"V6Feature{i}" :
+                i < FeatureCountV7 ? $"CpcEmbedding{i - FeatureCountV6}" :
+                $"F{i}";
+        }
+
+        return names;
+    }
+
+    public static string[] AppendInteractionFeatureNames(
+        string[] baseNames,
+        IReadOnlyList<FeatureInteractionPairDescriptor> pairs)
+    {
+        if (pairs.Count == 0) return baseNames;
+        var names = new string[baseNames.Length + pairs.Count];
+        Array.Copy(baseNames, names, baseNames.Length);
+        for (int i = 0; i < pairs.Count; i++)
+        {
+            var pair = pairs[i];
+            var a = pair.A >= 0 && pair.A < baseNames.Length ? baseNames[pair.A] : pair.NameA;
+            var b = pair.B >= 0 && pair.B < baseNames.Length ? baseNames[pair.B] : pair.NameB;
+            names[baseNames.Length + i] =
+                string.IsNullOrWhiteSpace(a) || string.IsNullOrWhiteSpace(b)
+                    ? $"Interaction_{pair.A}_{pair.B}"
+                    : $"{a}x{b}";
+        }
+
+        return names;
     }
 
     // ── Rec #22: SMOTE oversampling ───────────────────────────────────────────
@@ -4730,6 +4813,130 @@ public static class MLFeatureHelper
             var tickFlow      = tickFlowLookup(current.Timestamp);
             var orderBook     = orderBookLookup(current.Timestamp);
             var features      = BuildFeatureVectorV6(window, current, prev, slice, symbol, crossAsset, eventFeat, minuteEvents, tickFlow, orderBook, cotEntry);
+
+            float atr = (float)CalculateATR(window, 14);
+            if (atr <= 0f)
+            {
+                int fallbackDir = candles[i + 1].Close > candles[i].Close ? 1 : 0;
+                samples.Add(new TrainingSample(features, fallbackDir, 0f));
+                continue;
+            }
+
+            float profitTarget = atr * profitAtrMult + costBufferPriceUnits;
+            float stopLoss     = atr * stopAtrMult;
+            float entry        = (float)current.Close;
+
+            int   label     = 0;
+            float magnitude = 0f;
+
+            int maxLook = Math.Min(i + 1 + horizonBars, candles.Count);
+            for (int j = i + 1; j < maxLook; j++)
+            {
+                float hi = (float)candles[j].High;
+                float lo = (float)candles[j].Low;
+
+                bool profitHit = hi - entry >= profitTarget;
+                bool stopHit   = entry - lo  >= stopLoss;
+
+                if (profitHit && stopHit) { label = 1; magnitude = Clamp(profitTarget / atr, -5f, 5f); break; }
+                if (profitHit)            { label = 1; magnitude = Clamp((hi - entry) / atr, -5f, 5f); break; }
+                if (stopHit)              { label = 0; magnitude = Clamp((lo - entry) / atr, -5f, 5f); break; }
+            }
+
+            if (label == 0 && magnitude == 0f && maxLook > i + 1)
+            {
+                float exitClose = (float)candles[maxLook - 1].Close;
+                magnitude = Clamp((exitClose - entry) / atr, -5f, 5f);
+                label     = exitClose > entry ? 1 : 0;
+            }
+
+            samples.Add(new TrainingSample(features, label, magnitude));
+        }
+
+        return samples;
+    }
+
+    /// <summary>
+    /// V7 feature vector: <see cref="FeatureCountV6"/> V6 features + a fixed-size
+    /// <see cref="CpcEmbeddingBlockSize"/> CPC context-embedding block appended in slots
+    /// <c>[FeatureCountV6 .. FeatureCountV7)</c>. Zero-fills the block when
+    /// <paramref name="cpcEmbedding"/> is null (no active encoder for the pair) or the wrong
+    /// length (defensive — the worker's pinned-dim gate prevents this in practice).
+    ///
+    /// <para>
+    /// The caller owns encoder lookup and projection so this helper stays pure. Training
+    /// (<see cref="BuildTrainingSamplesWithTripleBarrierV7"/>) and inference
+    /// (<c>MLSignalScorer</c> V7 branch) both route through this helper, giving train/inference
+    /// parity automatically.
+    /// </para>
+    /// </summary>
+    public static float[] BuildFeatureVectorV7(
+        float[] v6Raw,
+        float[]? cpcEmbedding)
+    {
+        ArgumentNullException.ThrowIfNull(v6Raw);
+        if (v6Raw.Length != FeatureCountV6)
+        {
+            throw new InvalidOperationException(
+                $"BuildFeatureVectorV7 expects a V6 raw vector of length {FeatureCountV6}, got {v6Raw.Length}.");
+        }
+
+        var result = new float[FeatureCountV7];
+        Array.Copy(v6Raw, 0, result, 0, FeatureCountV6);
+
+        if (cpcEmbedding is null) return result;
+
+        int copy = Math.Min(cpcEmbedding.Length, CpcEmbeddingBlockSize);
+        for (int i = 0; i < copy; i++)
+            result[FeatureCountV6 + i] = SanitizeScalar(cpcEmbedding[i]);
+
+        return result;
+    }
+
+    /// <summary>
+    /// V7 training-sample builder. Identical to V6 except each sample's feature vector is the
+    /// V6 raw vector with an appended CPC embedding resolved via the caller-provided
+    /// <paramref name="cpcEmbeddingForWindow"/> callback. Callers should close over the active
+    /// <see cref="Domain.Entities.MLCpcEncoder"/> + <see cref="Application.Common.Interfaces.ICpcEncoderProjection"/>
+    /// once per (symbol, timeframe) outside this loop; the callback runs once per training sample
+    /// on the LookbackWindow-length candle window ending at the current bar.
+    /// </summary>
+    public static List<TrainingSample> BuildTrainingSamplesWithTripleBarrierV7(
+        List<Candle>                                                                                                           candles,
+        string                                                                                                                  symbol,
+        Dictionary<string, (DateTime[] Times, double[] Closes)>                                                                 fullBasket,
+        Func<DateTime, global::LascodiaTradingEngine.Application.Services.ML.CrossAssetSnapshot>                                 crossAssetLookup,
+        Func<DateTime, global::LascodiaTradingEngine.Application.Services.ML.EventFeatureSnapshot>                               eventLookup,
+        Func<DateTime, (float MinutesToNextHighNorm, float MinutesToNextMedHighNorm)>                                            minuteLevelEventLookup,
+        Func<DateTime, global::LascodiaTradingEngine.Application.Services.TickFlowSnapshot?>                                     tickFlowLookup,
+        Func<DateTime, global::LascodiaTradingEngine.Application.Services.OrderBookFeatureSnapshot?>                             orderBookLookup,
+        Func<List<Candle>, float[]?>                                                                                             cpcEmbeddingForWindow,
+        Func<DateTime, CotFeatureEntry>?                                                                                         cotLookup     = null,
+        float                                                                                                                   profitAtrMult = 1.5f,
+        float                                                                                                                   stopAtrMult   = 1.5f,
+        int                                                                                                                     horizonBars   = 24,
+        float                                                                                                                   costBufferPriceUnits = 0f)
+    {
+        ArgumentNullException.ThrowIfNull(cpcEmbeddingForWindow);
+
+        var samples = new List<TrainingSample>(candles.Count);
+
+        for (int i = LookbackWindow; i < candles.Count - 1; i++)
+        {
+            var window  = candles.GetRange(i - LookbackWindow, LookbackWindow);
+            var current = candles[i];
+            var prev    = window[^1];
+
+            var cotEntry      = cotLookup?.Invoke(current.Timestamp) ?? CotFeatureEntry.Zero;
+            var slice         = global::LascodiaTradingEngine.Application.Services.ML.MacroFeatureCalculator.SliceBasketAsOf(fullBasket, current.Timestamp);
+            var crossAsset    = crossAssetLookup(current.Timestamp);
+            var eventFeat     = eventLookup(current.Timestamp);
+            var minuteEvents  = minuteLevelEventLookup(current.Timestamp);
+            var tickFlow      = tickFlowLookup(current.Timestamp);
+            var orderBook     = orderBookLookup(current.Timestamp);
+            var v6            = BuildFeatureVectorV6(window, current, prev, slice, symbol, crossAsset, eventFeat, minuteEvents, tickFlow, orderBook, cotEntry);
+            var cpcEmbedding  = cpcEmbeddingForWindow(window);
+            var features      = BuildFeatureVectorV7(v6, cpcEmbedding);
 
             float atr = (float)CalculateATR(window, 14);
             if (atr <= 0f)

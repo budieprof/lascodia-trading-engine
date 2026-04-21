@@ -12,13 +12,16 @@ public sealed class MLConformalBreakerStateStore : IMLConformalBreakerStateStore
 {
     private readonly ILogger<MLConformalBreakerStateStore> _logger;
     private readonly TradingMetrics _metrics;
+    private readonly TimeProvider _timeProvider;
 
     public MLConformalBreakerStateStore(
         ILogger<MLConformalBreakerStateStore> logger,
-        TradingMetrics metrics)
+        TradingMetrics metrics,
+        TimeProvider? timeProvider = null)
     {
         _logger = logger;
         _metrics = metrics;
+        _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     public async Task<BreakerStateResult> ApplyAsync(
@@ -28,19 +31,21 @@ public sealed class MLConformalBreakerStateStore : IMLConformalBreakerStateStore
         IReadOnlyCollection<BreakerRefreshCandidate> refreshCandidates,
         CancellationToken ct)
     {
-        BreakerStateResult result = new(0, 0, 0, 0, []);
+        BreakerStateResult result = new(0, 0, 0, 0, 0, 0, 0, []);
         var strategy = db.Database.CreateExecutionStrategy();
         await strategy.ExecuteAsync(async token =>
         {
             db.ChangeTracker.Clear();
             await using var transaction = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable, token);
 
-            var now = DateTime.UtcNow;
+            var now = _timeProvider.GetUtcNow().UtcDateTime;
             var alerts = new List<BreakerAlertDispatch>();
 
             int expiredCount = await ClearExpiredBreakersAsync(db, now, token);
+            int duplicateRepairCount = await DeactivateDuplicateActiveBreakersAsync(db, token);
             int recoveredCount = await RecoverBreakersAsync(db, recoveryCandidates, token);
             int refreshedCount = await RefreshBreakersAsync(db, refreshCandidates, token);
+            int trippedCount = 0;
 
             foreach (var candidate in tripCandidates)
             {
@@ -59,20 +64,28 @@ public sealed class MLConformalBreakerStateStore : IMLConformalBreakerStateStore
                     candidate.Evaluation.CoverageUpperBound,
                     candidate.CoverageThreshold);
 
-                var existing = await db.Set<MLConformalBreakerLog>()
-                    .FirstOrDefaultAsync(
-                        b => b.MLModelId == candidate.MLModelId
-                             && b.Symbol == candidate.Symbol
-                             && b.Timeframe == candidate.Timeframe
-                             && b.IsActive,
-                        token);
+                var existingBreakers = await db.Set<MLConformalBreakerLog>()
+                    .Where(b => b.MLModelId == candidate.MLModelId
+                                && b.Symbol == candidate.Symbol
+                                && b.Timeframe == candidate.Timeframe
+                                && b.IsActive)
+                    .OrderByDescending(b => b.SuspendedAt)
+                    .ThenByDescending(b => b.Id)
+                    .ToListAsync(token);
 
-                if (existing is not null)
+                if (existingBreakers.Count > 0)
                 {
+                    var existing = existingBreakers[0];
                     ApplyDiagnostics(existing, candidate.Evaluation, candidate.TargetCoverage, candidate.CoverageThreshold);
                     existing.SuspensionBars = candidate.SuspensionBars;
                     existing.SuspendedAt    = now;
                     existing.ResumeAt       = resumeAt;
+
+                    foreach (var duplicate in existingBreakers.Skip(1))
+                    {
+                        duplicate.IsActive = false;
+                        duplicateRepairCount++;
+                    }
                 }
                 else
                 {
@@ -107,6 +120,7 @@ public sealed class MLConformalBreakerStateStore : IMLConformalBreakerStateStore
                     $"ML conformal breaker suppressed model {candidate.MLModelId} on {candidate.Symbol}/{candidate.Timeframe}: " +
                     $"reason={candidate.Evaluation.TripReason}, coverage={candidate.Evaluation.EmpiricalCoverage:P1}, " +
                     $"target={candidate.TargetCoverage:P1}, resumeAt={resumeAt:O}."));
+                trippedCount++;
             }
 
             await db.SaveChangesAsync(token);
@@ -114,10 +128,43 @@ public sealed class MLConformalBreakerStateStore : IMLConformalBreakerStateStore
 
             int activeBreakers = await db.Set<MLConformalBreakerLog>()
                 .CountAsync(b => b.IsActive && !b.IsDeleted, token);
-            result = new BreakerStateResult(expiredCount, recoveredCount, refreshedCount, activeBreakers, alerts);
+            if (duplicateRepairCount > 0)
+                _metrics.MLConformalBreakerDuplicateRepairs.Add(duplicateRepairCount);
+            result = new BreakerStateResult(
+                expiredCount,
+                recoveredCount,
+                refreshedCount,
+                trippedCount,
+                duplicateRepairCount,
+                alerts.Count,
+                activeBreakers,
+                alerts);
         }, ct);
 
         return result;
+    }
+
+    private static async Task<int> DeactivateDuplicateActiveBreakersAsync(DbContext db, CancellationToken token)
+    {
+        var activeBreakers = await db.Set<MLConformalBreakerLog>()
+            .Where(b => b.IsActive && !b.IsDeleted)
+            .OrderBy(b => b.MLModelId)
+            .ThenBy(b => b.Symbol)
+            .ThenBy(b => b.Timeframe)
+            .ThenByDescending(b => b.SuspendedAt)
+            .ThenByDescending(b => b.Id)
+            .ToListAsync(token);
+
+        int deactivated = 0;
+        foreach (var duplicate in activeBreakers
+                     .GroupBy(b => new { b.MLModelId, b.Symbol, b.Timeframe })
+                     .SelectMany(g => g.Skip(1)))
+        {
+            duplicate.IsActive = false;
+            deactivated++;
+        }
+
+        return deactivated;
     }
 
     private async Task<int> ClearExpiredBreakersAsync(DbContext db, DateTime now, CancellationToken token)
@@ -155,14 +202,28 @@ public sealed class MLConformalBreakerStateStore : IMLConformalBreakerStateStore
         foreach (var candidate in recoveryCandidates)
         {
             token.ThrowIfCancellationRequested();
-            var breaker = await db.Set<MLConformalBreakerLog>()
-                .FirstOrDefaultAsync(
-                    b => b.Id == candidate.BreakerId && b.IsActive,
-                    token);
-            if (breaker is null)
+            var activeBreakers = await db.Set<MLConformalBreakerLog>()
+                .Where(b => b.Id == candidate.BreakerId && b.IsActive)
+                .ToListAsync(token);
+            activeBreakers.AddRange(await db.Set<MLConformalBreakerLog>()
+                .Where(b => b.MLModelId == candidate.MLModelId
+                            && b.Symbol == candidate.Symbol
+                            && b.Timeframe == candidate.Timeframe
+                            && b.IsActive
+                            && b.Id != candidate.BreakerId)
+                .ToListAsync(token));
+
+            if (activeBreakers.Count == 0)
                 continue;
 
-            breaker.IsActive = false;
+            var breaker = activeBreakers
+                .OrderByDescending(b => b.SuspendedAt)
+                .ThenByDescending(b => b.Id)
+                .First();
+            foreach (var activeBreaker in activeBreakers)
+            {
+                activeBreaker.IsActive = false;
+            }
             ApplyDiagnostics(breaker, candidate.Evaluation, breaker.TargetCoverage, breaker.CoverageThreshold);
             recoveredCount++;
 
@@ -170,7 +231,10 @@ public sealed class MLConformalBreakerStateStore : IMLConformalBreakerStateStore
                 .FirstOrDefaultAsync(m => m.Id == candidate.MLModelId, token);
             if (suppressed is not null &&
                 await MLSuppressionStateHelper.CanLiftSuppressionAsync(
-                    db, suppressed, token, ignoreConformalBreakerId: breaker.Id))
+                    db,
+                    suppressed,
+                    token,
+                    ignoreConformalBreakerIds: activeBreakers.Select(b => b.Id).ToArray()))
                 suppressed.IsSuppressed = false;
 
             _metrics.MLConformalBreakerRecoveries.Add(1,
@@ -196,14 +260,29 @@ public sealed class MLConformalBreakerStateStore : IMLConformalBreakerStateStore
         foreach (var candidate in refreshCandidates)
         {
             token.ThrowIfCancellationRequested();
-            var breaker = await db.Set<MLConformalBreakerLog>()
-                .FirstOrDefaultAsync(
-                    b => b.Id == candidate.BreakerId && b.IsActive,
-                    token);
-            if (breaker is null)
+            var activeBreakers = await db.Set<MLConformalBreakerLog>()
+                .Where(b => b.Id == candidate.BreakerId && b.IsActive)
+                .ToListAsync(token);
+            activeBreakers.AddRange(await db.Set<MLConformalBreakerLog>()
+                .Where(b => b.MLModelId == candidate.MLModelId
+                            && b.Symbol == candidate.Symbol
+                            && b.Timeframe == candidate.Timeframe
+                            && b.IsActive
+                            && b.Id != candidate.BreakerId)
+                .ToListAsync(token));
+
+            if (activeBreakers.Count == 0)
                 continue;
 
+            var breaker = activeBreakers
+                .OrderByDescending(b => b.SuspendedAt)
+                .ThenByDescending(b => b.Id)
+                .First();
             ApplyDiagnostics(breaker, candidate.Evaluation, candidate.TargetCoverage, candidate.CoverageThreshold);
+            foreach (var duplicate in activeBreakers.Where(b => b.Id != breaker.Id))
+            {
+                duplicate.IsActive = false;
+            }
             refreshedCount++;
 
             _metrics.MLConformalBreakerRefreshes.Add(1,

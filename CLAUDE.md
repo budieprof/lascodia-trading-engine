@@ -194,6 +194,87 @@ Categories (keep counts; see `Workers/` for exact names):
 
 ---
 
+## CPC Encoder (V7 feature vector) — Rollout Recipe
+
+The V7 feature vector appends a fixed-size CPC (Contrastive Predictive Coding) context embedding to the V6 raw vector (`FeatureCountV7 = FeatureCountV6 + CpcEmbeddingBlockSize = 73`). Encoders are trained and rotated by `CpcPretrainerWorker` per `(Symbol, Timeframe, Regime?)` triple. V7 is opt-in — `MLTraining:UseV7CpcFeatureVector` is **false** by default so existing V1–V6 models keep scoring unchanged until you flip the flag.
+
+### Operational rollout path
+
+All keys live in the `EngineConfig` table and are hot-reloadable — no redeploy required to flip any of these.
+
+**1. Let encoders train (cheap, safe).** Leave all config at defaults. `CpcPretrainerWorker` runs under `WorkerBulkhead.MLTraining` every `MLCpc:PollIntervalSeconds` (3600s) and produces one `MLCpcEncoder` per `(Symbol, Timeframe)` pair that has an active `MLModel`. You can monitor:
+
+```sql
+SELECT "Symbol", "Timeframe", "Regime", "EncoderType", "InfoNceLoss", "TrainedAt"
+  FROM "MLCpcEncoder" WHERE "IsActive" AND NOT "IsDeleted"
+  ORDER BY "TrainedAt" DESC;
+```
+
+**2. Enable V7 training for a single pair first (staged).** The trainer reads `MLTraining:UseV7CpcFeatureVector` at the start of each run — flip it on globally, but enqueue a training run only for the pilot symbol:
+
+```sql
+INSERT INTO "EngineConfig" ("Key", "Value", "DataType", "IsHotReloadable", "LastUpdatedAt")
+  VALUES ('MLTraining:UseV7CpcFeatureVector', 'true', 2, TRUE, NOW());
+```
+
+Queue a training run for EURUSD/H1 (or your pilot pair) via `POST /api/v1/lascodia-trading-engine/ml-training/queue` (or however your pipeline currently enqueues runs). Confirm the resulting snapshot:
+
+```sql
+SELECT m."Symbol", m."Timeframe",
+       (m."ModelBytes"::jsonb->>'ExpectedInputFeatures')::int   AS expected_features,
+       (m."ModelBytes"::jsonb->>'FeatureSchemaVersion')::int   AS schema_version
+  FROM "MLModel" m WHERE m."IsActive" AND NOT m."IsDeleted"
+  ORDER BY m."Id" DESC LIMIT 5;
+```
+
+A healthy V7 model shows `expected_features=73` and `schema_version=7`.
+
+**3. Compare V7 vs V6 on live data.** Run both models through `MLShadowArbiterWorker`'s SPRT tournament (standard ML-promotion pipeline). V7 wins only if it materially beats V6 on the out-of-sample signal PnL test. If it loses, proceed to step 4.
+
+**4. Rollback** — flip the flag back:
+
+```sql
+UPDATE "EngineConfig" SET "Value"='false', "LastUpdatedAt"=NOW()
+  WHERE "Key"='MLTraining:UseV7CpcFeatureVector';
+```
+
+New training runs immediately fall back to V6. Existing V7 snapshots keep scoring (their `FeatureSchemaVersion=7` routes through `MLSignalScorer`'s V7 dispatch); rotate them out via the usual retirement path if you want to fully drop V7.
+
+### Encoder architecture upgrades
+
+`MLCpc:EncoderType` (values: `Linear` / `Tcn`) picks the architecture `CpcPretrainerWorker` produces on the next cycle. Default `Linear` — single-step `ReLU(W·x)`, lightweight, ~200-byte payload. `Tcn` uses a 2-layer dilated causal convolution with residual (receptive field ≈ 7 steps) — measurably slower to train, captures temporal context. Switch only if linear V7 underperforms V6 on soak data; existing Linear-typed `MLCpcEncoder` rows keep working because `CpcEncoderProjection` dispatches on `EncoderType`.
+
+### Per-regime encoders
+
+`MLCpc:TrainPerRegime=true` makes the worker enumerate each `MarketRegime` value per pair and train regime-specific encoders using `MarketRegimeSnapshot` to partition candles by the regime active at each bar. Inference (`MLSignalScorer` V7 dispatch) passes the current regime to `IActiveCpcEncoderProvider`, which prefers a regime-specific encoder and falls back to the global (null-regime) row if none exists. Default **off** — per-regime training multiplies the worker's per-cycle workload and is only worth turning on once you have soak evidence that a single global encoder per pair is too coarse.
+
+### V7 monitoring quick checks
+
+```sql
+-- V7 adoption rate on active models
+SELECT COALESCE((m."ModelBytes"::jsonb->>'FeatureSchemaVersion')::int, 0) AS schema_version,
+       COUNT(*) AS active_count
+  FROM "MLModel" m WHERE m."IsActive" AND NOT m."IsDeleted"
+  GROUP BY schema_version ORDER BY schema_version;
+
+-- CPC encoder health per pair
+SELECT "Symbol", "Timeframe", "Regime", "EncoderType",
+       AGE(NOW(), "TrainedAt") AS age, "InfoNceLoss"
+  FROM "MLCpcEncoder" WHERE "IsActive" AND NOT "IsDeleted"
+  ORDER BY "TrainedAt" ASC;
+
+-- Recent CPC pretraining decisions and quality-gate outcomes
+SELECT "Symbol", "Timeframe", "Regime", "EncoderType",
+       "Outcome", "Reason", "PriorInfoNceLoss",
+       "TrainInfoNceLoss", "ValidationInfoNceLoss",
+       "TrainingSequences", "ValidationSequences", "TrainingDurationMs",
+       "EvaluatedAt"
+  FROM "MLCpcEncoderTrainingLog" WHERE NOT "IsDeleted"
+  ORDER BY "EvaluatedAt" DESC LIMIT 50;
+```
+
+---
+
 ## Authentication & Accounts
 
 - `Broker` entity removed — broker name/server live on `TradingAccount`. Login = AccountId + BrokerServer.

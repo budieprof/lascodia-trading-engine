@@ -1,9 +1,12 @@
 using System.Text.Json;
+using System.Diagnostics;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Options;
 using LascodiaTradingEngine.Application.Common.WorkerGroups;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
@@ -39,18 +42,55 @@ namespace LascodiaTradingEngine.Application.Workers;
 /// </summary>
 public sealed class MLCorrelatedFailureWorker : BackgroundService
 {
-    // ── Config keys ────────────────────────────────────────────────────────────
-    private const string CK_PollSecs           = "MLCorrelated:PollIntervalSeconds";
-    private const string CK_AlarmRatio         = "MLCorrelated:AlarmRatio";
-    private const string CK_RecoveryRatio      = "MLCorrelated:RecoveryRatio";
-    private const string CK_MinModelsForAlarm  = "MLCorrelated:MinModelsForAlarm";
-    private const string CK_AccThreshold       = "MLTraining:DriftAccuracyThreshold";
-    private const string CK_WindowDays         = "MLTraining:DriftWindowDays";
-    private const string CK_MinPredictions     = "MLTraining:DriftMinPredictions";
+    private const string WorkerName = nameof(MLCorrelatedFailureWorker);
+    private const string DistributedLockKey = "ml:correlated-failure:cycle";
+
     private const string CK_SystemicPause      = "MLTraining:SystemicPauseActive";
+
+    private const int AlertPayloadSchemaVersion = 1;
 
     private readonly IServiceScopeFactory                  _scopeFactory;
     private readonly ILogger<MLCorrelatedFailureWorker>    _logger;
+    private readonly IDistributedLock?                     _distributedLock;
+    private readonly TimeProvider                          _timeProvider;
+    private readonly IWorkerHealthMonitor?                 _healthMonitor;
+    private readonly TradingMetrics?                       _metrics;
+    private readonly MLCorrelatedFailureOptions            _options;
+    private readonly MLCorrelatedFailureConfigReader       _configReader;
+
+    private static class EventIds
+    {
+        public static readonly EventId PauseActivated = new(4101, nameof(PauseActivated));
+        public static readonly EventId PauseRecovered = new(4102, nameof(PauseRecovered));
+        public static readonly EventId LockSkipped = new(4103, nameof(LockSkipped));
+        public static readonly EventId StateChangeCooldown = new(4104, nameof(StateChangeCooldown));
+    }
+
+    private sealed record ActiveModelSnapshot(long Id, string Symbol, Timeframe Timeframe);
+
+    private sealed record ModelPredictionStats(
+        long MLModelId,
+        int DirectionTotal,
+        int CorrectCount,
+        int ProfitTotal,
+        int ProfitableCount);
+
+    private sealed record FailingModelSnapshot(
+        long ModelId,
+        string Symbol,
+        Timeframe Timeframe,
+        int PredictionCount,
+        double Accuracy);
+
+    private sealed record CorrelatedFailureEvaluation(
+        int ActiveModelCount,
+        int EvaluatedModelCount,
+        int FailingModelCount,
+        int ModelsWithoutPredictions,
+        int ModelsBelowMinPredictions,
+        double FailureRatio,
+        IReadOnlyList<string> AffectedSymbols,
+        IReadOnlyList<FailingModelSnapshot> FailingModels);
 
     /// <summary>
     /// Initialises the worker with its required dependencies.
@@ -63,10 +103,22 @@ public sealed class MLCorrelatedFailureWorker : BackgroundService
     /// <param name="logger">Structured logger for correlated failure events.</param>
     public MLCorrelatedFailureWorker(
         IServiceScopeFactory                scopeFactory,
-        ILogger<MLCorrelatedFailureWorker>  logger)
+        ILogger<MLCorrelatedFailureWorker>  logger,
+        IDistributedLock?                   distributedLock = null,
+        TimeProvider?                       timeProvider = null,
+        IWorkerHealthMonitor?               healthMonitor = null,
+        TradingMetrics?                     metrics = null,
+        MLCorrelatedFailureOptions?         options = null,
+        MLCorrelatedFailureConfigReader?    configReader = null)
     {
-        _scopeFactory = scopeFactory;
-        _logger       = logger;
+        _scopeFactory    = scopeFactory;
+        _logger          = logger;
+        _distributedLock = distributedLock;
+        _timeProvider    = timeProvider ?? TimeProvider.System;
+        _healthMonitor   = healthMonitor;
+        _metrics         = metrics;
+        _options         = options ?? new MLCorrelatedFailureOptions();
+        _configReader    = configReader ?? new MLCorrelatedFailureConfigReader(_options);
     }
 
     /// <summary>
@@ -80,39 +132,23 @@ public sealed class MLCorrelatedFailureWorker : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation("MLCorrelatedFailureWorker started.");
+        _healthMonitor?.RecordWorkerMetadata(
+            WorkerName,
+            "Detects simultaneous live ML model degradation and toggles systemic training pause.",
+            TimeSpan.FromSeconds(_options.PollIntervalSeconds));
 
         while (!stoppingToken.IsCancellationRequested)
         {
-            int pollSecs = 600; // default 10 min
+            int pollSecs = _options.PollIntervalSeconds; // default 10 min
+            var cycleStart = Stopwatch.GetTimestamp();
 
             try
             {
-                await WorkerBulkhead.MLMonitoring.WaitAsync(stoppingToken);
-                try
-                {
-                    await using var scope = _scopeFactory.CreateAsyncScope();
-                    var writeDb  = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
-                    var readDb   = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
-                    var readCtx  = readDb.GetDbContext();
-                    var writeCtx = writeDb.GetDbContext();
-
-                    pollSecs = await GetConfigAsync<int>   (readCtx, CK_PollSecs,       600,  stoppingToken);
-                    double alarmRatio     = await GetConfigAsync<double>(readCtx, CK_AlarmRatio,     0.40, stoppingToken);
-                    double recoveryRatio  = await GetConfigAsync<double>(readCtx, CK_RecoveryRatio,  0.20, stoppingToken);
-                    int    minModels      = await GetConfigAsync<int>   (readCtx, CK_MinModelsForAlarm, 3, stoppingToken);
-                    double accThreshold   = await GetConfigAsync<double>(readCtx, CK_AccThreshold,   0.50, stoppingToken);
-                    int    windowDays     = await GetConfigAsync<int>   (readCtx, CK_WindowDays,     14,   stoppingToken);
-                    int    minPredictions = await GetConfigAsync<int>   (readCtx, CK_MinPredictions,  30,   stoppingToken);
-
-                    await EvaluateCorrelatedFailureAsync(
-                        readCtx, writeCtx,
-                        alarmRatio, recoveryRatio, minModels, accThreshold, windowDays, minPredictions,
-                        stoppingToken);
-                }
-                finally
-                {
-                    WorkerBulkhead.MLMonitoring.Release();
-                }
+                _healthMonitor?.RecordWorkerHeartbeat(WorkerName);
+                pollSecs = await RunCycleAsync(stoppingToken);
+                _healthMonitor?.RecordCycleSuccess(
+                    WorkerName,
+                    (long)Stopwatch.GetElapsedTime(cycleStart).TotalMilliseconds);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -120,13 +156,75 @@ public sealed class MLCorrelatedFailureWorker : BackgroundService
             }
             catch (Exception ex)
             {
+                _metrics?.WorkerErrors.Add(
+                    1,
+                    new KeyValuePair<string, object?>("worker", WorkerName));
+                _healthMonitor?.RecordCycleFailure(WorkerName, ex.Message);
                 _logger.LogError(ex, "MLCorrelatedFailureWorker loop error.");
             }
 
             await Task.Delay(TimeSpan.FromSeconds(pollSecs), stoppingToken);
         }
 
+        _healthMonitor?.RecordWorkerStopped(WorkerName);
         _logger.LogInformation("MLCorrelatedFailureWorker stopping.");
+    }
+
+    internal async Task<int> RunCycleAsync(CancellationToken ct)
+    {
+        IAsyncDisposable? cycleLock = null;
+        if (_distributedLock is not null)
+        {
+            cycleLock = await _distributedLock.TryAcquireAsync(
+                DistributedLockKey,
+                TimeSpan.FromSeconds(5),
+                ct);
+            if (cycleLock is null)
+            {
+                _metrics?.MLCorrelatedFailureLockAttempts.Add(
+                    1,
+                    new KeyValuePair<string, object?>("outcome", "busy"));
+                _logger.LogDebug(EventIds.LockSkipped, "MLCorrelatedFailureWorker: cycle skipped because distributed lock is held elsewhere.");
+                return _options.PollIntervalSeconds;
+            }
+
+            _metrics?.MLCorrelatedFailureLockAttempts.Add(
+                1,
+                new KeyValuePair<string, object?>("outcome", "acquired"));
+        }
+        else
+        {
+            _metrics?.MLCorrelatedFailureLockAttempts.Add(
+                1,
+                new KeyValuePair<string, object?>("outcome", "unavailable"));
+        }
+
+        await using (cycleLock)
+        {
+            await WorkerBulkhead.MLMonitoring.WaitAsync(ct);
+            try
+            {
+                await using var scope = _scopeFactory.CreateAsyncScope();
+                var writeDb  = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+                var readDb   = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+                var readCtx  = readDb.GetDbContext();
+                var writeCtx = writeDb.GetDbContext();
+
+                var config = await _configReader.LoadAsync(readCtx, ct);
+
+                await EvaluateCorrelatedFailureAsync(
+                    readCtx,
+                    writeCtx,
+                    config,
+                    ct);
+
+                return config.PollSeconds;
+            }
+            finally
+            {
+                WorkerBulkhead.MLMonitoring.Release();
+            }
+        }
     }
 
     // ── Core evaluation logic ──────────────────────────────────────────────────
@@ -143,24 +241,27 @@ public sealed class MLCorrelatedFailureWorker : BackgroundService
     /// <param name="accThreshold">Accuracy below which a model is considered failing.</param>
     /// <param name="windowDays">Rolling window (days) for prediction accuracy evaluation.</param>
     /// <param name="minPredictions">Minimum resolved predictions required to classify a model.</param>
+    /// <param name="stateChangeCooldownMinutes">Minimum minutes between pause state changes.</param>
     /// <param name="ct">Cancellation token.</param>
     private async Task EvaluateCorrelatedFailureAsync(
         Microsoft.EntityFrameworkCore.DbContext readCtx,
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
-        double                                  alarmRatio,
-        double                                  recoveryRatio,
-        int                                     minModelsForAlarm,
-        double                                  accThreshold,
-        int                                     windowDays,
-        int                                     minPredictions,
+        MLCorrelatedFailureRuntimeConfig        config,
         CancellationToken                       ct)
     {
         // ── 1. Load all active models ──────────────────────────────────────────
-        var activeModels = await readCtx.Set<MLModel>()
-            .Where(m => m.IsActive && !m.IsDeleted)
+        var activeModelRows = await readCtx.Set<MLModel>()
+            .Where(m => m.IsActive
+                        && !m.IsDeleted
+                        && !m.IsMetaLearner
+                        && !m.IsMamlInitializer
+                        && !m.IsSuppressed)
             .AsNoTracking()
-            .Select(m => new { m.Id, m.Symbol })
+            .Select(m => new { m.Id, m.Symbol, m.Timeframe })
             .ToListAsync(ct);
+        var activeModels = activeModelRows
+            .Select(m => new ActiveModelSnapshot(m.Id, m.Symbol, m.Timeframe))
+            .ToList();
 
         if (activeModels.Count == 0)
         {
@@ -169,50 +270,36 @@ public sealed class MLCorrelatedFailureWorker : BackgroundService
         }
 
         // ── 2. Batch-fetch prediction accuracy per model ───────────────────────
-        // Single query with GroupBy to avoid N+1.
-        var windowStart = DateTime.UtcNow.AddDays(-windowDays);
+        // Grouped batch queries avoid N+1 while keeping SQL parameter lists bounded.
+        var now = _timeProvider.GetUtcNow().UtcDateTime;
+        var windowStart = now.AddDays(-config.WindowDays);
         var modelIds    = activeModels.Select(m => m.Id).ToList();
 
-        var predictionStats = await readCtx.Set<MLModelPredictionLog>()
-            .Where(l => modelIds.Contains(l.MLModelId) &&
-                        !l.IsDeleted                   &&
-                        l.DirectionCorrect != null     &&
-                        l.PredictedAt >= windowStart)
-            .GroupBy(l => l.MLModelId)
-            .Select(g => new
-            {
-                MLModelId    = g.Key,
-                Total        = g.Count(),
-                CorrectCount = g.Count(l => l.DirectionCorrect == true),
-            })
-            .ToListAsync(ct);
+        var predictionStats = await LoadPredictionStatsAsync(
+            readCtx,
+            modelIds,
+            windowStart,
+            config.ModelStatsBatchSize,
+            ct);
 
-        var statsLookup = predictionStats.ToDictionary(s => s.MLModelId);
+        var evaluation = EvaluateModelStats(
+            activeModels,
+            predictionStats,
+            config.MinPredictions,
+            config.FailureThreshold,
+            config.FailureMetric);
 
-        // ── 3. Classify models ─────────────────────────────────────────────────
-        var failingSymbols = new List<string>();
-        int modelsWithEnoughPredictions = 0;
+        _metrics?.MLCorrelatedFailureModelsEvaluated.Add(evaluation.EvaluatedModelCount);
+        _metrics?.MLCorrelatedFailureModelsFailing.Add(evaluation.FailingModelCount);
+        _metrics?.MLCorrelatedFailureAffectedSymbols.Record(evaluation.AffectedSymbols.Count);
+        _metrics?.MLCorrelatedFailureRatio.Record(evaluation.FailureRatio);
+        RecordSkippedModels(evaluation);
 
-        foreach (var model in activeModels)
-        {
-            if (!statsLookup.TryGetValue(model.Id, out var stats))
-                continue; // No predictions at all — skip
-
-            if (stats.Total < minPredictions)
-                continue; // Not enough data to classify
-
-            modelsWithEnoughPredictions++;
-
-            double accuracy = (double)stats.CorrectCount / stats.Total;
-            if (accuracy < accThreshold)
-                failingSymbols.Add(model.Symbol);
-        }
-
-        if (modelsWithEnoughPredictions == 0)
+        if (evaluation.EvaluatedModelCount == 0)
         {
             _logger.LogDebug(
                 "MLCorrelatedFailureWorker: no models have >= {Min} predictions in window — skipping.",
-                minPredictions);
+                config.MinPredictions);
             return;
         }
 
@@ -225,136 +312,416 @@ public sealed class MLCorrelatedFailureWorker : BackgroundService
         // Observed 2026-04-15: GBPUSD/M15 (model 26, 13% accuracy) was the
         // sole evaluated model, triggering 100% ratio and blocking all training
         // for the entire queue of 23 runs.
-        if (modelsWithEnoughPredictions < minModelsForAlarm)
+        if (evaluation.EvaluatedModelCount < config.MinModelsForAlarm)
         {
             _logger.LogInformation(
                 "MLCorrelatedFailureWorker: only {Evaluated}/{Required} models evaluated " +
                 "(need {Required} for alarm). Skipping alarm check. Failing: {Failing} ({FailSymbols}).",
-                modelsWithEnoughPredictions, minModelsForAlarm, minModelsForAlarm,
-                failingSymbols.Count, string.Join(", ", failingSymbols));
+                evaluation.EvaluatedModelCount, config.MinModelsForAlarm, config.MinModelsForAlarm,
+                evaluation.FailingModelCount, string.Join(", ", evaluation.AffectedSymbols));
             return;
         }
 
-        int    failingCount  = failingSymbols.Count;
-        double failureRatio  = (double)failingCount / modelsWithEnoughPredictions;
+        int    failingCount  = evaluation.FailingModelCount;
+        double failureRatio  = evaluation.FailureRatio;
 
         _logger.LogDebug(
             "MLCorrelatedFailureWorker: {Failing}/{Total} models failing (ratio={Ratio:P1}, alarm={Alarm:P1}, recovery={Recovery:P1}).",
-            failingCount, modelsWithEnoughPredictions, failureRatio, alarmRatio, recoveryRatio);
+            failingCount, evaluation.EvaluatedModelCount, failureRatio, config.AlarmRatio, config.RecoveryRatio);
 
         // ── 4. Read current pause state ────────────────────────────────────────
-        bool currentlyPaused = await GetConfigAsync<bool>(readCtx, CK_SystemicPause, false, ct);
+        bool currentlyPaused = await GetConfigAsync(writeCtx, CK_SystemicPause, false, ct);
 
         // ── 5. Alarm: activate systemic pause ──────────────────────────────────
-        if (failureRatio >= alarmRatio)
+        if (failureRatio >= config.AlarmRatio)
         {
             if (!currentlyPaused)
             {
-                await UpsertConfigAsync(writeCtx, CK_SystemicPause, "true", ct);
-
-                var symbolsJson = JsonSerializer.Serialize(failingSymbols);
-
-                writeCtx.Set<MLCorrelatedFailureLog>().Add(new MLCorrelatedFailureLog
+                if (await HasRecentStateChangeAsync(writeCtx, now, config.StateChangeCooldownMinutes, ct))
                 {
-                    DetectedAt          = DateTime.UtcNow,
-                    FailingModelCount   = failingCount,
-                    TotalModelCount     = modelsWithEnoughPredictions,
-                    FailureRatio        = failureRatio,
-                    SymbolsAffectedJson = symbolsJson,
-                    PauseActivated      = true,
-                });
+                    _metrics?.MLCorrelatedFailureCooldownSkips.Add(
+                        1,
+                        new KeyValuePair<string, object?>("transition", "activate"));
+                    _logger.LogInformation(
+                        EventIds.StateChangeCooldown,
+                        "MLCorrelatedFailureWorker: activation skipped because state-change cooldown is active.");
+                    return;
+                }
 
-                writeCtx.Set<Alert>().Add(new Alert
+                var strategy = writeCtx.Database.CreateExecutionStrategy();
+                await strategy.ExecuteAsync(async token =>
                 {
-                    AlertType      = AlertType.SystemicMLDegradation,
-                    ConditionJson  = JsonSerializer.Serialize(new
+                    await using var tx = await writeCtx.Database.BeginTransactionAsync(token);
+                    bool pauseUnderLock = await GetConfigAsync(writeCtx, CK_SystemicPause, false, token);
+                    if (pauseUnderLock)
                     {
-                        Message  = $"Systemic ML degradation detected: {failingCount}/{modelsWithEnoughPredictions} models failing ({failureRatio:P1}). Training pause activated.",
-                        Symbols  = failingSymbols,
-                        Ratio    = failureRatio,
-                        Severity = "info",
-                    }),
-                    IsActive = true,
-                });
+                        await tx.CommitAsync(token);
+                        return;
+                    }
 
-                await writeCtx.SaveChangesAsync(ct);
+                    await UpsertConfigAsync(writeCtx, CK_SystemicPause, "true", token);
 
+                    var symbolsJson = JsonSerializer.Serialize(evaluation.AffectedSymbols);
+                    var failureDetailsJson = CreateFailureDetailsJson(evaluation);
+
+                    writeCtx.Set<MLCorrelatedFailureLog>().Add(new MLCorrelatedFailureLog
+                    {
+                        DetectedAt          = now,
+                        FailingModelCount   = failingCount,
+                        TotalModelCount     = evaluation.EvaluatedModelCount,
+                        ActiveModelCount    = evaluation.ActiveModelCount,
+                        EvaluatedModelCount = evaluation.EvaluatedModelCount,
+                        FailureRatio        = failureRatio,
+                        SymbolsAffectedJson = symbolsJson,
+                        FailureDetailsJson  = failureDetailsJson,
+                        PauseActivated      = true,
+                    });
+
+                    writeCtx.Set<Alert>().Add(new Alert
+                    {
+                        AlertType      = AlertType.SystemicMLDegradation,
+                        Severity       = AlertSeverity.High,
+                        Symbol         = "SYSTEM",
+                        DeduplicationKey = "MLCorrelatedFailure:SystemicPause:Global",
+                        CooldownSeconds = 3600,
+                        ConditionJson  = JsonSerializer.Serialize(new
+                        {
+                            SchemaVersion = AlertPayloadSchemaVersion,
+                            Message  = $"Systemic ML degradation detected: {failingCount}/{evaluation.EvaluatedModelCount} models failing ({failureRatio:P1}). Training pause activated.",
+                            Symbols  = evaluation.AffectedSymbols,
+                            FailingModels = evaluation.FailingModels.Select(m => new
+                            {
+                                m.ModelId,
+                                m.Symbol,
+                                Timeframe = m.Timeframe.ToString(),
+                                m.PredictionCount,
+                                Accuracy = m.Accuracy
+                            }).ToArray(),
+                            Ratio    = failureRatio,
+                            AlarmRatio = config.AlarmRatio,
+                            FailureMetric = config.FailureMetric.ToString(),
+                            EvaluatedModels = evaluation.EvaluatedModelCount,
+                            ActiveModels = evaluation.ActiveModelCount,
+                            Severity = "high",
+                        }),
+                        IsActive = true,
+                    });
+
+                    await writeCtx.SaveChangesAsync(token);
+                    await tx.CommitAsync(token);
+                }, ct);
+
+                _metrics?.MLCorrelatedFailurePauseActivations.Add(1);
                 _logger.LogWarning(
+                    EventIds.PauseActivated,
                     "Systemic ML degradation: {Failing}/{Total} models failing ({Ratio:P1} >= alarm {Alarm:P1}). " +
                     "Training pause ACTIVATED. Affected symbols: {Symbols}.",
-                    failingCount, modelsWithEnoughPredictions, failureRatio, alarmRatio,
-                    string.Join(", ", failingSymbols));
+                    failingCount, evaluation.EvaluatedModelCount, failureRatio, config.AlarmRatio,
+                    string.Join(", ", evaluation.AffectedSymbols));
             }
             else
             {
                 _logger.LogDebug(
                     "MLCorrelatedFailureWorker: systemic pause still active ({Failing}/{Total} failing, ratio={Ratio:P1}).",
-                    failingCount, modelsWithEnoughPredictions, failureRatio);
+                    failingCount, evaluation.EvaluatedModelCount, failureRatio);
             }
 
             return;
         }
 
         // ── 6. Recovery: lift systemic pause ───────────────────────────────────
-        if (failureRatio < recoveryRatio && currentlyPaused)
+        if (failureRatio < config.RecoveryRatio && currentlyPaused)
         {
-            await UpsertConfigAsync(writeCtx, CK_SystemicPause, "false", ct);
-
-            writeCtx.Set<MLCorrelatedFailureLog>().Add(new MLCorrelatedFailureLog
+            if (await HasRecentStateChangeAsync(writeCtx, now, config.StateChangeCooldownMinutes, ct))
             {
-                DetectedAt          = DateTime.UtcNow,
-                FailingModelCount   = failingCount,
-                TotalModelCount     = modelsWithEnoughPredictions,
-                FailureRatio        = failureRatio,
-                SymbolsAffectedJson = JsonSerializer.Serialize(failingSymbols),
-                PauseActivated      = false,
-            });
+                _metrics?.MLCorrelatedFailureCooldownSkips.Add(
+                    1,
+                    new KeyValuePair<string, object?>("transition", "recover"));
+                _logger.LogInformation(
+                    EventIds.StateChangeCooldown,
+                    "MLCorrelatedFailureWorker: recovery skipped because state-change cooldown is active.");
+                return;
+            }
 
-            await writeCtx.SaveChangesAsync(ct);
+            var strategy = writeCtx.Database.CreateExecutionStrategy();
+            await strategy.ExecuteAsync(async token =>
+            {
+                await using var tx = await writeCtx.Database.BeginTransactionAsync(token);
+                bool pauseUnderLock = await GetConfigAsync(writeCtx, CK_SystemicPause, false, token);
+                if (!pauseUnderLock)
+                {
+                    await tx.CommitAsync(token);
+                    return;
+                }
 
+                await UpsertConfigAsync(writeCtx, CK_SystemicPause, "false", token);
+
+                writeCtx.Set<MLCorrelatedFailureLog>().Add(new MLCorrelatedFailureLog
+                {
+                    DetectedAt          = now,
+                    FailingModelCount   = failingCount,
+                    TotalModelCount     = evaluation.EvaluatedModelCount,
+                    ActiveModelCount    = evaluation.ActiveModelCount,
+                    EvaluatedModelCount = evaluation.EvaluatedModelCount,
+                    FailureRatio        = failureRatio,
+                    SymbolsAffectedJson = JsonSerializer.Serialize(evaluation.AffectedSymbols),
+                    FailureDetailsJson  = CreateFailureDetailsJson(evaluation),
+                    PauseActivated      = false,
+                });
+
+                await writeCtx.SaveChangesAsync(token);
+                await tx.CommitAsync(token);
+            }, ct);
+
+            _metrics?.MLCorrelatedFailurePauseRecoveries.Add(1);
             _logger.LogInformation(
+                EventIds.PauseRecovered,
                 "Systemic ML recovery: failure ratio {Ratio:P1} < recovery threshold {Recovery:P1}. " +
                 "Training pause LIFTED.",
-                failureRatio, recoveryRatio);
+                failureRatio, config.RecoveryRatio);
         }
     }
 
+    private static async Task<List<ModelPredictionStats>> LoadPredictionStatsAsync(
+        Microsoft.EntityFrameworkCore.DbContext readCtx,
+        IReadOnlyList<long> modelIds,
+        DateTime windowStart,
+        int batchSize,
+        CancellationToken ct)
+    {
+        var predictionStats = new List<ModelPredictionStats>();
+
+        foreach (var batch in modelIds.Chunk(batchSize))
+        {
+            var batchIds = batch.ToArray();
+            var rows = await readCtx.Set<MLModelPredictionLog>()
+                .Where(l => batchIds.Contains(l.MLModelId) &&
+                            !l.IsDeleted                   &&
+                            ((l.DirectionCorrect != null) || (l.WasProfitable != null)) &&
+                            ((l.OutcomeRecordedAt != null && l.OutcomeRecordedAt >= windowStart)
+                             || (l.OutcomeRecordedAt == null && l.PredictedAt >= windowStart)))
+                .GroupBy(l => l.MLModelId)
+                .Select(g => new
+                {
+                    MLModelId = g.Key,
+                    DirectionTotal = g.Count(l => l.DirectionCorrect != null),
+                    CorrectCount = g.Count(l => l.DirectionCorrect == true),
+                    ProfitTotal = g.Count(l => l.WasProfitable != null),
+                    ProfitableCount = g.Count(l => l.WasProfitable == true)
+                })
+                .ToListAsync(ct);
+
+            predictionStats.AddRange(rows.Select(s => new ModelPredictionStats(
+                s.MLModelId,
+                s.DirectionTotal,
+                s.CorrectCount,
+                s.ProfitTotal,
+                s.ProfitableCount)));
+        }
+
+        return predictionStats;
+    }
+
+    private static CorrelatedFailureEvaluation EvaluateModelStats(
+        IReadOnlyCollection<ActiveModelSnapshot> activeModels,
+        IReadOnlyCollection<ModelPredictionStats> predictionStats,
+        int minPredictions,
+        double failureThreshold,
+        MLCorrelatedFailureMetric failureMetric)
+    {
+        var statsLookup = predictionStats.ToDictionary(s => s.MLModelId);
+        var affectedSymbols = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+        var failingModels = new List<FailingModelSnapshot>();
+        int evaluatedModelCount = 0;
+        int modelsWithoutPredictions = 0;
+        int modelsBelowMinPredictions = 0;
+
+        foreach (var model in activeModels)
+        {
+            if (!statsLookup.TryGetValue(model.Id, out var stats))
+            {
+                modelsWithoutPredictions++;
+                continue;
+            }
+
+            int sampleCount = GetMetricSampleCount(stats, failureMetric);
+            if (sampleCount < minPredictions)
+            {
+                modelsBelowMinPredictions++;
+                continue;
+            }
+
+            evaluatedModelCount++;
+
+            double healthScore = GetMetricHealthScore(stats, failureMetric);
+            if (healthScore >= failureThreshold)
+                continue;
+
+            failingModels.Add(new FailingModelSnapshot(
+                model.Id,
+                model.Symbol,
+                model.Timeframe,
+                sampleCount,
+                healthScore));
+            affectedSymbols.Add(model.Symbol);
+        }
+
+        double failureRatio = evaluatedModelCount == 0
+            ? 0.0
+            : (double)failingModels.Count / evaluatedModelCount;
+
+        return new CorrelatedFailureEvaluation(
+            activeModels.Count,
+            evaluatedModelCount,
+            failingModels.Count,
+            modelsWithoutPredictions,
+            modelsBelowMinPredictions,
+            failureRatio,
+            affectedSymbols.ToArray(),
+            failingModels);
+    }
+
+    private static int GetMetricSampleCount(
+        ModelPredictionStats stats,
+        MLCorrelatedFailureMetric failureMetric)
+        => failureMetric switch
+        {
+            MLCorrelatedFailureMetric.Profitability => stats.ProfitTotal,
+            MLCorrelatedFailureMetric.Composite => Math.Min(stats.DirectionTotal, stats.ProfitTotal),
+            _ => stats.DirectionTotal
+        };
+
+    private static double GetMetricHealthScore(
+        ModelPredictionStats stats,
+        MLCorrelatedFailureMetric failureMetric)
+    {
+        double directionAccuracy = stats.DirectionTotal == 0
+            ? 0.0
+            : (double)stats.CorrectCount / stats.DirectionTotal;
+        double profitability = stats.ProfitTotal == 0
+            ? 0.0
+            : (double)stats.ProfitableCount / stats.ProfitTotal;
+
+        return failureMetric switch
+        {
+            MLCorrelatedFailureMetric.Profitability => profitability,
+            MLCorrelatedFailureMetric.Composite => (directionAccuracy + profitability) / 2.0,
+            _ => directionAccuracy
+        };
+    }
+
+    private void RecordSkippedModels(CorrelatedFailureEvaluation evaluation)
+    {
+        if (_metrics is null)
+            return;
+
+        if (evaluation.ModelsWithoutPredictions > 0)
+        {
+            _metrics.MLCorrelatedFailureModelsSkipped.Add(
+                evaluation.ModelsWithoutPredictions,
+                new KeyValuePair<string, object?>("reason", "no_predictions"));
+        }
+
+        if (evaluation.ModelsBelowMinPredictions > 0)
+        {
+            _metrics.MLCorrelatedFailureModelsSkipped.Add(
+                evaluation.ModelsBelowMinPredictions,
+                new KeyValuePair<string, object?>("reason", "below_min_predictions"));
+        }
+    }
+
+    private async Task<bool> HasRecentStateChangeAsync(
+        Microsoft.EntityFrameworkCore.DbContext ctx,
+        DateTime nowUtc,
+        int cooldownMinutes,
+        CancellationToken ct)
+    {
+        if (cooldownMinutes <= 0)
+            return false;
+
+        var cutoff = nowUtc.AddMinutes(-cooldownMinutes);
+        return await ctx.Set<MLCorrelatedFailureLog>()
+            .AsNoTracking()
+            .AnyAsync(l => l.DetectedAt >= cutoff, ct);
+    }
+
+    private static string CreateFailureDetailsJson(CorrelatedFailureEvaluation evaluation)
+        => JsonSerializer.Serialize(new
+        {
+            SchemaVersion = AlertPayloadSchemaVersion,
+            evaluation.ActiveModelCount,
+            evaluation.EvaluatedModelCount,
+            evaluation.FailingModelCount,
+            evaluation.ModelsWithoutPredictions,
+            evaluation.ModelsBelowMinPredictions,
+            evaluation.FailureRatio,
+            AffectedSymbols = evaluation.AffectedSymbols,
+            FailingModels = evaluation.FailingModels.Select(m => new
+            {
+                m.ModelId,
+                m.Symbol,
+                Timeframe = m.Timeframe.ToString(),
+                m.PredictionCount,
+                Accuracy = m.Accuracy
+            }).ToArray()
+        });
+
     // ── Config helpers ─────────────────────────────────────────────────────────
 
-    /// <summary>
-    /// Reads a typed value from <see cref="EngineConfig"/> or returns <paramref name="defaultValue"/>
-    /// when the key is absent or its string value cannot be converted to <typeparamref name="T"/>.
-    /// All reads are <c>AsNoTracking</c> to avoid stale-cache issues in long-lived loops.
-    /// </summary>
-    private static async Task<T> GetConfigAsync<T>(
+    private static async Task<bool> GetConfigAsync(
         Microsoft.EntityFrameworkCore.DbContext ctx,
         string                                  key,
-        T                                       defaultValue,
+        bool                                    defaultValue,
         CancellationToken                       ct)
     {
         var entry = await ctx.Set<EngineConfig>()
             .AsNoTracking()
-            .FirstOrDefaultAsync(c => c.Key == key, ct);
+            .FirstOrDefaultAsync(c => c.Key == key && !c.IsDeleted, ct);
 
         if (entry?.Value is null) return defaultValue;
 
-        try   { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
-        catch { return defaultValue; }
+        return bool.TryParse(entry.Value, out var parsed)
+            ? parsed
+            : defaultValue;
     }
 
     /// <summary>
     /// Creates or updates an <see cref="EngineConfig"/> entry. If the key already exists,
     /// updates its value and <see cref="EngineConfig.LastUpdatedAt"/> timestamp. Otherwise
-    /// creates a new record with <see cref="ConfigDataType.String"/> and hot-reload enabled.
+    /// creates a new boolean record with hot-reload enabled. Soft-deleted rows are revived
+    /// because <see cref="EngineConfig.Key"/> is unique across the table.
     /// </summary>
     /// <param name="writeCtx">EF write context — must be a tracked context.</param>
     /// <param name="key">The configuration key to upsert.</param>
     /// <param name="value">The new string value.</param>
     /// <param name="ct">Cancellation token.</param>
-    private static Task UpsertConfigAsync(
+    private async Task UpsertConfigAsync(
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
         string                                  key,
         string                                  value,
         CancellationToken                       ct)
-        => LascodiaTradingEngine.Application.Common.Utilities.EngineConfigUpsert.UpsertAsync(writeCtx, key, value, dataType: LascodiaTradingEngine.Domain.Enums.ConfigDataType.Bool, ct: ct);
+    {
+        var entry = await writeCtx.Set<EngineConfig>()
+            .IgnoreQueryFilters()
+            .FirstOrDefaultAsync(c => c.Key == key, ct);
+
+        if (entry is null)
+        {
+            writeCtx.Set<EngineConfig>().Add(new EngineConfig
+            {
+                Key = key,
+                Value = value,
+                DataType = ConfigDataType.Bool,
+                IsHotReloadable = true,
+                LastUpdatedAt = _timeProvider.GetUtcNow().UtcDateTime
+            });
+            return;
+        }
+
+        entry.Value = value;
+        entry.DataType = ConfigDataType.Bool;
+        entry.IsHotReloadable = true;
+        entry.IsDeleted = false;
+        entry.LastUpdatedAt = _timeProvider.GetUtcNow().UtcDateTime;
+    }
 }

@@ -196,7 +196,12 @@ public record MLScoreResult(
     /// Higher values indicate disagreement among committee members.
     /// Null when single-model scoring was used.
     /// </summary>
-    decimal?        CommitteeDisagreement = null);
+    decimal?        CommitteeDisagreement = null,
+    /// <summary>
+    /// Raw feature vector supplied to the model before standardisation/masking, serialized
+    /// as JSON for post-hoc diagnostics such as feature-interaction discovery.
+    /// </summary>
+    string?         RawFeaturesJson = null);
 
 public interface IMLSignalScorer
 {

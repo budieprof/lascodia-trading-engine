@@ -32,6 +32,24 @@ public class MLFeatureConsensusSnapshot : Entity<long>
     /// </summary>
     public string   FeatureConsensusJson { get; set; } = "[]";
 
+    /// <summary>
+    /// Compatibility key for the feature schema represented by this snapshot. Includes the model
+    /// feature-schema fingerprint when available and the actual importance feature-name set.
+    /// </summary>
+    public string   SchemaKey            { get; set; } = string.Empty;
+
+    /// <summary>Number of distinct named features represented in <see cref="FeatureConsensusJson"/>.</summary>
+    public int      FeatureCount         { get; set; }
+
+    /// <summary>
+    /// JSON object summarising how many contributors used each importance source
+    /// (for example, TCN channel scores, calibrated permutation scores, raw importance, or weights).
+    /// </summary>
+    public string   ImportanceSourceSummaryJson { get; set; } = "{}";
+
+    /// <summary>JSON array of MLModel IDs that contributed to this exact consensus snapshot.</summary>
+    public string   ContributorModelIdsJson { get; set; } = "[]";
+
     /// <summary>Number of active models that contributed to this consensus.</summary>
     public int      ContributingModelCount { get; set; }
 

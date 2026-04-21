@@ -20,6 +20,15 @@ public interface IMLConformalPredictionLogReader
         CancellationToken ct);
 }
 
+public interface IMLConformalCalibrationReader
+{
+    Task<IReadOnlyDictionary<long, MLConformalCalibration>> LoadLatestUsableByModelAsync(
+        DbContext db,
+        IReadOnlyCollection<MLModel> models,
+        ConformalCalibrationSelectionOptions options,
+        CancellationToken ct);
+}
+
 public interface IMLConformalBreakerStateStore
 {
     Task<BreakerStateResult> ApplyAsync(
@@ -29,6 +38,12 @@ public interface IMLConformalBreakerStateStore
         IReadOnlyCollection<BreakerRefreshCandidate> refreshCandidates,
         CancellationToken ct);
 }
+
+public readonly record struct ConformalCalibrationSelectionOptions(
+    int MinSamples,
+    DateTime NowUtc,
+    int MaxCalibrationAgeDays,
+    bool RequireCalibrationAfterModelActivation);
 
 public readonly record struct ConformalCoverageEvaluationOptions(
     double TargetCoverage,
@@ -92,6 +107,9 @@ public readonly record struct BreakerStateResult(
     int ExpiredCount,
     int RecoveredCount,
     int RefreshedCount,
+    int TrippedCount,
+    int DuplicateActiveBreakersDeactivated,
+    int AlertsCreated,
     int ActiveBreakers,
     IReadOnlyList<BreakerAlertDispatch> Alerts);
 

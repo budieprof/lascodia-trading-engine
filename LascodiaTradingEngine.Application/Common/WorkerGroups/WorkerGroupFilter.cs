@@ -67,6 +67,7 @@ public static class WorkerGroupFilter
         typeof(MLAverageWeightInitWorker),
         typeof(MLOnlineLearningWorker),
         typeof(MLPredictionLogPruningWorker),
+        typeof(CpcPretrainerWorker),
     ];
 
     private static readonly Type[] MLMonitoringWorkers =

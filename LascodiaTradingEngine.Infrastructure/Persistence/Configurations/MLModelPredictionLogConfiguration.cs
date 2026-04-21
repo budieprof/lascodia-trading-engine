@@ -35,6 +35,7 @@ public class MLModelPredictionLogConfiguration : IEntityTypeConfiguration<MLMode
         builder.Property(x => x.ConformalThresholdUsed).HasPrecision(10, 8);
         builder.Property(x => x.ConformalTargetCoverageUsed).HasPrecision(5, 4);
         builder.Property(x => x.ConformalPredictionSetJson).HasMaxLength(100);
+        builder.Property(x => x.RawFeaturesJson).HasMaxLength(4000);
 
         builder.HasQueryFilter(x => !x.IsDeleted);
 

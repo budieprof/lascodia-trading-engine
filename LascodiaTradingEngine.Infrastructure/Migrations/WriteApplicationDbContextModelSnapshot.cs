@@ -1691,11 +1691,20 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
 
                     NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
 
+                    b.Property<int>("ActiveModelCount")
+                        .HasColumnType("integer");
+
                     b.Property<DateTime>("DetectedAt")
                         .HasColumnType("timestamp with time zone");
 
+                    b.Property<int>("EvaluatedModelCount")
+                        .HasColumnType("integer");
+
                     b.Property<int>("FailingModelCount")
                         .HasColumnType("integer");
+
+                    b.Property<string>("FailureDetailsJson")
+                        .HasColumnType("text");
 
                     b.Property<double>("FailureRatio")
                         .HasColumnType("double precision");
@@ -1737,6 +1746,9 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     b.Property<byte[]>("EncoderBytes")
                         .HasColumnType("bytea");
 
+                    b.Property<int>("EncoderType")
+                        .HasColumnType("integer");
+
                     b.Property<double>("InfoNceLoss")
                         .HasPrecision(12, 6)
                         .HasColumnType("double precision");
@@ -1751,6 +1763,9 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                         .HasColumnType("uuid");
 
                     b.Property<int>("PredictionSteps")
+                        .HasColumnType("integer");
+
+                    b.Property<int?>("Regime")
                         .HasColumnType("integer");
 
                     b.Property<string>("Symbol")
@@ -1769,9 +1784,102 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
 
                     b.HasKey("Id");
 
-                    b.HasIndex("Symbol", "Timeframe", "IsActive");
+                    b.HasIndex("Symbol", "Timeframe", "Regime")
+                        .IsUnique()
+                        .HasFilter("\"IsActive\" = true AND \"IsDeleted\" = false");
+
+                    NpgsqlIndexBuilderExtensions.AreNullsDistinct(b.HasIndex("Symbol", "Timeframe", "Regime"), false);
+
+                    b.HasIndex("Symbol", "Timeframe", "Regime", "EncoderType", "IsActive");
 
                     b.ToTable("MLCpcEncoder");
+                });
+
+            modelBuilder.Entity("LascodiaTradingEngine.Domain.Entities.MLCpcEncoderTrainingLog", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<int>("CandlesAfterRegimeFilter")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("CandlesLoaded")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("DiagnosticsJson")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<int>("EncoderType")
+                        .HasColumnType("integer");
+
+                    b.Property<DateTime>("EvaluatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<bool>("IsDeleted")
+                        .HasColumnType("boolean");
+
+                    b.Property<Guid>("OutboxId")
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("Outcome")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<long?>("PriorEncoderId")
+                        .HasColumnType("bigint");
+
+                    b.Property<double?>("PriorInfoNceLoss")
+                        .HasPrecision(12, 6)
+                        .HasColumnType("double precision");
+
+                    b.Property<long?>("PromotedEncoderId")
+                        .HasColumnType("bigint");
+
+                    b.Property<string>("Reason")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<int?>("Regime")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("Symbol")
+                        .IsRequired()
+                        .HasMaxLength(10)
+                        .HasColumnType("character varying(10)");
+
+                    b.Property<int>("Timeframe")
+                        .HasColumnType("integer");
+
+                    b.Property<double?>("TrainInfoNceLoss")
+                        .HasPrecision(12, 6)
+                        .HasColumnType("double precision");
+
+                    b.Property<long>("TrainingDurationMs")
+                        .HasColumnType("bigint");
+
+                    b.Property<int>("TrainingSequences")
+                        .HasColumnType("integer");
+
+                    b.Property<double?>("ValidationInfoNceLoss")
+                        .HasPrecision(12, 6)
+                        .HasColumnType("double precision");
+
+                    b.Property<int>("ValidationSequences")
+                        .HasColumnType("integer");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Outcome", "Reason", "EvaluatedAt");
+
+                    b.HasIndex("Symbol", "Timeframe", "Regime", "EvaluatedAt");
+
+                    b.ToTable("MLCpcEncoderTrainingLog");
                 });
 
             modelBuilder.Entity("LascodiaTradingEngine.Domain.Entities.MLErgodicityLog", b =>
@@ -1835,12 +1943,27 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     b.Property<int>("ContributingModelCount")
                         .HasColumnType("integer");
 
+                    b.Property<string>("ContributorModelIdsJson")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("text")
+                        .HasDefaultValue("[]");
+
                     b.Property<DateTime>("DetectedAt")
                         .HasColumnType("timestamp with time zone");
 
                     b.Property<string>("FeatureConsensusJson")
                         .IsRequired()
                         .HasColumnType("text");
+
+                    b.Property<int>("FeatureCount")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("ImportanceSourceSummaryJson")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("text")
+                        .HasDefaultValue("{}");
 
                     b.Property<bool>("IsDeleted")
                         .HasColumnType("boolean");
@@ -1850,6 +1973,13 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
 
                     b.Property<Guid>("OutboxId")
                         .HasColumnType("uuid");
+
+                    b.Property<string>("SchemaKey")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)")
+                        .HasDefaultValue("legacy");
 
                     b.Property<string>("Symbol")
                         .IsRequired()
@@ -1865,6 +1995,8 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
 
                     b.HasIndex("Symbol", "Timeframe", "DetectedAt");
 
+                    b.HasIndex("Symbol", "Timeframe", "SchemaKey", "DetectedAt");
+
                     b.ToTable("MLFeatureConsensusSnapshot");
                 });
 
@@ -1876,8 +2008,15 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
 
                     NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
 
+                    b.Property<int>("BaseFeatureCount")
+                        .HasColumnType("integer");
+
                     b.Property<DateTime>("ComputedAt")
                         .HasColumnType("timestamp with time zone");
+
+                    b.Property<double>("EffectSize")
+                        .HasPrecision(18, 8)
+                        .HasColumnType("double precision");
 
                     b.Property<int>("FeatureIndexA")
                         .HasColumnType("integer");
@@ -1895,6 +2034,9 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                         .HasMaxLength(50)
                         .HasColumnType("character varying(50)");
 
+                    b.Property<int>("FeatureSchemaVersion")
+                        .HasColumnType("integer");
+
                     b.Property<double>("InteractionScore")
                         .HasPrecision(18, 8)
                         .HasColumnType("double precision");
@@ -1908,10 +2050,26 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     b.Property<long>("MLModelId")
                         .HasColumnType("bigint");
 
+                    b.Property<string>("Method")
+                        .IsRequired()
+                        .HasMaxLength(80)
+                        .HasColumnType("character varying(80)");
+
                     b.Property<Guid>("OutboxId")
                         .HasColumnType("uuid");
 
+                    b.Property<double>("PValue")
+                        .HasPrecision(18, 8)
+                        .HasColumnType("double precision");
+
+                    b.Property<double>("QValue")
+                        .HasPrecision(18, 8)
+                        .HasColumnType("double precision");
+
                     b.Property<int>("Rank")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("SampleCount")
                         .HasColumnType("integer");
 
                     b.Property<string>("Symbol")
@@ -1929,6 +2087,8 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     b.HasIndex("MLModelId", "IsIncludedAsFeature");
 
                     b.HasIndex("MLModelId", "Rank");
+
+                    b.HasIndex("Symbol", "Timeframe", "IsIncludedAsFeature", "ComputedAt");
 
                     b.ToTable("MLFeatureInteractionAudit");
                 });
@@ -2658,6 +2818,10 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     b.Property<decimal>("PredictedMagnitudePips")
                         .HasPrecision(18, 5)
                         .HasColumnType("numeric(18,5)");
+
+                    b.Property<string>("RawFeaturesJson")
+                        .HasMaxLength(4000)
+                        .HasColumnType("character varying(4000)");
 
                     b.Property<decimal?>("RawProbability")
                         .HasPrecision(5, 4)

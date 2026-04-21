@@ -20,11 +20,20 @@ public class MLCorrelatedFailureLog : Entity<long>
     /// <summary>UTC timestamp when the correlated failure was detected.</summary>
     public DateTime DetectedAt          { get; set; } = DateTime.UtcNow;
 
-    /// <summary>Number of active models that are currently degraded (below drift accuracy threshold).</summary>
+    /// <summary>Number of evaluated models that are currently degraded (below drift accuracy threshold).</summary>
     public int      FailingModelCount   { get; set; }
 
-    /// <summary>Total number of active models evaluated.</summary>
+    /// <summary>
+    /// Number of evaluated models. Kept for backward compatibility; prefer
+    /// <see cref="EvaluatedModelCount"/> for new code.
+    /// </summary>
     public int      TotalModelCount     { get; set; }
+
+    /// <summary>Total number of active models considered before prediction-count filtering.</summary>
+    public int      ActiveModelCount    { get; set; }
+
+    /// <summary>Number of active models with enough resolved predictions to evaluate.</summary>
+    public int      EvaluatedModelCount { get; set; }
 
     /// <summary>Ratio of failing to total models (0.0–1.0).</summary>
     public double   FailureRatio        { get; set; }
@@ -33,6 +42,12 @@ public class MLCorrelatedFailureLog : Entity<long>
     /// JSON array of affected symbol strings: <c>["EURUSD","GBPUSD","USDJPY"]</c>.
     /// </summary>
     public string   SymbolsAffectedJson { get; set; } = "[]";
+
+    /// <summary>
+    /// JSON document containing model-level failure details such as model id, symbol,
+    /// timeframe, prediction count, and observed accuracy.
+    /// </summary>
+    public string?  FailureDetailsJson  { get; set; }
 
     /// <summary>
     /// <c>true</c> when this detection event triggered a systemic training pause.

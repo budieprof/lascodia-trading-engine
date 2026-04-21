@@ -97,8 +97,42 @@ public sealed class TradingMetrics
     public Counter<long>     MLConformalBreakerTrips { get; }
     public Counter<long>     MLConformalBreakerRecoveries { get; }
     public Counter<long>     MLConformalBreakerRefreshes { get; }
+    public Counter<long>     MLConformalBreakerLockAttempts { get; }
+    public Counter<long>     MLConformalBreakerDuplicateRepairs { get; }
+    public Counter<long>     MLConformalBreakerAlertsDispatched { get; }
+    public Counter<long>     MLConformalBreakerAlertDispatchFailures { get; }
+    public Histogram<double> MLConformalBreakerThresholdMismatchRate { get; }
     public Histogram<double> MLConformalBreakerEmpiricalCoverage { get; }
     public Histogram<double> MLConformalBreakerActive { get; }
+    public Counter<long>     MLCorrelatedFailureModelsEvaluated { get; }
+    public Counter<long>     MLCorrelatedFailureModelsFailing { get; }
+    public Counter<long>     MLCorrelatedFailureModelsSkipped { get; }
+    public Counter<long>     MLCorrelatedFailurePauseActivations { get; }
+    public Counter<long>     MLCorrelatedFailurePauseRecoveries { get; }
+    public Counter<long>     MLCorrelatedFailureLockAttempts { get; }
+    public Counter<long>     MLCorrelatedFailureCooldownSkips { get; }
+    public Histogram<double> MLCorrelatedFailureRatio { get; }
+    public Histogram<double> MLCorrelatedFailureAffectedSymbols { get; }
+    public Counter<long>     MLErgodicityModelsEvaluated { get; }
+    public Counter<long>     MLErgodicityModelsSkipped { get; }
+    public Counter<long>     MLErgodicityLogsWritten { get; }
+    public Counter<long>     MLErgodicityLockAttempts { get; }
+    public Histogram<double> MLErgodicityGap { get; }
+    public Histogram<double> MLErgodicityAdjustedKelly { get; }
+    public Histogram<double> MLErgodicityGrowthVariance { get; }
+    public Counter<long>     MLFeatureConsensusSnapshots { get; }
+    public Counter<long>     MLFeatureConsensusPairsSkipped { get; }
+    public Counter<long>     MLFeatureConsensusModelRejects { get; }
+    public Counter<long>     MLFeatureConsensusLockAttempts { get; }
+    public Histogram<double> MLFeatureConsensusContributors { get; }
+    public Histogram<double> MLFeatureConsensusMeanKendallTau { get; }
+    public Counter<long>     MLCpcCandidates { get; }
+    public Counter<long>     MLCpcPromotions { get; }
+    public Counter<long>     MLCpcRejections { get; }
+    public Histogram<double> MLCpcTrainingDurationMs { get; }
+    public Histogram<double> MLCpcSequences { get; }
+    public Histogram<double> MLCpcCandles { get; }
+    public Histogram<double> MLCpcValidationLoss { get; }
 
     // ── Workers ─────────────────────────────────────────────────────────────
     public Histogram<double> WorkerCycleDurationMs  { get; }
@@ -332,8 +366,42 @@ public sealed class TradingMetrics
         MLConformalBreakerTrips = _meter.CreateCounter<long>("trading.ml.conformal_breaker.trips", "breakers", "Conformal breaker suppressions, tagged by trip reason");
         MLConformalBreakerRecoveries = _meter.CreateCounter<long>("trading.ml.conformal_breaker.recoveries", "breakers", "Conformal breaker recoveries that lifted active breaker state");
         MLConformalBreakerRefreshes = _meter.CreateCounter<long>("trading.ml.conformal_breaker.refreshes", "breakers", "Active conformal breaker diagnostic refreshes without extending suspension");
+        MLConformalBreakerLockAttempts = _meter.CreateCounter<long>("trading.ml.conformal_breaker.lock_attempts", "cycles", "Conformal breaker distributed-lock attempts, tagged by outcome=acquired|busy|unavailable");
+        MLConformalBreakerDuplicateRepairs = _meter.CreateCounter<long>("trading.ml.conformal_breaker.duplicate_repairs", "breakers", "Duplicate active conformal breaker rows deactivated by repair logic");
+        MLConformalBreakerAlertsDispatched = _meter.CreateCounter<long>("trading.ml.conformal_breaker.alerts_dispatched", "alerts", "Conformal breaker alerts dispatched successfully");
+        MLConformalBreakerAlertDispatchFailures = _meter.CreateCounter<long>("trading.ml.conformal_breaker.alert_dispatch_failures", "alerts", "Conformal breaker alert dispatch failures after state persistence");
+        MLConformalBreakerThresholdMismatchRate = _meter.CreateHistogram<double>("trading.ml.conformal_breaker.threshold_mismatch_rate", "ratio", "Share of evaluated logs whose served conformal threshold differs from the current calibration threshold");
         MLConformalBreakerEmpiricalCoverage = _meter.CreateHistogram<double>("trading.ml.conformal_breaker.empirical_coverage", "ratio", "Empirical conformal coverage observed by the breaker");
         MLConformalBreakerActive = _meter.CreateHistogram<double>("trading.ml.conformal_breaker.active", "breakers", "Active conformal breaker count");
+        MLCorrelatedFailureModelsEvaluated = _meter.CreateCounter<long>("trading.ml.correlated_failure.models_evaluated", "models", "Active ML models with enough outcomes evaluated for systemic correlated failure");
+        MLCorrelatedFailureModelsFailing = _meter.CreateCounter<long>("trading.ml.correlated_failure.models_failing", "models", "Evaluated ML models below the configured drift accuracy threshold");
+        MLCorrelatedFailureModelsSkipped = _meter.CreateCounter<long>("trading.ml.correlated_failure.models_skipped", "models", "Active ML models skipped by correlated failure evaluation, tagged by reason");
+        MLCorrelatedFailurePauseActivations = _meter.CreateCounter<long>("trading.ml.correlated_failure.pause_activations", "pauses", "Systemic ML training pause activations");
+        MLCorrelatedFailurePauseRecoveries = _meter.CreateCounter<long>("trading.ml.correlated_failure.pause_recoveries", "recoveries", "Systemic ML training pause recoveries");
+        MLCorrelatedFailureLockAttempts = _meter.CreateCounter<long>("trading.ml.correlated_failure.lock_attempts", "cycles", "Correlated failure distributed-lock attempts, tagged by outcome=acquired|busy|unavailable");
+        MLCorrelatedFailureCooldownSkips = _meter.CreateCounter<long>("trading.ml.correlated_failure.cooldown_skips", "cycles", "Correlated failure state changes skipped because the state-change cooldown is active");
+        MLCorrelatedFailureRatio = _meter.CreateHistogram<double>("trading.ml.correlated_failure.failure_ratio", "ratio", "Share of evaluated ML models classified as failing");
+        MLCorrelatedFailureAffectedSymbols = _meter.CreateHistogram<double>("trading.ml.correlated_failure.affected_symbols", "symbols", "Number of distinct symbols affected by failing ML models");
+        MLErgodicityModelsEvaluated = _meter.CreateCounter<long>("trading.ml.ergodicity.models_evaluated", "models", "Active ML models with enough resolved outcomes evaluated for ergodicity economics");
+        MLErgodicityModelsSkipped = _meter.CreateCounter<long>("trading.ml.ergodicity.models_skipped", "models", "Active ML models skipped by ergodicity evaluation, tagged by reason");
+        MLErgodicityLogsWritten = _meter.CreateCounter<long>("trading.ml.ergodicity.logs_written", "logs", "MLErgodicityLog rows written");
+        MLErgodicityLockAttempts = _meter.CreateCounter<long>("trading.ml.ergodicity.lock_attempts", "cycles", "Ergodicity distributed-lock attempts, tagged by outcome=acquired|busy|unavailable");
+        MLErgodicityGap = _meter.CreateHistogram<double>("trading.ml.ergodicity.gap", "return", "Ergodicity gap between ensemble and time-average growth");
+        MLErgodicityAdjustedKelly = _meter.CreateHistogram<double>("trading.ml.ergodicity.adjusted_kelly", "fraction", "Ergodicity-adjusted Kelly fraction");
+        MLErgodicityGrowthVariance = _meter.CreateHistogram<double>("trading.ml.ergodicity.growth_variance", "variance", "Variance of per-outcome return proxies used by ergodicity metrics");
+        MLFeatureConsensusSnapshots = _meter.CreateCounter<long>("trading.ml.feature_consensus.snapshots", "snapshots", "Feature consensus snapshots written. Tagged by symbol and timeframe.");
+        MLFeatureConsensusPairsSkipped = _meter.CreateCounter<long>("trading.ml.feature_consensus.pairs_skipped", "pairs", "Feature consensus pairs skipped. Tagged by reason.");
+        MLFeatureConsensusModelRejects = _meter.CreateCounter<long>("trading.ml.feature_consensus.model_rejects", "models", "Models excluded from feature consensus. Tagged by reason.");
+        MLFeatureConsensusLockAttempts = _meter.CreateCounter<long>("trading.ml.feature_consensus.lock_attempts", "cycles", "Feature consensus distributed-lock attempts, tagged by outcome=acquired|busy|unavailable.");
+        MLFeatureConsensusContributors = _meter.CreateHistogram<double>("trading.ml.feature_consensus.contributors", "models", "Contributing models per written feature consensus snapshot.");
+        MLFeatureConsensusMeanKendallTau = _meter.CreateHistogram<double>("trading.ml.feature_consensus.mean_kendall_tau", "tau", "Mean pairwise Kendall tau-b rank agreement per feature consensus snapshot.");
+        MLCpcCandidates = _meter.CreateCounter<long>("trading.ml.cpc.candidates", "pairs", "CPC encoder candidates considered for training. Tagged by symbol, timeframe, regime, encoder_type.");
+        MLCpcPromotions = _meter.CreateCounter<long>("trading.ml.cpc.promotions", "encoders", "CPC encoders promoted. Tagged by symbol, timeframe, regime, encoder_type.");
+        MLCpcRejections = _meter.CreateCounter<long>("trading.ml.cpc.rejections", "encoders", "CPC training attempts rejected. Tagged by reason, symbol, timeframe, regime, encoder_type.");
+        MLCpcTrainingDurationMs = _meter.CreateHistogram<double>("trading.ml.cpc.training_duration_ms", "ms", "CPC pretraining duration per candidate. Tagged by symbol, timeframe, regime, encoder_type.");
+        MLCpcSequences = _meter.CreateHistogram<double>("trading.ml.cpc.sequences", "sequences", "CPC sequence counts. Tagged by split=train|validation and symbol/timeframe/regime.");
+        MLCpcCandles = _meter.CreateHistogram<double>("trading.ml.cpc.candles", "candles", "CPC candle counts. Tagged by stage=loaded|regime_filtered and symbol/timeframe/regime.");
+        MLCpcValidationLoss = _meter.CreateHistogram<double>("trading.ml.cpc.validation_loss", "loss", "Holdout contrastive loss for fitted CPC encoders. Tagged by symbol, timeframe, regime, encoder_type.");
 
         // Workers
         WorkerCycleDurationMs = _meter.CreateHistogram<double>("trading.workers.cycle_duration", "ms", "Worker poll cycle duration");

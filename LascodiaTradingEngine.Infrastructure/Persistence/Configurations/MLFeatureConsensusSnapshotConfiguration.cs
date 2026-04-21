@@ -18,9 +18,13 @@ public class MLFeatureConsensusSnapshotConfiguration : IEntityTypeConfiguration<
         builder.Property(x => x.Symbol).IsRequired().HasMaxLength(20);
         builder.Property(x => x.Timeframe).HasConversion<string>().IsRequired().HasMaxLength(10);
         builder.Property(x => x.FeatureConsensusJson).HasColumnType("text");
+        builder.Property(x => x.SchemaKey).IsRequired().HasMaxLength(256).HasDefaultValue("legacy");
+        builder.Property(x => x.ImportanceSourceSummaryJson).HasColumnType("text").HasDefaultValue("{}");
+        builder.Property(x => x.ContributorModelIdsJson).HasColumnType("text").HasDefaultValue("[]");
 
         // One consensus snapshot per symbol/timeframe at a time; older rows are retained for history
         builder.HasIndex(x => new { x.Symbol, x.Timeframe, x.DetectedAt });
+        builder.HasIndex(x => new { x.Symbol, x.Timeframe, x.SchemaKey, x.DetectedAt });
 
         builder.HasQueryFilter(x => !x.IsDeleted);
     }

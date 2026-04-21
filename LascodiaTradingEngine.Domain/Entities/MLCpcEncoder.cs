@@ -13,6 +13,18 @@ public class MLCpcEncoder : Entity<long>
 {
     public string    Symbol          { get; set; } = string.Empty;
     public Timeframe Timeframe       { get; set; } = Timeframe.H1;
+    /// <summary>
+    /// Optional market regime the encoder was trained under. <c>null</c> means "global" —
+    /// trained on all regimes pooled. The V7 inference path resolves the regime-specific
+    /// encoder when one exists and falls back to the global (null-regime) row otherwise.
+    /// Enabled per-regime via <c>MLCpc:TrainPerRegime=true</c>.
+    /// </summary>
+    public MarketRegime? Regime      { get; set; }
+    /// <summary>
+    /// Architecture the encoder was trained with. Discriminates the <see cref="EncoderBytes"/>
+    /// payload shape so the runtime can pick the correct forward-pass math at projection time.
+    /// </summary>
+    public CpcEncoderType EncoderType { get; set; } = CpcEncoderType.Linear;
     /// <summary>Dimensionality of the learned context embedding.</summary>
     public int       EmbeddingDim    { get; set; }
     /// <summary>Number of future steps predicted during CPC pre-training.</summary>

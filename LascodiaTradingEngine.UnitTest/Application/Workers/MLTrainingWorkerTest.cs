@@ -787,6 +787,8 @@ public class MLTrainingWorkerTest
             1f,
             -1f,
             1f,
+            Array.Empty<FeatureInteractionPairDescriptor>(),
+            0,
             _mockWriteDbContext.Object,
             ct,
         })!;

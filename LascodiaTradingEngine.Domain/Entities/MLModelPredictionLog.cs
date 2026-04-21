@@ -255,6 +255,15 @@ public class MLModelPredictionLog : Entity<long>
     /// </summary>
     public string?  ShapValuesJson       { get; set; }
 
+    /// <summary>
+    /// JSON array of the raw feature vector supplied to the model at prediction time,
+    /// after schema dispatch and replayable interaction-feature appends, but before
+    /// standardisation, model-specific transforms, and feature masking. This gives
+    /// post-hoc diagnostics workers an exact train/inference parity input instead of
+    /// inferring interactions from SHAP proxy values.
+    /// </summary>
+    public string?  RawFeaturesJson      { get; set; }
+
     // ── Rec #21: Quantile regression ──────────────────────────────────────────
 
     /// <summary>

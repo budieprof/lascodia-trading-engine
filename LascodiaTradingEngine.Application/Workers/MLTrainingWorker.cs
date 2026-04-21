@@ -85,6 +85,100 @@ public sealed class MLTrainingWorker : BackgroundService
     // ── Per-process identity (TOCTOU-safe atomic claim) ───────────────────────
     private static readonly Guid _instanceId = Guid.NewGuid();
 
+    private async Task<FeatureInteractionPairDescriptor[]> LoadFeatureInteractionPairsAsync(
+        Microsoft.EntityFrameworkCore.DbContext ctx,
+        string symbol,
+        Timeframe timeframe,
+        int baseFeatureCount,
+        CancellationToken ct)
+    {
+        if (baseFeatureCount <= 1)
+            return [];
+
+        bool enabled = await GetConfigAsync<bool>(ctx, CK_UseInteractionFeatures, true, ct);
+        if (!enabled)
+            return [];
+
+        int maxPairs = await GetConfigAsync<int>(ctx, CK_MaxInteractionFeatures, 3, ct);
+        maxPairs = Math.Clamp(maxPairs, 0, MLFeatureHelper.MaxAllowedFeatureCount - baseFeatureCount);
+        if (maxPairs <= 0)
+            return [];
+
+        List<InteractionAuditProjection> rows;
+        try
+        {
+            rows = await ctx.Set<MLFeatureInteractionAudit>()
+                .AsNoTracking()
+                .Where(a => a.Symbol == symbol
+                         && a.Timeframe == timeframe
+                         && a.IsIncludedAsFeature
+                         && a.BaseFeatureCount == baseFeatureCount)
+                .OrderByDescending(a => a.ComputedAt)
+                .ThenBy(a => a.Rank)
+                .Select(a => new
+                {
+                    a.FeatureIndexA,
+                    a.FeatureIndexB,
+                    a.FeatureNameA,
+                    a.FeatureNameB,
+                    a.ComputedAt,
+                    a.Rank
+                })
+                .Select(a => new InteractionAuditProjection(
+                    a.FeatureIndexA,
+                    a.FeatureIndexB,
+                    a.FeatureNameA,
+                    a.FeatureNameB,
+                    a.ComputedAt,
+                    a.Rank))
+                .Take(maxPairs * 8)
+                .ToListAsync(ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex,
+                "Run feature interaction lookup failed for {Symbol}/{Timeframe}; continuing without product features.",
+                symbol, timeframe);
+            return [];
+        }
+
+        var pairs = rows
+            .Where(a => a.FeatureIndexA >= 0
+                     && a.FeatureIndexB >= 0
+                     && a.FeatureIndexA < baseFeatureCount
+                     && a.FeatureIndexB < baseFeatureCount
+                     && a.FeatureIndexA != a.FeatureIndexB)
+            .GroupBy(a => a.FeatureIndexA < a.FeatureIndexB
+                ? (A: a.FeatureIndexA, B: a.FeatureIndexB)
+                : (A: a.FeatureIndexB, B: a.FeatureIndexA))
+            .Select(g => g.OrderByDescending(x => x.ComputedAt).ThenBy(x => x.Rank).First())
+            .OrderByDescending(a => a.ComputedAt)
+            .ThenBy(a => a.Rank)
+            .Take(maxPairs)
+            .Select(a => new FeatureInteractionPairDescriptor
+            {
+                A = Math.Min(a.FeatureIndexA, a.FeatureIndexB),
+                B = Math.Max(a.FeatureIndexA, a.FeatureIndexB),
+                NameA = a.FeatureIndexA <= a.FeatureIndexB ? a.FeatureNameA : a.FeatureNameB,
+                NameB = a.FeatureIndexA <= a.FeatureIndexB ? a.FeatureNameB : a.FeatureNameA
+            })
+            .ToArray();
+
+        MLFeatureHelper.AssertFeatureCountWithinCap(
+            baseFeatureCount + pairs.Length,
+            $"MLTrainingWorker interaction append ({symbol}/{timeframe})");
+
+        return pairs;
+    }
+
+    private sealed record InteractionAuditProjection(
+        int FeatureIndexA,
+        int FeatureIndexB,
+        string FeatureNameA,
+        string FeatureNameB,
+        DateTime ComputedAt,
+        int Rank);
+
     /// <summary>
     /// Minutes after which a <see cref="RunStatus.Running"/> claim from another worker
     /// instance is considered orphaned (e.g. due to crash/OOM) and eligible for recovery.
@@ -128,6 +222,8 @@ public sealed class MLTrainingWorker : BackgroundService
     private const string CK_DriftAccThreshold     = "MLTraining:DriftAccuracyThreshold";
     private const string CK_ConsecFailThreshold   = "MLTraining:ConsecutiveFailureAlertThreshold";
     private const string CK_AlertDestination      = "MLTraining:AlertDestination";
+    private const string CK_UseInteractionFeatures = "MLTraining:UseFeatureInteractionProducts";
+    private const string CK_MaxInteractionFeatures = "MLTraining:MaxFeatureInteractionProducts";
     private const string CK_MaxWfStdDev           = "MLTraining:MaxWalkForwardStdDev";
     private const string CK_LabelSmoothing        = "MLTraining:LabelSmoothing";
     private const string CK_MinFeatureImportance  = "MLTraining:MinFeatureImportance";
@@ -800,6 +896,14 @@ public sealed class MLTrainingWorker : BackgroundService
             bool useV6OrderBook = await GetConfigAsync<bool>(
                 ctx, "MLTraining:UseV6OrderBookFeatures", false, stoppingToken);
 
+            // V7 appends a fixed MLFeatureHelper.CpcEmbeddingBlockSize-sized CPC context
+            // embedding to the V6 vector, sourced per (symbol, timeframe) from the active
+            // MLCpcEncoder. Requires V6OrderBook to be on (V7 extends V6). Zero-fills the
+            // block when no active encoder exists so training doesn't stall while the
+            // CpcPretrainerWorker catches up.
+            bool useV7CpcFeatureVector = await GetConfigAsync<bool>(
+                ctx, "MLTraining:UseV7CpcFeatureVector", false, stoppingToken);
+
             Dictionary<string, (DateTime[] Times, double[] Closes)>? basket = null;
             if (useExtendedVector && candles.Count > 0)
             {
@@ -916,6 +1020,60 @@ public sealed class MLTrainingWorker : BackgroundService
                             if (orderBookCache.ContainsKey(c.Timestamp)) continue;
                             orderBookCache[c.Timestamp] = await orderBookProvider.GetSnapshotAsync(
                                 run.Symbol, c.Timestamp, stoppingToken);
+                        }
+
+                        if (useV7CpcFeatureVector)
+                        {
+                            // Resolve the active encoder once; the per-window callback closes
+                            // over it. A null encoder causes the V7 builder to zero-fill the
+                            // embedding block — live training continues, but the pair underperforms
+                            // until CpcPretrainerWorker produces one.
+                            var activeEncoderProvider = sp.GetRequiredService<global::LascodiaTradingEngine.Application.Common.Interfaces.IActiveCpcEncoderProvider>();
+                            var cpcProjection         = sp.GetRequiredService<global::LascodiaTradingEngine.Application.Common.Interfaces.ICpcEncoderProjection>();
+                            // Supervised training runs are not regime-scoped; pass null regime
+                            // so the provider returns the global encoder. Once MLTrainingRun
+                            // grows a regime column, this call becomes regime-aware for free.
+                            var activeEncoder         = await activeEncoderProvider.GetAsync(run.Symbol, run.Timeframe, regime: null, stoppingToken);
+
+                            Func<List<Candle>, float[]?> cpcForWindow = window =>
+                            {
+                                if (activeEncoder is null) return null;
+                                // seqLen = count - 1 because MLCpcSequenceBuilder consumes the
+                                // first candle as the prior-close reference.
+                                int seqLen = Math.Max(2, window.Count - 1);
+                                var seqs = global::LascodiaTradingEngine.Application.Services.ML.MLCpcSequenceBuilder.Build(
+                                    window,
+                                    seqLen: seqLen,
+                                    stride: seqLen,
+                                    maxSequences: 1);
+                                if (seqs.Count == 0) return null;
+                                return cpcProjection.ProjectLatest(activeEncoder, seqs[0]);
+                            };
+
+                            samples = MLFeatureHelper.BuildTrainingSamplesWithTripleBarrierV7(
+                                candles, run.Symbol, basket,
+                                ts => crossAssetCache.TryGetValue(
+                                    new DateTime(ts.Year, ts.Month, ts.Day, 0, 0, 0, DateTimeKind.Utc),
+                                    out var s) ? s : default,
+                                eventLookup.SnapshotAt,
+                                eventLookup.SnapshotMinuteLevel,
+                                ts => tickFlowCache.TryGetValue(ts, out var tf) ? tf : null,
+                                ts => orderBookCache.TryGetValue(ts, out var ob) ? ob : null,
+                                cpcForWindow,
+                                CotLookup,
+                                (float)hp.TripleBarrierProfitAtrMult,
+                                (float)hp.TripleBarrierStopAtrMult,
+                                hp.TripleBarrierHorizonBars,
+                                costBufferPriceUnits);
+
+                            int v7BookHits = orderBookCache.Values.Count(v => v is not null);
+                            int v7TickHits = tickFlowCache.Values.Count(v => v is not null);
+                            _logger.LogInformation(
+                                "Built {Samples} V7 training samples (features={Feat}, cpcEncoderActive={Active}, encoderId={EncId}, tickFlowCoverage={Th}/{TickTotal}, orderBookCoverage={Bh}/{BookTotal}, costBuffer={Buf:F5})",
+                                samples.Count, MLFeatureHelper.FeatureCountV7,
+                                activeEncoder is not null, activeEncoder?.Id,
+                                v7TickHits, tickFlowCache.Count, v7BookHits, orderBookCache.Count, costBufferPriceUnits);
+                            goto trainingSamplesBuilt;
                         }
 
                         samples = MLFeatureHelper.BuildTrainingSamplesWithTripleBarrierV6(
@@ -1060,6 +1218,28 @@ trainingSamplesBuilt:;
                 _logger.LogInformation(
                     "Built {Samples} training samples (features={Feat}, costBuffer={Buf:F5})",
                     samples.Count, MLFeatureHelper.FeatureCount, costBufferPriceUnits);
+            }
+
+            int interactionBaseFeatureCount = samples.Count > 0 ? samples[0].Features.Length : 0;
+            var interactionPairs = await LoadFeatureInteractionPairsAsync(
+                ctx,
+                run.Symbol,
+                run.Timeframe,
+                interactionBaseFeatureCount,
+                stoppingToken);
+
+            if (interactionPairs.Length > 0)
+            {
+                samples = samples
+                    .Select(s => s with
+                    {
+                        Features = MLFeatureHelper.AppendInteractionFeatures(s.Features, interactionPairs)
+                    })
+                    .ToList();
+
+                _logger.LogInformation(
+                    "Run {RunId}: appended {Count} replayable feature interaction product(s); features {Base}->{Total}.",
+                    run.Id, interactionPairs.Length, interactionBaseFeatureCount, samples[0].Features.Length);
             }
 
             if (samples.Count < hp.MinSamples)
@@ -1709,6 +1889,7 @@ trainingSamplesBuilt:;
             var (finalModelBytes, plattA, plattB) = await PatchSnapshotAsync(
                 result.ModelBytes, run, candles, samples, buyCount, sellCount,
                 imbalanceRatio, cotNetMin, cotNetMax, cotMomMin, cotMomMax,
+                interactionPairs, interactionBaseFeatureCount,
                 ctx, stoppingToken);
 
             // ── ONNX export (opt-in) ───────────────────────────────────────────
@@ -2127,6 +2308,8 @@ trainingSamplesBuilt:;
         float                                   cotNetMax,
         float                                   cotMomMin,
         float                                   cotMomMax,
+        FeatureInteractionPairDescriptor[]      interactionPairs,
+        int                                     interactionBaseFeatureCount,
         Microsoft.EntityFrameworkCore.DbContext ctx,
         CancellationToken                       ct)
     {
@@ -2166,6 +2349,7 @@ trainingSamplesBuilt:;
             {
                 snap.ExpectedInputFeatures = samples[0].Features.Length;
                 snap.FeatureSchemaVersion =
+                    snap.ExpectedInputFeatures == MLFeatureHelper.FeatureCountV7 ? 7 :
                     snap.ExpectedInputFeatures == MLFeatureHelper.FeatureCountV6 ? 6 :
                     snap.ExpectedInputFeatures == MLFeatureHelper.FeatureCountV5 ? 5 :
                     snap.ExpectedInputFeatures == MLFeatureHelper.FeatureCountV4 ? 4 :
@@ -2177,6 +2361,16 @@ trainingSamplesBuilt:;
                 MLFeatureHelper.AssertFeatureCountWithinCap(
                     snap.ExpectedInputFeatures,
                     $"MLTrainingWorker snapshot persist (model={run.MLModelId})");
+
+                snap.FeatureInteractionPairs = interactionPairs;
+                snap.InteractionBaseFeatureCount = interactionPairs.Length > 0
+                    ? interactionBaseFeatureCount
+                    : 0;
+                if (interactionPairs.Length > 0)
+                {
+                    var baseNames = MLFeatureHelper.ResolveFeatureNames(interactionBaseFeatureCount);
+                    snap.Features = MLFeatureHelper.AppendInteractionFeatureNames(baseNames, interactionPairs);
+                }
             }
 
             // Compute per-feature empirical variances from the deployed feature pipeline.

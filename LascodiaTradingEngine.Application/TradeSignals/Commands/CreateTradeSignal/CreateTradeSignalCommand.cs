@@ -77,6 +77,8 @@ public class CreateTradeSignalCommand : IRequest<ResponseData<long>>
     /// <c>MLModelPredictionLog.LatencyMs</c> for P50/P95/P99 monitoring.
     /// </summary>
     public int?          MLScoringLatencyMs     { get; set; }
+    /// <summary>Raw feature vector JSON emitted by ML scoring for diagnostics.</summary>
+    public string?       MLRawFeaturesJson      { get; set; }
     public DateTime      ExpiresAt              { get; set; }
 }
 
@@ -189,6 +191,7 @@ public class CreateTradeSignalCommandHandler : IRequestHandler<CreateTradeSignal
                 ConformalPredictionSetJson = request.MLConformalPredictionSetJson,
                 EnsembleDisagreement   = request.MLEnsembleDisagreement,
                 LatencyMs              = request.MLScoringLatencyMs,
+                RawFeaturesJson        = request.MLRawFeaturesJson,
                 PredictedAt            = DateTime.UtcNow,
             };
 

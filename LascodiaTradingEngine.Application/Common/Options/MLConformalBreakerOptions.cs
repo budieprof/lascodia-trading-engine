@@ -29,6 +29,27 @@ public class MLConformalBreakerOptions : ConfigurationOption<MLConformalBreakerO
     /// <summary>Maximum suspension length in bars.</summary>
     public int MaxSuspensionBars { get; set; } = 96;
 
+    /// <summary>Maximum active models evaluated per database batch.</summary>
+    public int ModelBatchSize { get; set; } = 250;
+
+    /// <summary>Maximum active models evaluated in one worker cycle.</summary>
+    public int MaxCycleModels { get; set; } = 10_000;
+
+    /// <summary>Maximum acceptable age of a conformal calibration.</summary>
+    public int MaxCalibrationAgeDays { get; set; } = 30;
+
+    /// <summary>Require the selected calibration to have been computed after model activation.</summary>
+    public bool RequireCalibrationAfterModelActivation { get; set; } = true;
+
+    /// <summary>Maximum random delay added after each poll interval to avoid synchronized workers.</summary>
+    public int PollJitterSeconds { get; set; } = 300;
+
+    /// <summary>Timeout for acquiring the singleton breaker-cycle distributed lock.</summary>
+    public int LockTimeoutSeconds { get; set; } = 5;
+
+    /// <summary>Allowed absolute difference between served and current conformal thresholds before recording drift telemetry.</summary>
+    public double ThresholdMismatchEpsilon { get; set; } = 0.000001;
+
     /// <summary>
     /// Require the Wilson confidence interval's upper bound to remain below the coverage floor
     /// before sustained low coverage trips. This makes the trip conservative rather than firing

@@ -16,6 +16,7 @@ public class MLCorrelatedFailureLogConfiguration : IEntityTypeConfiguration<MLCo
         builder.Property(x => x.Id).ValueGeneratedOnAdd();
 
         builder.Property(x => x.SymbolsAffectedJson).HasColumnType("text");
+        builder.Property(x => x.FailureDetailsJson).HasColumnType("text");
 
         builder.HasIndex(x => x.DetectedAt);
 

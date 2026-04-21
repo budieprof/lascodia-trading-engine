@@ -1,6 +1,11 @@
+using System.Diagnostics;
+using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Options;
+using LascodiaTradingEngine.Application.Common.WorkerGroups;
 using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Domain.Entities;
+using LascodiaTradingEngine.Domain.Enums;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -9,86 +14,112 @@ using Microsoft.Extensions.Logging;
 namespace LascodiaTradingEngine.Application.Workers;
 
 /// <summary>
-/// Computes ergodicity economics metrics for each active ML model (Rec #519).
-///
-/// <para>
-/// Ergodicity economics distinguishes ensemble-average growth (arithmetic mean) from
-/// time-average growth (geometric mean). The ergodicity gap between these two quantities
-/// drives a downward adjustment to the naive Kelly fraction, producing a position size
-/// that maximises long-run compounded wealth rather than expected value.
-/// </para>
-///
-/// Algorithm per cycle:
-/// <list type="number">
-///   <item>Load active, non-deleted ML models.</item>
-///   <item>For each model, load the last WindowDays (up to 200) resolved prediction logs.</item>
-///   <item>Convert outcomes to "returns": correct prediction = +confidence-0.5; incorrect = -(confidence-0.5).</item>
-///   <item>Compute ensemble growth rate, Peters time-average, ergodicity gap.</item>
-///   <item>Compute naive and ergodicity-adjusted Kelly fractions.</item>
-///   <item>Persist <see cref="MLErgodicityLog"/> per model.</item>
-/// </list>
-///
-/// Configuration keys (read from <see cref="EngineConfig"/>):
-/// <list type="bullet">
-///   <item><c>MLErgodicity:PollIntervalHours</c> — default 24</item>
-///   <item><c>MLErgodicity:WindowDays</c>        — rolling history in days, default 30</item>
-///   <item><c>MLErgodicity:MinSamples</c>        — minimum prediction log count required, default 20</item>
-/// </list>
+/// Computes ergodicity economics metrics for active production ML models.
 /// </summary>
+/// <remarks>
+/// Ergodicity economics distinguishes arithmetic ensemble-average growth from geometric
+/// time-average growth. The gap between them is used to temper Kelly sizing so downstream
+/// allocation favours long-run compounded wealth rather than one-step expected value.
+/// </remarks>
 public sealed class MLErgodicityWorker : BackgroundService
 {
-    private const string CK_PollHours  = "MLErgodicity:PollIntervalHours";
-    private const string CK_WindowDays = "MLErgodicity:WindowDays";
-    private const string CK_MinSamples = "MLErgodicity:MinSamples";
+    private const string WorkerName = nameof(MLErgodicityWorker);
+    private const string DistributedLockKey = "ml:ergodicity:cycle";
+    private const double MinVariance = 1e-10;
 
     private readonly IServiceScopeFactory        _scopeFactory;
     private readonly ILogger<MLErgodicityWorker> _logger;
+    private readonly IDistributedLock?           _distributedLock;
+    private readonly TimeProvider                _timeProvider;
+    private readonly IWorkerHealthMonitor?       _healthMonitor;
+    private readonly TradingMetrics?             _metrics;
+    private readonly MLErgodicityOptions         _options;
+    private readonly MLErgodicityConfigReader    _configReader;
+
+    private static class EventIds
+    {
+        public static readonly EventId LockSkipped = new(4201, nameof(LockSkipped));
+        public static readonly EventId CycleCompleted = new(4202, nameof(CycleCompleted));
+        public static readonly EventId ModelSkipped = new(4203, nameof(ModelSkipped));
+    }
+
+    private sealed record ActiveModelSnapshot(long Id, string Symbol);
+
+    private sealed record PredictionOutcomeSnapshot(
+        long Id,
+        long MLModelId,
+        string Symbol,
+        TradeDirection PredictedDirection,
+        bool DirectionCorrect,
+        DateTime OutcomeRecordedAt,
+        decimal? ServedCalibratedProbability,
+        decimal? CalibratedProbability,
+        decimal? RawProbability,
+        decimal? DecisionThresholdUsed,
+        decimal ConfidenceScore,
+        decimal? ActualMagnitudePips,
+        bool? WasProfitable);
+
+    private sealed record ErgodicityMetrics(
+        double EnsembleGrowthRate,
+        double TimeAverageGrowthRate,
+        double ErgodicityGap,
+        double NaiveKellyFraction,
+        double ErgodicityAdjustedKelly,
+        double GrowthRateVariance);
+
+    private sealed record ErgodicityCycleResult(
+        int ActiveModelCount,
+        int EvaluatedModelCount,
+        int SkippedModelCount,
+        int LogsWritten);
 
     /// <summary>
-    /// Initialises the worker with its DI scope factory and logger.
+    /// Initialises the worker with its DI dependencies.
     /// </summary>
-    /// <param name="scopeFactory">
-    /// Used to create a new async DI scope per poll cycle so scoped EF Core
-    /// contexts are correctly disposed after each ergodicity computation pass.
-    /// </param>
-    /// <param name="logger">Structured logger scoped to this worker type.</param>
     public MLErgodicityWorker(
-        IServiceScopeFactory         scopeFactory,
-        ILogger<MLErgodicityWorker>  logger)
+        IServiceScopeFactory        scopeFactory,
+        ILogger<MLErgodicityWorker> logger,
+        IDistributedLock?           distributedLock = null,
+        TimeProvider?               timeProvider = null,
+        IWorkerHealthMonitor?       healthMonitor = null,
+        TradingMetrics?             metrics = null,
+        MLErgodicityOptions?        options = null,
+        MLErgodicityConfigReader?   configReader = null)
     {
-        _scopeFactory = scopeFactory;
-        _logger       = logger;
+        _scopeFactory    = scopeFactory;
+        _logger          = logger;
+        _distributedLock = distributedLock;
+        _timeProvider    = timeProvider ?? TimeProvider.System;
+        _healthMonitor   = healthMonitor;
+        _metrics         = metrics;
+        _options         = options ?? new MLErgodicityOptions();
+        _configReader    = configReader ?? new MLErgodicityConfigReader(_options);
     }
 
     /// <summary>
-    /// Hosted-service entry point. Polls every <c>MLErgodicity:PollIntervalHours</c>
-    /// hours (default 24), reading the interval from <see cref="EngineConfig"/> on each
-    /// cycle so it can be hot-reloaded without a restart.
+    /// Hosted-service entry point. Runs a bounded ergodicity cycle at the configured interval.
     /// </summary>
-    /// <param name="stoppingToken">Signalled when the host is shutting down.</param>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation("MLErgodicityWorker started.");
+        _healthMonitor?.RecordWorkerMetadata(
+            WorkerName,
+            "Computes model ergodicity economics and Kelly sizing diagnostics.",
+            TimeSpan.FromHours(_options.PollIntervalHours));
 
         while (!stoppingToken.IsCancellationRequested)
         {
-            // Default 24-hour poll interval; refreshed from DB on every cycle.
-            int pollHours = 24;
+            int pollHours = _options.PollIntervalHours;
+            var cycleStart = Stopwatch.GetTimestamp();
 
             try
             {
-                await using var scope = _scopeFactory.CreateAsyncScope();
-                var readDb  = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
-                var writeDb = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
-                var ctx     = readDb.GetDbContext();
-                var wCtx    = writeDb.GetDbContext();
-
-                // Refresh all config values each cycle to support operator hot-reload.
-                pollHours      = await GetConfigAsync<int>(ctx, CK_PollHours,  24, stoppingToken);
-                int windowDays = await GetConfigAsync<int>(ctx, CK_WindowDays, 30, stoppingToken);
-                int minSamples = await GetConfigAsync<int>(ctx, CK_MinSamples, 20, stoppingToken);
-
-                await RunErgodicityAsync(ctx, wCtx, windowDays, minSamples, stoppingToken);
+                _healthMonitor?.RecordWorkerHeartbeat(WorkerName);
+                pollHours = await RunCycleAsync(stoppingToken);
+                _healthMonitor?.RecordCycleSuccess(
+                    WorkerName,
+                    (long)Stopwatch.GetElapsedTime(cycleStart).TotalMilliseconds);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -96,190 +127,337 @@ public sealed class MLErgodicityWorker : BackgroundService
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "MLErgodicityWorker loop error");
+                _metrics?.WorkerErrors.Add(
+                    1,
+                    new KeyValuePair<string, object?>("worker", WorkerName));
+                _healthMonitor?.RecordCycleFailure(WorkerName, ex.Message);
+                _logger.LogError(ex, "MLErgodicityWorker loop error.");
             }
 
             await Task.Delay(TimeSpan.FromHours(pollHours), stoppingToken);
         }
 
+        _healthMonitor?.RecordWorkerStopped(WorkerName);
         _logger.LogInformation("MLErgodicityWorker stopping.");
     }
 
-    // ── Ergodicity core ───────────────────────────────────────────────────────
-
-    /// <summary>
-    /// For each active model, computes ergodicity economics metrics from the last
-    /// <paramref name="windowDays"/> days of resolved prediction logs and persists the
-    /// results to <c>MLErgodicityLog</c>.
-    /// </summary>
-    /// <remarks>
-    /// Ergodicity economics methodology (Ole Peters, 2019):
-    ///
-    /// Classical expected-value theory maximises the ensemble average (arithmetic mean)
-    /// of outcomes across many parallel trials. However, a single trader experiences a
-    /// time sequence of outcomes, not an ensemble. For multiplicative processes (which
-    /// compounding wealth is), the long-run time average (geometric mean growth rate)
-    /// differs from the ensemble average:
-    ///   time_average = mean(log(1 + r))
-    ///   ensemble_average = mean(r)
-    ///   ergodicity_gap = ensemble_average − time_average
-    ///
-    /// A positive gap means the ensemble average overstates the long-run per-trade
-    /// growth rate. Kelly and naive position-sizing formulas derived from the ensemble
-    /// average oversize positions, leading to ruin in finite time even when expected
-    /// value is positive.
-    ///
-    /// The ergodicity-adjusted Kelly fraction corrects for this by scaling down the
-    /// naive Kelly: f_adj = f_naive × (1 − gap / variance). This produces a position
-    /// size that maximises the geometric growth rate (Peters optimal fraction) rather
-    /// than the arithmetic expectation (naive Kelly).
-    ///
-    /// Return proxy: each prediction log contributes a return of:
-    ///   r = (confidence − 0.5) if correct, −(confidence − 0.5) if incorrect.
-    /// This uses the model's stated confidence as a proxy for the magnitude of the
-    /// position's P&amp;L contribution. Positive confidence above 0.5 maps to a positive
-    /// return on a correct prediction.
-    /// </remarks>
-    /// <param name="readCtx">Read-only EF context for models and prediction logs.</param>
-    /// <param name="writeCtx">Write EF context for persisting <c>MLErgodicityLog</c> records.</param>
-    /// <param name="windowDays">Rolling history window for prediction logs.</param>
-    /// <param name="minSamples">Minimum resolved logs required before computing metrics.</param>
-    /// <param name="ct">Cancellation token forwarded from the host.</param>
-    private async Task RunErgodicityAsync(
-        Microsoft.EntityFrameworkCore.DbContext readCtx,
-        Microsoft.EntityFrameworkCore.DbContext writeCtx,
-        int                                     windowDays,
-        int                                     minSamples,
-        CancellationToken                       ct)
+    internal async Task<int> RunCycleAsync(CancellationToken ct)
     {
-        var now    = DateTime.UtcNow;
-        var cutoff = now.AddDays(-windowDays);
-
-        var models = await readCtx.Set<MLModel>()
-            .AsNoTracking()
-            .Where(m => !m.IsDeleted && m.IsActive)
-            .ToListAsync(ct);
-
-        foreach (var model in models)
+        IAsyncDisposable? cycleLock = null;
+        if (_distributedLock is not null)
         {
-            // Load resolved prediction logs within the rolling window.
-            // Cap at 200 records to bound memory usage per model.
-            var logs = await readCtx.Set<MLModelPredictionLog>()
-                .AsNoTracking()
-                .Where(l => l.MLModelId == model.Id &&
-                            !l.IsDeleted &&
-                            l.DirectionCorrect.HasValue &&
-                            l.OutcomeRecordedAt != null &&
-                            l.OutcomeRecordedAt >= cutoff)
-                .OrderByDescending(l => l.OutcomeRecordedAt)
-                .ThenByDescending(l => l.Id)
-                .Take(200)
-                .ToListAsync(ct);
-
-            // Skip models without enough resolved history for reliable metric estimates.
-            if (logs.Count < minSamples)
+            cycleLock = await _distributedLock.TryAcquireAsync(
+                DistributedLockKey,
+                TimeSpan.FromSeconds(_options.LockTimeoutSeconds),
+                ct);
+            if (cycleLock is null)
             {
-                _logger.LogDebug("MLErgodicityWorker: model {Id} ({Sym}) skipped — only {N} logs",
-                    model.Id, model.Symbol, logs.Count);
-                continue;
+                _metrics?.MLErgodicityLockAttempts.Add(
+                    1,
+                    new KeyValuePair<string, object?>("outcome", "busy"));
+                _logger.LogDebug(
+                    EventIds.LockSkipped,
+                    "MLErgodicityWorker: cycle skipped because distributed lock is held elsewhere.");
+                return _options.PollIntervalHours;
             }
 
-            // Convert prediction logs to return proxies.
-            // ret > 0 for correct predictions, ret < 0 for incorrect predictions.
-            // The magnitude is proportional to the model's stated confidence above 0.5.
-            double[] r = new double[logs.Count];
-            for (int i = 0; i < logs.Count; i++)
+            _metrics?.MLErgodicityLockAttempts.Add(
+                1,
+                new KeyValuePair<string, object?>("outcome", "acquired"));
+        }
+        else
+        {
+            _metrics?.MLErgodicityLockAttempts.Add(
+                1,
+                new KeyValuePair<string, object?>("outcome", "unavailable"));
+        }
+
+        await using (cycleLock)
+        {
+            await WorkerBulkhead.MLMonitoring.WaitAsync(ct);
+            try
             {
-                double pBuy = MLFeatureHelper.ResolveLoggedServedBuyProbability(logs[i]);
-                double conf = logs[i].PredictedDirection == LascodiaTradingEngine.Domain.Enums.TradeDirection.Buy
-                    ? pBuy
-                    : 1.0 - pBuy;
-                r[i] = logs[i].DirectionCorrect == true
-                    ? conf - 0.5          // correct: positive return proportional to confidence
-                    : -(conf - 0.5);      // incorrect: negative return proportional to confidence
+                await using var scope = _scopeFactory.CreateAsyncScope();
+                var readDb  = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+                var writeDb = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+                var readCtx = readDb.GetDbContext();
+                var writeCtx = writeDb.GetDbContext();
+
+                var config = await _configReader.LoadAsync(readCtx, ct);
+                var result = await RunErgodicityAsync(readCtx, writeCtx, config, ct);
+
+                _logger.LogInformation(
+                    EventIds.CycleCompleted,
+                    "MLErgodicityWorker: evaluated {Evaluated}/{Active} active models, skipped {Skipped}, wrote {Logs} logs.",
+                    result.EvaluatedModelCount,
+                    result.ActiveModelCount,
+                    result.SkippedModelCount,
+                    result.LogsWritten);
+
+                return config.PollIntervalHours;
             }
-
-            // Ensemble growth rate: arithmetic mean of returns across all predictions.
-            // This is what naive expected-value optimisation maximises.
-            double mu = r.Average();
-
-            // Peters time-average growth rate: mean of log(1 + r).
-            // This is the long-run geometric growth rate per trade for a compounding
-            // account. Clamp r to −0.9999 to prevent log(0) or log(negative).
-            double timeAvg = r.Average(v => Math.Log(1.0 + Math.Max(v, -0.9999)));
-
-            // Ergodicity gap: difference between ensemble and time averages.
-            // A large positive gap indicates that naive sizing would systematically
-            // oversize positions, degrading long-run compounded wealth.
-            double gap = mu - timeAvg;
-
-            // Variance of returns: used as the denominator in both Kelly formulas.
-            // Bessel-corrected (divide by N-1) for an unbiased sample variance.
-            double sigma2 = r.Sum(v => (v - mu) * (v - mu)) / Math.Max(r.Length - 1, 1);
-
-            // Naive Kelly fraction: f* = μ / σ² (continuous Kelly for log-normal returns).
-            // This maximises E[log(wealth)] ignoring the ergodicity correction.
-            double naiveKelly = mu / Math.Max(sigma2, 1e-10);
-
-            // Ergodicity-adjusted Kelly: scale naive Kelly by (1 − gap / σ²).
-            // This applies the Peters correction: it reduces the fraction when the
-            // ergodicity gap is positive (process is non-ergodic and multiplicative).
-            // Clamp to [−2, 2] to prevent pathological extreme values from unstable
-            // variance estimates with few samples.
-            double adjKelly = naiveKelly * (1.0 - gap / Math.Max(sigma2, 1e-10));
-            adjKelly = Math.Max(-2.0, Math.Min(2.0, adjKelly));
-
-            // Persist all computed metrics as a new MLErgodicityLog record.
-            // Downstream position-sizing workers read ErgodicityAdjustedKelly to
-            // determine the optimal fraction of account equity to risk per signal.
-            var log = new MLErgodicityLog
+            finally
             {
-                MLModelId                = model.Id,
-                Symbol                   = model.Symbol,
-                EnsembleGrowthRate       = (decimal)mu,
-                TimeAverageGrowthRate    = (decimal)timeAvg,
-                ErgodicityGap            = (decimal)gap,
-                NaiveKellyFraction       = (decimal)naiveKelly,
-                ErgodicityAdjustedKelly  = (decimal)adjKelly,
-                GrowthRateVariance       = (decimal)sigma2,
-                ComputedAt               = now,
-            };
-
-            writeCtx.Set<MLErgodicityLog>().Add(log);
-            await writeCtx.SaveChangesAsync(ct);
-
-            _logger.LogDebug(
-                "MLErgodicityWorker: model {Id} ({Sym}) mu={Mu:F4} timeAvg={TA:F4} gap={G:F4} kelly={K:F4} adjKelly={AK:F4}",
-                model.Id, model.Symbol, mu, timeAvg, gap, naiveKelly, adjKelly);
+                WorkerBulkhead.MLMonitoring.Release();
+            }
         }
     }
 
-    // ── Config helper ─────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Reads a typed configuration value from the <see cref="EngineConfig"/> table,
-    /// falling back to <paramref name="defaultValue"/> if the key is absent or
-    /// the stored value cannot be converted to <typeparamref name="T"/>.
-    /// </summary>
-    /// <typeparam name="T">Target value type (int, double, string, etc.).</typeparam>
-    /// <param name="ctx">EF Core context to query against.</param>
-    /// <param name="key">The EngineConfig key to look up.</param>
-    /// <param name="defaultValue">Value to return when the key is missing or invalid.</param>
-    /// <param name="ct">Cancellation token.</param>
-    /// <returns>The parsed config value or <paramref name="defaultValue"/>.</returns>
-    private static async Task<T> GetConfigAsync<T>(
-        Microsoft.EntityFrameworkCore.DbContext ctx,
-        string                                  key,
-        T                                       defaultValue,
-        CancellationToken                       ct)
+    private async Task<ErgodicityCycleResult> RunErgodicityAsync(
+        DbContext readCtx,
+        DbContext writeCtx,
+        MLErgodicityRuntimeConfig config,
+        CancellationToken ct)
     {
-        var entry = await ctx.Set<EngineConfig>()
+        var now = _timeProvider.GetUtcNow().UtcDateTime;
+        var cutoff = now.AddDays(-config.WindowDays);
+
+        var activeModels = await readCtx.Set<MLModel>()
             .AsNoTracking()
-            .FirstOrDefaultAsync(c => c.Key == key, ct);
+            .Where(m => m.IsActive
+                        && !m.IsDeleted
+                        && !m.IsMetaLearner
+                        && !m.IsMamlInitializer
+                        && !m.IsSuppressed)
+            .OrderBy(m => m.Id)
+            .Take(config.MaxCycleModels)
+            .Select(m => new ActiveModelSnapshot(m.Id, m.Symbol))
+            .ToListAsync(ct);
 
-        if (entry?.Value is null) return defaultValue;
+        if (activeModels.Count == 0)
+            return new ErgodicityCycleResult(0, 0, 0, 0);
 
-        try   { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
-        catch { return defaultValue; }
+        var outcomes = await LoadPredictionOutcomesAsync(
+            readCtx,
+            activeModels.Select(m => m.Id).ToArray(),
+            cutoff,
+            config,
+            ct);
+
+        var outcomesByModel = outcomes
+            .GroupBy(l => l.MLModelId)
+            .ToDictionary(g => g.Key, g => (IReadOnlyList<PredictionOutcomeSnapshot>)g
+                .OrderByDescending(l => l.OutcomeRecordedAt)
+                .ThenByDescending(l => l.Id)
+                .Take(config.MaxLogsPerModel)
+                .ToArray());
+
+        var logsToWrite = new List<MLErgodicityLog>(activeModels.Count);
+        int skipped = 0;
+
+        foreach (var model in activeModels)
+        {
+            if (!outcomesByModel.TryGetValue(model.Id, out var modelOutcomes))
+            {
+                skipped++;
+                _metrics?.MLErgodicityModelsSkipped.Add(
+                    1,
+                    new KeyValuePair<string, object?>("reason", "no_outcomes"));
+                _logger.LogDebug(
+                    EventIds.ModelSkipped,
+                    "MLErgodicityWorker: model {ModelId} ({Symbol}) skipped with no resolved outcomes.",
+                    model.Id,
+                    model.Symbol);
+                continue;
+            }
+
+            if (modelOutcomes.Count < config.MinSamples)
+            {
+                skipped++;
+                _metrics?.MLErgodicityModelsSkipped.Add(
+                    1,
+                    new KeyValuePair<string, object?>("reason", "below_min_samples"));
+                _logger.LogDebug(
+                    EventIds.ModelSkipped,
+                    "MLErgodicityWorker: model {ModelId} ({Symbol}) skipped with {Samples}/{Required} samples.",
+                    model.Id,
+                    model.Symbol,
+                    modelOutcomes?.Count ?? 0,
+                    config.MinSamples);
+                continue;
+            }
+
+            if (!TryComputeMetrics(modelOutcomes, config, out var metrics))
+            {
+                skipped++;
+                _metrics?.MLErgodicityModelsSkipped.Add(
+                    1,
+                    new KeyValuePair<string, object?>("reason", "non_finite_metrics"));
+                _logger.LogWarning(
+                    "MLErgodicityWorker: model {ModelId} ({Symbol}) skipped because computed metrics were non-finite.",
+                    model.Id,
+                    model.Symbol);
+                continue;
+            }
+
+            logsToWrite.Add(new MLErgodicityLog
+            {
+                MLModelId = model.Id,
+                Symbol = model.Symbol,
+                EnsembleGrowthRate = ToMetricDecimal(metrics.EnsembleGrowthRate),
+                TimeAverageGrowthRate = ToMetricDecimal(metrics.TimeAverageGrowthRate),
+                ErgodicityGap = ToMetricDecimal(metrics.ErgodicityGap),
+                NaiveKellyFraction = ToMetricDecimal(metrics.NaiveKellyFraction),
+                ErgodicityAdjustedKelly = ToMetricDecimal(metrics.ErgodicityAdjustedKelly),
+                GrowthRateVariance = ToMetricDecimal(metrics.GrowthRateVariance),
+                ComputedAt = now,
+            });
+
+            _metrics?.MLErgodicityGap.Record(metrics.ErgodicityGap);
+            _metrics?.MLErgodicityAdjustedKelly.Record(metrics.ErgodicityAdjustedKelly);
+            _metrics?.MLErgodicityGrowthVariance.Record(metrics.GrowthRateVariance);
+        }
+
+        if (logsToWrite.Count > 0)
+        {
+            var strategy = writeCtx.Database.CreateExecutionStrategy();
+            await strategy.ExecuteAsync(async token =>
+            {
+                await using var tx = await writeCtx.Database.BeginTransactionAsync(token);
+                writeCtx.Set<MLErgodicityLog>().AddRange(logsToWrite);
+                await writeCtx.SaveChangesAsync(token);
+                await tx.CommitAsync(token);
+            }, ct);
+
+            _metrics?.MLErgodicityLogsWritten.Add(logsToWrite.Count);
+        }
+
+        _metrics?.MLErgodicityModelsEvaluated.Add(logsToWrite.Count);
+
+        return new ErgodicityCycleResult(
+            activeModels.Count,
+            logsToWrite.Count,
+            skipped,
+            logsToWrite.Count);
+    }
+
+    private static async Task<List<PredictionOutcomeSnapshot>> LoadPredictionOutcomesAsync(
+        DbContext readCtx,
+        IReadOnlyList<long> modelIds,
+        DateTime cutoff,
+        MLErgodicityRuntimeConfig config,
+        CancellationToken ct)
+    {
+        var outcomes = new List<PredictionOutcomeSnapshot>();
+
+        foreach (var batch in modelIds.Chunk(config.ModelBatchSize))
+        {
+            var batchIds = batch.ToArray();
+            var rows = await readCtx.Set<MLModelPredictionLog>()
+                .AsNoTracking()
+                .Where(l => batchIds.Contains(l.MLModelId)
+                            && !l.IsDeleted
+                            && l.DirectionCorrect.HasValue
+                            && l.OutcomeRecordedAt != null
+                            && l.OutcomeRecordedAt >= cutoff)
+                .OrderByDescending(l => l.OutcomeRecordedAt)
+                .ThenByDescending(l => l.Id)
+                .Select(l => new PredictionOutcomeSnapshot(
+                    l.Id,
+                    l.MLModelId,
+                    l.Symbol,
+                    l.PredictedDirection,
+                    l.DirectionCorrect!.Value,
+                    l.OutcomeRecordedAt!.Value,
+                    l.ServedCalibratedProbability,
+                    l.CalibratedProbability,
+                    l.RawProbability,
+                    l.DecisionThresholdUsed,
+                    l.ConfidenceScore,
+                    l.ActualMagnitudePips,
+                    l.WasProfitable))
+                .ToListAsync(ct);
+
+            outcomes.AddRange(rows);
+        }
+
+        return outcomes;
+    }
+
+    private static bool TryComputeMetrics(
+        IReadOnlyList<PredictionOutcomeSnapshot> outcomes,
+        MLErgodicityRuntimeConfig config,
+        out ErgodicityMetrics metrics)
+    {
+        var returns = new double[outcomes.Count];
+        for (int i = 0; i < outcomes.Count; i++)
+        {
+            returns[i] = ResolveReturnProxy(outcomes[i], config);
+        }
+
+        double mu = returns.Average();
+        double timeAverage = returns.Average(v => Math.Log(1.0 + Math.Max(v, -0.999999)));
+        double gap = mu - timeAverage;
+        double variance = returns.Sum(v => (v - mu) * (v - mu)) / Math.Max(returns.Length - 1, 1);
+        double safeVariance = Math.Max(variance, MinVariance);
+        double naiveKelly = Math.Clamp(mu / safeVariance, -config.MaxKellyAbs, config.MaxKellyAbs);
+        double adjustedKelly = Math.Clamp(
+            naiveKelly * (1.0 - gap / safeVariance),
+            -config.MaxKellyAbs,
+            config.MaxKellyAbs);
+
+        metrics = new ErgodicityMetrics(mu, timeAverage, gap, naiveKelly, adjustedKelly, variance);
+        return double.IsFinite(metrics.EnsembleGrowthRate)
+               && double.IsFinite(metrics.TimeAverageGrowthRate)
+               && double.IsFinite(metrics.ErgodicityGap)
+               && double.IsFinite(metrics.NaiveKellyFraction)
+               && double.IsFinite(metrics.ErgodicityAdjustedKelly)
+               && double.IsFinite(metrics.GrowthRateVariance);
+    }
+
+    private static double ResolveReturnProxy(
+        PredictionOutcomeSnapshot outcome,
+        MLErgodicityRuntimeConfig config)
+    {
+        if (outcome.ActualMagnitudePips.HasValue)
+        {
+            double scaled = (double)outcome.ActualMagnitudePips.Value / config.ReturnPipScale;
+            if (double.IsFinite(scaled))
+                return Math.Clamp(scaled, -config.MaxReturnAbs, config.MaxReturnAbs);
+        }
+
+        if (outcome.WasProfitable.HasValue)
+        {
+            double confidence = ResolveServedPredictionConfidence(outcome);
+            double edge = Math.Clamp(confidence - 0.5, 0.0, config.MaxReturnAbs);
+            return outcome.WasProfitable.Value ? edge : -edge;
+        }
+
+        double fallbackConfidence = ResolveServedPredictionConfidence(outcome);
+        double fallbackEdge = Math.Clamp(fallbackConfidence - 0.5, 0.0, config.MaxReturnAbs);
+        return outcome.DirectionCorrect ? fallbackEdge : -fallbackEdge;
+    }
+
+    private static double ResolveServedPredictionConfidence(PredictionOutcomeSnapshot outcome)
+    {
+        var proxyLog = new MLModelPredictionLog
+        {
+            PredictedDirection = outcome.PredictedDirection,
+            ServedCalibratedProbability = outcome.ServedCalibratedProbability,
+            CalibratedProbability = outcome.CalibratedProbability,
+            RawProbability = outcome.RawProbability,
+            DecisionThresholdUsed = outcome.DecisionThresholdUsed,
+            ConfidenceScore = outcome.ConfidenceScore
+        };
+
+        double pBuy = MLFeatureHelper.ResolveLoggedServedBuyProbability(proxyLog);
+        double confidence = outcome.PredictedDirection == TradeDirection.Buy
+            ? pBuy
+            : 1.0 - pBuy;
+
+        if (double.IsFinite(confidence))
+            return Math.Clamp(confidence, 0.0, 1.0);
+
+        return Math.Clamp((double)outcome.ConfidenceScore, 0.0, 1.0);
+    }
+
+    private static decimal ToMetricDecimal(double value)
+    {
+        if (!double.IsFinite(value))
+            return 0m;
+
+        const double max = 99_999_999.99999999;
+        const double min = -99_999_999.99999999;
+        return (decimal)Math.Clamp(value, min, max);
     }
 }

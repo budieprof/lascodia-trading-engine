@@ -17,6 +17,15 @@ public class MLCpcEncoderConfiguration : IEntityTypeConfiguration<MLCpcEncoder>
         builder.Property(x => x.Symbol).IsRequired().HasMaxLength(10);
         builder.Property(x => x.InfoNceLoss).HasPrecision(12, 6);
         builder.HasQueryFilter(x => !x.IsDeleted);
-        builder.HasIndex(x => new { x.Symbol, x.Timeframe, x.IsActive });
+        // Lookup path for V7 projection, including architecture-aware retraining decisions.
+        builder.HasIndex(x => new { x.Symbol, x.Timeframe, x.Regime, x.EncoderType, x.IsActive });
+
+        // Production safety rail: only one live encoder may be served for a
+        // (symbol, timeframe, regime) triple. `AreNullsDistinct(false)` makes PostgreSQL
+        // treat the null global-regime row as a real key value for uniqueness.
+        builder.HasIndex(x => new { x.Symbol, x.Timeframe, x.Regime })
+            .IsUnique()
+            .HasFilter("\"IsActive\" = true AND \"IsDeleted\" = false")
+            .AreNullsDistinct(false);
     }
 }

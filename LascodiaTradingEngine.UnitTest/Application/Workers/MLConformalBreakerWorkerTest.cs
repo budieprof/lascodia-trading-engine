@@ -287,6 +287,55 @@ public class MLConformalBreakerWorkerTest
     }
 
     [Fact]
+    public async Task RunAsync_Recovers_Duplicate_Active_Breakers_For_Same_Model()
+    {
+        await using var db = CreateDbContext();
+        var now = DateTime.UtcNow;
+        var model = CreateModel(isSuppressed: true);
+        var olderBreaker = CreateBreaker(model.Id, id: 10, suspendedAt: now.AddHours(-3), resumeAt: now.AddHours(8));
+        var newerBreaker = CreateBreaker(model.Id, id: 11, suspendedAt: now.AddHours(-2), resumeAt: now.AddHours(8));
+        db.Set<MLModel>().Add(model);
+        db.Set<MLConformalBreakerLog>().AddRange(olderBreaker, newerBreaker);
+        AddCalibration(db, model, now);
+        AddPredictionLogs(db, model, newerBreaker.SuspendedAt.AddMinutes(1), covered: true, startTradeSignalId: 1);
+        await db.SaveChangesAsync();
+
+        var worker = CreateWorker(db, CreateBreakerOptions());
+        await worker.RunAsync(CancellationToken.None);
+
+        var breakers = await db.Set<MLConformalBreakerLog>().OrderBy(b => b.Id).ToListAsync();
+        Assert.All(breakers, b => Assert.False(b.IsActive));
+        Assert.False(await db.Set<MLModel>().Where(m => m.Id == model.Id).Select(m => m.IsSuppressed).SingleAsync());
+    }
+
+    [Fact]
+    public async Task RunAsync_Skips_Mismatched_Calibration_For_Model()
+    {
+        await using var db = CreateDbContext();
+        var now = DateTime.UtcNow;
+        var model = CreateModel(isSuppressed: false);
+        db.Set<MLModel>().Add(model);
+        db.Set<MLConformalCalibration>().Add(new MLConformalCalibration
+        {
+            MLModelId = model.Id,
+            Symbol = "GBPUSD",
+            Timeframe = model.Timeframe,
+            CalibrationSamples = 30,
+            TargetCoverage = 0.90,
+            CoverageThreshold = 0.50,
+            CalibratedAt = now.AddDays(-1)
+        });
+        AddPredictionLogs(db, model, now.AddHours(-2), covered: false, startTradeSignalId: 1);
+        await db.SaveChangesAsync();
+
+        var worker = CreateWorker(db, CreateBreakerOptions());
+        await worker.RunAsync(CancellationToken.None);
+
+        Assert.Empty(await db.Set<MLConformalBreakerLog>().ToListAsync());
+        Assert.False(await db.Set<MLModel>().Where(m => m.Id == model.Id).Select(m => m.IsSuppressed).SingleAsync());
+    }
+
+    [Fact]
     public async Task RunAsync_Creates_Structured_Trip_Alert_And_Audit_Diagnostics()
     {
         await using var db = CreateDbContext();
@@ -427,6 +476,9 @@ public class MLConformalBreakerWorkerTest
             d.ServiceType == typeof(IMLConformalPredictionLogReader)
             && d.ImplementationType == typeof(MLConformalPredictionLogReader));
         Assert.Contains(services, d =>
+            d.ServiceType == typeof(IMLConformalCalibrationReader)
+            && d.ImplementationType == typeof(MLConformalCalibrationReader));
+        Assert.Contains(services, d =>
             d.ServiceType == typeof(IMLConformalBreakerStateStore)
             && d.ImplementationType == typeof(MLConformalBreakerStateStore));
         Assert.Contains(services, d =>
@@ -457,6 +509,82 @@ public class MLConformalBreakerWorkerTest
         var ex = Assert.Throws<OptionsValidationException>(() => _ = options.Value);
         Assert.Contains("MinLogs", ex.Message, StringComparison.Ordinal);
         Assert.Contains("MaxLogs", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RunAsync_Skips_When_Distributed_Lock_Is_Busy()
+    {
+        await using var db = CreateDbContext();
+        var now = DateTime.UtcNow;
+        var model = CreateModel(isSuppressed: false);
+        db.Set<MLModel>().Add(model);
+        AddCalibration(db, model, now);
+        AddPredictionLogs(db, model, now.AddHours(-2), covered: false, startTradeSignalId: 1);
+        await db.SaveChangesAsync();
+
+        var distributedLock = new Mock<IDistributedLock>();
+        distributedLock
+            .Setup(l => l.TryAcquireAsync(It.IsAny<string>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((IAsyncDisposable?)null);
+
+        var worker = CreateWorker(db, CreateBreakerOptions(), distributedLock: distributedLock.Object);
+        await worker.RunAsync(CancellationToken.None);
+
+        Assert.Empty(await db.Set<MLConformalBreakerLog>().ToListAsync());
+        Assert.False(await db.Set<MLModel>().Where(m => m.Id == model.Id).Select(m => m.IsSuppressed).SingleAsync());
+    }
+
+    [Fact]
+    public async Task RunAsync_Skips_Calibration_Before_Model_Activation()
+    {
+        await using var db = CreateDbContext();
+        var now = DateTime.UtcNow;
+        var model = CreateModel(isSuppressed: false);
+        model.ActivatedAt = now;
+        db.Set<MLModel>().Add(model);
+        db.Set<MLConformalCalibration>().Add(new MLConformalCalibration
+        {
+            MLModelId = model.Id,
+            Symbol = model.Symbol,
+            Timeframe = model.Timeframe,
+            CalibrationSamples = 30,
+            TargetCoverage = 0.90,
+            CoverageThreshold = 0.50,
+            CalibratedAt = now.AddMinutes(-1)
+        });
+        AddPredictionLogs(db, model, now.AddHours(-2), covered: false, startTradeSignalId: 1);
+        await db.SaveChangesAsync();
+
+        var worker = CreateWorker(db, CreateBreakerOptions());
+        await worker.RunAsync(CancellationToken.None);
+
+        Assert.Empty(await db.Set<MLConformalBreakerLog>().ToListAsync());
+        Assert.False(await db.Set<MLModel>().Where(m => m.Id == model.Id).Select(m => m.IsSuppressed).SingleAsync());
+    }
+
+    [Fact]
+    public async Task RunAsync_Processes_Multiple_Model_Batches()
+    {
+        await using var db = CreateDbContext();
+        var now = DateTime.UtcNow;
+        var firstModel = CreateModel(1, "EURUSD", isSuppressed: false);
+        var secondModel = CreateModel(2, "GBPUSD", isSuppressed: false);
+        db.Set<MLModel>().AddRange(firstModel, secondModel);
+        AddCalibration(db, firstModel, now);
+        AddCalibration(db, secondModel, now);
+        AddPredictionLogs(db, firstModel, now.AddHours(-2), covered: false, startTradeSignalId: 1);
+        AddPredictionLogs(db, secondModel, now.AddHours(-2), covered: false, startTradeSignalId: 100);
+        await db.SaveChangesAsync();
+
+        var options = CreateBreakerOptions();
+        options.ModelBatchSize = 1;
+        options.MaxCycleModels = 2;
+        var worker = CreateWorker(db, options);
+        await worker.RunAsync(CancellationToken.None);
+
+        var breakers = await db.Set<MLConformalBreakerLog>().ToListAsync();
+        Assert.Equal(2, breakers.Count);
+        Assert.All(breakers, b => Assert.True(b.IsActive));
     }
 
     private static WriteApplicationDbContext CreateDbContext()
@@ -492,7 +620,9 @@ public class MLConformalBreakerWorkerTest
     private static MLConformalBreakerWorker CreateWorker(
         WriteApplicationDbContext db,
         MLConformalBreakerOptions? options = null,
-        IAlertDispatcher? alertDispatcher = null)
+        IAlertDispatcher? alertDispatcher = null,
+        IDistributedLock? distributedLock = null,
+        TimeProvider? timeProvider = null)
     {
         var readContext = new Mock<IReadApplicationDbContext>();
         readContext.Setup(c => c.GetDbContext()).Returns(db);
@@ -513,9 +643,13 @@ public class MLConformalBreakerWorkerTest
             alertDispatcher ?? Mock.Of<IAlertDispatcher>(),
             new MLConformalCoverageEvaluator(),
             new MLConformalPredictionLogReader(),
+            new MLConformalCalibrationReader(),
             new MLConformalBreakerStateStore(
                 Mock.Of<ILogger<MLConformalBreakerStateStore>>(),
-                new TradingMetrics(new TestMeterFactory())));
+                new TradingMetrics(new TestMeterFactory()),
+                timeProvider),
+            distributedLock,
+            timeProvider);
     }
 
     private static MLConformalBreakerOptions CreateBreakerOptions() => new()

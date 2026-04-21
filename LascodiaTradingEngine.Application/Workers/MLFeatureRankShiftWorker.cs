@@ -5,6 +5,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.MLModels.Shared;
+using LascodiaTradingEngine.Application.Services.ML;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -25,7 +26,8 @@ namespace LascodiaTradingEngine.Application.Workers;
 ///   <item>For each symbol/timeframe, find the current active model and its most recently
 ///         superseded predecessor (the previous champion).</item>
 ///   <item>For each model, extract a feature importance vector. Priority: stored
-///         <c>FeatureImportanceScores</c> → ensemble-averaged absolute weights.</item>
+///         TCN channel scores → stored <c>FeatureImportanceScores</c> → raw importance
+///         → ensemble-averaged absolute weights.</item>
 ///   <item>Take the union of the top-N features from both models and compute the
 ///         Spearman rank correlation of their importance scores across that union.</item>
 ///   <item>If the correlation is below <c>RankCorrelationThreshold</c>, fire an
@@ -229,9 +231,8 @@ public sealed class MLFeatureRankShiftWorker : BackgroundService
         if (champSnap is null || predSnap is null) return;
 
         // Extract feature-name → importance-score dictionaries for both models.
-        // See ExtractImportance for the priority logic (stored scores vs. weight-derived).
-        var champImportance = ExtractImportance(champSnap);
-        var predImportance  = ExtractImportance(predSnap);
+        var champImportance = ModelSnapshotFeatureImportanceExtractor.Extract(champSnap).Importance;
+        var predImportance  = ModelSnapshotFeatureImportanceExtractor.Extract(predSnap).Importance;
 
         if (champImportance.Count == 0 || predImportance.Count == 0) return;
 
@@ -320,67 +321,6 @@ public sealed class MLFeatureRankShiftWorker : BackgroundService
         });
 
         await writeCtx.SaveChangesAsync(ct);
-    }
-
-    // ── Feature importance extraction ─────────────────────────────────────────
-
-    /// <summary>
-    /// Returns a feature-name → importance-score dictionary from a <see cref="ModelSnapshot"/>.
-    /// </summary>
-    /// <remarks>
-    /// Two sources are tried in priority order:
-    /// <list type="number">
-    ///   <item><b>Stored FeatureImportanceScores</b> — explicitly computed during training
-    ///         (e.g. permutation importance or SHAP-based scores). Preferred because they
-    ///         reflect a direct measurement of each feature's contribution.</item>
-    ///   <item><b>Ensemble-averaged absolute weights</b> — fallback for older snapshots that
-    ///         predate the importance-score field. For a bagged logistic ensemble, the absolute
-    ///         value of the logistic weight is a reasonable proxy for feature importance.</item>
-    /// </list>
-    /// Returns an empty dictionary when neither source is available (prevents NPEs downstream).
-    /// </remarks>
-    /// <param name="snap">Deserialised model snapshot.</param>
-    /// <returns>Dictionary mapping each feature name to its importance score (higher = more important).</returns>
-    private static Dictionary<string, double> ExtractImportance(ModelSnapshot snap)
-    {
-        if (string.Equals(snap.Type, "TCN", StringComparison.OrdinalIgnoreCase) &&
-            snap.TcnChannelNames.Length > 0 &&
-            snap.TcnChannelImportanceScores.Length > 0)
-        {
-            int count = Math.Min(snap.TcnChannelNames.Length, snap.TcnChannelImportanceScores.Length);
-            return Enumerable.Range(0, count)
-                .ToDictionary(
-                    i => snap.TcnChannelNames[i],
-                    i => snap.TcnChannelImportanceScores[i]);
-        }
-
-        // Prefer explicit importance scores when available.
-        if (snap.FeatureImportanceScores.Length > 0 &&
-            snap.Features.Length >= snap.FeatureImportanceScores.Length)
-        {
-            return Enumerable.Range(0, snap.FeatureImportanceScores.Length)
-                .ToDictionary(
-                    i => snap.Features[i],
-                    i => snap.FeatureImportanceScores[i]);
-        }
-
-        // Fallback: ensemble-averaged absolute weight per feature.
-        // For each learner in the bagged ensemble, sum |weight_j| across all learners,
-        // then divide by the number of learners to produce a normalised average.
-        if (snap.Weights.Length == 0 || snap.Features.Length == 0)
-            return new Dictionary<string, double>();
-
-        int fCount = snap.Features.Length;
-        var sums   = new double[fCount];
-        foreach (var learnerWeights in snap.Weights)
-        {
-            for (int j = 0; j < fCount && j < learnerWeights.Length; j++)
-                sums[j] += Math.Abs(learnerWeights[j]);
-        }
-
-        double n = snap.Weights.Length;
-        return Enumerable.Range(0, fCount)
-            .ToDictionary(i => snap.Features[i], i => sums[i] / n);
     }
 
     // ── Spearman rank correlation ─────────────────────────────────────────────

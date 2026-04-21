@@ -23,6 +23,18 @@ public class MLConformalBreakerOptionsValidator : IValidateOptions<MLConformalBr
             errors.Add("MLConformalBreakerOptions.CoverageTolerance must be between 0.0 and 0.5.");
         if (o.MaxSuspensionBars < 1)
             errors.Add("MLConformalBreakerOptions.MaxSuspensionBars must be >= 1.");
+        if (o.ModelBatchSize < 1)
+            errors.Add("MLConformalBreakerOptions.ModelBatchSize must be >= 1.");
+        if (o.MaxCycleModels < o.ModelBatchSize)
+            errors.Add("MLConformalBreakerOptions.MaxCycleModels must be >= ModelBatchSize.");
+        if (o.MaxCalibrationAgeDays < 1)
+            errors.Add("MLConformalBreakerOptions.MaxCalibrationAgeDays must be >= 1.");
+        if (o.PollJitterSeconds < 0)
+            errors.Add("MLConformalBreakerOptions.PollJitterSeconds must be >= 0.");
+        if (o.LockTimeoutSeconds < 0)
+            errors.Add("MLConformalBreakerOptions.LockTimeoutSeconds must be >= 0.");
+        if (!double.IsFinite(o.ThresholdMismatchEpsilon) || o.ThresholdMismatchEpsilon < 0.0 || o.ThresholdMismatchEpsilon > 1.0)
+            errors.Add("MLConformalBreakerOptions.ThresholdMismatchEpsilon must be a finite value between 0.0 and 1.0.");
         if (o.WilsonConfidenceLevel is <= 0.5 or >= 1.0)
             errors.Add("MLConformalBreakerOptions.WilsonConfidenceLevel must be > 0.5 and < 1.0.");
         if (o.StatisticalAlpha is <= 0.0 or >= 0.5)
