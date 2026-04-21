@@ -1477,9 +1477,23 @@ public partial class StrategyWorker :
                 // ── Hawkes burst filter (scoped to this strategy) ────────────
                 if (_options.HawkesRecentSignalCount > 0)
                 {
-                    var recentTimestamps = await strategyContext.GetDbContext()
+                    var strategyDb = strategyContext.GetDbContext();
+                    string hawkesSymbol = strategy.Symbol.Trim().ToUpperInvariant();
+                    var hawkesStrategyIds = (await strategyDb
+                            .Set<Domain.Entities.Strategy>()
+                            .AsNoTracking()
+                            .Where(x => !x.IsDeleted && x.Timeframe == strategy.Timeframe)
+                            .Select(x => new { x.Id, x.Symbol })
+                            .ToListAsync(ct))
+                        .Where(x => x.Symbol.Trim().ToUpperInvariant() == hawkesSymbol)
+                        .Select(x => x.Id)
+                        .ToList();
+
+                    var recentTimestamps = hawkesStrategyIds.Count == 0
+                        ? []
+                        : await strategyDb
                         .Set<Domain.Entities.TradeSignal>()
-                        .Where(x => x.Symbol == strategy.Symbol && x.StrategyId == strategy.Id && !x.IsDeleted)
+                        .Where(x => !x.IsDeleted && hawkesStrategyIds.Contains(x.StrategyId))
                         .OrderByDescending(x => x.GeneratedAt)
                         .Take(_options.HawkesRecentSignalCount)
                         .Select(x => x.GeneratedAt)

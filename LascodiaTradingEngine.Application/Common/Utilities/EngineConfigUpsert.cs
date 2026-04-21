@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.Common.Utilities;
@@ -42,6 +43,11 @@ public static class EngineConfigUpsert
         bool isHotReloadable = true,
         CancellationToken ct = default)
     {
+        if (!ctx.Database.IsRelational())
+        {
+            return UpsertTrackedAsync(ctx, key, value, dataType, description, isHotReloadable, ct);
+        }
+
         var dataTypeName = dataType.ToString();
         var now = DateTime.UtcNow;
         return ctx.Database.ExecuteSqlInterpolatedAsync($@"
@@ -54,5 +60,45 @@ public static class EngineConfigUpsert
                 ""LastUpdatedAt"" = EXCLUDED.""LastUpdatedAt"",
                 ""IsDeleted"" = false",
             ct);
+    }
+
+    private static async Task UpsertTrackedAsync(
+        DbContext ctx,
+        string key,
+        string value,
+        ConfigDataType dataType,
+        string? description,
+        bool isHotReloadable,
+        CancellationToken ct)
+    {
+        var now = DateTime.UtcNow;
+        var entry = await ctx.Set<EngineConfig>()
+            .IgnoreQueryFilters()
+            .FirstOrDefaultAsync(c => c.Key == key, ct);
+
+        if (entry is null)
+        {
+            ctx.Set<EngineConfig>().Add(new EngineConfig
+            {
+                Key = key,
+                Value = value,
+                DataType = dataType,
+                Description = description,
+                IsHotReloadable = isHotReloadable,
+                LastUpdatedAt = now,
+                IsDeleted = false
+            });
+        }
+        else
+        {
+            entry.Value = value;
+            entry.DataType = dataType;
+            entry.Description = description ?? entry.Description;
+            entry.IsHotReloadable = isHotReloadable;
+            entry.LastUpdatedAt = now;
+            entry.IsDeleted = false;
+        }
+
+        await ctx.SaveChangesAsync(ct);
     }
 }

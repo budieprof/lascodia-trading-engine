@@ -18,7 +18,9 @@ public class MLFeatureStalenessLogConfiguration : IEntityTypeConfiguration<MLFea
         builder.Property(e => e.FeatureName).IsRequired().HasMaxLength(100);
         builder.HasOne(e => e.MLModel).WithMany()
             .HasForeignKey(e => e.MLModelId).OnDelete(DeleteBehavior.Restrict);
-        builder.HasIndex(e => new { e.MLModelId, e.FeatureName });
+        builder.HasIndex(e => new { e.MLModelId, e.FeatureName })
+            .IsUnique()
+            .HasFilter("\"IsDeleted\" = false");
         builder.HasQueryFilter(e => !e.IsDeleted);
     }
 }

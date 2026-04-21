@@ -41,7 +41,7 @@ internal static class MLSuppressionStateHelper
             return false;
 
         bool latestKellyNegative = await db.Set<MLKellyFractionLog>()
-            .Where(l => l.MLModelId == model.Id && !l.IsDeleted)
+            .Where(l => l.MLModelId == model.Id && l.IsReliable && !l.IsDeleted)
             .OrderByDescending(l => l.ComputedAt)
             .Select(l => l.NegativeEV)
             .FirstOrDefaultAsync(ct);

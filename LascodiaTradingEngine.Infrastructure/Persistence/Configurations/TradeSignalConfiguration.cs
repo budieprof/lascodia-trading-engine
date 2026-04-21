@@ -55,6 +55,7 @@ public class TradeSignalConfiguration : IEntityTypeConfiguration<TradeSignal>
 
         builder.HasIndex(x => new { x.Symbol, x.Status });
         builder.HasIndex(x => new { x.StrategyId, x.Status });
+        builder.HasIndex(x => new { x.StrategyId, x.GeneratedAt });
 
         builder.HasOne(x => x.Strategy)
                .WithMany(x => x.TradeSignals)

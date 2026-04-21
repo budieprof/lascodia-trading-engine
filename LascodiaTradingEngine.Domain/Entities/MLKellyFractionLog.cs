@@ -32,6 +32,30 @@ public class MLKellyFractionLog : Entity<long>
     /// <summary>Whether KellyFraction is negative, indicating the model has negative expected value.</summary>
     public bool NegativeEV { get; set; }
 
+    /// <summary>Total resolved prediction rows considered before usability filtering.</summary>
+    public int TotalResolvedSamples { get; set; }
+
+    /// <summary>Prediction outcomes that had a usable economic return proxy.</summary>
+    public int UsableSamples { get; set; }
+
+    /// <summary>Usable outcomes classified as profitable/winning.</summary>
+    public int WinCount { get; set; }
+
+    /// <summary>Usable outcomes classified as losing.</summary>
+    public int LossCount { get; set; }
+
+    /// <summary>Usable outcomes classified from closed-position P&amp;L rather than prediction-log fallback fields.</summary>
+    public int PnlBasedSamples { get; set; }
+
+    /// <summary>
+    /// Whether the row is based on enough usable observations to drive suppression or sizing decisions.
+    /// Unreliable rows are audit-only and must not be treated as evidence that a model recovered.
+    /// </summary>
+    public bool IsReliable { get; set; } = true;
+
+    /// <summary>Human-readable computation status, for example "Computed" or "InsufficientUsableSamples".</summary>
+    public string Status { get; set; } = "Computed";
+
     /// <summary>UTC timestamp when this Kelly Criterion calculation was computed.</summary>
     public DateTime ComputedAt { get; set; } = DateTime.UtcNow;
 

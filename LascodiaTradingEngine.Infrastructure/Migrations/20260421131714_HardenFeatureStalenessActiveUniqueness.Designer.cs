@@ -3,6 +3,7 @@ using System;
 using LascodiaTradingEngine.Infrastructure.Persistence.DbContexts;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 
@@ -11,9 +12,11 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace LascodiaTradingEngine.Infrastructure.Migrations
 {
     [DbContext(typeof(WriteApplicationDbContext))]
-    partial class WriteApplicationDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260421131714_HardenFeatureStalenessActiveUniqueness")]
+    partial class HardenFeatureStalenessActiveUniqueness
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -2193,10 +2196,6 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
 
                     b.HasKey("Id");
 
-                    b.HasIndex("Symbol", "Timeframe")
-                        .IsUnique()
-                        .HasFilter("\"IsDeleted\" = false");
-
                     b.HasIndex("Symbol", "Timeframe", "FittedAt");
 
                     b.ToTable("MLHawkesKernelParams");
@@ -2219,16 +2218,8 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     b.Property<bool>("IsDeleted")
                         .HasColumnType("boolean");
 
-                    b.Property<bool>("IsReliable")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("boolean")
-                        .HasDefaultValue(true);
-
                     b.Property<double>("KellyFraction")
                         .HasColumnType("double precision");
-
-                    b.Property<int>("LossCount")
-                        .HasColumnType("integer");
 
                     b.Property<long>("MLModelId")
                         .HasColumnType("bigint");
@@ -2238,16 +2229,6 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
 
                     b.Property<Guid>("OutboxId")
                         .HasColumnType("uuid");
-
-                    b.Property<int>("PnlBasedSamples")
-                        .HasColumnType("integer");
-
-                    b.Property<string>("Status")
-                        .IsRequired()
-                        .ValueGeneratedOnAdd()
-                        .HasMaxLength(40)
-                        .HasColumnType("character varying(40)")
-                        .HasDefaultValue("Computed");
 
                     b.Property<string>("Symbol")
                         .IsRequired()
@@ -2259,15 +2240,6 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                         .HasMaxLength(20)
                         .HasColumnType("character varying(20)");
 
-                    b.Property<int>("TotalResolvedSamples")
-                        .HasColumnType("integer");
-
-                    b.Property<int>("UsableSamples")
-                        .HasColumnType("integer");
-
-                    b.Property<int>("WinCount")
-                        .HasColumnType("integer");
-
                     b.Property<double>("WinLossRatio")
                         .HasColumnType("double precision");
 
@@ -2277,8 +2249,6 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     b.HasKey("Id");
 
                     b.HasIndex("MLModelId");
-
-                    b.HasIndex("MLModelId", "IsReliable", "ComputedAt");
 
                     b.ToTable("MLKellyFractionLogs", (string)null);
                 });
@@ -6516,8 +6486,6 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     b.HasKey("Id");
 
                     b.HasIndex("MLModelId");
-
-                    b.HasIndex("StrategyId", "GeneratedAt");
 
                     b.HasIndex("StrategyId", "Status");
 

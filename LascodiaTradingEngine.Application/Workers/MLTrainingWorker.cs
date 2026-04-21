@@ -179,6 +179,106 @@ public sealed class MLTrainingWorker : BackgroundService
         DateTime ComputedAt,
         int Rank);
 
+    private async Task<int[]> LoadStaleFeatureIndicesAsync(
+        Microsoft.EntityFrameworkCore.DbContext ctx,
+        string symbol,
+        Timeframe timeframe,
+        int featureCount,
+        CancellationToken ct)
+    {
+        if (featureCount <= 1)
+            return [];
+
+        bool enabled = await GetConfigAsync<bool>(ctx, CK_UseFeatureStalenessSuppression, true, ct);
+        if (!enabled)
+            return [];
+
+        int maxAgeDays = await GetConfigAsync<int>(ctx, CK_MaxStaleFeatureAgeDays, 30, ct);
+        maxAgeDays = Math.Clamp(maxAgeDays, 1, 3650);
+        double maxFraction = await GetConfigAsync<double>(ctx, CK_MaxStaleFeatureFraction, 0.25, ct);
+        maxFraction = Math.Clamp(maxFraction, 0.0, 1.0);
+        int maxDisabled = (int)Math.Floor(featureCount * maxFraction);
+        if (maxFraction > 0 && maxDisabled == 0)
+            maxDisabled = 1;
+        if (maxDisabled <= 0)
+            return [];
+
+        var featureNames = MLFeatureHelper.ResolveFeatureNames(featureCount);
+        var nameToIndex = featureNames
+            .Select((name, index) => new { name, index })
+            .ToDictionary(x => x.name, x => x.index, StringComparer.OrdinalIgnoreCase);
+        var cutoff = DateTime.UtcNow.AddDays(-maxAgeDays);
+
+        try
+        {
+            var rows = await ctx.Set<MLFeatureStalenessLog>()
+                .AsNoTracking()
+                .Where(l => l.Symbol == symbol
+                         && l.Timeframe == timeframe
+                         && l.IsStale
+                         && l.ComputedAt >= cutoff)
+                .OrderByDescending(l => l.ComputedAt)
+                .ThenByDescending(l => Math.Abs(l.Lag1Autocorr))
+                .Select(l => new
+                {
+                    l.FeatureName,
+                    l.Lag1Autocorr,
+                    l.ComputedAt
+                })
+                .Take(featureCount * 4)
+                .ToListAsync(ct);
+
+            return rows
+                .Where(r => nameToIndex.ContainsKey(r.FeatureName))
+                .GroupBy(r => nameToIndex[r.FeatureName])
+                .Select(g => new
+                {
+                    Index = g.Key,
+                    Latest = g.OrderByDescending(x => x.ComputedAt).ThenByDescending(x => Math.Abs(x.Lag1Autocorr)).First()
+                })
+                .OrderByDescending(x => Math.Abs(x.Latest.Lag1Autocorr))
+                .Take(maxDisabled)
+                .Select(x => x.Index)
+                .Order()
+                .ToArray();
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex,
+                "Run stale feature lookup failed for {Symbol}/{Timeframe}; continuing without stale feature suppression.",
+                symbol, timeframe);
+            return [];
+        }
+    }
+
+    internal static List<TrainingSample> ApplyDisabledFeatureMask(
+        IReadOnlyList<TrainingSample> samples,
+        IReadOnlyCollection<int> disabledFeatureIndices)
+    {
+        if (samples.Count == 0 || disabledFeatureIndices.Count == 0)
+            return samples.ToList();
+
+        var disabled = disabledFeatureIndices
+            .Where(index => index >= 0)
+            .ToHashSet();
+        if (disabled.Count == 0)
+            return samples.ToList();
+
+        return samples
+            .Select(sample =>
+            {
+                var features = sample.Features.ToArray();
+                foreach (int index in disabled)
+                {
+                    if (index < features.Length)
+                        features[index] = 0f;
+                }
+
+                return sample with { Features = features };
+            })
+            .ToList();
+    }
+
     /// <summary>
     /// Minutes after which a <see cref="RunStatus.Running"/> claim from another worker
     /// instance is considered orphaned (e.g. due to crash/OOM) and eligible for recovery.
@@ -224,6 +324,9 @@ public sealed class MLTrainingWorker : BackgroundService
     private const string CK_AlertDestination      = "MLTraining:AlertDestination";
     private const string CK_UseInteractionFeatures = "MLTraining:UseFeatureInteractionProducts";
     private const string CK_MaxInteractionFeatures = "MLTraining:MaxFeatureInteractionProducts";
+    private const string CK_UseFeatureStalenessSuppression = "MLTraining:UseFeatureStalenessSuppression";
+    private const string CK_MaxStaleFeatureAgeDays = "MLTraining:MaxStaleFeatureAgeDays";
+    private const string CK_MaxStaleFeatureFraction = "MLTraining:MaxStaleFeatureFraction";
     private const string CK_MaxWfStdDev           = "MLTraining:MaxWalkForwardStdDev";
     private const string CK_LabelSmoothing        = "MLTraining:LabelSmoothing";
     private const string CK_MinFeatureImportance  = "MLTraining:MinFeatureImportance";
@@ -1093,8 +1196,8 @@ public sealed class MLTrainingWorker : BackgroundService
                         int v6BookHits  = orderBookCache.Values.Count(v => v is not null);
                         int v6TickHits  = tickFlowCache.Values.Count(v => v is not null);
                         _logger.LogInformation(
-                            "Built {Samples} V6 training samples (features={Feat}, tickFlowCoverage={Th}/{Total}, orderBookCoverage={Bh}/{Total}, costBuffer={Buf:F5})",
-                            samples.Count, MLFeatureHelper.FeatureCountV6, v6TickHits, tickFlowCache.Count, v6BookHits, costBufferPriceUnits);
+                            "Built {Samples} V6 training samples (features={Feat}, tickFlowCoverage={Th}/{TickTotal}, orderBookCoverage={Bh}/{BookTotal}, costBuffer={Buf:F5})",
+                            samples.Count, MLFeatureHelper.FeatureCountV6, v6TickHits, tickFlowCache.Count, v6BookHits, orderBookCache.Count, costBufferPriceUnits);
                         goto trainingSamplesBuilt;
                     }
                     samples = MLFeatureHelper.BuildTrainingSamplesWithTripleBarrierV5(
@@ -1221,6 +1324,21 @@ trainingSamplesBuilt:;
             }
 
             int interactionBaseFeatureCount = samples.Count > 0 ? samples[0].Features.Length : 0;
+            var staleFeatureIndices = await LoadStaleFeatureIndicesAsync(
+                ctx,
+                run.Symbol,
+                run.Timeframe,
+                interactionBaseFeatureCount,
+                stoppingToken);
+
+            if (staleFeatureIndices.Length > 0)
+            {
+                samples = ApplyDisabledFeatureMask(samples, staleFeatureIndices);
+                _logger.LogInformation(
+                    "Run {RunId}: suppressed {Count} stale feature(s) from MLFeatureStalenessLog: {Indices}.",
+                    run.Id, staleFeatureIndices.Length, string.Join(",", staleFeatureIndices));
+            }
+
             var interactionPairs = await LoadFeatureInteractionPairsAsync(
                 ctx,
                 run.Symbol,
@@ -1889,7 +2007,7 @@ trainingSamplesBuilt:;
             var (finalModelBytes, plattA, plattB) = await PatchSnapshotAsync(
                 result.ModelBytes, run, candles, samples, buyCount, sellCount,
                 imbalanceRatio, cotNetMin, cotNetMax, cotMomMin, cotMomMax,
-                interactionPairs, interactionBaseFeatureCount,
+                interactionPairs, interactionBaseFeatureCount, staleFeatureIndices,
                 ctx, stoppingToken);
 
             // ── ONNX export (opt-in) ───────────────────────────────────────────
@@ -2310,6 +2428,7 @@ trainingSamplesBuilt:;
         float                                   cotMomMax,
         FeatureInteractionPairDescriptor[]      interactionPairs,
         int                                     interactionBaseFeatureCount,
+        int[]                                   staleFeatureIndices,
         Microsoft.EntityFrameworkCore.DbContext ctx,
         CancellationToken                       ct)
     {
@@ -2371,6 +2490,8 @@ trainingSamplesBuilt:;
                     var baseNames = MLFeatureHelper.ResolveFeatureNames(interactionBaseFeatureCount);
                     snap.Features = MLFeatureHelper.AppendInteractionFeatureNames(baseNames, interactionPairs);
                 }
+
+                ApplyStaleFeatureMaskToSnapshot(snap, staleFeatureIndices, snap.ExpectedInputFeatures);
             }
 
             // Compute per-feature empirical variances from the deployed feature pipeline.
@@ -2490,6 +2611,32 @@ trainingSamplesBuilt:;
         }
 
         return (finalModelBytes, plattA, plattB);
+    }
+
+    internal static void ApplyStaleFeatureMaskToSnapshot(
+        ModelSnapshot snapshot,
+        IReadOnlyCollection<int> staleFeatureIndices,
+        int featureCount)
+    {
+        if (featureCount <= 0 || staleFeatureIndices.Count == 0)
+            return;
+
+        var mask = snapshot.ActiveFeatureMask is { Length: > 0 } existing &&
+                   existing.Length == featureCount
+            ? existing.ToArray()
+            : Enumerable.Repeat(true, featureCount).ToArray();
+
+        foreach (int index in staleFeatureIndices)
+        {
+            if (index >= 0 && index < mask.Length)
+                mask[index] = false;
+        }
+
+        if (!mask.Any(static active => active))
+            throw new InvalidOperationException("Stale feature suppression cannot disable every feature.");
+
+        snapshot.ActiveFeatureMask = mask;
+        snapshot.PrunedFeatureCount = mask.Count(static active => !active);
     }
 
     // ── Promotion publishing ──────────────────────────────────────────────────

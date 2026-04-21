@@ -26,5 +26,8 @@ public class MLHawkesKernelParamsConfiguration : IEntityTypeConfiguration<MLHawk
         builder.HasQueryFilter(x => !x.IsDeleted);
 
         builder.HasIndex(x => new { x.Symbol, x.Timeframe, x.FittedAt });
+        builder.HasIndex(x => new { x.Symbol, x.Timeframe })
+            .IsUnique()
+            .HasFilter("\"IsDeleted\" = false");
     }
 }

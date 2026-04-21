@@ -24,9 +24,17 @@ public class MLKellyFractionLogConfiguration : IEntityTypeConfiguration<MLKellyF
         builder.Property(x => x.WinRate).IsRequired();
         builder.Property(x => x.WinLossRatio).IsRequired();
         builder.Property(x => x.NegativeEV).IsRequired();
+        builder.Property(x => x.TotalResolvedSamples).IsRequired();
+        builder.Property(x => x.UsableSamples).IsRequired();
+        builder.Property(x => x.WinCount).IsRequired();
+        builder.Property(x => x.LossCount).IsRequired();
+        builder.Property(x => x.PnlBasedSamples).IsRequired();
+        builder.Property(x => x.IsReliable).IsRequired().HasDefaultValue(true);
+        builder.Property(x => x.Status).IsRequired().HasMaxLength(40).HasDefaultValue("Computed");
         builder.Property(x => x.ComputedAt).IsRequired();
 
         builder.HasIndex(x => x.MLModelId);
+        builder.HasIndex(x => new { x.MLModelId, x.IsReliable, x.ComputedAt });
 
         builder.HasQueryFilter(e => !e.IsDeleted);
     }

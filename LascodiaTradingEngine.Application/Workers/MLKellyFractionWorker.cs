@@ -47,8 +47,16 @@ public sealed class MLKellyFractionWorker : BackgroundService
 {
     private const string KellyConfigKeyPrefix = "MLKelly:";
     private const string KellyCapKeySuffix = ":KellyCap";
+    private const string CK_PollSecs = "MLKellyFraction:PollIntervalSeconds";
+    private const string CK_WindowDays = "MLKellyFraction:WindowDays";
+    private const string CK_MinUsableSamples = "MLKellyFraction:MinUsableSamples";
+    private const string CK_MinWins = "MLKellyFraction:MinWins";
+    private const string CK_MinLosses = "MLKellyFraction:MinLosses";
+    private const string CK_MaxAbsKelly = "MLKellyFraction:MaxAbsKelly";
+
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<MLKellyFractionWorker> _logger;
+    private readonly TimeProvider _timeProvider;
 
     /// <summary>
     /// Initialises the worker with its DI scope factory and logger.
@@ -58,10 +66,14 @@ public sealed class MLKellyFractionWorker : BackgroundService
     /// contexts are correctly disposed after each pass.
     /// </param>
     /// <param name="logger">Structured logger scoped to this worker type.</param>
-    public MLKellyFractionWorker(IServiceScopeFactory scopeFactory, ILogger<MLKellyFractionWorker> logger)
+    public MLKellyFractionWorker(
+        IServiceScopeFactory scopeFactory,
+        ILogger<MLKellyFractionWorker> logger,
+        TimeProvider? timeProvider = null)
     {
         _scopeFactory = scopeFactory;
         _logger       = logger;
+        _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     /// <summary>
@@ -74,10 +86,23 @@ public sealed class MLKellyFractionWorker : BackgroundService
         _logger.LogInformation("MLKellyFractionWorker started.");
         while (!stoppingToken.IsCancellationRequested)
         {
+            int pollSeconds = 86_400;
             try { await RunAsync(stoppingToken); }
             catch (Exception ex) when (ex is not OperationCanceledException)
             { _logger.LogError(ex, "MLKellyFractionWorker error"); }
-            await Task.Delay(TimeSpan.FromHours(24), stoppingToken);
+
+            try
+            {
+                using var scope = _scopeFactory.CreateScope();
+                var readCtx = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>().GetDbContext();
+                pollSeconds = await GetConfigAsync(readCtx, CK_PollSecs, pollSeconds, stoppingToken);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogDebug(ex, "MLKellyFractionWorker: failed to read poll interval; using default.");
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(Math.Max(60, pollSeconds)), stoppingToken);
         }
     }
 
@@ -108,6 +133,8 @@ public sealed class MLKellyFractionWorker : BackgroundService
     /// </list>
     /// </remarks>
     /// <param name="ct">Cancellation token forwarded from the host.</param>
+    internal Task RunOnceAsync(CancellationToken ct = default) => RunAsync(ct);
+
     private async Task RunAsync(CancellationToken ct)
     {
         using var scope  = _scopeFactory.CreateScope();
@@ -115,12 +142,16 @@ public sealed class MLKellyFractionWorker : BackgroundService
         var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
         var readDb   = readCtx.GetDbContext();
         var writeDb  = writeCtx.GetDbContext();
+        var config = await LoadConfigAsync(readDb, ct);
+        var now = _timeProvider.GetUtcNow().UtcDateTime;
+        var cutoff = now.AddDays(-config.WindowDays);
 
         // Exclude meta-learners and MAML initialisers — they do not emit direct live trade signals.
         var models = await readDb.Set<MLModel>()
             .AsNoTracking()
             .Where(m => m.IsActive && !m.IsDeleted && !m.IsMetaLearner && !m.IsMamlInitializer
-                     && m.ModelBytes != null)
+                         && m.ModelBytes != null)
+            .OrderBy(m => m.Id)
             .ToListAsync(ct);
 
         foreach (var model in models)
@@ -132,15 +163,19 @@ public sealed class MLKellyFractionWorker : BackgroundService
                 .AsNoTracking()
                 .Where(l => l.MLModelId == model.Id
                          && !l.IsDeleted
+                         && l.ModelRole == ModelRole.Champion
+                         && l.TradeSignal.MLModelId == model.Id
                          && l.DirectionCorrect != null
                          && l.OutcomeRecordedAt != null
-                         && l.OutcomeRecordedAt >= DateTime.UtcNow.AddDays(-60))
+                         && l.OutcomeRecordedAt >= cutoff)
                 .OrderByDescending(l => l.OutcomeRecordedAt)
                 .ToListAsync(ct);
 
-            if (logs.Count < 30)
+            if (logs.Count < config.MinUsableSamples)
             {
-                await PersistNeutralKellyStateAsync(writeDb, model, configKey, ct);
+                await PersistNeutralKellyStateAsync(
+                    writeDb, model, configKey, logs.Count, 0, 0, 0, 0,
+                    "InsufficientResolvedSamples", now, ct);
                 continue;
             }
 
@@ -169,14 +204,19 @@ public sealed class MLKellyFractionWorker : BackgroundService
                 .Where(p => p.Status == PositionStatus.Closed
                          && p.OpenOrderId != null
                          && allOrderIds.Contains(p.OpenOrderId!.Value)
+                         && p.OpenLots > 0m
                          && !p.IsDeleted)
-                .Select(p => new { p.OpenOrderId, NetPnl = p.RealizedPnL + p.Swap - p.Commission })
+                .Select(p => new
+                {
+                    p.OpenOrderId,
+                    NormalizedNetPnl = (p.RealizedPnL + p.Swap - p.Commission) / p.OpenLots
+                })
                 .ToListAsync(ct);
 
             var orderToPnl = orderPositionPnl
                 .Where(x => x.OpenOrderId.HasValue)
                 .GroupBy(x => x.OpenOrderId!.Value)
-                .ToDictionary(g => g.Key, g => g.Sum(x => x.NetPnl));
+                .ToDictionary(g => g.Key, g => g.Sum(x => x.NormalizedNetPnl));
 
             // ── Compute Kelly from actual P&L where available, fall back to magnitude ──
             var wins   = new List<double>();
@@ -185,8 +225,6 @@ public sealed class MLKellyFractionWorker : BackgroundService
 
             foreach (var log in logs)
             {
-                double returnValue;
-
                 // Prefer actual position-level P&L (net of costs) when available
                 if (signalToOrderIds.TryGetValue(log.TradeSignalId, out var orderIds))
                 {
@@ -201,31 +239,27 @@ public sealed class MLKellyFractionWorker : BackgroundService
                         }
                     }
 
-                    if (hasPnl)
+                    if (hasPnl && TryClassifyEconomicOutcome(totalPnl, out var pnlOutcome))
                     {
-                        returnValue = (double)Math.Abs(totalPnl);
-                        if (returnValue <= 0.0) continue;
-
-                        if (totalPnl > 0) wins.Add(returnValue);
-                        else               losses.Add(returnValue);
+                        AddOutcome(wins, losses, pnlOutcome);
                         pnlBasedCount++;
                         continue;
                     }
                 }
 
-                // Fallback: use ActualMagnitudePips when no position link exists
-                if (log.ActualMagnitudePips is null) continue;
-                returnValue = (double)Math.Abs(log.ActualMagnitudePips.Value);
-                if (returnValue <= 0.0) continue;
-
-                if (log.DirectionCorrect == true) wins.Add(returnValue);
-                else                               losses.Add(returnValue);
+                if (TryClassifyFallbackOutcome(log, out var fallbackOutcome))
+                    AddOutcome(wins, losses, fallbackOutcome);
             }
 
-            // Require at least one win and one loss to compute a meaningful b ratio.
-            if (wins.Count == 0 || losses.Count == 0)
+            int usableSamples = wins.Count + losses.Count;
+            if (usableSamples < config.MinUsableSamples ||
+                wins.Count < config.MinWins ||
+                losses.Count < config.MinLosses)
             {
-                await PersistNeutralKellyStateAsync(writeDb, model, configKey, ct);
+                await PersistNeutralKellyStateAsync(
+                    writeDb, model, configKey, logs.Count, usableSamples,
+                    wins.Count, losses.Count, pnlBasedCount,
+                    "InsufficientUsableSamples", now, ct);
                 continue;
             }
 
@@ -237,7 +271,7 @@ public sealed class MLKellyFractionWorker : BackgroundService
 
             // Half-Kelly: conservative sizing that halves variance while retaining
             // most of the geometric growth benefit. Capped at ±25% of account equity.
-            double halfKelly = Math.Clamp(0.5 * fStar, -0.25, 0.25);
+            double halfKelly = Math.Clamp(0.5 * fStar, -config.MaxAbsKelly, config.MaxAbsKelly);
 
             bool negEv = fStar < 0;
             double deployedKellyCap = Math.Max(0.0, halfKelly);
@@ -247,12 +281,19 @@ public sealed class MLKellyFractionWorker : BackgroundService
                 MLModelId     = model.Id,
                 Symbol        = model.Symbol,
                 Timeframe     = model.Timeframe.ToString(),
-                KellyFraction = Math.Clamp(fStar, -0.25, 0.25),
+                KellyFraction = Math.Clamp(fStar, -config.MaxAbsKelly, config.MaxAbsKelly),
                 HalfKelly     = halfKelly,
                 WinRate       = p,
                 WinLossRatio  = b,
                 NegativeEV    = negEv,
-                ComputedAt    = DateTime.UtcNow
+                TotalResolvedSamples = logs.Count,
+                UsableSamples = usableSamples,
+                WinCount = wins.Count,
+                LossCount = losses.Count,
+                PnlBasedSamples = pnlBasedCount,
+                IsReliable = true,
+                Status = "Computed",
+                ComputedAt    = now
             });
 
             await UpsertConfigAsync(
@@ -279,7 +320,7 @@ public sealed class MLKellyFractionWorker : BackgroundService
             _logger.LogInformation(
                 "MLKellyFractionWorker: {S}/{T} f*={F:F4} halfKelly={H:F4} winRate={P:F3} b={B:F3} negEV={N} pnlBased={PnlPct:P0}",
                 model.Symbol, model.Timeframe, fStar, halfKelly, p, b, negEv,
-                logs.Count > 0 ? (double)pnlBasedCount / logs.Count : 0.0);
+                usableSamples > 0 ? (double)pnlBasedCount / usableSamples : 0.0);
         }
     }
 
@@ -290,12 +331,97 @@ public sealed class MLKellyFractionWorker : BackgroundService
         CancellationToken                       ct)
         => LascodiaTradingEngine.Application.Common.Utilities.EngineConfigUpsert.UpsertAsync(writeCtx, key, value, dataType: LascodiaTradingEngine.Domain.Enums.ConfigDataType.Decimal, ct: ct);
 
+    private static async Task<KellyRuntimeConfig> LoadConfigAsync(
+        Microsoft.EntityFrameworkCore.DbContext readDb,
+        CancellationToken ct)
+    {
+        int windowDays = await GetConfigAsync(readDb, CK_WindowDays, 60, ct);
+        int minUsable = await GetConfigAsync(readDb, CK_MinUsableSamples, 30, ct);
+        int minWins = await GetConfigAsync(readDb, CK_MinWins, 5, ct);
+        int minLosses = await GetConfigAsync(readDb, CK_MinLosses, 5, ct);
+        double maxAbsKelly = await GetConfigAsync(readDb, CK_MaxAbsKelly, 0.25, ct);
+
+        return new KellyRuntimeConfig(
+            WindowDays: Math.Clamp(windowDays, 1, 365),
+            MinUsableSamples: Math.Clamp(minUsable, 2, 10_000),
+            MinWins: Math.Clamp(minWins, 1, 10_000),
+            MinLosses: Math.Clamp(minLosses, 1, 10_000),
+            MaxAbsKelly: double.IsFinite(maxAbsKelly)
+                ? Math.Clamp(maxAbsKelly, 0.001, 1.0)
+                : 0.25);
+    }
+
+    private static async Task<T> GetConfigAsync<T>(
+        Microsoft.EntityFrameworkCore.DbContext db,
+        string key,
+        T defaultValue,
+        CancellationToken ct)
+    {
+        var entry = await db.Set<EngineConfig>()
+            .AsNoTracking()
+            .FirstOrDefaultAsync(c => c.Key == key && !c.IsDeleted, ct);
+
+        if (entry?.Value is null) return defaultValue;
+
+        try
+        {
+            return (T)Convert.ChangeType(
+                entry.Value,
+                typeof(T),
+                System.Globalization.CultureInfo.InvariantCulture);
+        }
+        catch
+        {
+            return defaultValue;
+        }
+    }
+
+    internal static bool TryClassifyEconomicOutcome(decimal pnl, out KellyOutcome outcome)
+    {
+        outcome = default;
+        double magnitude = (double)Math.Abs(pnl);
+        if (magnitude <= 0.0 || !double.IsFinite(magnitude))
+            return false;
+
+        outcome = new KellyOutcome(pnl > 0m, magnitude);
+        return true;
+    }
+
+    internal static bool TryClassifyFallbackOutcome(MLModelPredictionLog log, out KellyOutcome outcome)
+    {
+        outcome = default;
+        if (log.ActualMagnitudePips is null)
+            return false;
+
+        double magnitude = (double)Math.Abs(log.ActualMagnitudePips.Value);
+        if (magnitude <= 0.0 || !double.IsFinite(magnitude))
+            return false;
+
+        bool isWin = log.WasProfitable ?? (log.DirectionCorrect == true);
+        outcome = new KellyOutcome(isWin, magnitude);
+        return true;
+    }
+
+    private static void AddOutcome(List<double> wins, List<double> losses, KellyOutcome outcome)
+    {
+        if (outcome.IsWin) wins.Add(outcome.Magnitude);
+        else losses.Add(outcome.Magnitude);
+    }
+
     private static async Task PersistNeutralKellyStateAsync(
         Microsoft.EntityFrameworkCore.DbContext writeDb,
         MLModel                                 model,
         string                                  configKey,
+        int                                     totalResolvedSamples,
+        int                                     usableSamples,
+        int                                     winCount,
+        int                                     lossCount,
+        int                                     pnlBasedSamples,
+        string                                  status,
+        DateTime                                computedAt,
         CancellationToken                       ct)
     {
+        _ = configKey;
         writeDb.Set<MLKellyFractionLog>().Add(new MLKellyFractionLog
         {
             MLModelId     = model.Id,
@@ -306,18 +432,25 @@ public sealed class MLKellyFractionWorker : BackgroundService
             WinRate       = 0.5,
             WinLossRatio  = 1.0,
             NegativeEV    = false,
-            ComputedAt    = DateTime.UtcNow
+            TotalResolvedSamples = totalResolvedSamples,
+            UsableSamples = usableSamples,
+            WinCount = winCount,
+            LossCount = lossCount,
+            PnlBasedSamples = pnlBasedSamples,
+            IsReliable = false,
+            Status = status,
+            ComputedAt    = computedAt
         });
 
-        await UpsertConfigAsync(writeDb, configKey, "1.0000", ct);
         await writeDb.SaveChangesAsync(ct);
-
-        var tracked = await writeDb.Set<MLModel>().FindAsync(new object[] { model.Id }, ct);
-        if (tracked?.IsSuppressed == true &&
-            await MLSuppressionStateHelper.CanLiftSuppressionAsync(writeDb, tracked, ct))
-        {
-            tracked.IsSuppressed = false;
-            await writeDb.SaveChangesAsync(ct);
-        }
     }
+
+    internal readonly record struct KellyOutcome(bool IsWin, double Magnitude);
+
+    internal sealed record KellyRuntimeConfig(
+        int WindowDays,
+        int MinUsableSamples,
+        int MinWins,
+        int MinLosses,
+        double MaxAbsKelly);
 }
