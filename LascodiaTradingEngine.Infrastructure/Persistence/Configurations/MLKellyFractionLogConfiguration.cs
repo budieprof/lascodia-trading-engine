@@ -20,9 +20,14 @@ public class MLKellyFractionLogConfiguration : IEntityTypeConfiguration<MLKellyF
         builder.Property(x => x.Symbol).IsRequired().HasMaxLength(20);
         builder.Property(x => x.Timeframe).IsRequired().HasMaxLength(20);
         builder.Property(x => x.KellyFraction).IsRequired();
+        builder.Property(x => x.RawKellyFraction).IsRequired();
         builder.Property(x => x.HalfKelly).IsRequired();
         builder.Property(x => x.WinRate).IsRequired();
         builder.Property(x => x.WinLossRatio).IsRequired();
+        builder.Property(x => x.ConservativeWinRate).IsRequired().HasDefaultValue(0.5);
+        builder.Property(x => x.ShrinkageFactor).IsRequired().HasDefaultValue(1.0);
+        builder.Property(x => x.OutlierCap).IsRequired();
+        builder.Property(x => x.NormalizationMode).IsRequired().HasMaxLength(40).HasDefaultValue("Unknown");
         builder.Property(x => x.NegativeEV).IsRequired();
         builder.Property(x => x.TotalResolvedSamples).IsRequired();
         builder.Property(x => x.UsableSamples).IsRequired();

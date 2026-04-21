@@ -104,7 +104,8 @@ public sealed class MLEwmaAccuracyWorker : BackgroundService
                 var wCtx    = writeDb.GetDbContext();
 
                 // Re-read interval live so operators can tune without restart.
-                pollSecs = await GetConfigAsync<int>(ctx, CK_PollSecs, 600, stoppingToken);
+                pollSecs = NormalizePollSeconds(
+                    await GetConfigAsync<int>(ctx, CK_PollSecs, 600, stoppingToken));
 
                 await UpdateEwmaAsync(ctx, wCtx, stoppingToken);
             }
@@ -135,17 +136,25 @@ public sealed class MLEwmaAccuracyWorker : BackgroundService
     /// <param name="readCtx">Read-only DbContext for fetching models, logs, and alert state.</param>
     /// <param name="writeCtx">Write DbContext for upserting EWMA rows and inserting alerts.</param>
     /// <param name="ct">Cancellation token checked between model updates.</param>
-    private async Task UpdateEwmaAsync(
+    internal async Task UpdateEwmaAsync(
         Microsoft.EntityFrameworkCore.DbContext readCtx,
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
         CancellationToken                       ct)
     {
         // Load all EWMA parameters once per cycle.
-        double alpha         = await GetConfigAsync<double>(readCtx, CK_Alpha,     0.05,    ct);
-        int    minPredictions = await GetConfigAsync<int>  (readCtx, CK_MinPreds,  20,      ct);
-        double warnThreshold  = await GetConfigAsync<double>(readCtx, CK_WarnThr,  0.50,    ct);
-        double critThreshold  = await GetConfigAsync<double>(readCtx, CK_CritThr,  0.48,    ct);
-        string alertDest      = await GetConfigAsync<string>(readCtx, CK_AlertDest,"ml-ops", ct);
+        double alpha          = NormalizeAlpha(
+            await GetConfigAsync<double>(readCtx, CK_Alpha, 0.05, ct));
+        int    minPredictions = NormalizeMinPredictions(
+            await GetConfigAsync<int>(readCtx, CK_MinPreds, 20, ct));
+        double warnThreshold  = NormalizeProbability(
+            await GetConfigAsync<double>(readCtx, CK_WarnThr, 0.50, ct), 0.50);
+        double critThreshold  = NormalizeProbability(
+            await GetConfigAsync<double>(readCtx, CK_CritThr, 0.48, ct), 0.48);
+        string alertDest      = NormalizeDestination(
+            await GetConfigAsync<string>(readCtx, CK_AlertDest, "ml-ops", ct));
+
+        if (critThreshold > warnThreshold)
+            critThreshold = warnThreshold;
 
         // Only update EWMA for actively deployed models.
         var activeModels = await readCtx.Set<MLModel>()
@@ -182,9 +191,9 @@ public sealed class MLEwmaAccuracyWorker : BackgroundService
     ///   <item>Loads the model's existing EWMA state row (if any) from
     ///         <see cref="MLModelEwmaAccuracy"/> to resume from the last known EWMA
     ///         value and prediction timestamp.</item>
-    ///   <item>Queries only prediction logs that are newer than the last processed
-    ///         timestamp (<c>since</c>), making each poll O(new predictions) rather
-    ///         than O(all predictions).</item>
+    ///   <item>Queries only prediction logs whose resolved-outcome watermark is newer
+    ///         than the last processed <c>(OutcomeRecordedAt, Id)</c> pair, making each
+    ///         poll O(newly resolved predictions) rather than O(all predictions).</item>
     ///   <item>Applies the EWMA recurrence <c>ewma = α × outcome + (1−α) × ewma</c>
     ///         for each new resolved prediction, in chronological order.</item>
     ///   <item>Upserts the updated EWMA state row.</item>
@@ -199,8 +208,9 @@ public sealed class MLEwmaAccuracyWorker : BackgroundService
     ///
     /// <b>Incremental vs recomputed:</b> The EWMA is maintained incrementally rather
     /// than recomputed from scratch each poll. This is intentional — it means the
-    /// EWMA remembers history beyond the look-back window, providing a longer-memory
-    /// signal that is complementary to the fixed-window rolling accuracy computed by
+    /// EWMA remembers history beyond the look-back window while still advancing only
+    /// as outcomes become known. This provides a longer-memory signal that is
+    /// complementary to the fixed-window rolling accuracy computed by
     /// <c>MLRollingAccuracyWorker</c>.
     ///
     /// <b>Alert deduplication:</b> Alerts are only created when no active
@@ -244,19 +254,31 @@ public sealed class MLEwmaAccuracyWorker : BackgroundService
             .AsNoTracking()
             .FirstOrDefaultAsync(r => r.MLModelId == modelId, ct);
 
-        // Only fetch prediction logs newer than the last processed timestamp.
-        // This makes each poll incremental — we only process the "new" predictions
-        // since the previous cycle, never re-processing the full history.
-        var since = existing?.LastPredictionAt ?? DateTime.MinValue;
+        // Prediction logs are created at signal-scoring time, but outcomes are
+        // back-filled later and can arrive out of prediction order. Use outcome
+        // resolution time as the primary watermark, with log id as a tie-breaker.
+        var lastResolvedAt = existing?.LastOutcomeRecordedAt
+                             ?? existing?.LastPredictionAt
+                             ?? DateTime.MinValue;
+        long lastPredictionLogId = existing?.LastPredictionLogId ?? 0L;
 
         var newLogs = await readCtx.Set<MLModelPredictionLog>()
             .Where(l => l.MLModelId        == modelId  &&
                         l.DirectionCorrect != null      &&
-                        l.PredictedAt      > since      &&  // strictly newer than last run
+                        ((l.OutcomeRecordedAt ?? l.PredictedAt) > lastResolvedAt ||
+                         ((l.OutcomeRecordedAt ?? l.PredictedAt) == lastResolvedAt &&
+                          l.Id > lastPredictionLogId)) &&
                         !l.IsDeleted)
-            .OrderBy(l => l.PredictedAt)    // chronological order required for EWMA
+            .OrderBy(l => l.OutcomeRecordedAt ?? l.PredictedAt)
+            .ThenBy(l => l.Id)
             .AsNoTracking()
-            .Select(l => new { l.PredictedAt, Correct = l.DirectionCorrect!.Value })
+            .Select(l => new
+            {
+                l.Id,
+                l.PredictedAt,
+                ResolvedAt = l.OutcomeRecordedAt ?? l.PredictedAt,
+                Correct    = l.DirectionCorrect!.Value,
+            })
             .ToListAsync(ct);
 
         // Nothing to update if no new resolved predictions have arrived.
@@ -268,6 +290,10 @@ public sealed class MLEwmaAccuracyWorker : BackgroundService
         double ewma  = existing?.EwmaAccuracy ?? 0.5;
         int    total = existing?.TotalPredictions ?? 0;
         DateTime lastAt = existing?.LastPredictionAt ?? DateTime.MinValue;
+        DateTime lastOutcomeAt = existing?.LastOutcomeRecordedAt
+                                 ?? existing?.LastPredictionAt
+                                 ?? DateTime.MinValue;
+        long lastLogId = existing?.LastPredictionLogId ?? 0L;
 
         foreach (var log in newLogs)
         {
@@ -278,8 +304,12 @@ public sealed class MLEwmaAccuracyWorker : BackgroundService
             // Recent outcomes are weighted α; history decays geometrically by (1 - α).
             ewma = alpha * outcome + (1.0 - alpha) * ewma;
             total++;
-            lastAt = log.PredictedAt;
+            lastAt        = log.PredictedAt;
+            lastOutcomeAt = log.ResolvedAt;
+            lastLogId     = log.Id;
         }
+
+        ewma = Math.Clamp(ewma, 0.0, 1.0);
 
         var now = DateTime.UtcNow;
 
@@ -287,10 +317,14 @@ public sealed class MLEwmaAccuracyWorker : BackgroundService
         int rows = await writeCtx.Set<MLModelEwmaAccuracy>()
             .Where(r => r.MLModelId == modelId)
             .ExecuteUpdateAsync(s => s
+                .SetProperty(r => r.Symbol,           symbol)
+                .SetProperty(r => r.Timeframe,        timeframe)
                 .SetProperty(r => r.EwmaAccuracy,     ewma)
                 .SetProperty(r => r.Alpha,             alpha)
                 .SetProperty(r => r.TotalPredictions,  total)
                 .SetProperty(r => r.LastPredictionAt,  lastAt)
+                .SetProperty(r => r.LastOutcomeRecordedAt, lastOutcomeAt)
+                .SetProperty(r => r.LastPredictionLogId, lastLogId)
                 .SetProperty(r => r.ComputedAt,        now),
                 ct);
 
@@ -306,6 +340,8 @@ public sealed class MLEwmaAccuracyWorker : BackgroundService
                 Alpha            = alpha,
                 TotalPredictions = total,
                 LastPredictionAt = lastAt,
+                LastOutcomeRecordedAt = lastOutcomeAt,
+                LastPredictionLogId = lastLogId,
                 ComputedAt       = now,
             });
             await writeCtx.SaveChangesAsync(ct);
@@ -327,12 +363,15 @@ public sealed class MLEwmaAccuracyWorker : BackgroundService
 
         // Determine severity tier: critical if below the lower threshold, else warning.
         string severity = ewma < critThreshold ? "critical" : "warning";
+        AlertSeverity alertSeverity = ewma < critThreshold
+            ? AlertSeverity.Critical
+            : AlertSeverity.Medium;
+        string dedupKey = $"MLEwma:{modelId}:{symbol}:{timeframe}";
 
-        // Deduplicate: only create an alert if no active MLModelDegraded alert already
-        // exists for this symbol. This prevents alert storms during sustained degradation.
+        // Deduplicate this exact EWMA breach without hiding unrelated ML degradation
+        // alerts for another model, timeframe, or worker.
         bool alertExists = await readCtx.Set<Alert>()
-            .AnyAsync(a => a.Symbol    == symbol                  &&
-                           a.AlertType == AlertType.MLModelDegraded &&
+            .AnyAsync(a => a.DeduplicationKey == dedupKey &&
                            a.IsActive  && !a.IsDeleted, ct);
 
         if (alertExists) return;
@@ -358,8 +397,14 @@ public sealed class MLEwmaAccuracyWorker : BackgroundService
                 warnThreshold,
                 criticalThreshold = critThreshold,
                 totalPredictions  = total,
+                alertDestination  = alertDest,
+                lastOutcomeRecordedAt = lastOutcomeAt,
+                lastPredictionLogId = lastLogId,
             }),
-            IsActive = true,
+            Severity         = alertSeverity,
+            DeduplicationKey = dedupKey,
+            CooldownSeconds  = 600,
+            IsActive         = true,
         });
 
         await writeCtx.SaveChangesAsync(ct);
@@ -394,4 +439,19 @@ public sealed class MLEwmaAccuracyWorker : BackgroundService
         try   { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
         catch { return defaultValue; }
     }
+
+    internal static double NormalizeAlpha(double value)
+        => double.IsFinite(value) && value > 0.0 && value <= 1.0 ? value : 0.05;
+
+    internal static double NormalizeProbability(double value, double defaultValue)
+        => double.IsFinite(value) && value >= 0.0 && value <= 1.0 ? value : defaultValue;
+
+    internal static int NormalizeMinPredictions(int value)
+        => value >= 1 ? value : 20;
+
+    internal static int NormalizePollSeconds(int value)
+        => value is >= 1 and <= 86_400 ? value : 600;
+
+    internal static string NormalizeDestination(string? value)
+        => string.IsNullOrWhiteSpace(value) ? "ml-ops" : value.Trim();
 }

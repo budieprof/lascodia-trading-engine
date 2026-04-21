@@ -108,6 +108,7 @@ public class MLKellyFractionWorkerTest
     {
         await using var db = CreateDbContext();
         AddConfig(db, "MLKellyFraction:MaxAbsKelly", "1.0", ConfigDataType.Decimal);
+        AddNoShrinkageConfig(db);
         var model = AddModel(db);
 
         for (int i = 0; i < 20; i++)
@@ -133,9 +134,130 @@ public class MLKellyFractionWorkerTest
         Assert.Equal("Computed", log.Status);
         Assert.Equal(30, log.UsableSamples);
         Assert.Equal(30, log.PnlBasedSamples);
+        Assert.Equal("PnlPerLot", log.NormalizationMode);
         Assert.Equal(1.0, log.WinLossRatio, precision: 6);
         Assert.Equal(1.0 / 3.0, log.KellyFraction, precision: 6);
         Assert.Equal("0.1667", cap.Value);
+    }
+
+    [Fact]
+    public async Task RunOnceAsync_UsesRiskMultipleWhenStopLossAndContractSpecsExist()
+    {
+        await using var db = CreateDbContext();
+        AddConfig(db, "MLKellyFraction:MaxAbsKelly", "1.0", ConfigDataType.Decimal);
+        AddNoShrinkageConfig(db);
+        AddCurrencyPair(db);
+        var model = AddModel(db);
+
+        for (int i = 0; i < 20; i++)
+        {
+            var signal = await AddPredictionAsync(db, model, wasProfitable: true, directionCorrect: true, magnitudePips: 10m);
+            await AddClosedPositionAsync(db, signal.Id, realizedPnl: 1_000m, openLots: 1m);
+        }
+
+        for (int i = 0; i < 10; i++)
+        {
+            var signal = await AddPredictionAsync(db, model, wasProfitable: false, directionCorrect: false, magnitudePips: 5m);
+            await AddClosedPositionAsync(db, signal.Id, realizedPnl: -500m, openLots: 0.5m);
+        }
+
+        var worker = CreateWorker(db);
+
+        await worker.RunOnceAsync();
+
+        var log = await db.Set<MLKellyFractionLog>().SingleAsync(l => l.MLModelId == model.Id);
+
+        Assert.Equal("RiskMultiple", log.NormalizationMode);
+        Assert.Equal(1.0, log.WinLossRatio, precision: 6);
+        Assert.Equal(1.0 / 3.0, log.KellyFraction, precision: 6);
+    }
+
+    [Fact]
+    public async Task RunOnceAsync_NegativeConservativeKelly_SuppressesAndDeploysZeroCap()
+    {
+        await using var db = CreateDbContext();
+        AddConfig(db, "MLKellyFraction:MaxAbsKelly", "1.0", ConfigDataType.Decimal);
+        AddNoShrinkageConfig(db);
+        var model = AddModel(db);
+
+        for (int i = 0; i < 10; i++)
+        {
+            var signal = await AddPredictionAsync(db, model, wasProfitable: true, directionCorrect: true, magnitudePips: 5m);
+            await AddClosedPositionAsync(db, signal.Id, realizedPnl: 5m, openLots: 1m);
+        }
+
+        for (int i = 0; i < 20; i++)
+        {
+            var signal = await AddPredictionAsync(db, model, wasProfitable: false, directionCorrect: false, magnitudePips: 10m);
+            await AddClosedPositionAsync(db, signal.Id, realizedPnl: -10m, openLots: 1m);
+        }
+
+        var worker = CreateWorker(db);
+
+        await worker.RunOnceAsync();
+
+        var refreshedModel = await db.Set<MLModel>().SingleAsync(m => m.Id == model.Id);
+        var log = await db.Set<MLKellyFractionLog>().SingleAsync(l => l.MLModelId == model.Id);
+        var cap = await db.Set<EngineConfig>().SingleAsync(c => c.Key == "MLKelly:EURUSD:H1:1:KellyCap");
+
+        Assert.True(refreshedModel.IsSuppressed);
+        Assert.True(log.NegativeEV);
+        Assert.True(log.KellyFraction < 0.0);
+        Assert.Equal("0.0000", cap.Value);
+    }
+
+    [Fact]
+    public async Task RunOnceAsync_IgnoresChallengerLogsForServedChampionSizing()
+    {
+        await using var db = CreateDbContext();
+        var model = AddModel(db);
+
+        for (int i = 0; i < 30; i++)
+        {
+            await AddPredictionAsync(
+                db,
+                model,
+                wasProfitable: false,
+                directionCorrect: false,
+                magnitudePips: 10m,
+                modelRole: ModelRole.Challenger);
+        }
+
+        var worker = CreateWorker(db);
+
+        await worker.RunOnceAsync();
+
+        var refreshedModel = await db.Set<MLModel>().SingleAsync(m => m.Id == model.Id);
+        var log = await db.Set<MLKellyFractionLog>().SingleAsync(l => l.MLModelId == model.Id);
+
+        Assert.False(refreshedModel.IsSuppressed);
+        Assert.False(log.IsReliable);
+        Assert.Equal("InsufficientResolvedSamples", log.Status);
+        Assert.Equal(0, log.TotalResolvedSamples);
+    }
+
+    [Fact]
+    public void ConservativeKellyHelpers_ShrinkAndLowerBoundNoisyEdges()
+    {
+        var config = new MLKellyFractionWorker.KellyRuntimeConfig(
+            WindowDays: 60,
+            MinUsableSamples: 30,
+            MinWins: 5,
+            MinLosses: 5,
+            MaxAbsKelly: 0.25,
+            PriorTrades: 20.0,
+            WinRateLowerBoundZ: 1.0,
+            OutlierPercentile: 0.95,
+            MaxOutcomeMagnitude: 10.0);
+
+        double lowerBound = MLKellyFractionWorker.ComputeConservativeWinRate(20, 30, config);
+        double shrinkage = MLKellyFractionWorker.ComputeShrinkage(30, config);
+        var capped = MLKellyFractionWorker.ApplyOutcomeCap([1.0, 2.0, 100.0], [1.0, 2.0], config);
+
+        Assert.True(lowerBound < 20.0 / 30.0);
+        Assert.Equal(0.6, shrinkage, precision: 6);
+        Assert.Equal(10.0, capped.Cap);
+        Assert.Equal(10.0, capped.Wins.Max());
     }
 
     private static WriteApplicationDbContext CreateDbContext()
@@ -189,7 +311,8 @@ public class MLKellyFractionWorkerTest
         MLModel model,
         bool wasProfitable,
         bool directionCorrect,
-        decimal? magnitudePips)
+        decimal? magnitudePips,
+        ModelRole modelRole = ModelRole.Champion)
     {
         var signal = new TradeSignal
         {
@@ -197,6 +320,7 @@ public class MLKellyFractionWorkerTest
             Symbol = model.Symbol,
             Direction = TradeDirection.Buy,
             EntryPrice = 1.1000m,
+            StopLoss = 1.0900m,
             SuggestedLotSize = 0.1m,
             Confidence = 0.75m,
             MLModelId = model.Id,
@@ -211,7 +335,7 @@ public class MLKellyFractionWorkerTest
         {
             TradeSignalId = signal.Id,
             MLModelId = model.Id,
-            ModelRole = ModelRole.Champion,
+            ModelRole = modelRole,
             Symbol = model.Symbol,
             Timeframe = model.Timeframe,
             PredictedDirection = TradeDirection.Buy,
@@ -277,5 +401,29 @@ public class MLKellyFractionWorkerTest
             LastUpdatedAt = Now.UtcDateTime
         });
         db.SaveChanges();
+    }
+
+    private static void AddCurrencyPair(WriteApplicationDbContext db)
+    {
+        db.Set<CurrencyPair>().Add(new CurrencyPair
+        {
+            Symbol = "EURUSD",
+            BaseCurrency = "EUR",
+            QuoteCurrency = "USD",
+            DecimalPlaces = 5,
+            ContractSize = 100_000m,
+            PipSize = 0.0001m,
+            MinLotSize = 0.01m,
+            MaxLotSize = 100m,
+            LotStep = 0.01m,
+            IsActive = true
+        });
+        db.SaveChanges();
+    }
+
+    private static void AddNoShrinkageConfig(WriteApplicationDbContext db)
+    {
+        AddConfig(db, "MLKellyFraction:PriorTrades", "0", ConfigDataType.Decimal);
+        AddConfig(db, "MLKellyFraction:WinRateLowerBoundZ", "0", ConfigDataType.Decimal);
     }
 }

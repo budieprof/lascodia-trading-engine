@@ -23,6 +23,7 @@ public class MLModelEwmaAccuracyConfiguration : IEntityTypeConfiguration<MLModel
         // One row per active model — upserted on each compute cycle.
         builder.HasIndex(x => new { x.MLModelId }).IsUnique();
         builder.HasIndex(x => new { x.Symbol, x.Timeframe });
+        builder.HasIndex(x => new { x.MLModelId, x.LastOutcomeRecordedAt, x.LastPredictionLogId });
 
         builder.HasOne(x => x.MLModel)
                .WithMany()

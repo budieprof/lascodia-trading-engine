@@ -10,8 +10,8 @@ namespace LascodiaTradingEngine.Application.Workers;
 
 /// <summary>
 /// Computes the Kelly Criterion optimal position-sizing fraction (f*) for each active
-/// ML model from recent resolved live prediction logs. Suppresses models with negative
-/// expected value (f* &lt; 0) and caps the position fraction at 25%. Runs every 24 hours.
+/// ML model from recent resolved served-champion prediction logs. Suppresses models with
+/// negative conservative Kelly value and caps the position fraction. Runs every 24 hours by default.
 /// </summary>
 /// <remarks>
 /// <b>Kelly Criterion background:</b>
@@ -28,16 +28,16 @@ namespace LascodiaTradingEngine.Application.Workers;
 ///
 /// <b>Half-Kelly:</b> Full Kelly produces high volatility because estimation error in
 /// p and b causes the actual fraction to overshoot. The worker stores
-/// <c>HalfKelly = 0.5 × f*</c> as the recommended position fraction, which halves the
-/// theoretical variance while retaining ~75% of expected geometric growth
-/// (MacLean et al., 2010).
+/// <c>HalfKelly = 0.5 × conservative f*</c> as the recommended position fraction.
+/// The conservative value uses a Bayesian lower-bound win rate, sample-size shrinkage
+/// toward zero, and outlier-capped payoff magnitudes.
 ///
-/// <b>Negative EV suppression:</b> When f* &lt; 0 the model has negative expected
-/// geometric growth rate. The model is flagged <c>IsSuppressed = true</c> so the signal
-/// pipeline ignores its outputs until the next successful retrain.
+/// <b>Negative EV suppression:</b> When the conservative f* &lt; 0 the model is flagged
+/// <c>IsSuppressed = true</c> so the signal pipeline ignores its outputs until the
+/// suppression gates clear.
 ///
-/// <b>Polling interval:</b> 24 hours. Daily computation uses a 60-day live-outcome window
-/// for statistical stability while reflecting recent market conditions.
+/// <b>Polling interval:</b> 24 hours by default. Daily computation uses a 60-day
+/// live-outcome window by default, both hot-configurable via <c>EngineConfig</c>.
 ///
 /// <b>ML lifecycle contribution:</b> Provides a final risk-adjusted position sizing
 /// gate before signals reach the order execution layer by writing a live Kelly cap
@@ -53,6 +53,10 @@ public sealed class MLKellyFractionWorker : BackgroundService
     private const string CK_MinWins = "MLKellyFraction:MinWins";
     private const string CK_MinLosses = "MLKellyFraction:MinLosses";
     private const string CK_MaxAbsKelly = "MLKellyFraction:MaxAbsKelly";
+    private const string CK_PriorTrades = "MLKellyFraction:PriorTrades";
+    private const string CK_WinRateLowerBoundZ = "MLKellyFraction:WinRateLowerBoundZ";
+    private const string CK_OutlierPercentile = "MLKellyFraction:OutlierPercentile";
+    private const string CK_MaxOutcomeMagnitude = "MLKellyFraction:MaxOutcomeMagnitude";
 
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<MLKellyFractionWorker> _logger;
@@ -108,24 +112,24 @@ public sealed class MLKellyFractionWorker : BackgroundService
 
     /// <summary>
     /// Core Kelly computation cycle. Reconstructs realised signed returns from recent
-    /// resolved production predictions, then computes and persists the Kelly fraction
-    /// and Half-Kelly to <c>MLKellyFractionLog</c>. Models with negative expected
-    /// value are suppressed.
+    /// served champion predictions, then computes and persists raw/conservative Kelly
+    /// fractions and Half-Kelly to <c>MLKellyFractionLog</c>. Models with negative
+    /// conservative expected value are suppressed.
     /// </summary>
     /// <remarks>
     /// Live-outcome methodology:
     /// <list type="number">
     ///   <item>
-    ///     Load recent resolved <see cref="MLModelPredictionLog"/> rows for the last 60 days.
-    ///     Require both <c>DirectionCorrect</c> and <c>ActualMagnitudePips</c>.
+    ///     Load recent resolved served-champion <see cref="MLModelPredictionLog"/> rows.
     ///   </item>
     ///   <item>
-    ///     Convert each resolved prediction into a realised signed return proxy:
-    ///     <c>+|ActualMagnitudePips|</c> when the direction was correct,
-    ///     <c>-|ActualMagnitudePips|</c> when it was wrong.
+    ///     Prefer closed-position P&amp;L normalized to risk multiple when stop-loss
+    ///     and contract specs are available; otherwise fall back to P&amp;L per lot or
+    ///     prediction-log profitability/magnitude.
     ///   </item>
     ///   <item>
-    ///     Compute p, q, b, f* and Half-Kelly. Cap at ±25%.
+    ///     Apply outlier caps, Bayesian win-rate lower bound, shrinkage, then compute
+    ///     raw and conservative f* plus Half-Kelly.
     ///   </item>
     ///   <item>
     ///     Suppress the model if f* &lt; 0. Persist results to <c>MLKellyFractionLog</c>.
@@ -184,6 +188,19 @@ public sealed class MLKellyFractionWorker : BackgroundService
                 .Select(l => l.TradeSignalId)
                 .Distinct()
                 .ToList();
+            var symbols = logs.Select(l => l.Symbol).Distinct().ToList();
+
+            var signalSnapshots = await readDb.Set<TradeSignal>()
+                .AsNoTracking()
+                .Where(s => signalIds.Contains(s.Id) && !s.IsDeleted)
+                .Select(s => new SignalRiskSnapshot(s.Id, s.Symbol, s.EntryPrice, s.StopLoss))
+                .ToDictionaryAsync(s => s.Id, ct);
+
+            var contractSizes = await readDb.Set<CurrencyPair>()
+                .AsNoTracking()
+                .Where(c => !c.IsDeleted && symbols.Contains(c.Symbol))
+                .Select(c => new { c.Symbol, c.ContractSize })
+                .ToDictionaryAsync(c => c.Symbol, c => c.ContractSize, ct);
 
             // Map: TradeSignalId → list of OrderIds
             var signalOrderMap = await readDb.Set<Order>()
@@ -206,22 +223,22 @@ public sealed class MLKellyFractionWorker : BackgroundService
                          && allOrderIds.Contains(p.OpenOrderId!.Value)
                          && p.OpenLots > 0m
                          && !p.IsDeleted)
-                .Select(p => new
-                {
-                    p.OpenOrderId,
-                    NormalizedNetPnl = (p.RealizedPnL + p.Swap - p.Commission) / p.OpenLots
-                })
+                .Select(p => new OrderPositionOutcome(
+                    p.OpenOrderId!.Value,
+                    p.Symbol,
+                    p.RealizedPnL + p.Swap - p.Commission,
+                    p.OpenLots))
                 .ToListAsync(ct);
 
-            var orderToPnl = orderPositionPnl
-                .Where(x => x.OpenOrderId.HasValue)
-                .GroupBy(x => x.OpenOrderId!.Value)
-                .ToDictionary(g => g.Key, g => g.Sum(x => x.NormalizedNetPnl));
+            var orderToPositionOutcomes = orderPositionPnl
+                .GroupBy(x => x.OpenOrderId)
+                .ToDictionary(g => g.Key, g => g.ToList());
 
             // ── Compute Kelly from actual P&L where available, fall back to magnitude ──
             var wins   = new List<double>();
             var losses = new List<double>();
             int pnlBasedCount = 0;
+            int riskMultipleCount = 0;
 
             foreach (var log in logs)
             {
@@ -229,20 +246,36 @@ public sealed class MLKellyFractionWorker : BackgroundService
                 if (signalToOrderIds.TryGetValue(log.TradeSignalId, out var orderIds))
                 {
                     decimal totalPnl = 0m;
+                    decimal totalRiskAmount = 0m;
+                    decimal totalPnlPerLot = 0m;
                     bool hasPnl = false;
                     foreach (var oid in orderIds)
                     {
-                        if (orderToPnl.TryGetValue(oid, out var pnl))
+                        if (!orderToPositionOutcomes.TryGetValue(oid, out var positionOutcomes))
+                            continue;
+
+                        foreach (var positionOutcome in positionOutcomes)
                         {
-                            totalPnl += pnl;
+                            totalPnl += positionOutcome.NetPnl;
+                            totalPnlPerLot += positionOutcome.NetPnl / positionOutcome.OpenLots;
+
+                            if (signalSnapshots.TryGetValue(log.TradeSignalId, out var signalSnapshot) &&
+                                contractSizes.TryGetValue(positionOutcome.Symbol, out var contractSize) &&
+                                TryResolveRiskAmount(signalSnapshot, contractSize, positionOutcome.OpenLots, out var riskAmount))
+                            {
+                                totalRiskAmount += riskAmount;
+                            }
+
                             hasPnl = true;
                         }
                     }
 
-                    if (hasPnl && TryClassifyEconomicOutcome(totalPnl, out var pnlOutcome))
+                    if (hasPnl && TryClassifyEconomicOutcome(totalPnl, totalPnlPerLot, totalRiskAmount, out var pnlOutcome))
                     {
                         AddOutcome(wins, losses, pnlOutcome);
                         pnlBasedCount++;
+                        if (pnlOutcome.NormalizationMode == NormalizationModes.RiskMultiple)
+                            riskMultipleCount++;
                         continue;
                     }
                 }
@@ -263,11 +296,19 @@ public sealed class MLKellyFractionWorker : BackgroundService
                 continue;
             }
 
-            // Kelly formula: f* = (p × b − q) / b
-            double p     = (double)wins.Count / (wins.Count + losses.Count);
+            var clipped = ApplyOutcomeCap(wins, losses, config);
+
+            // Kelly formula: f* = (p × b − q) / b. The deployed value uses a
+            // Bayesian lower-bound win rate and sample-size shrinkage so marginal
+            // edges size toward zero instead of overreacting to noisy live samples.
+            double p     = (double)wins.Count / usableSamples;
             double q     = 1 - p;
-            double b     = wins.Average() / (losses.Average() + 1e-8);
-            double fStar = (p * b - q) / (b + 1e-8);
+            double b     = clipped.Wins.Average() / (clipped.Losses.Average() + 1e-8);
+            double rawFStar = (p * b - q) / (b + 1e-8);
+            double conservativeP = ComputeConservativeWinRate(wins.Count, usableSamples, config);
+            double conservativeQ = 1 - conservativeP;
+            double shrinkage = ComputeShrinkage(usableSamples, config);
+            double fStar = shrinkage * ((conservativeP * b - conservativeQ) / (b + 1e-8));
 
             // Half-Kelly: conservative sizing that halves variance while retaining
             // most of the geometric growth benefit. Capped at ±25% of account equity.
@@ -282,9 +323,16 @@ public sealed class MLKellyFractionWorker : BackgroundService
                 Symbol        = model.Symbol,
                 Timeframe     = model.Timeframe.ToString(),
                 KellyFraction = Math.Clamp(fStar, -config.MaxAbsKelly, config.MaxAbsKelly),
+                RawKellyFraction = Math.Clamp(rawFStar, -config.MaxAbsKelly, config.MaxAbsKelly),
                 HalfKelly     = halfKelly,
                 WinRate       = p,
                 WinLossRatio  = b,
+                ConservativeWinRate = conservativeP,
+                ShrinkageFactor = shrinkage,
+                OutlierCap = clipped.Cap,
+                NormalizationMode = riskMultipleCount > 0
+                    ? NormalizationModes.RiskMultiple
+                    : NormalizationModes.PnlPerLot,
                 NegativeEV    = negEv,
                 TotalResolvedSamples = logs.Count,
                 UsableSamples = usableSamples,
@@ -318,8 +366,8 @@ public sealed class MLKellyFractionWorker : BackgroundService
             }
 
             _logger.LogInformation(
-                "MLKellyFractionWorker: {S}/{T} f*={F:F4} halfKelly={H:F4} winRate={P:F3} b={B:F3} negEV={N} pnlBased={PnlPct:P0}",
-                model.Symbol, model.Timeframe, fStar, halfKelly, p, b, negEv,
+                "MLKellyFractionWorker: {S}/{T} rawF*={Raw:F4} f*={F:F4} halfKelly={H:F4} winRate={P:F3} pLcb={PLcb:F3} b={B:F3} shrink={Shrink:F3} negEV={N} pnlBased={PnlPct:P0}",
+                model.Symbol, model.Timeframe, rawFStar, fStar, halfKelly, p, conservativeP, b, shrinkage, negEv,
                 usableSamples > 0 ? (double)pnlBasedCount / usableSamples : 0.0);
         }
     }
@@ -340,6 +388,10 @@ public sealed class MLKellyFractionWorker : BackgroundService
         int minWins = await GetConfigAsync(readDb, CK_MinWins, 5, ct);
         int minLosses = await GetConfigAsync(readDb, CK_MinLosses, 5, ct);
         double maxAbsKelly = await GetConfigAsync(readDb, CK_MaxAbsKelly, 0.25, ct);
+        double priorTrades = await GetConfigAsync(readDb, CK_PriorTrades, 20.0, ct);
+        double winRateLowerBoundZ = await GetConfigAsync(readDb, CK_WinRateLowerBoundZ, 1.0, ct);
+        double outlierPercentile = await GetConfigAsync(readDb, CK_OutlierPercentile, 0.95, ct);
+        double maxOutcomeMagnitude = await GetConfigAsync(readDb, CK_MaxOutcomeMagnitude, 10.0, ct);
 
         return new KellyRuntimeConfig(
             WindowDays: Math.Clamp(windowDays, 1, 365),
@@ -348,7 +400,19 @@ public sealed class MLKellyFractionWorker : BackgroundService
             MinLosses: Math.Clamp(minLosses, 1, 10_000),
             MaxAbsKelly: double.IsFinite(maxAbsKelly)
                 ? Math.Clamp(maxAbsKelly, 0.001, 1.0)
-                : 0.25);
+                : 0.25,
+            PriorTrades: double.IsFinite(priorTrades)
+                ? Math.Clamp(priorTrades, 0.0, 1_000.0)
+                : 20.0,
+            WinRateLowerBoundZ: double.IsFinite(winRateLowerBoundZ)
+                ? Math.Clamp(winRateLowerBoundZ, 0.0, 3.0)
+                : 1.0,
+            OutlierPercentile: double.IsFinite(outlierPercentile)
+                ? Math.Clamp(outlierPercentile, 0.50, 1.0)
+                : 0.95,
+            MaxOutcomeMagnitude: double.IsFinite(maxOutcomeMagnitude)
+                ? Math.Clamp(maxOutcomeMagnitude, 0.001, 1_000_000.0)
+                : 10.0);
     }
 
     private static async Task<T> GetConfigAsync<T>(
@@ -376,16 +440,44 @@ public sealed class MLKellyFractionWorker : BackgroundService
         }
     }
 
-    internal static bool TryClassifyEconomicOutcome(decimal pnl, out KellyOutcome outcome)
+    private static bool TryResolveRiskAmount(
+        SignalRiskSnapshot signal,
+        decimal contractSize,
+        decimal lots,
+        out decimal riskAmount)
+    {
+        riskAmount = 0m;
+        if (!signal.StopLoss.HasValue || signal.EntryPrice <= 0m || signal.StopLoss.Value <= 0m ||
+            contractSize <= 0m || lots <= 0m)
+            return false;
+
+        riskAmount = Math.Abs(signal.EntryPrice - signal.StopLoss.Value) * contractSize * lots;
+        return riskAmount > 0m;
+    }
+
+    internal static bool TryClassifyEconomicOutcome(
+        decimal pnl,
+        decimal pnlPerLot,
+        decimal riskAmount,
+        out KellyOutcome outcome)
     {
         outcome = default;
-        double magnitude = (double)Math.Abs(pnl);
+        bool hasRisk = riskAmount > 0m;
+        double magnitude = hasRisk
+            ? (double)Math.Abs(pnl / riskAmount)
+            : (double)Math.Abs(pnlPerLot);
         if (magnitude <= 0.0 || !double.IsFinite(magnitude))
             return false;
 
-        outcome = new KellyOutcome(pnl > 0m, magnitude);
+        outcome = new KellyOutcome(
+            pnl > 0m,
+            magnitude,
+            hasRisk ? NormalizationModes.RiskMultiple : NormalizationModes.PnlPerLot);
         return true;
     }
+
+    internal static bool TryClassifyEconomicOutcome(decimal pnl, out KellyOutcome outcome)
+        => TryClassifyEconomicOutcome(pnl, pnl, 0m, out outcome);
 
     internal static bool TryClassifyFallbackOutcome(MLModelPredictionLog log, out KellyOutcome outcome)
     {
@@ -398,7 +490,7 @@ public sealed class MLKellyFractionWorker : BackgroundService
             return false;
 
         bool isWin = log.WasProfitable ?? (log.DirectionCorrect == true);
-        outcome = new KellyOutcome(isWin, magnitude);
+        outcome = new KellyOutcome(isWin, magnitude, NormalizationModes.FallbackMagnitude);
         return true;
     }
 
@@ -406,6 +498,51 @@ public sealed class MLKellyFractionWorker : BackgroundService
     {
         if (outcome.IsWin) wins.Add(outcome.Magnitude);
         else losses.Add(outcome.Magnitude);
+    }
+
+    internal static CappedOutcomes ApplyOutcomeCap(
+        IReadOnlyList<double> wins,
+        IReadOnlyList<double> losses,
+        KellyRuntimeConfig config)
+    {
+        var all = wins.Concat(losses)
+            .Where(v => double.IsFinite(v) && v > 0.0)
+            .OrderBy(v => v)
+            .ToArray();
+        if (all.Length == 0)
+            return new CappedOutcomes(wins.ToArray(), losses.ToArray(), config.MaxOutcomeMagnitude);
+
+        int index = Math.Clamp(
+            (int)Math.Ceiling(config.OutlierPercentile * all.Length) - 1,
+            0,
+            all.Length - 1);
+        double cap = Math.Min(all[index], config.MaxOutcomeMagnitude);
+
+        return new CappedOutcomes(
+            wins.Select(w => Math.Min(w, cap)).ToArray(),
+            losses.Select(l => Math.Min(l, cap)).ToArray(),
+            cap);
+    }
+
+    internal static double ComputeConservativeWinRate(int wins, int total, KellyRuntimeConfig config)
+    {
+        if (total <= 0) return 0.0;
+
+        double prior = config.PriorTrades;
+        double posteriorN = total + prior;
+        double posteriorMean = (wins + 0.5 * prior) / posteriorN;
+        double posteriorVariance = posteriorMean * (1.0 - posteriorMean) / Math.Max(posteriorN + 1.0, 1.0);
+
+        return Math.Clamp(
+            posteriorMean - config.WinRateLowerBoundZ * Math.Sqrt(Math.Max(0.0, posteriorVariance)),
+            0.0,
+            1.0);
+    }
+
+    internal static double ComputeShrinkage(int total, KellyRuntimeConfig config)
+    {
+        if (total <= 0) return 0.0;
+        return total / (total + config.PriorTrades);
     }
 
     private static async Task PersistNeutralKellyStateAsync(
@@ -428,9 +565,14 @@ public sealed class MLKellyFractionWorker : BackgroundService
             Symbol        = model.Symbol,
             Timeframe     = model.Timeframe.ToString(),
             KellyFraction = 0.0,
+            RawKellyFraction = 0.0,
             HalfKelly     = 0.0,
             WinRate       = 0.5,
             WinLossRatio  = 1.0,
+            ConservativeWinRate = 0.5,
+            ShrinkageFactor = 0.0,
+            OutlierCap = 0.0,
+            NormalizationMode = NormalizationModes.Unknown,
             NegativeEV    = false,
             TotalResolvedSamples = totalResolvedSamples,
             UsableSamples = usableSamples,
@@ -445,12 +587,30 @@ public sealed class MLKellyFractionWorker : BackgroundService
         await writeDb.SaveChangesAsync(ct);
     }
 
-    internal readonly record struct KellyOutcome(bool IsWin, double Magnitude);
+    internal static class NormalizationModes
+    {
+        internal const string Unknown = "Unknown";
+        internal const string RiskMultiple = "RiskMultiple";
+        internal const string PnlPerLot = "PnlPerLot";
+        internal const string FallbackMagnitude = "FallbackMagnitude";
+    }
+
+    internal readonly record struct KellyOutcome(bool IsWin, double Magnitude, string NormalizationMode);
+
+    internal sealed record CappedOutcomes(double[] Wins, double[] Losses, double Cap);
+
+    private sealed record SignalRiskSnapshot(long Id, string Symbol, decimal EntryPrice, decimal? StopLoss);
+
+    private sealed record OrderPositionOutcome(long OpenOrderId, string Symbol, decimal NetPnl, decimal OpenLots);
 
     internal sealed record KellyRuntimeConfig(
         int WindowDays,
         int MinUsableSamples,
         int MinWins,
         int MinLosses,
-        double MaxAbsKelly);
+        double MaxAbsKelly,
+        double PriorTrades,
+        double WinRateLowerBoundZ,
+        double OutlierPercentile,
+        double MaxOutcomeMagnitude);
 }

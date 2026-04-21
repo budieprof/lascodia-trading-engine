@@ -20,6 +20,9 @@ public class MLKellyFractionLog : Entity<long>
     /// <summary>Optimal full Kelly fraction f* = (p*b - q) / b.</summary>
     public double KellyFraction { get; set; }
 
+    /// <summary>Unadjusted Kelly fraction before shrinkage, lower-bound confidence, and outlier controls.</summary>
+    public double RawKellyFraction { get; set; }
+
     /// <summary>Practical half-Kelly recommendation: 0.5 * KellyFraction.</summary>
     public double HalfKelly { get; set; }
 
@@ -28,6 +31,18 @@ public class MLKellyFractionLog : Entity<long>
 
     /// <summary>Win/loss ratio b = mean_win / mean_loss.</summary>
     public double WinLossRatio { get; set; }
+
+    /// <summary>Bayesian lower confidence bound for the win rate used by the conservative Kelly estimate.</summary>
+    public double ConservativeWinRate { get; set; }
+
+    /// <summary>Multiplier applied to shrink the Kelly estimate toward zero as sample evidence weakens.</summary>
+    public double ShrinkageFactor { get; set; } = 1.0;
+
+    /// <summary>Upper magnitude cap applied to wins/losses before payoff-ratio estimation.</summary>
+    public double OutlierCap { get; set; }
+
+    /// <summary>Outcome normalization method, for example "RiskMultiple" or "PnlPerLot".</summary>
+    public string NormalizationMode { get; set; } = "Unknown";
 
     /// <summary>Whether KellyFraction is negative, indicating the model has negative expected value.</summary>
     public bool NegativeEV { get; set; }

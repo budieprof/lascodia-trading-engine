@@ -39,8 +39,21 @@ public class MLModelEwmaAccuracy : Entity<long>
     /// <summary>Total number of resolved predictions incorporated into the EWMA so far.</summary>
     public int       TotalPredictions   { get; set; }
 
-    /// <summary>UTC timestamp of the most recent resolved prediction used in this computation.</summary>
+    /// <summary>UTC prediction timestamp of the most recent resolved prediction used in this computation.</summary>
     public DateTime  LastPredictionAt   { get; set; }
+
+    /// <summary>
+    /// UTC outcome-resolution timestamp of the most recent prediction used in this computation.
+    /// This is the primary incremental watermark because prediction outcomes are back-filled
+    /// after the original prediction time.
+    /// </summary>
+    public DateTime? LastOutcomeRecordedAt { get; set; }
+
+    /// <summary>
+    /// Prediction log id paired with <see cref="LastOutcomeRecordedAt"/> to make the
+    /// incremental watermark stable when multiple outcomes share the same timestamp.
+    /// </summary>
+    public long      LastPredictionLogId { get; set; }
 
     /// <summary>UTC timestamp when this row was last updated.</summary>
     public DateTime  ComputedAt         { get; set; }
