@@ -45,10 +45,16 @@ public class StrategyConfiguration : IEntityTypeConfiguration<Strategy>
         builder.HasQueryFilter(x => !x.IsDeleted);
 
         builder.HasIndex(x => x.Symbol);
+        // The unique index enforces "at most one live Strategy per (type, symbol, TF)" —
+        // its original intent. The previous filter was `IsDeleted = false` alone, which
+        // also rejected legitimate duplicate pre-promotion candidates: the generator
+        // routinely inserts multiple CompositeML parameter variants per (symbol, TF) in
+        // PendingModel/Draft to be re-screened once a model activates. Those should all
+        // be allowed to coexist; only the Approved/Active rows can conflict.
         builder.HasIndex(x => new { x.StrategyType, x.Symbol, x.Timeframe })
             .HasDatabaseName("IX_Strategy_ActiveGenerationKey")
             .IsUnique()
-            .HasFilter("\"IsDeleted\" = false");
+            .HasFilter("\"IsDeleted\" = false AND \"LifecycleStage\" IN ('Approved', 'Active')");
         builder.HasIndex(x => x.RiskProfileId);
 
         builder.HasOne(x => x.RiskProfile)
