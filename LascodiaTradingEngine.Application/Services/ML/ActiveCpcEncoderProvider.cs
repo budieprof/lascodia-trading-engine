@@ -77,6 +77,22 @@ public sealed class ActiveCpcEncoderProvider : IActiveCpcEncoderProvider
         return encoder;
     }
 
+    public void Invalidate(
+        string symbol,
+        Timeframe timeframe,
+        global::LascodiaTradingEngine.Domain.Enums.MarketRegime? regime)
+    {
+        if (regime is not null)
+        {
+            _cache.Remove(BuildCacheKey(symbol, timeframe, regime));
+            return;
+        }
+
+        _cache.Remove(BuildCacheKey(symbol, timeframe, null));
+        foreach (var concreteRegime in Enum.GetValues<global::LascodiaTradingEngine.Domain.Enums.MarketRegime>())
+            _cache.Remove(BuildCacheKey(symbol, timeframe, concreteRegime));
+    }
+
     private static async Task<MLCpcEncoder?> LoadAsync(
         DbContext ctx,
         string symbol,

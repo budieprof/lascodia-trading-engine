@@ -176,6 +176,38 @@ public class ActiveCpcEncoderProviderTest
         Assert.Null(await provider.GetAsync("EURUSD", Timeframe.H1, regime: null, CancellationToken.None));
     }
 
+    [Fact]
+    public async Task Invalidate_Global_Evicts_Regime_Fallback_Cache_Entries()
+    {
+        await using var db = CreateDbContext();
+        db.Set<MLCpcEncoder>().Add(new MLCpcEncoder
+        {
+            Id = 1, Symbol = "EURUSD", Timeframe = Timeframe.H1,
+            EmbeddingDim = 16, EncoderBytes = [1], IsActive = true, Regime = null,
+            TrainedAt = DateTime.UtcNow.AddHours(-1)
+        });
+        await db.SaveChangesAsync();
+
+        var provider = CreateProvider(db, out _);
+        var cachedFallback = await provider.GetAsync("EURUSD", Timeframe.H1, MarketRegime.Ranging, CancellationToken.None);
+        Assert.Equal(1, cachedFallback!.Id);
+
+        var old = await db.Set<MLCpcEncoder>().SingleAsync(e => e.Id == 1);
+        old.IsActive = false;
+        db.Set<MLCpcEncoder>().Add(new MLCpcEncoder
+        {
+            Id = 2, Symbol = "EURUSD", Timeframe = Timeframe.H1,
+            EmbeddingDim = 16, EncoderBytes = [2], IsActive = true, Regime = null,
+            TrainedAt = DateTime.UtcNow
+        });
+        await db.SaveChangesAsync();
+
+        provider.Invalidate("EURUSD", Timeframe.H1, regime: null);
+        var refreshedFallback = await provider.GetAsync("EURUSD", Timeframe.H1, MarketRegime.Ranging, CancellationToken.None);
+
+        Assert.Equal(2, refreshedFallback!.Id);
+    }
+
     private static WriteApplicationDbContext CreateDbContext()
     {
         var options = new DbContextOptionsBuilder<WriteApplicationDbContext>()

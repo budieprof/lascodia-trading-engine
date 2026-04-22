@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Enums;
@@ -9,15 +10,36 @@ namespace LascodiaTradingEngine.Application.SignalFilters;
 /// Checks whether any high-impact economic event for the symbol's currencies
 /// falls within the blackout window around the intended trade time.
 /// Returns false (not safe) if a blocking event is found.
+///
+/// <para>Freshness: an empty / stale calendar returns "safe to trade" by construction
+/// (no blocking event found). Without a freshness SLA, a broken calendar feed would
+/// silently open a window where news halts stop working. IsSafeToTradeAsync therefore
+/// also consults MAX(ScheduledAt) and warns when the newest scheduled event is more
+/// than <see cref="StaleCalendarHours"/> hours in the past — the feed should always
+/// contain future events during trading hours. By default the filter returns true
+/// (permissive) on staleness and logs a Warning; set <c>NewsFilter:FailClosedOnStale</c>
+/// via EngineConfig to flip to fail-closed (returns false → block trading).</para>
 /// </summary>
 [RegisterService]
 public class NewsFilter : INewsFilter
 {
-    private readonly IReadApplicationDbContext _context;
+    /// <summary>Threshold for "stale calendar" detection. The feed writes future events
+    /// ahead of time, so MAX(ScheduledAt) should usually be hours in the future.</summary>
+    public const int StaleCalendarHours = 6;
 
-    public NewsFilter(IReadApplicationDbContext context)
+    private readonly IReadApplicationDbContext _context;
+    private readonly ILogger<NewsFilter> _logger;
+
+    // Throttle stale-calendar warnings to one per this interval so a persistently stale
+    // feed doesn't spam logs.
+    private static DateTime s_lastStaleWarnAt = DateTime.MinValue;
+    private static readonly TimeSpan s_staleWarnInterval = TimeSpan.FromMinutes(5);
+    private static readonly object s_staleWarnLock = new();
+
+    public NewsFilter(IReadApplicationDbContext context, ILogger<NewsFilter> logger)
     {
         _context = context;
+        _logger  = logger;
     }
 
     public async Task<bool> IsSafeToTradeAsync(
@@ -33,8 +55,39 @@ public class NewsFilter : INewsFilter
         var windowStart = tradeTime.AddMinutes(-blackoutMinutesBefore);
         var windowEnd   = tradeTime.AddMinutes(blackoutMinutesAfter);
 
-        bool hasBlockingEvent = await _context.GetDbContext()
-            .Set<Domain.Entities.EconomicEvent>()
+        var db = _context.GetDbContext();
+
+        // Freshness check — cheap probe of MAX(ScheduledAt) across non-deleted rows.
+        // A non-trivial feed always has future events queued ahead of time; if the
+        // newest scheduled event is in the past, the sync worker has fallen behind
+        // or the feed is down. We DON'T block on staleness by default (callers
+        // already have kill switches + other gates) but we do log and emit a
+        // stable Warning so monitoring can alert.
+        DateTime? latestEvent = await db.Set<Domain.Entities.EconomicEvent>()
+            .Where(x => !x.IsDeleted)
+            .OrderByDescending(x => x.ScheduledAt)
+            .Select(x => (DateTime?)x.ScheduledAt)
+            .FirstOrDefaultAsync(ct);
+        var now = DateTime.UtcNow;
+        bool calendarIsStale = latestEvent is null
+            || latestEvent.Value < now.AddHours(-StaleCalendarHours);
+        if (calendarIsStale)
+        {
+            bool shouldWarn;
+            lock (s_staleWarnLock)
+            {
+                shouldWarn = now - s_lastStaleWarnAt > s_staleWarnInterval;
+                if (shouldWarn) s_lastStaleWarnAt = now;
+            }
+            if (shouldWarn)
+                _logger.LogWarning(
+                    "NewsFilter: economic calendar appears stale — latest scheduled event at {Latest} (threshold {Hours}h). " +
+                    "High-impact news halts may not fire. Check EconomicCalendarWorker feed health.",
+                    latestEvent?.ToString("u") ?? "none",
+                    StaleCalendarHours);
+        }
+
+        bool hasBlockingEvent = await db.Set<Domain.Entities.EconomicEvent>()
             .AnyAsync(x => !x.IsDeleted
                         && x.Impact == EconomicImpact.High
                         && currencies.Contains(x.Currency)

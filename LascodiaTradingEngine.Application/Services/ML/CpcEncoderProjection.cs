@@ -89,7 +89,7 @@ public sealed class CpcEncoderProjection : ICpcEncoderProjection
 
     private LinearWeights LoadLinear(MLCpcEncoder encoder)
     {
-        if (_linearCache.TryGetValue(encoder.Id, out var cached))
+        if (encoder.Id > 0 && _linearCache.TryGetValue(encoder.Id, out var cached))
             return cached;
 
         if (encoder.EncoderBytes is null || encoder.EncoderBytes.Length == 0)
@@ -123,7 +123,8 @@ public sealed class CpcEncoderProjection : ICpcEncoderProjection
         }
 
         var weights = new LinearWeights(We, E, F);
-        _linearCache[encoder.Id] = weights;
+        if (encoder.Id > 0)
+            _linearCache[encoder.Id] = weights;
         return weights;
     }
 
@@ -215,7 +216,7 @@ public sealed class CpcEncoderProjection : ICpcEncoderProjection
 
     private TcnWeights LoadTcn(MLCpcEncoder encoder)
     {
-        if (_tcnCache.TryGetValue(encoder.Id, out var cached))
+        if (encoder.Id > 0 && _tcnCache.TryGetValue(encoder.Id, out var cached))
             return cached;
 
         if (encoder.EncoderBytes is null || encoder.EncoderBytes.Length == 0)
@@ -237,7 +238,8 @@ public sealed class CpcEncoderProjection : ICpcEncoderProjection
         var Wr = Read2(root.GetProperty("Wr"), E, F, "Wr");
 
         var weights = new TcnWeights(W1, W2, Wr, E, F, K);
-        _tcnCache[encoder.Id] = weights;
+        if (encoder.Id > 0)
+            _tcnCache[encoder.Id] = weights;
         return weights;
 
         static double[,,] Read3(JsonElement arr, int d0, int d1, int d2, string name)

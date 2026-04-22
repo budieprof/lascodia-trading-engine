@@ -127,18 +127,34 @@ public class ReceiveDealSnapshotCommandHandler : IRequestHandler<ReceiveDealSnap
                     $"Symbol '{dealSymbol}' is not owned by EA instance '{request.InstanceId}'", "-403");
         }
 
+        // Dedupe by deal ticket within the submitted snapshot. EAs occasionally re-emit
+        // a deal when they replay a queue after a reconnect; we don't want two identical
+        // Ticket values in the same snapshot to be processed twice. Deals are unique
+        // broker-side by Ticket so using it as the idempotency key is authoritative.
+        // We pick the later DealTime on collision in case the EA rebroadcast with
+        // updated fill metadata, but status is gated by Order.Status below regardless.
+        var dedupedDeals = request.Deals
+            .GroupBy(d => d.Ticket)
+            .Select(g => g.OrderBy(d => d.DealTime).Last())
+            .ToList();
+
         // Batch-load matching orders to avoid N+1 queries
-        var orderTickets = request.Deals.Select(d => d.OrderTicket.ToString()).Distinct().ToList();
+        var orderTickets = dedupedDeals.Select(d => d.OrderTicket.ToString()).Distinct().ToList();
         var matchingOrders = await dbContext
             .Set<Domain.Entities.Order>()
             .Where(x => orderTickets.Contains(x.BrokerOrderId!) && !x.IsDeleted)
             .ToListAsync(cancellationToken);
         var orderByTicket = matchingOrders.ToDictionary(o => o.BrokerOrderId!);
 
-        foreach (var deal in request.Deals)
+        foreach (var deal in dedupedDeals)
         {
             var orderTicket = deal.OrderTicket.ToString();
 
+            // The Status != Filled gate is the primary idempotency barrier — the first
+            // deal for an order transitions it to Filled, and any subsequent deal (even
+            // legitimately a second partial) is ignored here. Partial-fill aggregation
+            // is a separate feature not yet wired; treat the first deal we see for an
+            // order as the authoritative fill.
             if (orderByTicket.TryGetValue(orderTicket, out var order)
                 && order.Status != OrderStatus.Filled)
             {

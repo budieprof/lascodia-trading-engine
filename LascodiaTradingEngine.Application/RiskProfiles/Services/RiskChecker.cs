@@ -70,6 +70,14 @@ public class RiskChecker : IRiskChecker
 
         decimal contractSize = context.SymbolSpec.ContractSize;
 
+        // Working copy of the lot size used by this evaluation. NEVER write back to
+        // signal.SuggestedLotSize — the signal is shared across per-account attempts
+        // and mutating it leaks one account's recovery cap into another account's
+        // next Tier 2 run. The caller will read either resolvedLot (when the recovery
+        // cap applied) or signal.SuggestedLotSize (when it didn't) via the
+        // ResolvedLotSize field on RiskCheckResult.
+        decimal resolvedLot = signal.SuggestedLotSize;
+
         // ── 2. Minimum lot size (broker constraint) ─────────────────────────
         if (context.SymbolSpec.MinLotSize > 0 && signal.SuggestedLotSize < context.SymbolSpec.MinLotSize)
             return Fail(
@@ -108,8 +116,10 @@ public class RiskChecker : IRiskChecker
 
         // ── 5b. Drawdown recovery lot reduction (Tier 2 enforcement) ────────
         // If the account is in Reduced recovery mode, cap the effective lot size
-        // regardless of how the signal was created (strategy worker, API, manual).
-        // This is a second line of defense after StrategyWorker's own reduction.
+        // for THIS account only. We update `resolvedLot` (local working copy) instead
+        // of mutating signal.SuggestedLotSize, because the same signal may be evaluated
+        // against other accounts that are NOT in recovery — they must see the original
+        // lot. The caller propagates the resolved value via RiskCheckResult.ResolvedLotSize.
         {
             string recoveryMode = await GetRecoveryModeAsync(cancellationToken);
             if (string.Equals(recoveryMode, "Reduced", StringComparison.OrdinalIgnoreCase))
@@ -118,17 +128,34 @@ public class RiskChecker : IRiskChecker
                 if (multiplier < 1.0m)
                 {
                     // Don't reject — just cap. The signal is valid, just oversized for recovery mode.
-                    decimal originalLot = signal.SuggestedLotSize;
-                    signal.SuggestedLotSize = originalLot * multiplier;
+                    decimal originalLot = resolvedLot;
+                    resolvedLot = originalLot * multiplier;
                     _logger.LogInformation(
                         "Drawdown recovery Tier 2: lot capped from {OriginalLot} to {Lot} (x{Mult}) for account {Account}",
-                        originalLot, signal.SuggestedLotSize, multiplier, account.Id);
+                        originalLot, resolvedLot, multiplier, account.Id);
                 }
             }
             else if (string.Equals(recoveryMode, "Halted", StringComparison.OrdinalIgnoreCase))
             {
                 return Fail("Account is in Halted recovery mode — all new orders blocked.");
             }
+        }
+
+        // Post-cap validation: a deep recovery cap can push the lot below broker minimums
+        // or off the lot-step grid. Reject explicitly rather than letting the broker
+        // reject an invalid order — caller gets a clean rejection reason and no partial
+        // state on either side.
+        if (context.SymbolSpec.MinLotSize > 0 && resolvedLot < context.SymbolSpec.MinLotSize)
+            return Fail(
+                $"Drawdown recovery cap reduced lot to {resolvedLot}, below broker minimum {context.SymbolSpec.MinLotSize} for {signal.Symbol}. " +
+                "Increase recovery multiplier or wait for account exit from Reduced mode.");
+        if (context.SymbolSpec.LotStep > 0)
+        {
+            decimal remainderAfterCap = resolvedLot % context.SymbolSpec.LotStep;
+            if (remainderAfterCap != 0m)
+                return Fail(
+                    $"Drawdown recovery cap produced lot {resolvedLot} off the broker lot-step grid ({context.SymbolSpec.LotStep}) for {signal.Symbol}. " +
+                    "Adjust recovery multiplier to align with lot step.");
         }
 
         // ── 6. Minimum equity floor ─────────────────────────────────────────
@@ -259,7 +286,7 @@ public class RiskChecker : IRiskChecker
         {
             decimal symbolExposureLots = CalculateSymbolExposureLots(
                 context.OpenPositions, signal.Symbol, signal.Direction, account.MarginMode);
-            decimal proposedLots = symbolExposureLots + signal.SuggestedLotSize;
+            decimal proposedLots = symbolExposureLots + resolvedLot;
             decimal symbolMargin = proposedLots * contractSize * signal.EntryPrice * quoteToAccountRate / account.Leverage;
             decimal exposurePct = symbolMargin / account.Equity * 100m;
 
@@ -275,7 +302,7 @@ public class RiskChecker : IRiskChecker
             decimal totalMargin = CalculateTotalPortfolioMargin(
                 context.OpenPositions, account.Leverage,
                 context.PortfolioContractSizes, context.PortfolioQuoteToAccountRates);
-            decimal newTradeMargin = signal.SuggestedLotSize * contractSize * signal.EntryPrice * quoteToAccountRate / account.Leverage;
+            decimal newTradeMargin = resolvedLot * contractSize * signal.EntryPrice * quoteToAccountRate / account.Leverage;
             decimal projectedTotalMargin = totalMargin + newTradeMargin;
             decimal totalExposurePct = projectedTotalMargin / account.Equity * 100m;
 
@@ -293,7 +320,7 @@ public class RiskChecker : IRiskChecker
             // SL == Entry → zero risk distance — meaningless stop loss
             if (riskPips < 0.0000000001m)
                 return Fail("StopLoss is equal to entry price — zero risk distance.");
-            decimal riskAmount = signal.SuggestedLotSize * contractSize * riskPips * quoteToAccountRate * slippageBuffer;
+            decimal riskAmount = resolvedLot * contractSize * riskPips * quoteToAccountRate * slippageBuffer;
 
             // Apply weekend/holiday gap risk multiplier if within the gap window.
             // Use the dynamic gap risk model when available; take the higher of static vs dynamic
@@ -328,7 +355,7 @@ public class RiskChecker : IRiskChecker
         // ── 18. Margin sufficiency check (currency-converted, with slippage) ──
         if (account.Leverage > 0)
         {
-            decimal requiredMargin = signal.SuggestedLotSize * contractSize * signal.EntryPrice * quoteToAccountRate
+            decimal requiredMargin = resolvedLot * contractSize * signal.EntryPrice * quoteToAccountRate
                 / account.Leverage * slippageBuffer;
 
             // On netting accounts, an opposite-direction trade reduces margin rather than
@@ -349,7 +376,7 @@ public class RiskChecker : IRiskChecker
                     if (isOpposite)
                     {
                         decimal existingLots = existingOnSymbol.Sum(p => p.OpenLots);
-                        decimal netLots = Math.Max(0, signal.SuggestedLotSize - existingLots);
+                        decimal netLots = Math.Max(0, resolvedLot - existingLots);
                         requiredMargin = netLots * contractSize * signal.EntryPrice * quoteToAccountRate
                             / account.Leverage * slippageBuffer;
                     }
@@ -360,7 +387,7 @@ public class RiskChecker : IRiskChecker
                 return Fail(
                     $"Insufficient margin: trade requires {requiredMargin:F2} {account.Currency} " +
                     $"but only {account.MarginAvailable:F2} available " +
-                    $"(leverage {account.Leverage}:1, lot={signal.SuggestedLotSize}, " +
+                    $"(leverage {account.Leverage}:1, lot={resolvedLot}, " +
                     $"contract={contractSize:F0}, price={signal.EntryPrice}).");
         }
 
@@ -368,7 +395,7 @@ public class RiskChecker : IRiskChecker
         if (account.MarginUsed > 0 && account.Equity > 0)
         {
             decimal additionalMargin = account.Leverage > 0
-                ? signal.SuggestedLotSize * contractSize * signal.EntryPrice * quoteToAccountRate
+                ? resolvedLot * contractSize * signal.EntryPrice * quoteToAccountRate
                     / account.Leverage * slippageBuffer
                 : 0;
             decimal projectedMarginUsed = account.MarginUsed + additionalMargin;
@@ -406,7 +433,15 @@ public class RiskChecker : IRiskChecker
                 return Fail($"Portfolio VaR95 would breach limit: post-trade VaR={marginalVaR.PostTradeVaR95:F2}, marginal={marginalVaR.MarginalVaR95:F2}");
         }
 
-        return Pass();
+        // If the recovery cap rewrote the lot for THIS account, hand the resolved value
+        // back so the caller can submit the order with it (and does not have to read the
+        // signal, which remains at its original SuggestedLotSize for other accounts).
+        // When resolvedLot == signal.SuggestedLotSize, leave ResolvedLotSize null so the
+        // caller's `riskResult.ResolvedLotSize ?? signal.SuggestedLotSize` pattern keeps
+        // its nice default-branch semantics.
+        return resolvedLot == signal.SuggestedLotSize
+            ? Pass()
+            : new RiskCheckResult(true, null, resolvedLot);
     }
 
     public Task<RiskCheckResult> CheckDrawdownAsync(

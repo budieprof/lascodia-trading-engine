@@ -75,6 +75,10 @@ public static class DependencyInjection
             // Distributed lock via PostgreSQL advisory locks — no extra infrastructure needed.
             services.AddSingleton<IDistributedLock, PostgresAdvisoryLock>();
 
+            // Provider-specific DbUpdateException classifier (unique-violation etc.) so
+            // Application code can branch on duplicate keys without depending on Npgsql.
+            services.AddSingleton<IDatabaseExceptionClassifier, PostgresDatabaseExceptionClassifier>();
+
             // Event log reader for the IntegrationEventRetryWorker outbox poller
             services.AddScoped<IEventLogReader, EventLogReader>();
 

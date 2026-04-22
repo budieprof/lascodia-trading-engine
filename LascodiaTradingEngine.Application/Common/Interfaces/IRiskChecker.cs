@@ -5,8 +5,15 @@ namespace LascodiaTradingEngine.Application.Common.Interfaces;
 /// <summary>
 /// Result of a risk check. <see cref="Passed"/> is <c>true</c> if the trade is allowed;
 /// otherwise <see cref="BlockReason"/> describes why it was rejected.
+///
+/// <para><see cref="ResolvedLotSize"/> is populated when the checker has rewritten the lot
+/// for this particular account (e.g. drawdown recovery cap). Callers MUST use this value
+/// when submitting the order rather than <c>signal.SuggestedLotSize</c>, because the
+/// signal may be evaluated against other accounts later and mutating it would bleed one
+/// account's recovery mode into another's execution. <c>null</c> means "use the signal's
+/// original lot unchanged".</para>
 /// </summary>
-public record RiskCheckResult(bool Passed, string? BlockReason);
+public record RiskCheckResult(bool Passed, string? BlockReason, decimal? ResolvedLotSize = null);
 
 /// <summary>
 /// Context object passed to the risk checker containing the account state and open positions

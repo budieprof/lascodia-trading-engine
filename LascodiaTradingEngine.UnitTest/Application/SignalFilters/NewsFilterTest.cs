@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using MockQueryable.Moq;
 using LascodiaTradingEngine.Application.Common.Interfaces;
@@ -19,7 +20,7 @@ public class NewsFilterTest
         _mockContext = new Mock<IReadApplicationDbContext>();
         _mockDbContext = new Mock<DbContext>();
         _mockContext.Setup(c => c.GetDbContext()).Returns(_mockDbContext.Object);
-        _filter = new NewsFilter(_mockContext.Object);
+        _filter = new NewsFilter(_mockContext.Object, NullLogger<NewsFilter>.Instance);
     }
 
     private void SetupEvents(List<EconomicEvent> events)

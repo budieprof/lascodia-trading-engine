@@ -127,6 +127,7 @@ public sealed class TradingMetrics
     public Histogram<double> MLFeatureConsensusContributors { get; }
     public Histogram<double> MLFeatureConsensusMeanKendallTau { get; }
     public Counter<long>     MLCpcCandidates { get; }
+    public Counter<long>     MLCpcCandidatesThrottled { get; }
     public Counter<long>     MLCpcPromotions { get; }
     public Counter<long>     MLCpcRejections { get; }
     public Counter<long>     MLCpcLockAttempts { get; }
@@ -138,7 +139,12 @@ public sealed class TradingMetrics
     public Histogram<double> MLCpcValidationEmbeddingL2Norm { get; }
     public Histogram<double> MLCpcValidationEmbeddingVariance { get; }
     public Histogram<double> MLCpcDownstreamProbeBalancedAccuracy { get; }
+    public Histogram<double> MLCpcRepresentationCentroidDistance { get; }
+    public Histogram<double> MLCpcRepresentationMeanPsi { get; }
+    public Histogram<double> MLCpcArchitectureSwitchAccuracyDelta { get; }
+    public Histogram<double> MLCpcAdversarialValidationAuc { get; }
     public Counter<long>     MLCpcStaleEncoders { get; }
+    public Counter<long>     MLCpcConfigurationDriftAlerts { get; }
 
     // ── Workers ─────────────────────────────────────────────────────────────
     public Histogram<double> WorkerCycleDurationMs  { get; }
@@ -402,6 +408,7 @@ public sealed class TradingMetrics
         MLFeatureConsensusContributors = _meter.CreateHistogram<double>("trading.ml.feature_consensus.contributors", "models", "Contributing models per written feature consensus snapshot.");
         MLFeatureConsensusMeanKendallTau = _meter.CreateHistogram<double>("trading.ml.feature_consensus.mean_kendall_tau", "tau", "Mean pairwise Kendall tau-b rank agreement per feature consensus snapshot.");
         MLCpcCandidates = _meter.CreateCounter<long>("trading.ml.cpc.candidates", "pairs", "CPC encoder candidates considered for training. Tagged by symbol, timeframe, regime, encoder_type.");
+        MLCpcCandidatesThrottled = _meter.CreateCounter<long>("trading.ml.cpc.candidates_throttled", "pairs", "CPC candidates that a cycle could not process because MaxPairsPerCycle was saturated. Tagged by encoder_type.");
         MLCpcPromotions = _meter.CreateCounter<long>("trading.ml.cpc.promotions", "encoders", "CPC encoders promoted. Tagged by symbol, timeframe, regime, encoder_type.");
         MLCpcRejections = _meter.CreateCounter<long>("trading.ml.cpc.rejections", "encoders", "CPC training attempts rejected. Tagged by reason, symbol, timeframe, regime, encoder_type.");
         MLCpcLockAttempts = _meter.CreateCounter<long>("trading.ml.cpc.lock_attempts", "attempts", "CPC per-candidate distributed-lock attempts. Tagged by outcome=acquired|busy, symbol, timeframe, regime, encoder_type.");
@@ -413,7 +420,12 @@ public sealed class TradingMetrics
         MLCpcValidationEmbeddingL2Norm = _meter.CreateHistogram<double>("trading.ml.cpc.validation_embedding_l2_norm", "norm", "Average L2 norm of holdout CPC embeddings. Tagged by symbol, timeframe, regime, encoder_type.");
         MLCpcValidationEmbeddingVariance = _meter.CreateHistogram<double>("trading.ml.cpc.validation_embedding_variance", "variance", "Mean per-dimension variance of holdout CPC embeddings. Tagged by symbol, timeframe, regime, encoder_type.");
         MLCpcDownstreamProbeBalancedAccuracy = _meter.CreateHistogram<double>("trading.ml.cpc.downstream_probe_balanced_accuracy", "ratio", "Balanced accuracy of the CPC holdout linear direction probe. Tagged by candidate=current|prior and symbol/timeframe/regime/encoder_type.");
+        MLCpcRepresentationCentroidDistance = _meter.CreateHistogram<double>("trading.ml.cpc.representation_centroid_distance", "distance", "Cosine distance between candidate and prior CPC embedding centroids on the same holdout data (0=identical, 1=orthogonal). Tagged by symbol/timeframe/regime/encoder_type.");
+        MLCpcRepresentationMeanPsi = _meter.CreateHistogram<double>("trading.ml.cpc.representation_mean_psi", "psi", "Mean per-dimension Population Stability Index between candidate and prior CPC embeddings. Tagged by symbol/timeframe/regime/encoder_type.");
+        MLCpcArchitectureSwitchAccuracyDelta = _meter.CreateHistogram<double>("trading.ml.cpc.architecture_switch_accuracy_delta", "ratio", "Balanced-accuracy delta (candidate minus cross-architecture prior) on the same holdout data when a configured EncoderType change is in flight. Tagged by symbol/timeframe/regime/encoder_type.");
+        MLCpcAdversarialValidationAuc = _meter.CreateHistogram<double>("trading.ml.cpc.adversarial_validation_auc", "auc", "Separability AUC of a linear classifier between candidate and prior CPC embeddings (1.0 = pathological drift). Tagged by symbol/timeframe/regime/encoder_type.");
         MLCpcStaleEncoders = _meter.CreateCounter<long>("trading.ml.cpc.stale_encoders", "encoders", "Active CPC encoders older than the stale-encoder SLO. Tagged by symbol, timeframe, regime, encoder_type.");
+        MLCpcConfigurationDriftAlerts = _meter.CreateCounter<long>("trading.ml.cpc.configuration_drift_alerts", "alerts", "ConfigurationDrift alerts raised by the CPC worker. Tagged by kind=embedding_dim|pretrainer_missing|systemic_pause and encoder_type.");
 
         // Workers
         WorkerCycleDurationMs = _meter.CreateHistogram<double>("trading.workers.cycle_duration", "ms", "Worker poll cycle duration");

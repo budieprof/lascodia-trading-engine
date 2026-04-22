@@ -84,9 +84,10 @@ public class MLCpcOptions : ConfigurationOption<MLCpcOptions>
     /// <summary>
     /// Minimum mean per-dimension variance required across holdout embeddings. This is a
     /// representation-quality smoke test: CPC features must move with the validation data,
-    /// not just deserialize and return a constant vector.
+    /// not just deserialize and return a constant vector. Tightened from 1e-10 so near-zero
+    /// drift no longer slips through the variance gate.
     /// </summary>
-    public double MinValidationEmbeddingVariance { get; set; } = 1e-10;
+    public double MinValidationEmbeddingVariance { get; set; } = 1e-4;
 
     /// <summary>
     /// When true, promotion also requires a cheap downstream-proxy linear probe over CPC
@@ -99,16 +100,18 @@ public class MLCpcOptions : ConfigurationOption<MLCpcOptions>
     public int MinDownstreamProbeSamples { get; set; } = 40;
 
     /// <summary>
-    /// Minimum balanced accuracy required for the downstream-proxy probe. Set slightly below
-    /// 0.5 only during rollout if you want the gate to audit without blocking borderline pairs.
+    /// Minimum balanced accuracy required for the downstream-proxy probe. Default 0.52 —
+    /// explicitly better than random rather than merely at-random. Lower during rollout if
+    /// you want the gate to audit without blocking borderline pairs.
     /// </summary>
-    public double MinDownstreamProbeBalancedAccuracy { get; set; } = 0.50;
+    public double MinDownstreamProbeBalancedAccuracy { get; set; } = 0.52;
 
     /// <summary>
     /// Minimum balanced-accuracy improvement required over the prior active encoder when one
-    /// exists and can be evaluated on the same probe split.
+    /// exists and can be evaluated on the same probe split. Default 0.02 (two percentage
+    /// points) so single-sample noise does not clear the bar.
     /// </summary>
-    public double MinDownstreamProbeImprovement { get; set; } = 0.01;
+    public double MinDownstreamProbeImprovement { get; set; } = 0.02;
 
     /// <summary>
     /// Active encoders older than this many hours raise/update a stale-encoder alert while
@@ -159,4 +162,85 @@ public class MLCpcOptions : ConfigurationOption<MLCpcOptions>
     /// parity the same way the linear encoder does.
     /// </summary>
     public CpcEncoderType EncoderType { get; set; } = CpcEncoderType.Linear;
+
+    // ── Representation-drift novelty gate ──────────────────────────────────────
+
+    /// <summary>
+    /// When true, promotion requires the candidate encoder's holdout embedding centroid to
+    /// differ from the prior active encoder's centroid by at least
+    /// <see cref="MinCentroidCosineDistance"/> (and/or the mean per-dim PSI to be under
+    /// <see cref="MaxRepresentationMeanPsi"/>). Prevents "same loss, same representation"
+    /// promotions that add DB churn without changing inference.
+    /// </summary>
+    public bool EnableRepresentationDriftGate { get; set; } = true;
+
+    /// <summary>
+    /// Minimum 1 − cosine(candidate centroid, prior centroid) required on the shared holdout
+    /// embeddings before a candidate is treated as a meaningful representation update. Skipped
+    /// when there is no prior active encoder or the prior cannot be re-projected.
+    /// </summary>
+    public double MinCentroidCosineDistance { get; set; } = 1e-3;
+
+    /// <summary>
+    /// Upper bound on the mean per-dimension Population Stability Index between candidate and
+    /// prior holdout embeddings. A PSI above this ceiling means the two encoders carve the
+    /// embedding space so differently that inference continuity cannot be trusted.
+    /// </summary>
+    public double MaxRepresentationMeanPsi { get; set; } = 2.0;
+
+    // ── Anti-forgetting gate (cross-architecture switch) ───────────────────────
+
+    /// <summary>
+    /// When true, switching configured <see cref="EncoderType"/> (e.g. Linear→Tcn) requires
+    /// the new architecture to keep the downstream-proxy balanced accuracy within
+    /// <see cref="MaxArchitectureSwitchAccuracyRegression"/> of the currently active encoder
+    /// of the other architecture. Protects against catastrophic representation regression
+    /// during architecture migrations.
+    /// </summary>
+    public bool EnableArchitectureSwitchGate { get; set; } = true;
+
+    /// <summary>
+    /// Maximum allowed balanced-accuracy drop (as a ratio, e.g. 0.05 = 5 pp) when switching
+    /// <see cref="EncoderType"/>. Evaluated on the same holdout data as the downstream probe.
+    /// </summary>
+    public double MaxArchitectureSwitchAccuracyRegression { get; set; } = 0.05;
+
+    // ── Adversarial-validation gate ────────────────────────────────────────────
+
+    /// <summary>
+    /// When true, promotion rejects a candidate whose embeddings are trivially separable
+    /// from the prior encoder's embeddings — measured by a cheap linear classifier AUC above
+    /// <see cref="MaxAdversarialValidationAuc"/>. Catches pathological representation drift
+    /// even when loss-based gates pass.
+    /// </summary>
+    public bool EnableAdversarialValidationGate { get; set; } = true;
+
+    /// <summary>
+    /// Upper bound on the candidate-vs-prior separability AUC. Default 0.85 leaves
+    /// meaningful-but-not-catastrophic drift through while flagging near-perfect separability.
+    /// </summary>
+    public double MaxAdversarialValidationAuc { get; set; } = 0.85;
+
+    /// <summary>
+    /// Minimum labelled embedding samples (per class) required before the adversarial-validation
+    /// gate runs. Gate passes silently when either side cannot contribute enough samples.
+    /// </summary>
+    public int MinAdversarialValidationSamples { get; set; } = 40;
+
+    // ── Silent-skip operator alerts ────────────────────────────────────────────
+
+    /// <summary>
+    /// Consecutive cycles a single silent-skip condition (embedding-dim mismatch, no matching
+    /// pretrainer, or prolonged systemic pause) may persist before a
+    /// <c>ConfigurationDrift</c> alert is raised. Keeps transient misconfiguration quiet but
+    /// surfaces sustained drift.
+    /// </summary>
+    public int ConfigurationDriftAlertCycles { get; set; } = 3;
+
+    /// <summary>
+    /// Continuous hours the systemic-pause flag may stay active before a
+    /// <c>ConfigurationDrift</c> alert is raised. Defaults to one day so extended freezes do
+    /// not pass unnoticed.
+    /// </summary>
+    public int SystemicPauseAlertHours { get; set; } = 24;
 }

@@ -25,5 +25,13 @@ public class AlertConfiguration : IEntityTypeConfiguration<Alert>
         builder.HasQueryFilter(x => !x.IsDeleted);
 
         builder.HasIndex(x => new { x.Symbol, x.AlertType, x.IsActive });
+
+        // Filtered unique index on DeduplicationKey: only one live-active row per key at a
+        // time. Eliminates the replica-race path where two workers both insert and create
+        // duplicate Alert rows. The soft-delete filter keeps historically-closed alerts out
+        // of the constraint.
+        builder.HasIndex(x => x.DeduplicationKey)
+            .IsUnique()
+            .HasFilter("\"IsActive\" = TRUE AND \"IsDeleted\" = FALSE AND \"DeduplicationKey\" IS NOT NULL");
     }
 }

@@ -42,7 +42,17 @@ public sealed record MLCpcRuntimeConfig(
     bool    TrainPerRegime,
     int     MinCandlesPerRegime,
     int     RegimeCandleBackfillMultiplier,
-    CpcEncoderType EncoderType);
+    CpcEncoderType EncoderType,
+    bool    EnableRepresentationDriftGate,
+    double  MinCentroidCosineDistance,
+    double  MaxRepresentationMeanPsi,
+    bool    EnableArchitectureSwitchGate,
+    double  MaxArchitectureSwitchAccuracyRegression,
+    bool    EnableAdversarialValidationGate,
+    double  MaxAdversarialValidationAuc,
+    int     MinAdversarialValidationSamples,
+    int     ConfigurationDriftAlertCycles,
+    int     SystemicPauseAlertHours);
 
 public sealed class MLCpcConfigReader(MLCpcOptions options)
 {
@@ -75,6 +85,16 @@ public sealed class MLCpcConfigReader(MLCpcOptions options)
     private const string CK_MinCandlesPerRegime           = "MLCpc:MinCandlesPerRegime";
     private const string CK_RegimeCandleBackfillMultiplier = "MLCpc:RegimeCandleBackfillMultiplier";
     private const string CK_EncoderType                   = "MLCpc:EncoderType";
+    private const string CK_EnableRepresentationDriftGate = "MLCpc:EnableRepresentationDriftGate";
+    private const string CK_MinCentroidCosineDistance      = "MLCpc:MinCentroidCosineDistance";
+    private const string CK_MaxRepresentationMeanPsi       = "MLCpc:MaxRepresentationMeanPsi";
+    private const string CK_EnableArchitectureSwitchGate   = "MLCpc:EnableArchitectureSwitchGate";
+    private const string CK_MaxArchitectureSwitchAccuracyRegression = "MLCpc:MaxArchitectureSwitchAccuracyRegression";
+    private const string CK_EnableAdversarialValidationGate = "MLCpc:EnableAdversarialValidationGate";
+    private const string CK_MaxAdversarialValidationAuc     = "MLCpc:MaxAdversarialValidationAuc";
+    private const string CK_MinAdversarialValidationSamples = "MLCpc:MinAdversarialValidationSamples";
+    private const string CK_ConfigurationDriftAlertCycles  = "MLCpc:ConfigurationDriftAlertCycles";
+    private const string CK_SystemicPauseAlertHours        = "MLCpc:SystemicPauseAlertHours";
     private const string CK_SystemicPause                 = "MLTraining:SystemicPauseActive";
 
     public async Task<MLCpcRuntimeConfig> LoadAsync(DbContext ctx, CancellationToken ct)
@@ -85,9 +105,9 @@ public sealed class MLCpcConfigReader(MLCpcOptions options)
         int retrainHrs = Math.Max(
             1,
             await GetConfigAsync(ctx, CK_RetrainIntervalHours, options.RetrainIntervalHours, ct));
-        int maxPairs = Math.Max(
-            1,
-            await GetConfigAsync(ctx, CK_MaxPairsPerCycle, options.MaxPairsPerCycle, ct));
+        int maxPairs = Math.Clamp(
+            await GetConfigAsync(ctx, CK_MaxPairsPerCycle, options.MaxPairsPerCycle, ct),
+            1, 50);
         int embedDim = Math.Clamp(
             await GetConfigAsync(ctx, CK_EmbeddingDim, options.EmbeddingDim, ct),
             4, 128);
@@ -163,6 +183,31 @@ public sealed class MLCpcConfigReader(MLCpcOptions options)
             ? parsedType
             : options.EncoderType;
 
+        bool enableRepresentationDriftGate = await GetConfigAsync(ctx, CK_EnableRepresentationDriftGate, options.EnableRepresentationDriftGate, ct);
+        double minCentroidCosineDistance = await GetConfigAsync(ctx, CK_MinCentroidCosineDistance, options.MinCentroidCosineDistance, ct);
+        if (!double.IsFinite(minCentroidCosineDistance) || minCentroidCosineDistance < 0.0 || minCentroidCosineDistance > 2.0)
+            minCentroidCosineDistance = options.MinCentroidCosineDistance;
+        double maxRepresentationMeanPsi = await GetConfigAsync(ctx, CK_MaxRepresentationMeanPsi, options.MaxRepresentationMeanPsi, ct);
+        if (!double.IsFinite(maxRepresentationMeanPsi) || maxRepresentationMeanPsi <= 0.0)
+            maxRepresentationMeanPsi = options.MaxRepresentationMeanPsi;
+        bool enableArchitectureSwitchGate = await GetConfigAsync(ctx, CK_EnableArchitectureSwitchGate, options.EnableArchitectureSwitchGate, ct);
+        double maxArchitectureSwitchAccuracyRegression = Math.Clamp(
+            await GetConfigAsync(ctx, CK_MaxArchitectureSwitchAccuracyRegression, options.MaxArchitectureSwitchAccuracyRegression, ct),
+            0.0, 1.0);
+        bool enableAdversarialValidationGate = await GetConfigAsync(ctx, CK_EnableAdversarialValidationGate, options.EnableAdversarialValidationGate, ct);
+        double maxAdversarialValidationAuc = Math.Clamp(
+            await GetConfigAsync(ctx, CK_MaxAdversarialValidationAuc, options.MaxAdversarialValidationAuc, ct),
+            0.5, 1.0);
+        int minAdversarialValidationSamples = Math.Max(
+            10,
+            await GetConfigAsync(ctx, CK_MinAdversarialValidationSamples, options.MinAdversarialValidationSamples, ct));
+        int configurationDriftAlertCycles = Math.Max(
+            1,
+            await GetConfigAsync(ctx, CK_ConfigurationDriftAlertCycles, options.ConfigurationDriftAlertCycles, ct));
+        int systemicPauseAlertHours = Math.Max(
+            1,
+            await GetConfigAsync(ctx, CK_SystemicPauseAlertHours, options.SystemicPauseAlertHours, ct));
+
         return new MLCpcRuntimeConfig(
             PollSeconds: pollSecs,
             RetrainIntervalHours: retrainHrs,
@@ -193,7 +238,17 @@ public sealed class MLCpcConfigReader(MLCpcOptions options)
             TrainPerRegime: trainPerRegime,
             MinCandlesPerRegime: minPerRegime,
             RegimeCandleBackfillMultiplier: regimeBackfillMultiplier,
-            EncoderType: encoderType);
+            EncoderType: encoderType,
+            EnableRepresentationDriftGate: enableRepresentationDriftGate,
+            MinCentroidCosineDistance: minCentroidCosineDistance,
+            MaxRepresentationMeanPsi: maxRepresentationMeanPsi,
+            EnableArchitectureSwitchGate: enableArchitectureSwitchGate,
+            MaxArchitectureSwitchAccuracyRegression: maxArchitectureSwitchAccuracyRegression,
+            EnableAdversarialValidationGate: enableAdversarialValidationGate,
+            MaxAdversarialValidationAuc: maxAdversarialValidationAuc,
+            MinAdversarialValidationSamples: minAdversarialValidationSamples,
+            ConfigurationDriftAlertCycles: configurationDriftAlertCycles,
+            SystemicPauseAlertHours: systemicPauseAlertHours);
     }
 
     private static async Task<T> GetConfigAsync<T>(

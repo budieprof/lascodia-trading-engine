@@ -13,8 +13,8 @@ public class MLCpcOptionsValidator : IValidateOptions<MLCpcOptions>
             errors.Add("MLCpcOptions.PollIntervalSeconds must be in [300, 86400].");
         if (o.RetrainIntervalHours < 1)
             errors.Add("MLCpcOptions.RetrainIntervalHours must be >= 1.");
-        if (o.MaxPairsPerCycle < 1)
-            errors.Add("MLCpcOptions.MaxPairsPerCycle must be >= 1.");
+        if (o.MaxPairsPerCycle is < 1 or > 50)
+            errors.Add("MLCpcOptions.MaxPairsPerCycle must be in [1, 50].");
         if (o.EmbeddingDim is < 4 or > 128)
             errors.Add("MLCpcOptions.EmbeddingDim must be in [4, 128].");
         if (o.PredictionSteps is < 1 or > 10)
@@ -59,6 +59,20 @@ public class MLCpcOptionsValidator : IValidateOptions<MLCpcOptions>
             errors.Add("MLCpcOptions.MinCandlesPerRegime must be >= SequenceLength.");
         if (o.RegimeCandleBackfillMultiplier is < 1 or > 50)
             errors.Add("MLCpcOptions.RegimeCandleBackfillMultiplier must be in [1, 50].");
+        if (!double.IsFinite(o.MinCentroidCosineDistance) || o.MinCentroidCosineDistance is < 0.0 or > 2.0)
+            errors.Add("MLCpcOptions.MinCentroidCosineDistance must be a finite value in [0.0, 2.0].");
+        if (!double.IsFinite(o.MaxRepresentationMeanPsi) || o.MaxRepresentationMeanPsi <= 0.0)
+            errors.Add("MLCpcOptions.MaxRepresentationMeanPsi must be a finite value > 0.");
+        if (!double.IsFinite(o.MaxArchitectureSwitchAccuracyRegression) || o.MaxArchitectureSwitchAccuracyRegression is < 0.0 or > 1.0)
+            errors.Add("MLCpcOptions.MaxArchitectureSwitchAccuracyRegression must be a finite value in [0.0, 1.0].");
+        if (!double.IsFinite(o.MaxAdversarialValidationAuc) || o.MaxAdversarialValidationAuc is < 0.5 or > 1.0)
+            errors.Add("MLCpcOptions.MaxAdversarialValidationAuc must be a finite value in [0.5, 1.0].");
+        if (o.MinAdversarialValidationSamples < 10)
+            errors.Add("MLCpcOptions.MinAdversarialValidationSamples must be >= 10.");
+        if (o.ConfigurationDriftAlertCycles < 1)
+            errors.Add("MLCpcOptions.ConfigurationDriftAlertCycles must be >= 1.");
+        if (o.SystemicPauseAlertHours < 1)
+            errors.Add("MLCpcOptions.SystemicPauseAlertHours must be >= 1.");
 
         return errors.Count > 0
             ? ValidateOptionsResult.Fail(errors)

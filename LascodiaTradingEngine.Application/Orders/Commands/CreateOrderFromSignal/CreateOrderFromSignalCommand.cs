@@ -268,7 +268,12 @@ public class CreateOrderFromSignalCommandHandler
         if (todaySnapshot is not null)
             dailyStartBalance = todaySnapshot.CurrentEquity;
 
-        // Current spread
+        // Current spread. An inverted quote (Ask < Bid) is a data-quality anomaly — the
+        // feed is either mid-update or broken. RiskChecker rejects inverted quotes as a
+        // hard fail (RiskChecker.cs ~line 144); we mirror that here at the Tier-2 entry
+        // so the two tiers stay symmetric. Previously this path logged a warning and
+        // continued with spread validation skipped, which meant a broken feed could
+        // silently bypass the spread filter.
         decimal? currentSpread = null;
         try
         {
@@ -276,10 +281,17 @@ public class CreateOrderFromSignalCommandHandler
             if (livePrice is not null)
             {
                 if (livePrice.Value.Ask < livePrice.Value.Bid)
-                    _logger.LogWarning("CreateOrderFromSignal: inverted quote for {Symbol} (Bid={Bid}, Ask={Ask}) — skipping spread check",
+                {
+                    _logger.LogWarning(
+                        "CreateOrderFromSignal: inverted quote for {Symbol} (Bid={Bid}, Ask={Ask}) — rejecting as data-quality failure",
                         signal.Symbol, livePrice.Value.Bid, livePrice.Value.Ask);
-                else
-                    currentSpread = livePrice.Value.Ask - livePrice.Value.Bid;
+                    await RecordAttemptAsync(signal.Id, account.Id, false,
+                        $"Inverted quote for {signal.Symbol} (Bid={livePrice.Value.Bid}, Ask={livePrice.Value.Ask})",
+                        cancellationToken);
+                    return ResponseData<long>.Init(0, false,
+                        $"Inverted quote for {signal.Symbol} — data-quality failure, rejecting order", "-11");
+                }
+                currentSpread = livePrice.Value.Ask - livePrice.Value.Bid;
             }
         }
         catch (Exception ex) when (ex is KeyNotFoundException or InvalidOperationException)
@@ -380,6 +392,11 @@ public class CreateOrderFromSignalCommandHandler
         // throw InvalidOperationException.
         var wdb = _writeContext.GetDbContext();
 
+        // Use the per-account resolved lot if Tier 2 rewrote it (drawdown recovery cap).
+        // The risk checker does NOT mutate signal.SuggestedLotSize — doing so would leak
+        // one account's cap into the next account's Tier 2 evaluation. null means "no
+        // rewrite, use the signal value as-is".
+        decimal quantity = riskResult.ResolvedLotSize ?? signal.SuggestedLotSize;
         var orderResult = await _mediator.Send(new CreateOrderCommand
         {
             TradeSignalId    = signal.Id,
@@ -388,7 +405,7 @@ public class CreateOrderFromSignalCommandHandler
             Symbol           = signal.Symbol,
             OrderType        = signal.Direction.ToString(),
             ExecutionType    = "Market",
-            Quantity         = signal.SuggestedLotSize,
+            Quantity         = quantity,
             Price            = 0,
             StopLoss         = signal.StopLoss,
             TakeProfit       = signal.TakeProfit,

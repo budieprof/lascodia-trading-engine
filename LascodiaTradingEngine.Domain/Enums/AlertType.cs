@@ -39,5 +39,10 @@ public enum AlertType
     WorkerCrash = 10,
 
     /// <summary>All EA instances disconnected — market data unavailable.</summary>
-    EADisconnected = 11
+    EADisconnected = 11,
+
+    /// <summary>Worker configuration has drifted from what code requires (e.g. mismatched
+    /// embedding dimension, missing implementation for a configured encoder type, or a
+    /// long-running systemic pause). Operator-visible so silent skips surface.</summary>
+    ConfigurationDrift = 12
 }

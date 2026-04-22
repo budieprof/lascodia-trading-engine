@@ -24,6 +24,11 @@ public class MLCpcEncoderTrainingLogConfiguration : IEntityTypeConfiguration<MLC
 
         // Supports operational dashboards that group by promotion/rejection branch.
         builder.HasIndex(x => new { x.Outcome, x.Reason, x.EvaluatedAt });
+
+        // Supports the consecutive-failure counter query (per Symbol/Timeframe/Regime/EncoderType
+        // ordered by EvaluatedAt) used by the CpcPretrainerWorker to persist its failure counter.
+        builder.HasIndex(x => new { x.Symbol, x.Timeframe, x.Regime, x.EncoderType, x.EvaluatedAt });
+
         builder.HasQueryFilter(x => !x.IsDeleted);
     }
 }

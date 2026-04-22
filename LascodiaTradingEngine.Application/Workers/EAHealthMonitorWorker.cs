@@ -13,13 +13,22 @@ namespace LascodiaTradingEngine.Application.Workers;
 
 /// <summary>
 /// Monitors EA instance heartbeats and transitions stale instances to <see cref="EAInstanceStatus.Disconnected"/>.
-/// Runs every 30 seconds. If no heartbeat is received from an instance for 60 seconds, it is marked
-/// as disconnected so that <see cref="StrategyWorker"/> stops evaluating strategies on those symbols.
+/// Polls every 10 s so the status lag behind actual staleness is &lt;= 10 s (previously 30 s,
+/// which gave a 60 s + 30 s worst-case window where signals could be generated against a
+/// dead EA). Hard-disconnect at 60 s. Consumers should prefer
+/// <see cref="EAInstanceQueryExtensions.IsHeartbeatFresh(EAInstance, int)"/> to gate
+/// new-signal emission rather than relying on Status alone — that checks heartbeat age
+/// directly and closes the residual 0-10 s poll-latency window.
 /// </summary>
 public class EAHealthMonitorWorker : BackgroundService
 {
-    private const int PollIntervalSeconds = 30;
+    private const int PollIntervalSeconds = 10;
     private const int HeartbeatTimeoutSeconds = 60;
+    /// <summary>Soft-stale threshold used by consumers via IsHeartbeatFresh — within
+    /// this window Status is still Active but new-signal emission should pause.
+    /// Set to the EA's heartbeat interval (30 s) so a single missed heartbeat trips
+    /// the gate; two misses hit the 60 s hard-disconnect.</summary>
+    public const int HeartbeatSoftStaleSeconds = 30;
 
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IDegradationModeManager _degradationManager;

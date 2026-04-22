@@ -111,6 +111,23 @@ public class CpcEncoderProjectionTest
         Assert.Equal(r1, r2);
     }
 
+    [Fact]
+    public void ProjectLatest_Does_Not_Cache_Unsaved_Encoder_Id_Zero()
+    {
+        const int E = 2;
+        const int F = 2;
+        var first = CreateEncoder(E, F, new double[,] { { 1.0, 0.0 }, { 0.0, 1.0 } }, id: 0);
+        var second = CreateEncoder(E, F, new double[,] { { 2.0, 0.0 }, { 0.0, 3.0 } }, id: 0);
+        var projection = new CpcEncoderProjection();
+        var sequence = new[] { new float[] { 1f, 1f } };
+
+        var r1 = projection.ProjectLatest(first, sequence);
+        var r2 = projection.ProjectLatest(second, sequence);
+
+        Assert.Equal(new[] { 1f, 1f }, r1);
+        Assert.Equal(new[] { 2f, 3f }, r2);
+    }
+
     private static MLCpcEncoder CreateEncoder(int E, int F, double[,] We, long id = 1)
     {
         var flat = new double[E * F];

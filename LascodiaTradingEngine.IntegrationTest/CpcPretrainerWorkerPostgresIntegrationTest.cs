@@ -158,6 +158,67 @@ public class CpcPretrainerWorkerPostgresIntegrationTest : IClassFixture<Postgres
             .AnyAsync(l => l.Symbol == "AUDUSD" && l.Outcome == "promoted"));
     }
 
+    [Fact]
+    public async Task RunCycleAsync_Unique_DeduplicationKey_Index_Prevents_Duplicate_Alert_Rows()
+    {
+        await EnsureMigratedAsync();
+        await SeedModelAndCandlesAsync("NZDUSD", Timeframe.H1, candleCount: 1500);
+
+        // A deterministically failing pretrainer so every cycle writes a rejection row and the
+        // consecutive-fail counter climbs. Threshold=1 so the second cycle would try to INSERT
+        // a second Alert row if the filtered unique index were absent.
+        var pretrainer = new AlwaysFailingLinearPretrainer();
+        var options = new MLCpcOptions
+        {
+            EmbeddingDim = 16,
+            MinCandles = 1000,
+            SequenceLength = 60,
+            SequenceStride = 32,
+            MaxSequences = 120,
+            PollIntervalSeconds = 3600,
+            EncoderType = CpcEncoderType.Linear,
+            EnableDownstreamProbeGate = false,
+            ConsecutiveFailAlertThreshold = 1,
+        };
+
+        var worker = CreateWorker(options, [pretrainer]);
+        await worker.RunCycleAsync(CancellationToken.None);
+        await worker.RunCycleAsync(CancellationToken.None);
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        await using var assertContext = CreateContext();
+        var alerts = await assertContext.Set<Alert>()
+            .Where(a => a.DeduplicationKey!.StartsWith("MLCpcPretrainer:NZDUSD"))
+            .ToListAsync();
+        var alert = Assert.Single(alerts);
+        Assert.Contains("ConsecutiveFailures", alert.ConditionJson);
+    }
+
+    private sealed class AlwaysFailingLinearPretrainer : ICpcPretrainer
+    {
+        public CpcEncoderType Kind => CpcEncoderType.Linear;
+
+        public Task<MLCpcEncoder> TrainAsync(
+            string symbol,
+            Timeframe timeframe,
+            IReadOnlyList<float[][]> sequences,
+            int embeddingDim,
+            int predictionSteps,
+            CancellationToken cancellationToken)
+            => Task.FromResult(new MLCpcEncoder
+            {
+                Symbol = symbol,
+                Timeframe = timeframe,
+                EncoderType = CpcEncoderType.Linear,
+                EmbeddingDim = embeddingDim,
+                PredictionSteps = predictionSteps,
+                InfoNceLoss = double.NaN, // trips LossOutOfBounds
+                EncoderBytes = [0xFF],
+                TrainedAt = DateTime.UtcNow,
+                IsActive = true,
+            });
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────
 
     private CpcPretrainerWorker CreateWorker(
@@ -180,8 +241,17 @@ public class CpcPretrainerWorkerPostgresIntegrationTest : IClassFixture<Postgres
                 services.AddScoped(_ => pretrainer);
         }
         services.AddScoped<ICpcEncoderProjection, CpcEncoderProjection>();
+        services.AddSingleton<ICpcSequencePreparationService, CpcSequencePreparationService>();
+        services.AddScoped<ICpcContrastiveValidationScorer, CpcContrastiveValidationScorer>();
+        services.AddScoped<ICpcDownstreamProbeRunner, CpcDownstreamProbeRunner>();
+        services.AddScoped<ICpcDownstreamProbeEvaluator, CpcDownstreamProbeEvaluator>();
+        services.AddScoped<ICpcRepresentationDriftScorer, CpcRepresentationDriftScorer>();
+        services.AddScoped<ICpcAdversarialValidationScorer, CpcAdversarialValidationScorer>();
+        services.AddScoped<ICpcEncoderGateEvaluator, CpcEncoderGateEvaluator>();
+        services.AddScoped<ICpcEncoderPromotionService>(_ => new CpcEncoderPromotionService());
         services.AddLogging();
         services.AddSingleton<IDistributedLock, PostgresAdvisoryLock>();
+        services.AddSingleton<IDatabaseExceptionClassifier, PostgresDatabaseExceptionClassifier>();
         var provider = services.BuildServiceProvider();
 
         return new CpcPretrainerWorker(
@@ -192,7 +262,8 @@ public class CpcPretrainerWorkerPostgresIntegrationTest : IClassFixture<Postgres
             healthMonitor: null,
             metrics: null,
             options,
-            new MLCpcConfigReader(options));
+            new MLCpcConfigReader(options),
+            provider.GetRequiredService<IDatabaseExceptionClassifier>());
     }
 
     private WriteApplicationDbContext CreateContext()

@@ -21,11 +21,13 @@ public sealed class KillSwitchService : IKillSwitchService
     internal const string GlobalKey         = "KillSwitch:Global";
     internal const string StrategyKeyPrefix = "KillSwitch:Strategy:";
 
-    // A very short TTL keeps hot-path reads nearly free while still providing
-    // a safety net for multi-instance deployments where another process wrote
-    // the config. Single-instance deployments see sub-tick propagation because
+    // Kill switches are the last line of defence — multi-instance staleness of up to 30 s
+    // meant an armed global kill could take half a minute to propagate to every process.
+    // Dropped to 5 s: still cheap enough to keep the hot path fast (one DB read per 5 s per
+    // key per instance) but tight enough that cross-instance propagation is well within the
+    // EA's heartbeat SLA. Single-instance deploys see sub-tick propagation because
     // UpsertEngineConfigCommand calls EngineConfigCache.Invalidate directly.
-    private const int CacheTtlSeconds = 30;
+    private const int CacheTtlSeconds = 5;
 
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly EngineConfigCache _configCache;

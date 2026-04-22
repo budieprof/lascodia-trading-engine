@@ -29,4 +29,14 @@ public interface IActiveCpcEncoderProvider
         Timeframe timeframe,
         global::LascodiaTradingEngine.Domain.Enums.MarketRegime? regime,
         CancellationToken ct);
+
+    /// <summary>
+    /// Evicts cached encoder lookup results for a pair after a promotion. When
+    /// <paramref name="regime"/> is <c>null</c>, implementations must also evict regime-specific
+    /// fallback keys because those entries may contain the old global encoder.
+    /// </summary>
+    void Invalidate(
+        string symbol,
+        Timeframe timeframe,
+        global::LascodiaTradingEngine.Domain.Enums.MarketRegime? regime);
 }

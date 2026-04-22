@@ -337,6 +337,14 @@ public sealed class MLTrainingWorker : BackgroundService
     private const string CK_UseExtendedFeatureVector   = "MLTraining:UseExtendedFeatureVector";
     private const string CK_UseEventFeatureVector      = "MLTraining:UseEventFeatureVector";
     private const string CK_StarvationDeadline         = "MLTraining:StarvationDeadlineMinutes";
+    // Terminal embargo: the last N% of loaded candles is held out of ALL training / fold /
+    // calibration paths. Distinct from the per-fold EmbargoBarCount, which only gaps IS→OOS
+    // *within* a fold. This mirrors WalkForwardWorker's 10% terminal holdout so live-trained
+    // models don't overfit to the most recent regime. 0 = disabled; 0.10 = hold out the last
+    // 10% of the candle series. Floor of MinSamples + LookbackWindow is always enforced, so
+    // a tiny dataset never loses training samples to the embargo.
+    private const string CK_TerminalEmbargoPct         = "MLTraining:TerminalEmbargoPct";
+    private const double DefaultTerminalEmbargoPct     = 0.10;
     private const string CK_TripleBarrierProfitAtrMult = "MLTraining:TripleBarrierProfitAtrMult";
     private const string CK_TripleBarrierStopAtrMult   = "MLTraining:TripleBarrierStopAtrMult";
     private const string CK_TripleBarrierHorizonBars   = "MLTraining:TripleBarrierHorizonBars";
@@ -824,6 +832,37 @@ public sealed class MLTrainingWorker : BackgroundService
             if (candles.Count < minRequired)
                 throw new InvalidOperationException(
                     $"Insufficient candles: {candles.Count} (need {minRequired})");
+
+            // Terminal embargo — hold out the last N% of the candle series from all
+            // training and fold paths. Matches the 10% terminal holdout in
+            // WalkForwardWorker; without it, live training saw right up to the most
+            // recent bar and could overfit to the current regime's terminal shape.
+            // Guarded by `minRequired` floor — a tight dataset keeps its training
+            // samples; only excess goes into the holdout.
+            double terminalEmbargoPct = await GetConfigAsync<double>(
+                ctx, CK_TerminalEmbargoPct, DefaultTerminalEmbargoPct, stoppingToken);
+            if (terminalEmbargoPct > 0 && terminalEmbargoPct < 0.5)
+            {
+                int requestedHoldout = (int)Math.Round(candles.Count * terminalEmbargoPct);
+                // Preserve at least minRequired training samples. If the embargo would
+                // starve training, shrink it; log so the operator can widen the data
+                // window or lower the embargo.
+                int maxHoldout = Math.Max(0, candles.Count - minRequired);
+                int appliedHoldout = Math.Min(requestedHoldout, maxHoldout);
+                if (appliedHoldout > 0)
+                {
+                    var embargoStartTimestamp = candles[candles.Count - appliedHoldout].Timestamp;
+                    candles = candles.Take(candles.Count - appliedHoldout).ToList();
+                    _logger.LogInformation(
+                        "Run {RunId}: terminal embargo applied — held out last {Holdout} bars ({Pct:P1}, from {From}). Training on {Remaining} bars.",
+                        run.Id, appliedHoldout, (double)appliedHoldout / (appliedHoldout + candles.Count),
+                        embargoStartTimestamp, candles.Count);
+                    if (appliedHoldout < requestedHoldout)
+                        _logger.LogWarning(
+                            "Run {RunId}: terminal embargo shrunk from {Requested} to {Applied} bars to keep {MinRequired} training samples — extend data window or lower {Key}",
+                            run.Id, requestedHoldout, appliedHoldout, minRequired, CK_TerminalEmbargoPct);
+                }
+            }
 
             // ── Training data quality validation ────────────────────────────
             var dataWarnings = ValidateCandleData(candles);

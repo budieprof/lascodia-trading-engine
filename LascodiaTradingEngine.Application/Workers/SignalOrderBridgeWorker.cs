@@ -429,8 +429,15 @@ public class SignalOrderBridgeWorker : BackgroundService, IIntegrationEventHandl
         }
 
         // ── Guard: EA data availability for this symbol ───────────────────────
+        // Require a fresh heartbeat, not just Active status. The EAHealthMonitor runs on
+        // a poll interval, so Status lags reality by up to the poll period (~10 s). An
+        // EA that died 45 s ago may still read as Active until the next poll marks it
+        // Disconnected at the 60 s mark — we'd otherwise bridge new orders to a dead
+        // instance. Using EAHealthMonitorWorker.HeartbeatSoftStaleSeconds (30 s) mirrors
+        // the same freshness contract StrategyWorker already uses at signal emission.
+        var maxHeartbeatAge = TimeSpan.FromSeconds(EAHealthMonitorWorker.HeartbeatSoftStaleSeconds);
         bool hasActiveEA = await db.Set<Domain.Entities.EAInstance>()
-            .ActiveForSymbol(signal.Symbol)
+            .ActiveAndFreshForSymbol(signal.Symbol, maxHeartbeatAge)
             .AnyAsync(ct);
 
         if (!hasActiveEA)
