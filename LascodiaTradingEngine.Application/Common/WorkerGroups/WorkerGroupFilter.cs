@@ -58,6 +58,7 @@ public static class WorkerGroupFilter
         typeof(MLTrainingWorker),
         typeof(MLShadowArbiterWorker),
         typeof(MLPredictionOutcomeWorker),
+        typeof(MLMultiHorizonOutcomeWorker),
         typeof(MLModelActivatedEventHandler),
         typeof(MLModelRetirementWorker),
         typeof(MLTrainingRunHealthWorker),

@@ -3,6 +3,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Utilities;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -217,7 +218,7 @@ public sealed class MLRegimeTransitionGuardWorker : BackgroundService
             // Compute how many timeframe bars have elapsed since the regime changed.
             // Dividing wallclock seconds by bar duration converts time to "bar units",
             // making the window threshold timeframe-agnostic.
-            var barDuration  = TimeframeExpectedGap(timeframe);
+            var barDuration  = TimeframeDurationHelper.BarDuration(timeframe);
             double barsElapsed = barDuration.TotalSeconds > 0
                 ? (DateTime.UtcNow - latest.DetectedAt).TotalSeconds / barDuration.TotalSeconds
                 : double.MaxValue;
@@ -277,25 +278,6 @@ public sealed class MLRegimeTransitionGuardWorker : BackgroundService
         string                                  value,
         CancellationToken                       ct)
         => LascodiaTradingEngine.Application.Common.Utilities.EngineConfigUpsert.UpsertAsync(writeCtx, key, value, dataType: LascodiaTradingEngine.Domain.Enums.ConfigDataType.Decimal, ct: ct);
-
-    // ── Timeframe helper ──────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Maps a <see cref="Timeframe"/> enum value to the expected wall-clock duration
-    /// of one bar. Used to convert elapsed time since a regime transition into bar units,
-    /// making the <c>TransitionWindowBars</c> threshold timeframe-agnostic.
-    /// Unlisted timeframes default to H1 (1 hour).
-    /// </summary>
-    private static TimeSpan TimeframeExpectedGap(Timeframe tf) => tf switch
-    {
-        Timeframe.M1  => TimeSpan.FromMinutes(1),
-        Timeframe.M5  => TimeSpan.FromMinutes(5),
-        Timeframe.M15 => TimeSpan.FromMinutes(15),
-        Timeframe.H1  => TimeSpan.FromHours(1),
-        Timeframe.H4  => TimeSpan.FromHours(4),
-        Timeframe.D1  => TimeSpan.FromHours(24),
-        _             => TimeSpan.FromHours(1),
-    };
 
     // ── Config helper ─────────────────────────────────────────────────────────
 

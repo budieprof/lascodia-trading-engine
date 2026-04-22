@@ -18,10 +18,18 @@ public class MLModelHorizonAccuracyConfiguration : IEntityTypeConfiguration<MLMo
         builder.Property(x => x.Symbol).IsRequired().HasMaxLength(10);
         builder.Property(x => x.Timeframe).HasConversion<string>().IsRequired().HasMaxLength(10);
         builder.Property(x => x.Accuracy).HasColumnType("double precision");
+        builder.Property(x => x.AccuracyLowerBound).HasColumnType("double precision");
+        builder.Property(x => x.PrimaryAccuracy).HasColumnType("double precision");
+        builder.Property(x => x.PrimaryAccuracyGap).HasColumnType("double precision");
+        builder.Property(x => x.IsReliable).HasDefaultValue(true);
+        builder.Property(x => x.Status).IsRequired().HasMaxLength(50).HasDefaultValue("Computed");
 
-        // One row per model × horizon — upserted on each compute cycle.
-        builder.HasIndex(x => new { x.MLModelId, x.HorizonBars }).IsUnique();
+        // One row per model x horizon - upserted on each compute cycle.
+        builder.HasIndex(x => new { x.MLModelId, x.HorizonBars })
+               .IsUnique()
+               .HasFilter("\"IsDeleted\" = false");
         builder.HasIndex(x => new { x.Symbol, x.Timeframe, x.HorizonBars });
+        builder.HasIndex(x => new { x.MLModelId, x.IsReliable, x.ComputedAt });
 
         builder.HasOne(x => x.MLModel)
                .WithMany()

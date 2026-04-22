@@ -3,6 +3,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Utilities;
 using LascodiaTradingEngine.Application.Services;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
@@ -170,7 +171,7 @@ public sealed class MLPredictionOutcomeWorker : BackgroundService
 
             // Apply timeframe-aware cutoff so we only resolve logs where at least
             // one full candle has closed since the prediction was made.
-            var timeframeCutoff = DateTime.UtcNow.Subtract(TimeframeMinDuration(timeframe));
+            var timeframeCutoff = DateTime.UtcNow.Subtract(TimeframeDurationHelper.NextBarResolutionDelay(timeframe));
             var logsInGroup = group
                 .Where(l => l.PredictedAt <= timeframeCutoff)
                 .OrderBy(l => l.PredictedAt)
@@ -208,7 +209,7 @@ public sealed class MLPredictionOutcomeWorker : BackgroundService
                 // If the candle gap exceeds maxGapFactor × expected interval (e.g. a weekend or
                 // holiday break), the outcome would be contaminated by the gap move and should not
                 // be used for accuracy calculations. Mark as GapSkipped and leave DirectionCorrect null.
-                var    expectedGap    = TimeframeExpectedGap(timeframe);
+                var    expectedGap    = TimeframeDurationHelper.BarDuration(timeframe);
                 double actualGapMins  = (outcomeCandle.Timestamp - prevCandle.Timestamp).TotalMinutes;
                 double maxGapMins     = expectedGap.TotalMinutes * maxGapFactor;
 
@@ -311,45 +312,6 @@ public sealed class MLPredictionOutcomeWorker : BackgroundService
 
         return marked;
     }
-
-    // ── Timeframe helpers ─────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Returns the minimum elapsed time after a prediction before we can be confident
-    /// that at least one full candle has closed for the given timeframe.
-    /// Ensures outcome resolution waits for a meaningful price movement to occur.
-    /// </summary>
-    // Minimum duration before attempting outcome resolution. Must be long enough
-    // for the NEXT candle after the prediction to fully close and be written to DB.
-    // E.g. H1 prediction at 12:15 → outcome candle is 13:00 → closes ~14:00 →
-    // DB write ~14:02 → need at least 107 min from prediction time.
-    private static TimeSpan TimeframeMinDuration(Timeframe tf) => tf switch
-    {
-        Timeframe.M1  => TimeSpan.FromMinutes(3),
-        Timeframe.M5  => TimeSpan.FromMinutes(12),
-        Timeframe.M15 => TimeSpan.FromMinutes(35),
-        Timeframe.H1  => TimeSpan.FromMinutes(125),
-        Timeframe.H4  => TimeSpan.FromHours(5),
-        Timeframe.D1  => TimeSpan.FromHours(26),
-        _             => TimeSpan.FromMinutes(125),
-    };
-
-    /// <summary>
-    /// Returns the nominal candle interval for gap-detection purposes.
-    /// A consecutive-candle gap larger than <c>MaxCandleGapFactor × TimeframeExpectedGap</c>
-    /// is treated as a market closure (weekend, holiday) and the log is marked
-    /// <c>ResolutionSource = "GapSkipped"</c>.
-    /// </summary>
-    private static TimeSpan TimeframeExpectedGap(Timeframe tf) => tf switch
-    {
-        Timeframe.M1  => TimeSpan.FromMinutes(1),
-        Timeframe.M5  => TimeSpan.FromMinutes(5),
-        Timeframe.M15 => TimeSpan.FromMinutes(15),
-        Timeframe.H1  => TimeSpan.FromHours(1),
-        Timeframe.H4  => TimeSpan.FromHours(4),
-        Timeframe.D1  => TimeSpan.FromHours(24),
-        _             => TimeSpan.FromHours(1),
-    };
 
     // ── Config helper ─────────────────────────────────────────────────────────
 

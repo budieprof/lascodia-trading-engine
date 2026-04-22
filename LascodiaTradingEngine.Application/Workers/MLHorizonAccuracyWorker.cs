@@ -31,7 +31,8 @@ namespace LascodiaTradingEngine.Application.Workers;
 ///   <item><c>MLHorizon:PollIntervalSeconds</c>   — default 3600 (1 h)</item>
 ///   <item><c>MLHorizon:WindowDays</c>            — look-back window, default 30</item>
 ///   <item><c>MLHorizon:MinPredictions</c>        — minimum per horizon, default 20</item>
-///   <item><c>MLHorizon:HorizonGapThreshold</c>   — gap alert floor (0–1), default 0.10</item>
+///   <item><c>MLHorizon:HorizonGapThreshold</c>   — gap alert floor (0-1), default 0.10</item>
+///   <item><c>MLHorizon:WilsonZ</c>               — confidence-bound z score, default 1.96</item>
 ///   <item><c>MLHorizon:AlertDestination</c>      — default "ml-ops"</item>
 /// </list>
 /// </summary>
@@ -43,6 +44,7 @@ public sealed class MLHorizonAccuracyWorker : BackgroundService
     private const string CK_Window    = "MLHorizon:WindowDays";
     private const string CK_MinPreds  = "MLHorizon:MinPredictions";
     private const string CK_GapThr    = "MLHorizon:HorizonGapThreshold";
+    private const string CK_WilsonZ   = "MLHorizon:WilsonZ";
     private const string CK_AlertDest = "MLHorizon:AlertDestination";
 
     /// <summary>
@@ -113,7 +115,8 @@ public sealed class MLHorizonAccuracyWorker : BackgroundService
                 var wCtx    = writeDb.GetDbContext();
 
                 // Re-read interval live so operators can tune without restart.
-                pollSecs = await GetConfigAsync<int>(ctx, CK_PollSecs, 3600, stoppingToken);
+                pollSecs = NormalizePollSeconds(
+                    await GetConfigAsync<int>(ctx, CK_PollSecs, 3600, stoppingToken));
 
                 await ComputeAllModelsAsync(ctx, wCtx, stoppingToken);
             }
@@ -144,16 +147,17 @@ public sealed class MLHorizonAccuracyWorker : BackgroundService
     /// <param name="readCtx">Read-only DbContext for fetching models and prediction logs.</param>
     /// <param name="writeCtx">Write DbContext for upserting horizon accuracy rows and alerts.</param>
     /// <param name="ct">Cancellation token checked between model iterations.</param>
-    private async Task ComputeAllModelsAsync(
+    internal async Task ComputeAllModelsAsync(
         Microsoft.EntityFrameworkCore.DbContext readCtx,
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
         CancellationToken                       ct)
     {
         // Load all parameters once per cycle to avoid repeated DB round-trips in the loop.
-        int    windowDays  = await GetConfigAsync<int>   (readCtx, CK_Window,    30,      ct);
-        int    minPreds    = await GetConfigAsync<int>   (readCtx, CK_MinPreds,  20,      ct);
-        double gapThr      = await GetConfigAsync<double>(readCtx, CK_GapThr,    0.10,    ct);
-        string alertDest   = await GetConfigAsync<string>(readCtx, CK_AlertDest, "ml-ops", ct);
+        int    windowDays  = NormalizeWindowDays(await GetConfigAsync<int>(readCtx, CK_Window, 30, ct));
+        int    minPreds    = NormalizeMinPredictions(await GetConfigAsync<int>(readCtx, CK_MinPreds, 20, ct));
+        double gapThr      = NormalizeProbability(await GetConfigAsync<double>(readCtx, CK_GapThr, 0.10, ct), 0.10);
+        double wilsonZ     = NormalizeWilsonZ(await GetConfigAsync<double>(readCtx, CK_WilsonZ, 1.96, ct));
+        string alertDest   = NormalizeDestination(await GetConfigAsync<string>(readCtx, CK_AlertDest, "ml-ops", ct));
 
         var windowStart = DateTime.UtcNow.AddDays(-windowDays);
 
@@ -173,7 +177,7 @@ public sealed class MLHorizonAccuracyWorker : BackgroundService
             {
                 await ComputeForModelAsync(
                     model.Id, model.Symbol, model.Timeframe,
-                    windowStart, minPreds, gapThr, alertDest,
+                    windowStart, minPreds, gapThr, wilsonZ, alertDest,
                     readCtx, writeCtx, ct);
             }
             catch (Exception ex)
@@ -234,17 +238,18 @@ public sealed class MLHorizonAccuracyWorker : BackgroundService
         DateTime                                windowStart,
         int                                     minPredictions,
         double                                  horizonGapThreshold,
+        double                                  wilsonZ,
         string                                  alertDest,
         Microsoft.EntityFrameworkCore.DbContext readCtx,
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
         CancellationToken                       ct)
     {
-        // Load resolved prediction logs with all three horizon correctness fields.
-        // We only require DirectionCorrect != null (primary resolution); the individual
-        // horizon fields may be null if their resolution window hasn't elapsed yet.
+        // Load served champion prediction logs with all primary and horizon correctness fields.
+        // Horizon rows are computed from their own resolved fields, even if the primary
+        // trade-level outcome has not been recorded yet.
         var logs = await readCtx.Set<MLModelPredictionLog>()
             .Where(l => l.MLModelId        == modelId     &&
-                        l.DirectionCorrect != null         &&
+                        l.ModelRole        == ModelRole.Champion &&
                         l.PredictedAt      >= windowStart  &&
                         !l.IsDeleted)
             .AsNoTracking()
@@ -257,16 +262,14 @@ public sealed class MLHorizonAccuracyWorker : BackgroundService
             })
             .ToListAsync(ct);
 
-        // Guard: need a minimum primary-direction sample for the gap comparison to be valid.
-        if (logs.Count < minPredictions) return;
-
         var now = DateTime.UtcNow;
 
         // Compute primary (1-bar) direction accuracy from all resolved logs.
         // This is the baseline against which each horizon accuracy is compared.
-        int    primaryTotal   = logs.Count;
+        int    primaryTotal   = logs.Count(l => l.DirectionCorrect != null);
         int    primaryCorrect = logs.Count(l => l.DirectionCorrect == true);
-        double primaryAcc     = (double)primaryCorrect / primaryTotal;
+        double primaryAcc     = primaryTotal > 0 ? (double)primaryCorrect / primaryTotal : 0.0;
+        bool   primaryReliable = primaryTotal >= minPredictions;
 
         // Compute and upsert each horizon independently.
         foreach (var (horizonBars, _) in Horizons)
@@ -283,45 +286,41 @@ public sealed class MLHorizonAccuracyWorker : BackgroundService
                 _  => new List<bool>(),
             };
 
-            // Skip horizons with insufficient resolved data.
-            if (resolved.Count < minPredictions) continue;
-
             int    total    = resolved.Count;
             int    correct  = resolved.Count(v => v);
-            double accuracy = (double)correct / total;
+            double accuracy = total > 0 ? (double)correct / total : 0.0;
+            double lowerBound = WilsonLowerBound(correct, total, wilsonZ);
+            double primaryGap = primaryReliable ? Math.Max(0.0, primaryAcc - accuracy) : 0.0;
+            bool isReliable = primaryReliable && total >= minPredictions;
+            string status = isReliable
+                ? "Computed"
+                : total < minPredictions
+                    ? "InsufficientHorizonSamples"
+                    : "InsufficientPrimarySamples";
 
-            // Upsert strategy: update first; insert on miss.
-            int rows = await writeCtx.Set<MLModelHorizonAccuracy>()
-                .Where(r => r.MLModelId == modelId && r.HorizonBars == horizonBars)
-                .ExecuteUpdateAsync(s => s
-                    .SetProperty(r => r.TotalPredictions,   total)
-                    .SetProperty(r => r.CorrectPredictions, correct)
-                    .SetProperty(r => r.Accuracy,           accuracy)
-                    .SetProperty(r => r.WindowStart,        windowStart)
-                    .SetProperty(r => r.ComputedAt,         now),
-                    ct);
-
-            if (rows == 0)
-            {
-                // First computation for this model/horizon combination — insert.
-                writeCtx.Set<MLModelHorizonAccuracy>().Add(new MLModelHorizonAccuracy
-                {
-                    MLModelId          = modelId,
-                    Symbol             = symbol,
-                    Timeframe          = timeframe,
-                    HorizonBars        = horizonBars,
-                    TotalPredictions   = total,
-                    CorrectPredictions = correct,
-                    Accuracy           = accuracy,
-                    WindowStart        = windowStart,
-                    ComputedAt         = now,
-                });
-                await writeCtx.SaveChangesAsync(ct);
-            }
+            await UpsertHorizonAccuracyAsync(
+                writeCtx,
+                modelId,
+                symbol,
+                timeframe,
+                horizonBars,
+                total,
+                correct,
+                accuracy,
+                lowerBound,
+                primaryTotal,
+                primaryCorrect,
+                primaryAcc,
+                primaryGap,
+                isReliable,
+                status,
+                windowStart,
+                now,
+                ct);
 
             _logger.LogDebug(
-                "HorizonAccuracy: model {Id} ({Symbol}/{Tf}) h={H}bar — acc={Acc:P1} n={N}",
-                modelId, symbol, timeframe, horizonBars, accuracy, total);
+                "HorizonAccuracy: model {Id} ({Symbol}/{Tf}) h={H}bar - acc={Acc:P1} lb={Lb:P1} n={N} status={Status}",
+                modelId, symbol, timeframe, horizonBars, accuracy, lowerBound, total, status);
 
             // ── Horizon gap alert (3-bar only) ────────────────────────────────
             // Check whether the short-horizon (3-bar) accuracy lags the primary
@@ -329,14 +328,15 @@ public sealed class MLHorizonAccuracyWorker : BackgroundService
             // A large gap signals that the model's directional edge is valid at 1 bar
             // but decays too quickly — a "shallow temporal edge" that may be unsuitable
             // for multi-bar holding strategies.
-            if (horizonBars == 3 && primaryAcc - accuracy > horizonGapThreshold)
+            if (horizonBars == 3 && isReliable && primaryAcc - accuracy > horizonGapThreshold)
             {
-                // Deduplicate: only create an alert if no active MLModelDegraded alert
-                // already exists for this symbol.
+                string dedupKey = $"MLHorizon:{modelId}:{symbol}:{timeframe}:3";
+
+                // Deduplicate this exact horizon breach without hiding unrelated ML
+                // degradation alerts for another model, timeframe, or worker.
                 bool alertExists = await readCtx.Set<Alert>()
-                    .AnyAsync(a => a.Symbol    == symbol                  &&
-                                   a.AlertType == AlertType.MLModelDegraded &&
-                                   a.IsActive  && !a.IsDeleted, ct);
+                    .AnyAsync(a => a.DeduplicationKey == dedupKey &&
+                                   a.IsActive && !a.IsDeleted, ct);
 
                 if (!alertExists)
                 {
@@ -360,11 +360,17 @@ public sealed class MLHorizonAccuracyWorker : BackgroundService
                             modelId,
                             primaryDirectionAcc   = primaryAcc,   // 1-bar accuracy
                             horizon3BarAcc        = accuracy,     // 3-bar accuracy
+                            horizon3BarLowerBound = lowerBound,
                             gap                   = primaryAcc - accuracy,  // absolute gap
                             horizonGapThreshold,
+                            alertDestination      = alertDest,
                             sampleCount           = total,
+                            primarySampleCount    = primaryTotal,
                         }),
-                        IsActive = true,
+                        Severity         = AlertSeverity.Medium,
+                        DeduplicationKey = dedupKey,
+                        CooldownSeconds  = 3600,
+                        IsActive         = true,
                     });
                     await writeCtx.SaveChangesAsync(ct);
                 }
@@ -401,4 +407,99 @@ public sealed class MLHorizonAccuracyWorker : BackgroundService
         try   { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
         catch { return defaultValue; }
     }
+
+    private static async Task UpsertHorizonAccuracyAsync(
+        Microsoft.EntityFrameworkCore.DbContext writeCtx,
+        long modelId,
+        string symbol,
+        Timeframe timeframe,
+        int horizonBars,
+        int total,
+        int correct,
+        double accuracy,
+        double lowerBound,
+        int primaryTotal,
+        int primaryCorrect,
+        double primaryAccuracy,
+        double primaryGap,
+        bool isReliable,
+        string status,
+        DateTime windowStart,
+        DateTime computedAt,
+        CancellationToken ct)
+    {
+        int rows = await writeCtx.Set<MLModelHorizonAccuracy>()
+            .IgnoreQueryFilters()
+            .Where(r => r.MLModelId == modelId && r.HorizonBars == horizonBars)
+            .ExecuteUpdateAsync(s => s
+                .SetProperty(r => r.Symbol,                    symbol)
+                .SetProperty(r => r.Timeframe,                 timeframe)
+                .SetProperty(r => r.TotalPredictions,          total)
+                .SetProperty(r => r.CorrectPredictions,        correct)
+                .SetProperty(r => r.Accuracy,                  accuracy)
+                .SetProperty(r => r.AccuracyLowerBound,        lowerBound)
+                .SetProperty(r => r.PrimaryTotalPredictions,   primaryTotal)
+                .SetProperty(r => r.PrimaryCorrectPredictions, primaryCorrect)
+                .SetProperty(r => r.PrimaryAccuracy,           primaryAccuracy)
+                .SetProperty(r => r.PrimaryAccuracyGap,        primaryGap)
+                .SetProperty(r => r.IsReliable,                isReliable)
+                .SetProperty(r => r.Status,                    status)
+                .SetProperty(r => r.WindowStart,               windowStart)
+                .SetProperty(r => r.ComputedAt,                computedAt)
+                .SetProperty(r => r.IsDeleted,                 false),
+                ct);
+
+        if (rows > 0) return;
+
+        writeCtx.Set<MLModelHorizonAccuracy>().Add(new MLModelHorizonAccuracy
+        {
+            MLModelId                  = modelId,
+            Symbol                     = symbol,
+            Timeframe                  = timeframe,
+            HorizonBars                = horizonBars,
+            TotalPredictions           = total,
+            CorrectPredictions         = correct,
+            Accuracy                   = accuracy,
+            AccuracyLowerBound         = lowerBound,
+            PrimaryTotalPredictions    = primaryTotal,
+            PrimaryCorrectPredictions  = primaryCorrect,
+            PrimaryAccuracy            = primaryAccuracy,
+            PrimaryAccuracyGap         = primaryGap,
+            IsReliable                 = isReliable,
+            Status                     = status,
+            WindowStart                = windowStart,
+            ComputedAt                 = computedAt,
+        });
+        await writeCtx.SaveChangesAsync(ct);
+    }
+
+    internal static double WilsonLowerBound(int successes, int total, double z)
+    {
+        if (total <= 0) return 0.0;
+
+        double p = (double)successes / total;
+        double z2 = z * z;
+        double denominator = 1.0 + z2 / total;
+        double centre = p + z2 / (2.0 * total);
+        double margin = z * Math.Sqrt((p * (1.0 - p) + z2 / (4.0 * total)) / total);
+        return Math.Clamp((centre - margin) / denominator, 0.0, 1.0);
+    }
+
+    internal static int NormalizePollSeconds(int value)
+        => value is >= 1 and <= 86_400 ? value : 3600;
+
+    internal static int NormalizeWindowDays(int value)
+        => value is >= 1 and <= 3650 ? value : 30;
+
+    internal static int NormalizeMinPredictions(int value)
+        => value >= 1 ? value : 20;
+
+    internal static double NormalizeProbability(double value, double defaultValue)
+        => double.IsFinite(value) && value >= 0.0 && value <= 1.0 ? value : defaultValue;
+
+    internal static double NormalizeWilsonZ(double value)
+        => double.IsFinite(value) && value >= 0.0 && value <= 5.0 ? value : 1.96;
+
+    internal static string NormalizeDestination(string? value)
+        => string.IsNullOrWhiteSpace(value) ? "ml-ops" : value.Trim();
 }

@@ -1,6 +1,7 @@
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Options;
+using LascodiaTradingEngine.Application.Common.Utilities;
 using LascodiaTradingEngine.Application.MLModels.Shared;
 using LascodiaTradingEngine.Application.Services.Alerts;
 using LascodiaTradingEngine.Domain.Entities;
@@ -511,16 +512,8 @@ public sealed class MLConformalBreakerWorker : BackgroundService
             : null;
     }
 
-    internal static TimeSpan GetBarDuration(Timeframe timeframe) => timeframe switch
-    {
-        Timeframe.M1  => TimeSpan.FromMinutes(1),
-        Timeframe.M5  => TimeSpan.FromMinutes(5),
-        Timeframe.M15 => TimeSpan.FromMinutes(15),
-        Timeframe.H1  => TimeSpan.FromHours(1),
-        Timeframe.H4  => TimeSpan.FromHours(4),
-        Timeframe.D1  => TimeSpan.FromDays(1),
-        _             => TimeSpan.FromHours(1),
-    };
+    internal static TimeSpan GetBarDuration(Timeframe timeframe)
+        => TimeframeDurationHelper.BarDuration(timeframe);
 
     private TimeSpan GetInitialDelay() =>
         TimeSpan.FromMinutes(Math.Clamp(_options.InitialDelayMinutes, 0, 24 * 60));

@@ -4,6 +4,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Utilities;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 using LascodiaTradingEngine.Application.Services.Alerts;
@@ -259,7 +260,7 @@ public sealed class MLFeatureDataFreshnessWorker : BackgroundService
                 .OrderByDescending(c => c.Timestamp)
                 .FirstOrDefaultAsync(ct);
 
-            double expectedIntervalMinutes = TimeframeToMinutes(model.Timeframe) * staleMultiplier;
+            double expectedIntervalMinutes = TimeframeDurationHelper.BarMinutes(model.Timeframe) * staleMultiplier;
 
             bool isStale;
             string lastSeenAt;
@@ -307,19 +308,6 @@ public sealed class MLFeatureDataFreshnessWorker : BackgroundService
 
         return anyStale;
     }
-
-    // ── Timeframe to minutes mapping ──────────────────────────────────────────
-
-    private static double TimeframeToMinutes(Timeframe tf) => tf switch
-    {
-        Timeframe.M1  => 1,
-        Timeframe.M5  => 5,
-        Timeframe.M15 => 15,
-        Timeframe.H1  => 60,
-        Timeframe.H4  => 240,
-        Timeframe.D1  => 1440,
-        _             => 60,
-    };
 
     // ── Config helpers ────────────────────────────────────────────────────────
 
