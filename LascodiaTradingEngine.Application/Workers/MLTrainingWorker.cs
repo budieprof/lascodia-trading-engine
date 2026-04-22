@@ -2257,10 +2257,17 @@ trainingSamplesBuilt:;
             // Drift-gate rejection from TabNet is also policy-terminal: the training window
             // is non-stationary, and retrying immediately won't fix it — the window has to
             // age out and new data has to arrive. Retry loops there just spam fail-level logs.
+            //
+            // "Insufficient candles" is similar: the dataset isn't large enough to train a
+            // model. Exponential-backoff retries fire the same exception until enough new
+            // candles accumulate (hours-to-days). Mark terminal so the queue slot frees and
+            // the next scheduled training run can re-queue if/when data exists.
             bool isDriftGateRejection = ex.Message.Contains("drift gate rejected training", StringComparison.OrdinalIgnoreCase);
+            bool isInsufficientCandles = ex.Message.Contains("Insufficient candles:", StringComparison.OrdinalIgnoreCase);
+            bool isPolicyTerminal = isDriftGateRejection || isInsufficientCandles;
             bool isTerminalError =
                 ex.Message.Contains("Triple-barrier multipliers asymmetric", StringComparison.OrdinalIgnoreCase)
-                || isDriftGateRejection;
+                || isPolicyTerminal;
 
             bool canRetry = !isTerminalError && run.AttemptCount < run.MaxAttempts;
 
@@ -2286,13 +2293,14 @@ trainingSamplesBuilt:;
                 run.TrainingDurationMs = sw.ElapsedMilliseconds;
 
                 // Policy-driven terminal outcomes (drift gate refusing to fit a non-stationary
-                // window, etc.) are expected operational events rather than faults. Log them
-                // at Warning with a one-line summary instead of a full Error + stack trace so
-                // the operator error stream stays focused on genuine exceptions.
-                if (isDriftGateRejection)
+                // window, dataset too small to train, etc.) are expected operational events
+                // rather than faults. Log them at Warning with a one-line summary instead of
+                // a full Error + stack trace so the operator error stream stays focused on
+                // genuine exceptions.
+                if (isPolicyTerminal)
                 {
                     _logger.LogWarning(
-                        "Run {RunId} terminated by TabNet drift gate after {Attempts} attempt(s): {Reason}",
+                        "Run {RunId} terminated by training policy after {Attempts} attempt(s): {Reason}",
                         run.Id, run.AttemptCount, ex.Message);
                 }
                 else
