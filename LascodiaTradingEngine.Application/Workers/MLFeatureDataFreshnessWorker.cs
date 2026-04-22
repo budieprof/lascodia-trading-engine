@@ -153,7 +153,7 @@ public sealed class MLFeatureDataFreshnessWorker : BackgroundService
                 "COT data is stale (last seen {LastSeen}, max age {MaxDays}d).",
                 lastSeenAt, maxAgeDays);
 
-            writeCtx.Set<Alert>().Add(new Alert
+            await TouchOrCreateAlertAsync(writeCtx, new Alert
             {
                 AlertType     = AlertType.MLModelDegraded,
                 ConditionJson = JsonSerializer.Serialize(new
@@ -164,7 +164,7 @@ public sealed class MLFeatureDataFreshnessWorker : BackgroundService
                 }),
                 DeduplicationKey = "MLFeatureStale:COT",
                 CooldownSeconds  = alertCooldown,
-            });
+            }, ct);
 
             return true;
         }
@@ -211,7 +211,7 @@ public sealed class MLFeatureDataFreshnessWorker : BackgroundService
                 "Sentiment data is stale (last seen {LastSeen}, max age {MaxHours}h).",
                 lastSeenAt, maxAgeHours);
 
-            writeCtx.Set<Alert>().Add(new Alert
+            await TouchOrCreateAlertAsync(writeCtx, new Alert
             {
                 AlertType     = AlertType.MLModelDegraded,
                 ConditionJson = JsonSerializer.Serialize(new
@@ -222,7 +222,7 @@ public sealed class MLFeatureDataFreshnessWorker : BackgroundService
                 }),
                 DeduplicationKey = "MLFeatureStale:Sentiment",
                 CooldownSeconds  = alertCooldown,
-            });
+            }, ct);
 
             return true;
         }
@@ -286,7 +286,7 @@ public sealed class MLFeatureDataFreshnessWorker : BackgroundService
                     "Candle data stale for {Symbol}/{Tf} (last seen {LastSeen}, threshold {Mins:F0}min).",
                     model.Symbol, model.Timeframe, lastSeenAt, expectedIntervalMinutes);
 
-                writeCtx.Set<Alert>().Add(new Alert
+                await TouchOrCreateAlertAsync(writeCtx, new Alert
                 {
                     Symbol        = model.Symbol,
                     AlertType     = AlertType.MLModelDegraded,
@@ -300,13 +300,47 @@ public sealed class MLFeatureDataFreshnessWorker : BackgroundService
                     }),
                     DeduplicationKey = $"MLFeatureStale:{sourceKey}",
                     CooldownSeconds  = alertCooldown,
-                });
+                }, ct);
 
                 anyStale = true;
             }
         }
 
         return anyStale;
+    }
+
+    // ── Alert helper ──────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Add a new <see cref="Alert"/> row, or touch the existing active row for the same
+    /// <see cref="Alert.DeduplicationKey"/>. The unique partial index
+    /// <c>IX_Alert_DeduplicationKey</c> forbids more than one Active + non-deleted row per
+    /// key, so naive inserts every poll cycle violate the constraint. Here we find the
+    /// existing row and refresh its <c>LastTriggeredAt</c> timestamp + <c>ConditionJson</c>
+    /// instead, preserving operator-visible currency without inserting a duplicate.
+    /// </summary>
+    private static async Task TouchOrCreateAlertAsync(
+        DbContext writeCtx,
+        Alert     alert,
+        CancellationToken ct)
+    {
+        var existing = await writeCtx.Set<Alert>()
+            .FirstOrDefaultAsync(a =>
+                a.DeduplicationKey == alert.DeduplicationKey
+                && a.IsActive
+                && !a.IsDeleted, ct);
+
+        if (existing is null)
+        {
+            alert.LastTriggeredAt ??= DateTime.UtcNow;
+            alert.IsActive   = true;
+            writeCtx.Set<Alert>().Add(alert);
+        }
+        else
+        {
+            existing.LastTriggeredAt = DateTime.UtcNow;
+            existing.ConditionJson   = alert.ConditionJson;
+        }
     }
 
     // ── Config helpers ────────────────────────────────────────────────────────
