@@ -1,3 +1,4 @@
+using System.Data;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -24,10 +25,10 @@ namespace LascodiaTradingEngine.Application.Workers;
 ///
 /// <para><b>Decision flow:</b>
 /// <list type="number">
-///   <item>Load all active A/B tests from <c>EngineConfig</c>.</item>
+///   <item>Load all active A/B tests from <see cref="MLSignalAbTest"/>.</item>
 ///   <item>For each test, query closed <see cref="Position"/> records whose opening
-///         <see cref="Order"/> was tagged with a <see cref="TradeSignal"/> scored by the
-///         champion or challenger model (via <see cref="MLModelPredictionLog"/>).</item>
+///         <see cref="Order"/> was tagged with a <see cref="TradeSignal"/> assigned to the
+///         champion or challenger arm.</item>
 ///   <item>Compute per-arm metrics and run SPRT.</item>
 ///   <item>If challenger wins: activate challenger, demote champion, end test.</item>
 ///   <item>If champion wins: reject challenger, end test.</item>
@@ -40,25 +41,48 @@ public sealed class MLSignalAbTestWorker : BackgroundService
     private const string CK_PollSecs              = "AbTest:PollIntervalSeconds";
     private const string CK_MinTradesPerArm       = "AbTest:MinTradesPerArm";
     private const string CK_MaxDurationDays       = "AbTest:MaxDurationDays";
-    private const string CK_MaxConcurrentPerSymbol = "AbTest:MaxConcurrentPerSymbol";
-
+    private const string CK_Alpha                 = "AbTest:Alpha";
+    private const string CK_Beta                  = "AbTest:Beta";
+    private const string CK_DeltaWinMultiplier    = "AbTest:DeltaWinSizeMultiplier";
+    private const string CK_MinimumEffectPnl      = "AbTest:MinimumEffectPnl";
+    private const string CK_WinsorizationQuantile = "AbTest:WinsorizationQuantile";
+    private const string CK_MaxCovariateImbalance = "AbTest:MaxCovariateImbalance";
+    private const string CK_ImbalanceEvidenceMultiplier = "AbTest:ImbalanceEvidenceMultiplier";
     private const int DefaultPollSeconds            = 1800; // 30 minutes
     private const int DefaultMinTradesPerArm        = 30;
     private const int DefaultMaxDurationDays        = 14;
-    private const int DefaultMaxConcurrentPerSymbol = 3;
+    private const double DefaultAlpha               = 0.05;
+    private const double DefaultBeta                = 0.20;
+    private const double DefaultDeltaWinMultiplier  = 0.50;
+    private const double DefaultMinimumEffectPnl    = 0.0;
+    private const double DefaultWinsorizationQuantile = 0.05;
+    private const double DefaultMaxCovariateImbalance = 0.35;
+    private const double DefaultImbalanceEvidenceMultiplier = 1.5;
 
     private readonly IServiceScopeFactory              _scopeFactory;
     private readonly ILogger<MLSignalAbTestWorker>     _logger;
     private readonly SignalAbTestCoordinator            _coordinator;
+    private readonly IDistributedLock                   _distributedLock;
+    private readonly ISignalAbTestStateBuilder          _stateBuilder;
+    private readonly ISignalAbTestTerminalResultStore   _terminalResultStore;
+    private readonly IMLModelLifecycleTransitionService _lifecycleTransitionService;
 
     public MLSignalAbTestWorker(
         IServiceScopeFactory              scopeFactory,
         ILogger<MLSignalAbTestWorker>     logger,
-        SignalAbTestCoordinator            coordinator)
+        SignalAbTestCoordinator            coordinator,
+        IDistributedLock                   distributedLock,
+        ISignalAbTestStateBuilder          stateBuilder,
+        ISignalAbTestTerminalResultStore   terminalResultStore,
+        IMLModelLifecycleTransitionService lifecycleTransitionService)
     {
-        _scopeFactory = scopeFactory;
-        _logger       = logger;
-        _coordinator  = coordinator;
+        _scopeFactory               = scopeFactory;
+        _logger                     = logger;
+        _coordinator                = coordinator;
+        _distributedLock            = distributedLock;
+        _stateBuilder               = stateBuilder;
+        _terminalResultStore        = terminalResultStore;
+        _lifecycleTransitionService = lifecycleTransitionService;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -83,7 +107,7 @@ public sealed class MLSignalAbTestWorker : BackgroundService
                 await _coordinator.RefreshActiveCacheAsync(readContext, stoppingToken);
 
                 // Process all active A/B tests
-                await ProcessActiveTestsAsync(readDb, writeDb, writeContext, readContext, stoppingToken);
+                await ProcessActiveTestsAsync(readDb, writeDb, writeContext, stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -106,86 +130,93 @@ public sealed class MLSignalAbTestWorker : BackgroundService
         DbContext readDb,
         DbContext writeDb,
         IWriteApplicationDbContext writeContext,
-        IReadApplicationDbContext readContext,
         CancellationToken ct)
     {
         int minTrades    = await GetConfigAsync<int>(readDb, CK_MinTradesPerArm, DefaultMinTradesPerArm, ct);
         int maxDuration  = await GetConfigAsync<int>(readDb, CK_MaxDurationDays, DefaultMaxDurationDays, ct);
+        var evaluationOptions = await GetEvaluationOptionsAsync(readDb, ct);
 
-        // Load all active A/B test config entries
-        var activeConfigs = await readDb.Set<EngineConfig>()
+        // Load all active A/B tests
+        var activeTests = await readDb.Set<MLSignalAbTest>()
             .AsNoTracking()
-            .Where(c => c.Key.StartsWith("AbTest:Active:") && !c.Key.Contains(":Meta:"))
+            .Where(c => c.Status == MLSignalAbTestStatus.Active && !c.IsDeleted)
             .ToListAsync(ct);
 
-        if (activeConfigs.Count == 0)
+        if (activeTests.Count == 0)
         {
             _logger.LogDebug("No active A/B tests to evaluate.");
             return;
         }
 
-        _logger.LogDebug("Evaluating {Count} active A/B test(s).", activeConfigs.Count);
+        _logger.LogDebug("Evaluating {Count} active A/B test(s).", activeTests.Count);
 
-        foreach (var config in activeConfigs)
+        foreach (var test in activeTests)
         {
             try
             {
-                await ProcessSingleTestAsync(config, readDb, writeDb, writeContext, readContext,
-                    minTrades, maxDuration, ct);
+                await ProcessSingleTestAsync(
+                    test, readDb, writeDb, writeContext, minTrades, maxDuration, evaluationOptions, ct);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error processing A/B test {Key}.", config.Key);
+                _logger.LogError(ex, "Error processing A/B test {Id}.", test.Id);
             }
         }
     }
 
     private async Task ProcessSingleTestAsync(
-        EngineConfig config,
+        MLSignalAbTest test,
         DbContext readDb,
         DbContext writeDb,
         IWriteApplicationDbContext writeContext,
-        IReadApplicationDbContext readContext,
         int minTrades,
         int maxDuration,
+        AbTestEvaluationOptions evaluationOptions,
         CancellationToken ct)
     {
-        // Parse key: AbTest:Active:{championId}:{challengerId}
-        var parts = config.Key.Split(':');
-        if (parts.Length < 4 ||
-            !long.TryParse(parts[2], out var championId) ||
-            !long.TryParse(parts[3], out var challengerId))
+        var championId = test.ChampionModelId;
+        var challengerId = test.ChallengerModelId;
+
+        var lockKey = $"ml:signal-abtest:{championId}:{challengerId}";
+        await using var abTestLock = await _distributedLock.TryAcquireAsync(
+            lockKey,
+            TimeSpan.FromSeconds(5),
+            ct);
+        if (abTestLock is null)
         {
-            _logger.LogWarning("Malformed A/B test key: {Key}", config.Key);
+            _logger.LogInformation(
+                "A/B test {Id} is already being processed by another worker instance. Skipping this cycle.",
+                test.Id);
             return;
         }
 
-        var symbol = config.Value ?? string.Empty;
-        var metaPrefix = $"AbTest:Meta:{championId}:{challengerId}:";
+        var symbol = test.Symbol;
+        var timeframe = test.Timeframe;
+        var startedAt = test.StartedAtUtc;
 
-        // Load metadata
-        var metaEntries = await readDb.Set<EngineConfig>()
+        // ── Guard: check if both models are still suitable for an active test ──
+        var championModel = await readDb.Set<MLModel>()
             .AsNoTracking()
-            .Where(c => c.Key.StartsWith(metaPrefix))
-            .ToDictionaryAsync(c => c.Key, c => c.Value ?? string.Empty, ct);
-
-        if (!metaEntries.TryGetValue(metaPrefix + "Timeframe", out var tfStr) ||
-            !Enum.TryParse<Timeframe>(tfStr, out var timeframe))
-        {
-            _logger.LogWarning("Missing or invalid timeframe metadata for A/B test {Key}", config.Key);
-            return;
-        }
-
-        if (!metaEntries.TryGetValue(metaPrefix + "StartedAtUtc", out var startStr) ||
-            !DateTime.TryParse(startStr, null, System.Globalization.DateTimeStyles.RoundtripKind, out var startedAt))
-        {
-            startedAt = DateTime.UtcNow.AddDays(-1); // Fallback
-        }
-
-        // ── Guard: check if challenger model is still alive ─────────────────
+            .FirstOrDefaultAsync(m => m.Id == championId && !m.IsDeleted, ct);
         var challengerModel = await readDb.Set<MLModel>()
             .AsNoTracking()
             .FirstOrDefaultAsync(m => m.Id == challengerId && !m.IsDeleted, ct);
+
+        if (championModel is null || championModel.IsSuppressed ||
+            championModel.Status == MLModelStatus.Failed)
+        {
+            _logger.LogWarning(
+                "Champion model {ChampionId} is unavailable. Ending A/B test {Symbol}/{Timeframe} without changing model states.",
+                championId, symbol, timeframe);
+
+            await InvalidateTestAsync(
+                test,
+                writeDb,
+                writeContext,
+                "Champion model was unavailable, suppressed, deleted, or failed. Test invalidated without model state changes.",
+                ct);
+            return;
+        }
 
         if (challengerModel is null || challengerModel.IsSuppressed ||
             challengerModel.Status == MLModelStatus.Failed)
@@ -195,16 +226,21 @@ public sealed class MLSignalAbTestWorker : BackgroundService
                 "Auto-ending A/B test with KeepChampion for {Symbol}/{Timeframe}.",
                 challengerId, symbol, timeframe);
 
-            await _coordinator.EndAbTestAsync(championId, challengerId, symbol, timeframe, writeContext, ct);
+            await InvalidateTestAsync(
+                test,
+                writeDb,
+                writeContext,
+                "Challenger model was unavailable, suppressed, deleted, or failed. Test invalidated with champion retained.",
+                ct);
             return;
         }
 
         // ── Load resolved trade outcomes per arm ────────────────────────────
-        var state = await BuildAbTestStateAsync(
+        var state = await _stateBuilder.BuildAsync(
             readDb, championId, challengerId, symbol, timeframe, startedAt, ct);
 
         // ── Evaluate SPRT ───────────────────────────────────────────────────
-        var result = _coordinator.Evaluate(state, minTrades, maxDuration);
+        var result = _coordinator.Evaluate(state, minTrades, maxDuration, evaluationOptions);
 
         _logger.LogInformation(
             "A/B test {Symbol}/{Timeframe} (champion={Champion}, challenger={Challenger}): " +
@@ -222,13 +258,24 @@ public sealed class MLSignalAbTestWorker : BackgroundService
         switch (result.Decision)
         {
             case AbTestDecision.PromoteChallenger:
-                await PromoteChallengerAsync(writeDb, championId, challengerId, symbol, timeframe, ct);
-                await _coordinator.EndAbTestAsync(championId, challengerId, symbol, timeframe, writeContext, ct);
+                await using (var tx = await writeDb.Database.BeginTransactionAsync(IsolationLevel.Serializable, ct))
+                {
+                    await _terminalResultStore.PersistAsync(writeDb, state, result, ct);
+                    await _lifecycleTransitionService.PromoteChallengerAsync(
+                        writeDb, championId, challengerId, symbol, timeframe, ct);
+                    await _coordinator.EndAbTestAsync(championId, challengerId, symbol, timeframe, writeContext, ct);
+                    await tx.CommitAsync(ct);
+                }
                 break;
 
             case AbTestDecision.KeepChampion:
-                await RejectChallengerAsync(writeDb, challengerId, ct);
-                await _coordinator.EndAbTestAsync(championId, challengerId, symbol, timeframe, writeContext, ct);
+                await using (var tx = await writeDb.Database.BeginTransactionAsync(IsolationLevel.Serializable, ct))
+                {
+                    await _terminalResultStore.PersistAsync(writeDb, state, result, ct);
+                    await _lifecycleTransitionService.RejectChallengerAsync(writeDb, challengerId, ct);
+                    await _coordinator.EndAbTestAsync(championId, challengerId, symbol, timeframe, writeContext, ct);
+                    await tx.CommitAsync(ct);
+                }
                 break;
 
             case AbTestDecision.Inconclusive:
@@ -237,202 +284,39 @@ public sealed class MLSignalAbTestWorker : BackgroundService
         }
     }
 
-    // ── Build test state from resolved trades ───────────────────────────────
-
-    /// <summary>
-    /// Queries closed positions and their associated prediction logs to build the
-    /// full <see cref="AbTestState"/> for evaluation. The join path is:
-    /// Position → OpenOrderId → Order → TradeSignalId → TradeSignal → MLModelId,
-    /// cross-referenced with MLModelPredictionLog for the model attribution.
-    /// </summary>
-    private async Task<AbTestState> BuildAbTestStateAsync(
-        DbContext readDb,
-        long championId,
-        long challengerId,
-        string symbol,
-        Timeframe timeframe,
-        DateTime startedAt,
-        CancellationToken ct)
-    {
-        // Find all closed positions for this symbol since the test started,
-        // joined to their opening order and trade signal for model attribution.
-        var closedPositions = await readDb.Set<Position>()
-            .AsNoTracking()
-            .Where(p => p.Symbol == symbol &&
-                        p.Status == PositionStatus.Closed &&
-                        !p.IsDeleted &&
-                        p.ClosedAt != null &&
-                        p.ClosedAt >= startedAt &&
-                        p.OpenOrderId != null)
-            .Select(p => new
-            {
-                p.Id,
-                p.RealizedPnL,
-                p.OpenedAt,
-                p.ClosedAt,
-                p.OpenOrderId,
-            })
-            .ToListAsync(ct);
-
-        if (closedPositions.Count == 0)
-        {
-            return new AbTestState(0, championId, challengerId, symbol, timeframe, startedAt,
-                new List<AbTestOutcome>(), new List<AbTestOutcome>());
-        }
-
-        // Get the order IDs to find associated trade signals
-        var openOrderIds = closedPositions
-            .Where(p => p.OpenOrderId.HasValue)
-            .Select(p => p.OpenOrderId!.Value)
-            .Distinct()
-            .ToList();
-
-        // Order → TradeSignalId mapping
-        var orderSignalMap = await readDb.Set<Order>()
-            .AsNoTracking()
-            .Where(o => openOrderIds.Contains(o.Id) && o.TradeSignalId != null)
-            .Select(o => new { o.Id, o.TradeSignalId })
-            .ToDictionaryAsync(o => o.Id, o => o.TradeSignalId!.Value, ct);
-
-        var signalIds = orderSignalMap.Values.Distinct().ToList();
-
-        // TradeSignal → MLModelId mapping
-        var signalModelMap = await readDb.Set<TradeSignal>()
-            .AsNoTracking()
-            .Where(s => signalIds.Contains(s.Id) && s.MLModelId != null)
-            .Select(s => new { s.Id, s.MLModelId })
-            .ToDictionaryAsync(s => s.Id, s => s.MLModelId!.Value, ct);
-
-        // Also check MLModelPredictionLog for model attribution (more reliable for A/B tests
-        // where model routing was explicitly tracked)
-        var predictionModelMap = await readDb.Set<MLModelPredictionLog>()
-            .AsNoTracking()
-            .Where(pl => signalIds.Contains(pl.TradeSignalId) &&
-                         (pl.MLModelId == championId || pl.MLModelId == challengerId))
-            .Select(pl => new { pl.TradeSignalId, pl.MLModelId })
-            .ToDictionaryAsync(pl => pl.TradeSignalId, pl => pl.MLModelId, ct);
-
-        // Build outcomes per arm
-        var champOutcomes = new List<AbTestOutcome>();
-        var challOutcomes = new List<AbTestOutcome>();
-
-        foreach (var pos in closedPositions)
-        {
-            if (!pos.OpenOrderId.HasValue) continue;
-            if (!orderSignalMap.TryGetValue(pos.OpenOrderId.Value, out var signalId)) continue;
-
-            // Prefer prediction log attribution, fall back to signal's MLModelId
-            long? modelId = predictionModelMap.TryGetValue(signalId, out var predModelId)
-                ? predModelId
-                : signalModelMap.TryGetValue(signalId, out var sigModelId) ? sigModelId : null;
-
-            if (modelId is null) continue;
-
-            var durationMinutes = pos.ClosedAt.HasValue
-                ? (int)(pos.ClosedAt.Value - pos.OpenedAt).TotalMinutes
-                : 0;
-
-            var outcome = new AbTestOutcome(
-                Pnl:             (double)pos.RealizedPnL,
-                Magnitude:       Math.Abs((double)pos.RealizedPnL),
-                DurationMinutes: durationMinutes,
-                ResolvedAtUtc:   pos.ClosedAt ?? DateTime.UtcNow);
-
-            if (modelId == championId)
-                champOutcomes.Add(outcome);
-            else if (modelId == challengerId)
-                challOutcomes.Add(outcome);
-        }
-
-        return new AbTestState(0, championId, challengerId, symbol, timeframe, startedAt,
-            champOutcomes, challOutcomes);
-    }
-
-    // ── Promotion / rejection ───────────────────────────────────────────────
-
-    /// <summary>
-    /// Promotes the challenger model: activates it and demotes the champion to Superseded.
-    /// </summary>
-    private async Task PromoteChallengerAsync(
+    private async Task InvalidateTestAsync(
+        MLSignalAbTest test,
         DbContext writeDb,
-        long championId,
-        long challengerId,
-        string symbol,
-        Timeframe timeframe,
+        IWriteApplicationDbContext writeContext,
+        string reason,
         CancellationToken ct)
     {
-        // Demote champion
-        await writeDb.Set<MLModel>()
-            .Where(m => m.Id == championId)
-            .ExecuteUpdateAsync(s => s
-                .SetProperty(m => m.IsActive, false)
-                .SetProperty(m => m.Status, MLModelStatus.Superseded), ct);
+        var state = new AbTestState(
+            test.Id,
+            test.ChampionModelId,
+            test.ChallengerModelId,
+            test.Symbol,
+            test.Timeframe,
+            test.StartedAtUtc,
+            [],
+            []);
 
-        // Promote challenger
-        await writeDb.Set<MLModel>()
-            .Where(m => m.Id == challengerId)
-            .ExecuteUpdateAsync(s => s
-                .SetProperty(m => m.IsActive, true)
-                .SetProperty(m => m.Status, MLModelStatus.Active)
-                .SetProperty(m => m.ActivatedAt, DateTime.UtcNow)
-                .SetProperty(m => m.PreviousChampionModelId, championId), ct);
-
-        // Log lifecycle events
-        writeDb.Set<MLModelLifecycleLog>().Add(new MLModelLifecycleLog
+        var result = new AbTestResult
         {
-            MLModelId                = challengerId,
-            EventType                = "AbTestPromotion",
-            NewStatus                = MLModelStatus.Active,
-            PreviousChampionModelId  = championId,
-            Reason                   = $"Promoted via signal-level A/B test. Previous champion: {championId}.",
-            OccurredAt               = DateTime.UtcNow,
-        });
+            Decision = AbTestDecision.Invalidated,
+            Reason = reason,
+        };
 
-        writeDb.Set<MLModelLifecycleLog>().Add(new MLModelLifecycleLog
-        {
-            MLModelId    = championId,
-            EventType    = "AbTestDemotion",
-            NewStatus    = MLModelStatus.Superseded,
-            Reason       = $"Demoted by signal-level A/B test. New champion: {challengerId}.",
-            OccurredAt   = DateTime.UtcNow,
-        });
-
-        await writeDb.SaveChangesAsync(ct);
-
-        _logger.LogInformation(
-            "A/B test promotion: model {Challenger} promoted to champion for {Symbol}/{Timeframe}. " +
-            "Previous champion {Champion} demoted to Superseded.",
-            challengerId, symbol, timeframe, championId);
-    }
-
-    /// <summary>
-    /// Rejects the challenger model by marking it as Retired.
-    /// </summary>
-    private async Task RejectChallengerAsync(
-        DbContext writeDb,
-        long challengerId,
-        CancellationToken ct)
-    {
-        await writeDb.Set<MLModel>()
-            .Where(m => m.Id == challengerId)
-            .ExecuteUpdateAsync(s => s
-                .SetProperty(m => m.Status, MLModelStatus.Superseded)
-                .SetProperty(m => m.IsActive, false), ct);
-
-        writeDb.Set<MLModelLifecycleLog>().Add(new MLModelLifecycleLog
-        {
-            MLModelId    = challengerId,
-            EventType    = "AbTestRejection",
-            NewStatus    = MLModelStatus.Superseded,
-            Reason       = "Rejected by signal-level A/B test. Champion retained.",
-            OccurredAt   = DateTime.UtcNow,
-        });
-
-        await writeDb.SaveChangesAsync(ct);
-
-        _logger.LogInformation(
-            "A/B test rejection: challenger model {Challenger} retired. Champion retained.",
-            challengerId);
+        await using var tx = await writeDb.Database.BeginTransactionAsync(IsolationLevel.Serializable, ct);
+        await _terminalResultStore.PersistAsync(writeDb, state, result, ct);
+        await _coordinator.EndAbTestAsync(
+            test.ChampionModelId,
+            test.ChallengerModelId,
+            test.Symbol,
+            test.Timeframe,
+            writeContext,
+            ct);
+        await tx.CommitAsync(ct);
     }
 
     // ── Config helper ────────────────────────────────────────────────────────
@@ -455,5 +339,32 @@ public sealed class MLSignalAbTestWorker : BackgroundService
 
         try   { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
         catch { return defaultValue; }
+    }
+
+    private static async Task<AbTestEvaluationOptions> GetEvaluationOptionsAsync(
+        DbContext ctx,
+        CancellationToken ct)
+    {
+        var alpha = await GetConfigAsync<double>(ctx, CK_Alpha, DefaultAlpha, ct);
+        var beta = await GetConfigAsync<double>(ctx, CK_Beta, DefaultBeta, ct);
+        var deltaWinMultiplier = await GetConfigAsync<double>(
+            ctx, CK_DeltaWinMultiplier, DefaultDeltaWinMultiplier, ct);
+        var minimumEffectPnl = await GetConfigAsync<double>(
+            ctx, CK_MinimumEffectPnl, DefaultMinimumEffectPnl, ct);
+        var winsorizationQuantile = await GetConfigAsync<double>(
+            ctx, CK_WinsorizationQuantile, DefaultWinsorizationQuantile, ct);
+        var maxCovariateImbalance = await GetConfigAsync<double>(
+            ctx, CK_MaxCovariateImbalance, DefaultMaxCovariateImbalance, ct);
+        var imbalanceEvidenceMultiplier = await GetConfigAsync<double>(
+            ctx, CK_ImbalanceEvidenceMultiplier, DefaultImbalanceEvidenceMultiplier, ct);
+
+        return new AbTestEvaluationOptions(
+            alpha,
+            beta,
+            deltaWinMultiplier,
+            minimumEffectPnl > 0 ? minimumEffectPnl : null,
+            winsorizationQuantile,
+            maxCovariateImbalance,
+            imbalanceEvidenceMultiplier);
     }
 }

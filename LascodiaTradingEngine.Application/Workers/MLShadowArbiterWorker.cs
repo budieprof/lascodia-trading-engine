@@ -4,6 +4,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.MLModels.Shared;
+using LascodiaTradingEngine.Application.Services.ML;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 using MarketRegimeEnum = LascodiaTradingEngine.Domain.Enums.MarketRegime;
@@ -31,6 +32,7 @@ public sealed class MLShadowArbiterWorker : BackgroundService
 {
     private const string CK_PollSecs       = "MLShadow:PollIntervalSeconds";
     private const string CK_ShadowMinZScore = "MLTraining:ShadowMinZScore";
+    private const string CK_AbTestMaxConcurrentPerSymbol = "AbTest:MaxConcurrentPerSymbol";
 
     private readonly IServiceScopeFactory           _scopeFactory;
     private readonly ILogger<MLShadowArbiterWorker> _logger;
@@ -601,7 +603,35 @@ public sealed class MLShadowArbiterWorker : BackgroundService
                 return;
             }
 
-            await PromoteChallengerAsync(shadow, writeCtx, ct);
+            var maxConcurrentAbTests = await GetConfigAsync<int>(
+                readCtx,
+                CK_AbTestMaxConcurrentPerSymbol,
+                3,
+                ct);
+            using var abTestScope = _scopeFactory.CreateScope();
+            var coordinator = abTestScope.ServiceProvider.GetRequiredService<SignalAbTestCoordinator>();
+
+            var testId = await coordinator.StartAbTestAsync(
+                shadow.ChampionModelId,
+                shadow.ChallengerModelId,
+                shadow.Symbol,
+                shadow.Timeframe,
+                writeCtx,
+                readCtx,
+                maxConcurrentAbTests,
+                ct);
+
+            if (testId < 0)
+            {
+                _logger.LogWarning(
+                    "Shadow eval {Id}: challenger {ChalId} passed accuracy gates but signal-level A/B test could not start. Champion retained.",
+                    shadow.Id, shadow.ChallengerModelId);
+                return;
+            }
+
+            _logger.LogInformation(
+                "Shadow eval {Id}: challenger {ChalId} passed accuracy gates; started signal-level A/B test {TestId} before promotion.",
+                shadow.Id, shadow.ChallengerModelId, testId);
 
             // Improvement #12: invalidate TrainerSelector cache so shadow regime
             // affinity data is picked up immediately

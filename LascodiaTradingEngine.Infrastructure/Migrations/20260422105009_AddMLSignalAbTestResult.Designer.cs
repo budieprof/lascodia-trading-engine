@@ -3,6 +3,7 @@ using System;
 using LascodiaTradingEngine.Infrastructure.Persistence.DbContexts;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 
@@ -11,9 +12,11 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace LascodiaTradingEngine.Infrastructure.Migrations
 {
     [DbContext(typeof(WriteApplicationDbContext))]
-    partial class WriteApplicationDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260422105009_AddMLSignalAbTestResult")]
+    partial class AddMLSignalAbTestResult
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -2778,15 +2781,7 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
 
                     b.HasKey("Id");
 
-                    b.HasIndex("MLModelId", "EventType")
-                        .IsUnique()
-                        .HasFilter("\"EventType\" = 'AbTestRejection' AND \"IsDeleted\" = FALSE");
-
                     b.HasIndex("MLModelId", "OccurredAt");
-
-                    b.HasIndex("MLModelId", "EventType", "PreviousChampionModelId")
-                        .IsUnique()
-                        .HasFilter("\"EventType\" = 'AbTestPromotion' AND \"IsDeleted\" = FALSE");
 
                     b.ToTable("MLModelLifecycleLog");
                 });
@@ -3419,66 +3414,6 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     b.ToTable("MLShadowRegimeBreakdown");
                 });
 
-            modelBuilder.Entity("LascodiaTradingEngine.Domain.Entities.MLSignalAbTest", b =>
-                {
-                    b.Property<long>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("bigint");
-
-                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
-
-                    b.Property<long>("ChallengerModelId")
-                        .HasColumnType("bigint");
-
-                    b.Property<long>("ChampionModelId")
-                        .HasColumnType("bigint");
-
-                    b.Property<DateTime?>("CompletedAtUtc")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<bool>("IsDeleted")
-                        .HasColumnType("boolean");
-
-                    b.Property<Guid>("OutboxId")
-                        .HasColumnType("uuid");
-
-                    b.Property<uint>("RowVersion")
-                        .IsConcurrencyToken()
-                        .ValueGeneratedOnAddOrUpdate()
-                        .HasColumnType("xid")
-                        .HasColumnName("xmin");
-
-                    b.Property<DateTime>("StartedAtUtc")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<string>("Status")
-                        .IsRequired()
-                        .HasMaxLength(30)
-                        .HasColumnType("character varying(30)");
-
-                    b.Property<string>("Symbol")
-                        .IsRequired()
-                        .HasMaxLength(20)
-                        .HasColumnType("character varying(20)");
-
-                    b.Property<string>("Timeframe")
-                        .IsRequired()
-                        .HasMaxLength(30)
-                        .HasColumnType("character varying(30)");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("StartedAtUtc");
-
-                    b.HasIndex("Symbol", "Timeframe")
-                        .IsUnique()
-                        .HasFilter("\"Status\" = 'Active' AND \"IsDeleted\" = FALSE");
-
-                    b.HasIndex("ChampionModelId", "ChallengerModelId", "Status");
-
-                    b.ToTable("MLSignalAbTest", (string)null);
-                });
-
             modelBuilder.Entity("LascodiaTradingEngine.Domain.Entities.MLSignalAbTestResult", b =>
                 {
                     b.Property<long>("Id")
@@ -3517,10 +3452,6 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
 
                     b.Property<DateTime>("CompletedAtUtc")
                         .HasColumnType("timestamp with time zone");
-
-                    b.Property<decimal>("CovariateImbalanceScore")
-                        .HasPrecision(18, 8)
-                        .HasColumnType("numeric(18,8)");
 
                     b.Property<string>("Decision")
                         .IsRequired()

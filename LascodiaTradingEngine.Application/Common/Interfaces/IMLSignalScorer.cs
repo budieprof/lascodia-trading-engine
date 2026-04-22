@@ -201,7 +201,12 @@ public record MLScoreResult(
     /// Raw feature vector supplied to the model before standardisation/masking, serialized
     /// as JSON for post-hoc diagnostics such as feature-interaction discovery.
     /// </summary>
-    string?         RawFeaturesJson = null);
+    string?         RawFeaturesJson = null,
+    /// <summary>
+    /// Role the served model played at scoring time. During signal-level A/B tests this
+    /// distinguishes challenger-served predictions from the normal champion path.
+    /// </summary>
+    ModelRole       ModelRole = ModelRole.Champion);
 
 public interface IMLSignalScorer
 {

@@ -44,6 +44,8 @@ public class CreateTradeSignalCommand : IRequest<ResponseData<long>>
     public decimal?      MLConfidenceScore      { get; set; }
     /// <summary>Identifier of the ML model that scored this signal.</summary>
     public long?         MLModelId              { get; set; }
+    /// <summary>Role of the served ML model at prediction time.</summary>
+    public ModelRole     MLModelRole            { get; set; } = ModelRole.Champion;
     /// <summary>Raw (uncalibrated) probability from the ML model.</summary>
     public decimal?      MLRawProbability       { get; set; }
     /// <summary>Calibrated probability after Platt scaling or isotonic regression.</summary>
@@ -175,7 +177,7 @@ public class CreateTradeSignalCommandHandler : IRequestHandler<CreateTradeSignal
             {
                 TradeSignalId          = entity.Id,
                 MLModelId              = request.MLModelId.Value,
-                ModelRole              = ModelRole.Champion,
+                ModelRole              = request.MLModelRole,
                 Symbol                 = entity.Symbol,
                 Timeframe              = request.Timeframe,
                 PredictedDirection     = entity.MLPredictedDirection ?? entity.Direction,

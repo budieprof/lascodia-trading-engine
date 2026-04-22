@@ -15,7 +15,7 @@ public class MLModelLifecycleLogConfiguration : IEntityTypeConfiguration<MLModel
         builder.HasKey(x => x.Id);
         builder.Property(x => x.Id).ValueGeneratedOnAdd();
 
-        builder.Property(x => x.EventType).IsRequired().HasMaxLength(50);
+        builder.Property(x => x.EventType).HasConversion<string>().IsRequired().HasMaxLength(50);
         builder.Property(x => x.PreviousStatus).HasConversion<string>().HasMaxLength(30);
         builder.Property(x => x.NewStatus).HasConversion<string>().IsRequired().HasMaxLength(30);
         builder.Property(x => x.Reason).IsRequired().HasMaxLength(1000);
@@ -29,6 +29,14 @@ public class MLModelLifecycleLogConfiguration : IEntityTypeConfiguration<MLModel
         builder.HasQueryFilter(x => !x.IsDeleted);
 
         builder.HasIndex(x => new { x.MLModelId, x.OccurredAt });
+
+        builder.HasIndex(x => new { x.MLModelId, x.EventType, x.PreviousChampionModelId })
+            .IsUnique()
+            .HasFilter("\"EventType\" = 'AbTestPromotion' AND \"IsDeleted\" = FALSE");
+
+        builder.HasIndex(x => new { x.MLModelId, x.EventType })
+            .IsUnique()
+            .HasFilter("\"EventType\" = 'AbTestRejection' AND \"IsDeleted\" = FALSE");
 
         builder.Property(x => x.RowVersion).IsRowVersion();
     }

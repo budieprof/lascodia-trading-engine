@@ -37,6 +37,7 @@ public sealed class CpcPretrainerWorker : BackgroundService
 {
     private const string WorkerName = nameof(CpcPretrainerWorker);
     private const int    AlertPayloadSchemaVersion = 1;
+    private const int    RegimeCandleBackfillMultiplier = 8;
 
     private readonly IServiceScopeFactory        _scopeFactory;
     private readonly ILogger<CpcPretrainerWorker> _logger;
@@ -166,8 +167,21 @@ public sealed class CpcPretrainerWorker : BackgroundService
         {
             ct.ThrowIfCancellationRequested();
 
-            var outcome = await TrainOnePairAsync(
-                scope.ServiceProvider, writeCtx, candidate, config, ct);
+            TrainOutcome outcome;
+            try
+            {
+                outcome = await TrainOnePairAsync(
+                    scope.ServiceProvider, writeCtx, candidate, config, ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                outcome = await RecordUnexpectedCandidateFailureAsync(
+                    writeCtx, candidate, config, ex, ct);
+            }
 
             switch (outcome)
             {
@@ -272,17 +286,9 @@ public sealed class CpcPretrainerWorker : BackgroundService
         var readCtx = readDb.GetDbContext();
         _metrics?.MLCpcCandidates.Add(1, CpcTags(candidate, config));
 
-        // Load enough candles to build sequences.
-        var candles = await readCtx.Set<Candle>()
-            .AsNoTracking()
-            .Where(c => c.Symbol == candidate.Symbol
-                     && c.Timeframe == candidate.Timeframe
-                     && c.IsClosed
-                     && !c.IsDeleted)
-            .OrderByDescending(c => c.Timestamp)
-            .Take(config.TrainingCandles)
-            .ToListAsync(ct);
-        candles.Reverse(); // ascending time order for sequence builder
+        // Load enough candles to build sequences. Regime-specific candidates may need an
+        // expanded historical window because rare regimes are sparse in the latest global tail.
+        var candles = await LoadTrainingCandlesAsync(readCtx, candidate, config, ct);
         int candlesLoaded = candles.Count;
         RecordCpcCandles(candidate, config, "loaded", candlesLoaded);
 
@@ -294,10 +300,7 @@ public sealed class CpcPretrainerWorker : BackgroundService
             : config.MinCandlesPerRegime;
 
         if (candidate.Regime is not null)
-        {
-            candles = await FilterCandlesByRegimeAsync(
-                readCtx, candles, candidate.Symbol, candidate.Timeframe, candidate.Regime.Value, ct);
-        }
+            candles = await FilterCandlesByRegimeAsync(readCtx, candles, candidate, config, ct);
         int candlesAfterRegimeFilter = candles.Count;
         RecordCpcCandles(candidate, config, "regime_filtered", candlesAfterRegimeFilter);
 
@@ -375,8 +378,8 @@ public sealed class CpcPretrainerWorker : BackgroundService
         }
 
         var trainStart = Stopwatch.GetTimestamp();
-        await WorkerBulkhead.MLTraining.WaitAsync(ct);
         MLCpcEncoder? newEncoder;
+        await WorkerBulkhead.MLTraining.WaitAsync(ct);
         try
         {
             newEncoder = await pretrainer.TrainAsync(
@@ -387,6 +390,30 @@ public sealed class CpcPretrainerWorker : BackgroundService
                 config.PredictionSteps,
                 ct);
         }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            long failedTrainingDurationMs = (long)Stopwatch.GetElapsedTime(trainStart).TotalMilliseconds;
+            _metrics?.MLCpcTrainingDurationMs.Record(
+                failedTrainingDurationMs,
+                CpcTags(candidate, config));
+            _logger.LogWarning(
+                EventIds.EncoderRejected,
+                ex,
+                "CpcPretrainerWorker: {Symbol}/{Timeframe}/{Regime} pretrainer threw — rejected.",
+                candidate.Symbol,
+                candidate.Timeframe,
+                candidate.Regime?.ToString() ?? "global");
+            await WriteTrainingLogAsync(
+                writeCtx, candidate, config, "rejected", "trainer_exception",
+                candlesLoaded, candlesAfterRegimeFilter, split.Training.Count, split.Validation.Count, failedTrainingDurationMs,
+                trainLoss: null, validationLoss: null, promotedEncoderId: null, ct);
+            RecordCpcRejection(candidate, config, "trainer_exception");
+            return await RecordFailureAsync(writeCtx, candidate, "trainer_exception", config, ct);
+        }
         finally
         {
             WorkerBulkhead.MLTraining.Release();
@@ -396,11 +423,30 @@ public sealed class CpcPretrainerWorker : BackgroundService
             trainingDurationMs,
             CpcTags(candidate, config));
 
+        if (newEncoder is null)
+        {
+            _logger.LogWarning(
+                EventIds.EncoderRejected,
+                "CpcPretrainerWorker: {Symbol}/{Timeframe}/{Regime} pretrainer returned null — rejected.",
+                candidate.Symbol,
+                candidate.Timeframe,
+                candidate.Regime?.ToString() ?? "global");
+            await WriteTrainingLogAsync(
+                writeCtx, candidate, config, "rejected", "trainer_returned_null",
+                candlesLoaded, candlesAfterRegimeFilter, split.Training.Count, split.Validation.Count, trainingDurationMs,
+                trainLoss: null, validationLoss: null, promotedEncoderId: null, ct);
+            RecordCpcRejection(candidate, config, "trainer_returned_null");
+            return await RecordFailureAsync(writeCtx, candidate, "trainer_returned_null", config, ct);
+        }
+
         // Stamp regime and encoder type on the freshly-trained row. CpcPretrainer* itself is
         // regime-agnostic — the split-by-regime happened at candle selection above — and the
         // Kind-matched pretrainer already set EncoderType, but we re-stamp to be defensive.
+        newEncoder.Symbol = candidate.Symbol;
+        newEncoder.Timeframe = candidate.Timeframe;
         newEncoder.Regime = candidate.Regime;
         newEncoder.EncoderType = pretrainer.Kind;
+        newEncoder.IsActive = true;
 
         // Shape + improvement gates.
         if (newEncoder.EmbeddingDim != MLFeatureHelper.CpcEmbeddingBlockSize)
@@ -530,7 +576,18 @@ public sealed class CpcPretrainerWorker : BackgroundService
         // Passed all gates — rotate atomically.
         try
         {
-            await PromoteEncoderAsync(writeCtx, candidate, newEncoder, ct);
+            var promoteResult = await PromoteEncoderAsync(writeCtx, candidate, newEncoder, config, ct);
+            if (promoteResult != PromotionResult.Promoted)
+            {
+                var reason = promoteResult == PromotionResult.SupersededByBetterActive
+                    ? "superseded_by_better_active"
+                    : "promotion_conflict";
+                await WriteTrainingLogAsync(
+                    writeCtx, candidate, config, "skipped", reason,
+                    candlesLoaded, candlesAfterRegimeFilter, split.Training.Count, split.Validation.Count, trainingDurationMs,
+                    newEncoder.InfoNceLoss, validationLoss, promotedEncoderId: null, ct);
+                return TrainOutcome.Skipped;
+            }
         }
         catch (DbUpdateException ex) when (IsUniqueConstraintViolation(ex))
         {
@@ -579,6 +636,45 @@ public sealed class CpcPretrainerWorker : BackgroundService
         }
 
         return false;
+    }
+
+    private async Task<TrainOutcome> RecordUnexpectedCandidateFailureAsync(
+        DbContext writeCtx,
+        PairCandidate candidate,
+        MLCpcRuntimeConfig config,
+        Exception ex,
+        CancellationToken ct)
+    {
+        _metrics?.WorkerErrors.Add(
+            1, new KeyValuePair<string, object?>("worker", WorkerName));
+        _logger.LogError(
+            ex,
+            "CpcPretrainerWorker: {Symbol}/{Timeframe}/{Regime} candidate failed unexpectedly.",
+            candidate.Symbol,
+            candidate.Timeframe,
+            candidate.Regime?.ToString() ?? "global");
+
+        writeCtx.ChangeTracker.Clear();
+        try
+        {
+            await WriteTrainingLogAsync(
+                writeCtx, candidate, config, "rejected", "worker_exception",
+                candlesLoaded: 0, candlesAfterRegimeFilter: 0,
+                trainingSequences: 0, validationSequences: 0, trainingDurationMs: 0,
+                trainLoss: null, validationLoss: null, promotedEncoderId: null, ct);
+            RecordCpcRejection(candidate, config, "worker_exception");
+            return await RecordFailureAsync(writeCtx, candidate, "worker_exception", config, ct);
+        }
+        catch (Exception logEx) when (logEx is not OperationCanceledException)
+        {
+            _logger.LogError(
+                logEx,
+                "CpcPretrainerWorker: failed to persist unexpected-failure audit row for {Symbol}/{Timeframe}/{Regime}.",
+                candidate.Symbol,
+                candidate.Timeframe,
+                candidate.Regime?.ToString() ?? "global");
+            return TrainOutcome.Rejected;
+        }
     }
 
     private static SequenceSplit SplitSequences(IReadOnlyList<float[][]> sequences, MLCpcRuntimeConfig config)
@@ -750,12 +846,14 @@ public sealed class CpcPretrainerWorker : BackgroundService
         await writeCtx.SaveChangesAsync(ct);
     }
 
-    private async Task PromoteEncoderAsync(
+    private async Task<PromotionResult> PromoteEncoderAsync(
         DbContext writeCtx,
         PairCandidate candidate,
         MLCpcEncoder newEncoder,
+        MLCpcRuntimeConfig config,
         CancellationToken ct)
     {
+        var result = PromotionResult.Promoted;
         var strategy = writeCtx.Database.CreateExecutionStrategy();
         await strategy.ExecuteAsync(async token =>
         {
@@ -770,15 +868,44 @@ public sealed class CpcPretrainerWorker : BackgroundService
                          && e.Regime == candidate.Regime
                          && e.IsActive
                          && !e.IsDeleted)
+                .OrderByDescending(e => e.TrainedAt)
+                .ThenByDescending(e => e.Id)
                 .ToListAsync(token);
+
+            var currentActive = existingActive.FirstOrDefault();
+            if (currentActive is not null &&
+                currentActive.EncoderType == newEncoder.EncoderType &&
+                currentActive.Id != candidate.PriorEncoderId &&
+                !BeatsPriorLoss(newEncoder.InfoNceLoss, currentActive.InfoNceLoss, config.MinImprovement))
+            {
+                await tx.RollbackAsync(token);
+                result = PromotionResult.SupersededByBetterActive;
+                return;
+            }
+
             foreach (var row in existingActive)
                 row.IsActive = false;
 
-            // `newEncoder` already has IsActive = true from the trainer.
+            // Flush the deactivation before the insert so PostgreSQL's filtered unique active
+            // index sees an explicit UPDATE-then-INSERT order inside the same transaction.
+            if (existingActive.Count > 0)
+                await writeCtx.SaveChangesAsync(token);
+
+            newEncoder.IsActive = true;
             writeCtx.Set<MLCpcEncoder>().Add(newEncoder);
             await writeCtx.SaveChangesAsync(token);
             await tx.CommitAsync(token);
         }, ct);
+
+        return result;
+    }
+
+    private static bool BeatsPriorLoss(double candidateLoss, double priorLoss, double minImprovement)
+    {
+        if (!double.IsFinite(candidateLoss) || !double.IsFinite(priorLoss))
+            return false;
+
+        return candidateLoss < priorLoss * (1.0 - minImprovement);
     }
 
     private async Task<TrainOutcome> RecordFailureAsync(
@@ -838,6 +965,33 @@ public sealed class CpcPretrainerWorker : BackgroundService
         return TrainOutcome.Rejected;
     }
 
+    private static async Task<List<Candle>> LoadTrainingCandlesAsync(
+        DbContext readCtx,
+        PairCandidate candidate,
+        MLCpcRuntimeConfig config,
+        CancellationToken ct)
+    {
+        int take = candidate.Regime is null
+            ? config.TrainingCandles
+            : Math.Max(
+                config.TrainingCandles,
+                Math.Min(
+                    config.TrainingCandles * RegimeCandleBackfillMultiplier,
+                    config.TrainingCandles + (config.MinCandlesPerRegime * RegimeCandleBackfillMultiplier)));
+
+        var candles = await readCtx.Set<Candle>()
+            .AsNoTracking()
+            .Where(c => c.Symbol == candidate.Symbol
+                     && c.Timeframe == candidate.Timeframe
+                     && c.IsClosed
+                     && !c.IsDeleted)
+            .OrderByDescending(c => c.Timestamp)
+            .Take(take)
+            .ToListAsync(ct);
+        candles.Reverse(); // ascending time order for sequence builder
+        return candles;
+    }
+
     /// <summary>
     /// Partitions candles to those whose timestamp falls under the given regime per the
     /// <see cref="MarketRegimeSnapshot"/> timeline. Uses binary search over the sorted
@@ -846,19 +1000,19 @@ public sealed class CpcPretrainerWorker : BackgroundService
     private static async Task<List<Candle>> FilterCandlesByRegimeAsync(
         DbContext readCtx,
         List<Candle> candles,
-        string symbol,
-        Timeframe timeframe,
-        global::LascodiaTradingEngine.Domain.Enums.MarketRegime targetRegime,
+        PairCandidate candidate,
+        MLCpcRuntimeConfig config,
         CancellationToken ct)
     {
-        if (candles.Count == 0) return candles;
+        if (candles.Count == 0 || candidate.Regime is null) return candles;
 
         var windowEnd = candles[^1].Timestamp;
+        var targetRegime = candidate.Regime.Value;
 
         var snapshots = await readCtx.Set<MarketRegimeSnapshot>()
             .AsNoTracking()
-            .Where(s => s.Symbol == symbol
-                     && s.Timeframe == timeframe
+            .Where(s => s.Symbol == candidate.Symbol
+                     && s.Timeframe == candidate.Timeframe
                      && !s.IsDeleted
                      && s.DetectedAt <= windowEnd)
             .OrderBy(s => s.DetectedAt)
@@ -880,12 +1034,18 @@ public sealed class CpcPretrainerWorker : BackgroundService
             if (regimes[idx] == targetRegime)
                 result.Add(c);
         }
-        return result;
+
+        int keep = Math.Max(config.TrainingCandles, config.MinCandlesPerRegime);
+        return result.Count > keep
+            ? result.Skip(result.Count - keep).ToList()
+            : result;
     }
 
     // ── Supporting types ──────────────────────────────────────────────────────
 
     private enum TrainOutcome { Promoted, Rejected, Skipped }
+
+    private enum PromotionResult { Promoted, SupersededByBetterActive }
 
     private sealed record SequenceSplit(
         IReadOnlyList<float[][]> Training,

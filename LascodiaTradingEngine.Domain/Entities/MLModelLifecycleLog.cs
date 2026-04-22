@@ -14,7 +14,7 @@ public class MLModelLifecycleLog : Entity<long>
     public long MLModelId { get; set; }
 
     /// <summary>Lifecycle event type.</summary>
-    public string EventType { get; set; } = string.Empty;
+    public MLModelLifecycleEventType EventType { get; set; }
 
     /// <summary>Model status before the event. Null for the initial lifecycle event (e.g. first training).</summary>
     public MLModelStatus? PreviousStatus { get; set; }

@@ -9,7 +9,9 @@ using LascodiaTradingEngine.Application.MLModels.Commands.RollbackMLModel;
 using LascodiaTradingEngine.Application.MLModels.Commands.TriggerMLHyperparamSearch;
 using LascodiaTradingEngine.Application.MLModels.Queries.DTOs;
 using LascodiaTradingEngine.Application.MLModels.Queries.GetMLModel;
+using LascodiaTradingEngine.Application.MLModels.Queries.GetMLSignalAbTestResult;
 using LascodiaTradingEngine.Application.MLModels.Queries.GetPagedMLModels;
+using LascodiaTradingEngine.Application.MLModels.Queries.GetPagedMLSignalAbTestResults;
 using LascodiaTradingEngine.Application.MLModels.Queries.GetMLTrainingRun;
 using LascodiaTradingEngine.Application.MLModels.Queries.GetPagedMLTrainingRuns;
 
@@ -92,6 +94,23 @@ public class MLModelController : AuthControllerBase<MLModelController>
     {
         if (!ModelState.IsValid)
             return ResponseData<PagedData<MLTrainingRunDto>>.Init(null, false, "Model state failed", "-11");
+
+        Logger.LogInformation(query.GetJson());
+        return await Mediator.Send(query);
+    }
+
+    /// <summary>Get completed signal-level A/B test result by Id</summary>
+    [HttpGet("signal-ab-tests/{id}")]
+    public async Task<ResponseData<MLSignalAbTestResultDto>> GetSignalAbTestResult(long id)
+        => await Mediator.Send(new GetMLSignalAbTestResultQuery { Id = id });
+
+    /// <summary>Get paged list of completed signal-level A/B test results</summary>
+    [HttpPost("signal-ab-tests/list")]
+    public async Task<ResponseData<PagedData<MLSignalAbTestResultDto>>> GetPagedSignalAbTestResults(
+        GetPagedMLSignalAbTestResultsQuery query)
+    {
+        if (!ModelState.IsValid)
+            return ResponseData<PagedData<MLSignalAbTestResultDto>>.Init(null, false, "Model state failed", "-11");
 
         Logger.LogInformation(query.GetJson());
         return await Mediator.Send(query);

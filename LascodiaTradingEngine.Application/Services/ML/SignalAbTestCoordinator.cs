@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
+using System.Data;
 using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.MLModels.Shared;
@@ -35,10 +36,14 @@ public sealed class SignalAbTestCoordinator
     private readonly ConcurrentDictionary<(string Symbol, Timeframe Timeframe), ActiveAbTestEntry> _activeTests = new();
 
     private readonly ILogger<SignalAbTestCoordinator> _logger;
+    private readonly IDistributedLock? _distributedLock;
 
-    public SignalAbTestCoordinator(ILogger<SignalAbTestCoordinator> logger)
+    public SignalAbTestCoordinator(
+        ILogger<SignalAbTestCoordinator> logger,
+        IDistributedLock? distributedLock = null)
     {
         _logger = logger;
+        _distributedLock = distributedLock;
     }
 
     // ── A/B test lifecycle ──────────────────────────────────────────────────
@@ -49,9 +54,8 @@ public sealed class SignalAbTestCoordinator
     /// The A/B test validates signal-level P&amp;L performance before full promotion.
     /// </summary>
     /// <returns>
-    /// The ID of the newly created <see cref="MLModelPredictionLog"/> sentinel record
-    /// tracking the test, or -1 if a concurrent test already exists or the max concurrent
-    /// limit has been reached.
+    /// The ID of the newly created <see cref="MLSignalAbTest"/> record, or -1 if a
+    /// concurrent test already exists or the max concurrent limit has been reached.
     /// </returns>
     public async Task<long> StartAbTestAsync(
         long championModelId,
@@ -63,27 +67,84 @@ public sealed class SignalAbTestCoordinator
         int maxConcurrentPerSymbol,
         CancellationToken ct = default)
     {
-        var writeDb = writeContext.GetDbContext();
-        var readDb  = readContext.GetDbContext();
+        return await StartAbTestAsync(
+            championModelId,
+            challengerModelId,
+            symbol,
+            timeframe,
+            writeContext.GetDbContext(),
+            readContext.GetDbContext(),
+            maxConcurrentPerSymbol,
+            ct);
+    }
+
+    public async Task<long> StartAbTestAsync(
+        long championModelId,
+        long challengerModelId,
+        string symbol,
+        Timeframe timeframe,
+        DbContext writeDb,
+        DbContext readDb,
+        int maxConcurrentPerSymbol,
+        CancellationToken ct = default)
+    {
+        var normalizedSymbol = symbol.ToUpperInvariant();
+        await using var startLock = _distributedLock is null
+            ? null
+            : await _distributedLock.TryAcquireAsync(
+                $"ml:signal-abtest-start:{normalizedSymbol}",
+                TimeSpan.FromSeconds(10),
+                ct);
+
+        if (_distributedLock is not null && startLock is null)
+        {
+            _logger.LogWarning(
+                "Cannot start A/B test for {Symbol}/{Timeframe}: another worker is starting a test for this symbol.",
+                normalizedSymbol, timeframe);
+            return -1;
+        }
+
+        await using var tx = writeDb.Database.CurrentTransaction is null
+            ? await writeDb.Database.BeginTransactionAsync(IsolationLevel.Serializable, ct)
+            : null;
 
         // Guard: max concurrent A/B tests per symbol
-        var existingCount = await readDb.Set<EngineConfig>()
+        var existingCount = await writeDb.Set<MLSignalAbTest>()
             .AsNoTracking()
-            .CountAsync(c => c.Key.StartsWith("AbTest:Active:") && c.Value == symbol, ct);
+            .CountAsync(c => c.Symbol == normalizedSymbol &&
+                             c.Status == MLSignalAbTestStatus.Active &&
+                             !c.IsDeleted, ct);
 
         if (existingCount >= maxConcurrentPerSymbol)
         {
             _logger.LogWarning(
                 "Cannot start A/B test for {Symbol}/{Timeframe}: {Count} concurrent tests already running (max {Max})",
-                symbol, timeframe, existingCount, maxConcurrentPerSymbol);
+                normalizedSymbol, timeframe, existingCount, maxConcurrentPerSymbol);
+            return -1;
+        }
+
+        var activeForPair = await writeDb.Set<MLSignalAbTest>()
+            .AsNoTracking()
+            .AnyAsync(c => c.Symbol == normalizedSymbol &&
+                           c.Timeframe == timeframe &&
+                           c.Status == MLSignalAbTestStatus.Active &&
+                           !c.IsDeleted, ct);
+
+        if (activeForPair)
+        {
+            _logger.LogWarning(
+                "Cannot start A/B test for {Symbol}/{Timeframe}: another test is already active for this pair.",
+                normalizedSymbol, timeframe);
             return -1;
         }
 
         // Guard: no duplicate test for same champion/challenger pair
-        var duplicateKey = $"AbTest:Active:{championModelId}:{challengerModelId}";
-        var existing = await readDb.Set<EngineConfig>()
+        var existing = await writeDb.Set<MLSignalAbTest>()
             .AsNoTracking()
-            .FirstOrDefaultAsync(c => c.Key == duplicateKey, ct);
+            .FirstOrDefaultAsync(c => c.ChampionModelId == championModelId &&
+                                      c.ChallengerModelId == challengerModelId &&
+                                      c.Status == MLSignalAbTestStatus.Active &&
+                                      !c.IsDeleted, ct);
 
         if (existing is not null)
         {
@@ -93,52 +154,52 @@ public sealed class SignalAbTestCoordinator
             return -1;
         }
 
-        // Store the test as an EngineConfig entry (AbTest:Active:{champion}:{challenger})
-        var configEntry = new EngineConfig
+        var abTest = new MLSignalAbTest
         {
-            Key   = duplicateKey,
-            Value = symbol,
+            ChampionModelId = championModelId,
+            ChallengerModelId = challengerModelId,
+            Symbol = normalizedSymbol,
+            Timeframe = timeframe,
+            Status = MLSignalAbTestStatus.Active,
+            StartedAtUtc = DateTime.UtcNow,
         };
-        writeDb.Set<EngineConfig>().Add(configEntry);
-
-        // Store test metadata
-        var metadataEntries = new[]
+        writeDb.Set<MLSignalAbTest>().Add(abTest);
+        try
         {
-            new EngineConfig
-            {
-                Key   = $"AbTest:Meta:{championModelId}:{challengerModelId}:Timeframe",
-                Value = timeframe.ToString(),
-            },
-            new EngineConfig
-            {
-                Key   = $"AbTest:Meta:{championModelId}:{challengerModelId}:StartedAtUtc",
-                Value = DateTime.UtcNow.ToString("O"),
-            },
-            new EngineConfig
-            {
-                Key   = $"AbTest:Meta:{championModelId}:{challengerModelId}:ChampionId",
-                Value = championModelId.ToString(),
-            },
-            new EngineConfig
-            {
-                Key   = $"AbTest:Meta:{championModelId}:{challengerModelId}:ChallengerId",
-                Value = challengerModelId.ToString(),
-            },
-        };
+            await writeDb.SaveChangesAsync(ct);
+            if (tx is not null)
+                await tx.CommitAsync(ct);
+        }
+        catch (DbUpdateException ex)
+        {
+            writeDb.Entry(abTest).State = EntityState.Detached;
+            var conflictingActiveTest = await writeDb.Set<MLSignalAbTest>()
+                .AsNoTracking()
+                .AnyAsync(c => c.Symbol == normalizedSymbol &&
+                               c.Timeframe == timeframe &&
+                               c.Status == MLSignalAbTestStatus.Active &&
+                               !c.IsDeleted, ct);
 
-        writeDb.Set<EngineConfig>().AddRange(metadataEntries);
-        await writeDb.SaveChangesAsync(ct);
+            if (!conflictingActiveTest)
+                throw;
+
+            _logger.LogWarning(
+                ex,
+                "Could not start A/B test for {Symbol}/{Timeframe}: another worker created a conflicting active test.",
+                normalizedSymbol, timeframe);
+            return -1;
+        }
 
         // Register in the in-memory lookup
-        var key = (symbol, timeframe);
-        var entry = new ActiveAbTestEntry(configEntry.Id, championModelId, challengerModelId);
+        var key = (normalizedSymbol, timeframe);
+        var entry = new ActiveAbTestEntry(abTest.Id, championModelId, challengerModelId);
         _activeTests[key] = entry;
 
         _logger.LogInformation(
             "Started A/B test for {Symbol}/{Timeframe}: champion={Champion}, challenger={Challenger}",
-            symbol, timeframe, championModelId, challengerModelId);
+            normalizedSymbol, timeframe, championModelId, challengerModelId);
 
-        return configEntry.Id;
+        return abTest.Id;
     }
 
     /// <summary>
@@ -154,14 +215,24 @@ public sealed class SignalAbTestCoordinator
         CancellationToken ct = default)
     {
         var writeDb = writeContext.GetDbContext();
-        var prefix  = $"AbTest:Active:{championModelId}:{challengerModelId}";
-        var metaPrefix = $"AbTest:Meta:{championModelId}:{challengerModelId}:";
 
-        await writeDb.Set<EngineConfig>()
-            .Where(c => c.Key == prefix || c.Key.StartsWith(metaPrefix))
-            .ExecuteDeleteAsync(ct);
+        var activeTests = await writeDb.Set<MLSignalAbTest>()
+            .Where(c => c.ChampionModelId == championModelId &&
+                        c.ChallengerModelId == challengerModelId &&
+                        c.Status == MLSignalAbTestStatus.Active &&
+                        !c.IsDeleted)
+            .ToListAsync(ct);
 
-        _activeTests.TryRemove((symbol, timeframe), out _);
+        foreach (var test in activeTests)
+        {
+            test.Status = MLSignalAbTestStatus.Completed;
+            test.CompletedAtUtc = DateTime.UtcNow;
+        }
+
+        if (activeTests.Count > 0)
+            await writeDb.SaveChangesAsync(ct);
+
+        _activeTests.TryRemove((symbol.ToUpperInvariant(), timeframe), out _);
 
         _logger.LogInformation(
             "Ended A/B test for {Symbol}/{Timeframe}: champion={Champion}, challenger={Challenger}",
@@ -175,7 +246,7 @@ public sealed class SignalAbTestCoordinator
     /// Returns <c>null</c> if no test is active (normal single-model scoring proceeds).
     /// </summary>
     public ActiveAbTestEntry? GetActiveTest(string symbol, Timeframe timeframe)
-        => _activeTests.TryGetValue((symbol, timeframe), out var entry) ? entry : null;
+        => _activeTests.TryGetValue((symbol.ToUpperInvariant(), timeframe), out var entry) ? entry : null;
 
     /// <summary>
     /// Routes a signal scoring request to either champion or challenger based on a
@@ -204,33 +275,19 @@ public sealed class SignalAbTestCoordinator
     {
         var readDb = readContext.GetDbContext();
 
-        var activeKeys = await readDb.Set<EngineConfig>()
+        var activeTests = await readDb.Set<MLSignalAbTest>()
             .AsNoTracking()
-            .Where(c => c.Key.StartsWith("AbTest:Active:") && !c.Key.Contains(":Meta:"))
+            .Where(c => c.Status == MLSignalAbTestStatus.Active && !c.IsDeleted)
             .ToListAsync(ct);
 
         var freshEntries = new Dictionary<(string Symbol, Timeframe Timeframe), ActiveAbTestEntry>();
 
-        foreach (var config in activeKeys)
+        foreach (var test in activeTests)
         {
-            // Key format: AbTest:Active:{championId}:{challengerId}
-            var parts = config.Key.Split(':');
-            if (parts.Length < 4 ||
-                !long.TryParse(parts[2], out var champId) ||
-                !long.TryParse(parts[3], out var challId))
-                continue;
-
-            var symbol    = config.Value ?? string.Empty;
-            var metaKey   = $"AbTest:Meta:{champId}:{challId}:Timeframe";
-            var tfConfig  = await readDb.Set<EngineConfig>()
-                .AsNoTracking()
-                .FirstOrDefaultAsync(c => c.Key == metaKey, ct);
-
-            if (tfConfig?.Value is null ||
-                !Enum.TryParse<Timeframe>(tfConfig.Value, out var tf))
-                continue;
-
-            freshEntries[(symbol, tf)] = new ActiveAbTestEntry(config.Id, champId, challId);
+            freshEntries[(test.Symbol, test.Timeframe)] = new ActiveAbTestEntry(
+                test.Id,
+                test.ChampionModelId,
+                test.ChallengerModelId);
         }
 
         // Atomic swap: remove stale entries, add fresh ones
@@ -259,13 +316,21 @@ public sealed class SignalAbTestCoordinator
     /// <param name="minTradesPerArm">Minimum resolved trades per arm before SPRT can decide (default 30).</param>
     /// <param name="maxDurationDays">Maximum test duration in days before auto-resolution (default 14).</param>
     /// <returns>An <see cref="AbTestResult"/> with the decision and supporting metrics.</returns>
-    public AbTestResult Evaluate(AbTestState state, int minTradesPerArm = 30, int maxDurationDays = 14)
+    public AbTestResult Evaluate(
+        AbTestState state,
+        int minTradesPerArm = 30,
+        int maxDurationDays = 14,
+        AbTestEvaluationOptions? options = null)
     {
+        options = NormalizeOptions(options);
         var result = new AbTestResult
         {
             ChampionTradeCount  = state.ChampionOutcomes.Count,
             ChallengerTradeCount = state.ChallengerOutcomes.Count,
         };
+        result.CovariateImbalanceScore = ComputeCovariateImbalance(
+            state.ChampionOutcomes,
+            state.ChallengerOutcomes);
 
         // ── Minimum sample guard ────────────────────────────────────────────
         if (state.ChampionOutcomes.Count < minTradesPerArm ||
@@ -290,6 +355,8 @@ public sealed class SignalAbTestCoordinator
         // ── Compute per-arm metrics ─────────────────────────────────────────
         var champPnls = state.ChampionOutcomes.Select(o => o.Pnl).ToList();
         var challPnls = state.ChallengerOutcomes.Select(o => o.Pnl).ToList();
+        var robustChampPnls = Winsorize(champPnls, options.WinsorizationQuantile);
+        var robustChallPnls = Winsorize(challPnls, options.WinsorizationQuantile);
 
         result.ChampionAvgPnl  = champPnls.Average();
         result.ChallengerAvgPnl = challPnls.Average();
@@ -297,17 +364,25 @@ public sealed class SignalAbTestCoordinator
         result.ChallengerSharpe = ComputeSharpe(challPnls);
 
         // δ = minimum meaningful improvement = 0.5 × champion's average win size
-        var champWins  = champPnls.Where(p => p > 0).ToList();
-        double delta   = champWins.Count > 0 ? 0.5 * champWins.Average() : 1.0;
+        var champWins  = robustChampPnls.Where(p => p > 0).ToList();
+        double delta   = champWins.Count > 0
+            ? options.DeltaWinSizeMultiplier * champWins.Average()
+            : options.MinimumEffectPnl ?? 1.0;
+        if (options.MinimumEffectPnl.HasValue)
+            delta = Math.Max(delta, options.MinimumEffectPnl.Value);
         if (delta < 1e-6) delta = 1.0; // Floor to prevent degenerate SPRT
 
         // ── SPRT ────────────────────────────────────────────────────────────
-        const double alpha = 0.05; // false positive rate
-        const double beta  = 0.20; // false negative rate
-        double upperBound  = Math.Log((1.0 - beta) / alpha);   // ≈ 2.77
-        double lowerBound  = Math.Log(beta / (1.0 - alpha));    // ≈ -1.39
+        double upperBound  = Math.Log((1.0 - options.Beta) / options.Alpha);
+        double lowerBound  = Math.Log(options.Beta / (1.0 - options.Alpha));
+        var imbalanceAdjusted = result.CovariateImbalanceScore > options.MaxCovariateImbalance;
+        if (imbalanceAdjusted)
+        {
+            upperBound *= options.ImbalanceEvidenceMultiplier;
+            lowerBound *= options.ImbalanceEvidenceMultiplier;
+        }
 
-        double llr = ComputeSprtLogLikelihoodRatio(champPnls, challPnls, delta);
+        double llr = ComputeSprtLogLikelihoodRatio(robustChampPnls, robustChallPnls, delta);
         result.SprtLogLikelihoodRatio = llr;
 
         if (llr >= upperBound)
@@ -315,14 +390,16 @@ public sealed class SignalAbTestCoordinator
             result.Decision = AbTestDecision.PromoteChallenger;
             result.Reason   = $"SPRT crossed upper boundary ({llr:F3} >= {upperBound:F3}). " +
                               $"Challenger avg P&L={result.ChallengerAvgPnl:F4} vs Champion={result.ChampionAvgPnl:F4}. " +
-                              $"Challenger Sharpe={result.ChallengerSharpe:F3} vs Champion={result.ChampionSharpe:F3}.";
+                              $"Challenger Sharpe={result.ChallengerSharpe:F3} vs Champion={result.ChampionSharpe:F3}. " +
+                              $"Covariate imbalance={result.CovariateImbalanceScore:F3}.";
         }
         else if (llr <= lowerBound)
         {
             result.Decision = AbTestDecision.KeepChampion;
             result.Reason   = $"SPRT crossed lower boundary ({llr:F3} <= {lowerBound:F3}). " +
                               $"Champion avg P&L={result.ChampionAvgPnl:F4} vs Challenger={result.ChallengerAvgPnl:F4}. " +
-                              $"Champion Sharpe={result.ChampionSharpe:F3} vs Challenger={result.ChallengerSharpe:F3}.";
+                              $"Champion Sharpe={result.ChampionSharpe:F3} vs Challenger={result.ChallengerSharpe:F3}. " +
+                              $"Covariate imbalance={result.CovariateImbalanceScore:F3}.";
         }
         else if (DateTime.UtcNow - state.StartedAtUtc > TimeSpan.FromDays(maxDurationDays))
         {
@@ -334,7 +411,8 @@ public sealed class SignalAbTestCoordinator
         {
             result.Decision = AbTestDecision.Inconclusive;
             result.Reason   = $"SPRT inconclusive (LLR={llr:F3}, bounds=[{lowerBound:F3}, {upperBound:F3}]). " +
-                              $"Champion trades={result.ChampionTradeCount}, Challenger trades={result.ChallengerTradeCount}.";
+                              $"Champion trades={result.ChampionTradeCount}, Challenger trades={result.ChallengerTradeCount}. " +
+                              $"Covariate imbalance={result.CovariateImbalanceScore:F3}.";
         }
 
         return result;
@@ -398,5 +476,100 @@ public sealed class SignalAbTestCoordinator
         double stdev = Math.Sqrt(Variance(pnls));
         if (stdev < 1e-10) return mean > 0 ? 10.0 : -10.0; // Cap extreme values
         return (mean / stdev) * Math.Sqrt(252.0);
+    }
+
+    private static AbTestEvaluationOptions NormalizeOptions(AbTestEvaluationOptions? options)
+    {
+        options ??= new AbTestEvaluationOptions();
+
+        var alpha = options.Alpha is > 0 and < 1 ? options.Alpha : 0.05;
+        var beta = options.Beta is > 0 and < 1 ? options.Beta : 0.20;
+        var multiplier = options.DeltaWinSizeMultiplier > 0 ? options.DeltaWinSizeMultiplier : 0.5;
+        var minimumEffect = options.MinimumEffectPnl is > 0 ? options.MinimumEffectPnl : null;
+        var winsor = options.WinsorizationQuantile is >= 0 and < 0.5
+            ? options.WinsorizationQuantile
+            : 0.05;
+        var maxImbalance = options.MaxCovariateImbalance is >= 0 and <= 1
+            ? options.MaxCovariateImbalance
+            : 0.35;
+        var evidenceMultiplier = options.ImbalanceEvidenceMultiplier >= 1
+            ? options.ImbalanceEvidenceMultiplier
+            : 1.5;
+
+        return new AbTestEvaluationOptions(
+            alpha,
+            beta,
+            multiplier,
+            minimumEffect,
+            winsor,
+            maxImbalance,
+            evidenceMultiplier);
+    }
+
+    private static List<double> Winsorize(List<double> values, double quantile)
+    {
+        if (values.Count < 4 || quantile <= 0)
+            return values;
+
+        var ordered = values.OrderBy(x => x).ToList();
+        var lower = ordered[(int)Math.Floor((ordered.Count - 1) * quantile)];
+        var upper = ordered[(int)Math.Ceiling((ordered.Count - 1) * (1.0 - quantile))];
+
+        return values.Select(v => Math.Min(Math.Max(v, lower), upper)).ToList();
+    }
+
+    private static double ComputeCovariateImbalance(
+        IReadOnlyList<AbTestOutcome> championOutcomes,
+        IReadOnlyList<AbTestOutcome> challengerOutcomes)
+    {
+        var strategyImbalance = DistributionDistance(
+            championOutcomes
+                .Where(x => x.StrategyId.HasValue)
+                .Select(x => x.StrategyId!.Value),
+            challengerOutcomes
+                .Where(x => x.StrategyId.HasValue)
+                .Select(x => x.StrategyId!.Value));
+
+        var sessionImbalance = DistributionDistance(
+            championOutcomes
+                .Where(x => x.SessionHourUtc.HasValue)
+                .Select(x => x.SessionHourUtc!.Value),
+            challengerOutcomes
+                .Where(x => x.SessionHourUtc.HasValue)
+                .Select(x => x.SessionHourUtc!.Value));
+
+        return Math.Max(strategyImbalance, sessionImbalance);
+    }
+
+    private static double DistributionDistance<T>(
+        IEnumerable<T> championValues,
+        IEnumerable<T> challengerValues)
+        where T : notnull
+    {
+        var championCounts = championValues
+            .GroupBy(x => x)
+            .ToDictionary(g => g.Key, g => g.Count());
+        var challengerCounts = challengerValues
+            .GroupBy(x => x)
+            .ToDictionary(g => g.Key, g => g.Count());
+
+        var championTotal = championCounts.Values.Sum();
+        var challengerTotal = challengerCounts.Values.Sum();
+        if (championTotal == 0 || challengerTotal == 0)
+            return 0.0;
+
+        var keys = championCounts.Keys.Concat(challengerCounts.Keys).Distinct();
+        var distance = keys.Sum(key =>
+        {
+            var championShare = championCounts.TryGetValue(key, out var championCount)
+                ? (double)championCount / championTotal
+                : 0.0;
+            var challengerShare = challengerCounts.TryGetValue(key, out var challengerCount)
+                ? (double)challengerCount / challengerTotal
+                : 0.0;
+            return Math.Abs(championShare - challengerShare);
+        });
+
+        return distance / 2.0;
     }
 }

@@ -23,7 +23,9 @@ public record AbTestOutcome(
     double Pnl,
     double Magnitude,
     int DurationMinutes,
-    DateTime ResolvedAtUtc);
+    DateTime ResolvedAtUtc,
+    long? StrategyId = null,
+    int? SessionHourUtc = null);
 
 /// <summary>
 /// The decision produced by evaluating an A/B test via SPRT on cumulative P&amp;L.
@@ -37,8 +39,23 @@ public enum AbTestDecision
     PromoteChallenger,
 
     /// <summary>Champion model is equal or better — reject the challenger.</summary>
-    KeepChampion
+    KeepChampion,
+
+    /// <summary>The test was ended because one arm became unavailable or invalid.</summary>
+    Invalidated
 }
+
+/// <summary>
+/// Statistical controls used when evaluating a signal-level A/B test.
+/// </summary>
+public record AbTestEvaluationOptions(
+    double Alpha = 0.05,
+    double Beta = 0.20,
+    double DeltaWinSizeMultiplier = 0.5,
+    double? MinimumEffectPnl = null,
+    double WinsorizationQuantile = 0.05,
+    double MaxCovariateImbalance = 0.35,
+    double ImbalanceEvidenceMultiplier = 1.5);
 
 /// <summary>
 /// Detailed result of an A/B test evaluation, including per-arm metrics and the SPRT decision.
@@ -51,6 +68,7 @@ public class AbTestResult
     public double ChampionSharpe { get; set; }
     public double ChallengerSharpe { get; set; }
     public double SprtLogLikelihoodRatio { get; set; }
+    public double CovariateImbalanceScore { get; set; }
     public int ChampionTradeCount { get; set; }
     public int ChallengerTradeCount { get; set; }
     public string Reason { get; set; } = string.Empty;

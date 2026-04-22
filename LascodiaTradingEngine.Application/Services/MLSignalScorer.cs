@@ -130,6 +130,7 @@ public sealed class MLSignalScorer : IMLSignalScorer
     private readonly global::LascodiaTradingEngine.Application.Services.IOrderBookFeatureProvider? _orderBookProvider;
     private readonly global::LascodiaTradingEngine.Application.Common.Interfaces.IActiveCpcEncoderProvider? _cpcEncoderProvider;
     private readonly global::LascodiaTradingEngine.Application.Common.Interfaces.ICpcEncoderProjection? _cpcProjection;
+    private readonly SignalAbTestCoordinator _abTestCoordinator;
 
     /// <summary>
     /// Tracks models already loaded into <see cref="_onnxEngine"/> so repeat scoring
@@ -149,13 +150,16 @@ public sealed class MLSignalScorer : IMLSignalScorer
         global::LascodiaTradingEngine.Application.Services.ITickFlowProvider? tickFlowProvider = null,
         global::LascodiaTradingEngine.Application.Services.IOrderBookFeatureProvider? orderBookProvider = null,
         global::LascodiaTradingEngine.Application.Common.Interfaces.IActiveCpcEncoderProvider? cpcEncoderProvider = null,
-        global::LascodiaTradingEngine.Application.Common.Interfaces.ICpcEncoderProjection? cpcProjection = null)
+        global::LascodiaTradingEngine.Application.Common.Interfaces.ICpcEncoderProjection? cpcProjection = null,
+        SignalAbTestCoordinator? abTestCoordinator = null)
     {
         _context           = context;
         _cache             = cache;
         _logger            = logger;
         _inferenceEngines  = inferenceEngines;
-        _modelResolver     = new MLModelResolver(context, logger);
+        _abTestCoordinator = abTestCoordinator ?? new SignalAbTestCoordinator(
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<SignalAbTestCoordinator>.Instance);
+        _modelResolver     = new MLModelResolver(context, logger, _abTestCoordinator);
         _configService     = new MLConfigService(cache, logger);
         _crossAssetProvider = crossAssetProvider;
         _eventProvider     = eventProvider;
@@ -223,6 +227,19 @@ public sealed class MLSignalScorer : IMLSignalScorer
         for (int i = 0; i < batch.Count; i++)
             timeframes[i] = batch[i].Candles.Count > 0 ? batch[i].Candles[0].Timeframe : Timeframe.H1;
 
+        if (batch.Any(x => _abTestCoordinator.GetActiveTest(
+                x.Signal.Symbol,
+                x.Candles.Count > 0 ? x.Candles[0].Timeframe : Timeframe.H1) is not null))
+        {
+            var seq = new MLScoreResult[batch.Count];
+            for (int i = 0; i < batch.Count; i++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                seq[i] = await ScoreAsync(batch[i].Signal, batch[i].Candles, cancellationToken);
+            }
+            return seq;
+        }
+
         // Bulk-resolve models for all (symbol, timeframe) pairs in the batch.
         var pairs = new List<(TradeSignal Signal, Timeframe Tf)>(batch.Count);
         for (int i = 0; i < batch.Count; i++)
@@ -258,7 +275,7 @@ public sealed class MLSignalScorer : IMLSignalScorer
             }
 
             results[i] = await ScoreForModelAsync(
-                r.Model, r.CurrentRegime, signal, candles, tf,
+                r.Model, r.CurrentRegime, signal, candles, tf, r.Role,
                 scoringStart, cancellationToken);
         }
 
@@ -284,14 +301,14 @@ public sealed class MLSignalScorer : IMLSignalScorer
 
         if (committeeSize <= 1)
         {
-            var (primary, primaryRegime) = await _modelResolver.ResolveActiveModelAsync(
+            var (primary, primaryRegime, primaryRole) = await _modelResolver.ResolveActiveModelAsync(
                 signal, signalTimeframe, cancellationToken);
             if (primary is null)
                 return new MLScoreResult(null, null, null, null);
 
             return await ScoreForModelAsync(
                 primary, primaryRegime, signal, candles, signalTimeframe,
-                scoringStart, cancellationToken);
+                primaryRole, scoringStart, cancellationToken);
         }
 
         // ── Committee scoring ─────────────────────────────────────────────────
@@ -304,12 +321,12 @@ public sealed class MLSignalScorer : IMLSignalScorer
             return new MLScoreResult(null, null, null, null);
 
         var blendInputs = new List<(MLScoreResult Result, decimal TrainingAccuracy)>(members.Count);
-        foreach (var (member, memberRegime) in members)
+        foreach (var (member, memberRegime, memberRole) in members)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var memberResult = await ScoreForModelAsync(
                 member, memberRegime, signal, candles, signalTimeframe,
-                scoringStart, cancellationToken);
+                memberRole, scoringStart, cancellationToken);
 
             // A valid member contribution has MLModelId set (breaker-skipped or
             // suppressed results return with null model id and are discarded).
@@ -338,6 +355,7 @@ public sealed class MLSignalScorer : IMLSignalScorer
         TradeSignal           signal,
         IReadOnlyList<Candle> candles,
         Timeframe             signalTimeframe,
+        ModelRole             modelRole,
         long                  scoringStart,
         CancellationToken     cancellationToken)
     {
@@ -552,7 +570,8 @@ public sealed class MLSignalScorer : IMLSignalScorer
                 ConformalThresholdUsed: conformalThresholdUsed,
                 ConformalTargetCoverageUsed: conformalTargetCoverageUsed,
                 ConformalPredictionSetJson: conformalPredictionSetJson,
-                EntropyScore: (decimal)entropyScore);
+                EntropyScore: (decimal)entropyScore,
+                ModelRole: modelRole);
         }
 
         if (abstentionScore.HasValue &&
@@ -578,7 +597,8 @@ public sealed class MLSignalScorer : IMLSignalScorer
                 ConformalThresholdUsed: conformalThresholdUsed,
                 ConformalTargetCoverageUsed: conformalTargetCoverageUsed,
                 ConformalPredictionSetJson: conformalPredictionSetJson,
-                EntropyScore: (decimal)entropyScore);
+                EntropyScore: (decimal)entropyScore,
+                ModelRole: modelRole);
         }
 
         var scoringElapsed = Stopwatch.GetElapsedTime(scoringStart);
@@ -637,7 +657,8 @@ public sealed class MLSignalScorer : IMLSignalScorer
             CalibratedProbability:        (decimal)baseCalibP,
             ServedCalibratedProbability:  (decimal)effectiveCalibP,
             DecisionThresholdUsed:        (decimal)threshold,
-            RawFeaturesJson:              JsonSerializer.Serialize(rawFeatures));
+            RawFeaturesJson:              JsonSerializer.Serialize(rawFeatures),
+            ModelRole:                    modelRole);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

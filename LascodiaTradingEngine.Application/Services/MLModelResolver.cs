@@ -2,6 +2,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Services.ML;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 using MarketRegimeEnum = LascodiaTradingEngine.Domain.Enums.MarketRegime;
@@ -19,14 +20,19 @@ internal sealed class MLModelResolver
 
     private readonly IReadApplicationDbContext _context;
     private readonly ILogger _logger;
+    private readonly SignalAbTestCoordinator? _abTestCoordinator;
 
-    internal MLModelResolver(IReadApplicationDbContext context, ILogger logger)
+    internal MLModelResolver(
+        IReadApplicationDbContext context,
+        ILogger logger,
+        SignalAbTestCoordinator? abTestCoordinator = null)
     {
-        _context = context;
-        _logger  = logger;
+        _context           = context;
+        _logger            = logger;
+        _abTestCoordinator = abTestCoordinator;
     }
 
-    internal async Task<(MLModel? Model, string? CurrentRegime)> ResolveActiveModelAsync(
+    internal async Task<(MLModel? Model, string? CurrentRegime, ModelRole Role)> ResolveActiveModelAsync(
         TradeSignal signal, Timeframe signalTimeframe, CancellationToken cancellationToken)
     {
         var db = _context.GetDbContext();
@@ -53,6 +59,40 @@ internal sealed class MLModelResolver
         {
             _logger.LogDebug(ex, "Regime lookup failed for {Symbol}/{Tf} — using global model",
                 signal.Symbol, signalTimeframe);
+        }
+
+        if (_abTestCoordinator?.GetActiveTest(signal.Symbol, signalTimeframe) is { } activeTest)
+        {
+            var routedModelId = _abTestCoordinator.ResolveModelForSignal(
+                signal.StrategyId,
+                activeTest.ChampionModelId,
+                activeTest.ChallengerModelId);
+            var role = routedModelId == activeTest.ChallengerModelId
+                ? ModelRole.Challenger
+                : ModelRole.Champion;
+
+            var routed = await db.Set<MLModel>()
+                .AsNoTracking()
+                .FirstOrDefaultAsync(x =>
+                    x.Id == routedModelId &&
+                    x.Symbol == signal.Symbol &&
+                    x.Timeframe == signalTimeframe &&
+                    !x.IsDeleted &&
+                    x.Status != MLModelStatus.Failed,
+                    cancellationToken);
+
+            if (routed?.ModelBytes is { Length: > 0 } && !routed.IsSuppressed)
+            {
+                _logger.LogDebug(
+                    "A/B routing {Symbol}/{Tf} strategy {StrategyId}: {Role} model {ModelId}",
+                    signal.Symbol, signalTimeframe, signal.StrategyId, role, routed.Id);
+                return (routed, currentRegime, role);
+            }
+
+            _logger.LogWarning(
+                "A/B routing selected unavailable {Role} model {ModelId} for {Symbol}/{Tf}; signal proceeds unscored until test is repaired or ended",
+                role, routedModelId, signal.Symbol, signalTimeframe);
+            return (null, currentRegime, role);
         }
 
         MLModel? model = null;
@@ -91,7 +131,7 @@ internal sealed class MLModelResolver
             _logger.LogDebug(
                 "No active ML model for {Symbol}/{Tf} — signal proceeds unscored",
                 signal.Symbol, signalTimeframe);
-            return (null, currentRegime);
+            return (null, currentRegime, ModelRole.Champion);
         }
 
         if (model.IsSuppressed)
@@ -128,7 +168,7 @@ internal sealed class MLModelResolver
                 _logger.LogDebug(
                     "Scoring suppressed for {Symbol}/{Tf} model {Id} — no fallback champion available.",
                     signal.Symbol, signalTimeframe, model.Id);
-                return (null, currentRegime);
+                return (null, currentRegime, ModelRole.Champion);
             }
 
             _logger.LogDebug(
@@ -138,7 +178,7 @@ internal sealed class MLModelResolver
             model = fallback;
         }
 
-        return (model, currentRegime);
+        return (model, currentRegime, ModelRole.Champion);
     }
 
     // ── Improvement #2: Bulk model resolution for batch scoring ──────────
@@ -155,12 +195,12 @@ internal sealed class MLModelResolver
     /// fallback champion. Signals that resolve to no model (or to a suppressed model
     /// with no fallback) are returned with <c>Model = null</c>.
     /// </remarks>
-    internal async Task<IReadOnlyDictionary<(string Symbol, Timeframe Tf), (MLModel? Model, string? CurrentRegime)>>
+    internal async Task<IReadOnlyDictionary<(string Symbol, Timeframe Tf), (MLModel? Model, string? CurrentRegime, ModelRole Role)>>
         ResolveActiveModelsBatchAsync(
             IReadOnlyList<(TradeSignal Signal, Timeframe Tf)> inputs,
             CancellationToken cancellationToken)
     {
-        var result = new Dictionary<(string, Timeframe), (MLModel?, string?)>();
+        var result = new Dictionary<(string, Timeframe), (MLModel?, string?, ModelRole)>();
         if (inputs.Count == 0) return result;
 
         var db = _context.GetDbContext();
@@ -220,6 +260,33 @@ internal sealed class MLModelResolver
         {
             regimeMap.TryGetValue((symbol, tf), out var currentRegime);
 
+            var firstSignalForPair = inputs.First(i => i.Signal.Symbol == symbol && i.Tf == tf).Signal;
+            if (_abTestCoordinator?.GetActiveTest(symbol, tf) is { } activeTest)
+            {
+                var routedModelId = _abTestCoordinator.ResolveModelForSignal(
+                    firstSignalForPair.StrategyId,
+                    activeTest.ChampionModelId,
+                    activeTest.ChallengerModelId);
+                var role = routedModelId == activeTest.ChallengerModelId
+                    ? ModelRole.Challenger
+                    : ModelRole.Champion;
+
+                var routed = await db.Set<MLModel>()
+                    .AsNoTracking()
+                    .FirstOrDefaultAsync(x =>
+                        x.Id == routedModelId &&
+                        x.Symbol == symbol &&
+                        x.Timeframe == tf &&
+                        !x.IsDeleted &&
+                        x.Status != MLModelStatus.Failed,
+                        cancellationToken);
+
+                result[(symbol, tf)] = routed?.ModelBytes is { Length: > 0 } && !routed.IsSuppressed
+                    ? (routed, currentRegime, role)
+                    : (null, currentRegime, role);
+                continue;
+            }
+
             // Prefer regime-scoped match; fall back to RegimeScope==null (global).
             MLModel? picked = null;
             if (currentRegime is not null)
@@ -232,7 +299,7 @@ internal sealed class MLModelResolver
 
             if (picked is null)
             {
-                result[(symbol, tf)] = (null, currentRegime);
+                result[(symbol, tf)] = (null, currentRegime, ModelRole.Champion);
                 continue;
             }
 
@@ -240,11 +307,11 @@ internal sealed class MLModelResolver
             {
                 suppressedPrimaries.Add((symbol, tf, picked));
                 // Placeholder; step 3 fills in fallback or null.
-                result[(symbol, tf)] = (null, currentRegime);
+                result[(symbol, tf)] = (null, currentRegime, ModelRole.Champion);
             }
             else
             {
-                result[(symbol, tf)] = (picked, currentRegime);
+                result[(symbol, tf)] = (picked, currentRegime, ModelRole.Champion);
             }
         }
 
@@ -289,14 +356,14 @@ internal sealed class MLModelResolver
                     _logger.LogDebug(
                         "Batch: scoring suppressed for {Symbol}/{Tf} model {Id} — no fallback champion",
                         symbol, tf, primary.Id);
-                    result[(symbol, tf)] = (null, currentRegime);
+                    result[(symbol, tf)] = (null, currentRegime, ModelRole.Champion);
                 }
                 else
                 {
                     _logger.LogDebug(
                         "Batch: suppressed primary {Id} for {Symbol}/{Tf} → fallback {FbId}",
                         primary.Id, symbol, tf, fb.Id);
-                    result[(symbol, tf)] = (fb, currentRegime);
+                    result[(symbol, tf)] = (fb, currentRegime, ModelRole.Champion);
                 }
             }
         }
@@ -318,15 +385,15 @@ internal sealed class MLModelResolver
     /// A list of (Model, CurrentRegime) tuples. Empty if no active model exists.
     /// The first element is always the primary model.
     /// </returns>
-    internal async Task<List<(MLModel Model, string? CurrentRegime)>> ResolveCommitteeModelsAsync(
+    internal async Task<List<(MLModel Model, string? CurrentRegime, ModelRole Role)>> ResolveCommitteeModelsAsync(
         TradeSignal signal, Timeframe signalTimeframe, int maxSize, CancellationToken ct)
     {
-        var (primary, regime) = await ResolveActiveModelAsync(signal, signalTimeframe, ct);
+        var (primary, regime, role) = await ResolveActiveModelAsync(signal, signalTimeframe, ct);
         if (primary is null)
             return [];
 
-        var result = new List<(MLModel, string?)>(maxSize) { (primary, regime) };
-        if (maxSize <= 1)
+        var result = new List<(MLModel, string?, ModelRole)>(maxSize) { (primary, regime, role) };
+        if (maxSize <= 1 || role == ModelRole.Challenger)
             return result;
 
         // Load all active, non-suppressed global models for this symbol/timeframe
@@ -357,7 +424,7 @@ internal sealed class MLModelResolver
             int family = FamilyOf(candidate.LearnerArchitecture);
             if (!usedFamilies.Add(family)) continue;
 
-            result.Add((candidate, regime));
+            result.Add((candidate, regime, ModelRole.Champion));
         }
 
         return result;

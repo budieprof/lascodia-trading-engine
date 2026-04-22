@@ -3219,7 +3219,7 @@ trainingSamplesBuilt:;
                 db.GetDbContext().Add(new MLModelLifecycleLog
                 {
                     MLModelId = champion.Id,
-                    EventType = "DegradationRetirement",
+                    EventType = MLModelLifecycleEventType.DegradationRetirement,
                     OccurredAt = DateTime.UtcNow,
                     Reason = $"Retired after {champion.ConsecutiveRetrainFailures} consecutive failed retrains — edge likely gone, generate a new strategy rather than retrain",
                 });

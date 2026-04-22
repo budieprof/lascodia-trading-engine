@@ -2132,6 +2132,7 @@ public partial class StrategyWorker :
                 MLPredictedMagnitude   = mlScore.PredictedMagnitudePips,
                 MLConfidenceScore      = mlScore.ConfidenceScore,
                 MLModelId              = mlScore.MLModelId,
+                MLModelRole            = mlScore.ModelRole,
                 MLRawProbability       = mlScore.RawProbability,
                 MLCalibratedProbability = mlScore.CalibratedProbability,
                 MLServedCalibratedProbability = mlScore.ServedCalibratedProbability,

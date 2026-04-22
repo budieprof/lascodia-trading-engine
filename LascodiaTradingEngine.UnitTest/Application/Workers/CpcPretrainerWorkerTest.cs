@@ -589,6 +589,175 @@ public class CpcPretrainerWorkerTest
         Assert.Empty(await db.Set<MLCpcEncoder>().ToListAsync());
     }
 
+    [Fact]
+    public async Task RunCycleAsync_Continues_With_Next_Candidate_When_Pretrainer_Throws()
+    {
+        await using var db = CreateDbContext();
+        SeedModelAndCandles(db, "EURUSD", Timeframe.H1, candleCount: 1500);
+        SeedModelAndCandles(db, "GBPUSD", Timeframe.H1, candleCount: 1500);
+        await db.SaveChangesAsync();
+
+        var trainer = new Mock<ICpcPretrainer>();
+        trainer.SetupGet(t => t.Kind).Returns(CpcEncoderType.Linear);
+        trainer.Setup(t => t.TrainAsync("EURUSD", Timeframe.H1,
+                It.IsAny<IReadOnlyList<float[][]>>(), 16, 3, It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("boom"));
+        trainer.Setup(t => t.TrainAsync("GBPUSD", Timeframe.H1,
+                It.IsAny<IReadOnlyList<float[][]>>(), 16, 3, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new MLCpcEncoder
+            {
+                Symbol = "GBPUSD", Timeframe = Timeframe.H1,
+                EmbeddingDim = 16, PredictionSteps = 3,
+                InfoNceLoss = 1.0, EncoderBytes = [1],
+                TrainedAt = DateTime.UtcNow, IsActive = true
+            });
+
+        var worker = CreateWorker(db, trainer.Object, options: new MLCpcOptions
+        {
+            EmbeddingDim = 16,
+            MinCandles = 1000,
+            SequenceLength = 60,
+            PollIntervalSeconds = 3600,
+            MaxPairsPerCycle = 10,
+        });
+
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        Assert.True(await db.Set<MLCpcEncoder>().AnyAsync(e => e.Symbol == "GBPUSD" && e.IsActive));
+        Assert.True(await db.Set<MLCpcEncoderTrainingLog>().AnyAsync(l =>
+            l.Symbol == "EURUSD" && l.Outcome == "rejected" && l.Reason == "trainer_exception"));
+        Assert.True(await db.Set<MLCpcEncoderTrainingLog>().AnyAsync(l =>
+            l.Symbol == "GBPUSD" && l.Outcome == "promoted"));
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_Does_Not_Replace_Newer_Better_Active_Encoder_Promoted_During_Training()
+    {
+        await using var db = CreateDbContext();
+        SeedModelAndCandles(db, "EURUSD", Timeframe.H1, candleCount: 1500);
+        db.Set<MLCpcEncoder>().Add(new MLCpcEncoder
+        {
+            Id = 1,
+            Symbol = "EURUSD",
+            Timeframe = Timeframe.H1,
+            EncoderType = CpcEncoderType.Linear,
+            EmbeddingDim = 16,
+            InfoNceLoss = 3.0,
+            EncoderBytes = [1],
+            TrainedAt = DateTime.UtcNow.AddDays(-30),
+            IsActive = true
+        });
+        await db.SaveChangesAsync();
+
+        var trainer = new Mock<ICpcPretrainer>();
+        trainer.SetupGet(t => t.Kind).Returns(CpcEncoderType.Linear);
+        trainer.Setup(t => t.TrainAsync("EURUSD", Timeframe.H1,
+                It.IsAny<IReadOnlyList<float[][]>>(), 16, 3, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(() =>
+            {
+                var old = db.Set<MLCpcEncoder>().Single(e => e.Id == 1);
+                old.IsActive = false;
+                db.Set<MLCpcEncoder>().Add(new MLCpcEncoder
+                {
+                    Id = 2,
+                    Symbol = "EURUSD",
+                    Timeframe = Timeframe.H1,
+                    EncoderType = CpcEncoderType.Linear,
+                    EmbeddingDim = 16,
+                    InfoNceLoss = 1.0,
+                    EncoderBytes = [2],
+                    TrainedAt = DateTime.UtcNow,
+                    IsActive = true
+                });
+                db.SaveChanges();
+
+                return new MLCpcEncoder
+                {
+                    Symbol = "EURUSD",
+                    Timeframe = Timeframe.H1,
+                    EncoderType = CpcEncoderType.Linear,
+                    EmbeddingDim = 16,
+                    PredictionSteps = 3,
+                    InfoNceLoss = 1.6,
+                    EncoderBytes = [3],
+                    TrainedAt = DateTime.UtcNow,
+                    IsActive = true
+                };
+            });
+
+        var worker = CreateWorker(db, trainer.Object);
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        var active = await db.Set<MLCpcEncoder>().SingleAsync(e => e.IsActive);
+        Assert.Equal(2, active.Id);
+        Assert.Equal(1.0, active.InfoNceLoss);
+        Assert.False(await db.Set<MLCpcEncoder>().AnyAsync(e => e.EncoderBytes != null && e.EncoderBytes.SequenceEqual(new byte[] { 3 })));
+
+        var log = await db.Set<MLCpcEncoderTrainingLog>().SingleAsync();
+        Assert.Equal("skipped", log.Outcome);
+        Assert.Equal("superseded_by_better_active", log.Reason);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_Per_Regime_Loads_Expanded_Window_For_Rare_Older_Regime()
+    {
+        await using var db = CreateDbContext();
+        SeedModelAndCandles(db, "EURUSD", Timeframe.H1, candleCount: 2000);
+        await db.SaveChangesAsync();
+        var firstCandle = await db.Set<Candle>()
+            .Where(c => c.Symbol == "EURUSD" && c.Timeframe == Timeframe.H1)
+            .OrderBy(c => c.Timestamp)
+            .FirstAsync();
+        var recentBoundary = DateTime.UtcNow.AddHours(-700);
+        db.Set<MarketRegimeSnapshot>().AddRange(
+            new MarketRegimeSnapshot
+            {
+                Symbol = "EURUSD", Timeframe = Timeframe.H1,
+                Regime = MarketRegime.Trending, Confidence = 0.9m,
+                DetectedAt = firstCandle.Timestamp.AddHours(-1)
+            },
+            new MarketRegimeSnapshot
+            {
+                Symbol = "EURUSD", Timeframe = Timeframe.H1,
+                Regime = MarketRegime.Ranging, Confidence = 0.9m,
+                DetectedAt = recentBoundary
+            });
+        await db.SaveChangesAsync();
+
+        var trainer = new Mock<ICpcPretrainer>();
+        trainer.SetupGet(t => t.Kind).Returns(CpcEncoderType.Linear);
+        trainer.Setup(t => t.TrainAsync(It.IsAny<string>(), It.IsAny<Timeframe>(),
+                It.IsAny<IReadOnlyList<float[][]>>(), It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((string s, Timeframe tf, IReadOnlyList<float[][]> _, int embed, int steps, CancellationToken _ct) =>
+                new MLCpcEncoder
+                {
+                    Symbol = s, Timeframe = tf,
+                    EmbeddingDim = embed, PredictionSteps = steps,
+                    InfoNceLoss = 1.0, EncoderBytes = [1],
+                    TrainedAt = DateTime.UtcNow, IsActive = true
+                });
+
+        var worker = CreateWorker(db, trainer.Object, options: new MLCpcOptions
+        {
+            EmbeddingDim = 16,
+            MinCandles = 1000,
+            MinCandlesPerRegime = 500,
+            TrainingCandles = 1000,
+            SequenceLength = 60,
+            PollIntervalSeconds = 3600,
+            MaxPairsPerCycle = 10,
+            TrainPerRegime = true,
+        });
+
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        Assert.True(await db.Set<MLCpcEncoder>().AnyAsync(e =>
+            e.Symbol == "EURUSD" && e.Timeframe == Timeframe.H1 &&
+            e.Regime == MarketRegime.Trending && e.IsActive));
+        Assert.True(await db.Set<MLCpcEncoderTrainingLog>().AnyAsync(l =>
+            l.Regime == MarketRegime.Trending && l.CandlesLoaded > 1000 && l.Outcome == "promoted"));
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────
 
     private static WriteApplicationDbContext CreateDbContext()
@@ -658,9 +827,13 @@ public class CpcPretrainerWorkerTest
 
     private static void SeedModelAndCandles(DbContext db, string symbol, Timeframe timeframe, int candleCount)
     {
+        var nextModelId = db.Set<MLModel>().Local
+            .Select(m => m.Id)
+            .DefaultIfEmpty(0)
+            .Max() + 1;
         db.Set<MLModel>().Add(new MLModel
         {
-            Id = 1,
+            Id = nextModelId,
             Symbol = symbol,
             Timeframe = timeframe,
             ModelVersion = "1.0.0",
@@ -679,6 +852,10 @@ public class CpcPretrainerWorkerTest
         var rng = new Random(17);
         decimal price = 1.10m;
         var start = DateTime.UtcNow.AddHours(-candleCount);
+        var nextCandleId = db.Set<Candle>().Local
+            .Select(c => c.Id)
+            .DefaultIfEmpty(0)
+            .Max() + 1;
         for (int i = 0; i < candleCount; i++)
         {
             decimal d = (decimal)((rng.NextDouble() - 0.5) * 0.002);
@@ -688,7 +865,7 @@ public class CpcPretrainerWorkerTest
             decimal lo = Math.Min(open, close) - 0.0001m;
             db.Set<Candle>().Add(new Candle
             {
-                Id = i + 1,
+                Id = nextCandleId + i,
                 Symbol = symbol,
                 Timeframe = timeframe,
                 Timestamp = start.AddHours(i),
