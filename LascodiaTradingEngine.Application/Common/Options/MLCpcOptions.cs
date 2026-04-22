@@ -75,11 +75,59 @@ public class MLCpcOptions : ConfigurationOption<MLCpcOptions>
     /// </summary>
     public double MaxValidationLoss { get; set; } = 10.0;
 
+    /// <summary>
+    /// Minimum average L2 norm required across holdout embeddings. Rejects collapsed
+    /// encoders that project every validation window to an all-zero or near-zero vector.
+    /// </summary>
+    public double MinValidationEmbeddingL2Norm { get; set; } = 1e-6;
+
+    /// <summary>
+    /// Minimum mean per-dimension variance required across holdout embeddings. This is a
+    /// representation-quality smoke test: CPC features must move with the validation data,
+    /// not just deserialize and return a constant vector.
+    /// </summary>
+    public double MinValidationEmbeddingVariance { get; set; } = 1e-10;
+
+    /// <summary>
+    /// When true, promotion also requires a cheap downstream-proxy linear probe over CPC
+    /// holdout embeddings. The probe predicts future candle direction from embeddings, so
+    /// promotion is not based only on the internal contrastive objective.
+    /// </summary>
+    public bool EnableDownstreamProbeGate { get; set; } = true;
+
+    /// <summary>Minimum labelled train/validation embedding samples required for the probe gate.</summary>
+    public int MinDownstreamProbeSamples { get; set; } = 40;
+
+    /// <summary>
+    /// Minimum balanced accuracy required for the downstream-proxy probe. Set slightly below
+    /// 0.5 only during rollout if you want the gate to audit without blocking borderline pairs.
+    /// </summary>
+    public double MinDownstreamProbeBalancedAccuracy { get; set; } = 0.50;
+
+    /// <summary>
+    /// Minimum balanced-accuracy improvement required over the prior active encoder when one
+    /// exists and can be evaluated on the same probe split.
+    /// </summary>
+    public double MinDownstreamProbeImprovement { get; set; } = 0.01;
+
+    /// <summary>
+    /// Active encoders older than this many hours raise/update a stale-encoder alert while
+    /// they are waiting for a successful replacement.
+    /// </summary>
+    public int StaleEncoderAlertHours { get; set; } = 336;
+
     /// <summary>When false, the worker loops but performs no training work.</summary>
     public bool Enabled { get; set; } = true;
 
     /// <summary>Consecutive cycle failures per pair before a DataQualityIssue alert is raised.</summary>
     public int ConsecutiveFailAlertThreshold { get; set; } = 3;
+
+    /// <summary>
+    /// Maximum seconds to wait for the per-(symbol,timeframe,regime,encoder-type) distributed
+    /// lock. Default zero means "try once"; if another worker is already training that tuple,
+    /// this worker skips it and lets the next poll reconsider.
+    /// </summary>
+    public int LockTimeoutSeconds { get; set; } = 0;
 
     /// <summary>
     /// When true, the worker trains one encoder per <c>(symbol, timeframe, regime)</c> triple
@@ -95,6 +143,13 @@ public class MLCpcOptions : ConfigurationOption<MLCpcOptions>
     /// is skipped and the global-fallback lookup keeps its pair scoring.
     /// </summary>
     public int MinCandlesPerRegime { get; set; } = 500;
+
+    /// <summary>
+    /// Multiplier applied to <see cref="TrainingCandles"/> when loading candidate candles for
+    /// regime-specific training. Sparse regimes often sit outside the latest global tail, so
+    /// per-regime candidates can scan deeper history while still staying bounded.
+    /// </summary>
+    public int RegimeCandleBackfillMultiplier { get; set; } = 8;
 
     /// <summary>
     /// Encoder architecture the worker will produce. <see cref="CpcEncoderType.Linear"/> is

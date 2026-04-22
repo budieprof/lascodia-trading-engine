@@ -1,3 +1,4 @@
+using System.Data;
 using System.Diagnostics;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
@@ -37,7 +38,6 @@ public sealed class CpcPretrainerWorker : BackgroundService
 {
     private const string WorkerName = nameof(CpcPretrainerWorker);
     private const int    AlertPayloadSchemaVersion = 1;
-    private const int    RegimeCandleBackfillMultiplier = 8;
 
     private readonly IServiceScopeFactory        _scopeFactory;
     private readonly ILogger<CpcPretrainerWorker> _logger;
@@ -46,6 +46,7 @@ public sealed class CpcPretrainerWorker : BackgroundService
     private readonly TradingMetrics?             _metrics;
     private readonly MLCpcOptions                _options;
     private readonly MLCpcConfigReader           _configReader;
+    private readonly IDistributedLock            _distributedLock;
 
     private readonly Dictionary<(string Symbol, Timeframe Timeframe, global::LascodiaTradingEngine.Domain.Enums.MarketRegime? Regime), int> _consecutiveFailures = new();
 
@@ -63,6 +64,7 @@ public sealed class CpcPretrainerWorker : BackgroundService
     public CpcPretrainerWorker(
         IServiceScopeFactory         scopeFactory,
         ILogger<CpcPretrainerWorker> logger,
+        IDistributedLock             distributedLock,
         TimeProvider?                timeProvider  = null,
         IWorkerHealthMonitor?        healthMonitor = null,
         TradingMetrics?              metrics       = null,
@@ -71,6 +73,7 @@ public sealed class CpcPretrainerWorker : BackgroundService
     {
         _scopeFactory  = scopeFactory;
         _logger        = logger;
+        _distributedLock = distributedLock ?? throw new ArgumentNullException(nameof(distributedLock));
         _timeProvider  = timeProvider ?? TimeProvider.System;
         _healthMonitor = healthMonitor;
         _metrics       = metrics;
@@ -161,6 +164,7 @@ public sealed class CpcPretrainerWorker : BackgroundService
             _logger.LogDebug("CpcPretrainerWorker: no stale pairs — nothing to train.");
             return config.PollSeconds;
         }
+        await RecordStaleEncoderAlertsAsync(writeCtx, candidates, config, ct);
 
         int trained = 0, skipped = 0, failed = 0;
         foreach (var candidate in candidates.Take(config.MaxPairsPerCycle))
@@ -170,8 +174,27 @@ public sealed class CpcPretrainerWorker : BackgroundService
             TrainOutcome outcome;
             try
             {
-                outcome = await TrainOnePairAsync(
-                    scope.ServiceProvider, writeCtx, candidate, config, ct);
+                await using var candidateLock = await TryAcquireCandidateLockAsync(
+                    writeCtx, candidate, config, ct);
+                if (candidateLock is null)
+                {
+                    await WriteTrainingLogAsync(
+                        writeCtx, candidate, config, "skipped", "lock_busy",
+                        candlesLoaded: 0, candlesAfterRegimeFilter: 0,
+                        trainingSequences: 0, validationSequences: 0, trainingDurationMs: 0,
+                        trainLoss: null, validationLoss: null, promotedEncoderId: null, ct,
+                        extraDiagnostics: new Dictionary<string, object?>
+                        {
+                            ["LockKey"] = BuildCandidateLockKey(candidate, config),
+                            ["LockTimeoutSeconds"] = config.LockTimeoutSeconds,
+                        });
+                    outcome = TrainOutcome.Skipped;
+                }
+                else
+                {
+                    outcome = await TrainOnePairAsync(
+                        scope.ServiceProvider, writeCtx, candidate, config, ct);
+                }
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -410,7 +433,12 @@ public sealed class CpcPretrainerWorker : BackgroundService
             await WriteTrainingLogAsync(
                 writeCtx, candidate, config, "rejected", "trainer_exception",
                 candlesLoaded, candlesAfterRegimeFilter, split.Training.Count, split.Validation.Count, failedTrainingDurationMs,
-                trainLoss: null, validationLoss: null, promotedEncoderId: null, ct);
+                trainLoss: null, validationLoss: null, promotedEncoderId: null, ct,
+                extraDiagnostics: new Dictionary<string, object?>
+                {
+                    ["ExceptionType"] = ex.GetType().FullName,
+                    ["ExceptionMessage"] = ex.Message,
+                });
             RecordCpcRejection(candidate, config, "trainer_exception");
             return await RecordFailureAsync(writeCtx, candidate, "trainer_exception", config, ct);
         }
@@ -446,7 +474,11 @@ public sealed class CpcPretrainerWorker : BackgroundService
         newEncoder.Timeframe = candidate.Timeframe;
         newEncoder.Regime = candidate.Regime;
         newEncoder.EncoderType = pretrainer.Kind;
+        newEncoder.PredictionSteps = config.PredictionSteps;
+        newEncoder.TrainingSamples = split.Training.Count;
+        newEncoder.TrainedAt = _timeProvider.GetUtcNow().UtcDateTime;
         newEncoder.IsActive = true;
+        double trainLoss = newEncoder.InfoNceLoss;
 
         // Shape + improvement gates.
         if (newEncoder.EmbeddingDim != MLFeatureHelper.CpcEmbeddingBlockSize)
@@ -458,7 +490,7 @@ public sealed class CpcPretrainerWorker : BackgroundService
             await WriteTrainingLogAsync(
                 writeCtx, candidate, config, "rejected", "embedding_dim_mismatch",
                 candlesLoaded, candlesAfterRegimeFilter, split.Training.Count, split.Validation.Count, trainingDurationMs,
-                newEncoder.InfoNceLoss, validationLoss: null, promotedEncoderId: null, ct);
+                trainLoss, validationLoss: null, promotedEncoderId: null, ct);
             RecordCpcRejection(candidate, config, "embedding_dim_mismatch");
             return await RecordFailureAsync(writeCtx, candidate, "embedding_dim_mismatch", config, ct);
         }
@@ -471,28 +503,27 @@ public sealed class CpcPretrainerWorker : BackgroundService
             await WriteTrainingLogAsync(
                 writeCtx, candidate, config, "rejected", "empty_weights",
                 candlesLoaded, candlesAfterRegimeFilter, split.Training.Count, split.Validation.Count, trainingDurationMs,
-                newEncoder.InfoNceLoss, validationLoss: null, promotedEncoderId: null, ct);
+                trainLoss, validationLoss: null, promotedEncoderId: null, ct);
             RecordCpcRejection(candidate, config, "empty_weights");
             return await RecordFailureAsync(writeCtx, candidate, "empty_weights", config, ct);
         }
 
-        if (!double.IsFinite(newEncoder.InfoNceLoss) ||
-            newEncoder.InfoNceLoss > config.MaxAcceptableLoss)
+        if (!double.IsFinite(trainLoss) || trainLoss > config.MaxAcceptableLoss)
         {
             _logger.LogWarning(
                 EventIds.EncoderRejected,
                 "CpcPretrainerWorker: {Symbol}/{Timeframe} rejected — loss={Loss} (max={Max}).",
-                candidate.Symbol, candidate.Timeframe, newEncoder.InfoNceLoss, config.MaxAcceptableLoss);
+                candidate.Symbol, candidate.Timeframe, trainLoss, config.MaxAcceptableLoss);
             await WriteTrainingLogAsync(
                 writeCtx, candidate, config, "rejected", "loss_out_of_bounds",
                 candlesLoaded, candlesAfterRegimeFilter, split.Training.Count, split.Validation.Count, trainingDurationMs,
-                newEncoder.InfoNceLoss, validationLoss: null, promotedEncoderId: null, ct);
+                trainLoss, validationLoss: null, promotedEncoderId: null, ct);
             RecordCpcRejection(candidate, config, "loss_out_of_bounds");
             return await RecordFailureAsync(writeCtx, candidate, "loss_out_of_bounds", config, ct);
         }
 
         var projection = scopedProvider.GetRequiredService<ICpcEncoderProjection>();
-        double validationLoss;
+        CpcValidationScore validationScore;
         try
         {
             var smoke = projection.ProjectLatest(newEncoder, split.Validation[0]);
@@ -510,14 +541,17 @@ public sealed class CpcPretrainerWorker : BackgroundService
                 await WriteTrainingLogAsync(
                     writeCtx, candidate, config, "rejected", "projection_invalid",
                     candlesLoaded, candlesAfterRegimeFilter, split.Training.Count, split.Validation.Count, trainingDurationMs,
-                    newEncoder.InfoNceLoss, validationLoss: null, promotedEncoderId: null, ct);
+                    trainLoss, validationLoss: null, promotedEncoderId: null, ct);
                 RecordCpcRejection(candidate, config, "projection_invalid");
                 return await RecordFailureAsync(writeCtx, candidate, "projection_invalid", config, ct);
             }
 
-            validationLoss = ComputeHoldoutContrastiveLoss(
+            validationScore = ComputeHoldoutContrastiveScore(
                 projection, newEncoder, split.Validation, config.PredictionSteps);
-            _metrics?.MLCpcValidationLoss.Record(validationLoss, CpcTags(candidate, config));
+            var tags = CpcTags(candidate, config);
+            _metrics?.MLCpcValidationLoss.Record(validationScore.InfoNceLoss, tags);
+            _metrics?.MLCpcValidationEmbeddingL2Norm.Record(validationScore.MeanL2Norm, tags);
+            _metrics?.MLCpcValidationEmbeddingVariance.Record(validationScore.MeanDimensionVariance, tags);
         }
         catch (Exception ex)
         {
@@ -531,12 +565,12 @@ public sealed class CpcPretrainerWorker : BackgroundService
             await WriteTrainingLogAsync(
                 writeCtx, candidate, config, "rejected", "projection_invalid",
                 candlesLoaded, candlesAfterRegimeFilter, split.Training.Count, split.Validation.Count, trainingDurationMs,
-                newEncoder.InfoNceLoss, validationLoss: null, promotedEncoderId: null, ct);
+                trainLoss, validationLoss: null, promotedEncoderId: null, ct);
             RecordCpcRejection(candidate, config, "projection_invalid");
             return await RecordFailureAsync(writeCtx, candidate, "projection_invalid", config, ct);
         }
 
-        if (!double.IsFinite(validationLoss) || validationLoss > config.MaxValidationLoss)
+        if (!double.IsFinite(validationScore.InfoNceLoss) || validationScore.InfoNceLoss > config.MaxValidationLoss)
         {
             _logger.LogWarning(
                 EventIds.EncoderRejected,
@@ -544,48 +578,106 @@ public sealed class CpcPretrainerWorker : BackgroundService
                 candidate.Symbol,
                 candidate.Timeframe,
                 candidate.Regime?.ToString() ?? "global",
-                validationLoss,
+                validationScore.InfoNceLoss,
                 config.MaxValidationLoss);
             await WriteTrainingLogAsync(
                 writeCtx, candidate, config, "rejected", "validation_loss_out_of_bounds",
                 candlesLoaded, candlesAfterRegimeFilter, split.Training.Count, split.Validation.Count, trainingDurationMs,
-                newEncoder.InfoNceLoss, validationLoss, promotedEncoderId: null, ct);
+                trainLoss, validationScore.InfoNceLoss, promotedEncoderId: null, ct);
             RecordCpcRejection(candidate, config, "validation_loss_out_of_bounds");
             return await RecordFailureAsync(writeCtx, candidate, "validation_loss_out_of_bounds", config, ct);
+        }
+
+        if (validationScore.MeanL2Norm < config.MinValidationEmbeddingL2Norm ||
+            validationScore.MeanDimensionVariance < config.MinValidationEmbeddingVariance)
+        {
+            _logger.LogWarning(
+                EventIds.EncoderRejected,
+                "CpcPretrainerWorker: {Symbol}/{Timeframe}/{Regime} rejected — collapsed holdout embeddings (meanL2={MeanL2:E3}, meanDimVar={MeanDimVariance:E3}).",
+                candidate.Symbol,
+                candidate.Timeframe,
+                candidate.Regime?.ToString() ?? "global",
+                validationScore.MeanL2Norm,
+                validationScore.MeanDimensionVariance);
+            await WriteTrainingLogAsync(
+                writeCtx, candidate, config, "rejected", "embedding_collapsed",
+                candlesLoaded, candlesAfterRegimeFilter, split.Training.Count, split.Validation.Count, trainingDurationMs,
+                trainLoss, validationScore.InfoNceLoss, promotedEncoderId: null, ct,
+                extraDiagnostics: new Dictionary<string, object?>
+                {
+                    ["ValidationMeanEmbeddingL2Norm"] = validationScore.MeanL2Norm,
+                    ["ValidationMeanEmbeddingVariance"] = validationScore.MeanDimensionVariance,
+                });
+            RecordCpcRejection(candidate, config, "embedding_collapsed");
+            return await RecordFailureAsync(writeCtx, candidate, "embedding_collapsed", config, ct);
+        }
+
+        var downstreamProbe = await EvaluateDownstreamProbeAsync(
+            readCtx,
+            projection,
+            candidate,
+            config,
+            newEncoder,
+            split,
+            ct);
+        if (config.EnableDownstreamProbeGate && !downstreamProbe.Passed)
+        {
+            _logger.LogWarning(
+                EventIds.EncoderRejected,
+                "CpcPretrainerWorker: {Symbol}/{Timeframe}/{Regime} rejected by downstream probe — reason={Reason}, candidateBalancedAcc={CandidateBalancedAcc:F4}, priorBalancedAcc={PriorBalancedAcc:F4}.",
+                candidate.Symbol,
+                candidate.Timeframe,
+                candidate.Regime?.ToString() ?? "global",
+                downstreamProbe.Reason,
+                downstreamProbe.CandidateBalancedAccuracy,
+                downstreamProbe.PriorBalancedAccuracy);
+            await WriteTrainingLogAsync(
+                writeCtx, candidate, config, "rejected", downstreamProbe.Reason,
+                candlesLoaded, candlesAfterRegimeFilter, split.Training.Count, split.Validation.Count, trainingDurationMs,
+                trainLoss, validationScore.InfoNceLoss, promotedEncoderId: null, ct,
+                extraDiagnostics: BuildValidationDiagnostics(validationScore, downstreamProbe));
+            RecordCpcRejection(candidate, config, downstreamProbe.Reason);
+            return await RecordFailureAsync(writeCtx, candidate, downstreamProbe.Reason, config, ct);
         }
 
         if (candidate.PriorInfoNceLoss is { } prior)
         {
             double threshold = prior * (1.0 - config.MinImprovement);
-            if (newEncoder.InfoNceLoss >= threshold)
+            if (validationScore.InfoNceLoss >= threshold)
             {
                 _logger.LogInformation(
                     EventIds.EncoderRejected,
                     "CpcPretrainerWorker: {Symbol}/{Timeframe} loss {New:F4} did not beat prior {Prior:F4} by {Pct:P0} — rejected.",
                     candidate.Symbol, candidate.Timeframe,
-                    newEncoder.InfoNceLoss, prior, config.MinImprovement);
+                    validationScore.InfoNceLoss, prior, config.MinImprovement);
                 await WriteTrainingLogAsync(
                     writeCtx, candidate, config, "rejected", "no_improvement",
                     candlesLoaded, candlesAfterRegimeFilter, split.Training.Count, split.Validation.Count, trainingDurationMs,
-                    newEncoder.InfoNceLoss, validationLoss, promotedEncoderId: null, ct);
+                    trainLoss, validationScore.InfoNceLoss, promotedEncoderId: null, ct);
                 RecordCpcRejection(candidate, config, "no_improvement");
                 return await RecordFailureAsync(writeCtx, candidate, "no_improvement", config, ct);
             }
         }
 
+        // The active row's InfoNceLoss is the deterministic holdout promotion score. The
+        // trainer-returned loss remains in audit logs as TrainInfoNceLoss.
+        newEncoder.InfoNceLoss = validationScore.InfoNceLoss;
+
         // Passed all gates — rotate atomically.
         try
         {
             var promoteResult = await PromoteEncoderAsync(writeCtx, candidate, newEncoder, config, ct);
-            if (promoteResult != PromotionResult.Promoted)
+            if (!promoteResult.Promoted)
             {
-                var reason = promoteResult == PromotionResult.SupersededByBetterActive
-                    ? "superseded_by_better_active"
-                    : "promotion_conflict";
                 await WriteTrainingLogAsync(
-                    writeCtx, candidate, config, "skipped", reason,
+                    writeCtx, candidate, config, "skipped", promoteResult.Reason ?? "promotion_conflict",
                     candlesLoaded, candlesAfterRegimeFilter, split.Training.Count, split.Validation.Count, trainingDurationMs,
-                    newEncoder.InfoNceLoss, validationLoss, promotedEncoderId: null, ct);
+                    trainLoss, validationScore.InfoNceLoss, promotedEncoderId: null, ct,
+                    extraDiagnostics: new Dictionary<string, object?>
+                    {
+                        ["CurrentActiveEncoderId"] = promoteResult.CurrentActiveEncoderId,
+                        ["CurrentActiveInfoNceLoss"] = promoteResult.CurrentActiveInfoNceLoss,
+                    });
                 return TrainOutcome.Skipped;
             }
         }
@@ -602,23 +694,24 @@ public sealed class CpcPretrainerWorker : BackgroundService
             await WriteTrainingLogAsync(
                 writeCtx, candidate, config, "skipped", "promotion_conflict",
                 candlesLoaded, candlesAfterRegimeFilter, split.Training.Count, split.Validation.Count, trainingDurationMs,
-                newEncoder.InfoNceLoss, validationLoss, promotedEncoderId: null, ct);
+                trainLoss, validationScore.InfoNceLoss, promotedEncoderId: null, ct);
             return TrainOutcome.Skipped;
         }
 
         _consecutiveFailures.Remove((candidate.Symbol, candidate.Timeframe, candidate.Regime));
         _metrics?.MLCpcPromotions.Add(1, CpcTags(candidate, config));
-        await WriteTrainingLogAsync(
-            writeCtx, candidate, config, "promoted", "accepted",
-            candlesLoaded, candlesAfterRegimeFilter, split.Training.Count, split.Validation.Count, trainingDurationMs,
-            newEncoder.InfoNceLoss, validationLoss, newEncoder.Id, ct);
+            await WriteTrainingLogAsync(
+                writeCtx, candidate, config, "promoted", "accepted",
+                candlesLoaded, candlesAfterRegimeFilter, split.Training.Count, split.Validation.Count, trainingDurationMs,
+                trainLoss, validationScore.InfoNceLoss, newEncoder.Id, ct,
+            extraDiagnostics: BuildValidationDiagnostics(validationScore, downstreamProbe));
 
         _logger.LogInformation(
             EventIds.EncoderPromoted,
             "CpcPretrainerWorker: promoted encoder for {Symbol}/{Timeframe}/{Regime} loss={Loss:F4} validationLoss={ValidationLoss:F4} trainSequences={TrainSequences} validationSequences={ValidationSequences}.",
             candidate.Symbol, candidate.Timeframe,
             candidate.Regime?.ToString() ?? "global",
-            newEncoder.InfoNceLoss, validationLoss, split.Training.Count, split.Validation.Count);
+            newEncoder.InfoNceLoss, validationScore.InfoNceLoss, split.Training.Count, split.Validation.Count);
 
         return TrainOutcome.Promoted;
     }
@@ -636,6 +729,103 @@ public sealed class CpcPretrainerWorker : BackgroundService
         }
 
         return false;
+    }
+
+    private async Task<IAsyncDisposable?> TryAcquireCandidateLockAsync(
+        DbContext writeCtx,
+        PairCandidate candidate,
+        MLCpcRuntimeConfig config,
+        CancellationToken ct)
+    {
+        var lockKey = BuildCandidateLockKey(candidate, config);
+        var timeout = TimeSpan.FromSeconds(config.LockTimeoutSeconds);
+        var started = Stopwatch.GetTimestamp();
+        var lockHandle = await _distributedLock.TryAcquireAsync(lockKey, timeout, ct);
+        var elapsedMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+        _metrics?.MLCpcLockAcquisitionMs.Record(
+            elapsedMs,
+            CpcTags(candidate, config).Append(new("outcome", lockHandle is null ? "busy" : "acquired")).ToArray());
+        _metrics?.MLCpcLockAttempts.Add(
+            1,
+            CpcTags(candidate, config).Append(new("outcome", lockHandle is null ? "busy" : "acquired")).ToArray());
+
+        if (lockHandle is not null)
+            return lockHandle;
+
+        _logger.LogInformation(
+            "CpcPretrainerWorker: skipped {Symbol}/{Timeframe}/{Regime}/{EncoderType} because another worker holds the CPC training lock.",
+            candidate.Symbol,
+            candidate.Timeframe,
+            candidate.Regime?.ToString() ?? "global",
+            config.EncoderType);
+        writeCtx.ChangeTracker.Clear();
+        return null;
+    }
+
+    private static string BuildCandidateLockKey(PairCandidate candidate, MLCpcRuntimeConfig config)
+        => $"MLCpcPretrainer:{candidate.Symbol}:{candidate.Timeframe}:{candidate.Regime?.ToString() ?? "global"}:{config.EncoderType}";
+
+    private async Task RecordStaleEncoderAlertsAsync(
+        DbContext writeCtx,
+        IReadOnlyList<PairCandidate> candidates,
+        MLCpcRuntimeConfig config,
+        CancellationToken ct)
+    {
+        var cutoff = _timeProvider.GetUtcNow().UtcDateTime.AddHours(-config.StaleEncoderAlertHours);
+        foreach (var candidate in candidates)
+        {
+            if (candidate.PriorEncoderId is null ||
+                candidate.PriorTrainedAt is null ||
+                candidate.PriorTrainedAt.Value > cutoff)
+            {
+                continue;
+            }
+
+            _metrics?.MLCpcStaleEncoders.Add(1, CpcTags(candidate, config));
+
+            var regimeLabel = candidate.Regime?.ToString() ?? "global";
+            var dedupeKey = $"MLCpcPretrainer:StaleEncoder:{candidate.Symbol}:{candidate.Timeframe}:{regimeLabel}:{config.EncoderType}";
+            var now = _timeProvider.GetUtcNow().UtcDateTime;
+            var ageHours = Math.Max(0.0, (now - candidate.PriorTrainedAt.Value).TotalHours);
+            var conditionJson = JsonSerializer.Serialize(new
+            {
+                SchemaVersion = AlertPayloadSchemaVersion,
+                Message = $"Active CPC encoder for {candidate.Symbol}/{candidate.Timeframe}/{regimeLabel}/{config.EncoderType} is stale ({ageHours:F1}h old).",
+                candidate.Symbol,
+                Timeframe = candidate.Timeframe.ToString(),
+                Regime = regimeLabel,
+                EncoderType = config.EncoderType.ToString(),
+                PriorEncoderId = candidate.PriorEncoderId,
+                PriorTrainedAt = candidate.PriorTrainedAt,
+                AgeHours = ageHours,
+                StaleEncoderAlertHours = config.StaleEncoderAlertHours,
+            });
+
+            var existing = await writeCtx.Set<Alert>()
+                .Where(a => a.DeduplicationKey == dedupeKey && a.IsActive && !a.IsDeleted)
+                .OrderByDescending(a => a.Id)
+                .FirstOrDefaultAsync(ct);
+            if (existing is not null)
+            {
+                existing.ConditionJson = conditionJson;
+                existing.LastTriggeredAt = now;
+                await writeCtx.SaveChangesAsync(ct);
+                continue;
+            }
+
+            writeCtx.Set<Alert>().Add(new Alert
+            {
+                AlertType = AlertType.DataQualityIssue,
+                Severity = AlertSeverity.Medium,
+                Symbol = candidate.Symbol,
+                DeduplicationKey = dedupeKey,
+                CooldownSeconds = 3600,
+                ConditionJson = conditionJson,
+                LastTriggeredAt = now,
+                IsActive = true,
+            });
+            await writeCtx.SaveChangesAsync(ct);
+        }
     }
 
     private async Task<TrainOutcome> RecordUnexpectedCandidateFailureAsync(
@@ -661,7 +851,12 @@ public sealed class CpcPretrainerWorker : BackgroundService
                 writeCtx, candidate, config, "rejected", "worker_exception",
                 candlesLoaded: 0, candlesAfterRegimeFilter: 0,
                 trainingSequences: 0, validationSequences: 0, trainingDurationMs: 0,
-                trainLoss: null, validationLoss: null, promotedEncoderId: null, ct);
+                trainLoss: null, validationLoss: null, promotedEncoderId: null, ct,
+                extraDiagnostics: new Dictionary<string, object?>
+                {
+                    ["ExceptionType"] = ex.GetType().FullName,
+                    ["ExceptionMessage"] = ex.Message,
+                });
             RecordCpcRejection(candidate, config, "worker_exception");
             return await RecordFailureAsync(writeCtx, candidate, "worker_exception", config, ct);
         }
@@ -690,21 +885,226 @@ public sealed class CpcPretrainerWorker : BackgroundService
             sequences.Skip(trainingCount).Take(validationCount).ToArray());
     }
 
-    private static double ComputeHoldoutContrastiveLoss(
+    private async Task<DownstreamProbeResult> EvaluateDownstreamProbeAsync(
+        DbContext readCtx,
+        ICpcEncoderProjection projection,
+        PairCandidate candidate,
+        MLCpcRuntimeConfig config,
+        MLCpcEncoder newEncoder,
+        SequenceSplit split,
+        CancellationToken ct)
+    {
+        if (!config.EnableDownstreamProbeGate)
+            return DownstreamProbeResult.Disabled;
+
+        var candidateProbe = EvaluateDirectionalProbe(
+            projection,
+            newEncoder,
+            split.Training,
+            split.Validation,
+            config.PredictionSteps,
+            config.MinDownstreamProbeSamples);
+        RecordDownstreamProbeMetric(candidate, config, "current", candidateProbe.BalancedAccuracy);
+
+        if (!candidateProbe.Evaluable)
+        {
+            return new DownstreamProbeResult(
+                Passed: false,
+                Reason: candidateProbe.Reason,
+                CandidateBalancedAccuracy: candidateProbe.BalancedAccuracy,
+                PriorBalancedAccuracy: null);
+        }
+
+        if (candidateProbe.BalancedAccuracy < config.MinDownstreamProbeBalancedAccuracy)
+        {
+            return new DownstreamProbeResult(
+                Passed: false,
+                Reason: "downstream_probe_below_floor",
+                CandidateBalancedAccuracy: candidateProbe.BalancedAccuracy,
+                PriorBalancedAccuracy: null);
+        }
+
+        if (candidate.PriorEncoderId is not { } priorId)
+        {
+            return new DownstreamProbeResult(
+                Passed: true,
+                Reason: "downstream_probe_passed",
+                CandidateBalancedAccuracy: candidateProbe.BalancedAccuracy,
+                PriorBalancedAccuracy: null);
+        }
+
+        var priorEncoder = await readCtx.Set<MLCpcEncoder>()
+            .AsNoTracking()
+            .FirstOrDefaultAsync(e => e.Id == priorId && !e.IsDeleted, ct);
+        if (priorEncoder is null || priorEncoder.EncoderType != newEncoder.EncoderType)
+        {
+            return new DownstreamProbeResult(
+                Passed: true,
+                Reason: "downstream_probe_passed_prior_unavailable",
+                CandidateBalancedAccuracy: candidateProbe.BalancedAccuracy,
+                PriorBalancedAccuracy: null);
+        }
+
+        var priorProbe = EvaluateDirectionalProbe(
+            projection,
+            priorEncoder,
+            split.Training,
+            split.Validation,
+            config.PredictionSteps,
+            config.MinDownstreamProbeSamples);
+        RecordDownstreamProbeMetric(candidate, config, "prior", priorProbe.BalancedAccuracy);
+
+        if (!priorProbe.Evaluable)
+        {
+            return new DownstreamProbeResult(
+                Passed: true,
+                Reason: "downstream_probe_passed_prior_unevaluable",
+                CandidateBalancedAccuracy: candidateProbe.BalancedAccuracy,
+                PriorBalancedAccuracy: priorProbe.BalancedAccuracy);
+        }
+
+        if (candidateProbe.BalancedAccuracy + 1e-12 <
+            priorProbe.BalancedAccuracy + config.MinDownstreamProbeImprovement)
+        {
+            return new DownstreamProbeResult(
+                Passed: false,
+                Reason: "downstream_probe_no_lift",
+                CandidateBalancedAccuracy: candidateProbe.BalancedAccuracy,
+                PriorBalancedAccuracy: priorProbe.BalancedAccuracy);
+        }
+
+        return new DownstreamProbeResult(
+            Passed: true,
+            Reason: "downstream_probe_passed",
+            CandidateBalancedAccuracy: candidateProbe.BalancedAccuracy,
+            PriorBalancedAccuracy: priorProbe.BalancedAccuracy);
+    }
+
+    private static DirectionalProbeScore EvaluateDirectionalProbe(
+        ICpcEncoderProjection projection,
+        MLCpcEncoder encoder,
+        IReadOnlyList<float[][]> trainingSequences,
+        IReadOnlyList<float[][]> validationSequences,
+        int predictionSteps,
+        int minSamples)
+    {
+        var train = BuildDirectionalProbeSamples(projection, encoder, trainingSequences, predictionSteps);
+        var validation = BuildDirectionalProbeSamples(projection, encoder, validationSequences, predictionSteps);
+        if (train.Count < minSamples || validation.Count < minSamples)
+            return DirectionalProbeScore.NotEvaluable("downstream_probe_insufficient_samples");
+
+        int trainPos = train.Count(s => s.Label);
+        int trainNeg = train.Count - trainPos;
+        int validationPos = validation.Count(s => s.Label);
+        int validationNeg = validation.Count - validationPos;
+        if (trainPos == 0 || trainNeg == 0 || validationPos == 0 || validationNeg == 0)
+            return DirectionalProbeScore.NotEvaluable("downstream_probe_insufficient_labels");
+
+        var direction = new double[encoder.EmbeddingDim];
+        var midpoint = new double[encoder.EmbeddingDim];
+        foreach (var sample in train)
+        {
+            var sign = sample.Label ? 1.0 : -1.0;
+            for (int i = 0; i < direction.Length; i++)
+            {
+                direction[i] += sign * sample.Embedding[i];
+                midpoint[i] += sample.Embedding[i];
+            }
+        }
+
+        for (int i = 0; i < direction.Length; i++)
+        {
+            direction[i] = (direction[i] / train.Count);
+            midpoint[i] /= train.Count;
+        }
+
+        int tp = 0, tn = 0, fp = 0, fn = 0;
+        foreach (var sample in validation)
+        {
+            double score = 0.0;
+            for (int i = 0; i < direction.Length; i++)
+                score += (sample.Embedding[i] - midpoint[i]) * direction[i];
+
+            bool predicted = score >= 0.0;
+            if (predicted && sample.Label) tp++;
+            else if (!predicted && !sample.Label) tn++;
+            else if (predicted) fp++;
+            else fn++;
+        }
+
+        double tpr = tp + fn > 0 ? tp / (double)(tp + fn) : 0.0;
+        double tnr = tn + fp > 0 ? tn / (double)(tn + fp) : 0.0;
+        return DirectionalProbeScore.CreateEvaluable((tpr + tnr) / 2.0);
+    }
+
+    private static List<DirectionalProbeSample> BuildDirectionalProbeSamples(
+        ICpcEncoderProjection projection,
+        MLCpcEncoder encoder,
+        IReadOnlyList<float[][]> sequences,
+        int predictionSteps)
+    {
+        var samples = new List<DirectionalProbeSample>(sequences.Count);
+        foreach (var sequence in sequences)
+        {
+            if (sequence.Length <= predictionSteps + 1)
+                continue;
+
+            var projected = projection.ProjectSequence(encoder, sequence);
+            if (projected.Length != sequence.Length)
+                continue;
+
+            int t = Math.Max(0, (sequence.Length - predictionSteps - 1) / 2);
+            if (projected[t].Length != encoder.EmbeddingDim)
+                continue;
+
+            double futureReturn = 0.0;
+            for (int k = 1; k <= predictionSteps && t + k < sequence.Length; k++)
+                futureReturn += sequence[t + k].Length > 3 ? sequence[t + k][3] : 0.0;
+
+            if (Math.Abs(futureReturn) < 1e-12)
+                continue;
+
+            var embedding = projected[t];
+            if (embedding.Any(v => !float.IsFinite(v)))
+                continue;
+
+            samples.Add(new DirectionalProbeSample(embedding, futureReturn > 0.0));
+        }
+
+        return samples;
+    }
+
+    private void RecordDownstreamProbeMetric(
+        PairCandidate candidate,
+        MLCpcRuntimeConfig config,
+        string probeCandidate,
+        double? balancedAccuracy)
+    {
+        if (balancedAccuracy is not { } value || !double.IsFinite(value))
+            return;
+
+        _metrics?.MLCpcDownstreamProbeBalancedAccuracy.Record(
+            value,
+            CpcTags(candidate, config).Append(new("candidate", probeCandidate)).ToArray());
+    }
+
+    private static CpcValidationScore ComputeHoldoutContrastiveScore(
         ICpcEncoderProjection projection,
         MLCpcEncoder encoder,
         IReadOnlyList<float[][]> validationSequences,
         int predictionSteps)
     {
         if (validationSequences.Count == 0)
-            return double.NaN;
+            return new CpcValidationScore(double.NaN, double.NaN, double.NaN);
 
         var projected = validationSequences
             .Select(seq => projection.ProjectSequence(encoder, seq))
             .Where(seq => seq.Length > predictionSteps + 1)
             .ToArray();
         if (projected.Length == 0)
-            return double.NaN;
+            return new CpcValidationScore(double.NaN, double.NaN, double.NaN);
+
+        var embeddingQuality = ComputeEmbeddingQuality(projected, encoder.EmbeddingDim);
 
         const int Negatives = 9;
         double totalLoss = 0.0;
@@ -739,7 +1139,62 @@ public sealed class CpcPretrainerWorker : BackgroundService
             }
         }
 
-        return samples > 0 ? totalLoss / samples : double.NaN;
+        return new CpcValidationScore(
+            samples > 0 ? totalLoss / samples : double.NaN,
+            embeddingQuality.MeanL2Norm,
+            embeddingQuality.MeanDimensionVariance);
+    }
+
+    private static EmbeddingQuality ComputeEmbeddingQuality(
+        IReadOnlyList<float[][]> projectedSequences,
+        int embeddingDim)
+    {
+        if (projectedSequences.Count == 0 || embeddingDim <= 0)
+            return new EmbeddingQuality(double.NaN, double.NaN);
+
+        long count = 0;
+        double normTotal = 0.0;
+        var sum = new double[embeddingDim];
+        var sumSq = new double[embeddingDim];
+
+        foreach (var sequence in projectedSequences)
+        {
+            foreach (var embedding in sequence)
+            {
+                if (embedding.Length != embeddingDim)
+                    return new EmbeddingQuality(double.NaN, double.NaN);
+
+                double normSq = 0.0;
+                for (int i = 0; i < embeddingDim; i++)
+                {
+                    var value = embedding[i];
+                    if (!float.IsFinite(value))
+                        return new EmbeddingQuality(double.NaN, double.NaN);
+
+                    normSq += value * value;
+                    sum[i] += value;
+                    sumSq[i] += value * value;
+                }
+
+                normTotal += Math.Sqrt(normSq);
+                count++;
+            }
+        }
+
+        if (count == 0)
+            return new EmbeddingQuality(double.NaN, double.NaN);
+
+        double varianceTotal = 0.0;
+        for (int i = 0; i < embeddingDim; i++)
+        {
+            double mean = sum[i] / count;
+            double variance = (sumSq[i] / count) - (mean * mean);
+            varianceTotal += Math.Max(0.0, variance);
+        }
+
+        return new EmbeddingQuality(
+            MeanL2Norm: normTotal / count,
+            MeanDimensionVariance: varianceTotal / embeddingDim);
     }
 
     private static double Dot(float[] a, float[] b)
@@ -808,8 +1263,36 @@ public sealed class CpcPretrainerWorker : BackgroundService
         double? trainLoss,
         double? validationLoss,
         long? promotedEncoderId,
-        CancellationToken ct)
+        CancellationToken ct,
+        IReadOnlyDictionary<string, object?>? extraDiagnostics = null)
     {
+        var diagnostics = new Dictionary<string, object?>
+        {
+            ["SchemaVersion"] = 2,
+            ["SequenceLength"] = config.SequenceLength,
+            ["SequenceStride"] = config.SequenceStride,
+            ["MaxSequences"] = config.MaxSequences,
+            ["ValidationSplit"] = config.ValidationSplit,
+            ["MinValidationSequences"] = config.MinValidationSequences,
+            ["MaxValidationLoss"] = config.MaxValidationLoss,
+            ["MinValidationEmbeddingL2Norm"] = config.MinValidationEmbeddingL2Norm,
+            ["MinValidationEmbeddingVariance"] = config.MinValidationEmbeddingVariance,
+            ["EnableDownstreamProbeGate"] = config.EnableDownstreamProbeGate,
+            ["MinDownstreamProbeSamples"] = config.MinDownstreamProbeSamples,
+            ["MinDownstreamProbeBalancedAccuracy"] = config.MinDownstreamProbeBalancedAccuracy,
+            ["MinDownstreamProbeImprovement"] = config.MinDownstreamProbeImprovement,
+            ["StaleEncoderAlertHours"] = config.StaleEncoderAlertHours,
+            ["PredictionSteps"] = config.PredictionSteps,
+            ["EmbeddingDim"] = config.EmbeddingDim,
+            ["LockTimeoutSeconds"] = config.LockTimeoutSeconds,
+            ["RegimeCandleBackfillMultiplier"] = config.RegimeCandleBackfillMultiplier,
+        };
+        if (extraDiagnostics is not null)
+        {
+            foreach (var kvp in extraDiagnostics)
+                diagnostics[kvp.Key] = kvp.Value;
+        }
+
         writeCtx.Set<MLCpcEncoderTrainingLog>().Add(new MLCpcEncoderTrainingLog
         {
             Symbol = candidate.Symbol,
@@ -829,21 +1312,26 @@ public sealed class CpcPretrainerWorker : BackgroundService
             TrainingSequences = trainingSequences,
             ValidationSequences = validationSequences,
             TrainingDurationMs = trainingDurationMs,
-            DiagnosticsJson = JsonSerializer.Serialize(new
-            {
-                SchemaVersion = 1,
-                config.SequenceLength,
-                config.SequenceStride,
-                config.MaxSequences,
-                config.ValidationSplit,
-                config.MinValidationSequences,
-                config.MaxValidationLoss,
-                config.PredictionSteps,
-                config.EmbeddingDim,
-            }),
+            DiagnosticsJson = JsonSerializer.Serialize(diagnostics),
         });
 
         await writeCtx.SaveChangesAsync(ct);
+    }
+
+    private static Dictionary<string, object?> BuildValidationDiagnostics(
+        CpcValidationScore validationScore,
+        DownstreamProbeResult downstreamProbe)
+    {
+        var diagnostics = new Dictionary<string, object?>
+        {
+            ["ValidationMeanEmbeddingL2Norm"] = validationScore.MeanL2Norm,
+            ["ValidationMeanEmbeddingVariance"] = validationScore.MeanDimensionVariance,
+            ["DownstreamProbePassed"] = downstreamProbe.Passed,
+            ["DownstreamProbeReason"] = downstreamProbe.Reason,
+            ["DownstreamProbeCandidateBalancedAccuracy"] = downstreamProbe.CandidateBalancedAccuracy,
+            ["DownstreamProbePriorBalancedAccuracy"] = downstreamProbe.PriorBalancedAccuracy,
+        };
+        return diagnostics;
     }
 
     private async Task<PromotionResult> PromoteEncoderAsync(
@@ -853,11 +1341,11 @@ public sealed class CpcPretrainerWorker : BackgroundService
         MLCpcRuntimeConfig config,
         CancellationToken ct)
     {
-        var result = PromotionResult.Promoted;
+        var result = PromotionResult.Accepted;
         var strategy = writeCtx.Database.CreateExecutionStrategy();
         await strategy.ExecuteAsync(async token =>
         {
-            await using var tx = await writeCtx.Database.BeginTransactionAsync(token);
+            await using var tx = await writeCtx.Database.BeginTransactionAsync(IsolationLevel.Serializable, token);
 
             // Deactivate any currently active rows for this (Symbol, Timeframe, Regime).
             // Scoping on Regime is critical: a global encoder and a per-regime encoder are
@@ -879,7 +1367,11 @@ public sealed class CpcPretrainerWorker : BackgroundService
                 !BeatsPriorLoss(newEncoder.InfoNceLoss, currentActive.InfoNceLoss, config.MinImprovement))
             {
                 await tx.RollbackAsync(token);
-                result = PromotionResult.SupersededByBetterActive;
+                result = new PromotionResult(
+                    Promoted: false,
+                    Reason: "superseded_by_better_active",
+                    CurrentActiveEncoderId: currentActive.Id,
+                    CurrentActiveInfoNceLoss: currentActive.InfoNceLoss);
                 return;
             }
 
@@ -976,8 +1468,8 @@ public sealed class CpcPretrainerWorker : BackgroundService
             : Math.Max(
                 config.TrainingCandles,
                 Math.Min(
-                    config.TrainingCandles * RegimeCandleBackfillMultiplier,
-                    config.TrainingCandles + (config.MinCandlesPerRegime * RegimeCandleBackfillMultiplier)));
+                    config.TrainingCandles * config.RegimeCandleBackfillMultiplier,
+                    config.TrainingCandles + (config.MinCandlesPerRegime * config.RegimeCandleBackfillMultiplier)));
 
         var candles = await readCtx.Set<Candle>()
             .AsNoTracking()
@@ -1045,11 +1537,53 @@ public sealed class CpcPretrainerWorker : BackgroundService
 
     private enum TrainOutcome { Promoted, Rejected, Skipped }
 
-    private enum PromotionResult { Promoted, SupersededByBetterActive }
+    private sealed record PromotionResult(
+        bool Promoted,
+        string? Reason = null,
+        long? CurrentActiveEncoderId = null,
+        double? CurrentActiveInfoNceLoss = null)
+    {
+        public static readonly PromotionResult Accepted = new(true);
+    }
 
     private sealed record SequenceSplit(
         IReadOnlyList<float[][]> Training,
         IReadOnlyList<float[][]> Validation);
+
+    private sealed record CpcValidationScore(
+        double InfoNceLoss,
+        double MeanL2Norm,
+        double MeanDimensionVariance);
+
+    private sealed record EmbeddingQuality(
+        double MeanL2Norm,
+        double MeanDimensionVariance);
+
+    private sealed record DirectionalProbeSample(
+        float[] Embedding,
+        bool Label);
+
+    private sealed record DirectionalProbeScore(
+        bool Evaluable,
+        string Reason,
+        double? BalancedAccuracy)
+    {
+        public static DirectionalProbeScore CreateEvaluable(double balancedAccuracy)
+            => new(true, "ok", balancedAccuracy);
+
+        public static DirectionalProbeScore NotEvaluable(string reason)
+            => new(false, reason, null);
+    }
+
+    private sealed record DownstreamProbeResult(
+        bool Passed,
+        string Reason,
+        double? CandidateBalancedAccuracy,
+        double? PriorBalancedAccuracy)
+    {
+        public static readonly DownstreamProbeResult Disabled =
+            new(true, "downstream_probe_disabled", null, null);
+    }
 
     private sealed record PairCandidate(
         string Symbol,

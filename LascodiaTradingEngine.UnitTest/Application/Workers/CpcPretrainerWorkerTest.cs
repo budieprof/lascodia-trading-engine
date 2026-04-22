@@ -108,7 +108,6 @@ public class CpcPretrainerWorkerTest
         var active = Assert.Single(encoders.Where(e => e.IsActive));
         Assert.Equal("EURUSD", active.Symbol);
         Assert.Equal(Timeframe.H1, active.Timeframe);
-        Assert.Equal(1.5, active.InfoNceLoss);
 
         var log = await db.Set<MLCpcEncoderTrainingLog>().SingleAsync();
         Assert.Equal("promoted", log.Outcome);
@@ -116,6 +115,8 @@ public class CpcPretrainerWorkerTest
         Assert.True(log.TrainingSequences > 0);
         Assert.True(log.ValidationSequences >= 20);
         Assert.True(double.IsFinite(log.ValidationInfoNceLoss!.Value));
+        Assert.Equal(1.5, log.TrainInfoNceLoss);
+        Assert.Equal(log.ValidationInfoNceLoss.Value, active.InfoNceLoss);
     }
 
     [Fact]
@@ -562,6 +563,216 @@ public class CpcPretrainerWorkerTest
     }
 
     [Fact]
+    public async Task RunCycleAsync_Rejects_When_Holdout_Embedding_Is_Collapsed()
+    {
+        await using var db = CreateDbContext();
+        SeedModelAndCandles(db, "EURUSD", Timeframe.H1, candleCount: 1500);
+        await db.SaveChangesAsync();
+
+        var trainer = new Mock<ICpcPretrainer>();
+        trainer.SetupGet(t => t.Kind).Returns(CpcEncoderType.Linear);
+        trainer.Setup(t => t.TrainAsync(It.IsAny<string>(), It.IsAny<Timeframe>(),
+                It.IsAny<IReadOnlyList<float[][]>>(), It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((string s, Timeframe tf, IReadOnlyList<float[][]> _, int embed, int steps, CancellationToken _ct) =>
+                new MLCpcEncoder
+                {
+                    Symbol = s, Timeframe = tf,
+                    EmbeddingDim = embed, PredictionSteps = steps,
+                    InfoNceLoss = 1.0,
+                    EncoderBytes = [1],
+                    TrainedAt = DateTime.UtcNow,
+                    IsActive = true
+                });
+
+        var projection = new Mock<ICpcEncoderProjection>();
+        projection.Setup(p => p.ProjectLatest(It.IsAny<MLCpcEncoder>(), It.IsAny<float[][]>()))
+            .Returns((MLCpcEncoder e, float[][] _) => new float[e.EmbeddingDim]);
+        projection.Setup(p => p.ProjectSequence(It.IsAny<MLCpcEncoder>(), It.IsAny<float[][]>()))
+            .Returns((MLCpcEncoder e, float[][] seq) =>
+                seq.Select(_ => new float[e.EmbeddingDim]).ToArray());
+
+        var worker = CreateWorker(db, trainer.Object, projection: projection.Object);
+
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        Assert.Empty(await db.Set<MLCpcEncoder>().ToListAsync());
+        var log = await db.Set<MLCpcEncoderTrainingLog>().SingleAsync();
+        Assert.Equal("rejected", log.Outcome);
+        Assert.Equal("embedding_collapsed", log.Reason);
+        Assert.Contains("ValidationMeanEmbeddingL2Norm", log.DiagnosticsJson);
+        Assert.Contains("ValidationMeanEmbeddingVariance", log.DiagnosticsJson);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_Uses_Holdout_Validation_Loss_When_Checking_Improvement()
+    {
+        await using var db = CreateDbContext();
+        SeedModelAndCandles(db, "EURUSD", Timeframe.H1, candleCount: 1500);
+        db.Set<MLCpcEncoder>().Add(new MLCpcEncoder
+        {
+            Id = 1,
+            Symbol = "EURUSD",
+            Timeframe = Timeframe.H1,
+            EmbeddingDim = 16,
+            InfoNceLoss = 2.0,
+            EncoderBytes = [1],
+            TrainedAt = DateTime.UtcNow.AddDays(-10),
+            IsActive = true
+        });
+        await db.SaveChangesAsync();
+
+        var trainer = new Mock<ICpcPretrainer>();
+        trainer.SetupGet(t => t.Kind).Returns(CpcEncoderType.Linear);
+        trainer.Setup(t => t.TrainAsync(It.IsAny<string>(), It.IsAny<Timeframe>(),
+                It.IsAny<IReadOnlyList<float[][]>>(), It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((string s, Timeframe tf, IReadOnlyList<float[][]> _, int embed, int steps, CancellationToken _ct) =>
+                new MLCpcEncoder
+                {
+                    Symbol = s, Timeframe = tf,
+                    EmbeddingDim = embed, PredictionSteps = steps,
+                    InfoNceLoss = 0.5,
+                    EncoderBytes = [2],
+                    TrainedAt = DateTime.UtcNow,
+                    IsActive = true
+                });
+
+        var projection = CreateNearRandomProjection();
+        var worker = CreateWorker(db, trainer.Object, projection: projection);
+
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        var rows = await db.Set<MLCpcEncoder>().ToListAsync();
+        var active = Assert.Single(rows);
+        Assert.Equal(1, active.Id);
+
+        var log = await db.Set<MLCpcEncoderTrainingLog>().SingleAsync();
+        Assert.Equal("rejected", log.Outcome);
+        Assert.Equal("no_improvement", log.Reason);
+        Assert.Equal(0.5, log.TrainInfoNceLoss);
+        Assert.True(log.ValidationInfoNceLoss > 2.0);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_Rejects_When_Downstream_Probe_Has_No_Directional_Lift()
+    {
+        await using var db = CreateDbContext();
+        AddConfig(db, "MLCpc:EnableDownstreamProbeGate", "true", ConfigDataType.Bool);
+        AddConfig(db, "MLCpc:MinDownstreamProbeSamples", "10", ConfigDataType.Int);
+        AddConfig(db, "MLCpc:MinDownstreamProbeBalancedAccuracy", "0.80", ConfigDataType.Decimal);
+        AddConfig(db, "MLCpc:MaxValidationLoss", "1000", ConfigDataType.Decimal);
+        SeedModelAndCandles(db, "EURUSD", Timeframe.H1, candleCount: 1500);
+        await db.SaveChangesAsync();
+
+        var trainer = new Mock<ICpcPretrainer>();
+        trainer.SetupGet(t => t.Kind).Returns(CpcEncoderType.Linear);
+        trainer.Setup(t => t.TrainAsync(It.IsAny<string>(), It.IsAny<Timeframe>(),
+                It.IsAny<IReadOnlyList<float[][]>>(), It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((string s, Timeframe tf, IReadOnlyList<float[][]> _, int embed, int steps, CancellationToken _ct) =>
+                new MLCpcEncoder
+                {
+                    Symbol = s, Timeframe = tf,
+                    EmbeddingDim = embed, PredictionSteps = steps,
+                    InfoNceLoss = 1.0,
+                    EncoderBytes = [2],
+                    TrainedAt = DateTime.UtcNow,
+                    IsActive = true
+                });
+
+        var worker = CreateWorker(db, trainer.Object, projection: CreateNearRandomProjection());
+
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        Assert.Empty(await db.Set<MLCpcEncoder>().ToListAsync());
+        var log = await db.Set<MLCpcEncoderTrainingLog>().SingleAsync();
+        Assert.Equal("rejected", log.Outcome);
+        Assert.Equal("downstream_probe_below_floor", log.Reason);
+        Assert.Contains("DownstreamProbeCandidateBalancedAccuracy", log.DiagnosticsJson);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_Rejects_When_Downstream_Probe_Does_Not_Beat_Prior()
+    {
+        await using var db = CreateDbContext();
+        AddConfig(db, "MLCpc:EnableDownstreamProbeGate", "true", ConfigDataType.Bool);
+        AddConfig(db, "MLCpc:MinDownstreamProbeSamples", "10", ConfigDataType.Int);
+        AddConfig(db, "MLCpc:MinDownstreamProbeBalancedAccuracy", "0.50", ConfigDataType.Decimal);
+        AddConfig(db, "MLCpc:MinDownstreamProbeImprovement", "0.01", ConfigDataType.Decimal);
+        AddConfig(db, "MLCpc:MaxValidationLoss", "1000", ConfigDataType.Decimal);
+        SeedModelAndCandles(db, "EURUSD", Timeframe.H1, candleCount: 1500);
+        db.Set<MLCpcEncoder>().Add(new MLCpcEncoder
+        {
+            Id = 1,
+            Symbol = "EURUSD",
+            Timeframe = Timeframe.H1,
+            EmbeddingDim = 16,
+            PredictionSteps = 3,
+            InfoNceLoss = 4.0,
+            EncoderBytes = [1],
+            TrainedAt = DateTime.UtcNow.AddDays(-10),
+            IsActive = true
+        });
+        await db.SaveChangesAsync();
+
+        var trainer = new Mock<ICpcPretrainer>();
+        trainer.SetupGet(t => t.Kind).Returns(CpcEncoderType.Linear);
+        trainer.Setup(t => t.TrainAsync(It.IsAny<string>(), It.IsAny<Timeframe>(),
+                It.IsAny<IReadOnlyList<float[][]>>(), It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((string s, Timeframe tf, IReadOnlyList<float[][]> _, int embed, int steps, CancellationToken _ct) =>
+                new MLCpcEncoder
+                {
+                    Symbol = s, Timeframe = tf,
+                    EmbeddingDim = embed, PredictionSteps = steps,
+                    InfoNceLoss = 1.0,
+                    EncoderBytes = [1],
+                    TrainedAt = DateTime.UtcNow,
+                    IsActive = true
+                });
+
+        var worker = CreateWorker(db, trainer.Object, projection: CreateFutureAwareProjection());
+
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        var active = await db.Set<MLCpcEncoder>().SingleAsync(e => e.IsActive);
+        Assert.Equal(1, active.Id);
+
+        var log = await db.Set<MLCpcEncoderTrainingLog>().SingleAsync();
+        Assert.Equal("rejected", log.Outcome);
+        Assert.Equal("downstream_probe_no_lift", log.Reason);
+        Assert.Contains("DownstreamProbePriorBalancedAccuracy", log.DiagnosticsJson);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_Raises_Stale_Encoder_Alert_When_Active_Encoder_Exceeds_Slo()
+    {
+        await using var db = CreateDbContext();
+        AddConfig(db, "MLCpc:StaleEncoderAlertHours", "240", ConfigDataType.Int);
+        SeedModelAndCandles(db, "EURUSD", Timeframe.H1, candleCount: 100); // skip training; alert should still be raised.
+        db.Set<MLCpcEncoder>().Add(new MLCpcEncoder
+        {
+            Id = 1,
+            Symbol = "EURUSD",
+            Timeframe = Timeframe.H1,
+            EmbeddingDim = 16,
+            InfoNceLoss = 1.0,
+            EncoderBytes = [1],
+            TrainedAt = DateTime.UtcNow.AddDays(-20),
+            IsActive = true
+        });
+        await db.SaveChangesAsync();
+
+        var trainer = new Mock<ICpcPretrainer>();
+        trainer.SetupGet(t => t.Kind).Returns(CpcEncoderType.Linear);
+        var worker = CreateWorker(db, trainer.Object);
+
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        var alert = await db.Set<Alert>().SingleAsync(a =>
+            a.AlertType == AlertType.DataQualityIssue &&
+            a.DeduplicationKey.Contains("StaleEncoder"));
+        Assert.Contains("StaleEncoderAlertHours", alert.ConditionJson);
+    }
+
+    [Fact]
     public async Task RunCycleAsync_Skips_When_No_Pretrainer_Matches_Configured_EncoderType()
     {
         await using var db = CreateDbContext();
@@ -758,6 +969,45 @@ public class CpcPretrainerWorkerTest
             l.Regime == MarketRegime.Trending && l.CandlesLoaded > 1000 && l.Outcome == "promoted"));
     }
 
+    [Fact]
+    public async Task RunCycleAsync_Skips_Candidate_When_Distributed_Lock_Is_Busy()
+    {
+        await using var db = CreateDbContext();
+        SeedModelAndCandles(db, "EURUSD", Timeframe.H1, candleCount: 1500);
+        await db.SaveChangesAsync();
+
+        var trainer = new Mock<ICpcPretrainer>();
+        trainer.SetupGet(t => t.Kind).Returns(CpcEncoderType.Linear);
+        var distributedLock = new BusyDistributedLock();
+
+        var worker = CreateWorker(
+            db,
+            trainer.Object,
+            options: new MLCpcOptions
+            {
+                EmbeddingDim = 16,
+                MinCandles = 1000,
+                SequenceLength = 60,
+                PollIntervalSeconds = 3600,
+                LockTimeoutSeconds = 0,
+            },
+            distributedLock: distributedLock);
+
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        trainer.Verify(t => t.TrainAsync(
+            It.IsAny<string>(), It.IsAny<Timeframe>(), It.IsAny<IReadOnlyList<float[][]>>(),
+            It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+
+        var log = await db.Set<MLCpcEncoderTrainingLog>().SingleAsync();
+        Assert.Equal("skipped", log.Outcome);
+        Assert.Equal("lock_busy", log.Reason);
+        Assert.Contains("LockKey", log.DiagnosticsJson);
+        Assert.Contains("LockTimeoutSeconds", log.DiagnosticsJson);
+        Assert.Single(distributedLock.RequestedKeys);
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────
 
     private static WriteApplicationDbContext CreateDbContext()
@@ -773,14 +1023,16 @@ public class CpcPretrainerWorkerTest
         DbContext db,
         ICpcPretrainer trainer,
         MLCpcOptions? options = null,
-        ICpcEncoderProjection? projection = null)
-        => CreateWorker(db, trainers: new[] { trainer }, options, projection);
+        ICpcEncoderProjection? projection = null,
+        IDistributedLock? distributedLock = null)
+        => CreateWorker(db, trainers: new[] { trainer }, options, projection, distributedLock);
 
     private static CpcPretrainerWorker CreateWorker(
         DbContext db,
         IReadOnlyList<ICpcPretrainer> trainers,
         MLCpcOptions? options = null,
-        ICpcEncoderProjection? projection = null)
+        ICpcEncoderProjection? projection = null,
+        IDistributedLock? distributedLock = null)
     {
         options ??= new MLCpcOptions
         {
@@ -788,7 +1040,9 @@ public class CpcPretrainerWorkerTest
             MinCandles = 1000,
             SequenceLength = 60,
             PollIntervalSeconds = 3600,
+            EnableDownstreamProbeGate = false,
         };
+        options.EnableDownstreamProbeGate = false;
 
         var readContext = new Mock<IReadApplicationDbContext>();
         readContext.Setup(c => c.GetDbContext()).Returns(db);
@@ -801,23 +1055,14 @@ public class CpcPretrainerWorkerTest
         foreach (var t in trainers)
             services.AddScoped(_ => t);
         if (projection is null)
-        {
-            var projectionMock = new Mock<ICpcEncoderProjection>();
-            projectionMock
-                .Setup(p => p.ProjectLatest(It.IsAny<MLCpcEncoder>(), It.IsAny<float[][]>()))
-                .Returns((MLCpcEncoder e, float[][] _) => new float[e.EmbeddingDim]);
-            projectionMock
-                .Setup(p => p.ProjectSequence(It.IsAny<MLCpcEncoder>(), It.IsAny<float[][]>()))
-                .Returns((MLCpcEncoder e, float[][] seq) =>
-                    seq.Select(_ => new float[e.EmbeddingDim]).ToArray());
-            projection = projectionMock.Object;
-        }
+            projection = CreateDataDependentProjection();
         services.AddScoped(_ => projection);
         var provider = services.BuildServiceProvider();
 
         return new CpcPretrainerWorker(
             provider.GetRequiredService<IServiceScopeFactory>(),
             Mock.Of<ILogger<CpcPretrainerWorker>>(),
+            distributedLock ?? new NoopDistributedLock(),
             TimeProvider.System,
             null, // health monitor
             null, // metrics
@@ -883,4 +1128,118 @@ public class CpcPretrainerWorkerTest
             Key = key, Value = value, DataType = dataType,
             IsHotReloadable = true, LastUpdatedAt = DateTime.UtcNow
         });
+
+    private static ICpcEncoderProjection CreateDataDependentProjection()
+    {
+        var projectionMock = new Mock<ICpcEncoderProjection>();
+        projectionMock
+            .Setup(p => p.ProjectLatest(It.IsAny<MLCpcEncoder>(), It.IsAny<float[][]>()))
+            .Returns((MLCpcEncoder e, float[][] seq) => ProjectRow(e, seq[^1], seq.Length));
+        projectionMock
+            .Setup(p => p.ProjectSequence(It.IsAny<MLCpcEncoder>(), It.IsAny<float[][]>()))
+            .Returns((MLCpcEncoder e, float[][] seq) =>
+                seq.Select((row, i) => ProjectRow(e, row, i + 1)).ToArray());
+        return projectionMock.Object;
+    }
+
+    private static ICpcEncoderProjection CreateNearRandomProjection()
+    {
+        var projectionMock = new Mock<ICpcEncoderProjection>();
+        projectionMock
+            .Setup(p => p.ProjectLatest(It.IsAny<MLCpcEncoder>(), It.IsAny<float[][]>()))
+            .Returns((MLCpcEncoder e, float[][] _) =>
+            {
+                var row = new float[e.EmbeddingDim];
+                row[0] = 0.001f;
+                return row;
+            });
+        projectionMock
+            .Setup(p => p.ProjectSequence(It.IsAny<MLCpcEncoder>(), It.IsAny<float[][]>()))
+            .Returns((MLCpcEncoder e, float[][] seq) =>
+                seq.Select((_, i) =>
+                {
+                    var row = new float[e.EmbeddingDim];
+                    row[0] = i % 2 == 0 ? 0.001f : -0.001f;
+                    return row;
+                }).ToArray());
+        return projectionMock.Object;
+    }
+
+    private static ICpcEncoderProjection CreateFutureAwareProjection()
+    {
+        var projectionMock = new Mock<ICpcEncoderProjection>();
+        projectionMock
+            .Setup(p => p.ProjectLatest(It.IsAny<MLCpcEncoder>(), It.IsAny<float[][]>()))
+            .Returns((MLCpcEncoder e, float[][] seq) => ProjectFutureAware(e, seq)[^1]);
+        projectionMock
+            .Setup(p => p.ProjectSequence(It.IsAny<MLCpcEncoder>(), It.IsAny<float[][]>()))
+            .Returns((MLCpcEncoder e, float[][] seq) => ProjectFutureAware(e, seq));
+        return projectionMock.Object;
+    }
+
+    private static float[][] ProjectFutureAware(MLCpcEncoder encoder, float[][] sequence)
+    {
+        var result = new float[sequence.Length][];
+        var polarity = encoder.EncoderBytes is { Length: > 0 } && encoder.EncoderBytes[0] == 2
+            ? -1f
+            : 1f;
+
+        for (int i = 0; i < sequence.Length; i++)
+        {
+            double futureReturn = 0.0;
+            for (int k = 1; k <= Math.Max(1, encoder.PredictionSteps) && i + k < sequence.Length; k++)
+                futureReturn += sequence[i + k].Length > 3 ? sequence[i + k][3] : 0.0;
+
+            var row = new float[encoder.EmbeddingDim];
+            var signed = futureReturn >= 0.0 ? polarity : -polarity;
+            for (int j = 0; j < row.Length; j++)
+                row[j] = signed * (1.0f + (j * 0.01f));
+            result[i] = row;
+        }
+
+        return result;
+    }
+
+    private static float[] ProjectRow(MLCpcEncoder encoder, float[] row, int ordinal)
+    {
+        var result = new float[encoder.EmbeddingDim];
+        for (int i = 0; i < result.Length; i++)
+        {
+            var source = row.Length == 0 ? 0f : row[i % row.Length];
+            result[i] = (float)((source * 0.001 * (i + 1)) + (ordinal * 0.0001));
+        }
+
+        return result;
+    }
+
+    private sealed class BusyDistributedLock : IDistributedLock
+    {
+        public List<string> RequestedKeys { get; } = [];
+
+        public Task<IAsyncDisposable?> TryAcquireAsync(string lockKey, CancellationToken ct = default)
+        {
+            RequestedKeys.Add(lockKey);
+            return Task.FromResult<IAsyncDisposable?>(null);
+        }
+
+        public Task<IAsyncDisposable?> TryAcquireAsync(string lockKey, TimeSpan timeout, CancellationToken ct = default)
+        {
+            RequestedKeys.Add(lockKey);
+            return Task.FromResult<IAsyncDisposable?>(null);
+        }
+    }
+
+    private sealed class NoopDistributedLock : IDistributedLock
+    {
+        public Task<IAsyncDisposable?> TryAcquireAsync(string lockKey, CancellationToken ct = default)
+            => Task.FromResult<IAsyncDisposable?>(new Handle());
+
+        public Task<IAsyncDisposable?> TryAcquireAsync(string lockKey, TimeSpan timeout, CancellationToken ct = default)
+            => Task.FromResult<IAsyncDisposable?>(new Handle());
+
+        private sealed class Handle : IAsyncDisposable
+        {
+            public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        }
+    }
 }

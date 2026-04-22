@@ -129,10 +129,16 @@ public sealed class TradingMetrics
     public Counter<long>     MLCpcCandidates { get; }
     public Counter<long>     MLCpcPromotions { get; }
     public Counter<long>     MLCpcRejections { get; }
+    public Counter<long>     MLCpcLockAttempts { get; }
+    public Histogram<double> MLCpcLockAcquisitionMs { get; }
     public Histogram<double> MLCpcTrainingDurationMs { get; }
     public Histogram<double> MLCpcSequences { get; }
     public Histogram<double> MLCpcCandles { get; }
     public Histogram<double> MLCpcValidationLoss { get; }
+    public Histogram<double> MLCpcValidationEmbeddingL2Norm { get; }
+    public Histogram<double> MLCpcValidationEmbeddingVariance { get; }
+    public Histogram<double> MLCpcDownstreamProbeBalancedAccuracy { get; }
+    public Counter<long>     MLCpcStaleEncoders { get; }
 
     // ── Workers ─────────────────────────────────────────────────────────────
     public Histogram<double> WorkerCycleDurationMs  { get; }
@@ -398,10 +404,16 @@ public sealed class TradingMetrics
         MLCpcCandidates = _meter.CreateCounter<long>("trading.ml.cpc.candidates", "pairs", "CPC encoder candidates considered for training. Tagged by symbol, timeframe, regime, encoder_type.");
         MLCpcPromotions = _meter.CreateCounter<long>("trading.ml.cpc.promotions", "encoders", "CPC encoders promoted. Tagged by symbol, timeframe, regime, encoder_type.");
         MLCpcRejections = _meter.CreateCounter<long>("trading.ml.cpc.rejections", "encoders", "CPC training attempts rejected. Tagged by reason, symbol, timeframe, regime, encoder_type.");
+        MLCpcLockAttempts = _meter.CreateCounter<long>("trading.ml.cpc.lock_attempts", "attempts", "CPC per-candidate distributed-lock attempts. Tagged by outcome=acquired|busy, symbol, timeframe, regime, encoder_type.");
+        MLCpcLockAcquisitionMs = _meter.CreateHistogram<double>("trading.ml.cpc.lock_acquisition_ms", "ms", "Wall-clock time spent acquiring the CPC per-candidate distributed lock. Tagged by outcome, symbol, timeframe, regime, encoder_type.");
         MLCpcTrainingDurationMs = _meter.CreateHistogram<double>("trading.ml.cpc.training_duration_ms", "ms", "CPC pretraining duration per candidate. Tagged by symbol, timeframe, regime, encoder_type.");
         MLCpcSequences = _meter.CreateHistogram<double>("trading.ml.cpc.sequences", "sequences", "CPC sequence counts. Tagged by split=train|validation and symbol/timeframe/regime.");
         MLCpcCandles = _meter.CreateHistogram<double>("trading.ml.cpc.candles", "candles", "CPC candle counts. Tagged by stage=loaded|regime_filtered and symbol/timeframe/regime.");
         MLCpcValidationLoss = _meter.CreateHistogram<double>("trading.ml.cpc.validation_loss", "loss", "Holdout contrastive loss for fitted CPC encoders. Tagged by symbol, timeframe, regime, encoder_type.");
+        MLCpcValidationEmbeddingL2Norm = _meter.CreateHistogram<double>("trading.ml.cpc.validation_embedding_l2_norm", "norm", "Average L2 norm of holdout CPC embeddings. Tagged by symbol, timeframe, regime, encoder_type.");
+        MLCpcValidationEmbeddingVariance = _meter.CreateHistogram<double>("trading.ml.cpc.validation_embedding_variance", "variance", "Mean per-dimension variance of holdout CPC embeddings. Tagged by symbol, timeframe, regime, encoder_type.");
+        MLCpcDownstreamProbeBalancedAccuracy = _meter.CreateHistogram<double>("trading.ml.cpc.downstream_probe_balanced_accuracy", "ratio", "Balanced accuracy of the CPC holdout linear direction probe. Tagged by candidate=current|prior and symbol/timeframe/regime/encoder_type.");
+        MLCpcStaleEncoders = _meter.CreateCounter<long>("trading.ml.cpc.stale_encoders", "encoders", "Active CPC encoders older than the stale-encoder SLO. Tagged by symbol, timeframe, regime, encoder_type.");
 
         // Workers
         WorkerCycleDurationMs = _meter.CreateHistogram<double>("trading.workers.cycle_duration", "ms", "Worker poll cycle duration");

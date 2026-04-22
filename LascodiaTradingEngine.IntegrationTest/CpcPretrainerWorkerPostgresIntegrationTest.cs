@@ -5,6 +5,7 @@ using LascodiaTradingEngine.Application.Workers;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 using LascodiaTradingEngine.Infrastructure.Persistence.DbContexts;
+using LascodiaTradingEngine.Infrastructure.Services;
 using LascodiaTradingEngine.IntegrationTest.Fixtures;
 using Microsoft.AspNetCore.Http;
 using Microsoft.EntityFrameworkCore;
@@ -50,6 +51,7 @@ public class CpcPretrainerWorkerPostgresIntegrationTest : IClassFixture<Postgres
             MaxSequences = 200,
             PollIntervalSeconds = 3600,
             EncoderType = CpcEncoderType.Linear,
+            EnableDownstreamProbeGate = false,
         });
 
         await worker.RunCycleAsync(CancellationToken.None);
@@ -85,6 +87,7 @@ public class CpcPretrainerWorkerPostgresIntegrationTest : IClassFixture<Postgres
             MaxSequences = 150,
             PollIntervalSeconds = 3600,
             EncoderType = CpcEncoderType.Tcn,
+            EnableDownstreamProbeGate = false,
         });
 
         await worker.RunCycleAsync(CancellationToken.None);
@@ -108,23 +111,83 @@ public class CpcPretrainerWorkerPostgresIntegrationTest : IClassFixture<Postgres
         foreach (var v in embedding) Assert.True(float.IsFinite(v));
     }
 
+    [Fact]
+    public async Task RunCycleAsync_Concurrent_Workers_Serialize_Per_Candidate_With_Postgres_Advisory_Lock()
+    {
+        await EnsureMigratedAsync();
+        await SeedModelAndCandlesAsync("AUDUSD", Timeframe.H1, candleCount: 1500);
+
+        var enteredTraining = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseTraining = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pretrainer = new BlockingLinearPretrainer(enteredTraining, releaseTraining);
+        var options = new MLCpcOptions
+        {
+            EmbeddingDim = 16,
+            MinCandles = 1000,
+            SequenceLength = 60,
+            SequenceStride = 32,
+            MaxSequences = 120,
+            PollIntervalSeconds = 3600,
+            EncoderType = CpcEncoderType.Linear,
+            LockTimeoutSeconds = 0,
+            EnableDownstreamProbeGate = false,
+        };
+
+        var workers = Enumerable.Range(0, 4)
+            .Select(_ => CreateWorker(options, [pretrainer]))
+            .ToArray();
+
+        var run1 = workers[0].RunCycleAsync(CancellationToken.None);
+        await enteredTraining.Task.WaitAsync(TimeSpan.FromSeconds(20));
+
+        var contendingRuns = workers.Skip(1)
+            .Select(w => w.RunCycleAsync(CancellationToken.None))
+            .ToArray();
+        await Task.WhenAll(contendingRuns).WaitAsync(TimeSpan.FromSeconds(20));
+
+        releaseTraining.SetResult();
+        await run1.WaitAsync(TimeSpan.FromSeconds(20));
+
+        await using var assertContext = CreateContext();
+        Assert.Equal(1, pretrainer.Calls);
+        Assert.Equal(1, await assertContext.Set<MLCpcEncoder>()
+            .CountAsync(e => e.Symbol == "AUDUSD" && e.Timeframe == Timeframe.H1 && e.IsActive));
+        Assert.Equal(3, await assertContext.Set<MLCpcEncoderTrainingLog>()
+            .CountAsync(l => l.Symbol == "AUDUSD" && l.Outcome == "skipped" && l.Reason == "lock_busy"));
+        Assert.True(await assertContext.Set<MLCpcEncoderTrainingLog>()
+            .AnyAsync(l => l.Symbol == "AUDUSD" && l.Outcome == "promoted"));
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────
 
-    private CpcPretrainerWorker CreateWorker(MLCpcOptions options)
+    private CpcPretrainerWorker CreateWorker(
+        MLCpcOptions options,
+        IReadOnlyList<ICpcPretrainer>? pretrainers = null)
     {
         var services = new ServiceCollection();
         services.AddScoped(_ => new DbContextAccessor(CreateContext()));
         services.AddScoped<IReadApplicationDbContext>(sp => sp.GetRequiredService<DbContextAccessor>());
         services.AddScoped<IWriteApplicationDbContext>(sp => sp.GetRequiredService<DbContextAccessor>());
-        // Register both real pretrainers; the worker selects by Kind.
-        services.AddScoped<ICpcPretrainer, CpcPretrainer>();
-        services.AddScoped<ICpcPretrainer, CpcTcnPretrainer>();
+        if (pretrainers is null)
+        {
+            // Register both real pretrainers; the worker selects by Kind.
+            services.AddScoped<ICpcPretrainer, CpcPretrainer>();
+            services.AddScoped<ICpcPretrainer, CpcTcnPretrainer>();
+        }
+        else
+        {
+            foreach (var pretrainer in pretrainers)
+                services.AddScoped(_ => pretrainer);
+        }
         services.AddScoped<ICpcEncoderProjection, CpcEncoderProjection>();
+        services.AddLogging();
+        services.AddSingleton<IDistributedLock, PostgresAdvisoryLock>();
         var provider = services.BuildServiceProvider();
 
         return new CpcPretrainerWorker(
             provider.GetRequiredService<IServiceScopeFactory>(),
             NullLogger<CpcPretrainerWorker>.Instance,
+            provider.GetRequiredService<IDistributedLock>(),
             TimeProvider.System,
             healthMonitor: null,
             metrics: null,
@@ -196,5 +259,42 @@ public class CpcPretrainerWorkerPostgresIntegrationTest : IClassFixture<Postgres
         public Task<int> SaveChangesAsync(CancellationToken cancellationToken = default)
             => context.SaveChangesAsync(cancellationToken);
         public ValueTask DisposeAsync() => context.DisposeAsync();
+    }
+
+    private sealed class BlockingLinearPretrainer(
+        TaskCompletionSource enteredTraining,
+        TaskCompletionSource releaseTraining) : ICpcPretrainer
+    {
+        private int _calls;
+        public int Calls => _calls;
+        public CpcEncoderType Kind => CpcEncoderType.Linear;
+
+        public async Task<MLCpcEncoder> TrainAsync(
+            string symbol,
+            Timeframe timeframe,
+            IReadOnlyList<float[][]> sequences,
+            int embeddingDim,
+            int predictionSteps,
+            CancellationToken cancellationToken)
+        {
+            Interlocked.Increment(ref _calls);
+            enteredTraining.TrySetResult();
+            await releaseTraining.Task.WaitAsync(cancellationToken);
+
+            var weights = Enumerable.Repeat(0.1, embeddingDim * MLCpcSequenceBuilder.FeaturesPerStep).ToArray();
+            return new MLCpcEncoder
+            {
+                Symbol = symbol,
+                Timeframe = timeframe,
+                EncoderType = CpcEncoderType.Linear,
+                EmbeddingDim = embeddingDim,
+                PredictionSteps = predictionSteps,
+                InfoNceLoss = 1.0,
+                TrainingSamples = sequences.Count,
+                EncoderBytes = System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(new { We = weights }),
+                TrainedAt = DateTime.UtcNow,
+                IsActive = true,
+            };
+        }
     }
 }
