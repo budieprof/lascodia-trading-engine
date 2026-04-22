@@ -40,6 +40,15 @@ public class FeatureVectorConfiguration : IEntityTypeConfiguration<FeatureVector
         builder.HasIndex(x => new { x.SchemaHash, x.ComputedAt })
             .HasDatabaseName("IX_FeatureVector_SchemaEviction");
 
+        // Composite index for the feature-generation NOT EXISTS scan that looks up
+        // "does this candle already have a FeatureVector at the current schema version?".
+        // Observed cost without this index: 6.7s sequential scan on Candle, one row per
+        // Candle probing FeatureVector via the single-column CandleId index then filtering
+        // in the heap by SchemaVersion. Partial filter on IsDeleted keeps the index small.
+        builder.HasIndex(x => new { x.CandleId, x.SchemaVersion })
+            .HasDatabaseName("IX_FeatureVector_CandleSchemaLookup")
+            .HasFilter("\"IsDeleted\" = false");
+
         builder.Property(x => x.RowVersion).IsRowVersion();
     }
 }
