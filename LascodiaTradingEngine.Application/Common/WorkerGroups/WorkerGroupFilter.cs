@@ -47,6 +47,7 @@ public static class WorkerGroupFilter
         typeof(DrawdownMonitorWorker),
         typeof(DrawdownRecoveryWorker),
         typeof(ExecutionQualityCircuitBreakerWorker),
+        typeof(BrokerPnLReconciliationWorker),
         typeof(StrategyHealthWorker),
         typeof(StrategyFeedbackWorker),
         typeof(CorrelationMatrixWorker),

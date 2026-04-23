@@ -27,6 +27,16 @@ public class BrokerAccountSnapshot : Entity<long>
     /// <summary>Broker-reported free margin available for new trades.</summary>
     public decimal FreeMargin { get; set; }
 
+    /// <summary>
+    /// Broker-reported deposit currency (ISO-4217). Used by
+    /// <c>BrokerPnLReconciliationWorker</c> to reject snapshots whose currency
+    /// disagrees with the engine-tracked <see cref="TradingAccount.Currency"/>,
+    /// which would make an equity variance comparison meaningless.
+    /// Empty string means the EA did not report a currency — callers should
+    /// default to the owning <see cref="TradingAccount.Currency"/>.
+    /// </summary>
+    public string Currency { get; set; } = string.Empty;
+
     /// <summary>UTC timestamp when the EA captured this snapshot from the broker.</summary>
     public DateTime ReportedAt { get; set; }
 

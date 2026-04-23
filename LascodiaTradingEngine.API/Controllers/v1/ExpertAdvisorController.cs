@@ -11,6 +11,7 @@ using LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ReceiveSymbolSpec
 using LascodiaTradingEngine.Application.ExpertAdvisor.Commands.RefreshSymbolSpecs;
 using LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ReceiveTradingSessions;
 using LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ReceivePositionSnapshot;
+using LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ReceiveBrokerAccountSnapshot;
 using LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ReceiveOrderSnapshot;
 using LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ReceiveDealSnapshot;
 using LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ProcessReconciliation;
@@ -86,6 +87,11 @@ public class ExpertAdvisorController : AuthControllerBase<ExpertAdvisorControlle
     /// <summary>Receive a snapshot of open positions from the EA</summary>
     [HttpPost("positions/snapshot")]
     public async Task<IActionResult> ReceivePositionSnapshot(ReceivePositionSnapshotCommand command)
+        => Ok(await Mediator.Send(command));
+
+    /// <summary>Receive an account-level broker balance/equity snapshot from the EA</summary>
+    [HttpPost("account/snapshot")]
+    public async Task<IActionResult> ReceiveBrokerAccountSnapshot(ReceiveBrokerAccountSnapshotCommand command)
         => Ok(await Mediator.Send(command));
 
     /// <summary>Receive a snapshot of pending orders from the EA</summary>

@@ -48,6 +48,7 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
     private const int    AlertPayloadSchemaVersion   = 2;
     private const int    TrainingLogSchemaVersion    = 3;
     private const string MLCpcPretrainerKey = "MLCpcPretrainer";
+    private const string PostgresProvider = "Npgsql.EntityFrameworkCore.PostgreSQL";
 
     private readonly IServiceScopeFactory         _scopeFactory;
     private readonly ILogger<CpcPretrainerWorker> _logger;
@@ -173,6 +174,10 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
         else
         {
             _pretrainerMissingConsecutive = 0;
+            await TryResolveActiveAlertAsync(
+                writeCtx,
+                BuildConfigurationDriftAlertDedupeKey("pretrainer_missing", config.EncoderType),
+                ct);
         }
 
         var candidates = await LoadCandidatePairsAsync(readCtx, config, ct);
@@ -263,6 +268,10 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
         {
             _systemicPauseStartedAt = null;
             _systemicPauseConsecutiveAlerts = 0;
+            await TryResolveActiveAlertAsync(
+                writeCtx,
+                BuildConfigurationDriftAlertDedupeKey("systemic_pause", config.EncoderType),
+                ct);
             return false;
         }
 
@@ -298,6 +307,10 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
         if (config.EmbeddingDim == MLFeatureHelper.CpcEmbeddingBlockSize)
         {
             _embeddingDimMismatchConsecutive = 0;
+            await TryResolveActiveAlertAsync(
+                writeCtx,
+                BuildConfigurationDriftAlertDedupeKey("embedding_dim", config.EncoderType),
+                ct);
             return false;
         }
 
@@ -371,7 +384,7 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
             new KeyValuePair<string, object?>("encoder_type", encoderType.ToString()));
 
         var now = _timeProvider.GetUtcNow().UtcDateTime;
-        var dedupeKey = $"{MLCpcPretrainerKey}:ConfigurationDrift:{kind}:{encoderType}";
+        var dedupeKey = BuildConfigurationDriftAlertDedupeKey(kind, encoderType);
         var payload = new Dictionary<string, object?>
         {
             ["SchemaVersion"] = AlertPayloadSchemaVersion,
@@ -383,29 +396,16 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
             foreach (var kvp in extra) payload[kvp.Key] = kvp.Value;
         string conditionJson = JsonSerializer.Serialize(payload);
 
-        var existing = await writeCtx.Set<Alert>()
-            .Where(a => a.DeduplicationKey == dedupeKey && a.IsActive && !a.IsDeleted)
-            .OrderByDescending(a => a.Id)
-            .FirstOrDefaultAsync(ct);
-        if (existing is not null)
-        {
-            existing.ConditionJson = conditionJson;
-            existing.LastTriggeredAt = now;
-            await TrySaveAlertChangesAsync(writeCtx, dedupeKey, ct);
-            return;
-        }
-
-        writeCtx.Set<Alert>().Add(new Alert
-        {
-            AlertType        = AlertType.ConfigurationDrift,
-            Severity         = AlertSeverity.High,
-            DeduplicationKey = dedupeKey,
-            CooldownSeconds  = 3600,
-            ConditionJson    = conditionJson,
-            LastTriggeredAt  = now,
-            IsActive         = true,
-        });
-        await TrySaveAlertChangesAsync(writeCtx, dedupeKey, ct);
+        await UpsertActiveAlertAsync(
+            writeCtx,
+            alertType: AlertType.ConfigurationDrift,
+            severity: AlertSeverity.High,
+            symbol: null,
+            dedupeKey,
+            cooldownSeconds: 3600,
+            conditionJson,
+            now,
+            ct);
     }
 
     // ── Candidate selection ───────────────────────────────────────────────────
@@ -764,6 +764,7 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
             split.Training.Count, split.Validation.Count, trainingDurationMs,
             trainLoss, gateResult.ValidationInfoNceLoss, newEncoder.Id,
             extraDiagnostics: gateResult.Diagnostics, ct: ct);
+        await TryResolveRecoveredCandidateAlertsAsync(writeCtx, candidate, config, ct);
 
         LogEncoderPromoted(
             candidate, trainLoss, gateResult.ValidationInfoNceLoss ?? 0.0,
@@ -967,7 +968,7 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
             _metrics?.MLCpcStaleEncoders.Add(1, CpcTags(candidate, config));
 
             var regimeLabel = candidate.Regime?.ToString() ?? "global";
-            var dedupeKey = $"{MLCpcPretrainerKey}:StaleEncoder:{EscapeKeyComponent(candidate.Symbol)}:{candidate.Timeframe}:{regimeLabel}:{config.EncoderType}";
+            var dedupeKey = BuildStaleEncoderAlertDedupeKey(candidate, config);
             var now = _timeProvider.GetUtcNow().UtcDateTime;
             var ageHours = Math.Max(0.0, (now - candidate.PriorTrainedAt.Value).TotalHours);
             var conditionJson = JsonSerializer.Serialize(new
@@ -984,30 +985,16 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
                 StaleEncoderAlertHours = config.StaleEncoderAlertHours,
             });
 
-            var existing = await writeCtx.Set<Alert>()
-                .Where(a => a.DeduplicationKey == dedupeKey && a.IsActive && !a.IsDeleted)
-                .OrderByDescending(a => a.Id)
-                .FirstOrDefaultAsync(ct);
-            if (existing is not null)
-            {
-                existing.ConditionJson = conditionJson;
-                existing.LastTriggeredAt = now;
-                await TrySaveAlertChangesAsync(writeCtx, dedupeKey, ct);
-                continue;
-            }
-
-            writeCtx.Set<Alert>().Add(new Alert
-            {
-                AlertType = AlertType.DataQualityIssue,
-                Severity = AlertSeverity.Medium,
-                Symbol = candidate.Symbol,
-                DeduplicationKey = dedupeKey,
-                CooldownSeconds = 3600,
-                ConditionJson = conditionJson,
-                LastTriggeredAt = now,
-                IsActive = true,
-            });
-            await TrySaveAlertChangesAsync(writeCtx, dedupeKey, ct);
+            await UpsertActiveAlertAsync(
+                writeCtx,
+                AlertType.DataQualityIssue,
+                AlertSeverity.Medium,
+                candidate.Symbol,
+                dedupeKey,
+                cooldownSeconds: 3600,
+                conditionJson,
+                now,
+                ct);
         }
     }
 
@@ -1376,14 +1363,16 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
         string promotedWire = CpcOutcome.Promoted.ToWire();
         string rejectedWire = CpcOutcome.Rejected.ToWire();
 
-        var lastPromotedAt = await writeCtx.Set<MLCpcEncoderTrainingLog>()
+        var promotedQuery = writeCtx.Set<MLCpcEncoderTrainingLog>()
             .AsNoTracking()
             .Where(l => l.Symbol == candidate.Symbol
                      && l.Timeframe == candidate.Timeframe
-                     && l.Regime == candidate.Regime
                      && l.EncoderType == config.EncoderType
                      && l.Outcome == promotedWire
-                     && !l.IsDeleted)
+                     && !l.IsDeleted);
+        promotedQuery = WhereTrainingLogRegime(promotedQuery, candidate.Regime);
+
+        var lastPromotedAt = await promotedQuery
             .OrderByDescending(l => l.EvaluatedAt)
             .Select(l => (DateTime?)l.EvaluatedAt)
             .FirstOrDefaultAsync(ct);
@@ -1392,14 +1381,25 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
             .AsNoTracking()
             .Where(l => l.Symbol == candidate.Symbol
                      && l.Timeframe == candidate.Timeframe
-                     && l.Regime == candidate.Regime
                      && l.EncoderType == config.EncoderType
                      && l.Outcome == rejectedWire
                      && !l.IsDeleted);
+        query = WhereTrainingLogRegime(query, candidate.Regime);
         if (lastPromotedAt is not null)
             query = query.Where(l => l.EvaluatedAt > lastPromotedAt.Value);
 
         return await query.CountAsync(ct);
+    }
+
+    private static IQueryable<MLCpcEncoderTrainingLog> WhereTrainingLogRegime(
+        IQueryable<MLCpcEncoderTrainingLog> query,
+        CandleMarketRegime? regime)
+    {
+        if (regime is null)
+            return query.Where(l => l.Regime == null);
+
+        var value = regime.Value;
+        return query.Where(l => l.Regime == value);
     }
 
     private async Task UpsertConsecutiveFailAlertAsync(
@@ -1411,7 +1411,7 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
         CancellationToken ct)
     {
         var regimeLabel = candidate.Regime?.ToString() ?? "global";
-        var dedupeKey = $"{MLCpcPretrainerKey}:{EscapeKeyComponent(candidate.Symbol)}:{candidate.Timeframe}:{regimeLabel}:{config.EncoderType}";
+        var dedupeKey = BuildConsecutiveFailureAlertDedupeKey(candidate, config);
         var now = _timeProvider.GetUtcNow().UtcDateTime;
         var conditionJson = JsonSerializer.Serialize(new
         {
@@ -1425,48 +1425,190 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
             ConsecutiveFailures = count,
         });
 
+        await UpsertActiveAlertAsync(
+            writeCtx,
+            AlertType.DataQualityIssue,
+            AlertSeverity.Medium,
+            candidate.Symbol,
+            dedupeKey,
+            cooldownSeconds: 3600,
+            conditionJson,
+            now,
+            ct);
+    }
+
+    private async Task UpsertActiveAlertAsync(
+        DbContext writeCtx,
+        AlertType alertType,
+        AlertSeverity severity,
+        string? symbol,
+        string dedupeKey,
+        int cooldownSeconds,
+        string conditionJson,
+        DateTime now,
+        CancellationToken ct)
+    {
+        if (IsPostgresProvider(writeCtx))
+        {
+            var outboxId = Guid.NewGuid();
+            await writeCtx.Database.ExecuteSqlInterpolatedAsync($"""
+                INSERT INTO "Alert"
+                    ("AlertType", "Symbol", "ConditionJson", "IsActive", "LastTriggeredAt",
+                     "Severity", "DeduplicationKey", "CooldownSeconds", "AutoResolvedAt", "IsDeleted", "OutboxId")
+                VALUES
+                    ({alertType.ToString()}, {symbol}, {conditionJson}, TRUE, {now},
+                     {severity.ToString()}, {dedupeKey}, {cooldownSeconds}, NULL, FALSE, {outboxId})
+                ON CONFLICT ("DeduplicationKey")
+                    WHERE "IsActive" = TRUE
+                      AND "IsDeleted" = FALSE
+                      AND "DeduplicationKey" IS NOT NULL
+                DO UPDATE SET
+                    "AlertType" = EXCLUDED."AlertType",
+                    "Symbol" = EXCLUDED."Symbol",
+                    "ConditionJson" = EXCLUDED."ConditionJson",
+                    "LastTriggeredAt" = EXCLUDED."LastTriggeredAt",
+                    "Severity" = EXCLUDED."Severity",
+                    "CooldownSeconds" = EXCLUDED."CooldownSeconds",
+                    "AutoResolvedAt" = NULL
+                """, ct);
+            return;
+        }
+
         var existing = await writeCtx.Set<Alert>()
             .Where(a => a.DeduplicationKey == dedupeKey && a.IsActive && !a.IsDeleted)
             .OrderByDescending(a => a.Id)
             .FirstOrDefaultAsync(ct);
+
         if (existing is not null)
         {
+            existing.AlertType = alertType;
+            existing.Symbol = symbol;
             existing.ConditionJson = conditionJson;
             existing.LastTriggeredAt = now;
-            await TrySaveAlertChangesAsync(writeCtx, dedupeKey, ct);
-            return;
+            existing.Severity = severity;
+            existing.CooldownSeconds = cooldownSeconds;
+            existing.AutoResolvedAt = null;
+        }
+        else
+        {
+            writeCtx.Set<Alert>().Add(new Alert
+            {
+                AlertType = alertType,
+                Severity = severity,
+                Symbol = symbol,
+                DeduplicationKey = dedupeKey,
+                CooldownSeconds = cooldownSeconds,
+                ConditionJson = conditionJson,
+                LastTriggeredAt = now,
+                IsActive = true,
+            });
         }
 
-        writeCtx.Set<Alert>().Add(new Alert
-        {
-            AlertType = AlertType.DataQualityIssue,
-            Severity = AlertSeverity.Medium,
-            Symbol = candidate.Symbol,
-            DeduplicationKey = dedupeKey,
-            CooldownSeconds = 3600,
-            ConditionJson = conditionJson,
-            LastTriggeredAt = now,
-            IsActive = true,
-        });
-        await TrySaveAlertChangesAsync(writeCtx, dedupeKey, ct);
-    }
-
-    /// <summary>
-    /// Races across replicas — and across the in-flight promotion's own tx — can push two
-    /// processes to try the same Alert upsert. If a unique index kicks in (or any other
-    /// DbUpdateException surfaces) we clear the tracker and log rather than tear the cycle.
-    /// </summary>
-    private async Task TrySaveAlertChangesAsync(DbContext writeCtx, string dedupeKey, CancellationToken ct)
-    {
         try
         {
             await writeCtx.SaveChangesAsync(ct);
         }
-        catch (DbUpdateException ex)
+        catch (DbUpdateException ex) when (IsUniqueConstraintViolation(ex))
         {
             LogAlertUpsertRace(dedupeKey, ex);
             writeCtx.ChangeTracker.Clear();
+            await UpdateExistingActiveAlertAsync(
+                writeCtx,
+                alertType,
+                severity,
+                symbol,
+                dedupeKey,
+                cooldownSeconds,
+                conditionJson,
+                now,
+                ct);
         }
+    }
+
+    private static async Task UpdateExistingActiveAlertAsync(
+        DbContext writeCtx,
+        AlertType alertType,
+        AlertSeverity severity,
+        string? symbol,
+        string dedupeKey,
+        int cooldownSeconds,
+        string conditionJson,
+        DateTime now,
+        CancellationToken ct)
+    {
+        var existing = await writeCtx.Set<Alert>()
+            .Where(a => a.DeduplicationKey == dedupeKey && a.IsActive && !a.IsDeleted)
+            .OrderByDescending(a => a.Id)
+            .FirstOrDefaultAsync(ct);
+        if (existing is null)
+            throw new InvalidOperationException(
+                $"Alert upsert raced for {dedupeKey}, but no active row could be reloaded.");
+
+        existing.AlertType = alertType;
+        existing.Symbol = symbol;
+        existing.ConditionJson = conditionJson;
+        existing.LastTriggeredAt = now;
+        existing.Severity = severity;
+        existing.CooldownSeconds = cooldownSeconds;
+        existing.AutoResolvedAt = null;
+        await writeCtx.SaveChangesAsync(ct);
+    }
+
+    private async Task TryResolveRecoveredCandidateAlertsAsync(
+        DbContext writeCtx,
+        PairCandidate candidate,
+        MLCpcRuntimeConfig config,
+        CancellationToken ct)
+    {
+        await TryResolveActiveAlertAsync(
+            writeCtx,
+            BuildConsecutiveFailureAlertDedupeKey(candidate, config),
+            ct);
+        await TryResolveActiveAlertAsync(
+            writeCtx,
+            BuildStaleEncoderAlertDedupeKey(candidate, config),
+            ct);
+    }
+
+    private async Task TryResolveActiveAlertAsync(DbContext writeCtx, string dedupeKey, CancellationToken ct)
+    {
+        try
+        {
+            await ResolveActiveAlertAsync(writeCtx, dedupeKey, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            LogAlertResolutionFailed(dedupeKey, ex);
+            writeCtx.ChangeTracker.Clear();
+        }
+    }
+
+    private async Task ResolveActiveAlertAsync(DbContext writeCtx, string dedupeKey, CancellationToken ct)
+    {
+        var now = _timeProvider.GetUtcNow().UtcDateTime;
+        if (IsPostgresProvider(writeCtx))
+        {
+            await writeCtx.Database.ExecuteSqlInterpolatedAsync($"""
+                UPDATE "Alert"
+                   SET "IsActive" = FALSE,
+                       "AutoResolvedAt" = {now}
+                 WHERE "DeduplicationKey" = {dedupeKey}
+                   AND "IsActive" = TRUE
+                   AND "IsDeleted" = FALSE
+                """, ct);
+            return;
+        }
+
+        var existing = await writeCtx.Set<Alert>()
+            .Where(a => a.DeduplicationKey == dedupeKey && a.IsActive && !a.IsDeleted)
+            .OrderByDescending(a => a.Id)
+            .FirstOrDefaultAsync(ct);
+        if (existing is null)
+            return;
+
+        existing.IsActive = false;
+        existing.AutoResolvedAt = now;
+        await writeCtx.SaveChangesAsync(ct);
     }
 
     private bool IsUniqueConstraintViolation(DbUpdateException ex)
@@ -1487,6 +1629,30 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
         }
         return false;
     }
+
+    private static bool IsPostgresProvider(DbContext ctx)
+        => string.Equals(ctx.Database.ProviderName, PostgresProvider, StringComparison.Ordinal);
+
+    private static string BuildConsecutiveFailureAlertDedupeKey(
+        PairCandidate candidate,
+        MLCpcRuntimeConfig config)
+    {
+        var regimeLabel = candidate.Regime?.ToString() ?? "global";
+        return $"{MLCpcPretrainerKey}:{EscapeKeyComponent(candidate.Symbol)}:{candidate.Timeframe}:{regimeLabel}:{config.EncoderType}";
+    }
+
+    private static string BuildStaleEncoderAlertDedupeKey(
+        PairCandidate candidate,
+        MLCpcRuntimeConfig config)
+    {
+        var regimeLabel = candidate.Regime?.ToString() ?? "global";
+        return $"{MLCpcPretrainerKey}:StaleEncoder:{EscapeKeyComponent(candidate.Symbol)}:{candidate.Timeframe}:{regimeLabel}:{config.EncoderType}";
+    }
+
+    private static string BuildConfigurationDriftAlertDedupeKey(
+        string kind,
+        CpcEncoderType encoderType)
+        => $"{MLCpcPretrainerKey}:ConfigurationDrift:{kind}:{encoderType}";
 
     // ── Supporting types ──────────────────────────────────────────────────────
 

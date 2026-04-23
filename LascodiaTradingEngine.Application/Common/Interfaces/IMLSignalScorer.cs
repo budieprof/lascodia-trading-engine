@@ -208,6 +208,21 @@ public record MLScoreResult(
     /// </summary>
     ModelRole       ModelRole = ModelRole.Champion);
 
+public interface IMLModelWarmupScorer
+{
+    /// <summary>
+    /// Runs the model-specific warm-up path for an already selected model using real
+    /// candle data. This bypasses live model routing and signal-level gates while
+    /// still exercising snapshot deserialization, feature engineering, inference,
+    /// and calibration.
+    /// </summary>
+    Task WarmupModelAsync(
+        MLModel model,
+        IReadOnlyList<Candle> candles,
+        string? currentRegime,
+        CancellationToken cancellationToken);
+}
+
 public interface IMLSignalScorer
 {
     /// <summary>

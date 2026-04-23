@@ -196,7 +196,7 @@ Categories (keep counts; see `Workers/` for exact names):
 
 ## CPC Encoder (V7 feature vector) — Rollout Recipe
 
-The V7 feature vector appends a fixed-size CPC (Contrastive Predictive Coding) context embedding to the V6 raw vector (`FeatureCountV7 = FeatureCountV6 + CpcEmbeddingBlockSize = 73`). Encoders are trained and rotated by `CpcPretrainerWorker` per `(Symbol, Timeframe, Regime?)` triple. V7 is opt-in — `MLTraining:UseV7CpcFeatureVector` is **false** by default so existing V1–V6 models keep scoring unchanged until you flip the flag.
+The V7 feature vector appends a fixed-size CPC (Contrastive Predictive Coding) context embedding to the V6 raw vector (`FeatureCountV7 = FeatureCountV6 + CpcEmbeddingBlockSize = 73`). Encoders are trained and rotated by `CpcPretrainerWorker` per `(Symbol, Timeframe, Regime?)` triple. **V7 is the default feature vector** — the full V2→V7 stack is defaulted on: `MLTraining:UseExtendedFeatureVector`, `MLTraining:UseEventFeatureVector`, `MLTraining:UseTickMicrostructureFeatureVector`, `MLTraining:UseV5SyntheticMicrostructure`, `MLTraining:UseV6OrderBookFeatures`, and `MLTraining:UseV7CpcFeatureVector` all default to `true`. Each individual layer's data slots zero-fill when its upstream source is missing, so training never stalls: a missing DXY/US10Y/VIX stream degrades V3, missing ticks degrade V4/V5, missing DOM snapshots degrade V6, and a missing `MLCpcEncoder` zero-fills the CPC block. Operators can still opt a layer off by inserting an `EngineConfig` row with the corresponding key set to `false`.
 
 ### Operational rollout path
 
@@ -210,14 +210,7 @@ SELECT "Symbol", "Timeframe", "Regime", "EncoderType", "InfoNceLoss", "TrainedAt
   ORDER BY "TrainedAt" DESC;
 ```
 
-**2. Enable V7 training for a single pair first (staged).** The trainer reads `MLTraining:UseV7CpcFeatureVector` at the start of each run — flip it on globally, but enqueue a training run only for the pilot symbol:
-
-```sql
-INSERT INTO "EngineConfig" ("Key", "Value", "DataType", "IsHotReloadable", "LastUpdatedAt")
-  VALUES ('MLTraining:UseV7CpcFeatureVector', 'true', 2, TRUE, NOW());
-```
-
-Queue a training run for EURUSD/H1 (or your pilot pair) via `POST /api/v1/lascodia-trading-engine/ml-training/queue` (or however your pipeline currently enqueues runs). Confirm the resulting snapshot:
+**2. Enable V7 training for a single pair first (staged).** V7 is already on by default — you don't need to insert the key. You only need a row if you want to temporarily *disable* V7 for a pilot window (see step 4). Enqueue a training run for the pilot pair via `POST /api/v1/lascodia-trading-engine/ml-training/queue` (or however your pipeline currently enqueues runs) and confirm the resulting snapshot:
 
 ```sql
 SELECT m."Symbol", m."Timeframe",
@@ -231,11 +224,12 @@ A healthy V7 model shows `expected_features=73` and `schema_version=7`.
 
 **3. Compare V7 vs V6 on live data.** Run both models through `MLShadowArbiterWorker`'s SPRT tournament (standard ML-promotion pipeline). V7 wins only if it materially beats V6 on the out-of-sample signal PnL test. If it loses, proceed to step 4.
 
-**4. Rollback** — flip the flag back:
+**4. Rollback** — insert (or update) the config row to false:
 
 ```sql
-UPDATE "EngineConfig" SET "Value"='false', "LastUpdatedAt"=NOW()
-  WHERE "Key"='MLTraining:UseV7CpcFeatureVector';
+INSERT INTO "EngineConfig" ("Key", "Value", "DataType", "IsHotReloadable", "LastUpdatedAt")
+  VALUES ('MLTraining:UseV7CpcFeatureVector', 'false', 2, TRUE, NOW())
+  ON CONFLICT ("Key") DO UPDATE SET "Value"='false', "LastUpdatedAt"=NOW();
 ```
 
 New training runs immediately fall back to V6. Existing V7 snapshots keep scoring (their `FeatureSchemaVersion=7` routes through `MLSignalScorer`'s V7 dispatch); rotate them out via the usual retirement path if you want to fully drop V7.

@@ -8,7 +8,7 @@ namespace LascodiaTradingEngine.Application.MLModels.Services;
 /// Returns null scores — real ML scoring is performed by MLSignalScorer in Infrastructure
 /// once a trained model file is available.
 /// </summary>
-public class NullMLSignalScorer : IMLSignalScorer
+public class NullMLSignalScorer : IMLSignalScorer, IMLModelWarmupScorer
 {
     public Task<MLScoreResult> ScoreAsync(
         TradeSignal signal,
@@ -16,5 +16,15 @@ public class NullMLSignalScorer : IMLSignalScorer
         CancellationToken cancellationToken)
     {
         return Task.FromResult(new MLScoreResult(null, null, null, null));
+    }
+
+    public Task WarmupModelAsync(
+        MLModel model,
+        IReadOnlyList<Candle> candles,
+        string? currentRegime,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.CompletedTask;
     }
 }

@@ -144,4 +144,8 @@ public sealed partial class CpcPretrainerWorker
     [LoggerMessage(EventId = 4324, Level = LogLevel.Information,
         Message = "CpcPretrainerWorker: alert upsert raced on dedupeKey={DedupeKey}; clearing tracker and continuing.")]
     private partial void LogAlertUpsertRace(string dedupeKey, Exception ex);
+
+    [LoggerMessage(EventId = 4325, Level = LogLevel.Warning,
+        Message = "CpcPretrainerWorker: failed to auto-resolve alert dedupeKey={DedupeKey}; continuing.")]
+    private partial void LogAlertResolutionFailed(string dedupeKey, Exception ex);
 }

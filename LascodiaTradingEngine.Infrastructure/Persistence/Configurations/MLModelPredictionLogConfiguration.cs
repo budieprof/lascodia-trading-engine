@@ -41,6 +41,9 @@ public class MLModelPredictionLogConfiguration : IEntityTypeConfiguration<MLMode
 
         builder.HasIndex(x => x.TradeSignalId);
         builder.HasIndex(x => new { x.MLModelId, x.ModelRole });
+        builder.HasIndex(x => new { x.MLModelId, x.ModelRole, x.PredictedAt })
+               .HasDatabaseName("IX_MLModelPredictionLog_HorizonAccuracyLookup")
+               .HasFilter("\"IsDeleted\" = FALSE");
         builder.HasIndex(x => new { x.MLModelId, x.OutcomeRecordedAt });
         builder.HasIndex(x => new { x.MLModelId, x.WasConformalCovered, x.OutcomeRecordedAt })
                .HasFilter("\"OutcomeRecordedAt\" IS NOT NULL AND \"IsDeleted\" = FALSE");

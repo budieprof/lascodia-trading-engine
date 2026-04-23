@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Attributes;
 using LascodiaTradingEngine.Application.Common.Interfaces;
@@ -43,8 +44,9 @@ namespace LascodiaTradingEngine.Application.Services;
 ///         disagreement (returned in <see cref="MLScoreResult.EnsembleDisagreement"/>).</item>
 /// </list>
 /// </summary>
-[RegisterService]
-public sealed class MLSignalScorer : IMLSignalScorer
+[RegisterService(ServiceLifetime.Scoped, typeof(IMLSignalScorer))]
+[RegisterService(ServiceLifetime.Scoped, typeof(IMLModelWarmupScorer))]
+public sealed class MLSignalScorer : IMLSignalScorer, IMLModelWarmupScorer
 {
     private static readonly JsonSerializerOptions JsonOptions =
         new() { PropertyNameCaseInsensitive = true };
@@ -172,6 +174,87 @@ public sealed class MLSignalScorer : IMLSignalScorer
 
     private IModelInferenceEngine? ResolveEngine(ModelSnapshot snap)
         => _inferenceEngines.FirstOrDefault(e => e.CanHandle(snap));
+
+    public async Task WarmupModelAsync(
+        MLModel model,
+        IReadOnlyList<Candle> candles,
+        string? currentRegime,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (model.ModelBytes is not { Length: > 0 })
+            throw new InvalidOperationException($"Model {model.Id} has no serialized snapshot.");
+
+        if (candles.Count < MLFeatureHelper.LookbackWindow + 1)
+            throw new InvalidOperationException(
+                $"Model {model.Id} warm-up requires at least {MLFeatureHelper.LookbackWindow + 1} candles.");
+
+        var db = _context.GetDbContext();
+        var signalTimeframe = candles.Count > 0 ? candles[0].Timeframe : model.Timeframe;
+        var latestCandle = candles.OrderBy(c => c.Timestamp).Last();
+        var warmupSignal = new TradeSignal
+        {
+            Symbol           = model.Symbol,
+            Direction        = TradeDirection.Buy,
+            EntryPrice       = latestCandle.Close,
+            SuggestedLotSize = 0.01m,
+            Confidence       = 1m,
+            GeneratedAt      = DateTime.UtcNow
+        };
+
+        var snap = await GetOrDeserializeSnapshotAsync(model);
+        if (snap is null || !HasModelWeights(snap))
+            throw new InvalidOperationException(
+                $"Model {model.Id} snapshot is empty or has no usable weights (type={snap?.Type ?? "null"}).");
+
+        var featureResult = await BuildFeaturesAsync(
+            warmupSignal, candles, snap, currentRegime, signalTimeframe, model.Id,
+            db, cancellationToken);
+        if (featureResult is null)
+            throw new InvalidOperationException(
+                $"Model {model.Id} warm-up could not build a valid feature vector.");
+
+        var (features, _, _, _, window, featureCount, _, _) = featureResult.Value;
+        bool useOnnx = model.OnnxBytes is { Length: > 0 } &&
+                       await _configService.GetPreferOnnxAsync(db, cancellationToken);
+
+        await _inferenceSemaphore.WaitAsync(cancellationToken);
+        Task<InferencePipelineResult?>? inferenceTask = null;
+        try
+        {
+            // Bound the startup worker's wait without holding the shared inference
+            // semaphore forever if a warm-up forward pass stalls.
+            inferenceTask = Task.Run(() => RunInferencePipeline(
+                features, featureCount, snap, window, warmupSignal, model,
+                currentRegime, signalTimeframe, useOnnx), CancellationToken.None);
+
+            var inferenceResult = await inferenceTask.WaitAsync(cancellationToken);
+
+            if (inferenceResult is null)
+                throw new InvalidOperationException(
+                    $"Model {model.Id} warm-up inference returned no result.");
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            if (inferenceTask is { IsCompleted: false })
+            {
+                _ = inferenceTask.ContinueWith(
+                    t => _logger.LogDebug(t.Exception,
+                        "Timed-out warm-up inference for model {ModelId} eventually faulted",
+                        model.Id),
+                    CancellationToken.None,
+                    TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
+            }
+
+            throw;
+        }
+        finally
+        {
+            _inferenceSemaphore.Release();
+        }
+    }
 
     /// <summary>
     /// Batch-scores a set of signals. Pre-resolves active models for all

@@ -150,6 +150,11 @@ public sealed class TradingMetrics
     public Histogram<double> WorkerCycleDurationMs  { get; }
     public Counter<long>     WorkerErrors           { get; }
 
+    // ── Broker PnL Reconciliation ───────────────────────────────────────────
+    public Histogram<double> BrokerReconciliationVariance { get; }
+    public Counter<long>     BrokerReconciliationOutcomes { get; }
+    public Histogram<double> BrokerReconciliationSnapshotAgeSeconds { get; }
+
     // ── Integration Event Retry ─────────────────────────────────────────
     public Counter<long>     EventRetrySuccesses    { get; }
     public Counter<long>     EventRetryExhausted    { get; }
@@ -430,6 +435,20 @@ public sealed class TradingMetrics
         // Workers
         WorkerCycleDurationMs = _meter.CreateHistogram<double>("trading.workers.cycle_duration", "ms", "Worker poll cycle duration");
         WorkerErrors          = _meter.CreateCounter<long>("trading.workers.errors", "errors", "Unhandled worker errors");
+
+        // Broker PnL Reconciliation
+        BrokerReconciliationVariance = _meter.CreateHistogram<double>(
+            "trading.reconciliation.broker_variance",
+            "ratio",
+            "Absolute fractional variance between engine-tracked and broker-reported account figures. Tagged with account_id, metric={equity|balance}, direction={over|under|exact} (engine_vs_broker).");
+        BrokerReconciliationOutcomes = _meter.CreateCounter<long>(
+            "trading.reconciliation.broker_outcomes",
+            "outcomes",
+            "Per-account reconciliation outcome counts. Tagged with metric={equity|balance} and outcome={ok|warning|critical|invalid|stale|currency_mismatch}.");
+        BrokerReconciliationSnapshotAgeSeconds = _meter.CreateHistogram<double>(
+            "trading.reconciliation.broker_snapshot_age",
+            "s",
+            "Age (seconds) of the broker account snapshot being reconciled against, at evaluation time. Tagged with account_id.");
 
         // Integration Event Retry
         EventRetrySuccesses    = _meter.CreateCounter<long>("trading.events.retry_successes", "events", "Integration events successfully re-published by retry worker");

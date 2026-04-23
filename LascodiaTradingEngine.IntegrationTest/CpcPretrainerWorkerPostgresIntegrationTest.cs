@@ -159,6 +159,60 @@ public class CpcPretrainerWorkerPostgresIntegrationTest : IClassFixture<Postgres
     }
 
     [Fact]
+    public async Task RunCycleAsync_PerRegime_Promotes_Global_And_Regime_Encoders_On_Postgres()
+    {
+        await EnsureMigratedAsync();
+        await SeedModelAndCandlesAsync("CADJPY", Timeframe.H1, candleCount: 1500);
+
+        await using (var seedContext = CreateContext())
+        {
+            var firstCandle = await seedContext.Set<Candle>()
+                .Where(c => c.Symbol == "CADJPY" && c.Timeframe == Timeframe.H1)
+                .OrderBy(c => c.Timestamp)
+                .FirstAsync();
+            seedContext.Set<MarketRegimeSnapshot>().Add(new MarketRegimeSnapshot
+            {
+                Symbol = "CADJPY",
+                Timeframe = Timeframe.H1,
+                Regime = MarketRegime.Trending,
+                Confidence = 0.90m,
+                DetectedAt = firstCandle.Timestamp.AddHours(-1),
+            });
+            await seedContext.SaveChangesAsync();
+        }
+
+        var worker = CreateWorker(new MLCpcOptions
+        {
+            EmbeddingDim = 16,
+            MinCandles = 1000,
+            MinCandlesPerRegime = 500,
+            SequenceLength = 60,
+            SequenceStride = 32,
+            MaxSequences = 120,
+            MaxPairsPerCycle = 10,
+            PollIntervalSeconds = 3600,
+            EncoderType = CpcEncoderType.Linear,
+            TrainPerRegime = true,
+            EnableDownstreamProbeGate = false,
+        });
+
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        await using var assertContext = CreateContext();
+        var active = await assertContext.Set<MLCpcEncoder>()
+            .Where(e => e.Symbol == "CADJPY" && e.Timeframe == Timeframe.H1 && e.IsActive)
+            .ToListAsync();
+
+        Assert.Contains(active, e => e.Regime == null);
+        Assert.Contains(active, e => e.Regime == MarketRegime.Trending);
+        Assert.Equal(2, active.Count);
+        Assert.True(await assertContext.Set<MLCpcEncoderTrainingLog>().AnyAsync(l =>
+            l.Symbol == "CADJPY" &&
+            l.Regime == MarketRegime.Trending &&
+            l.Outcome == "promoted"));
+    }
+
+    [Fact]
     public async Task RunCycleAsync_Unique_DeduplicationKey_Index_Prevents_Duplicate_Alert_Rows()
     {
         await EnsureMigratedAsync();
@@ -191,7 +245,10 @@ public class CpcPretrainerWorkerPostgresIntegrationTest : IClassFixture<Postgres
             .Where(a => a.DeduplicationKey!.StartsWith("MLCpcPretrainer:NZDUSD"))
             .ToListAsync();
         var alert = Assert.Single(alerts);
+        Assert.True(alert.IsActive);
         Assert.Contains("ConsecutiveFailures", alert.ConditionJson);
+        Assert.Equal(3, await assertContext.Set<MLCpcEncoderTrainingLog>()
+            .CountAsync(l => l.Symbol == "NZDUSD" && l.Outcome == "rejected"));
     }
 
     private sealed class AlwaysFailingLinearPretrainer : ICpcPretrainer

@@ -44,5 +44,13 @@ public enum AlertType
     /// <summary>Worker configuration has drifted from what code requires (e.g. mismatched
     /// embedding dimension, missing implementation for a configured encoder type, or a
     /// long-running systemic pause). Operator-visible so silent skips surface.</summary>
-    ConfigurationDrift = 12
+    ConfigurationDrift = 12,
+
+    /// <summary>
+    /// Engine-tracked account state has diverged from the broker-reported account state
+    /// (e.g. equity or balance variance beyond threshold). Raised by
+    /// <c>BrokerPnLReconciliationWorker</c>. Distinct from <see cref="DataQualityIssue"/>
+    /// because the data is trustworthy — the engine's bookkeeping is not.
+    /// </summary>
+    BrokerReconciliation = 13
 }

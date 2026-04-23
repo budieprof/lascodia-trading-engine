@@ -1,3 +1,4 @@
+using System.Globalization;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -38,6 +39,12 @@ namespace LascodiaTradingEngine.Application.Workers;
 /// </summary>
 public sealed class MLHorizonAccuracyWorker : BackgroundService
 {
+    private const int    AlertCooldownSeconds       = 3600;
+    private const int    MaxAlertDestinationLength  = 100;
+    private const string HorizonAccuracyGapReason   = "horizon_accuracy_gap";
+    private const string HorizonAccuracyUniqueIndex  = "IX_MLModelHorizonAccuracy_MLModelId_HorizonBars";
+    private const string AlertDeduplicationIndex     = "IX_Alert_DeduplicationKey";
+
     // ── EngineConfig keys ─────────────────────────────────────────────────────
     // All config is read live from the EngineConfig table each poll cycle.
     private const string CK_PollSecs  = "MLHorizon:PollIntervalSeconds";
@@ -67,6 +74,7 @@ public sealed class MLHorizonAccuracyWorker : BackgroundService
 
     private readonly IServiceScopeFactory              _scopeFactory;
     private readonly ILogger<MLHorizonAccuracyWorker>  _logger;
+    private readonly IDatabaseExceptionClassifier?     _dbExceptionClassifier;
 
     /// <summary>
     /// Initialises the worker with a DI scope factory and logger.
@@ -78,10 +86,12 @@ public sealed class MLHorizonAccuracyWorker : BackgroundService
     /// <param name="logger">Structured logger for computation diagnostics and alerts.</param>
     public MLHorizonAccuracyWorker(
         IServiceScopeFactory               scopeFactory,
-        ILogger<MLHorizonAccuracyWorker>   logger)
+        ILogger<MLHorizonAccuracyWorker>   logger,
+        IDatabaseExceptionClassifier?      dbExceptionClassifier = null)
     {
-        _scopeFactory = scopeFactory;
-        _logger       = logger;
+        _scopeFactory          = scopeFactory;
+        _logger                = logger;
+        _dbExceptionClassifier = dbExceptionClassifier;
     }
 
     /// <summary>
@@ -131,7 +141,14 @@ public sealed class MLHorizonAccuracyWorker : BackgroundService
                 _logger.LogError(ex, "MLHorizonAccuracyWorker loop error");
             }
 
-            await Task.Delay(TimeSpan.FromSeconds(pollSecs), stoppingToken);
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(pollSecs), stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                break;
+            }
         }
 
         _logger.LogInformation("MLHorizonAccuracyWorker stopping.");
@@ -180,6 +197,10 @@ public sealed class MLHorizonAccuracyWorker : BackgroundService
                     windowStart, minPreds, gapThr, wilsonZ, alertDest,
                     readCtx, writeCtx, ct);
             }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
             catch (Exception ex)
             {
                 // Isolate per-model failures.
@@ -187,25 +208,26 @@ public sealed class MLHorizonAccuracyWorker : BackgroundService
                     "HorizonAccuracy: compute failed for model {Id} ({Symbol}/{Tf}) — skipping.",
                     model.Id, model.Symbol, model.Timeframe);
             }
+            finally
+            {
+                writeCtx.ChangeTracker.Clear();
+            }
         }
     }
 
     /// <summary>
     /// Computes multi-horizon direction accuracy for a single ML model:
     /// <list type="number">
-    ///   <item>Loads all resolved prediction logs (where <c>DirectionCorrect</c> is not null)
-    ///         within the look-back window, selecting the primary direction outcome and
-    ///         all three horizon-specific correctness flags.</item>
-    ///   <item>Computes the primary 1-bar direction accuracy as the baseline for
-    ///         horizon-gap detection.</item>
-    ///   <item>For each of the three tracked horizons (3, 6, 12 bars), filters logs where
-    ///         that horizon's field is resolved (not null), computes accuracy, and upserts
-    ///         a <see cref="MLModelHorizonAccuracy"/> row.</item>
-    ///   <item>Fires a <see cref="AlertType.MLModelDegraded"/> alert with reason
-    ///         <c>"horizon_accuracy_gap"</c> when the 3-bar accuracy is more than
-    ///         <paramref name="horizonGapThreshold"/> below the primary accuracy.
-    ///         This indicates a model with a shallow temporal edge: it predicts the
-    ///         correct direction but is wrong about the timing of the move.</item>
+    ///   <item>Aggregates champion prediction logs within the look-back window in a
+    ///         single SQL statement, producing primary, 3-bar, 6-bar, and 12-bar
+    ///         resolved/correct counts from one database snapshot.</item>
+    ///   <item>Computes primary 1-bar direction accuracy as the baseline for horizon-gap
+    ///         detection.</item>
+    ///   <item>For each tracked horizon (3, 6, 12 bars), computes accuracy, conservative
+    ///         Wilson lower bound, reliability state, and upserts one
+    ///         <see cref="MLModelHorizonAccuracy"/> row.</item>
+    ///   <item>Synchronizes the 3-bar gap alert: create/update while breached, auto-resolve
+    ///         once the breach clears or the row no longer has enough current samples.</item>
     /// </list>
     ///
     /// <b>Why the gap check uses only horizon 3?</b>
@@ -228,7 +250,7 @@ public sealed class MLHorizonAccuracyWorker : BackgroundService
     /// an alert is raised. Default 0.10 (10 percentage points).
     /// </param>
     /// <param name="alertDest">Alert destination identifier (e.g., "ml-ops").</param>
-    /// <param name="readCtx">Read DbContext for prediction logs and existing alert state.</param>
+    /// <param name="readCtx">Read DbContext for prediction logs.</param>
     /// <param name="writeCtx">Write DbContext for accuracy rows and alert inserts.</param>
     /// <param name="ct">Cancellation token.</param>
     private async Task ComputeForModelAsync(
@@ -244,50 +266,38 @@ public sealed class MLHorizonAccuracyWorker : BackgroundService
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
         CancellationToken                       ct)
     {
-        // Load served champion prediction logs with all primary and horizon correctness fields.
-        // Horizon rows are computed from their own resolved fields, even if the primary
-        // trade-level outcome has not been recorded yet.
-        var logs = await readCtx.Set<MLModelPredictionLog>()
+        // Aggregate in one SQL statement instead of materialising prediction logs or issuing
+        // separate total/correct counts. This keeps the worker stable for long look-back
+        // windows and prevents count skew while horizon outcomes are being resolved.
+        var logs = readCtx.Set<MLModelPredictionLog>()
             .Where(l => l.MLModelId        == modelId     &&
                         l.ModelRole        == ModelRole.Champion &&
                         l.PredictedAt      >= windowStart  &&
                         !l.IsDeleted)
-            .AsNoTracking()
-            .Select(l => new
-            {
-                l.DirectionCorrect,
-                l.HorizonCorrect3,
-                l.HorizonCorrect6,
-                l.HorizonCorrect12,
-            })
-            .ToListAsync(ct);
+            .AsNoTracking();
 
         var now = DateTime.UtcNow;
+        var aggregate = await LoadAggregateStatsAsync(logs, ct);
 
         // Compute primary (1-bar) direction accuracy from all resolved logs.
         // This is the baseline against which each horizon accuracy is compared.
-        int    primaryTotal   = logs.Count(l => l.DirectionCorrect != null);
-        int    primaryCorrect = logs.Count(l => l.DirectionCorrect == true);
+        var primary = aggregate.Primary;
+        int    primaryTotal   = primary.Total;
+        int    primaryCorrect = primary.Correct;
         double primaryAcc     = primaryTotal > 0 ? (double)primaryCorrect / primaryTotal : 0.0;
         bool   primaryReliable = primaryTotal >= minPredictions;
 
         // Compute and upsert each horizon independently.
         foreach (var (horizonBars, _) in Horizons)
         {
-            // Filter to logs where this specific horizon field has been resolved.
-            // HorizonCorrectN is populated by MLPredictionOutcomeWorker after N bars
+            // Count logs where this specific horizon field has been resolved.
+            // HorizonCorrectN is populated by MLMultiHorizonOutcomeWorker after N bars
             // have elapsed since the prediction — so fewer logs will have resolved
             // values for longer horizons, especially for recent predictions.
-            var resolved = horizonBars switch
-            {
-                3  => logs.Where(l => l.HorizonCorrect3  != null).Select(l => l.HorizonCorrect3!.Value).ToList(),
-                6  => logs.Where(l => l.HorizonCorrect6  != null).Select(l => l.HorizonCorrect6!.Value).ToList(),
-                12 => logs.Where(l => l.HorizonCorrect12 != null).Select(l => l.HorizonCorrect12!.Value).ToList(),
-                _  => new List<bool>(),
-            };
+            var horizon = aggregate.ForHorizon(horizonBars);
 
-            int    total    = resolved.Count;
-            int    correct  = resolved.Count(v => v);
+            int    total    = horizon.Total;
+            int    correct  = horizon.Correct;
             double accuracy = total > 0 ? (double)correct / total : 0.0;
             double lowerBound = WilsonLowerBound(correct, total, wilsonZ);
             double primaryGap = primaryReliable ? Math.Max(0.0, primaryAcc - accuracy) : 0.0;
@@ -316,64 +326,31 @@ public sealed class MLHorizonAccuracyWorker : BackgroundService
                 status,
                 windowStart,
                 now,
+                _dbExceptionClassifier,
                 ct);
 
             _logger.LogDebug(
                 "HorizonAccuracy: model {Id} ({Symbol}/{Tf}) h={H}bar - acc={Acc:P1} lb={Lb:P1} n={N} status={Status}",
                 modelId, symbol, timeframe, horizonBars, accuracy, lowerBound, total, status);
 
-            // ── Horizon gap alert (3-bar only) ────────────────────────────────
-            // Check whether the short-horizon (3-bar) accuracy lags the primary
-            // 1-bar accuracy by more than the configured gap threshold.
-            // A large gap signals that the model's directional edge is valid at 1 bar
-            // but decays too quickly — a "shallow temporal edge" that may be unsuitable
-            // for multi-bar holding strategies.
-            if (horizonBars == 3 && isReliable && primaryAcc - accuracy > horizonGapThreshold)
+            if (horizonBars == 3)
             {
-                string dedupKey = $"MLHorizon:{modelId}:{symbol}:{timeframe}:3";
-
-                // Deduplicate this exact horizon breach without hiding unrelated ML
-                // degradation alerts for another model, timeframe, or worker.
-                bool alertExists = await readCtx.Set<Alert>()
-                    .AnyAsync(a => a.DeduplicationKey == dedupKey &&
-                                   a.IsActive && !a.IsDeleted, ct);
-
-                if (!alertExists)
-                {
-                    _logger.LogWarning(
-                        "HorizonAccuracy: model {Id} ({Symbol}/{Tf}) — primary={P:P1} h3={H3:P1} " +
-                        "gap={Gap:P1} exceeds threshold {Thr:P0}. Model has shallow temporal edge.",
-                        modelId, symbol, timeframe, primaryAcc, accuracy,
-                        primaryAcc - accuracy, horizonGapThreshold);
-
-                    // Persist alert with full diagnostic context.
-                    writeCtx.Set<Alert>().Add(new Alert
-                    {
-                        AlertType     = AlertType.MLModelDegraded,
-                        Symbol        = symbol,
-                        ConditionJson = System.Text.Json.JsonSerializer.Serialize(new
-                        {
-                            reason                = "horizon_accuracy_gap",
-                            severity              = "warning",
-                            symbol,
-                            timeframe             = timeframe.ToString(),
-                            modelId,
-                            primaryDirectionAcc   = primaryAcc,   // 1-bar accuracy
-                            horizon3BarAcc        = accuracy,     // 3-bar accuracy
-                            horizon3BarLowerBound = lowerBound,
-                            gap                   = primaryAcc - accuracy,  // absolute gap
-                            horizonGapThreshold,
-                            alertDestination      = alertDest,
-                            sampleCount           = total,
-                            primarySampleCount    = primaryTotal,
-                        }),
-                        Severity         = AlertSeverity.Medium,
-                        DeduplicationKey = dedupKey,
-                        CooldownSeconds  = 3600,
-                        IsActive         = true,
-                    });
-                    await writeCtx.SaveChangesAsync(ct);
-                }
+                await SyncHorizonGapAlertAsync(
+                    writeCtx,
+                    modelId,
+                    symbol,
+                    timeframe,
+                    primaryAcc,
+                    accuracy,
+                    lowerBound,
+                    primaryGap,
+                    horizonGapThreshold,
+                    alertDest,
+                    total,
+                    primaryTotal,
+                    isReliable,
+                    now,
+                    ct);
             }
         }
     }
@@ -404,8 +381,36 @@ public sealed class MLHorizonAccuracyWorker : BackgroundService
 
         if (entry?.Value is null) return defaultValue;
 
-        try   { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
+        try   { return (T)Convert.ChangeType(entry.Value, typeof(T), CultureInfo.InvariantCulture); }
         catch { return defaultValue; }
+    }
+
+    private static async Task<HorizonAggregateStats> LoadAggregateStatsAsync(
+        IQueryable<MLModelPredictionLog> logs,
+        CancellationToken ct)
+    {
+        var row = await logs
+            .GroupBy(_ => 1)
+            .Select(g => new
+            {
+                PrimaryTotal   = g.Count(l => l.DirectionCorrect != null),
+                PrimaryCorrect = g.Count(l => l.DirectionCorrect == true),
+                H3Total        = g.Count(l => l.HorizonCorrect3 != null),
+                H3Correct      = g.Count(l => l.HorizonCorrect3 == true),
+                H6Total        = g.Count(l => l.HorizonCorrect6 != null),
+                H6Correct      = g.Count(l => l.HorizonCorrect6 == true),
+                H12Total       = g.Count(l => l.HorizonCorrect12 != null),
+                H12Correct     = g.Count(l => l.HorizonCorrect12 == true),
+            })
+            .SingleOrDefaultAsync(ct);
+
+        return row is null
+            ? HorizonAggregateStats.Empty
+            : new HorizonAggregateStats(
+                new OutcomeStats(row.PrimaryTotal, row.PrimaryCorrect),
+                new OutcomeStats(row.H3Total, row.H3Correct),
+                new OutcomeStats(row.H6Total, row.H6Correct),
+                new OutcomeStats(row.H12Total, row.H12Correct));
     }
 
     private static async Task UpsertHorizonAccuracyAsync(
@@ -426,32 +431,32 @@ public sealed class MLHorizonAccuracyWorker : BackgroundService
         string status,
         DateTime windowStart,
         DateTime computedAt,
+        IDatabaseExceptionClassifier? dbExceptionClassifier,
         CancellationToken ct)
     {
-        int rows = await writeCtx.Set<MLModelHorizonAccuracy>()
-            .IgnoreQueryFilters()
-            .Where(r => r.MLModelId == modelId && r.HorizonBars == horizonBars)
-            .ExecuteUpdateAsync(s => s
-                .SetProperty(r => r.Symbol,                    symbol)
-                .SetProperty(r => r.Timeframe,                 timeframe)
-                .SetProperty(r => r.TotalPredictions,          total)
-                .SetProperty(r => r.CorrectPredictions,        correct)
-                .SetProperty(r => r.Accuracy,                  accuracy)
-                .SetProperty(r => r.AccuracyLowerBound,        lowerBound)
-                .SetProperty(r => r.PrimaryTotalPredictions,   primaryTotal)
-                .SetProperty(r => r.PrimaryCorrectPredictions, primaryCorrect)
-                .SetProperty(r => r.PrimaryAccuracy,           primaryAccuracy)
-                .SetProperty(r => r.PrimaryAccuracyGap,        primaryGap)
-                .SetProperty(r => r.IsReliable,                isReliable)
-                .SetProperty(r => r.Status,                    status)
-                .SetProperty(r => r.WindowStart,               windowStart)
-                .SetProperty(r => r.ComputedAt,                computedAt)
-                .SetProperty(r => r.IsDeleted,                 false),
-                ct);
+        int rows = await UpdateHorizonAccuracyAsync(
+            writeCtx,
+            modelId,
+            symbol,
+            timeframe,
+            horizonBars,
+            total,
+            correct,
+            accuracy,
+            lowerBound,
+            primaryTotal,
+            primaryCorrect,
+            primaryAccuracy,
+            primaryGap,
+            isReliable,
+            status,
+            windowStart,
+            computedAt,
+            ct);
 
         if (rows > 0) return;
 
-        writeCtx.Set<MLModelHorizonAccuracy>().Add(new MLModelHorizonAccuracy
+        var row = new MLModelHorizonAccuracy
         {
             MLModelId                  = modelId,
             Symbol                     = symbol,
@@ -469,13 +474,210 @@ public sealed class MLHorizonAccuracyWorker : BackgroundService
             Status                     = status,
             WindowStart                = windowStart,
             ComputedAt                 = computedAt,
+        };
+
+        writeCtx.Set<MLModelHorizonAccuracy>().Add(row);
+
+        try
+        {
+            await writeCtx.SaveChangesAsync(ct);
+        }
+        catch (DbUpdateException ex) when (IsExpectedUniqueConstraintViolation(
+                   ex,
+                   HorizonAccuracyUniqueIndex,
+                   dbExceptionClassifier,
+                   "MLModelHorizonAccuracy",
+                   "MLModelId",
+                   "HorizonBars"))
+        {
+            Detach(writeCtx, row);
+
+            rows = await UpdateHorizonAccuracyAsync(
+                writeCtx,
+                modelId,
+                symbol,
+                timeframe,
+                horizonBars,
+                total,
+                correct,
+                accuracy,
+                lowerBound,
+                primaryTotal,
+                primaryCorrect,
+                primaryAccuracy,
+                primaryGap,
+                isReliable,
+                status,
+                windowStart,
+                computedAt,
+                ct);
+
+            if (rows > 0) return;
+            throw;
+        }
+    }
+
+    private static Task<int> UpdateHorizonAccuracyAsync(
+        Microsoft.EntityFrameworkCore.DbContext writeCtx,
+        long modelId,
+        string symbol,
+        Timeframe timeframe,
+        int horizonBars,
+        int total,
+        int correct,
+        double accuracy,
+        double lowerBound,
+        int primaryTotal,
+        int primaryCorrect,
+        double primaryAccuracy,
+        double primaryGap,
+        bool isReliable,
+        string status,
+        DateTime windowStart,
+        DateTime computedAt,
+        CancellationToken ct)
+        => writeCtx.Set<MLModelHorizonAccuracy>()
+            .Where(r => r.MLModelId == modelId && r.HorizonBars == horizonBars)
+            .ExecuteUpdateAsync(s => s
+                .SetProperty(r => r.Symbol,                    symbol)
+                .SetProperty(r => r.Timeframe,                 timeframe)
+                .SetProperty(r => r.TotalPredictions,          total)
+                .SetProperty(r => r.CorrectPredictions,        correct)
+                .SetProperty(r => r.Accuracy,                  accuracy)
+                .SetProperty(r => r.AccuracyLowerBound,        lowerBound)
+                .SetProperty(r => r.PrimaryTotalPredictions,   primaryTotal)
+                .SetProperty(r => r.PrimaryCorrectPredictions, primaryCorrect)
+                .SetProperty(r => r.PrimaryAccuracy,           primaryAccuracy)
+                .SetProperty(r => r.PrimaryAccuracyGap,        primaryGap)
+                .SetProperty(r => r.IsReliable,                isReliable)
+                .SetProperty(r => r.Status,                    status)
+                .SetProperty(r => r.WindowStart,               windowStart)
+                .SetProperty(r => r.ComputedAt,                computedAt),
+                ct);
+
+    private async Task SyncHorizonGapAlertAsync(
+        Microsoft.EntityFrameworkCore.DbContext writeCtx,
+        long modelId,
+        string symbol,
+        Timeframe timeframe,
+        double primaryAccuracy,
+        double horizon3Accuracy,
+        double horizon3LowerBound,
+        double gap,
+        double horizonGapThreshold,
+        string alertDestination,
+        int sampleCount,
+        int primarySampleCount,
+        bool isReliable,
+        DateTime computedAt,
+        CancellationToken ct)
+    {
+        string dedupKey = HorizonGapDedupKey(modelId, symbol, timeframe);
+        bool isBreached = isReliable && gap > horizonGapThreshold;
+
+        if (!isBreached)
+        {
+            int resolved = await writeCtx.Set<Alert>()
+                .Where(a => a.DeduplicationKey == dedupKey &&
+                            a.IsActive &&
+                            !a.IsDeleted)
+                .ExecuteUpdateAsync(s => s
+                    .SetProperty(a => a.IsActive, false)
+                    .SetProperty(a => a.AutoResolvedAt, computedAt),
+                    ct);
+
+            if (resolved > 0)
+            {
+                _logger.LogInformation(
+                    "HorizonAccuracy: resolved horizon gap alert for model {Id} ({Symbol}/{Tf}).",
+                    modelId, symbol, timeframe);
+            }
+
+            return;
+        }
+
+        string conditionJson = System.Text.Json.JsonSerializer.Serialize(new
+        {
+            reason                = HorizonAccuracyGapReason,
+            severity              = "warning",
+            symbol,
+            timeframe             = timeframe.ToString(),
+            modelId,
+            primaryDirectionAcc   = primaryAccuracy,
+            horizon3BarAcc        = horizon3Accuracy,
+            horizon3BarLowerBound = horizon3LowerBound,
+            gap,
+            horizonGapThreshold,
+            alertDestination,
+            sampleCount,
+            primarySampleCount,
+            computedAt,
         });
-        await writeCtx.SaveChangesAsync(ct);
+
+        int updated = await writeCtx.Set<Alert>()
+            .Where(a => a.DeduplicationKey == dedupKey &&
+                        a.IsActive &&
+                        !a.IsDeleted)
+            .ExecuteUpdateAsync(s => s
+                .SetProperty(a => a.Symbol, symbol)
+                .SetProperty(a => a.ConditionJson, conditionJson)
+                .SetProperty(a => a.Severity, AlertSeverity.Medium)
+                .SetProperty(a => a.CooldownSeconds, AlertCooldownSeconds)
+                .SetProperty(a => a.AutoResolvedAt, (DateTime?)null),
+                ct);
+
+        if (updated > 0) return;
+
+        _logger.LogWarning(
+            "HorizonAccuracy: model {Id} ({Symbol}/{Tf}) — primary={P:P1} h3={H3:P1} " +
+            "gap={Gap:P1} exceeds threshold {Thr:P0}. Model has shallow temporal edge.",
+            modelId, symbol, timeframe, primaryAccuracy, horizon3Accuracy,
+            gap, horizonGapThreshold);
+
+        var alert = new Alert
+        {
+            AlertType        = AlertType.MLModelDegraded,
+            Symbol           = symbol,
+            ConditionJson    = conditionJson,
+            Severity         = AlertSeverity.Medium,
+            DeduplicationKey = dedupKey,
+            CooldownSeconds  = AlertCooldownSeconds,
+            IsActive         = true,
+        };
+
+        writeCtx.Set<Alert>().Add(alert);
+
+        try
+        {
+            await writeCtx.SaveChangesAsync(ct);
+        }
+        catch (DbUpdateException ex) when (IsExpectedUniqueConstraintViolation(
+                   ex,
+                   AlertDeduplicationIndex,
+                   _dbExceptionClassifier,
+                   "Alert",
+                   "DeduplicationKey"))
+        {
+            Detach(writeCtx, alert);
+
+            bool alertExists = await writeCtx.Set<Alert>()
+                .AsNoTracking()
+                .AnyAsync(a => a.DeduplicationKey == dedupKey &&
+                               a.IsActive &&
+                               !a.IsDeleted,
+                               ct);
+
+            if (alertExists) return;
+            throw;
+        }
     }
 
     internal static double WilsonLowerBound(int successes, int total, double z)
     {
         if (total <= 0) return 0.0;
+
+        successes = Math.Clamp(successes, 0, total);
+        z = NormalizeWilsonZ(z);
 
         double p = (double)successes / total;
         double z2 = z * z;
@@ -492,7 +694,7 @@ public sealed class MLHorizonAccuracyWorker : BackgroundService
         => value is >= 1 and <= 3650 ? value : 30;
 
     internal static int NormalizeMinPredictions(int value)
-        => value >= 1 ? value : 20;
+        => value is >= 1 and <= 1_000_000 ? value : 20;
 
     internal static double NormalizeProbability(double value, double defaultValue)
         => double.IsFinite(value) && value >= 0.0 && value <= 1.0 ? value : defaultValue;
@@ -501,5 +703,133 @@ public sealed class MLHorizonAccuracyWorker : BackgroundService
         => double.IsFinite(value) && value >= 0.0 && value <= 5.0 ? value : 1.96;
 
     internal static string NormalizeDestination(string? value)
-        => string.IsNullOrWhiteSpace(value) ? "ml-ops" : value.Trim();
+    {
+        if (string.IsNullOrWhiteSpace(value)) return "ml-ops";
+
+        var trimmed = value.Trim();
+        return trimmed.Length <= MaxAlertDestinationLength
+            ? trimmed
+            : trimmed[..MaxAlertDestinationLength];
+    }
+
+    private static string HorizonGapDedupKey(long modelId, string symbol, Timeframe timeframe)
+        => $"MLHorizon:{modelId}:{symbol}:{timeframe}:3";
+
+    internal static bool IsExpectedUniqueConstraintViolation(
+        DbUpdateException ex,
+        string expectedConstraintName,
+        IDatabaseExceptionClassifier? dbExceptionClassifier = null,
+        params string[] requiredMessageTokens)
+    {
+        ArgumentNullException.ThrowIfNull(ex);
+
+        bool isUnique = dbExceptionClassifier?.IsUniqueConstraintViolation(ex) == true
+                        || LooksLikeUniqueConstraintViolation(ex);
+
+        if (!isUnique) return false;
+
+        string? constraintName = TryGetProviderConstraintName(ex);
+        if (!string.IsNullOrWhiteSpace(constraintName))
+        {
+            return string.Equals(
+                constraintName,
+                expectedConstraintName,
+                StringComparison.OrdinalIgnoreCase);
+        }
+
+        string message = FlattenExceptionMessages(ex);
+        if (message.Contains(expectedConstraintName, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return requiredMessageTokens.Length > 0 &&
+               requiredMessageTokens.All(token =>
+                   message.Contains(token, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool LooksLikeUniqueConstraintViolation(Exception ex)
+    {
+        for (Exception? current = ex; current is not null; current = current.InnerException)
+        {
+            var sqlState = current.GetType().GetProperty("SqlState")?.GetValue(current) as string;
+            if (string.Equals(sqlState, "23505", StringComparison.Ordinal))
+                return true;
+
+            var sqliteErrorCode = current.GetType().GetProperty("SqliteErrorCode")?.GetValue(current);
+            var sqliteExtendedErrorCode = current.GetType().GetProperty("SqliteExtendedErrorCode")?.GetValue(current);
+
+            if (sqliteErrorCode is int code && code == 19)
+                return true;
+
+            if (sqliteExtendedErrorCode is int extendedCode && extendedCode == 2067)
+                return true;
+
+            string message = current.Message ?? string.Empty;
+            if (message.Contains("23505", StringComparison.Ordinal) ||
+                message.Contains("duplicate key", StringComparison.OrdinalIgnoreCase) ||
+                message.Contains("unique constraint", StringComparison.OrdinalIgnoreCase) ||
+                message.Contains("UNIQUE constraint failed", StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+
+    private static string? TryGetProviderConstraintName(Exception ex)
+    {
+        for (Exception? current = ex; current is not null; current = current.InnerException)
+        {
+            var constraintName = current.GetType().GetProperty("ConstraintName")?.GetValue(current) as string;
+            if (!string.IsNullOrWhiteSpace(constraintName))
+                return constraintName;
+        }
+
+        return null;
+    }
+
+    private static string FlattenExceptionMessages(Exception ex)
+    {
+        var messages = new List<string>();
+
+        for (Exception? current = ex; current is not null; current = current.InnerException)
+        {
+            if (!string.IsNullOrWhiteSpace(current.Message))
+                messages.Add(current.Message);
+        }
+
+        return string.Join(' ', messages);
+    }
+
+    private static void Detach<TEntity>(
+        Microsoft.EntityFrameworkCore.DbContext ctx,
+        TEntity entity)
+        where TEntity : class
+    {
+        var entry = ctx.Entry(entity);
+        if (entry.State != EntityState.Detached)
+            entry.State = EntityState.Detached;
+    }
+
+    private readonly record struct OutcomeStats(int Total, int Correct);
+
+    private readonly record struct HorizonAggregateStats(
+        OutcomeStats Primary,
+        OutcomeStats H3,
+        OutcomeStats H6,
+        OutcomeStats H12)
+    {
+        public static HorizonAggregateStats Empty { get; } = new(
+            new OutcomeStats(0, 0),
+            new OutcomeStats(0, 0),
+            new OutcomeStats(0, 0),
+            new OutcomeStats(0, 0));
+
+        public OutcomeStats ForHorizon(int horizonBars)
+            => horizonBars switch
+            {
+                3  => H3,
+                6  => H6,
+                12 => H12,
+                _  => throw new ArgumentOutOfRangeException(nameof(horizonBars), horizonBars, "Unsupported horizon."),
+            };
+    }
 }

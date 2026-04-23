@@ -3,6 +3,8 @@ using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Security;
+using LascodiaTradingEngine.Application.Common.Utilities;
 using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ProcessReconciliation;
@@ -122,29 +124,52 @@ public class ProcessReconciliationCommandValidator : AbstractValidator<ProcessRe
 /// Counts orphaned engine records (present in engine but not on broker), unknown broker records
 /// (present on broker but not in engine), and returns the discrepancy summary without modifying data.
 /// </summary>
-public class ProcessReconciliationCommandHandler : IRequestHandler<ProcessReconciliationCommand, ResponseData<ReconciliationResult>>
-{
-    private readonly IWriteApplicationDbContext _context;
-
-    public ProcessReconciliationCommandHandler(IWriteApplicationDbContext context)
+    public class ProcessReconciliationCommandHandler : IRequestHandler<ProcessReconciliationCommand, ResponseData<ReconciliationResult>>
     {
-        _context = context;
-    }
+        private readonly IWriteApplicationDbContext _context;
+        private readonly IEAOwnershipGuard _ownershipGuard;
 
-    public async Task<ResponseData<ReconciliationResult>> Handle(ProcessReconciliationCommand request, CancellationToken cancellationToken)
-    {
-        var dbContext = _context.GetDbContext();
-        var result = new ReconciliationResult();
+        public ProcessReconciliationCommandHandler(
+            IWriteApplicationDbContext context,
+            IEAOwnershipGuard ownershipGuard)
+        {
+            _context = context;
+            _ownershipGuard = ownershipGuard;
+        }
+
+        public async Task<ResponseData<ReconciliationResult>> Handle(ProcessReconciliationCommand request, CancellationToken cancellationToken)
+        {
+            if (!await _ownershipGuard.IsOwnerAsync(request.InstanceId, cancellationToken))
+                return ResponseData<ReconciliationResult>.Init(null, false, "Unauthorized: caller does not own this EA instance", "-403");
+
+            var dbContext = _context.GetDbContext();
+            var result = new ReconciliationResult();
+
+            var eaInstance = await dbContext.Set<Domain.Entities.EAInstance>()
+                .AsNoTracking()
+                .FirstOrDefaultAsync(x => x.InstanceId == request.InstanceId && !x.IsDeleted, cancellationToken);
+
+            if (eaInstance is null)
+                return ResponseData<ReconciliationResult>.Init(null, false, "EA instance not found", "-14");
+
+            var ownedSymbols = eaInstance.Symbols
+                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Select(SymbolNormalizer.Normalize)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
         // ── Reconcile positions ──────────────────────────────────────────────
         var brokerTickets = request.BrokerPositions
             .Select(p => p.Ticket.ToString())
             .ToHashSet();
 
-        var enginePositions = await dbContext
+        var enginePositionsQuery = dbContext
             .Set<Domain.Entities.Position>()
-            .Where(x => x.Status == PositionStatus.Open && !x.IsDeleted)
-            .ToListAsync(cancellationToken);
+            .Where(x => x.Status == PositionStatus.Open && !x.IsDeleted);
+
+        if (ownedSymbols.Count > 0)
+            enginePositionsQuery = enginePositionsQuery.Where(x => ownedSymbols.Contains(x.Symbol));
+
+        var enginePositions = await enginePositionsQuery.ToListAsync(cancellationToken);
 
         // Positions in the engine but not on the broker
         foreach (var pos in enginePositions)
@@ -161,6 +186,11 @@ public class ProcessReconciliationCommandHandler : IRequestHandler<ProcessReconc
 
         foreach (var bp in request.BrokerPositions)
         {
+            var symbol = SymbolNormalizer.Normalize(bp.Symbol);
+            if (ownedSymbols.Count > 0 && !ownedSymbols.Contains(symbol))
+                return ResponseData<ReconciliationResult>.Init(null, false,
+                    $"Symbol '{symbol}' is not owned by EA instance '{request.InstanceId}'", "-403");
+
             if (!engineTickets.Contains(bp.Ticket.ToString()))
                 result.UnknownBrokerPositions++;
         }
@@ -172,7 +202,9 @@ public class ProcessReconciliationCommandHandler : IRequestHandler<ProcessReconc
 
         var engineOrders = await dbContext
             .Set<Domain.Entities.Order>()
-            .Where(x => x.Status == OrderStatus.Submitted && !x.IsDeleted)
+            .Where(x => x.Status == OrderStatus.Submitted
+                     && x.TradingAccountId == eaInstance.TradingAccountId
+                     && !x.IsDeleted)
             .ToListAsync(cancellationToken);
 
         foreach (var order in engineOrders)
@@ -188,6 +220,11 @@ public class ProcessReconciliationCommandHandler : IRequestHandler<ProcessReconc
 
         foreach (var bo in request.BrokerOrders)
         {
+            var symbol = SymbolNormalizer.Normalize(bo.Symbol);
+            if (ownedSymbols.Count > 0 && !ownedSymbols.Contains(symbol))
+                return ResponseData<ReconciliationResult>.Init(null, false,
+                    $"Symbol '{symbol}' is not owned by EA instance '{request.InstanceId}'", "-403");
+
             if (!engineOrderTickets.Contains(bo.Ticket.ToString()))
                 result.UnknownBrokerOrders++;
         }

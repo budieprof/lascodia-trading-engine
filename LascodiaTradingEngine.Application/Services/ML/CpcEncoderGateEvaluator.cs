@@ -209,14 +209,18 @@ public sealed class CpcEncoderGateEvaluator : ICpcEncoderGateEvaluator
         CpcEncoderGateOptions options,
         CancellationToken ct)
     {
-        var crossArchPrior = await readCtx.Set<MLCpcEncoder>()
+        var query = readCtx.Set<MLCpcEncoder>()
             .AsNoTracking()
             .Where(e => e.Symbol == request.Symbol
                      && e.Timeframe == request.Timeframe
-                     && e.Regime == request.Regime
                      && e.IsActive
                      && !e.IsDeleted
-                     && e.EncoderType != request.Encoder.EncoderType)
+                     && e.EncoderType != request.Encoder.EncoderType);
+        query = request.Regime is null
+            ? query.Where(e => e.Regime == null)
+            : query.Where(e => e.Regime == request.Regime.Value);
+
+        var crossArchPrior = await query
             .OrderByDescending(e => e.TrainedAt)
             .ThenByDescending(e => e.Id)
             .FirstOrDefaultAsync(ct);

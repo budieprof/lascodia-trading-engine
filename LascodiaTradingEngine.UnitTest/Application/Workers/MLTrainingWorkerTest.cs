@@ -122,6 +122,20 @@ public class MLTrainingWorkerTest
         _mockWriteDbContext.Setup(c => c.Set<MLTrainingRun>()).Returns(mockSet.Object);
     }
 
+    /// <summary>
+    /// Keeps the unit suite on the V2 feature vector so tests need no V3–V7 data-provider
+    /// registrations (IOrderBookFeatureProvider, ITickFlowProvider, EconomicEventFeatureProvider,
+    /// CrossAssetFeatureProvider). Production defaults run the full V7 stack.
+    /// </summary>
+    private static List<EngineConfig> TestEngineConfigsPinnedToV2() =>
+    [
+        new() { Key = "MLTraining:UseEventFeatureVector",              Value = "false" },
+        new() { Key = "MLTraining:UseTickMicrostructureFeatureVector", Value = "false" },
+        new() { Key = "MLTraining:UseV5SyntheticMicrostructure",       Value = "false" },
+        new() { Key = "MLTraining:UseV6OrderBookFeatures",             Value = "false" },
+        new() { Key = "MLTraining:UseV7CpcFeatureVector",              Value = "false" },
+    ];
+
     private void SetupEngineConfigs(List<EngineConfig> configs)
     {
         var mockSet = configs.AsQueryable().BuildMockDbSet();
@@ -173,7 +187,7 @@ public class MLTrainingWorkerTest
     private void SetupEmptyDefaults()
     {
         SetupTrainingRuns(new List<MLTrainingRun>());
-        SetupEngineConfigs(new List<EngineConfig>());
+        SetupEngineConfigs(TestEngineConfigsPinnedToV2());
         SetupModels(new List<MLModel>());
         SetupCandles(new List<Candle>());
         SetupCOTReports(new List<COTReport>());
@@ -699,6 +713,14 @@ public class MLTrainingWorkerTest
         {
             new() { Key = "MLTraining:MinTrainingSamples",           Value = "10"    },
             new() { Key = "MLTraining:RequireSymmetricTripleBarrier", Value = "false" },
+            // Pin the unit suite to V2 so tests don't need to register V3-V7 data providers
+            // (IOrderBookFeatureProvider, ITickFlowProvider, EconomicEventFeatureProvider,
+            // CrossAssetFeatureProvider). Production defaults run the full V7 stack.
+            new() { Key = "MLTraining:UseEventFeatureVector",             Value = "false" },
+            new() { Key = "MLTraining:UseTickMicrostructureFeatureVector", Value = "false" },
+            new() { Key = "MLTraining:UseV5SyntheticMicrostructure",      Value = "false" },
+            new() { Key = "MLTraining:UseV6OrderBookFeatures",            Value = "false" },
+            new() { Key = "MLTraining:UseV7CpcFeatureVector",             Value = "false" },
         });
         SetupModels(existingModels);
         SetupCandles(candles);
@@ -857,7 +879,7 @@ public class MLTrainingWorkerTest
         };
 
         SetupTrainingRuns(new List<MLTrainingRun> { staleRun });
-        SetupEngineConfigs(new List<EngineConfig>());
+        SetupEngineConfigs(TestEngineConfigsPinnedToV2());
         SetupModels(new List<MLModel>());
         SetupCandles(new List<Candle>());
         SetupCOTReports(new List<COTReport>());

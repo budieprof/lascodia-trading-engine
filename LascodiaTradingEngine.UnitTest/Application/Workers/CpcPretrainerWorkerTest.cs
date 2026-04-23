@@ -781,8 +781,56 @@ public class CpcPretrainerWorkerTest
 
         var alert = await db.Set<Alert>().SingleAsync(a =>
             a.AlertType == AlertType.DataQualityIssue &&
+            a.DeduplicationKey != null &&
             a.DeduplicationKey.Contains("StaleEncoder"));
         Assert.Contains("StaleEncoderAlertHours", alert.ConditionJson);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_Auto_Resolves_Stale_Encoder_Alert_When_Replacement_Promotes()
+    {
+        await using var db = CreateDbContext();
+        AddConfig(db, "MLCpc:StaleEncoderAlertHours", "240", ConfigDataType.Int);
+        SeedModelAndCandles(db, "EURUSD", Timeframe.H1, candleCount: 1500);
+        db.Set<MLCpcEncoder>().Add(new MLCpcEncoder
+        {
+            Id = 1,
+            Symbol = "EURUSD",
+            Timeframe = Timeframe.H1,
+            EncoderType = CpcEncoderType.Linear,
+            EmbeddingDim = 16,
+            InfoNceLoss = 10.0,
+            EncoderBytes = [1],
+            TrainedAt = DateTime.UtcNow.AddDays(-20),
+            IsActive = true
+        });
+        await db.SaveChangesAsync();
+
+        var trainer = new Mock<ICpcPretrainer>();
+        trainer.SetupGet(t => t.Kind).Returns(CpcEncoderType.Linear);
+        trainer.Setup(t => t.TrainAsync(It.IsAny<string>(), It.IsAny<Timeframe>(),
+                It.IsAny<IReadOnlyList<float[][]>>(), It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((string s, Timeframe tf, IReadOnlyList<float[][]> _, int embed, int steps, CancellationToken _ct) =>
+                new MLCpcEncoder
+                {
+                    Symbol = s, Timeframe = tf,
+                    EncoderType = CpcEncoderType.Linear,
+                    EmbeddingDim = embed, PredictionSteps = steps,
+                    InfoNceLoss = 1.0,
+                    EncoderBytes = [2],
+                    TrainedAt = DateTime.UtcNow, IsActive = true
+                });
+
+        var worker = CreateWorker(db, trainer.Object);
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        var alert = await db.Set<Alert>().SingleAsync(a =>
+            a.AlertType == AlertType.DataQualityIssue &&
+            a.DeduplicationKey != null &&
+            a.DeduplicationKey.Contains("StaleEncoder"));
+        Assert.False(alert.IsActive);
+        Assert.NotNull(alert.AutoResolvedAt);
+        Assert.True(await db.Set<MLCpcEncoder>().AnyAsync(e => e.Id != 1 && e.IsActive));
     }
 
     [Fact]
@@ -1119,6 +1167,45 @@ public class CpcPretrainerWorkerTest
     }
 
     [Fact]
+    public async Task RunCycleAsync_Auto_Resolves_ConfigurationDrift_Alert_When_EmbeddingDim_Recovers()
+    {
+        await using var db = CreateDbContext();
+        AddConfig(db, "MLCpc:EmbeddingDim", "4", ConfigDataType.Int);
+        SeedModelAndCandles(db, "EURUSD", Timeframe.H1, candleCount: 100);
+        await db.SaveChangesAsync();
+
+        var trainer = new Mock<ICpcPretrainer>();
+        trainer.SetupGet(t => t.Kind).Returns(CpcEncoderType.Linear);
+        var worker = CreateWorker(db, trainer.Object, options: new MLCpcOptions
+        {
+            EmbeddingDim = 16,
+            MinCandles = 1000,
+            SequenceLength = 60,
+            PollIntervalSeconds = 3600,
+            ConfigurationDriftAlertCycles = 1,
+        });
+
+        await worker.RunCycleAsync(CancellationToken.None);
+        var active = Assert.Single(await db.Set<Alert>()
+            .Where(a => a.AlertType == AlertType.ConfigurationDrift && a.IsActive)
+            .ToListAsync());
+        Assert.NotNull(active.DeduplicationKey);
+        Assert.Contains("embedding_dim", active.DeduplicationKey);
+
+        var config = await db.Set<EngineConfig>().SingleAsync(c => c.Key == "MLCpc:EmbeddingDim");
+        config.Value = "16";
+        await db.SaveChangesAsync();
+
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        var resolved = Assert.Single(await db.Set<Alert>()
+            .Where(a => a.AlertType == AlertType.ConfigurationDrift)
+            .ToListAsync());
+        Assert.False(resolved.IsActive);
+        Assert.NotNull(resolved.AutoResolvedAt);
+    }
+
+    [Fact]
     public async Task RunCycleAsync_Raises_ConfigurationDrift_Alert_When_No_Pretrainer_Matches()
     {
         await using var db = CreateDbContext();
@@ -1214,6 +1301,8 @@ public class CpcPretrainerWorkerTest
         var alerts = await db.Set<Alert>().Where(a => a.AlertType == AlertType.DataQualityIssue).ToListAsync();
         var alert = Assert.Single(alerts);
         Assert.Contains("\"ConsecutiveFailures\":2", alert.ConditionJson);
+        Assert.False(alert.IsActive);
+        Assert.NotNull(alert.AutoResolvedAt);
         Assert.True(await db.Set<MLCpcEncoder>().AnyAsync(e => e.IsActive));
     }
 
@@ -1318,7 +1407,9 @@ public class CpcPretrainerWorkerTest
         await worker.RunCycleAsync(CancellationToken.None);
         await worker.RunCycleAsync(CancellationToken.None);
 
-        var alerts = await db.Set<Alert>().Where(a => a.DeduplicationKey.Contains("StaleEncoder")).ToListAsync();
+        var alerts = await db.Set<Alert>()
+            .Where(a => a.DeduplicationKey != null && a.DeduplicationKey.Contains("StaleEncoder"))
+            .ToListAsync();
         Assert.Single(alerts);
     }
 

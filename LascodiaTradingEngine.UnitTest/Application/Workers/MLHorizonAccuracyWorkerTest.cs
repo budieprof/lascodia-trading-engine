@@ -3,6 +3,7 @@ using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
+using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Workers;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
@@ -263,23 +264,195 @@ public class MLHorizonAccuracyWorkerTest
     }
 
     [Fact]
+    public async Task ComputeAllModelsAsync_DoesNotResurrectSoftDeletedHistoryRows()
+    {
+        await using var fixture = await HorizonFixture.CreateAsync();
+        var db = fixture.Db;
+        var model = await SeedActiveModelAsync(db);
+        var t0 = DateTime.UtcNow.AddDays(-1);
+
+        db.Set<EngineConfig>().Add(Config("MLHorizon:MinPredictions", "1"));
+        db.Set<MLModelHorizonAccuracy>().AddRange(
+            DeletedHorizonRow(model, 3, t0.AddDays(-10)),
+            DeletedHorizonRow(model, 3, t0.AddDays(-5)));
+
+        await SeedPredictionAsync(db, model, t0, TradeDirection.Buy, true, true, null, null);
+        await db.SaveChangesAsync();
+        db.ChangeTracker.Clear();
+
+        await CreateAccuracyWorker().ComputeAllModelsAsync(db, db, CancellationToken.None);
+        db.ChangeTracker.Clear();
+
+        var allH3Rows = await db.Set<MLModelHorizonAccuracy>()
+            .IgnoreQueryFilters()
+            .Where(r => r.MLModelId == model.Id && r.HorizonBars == 3)
+            .ToListAsync();
+
+        Assert.Equal(3, allH3Rows.Count);
+        Assert.Equal(1, allH3Rows.Count(r => !r.IsDeleted));
+        Assert.Equal(2, allH3Rows.Count(r => r.IsDeleted));
+
+        var active = Assert.Single(allH3Rows, r => !r.IsDeleted);
+        Assert.True(active.IsReliable);
+        Assert.Equal("Computed", active.Status);
+        Assert.Equal(1.0, active.Accuracy);
+    }
+
+    [Fact]
+    public async Task ComputeAllModelsAsync_ResolvesActiveGapAlertWhenBreachClears()
+    {
+        await using var fixture = await HorizonFixture.CreateAsync();
+        var db = fixture.Db;
+        var model = await SeedActiveModelAsync(db);
+        var t0 = DateTime.UtcNow.AddDays(-1);
+        var dedupKey = $"MLHorizon:{model.Id}:{model.Symbol}:{model.Timeframe}:3";
+
+        db.Set<EngineConfig>().AddRange(
+            Config("MLHorizon:MinPredictions", "2"),
+            Config("MLHorizon:HorizonGapThreshold", "0.10"));
+        db.Set<Alert>().Add(new Alert
+        {
+            Symbol = model.Symbol,
+            AlertType = AlertType.MLModelDegraded,
+            DeduplicationKey = dedupKey,
+            ConditionJson = "{}",
+            Severity = AlertSeverity.Medium,
+            CooldownSeconds = 3600,
+            IsActive = true,
+        });
+
+        await SeedPredictionAsync(db, model, t0.AddMinutes(1), TradeDirection.Buy, true, true, null, null);
+        await SeedPredictionAsync(db, model, t0.AddMinutes(2), TradeDirection.Buy, true, true, null, null);
+        await db.SaveChangesAsync();
+        db.ChangeTracker.Clear();
+
+        await CreateAccuracyWorker().ComputeAllModelsAsync(db, db, CancellationToken.None);
+        db.ChangeTracker.Clear();
+
+        var alert = await db.Set<Alert>()
+            .SingleAsync(a => a.DeduplicationKey == dedupKey);
+
+        Assert.False(alert.IsActive);
+        Assert.NotNull(alert.AutoResolvedAt);
+    }
+
+    [Fact]
+    public async Task ComputeAllModelsAsync_RefreshesExistingGapAlertWhenBreachPersists()
+    {
+        await using var fixture = await HorizonFixture.CreateAsync();
+        var db = fixture.Db;
+        var model = await SeedActiveModelAsync(db);
+        var t0 = DateTime.UtcNow.AddDays(-1);
+        var dedupKey = $"MLHorizon:{model.Id}:{model.Symbol}:{model.Timeframe}:3";
+
+        db.Set<EngineConfig>().AddRange(
+            Config("MLHorizon:MinPredictions", "2"),
+            Config("MLHorizon:HorizonGapThreshold", "0.10"),
+            Config("MLHorizon:AlertDestination", "fresh-desk"));
+        db.Set<Alert>().Add(new Alert
+        {
+            Symbol = model.Symbol,
+            AlertType = AlertType.MLModelDegraded,
+            DeduplicationKey = dedupKey,
+            ConditionJson = """{"reason":"old_payload"}""",
+            Severity = AlertSeverity.Info,
+            CooldownSeconds = 30,
+            AutoResolvedAt = t0.AddHours(-1),
+            IsActive = true,
+        });
+
+        await SeedPredictionAsync(db, model, t0.AddMinutes(1), TradeDirection.Buy, true, false, null, null);
+        await SeedPredictionAsync(db, model, t0.AddMinutes(2), TradeDirection.Buy, true, false, null, null);
+        await db.SaveChangesAsync();
+        db.ChangeTracker.Clear();
+
+        await CreateAccuracyWorker().ComputeAllModelsAsync(db, db, CancellationToken.None);
+        db.ChangeTracker.Clear();
+
+        var alert = await db.Set<Alert>()
+            .SingleAsync(a => a.DeduplicationKey == dedupKey);
+
+        Assert.True(alert.IsActive);
+        Assert.Null(alert.AutoResolvedAt);
+        Assert.Equal(AlertSeverity.Medium, alert.Severity);
+        Assert.Equal(3600, alert.CooldownSeconds);
+        Assert.Contains("\"reason\":\"horizon_accuracy_gap\"", alert.ConditionJson);
+        Assert.Contains("\"alertDestination\":\"fresh-desk\"", alert.ConditionJson);
+        Assert.Contains("\"sampleCount\":2", alert.ConditionJson);
+    }
+
+    [Fact]
     public void HorizonAccuracyHelpers_RejectUnsafeValuesAndComputeWilsonBound()
     {
         Assert.Equal(3600, MLHorizonAccuracyWorker.NormalizePollSeconds(0));
         Assert.Equal(30, MLHorizonAccuracyWorker.NormalizeWindowDays(-1));
         Assert.Equal(20, MLHorizonAccuracyWorker.NormalizeMinPredictions(0));
+        Assert.Equal(20, MLHorizonAccuracyWorker.NormalizeMinPredictions(1_000_001));
         Assert.Equal(0.10, MLHorizonAccuracyWorker.NormalizeProbability(double.NaN, 0.10));
         Assert.Equal(1.96, MLHorizonAccuracyWorker.NormalizeWilsonZ(double.PositiveInfinity));
         Assert.Equal("ml-ops", MLHorizonAccuracyWorker.NormalizeDestination(" "));
+        Assert.Equal(100, MLHorizonAccuracyWorker.NormalizeDestination(new string('x', 101)).Length);
 
         double lower = MLHorizonAccuracyWorker.WilsonLowerBound(8, 10, 1.96);
         Assert.InRange(lower, 0.49, 0.50);
+        Assert.Equal(1.0, MLHorizonAccuracyWorker.WilsonLowerBound(20, 10, 0));
     }
 
-    private static MLHorizonAccuracyWorker CreateAccuracyWorker()
+    [Fact]
+    public void HorizonAccuracyHelpers_ClassifyOnlyExpectedUniqueConstraintViolations()
+    {
+        var sqliteHorizonUnique = new DbUpdateException(
+            "save failed",
+            new InvalidOperationException(
+                "SQLite Error 19: 'UNIQUE constraint failed: MLModelHorizonAccuracy.MLModelId, MLModelHorizonAccuracy.HorizonBars'."));
+
+        Assert.True(MLHorizonAccuracyWorker.IsExpectedUniqueConstraintViolation(
+            sqliteHorizonUnique,
+            "IX_MLModelHorizonAccuracy_MLModelId_HorizonBars",
+            requiredMessageTokens:
+            [
+                "MLModelHorizonAccuracy",
+                "MLModelId",
+                "HorizonBars"
+            ]));
+
+        Assert.False(MLHorizonAccuracyWorker.IsExpectedUniqueConstraintViolation(
+            sqliteHorizonUnique,
+            "IX_Alert_DeduplicationKey",
+            requiredMessageTokens:
+            [
+                "Alert",
+                "DeduplicationKey"
+            ]));
+
+        var postgresAlertUnique = new DbUpdateException(
+            "duplicate key value violates unique constraint \"IX_Alert_DeduplicationKey\"",
+            new InvalidOperationException("23505"));
+
+        Assert.True(MLHorizonAccuracyWorker.IsExpectedUniqueConstraintViolation(
+            postgresAlertUnique,
+            "IX_Alert_DeduplicationKey",
+            new TestDatabaseExceptionClassifier(isUnique: true),
+            "Alert",
+            "DeduplicationKey"));
+
+        var nonUnique = new DbUpdateException(
+            "write failed",
+            new TimeoutException("timed out"));
+
+        Assert.False(MLHorizonAccuracyWorker.IsExpectedUniqueConstraintViolation(
+            nonUnique,
+            "IX_Alert_DeduplicationKey",
+            new TestDatabaseExceptionClassifier(isUnique: false),
+            "Alert",
+            "DeduplicationKey"));
+    }
+
+    private static MLHorizonAccuracyWorker CreateAccuracyWorker(IDatabaseExceptionClassifier? classifier = null)
         => new(
             Mock.Of<IServiceScopeFactory>(),
-            NullLogger<MLHorizonAccuracyWorker>.Instance);
+            NullLogger<MLHorizonAccuracyWorker>.Instance,
+            classifier);
 
     private static async Task<MLModel> SeedActiveModelAsync(HorizonTestDbContext db)
     {
@@ -373,6 +546,31 @@ public class MLHorizonAccuracyWorkerTest
             IsClosed = true,
         };
 
+    private static MLModelHorizonAccuracy DeletedHorizonRow(
+        MLModel model,
+        int horizonBars,
+        DateTime computedAt)
+        => new()
+        {
+            MLModelId = model.Id,
+            Symbol = model.Symbol,
+            Timeframe = model.Timeframe,
+            HorizonBars = horizonBars,
+            TotalPredictions = 10,
+            CorrectPredictions = 8,
+            Accuracy = 0.8,
+            AccuracyLowerBound = 0.7,
+            PrimaryTotalPredictions = 10,
+            PrimaryCorrectPredictions = 8,
+            PrimaryAccuracy = 0.8,
+            PrimaryAccuracyGap = 0.0,
+            IsReliable = true,
+            Status = "Computed",
+            WindowStart = computedAt.AddDays(-30),
+            ComputedAt = computedAt,
+            IsDeleted = true,
+        };
+
     private static EngineConfig Config(string key, string value)
         => new()
         {
@@ -437,5 +635,10 @@ public class MLHorizonAccuracyWorkerTest
                 .IsConcurrencyToken(false)
                 .ValueGeneratedNever();
         }
+    }
+
+    private sealed class TestDatabaseExceptionClassifier(bool isUnique) : IDatabaseExceptionClassifier
+    {
+        public bool IsUniqueConstraintViolation(DbUpdateException ex) => isUnique;
     }
 }

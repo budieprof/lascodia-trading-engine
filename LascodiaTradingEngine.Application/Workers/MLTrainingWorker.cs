@@ -1012,39 +1012,50 @@ public sealed class MLTrainingWorker : BackgroundService
             bool useExtendedVector = await GetConfigAsync<bool>(
                 ctx, CK_UseExtendedFeatureVector, true, stoppingToken);
             // V3 adds cross-asset (DXY/US10Y/VIX) + event-proximity features on top of V2.
-            // Off by default because V3 expects DXY/US10Y/VIX candles to be ingested; zero-fill
-            // when missing still produces a valid vector but sacrifices the signal quality
-            // that motivated the extension.
+            // Default flipped to true so the full V2→V7 stack activates by default. Each
+            // feature slot zero-fills when its data source is missing, so an operator whose
+            // DXY/US10Y/VIX stream is not yet wired still gets a valid vector — the signal
+            // quality just degrades until the underlying stream lands. Opt out via
+            // MLTraining:UseEventFeatureVector=false.
             bool useEventFeatureVector = await GetConfigAsync<bool>(
-                ctx, CK_UseEventFeatureVector, false, stoppingToken);
+                ctx, CK_UseEventFeatureVector, true, stoppingToken);
 
             // V4 layers minute-level news proximity + tick-microstructure features on top
-            // of V3. Requires persistent TickRecord (ReceiveTickBatch now writes them) —
-            // without ticks, the 3 microstructure slots zero-fill and V4 degrades to V3
-            // plus 2 calendar features. Only enable once ticks have accumulated (~days).
+            // of V3. Default flipped to true; requires persistent TickRecord
+            // (ReceiveTickBatch now writes them). Without ticks the 3 microstructure slots
+            // zero-fill and V4 degrades gracefully to V3 plus 2 calendar features. Opt out
+            // via MLTraining:UseTickMicrostructureFeatureVector=false.
             bool useTickMicrostructureFeatureVector = await GetConfigAsync<bool>(
-                ctx, "MLTraining:UseTickMicrostructureFeatureVector", false, stoppingToken);
+                ctx, "MLTraining:UseTickMicrostructureFeatureVector", true, stoppingToken);
 
             // V5 adds 4 synthetic-microstructure proxies on top of V4 — EffectiveSpread,
             // AmihudIlliquidity, RollSpreadEstimate, VarianceRatio. Computed from the same
-            // tick stream V4 uses (no extra data source). Implies V4 + event-vector + ticks.
+            // tick stream V4 uses (no extra data source). Default true; falls through to
+            // V4 semantics when ticks are unavailable. Opt out via
+            // MLTraining:UseV5SyntheticMicrostructure=false.
             bool useV5SyntheticMicrostructure = await GetConfigAsync<bool>(
-                ctx, "MLTraining:UseV5SyntheticMicrostructure", false, stoppingToken);
+                ctx, "MLTraining:UseV5SyntheticMicrostructure", true, stoppingToken);
 
             // V6 adds 5 real-DOM features on top of V5 — BookImbalance{Top1,Top5},
-            // TotalLiquidityNorm, BookSlopeBid/Ask. Requires the EA to stream depth
-            // via MarketBookAdd → ReceiveOrderBookSnapshot. Symbols where the broker
-            // doesn't expose DOM still get a vector; the DOM slots zero-fill.
+            // TotalLiquidityNorm, BookSlopeBid/Ask. Default flipped to true so V7 (which
+            // extends V6) fires by default; requires the EA to stream depth via
+            // MarketBookAdd → ReceiveOrderBookSnapshot. Symbols whose broker does not
+            // expose DOM still get a vector — the DOM slots zero-fill. Opt out via
+            // MLTraining:UseV6OrderBookFeatures=false.
             bool useV6OrderBook = await GetConfigAsync<bool>(
-                ctx, "MLTraining:UseV6OrderBookFeatures", false, stoppingToken);
+                ctx, "MLTraining:UseV6OrderBookFeatures", true, stoppingToken);
 
             // V7 appends a fixed MLFeatureHelper.CpcEmbeddingBlockSize-sized CPC context
             // embedding to the V6 vector, sourced per (symbol, timeframe) from the active
-            // MLCpcEncoder. Requires V6OrderBook to be on (V7 extends V6). Zero-fills the
-            // block when no active encoder exists so training doesn't stall while the
-            // CpcPretrainerWorker catches up.
+            // MLCpcEncoder. Default flipped to true: once V6 data prerequisites (DOM
+            // streaming) are in place, V7 layers on transparently — a missing encoder
+            // zero-fills the block, so training never stalls while CpcPretrainerWorker
+            // catches up. V7 only actually fires when the full V2→V6 chain is also on
+            // (each of those remains opt-in because it has its own data prerequisites —
+            // cross-asset candles, persistent ticks, DOM snapshots). Operators wanting
+            // pure-V6 behaviour can opt out via MLTraining:UseV7CpcFeatureVector=false.
             bool useV7CpcFeatureVector = await GetConfigAsync<bool>(
-                ctx, "MLTraining:UseV7CpcFeatureVector", false, stoppingToken);
+                ctx, "MLTraining:UseV7CpcFeatureVector", true, stoppingToken);
 
             Dictionary<string, (DateTime[] Times, double[] Closes)>? basket = null;
             if (useExtendedVector && candles.Count > 0)

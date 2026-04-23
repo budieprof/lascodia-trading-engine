@@ -81,12 +81,16 @@ public sealed class CpcEncoderPromotionService : ICpcEncoderPromotionService
         if (string.Equals(writeCtx.Database.ProviderName, PostgresProvider, StringComparison.Ordinal))
             return LoadActiveRowsForPromotionWithUpdateLockAsync(writeCtx, request, ct);
 
-        return writeCtx.Set<MLCpcEncoder>()
+        var query = writeCtx.Set<MLCpcEncoder>()
             .Where(e => e.Symbol == request.Symbol
                      && e.Timeframe == request.Timeframe
-                     && e.Regime == request.Regime
                      && e.IsActive
-                     && !e.IsDeleted)
+                     && !e.IsDeleted);
+        query = request.Regime is null
+            ? query.Where(e => e.Regime == null)
+            : query.Where(e => e.Regime == request.Regime.Value);
+
+        return query
             .OrderByDescending(e => e.TrainedAt)
             .ThenByDescending(e => e.Id)
             .ToListAsync(ct);
