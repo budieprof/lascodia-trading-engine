@@ -158,12 +158,29 @@ builder.Services.AddAuthentication("Bearer")
         // Browsers can't send Authorization headers on WebSocket upgrades, so SignalR
         // clients pass the JWT in the `access_token` query string. We only honour it for
         // requests targeting /api/hubs to keep the surface tight.
+        //
+        // Additionally: web logins land their JWT in an HttpOnly `lascodia-auth`
+        // cookie (see `TradingAccountAuthController`). When no Authorization header
+        // is present, try the cookie so normal REST calls with credentials work.
         OnMessageReceived = context =>
         {
+            // Priority 1: `access_token` on WebSocket handshakes.
             var accessToken = context.Request.Query["access_token"];
             var path = context.HttpContext.Request.Path;
             if (!string.IsNullOrEmpty(accessToken) && path.StartsWithSegments("/api/hubs"))
+            {
                 context.Token = accessToken;
+                return Task.CompletedTask;
+            }
+
+            // Priority 2: cookie fallback for cookie-authenticated web sessions.
+            if (string.IsNullOrEmpty(context.Token)
+                && string.IsNullOrEmpty(context.Request.Headers.Authorization))
+            {
+                var cookieToken = context.Request.Cookies["lascodia-auth"];
+                if (!string.IsNullOrEmpty(cookieToken))
+                    context.Token = cookieToken;
+            }
             return Task.CompletedTask;
         },
 

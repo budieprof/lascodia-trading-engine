@@ -1,3 +1,4 @@
+using System.Globalization;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.DependencyInjection;
@@ -61,11 +62,18 @@ public sealed class DrawdownRecoveryModeProvider
             .Select(c => new { c.Key, c.Value })
             .ToListAsync(ct);
 
-        var mode = rows.FirstOrDefault(r => r.Key == "DrawdownRecovery:ActiveMode")?.Value ?? "Normal";
+        var mode = rows.FirstOrDefault(r => r.Key == "DrawdownRecovery:ActiveMode")?.Value?.Trim();
+        if (string.IsNullOrWhiteSpace(mode))
+            mode = DefaultSnapshot.Mode;
+
         var multiplier = DefaultSnapshot.ReducedLotMultiplier;
         var rawMultiplier = rows.FirstOrDefault(r => r.Key == "DrawdownRecovery:ReducedLotMultiplier")?.Value;
-        if (rawMultiplier is not null && decimal.TryParse(rawMultiplier, out var parsed) && parsed > 0)
-            multiplier = parsed;
+        if (rawMultiplier is not null &&
+            decimal.TryParse(rawMultiplier, NumberStyles.Number, CultureInfo.InvariantCulture, out var parsed) &&
+            parsed > 0)
+        {
+            multiplier = Math.Clamp(parsed, 0.01m, 1.0m);
+        }
 
         var snapshot = new DrawdownRecoverySnapshot(mode, multiplier);
         _cache.Set(CacheKey, snapshot, CacheTtl);

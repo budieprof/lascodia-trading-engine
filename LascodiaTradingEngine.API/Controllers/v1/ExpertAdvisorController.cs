@@ -70,11 +70,13 @@ public class ExpertAdvisorController : AuthControllerBase<ExpertAdvisorControlle
 
     /// <summary>Process a heartbeat from an EA instance</summary>
     [HttpPost("heartbeat")]
+    [Authorize(Policy = Policies.EAIngest)]
     public async Task<IActionResult> Heartbeat(ProcessHeartbeatCommand command)
         => Ok(await Mediator.Send(command));
 
     /// <summary>Receive symbol specifications from the EA</summary>
     [HttpPost("symbol-specs")]
+    [Authorize(Policy = Policies.EAIngest)]
     public async Task<IActionResult> ReceiveSymbolSpecs(ReceiveSymbolSpecsCommand command)
         => Ok(await Mediator.Send(command));
 
@@ -86,32 +88,38 @@ public class ExpertAdvisorController : AuthControllerBase<ExpertAdvisorControlle
 
     /// <summary>Receive trading session schedule data from the EA</summary>
     [HttpPost("trading-sessions")]
+    [Authorize(Policy = Policies.EAIngest)]
     public async Task<IActionResult> ReceiveTradingSessions(ReceiveTradingSessionsCommand command)
         => Ok(await Mediator.Send(command));
 
     /// <summary>Receive a snapshot of open positions from the EA</summary>
     [HttpPost("positions/snapshot")]
+    [Authorize(Policy = Policies.EAIngest)]
     public async Task<IActionResult> ReceivePositionSnapshot(ReceivePositionSnapshotCommand command)
         => Ok(await Mediator.Send(command));
 
     /// <summary>Receive an account-level broker balance/equity snapshot from the EA</summary>
     [HttpPost("account/snapshot")]
+    [Authorize(Policy = Policies.EAIngest)]
     public async Task<IActionResult> ReceiveBrokerAccountSnapshot(ReceiveBrokerAccountSnapshotCommand command)
         => Ok(await Mediator.Send(command));
 
     /// <summary>Receive a snapshot of pending orders from the EA</summary>
     [HttpPost("orders/snapshot")]
+    [Authorize(Policy = Policies.EAIngest)]
     public async Task<IActionResult> ReceiveOrderSnapshot(ReceiveOrderSnapshotCommand command)
         => Ok(await Mediator.Send(command));
 
     /// <summary>Receive a snapshot of recent deals from the EA</summary>
     [HttpPost("deals/snapshot")]
+    [Authorize(Policy = Policies.EAIngest)]
     public async Task<IActionResult> ReceiveDealSnapshot(ReceiveDealSnapshotCommand command)
         => Ok(await Mediator.Send(command));
 
     /// <summary>Receive an order-book (DOM) snapshot from the EA — top of book plus
     /// optional multi-level depth via MarketBookGet when the broker exposes it.</summary>
     [HttpPost("orderbook/snapshot")]
+    [Authorize(Policy = Policies.EAIngest)]
     public async Task<IActionResult> ReceiveOrderBookSnapshot(
         LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ReceiveOrderBookSnapshot.ReceiveOrderBookSnapshotCommand command)
         => Ok(await Mediator.Send(command));
@@ -135,6 +143,7 @@ public class ExpertAdvisorController : AuthControllerBase<ExpertAdvisorControlle
 
     /// <summary>Acknowledge execution of a command by the EA</summary>
     [HttpPut("commands/{id}/ack")]
+    [Authorize(Policy = Policies.EAIngest)]
     public async Task<IActionResult> AcknowledgeCommand(long id, AcknowledgeCommandCommand command)
     {
         command.Id = id;
@@ -158,11 +167,13 @@ public class ExpertAdvisorController : AuthControllerBase<ExpertAdvisorControlle
 
     /// <summary>Receive signal feedback from EA (deferred, dropped, expired signals)</summary>
     [HttpPost("signal-feedback")]
+    [Authorize(Policy = Policies.EAIngest)]
     public async Task<IActionResult> ProcessSignalFeedback(ProcessSignalFeedbackCommand command)
         => Ok(await Mediator.Send(command));
 
     /// <summary>Receive incremental position changes (opened/closed/modified)</summary>
     [HttpPost("positions/delta")]
+    [Authorize(Policy = Policies.EAIngest)]
     public async Task<IActionResult> ReceivePositionDelta(ReceivePositionDeltaCommand command)
         => Ok(await Mediator.Send(command));
 }

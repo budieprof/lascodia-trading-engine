@@ -2,6 +2,7 @@ using FluentValidation.TestHelper;
 using Microsoft.EntityFrameworkCore;
 using Moq;
 using MockQueryable.Moq;
+using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Sentiment.Commands.RecordSentiment;
 using LascodiaTradingEngine.Domain.Entities;
@@ -11,19 +12,24 @@ namespace LascodiaTradingEngine.UnitTest.Application.Sentiment;
 public class RecordSentimentCommandTest
 {
     private readonly Mock<IWriteApplicationDbContext> _mockWriteContext;
+    private readonly Mock<IIntegrationEventService> _mockEventBus;
     private readonly RecordSentimentCommandHandler _handler;
     private readonly RecordSentimentCommandValidator _validator;
 
     public RecordSentimentCommandTest()
     {
         _mockWriteContext = new Mock<IWriteApplicationDbContext>();
+        _mockEventBus = new Mock<IIntegrationEventService>();
 
         var mockDbContext = new Mock<DbContext>();
         var snapshots = new List<SentimentSnapshot>().AsQueryable().BuildMockDbSet();
         mockDbContext.Setup(c => c.Set<SentimentSnapshot>()).Returns(snapshots.Object);
         _mockWriteContext.Setup(c => c.GetDbContext()).Returns(mockDbContext.Object);
+        _mockEventBus
+            .Setup(bus => bus.SaveAndPublish(_mockWriteContext.Object, It.IsAny<Lascodia.Trading.Engine.EventBus.Events.IntegrationEvent>()))
+            .Returns(Task.CompletedTask);
 
-        _handler = new RecordSentimentCommandHandler(_mockWriteContext.Object);
+        _handler = new RecordSentimentCommandHandler(_mockWriteContext.Object, _mockEventBus.Object);
         _validator = new RecordSentimentCommandValidator();
     }
 

@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -44,12 +45,17 @@ namespace LascodiaTradingEngine.Application.Workers;
 /// Configurable thresholds (EngineConfig keys with defaults):
 /// <list type="bullet">
 ///   <item><description><c>DrawdownRecovery:PollIntervalSeconds</c> — default 30 s</description></item>
+///   <item><description><c>DrawdownRecovery:SnapshotStaleAfterSeconds</c> — default 180 s</description></item>
 /// </list>
 /// </summary>
 public sealed class DrawdownRecoveryWorker : BackgroundService
 {
+    private const int DefaultPollIntervalSeconds = 30;
+    private const int DefaultSnapshotStaleAfterSeconds = 180;
+
     /// <summary>EngineConfig key that stores the polling interval in seconds (default 30).</summary>
     private const string CK_PollSecs       = "DrawdownRecovery:PollIntervalSeconds";
+    private const string CK_SnapshotStaleAfterSecs = "DrawdownRecovery:SnapshotStaleAfterSeconds";
 
     /// <summary>
     /// EngineConfig key that stores the currently enforced <see cref="RecoveryMode"/>
@@ -66,11 +72,15 @@ public sealed class DrawdownRecoveryWorker : BackgroundService
     /// strategies paused manually by the operator are not reactivated without consent.
     /// </summary>
     private const string CK_AutoPausedIds  = "DrawdownRecovery:AutoPausedStrategyIds";
+    private const string DrawdownPauseReason = "DrawdownRecovery";
+    private const string EmptyAutoPausedIdsJson = "[]";
 
     private readonly IServiceScopeFactory            _scopeFactory;
     private readonly ILogger<DrawdownRecoveryWorker> _logger;
     private readonly DrawdownRecoveryModeProvider _modeProvider;
+    private readonly TimeProvider _timeProvider;
     private int _consecutiveErrors;
+    private long? _lastStaleSnapshotWarningId;
 
     /// <summary>
     /// Initialises the worker.
@@ -81,11 +91,13 @@ public sealed class DrawdownRecoveryWorker : BackgroundService
     public DrawdownRecoveryWorker(
         IServiceScopeFactory             scopeFactory,
         DrawdownRecoveryModeProvider     modeProvider,
-        ILogger<DrawdownRecoveryWorker>  logger)
+        ILogger<DrawdownRecoveryWorker>  logger,
+        TimeProvider?                    timeProvider = null)
     {
         _scopeFactory = scopeFactory;
         _modeProvider = modeProvider;
         _logger       = logger;
+        _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     /// <summary>
@@ -104,26 +116,12 @@ public sealed class DrawdownRecoveryWorker : BackgroundService
 
         while (!stoppingToken.IsCancellationRequested)
         {
-            // Default interval used if the EngineConfig row has not been created yet.
-            int pollSecs = 30;
+            int pollSecs = DefaultPollIntervalSeconds;
 
             try
             {
-                // Create a new async scope per cycle — this ensures scoped EF contexts
-                // (IReadApplicationDbContext, IWriteApplicationDbContext) are freshly
-                // instantiated and disposed after each cycle.
-                await using var scope = _scopeFactory.CreateAsyncScope();
-                var readDb  = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
-                var writeDb = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
-                var mediator = scope.ServiceProvider.GetRequiredService<IMediator>();
-                var ctx      = readDb.GetDbContext();
-                var writeCtx = writeDb.GetDbContext();
-
-                // Hot-reload the poll interval from EngineConfig on every cycle
-                // so operators can adjust frequency without restarting the engine.
-                pollSecs = await GetConfigAsync<int>(ctx, CK_PollSecs, 30, stoppingToken);
-
-                await EnforceModeAsync(ctx, writeCtx, mediator, stoppingToken);
+                pollSecs = await ReadPollIntervalSecondsAsync(stoppingToken);
+                await RunCycleAsync(stoppingToken);
                 _consecutiveErrors = 0;
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
@@ -146,6 +144,39 @@ public sealed class DrawdownRecoveryWorker : BackgroundService
         }
 
         _logger.LogInformation("DrawdownRecoveryWorker stopping.");
+    }
+
+    /// <summary>
+    /// Runs a single enforcement cycle. Internal for deterministic unit test access.
+    /// </summary>
+    internal async Task RunCycleAsync(CancellationToken ct)
+    {
+        // Create a new async scope per cycle — this ensures scoped EF contexts
+        // (IReadApplicationDbContext, IWriteApplicationDbContext) are freshly
+        // instantiated and disposed after each cycle.
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        var writeDb  = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+        var mediator = scope.ServiceProvider.GetRequiredService<IMediator>();
+
+        await EnforceModeAsync(
+            writeDb.GetDbContext(),
+            mediator,
+            ct);
+    }
+
+    /// <summary>
+    /// Reads and normalizes the hot-reloadable poll interval.
+    /// Internal for deterministic unit test access.
+    /// </summary>
+    internal async Task<int> ReadPollIntervalSecondsAsync(CancellationToken ct)
+    {
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        var readDb = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+        return await GetPositiveIntConfigAsync(
+            readDb.GetDbContext(),
+            CK_PollSecs,
+            DefaultPollIntervalSeconds,
+            ct);
     }
 
     // ── Core enforcement ──────────────────────────────────────────────────────
@@ -177,103 +208,154 @@ public sealed class DrawdownRecoveryWorker : BackgroundService
     /// Every transition is recorded in the audit trail via <see cref="LogDecisionCommand"/>.
     /// </summary>
     private async Task EnforceModeAsync(
-        Microsoft.EntityFrameworkCore.DbContext readCtx,
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
         IMediator                               mediator,
         CancellationToken                       ct)
     {
-        // Load latest drawdown snapshot — this is the source of truth for the current mode.
-        var latest = await readCtx.Set<DrawdownSnapshot>()
-            .OrderByDescending(s => s.RecordedAt)
-            .AsNoTracking()
-            .FirstOrDefaultAsync(ct);
+        bool modeTransitionCommitted = false;
+        var strategy = writeCtx.Database.CreateExecutionStrategy();
 
-        // No snapshots yet (e.g. engine just started) — nothing to enforce.
-        if (latest is null) return;
-
-        RecoveryMode currentMode = latest.RecoveryMode;
-
-        // Read the previously enforced mode from EngineConfig.
-        // This acts as the worker's persistent state across restarts.
-        var modeEntry = await readCtx.Set<EngineConfig>()
-            .AsNoTracking()
-            .FirstOrDefaultAsync(c => c.Key == CK_ActiveMode, ct);
-
-        RecoveryMode previousMode = RecoveryMode.Normal;
-        if (modeEntry?.Value is not null &&
-            Enum.TryParse<RecoveryMode>(modeEntry.Value, out var parsed))
+        await strategy.ExecuteAsync(async token =>
         {
-            previousMode = parsed;
-        }
+            await using var tx = await writeCtx.Database.BeginTransactionAsync(token);
 
-        // Early exit — mode has not changed, no action required.
-        if (currentMode == previousMode) return;
+            // Load latest drawdown snapshot inside the transaction so the worker acts on
+            // the most current persisted mode available at the moment enforcement begins.
+            var latest = await LoadLatestSnapshotAsync(writeCtx, token);
 
-        _logger.LogInformation(
-            "DrawdownRecoveryWorker: mode transition {From} → {To} (DrawdownPct={DD:F2}%)",
-            previousMode, currentMode, latest.DrawdownPct);
+            // No snapshots yet (e.g. engine just started) — nothing to enforce.
+            if (latest is null)
+                return;
 
-        // ── Handle transition ─────────────────────────────────────────────────
-        if (currentMode == RecoveryMode.Halted)
-        {
-            // Critical drawdown threshold crossed — pause all active strategies immediately
-            // to stop the engine from accumulating further losses.
-            await PauseAllActiveStrategiesAsync(writeCtx, mediator, latest.DrawdownPct, ct);
-        }
-        else if (previousMode == RecoveryMode.Halted)
-        {
-            // Account has recovered from a halted state — re-enable only the strategies
-            // this worker paused automatically. Manually paused strategies are intentionally
-            // excluded to avoid overriding an operator's explicit pause decision.
-            await ResumeAutoPausedStrategiesAsync(readCtx, writeCtx, mediator, ct);
+            var snapshotRecordedAtUtc = NormalizeUtc(latest.RecordedAt);
+            int staleAfterSeconds = await ReadSnapshotStaleAfterSecondsAsync(writeCtx, token);
+            var snapshotAge = _timeProvider.GetUtcNow().UtcDateTime - snapshotRecordedAtUtc;
+            if (snapshotAge < TimeSpan.Zero)
+                snapshotAge = TimeSpan.Zero;
 
-            // If the new mode is Reduced (not Normal), log that strategies are resumed
-            // but should continue with reduced lot sizing until fully recovered.
-            if (currentMode == RecoveryMode.Reduced)
+            // Defensive stale-data guard: do not pause or resume strategies from an old
+            // snapshot if DrawdownMonitorWorker has stalled or the engine just restarted.
+            if (snapshotAge > TimeSpan.FromSeconds(staleAfterSeconds))
             {
+                if (_lastStaleSnapshotWarningId != latest.Id)
+                {
+                    _logger.LogWarning(
+                        "DrawdownRecoveryWorker: latest drawdown snapshot {SnapshotId} is stale (RecordedAt={RecordedAt:o}, AgeSeconds={Age:F0}, MaxAgeSeconds={MaxAge}). " +
+                        "Skipping enforcement until a fresh snapshot arrives.",
+                        latest.Id,
+                        snapshotRecordedAtUtc,
+                        snapshotAge.TotalSeconds,
+                        staleAfterSeconds);
+                    _lastStaleSnapshotWarningId = latest.Id;
+                }
+
+                return;
+            }
+
+            _lastStaleSnapshotWarningId = null;
+
+            RecoveryMode currentMode = latest.RecoveryMode;
+            RecoveryMode previousMode = await ReadPersistedModeAsync(writeCtx, token);
+
+            // Early exit — mode has not changed, no action required.
+            if (currentMode == previousMode)
+                return;
+
+            _logger.LogInformation(
+                "DrawdownRecoveryWorker: mode transition {From} → {To} (DrawdownPct={DD:F2}%, SnapshotId={SnapshotId}, RecordedAt={RecordedAt:o})",
+                previousMode, currentMode, latest.DrawdownPct, latest.Id, snapshotRecordedAtUtc);
+
+            List<long> pausedIds = [];
+            List<long> resumedIds = [];
+
+            // ── Handle transition ─────────────────────────────────────────────
+            if (currentMode == RecoveryMode.Halted)
+            {
+                // Critical drawdown threshold crossed — pause all active strategies immediately
+                // to stop the engine from accumulating further losses.
+                pausedIds = await PauseAllActiveStrategiesAsync(
+                    writeCtx,
+                    mediator,
+                    latest,
+                    previousMode,
+                    currentMode,
+                    snapshotAge,
+                    token);
+            }
+            else if (previousMode == RecoveryMode.Halted)
+            {
+                // Account has recovered from a halted state — re-enable only the strategies
+                // this worker paused automatically. Manually paused strategies are intentionally
+                // excluded to avoid overriding an operator's explicit pause decision.
+                resumedIds = await ResumeAutoPausedStrategiesAsync(
+                    writeCtx,
+                    mediator,
+                    latest,
+                    previousMode,
+                    currentMode,
+                    snapshotAge,
+                    token);
+
+                // If the new mode is Reduced (not Normal), log that strategies are resumed
+                // but should continue with reduced lot sizing until fully recovered.
+                if (currentMode == RecoveryMode.Reduced)
+                {
+                    _logger.LogWarning(
+                        "DrawdownRecoveryWorker: transitioned Halted → Reduced (not yet Normal). " +
+                        "Strategies resumed but lot sizing should remain reduced. DrawdownPct={DD:F2}%",
+                        latest.DrawdownPct);
+                }
+            }
+            else if (currentMode == RecoveryMode.Reduced)
+            {
+                // Drawdown entered the "caution zone" — strategies continue but should
+                // reduce lot sizes. The actual lot-size reduction is the responsibility
+                // of the strategy evaluators that read CK_ActiveMode.
                 _logger.LogWarning(
-                    "DrawdownRecoveryWorker: transitioned Halted → Reduced (not yet Normal). " +
-                    "Strategies resumed but lot sizing should remain reduced. DrawdownPct={DD:F2}%",
+                    "DrawdownRecoveryWorker: account entered REDUCED mode — DrawdownPct={DD:F2}%. " +
+                    "Lot sizing should be reduced. Active strategies continue with caution.",
                     latest.DrawdownPct);
             }
-        }
-        else if (currentMode == RecoveryMode.Reduced)
-        {
-            // Drawdown entered the "caution zone" — strategies continue but should
-            // reduce lot sizes. The actual lot-size reduction is the responsibility
-            // of the strategy evaluators that read CK_ActiveMode.
-            _logger.LogWarning(
-                "DrawdownRecoveryWorker: account entered REDUCED mode — DrawdownPct={DD:F2}%. " +
-                "Lot sizing should be reduced. Active strategies continue with caution.",
-                latest.DrawdownPct);
-        }
-        else if (currentMode == RecoveryMode.Normal)
-        {
-            _logger.LogInformation(
-                "DrawdownRecoveryWorker: account returned to NORMAL mode — DrawdownPct={DD:F2}%.",
-                latest.DrawdownPct);
-        }
+            else if (currentMode == RecoveryMode.Normal)
+            {
+                _logger.LogInformation(
+                    "DrawdownRecoveryWorker: account returned to NORMAL mode — DrawdownPct={DD:F2}%.",
+                    latest.DrawdownPct);
+            }
 
-        // ── Persist the new active mode ───────────────────────────────────────
-        // Storing the mode in EngineConfig allows other workers and query handlers to
-        // read the current drawdown state without querying the snapshot table.
-        await UpsertConfigAsync(writeCtx, CK_ActiveMode, currentMode.ToString(), ct);
+            // ── Persist the new active mode ───────────────────────────────────
+            // Storing the mode in EngineConfig allows other workers and query handlers to
+            // read the current drawdown state without querying the snapshot table.
+            await UpsertConfigAsync(writeCtx, CK_ActiveMode, currentMode.ToString(), token);
 
-        // Drop the cached snapshot in DrawdownRecoveryModeProvider so hot-path callers
-        // (StrategyWorker) pick up the new mode on their next signal rather than
-        // waiting for the TTL to expire.
-        _modeProvider.Invalidate();
+            await mediator.Send(new LogDecisionCommand
+            {
+                EntityType   = "Account",
+                EntityId     = 0,
+                DecisionType = "DrawdownModeTransition",
+                Outcome      = currentMode.ToString(),
+                Reason       = $"Mode changed from {previousMode} to {currentMode}. DrawdownPct={latest.DrawdownPct:F2}%",
+                ContextJson  = BuildTransitionAuditContextJson(
+                    latest,
+                    previousMode,
+                    currentMode,
+                    snapshotRecordedAtUtc,
+                    snapshotAge,
+                    pausedIds,
+                    resumedIds),
+                Source       = "DrawdownRecoveryWorker"
+            }, token);
 
-        // Record the transition in the audit trail for compliance and post-incident review.
-        await mediator.Send(new LogDecisionCommand
-        {
-            EntityType   = "Account",
-            EntityId     = 0,
-            DecisionType = "DrawdownModeTransition",
-            Outcome      = currentMode.ToString(),
-            Reason       = $"Mode changed from {previousMode} to {currentMode}. DrawdownPct={latest.DrawdownPct:F2}%",
-            Source       = "DrawdownRecoveryWorker"
+            await tx.CommitAsync(token);
+            modeTransitionCommitted = true;
         }, ct);
+
+        if (modeTransitionCommitted)
+        {
+            // Drop the cached snapshot in DrawdownRecoveryModeProvider only after the
+            // transaction commits so hot-path callers never observe an uncommitted mode.
+            _modeProvider.Invalidate();
+        }
     }
 
     // ── Strategy pause / resume ───────────────────────────────────────────────
@@ -286,43 +368,64 @@ public sealed class DrawdownRecoveryWorker : BackgroundService
     /// </summary>
     /// <param name="writeCtx">Write DB context used for the bulk update and config upsert.</param>
     /// <param name="mediator">MediatR used to write per-strategy audit entries.</param>
-    /// <param name="drawdownPct">Current drawdown percentage, included in audit messages.</param>
     /// <param name="ct">Propagated cancellation token.</param>
-    private async Task PauseAllActiveStrategiesAsync(
+    private async Task<List<long>> PauseAllActiveStrategiesAsync(
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
         IMediator                               mediator,
-        decimal                                 drawdownPct,
+        DrawdownSnapshot                        latest,
+        RecoveryMode                            previousMode,
+        RecoveryMode                            currentMode,
+        TimeSpan                                snapshotAge,
         CancellationToken                       ct)
     {
-        // Collect IDs before the bulk update so we know exactly which strategies were paused.
-        var activeIds = await writeCtx.Set<Strategy>()
+        // Collect candidate IDs before the bulk update. The follow-up query below
+        // re-reads the actual drawdown-owned rows so we never resume a strategy whose
+        // state changed concurrently between the SELECT and UPDATE.
+        var candidateIds = await writeCtx.Set<Strategy>()
             .Where(s => s.Status == StrategyStatus.Active && !s.IsDeleted)
             .Select(s => s.Id)
             .ToListAsync(ct);
 
-        if (activeIds.Count == 0) return;
-
         // Single bulk UPDATE — avoids N round-trips and minimises the window during which
         // strategies could generate new signals before being paused.
-        await writeCtx.Set<Strategy>()
-            .Where(s => activeIds.Contains(s.Id))
-            .ExecuteUpdateAsync(s => s
-                .SetProperty(x => x.Status, StrategyStatus.Paused)
-                .SetProperty(x => x.PauseReason, "DrawdownRecovery"),
-                ct);
+        if (candidateIds.Count > 0)
+        {
+            await writeCtx.Set<Strategy>()
+                .Where(s => candidateIds.Contains(s.Id) &&
+                            s.Status == StrategyStatus.Active &&
+                            !s.IsDeleted)
+                .ExecuteUpdateAsync(s => s
+                    .SetProperty(x => x.Status, StrategyStatus.Paused)
+                    .SetProperty(x => x.PauseReason, DrawdownPauseReason),
+                    ct);
+        }
 
-        // Store the IDs so we can resume exactly these strategies later.
-        // Serialising to JSON allows the list to survive worker restarts.
-        var json = JsonSerializer.Serialize(activeIds);
+        // Re-read the final owned set so we only persist and audit strategies that are
+        // still paused specifically by DrawdownRecovery.
+        var pausedIds = candidateIds.Count == 0
+            ? []
+            : await writeCtx.Set<Strategy>()
+                .AsNoTracking()
+                .Where(s => candidateIds.Contains(s.Id) &&
+                            s.Status == StrategyStatus.Paused &&
+                            s.PauseReason == DrawdownPauseReason &&
+                            !s.IsDeleted)
+                .OrderBy(s => s.Id)
+                .Select(s => s.Id)
+                .ToListAsync(ct);
+
+        // Persist the owned set on every Halted transition, even when empty, so stale
+        // lists from a previous halt cannot be replayed on recovery.
+        var json = SerializeStrategyIds(pausedIds);
         await UpsertConfigAsync(writeCtx, CK_AutoPausedIds, json, ct);
 
         _logger.LogWarning(
             "DrawdownRecoveryWorker: HALTED — paused {Count} active strategy/strategies " +
             "due to DrawdownPct={DD:F2}%. IDs: {Ids}",
-            activeIds.Count, drawdownPct, string.Join(", ", activeIds));
+            pausedIds.Count, latest.DrawdownPct, string.Join(", ", pausedIds));
 
         // Individual audit entries per strategy for a complete, queryable audit trail.
-        foreach (var id in activeIds)
+        foreach (var id in pausedIds)
         {
             await mediator.Send(new LogDecisionCommand
             {
@@ -330,10 +433,19 @@ public sealed class DrawdownRecoveryWorker : BackgroundService
                 EntityId     = id,
                 DecisionType = "AutoPause",
                 Outcome      = "Paused",
-                Reason       = $"Account entered Halted drawdown mode (DrawdownPct={drawdownPct:F2}%). Auto-paused by DrawdownRecoveryWorker.",
+                Reason       = $"Account entered Halted drawdown mode (DrawdownPct={latest.DrawdownPct:F2}%). Auto-paused by DrawdownRecoveryWorker.",
+                ContextJson  = BuildStrategyAuditContextJson(
+                    latest,
+                    previousMode,
+                    currentMode,
+                    NormalizeUtc(latest.RecordedAt),
+                    snapshotAge,
+                    operation: "Pause"),
                 Source       = "DrawdownRecoveryWorker"
             }, ct);
         }
+
+        return pausedIds;
     }
 
     /// <summary>
@@ -343,53 +455,56 @@ public sealed class DrawdownRecoveryWorker : BackgroundService
     /// pause time. After resumption the entry is cleared to prevent stale IDs from
     /// being reactivated on a future recovery cycle.
     /// </summary>
-    /// <param name="readCtx">Read DB context for loading the stored ID list.</param>
     /// <param name="writeCtx">Write DB context for the bulk strategy update and config clear.</param>
     /// <param name="mediator">MediatR used to write per-strategy audit entries.</param>
     /// <param name="ct">Propagated cancellation token.</param>
-    private async Task ResumeAutoPausedStrategiesAsync(
-        Microsoft.EntityFrameworkCore.DbContext readCtx,
+    private async Task<List<long>> ResumeAutoPausedStrategiesAsync(
         Microsoft.EntityFrameworkCore.DbContext writeCtx,
         IMediator                               mediator,
+        DrawdownSnapshot                        latest,
+        RecoveryMode                            previousMode,
+        RecoveryMode                            currentMode,
+        TimeSpan                                snapshotAge,
         CancellationToken                       ct)
     {
-        // Retrieve the JSON list of strategy IDs that were auto-paused during the halt.
-        var idsEntry = await readCtx.Set<EngineConfig>()
-            .AsNoTracking()
-            .FirstOrDefaultAsync(c => c.Key == CK_AutoPausedIds, ct);
-
-        // If the entry is missing or empty, there is nothing to resume.
-        if (idsEntry?.Value is null) return;
-
-        List<long>? ids;
-        try { ids = JsonSerializer.Deserialize<List<long>>(idsEntry.Value); }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex,
-                "DrawdownRecoveryWorker: failed to deserialize auto-paused strategy IDs — treating as empty. Raw value: {Value}",
-                idsEntry.Value?.Length > 200 ? idsEntry.Value[..200] + "…" : idsEntry.Value);
-            ids = null;
-        }
-
-        if (ids is null || ids.Count == 0) return;
+        var trackedIds = await GetTrackedAutoPausedStrategyIdsAsync(writeCtx, ct);
+        var resumableIds = trackedIds.Count == 0
+            ? []
+            : await writeCtx.Set<Strategy>()
+                .AsNoTracking()
+                .Where(s => trackedIds.Contains(s.Id) &&
+                            s.Status == StrategyStatus.Paused &&
+                            s.PauseReason == DrawdownPauseReason &&
+                            !s.IsDeleted)
+                .OrderBy(s => s.Id)
+                .Select(s => s.Id)
+                .ToListAsync(ct);
 
         // Re-activate only the previously auto-paused strategies.
-        // The IsDeleted filter ensures soft-deleted strategies are not resurrected.
-        await writeCtx.Set<Strategy>()
-            .Where(s => ids.Contains(s.Id) && !s.IsDeleted)
-            .ExecuteUpdateAsync(s => s
-                .SetProperty(x => x.Status, StrategyStatus.Active),
-                ct);
+        // The PauseReason filter preserves manual/operator and other subsystem pauses.
+        if (resumableIds.Count > 0)
+        {
+            await writeCtx.Set<Strategy>()
+                .Where(s => resumableIds.Contains(s.Id) &&
+                            s.Status == StrategyStatus.Paused &&
+                            s.PauseReason == DrawdownPauseReason &&
+                            !s.IsDeleted)
+                .ExecuteUpdateAsync(s => s
+                    .SetProperty(x => x.Status, StrategyStatus.Active)
+                    .SetProperty(x => x.PauseReason, (string?)null),
+                    ct);
+        }
 
         // Clear the stored list — prevents a second resume on the next polling cycle
-        // if the mode bounces back to Halted briefly.
-        await UpsertConfigAsync(writeCtx, CK_AutoPausedIds, string.Empty, ct);
+        // if the mode bounces back to Halted briefly, and releases ownership of any
+        // tracked strategy that was manually re-paused or otherwise changed meanwhile.
+        await UpsertConfigAsync(writeCtx, CK_AutoPausedIds, EmptyAutoPausedIdsJson, ct);
 
         _logger.LogInformation(
             "DrawdownRecoveryWorker: resumed {Count} auto-paused strategy/strategies (IDs: {Ids}).",
-            ids.Count, string.Join(", ", ids));
+            resumableIds.Count, string.Join(", ", resumableIds));
 
-        foreach (var id in ids)
+        foreach (var id in resumableIds)
         {
             await mediator.Send(new LogDecisionCommand
             {
@@ -397,20 +512,27 @@ public sealed class DrawdownRecoveryWorker : BackgroundService
                 EntityId     = id,
                 DecisionType = "AutoResume",
                 Outcome      = "Active",
-                Reason       = "Account exited Halted drawdown mode. Strategy auto-resumed by DrawdownRecoveryWorker.",
+                Reason       = $"Account exited Halted drawdown mode into {currentMode}. Strategy auto-resumed by DrawdownRecoveryWorker.",
+                ContextJson  = BuildStrategyAuditContextJson(
+                    latest,
+                    previousMode,
+                    currentMode,
+                    NormalizeUtc(latest.RecordedAt),
+                    snapshotAge,
+                    operation: "Resume"),
                 Source       = "DrawdownRecoveryWorker"
             }, ct);
         }
+
+        return resumableIds;
     }
 
     // ── EngineConfig upsert ───────────────────────────────────────────────────
 
     /// <summary>
     /// Updates the value of an existing <see cref="EngineConfig"/> row or inserts a new one
-    /// if the key does not yet exist. Uses a bulk <c>ExecuteUpdateAsync</c> first (optimistic
-    /// update) and falls back to an <c>Add</c> + <c>SaveChangesAsync</c> if no rows were
-    /// modified. This avoids a read-before-write and is safe for concurrent workers because
-    /// <c>ExecuteUpdateAsync</c> is a single atomic SQL statement.
+    /// if the key does not yet exist. The shared helper uses an atomic PostgreSQL upsert in
+    /// production and a tracked fallback for non-Postgres providers used in tests.
     /// </summary>
     /// <param name="writeCtx">Write DB context for the upsert operation.</param>
     /// <param name="key">The EngineConfig key to upsert.</param>
@@ -426,33 +548,186 @@ public sealed class DrawdownRecoveryWorker : BackgroundService
     // ── Config helper ─────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Reads a typed value from the <see cref="EngineConfig"/> table by key, falling back
-    /// to <paramref name="defaultValue"/> if the key does not exist or if the stored value
-    /// cannot be converted to <typeparamref name="T"/>. This makes all configuration
-    /// hot-reloadable without a worker restart: the next polling cycle will pick up any
-    /// changes made to the EngineConfig table.
+    /// Reads a raw EngineConfig value by key.
     /// </summary>
-    /// <typeparam name="T">The target type (e.g. <see cref="int"/>, <see cref="bool"/>).</typeparam>
-    /// <param name="ctx">Read DB context.</param>
-    /// <param name="key">EngineConfig key to look up.</param>
-    /// <param name="defaultValue">Fallback value returned when the key is missing or unreadable.</param>
-    /// <param name="ct">Propagated cancellation token.</param>
-    /// <returns>The stored value converted to <typeparamref name="T"/>, or <paramref name="defaultValue"/>.</returns>
-    private static async Task<T> GetConfigAsync<T>(
+    private static async Task<string?> GetConfigValueAsync(
         Microsoft.EntityFrameworkCore.DbContext ctx,
         string                                  key,
-        T                                       defaultValue,
         CancellationToken                       ct)
     {
         var entry = await ctx.Set<EngineConfig>()
             .AsNoTracking()
             .FirstOrDefaultAsync(c => c.Key == key, ct);
 
-        if (entry?.Value is null) return defaultValue;
-
-        // Convert.ChangeType handles string-to-int, string-to-bool, etc.
-        // The catch block ensures a malformed config value never crashes the worker.
-        try   { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
-        catch { return defaultValue; }
+        return entry?.Value;
     }
+
+    private async Task<int> ReadSnapshotStaleAfterSecondsAsync(
+        Microsoft.EntityFrameworkCore.DbContext ctx,
+        CancellationToken                       ct)
+        => await GetPositiveIntConfigAsync(
+            ctx,
+            CK_SnapshotStaleAfterSecs,
+            DefaultSnapshotStaleAfterSeconds,
+            ct);
+
+    private async Task<int> GetPositiveIntConfigAsync(
+        Microsoft.EntityFrameworkCore.DbContext ctx,
+        string                                  key,
+        int                                     defaultValue,
+        CancellationToken                       ct)
+    {
+        var raw = await GetConfigValueAsync(ctx, key, ct);
+        if (string.IsNullOrWhiteSpace(raw))
+            return defaultValue;
+
+        if (int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed) &&
+            parsed > 0)
+        {
+            return parsed;
+        }
+
+        _logger.LogWarning(
+            "DrawdownRecoveryWorker: invalid positive integer '{Value}' for {Key} — using default {Default}.",
+            raw,
+            key,
+            defaultValue);
+
+        return defaultValue;
+    }
+
+    private async Task<RecoveryMode> ReadPersistedModeAsync(
+        Microsoft.EntityFrameworkCore.DbContext ctx,
+        CancellationToken                       ct)
+    {
+        var raw = await GetConfigValueAsync(ctx, CK_ActiveMode, ct);
+        if (string.IsNullOrWhiteSpace(raw))
+            return RecoveryMode.Normal;
+
+        if (Enum.TryParse<RecoveryMode>(raw.Trim(), ignoreCase: true, out var parsed))
+            return parsed;
+
+        _logger.LogWarning(
+            "DrawdownRecoveryWorker: invalid recovery mode '{Value}' in {Key} — defaulting to {DefaultMode}.",
+            raw,
+            CK_ActiveMode,
+            RecoveryMode.Normal);
+
+        return RecoveryMode.Normal;
+    }
+
+    private static async Task<DrawdownSnapshot?> LoadLatestSnapshotAsync(
+        Microsoft.EntityFrameworkCore.DbContext ctx,
+        CancellationToken                       ct)
+        => await ctx.Set<DrawdownSnapshot>()
+            .AsNoTracking()
+            .OrderByDescending(s => s.RecordedAt)
+            .ThenByDescending(s => s.Id)
+            .FirstOrDefaultAsync(ct);
+
+    private async Task<List<long>> GetTrackedAutoPausedStrategyIdsAsync(
+        Microsoft.EntityFrameworkCore.DbContext ctx,
+        CancellationToken                       ct)
+    {
+        var idsEntry = await ctx.Set<EngineConfig>()
+            .AsNoTracking()
+            .FirstOrDefaultAsync(c => c.Key == CK_AutoPausedIds, ct);
+
+        if (!string.IsNullOrWhiteSpace(idsEntry?.Value))
+        {
+            try
+            {
+                var parsed = JsonSerializer.Deserialize<List<long>>(idsEntry.Value);
+                var sanitized = SanitizeStrategyIds(parsed);
+                if (sanitized.Count > 0)
+                    return sanitized;
+
+                return [];
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "DrawdownRecoveryWorker: failed to deserialize auto-paused strategy IDs — falling back to strategy state. Raw value: {Value}",
+                    idsEntry.Value.Length > 200 ? idsEntry.Value[..200] + "..." : idsEntry.Value);
+            }
+        }
+
+        var fallbackIds = await ctx.Set<Strategy>()
+            .AsNoTracking()
+            .Where(s => s.Status == StrategyStatus.Paused &&
+                        s.PauseReason == DrawdownPauseReason &&
+                        !s.IsDeleted)
+            .OrderBy(s => s.Id)
+            .Select(s => s.Id)
+            .ToListAsync(ct);
+
+        if (fallbackIds.Count > 0)
+        {
+            _logger.LogWarning(
+                "DrawdownRecoveryWorker: auto-paused strategy ID list missing/unreadable — recovered {Count} strategy/strategies from persisted PauseReason state.",
+                fallbackIds.Count);
+        }
+
+        return fallbackIds;
+    }
+
+    private static List<long> SanitizeStrategyIds(IEnumerable<long>? ids)
+        => ids?
+            .Where(id => id > 0)
+            .Distinct()
+            .OrderBy(id => id)
+            .ToList()
+        ?? [];
+
+    private static DateTime NormalizeUtc(DateTime value)
+        => value.Kind switch
+        {
+            DateTimeKind.Utc         => value,
+            DateTimeKind.Local       => value.ToUniversalTime(),
+            DateTimeKind.Unspecified => DateTime.SpecifyKind(value, DateTimeKind.Utc),
+            _                        => value
+        };
+
+    private static string BuildTransitionAuditContextJson(
+        DrawdownSnapshot   latest,
+        RecoveryMode       previousMode,
+        RecoveryMode       currentMode,
+        DateTime           snapshotRecordedAtUtc,
+        TimeSpan           snapshotAge,
+        IReadOnlyList<long> pausedIds,
+        IReadOnlyList<long> resumedIds)
+        => JsonSerializer.Serialize(new
+        {
+            SnapshotId              = latest.Id,
+            SnapshotRecordedAtUtc   = snapshotRecordedAtUtc,
+            SnapshotAgeSeconds      = Math.Round(snapshotAge.TotalSeconds, 3),
+            DrawdownPct             = latest.DrawdownPct,
+            PreviousMode            = previousMode.ToString(),
+            CurrentMode             = currentMode.ToString(),
+            AutoPausedStrategyCount = pausedIds.Count,
+            AutoPausedStrategyIds   = pausedIds,
+            AutoResumedStrategyCount = resumedIds.Count,
+            AutoResumedStrategyIds   = resumedIds
+        });
+
+    private static string BuildStrategyAuditContextJson(
+        DrawdownSnapshot latest,
+        RecoveryMode     previousMode,
+        RecoveryMode     currentMode,
+        DateTime         snapshotRecordedAtUtc,
+        TimeSpan         snapshotAge,
+        string           operation)
+        => JsonSerializer.Serialize(new
+        {
+            Operation            = operation,
+            SnapshotId           = latest.Id,
+            SnapshotRecordedAtUtc = snapshotRecordedAtUtc,
+            SnapshotAgeSeconds   = Math.Round(snapshotAge.TotalSeconds, 3),
+            DrawdownPct          = latest.DrawdownPct,
+            PreviousMode         = previousMode.ToString(),
+            CurrentMode          = currentMode.ToString()
+        });
+
+    private static string SerializeStrategyIds(IEnumerable<long> ids)
+        => JsonSerializer.Serialize(SanitizeStrategyIds(ids));
 }

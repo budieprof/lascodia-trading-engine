@@ -1,6 +1,8 @@
 using FluentValidation;
 using MediatR;
+using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
+using LascodiaTradingEngine.Application.Common.Events;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 
 namespace LascodiaTradingEngine.Application.AuditTrail.Commands.LogDecision;
@@ -69,10 +71,14 @@ public class LogDecisionCommandValidator : AbstractValidator<LogDecisionCommand>
 public class LogDecisionCommandHandler : IRequestHandler<LogDecisionCommand, ResponseData<long>>
 {
     private readonly IWriteApplicationDbContext _context;
+    private readonly IIntegrationEventService _eventBus;
 
-    public LogDecisionCommandHandler(IWriteApplicationDbContext context)
+    public LogDecisionCommandHandler(
+        IWriteApplicationDbContext context,
+        IIntegrationEventService   eventBus)
     {
-        _context = context;
+        _context  = context;
+        _eventBus = eventBus;
     }
 
     public async Task<ResponseData<long>> Handle(LogDecisionCommand request, CancellationToken cancellationToken)
@@ -93,7 +99,19 @@ public class LogDecisionCommandHandler : IRequestHandler<LogDecisionCommand, Res
             .Set<Domain.Entities.DecisionLog>()
             .AddAsync(entity, cancellationToken);
 
-        await _context.SaveChangesAsync(cancellationToken);
+        // Persist + publish together via the outbox so the audit page gets a
+        // push the moment the row is durable. Decision logs are append-only,
+        // so there's no "updated" counterpart.
+        await _eventBus.SaveAndPublish(_context, new AuditDecisionLoggedIntegrationEvent
+        {
+            DecisionLogId = entity.Id,
+            EntityType    = entity.EntityType,
+            EntityId      = entity.EntityId,
+            DecisionType  = entity.DecisionType,
+            Outcome       = entity.Outcome,
+            Source        = entity.Source,
+            CreatedAt     = entity.CreatedAt,
+        });
 
         return ResponseData<long>.Init(entity.Id, true, "Successful", "00");
     }

@@ -1,6 +1,8 @@
 using FluentValidation;
 using MediatR;
+using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
+using LascodiaTradingEngine.Application.Common.Events;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -46,10 +48,14 @@ public class RecordSentimentCommandValidator : AbstractValidator<RecordSentiment
 public class RecordSentimentCommandHandler : IRequestHandler<RecordSentimentCommand, ResponseData<long>>
 {
     private readonly IWriteApplicationDbContext _context;
+    private readonly IIntegrationEventService _eventBus;
 
-    public RecordSentimentCommandHandler(IWriteApplicationDbContext context)
+    public RecordSentimentCommandHandler(
+        IWriteApplicationDbContext context,
+        IIntegrationEventService   eventBus)
     {
-        _context = context;
+        _context  = context;
+        _eventBus = eventBus;
     }
 
     public async Task<ResponseData<long>> Handle(
@@ -74,7 +80,17 @@ public class RecordSentimentCommandHandler : IRequestHandler<RecordSentimentComm
             .Set<Domain.Entities.SentimentSnapshot>()
             .AddAsync(entity, cancellationToken);
 
-        await _context.SaveChangesAsync(cancellationToken);
+        // Atomically persist the snapshot and publish the integration event.
+        // SaveAndPublish writes both through the outbox so a DB failure
+        // doesn't produce a phantom event.
+        await _eventBus.SaveAndPublish(_context, new SentimentSnapshotCreatedIntegrationEvent
+        {
+            SnapshotId     = entity.Id,
+            Symbol         = entity.Currency ?? string.Empty,
+            Source         = entity.Source.ToString(),
+            SentimentScore = entity.SentimentScore,
+            CapturedAt     = entity.CapturedAt,
+        });
 
         return ResponseData<long>.Init(entity.Id, true, "Successful", "00");
     }

@@ -8,6 +8,9 @@ namespace LascodiaTradingEngine.Application.Common.Interfaces;
 /// </summary>
 public interface IWebSocketBridge
 {
+    /// <summary>Returns the currently connected EA instance IDs.</summary>
+    IReadOnlyCollection<string> GetConnectedInstanceIds();
+
     /// <summary>Whether a specific EA instance has an active WebSocket connection.</summary>
     bool IsConnected(string instanceId);
 

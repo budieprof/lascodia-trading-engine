@@ -45,11 +45,20 @@ public static class OperatorRoleNames
 /// </summary>
 public static class Policies
 {
-    public const string Viewer   = nameof(Viewer);
-    public const string Trader   = nameof(Trader);
-    public const string Analyst  = nameof(Analyst);
-    public const string Operator = nameof(Operator);
-    public const string Admin    = nameof(Admin);
+    public const string Viewer    = nameof(Viewer);
+    public const string Trader    = nameof(Trader);
+    public const string Analyst   = nameof(Analyst);
+    public const string Operator  = nameof(Operator);
+    public const string Admin     = nameof(Admin);
+
+    /// <summary>
+    /// EA-data-path policy. Accepts EA, Operator, and Admin — crucially NOT
+    /// Viewer/Trader/Analyst — so tick/candle/snapshot ingestion can't be
+    /// called by a human operator account with a narrow role. Operator and
+    /// Admin stay in the allow-list so admin tools can simulate EA traffic
+    /// during integration testing without swapping role claims.
+    /// </summary>
+    public const string EAIngest = nameof(EAIngest);
 
     /// <summary>Adds the policy ladder to <paramref name="o"/>. Idempotent.</summary>
     public static void Register(AuthorizationOptions o)
@@ -68,5 +77,8 @@ public static class Policies
             OperatorRoleNames.Operator, OperatorRoleNames.Admin));
 
         o.AddPolicy(Admin,    p => p.RequireRole(OperatorRoleNames.Admin));
+
+        o.AddPolicy(EAIngest, p => p.RequireRole(
+            OperatorRoleNames.EA, OperatorRoleNames.Operator, OperatorRoleNames.Admin));
     }
 }

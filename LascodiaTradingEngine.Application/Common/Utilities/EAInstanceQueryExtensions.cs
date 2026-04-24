@@ -15,6 +15,20 @@ namespace LascodiaTradingEngine.Application.Common.Utilities;
 public static class EAInstanceQueryExtensions
 {
     /// <summary>
+    /// Returns true when the instance has sent a heartbeat within the supplied age window.
+    /// Intended for in-memory guards and diagnostics; queryable callers should use
+    /// <see cref="ActiveAndFreshForSymbol(IQueryable{EAInstance}, string, TimeSpan)"/>.
+    /// </summary>
+    public static bool IsHeartbeatFresh(EAInstance instance, int maxHeartbeatAgeSeconds)
+    {
+        ArgumentNullException.ThrowIfNull(instance);
+        if (maxHeartbeatAgeSeconds < 0)
+            throw new ArgumentOutOfRangeException(nameof(maxHeartbeatAgeSeconds));
+
+        return instance.LastHeartbeat >= DateTime.UtcNow.AddSeconds(-maxHeartbeatAgeSeconds);
+    }
+
+    /// <summary>
     /// Returns an EF-translatable expression that matches <paramref name="symbol"/> as
     /// an exact comma-delimited entry within <see cref="EAInstance.Symbols"/>.
     /// Covers all four positions: sole entry, first, last, and middle.

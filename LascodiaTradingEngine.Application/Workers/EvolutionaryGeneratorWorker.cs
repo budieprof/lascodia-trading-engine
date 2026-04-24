@@ -1,8 +1,15 @@
+using System.Diagnostics;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json.Nodes;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using LascodiaTradingEngine.Application.Backtesting;
+using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Services;
 using LascodiaTradingEngine.Application.StrategyGeneration;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
@@ -10,140 +17,839 @@ using LascodiaTradingEngine.Domain.Enums;
 namespace LascodiaTradingEngine.Application.Workers;
 
 /// <summary>
-/// Daily evolutionary cycle: invoke <see cref="IEvolutionaryStrategyGenerator"/>,
-/// persist surviving offspring as <see cref="StrategyStatus.Paused"/> + Draft
-/// strategies for the existing screening pipeline to evaluate. Closes the loop
-/// where the engine could only ever screen template-driven candidates by
-/// continuously feeding mutated descendants of its best winners back into
-/// generation.
+/// Periodically generates mutated offspring of strong live strategies, persists them as paused
+/// draft candidates, and queues their initial validation backtests so they actually enter the
+/// existing screening pipeline.
 ///
 /// <para>
-/// Idempotent — duplicates (same parent, identical mutated parameters within the
-/// dedup window) are dropped at insert time via the existing
-/// <c>(Symbol, Timeframe, ParametersJson)</c> uniqueness behaviour.
+/// Idempotency is enforced by the worker itself using a stable candidate identity built from
+/// <see cref="StrategyType"/>, symbol, timeframe, and canonicalized parameter JSON. This is
+/// intentionally stricter than relying on the database because Draft candidates are allowed to
+/// coexist under the active-strategy uniqueness filter.
 /// </para>
 /// </summary>
 public sealed class EvolutionaryGeneratorWorker : BackgroundService
 {
+    internal const string WorkerName = nameof(EvolutionaryGeneratorWorker);
+
+    private const string CK_Enabled = "Evolution:Enabled";
+    private const string CK_PollSeconds = "Evolution:PollIntervalSeconds";
+    private const string CK_MaxOffspring = "Evolution:MaxOffspringPerCycle";
+
+    private const string DistributedLockKey = "workers:evolutionary-generator:cycle";
+
+    private const int DefaultPollSecs = 24 * 60 * 60; // daily
+    private const int MinPollSecs = 60;
+    private const int MaxPollSecs = 7 * 24 * 60 * 60;
+    private const int DefaultMaxOffspring = 12;
+    private const int MinMaxOffspring = 0;
+    private const int MaxMaxOffspring = 100;
+    private const int InitialValidationLookbackDays = 365;
+    private const decimal InitialValidationBalance = 10_000m;
+
+    private static readonly TimeSpan DistributedLockTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan InitialRetryDelay = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan MaxRetryDelay = TimeSpan.FromHours(1);
+
     private readonly ILogger<EvolutionaryGeneratorWorker> _logger;
     private readonly IServiceScopeFactory _scopeFactory;
+    private readonly TradingMetrics? _metrics;
+    private readonly TimeProvider _timeProvider;
+    private readonly IWorkerHealthMonitor? _healthMonitor;
+    private readonly IDistributedLock? _distributedLock;
 
-    private const string CK_Enabled            = "Evolution:Enabled";
-    private const string CK_PollSeconds        = "Evolution:PollIntervalSeconds";
-    private const string CK_MaxOffspring       = "Evolution:MaxOffspringPerCycle";
-
-    private const int    DefaultPollSecs       = 86400; // daily
-    private const int    DefaultMaxOffspring   = 12;
+    private int _consecutiveFailures;
+    private bool _missingDistributedLockWarningEmitted;
 
     public EvolutionaryGeneratorWorker(
-        ILogger<EvolutionaryGeneratorWorker> logger, IServiceScopeFactory scopeFactory)
+        ILogger<EvolutionaryGeneratorWorker> logger,
+        IServiceScopeFactory scopeFactory,
+        TradingMetrics? metrics = null,
+        TimeProvider? timeProvider = null,
+        IWorkerHealthMonitor? healthMonitor = null,
+        IDistributedLock? distributedLock = null)
     {
-        _logger       = logger;
+        _logger = logger;
         _scopeFactory = scopeFactory;
+        _metrics = metrics;
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _healthMonitor = healthMonitor;
+        _distributedLock = distributedLock;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("EvolutionaryGeneratorWorker starting");
-        try { await Task.Delay(TimeSpan.FromSeconds(30), stoppingToken); }
-        catch (OperationCanceledException) { return; }
+        _logger.LogInformation("{Worker} started.", WorkerName);
+        _healthMonitor?.RecordWorkerMetadata(
+            WorkerName,
+            "Generates canonicalized evolutionary offspring, persists them as draft strategies, and queues their initial validation backtests.",
+            TimeSpan.FromSeconds(DefaultPollSecs));
 
-        while (!stoppingToken.IsCancellationRequested)
+        var currentPollInterval = TimeSpan.FromSeconds(DefaultPollSecs);
+
+        try
         {
-            int pollSecs = DefaultPollSecs;
             try
             {
-                pollSecs = await RunCycleAsync(stoppingToken);
+                var initialDelay = WorkerStartupSequencer.GetDelay(WorkerName);
+                if (initialDelay > TimeSpan.Zero)
+                    await Task.Delay(initialDelay, _timeProvider, stoppingToken);
             }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { break; }
-            catch (Exception ex)
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
-                _logger.LogError(ex, "EvolutionaryGeneratorWorker: cycle error");
+                return;
             }
-            try { await Task.Delay(TimeSpan.FromSeconds(pollSecs), stoppingToken); }
-            catch (OperationCanceledException) { break; }
+
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                long cycleStarted = Stopwatch.GetTimestamp();
+
+                try
+                {
+                    _healthMonitor?.RecordWorkerHeartbeat(WorkerName);
+
+                    var result = await RunCycleAsync(stoppingToken);
+                    currentPollInterval = result.Settings.PollInterval;
+
+                    long durationMs = (long)Stopwatch.GetElapsedTime(cycleStarted).TotalMilliseconds;
+                    _healthMonitor?.RecordBacklogDepth(WorkerName, result.BacklogDepth);
+                    _healthMonitor?.RecordCycleSuccess(WorkerName, durationMs);
+                    _metrics?.WorkerCycleDurationMs.Record(
+                        durationMs,
+                        new KeyValuePair<string, object?>("worker", WorkerName));
+                    _metrics?.EvolutionaryCycleDurationMs.Record(durationMs);
+
+                    if (result.SkippedReason is { Length: > 0 })
+                    {
+                        _logger.LogDebug(
+                            "{Worker}: cycle skipped ({Reason}).",
+                            WorkerName,
+                            result.SkippedReason);
+                    }
+                    else if (result.InsertedCandidateCount > 0 || result.PersistenceFailureCount > 0)
+                    {
+                        _logger.LogInformation(
+                            "{Worker}: proposed={Proposed}, inserted={Inserted}, queuedBacktests={Queued}, skipped={Skipped}, persistenceFailures={Failures}, backlog={Backlog}.",
+                            WorkerName,
+                            result.ProposedCandidateCount,
+                            result.InsertedCandidateCount,
+                            result.QueuedBacktestCount,
+                            result.SkippedCandidateCount,
+                            result.PersistenceFailureCount,
+                            result.BacklogDepth);
+                    }
+                    else
+                    {
+                        _logger.LogDebug(
+                            "{Worker}: no new evolutionary offspring persisted (proposed={Proposed}, skipped={Skipped}, backlog={Backlog}).",
+                            WorkerName,
+                            result.ProposedCandidateCount,
+                            result.SkippedCandidateCount,
+                            result.BacklogDepth);
+                    }
+
+                    if (_consecutiveFailures > 0)
+                    {
+                        _healthMonitor?.RecordRecovery(WorkerName, _consecutiveFailures);
+                        _logger.LogInformation(
+                            "{Worker}: recovered after {Failures} consecutive failure(s).",
+                            WorkerName,
+                            _consecutiveFailures);
+                    }
+
+                    _consecutiveFailures = 0;
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    _consecutiveFailures++;
+                    _healthMonitor?.RecordRetry(WorkerName);
+                    _healthMonitor?.RecordCycleFailure(WorkerName, ex.Message);
+                    _metrics?.WorkerErrors.Add(
+                        1,
+                        new KeyValuePair<string, object?>("worker", WorkerName),
+                        new KeyValuePair<string, object?>("reason", "evolutionary_generator_cycle"));
+                    _logger.LogError(ex, "{Worker}: cycle failed.", WorkerName);
+                }
+
+                try
+                {
+                    await Task.Delay(
+                        CalculateDelay(currentPollInterval, _consecutiveFailures),
+                        _timeProvider,
+                        stoppingToken);
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    break;
+                }
+            }
+        }
+        finally
+        {
+            _healthMonitor?.RecordWorkerStopped(WorkerName);
+            _logger.LogInformation("{Worker} stopped.", WorkerName);
         }
     }
 
-    private async Task<int> RunCycleAsync(CancellationToken ct)
+    internal async Task<EvolutionaryGeneratorCycleResult> RunCycleAsync(CancellationToken ct)
     {
-        using var scope = _scopeFactory.CreateScope();
-        var writeCtx  = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
-        var readCtx   = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
-        var generator = scope.ServiceProvider.GetRequiredService<IEvolutionaryStrategyGenerator>();
-        var writeDb   = writeCtx.GetDbContext();
-        var readDb    = readCtx.GetDbContext();
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        var serviceProvider = scope.ServiceProvider;
+        var writeContext = serviceProvider.GetRequiredService<IWriteApplicationDbContext>();
+        var generator = serviceProvider.GetRequiredService<IEvolutionaryStrategyGenerator>();
+        var validationRunFactory = serviceProvider.GetRequiredService<IValidationRunFactory>();
+        var db = writeContext.GetDbContext();
+        var settings = await LoadSettingsAsync(db, ct);
 
-        bool enabled = await GetBoolAsync(readDb, CK_Enabled, defaultValue: true, ct);
-        int pollSecs = await GetIntAsync (readDb, CK_PollSeconds,    DefaultPollSecs,     ct);
-        int maxOff   = await GetIntAsync (readDb, CK_MaxOffspring,   DefaultMaxOffspring, ct);
-        if (!enabled)
+        if (_distributedLock is null)
         {
-            _logger.LogDebug("EvolutionaryGeneratorWorker: disabled via Evolution:Enabled=false");
-            return pollSecs;
-        }
-
-        var offspring = await generator.ProposeOffspringAsync(maxOff, ct);
-        if (offspring.Count == 0) return pollSecs;
-
-        // Dedup: skip any offspring whose (Symbol, Timeframe, ParametersJson) collides with
-        // an existing strategy. Cheap one-shot query against the candidates' triple set.
-        var candidateKeys = offspring
-            .Select(o => new { o.Symbol, o.Timeframe, o.ParametersJson })
-            .Distinct()
-            .ToList();
-        var existingKeys = await writeDb.Set<Strategy>()
-            .Where(s => !s.IsDeleted)
-            .Select(s => new { s.Symbol, s.Timeframe, s.ParametersJson })
-            .Where(s => candidateKeys.Contains(s))
-            .ToListAsync(ct);
-        var existingSet = existingKeys.Select(e => (e.Symbol, e.Timeframe, e.ParametersJson)).ToHashSet();
-
-        int inserted = 0;
-        var nowUtc = DateTime.UtcNow;
-        foreach (var c in offspring)
-        {
-            if (existingSet.Contains((c.Symbol, c.Timeframe, c.ParametersJson))) continue;
-
-            writeDb.Set<Strategy>().Add(new Strategy
+            if (!_missingDistributedLockWarningEmitted)
             {
-                Name                    = $"evo_{c.Symbol}_{c.Timeframe}_g{c.Generation}_{Guid.NewGuid():N}".Substring(0, 32),
-                Description             = $"Evolutionary offspring of strategy {c.ParentStrategyId}: {c.MutationDescription}",
-                Symbol                  = c.Symbol,
-                Timeframe               = c.Timeframe,
-                StrategyType            = c.StrategyType,
-                ParametersJson          = c.ParametersJson,
-                Status                  = StrategyStatus.Paused,
-                LifecycleStage          = StrategyLifecycleStage.Draft,
-                LifecycleStageEnteredAt = nowUtc,
-                CreatedAt               = nowUtc,
-                ParentStrategyId        = c.ParentStrategyId,
-                Generation              = c.Generation,
-            });
-            inserted++;
+                _logger.LogWarning(
+                    "{Worker} running without IDistributedLock; duplicate evolutionary cycles are possible in multi-instance deployments.",
+                    WorkerName);
+                _missingDistributedLockWarningEmitted = true;
+            }
+        }
+        else
+        {
+            var cycleLock = await _distributedLock.TryAcquireAsync(DistributedLockKey, DistributedLockTimeout, ct);
+            if (cycleLock is null)
+            {
+                int busyBacklog = await CountPendingValidationBacklogAsync(db, ct);
+                return EvolutionaryGeneratorCycleResult.Skipped(settings, busyBacklog, "lock_busy");
+            }
+
+            await using (cycleLock)
+            {
+                return await RunCycleCoreAsync(db, writeContext, generator, validationRunFactory, settings, ct);
+            }
         }
 
-        if (inserted > 0)
+        return await RunCycleCoreAsync(db, writeContext, generator, validationRunFactory, settings, ct);
+    }
+
+    internal static TimeSpan CalculateDelay(TimeSpan baseInterval, int consecutiveFailures)
+    {
+        if (consecutiveFailures <= 0)
+            return baseInterval <= TimeSpan.Zero ? TimeSpan.FromSeconds(DefaultPollSecs) : baseInterval;
+
+        var cappedExponent = Math.Min(consecutiveFailures - 1, 30);
+        var delayedSeconds = InitialRetryDelay.TotalSeconds * Math.Pow(2, cappedExponent);
+        return TimeSpan.FromSeconds(Math.Min(delayedSeconds, MaxRetryDelay.TotalSeconds));
+    }
+
+    private async Task<EvolutionaryGeneratorCycleResult> RunCycleCoreAsync(
+        DbContext db,
+        IWriteApplicationDbContext writeContext,
+        IEvolutionaryStrategyGenerator generator,
+        IValidationRunFactory validationRunFactory,
+        EvolutionaryGeneratorSettings settings,
+        CancellationToken ct)
+    {
+        int backlogBefore = await CountPendingValidationBacklogAsync(db, ct);
+        if (!settings.Enabled)
+            return EvolutionaryGeneratorCycleResult.Skipped(settings, backlogBefore, "disabled");
+
+        var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
+        string cycleId = BuildCycleId(nowUtc);
+
+        var proposedCandidates = await generator.ProposeOffspringAsync(settings.MaxOffspring, ct);
+        _metrics?.EvolutionaryCandidatesProposed.Add(proposedCandidates.Count);
+
+        if (proposedCandidates.Count == 0)
+            return EvolutionaryGeneratorCycleResult.Empty(settings, backlogBefore, proposedCandidates.Count);
+
+        var eligibleParents = await LoadEligibleParentsAsync(
+            db,
+            proposedCandidates
+                .Select(candidate => candidate.ParentStrategyId)
+                .Distinct()
+                .ToArray(),
+            ct);
+
+        var preparedCandidates = new List<PreparedEvolutionaryCandidate>(proposedCandidates.Count);
+        var preparedKeys = new HashSet<CandidateKey>();
+
+        int ineligibleParentCount = 0;
+        int invalidParameterCount = 0;
+        int duplicateProposalCount = 0;
+
+        foreach (var proposed in proposedCandidates)
         {
-            await writeCtx.SaveChangesAsync(ct);
-            _logger.LogInformation(
-                "EvolutionaryGeneratorWorker: inserted {New} offspring strategies (proposed {Proposed}, deduped {Dedup})",
-                inserted, offspring.Count, offspring.Count - inserted);
+            if (!eligibleParents.TryGetValue(proposed.ParentStrategyId, out var parent))
+            {
+                ineligibleParentCount++;
+                continue;
+            }
+
+            if (!TryPrepareCandidate(proposed, parent, cycleId, out var prepared))
+            {
+                invalidParameterCount++;
+                continue;
+            }
+
+            if (!preparedKeys.Add(prepared.Key))
+            {
+                duplicateProposalCount++;
+                continue;
+            }
+
+            preparedCandidates.Add(prepared);
         }
-        return pollSecs;
+
+        var existingStrategyKeys = await LoadExistingStrategyKeysAsync(db, preparedCandidates, ct);
+        var activeValidationQueueKeys = await LoadActiveValidationQueueKeysAsync(
+            db,
+            preparedCandidates
+                .Select(candidate => candidate.BacktestQueueKey)
+                .Distinct(StringComparer.Ordinal)
+                .ToArray(),
+            ct);
+
+        int existingStrategyCount = 0;
+        int activeQueueCount = 0;
+        int insertedCount = 0;
+        int queuedBacktestCount = 0;
+        int persistenceFailureCount = 0;
+
+        foreach (var candidate in preparedCandidates)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (existingStrategyKeys.Contains(candidate.Key))
+            {
+                existingStrategyCount++;
+                continue;
+            }
+
+            if (activeValidationQueueKeys.Contains(candidate.BacktestQueueKey))
+            {
+                activeQueueCount++;
+                continue;
+            }
+
+            if (!await TryPersistCandidateAsync(db, writeContext, validationRunFactory, candidate, nowUtc, ct))
+            {
+                persistenceFailureCount++;
+                continue;
+            }
+
+            insertedCount++;
+            queuedBacktestCount++;
+            existingStrategyKeys.Add(candidate.Key);
+            activeValidationQueueKeys.Add(candidate.BacktestQueueKey);
+        }
+
+        RecordSkippedCandidateMetrics("parent_ineligible", ineligibleParentCount);
+        RecordSkippedCandidateMetrics("invalid_parameters", invalidParameterCount);
+        RecordSkippedCandidateMetrics("duplicate_proposal", duplicateProposalCount);
+        RecordSkippedCandidateMetrics("existing_strategy", existingStrategyCount);
+        RecordSkippedCandidateMetrics("active_validation_queue", activeQueueCount);
+        RecordSkippedCandidateMetrics("persist_failed", persistenceFailureCount);
+
+        if (insertedCount > 0)
+            _metrics?.EvolutionaryCandidatesInserted.Add(insertedCount);
+
+        if (queuedBacktestCount > 0)
+            _metrics?.EvolutionaryBacktestsQueued.Add(queuedBacktestCount);
+
+        int backlogDepth = await CountPendingValidationBacklogAsync(db, ct);
+
+        return new EvolutionaryGeneratorCycleResult(
+            settings,
+            ProposedCandidateCount: proposedCandidates.Count,
+            InsertedCandidateCount: insertedCount,
+            QueuedBacktestCount: queuedBacktestCount,
+            DuplicateProposalCount: duplicateProposalCount,
+            ExistingStrategyCount: existingStrategyCount,
+            ActiveQueueCount: activeQueueCount,
+            IneligibleParentCount: ineligibleParentCount,
+            InvalidParameterCount: invalidParameterCount,
+            PersistenceFailureCount: persistenceFailureCount,
+            BacklogDepth: backlogDepth,
+            SkippedReason: null);
+    }
+
+    private void RecordSkippedCandidateMetrics(string reason, int count)
+    {
+        if (count <= 0)
+            return;
+
+        _metrics?.EvolutionaryCandidatesSkipped.Add(
+            count,
+            new KeyValuePair<string, object?>("reason", reason));
+    }
+
+    private async Task<bool> TryPersistCandidateAsync(
+        DbContext db,
+        IWriteApplicationDbContext writeContext,
+        IValidationRunFactory validationRunFactory,
+        PreparedEvolutionaryCandidate candidate,
+        DateTime nowUtc,
+        CancellationToken ct)
+    {
+        await using var transaction = await db.Database.BeginTransactionAsync(ct);
+
+        try
+        {
+            var strategy = new Strategy
+            {
+                Name = BuildStrategyName(candidate),
+                Description = $"Evolutionary offspring of strategy {candidate.ParentStrategyId}: {candidate.MutationDescription}",
+                Symbol = candidate.Symbol,
+                Timeframe = candidate.Timeframe,
+                StrategyType = candidate.StrategyType,
+                ParametersJson = candidate.ParametersJson,
+                Status = StrategyStatus.Paused,
+                LifecycleStage = StrategyLifecycleStage.Draft,
+                LifecycleStageEnteredAt = nowUtc,
+                CreatedAt = nowUtc,
+                ParentStrategyId = candidate.ParentStrategyId,
+                Generation = candidate.Generation,
+                GenerationCycleId = candidate.CycleId,
+                GenerationCandidateId = candidate.CandidateId,
+                ValidationPriority = candidate.ValidationPriority,
+            };
+
+            db.Set<Strategy>().Add(strategy);
+            await writeContext.SaveChangesAsync(ct);
+
+            var backtestRun = await validationRunFactory.BuildBacktestRunAsync(
+                db,
+                new BacktestQueueRequest(
+                    StrategyId: strategy.Id,
+                    Symbol: strategy.Symbol,
+                    Timeframe: strategy.Timeframe,
+                    FromDate: nowUtc.AddDays(-InitialValidationLookbackDays),
+                    ToDate: nowUtc,
+                    InitialBalance: InitialValidationBalance,
+                    QueueSource: ValidationRunQueueSources.StrategyGenerationInitial,
+                    Priority: strategy.ValidationPriority,
+                    ParametersSnapshotJson: strategy.ParametersJson,
+                    ValidationQueueKey: candidate.BacktestQueueKey),
+                ct);
+
+            db.Set<BacktestRun>().Add(backtestRun);
+            await writeContext.SaveChangesAsync(ct);
+            await transaction.CommitAsync(ct);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            try
+            {
+                await transaction.RollbackAsync(ct);
+            }
+            catch
+            {
+                // Best effort rollback only.
+            }
+
+            DetachDirtyEntries(db);
+            _logger.LogWarning(
+                ex,
+                "{Worker}: failed to persist evolutionary candidate {CandidateId} for parent {ParentStrategyId}.",
+                WorkerName,
+                candidate.CandidateId,
+                candidate.ParentStrategyId);
+            return false;
+        }
+    }
+
+    private async Task<EvolutionaryGeneratorSettings> LoadSettingsAsync(DbContext db, CancellationToken ct)
+    {
+        bool enabled = await GetBoolAsync(db, CK_Enabled, defaultValue: true, ct);
+        int configuredPollSeconds = await GetIntAsync(db, CK_PollSeconds, DefaultPollSecs, ct);
+        int configuredMaxOffspring = await GetIntAsync(db, CK_MaxOffspring, DefaultMaxOffspring, ct);
+
+        int pollSeconds = Clamp(configuredPollSeconds, MinPollSecs, MaxPollSecs);
+        int maxOffspring = Clamp(configuredMaxOffspring, MinMaxOffspring, MaxMaxOffspring);
+
+        if (configuredPollSeconds != pollSeconds)
+        {
+            _logger.LogDebug(
+                "{Worker}: clamped invalid poll interval {Configured}s to {Effective}s.",
+                WorkerName,
+                configuredPollSeconds,
+                pollSeconds);
+        }
+
+        if (configuredMaxOffspring != maxOffspring)
+        {
+            _logger.LogDebug(
+                "{Worker}: clamped invalid max offspring {Configured} to {Effective}.",
+                WorkerName,
+                configuredMaxOffspring,
+                maxOffspring);
+        }
+
+        return new EvolutionaryGeneratorSettings(
+            Enabled: enabled,
+            PollInterval: TimeSpan.FromSeconds(pollSeconds),
+            MaxOffspring: maxOffspring);
+    }
+
+    private async Task<Dictionary<long, EligibleParentInfo>> LoadEligibleParentsAsync(
+        DbContext db,
+        IReadOnlyCollection<long> parentIds,
+        CancellationToken ct)
+    {
+        if (parentIds.Count == 0)
+            return [];
+
+        var parents = await db.Set<Strategy>()
+            .AsNoTracking()
+            .Where(strategy =>
+                !strategy.IsDeleted &&
+                parentIds.Contains(strategy.Id) &&
+                (strategy.Status == StrategyStatus.Active || strategy.LifecycleStage == StrategyLifecycleStage.Approved))
+            .Select(strategy => new
+            {
+                strategy.Id,
+                strategy.Symbol,
+                strategy.Timeframe,
+                strategy.StrategyType,
+                strategy.Generation
+            })
+            .ToListAsync(ct);
+
+        var sharpeRows = await db.Set<StrategyPerformanceSnapshot>()
+            .AsNoTracking()
+            .Where(snapshot => !snapshot.IsDeleted && parentIds.Contains(snapshot.StrategyId))
+            .OrderByDescending(snapshot => snapshot.EvaluatedAt)
+            .Select(snapshot => new
+            {
+                snapshot.StrategyId,
+                snapshot.SharpeRatio
+            })
+            .ToListAsync(ct);
+
+        var latestSharpeByParentId = sharpeRows
+            .GroupBy(snapshot => snapshot.StrategyId)
+            .ToDictionary(
+                group => group.Key,
+                group => (decimal?)group.First().SharpeRatio);
+
+        return parents.ToDictionary(
+            parent => parent.Id,
+            parent => new EligibleParentInfo(
+                parent.Id,
+                NormalizeSymbol(parent.Symbol),
+                parent.Timeframe,
+                parent.StrategyType,
+                parent.Generation,
+                latestSharpeByParentId.GetValueOrDefault(parent.Id)));
+    }
+
+    private async Task<HashSet<CandidateKey>> LoadExistingStrategyKeysAsync(
+        DbContext db,
+        IReadOnlyCollection<PreparedEvolutionaryCandidate> candidates,
+        CancellationToken ct)
+    {
+        if (candidates.Count == 0)
+            return [];
+
+        var strategyTypes = candidates.Select(candidate => candidate.StrategyType).Distinct().ToList();
+        var symbols = candidates.Select(candidate => candidate.Symbol).Distinct(StringComparer.Ordinal).ToList();
+        var timeframes = candidates.Select(candidate => candidate.Timeframe).Distinct().ToList();
+
+        var existingStrategies = await db.Set<Strategy>()
+            .AsNoTracking()
+            .Where(strategy =>
+                !strategy.IsDeleted &&
+                strategyTypes.Contains(strategy.StrategyType) &&
+                symbols.Contains(strategy.Symbol) &&
+                timeframes.Contains(strategy.Timeframe))
+            .Select(strategy => new
+            {
+                strategy.StrategyType,
+                strategy.Symbol,
+                strategy.Timeframe,
+                strategy.ParametersJson
+            })
+            .ToListAsync(ct);
+
+        var keys = new HashSet<CandidateKey>();
+        foreach (var existing in existingStrategies)
+        {
+            if (!TryNormalizeParametersJson(existing.ParametersJson, out var normalizedParameters))
+                continue;
+
+            keys.Add(new CandidateKey(
+                existing.StrategyType,
+                NormalizeSymbol(existing.Symbol),
+                existing.Timeframe,
+                normalizedParameters));
+        }
+
+        return keys;
+    }
+
+    private static async Task<HashSet<string>> LoadActiveValidationQueueKeysAsync(
+        DbContext db,
+        IReadOnlyCollection<string> queueKeys,
+        CancellationToken ct)
+    {
+        if (queueKeys.Count == 0)
+            return [];
+
+        var activeQueueKeys = await db.Set<BacktestRun>()
+            .AsNoTracking()
+            .Where(run =>
+                !run.IsDeleted &&
+                run.ValidationQueueKey != null &&
+                queueKeys.Contains(run.ValidationQueueKey) &&
+                (run.Status == RunStatus.Queued || run.Status == RunStatus.Running))
+            .Select(run => run.ValidationQueueKey!)
+            .ToListAsync(ct);
+
+        return activeQueueKeys.ToHashSet(StringComparer.Ordinal);
+    }
+
+    private static async Task<int> CountPendingValidationBacklogAsync(DbContext db, CancellationToken ct)
+    {
+        return await db.Set<Strategy>()
+            .AsNoTracking()
+            .Where(strategy =>
+                !strategy.IsDeleted &&
+                strategy.ParentStrategyId != null &&
+                strategy.Status == StrategyStatus.Paused &&
+                strategy.LifecycleStage == StrategyLifecycleStage.Draft)
+            .CountAsync(
+                strategy => !db.Set<BacktestRun>().Any(run =>
+                    !run.IsDeleted &&
+                    run.StrategyId == strategy.Id &&
+                    run.Status == RunStatus.Completed),
+                ct);
+    }
+
+    private static bool TryPrepareCandidate(
+        EvolutionaryCandidate candidate,
+        EligibleParentInfo parent,
+        string cycleId,
+        out PreparedEvolutionaryCandidate prepared)
+    {
+        if (!TryNormalizeParametersJson(candidate.ParametersJson, out var normalizedParameters))
+        {
+            prepared = default;
+            return false;
+        }
+
+        var key = new CandidateKey(
+            parent.StrategyType,
+            parent.Symbol,
+            parent.Timeframe,
+            normalizedParameters);
+        string candidateId = BuildCandidateId(key);
+
+        prepared = new PreparedEvolutionaryCandidate(
+            Key: key,
+            CandidateId: candidateId,
+            CycleId: cycleId,
+            BacktestQueueKey: BuildInitialBacktestQueueKey(candidateId),
+            ParentStrategyId: parent.Id,
+            Generation: parent.Generation + 1,
+            StrategyType: parent.StrategyType,
+            Symbol: parent.Symbol,
+            Timeframe: parent.Timeframe,
+            ParametersJson: normalizedParameters,
+            MutationDescription: string.IsNullOrWhiteSpace(candidate.MutationDescription) ? "mutation" : candidate.MutationDescription.Trim(),
+            ValidationPriority: ResolveValidationPriority(parent.LatestSharpeRatio));
+        return true;
+    }
+
+    private static bool TryNormalizeParametersJson(string parametersJson, out string normalizedParameters)
+    {
+        normalizedParameters = string.Empty;
+        if (string.IsNullOrWhiteSpace(parametersJson))
+            return false;
+
+        try
+        {
+            if (JsonNode.Parse(parametersJson) is not JsonObject)
+                return false;
+        }
+        catch
+        {
+            return false;
+        }
+
+        normalizedParameters = StrategyGenerationHelpers.NormalizeTemplateParameters(parametersJson);
+        return !string.IsNullOrWhiteSpace(normalizedParameters);
+    }
+
+    private static int ResolveValidationPriority(decimal? latestSharpeRatio)
+    {
+        if (!latestSharpeRatio.HasValue)
+            return 0;
+
+        return Math.Max(
+            0,
+            (int)Math.Round((double)latestSharpeRatio.Value * 100d, MidpointRounding.AwayFromZero));
+    }
+
+    private static string BuildStrategyName(PreparedEvolutionaryCandidate candidate)
+    {
+        string hashSuffix = candidate.CandidateId.Length > 12
+            ? candidate.CandidateId[^12..]
+            : candidate.CandidateId;
+
+        return $"evo_{candidate.Symbol}_{candidate.Timeframe}_{hashSuffix}";
+    }
+
+    private static string BuildCycleId(DateTime nowUtc)
+        => $"evo-{nowUtc:yyyyMMddHHmmssfff}";
+
+    private static string BuildInitialBacktestQueueKey(string candidateId)
+        => $"strategy-candidate:{candidateId}:backtest:initial";
+
+    private static string BuildCandidateId(CandidateKey key)
+    {
+        string rawIdentity = $"{key.StrategyType}|{key.Symbol}|{key.Timeframe}|{key.ParametersJson}";
+        string hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(rawIdentity)));
+        return $"evo:{key.StrategyType}:{key.Symbol}:{key.Timeframe}:{hash[..24]}";
+    }
+
+    private static string NormalizeSymbol(string symbol)
+        => (symbol ?? string.Empty).Trim().ToUpperInvariant();
+
+    private static void DetachDirtyEntries(DbContext db)
+    {
+        var dirtyEntries = db.ChangeTracker.Entries()
+            .Where(entry => entry.State != EntityState.Unchanged)
+            .ToList();
+
+        foreach (var entry in dirtyEntries)
+            entry.State = EntityState.Detached;
     }
 
     private static async Task<int> GetIntAsync(DbContext db, string key, int fallback, CancellationToken ct)
     {
-        var raw = await db.Set<EngineConfig>().AsNoTracking()
-            .Where(c => c.Key == key && !c.IsDeleted).Select(c => c.Value).FirstOrDefaultAsync(ct);
-        return int.TryParse(raw, System.Globalization.CultureInfo.InvariantCulture, out var v) ? v : fallback;
+        var raw = await db.Set<EngineConfig>()
+            .AsNoTracking()
+            .Where(config => !config.IsDeleted && config.Key == key)
+            .Select(config => config.Value)
+            .FirstOrDefaultAsync(ct);
+
+        return int.TryParse(raw, out var value) ? value : fallback;
     }
 
     private static async Task<bool> GetBoolAsync(DbContext db, string key, bool defaultValue, CancellationToken ct)
     {
-        var raw = await db.Set<EngineConfig>().AsNoTracking()
-            .Where(c => c.Key == key && !c.IsDeleted).Select(c => c.Value).FirstOrDefaultAsync(ct);
-        return bool.TryParse(raw, out var v) ? v : defaultValue;
+        var raw = await db.Set<EngineConfig>()
+            .AsNoTracking()
+            .Where(config => !config.IsDeleted && config.Key == key)
+            .Select(config => config.Value)
+            .FirstOrDefaultAsync(ct);
+
+        if (raw is null)
+            return defaultValue;
+
+        if (bool.TryParse(raw, out var boolValue))
+            return boolValue;
+
+        if (int.TryParse(raw, out var intValue))
+            return intValue != 0;
+
+        return defaultValue;
+    }
+
+    private static int Clamp(int value, int min, int max)
+        => Math.Min(Math.Max(value, min), max);
+
+    private readonly record struct EligibleParentInfo(
+        long Id,
+        string Symbol,
+        Timeframe Timeframe,
+        StrategyType StrategyType,
+        int Generation,
+        decimal? LatestSharpeRatio);
+
+    private readonly record struct CandidateKey(
+        StrategyType StrategyType,
+        string Symbol,
+        Timeframe Timeframe,
+        string ParametersJson);
+
+    private readonly record struct PreparedEvolutionaryCandidate(
+        CandidateKey Key,
+        string CandidateId,
+        string CycleId,
+        string BacktestQueueKey,
+        long ParentStrategyId,
+        int Generation,
+        StrategyType StrategyType,
+        string Symbol,
+        Timeframe Timeframe,
+        string ParametersJson,
+        string MutationDescription,
+        int ValidationPriority);
+
+    internal readonly record struct EvolutionaryGeneratorSettings(
+        bool Enabled,
+        TimeSpan PollInterval,
+        int MaxOffspring);
+
+    internal readonly record struct EvolutionaryGeneratorCycleResult(
+        EvolutionaryGeneratorSettings Settings,
+        int ProposedCandidateCount,
+        int InsertedCandidateCount,
+        int QueuedBacktestCount,
+        int DuplicateProposalCount,
+        int ExistingStrategyCount,
+        int ActiveQueueCount,
+        int IneligibleParentCount,
+        int InvalidParameterCount,
+        int PersistenceFailureCount,
+        int BacklogDepth,
+        string? SkippedReason)
+    {
+        public int SkippedCandidateCount
+            => DuplicateProposalCount
+             + ExistingStrategyCount
+             + ActiveQueueCount
+             + IneligibleParentCount
+             + InvalidParameterCount;
+
+        public static EvolutionaryGeneratorCycleResult Empty(
+            EvolutionaryGeneratorSettings settings,
+            int backlogDepth,
+            int proposedCandidateCount)
+            => new(
+                settings,
+                ProposedCandidateCount: proposedCandidateCount,
+                InsertedCandidateCount: 0,
+                QueuedBacktestCount: 0,
+                DuplicateProposalCount: 0,
+                ExistingStrategyCount: 0,
+                ActiveQueueCount: 0,
+                IneligibleParentCount: 0,
+                InvalidParameterCount: 0,
+                PersistenceFailureCount: 0,
+                BacklogDepth: backlogDepth,
+                SkippedReason: null);
+
+        public static EvolutionaryGeneratorCycleResult Skipped(
+            EvolutionaryGeneratorSettings settings,
+            int backlogDepth,
+            string reason)
+            => new(
+                settings,
+                ProposedCandidateCount: 0,
+                InsertedCandidateCount: 0,
+                QueuedBacktestCount: 0,
+                DuplicateProposalCount: 0,
+                ExistingStrategyCount: 0,
+                ActiveQueueCount: 0,
+                IneligibleParentCount: 0,
+                InvalidParameterCount: 0,
+                PersistenceFailureCount: 0,
+                BacklogDepth: backlogDepth,
+                SkippedReason: reason);
     }
 }

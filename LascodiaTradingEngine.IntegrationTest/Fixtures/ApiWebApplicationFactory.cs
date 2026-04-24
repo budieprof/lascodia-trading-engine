@@ -32,6 +32,32 @@ public sealed class ApiWebApplicationFactory : WebApplicationFactory<Program>
         return client;
     }
 
+    /// <summary>
+    /// Authenticated client that also carries the supplied role claims — used to
+    /// exercise RBAC policies (e.g. Operator-only endpoints). Pass no roles to
+    /// get a bare authenticated identity, which mirrors a Viewer-less web token.
+    /// </summary>
+    public HttpClient CreateAuthenticatedClient(params string[] roles)
+    {
+        var client = CreateAuthenticatedClient();
+        if (roles.Length > 0)
+            client.DefaultRequestHeaders.Add(TestAuthHandler.RolesHeader, string.Join(',', roles));
+        return client;
+    }
+
+    /// <summary>
+    /// Authenticated client with a stable <c>jti</c> header so logout-revocation tests
+    /// can replay the same synthetic token across requests. After <c>POST /auth/logout</c>
+    /// further requests from any client carrying the same jti will fail auth — the
+    /// shared <see cref="IMemoryCache"/> is the rendezvous point.
+    /// </summary>
+    public HttpClient CreateAuthenticatedClientWithJti(string jti, params string[] roles)
+    {
+        var client = CreateAuthenticatedClient(roles);
+        client.DefaultRequestHeaders.Add(TestAuthHandler.JtiHeader, jti);
+        return client;
+    }
+
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
         builder.UseEnvironment("Testing");

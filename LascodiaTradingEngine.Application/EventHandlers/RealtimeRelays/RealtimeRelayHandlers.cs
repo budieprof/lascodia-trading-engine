@@ -91,3 +91,19 @@ public sealed class BacktestCompletedRealtimeRelay(IRealtimeNotifier notifier)
     public Task Handle(BacktestCompletedIntegrationEvent @event) =>
         notifier.NotifyAsync(null, "backtestCompleted", @event);
 }
+
+/// <summary>Pushes <see cref="SentimentSnapshotCreatedIntegrationEvent"/> — broadcast (sentiment page).</summary>
+public sealed class SentimentSnapshotCreatedRealtimeRelay(IRealtimeNotifier notifier)
+    : IIntegrationEventHandler<SentimentSnapshotCreatedIntegrationEvent>
+{
+    public Task Handle(SentimentSnapshotCreatedIntegrationEvent @event) =>
+        notifier.NotifyAsync(null, "sentimentSnapshotCreated", @event);
+}
+
+/// <summary>Pushes <see cref="AuditDecisionLoggedIntegrationEvent"/> — broadcast (audit-trail page).</summary>
+public sealed class AuditDecisionLoggedRealtimeRelay(IRealtimeNotifier notifier)
+    : IIntegrationEventHandler<AuditDecisionLoggedIntegrationEvent>
+{
+    public Task Handle(AuditDecisionLoggedIntegrationEvent @event) =>
+        notifier.NotifyAsync(null, "auditDecisionLogged", @event);
+}

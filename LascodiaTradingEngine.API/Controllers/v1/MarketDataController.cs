@@ -1,10 +1,12 @@
 using System.Threading.RateLimiting;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using Lascodia.Trading.Engine.SharedApplication.Common.Services;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedLibrary;
+using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Application.MarketData.Queries.DTOs;
 using LascodiaTradingEngine.Application.MarketData.Queries.GetCandles;
 using LascodiaTradingEngine.Application.MarketData.Queries.GetCandleWatermarks;
@@ -65,6 +67,7 @@ public class MarketDataController : AuthControllerBase<MarketDataController>
 
     /// <summary>Receive a batch of tick data from the EA</summary>
     [HttpPost("tick/batch")]
+    [Authorize(Policy = Policies.EAIngest)]
     public async Task<ResponseData<string>> ReceiveTickBatch(ReceiveTickBatchCommand command)
     {
         if (!ModelState.IsValid)
@@ -75,6 +78,7 @@ public class MarketDataController : AuthControllerBase<MarketDataController>
 
     /// <summary>Receive a single candle from the EA</summary>
     [HttpPost("candle")]
+    [Authorize(Policy = Policies.EAIngest)]
     public async Task<ResponseData<long>> ReceiveCandle(ReceiveCandleCommand command)
     {
         if (!ModelState.IsValid)
@@ -85,6 +89,7 @@ public class MarketDataController : AuthControllerBase<MarketDataController>
 
     /// <summary>Receive a batch of live candles from the EA</summary>
     [HttpPost("candle/batch")]
+    [Authorize(Policy = Policies.EAIngest)]
     public async Task<ResponseData<int>> ReceiveCandleBatch(ReceiveCandleBatchCommand command)
     {
         if (!ModelState.IsValid)
@@ -95,6 +100,7 @@ public class MarketDataController : AuthControllerBase<MarketDataController>
 
     /// <summary>Receive a backfill batch of historical candles from the EA</summary>
     [HttpPost("candle/backfill")]
+    [Authorize(Policy = Policies.EAIngest)]
     public async Task<ResponseData<int>> ReceiveCandleBackfill(ReceiveCandleBackfillCommand command)
     {
         if (!ModelState.IsValid)

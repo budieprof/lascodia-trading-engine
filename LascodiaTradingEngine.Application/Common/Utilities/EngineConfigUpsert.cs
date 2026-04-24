@@ -19,6 +19,8 @@ namespace LascodiaTradingEngine.Application.Common.Utilities;
 /// </summary>
 public static class EngineConfigUpsert
 {
+    private const string PostgresProvider = "Npgsql.EntityFrameworkCore.PostgreSQL";
+
     /// <summary>
     /// Atomically upserts a single <c>EngineConfig</c> key/value via a single
     /// parameterised SQL statement. Safe to call concurrently from multiple
@@ -43,7 +45,7 @@ public static class EngineConfigUpsert
         bool isHotReloadable = true,
         CancellationToken ct = default)
     {
-        if (!ctx.Database.IsRelational())
+        if (!string.Equals(ctx.Database.ProviderName, PostgresProvider, StringComparison.Ordinal))
         {
             return UpsertTrackedAsync(ctx, key, value, dataType, description, isHotReloadable, ct);
         }

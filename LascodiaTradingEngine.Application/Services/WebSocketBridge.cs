@@ -30,6 +30,31 @@ public class WebSocketBridge : IWebSocketBridge
         _logger  = logger;
     }
 
+    public IReadOnlyCollection<string> GetConnectedInstanceIds()
+    {
+        if (_connections.IsEmpty)
+            return Array.Empty<string>();
+
+        List<string>? connectedIds = null;
+
+        foreach (var (instanceId, socket) in _connections)
+        {
+            if (socket.State == WebSocketState.Open)
+            {
+                connectedIds ??= [];
+                connectedIds.Add(instanceId);
+                continue;
+            }
+
+            // Best-effort pruning of sockets that closed without an explicit unregister call.
+            UnregisterConnection(instanceId);
+        }
+
+        return connectedIds is null
+            ? Array.Empty<string>()
+            : connectedIds;
+    }
+
     public bool IsConnected(string instanceId)
         => _connections.TryGetValue(instanceId, out var ws) && ws.State == WebSocketState.Open;
 
@@ -68,11 +93,17 @@ public class WebSocketBridge : IWebSocketBridge
 
     public void RegisterConnection(string instanceId, WebSocket socket)
     {
-        if (_connections.Count >= _options.MaxConnections)
+        bool isReplacement = _connections.ContainsKey(instanceId);
+        if (!isReplacement && _connections.Count >= _options.MaxConnections)
         {
             _logger.LogWarning("WebSocket: max connections ({Max}) reached, rejecting {Instance}",
                 _options.MaxConnections, instanceId);
             return;
+        }
+
+        if (_connections.TryGetValue(instanceId, out var existing) && !ReferenceEquals(existing, socket))
+        {
+            try { existing.Dispose(); } catch { /* best-effort cleanup */ }
         }
 
         _connections[instanceId] = socket;

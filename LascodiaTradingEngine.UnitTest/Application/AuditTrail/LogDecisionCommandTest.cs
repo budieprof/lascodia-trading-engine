@@ -2,6 +2,7 @@ using FluentValidation.TestHelper;
 using Microsoft.EntityFrameworkCore;
 using Moq;
 using MockQueryable.Moq;
+using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using LascodiaTradingEngine.Application.AuditTrail.Commands.LogDecision;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Domain.Entities;
@@ -56,13 +57,17 @@ public class LogDecisionCommandTest
     public async Task Handler_Creates_DecisionLog_Successfully()
     {
         var mockContext = new Mock<IWriteApplicationDbContext>();
+        var mockEventBus = new Mock<IIntegrationEventService>();
         var mockDbContext = new Mock<DbContext>();
         var logs = new List<DecisionLog>().AsQueryable().BuildMockDbSet();
         mockDbContext.Setup(c => c.Set<DecisionLog>()).Returns(logs.Object);
         mockContext.Setup(c => c.GetDbContext()).Returns(mockDbContext.Object);
         mockContext.Setup(c => c.SaveChangesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(1);
+        mockEventBus
+            .Setup(bus => bus.SaveAndPublish(mockContext.Object, It.IsAny<Lascodia.Trading.Engine.EventBus.Events.IntegrationEvent>()))
+            .Returns(Task.CompletedTask);
 
-        var handler = new LogDecisionCommandHandler(mockContext.Object);
+        var handler = new LogDecisionCommandHandler(mockContext.Object, mockEventBus.Object);
         var cmd = new LogDecisionCommand { EntityType = "Order", EntityId = 1, DecisionType = "Test", Outcome = "Ok", Reason = "r", Source = "s" };
 
         var result = await handler.Handle(cmd, CancellationToken.None);

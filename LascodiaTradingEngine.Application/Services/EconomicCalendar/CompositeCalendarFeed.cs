@@ -9,7 +9,7 @@ namespace LascodiaTradingEngine.Application.Services.EconomicCalendar;
 /// block the others.
 ///
 /// Deduplication: events with the same Title + Currency + ScheduledAt (minute precision)
-/// are collapsed — the first source to return an event wins.
+/// are collapsed and merged so richer fields from later sources are preserved.
 /// </summary>
 public sealed class CompositeCalendarFeed : IEconomicCalendarFeed
 {
@@ -38,19 +38,27 @@ public sealed class CompositeCalendarFeed : IEconomicCalendarFeed
 
         var results = await Task.WhenAll(tasks);
 
-        // Merge and deduplicate across sources
-        var seen    = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var merged  = new List<EconomicCalendarEvent>();
+        // Merge and deduplicate across sources while preserving richer fields from
+        // later sources (for example when one feed has the Actual or ExternalKey
+        // and the earlier feed does not).
+        var mergedByKey = new Dictionary<string, EconomicCalendarEvent>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var batch in results)
         {
             foreach (var ev in batch)
             {
                 var key = $"{ev.Title.Trim().ToUpperInvariant()}|{ev.Currency.ToUpperInvariant()}|{ev.ScheduledAt:yyyyMMddHHmm}";
-                if (seen.Add(key))
-                    merged.Add(ev);
+                if (!mergedByKey.TryGetValue(key, out var existing))
+                {
+                    mergedByKey[key] = ev;
+                    continue;
+                }
+
+                mergedByKey[key] = Merge(existing, ev);
             }
         }
+
+        var merged = mergedByKey.Values.ToList();
 
         _logger.LogInformation(
             "CompositeCalendarFeed: merged {Total} events from {Sources} source(s) ({Deduped} after dedup)",
@@ -102,4 +110,48 @@ public sealed class CompositeCalendarFeed : IEconomicCalendarFeed
             return [];
         }
     }
+
+    private static EconomicCalendarEvent Merge(EconomicCalendarEvent existing, EconomicCalendarEvent candidate)
+    {
+        bool candidateProvidesActual = !string.IsNullOrWhiteSpace(candidate.Actual);
+        bool existingProvidesActual = !string.IsNullOrWhiteSpace(existing.Actual);
+        bool candidateProvidesExternalKey = !string.IsNullOrWhiteSpace(candidate.ExternalKey);
+        bool existingProvidesExternalKey = !string.IsNullOrWhiteSpace(existing.ExternalKey);
+
+        var preferred = existing;
+        if (candidateProvidesActual && !existingProvidesActual)
+            preferred = candidate;
+        else if (candidateProvidesActual == existingProvidesActual &&
+                 candidateProvidesExternalKey && !existingProvidesExternalKey)
+            preferred = candidate;
+        else if (candidateProvidesActual == existingProvidesActual &&
+                 candidateProvidesExternalKey == existingProvidesExternalKey &&
+                 GetImpactPriority(candidate.Impact) > GetImpactPriority(existing.Impact))
+            preferred = candidate;
+
+        var other = ReferenceEquals(preferred, existing) ? candidate : existing;
+
+        return preferred with
+        {
+            Forecast = FirstNonBlank(preferred.Forecast, other.Forecast),
+            Previous = FirstNonBlank(preferred.Previous, other.Previous),
+            Actual = FirstNonBlank(preferred.Actual, other.Actual),
+            ExternalKey = FirstNonBlank(preferred.ExternalKey, other.ExternalKey) ?? string.Empty,
+            Impact = GetImpactPriority(preferred.Impact) >= GetImpactPriority(other.Impact) ? preferred.Impact : other.Impact,
+            IsAllDay = preferred.IsAllDay || other.IsAllDay,
+            IsTentative = preferred.IsTentative || other.IsTentative
+        };
+    }
+
+    private static string? FirstNonBlank(string? first, string? second)
+        => !string.IsNullOrWhiteSpace(first) ? first : second;
+
+    private static int GetImpactPriority(Domain.Enums.EconomicImpact impact)
+        => impact switch
+        {
+            Domain.Enums.EconomicImpact.High => 3,
+            Domain.Enums.EconomicImpact.Medium => 2,
+            Domain.Enums.EconomicImpact.Low => 1,
+            _ => 0
+        };
 }

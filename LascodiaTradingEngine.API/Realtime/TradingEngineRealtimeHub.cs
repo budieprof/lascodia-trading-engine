@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.SignalR;
 
@@ -25,6 +26,18 @@ public class TradingEngineRealtimeHub : Hub
     /// <summary>Format the SignalR group name for a given trading account id.</summary>
     public static string GroupForAccount(long tradingAccountId) => $"account:{tradingAccountId}";
 
+    /// <summary>Format the SignalR group name for a presence room keyed on a route path.</summary>
+    public static string GroupForRoom(string routeKey) => $"room:{routeKey}";
+
+    /// <summary>
+    /// Per-connection bookkeeping so we can emit <c>presenceLeft</c> for every
+    /// room the operator was in when their connection drops — without iterating
+    /// every known room on disconnect. Keyed by <c>ConnectionId</c> because one
+    /// tab = one connection, and a tab can occupy multiple rooms (e.g. detail
+    /// page opened in a split layout).
+    /// </summary>
+    private static readonly ConcurrentDictionary<string, HashSet<string>> Rooms = new();
+
     /// <summary>
     /// On connect, read the <c>tradingAccountId</c> claim from the principal and add the
     /// caller's connection to <c>account:{tradingAccountId}</c>. Connections without the
@@ -49,6 +62,58 @@ public class TradingEngineRealtimeHub : Hub
         if (long.TryParse(accountClaim, out var accountId))
             await Groups.RemoveFromGroupAsync(Context.ConnectionId, GroupForAccount(accountId));
 
+        // Broadcast a `presenceLeft` for every room this connection was in so
+        // peers see the departure even when the tab closed without an explicit
+        // LeaveRoom.
+        if (Rooms.TryRemove(Context.ConnectionId, out var rooms) && long.TryParse(accountClaim, out var id))
+        {
+            foreach (var routeKey in rooms)
+            {
+                await Clients.Group(GroupForRoom(routeKey))
+                    .SendAsync("presenceLeft", new { accountId = id, routeKey });
+            }
+        }
+
         await base.OnDisconnectedAsync(exception);
+    }
+
+    /// <summary>
+    /// Client-invoked. Adds the connection to a presence room and broadcasts
+    /// <c>presenceJoined</c> to every other member. No-op if the connection
+    /// is already in the room.
+    /// </summary>
+    public async Task EnterRoom(string routeKey)
+    {
+        if (string.IsNullOrWhiteSpace(routeKey)) return;
+        if (!long.TryParse(Context.User?.FindFirst("tradingAccountId")?.Value, out var accountId)) return;
+
+        var set = Rooms.GetOrAdd(Context.ConnectionId, _ => new HashSet<string>());
+        lock (set)
+        {
+            if (!set.Add(routeKey)) return; // already in room
+        }
+
+        await Groups.AddToGroupAsync(Context.ConnectionId, GroupForRoom(routeKey));
+        await Clients.Group(GroupForRoom(routeKey))
+            .SendAsync("presenceJoined", new { accountId, routeKey });
+    }
+
+    /// <summary>
+    /// Client-invoked. Removes the connection from a presence room and broadcasts
+    /// <c>presenceLeft</c>. Idempotent.
+    /// </summary>
+    public async Task LeaveRoom(string routeKey)
+    {
+        if (string.IsNullOrWhiteSpace(routeKey)) return;
+        if (!long.TryParse(Context.User?.FindFirst("tradingAccountId")?.Value, out var accountId)) return;
+
+        if (Rooms.TryGetValue(Context.ConnectionId, out var set))
+        {
+            lock (set) { set.Remove(routeKey); }
+        }
+
+        await Groups.RemoveFromGroupAsync(Context.ConnectionId, GroupForRoom(routeKey));
+        await Clients.Group(GroupForRoom(routeKey))
+            .SendAsync("presenceLeft", new { accountId, routeKey });
     }
 }

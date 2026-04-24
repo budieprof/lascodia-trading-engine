@@ -1650,9 +1650,9 @@ public class StrategyGenerationWorkerIntegrationTest : IClassFixture<PostgresFix
     {
         private readonly LogDecisionCommandHandler _handler;
 
-        public DecisionLogMediator(IWriteApplicationDbContext writeContext)
+        public DecisionLogMediator(IWriteApplicationDbContext writeContext, IIntegrationEventService eventBus)
         {
-            _handler = new LogDecisionCommandHandler(writeContext);
+            _handler = new LogDecisionCommandHandler(writeContext, eventBus);
         }
 
         public Task<TResponse> Send<TResponse>(IRequest<TResponse> request, CancellationToken cancellationToken = default)

@@ -54,6 +54,10 @@ public sealed class TradingMetrics
     public Counter<long>     MarketRegimeCacheMisses { get; }
     public Counter<long>     EngineConfigCacheHits  { get; }
     public Counter<long>     EngineConfigCacheMisses { get; }
+    public Counter<long>     EngineConfigExpiredEntries { get; }
+    public Counter<long>     EngineConfigStaleMetricsBlocksPruned { get; }
+    public Counter<long>     EngineConfigStaleMetricsEntriesPruned { get; }
+    public Histogram<double> EngineConfigExpiryCycleDurationMs { get; }
     public Counter<long>     KillSwitchTriggered    { get; }
     public Counter<long>     CircuitBreakerTransitions { get; }
     public Counter<long>     CircuitBreakerShortCircuits { get; }
@@ -63,6 +67,9 @@ public sealed class TradingMetrics
     public Histogram<double> MLScoringBatchSize     { get; }
     public Counter<long>     ConflictResolutionEarlyExits { get; }
     public Counter<long>     EaReconciliationDrift  { get; }
+    public Histogram<double> EaReconciliationMeanDriftPerRun { get; }
+    public Histogram<double> EaReconciliationWindowRunCount { get; }
+    public Counter<long>     EaReconciliationAlertTransitions { get; }
     public Counter<long>     RetentionRowsDeleted   { get; }
     public Histogram<double> StrategyLockAcquisitionMs { get; }
     public Counter<long>     RegimeParamsCacheHits  { get; }
@@ -150,6 +157,19 @@ public sealed class TradingMetrics
     public Histogram<double> WorkerCycleDurationMs  { get; }
     public Counter<long>     WorkerErrors           { get; }
     public Counter<long>     DrawdownEmergencySnapshots { get; }
+    public Counter<long>     EaCommandsPushed       { get; }
+    public Counter<long>     EaCommandPushFailures  { get; }
+    public Counter<long>     EaCommandsExpired      { get; }
+    public Histogram<double> EaCommandQueueLatencyMs { get; }
+    public Histogram<double> EaCommandPushSendDurationMs { get; }
+    public Histogram<double> EaCommandPushBacklogDepth { get; }
+    public Counter<long>     EaInstancesDisconnected { get; }
+    public Counter<long>     EaSymbolsReassigned { get; }
+    public Counter<long>     EaCoordinatorFailovers { get; }
+    public Counter<long>     EaAvailabilityTransitions { get; }
+    public Histogram<double> EaActiveInstanceCount { get; }
+    public Histogram<double> EaStaleInstanceCount { get; }
+    public Histogram<double> EaDisconnectedHeartbeatAgeSeconds { get; }
 
     // ── Candle Aggregation ──────────────────────────────────────────────────
     public Counter<long>     CandlesSynthesized     { get; }
@@ -197,6 +217,11 @@ public sealed class TradingMetrics
     public Counter<long>     StrategyGenTypeFaultDisabled       { get; }
     public Counter<long>     StrategyGenCompensationCleanupFailures { get; }
     public Histogram<double> StrategyGenScreeningDurationMs    { get; }
+    public Counter<long>     EvolutionaryCandidatesProposed    { get; }
+    public Counter<long>     EvolutionaryCandidatesInserted    { get; }
+    public Counter<long>     EvolutionaryCandidatesSkipped     { get; }
+    public Counter<long>     EvolutionaryBacktestsQueued       { get; }
+    public Histogram<double> EvolutionaryCycleDurationMs       { get; }
 
     // ── Optimization ────────────────────────────────────────────────────
     public Counter<long>     OptimizationRunsProcessed  { get; }
@@ -261,7 +286,10 @@ public sealed class TradingMetrics
     public Counter<long>     EconEventsIngested     { get; }
     public Counter<long>     EconActualsPatched     { get; }
     public Counter<long>     EconFeedErrors         { get; }
+    public Counter<long>     EconCircuitBreakerSkips { get; }
+    public Counter<long>     EconAlertTransitions   { get; }
     public Histogram<double> EconCycleDurationMs    { get; }
+    public Histogram<double> EconPendingActualsBacklog { get; }
 
     // ── Economic Calendar Feed ──────────────────────────────────────────────
     public Counter<long>     EconFeedFetches        { get; }
@@ -349,6 +377,10 @@ public sealed class TradingMetrics
         MarketRegimeCacheMisses = _meter.CreateCounter<long>("trading.market_regime_cache.misses", "lookups", "Cross-tick market regime cache misses that triggered a DB refresh.");
         EngineConfigCacheHits = _meter.CreateCounter<long>("trading.engine_config_cache.hits", "lookups", "EngineConfig cache hits on the hot tick path.");
         EngineConfigCacheMisses = _meter.CreateCounter<long>("trading.engine_config_cache.misses", "lookups", "EngineConfig cache misses that triggered a DB refresh.");
+        EngineConfigExpiredEntries = _meter.CreateCounter<long>("trading.engine_config_expiry.expired_entries", "entries", "Explicit expiry-managed EngineConfig rows soft-deleted by EngineConfigExpiryWorker.");
+        EngineConfigStaleMetricsBlocksPruned = _meter.CreateCounter<long>("trading.engine_config_expiry.stale_metrics_blocks_pruned", "blocks", "Stale MLMetrics blocks soft-deleted by EngineConfigExpiryWorker.");
+        EngineConfigStaleMetricsEntriesPruned = _meter.CreateCounter<long>("trading.engine_config_expiry.stale_metrics_entries_pruned", "entries", "MLMetrics EngineConfig rows soft-deleted as part of stale-block pruning.");
+        EngineConfigExpiryCycleDurationMs = _meter.CreateHistogram<double>("trading.engine_config_expiry.cycle_duration_ms", "ms", "EngineConfigExpiryWorker cycle duration.");
         KillSwitchTriggered = _meter.CreateCounter<long>("trading.kill_switch.triggered", "events", "Decisions short-circuited by an active kill switch. Tagged with scope={global|strategy} and site={strategy_worker|signal_bridge}.");
         CircuitBreakerTransitions = _meter.CreateCounter<long>("trading.circuit_breaker.transitions", "transitions", "External-service circuit breaker state transitions. Tagged with service and state.");
         CircuitBreakerShortCircuits = _meter.CreateCounter<long>("trading.circuit_breaker.short_circuits", "events", "Calls skipped because the circuit breaker was open. Tagged with service.");
@@ -357,7 +389,10 @@ public sealed class TradingMetrics
         MLScoringBatchCalls = _meter.CreateCounter<long>("trading.ml.scoring_batch_calls", "calls", "IMLSignalScorer.ScoreBatchAsync invocations by StrategyWorker. Tagged with batch_size={1..N}.");
         MLScoringBatchSize = _meter.CreateHistogram<double>("trading.ml.scoring_batch_size", "signals", "Number of signals per batched ML scoring call.");
         ConflictResolutionEarlyExits = _meter.CreateCounter<long>("trading.signals.conflict_resolution_early_exits", "candidates", "Candidate signals skipped by pre-score filtering before expensive per-strategy work ran.");
-        EaReconciliationDrift = _meter.CreateCounter<long>("trading.ea.reconciliation_drift", "events", "Non-zero drift findings persisted by the ReconciliationMonitor. Tagged with kind={orphaned_engine|unknown_broker|mismatched}.");
+        EaReconciliationDrift = _meter.CreateCounter<long>("trading.ea.reconciliation_drift", "events", "Drift findings observed while evaluating rolling EA reconciliation windows. Tagged with kind={orphaned_engine_positions|unknown_broker_positions|mismatched_positions|orphaned_engine_orders|unknown_broker_orders}.");
+        EaReconciliationMeanDriftPerRun = _meter.CreateHistogram<double>("trading.ea.reconciliation_mean_drift_per_run", "drift", "Mean total drift per run for each EA instance evaluated by the reconciliation monitor. Tagged with state={breached|healthy}.");
+        EaReconciliationWindowRunCount = _meter.CreateHistogram<double>("trading.ea.reconciliation_window_run_count", "runs", "Number of reconciliation runs contributing to a per-instance rolling-window evaluation. Tagged with state={breached|healthy}.");
+        EaReconciliationAlertTransitions = _meter.CreateCounter<long>("trading.ea.reconciliation_alert_transitions", "alerts", "Reconciliation alert notifications and resolutions. Tagged with transition={dispatched|resolved}.");
         RetentionRowsDeleted = _meter.CreateCounter<long>("trading.retention.rows_deleted", "rows", "Rows deleted by AuditRetentionWorker. Tagged with table.");
         StrategyLockAcquisitionMs = _meter.CreateHistogram<double>("trading.strategy.lock_acquisition_ms", "ms", "Wall-clock time spent inside IDistributedLock.TryAcquireAsync for strategy evaluation. Tagged with outcome={acquired|busy}.");
         RegimeParamsCacheHits = _meter.CreateCounter<long>("trading.strategy.regime_params_cache.hits", "lookups", "StrategyRegimeParams cache hits on the hot tick path.");
@@ -443,6 +478,58 @@ public sealed class TradingMetrics
             "trading.drawdown.emergency_snapshots",
             "snapshots",
             "Out-of-cycle drawdown snapshots triggered by large realised losses. Tagged with worker and trigger.");
+        EaCommandsPushed = _meter.CreateCounter<long>(
+            "trading.ea.commands_pushed",
+            "commands",
+            "EA commands successfully pushed over the realtime bridge. Tagged with command_type.");
+        EaCommandPushFailures = _meter.CreateCounter<long>(
+            "trading.ea.command_push_failures",
+            "commands",
+            "EA command push attempts that failed after candidate selection. Tagged with reason and command_type.");
+        EaCommandsExpired = _meter.CreateCounter<long>(
+            "trading.ea.commands_expired",
+            "commands",
+            "EA commands auto-expired after exceeding the realtime/poll fallback TTL.");
+        EaCommandQueueLatencyMs = _meter.CreateHistogram<double>(
+            "trading.ea.command_queue_latency",
+            "ms",
+            "Time from EA command creation to successful realtime push. Tagged with command_type.");
+        EaCommandPushSendDurationMs = _meter.CreateHistogram<double>(
+            "trading.ea.command_push_send_duration",
+            "ms",
+            "Realtime bridge send duration per successfully pushed EA command. Tagged with command_type.");
+        EaCommandPushBacklogDepth = _meter.CreateHistogram<double>(
+            "trading.ea.command_push_backlog_depth",
+            "commands",
+            "Sampled backlog depth of push-eligible EA commands across currently connected instances.");
+        EaInstancesDisconnected = _meter.CreateCounter<long>(
+            "trading.ea.instances_disconnected",
+            "instances",
+            "EA instances marked disconnected after heartbeat timeout.");
+        EaSymbolsReassigned = _meter.CreateCounter<long>(
+            "trading.ea.symbols_reassigned",
+            "symbols",
+            "Symbol ownership transferred from stale EAs to active standby instances.");
+        EaCoordinatorFailovers = _meter.CreateCounter<long>(
+            "trading.ea.coordinator_failovers",
+            "failovers",
+            "Coordinator role failovers triggered after stale EA disconnect detection.");
+        EaAvailabilityTransitions = _meter.CreateCounter<long>(
+            "trading.ea.availability_transitions",
+            "transitions",
+            "Transitions into or out of the no-active-EA state. Tagged with transition=enter|recover.");
+        EaActiveInstanceCount = _meter.CreateHistogram<double>(
+            "trading.ea.active_instance_count",
+            "instances",
+            "Sampled count of active EA instances seen by the EA health monitor.");
+        EaStaleInstanceCount = _meter.CreateHistogram<double>(
+            "trading.ea.stale_instance_count",
+            "instances",
+            "Number of active EA instances found stale in a health-monitor cycle.");
+        EaDisconnectedHeartbeatAgeSeconds = _meter.CreateHistogram<double>(
+            "trading.ea.disconnected_heartbeat_age",
+            "s",
+            "Heartbeat age of EA instances at the moment they were marked disconnected.");
 
         // Candle Aggregation
         CandlesSynthesized = _meter.CreateCounter<long>(
@@ -502,6 +589,11 @@ public sealed class TradingMetrics
         StrategyGenTypeFaultDisabled         = _meter.CreateCounter<long>("trading.strategy_generation.type_fault_disabled", "types", "Strategy types disabled mid-cycle due to repeated screening faults (tag: strategy_type)");
         StrategyGenCompensationCleanupFailures = _meter.CreateCounter<long>("trading.strategy_generation.compensation_cleanup_failures", "failures", "Failures encountered while cleaning up partially persisted strategy-generation candidates");
         StrategyGenScreeningDurationMs       = _meter.CreateHistogram<double>("trading.strategy_generation.screening_duration", "ms", "Per-candidate screening pipeline duration (tag: strategy_type)");
+        EvolutionaryCandidatesProposed       = _meter.CreateCounter<long>("trading.strategy_generation.evolutionary_proposed", "candidates", "Evolutionary offspring proposed before worker-side filtering.");
+        EvolutionaryCandidatesInserted       = _meter.CreateCounter<long>("trading.strategy_generation.evolutionary_inserted", "candidates", "Evolutionary offspring persisted as draft strategies.");
+        EvolutionaryCandidatesSkipped        = _meter.CreateCounter<long>("trading.strategy_generation.evolutionary_skipped", "candidates", "Evolutionary offspring skipped by the worker. Tagged with reason={parent_ineligible|invalid_parameters|duplicate_proposal|existing_strategy|active_validation_queue|persist_failed}.");
+        EvolutionaryBacktestsQueued          = _meter.CreateCounter<long>("trading.strategy_generation.evolutionary_backtests_queued", "runs", "Initial validation backtests queued for persisted evolutionary offspring.");
+        EvolutionaryCycleDurationMs          = _meter.CreateHistogram<double>("trading.strategy_generation.evolutionary_cycle_duration_ms", "ms", "EvolutionaryGeneratorWorker cycle duration.");
 
         // Optimization
         OptimizationRunsProcessed  = _meter.CreateCounter<long>("trading.optimization.runs_processed", "runs", "Optimization runs completed");
@@ -566,7 +658,10 @@ public sealed class TradingMetrics
         EconEventsIngested  = _meter.CreateCounter<long>("trading.econ_calendar.events_ingested", "events", "Economic events ingested from feed");
         EconActualsPatched  = _meter.CreateCounter<long>("trading.econ_calendar.actuals_patched", "events", "Economic events patched with actual values");
         EconFeedErrors      = _meter.CreateCounter<long>("trading.econ_calendar.feed_errors", "errors", "Economic calendar feed errors");
+        EconCircuitBreakerSkips = _meter.CreateCounter<long>("trading.econ_calendar.circuit_breaker_skips", "cycles", "Economic calendar ingestion cycles skipped because the feed circuit breaker is open.");
+        EconAlertTransitions = _meter.CreateCounter<long>("trading.econ_calendar.alert_transitions", "alerts", "Economic calendar feed-health alert notifications and resolutions. Tagged with transition={dispatched|resolved}.");
         EconCycleDurationMs = _meter.CreateHistogram<double>("trading.econ_calendar.cycle_duration", "ms", "Economic calendar worker full cycle duration");
+        EconPendingActualsBacklog = _meter.CreateHistogram<double>("trading.econ_calendar.pending_actuals_backlog", "events", "Pending economic events awaiting actual-value patching in a worker cycle.");
 
         // Economic Calendar Feed
         EconFeedFetches       = _meter.CreateCounter<long>("trading.econ_calendar.feed_fetches", "fetches", "HTTP fetches to calendar feed");
