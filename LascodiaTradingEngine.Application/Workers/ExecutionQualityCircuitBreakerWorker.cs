@@ -1,419 +1,934 @@
+using System.Diagnostics;
+using System.Globalization;
+using System.Text.Json;
+using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.AuditTrail.Commands.LogDecision;
+using LascodiaTradingEngine.Application.Common.Diagnostics;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Services;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
-using MediatR;
 
 namespace LascodiaTradingEngine.Application.Workers;
 
 /// <summary>
-/// Monitors execution quality per strategy and auto-pauses any strategy whose rolling
-/// average slippage or fill latency persistently exceeds configured thresholds.
+/// Monitors per-strategy execution quality and automatically pauses strategies whose recent
+/// execution windows show persistently poor fills.
 ///
 /// <para>
-/// <see cref="OrderExecutionWorker"/> writes a <see cref="ExecutionQualityLog"/> for
-/// every filled order. Without a consumer that acts on those records, a strategy can
-/// silently incur 3-5 pip slippage on every trade — eroding edge that backtests never
-/// modelled. This worker closes that feedback loop.
+/// The worker evaluates only fresh execution-quality evidence and only for strategies that are
+/// currently active or already paused by this worker. That prevents stale fills from causing new
+/// trips or auto-resumes months later.
 /// </para>
 ///
-/// Decision rules (evaluated over the last <c>ExecQuality:WindowFills</c> fills):
+/// <para>
+/// Decision rules are evaluated over the most recent <c>ExecQuality:WindowFills</c> fills inside
+/// the configured lookback window:
+/// </para>
+///
 /// <list type="bullet">
 ///   <item><description>
-///     Avg <see cref="ExecutionQualityLog.SlippagePips"/> &gt;
-///     <c>ExecQuality:MaxAvgSlippagePips</c> → strategy paused.
+///     Mean absolute <see cref="ExecutionQualityLog.SlippagePips"/> &gt;
+///     <c>ExecQuality:MaxAvgSlippagePips</c> trips the circuit.
 ///   </description></item>
 ///   <item><description>
-///     Avg <see cref="ExecutionQualityLog.SubmitToFillMs"/> &gt;
-///     <c>ExecQuality:MaxAvgLatencyMs</c> → strategy paused.
+///     Mean positive <see cref="ExecutionQualityLog.SubmitToFillMs"/> values &gt;
+///     <c>ExecQuality:MaxAvgLatencyMs</c> trips the circuit. Zero/negative latencies are treated as
+///     missing telemetry and excluded from the latency average instead of biasing it downward.
+///   </description></item>
+///   <item><description>
+///     When enabled, mean <see cref="ExecutionQualityLog.FillRate"/> &lt;
+///     <c>ExecQuality:MinAvgFillRate</c> also trips the circuit.
 ///   </description></item>
 /// </list>
 ///
-/// Config keys (EngineConfig, all hot-reloadable):
-/// <list type="bullet">
-///   <item><description><c>ExecQuality:PollIntervalMinutes</c> — default 15</description></item>
-///   <item><description><c>ExecQuality:WindowFills</c> — default 50 (minimum fills required for statistical significance)</description></item>
-///   <item><description><c>ExecQuality:MaxAvgSlippagePips</c> — default 3.0</description></item>
-///   <item><description><c>ExecQuality:MaxAvgLatencyMs</c> — default 2000</description></item>
-///   <item><description><c>ExecQuality:AutoPauseEnabled</c> — default true</description></item>
-/// </list>
+/// <para>
+/// Hysteresis is applied on recovery so a strategy paused by this worker is only auto-resumed
+/// once its window has moved meaningfully back inside the thresholds.
+/// </para>
 /// </summary>
 public sealed class ExecutionQualityCircuitBreakerWorker : BackgroundService
 {
-    /// <summary>EngineConfig key: how often the circuit-breaker runs, in minutes (default 15).</summary>
-    private const string CK_PollMins     = "ExecQuality:PollIntervalMinutes";
+    internal const string WorkerName = nameof(ExecutionQualityCircuitBreakerWorker);
 
-    /// <summary>
-    /// EngineConfig key: the rolling window size — the number of most recent fills used
-    /// to compute averages (default 20). A strategy must have at least this many fills
-    /// before the circuit breaker will evaluate it, preventing false trips on small samples.
-    /// </summary>
-    private const string CK_WindowFills  = "ExecQuality:WindowFills";
+    private const string ExecutionQualityPauseReason = "ExecutionQuality";
 
-    /// <summary>
-    /// EngineConfig key: the maximum acceptable average slippage in pips (default 3.0).
-    /// Exceeding this threshold over the last <c>WindowFills</c> fills trips the circuit
-    /// breaker. For a EUR/USD 4-decimal pair, 3 pips = 0.0003 price units.
-    /// </summary>
-    private const string CK_MaxSlippage  = "ExecQuality:MaxAvgSlippagePips";
-
-    /// <summary>
-    /// EngineConfig key: the maximum acceptable average order fill latency in milliseconds
-    /// (default 2000 ms). High latency is a leading indicator of broker connectivity issues
-    /// or liquidity stress that will manifest as slippage if left unchecked.
-    /// </summary>
+    private const string CK_PollMins = "ExecQuality:PollIntervalMinutes";
+    private const string CK_WindowFills = "ExecQuality:WindowFills";
+    private const string CK_MaxSlippage = "ExecQuality:MaxAvgSlippagePips";
     private const string CK_MaxLatencyMs = "ExecQuality:MaxAvgLatencyMs";
-
-    /// <summary>
-    /// EngineConfig key: when <c>true</c> (default), a breaching strategy is automatically
-    /// paused. When <c>false</c>, the worker logs an audit warning but does not pause,
-    /// effectively putting it into observation-only mode.
-    /// </summary>
-    private const string CK_AutoPause    = "ExecQuality:AutoPauseEnabled";
+    private const string CK_AutoPause = "ExecQuality:AutoPauseEnabled";
     private const string CK_HysteresisMargin = "ExecQuality:HysteresisMarginPct";
+    private const string CK_LookbackDays = "ExecQuality:LookbackDays";
+    private const string CK_MinAvgFillRate = "ExecQuality:MinAvgFillRate";
+    private const string DistributedLockKey = "workers:execution-quality-circuit-breaker:cycle";
 
-    private readonly IServiceScopeFactory                              _scopeFactory;
-    private readonly ILogger<ExecutionQualityCircuitBreakerWorker>     _logger;
+    private const int DefaultPollIntervalMinutes = 15;
+    private const int MinPollIntervalMinutes = 1;
+    private const int MaxPollIntervalMinutes = 24 * 60;
 
-    /// <summary>
-    /// Initialises the worker.
-    /// </summary>
-    /// <param name="scopeFactory">Factory for creating per-cycle DI scopes.</param>
-    /// <param name="logger">Structured logger.</param>
+    private const int DefaultWindowFills = 50;
+    private const int MinWindowFills = 3;
+    private const int MaxWindowFills = 500;
+
+    private const double DefaultMaxAverageAbsoluteSlippagePips = 3.0;
+    private const double MaxAllowedAverageAbsoluteSlippagePips = 50.0;
+
+    private const double DefaultMaxAverageLatencyMs = 2000.0;
+    private const double MaxAllowedAverageLatencyMs = 60_000.0;
+
+    private const double DefaultHysteresisMargin = 0.20;
+    private const double MinHysteresisMargin = 0.0;
+    private const double MaxHysteresisMargin = 0.95;
+
+    private const int DefaultLookbackDays = 30;
+    private const int MinLookbackDays = 1;
+    private const int MaxLookbackDays = 365;
+
+    private const double DefaultMinAverageFillRate = 0.0;
+    private const double MinAverageFillRate = 0.0;
+    private const double MaxAverageFillRate = 1.0;
+
+    private static readonly TimeSpan DistributedLockTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan InitialRetryDelay = TimeSpan.FromMinutes(1);
+    private static readonly TimeSpan MaxRetryDelay = TimeSpan.FromMinutes(15);
+
+    private readonly IServiceScopeFactory _scopeFactory;
+    private readonly ILogger<ExecutionQualityCircuitBreakerWorker> _logger;
+    private readonly TradingMetrics? _metrics;
+    private readonly TimeProvider _timeProvider;
+    private readonly IWorkerHealthMonitor? _healthMonitor;
+    private readonly IDistributedLock? _distributedLock;
+
+    private int _consecutiveFailures;
+    private bool _missingDistributedLockWarningEmitted;
+
     public ExecutionQualityCircuitBreakerWorker(
-        IServiceScopeFactory                             scopeFactory,
-        ILogger<ExecutionQualityCircuitBreakerWorker>    logger)
+        IServiceScopeFactory scopeFactory,
+        ILogger<ExecutionQualityCircuitBreakerWorker> logger,
+        TradingMetrics? metrics = null,
+        TimeProvider? timeProvider = null,
+        IWorkerHealthMonitor? healthMonitor = null,
+        IDistributedLock? distributedLock = null)
     {
         _scopeFactory = scopeFactory;
-        _logger       = logger;
+        _logger = logger;
+        _metrics = metrics;
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _healthMonitor = healthMonitor;
+        _distributedLock = distributedLock;
     }
 
-    /// <summary>
-    /// Entry point for the hosted service. On each iteration:
-    /// <list type="number">
-    ///   <item><description>Reads all five EngineConfig thresholds (hot-reloadable).</description></item>
-    ///   <item><description>
-    ///     Calls <see cref="CheckAllStrategiesAsync"/> which iterates every strategy that has
-    ///     at least one <see cref="ExecutionQualityLog"/> row and evaluates its rolling averages.
-    ///   </description></item>
-    ///   <item><description>Waits for the configured poll interval before the next cycle.</description></item>
-    /// </list>
-    /// </summary>
-    /// <param name="stoppingToken">Signalled by the host on application shutdown.</param>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("ExecutionQualityCircuitBreakerWorker started.");
+        _logger.LogInformation("{Worker} started.", WorkerName);
+        _healthMonitor?.RecordWorkerMetadata(
+            WorkerName,
+            "Monitors recent execution quality windows, auto-pauses active strategies on sustained slippage/latency/fill-quality breaches, and auto-resumes only worker-owned pauses after hysteresis recovery.",
+            TimeSpan.FromMinutes(DefaultPollIntervalMinutes));
 
-        while (!stoppingToken.IsCancellationRequested)
+        var currentPollInterval = TimeSpan.FromMinutes(DefaultPollIntervalMinutes);
+
+        try
         {
-            // Default interval used if the EngineConfig row has not been created yet.
-            int pollMins = 15;
-
             try
             {
-                // Fresh async scope per cycle keeps the EF change-tracker clean and
-                // ensures config reads reflect the latest DB values each iteration.
-                await using var scope = _scopeFactory.CreateAsyncScope();
-                var readDb   = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
-                var writeDb  = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
-                var mediator = scope.ServiceProvider.GetRequiredService<IMediator>();
-                var ctx      = readDb.GetDbContext();
-                var writeCtx = writeDb.GetDbContext();
-
-                // Read all thresholds from EngineConfig — hot-reloadable without restart.
-                pollMins            = await GetConfigAsync<int>   (ctx, CK_PollMins,    15,   stoppingToken);
-                int    windowFills  = await GetConfigAsync<int>   (ctx, CK_WindowFills, 50,   stoppingToken);
-                double maxSlippage  = await GetConfigAsync<double>(ctx, CK_MaxSlippage, 3.0,  stoppingToken);
-                double maxLatencyMs = await GetConfigAsync<double>(ctx, CK_MaxLatencyMs,2000, stoppingToken);
-                bool   autoPause    = await GetConfigAsync<bool>  (ctx, CK_AutoPause,   true, stoppingToken);
-                double hysteresisMargin = await GetConfigAsync<double>(ctx, CK_HysteresisMargin, 0.20, stoppingToken);
-
-                await CheckAllStrategiesAsync(
-                    ctx, writeCtx, mediator,
-                    windowFills, maxSlippage, maxLatencyMs, autoPause, hysteresisMargin,
-                    stoppingToken);
+                var initialDelay = WorkerStartupSequencer.GetDelay(WorkerName);
+                if (initialDelay > TimeSpan.Zero)
+                    await Task.Delay(initialDelay, _timeProvider, stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
-                // Graceful shutdown.
-                break;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "ExecutionQualityCircuitBreakerWorker loop error");
+                return;
             }
 
-            await Task.Delay(TimeSpan.FromMinutes(pollMins), stoppingToken);
-        }
-
-        _logger.LogInformation("ExecutionQualityCircuitBreakerWorker stopping.");
-    }
-
-    // ── Per-strategy quality check ────────────────────────────────────────────
-
-    /// <summary>
-    /// Identifies all strategies that have at least one <see cref="ExecutionQualityLog"/>
-    /// record and evaluates each one in turn. Strategies with no logs are skipped — the
-    /// circuit breaker only acts on evidence, not absence of data.
-    /// </summary>
-    /// <param name="readCtx">Read DB context for loading quality log data.</param>
-    /// <param name="writeCtx">Write DB context for pausing breaching strategies.</param>
-    /// <param name="mediator">MediatR used for audit trail entries.</param>
-    /// <param name="windowFills">Minimum number of fills required before a strategy is evaluated.</param>
-    /// <param name="maxSlippage">Maximum acceptable average slippage in pips.</param>
-    /// <param name="maxLatencyMs">Maximum acceptable average fill latency in milliseconds.</param>
-    /// <param name="autoPause">Whether breaching strategies should be automatically paused.</param>
-    /// <param name="ct">Propagated cancellation token.</param>
-    private async Task CheckAllStrategiesAsync(
-        Microsoft.EntityFrameworkCore.DbContext readCtx,
-        Microsoft.EntityFrameworkCore.DbContext writeCtx,
-        IMediator                               mediator,
-        int                                     windowFills,
-        double                                  maxSlippage,
-        double                                  maxLatencyMs,
-        bool                                    autoPause,
-        double                                  hysteresisMargin,
-        CancellationToken                       ct)
-    {
-        // Only evaluate strategies that have at least one execution quality log.
-        // This avoids unnecessary per-strategy queries for strategies that have never traded.
-        var strategyIds = await readCtx.Set<ExecutionQualityLog>()
-            .Where(l => l.StrategyId != null && !l.IsDeleted)
-            .Select(l => l.StrategyId!.Value)
-            .Distinct()
-            .ToListAsync(ct);
-
-        if (strategyIds.Count == 0) return;
-
-        _logger.LogDebug(
-            "ExecutionQualityCircuitBreakerWorker: checking {Count} strategy/strategies.",
-            strategyIds.Count);
-
-        foreach (var strategyId in strategyIds)
-        {
-            // Honour cancellation between strategies — avoids holding resources if
-            // the host requests shutdown mid-cycle.
-            ct.ThrowIfCancellationRequested();
-            await CheckStrategyAsync(
-                strategyId, readCtx, writeCtx, mediator,
-                windowFills, maxSlippage, maxLatencyMs, autoPause, hysteresisMargin, ct);
-        }
-    }
-
-    /// <summary>
-    /// Evaluates execution quality for a single strategy. Computes rolling averages of
-    /// slippage and fill latency over the most recent <paramref name="windowFills"/> fills,
-    /// then compares them against the configured thresholds.
-    ///
-    /// <para>
-    /// <b>Circuit-breaker logic:</b>
-    /// <list type="bullet">
-    ///   <item><description>
-    ///     If the strategy has fewer than <paramref name="windowFills"/> fills, evaluation is
-    ///     skipped to avoid acting on a statistically insignificant sample.
-    ///   </description></item>
-    ///   <item><description>
-    ///     If either threshold is exceeded and <paramref name="autoPause"/> is <c>true</c>,
-    ///     the strategy is paused via a single targeted SQL UPDATE (only if currently Active).
-    ///   </description></item>
-    ///   <item><description>
-    ///     If <paramref name="autoPause"/> is <c>false</c>, a warning audit entry is written
-    ///     but no state change is made — useful for observing circuit-breaker behaviour in
-    ///     a new deployment before enabling enforcement.
-    ///   </description></item>
-    /// </list>
-    /// </para>
-    /// </summary>
-    /// <param name="strategyId">The ID of the strategy being evaluated.</param>
-    /// <param name="readCtx">Read DB context.</param>
-    /// <param name="writeCtx">Write DB context.</param>
-    /// <param name="mediator">MediatR for audit trail entries.</param>
-    /// <param name="windowFills">Rolling window size in number of fills.</param>
-    /// <param name="maxSlippage">Slippage threshold in pips.</param>
-    /// <param name="maxLatencyMs">Latency threshold in milliseconds.</param>
-    /// <param name="autoPause">Whether to pause the strategy on breach.</param>
-    /// <param name="ct">Propagated cancellation token.</param>
-    private async Task CheckStrategyAsync(
-        long                                    strategyId,
-        Microsoft.EntityFrameworkCore.DbContext readCtx,
-        Microsoft.EntityFrameworkCore.DbContext writeCtx,
-        IMediator                               mediator,
-        int                                     windowFills,
-        double                                  maxSlippage,
-        double                                  maxLatencyMs,
-        bool                                    autoPause,
-        double                                  hysteresisMargin,
-        CancellationToken                       ct)
-    {
-        // Load the most recent N fills for this strategy, ordered newest-first.
-        // AsNoTracking is used because we only read — no change tracking needed.
-        var logs = await readCtx.Set<ExecutionQualityLog>()
-            .Where(l => l.StrategyId == strategyId && !l.IsDeleted)
-            .OrderByDescending(l => l.RecordedAt)
-            .Take(windowFills)
-            .AsNoTracking()
-            .ToListAsync(ct);
-
-        // Require a minimum sample size to avoid false positives from sparse data.
-        // A strategy that just started trading will not be evaluated until enough
-        // fill records have been written by OrderExecutionWorker.
-        if (logs.Count < windowFills)
-        {
-            _logger.LogDebug(
-                "ExecQualityCircuitBreaker: strategy {Id} has only {N}/{Min} fills — skipping.",
-                strategyId, logs.Count, windowFills);
-            return;
-        }
-
-        // Compute rolling averages — cast SlippagePips to double for consistent arithmetic.
-        double avgSlippage  = (double)logs.Average(l => l.SlippagePips);
-        double avgLatency   = logs.Average(l => l.SubmitToFillMs);
-
-        bool slippageBreached = avgSlippage  > maxSlippage;
-        bool latencyBreached  = avgLatency   > maxLatencyMs;
-
-        // Hysteresis: if a strategy was previously paused by this circuit breaker and
-        // its metrics have recovered below the recovery threshold (trip - margin),
-        // auto-resume it. This prevents flapping where metrics oscillate around the
-        // threshold boundary. E.g., with maxSlippage=3.0 and margin=0.20, the strategy
-        // trips at >3.0 but only recovers when avgSlippage drops below 2.4 (3.0 * 0.80).
-        // Both slippage and latency use the same hysteresis margin for symmetric recovery.
-        double slippageRecoveryThreshold = maxSlippage * (1.0 - hysteresisMargin);
-        double latencyRecoveryThreshold  = maxLatencyMs * (1.0 - hysteresisMargin);
-
-        if (!slippageBreached && !latencyBreached)
-        {
-            // Check if this strategy was paused by THIS circuit breaker and has now recovered
-            // below the hysteresis recovery threshold — auto-resume it. Only resume if the
-            // pause reason was "ExecutionQuality" to avoid overriding pauses from other
-            // sources (DrawdownRecovery, StrategyHealth, manual operator pause).
-            bool fullyRecovered = avgSlippage <= slippageRecoveryThreshold && avgLatency <= latencyRecoveryThreshold;
-            if (fullyRecovered && autoPause)
+            while (!stoppingToken.IsCancellationRequested)
             {
-                int resumed = await writeCtx.Set<Strategy>()
-                    .Where(s => s.Id == strategyId && s.Status == StrategyStatus.Paused && !s.IsDeleted
-                             && s.PauseReason == "ExecutionQuality")
-                    .ExecuteUpdateAsync(s => s
-                        .SetProperty(x => x.Status, StrategyStatus.Active)
-                        .SetProperty(x => x.PauseReason, (string?)null),
-                        ct);
+                long cycleStarted = Stopwatch.GetTimestamp();
 
-                if (resumed > 0)
+                try
                 {
-                    _logger.LogInformation(
-                        "ExecQualityCircuitBreaker: strategy {Id} AUTO-RESUMED — metrics recovered below hysteresis threshold " +
-                        "(avgSlippage={Slip:F2} <= {SlipRecovery:F2}, avgLatency={Lat:F0} <= {LatRecovery:F0})",
-                        strategyId, avgSlippage, slippageRecoveryThreshold, avgLatency, latencyRecoveryThreshold);
+                    _healthMonitor?.RecordWorkerHeartbeat(WorkerName);
 
-                    await mediator.Send(new LogDecisionCommand
+                    var result = await RunCycleAsync(stoppingToken);
+                    currentPollInterval = result.Settings.PollInterval;
+
+                    long durationMs = (long)Stopwatch.GetElapsedTime(cycleStarted).TotalMilliseconds;
+                    _healthMonitor?.RecordBacklogDepth(WorkerName, result.CandidateStrategyCount);
+                    _healthMonitor?.RecordCycleSuccess(WorkerName, durationMs);
+                    _metrics?.WorkerCycleDurationMs.Record(
+                        durationMs,
+                        new KeyValuePair<string, object?>("worker", WorkerName));
+                    _metrics?.ExecutionQualityCycleDurationMs.Record(durationMs);
+
+                    if (result.SkippedReason is { Length: > 0 })
                     {
-                        EntityType   = "Strategy",
-                        EntityId     = strategyId,
-                        DecisionType = "ExecQualityRecovery",
-                        Outcome      = "Resumed",
-                        Reason       = $"Metrics recovered: avgSlippage={avgSlippage:F2} pips <= {slippageRecoveryThreshold:F2}, " +
-                                       $"avgLatency={avgLatency:F0} ms <= {latencyRecoveryThreshold:F0} " +
-                                       $"(hysteresis margin={hysteresisMargin:P0})",
-                        Source       = "ExecutionQualityCircuitBreakerWorker"
-                    }, ct);
+                        _logger.LogDebug(
+                            "{Worker}: cycle skipped ({Reason}).",
+                            WorkerName,
+                            result.SkippedReason);
+                    }
+                    else if (result.PauseCount > 0 || result.ResumeCount > 0 || result.WarningCount > 0)
+                    {
+                        _logger.LogInformation(
+                            "{Worker}: candidates={Candidates}, evaluated={Evaluated}, breaches={Breaches}, paused={Paused}, resumed={Resumed}, warnings={Warnings}, insufficientFreshData={Insufficient}.",
+                            WorkerName,
+                            result.CandidateStrategyCount,
+                            result.EvaluatedStrategyCount,
+                            result.BreachCount,
+                            result.PauseCount,
+                            result.ResumeCount,
+                            result.WarningCount,
+                            result.InsufficientFreshDataCount);
+                    }
+                    else
+                    {
+                        _logger.LogDebug(
+                            "{Worker}: candidates={Candidates}, evaluated={Evaluated}, insufficientFreshData={Insufficient}, no state changes.",
+                            WorkerName,
+                            result.CandidateStrategyCount,
+                            result.EvaluatedStrategyCount,
+                            result.InsufficientFreshDataCount);
+                    }
+
+                    if (_consecutiveFailures > 0)
+                    {
+                        _healthMonitor?.RecordRecovery(WorkerName, _consecutiveFailures);
+                        _logger.LogInformation(
+                            "{Worker}: recovered after {Failures} consecutive failure(s).",
+                            WorkerName,
+                            _consecutiveFailures);
+                    }
+
+                    _consecutiveFailures = 0;
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    _consecutiveFailures++;
+                    _healthMonitor?.RecordRetry(WorkerName);
+                    _healthMonitor?.RecordCycleFailure(WorkerName, ex.Message);
+                    _metrics?.WorkerErrors.Add(
+                        1,
+                        new KeyValuePair<string, object?>("worker", WorkerName),
+                        new KeyValuePair<string, object?>("reason", "execution_quality_circuit_breaker_cycle"));
+                    _logger.LogError(ex, "{Worker}: cycle failed.", WorkerName);
+                }
+
+                try
+                {
+                    await Task.Delay(
+                        CalculateDelay(currentPollInterval, _consecutiveFailures),
+                        _timeProvider,
+                        stoppingToken);
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    break;
                 }
             }
-
-            _logger.LogDebug(
-                "ExecQualityCircuitBreaker: strategy {Id} OK — avgSlippage={Slip:F2} pips, avgLatency={Lat:F0} ms.",
-                strategyId, avgSlippage, avgLatency);
-            return;
         }
-
-        // Build a human-readable breach reason that will appear in the audit trail
-        // and in the Warning log, making it clear exactly which threshold was crossed.
-        var reasons = new List<string>();
-        if (slippageBreached)
-            reasons.Add($"avgSlippage={avgSlippage:F2} pips > threshold {maxSlippage:F1} pips");
-        if (latencyBreached)
-            reasons.Add($"avgLatency={avgLatency:F0} ms > threshold {maxLatencyMs:F0} ms");
-
-        string reason = string.Join("; ", reasons) + $" (over last {windowFills} fills)";
-
-        _logger.LogWarning(
-            "ExecQualityCircuitBreaker: strategy {Id} breached execution quality thresholds — {Reason}",
-            strategyId, reason);
-
-        if (autoPause)
+        finally
         {
-            // Only pause if currently Active — idempotent if already paused by another worker.
-            // ExecuteUpdateAsync issues a single targeted SQL UPDATE without loading the entity.
-            int affected = await writeCtx.Set<Strategy>()
-                .Where(s => s.Id == strategyId && s.Status == StrategyStatus.Active && !s.IsDeleted)
-                .ExecuteUpdateAsync(s => s
-                    .SetProperty(x => x.Status, StrategyStatus.Paused)
-                    .SetProperty(x => x.PauseReason, "ExecutionQuality"),
-                    ct);
+            _healthMonitor?.RecordWorkerStopped(WorkerName);
+            _logger.LogInformation("{Worker} stopping.", WorkerName);
+        }
+    }
 
-            if (affected > 0)
+    internal async Task<ExecutionQualityCircuitBreakerCycleResult> RunCycleAsync(CancellationToken ct)
+    {
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        var serviceProvider = scope.ServiceProvider;
+        var writeContext = serviceProvider.GetRequiredService<IWriteApplicationDbContext>();
+        var mediator = serviceProvider.GetRequiredService<IMediator>();
+        var db = writeContext.GetDbContext();
+        var settings = await LoadSettingsAsync(db, ct);
+
+        if (_distributedLock is null)
+        {
+            if (!_missingDistributedLockWarningEmitted)
             {
                 _logger.LogWarning(
-                    "ExecQualityCircuitBreaker: strategy {Id} AUTO-PAUSED due to poor execution quality.",
-                    strategyId);
-
-                // Record the circuit-break decision with full context for post-mortem analysis.
-                await mediator.Send(new LogDecisionCommand
-                {
-                    EntityType   = "Strategy",
-                    EntityId     = strategyId,
-                    DecisionType = "ExecQualityCircuitBreak",
-                    Outcome      = "Paused",
-                    Reason       = reason,
-                    Source       = "ExecutionQualityCircuitBreakerWorker"
-                }, ct);
+                    "{Worker} running without IDistributedLock; duplicate multi-instance cycles are possible.",
+                    WorkerName);
+                _missingDistributedLockWarningEmitted = true;
             }
         }
         else
         {
-            // Audit-only mode — log but don't pause. Useful during initial deployments
-            // to observe the circuit breaker without affecting trading activity.
-            await mediator.Send(new LogDecisionCommand
+            var cycleLock = await _distributedLock.TryAcquireAsync(DistributedLockKey, DistributedLockTimeout, ct);
+            if (cycleLock is null)
+                return ExecutionQualityCircuitBreakerCycleResult.Skipped(settings, "lock_busy");
+
+            await using (cycleLock)
             {
-                EntityType   = "Strategy",
-                EntityId     = strategyId,
-                DecisionType = "ExecQualityWarning",
-                Outcome      = "Warning",
-                Reason       = reason + " (AutoPause disabled)",
-                Source       = "ExecutionQualityCircuitBreakerWorker"
-            }, ct);
+                return await RunCycleCoreAsync(db, mediator, settings, ct);
+            }
         }
+
+        return await RunCycleCoreAsync(db, mediator, settings, ct);
     }
 
-    // ── Config helper ─────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Reads a typed value from the <see cref="EngineConfig"/> table by key, returning
-    /// <paramref name="defaultValue"/> when the key is absent or the value cannot be
-    /// converted to <typeparamref name="T"/>. All config reads use <c>AsNoTracking</c> to
-    /// avoid polluting the EF change tracker with configuration rows.
-    /// </summary>
-    /// <typeparam name="T">Target primitive type (e.g. <see cref="int"/>, <see cref="double"/>, <see cref="bool"/>).</typeparam>
-    /// <param name="ctx">Read DB context.</param>
-    /// <param name="key">EngineConfig key.</param>
-    /// <param name="defaultValue">Value returned when the key is missing or conversion fails.</param>
-    /// <param name="ct">Propagated cancellation token.</param>
-    private static async Task<T> GetConfigAsync<T>(
-        Microsoft.EntityFrameworkCore.DbContext ctx,
-        string                                  key,
-        T                                       defaultValue,
-        CancellationToken                       ct)
+    internal static TimeSpan CalculateDelay(TimeSpan baseInterval, int consecutiveFailures)
     {
-        var entry = await ctx.Set<EngineConfig>()
+        if (consecutiveFailures <= 0)
+            return baseInterval <= TimeSpan.Zero
+                ? TimeSpan.FromMinutes(DefaultPollIntervalMinutes)
+                : baseInterval;
+
+        var cappedExponent = Math.Min(consecutiveFailures - 1, 30);
+        var delayedSeconds = InitialRetryDelay.TotalSeconds * Math.Pow(2, cappedExponent);
+        return TimeSpan.FromSeconds(Math.Min(delayedSeconds, MaxRetryDelay.TotalSeconds));
+    }
+
+    private async Task<ExecutionQualityCircuitBreakerCycleResult> RunCycleCoreAsync(
+        DbContext db,
+        IMediator mediator,
+        ExecutionQualityCircuitBreakerSettings settings,
+        CancellationToken ct)
+    {
+        var freshCutoffUtc = _timeProvider.GetUtcNow().UtcDateTime.AddDays(-settings.LookbackDays);
+        var candidates = await LoadCandidateStrategiesAsync(db, freshCutoffUtc, ct);
+        if (candidates.Count == 0)
+            return ExecutionQualityCircuitBreakerCycleResult.Empty(settings);
+
+        int evaluatedCount = 0;
+        int breachCount = 0;
+        int pauseCount = 0;
+        int resumeCount = 0;
+        int warningCount = 0;
+        int insufficientFreshDataCount = 0;
+
+        foreach (var candidate in candidates)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var outcome = await EvaluateStrategyAsync(db, mediator, candidate, settings, freshCutoffUtc, ct);
+            if (outcome.InsufficientFreshData)
+            {
+                insufficientFreshDataCount++;
+                continue;
+            }
+
+            if (!outcome.Evaluated)
+                continue;
+
+            evaluatedCount++;
+            if (outcome.Breached)
+                breachCount++;
+            if (outcome.Paused)
+                pauseCount++;
+            if (outcome.Resumed)
+                resumeCount++;
+            if (outcome.WarningLogged)
+                warningCount++;
+        }
+
+        if (evaluatedCount > 0)
+            _metrics?.ExecutionQualityStrategiesEvaluated.Add(evaluatedCount);
+
+        if (insufficientFreshDataCount > 0)
+            _metrics?.ExecutionQualityInsufficientFreshDataSkips.Add(insufficientFreshDataCount);
+
+        return new ExecutionQualityCircuitBreakerCycleResult(
+            settings,
+            CandidateStrategyCount: candidates.Count,
+            EvaluatedStrategyCount: evaluatedCount,
+            BreachCount: breachCount,
+            PauseCount: pauseCount,
+            ResumeCount: resumeCount,
+            WarningCount: warningCount,
+            InsufficientFreshDataCount: insufficientFreshDataCount,
+            SkippedReason: null);
+    }
+
+    private async Task<StrategyEvaluationOutcome> EvaluateStrategyAsync(
+        DbContext db,
+        IMediator mediator,
+        CandidateStrategyInfo candidate,
+        ExecutionQualityCircuitBreakerSettings settings,
+        DateTime freshCutoffUtc,
+        CancellationToken ct)
+    {
+        var logs = await db.Set<ExecutionQualityLog>()
             .AsNoTracking()
-            .FirstOrDefaultAsync(c => c.Key == key, ct);
+            .Where(log =>
+                !log.IsDeleted &&
+                log.StrategyId == candidate.Id &&
+                log.RecordedAt >= freshCutoffUtc)
+            .OrderByDescending(log => log.RecordedAt)
+            .Take(settings.WindowFills)
+            .ToListAsync(ct);
 
-        if (entry?.Value is null) return defaultValue;
+        if (logs.Count < settings.WindowFills)
+        {
+            _logger.LogDebug(
+                "{Worker}: strategy {StrategyId} has only {Count}/{Window} fresh fills inside the last {LookbackDays} day(s) — skipping.",
+                WorkerName,
+                candidate.Id,
+                logs.Count,
+                settings.WindowFills,
+                settings.LookbackDays);
 
-        try   { return (T)Convert.ChangeType(entry.Value, typeof(T)); }
-        catch { return defaultValue; }
+            return StrategyEvaluationOutcome.ForInsufficientFreshData();
+        }
+
+        var metrics = CalculateWindowMetrics(logs, settings);
+
+        _metrics?.ExecutionQualityAvgAbsoluteSlippagePips.Record(metrics.AvgAbsoluteSlippagePips);
+        if (metrics.HasLatencySamples)
+            _metrics?.ExecutionQualityAvgLatencyMs.Record(metrics.AvgLatencyMs);
+        _metrics?.ExecutionQualityAvgFillRate.Record(metrics.AvgFillRate);
+
+        if (metrics.SlippageBreached)
+        {
+            _metrics?.ExecutionQualityBreaches.Add(
+                1,
+                new KeyValuePair<string, object?>("metric", "slippage"));
+        }
+
+        if (metrics.LatencyBreached)
+        {
+            _metrics?.ExecutionQualityBreaches.Add(
+                1,
+                new KeyValuePair<string, object?>("metric", "latency"));
+        }
+
+        if (metrics.FillRateBreached)
+        {
+            _metrics?.ExecutionQualityBreaches.Add(
+                1,
+                new KeyValuePair<string, object?>("metric", "fill_rate"));
+        }
+
+        if (!metrics.AnyBreach)
+        {
+            if (candidate.IsExecutionQualityPaused && settings.AutoPauseEnabled && metrics.FullyRecovered)
+            {
+                int resumed = await db.Set<Strategy>()
+                    .Where(strategy =>
+                        !strategy.IsDeleted &&
+                        strategy.Id == candidate.Id &&
+                        strategy.Status == StrategyStatus.Paused &&
+                        strategy.PauseReason == ExecutionQualityPauseReason)
+                    .ExecuteUpdateAsync(setters => setters
+                        .SetProperty(strategy => strategy.Status, StrategyStatus.Active)
+                        .SetProperty(strategy => strategy.PauseReason, (string?)null),
+                        ct);
+
+                if (resumed > 0)
+                {
+                    _metrics?.ExecutionQualityResumes.Add(1);
+                    string contextJson = BuildDecisionContextJson(
+                        "Recovery",
+                        settings,
+                        metrics,
+                        Array.Empty<string>());
+
+                    _logger.LogInformation(
+                        "{Worker}: strategy {StrategyId} auto-resumed after execution quality recovery.",
+                        WorkerName,
+                        candidate.Id);
+
+                    await mediator.Send(new LogDecisionCommand
+                    {
+                        EntityType = "Strategy",
+                        EntityId = candidate.Id,
+                        DecisionType = "ExecQualityRecovery",
+                        Outcome = "Resumed",
+                        Reason = BuildRecoveryReason(metrics),
+                        ContextJson = contextJson,
+                        Source = WorkerName
+                    }, ct);
+
+                    return StrategyEvaluationOutcome.ForResume();
+                }
+            }
+
+            if (candidate.IsExecutionQualityPaused)
+            {
+                _logger.LogDebug(
+                    "{Worker}: strategy {StrategyId} remains paused by execution-quality circuit breaker pending hysteresis recovery.",
+                    WorkerName,
+                    candidate.Id);
+            }
+            else
+            {
+                _logger.LogDebug(
+                    "{Worker}: strategy {StrategyId} execution quality healthy (avgAbsSlippage={Slippage:F2}, avgLatency={Latency}, avgFillRate={FillRate:F3}).",
+                    WorkerName,
+                    candidate.Id,
+                    metrics.AvgAbsoluteSlippagePips,
+                    metrics.HasLatencySamples ? $"{metrics.AvgLatencyMs:F0} ms" : "n/a",
+                    metrics.AvgFillRate);
+            }
+
+            return StrategyEvaluationOutcome.ForHealthyEvaluation();
+        }
+
+        var breachedMetrics = BuildBreachedMetricNames(metrics);
+        string reason = BuildBreachReason(metrics, settings);
+        string context = BuildDecisionContextJson("Breach", settings, metrics, breachedMetrics);
+
+        _logger.LogWarning(
+            "{Worker}: strategy {StrategyId} breached execution quality thresholds — {Reason}",
+            WorkerName,
+            candidate.Id,
+            reason);
+
+        if (settings.AutoPauseEnabled && candidate.Status == StrategyStatus.Active)
+        {
+            int paused = await db.Set<Strategy>()
+                .Where(strategy =>
+                    !strategy.IsDeleted &&
+                    strategy.Id == candidate.Id &&
+                    strategy.Status == StrategyStatus.Active)
+                .ExecuteUpdateAsync(setters => setters
+                    .SetProperty(strategy => strategy.Status, StrategyStatus.Paused)
+                    .SetProperty(strategy => strategy.PauseReason, ExecutionQualityPauseReason),
+                    ct);
+
+            if (paused > 0)
+            {
+                _metrics?.ExecutionQualityPauses.Add(1);
+                await mediator.Send(new LogDecisionCommand
+                {
+                    EntityType = "Strategy",
+                    EntityId = candidate.Id,
+                    DecisionType = "ExecQualityCircuitBreak",
+                    Outcome = "Paused",
+                    Reason = reason,
+                    ContextJson = context,
+                    Source = WorkerName
+                }, ct);
+
+                return StrategyEvaluationOutcome.ForPause();
+            }
+
+            return StrategyEvaluationOutcome.ForBreachWithoutStateChange();
+        }
+
+        if (!settings.AutoPauseEnabled && candidate.Status == StrategyStatus.Active)
+        {
+            _metrics?.ExecutionQualityWarnings.Add(1);
+            await mediator.Send(new LogDecisionCommand
+            {
+                EntityType = "Strategy",
+                EntityId = candidate.Id,
+                DecisionType = "ExecQualityWarning",
+                Outcome = "Warning",
+                Reason = reason + " (AutoPause disabled)",
+                ContextJson = context,
+                Source = WorkerName
+            }, ct);
+
+            return StrategyEvaluationOutcome.ForWarning();
+        }
+
+        return StrategyEvaluationOutcome.ForBreachWithoutStateChange();
+    }
+
+    private static StrategyWindowMetrics CalculateWindowMetrics(
+        IReadOnlyList<ExecutionQualityLog> logs,
+        ExecutionQualityCircuitBreakerSettings settings)
+    {
+        double avgAbsoluteSlippagePips = logs.Average(log => (double)Math.Abs(log.SlippagePips));
+
+        var latencySamples = logs
+            .Where(log => log.SubmitToFillMs > 0)
+            .Select(log => (double)log.SubmitToFillMs)
+            .ToList();
+
+        bool hasLatencySamples = latencySamples.Count > 0;
+        double avgLatencyMs = hasLatencySamples ? latencySamples.Average() : 0.0;
+
+        double avgFillRate = logs.Average(log => Clamp((double)log.FillRate, MinAverageFillRate, MaxAverageFillRate));
+        bool fillRateMonitoringEnabled = settings.MinAverageFillRate > 0.0;
+
+        double slippageRecoveryThresholdPips = settings.MaxAverageAbsoluteSlippagePips * (1.0 - settings.HysteresisMargin);
+        double latencyRecoveryThresholdMs = settings.MaxAverageLatencyMs * (1.0 - settings.HysteresisMargin);
+        double fillRateRecoveryThreshold = fillRateMonitoringEnabled
+            ? Math.Min(1.0, settings.MinAverageFillRate + ((1.0 - settings.MinAverageFillRate) * settings.HysteresisMargin))
+            : 0.0;
+
+        return new StrategyWindowMetrics(
+            SampleSize: logs.Count,
+            AvgAbsoluteSlippagePips: avgAbsoluteSlippagePips,
+            AvgLatencyMs: avgLatencyMs,
+            HasLatencySamples: hasLatencySamples,
+            AvgFillRate: avgFillRate,
+            FillRateMonitoringEnabled: fillRateMonitoringEnabled,
+            OldestLogRecordedAtUtc: NormalizeUtc(logs[^1].RecordedAt),
+            NewestLogRecordedAtUtc: NormalizeUtc(logs[0].RecordedAt),
+            SlippageBreached: avgAbsoluteSlippagePips > settings.MaxAverageAbsoluteSlippagePips,
+            LatencyBreached: hasLatencySamples && avgLatencyMs > settings.MaxAverageLatencyMs,
+            FillRateBreached: fillRateMonitoringEnabled && avgFillRate < settings.MinAverageFillRate,
+            SlippageRecoveryThresholdPips: slippageRecoveryThresholdPips,
+            LatencyRecoveryThresholdMs: latencyRecoveryThresholdMs,
+            FillRateRecoveryThreshold: fillRateRecoveryThreshold);
+    }
+
+    private async Task<ExecutionQualityCircuitBreakerSettings> LoadSettingsAsync(DbContext db, CancellationToken ct)
+    {
+        int configuredPollMinutes = await GetIntAsync(db, CK_PollMins, DefaultPollIntervalMinutes, ct);
+        int configuredWindowFills = await GetIntAsync(db, CK_WindowFills, DefaultWindowFills, ct);
+        double configuredMaxSlippage = await GetDoubleAsync(db, CK_MaxSlippage, DefaultMaxAverageAbsoluteSlippagePips, ct);
+        double configuredMaxLatencyMs = await GetDoubleAsync(db, CK_MaxLatencyMs, DefaultMaxAverageLatencyMs, ct);
+        bool autoPauseEnabled = await GetBoolAsync(db, CK_AutoPause, true, ct);
+        double configuredHysteresisMargin = await GetDoubleAsync(db, CK_HysteresisMargin, DefaultHysteresisMargin, ct);
+        int configuredLookbackDays = await GetIntAsync(db, CK_LookbackDays, DefaultLookbackDays, ct);
+        double configuredMinAvgFillRate = await GetDoubleAsync(db, CK_MinAvgFillRate, DefaultMinAverageFillRate, ct);
+
+        int pollMinutes = Clamp(configuredPollMinutes, MinPollIntervalMinutes, MaxPollIntervalMinutes);
+        int windowFills = Clamp(configuredWindowFills, MinWindowFills, MaxWindowFills);
+        double maxAverageSlippagePips = NormalizePositiveThreshold(
+            configuredMaxSlippage,
+            DefaultMaxAverageAbsoluteSlippagePips,
+            MaxAllowedAverageAbsoluteSlippagePips);
+        double maxAverageLatencyMs = NormalizePositiveThreshold(
+            configuredMaxLatencyMs,
+            DefaultMaxAverageLatencyMs,
+            MaxAllowedAverageLatencyMs);
+        double hysteresisMargin = Clamp(
+            configuredHysteresisMargin,
+            MinHysteresisMargin,
+            MaxHysteresisMargin);
+        int lookbackDays = configuredLookbackDays <= 0
+            ? DefaultLookbackDays
+            : Clamp(configuredLookbackDays, MinLookbackDays, MaxLookbackDays);
+        double minAverageFillRate = Clamp(
+            configuredMinAvgFillRate,
+            MinAverageFillRate,
+            MaxAverageFillRate);
+
+        LogNormalizedSetting(CK_PollMins, configuredPollMinutes, pollMinutes);
+        LogNormalizedSetting(CK_WindowFills, configuredWindowFills, windowFills);
+        LogNormalizedSetting(CK_MaxSlippage, configuredMaxSlippage, maxAverageSlippagePips);
+        LogNormalizedSetting(CK_MaxLatencyMs, configuredMaxLatencyMs, maxAverageLatencyMs);
+        LogNormalizedSetting(CK_HysteresisMargin, configuredHysteresisMargin, hysteresisMargin);
+        LogNormalizedSetting(CK_LookbackDays, configuredLookbackDays, lookbackDays);
+        LogNormalizedSetting(CK_MinAvgFillRate, configuredMinAvgFillRate, minAverageFillRate);
+
+        return new ExecutionQualityCircuitBreakerSettings(
+            PollInterval: TimeSpan.FromMinutes(pollMinutes),
+            WindowFills: windowFills,
+            MaxAverageAbsoluteSlippagePips: maxAverageSlippagePips,
+            MaxAverageLatencyMs: maxAverageLatencyMs,
+            AutoPauseEnabled: autoPauseEnabled,
+            HysteresisMargin: hysteresisMargin,
+            LookbackDays: lookbackDays,
+            MinAverageFillRate: minAverageFillRate);
+    }
+
+    private void LogNormalizedSetting<T>(string key, T configuredValue, T effectiveValue)
+        where T : IEquatable<T>
+    {
+        if (configuredValue.Equals(effectiveValue))
+            return;
+
+        _logger.LogDebug(
+            "{Worker}: normalized config {Key} from {Configured} to {Effective}.",
+            WorkerName,
+            key,
+            configuredValue,
+            effectiveValue);
+    }
+
+    private static async Task<List<CandidateStrategyInfo>> LoadCandidateStrategiesAsync(
+        DbContext db,
+        DateTime freshCutoffUtc,
+        CancellationToken ct)
+    {
+        return await db.Set<Strategy>()
+            .AsNoTracking()
+            .Where(strategy =>
+                !strategy.IsDeleted &&
+                (strategy.Status == StrategyStatus.Active ||
+                 (strategy.Status == StrategyStatus.Paused && strategy.PauseReason == ExecutionQualityPauseReason)) &&
+                db.Set<ExecutionQualityLog>().Any(log =>
+                    !log.IsDeleted &&
+                    log.StrategyId == strategy.Id &&
+                    log.RecordedAt >= freshCutoffUtc))
+            .OrderBy(strategy => strategy.Id)
+            .Select(strategy => new CandidateStrategyInfo(
+                strategy.Id,
+                strategy.Status,
+                strategy.PauseReason))
+            .ToListAsync(ct);
+    }
+
+    private static string BuildBreachReason(
+        StrategyWindowMetrics metrics,
+        ExecutionQualityCircuitBreakerSettings settings)
+    {
+        var reasons = new List<string>(3);
+
+        if (metrics.SlippageBreached)
+        {
+            reasons.Add(
+                $"avgAbsSlippage={metrics.AvgAbsoluteSlippagePips:F2} pips > threshold {settings.MaxAverageAbsoluteSlippagePips:F2} pips");
+        }
+
+        if (metrics.LatencyBreached)
+        {
+            reasons.Add(
+                $"avgLatency={metrics.AvgLatencyMs:F0} ms > threshold {settings.MaxAverageLatencyMs:F0} ms");
+        }
+
+        if (metrics.FillRateBreached)
+        {
+            reasons.Add(
+                $"avgFillRate={metrics.AvgFillRate:F3} < threshold {settings.MinAverageFillRate:F3}");
+        }
+
+        return string.Join("; ", reasons) + $" (over last {metrics.SampleSize} fresh fills)";
+    }
+
+    private static string BuildRecoveryReason(StrategyWindowMetrics metrics)
+    {
+        var reasons = new List<string>(3)
+        {
+            $"avgAbsSlippage={metrics.AvgAbsoluteSlippagePips:F2} pips <= recovery {metrics.SlippageRecoveryThresholdPips:F2} pips"
+        };
+
+        if (metrics.HasLatencySamples)
+        {
+            reasons.Add(
+                $"avgLatency={metrics.AvgLatencyMs:F0} ms <= recovery {metrics.LatencyRecoveryThresholdMs:F0} ms");
+        }
+
+        if (metrics.FillRateMonitoringEnabled)
+        {
+            reasons.Add(
+                $"avgFillRate={metrics.AvgFillRate:F3} >= recovery {metrics.FillRateRecoveryThreshold:F3}");
+        }
+
+        return string.Join("; ", reasons);
+    }
+
+    private static string[] BuildBreachedMetricNames(StrategyWindowMetrics metrics)
+    {
+        var breached = new List<string>(3);
+        if (metrics.SlippageBreached)
+            breached.Add("slippage");
+        if (metrics.LatencyBreached)
+            breached.Add("latency");
+        if (metrics.FillRateBreached)
+            breached.Add("fill_rate");
+        return breached.ToArray();
+    }
+
+    private static string BuildDecisionContextJson(
+        string operation,
+        ExecutionQualityCircuitBreakerSettings settings,
+        StrategyWindowMetrics metrics,
+        IReadOnlyList<string> breachedMetrics)
+    {
+        return JsonSerializer.Serialize(new
+        {
+            operation,
+            sampleSize = metrics.SampleSize,
+            lookbackDays = settings.LookbackDays,
+            autoPauseEnabled = settings.AutoPauseEnabled,
+            avgAbsoluteSlippagePips = Math.Round(metrics.AvgAbsoluteSlippagePips, 6),
+            maxAverageAbsoluteSlippagePips = settings.MaxAverageAbsoluteSlippagePips,
+            avgLatencyMs = metrics.HasLatencySamples ? Math.Round(metrics.AvgLatencyMs, 3) : (double?)null,
+            maxAverageLatencyMs = settings.MaxAverageLatencyMs,
+            avgFillRate = Math.Round(metrics.AvgFillRate, 6),
+            minAverageFillRate = settings.MinAverageFillRate > 0.0 ? settings.MinAverageFillRate : (double?)null,
+            hysteresisMarginPct = settings.HysteresisMargin,
+            slippageRecoveryThresholdPips = Math.Round(metrics.SlippageRecoveryThresholdPips, 6),
+            latencyRecoveryThresholdMs = metrics.HasLatencySamples ? Math.Round(metrics.LatencyRecoveryThresholdMs, 3) : (double?)null,
+            fillRateRecoveryThreshold = metrics.FillRateMonitoringEnabled ? Math.Round(metrics.FillRateRecoveryThreshold, 6) : (double?)null,
+            oldestLogRecordedAtUtc = metrics.OldestLogRecordedAtUtc,
+            newestLogRecordedAtUtc = metrics.NewestLogRecordedAtUtc,
+            breachedMetrics = breachedMetrics.Count > 0 ? breachedMetrics : null
+        });
+    }
+
+    private static async Task<int> GetIntAsync(DbContext db, string key, int defaultValue, CancellationToken ct)
+    {
+        var raw = await db.Set<EngineConfig>()
+            .AsNoTracking()
+            .Where(config => !config.IsDeleted && config.Key == key)
+            .Select(config => config.Value)
+            .FirstOrDefaultAsync(ct);
+
+        return int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var value)
+            ? value
+            : defaultValue;
+    }
+
+    private static async Task<double> GetDoubleAsync(DbContext db, string key, double defaultValue, CancellationToken ct)
+    {
+        var raw = await db.Set<EngineConfig>()
+            .AsNoTracking()
+            .Where(config => !config.IsDeleted && config.Key == key)
+            .Select(config => config.Value)
+            .FirstOrDefaultAsync(ct);
+
+        return double.TryParse(raw, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.InvariantCulture, out var value)
+            ? value
+            : defaultValue;
+    }
+
+    private static async Task<bool> GetBoolAsync(DbContext db, string key, bool defaultValue, CancellationToken ct)
+    {
+        var raw = await db.Set<EngineConfig>()
+            .AsNoTracking()
+            .Where(config => !config.IsDeleted && config.Key == key)
+            .Select(config => config.Value)
+            .FirstOrDefaultAsync(ct);
+
+        if (raw is null)
+            return defaultValue;
+
+        if (bool.TryParse(raw, out var boolValue))
+            return boolValue;
+
+        if (int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var intValue))
+            return intValue != 0;
+
+        return defaultValue;
+    }
+
+    private static double NormalizePositiveThreshold(double configuredValue, double defaultValue, double maxAllowedValue)
+    {
+        if (double.IsNaN(configuredValue) || double.IsInfinity(configuredValue) || configuredValue <= 0.0)
+            return defaultValue;
+
+        return Math.Min(configuredValue, maxAllowedValue);
+    }
+
+    private static int Clamp(int value, int min, int max)
+        => Math.Min(Math.Max(value, min), max);
+
+    private static double Clamp(double value, double min, double max)
+        => Math.Min(Math.Max(value, min), max);
+
+    private static DateTime NormalizeUtc(DateTime value)
+    {
+        return value.Kind switch
+        {
+            DateTimeKind.Utc => value,
+            DateTimeKind.Local => value.ToUniversalTime(),
+            _ => DateTime.SpecifyKind(value, DateTimeKind.Utc)
+        };
+    }
+
+    private readonly record struct CandidateStrategyInfo(
+        long Id,
+        StrategyStatus Status,
+        string? PauseReason)
+    {
+        public bool IsExecutionQualityPaused
+            => Status == StrategyStatus.Paused &&
+               string.Equals(PauseReason, ExecutionQualityPauseReason, StringComparison.Ordinal);
+    }
+
+    private readonly record struct StrategyWindowMetrics(
+        int SampleSize,
+        double AvgAbsoluteSlippagePips,
+        double AvgLatencyMs,
+        bool HasLatencySamples,
+        double AvgFillRate,
+        bool FillRateMonitoringEnabled,
+        DateTime OldestLogRecordedAtUtc,
+        DateTime NewestLogRecordedAtUtc,
+        bool SlippageBreached,
+        bool LatencyBreached,
+        bool FillRateBreached,
+        double SlippageRecoveryThresholdPips,
+        double LatencyRecoveryThresholdMs,
+        double FillRateRecoveryThreshold)
+    {
+        public bool AnyBreach => SlippageBreached || LatencyBreached || FillRateBreached;
+
+        public bool FullyRecovered =>
+            AvgAbsoluteSlippagePips <= SlippageRecoveryThresholdPips &&
+            (!HasLatencySamples || AvgLatencyMs <= LatencyRecoveryThresholdMs) &&
+            (!FillRateMonitoringEnabled || AvgFillRate >= FillRateRecoveryThreshold);
+    }
+
+    private readonly record struct StrategyEvaluationOutcome(
+        bool Evaluated,
+        bool Breached,
+        bool Paused,
+        bool Resumed,
+        bool WarningLogged,
+        bool InsufficientFreshData)
+    {
+        public static StrategyEvaluationOutcome ForHealthyEvaluation()
+            => new(true, false, false, false, false, false);
+
+        public static StrategyEvaluationOutcome ForPause()
+            => new(true, true, true, false, false, false);
+
+        public static StrategyEvaluationOutcome ForResume()
+            => new(true, false, false, true, false, false);
+
+        public static StrategyEvaluationOutcome ForWarning()
+            => new(true, true, false, false, true, false);
+
+        public static StrategyEvaluationOutcome ForBreachWithoutStateChange()
+            => new(true, true, false, false, false, false);
+
+        public static StrategyEvaluationOutcome ForInsufficientFreshData()
+            => new(false, false, false, false, false, true);
+    }
+
+    internal readonly record struct ExecutionQualityCircuitBreakerSettings(
+        TimeSpan PollInterval,
+        int WindowFills,
+        double MaxAverageAbsoluteSlippagePips,
+        double MaxAverageLatencyMs,
+        bool AutoPauseEnabled,
+        double HysteresisMargin,
+        int LookbackDays,
+        double MinAverageFillRate);
+
+    internal readonly record struct ExecutionQualityCircuitBreakerCycleResult(
+        ExecutionQualityCircuitBreakerSettings Settings,
+        int CandidateStrategyCount,
+        int EvaluatedStrategyCount,
+        int BreachCount,
+        int PauseCount,
+        int ResumeCount,
+        int WarningCount,
+        int InsufficientFreshDataCount,
+        string? SkippedReason)
+    {
+        public static ExecutionQualityCircuitBreakerCycleResult Empty(ExecutionQualityCircuitBreakerSettings settings)
+            => new(
+                settings,
+                CandidateStrategyCount: 0,
+                EvaluatedStrategyCount: 0,
+                BreachCount: 0,
+                PauseCount: 0,
+                ResumeCount: 0,
+                WarningCount: 0,
+                InsufficientFreshDataCount: 0,
+                SkippedReason: null);
+
+        public static ExecutionQualityCircuitBreakerCycleResult Skipped(
+            ExecutionQualityCircuitBreakerSettings settings,
+            string reason)
+            => new(
+                settings,
+                CandidateStrategyCount: 0,
+                EvaluatedStrategyCount: 0,
+                BreachCount: 0,
+                PauseCount: 0,
+                ResumeCount: 0,
+                WarningCount: 0,
+                InsufficientFreshDataCount: 0,
+                SkippedReason: reason);
     }
 }

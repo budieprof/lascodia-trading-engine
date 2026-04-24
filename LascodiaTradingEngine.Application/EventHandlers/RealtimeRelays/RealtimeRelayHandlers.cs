@@ -107,3 +107,15 @@ public sealed class AuditDecisionLoggedRealtimeRelay(IRealtimeNotifier notifier)
     public Task Handle(AuditDecisionLoggedIntegrationEvent @event) =>
         notifier.NotifyAsync(null, "auditDecisionLogged", @event);
 }
+
+/// <summary>
+/// Pushes <see cref="StrategyActivatedIntegrationEvent"/> — broadcast so the
+/// strategies list + detail pages can refresh the moment a strategy flips to
+/// <c>Active</c>, instead of waiting for the next ag-grid refetch cycle.
+/// </summary>
+public sealed class StrategyActivatedRealtimeRelay(IRealtimeNotifier notifier)
+    : IIntegrationEventHandler<StrategyActivatedIntegrationEvent>
+{
+    public Task Handle(StrategyActivatedIntegrationEvent @event) =>
+        notifier.NotifyAsync(null, "strategyActivated", @event);
+}

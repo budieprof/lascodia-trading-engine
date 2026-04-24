@@ -105,7 +105,7 @@ public class FeatureStoreBackfillWorker : BackgroundService
             .ToList();
 
         // Pre-load COT data per base currency (shared across all timeframes of the same symbol)
-        var cotCache = new Dictionary<string, CotFeatureEntry>();
+        var cotLookupCache = new Dictionary<string, CotFeatureLookupSnapshot>(StringComparer.OrdinalIgnoreCase);
 
         var vectors = new List<StoredFeatureVector>();
         int skippedInsufficient = 0;
@@ -135,10 +135,10 @@ public class FeatureStoreBackfillWorker : BackgroundService
                 candleIndex[contextCandles[i].Id] = i;
 
             // Load COT data for this symbol's base currency
-            if (!cotCache.TryGetValue(symbol, out var cotEntry))
+            if (!cotLookupCache.TryGetValue(symbol, out var cotLookup))
             {
-                cotEntry = await LoadCotEntryAsync(readCtx, symbol, ct);
-                cotCache[symbol] = cotEntry;
+                cotLookup = await CotFeatureLookupSnapshot.LoadAsync(readCtx.GetDbContext(), symbol, ct);
+                cotLookupCache[symbol] = cotLookup;
             }
 
             foreach (var candle in groupCandles)
@@ -163,13 +163,20 @@ public class FeatureStoreBackfillWorker : BackgroundService
 
                 try
                 {
-                    float[] floatFeatures = MLFeatureHelper.BuildFeatureVector(window, current, previous, cotEntry);
+                    float[] floatFeatures = MLFeatureHelper.BuildFeatureVector(
+                        window,
+                        current,
+                        previous,
+                        cotLookup.Resolve(current.Timestamp));
                     double[] features = Array.ConvertAll(floatFeatures, f => (double)f);
 
                     vectors.Add(new StoredFeatureVector(
                         candle.Id, symbol, timeframe, candle.Timestamp,
                         features, featureStore.CurrentSchemaVersion,
-                        MLFeatureHelper.FeatureNames));
+                        MLFeatureHelper.ResolveFeatureNames(features.Length))
+                    {
+                        SchemaHash = featureStore.CurrentSchemaHash
+                    });
                 }
                 catch (Exception ex)
                 {
@@ -186,42 +193,5 @@ public class FeatureStoreBackfillWorker : BackgroundService
         _logger.LogInformation(
             "FeatureStoreBackfillWorker: backfilled {Count} candles, skipped {Skipped} (insufficient lookback)",
             vectors.Count, skippedInsufficient);
-    }
-
-    /// <summary>
-    /// Loads the latest COT report for the base currency of the given symbol.
-    /// Returns <see cref="CotFeatureEntry.Zero"/> if no report is available.
-    /// </summary>
-    private static async Task<CotFeatureEntry> LoadCotEntryAsync(
-        IReadApplicationDbContext readCtx, string symbol, CancellationToken ct)
-    {
-        if (symbol.Length < 3) return CotFeatureEntry.Zero;
-
-        string baseCurrency = symbol[..3];
-
-        var latestCot = await readCtx.GetDbContext()
-            .Set<COTReport>()
-            .Where(c => c.Currency == baseCurrency && !c.IsDeleted)
-            .OrderByDescending(c => c.ReportDate)
-            .FirstOrDefaultAsync(ct);
-
-        if (latestCot is null) return CotFeatureEntry.Zero;
-
-        var previousCot = await readCtx.GetDbContext()
-            .Set<COTReport>()
-            .Where(c => c.Currency == baseCurrency && !c.IsDeleted
-                     && c.ReportDate < latestCot.ReportDate)
-            .OrderByDescending(c => c.ReportDate)
-            .FirstOrDefaultAsync(ct);
-
-        float netNorm = (float)(latestCot.NetNonCommercialPositioning / 100_000m);
-        float momentum = previousCot is not null
-            ? (float)((latestCot.NetNonCommercialPositioning - previousCot.NetNonCommercialPositioning) / 10_000m)
-            : 0f;
-
-        return new CotFeatureEntry(
-            Math.Clamp(netNorm, -3f, 3f),
-            Math.Clamp(momentum, -3f, 3f),
-            HasData: true);
     }
 }

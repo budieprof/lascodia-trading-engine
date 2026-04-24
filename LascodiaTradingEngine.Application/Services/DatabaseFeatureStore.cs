@@ -66,8 +66,20 @@ public class DatabaseFeatureStore : IFeatureStore
         using var scope = _scopeFactory.CreateScope();
         var ctx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>().GetDbContext();
 
-        var entity = ToEntity(vector);
-        await ctx.Set<FeatureVector>().AddAsync(entity, cancellationToken);
+        var entity = await ctx.Set<FeatureVector>()
+            .IgnoreQueryFilters()
+            .FirstOrDefaultAsync(feature => feature.CandleId == vector.CandleId, cancellationToken);
+
+        if (entity is null)
+        {
+            entity = ToEntity(vector);
+            await ctx.Set<FeatureVector>().AddAsync(entity, cancellationToken);
+        }
+        else
+        {
+            ApplyToEntity(entity, vector);
+        }
+
         await ctx.SaveChangesAsync(cancellationToken);
 
         CacheVector(vector);
@@ -80,12 +92,34 @@ public class DatabaseFeatureStore : IFeatureStore
         using var scope = _scopeFactory.CreateScope();
         var ctx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>().GetDbContext();
 
-        var entities = vectors.Select(ToEntity).ToList();
-        await ctx.Set<FeatureVector>().AddRangeAsync(entities, cancellationToken);
+        var latestVectors = vectors
+            .GroupBy(vector => vector.CandleId)
+            .Select(group => group.Last())
+            .ToList();
+        var candleIds = latestVectors.Select(vector => vector.CandleId).ToList();
+
+        var existing = await ctx.Set<FeatureVector>()
+            .IgnoreQueryFilters()
+            .Where(feature => candleIds.Contains(feature.CandleId))
+            .ToListAsync(cancellationToken);
+        var existingByCandleId = existing.ToDictionary(feature => feature.CandleId);
+
+        foreach (var vector in latestVectors)
+        {
+            if (existingByCandleId.TryGetValue(vector.CandleId, out var entity))
+            {
+                ApplyToEntity(entity, vector);
+            }
+            else
+            {
+                await ctx.Set<FeatureVector>().AddAsync(ToEntity(vector), cancellationToken);
+            }
+        }
+
         await ctx.SaveChangesAsync(cancellationToken);
 
-        foreach (var v in vectors)
-            CacheVector(v);
+        foreach (var vector in latestVectors)
+            CacheVector(vector);
     }
 
     public async Task<StoredFeatureVector?> GetAsync(
@@ -101,7 +135,8 @@ public class DatabaseFeatureStore : IFeatureStore
 
         var entity = await ctx.Set<FeatureVector>()
             .Where(f => f.Symbol == symbol && f.Timeframe == timeframe
-                     && f.BarTimestamp == barTimestamp && f.SchemaVersion == CurrentSchemaVersion
+                     && f.BarTimestamp == barTimestamp
+                     && f.SchemaHash == CurrentSchemaHash
                      && !f.IsDeleted)
             .FirstOrDefaultAsync(cancellationToken);
 
@@ -122,7 +157,7 @@ public class DatabaseFeatureStore : IFeatureStore
         var entities = await ctx.Set<FeatureVector>()
             .Where(f => f.Symbol == symbol && f.Timeframe == timeframe
                      && f.BarTimestamp >= from && f.BarTimestamp <= to
-                     && f.SchemaVersion == CurrentSchemaVersion
+                     && f.SchemaHash == CurrentSchemaHash
                      && !f.IsDeleted)
             .OrderBy(f => f.BarTimestamp)
             .ToListAsync(cancellationToken);
@@ -343,8 +378,27 @@ public class DatabaseFeatureStore : IFeatureStore
             SchemaHash       = v.SchemaHash ?? CurrentSchemaHash,
             FeatureCount     = v.Features.Length,
             FeatureNamesJson = JsonSerializer.Serialize(v.FeatureNames),
-            ComputedAt       = DateTime.UtcNow
+            ComputedAt       = DateTime.UtcNow,
+            IsDeleted        = false
         };
+    }
+
+    private void ApplyToEntity(FeatureVector entity, StoredFeatureVector vector)
+    {
+        var featureBytes = new byte[vector.Features.Length * sizeof(double)];
+        Buffer.BlockCopy(vector.Features, 0, featureBytes, 0, featureBytes.Length);
+
+        entity.CandleId = vector.CandleId;
+        entity.Symbol = vector.Symbol;
+        entity.Timeframe = vector.Timeframe;
+        entity.BarTimestamp = vector.BarTimestamp;
+        entity.Features = featureBytes;
+        entity.SchemaVersion = vector.SchemaVersion;
+        entity.SchemaHash = vector.SchemaHash ?? CurrentSchemaHash;
+        entity.FeatureCount = vector.Features.Length;
+        entity.FeatureNamesJson = JsonSerializer.Serialize(vector.FeatureNames);
+        entity.ComputedAt = DateTime.UtcNow;
+        entity.IsDeleted = false;
     }
 
     private static StoredFeatureVector ToStoredVector(FeatureVector e)

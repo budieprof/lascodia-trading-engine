@@ -170,6 +170,23 @@ public sealed class TradingMetrics
     public Histogram<double> EaActiveInstanceCount { get; }
     public Histogram<double> EaStaleInstanceCount { get; }
     public Histogram<double> EaDisconnectedHeartbeatAgeSeconds { get; }
+    public Counter<long>     ExecutionQualityStrategiesEvaluated { get; }
+    public Counter<long>     ExecutionQualityBreaches { get; }
+    public Counter<long>     ExecutionQualityPauses { get; }
+    public Counter<long>     ExecutionQualityResumes { get; }
+    public Counter<long>     ExecutionQualityWarnings { get; }
+    public Counter<long>     ExecutionQualityInsufficientFreshDataSkips { get; }
+    public Histogram<double> ExecutionQualityAvgAbsoluteSlippagePips { get; }
+    public Histogram<double> ExecutionQualityAvgLatencyMs { get; }
+    public Histogram<double> ExecutionQualityAvgFillRate { get; }
+    public Histogram<double> ExecutionQualityCycleDurationMs { get; }
+    public Counter<long>     FeaturePrecomputePairsEvaluated { get; }
+    public Counter<long>     FeaturePrecomputeVectorsWritten { get; }
+    public Counter<long>     FeaturePrecomputePairsSkipped { get; }
+    public Counter<long>     FeaturePrecomputeLineageWrites { get; }
+    public Counter<long>     FeaturePrecomputeLockAttempts { get; }
+    public Histogram<double> FeaturePrecomputeCatchUpBars { get; }
+    public Histogram<double> FeaturePrecomputeCycleDurationMs { get; }
 
     // ── Candle Aggregation ──────────────────────────────────────────────────
     public Counter<long>     CandlesSynthesized     { get; }
@@ -530,6 +547,74 @@ public sealed class TradingMetrics
             "trading.ea.disconnected_heartbeat_age",
             "s",
             "Heartbeat age of EA instances at the moment they were marked disconnected.");
+        ExecutionQualityStrategiesEvaluated = _meter.CreateCounter<long>(
+            "trading.execution_quality.strategies_evaluated",
+            "strategies",
+            "Strategy execution-quality windows evaluated by ExecutionQualityCircuitBreakerWorker.");
+        ExecutionQualityBreaches = _meter.CreateCounter<long>(
+            "trading.execution_quality.breaches",
+            "breaches",
+            "Execution-quality threshold breaches observed by metric. Tagged with metric={slippage|latency|fill_rate}.");
+        ExecutionQualityPauses = _meter.CreateCounter<long>(
+            "trading.execution_quality.pauses",
+            "strategies",
+            "Strategies auto-paused by ExecutionQualityCircuitBreakerWorker.");
+        ExecutionQualityResumes = _meter.CreateCounter<long>(
+            "trading.execution_quality.resumes",
+            "strategies",
+            "Strategies auto-resumed after execution-quality recovery.");
+        ExecutionQualityWarnings = _meter.CreateCounter<long>(
+            "trading.execution_quality.warnings",
+            "strategies",
+            "Observation-only execution-quality warnings emitted while auto-pause is disabled.");
+        ExecutionQualityInsufficientFreshDataSkips = _meter.CreateCounter<long>(
+            "trading.execution_quality.insufficient_fresh_data_skips",
+            "strategies",
+            "Strategies skipped because there were not enough fresh fills inside the execution-quality lookback window.");
+        ExecutionQualityAvgAbsoluteSlippagePips = _meter.CreateHistogram<double>(
+            "trading.execution_quality.avg_abs_slippage_pips",
+            "pips",
+            "Per-strategy rolling-window average absolute slippage evaluated by ExecutionQualityCircuitBreakerWorker.");
+        ExecutionQualityAvgLatencyMs = _meter.CreateHistogram<double>(
+            "trading.execution_quality.avg_latency_ms",
+            "ms",
+            "Per-strategy rolling-window average fill latency using only positive latency samples.");
+        ExecutionQualityAvgFillRate = _meter.CreateHistogram<double>(
+            "trading.execution_quality.avg_fill_rate",
+            "ratio",
+            "Per-strategy rolling-window average fill rate evaluated by ExecutionQualityCircuitBreakerWorker.");
+        ExecutionQualityCycleDurationMs = _meter.CreateHistogram<double>(
+            "trading.execution_quality.cycle_duration_ms",
+            "ms",
+            "ExecutionQualityCircuitBreakerWorker cycle duration.");
+        FeaturePrecomputePairsEvaluated = _meter.CreateCounter<long>(
+            "trading.feature_precompute.pairs_evaluated",
+            "pairs",
+            "Active symbol/timeframe pairs evaluated by FeaturePreComputationWorker.");
+        FeaturePrecomputeVectorsWritten = _meter.CreateCounter<long>(
+            "trading.feature_precompute.vectors_written",
+            "vectors",
+            "Feature vectors written or refreshed by FeaturePreComputationWorker.");
+        FeaturePrecomputePairsSkipped = _meter.CreateCounter<long>(
+            "trading.feature_precompute.pairs_skipped",
+            "pairs",
+            "Active pairs skipped by FeaturePreComputationWorker. Tagged with reason={insufficient_history|already_fresh|pair_error}.");
+        FeaturePrecomputeLineageWrites = _meter.CreateCounter<long>(
+            "trading.feature_precompute.lineage_writes",
+            "writes",
+            "FeatureVectorLineage records written by FeaturePreComputationWorker.");
+        FeaturePrecomputeLockAttempts = _meter.CreateCounter<long>(
+            "trading.feature_precompute.lock_attempts",
+            "cycles",
+            "FeaturePreComputationWorker distributed-lock attempts. Tagged with outcome={acquired|busy|unavailable}.");
+        FeaturePrecomputeCatchUpBars = _meter.CreateHistogram<double>(
+            "trading.feature_precompute.catch_up_bars",
+            "bars",
+            "Number of recent bars refreshed for a pair in a FeaturePreComputationWorker cycle.");
+        FeaturePrecomputeCycleDurationMs = _meter.CreateHistogram<double>(
+            "trading.feature_precompute.cycle_duration_ms",
+            "ms",
+            "FeaturePreComputationWorker cycle duration.");
 
         // Candle Aggregation
         CandlesSynthesized = _meter.CreateCounter<long>(

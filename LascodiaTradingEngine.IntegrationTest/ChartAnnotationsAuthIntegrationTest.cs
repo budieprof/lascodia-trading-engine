@@ -13,11 +13,11 @@ using LascodiaTradingEngine.IntegrationTest.Fixtures;
 namespace LascodiaTradingEngine.IntegrationTest;
 
 /// <summary>
-/// Integration coverage for the chart-annotation CRUD endpoints and the
+/// Integration coverage for the chart-annotation CRUD endpoints, the
 /// cookie-session probes (<c>whoami</c>, <c>ws-ticket</c>) that back the
-/// admin UI's realtime flow. Presence (<c>EnterRoom</c>/<c>LeaveRoom</c>) is
-/// deferred — SignalR hub testing needs a full in-memory WebSocket client
-/// which is a separate fixture.
+/// admin UI's realtime flow, and the SignalR presence hub. Presence runs
+/// over long-polling because <c>TestServer</c> doesn't ship a WebSocket
+/// transport.
 /// </summary>
 public class ChartAnnotationsAuthIntegrationTest : IClassFixture<PostgresFixture>
 {

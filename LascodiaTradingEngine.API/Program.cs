@@ -266,10 +266,16 @@ builder.Services.AddCors(options =>
         }
         else if (builder.Environment.IsDevelopment())
         {
-            // Development fallback: allow all origins
-            policy.AllowAnyOrigin()
+            // Development fallback: reflect whatever origin asked. We can't use
+            // AllowAnyOrigin() here because the admin UI sends credentialed
+            // requests (HttpOnly auth cookie) and browsers refuse the wildcard
+            // `Access-Control-Allow-Origin: *` response when credentials are
+            // included. SetIsOriginAllowed(_ => true) keeps dev permissive while
+            // echoing the concrete origin on every response.
+            policy.SetIsOriginAllowed(_ => true)
                   .AllowAnyMethod()
-                  .AllowAnyHeader();
+                  .AllowAnyHeader()
+                  .AllowCredentials();
         }
         else
         {
