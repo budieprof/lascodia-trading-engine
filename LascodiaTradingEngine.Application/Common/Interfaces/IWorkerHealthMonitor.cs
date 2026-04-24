@@ -47,4 +47,11 @@ public interface IWorkerHealthMonitor
 
     /// <summary>Records that a worker has stopped execution (normal shutdown or crash).</summary>
     void RecordWorkerStopped(string workerName, string? errorMessage = null);
+
+    /// <summary>
+    /// Records that a one-shot worker has finished its job cleanly. Unlike
+    /// <see cref="RecordWorkerStopped"/> this marks the worker as completed so
+    /// the aggregate health check does not report it as unhealthy.
+    /// </summary>
+    void RecordWorkerCompleted(string workerName);
 }

@@ -80,6 +80,7 @@ public sealed class FeatureSchemaVersionBackfillWorker : BackgroundService
             "One-shot migration that safely backfills FeatureSchemaVersion on legacy MLModel snapshots and leaves unresolved blobs explicitly incomplete for retry.",
             TimeSpan.FromDays(1));
 
+        bool cycleFaulted = false;
         try
         {
             try
@@ -149,6 +150,7 @@ public sealed class FeatureSchemaVersionBackfillWorker : BackgroundService
             }
             catch (Exception ex)
             {
+                cycleFaulted = true;
                 _healthMonitor?.RecordCycleFailure(WorkerName, ex.Message);
                 _metrics?.WorkerErrors.Add(
                     1,
@@ -159,7 +161,10 @@ public sealed class FeatureSchemaVersionBackfillWorker : BackgroundService
         }
         finally
         {
-            _healthMonitor?.RecordWorkerStopped(WorkerName);
+            if (cycleFaulted)
+                _healthMonitor?.RecordWorkerStopped(WorkerName);
+            else
+                _healthMonitor?.RecordWorkerCompleted(WorkerName);
             _logger.LogInformation("{Worker} stopped.", WorkerName);
         }
     }

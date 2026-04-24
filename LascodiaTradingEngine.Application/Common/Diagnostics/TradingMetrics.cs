@@ -186,6 +186,14 @@ public sealed class TradingMetrics
     public Counter<long>     FeatureSchemaBackfillLockAttempts { get; }
     public Counter<long>     FeatureSchemaBackfillCyclesSkipped { get; }
     public Histogram<double> FeatureSchemaBackfillCycleDurationMs { get; }
+    public Counter<long>     FeatureStoreBackfillCandlesEvaluated { get; }
+    public Counter<long>     FeatureStoreBackfillVectorsWritten { get; }
+    public Counter<long>     FeatureStoreBackfillCandlesSkipped { get; }
+    public Counter<long>     FeatureStoreBackfillLineageWrites { get; }
+    public Counter<long>     FeatureStoreBackfillLockAttempts { get; }
+    public Counter<long>     FeatureStoreBackfillCyclesSkipped { get; }
+    public Histogram<double> FeatureStoreBackfillPendingCandles { get; }
+    public Histogram<double> FeatureStoreBackfillCycleDurationMs { get; }
     public Counter<long>     FeaturePrecomputePairsEvaluated { get; }
     public Counter<long>     FeaturePrecomputeVectorsWritten { get; }
     public Counter<long>     FeaturePrecomputePairsSkipped { get; }
@@ -195,6 +203,12 @@ public sealed class TradingMetrics
     public Histogram<double> FeaturePrecomputeCatchUpBars { get; }
     public Histogram<double> FeaturePrecomputePendingVectors { get; }
     public Histogram<double> FeaturePrecomputeCycleDurationMs { get; }
+    public Counter<long>     IntradayAttributionAccountsEvaluated { get; }
+    public Counter<long>     IntradayAttributionSnapshotsInserted { get; }
+    public Counter<long>     IntradayAttributionSnapshotsUpdated { get; }
+    public Counter<long>     IntradayAttributionLockAttempts { get; }
+    public Counter<long>     IntradayAttributionCyclesSkipped { get; }
+    public Histogram<double> IntradayAttributionCycleDurationMs { get; }
 
     // ── Candle Aggregation ──────────────────────────────────────────────────
     public Counter<long>     CandlesSynthesized     { get; }
@@ -623,6 +637,38 @@ public sealed class TradingMetrics
             "trading.feature_schema_backfill.cycle_duration_ms",
             "ms",
             "FeatureSchemaVersionBackfillWorker cycle duration.");
+        FeatureStoreBackfillCandlesEvaluated = _meter.CreateCounter<long>(
+            "trading.feature_store_backfill.candles_evaluated",
+            "candles",
+            "Historical candles evaluated for feature-store backfill under the current schema.");
+        FeatureStoreBackfillVectorsWritten = _meter.CreateCounter<long>(
+            "trading.feature_store_backfill.vectors_written",
+            "vectors",
+            "Historical feature vectors written or refreshed by FeatureStoreBackfillWorker.");
+        FeatureStoreBackfillCandlesSkipped = _meter.CreateCounter<long>(
+            "trading.feature_store_backfill.candles_skipped",
+            "candles",
+            "Historical candles skipped by FeatureStoreBackfillWorker. Tagged with reason={insufficient_history|compute_error}.");
+        FeatureStoreBackfillLineageWrites = _meter.CreateCounter<long>(
+            "trading.feature_store_backfill.lineage_writes",
+            "writes",
+            "FeatureVectorLineage records written by FeatureStoreBackfillWorker.");
+        FeatureStoreBackfillLockAttempts = _meter.CreateCounter<long>(
+            "trading.feature_store_backfill.lock_attempts",
+            "cycles",
+            "FeatureStoreBackfillWorker distributed-lock attempts. Tagged with outcome={acquired|busy|unavailable}.");
+        FeatureStoreBackfillCyclesSkipped = _meter.CreateCounter<long>(
+            "trading.feature_store_backfill.cycles_skipped",
+            "cycles",
+            "FeatureStoreBackfillWorker cycles skipped without processing. Tagged with reason=lock_busy.");
+        FeatureStoreBackfillPendingCandles = _meter.CreateHistogram<double>(
+            "trading.feature_store_backfill.pending_candles",
+            "candles",
+            "Historical stale or missing candles loaded into a FeatureStoreBackfillWorker cycle.");
+        FeatureStoreBackfillCycleDurationMs = _meter.CreateHistogram<double>(
+            "trading.feature_store_backfill.cycle_duration_ms",
+            "ms",
+            "FeatureStoreBackfillWorker cycle duration.");
         FeaturePrecomputePairsEvaluated = _meter.CreateCounter<long>(
             "trading.feature_precompute.pairs_evaluated",
             "pairs",
@@ -659,6 +705,30 @@ public sealed class TradingMetrics
             "trading.feature_precompute.cycle_duration_ms",
             "ms",
             "FeaturePreComputationWorker cycle duration.");
+        IntradayAttributionAccountsEvaluated = _meter.CreateCounter<long>(
+            "trading.intraday_attribution.accounts_evaluated",
+            "accounts",
+            "Active accounts evaluated by IntradayAttributionWorker.");
+        IntradayAttributionSnapshotsInserted = _meter.CreateCounter<long>(
+            "trading.intraday_attribution.snapshots_inserted",
+            "snapshots",
+            "New hourly attribution snapshots inserted by IntradayAttributionWorker.");
+        IntradayAttributionSnapshotsUpdated = _meter.CreateCounter<long>(
+            "trading.intraday_attribution.snapshots_updated",
+            "snapshots",
+            "Existing hourly attribution snapshots refreshed by IntradayAttributionWorker.");
+        IntradayAttributionLockAttempts = _meter.CreateCounter<long>(
+            "trading.intraday_attribution.lock_attempts",
+            "cycles",
+            "IntradayAttributionWorker distributed-lock attempts. Tagged with outcome={acquired|busy|unavailable}.");
+        IntradayAttributionCyclesSkipped = _meter.CreateCounter<long>(
+            "trading.intraday_attribution.cycles_skipped",
+            "cycles",
+            "IntradayAttributionWorker cycles skipped without processing. Tagged with reason={disabled|lock_busy|no_active_accounts}.");
+        IntradayAttributionCycleDurationMs = _meter.CreateHistogram<double>(
+            "trading.intraday_attribution.cycle_duration_ms",
+            "ms",
+            "IntradayAttributionWorker cycle duration.");
 
         // Candle Aggregation
         CandlesSynthesized = _meter.CreateCounter<long>(

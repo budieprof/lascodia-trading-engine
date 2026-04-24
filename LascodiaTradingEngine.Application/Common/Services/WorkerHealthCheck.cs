@@ -27,7 +27,7 @@ public class WorkerHealthCheck : IHealthCheck
             return Task.FromResult(HealthCheckResult.Degraded("No worker health snapshots available"));
 
         var critical = snapshots
-            .Where(s => !s.IsRunning || s.ConsecutiveFailures > 10)
+            .Where(s => (!s.IsRunning && !s.IsCompleted) || s.ConsecutiveFailures > 10)
             .Select(s => s.WorkerName)
             .ToList();
 

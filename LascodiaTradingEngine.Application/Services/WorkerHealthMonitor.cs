@@ -61,6 +61,7 @@ public class WorkerHealthMonitor : IWorkerHealthMonitor
         public string? Purpose;
         public int ExpectedIntervalSeconds;
         public bool IsStopped;
+        public bool IsCompleted;
     }
 
     public WorkerHealthMonitor(
@@ -167,6 +168,7 @@ public class WorkerHealthMonitor : IWorkerHealthMonitor
             {
                 WorkerName               = kvp.Key,
                 IsRunning                = kvp.Value.IsRunning,
+                IsCompleted              = kvp.Value.IsCompleted,
                 LastSuccessAt            = kvp.Value.LastSuccessAt,
                 LastErrorAt              = kvp.Value.LastErrorAt,
                 LastErrorMessage         = kvp.Value.LastErrorMessage,
@@ -369,6 +371,16 @@ public class WorkerHealthMonitor : IWorkerHealthMonitor
             state.LastErrorMessage = errorMessage.Length > 500 ? errorMessage[..500] : errorMessage;
             _logger.LogError("WorkerHealthMonitor: {Worker} stopped with error: {Error}", workerName, errorMessage);
         }
+    }
+
+    public void RecordWorkerCompleted(string workerName)
+    {
+        var state = _state.GetOrAdd(workerName, _ => new WorkerState());
+        state.IsRunning = false;
+        state.IsStopped = true;
+        state.IsCompleted = true;
+        // Clear any stale crash-alert dedup so a future re-run isn't treated as recovery.
+        _alertedWorkers.TryRemove(workerName, out _);
     }
 
     private static long GetPercentile(long[] sorted, double percentile)

@@ -23,5 +23,7 @@ public class WorkerHealthSnapshotConfiguration : IEntityTypeConfiguration<Worker
         builder.HasIndex(x => new { x.WorkerName, x.CapturedAt });
 
         builder.Property(x => x.RowVersion).IsRowVersion();
+
+        builder.Ignore(x => x.IsCompleted);
     }
 }

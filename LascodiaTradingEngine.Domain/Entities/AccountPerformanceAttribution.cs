@@ -4,9 +4,9 @@ using LascodiaTradingEngine.Domain.Enums;
 namespace LascodiaTradingEngine.Domain.Entities;
 
 /// <summary>
-/// Daily performance attribution for a trading account, decomposing returns into
-/// alpha sources. Used by institutional allocators to evaluate whether the engine
-/// generates genuine alpha or levered beta.
+/// Performance attribution snapshot for a trading account, decomposing returns
+/// into alpha sources. Used for both end-of-day reporting and intraday running
+/// snapshots.
 /// </summary>
 public class AccountPerformanceAttribution : Entity<long>
 {
@@ -15,6 +15,12 @@ public class AccountPerformanceAttribution : Entity<long>
 
     /// <summary>Date this attribution covers.</summary>
     public DateTime AttributionDate { get; set; }
+
+    /// <summary>
+    /// Indicates whether this row is a daily end-of-day snapshot or an hourly
+    /// intraday running snapshot.
+    /// </summary>
+    public PerformanceAttributionGranularity Granularity { get; set; } = PerformanceAttributionGranularity.Daily;
 
     /// <summary>Account equity at start of day.</summary>
     public decimal StartOfDayEquity { get; set; }

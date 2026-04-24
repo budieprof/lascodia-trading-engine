@@ -86,6 +86,7 @@ public class PerformanceAttributionWorker : BackgroundService
                 .Set<AccountPerformanceAttribution>()
                 .AnyAsync(a => a.TradingAccountId == account.Id
                             && a.AttributionDate == yesterday
+                            && a.Granularity == PerformanceAttributionGranularity.Daily
                             && !a.IsDeleted, ct);
 
             if (existing) continue;
@@ -165,6 +166,7 @@ public class PerformanceAttributionWorker : BackgroundService
                 .Set<AccountPerformanceAttribution>()
                 .Where(a => a.TradingAccountId == account.Id
                          && a.AttributionDate < yesterday
+                         && a.Granularity == PerformanceAttributionGranularity.Daily
                          && !a.IsDeleted)
                 .OrderByDescending(a => a.AttributionDate)
                 .FirstOrDefaultAsync(ct);
@@ -405,6 +407,7 @@ public class PerformanceAttributionWorker : BackgroundService
             {
                 TradingAccountId        = account.Id,
                 AttributionDate         = yesterday,
+                Granularity            = PerformanceAttributionGranularity.Daily,
                 StartOfDayEquity        = startOfDayEquity,
                 EndOfDayEquity          = endOfDayEquity,
                 RealizedPnl             = realizedPnl,
@@ -451,6 +454,7 @@ public class PerformanceAttributionWorker : BackgroundService
             .Set<AccountPerformanceAttribution>()
             .Where(a => a.TradingAccountId == accountId
                      && a.AttributionDate < beforeDate
+                     && a.Granularity == PerformanceAttributionGranularity.Daily
                      && !a.IsDeleted)
             .OrderByDescending(a => a.AttributionDate)
             .Take(days)
@@ -472,6 +476,7 @@ public class PerformanceAttributionWorker : BackgroundService
             .Set<AccountPerformanceAttribution>()
             .Where(a => a.TradingAccountId == accountId
                      && a.AttributionDate < beforeDate
+                     && a.Granularity == PerformanceAttributionGranularity.Daily
                      && !a.IsDeleted)
             .OrderByDescending(a => a.AttributionDate)
             .Take(days)

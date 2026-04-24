@@ -17,6 +17,7 @@ public class AccountPerformanceAttributionConfiguration : IEntityTypeConfigurati
 
         builder.Property(x => x.StrategyAttributionJson).IsRequired().HasMaxLength(8000);
         builder.Property(x => x.SymbolAttributionJson).IsRequired().HasMaxLength(8000);
+        builder.Property(x => x.Granularity).HasConversion<int>();
 
         builder.HasOne(x => x.TradingAccount)
             .WithMany()
@@ -46,7 +47,7 @@ public class AccountPerformanceAttributionConfiguration : IEntityTypeConfigurati
 
         builder.HasQueryFilter(x => !x.IsDeleted);
 
-        builder.HasIndex(x => new { x.TradingAccountId, x.AttributionDate }).IsUnique();
+        builder.HasIndex(x => new { x.TradingAccountId, x.AttributionDate, x.Granularity }).IsUnique();
 
         builder.Property(x => x.RowVersion).IsRowVersion();
     }

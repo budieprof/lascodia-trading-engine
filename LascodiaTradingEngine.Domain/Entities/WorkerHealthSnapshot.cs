@@ -15,6 +15,12 @@ public class WorkerHealthSnapshot : Entity<long>
     /// <summary>Whether the worker is currently running.</summary>
     public bool IsRunning { get; set; }
 
+    /// <summary>
+    /// True when a one-shot worker has finished its job cleanly. In-memory only
+    /// (not persisted) — used by WorkerHealthCheck to distinguish "done" from "crashed".
+    /// </summary>
+    public bool IsCompleted { get; set; }
+
     /// <summary>Timestamp of the last successful cycle completion.</summary>
     public DateTime? LastSuccessAt { get; set; }
 
