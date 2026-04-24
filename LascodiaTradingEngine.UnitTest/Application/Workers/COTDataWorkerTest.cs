@@ -99,6 +99,62 @@ public class COTDataWorkerTest
     }
 
     [Fact]
+    public async Task RunCycleAsync_NormalizesFeedReportDateToUtcBeforePersisting()
+    {
+        var mediator = new Mock<IMediator>();
+        var feed = new Mock<ICOTDataFeed>(MockBehavior.Strict);
+        IngestCOTReportCommand? command = null;
+
+        mediator
+            .Setup(m => m.Send(It.IsAny<IngestCOTReportCommand>(), It.IsAny<CancellationToken>()))
+            .Callback<IRequest<ResponseData<long>>, CancellationToken>((request, _) =>
+                command = (IngestCOTReportCommand)request)
+            .ReturnsAsync(ResponseData<long>.Init(1, true, "Successful", "00"));
+
+        feed.Setup(f => f.SupportsCurrency(It.IsAny<string>()))
+            .Returns<string>(currency => currency == "EUR");
+
+        feed.Setup(f => f.GetLatestPublishedReportAsync("EUR", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new COTPositioningData(
+                ReportDate: new DateTime(2026, 5, 25),
+                CommercialLong: 10,
+                CommercialShort: 11,
+                NonCommercialLong: 30,
+                NonCommercialShort: 12,
+                RetailLong: 6,
+                RetailShort: 4,
+                TotalOpenInterest: 73));
+
+        using var provider = BuildProvider(
+            mediator.Object,
+            feed.Object,
+            db =>
+            {
+                db.Set<CurrencyPair>().Add(new CurrencyPair
+                {
+                    Id = 1,
+                    Symbol = "EURUSD",
+                    BaseCurrency = "EUR",
+                    QuoteCurrency = "ZZZ",
+                    IsActive = true,
+                    IsDeleted = false
+                });
+            });
+
+        var worker = new COTDataWorker(
+            NullLogger<COTDataWorker>.Instance,
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            new FakeDistributedLock());
+
+        var result = await worker.RunCycleAsync(CancellationToken.None);
+
+        Assert.Equal(1, result.CreatedCount);
+        Assert.NotNull(command);
+        Assert.Equal(DateTimeKind.Utc, command.ReportDate.Kind);
+        Assert.Equal(new DateTime(2026, 5, 25, 0, 0, 0, DateTimeKind.Utc), command.ReportDate);
+    }
+
+    [Fact]
     public async Task RunCycleAsync_RepairsStoredRow_WhenSameDatePayloadDiffers()
     {
         var mediator = new Mock<IMediator>();

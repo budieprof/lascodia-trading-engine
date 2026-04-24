@@ -38,9 +38,10 @@ public sealed class FeatureStoreBackfillWorkerTest
             .Select(index => (long)index)
             .ToArray();
 
-        Assert.Equal(5, result.PendingCandleCount);
+        Assert.Equal(MLFeatureHelper.LookbackWindow + 5, result.PendingCandleCount);
         Assert.Equal(5, result.VectorCount);
         Assert.Equal(1, result.LineageWriteCount);
+        Assert.Equal(MLFeatureHelper.LookbackWindow, result.InsufficientHistoryCount);
         Assert.Equal(expectedCandleIds, vectors.Select(vector => vector.CandleId).ToArray());
         var lineage = Assert.Single(lineages);
         Assert.Equal("EURUSD", lineage.Symbol);

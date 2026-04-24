@@ -20,11 +20,10 @@ namespace LascodiaTradingEngine.Application.Workers;
 /// is missing, stale, or structurally invalid under the current schema.
 ///
 /// <para>
-/// Unlike the active-pair pre-computation worker, this worker scans historical candles
-/// oldest-first across the full corpus. It excludes permanently ineligible early bars
-/// that do not yet have enough lookback context, preventing the historical backlog from
-/// stalling forever on the first <see cref="MLFeatureHelper.LookbackWindow"/> bars of
-/// each symbol/timeframe.
+    /// Unlike the active-pair pre-computation worker, this worker scans historical candles
+    /// oldest-first across the full corpus. The database scan intentionally stays simple
+    /// and index-friendly; lookback eligibility is enforced in the group processor so
+    /// permanently ineligible warmup bars cannot trigger expensive per-row history probes.
 /// </para>
 /// </summary>
 public sealed class FeatureStoreBackfillWorker : BackgroundService
@@ -149,7 +148,8 @@ public sealed class FeatureStoreBackfillWorker : BackgroundService
                     else
                     {
                         _logger.LogDebug(
-                            "{Worker}: no historical candles require feature-store backfill under the current schema.");
+                            "{Worker}: no historical candles require feature-store backfill under the current schema.",
+                            WorkerName);
                     }
 
                     if (_consecutiveFailures > 0)
@@ -383,12 +383,6 @@ public sealed class FeatureStoreBackfillWorker : BackgroundService
             .Where(candle =>
                 candle.IsClosed &&
                 !candle.IsDeleted &&
-                db.Set<Candle>().Count(prior =>
-                    prior.IsClosed &&
-                    !prior.IsDeleted &&
-                    prior.Symbol == candle.Symbol &&
-                    prior.Timeframe == candle.Timeframe &&
-                    prior.Timestamp < candle.Timestamp) >= MLFeatureHelper.LookbackWindow &&
                 !db.Set<FeatureVector>().Any(feature =>
                     feature.CandleId == candle.Id &&
                     !feature.IsDeleted &&

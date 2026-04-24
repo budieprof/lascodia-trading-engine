@@ -126,7 +126,7 @@ public class CftcCOTDataFeed : ICOTDataFeed
         }
 
         return new COTPositioningData(
-            ReportDate:        match.ReportDate.Date,
+            ReportDate:        ToUtcDate(match.ReportDate),
             CommercialLong:     match.CommercialLong,
             CommercialShort:    match.CommercialShort,
             NonCommercialLong:  match.NonCommercialLong,
@@ -195,6 +195,9 @@ public class CftcCOTDataFeed : ICOTDataFeed
     }
 
     private static string BuildCacheKey(int year) => $"cftc_cot_{year}";
+
+    private static DateTime ToUtcDate(DateTime value)
+        => DateTime.SpecifyKind(value.Date, DateTimeKind.Utc);
 
     /// <summary>
     /// Downloads the CFTC Legacy COT ZIP for the given year and parses its CSV contents.
@@ -305,8 +308,8 @@ public class CftcCOTDataFeed : ICOTDataFeed
                 var record = new CftcCsvRecord
                 {
                     ContractName     = fields[indices.MarketName].Trim(),
-                    ReportDate       = DateTime.ParseExact(
-                        fields[indices.ReportDate].Trim(), "yyyy-MM-dd", CultureInfo.InvariantCulture),
+                    ReportDate       = ToUtcDate(DateTime.ParseExact(
+                        fields[indices.ReportDate].Trim(), "yyyy-MM-dd", CultureInfo.InvariantCulture)),
                     CommercialLong   = ParseLong(fields[indices.CommLong]),
                     CommercialShort  = ParseLong(fields[indices.CommShort]),
                     NonCommercialLong  = ParseLong(fields[indices.NonCommLong]),

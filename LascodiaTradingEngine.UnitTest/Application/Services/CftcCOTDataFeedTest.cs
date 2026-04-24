@@ -42,7 +42,7 @@ public class CftcCOTDataFeedTest : IDisposable
         var result = await feed.GetLatestPublishedReportAsync("EUR", CancellationToken.None);
 
         Assert.NotNull(result);
-        Assert.Equal(new DateTime(2026, 4, 21, 0, 0, 0, DateTimeKind.Unspecified), result!.ReportDate);
+        Assert.Equal(new DateTime(2026, 4, 21, 0, 0, 0, DateTimeKind.Utc), result!.ReportDate);
         Assert.Equal(75, result.CommercialLong);
         Assert.Equal(65, result.CommercialShort);
         Assert.Equal(140, result.NonCommercialLong);
@@ -70,7 +70,7 @@ public class CftcCOTDataFeedTest : IDisposable
         var result = await feed.GetLatestPublishedReportAsync("EUR", CancellationToken.None);
 
         Assert.NotNull(result);
-        Assert.Equal(new DateTime(2025, 12, 30, 0, 0, 0, DateTimeKind.Unspecified), result!.ReportDate);
+        Assert.Equal(new DateTime(2025, 12, 30, 0, 0, 0, DateTimeKind.Utc), result!.ReportDate);
         Assert.Equal(69, result.CommercialLong);
         Assert.Equal(58, result.CommercialShort);
         Assert.Equal(98, result.NonCommercialLong);

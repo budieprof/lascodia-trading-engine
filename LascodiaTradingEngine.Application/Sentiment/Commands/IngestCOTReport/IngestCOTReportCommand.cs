@@ -76,13 +76,14 @@ public class IngestCOTReportCommandHandler : IRequestHandler<IngestCOTReportComm
         string currency = request.Symbol.Length >= 3
             ? request.Symbol[..3].ToUpperInvariant()
             : request.Symbol.ToUpperInvariant();
+        DateTime reportDate = DateTime.SpecifyKind(request.ReportDate.Date, DateTimeKind.Utc);
 
         decimal netNonCommercial = request.NonCommercialLong - request.NonCommercialShort;
 
         // Query the previous week's report for this currency to compute week-over-week delta.
         var previousReport = await _context.GetDbContext()
             .Set<Domain.Entities.COTReport>()
-            .Where(x => x.Currency == currency && x.ReportDate < request.ReportDate && !x.IsDeleted)
+            .Where(x => x.Currency == currency && x.ReportDate < reportDate && !x.IsDeleted)
             .OrderByDescending(x => x.ReportDate)
             .Select(x => new { x.NetNonCommercialPositioning })
             .FirstOrDefaultAsync(cancellationToken);
@@ -95,7 +96,7 @@ public class IngestCOTReportCommandHandler : IRequestHandler<IngestCOTReportComm
         var existing = await _context.GetDbContext()
             .Set<Domain.Entities.COTReport>()
             .FirstOrDefaultAsync(
-                x => x.Currency == currency && x.ReportDate == request.ReportDate && !x.IsDeleted,
+                x => x.Currency == currency && x.ReportDate == reportDate && !x.IsDeleted,
                 cancellationToken);
 
         if (existing != null)
@@ -117,7 +118,7 @@ public class IngestCOTReportCommandHandler : IRequestHandler<IngestCOTReportComm
         var entity = new Domain.Entities.COTReport
         {
             Currency                    = currency,
-            ReportDate                  = request.ReportDate,
+            ReportDate                  = reportDate,
             CommercialLong              = (long)request.CommercialLong,
             CommercialShort             = (long)request.CommercialShort,
             NonCommercialLong           = (long)request.NonCommercialLong,

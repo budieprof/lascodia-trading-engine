@@ -32,5 +32,8 @@ public class CandleConfiguration : IEntityTypeConfiguration<Candle>
         // Composite index for efficient candle lookups
         builder.HasIndex(x => new { x.Symbol, x.Timeframe, x.Timestamp }).IsUnique();
         builder.HasIndex(x => new { x.Symbol, x.Timeframe, x.IsClosed });
+        builder.HasIndex(x => new { x.Timestamp, x.Id })
+            .HasDatabaseName("IX_Candle_ClosedOldestScan")
+            .HasFilter("\"IsClosed\" = true AND \"IsDeleted\" = false");
     }
 }

@@ -116,7 +116,7 @@ public sealed class COTReportSyncService : ICOTReportSyncService
         }
 
         var reportDates = latestPublishedReports
-            .Select(x => x.Data.ReportDate.Date)
+            .Select(x => ToUtcDate(x.Data.ReportDate))
             .Distinct()
             .ToList();
 
@@ -292,7 +292,7 @@ public sealed class COTReportSyncService : ICOTReportSyncService
 
     private static bool Matches(COTReport existing, COTPositioningData data)
     {
-        return existing.ReportDate.Date == data.ReportDate.Date
+        return ToUtcDate(existing.ReportDate) == ToUtcDate(data.ReportDate)
             && existing.CommercialLong == data.CommercialLong
             && existing.CommercialShort == data.CommercialShort
             && existing.NonCommercialLong == data.NonCommercialLong
@@ -307,7 +307,7 @@ public sealed class COTReportSyncService : ICOTReportSyncService
         return new IngestCOTReportCommand
         {
             Symbol = currency,
-            ReportDate = data.ReportDate.Date,
+            ReportDate = ToUtcDate(data.ReportDate),
             CommercialLong = data.CommercialLong,
             CommercialShort = data.CommercialShort,
             NonCommercialLong = data.NonCommercialLong,
@@ -319,7 +319,10 @@ public sealed class COTReportSyncService : ICOTReportSyncService
     }
 
     private static string BuildReportKey(string currency, DateTime reportDate)
-        => $"{currency.ToUpperInvariant()}|{reportDate:yyyyMMdd}";
+        => $"{currency.ToUpperInvariant()}|{ToUtcDate(reportDate):yyyyMMdd}";
+
+    private static DateTime ToUtcDate(DateTime value)
+        => DateTime.SpecifyKind(value.Date, DateTimeKind.Utc);
 
     private sealed record CurrencyCOTReport(string Currency, COTPositioningData Data);
 

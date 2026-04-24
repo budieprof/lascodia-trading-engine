@@ -10,29 +10,39 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
         /// <inheritdoc />
         protected override void Up(MigrationBuilder migrationBuilder)
         {
-            migrationBuilder.DropIndex(
-                name: "IX_TradingAccount_IsActive",
-                table: "TradingAccount");
+            migrationBuilder.Sql("""
+                DROP INDEX IF EXISTS "IX_TradingAccount_IsActive";
 
-            migrationBuilder.CreateIndex(
-                name: "IX_TradingAccount_IsActive_SingleTrue",
-                table: "TradingAccount",
-                column: "IsActive",
-                unique: true,
-                filter: "\"IsActive\" = true AND \"IsDeleted\" = false");
+                WITH ranked_active_accounts AS (
+                    SELECT
+                        "Id",
+                        ROW_NUMBER() OVER (
+                            ORDER BY "LastSyncedAt" DESC, "Id" DESC
+                        ) AS row_num
+                    FROM "TradingAccount"
+                    WHERE "IsActive" = true AND "IsDeleted" = false
+                )
+                UPDATE "TradingAccount" account
+                SET "IsActive" = false
+                FROM ranked_active_accounts ranked
+                WHERE account."Id" = ranked."Id"
+                  AND ranked.row_num > 1;
+
+                CREATE UNIQUE INDEX IF NOT EXISTS "IX_TradingAccount_IsActive_SingleTrue"
+                ON "TradingAccount" ("IsActive")
+                WHERE "IsActive" = true AND "IsDeleted" = false;
+                """);
         }
 
         /// <inheritdoc />
         protected override void Down(MigrationBuilder migrationBuilder)
         {
-            migrationBuilder.DropIndex(
-                name: "IX_TradingAccount_IsActive_SingleTrue",
-                table: "TradingAccount");
+            migrationBuilder.Sql("""
+                DROP INDEX IF EXISTS "IX_TradingAccount_IsActive_SingleTrue";
 
-            migrationBuilder.CreateIndex(
-                name: "IX_TradingAccount_IsActive",
-                table: "TradingAccount",
-                column: "IsActive");
+                CREATE INDEX IF NOT EXISTS "IX_TradingAccount_IsActive"
+                ON "TradingAccount" ("IsActive");
+                """);
         }
     }
 }
