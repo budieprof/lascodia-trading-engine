@@ -1755,8 +1755,7 @@ public class StrategyGenerationWorkerIntegrationTest : IClassFixture<PostgresFix
         }
 
         public Task<List<IntegrationEventLogEntry>> GetRetryableEventsAsync(
-            TimeSpan stuckThreshold,
-            int maxRetries,
+            DateTime stuckInProgressBeforeUtc,
             int batchSize,
             CancellationToken ct)
             => Task.FromResult(new List<IntegrationEventLogEntry>());
@@ -1775,7 +1774,8 @@ public class StrategyGenerationWorkerIntegrationTest : IClassFixture<PostgresFix
         }
 
         public Task<List<IntegrationEventLogEntry>> GetStalePublishedEventsAsync(
-            TimeSpan staleThreshold,
+            DateTime stalePublishedBeforeUtc,
+            int maxTimesSentExclusive,
             int batchSize,
             CancellationToken ct)
             => Task.FromResult(new List<IntegrationEventLogEntry>());

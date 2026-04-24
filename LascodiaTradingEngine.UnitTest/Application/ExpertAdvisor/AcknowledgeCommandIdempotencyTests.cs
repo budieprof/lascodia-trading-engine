@@ -2,6 +2,7 @@ using Microsoft.EntityFrameworkCore;
 using Moq;
 using MockQueryable.Moq;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Application.ExpertAdvisor.Commands.AcknowledgeCommand;
 using LascodiaTradingEngine.Domain.Entities;
 
@@ -27,6 +28,44 @@ public class AcknowledgeCommandIdempotencyTests
         Assert.Equal("00", result.responseCode);
         Assert.True(ea.Acknowledged);
         Assert.Equal("token-A", ea.ClientAckToken);
+    }
+
+    [Fact]
+    public async Task CompletedAck_FinalizesAsSuccessful()
+    {
+        var ea = new EACommand { Id = 1, TargetInstanceId = "ea1", Symbol = "EURUSD" };
+        var handler = NewHandler(ea);
+
+        var result = await handler.Handle(new AcknowledgeCommandCommand
+        {
+            Id = 1,
+            Status = "Completed",
+            Result = "OK",
+            ClientAckToken = "token-A",
+        }, CancellationToken.None);
+
+        Assert.True(result.status);
+        Assert.True(ea.Acknowledged);
+        Assert.Equal("OK", ea.AckResult);
+    }
+
+    [Fact]
+    public async Task AckForUnownedCommand_Returns403()
+    {
+        var ea = new EACommand { Id = 1, TargetInstanceId = "ea1", Symbol = "EURUSD" };
+        var handler = NewHandler(ea, isOwner: false);
+
+        var result = await handler.Handle(new AcknowledgeCommandCommand
+        {
+            Id = 1,
+            Status = "Success",
+            Result = "OK",
+            ClientAckToken = "token-A",
+        }, CancellationToken.None);
+
+        Assert.False(result.status);
+        Assert.Equal("-403", result.responseCode);
+        Assert.False(ea.Acknowledged);
     }
 
     [Fact]
@@ -97,7 +136,7 @@ public class AcknowledgeCommandIdempotencyTests
         Assert.Equal("-409", result.responseCode);
     }
 
-    private static AcknowledgeCommandCommandHandler NewHandler(EACommand entity)
+    private static AcknowledgeCommandCommandHandler NewHandler(EACommand entity, bool isOwner = true)
     {
         var mockWrite = new Mock<IWriteApplicationDbContext>();
         var mockDb = new Mock<DbContext>();
@@ -105,6 +144,12 @@ public class AcknowledgeCommandIdempotencyTests
         mockWrite.Setup(w => w.SaveChangesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(1);
         mockDb.Setup(d => d.Set<EACommand>())
             .Returns(new List<EACommand> { entity }.AsQueryable().BuildMockDbSet().Object);
-        return new AcknowledgeCommandCommandHandler(mockWrite.Object);
+
+        var ownershipGuard = new Mock<IEAOwnershipGuard>();
+        ownershipGuard
+            .Setup(g => g.IsOwnerAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(isOwner);
+
+        return new AcknowledgeCommandCommandHandler(mockWrite.Object, ownershipGuard.Object);
     }
 }

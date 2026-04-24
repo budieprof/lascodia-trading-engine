@@ -55,6 +55,7 @@ public class TradeSignalController : AuthControllerBase<TradeSignalController>
 
     /// <summary>Get approved trade signals pending broker execution</summary>
     [HttpGet("pending-execution")]
+    [Authorize(Policy = Policies.EAIngest)]
     public async Task<ResponseData<List<TradeSignalDto>>> GetPendingExecution()
         => await Mediator.Send(new GetPendingExecutionTradeSignalsQuery());
 

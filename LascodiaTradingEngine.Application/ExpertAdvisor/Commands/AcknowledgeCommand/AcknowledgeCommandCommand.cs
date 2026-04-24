@@ -3,6 +3,7 @@ using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Security;
 
 namespace LascodiaTradingEngine.Application.ExpertAdvisor.Commands.AcknowledgeCommand;
 
@@ -61,10 +62,14 @@ public class AcknowledgeCommandCommandValidator : AbstractValidator<AcknowledgeC
 public class AcknowledgeCommandCommandHandler : IRequestHandler<AcknowledgeCommandCommand, ResponseData<string>>
 {
     private readonly IWriteApplicationDbContext _context;
+    private readonly IEAOwnershipGuard _ownershipGuard;
 
-    public AcknowledgeCommandCommandHandler(IWriteApplicationDbContext context)
+    public AcknowledgeCommandCommandHandler(
+        IWriteApplicationDbContext context,
+        IEAOwnershipGuard ownershipGuard)
     {
-        _context = context;
+        _context        = context;
+        _ownershipGuard = ownershipGuard;
     }
 
     public async Task<ResponseData<string>> Handle(AcknowledgeCommandCommand request, CancellationToken cancellationToken)
@@ -77,6 +82,9 @@ public class AcknowledgeCommandCommandHandler : IRequestHandler<AcknowledgeComma
 
         if (entity == null)
             return ResponseData<string>.Init(null, false, "Command not found", "-14");
+
+        if (!await _ownershipGuard.IsOwnerAsync(entity.TargetInstanceId, cancellationToken))
+            return ResponseData<string>.Init(null, false, "Unauthorized", "-403");
 
         // Idempotency: a duplicate ACK carrying the same ClientAckToken on an
         // already-acknowledged command is a network retry from the EA side —

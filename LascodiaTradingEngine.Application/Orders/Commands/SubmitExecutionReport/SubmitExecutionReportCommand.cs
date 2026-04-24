@@ -5,6 +5,8 @@ using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.Common.Events;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Security;
+using LascodiaTradingEngine.Application.Orders.Commands;
 using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.Orders.Commands.SubmitExecutionReport;
@@ -21,7 +23,7 @@ public class SubmitExecutionReportCommand : IRequest<ResponseData<string>>
     public string?  BrokerOrderId  { get; set; }
     public decimal? FilledPrice    { get; set; }
     public decimal? FilledQuantity { get; set; }
-    public required string Status  { get; set; }  // "Filled" | "Rejected" | "Cancelled"
+    public required string Status  { get; set; }
     public string?  RejectionReason { get; set; }
     public DateTime? FilledAt      { get; set; }
 
@@ -42,7 +44,7 @@ public class SubmitExecutionReportCommand : IRequest<ResponseData<string>>
 
 // ── Validator ─────────────────────────────────────────────────────────────────
 
-/// <summary>Validates that the order Id is positive and Status is one of Filled, Rejected, or Cancelled.</summary>
+/// <summary>Validates that the order Id is positive and Status is a known EA execution-report status.</summary>
 public class SubmitExecutionReportCommandValidator : AbstractValidator<SubmitExecutionReportCommand>
 {
     public SubmitExecutionReportCommandValidator()
@@ -52,8 +54,8 @@ public class SubmitExecutionReportCommandValidator : AbstractValidator<SubmitExe
 
         RuleFor(x => x.Status)
             .NotEmpty().WithMessage("Status cannot be empty")
-            .Must(s => s is "Filled" or "Rejected" or "Cancelled" or "PartialFill" or "Failed")
-            .WithMessage("Status must be Filled, Rejected, Cancelled, PartialFill, or Failed");
+            .Must(ExecutionReportStatusMapper.IsKnown)
+            .WithMessage(ExecutionReportStatusMapper.ValidStatusMessage);
     }
 }
 
@@ -67,17 +69,29 @@ public class SubmitExecutionReportCommandHandler : IRequestHandler<SubmitExecuti
 {
     private readonly IWriteApplicationDbContext _context;
     private readonly IIntegrationEventService _eventBus;
+    private readonly IEAOwnershipGuard _ownershipGuard;
 
-    public SubmitExecutionReportCommandHandler(IWriteApplicationDbContext context, IIntegrationEventService eventBus)
+    public SubmitExecutionReportCommandHandler(
+        IWriteApplicationDbContext context,
+        IIntegrationEventService eventBus,
+        IEAOwnershipGuard ownershipGuard)
     {
-        _context  = context;
-        _eventBus = eventBus;
+        _context        = context;
+        _eventBus       = eventBus;
+        _ownershipGuard = ownershipGuard;
     }
 
     public async Task<ResponseData<string>> Handle(SubmitExecutionReportCommand request, CancellationToken cancellationToken)
     {
         var ctx = _context.GetDbContext();
-        var newStatus = Enum.Parse<OrderStatus>(request.Status, ignoreCase: true);
+        var callerAccountId = _ownershipGuard.GetCallerAccountId();
+        if (callerAccountId is null)
+            return ResponseData<string>.Init(null, false, "Unauthorized", "-403");
+
+        if (!ExecutionReportStatusMapper.IsKnown(request.Status))
+            return ResponseData<string>.Init(null, false, $"Invalid status: {request.Status}", "-11");
+
+        bool updatesOrderStatus = ExecutionReportStatusMapper.TryMapToOrderStatus(request.Status, out var newStatus);
 
         // ── Atomic idempotency for Filled transitions ──────────────────────────
         // Two concurrent EA reports for the same order previously both observed
@@ -86,10 +100,13 @@ public class SubmitExecutionReportCommandHandler : IRequestHandler<SubmitExecuti
         // (WHERE Status != Filled) so only the winning UPDATE affects a row; the
         // loser sees 0 rows and skips the publish. Tracked-entity updates are
         // still used for non-Filled transitions since they don't emit events.
-        if (newStatus == OrderStatus.Filled)
+        if (updatesOrderStatus && newStatus == OrderStatus.Filled)
         {
             int rows = await ctx.Set<Domain.Entities.Order>()
-                .Where(o => o.Id == request.Id && o.Status != OrderStatus.Filled && !o.IsDeleted)
+                .Where(o => o.Id == request.Id
+                         && o.TradingAccountId == callerAccountId.Value
+                         && o.Status != OrderStatus.Filled
+                         && !o.IsDeleted)
                 .ExecuteUpdateAsync(s => s
                     .SetProperty(o => o.Status,          OrderStatus.Filled)
                     .SetProperty(o => o.BrokerOrderId,   o => request.BrokerOrderId   ?? o.BrokerOrderId)
@@ -104,7 +121,10 @@ public class SubmitExecutionReportCommandHandler : IRequestHandler<SubmitExecuti
                 // Either the order doesn't exist or it is already Filled. Distinguish
                 // so legitimate "already filled" retries return success (idempotent).
                 bool exists = await ctx.Set<Domain.Entities.Order>().AsNoTracking()
-                    .AnyAsync(o => o.Id == request.Id && !o.IsDeleted, cancellationToken);
+                    .AnyAsync(o => o.Id == request.Id
+                                && o.TradingAccountId == callerAccountId.Value
+                                && !o.IsDeleted,
+                        cancellationToken);
                 return exists
                     ? ResponseData<string>.Init(null, true, "Successful (already filled — idempotent)", "00")
                     : ResponseData<string>.Init(null, false, "Order not found", "-14");
@@ -112,7 +132,10 @@ public class SubmitExecutionReportCommandHandler : IRequestHandler<SubmitExecuti
 
             // Won the CAS. Re-load canonical row to build the event payload.
             var entity = await ctx.Set<Domain.Entities.Order>().AsNoTracking()
-                .FirstOrDefaultAsync(o => o.Id == request.Id && !o.IsDeleted, cancellationToken);
+                .FirstOrDefaultAsync(o => o.Id == request.Id
+                                       && o.TradingAccountId == callerAccountId.Value
+                                       && !o.IsDeleted,
+                    cancellationToken);
             if (entity is null)
                 return ResponseData<string>.Init(null, false, "Order not found", "-14");
 
@@ -142,21 +165,34 @@ public class SubmitExecutionReportCommandHandler : IRequestHandler<SubmitExecuti
             return ResponseData<string>.Init(null, true, "Successful", "00");
         }
 
-        // ── Non-Filled transitions (Rejected/Cancelled/PartialFill/Failed) ─────
+        // ── Non-Filled and position-lifecycle reports ─────────────────────────
         // These do not emit integration events, so tracked-entity updates are safe.
         var nonFilledEntity = await ctx.Set<Domain.Entities.Order>()
-            .FirstOrDefaultAsync(o => o.Id == request.Id && !o.IsDeleted, cancellationToken);
+            .FirstOrDefaultAsync(o => o.Id == request.Id
+                                   && o.TradingAccountId == callerAccountId.Value
+                                   && !o.IsDeleted,
+                cancellationToken);
         if (nonFilledEntity is null)
             return ResponseData<string>.Init(null, false, "Order not found", "-14");
 
-        nonFilledEntity.Status          = newStatus;
-        nonFilledEntity.BrokerOrderId   = request.BrokerOrderId   ?? nonFilledEntity.BrokerOrderId;
-        nonFilledEntity.FilledPrice     = request.FilledPrice     ?? nonFilledEntity.FilledPrice;
-        nonFilledEntity.FilledQuantity  = request.FilledQuantity  ?? nonFilledEntity.FilledQuantity;
-        nonFilledEntity.RejectionReason = request.RejectionReason ?? nonFilledEntity.RejectionReason;
-        nonFilledEntity.FilledAt        = request.FilledAt        ?? nonFilledEntity.FilledAt;
+        if (updatesOrderStatus && CanApplyStatusTransition(nonFilledEntity.Status, newStatus))
+            nonFilledEntity.Status = newStatus;
+
+        ApplyBrokerFields(nonFilledEntity, request);
         await _context.SaveChangesAsync(cancellationToken);
 
         return ResponseData<string>.Init(null, true, "Successful", "00");
+    }
+
+    private static bool CanApplyStatusTransition(OrderStatus currentStatus, OrderStatus newStatus)
+        => currentStatus == newStatus || currentStatus.CanTransitionTo(newStatus);
+
+    private static void ApplyBrokerFields(Domain.Entities.Order entity, SubmitExecutionReportCommand request)
+    {
+        entity.BrokerOrderId   = request.BrokerOrderId   ?? entity.BrokerOrderId;
+        entity.FilledPrice     = request.FilledPrice     ?? entity.FilledPrice;
+        entity.FilledQuantity  = request.FilledQuantity  ?? entity.FilledQuantity;
+        entity.RejectionReason = request.RejectionReason ?? entity.RejectionReason;
+        entity.FilledAt        = request.FilledAt        ?? entity.FilledAt;
     }
 }

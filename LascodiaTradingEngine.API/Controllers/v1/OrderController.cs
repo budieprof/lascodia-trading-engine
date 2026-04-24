@@ -107,6 +107,7 @@ public class OrderController : AuthControllerBase<OrderController>
 
     /// <summary>Submit an execution report from the EA after broker-side execution</summary>
     [HttpPost("{id}/execution-report")]
+    [Authorize(Policy = Policies.EAIngest)]
     public async Task<ResponseData<string>> ExecutionReport(long id, SubmitExecutionReportCommand command)
     {
         command.Id = id;
@@ -115,6 +116,7 @@ public class OrderController : AuthControllerBase<OrderController>
 
     /// <summary>Submit a batch of execution reports from the EA</summary>
     [HttpPost("execution-report/batch")]
+    [Authorize(Policy = Policies.EAIngest)]
     public async Task<ResponseData<ExecutionReportBatchResult>> ExecutionReportBatch(SubmitExecutionReportBatchCommand command)
     {
         if (!ModelState.IsValid)

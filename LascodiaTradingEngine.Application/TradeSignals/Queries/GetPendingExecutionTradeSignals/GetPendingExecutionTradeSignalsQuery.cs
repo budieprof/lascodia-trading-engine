@@ -46,8 +46,14 @@ public class GetPendingExecutionTradeSignalsQueryHandler : IRequestHandler<GetPe
     {
         var dbContext = _context.GetDbContext();
 
-        // Resolve the caller's account if not explicitly provided
-        var accountId = request.TradingAccountId ?? _ownershipGuard.GetCallerAccountId();
+        var callerAccountId = _ownershipGuard.GetCallerAccountId();
+        if (callerAccountId is null)
+            return ResponseData<List<TradeSignalDto>>.Init([], false, "Unauthorized", "-403");
+
+        if (request.TradingAccountId.HasValue && request.TradingAccountId.Value != callerAccountId.Value)
+            return ResponseData<List<TradeSignalDto>>.Init([], false, "Unauthorized", "-403");
+
+        var accountId = request.TradingAccountId ?? callerAccountId.Value;
 
         var query = dbContext
             .Set<Domain.Entities.TradeSignal>()
@@ -57,27 +63,25 @@ public class GetPendingExecutionTradeSignalsQueryHandler : IRequestHandler<GetPe
                       && x.ExpiresAt > DateTime.UtcNow
                       && !x.IsDeleted);
 
-        // Filter signals to only those whose symbol is covered by the caller's EA instances
-        if (accountId.HasValue)
-        {
-            var ownedSymbols = await dbContext
-                .Set<Domain.Entities.EAInstance>()
-                .AsNoTracking()
-                .Where(e => e.TradingAccountId == accountId.Value
-                         && e.Status == EAInstanceStatus.Active
-                         && !e.IsDeleted)
-                .Select(e => e.Symbols)
-                .ToListAsync(cancellationToken);
+        var ownedSymbols = await dbContext
+            .Set<Domain.Entities.EAInstance>()
+            .AsNoTracking()
+            .Where(e => e.TradingAccountId == accountId
+                     && e.Status == EAInstanceStatus.Active
+                     && !e.IsDeleted)
+            .Select(e => e.Symbols)
+            .ToListAsync(cancellationToken);
 
-            var symbolSet = ownedSymbols
-                .SelectMany(s => s.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-                .Select(s => s.ToUpperInvariant())
-                .Distinct()
-                .ToList();
+        var symbolSet = ownedSymbols
+            .SelectMany(s => s.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            .Select(s => s.ToUpperInvariant())
+            .Distinct()
+            .ToList();
 
-            if (symbolSet.Count > 0)
-                query = query.Where(x => symbolSet.Contains(x.Symbol));
-        }
+        if (symbolSet.Count == 0)
+            return ResponseData<List<TradeSignalDto>>.Init([], true, "Successful", "00");
+
+        query = query.Where(x => symbolSet.Contains(x.Symbol));
 
         var signals = await query
             .OrderBy(x => x.GeneratedAt)

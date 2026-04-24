@@ -5,6 +5,8 @@ using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.Common.Events;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Security;
+using LascodiaTradingEngine.Application.Orders.Commands;
 using LascodiaTradingEngine.Domain.Enums;
 
 namespace LascodiaTradingEngine.Application.Orders.Commands.SubmitExecutionReportBatch;
@@ -25,7 +27,7 @@ public class ExecutionReportItem
     public decimal? FilledPrice     { get; set; }
     /// <summary>Actual filled quantity from the broker.</summary>
     public decimal? FilledQuantity  { get; set; }
-    /// <summary>Execution outcome: "Filled", "Rejected", "Cancelled", "PartialFill", or "Failed".</summary>
+    /// <summary>EA execution outcome string.</summary>
     public required string Status   { get; set; }
     /// <summary>Reason the order was rejected, if applicable.</summary>
     public string?  RejectionReason { get; set; }
@@ -114,8 +116,8 @@ public class SubmitExecutionReportBatchCommandValidator : AbstractValidator<Subm
 
             report.RuleFor(r => r.Status)
                 .NotEmpty().WithMessage("Status cannot be empty")
-                .Must(s => s is "Filled" or "Rejected" or "Cancelled" or "PartialFill" or "Failed")
-                .WithMessage("Status must be Filled, Rejected, Cancelled, PartialFill, or Failed");
+                .Must(ExecutionReportStatusMapper.IsKnown)
+                .WithMessage(ExecutionReportStatusMapper.ValidStatusMessage);
         });
     }
 }
@@ -130,24 +132,107 @@ public class SubmitExecutionReportBatchCommandHandler : IRequestHandler<SubmitEx
 {
     private readonly IWriteApplicationDbContext _context;
     private readonly IIntegrationEventService _eventBus;
+    private readonly IEAOwnershipGuard _ownershipGuard;
 
-    public SubmitExecutionReportBatchCommandHandler(IWriteApplicationDbContext context, IIntegrationEventService eventBus)
+    public SubmitExecutionReportBatchCommandHandler(
+        IWriteApplicationDbContext context,
+        IIntegrationEventService eventBus,
+        IEAOwnershipGuard ownershipGuard)
     {
-        _context  = context;
-        _eventBus = eventBus;
+        _context        = context;
+        _eventBus       = eventBus;
+        _ownershipGuard = ownershipGuard;
     }
 
     public async Task<ResponseData<ExecutionReportBatchResult>> Handle(SubmitExecutionReportBatchCommand request, CancellationToken cancellationToken)
     {
         var dbContext = _context.GetDbContext();
         var result = new ExecutionReportBatchResult();
+        var callerAccountId = _ownershipGuard.GetCallerAccountId();
+        if (callerAccountId is null)
+            return ResponseData<ExecutionReportBatchResult>.Init(result, false, "Unauthorized", "-403");
 
         foreach (var report in request.Reports)
         {
+            if (!ExecutionReportStatusMapper.IsKnown(report.Status))
+            {
+                result.Skipped++;
+                result.Items.Add(new ExecutionReportItemResult
+                    { OrderId = report.OrderId, Success = false, Reason = $"Invalid status: {report.Status}" });
+                continue;
+            }
+
+            bool updatesOrderStatus = ExecutionReportStatusMapper.TryMapToOrderStatus(report.Status, out var newStatus);
+            if (updatesOrderStatus && newStatus == OrderStatus.Filled)
+            {
+                await _context.SaveChangesAsync(cancellationToken);
+                dbContext.ChangeTracker.Clear();
+
+                int rows = await dbContext.Set<Domain.Entities.Order>()
+                    .Where(o => o.Id == report.OrderId
+                             && o.TradingAccountId == callerAccountId.Value
+                             && o.Status != OrderStatus.Filled
+                             && !o.IsDeleted)
+                    .ExecuteUpdateAsync(s => s
+                        .SetProperty(o => o.Status,          OrderStatus.Filled)
+                        .SetProperty(o => o.BrokerOrderId,   o => report.BrokerOrderId   ?? o.BrokerOrderId)
+                        .SetProperty(o => o.FilledPrice,     o => report.FilledPrice     ?? o.FilledPrice)
+                        .SetProperty(o => o.FilledQuantity,  o => report.FilledQuantity  ?? o.FilledQuantity)
+                        .SetProperty(o => o.RejectionReason, o => report.RejectionReason ?? o.RejectionReason)
+                        .SetProperty(o => o.FilledAt,        o => report.FilledAt        ?? o.FilledAt),
+                        cancellationToken);
+
+                if (rows == 0)
+                {
+                    bool exists = await dbContext.Set<Domain.Entities.Order>().AsNoTracking()
+                        .AnyAsync(o => o.Id == report.OrderId
+                                    && o.TradingAccountId == callerAccountId.Value
+                                    && !o.IsDeleted,
+                            cancellationToken);
+
+                    if (exists)
+                    {
+                        result.Processed++;
+                        result.Items.Add(new ExecutionReportItemResult
+                            { OrderId = report.OrderId, Success = true });
+                    }
+                    else
+                    {
+                        result.Skipped++;
+                        result.Items.Add(new ExecutionReportItemResult
+                            { OrderId = report.OrderId, Success = false, Reason = "Order not found" });
+                    }
+
+                    continue;
+                }
+
+                var filledEntity = await dbContext.Set<Domain.Entities.Order>().AsNoTracking()
+                    .FirstOrDefaultAsync(o => o.Id == report.OrderId
+                                           && o.TradingAccountId == callerAccountId.Value
+                                           && !o.IsDeleted,
+                        cancellationToken);
+                if (filledEntity is null)
+                {
+                    result.Skipped++;
+                    result.Items.Add(new ExecutionReportItemResult
+                        { OrderId = report.OrderId, Success = false, Reason = "Order not found" });
+                    continue;
+                }
+
+                await _eventBus.SaveAndPublish(_context, BuildFilledEvent(filledEntity, report));
+
+                result.Processed++;
+                result.Items.Add(new ExecutionReportItemResult
+                    { OrderId = report.OrderId, Success = true });
+                continue;
+            }
+
             var entity = await dbContext
                 .Set<Domain.Entities.Order>()
                 .FirstOrDefaultAsync(
-                    x => x.Id == report.OrderId && !x.IsDeleted,
+                    x => x.Id == report.OrderId
+                         && x.TradingAccountId == callerAccountId.Value
+                         && !x.IsDeleted,
                     cancellationToken);
 
             if (entity == null)
@@ -158,47 +243,10 @@ public class SubmitExecutionReportBatchCommandHandler : IRequestHandler<SubmitEx
                 continue;
             }
 
-            if (!Enum.TryParse<OrderStatus>(report.Status, ignoreCase: true, out var newStatus))
-            {
-                result.Skipped++;
-                result.Items.Add(new ExecutionReportItemResult
-                    { OrderId = report.OrderId, Success = false, Reason = $"Invalid status: {report.Status}" });
-                continue;
-            }
+            if (updatesOrderStatus && CanApplyStatusTransition(entity.Status, newStatus))
+                entity.Status = newStatus;
 
-            var previousStatus = entity.Status;
-            entity.Status          = newStatus;
-            entity.BrokerOrderId   = report.BrokerOrderId ?? entity.BrokerOrderId;
-            entity.FilledPrice     = report.FilledPrice ?? entity.FilledPrice;
-            entity.FilledQuantity  = report.FilledQuantity ?? entity.FilledQuantity;
-            entity.RejectionReason = report.RejectionReason ?? entity.RejectionReason;
-            entity.FilledAt        = report.FilledAt ?? entity.FilledAt;
-
-            if (newStatus == OrderStatus.Filled && previousStatus != OrderStatus.Filled)
-            {
-                var filledPrice = entity.FilledPrice ?? 0;
-                var filledQty   = entity.FilledQuantity ?? 0;
-                var fillRate    = entity.Quantity > 0 ? filledQty / entity.Quantity : 1m;
-
-                await _eventBus.SaveAndPublish(_context, new OrderFilledIntegrationEvent
-                {
-                    OrderId            = entity.Id,
-                    StrategyId         = entity.StrategyId,
-                    Symbol             = entity.Symbol,
-                    Session            = entity.Session,
-                    RequestedPrice     = report.RequestedPrice ?? entity.Price,
-                    FilledPrice        = filledPrice,
-                    WasPartialFill     = fillRate < 1m,
-                    FillRate           = fillRate,
-                    FilledAt           = entity.FilledAt ?? DateTime.UtcNow,
-                    SubmitToFillMs     = report.ExecutionLatencyMs ?? 0,
-                    SlippagePips       = report.SlippagePips,
-                    Commission         = report.Commission,
-                    QueueDwellMs       = report.QueueDwellMs,
-                    BrokerRetcode      = report.BrokerRetcode,
-                    BrokerOrderId      = entity.BrokerOrderId,
-                });
-            }
+            ApplyBrokerFields(entity, report);
 
             result.Processed++;
             result.Items.Add(new ExecutionReportItemResult
@@ -207,5 +255,43 @@ public class SubmitExecutionReportBatchCommandHandler : IRequestHandler<SubmitEx
 
         await _context.SaveChangesAsync(cancellationToken);
         return ResponseData<ExecutionReportBatchResult>.Init(result, true, "Successful", "00");
+    }
+
+    private static bool CanApplyStatusTransition(OrderStatus currentStatus, OrderStatus newStatus)
+        => currentStatus == newStatus || currentStatus.CanTransitionTo(newStatus);
+
+    private static void ApplyBrokerFields(Domain.Entities.Order entity, ExecutionReportItem report)
+    {
+        entity.BrokerOrderId   = report.BrokerOrderId   ?? entity.BrokerOrderId;
+        entity.FilledPrice     = report.FilledPrice     ?? entity.FilledPrice;
+        entity.FilledQuantity  = report.FilledQuantity  ?? entity.FilledQuantity;
+        entity.RejectionReason = report.RejectionReason ?? entity.RejectionReason;
+        entity.FilledAt        = report.FilledAt        ?? entity.FilledAt;
+    }
+
+    private static OrderFilledIntegrationEvent BuildFilledEvent(Domain.Entities.Order entity, ExecutionReportItem report)
+    {
+        var filledPrice = entity.FilledPrice ?? 0;
+        var filledQty   = entity.FilledQuantity ?? 0;
+        var fillRate    = entity.Quantity > 0 ? filledQty / entity.Quantity : 1m;
+
+        return new OrderFilledIntegrationEvent
+        {
+            OrderId            = entity.Id,
+            StrategyId         = entity.StrategyId,
+            Symbol             = entity.Symbol,
+            Session            = entity.Session,
+            RequestedPrice     = report.RequestedPrice ?? entity.Price,
+            FilledPrice        = filledPrice,
+            WasPartialFill     = fillRate < 1m,
+            FillRate           = fillRate,
+            FilledAt           = entity.FilledAt ?? DateTime.UtcNow,
+            SubmitToFillMs     = report.ExecutionLatencyMs ?? 0,
+            SlippagePips       = report.SlippagePips,
+            Commission         = report.Commission,
+            QueueDwellMs       = report.QueueDwellMs,
+            BrokerRetcode      = report.BrokerRetcode,
+            BrokerOrderId      = entity.BrokerOrderId,
+        };
     }
 }

@@ -134,7 +134,9 @@ public class EACommand : Entity<long>
         if (isRetryable && TryRequeue(status, result))
             return true;
 
-        bool success = !isRetryable && string.Equals(status, "Success", StringComparison.OrdinalIgnoreCase);
+        bool success = !isRetryable
+            && (string.Equals(status, "Success", StringComparison.OrdinalIgnoreCase)
+             || string.Equals(status, "Completed", StringComparison.OrdinalIgnoreCase));
         FinalizeAck(isRetryable, success, result);
         return false;
     }
