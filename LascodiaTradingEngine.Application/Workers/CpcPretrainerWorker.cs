@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -45,9 +44,6 @@ namespace LascodiaTradingEngine.Application.Workers;
 public sealed partial class CpcPretrainerWorker : BackgroundService
 {
     private const string WorkerName = nameof(CpcPretrainerWorker);
-    private const int    AlertPayloadSchemaVersion   = 2;
-    private const int    TrainingLogSchemaVersion    = 3;
-    private const string MLCpcPretrainerKey = "MLCpcPretrainer";
     private const string PostgresProvider = "Npgsql.EntityFrameworkCore.PostgreSQL";
 
     private readonly IServiceScopeFactory         _scopeFactory;
@@ -150,43 +146,49 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
         var writeDb  = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
         var readCtx  = readDb.GetDbContext();
         var writeCtx = writeDb.GetDbContext();
+        var auditService = scope.ServiceProvider.GetRequiredService<ICpcPretrainerAuditService>();
+        var candidateSelector = scope.ServiceProvider.GetRequiredService<ICpcPretrainerCandidateSelector>();
 
         var config = await _configReader.LoadAsync(readCtx, ct);
+        await auditService.ReconcileDataQualityAlertsAsync(readCtx, writeCtx, config, ct);
+        await auditService.ResolveObsoleteConfigurationDriftAlertsAsync(writeCtx, config.EncoderType, ct);
 
         if (!config.Enabled)
         {
+            await auditService.ResolveAllConfigurationDriftAlertsAsync(writeCtx, ct);
             LogCycleDisabled();
             ClearSilentSkipTrackersExcept(null);
             return config.PollSeconds;
         }
 
-        if (await HandleSystemicPauseAsync(writeCtx, config, ct))
+        if (await HandleSystemicPauseAsync(writeCtx, auditService, config, ct))
             return config.PollSeconds;
-        if (await HandleEmbeddingDimMismatchAsync(writeCtx, config, ct))
+        if (await HandleEmbeddingDimMismatchAsync(writeCtx, auditService, config, ct))
             return config.PollSeconds;
 
         var pretrainers = scope.ServiceProvider.GetServices<ICpcPretrainer>().ToList();
         if (!pretrainers.Any(p => p.Kind == config.EncoderType))
         {
-            await HandlePretrainerMissingAsync(writeCtx, config, ct);
+            await HandlePretrainerMissingAsync(writeCtx, auditService, config, ct);
             return config.PollSeconds;
         }
         else
         {
             _pretrainerMissingConsecutive = 0;
-            await TryResolveActiveAlertAsync(
+            await auditService.TryResolveConfigurationDriftAlertAsync(
                 writeCtx,
-                BuildConfigurationDriftAlertDedupeKey("pretrainer_missing", config.EncoderType),
+                "pretrainer_missing",
+                config.EncoderType,
                 ct);
         }
 
-        var candidates = await LoadCandidatePairsAsync(readCtx, config, ct);
+        var candidates = await candidateSelector.LoadCandidatePairsAsync(readCtx, config, ct);
         if (candidates.Count == 0)
         {
             LogNoStalePairs();
             return config.PollSeconds;
         }
-        await RecordStaleEncoderAlertsAsync(writeCtx, candidates, config, ct);
+        await auditService.RecordStaleEncoderAlertsAsync(writeCtx, candidates, config, ct);
 
         int attempted = Math.Min(candidates.Count, config.MaxPairsPerCycle);
         int throttled = candidates.Count - attempted;
@@ -218,13 +220,14 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
                 if (candidateLock is null)
                 {
                     await WriteSkippedLogAsync(
+                        auditService,
                         writeCtx, candidate, config, CpcReason.LockBusy,
                         candlesLoaded: 0, candlesAfterRegimeFilter: 0,
                         trainingSequences: 0, validationSequences: 0, trainingDurationMs: 0,
                         trainLoss: null, validationLoss: null, promotedEncoderId: null,
                         extraDiagnostics: new Dictionary<string, object?>
                         {
-                            ["LockKey"] = BuildCandidateLockKey(candidate, config),
+                            ["LockKey"] = CpcPretrainerKeys.BuildCandidateLockKey(candidate, config),
                             ["LockTimeoutSeconds"] = config.LockTimeoutSeconds,
                         },
                         ct: ct);
@@ -233,7 +236,7 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
                 else
                 {
                     outcome = await TrainOnePairAsync(
-                        scope.ServiceProvider, writeCtx, candidate, config, pretrainers, ct);
+                        scope.ServiceProvider, writeCtx, candidate, config, pretrainers, auditService, ct);
                 }
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -243,7 +246,7 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
             catch (Exception ex)
             {
                 outcome = await RecordUnexpectedCandidateFailureAsync(
-                    writeCtx, candidate, config, ex, ct);
+                    writeCtx, candidate, config, auditService, ex, ct);
             }
 
             switch (outcome)
@@ -262,15 +265,19 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
     // ── Silent-skip handlers ───────────────────────────────────────────────────
 
     private async Task<bool> HandleSystemicPauseAsync(
-        DbContext writeCtx, MLCpcRuntimeConfig config, CancellationToken ct)
+        DbContext writeCtx,
+        ICpcPretrainerAuditService auditService,
+        MLCpcRuntimeConfig config,
+        CancellationToken ct)
     {
         if (!config.SystemicPauseActive)
         {
             _systemicPauseStartedAt = null;
             _systemicPauseConsecutiveAlerts = 0;
-            await TryResolveActiveAlertAsync(
+            await auditService.TryResolveConfigurationDriftAlertAsync(
                 writeCtx,
-                BuildConfigurationDriftAlertDedupeKey("systemic_pause", config.EncoderType),
+                "systemic_pause",
+                config.EncoderType,
                 ct);
             return false;
         }
@@ -284,7 +291,7 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
             ++_systemicPauseConsecutiveAlerts >= config.ConfigurationDriftAlertCycles)
         {
             _systemicPauseConsecutiveAlerts = config.ConfigurationDriftAlertCycles; // cap
-            await RaiseConfigurationDriftAlertAsync(
+            await auditService.RaiseConfigurationDriftAlertAsync(
                 writeCtx,
                 kind: "systemic_pause",
                 encoderType: config.EncoderType,
@@ -302,14 +309,18 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
     }
 
     private async Task<bool> HandleEmbeddingDimMismatchAsync(
-        DbContext writeCtx, MLCpcRuntimeConfig config, CancellationToken ct)
+        DbContext writeCtx,
+        ICpcPretrainerAuditService auditService,
+        MLCpcRuntimeConfig config,
+        CancellationToken ct)
     {
         if (config.EmbeddingDim == MLFeatureHelper.CpcEmbeddingBlockSize)
         {
             _embeddingDimMismatchConsecutive = 0;
-            await TryResolveActiveAlertAsync(
+            await auditService.TryResolveConfigurationDriftAlertAsync(
                 writeCtx,
-                BuildConfigurationDriftAlertDedupeKey("embedding_dim", config.EncoderType),
+                "embedding_dim",
+                config.EncoderType,
                 ct);
             return false;
         }
@@ -319,7 +330,7 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
 
         if (_embeddingDimMismatchConsecutive >= config.ConfigurationDriftAlertCycles)
         {
-            await RaiseConfigurationDriftAlertAsync(
+            await auditService.RaiseConfigurationDriftAlertAsync(
                 writeCtx,
                 kind: "embedding_dim",
                 encoderType: config.EncoderType,
@@ -336,14 +347,17 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
     }
 
     private async Task HandlePretrainerMissingAsync(
-        DbContext writeCtx, MLCpcRuntimeConfig config, CancellationToken ct)
+        DbContext writeCtx,
+        ICpcPretrainerAuditService auditService,
+        MLCpcRuntimeConfig config,
+        CancellationToken ct)
     {
         LogPretrainerMissing(config.EncoderType);
         _pretrainerMissingConsecutive++;
 
         if (_pretrainerMissingConsecutive >= config.ConfigurationDriftAlertCycles)
         {
-            await RaiseConfigurationDriftAlertAsync(
+            await auditService.RaiseConfigurationDriftAlertAsync(
                 writeCtx,
                 kind: "pretrainer_missing",
                 encoderType: config.EncoderType,
@@ -370,147 +384,15 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
             _pretrainerMissingConsecutive = 0;
     }
 
-    private async Task RaiseConfigurationDriftAlertAsync(
-        DbContext writeCtx,
-        string kind,
-        CpcEncoderType encoderType,
-        string message,
-        IReadOnlyDictionary<string, object?>? extra,
-        CancellationToken ct)
-    {
-        _metrics?.MLCpcConfigurationDriftAlerts.Add(
-            1,
-            new KeyValuePair<string, object?>("kind", kind),
-            new KeyValuePair<string, object?>("encoder_type", encoderType.ToString()));
-
-        var now = _timeProvider.GetUtcNow().UtcDateTime;
-        var dedupeKey = BuildConfigurationDriftAlertDedupeKey(kind, encoderType);
-        var payload = new Dictionary<string, object?>
-        {
-            ["SchemaVersion"] = AlertPayloadSchemaVersion,
-            ["Kind"]          = kind,
-            ["EncoderType"]   = encoderType.ToString(),
-            ["Message"]       = message,
-        };
-        if (extra is not null)
-            foreach (var kvp in extra) payload[kvp.Key] = kvp.Value;
-        string conditionJson = JsonSerializer.Serialize(payload);
-
-        await UpsertActiveAlertAsync(
-            writeCtx,
-            alertType: AlertType.ConfigurationDrift,
-            severity: AlertSeverity.High,
-            symbol: null,
-            dedupeKey,
-            cooldownSeconds: 3600,
-            conditionJson,
-            now,
-            ct);
-    }
-
-    // ── Candidate selection ───────────────────────────────────────────────────
-
-    private async Task<List<PairCandidate>> LoadCandidatePairsAsync(
-        DbContext readCtx,
-        MLCpcRuntimeConfig config,
-        CancellationToken ct)
-    {
-        var pairs = await readCtx.Set<MLModel>()
-            .AsNoTracking()
-            .Where(m => m.IsActive && !m.IsDeleted)
-            .Select(m => new { m.Symbol, m.Timeframe })
-            .Distinct()
-            .ToListAsync(ct);
-
-        if (pairs.Count == 0) return new();
-
-        var symbols = pairs.Select(p => p.Symbol).Distinct().ToArray();
-        var encoderRows = await readCtx.Set<MLCpcEncoder>()
-            .AsNoTracking()
-            .Where(e => e.IsActive
-                     && !e.IsDeleted
-                     && e.EncoderType == config.EncoderType
-                     && symbols.Contains(e.Symbol))
-            .Select(e => new { e.Id, e.Symbol, e.Timeframe, e.Regime, e.TrainedAt, e.InfoNceLoss })
-            .ToListAsync(ct);
-
-        var encoderLookup = encoderRows
-            .GroupBy(e => (e.Symbol, e.Timeframe, e.Regime))
-            .ToDictionary(g => g.Key, g => g.OrderByDescending(r => r.Id).First());
-
-        var now    = _timeProvider.GetUtcNow().UtcDateTime;
-        var cutoff = now.AddHours(-config.RetrainIntervalHours);
-
-        var observedRegimesByPair = new Dictionary<(string Symbol, Timeframe Timeframe), List<CandleMarketRegime>>();
-        if (config.TrainPerRegime)
-        {
-            var observedRegimeRows = await readCtx.Set<MarketRegimeSnapshot>()
-                .AsNoTracking()
-                .Where(s => symbols.Contains(s.Symbol) && !s.IsDeleted)
-                .Select(s => new { s.Symbol, s.Timeframe, s.Regime })
-                .Distinct()
-                .ToListAsync(ct);
-
-            observedRegimesByPair = observedRegimeRows
-                .GroupBy(s => (s.Symbol, s.Timeframe))
-                .ToDictionary(
-                    g => g.Key,
-                    g => g.Select(s => s.Regime).Distinct().OrderBy(r => r).ToList());
-        }
-
-        var result = new List<PairCandidate>();
-        foreach (var p in pairs)
-        {
-            var regimes = new List<CandleMarketRegime?> { null };
-            if (config.TrainPerRegime &&
-                observedRegimesByPair.TryGetValue((p.Symbol, p.Timeframe), out var observedRegimes))
-            {
-                regimes.AddRange(observedRegimes.Cast<CandleMarketRegime?>());
-            }
-            if (config.TrainPerRegime)
-            {
-                regimes.AddRange(encoderRows
-                    .Where(e => e.Symbol == p.Symbol && e.Timeframe == p.Timeframe && e.Regime is not null)
-                    .Select(e => e.Regime)
-                    .Distinct());
-                regimes = regimes.Distinct().OrderBy(r => r is null ? -1 : (int)r.Value).ToList();
-            }
-
-            foreach (var regime in regimes)
-            {
-                encoderLookup.TryGetValue((p.Symbol, p.Timeframe, regime), out var existing);
-                if (existing is not null && existing.TrainedAt > cutoff)
-                    continue;
-
-                result.Add(new PairCandidate(
-                    p.Symbol,
-                    p.Timeframe,
-                    regime,
-                    existing?.Id,
-                    existing?.InfoNceLoss,
-                    existing?.TrainedAt));
-            }
-        }
-
-        result.Sort((a, b) =>
-        {
-            if (a.PriorTrainedAt is null && b.PriorTrainedAt is null) return 0;
-            if (a.PriorTrainedAt is null) return -1;
-            if (b.PriorTrainedAt is null) return 1;
-            return a.PriorTrainedAt.Value.CompareTo(b.PriorTrainedAt.Value);
-        });
-
-        return result;
-    }
-
     // ── Per-pair training orchestration ───────────────────────────────────────
 
     private async Task<TrainOutcome> TrainOnePairAsync(
         IServiceProvider scopedProvider,
         DbContext writeCtx,
-        PairCandidate candidate,
+        CpcPairCandidate candidate,
         MLCpcRuntimeConfig config,
         IReadOnlyList<ICpcPretrainer> pretrainers,
+        ICpcPretrainerAuditService auditService,
         CancellationToken ct)
     {
         var readDb = scopedProvider.GetRequiredService<IReadApplicationDbContext>();
@@ -523,11 +405,13 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
             LogInsufficientCandles(candidate, loaded.Candles.Count, loaded.EffectiveMinCandles);
             return candidate.Regime is null
                 ? await RejectCandidateAsync(
+                    auditService,
                     writeCtx, candidate, config, CpcReason.InsufficientCandles,
                     loaded.CandlesLoaded, loaded.Candles.Count, 0, 0, 0,
                     trainLoss: null, validationLoss: null, promotedEncoderId: null,
                     extraDiagnostics: null, ct)
                 : await SkipAndAuditAsync(
+                    auditService,
                     writeCtx, candidate, config, CpcReason.InsufficientCandles,
                     loaded.CandlesLoaded, loaded.Candles.Count, 0, 0, 0,
                     trainLoss: null, validationLoss: null,
@@ -545,11 +429,13 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
             LogNoSequences(candidate);
             return candidate.Regime is null
                 ? await RejectCandidateAsync(
+                    auditService,
                     writeCtx, candidate, config, CpcReason.NoSequences,
                     loaded.CandlesLoaded, loaded.Candles.Count, 0, 0, 0,
                     trainLoss: null, validationLoss: null, promotedEncoderId: null,
                     extraDiagnostics: null, ct)
                 : await SkipAndAuditAsync(
+                    auditService,
                     writeCtx, candidate, config, CpcReason.NoSequences,
                     loaded.CandlesLoaded, loaded.Candles.Count, 0, 0, 0,
                     trainLoss: null, validationLoss: null,
@@ -563,12 +449,14 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
             RecordCpcRejection(candidate, config, CpcReason.InsufficientValidationSequences);
             return candidate.Regime is null
                 ? await RejectCandidateAsync(
+                    auditService,
                     writeCtx, candidate, config, CpcReason.InsufficientValidationSequences,
                     loaded.CandlesLoaded, loaded.Candles.Count,
                     split.Training.Count, split.Validation.Count, 0,
                     trainLoss: null, validationLoss: null, promotedEncoderId: null,
                     extraDiagnostics: null, ct)
                 : await SkipAndAuditAsync(
+                    auditService,
                     writeCtx, candidate, config, CpcReason.InsufficientValidationSequences,
                     loaded.CandlesLoaded, loaded.Candles.Count,
                     split.Training.Count, split.Validation.Count, 0,
@@ -586,6 +474,7 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
             LogPretrainerMissingForCandidate(candidate, config.EncoderType);
             RecordCpcRejection(candidate, config, CpcReason.PretrainerMissing);
             return await SkipAndAuditAsync(
+                auditService,
                 writeCtx, candidate, config, CpcReason.PretrainerMissing,
                 loaded.CandlesLoaded, loaded.Candles.Count,
                 split.Training.Count, split.Validation.Count, 0,
@@ -618,6 +507,7 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
             LogTrainerException(candidate, ex);
             RecordCpcRejection(candidate, config, CpcReason.TrainerException);
             return await RejectCandidateAsync(
+                auditService,
                 writeCtx, candidate, config, CpcReason.TrainerException,
                 loaded.CandlesLoaded, loaded.Candles.Count,
                 split.Training.Count, split.Validation.Count, trainingDurationMs,
@@ -640,6 +530,7 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
             LogTrainerReturnedNull(candidate);
             RecordCpcRejection(candidate, config, CpcReason.TrainerReturnedNull);
             return await RejectCandidateAsync(
+                auditService,
                 writeCtx, candidate, config, CpcReason.TrainerReturnedNull,
                 loaded.CandlesLoaded, loaded.Candles.Count,
                 split.Training.Count, split.Validation.Count, trainingDurationMs,
@@ -657,6 +548,7 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
             LogShapeGateReject(candidate, shapeReason, trainLoss, config.MaxAcceptableLoss);
             RecordCpcRejection(candidate, config, shapeReason);
             return await RejectCandidateAsync(
+                auditService,
                 writeCtx, candidate, config, shapeReason,
                 loaded.CandlesLoaded, loaded.Candles.Count,
                 split.Training.Count, split.Validation.Count, trainingDurationMs,
@@ -686,9 +578,10 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
         catch (Exception ex)
         {
             LogProjectionInvalidThrew(candidate, ex);
-            RecordCpcRejection(candidate, config, CpcReason.ProjectionInvalid);
+            RecordCpcRejection(candidate, config, CpcReason.GateEvaluationException);
             return await RejectCandidateAsync(
-                writeCtx, candidate, config, CpcReason.ProjectionInvalid,
+                auditService,
+                writeCtx, candidate, config, CpcReason.GateEvaluationException,
                 loaded.CandlesLoaded, loaded.Candles.Count,
                 split.Training.Count, split.Validation.Count, trainingDurationMs,
                 trainLoss, validationLoss: null, promotedEncoderId: null,
@@ -706,6 +599,7 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
             LogGateReject(candidate, gateResult.Reason);
             RecordCpcRejection(candidate, config, rejectReason);
             return await RejectCandidateAsync(
+                auditService,
                 writeCtx, candidate, config, rejectReason,
                 loaded.CandlesLoaded, loaded.Candles.Count,
                 split.Training.Count, split.Validation.Count, trainingDurationMs,
@@ -726,12 +620,14 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
                     candidate.Timeframe,
                     candidate.Regime,
                     candidate.PriorEncoderId,
-                    config.MinImprovement),
+                    config.MinImprovement,
+                    candidate.ExpectedActiveEncoderId),
                 newEncoder,
                 ct);
             if (!promoteResult.Promoted)
             {
                 return await SkipAndAuditAsync(
+                    auditService,
                     writeCtx, candidate, config,
                     ParseSupersededReason(promoteResult.Reason),
                     loaded.CandlesLoaded, loaded.Candles.Count,
@@ -749,6 +645,7 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
             LogPromotionConflict(candidate, ex);
             writeCtx.ChangeTracker.Clear();
             return await SkipAndAuditAsync(
+                auditService,
                 writeCtx, candidate, config, CpcReason.PromotionConflict,
                 loaded.CandlesLoaded, loaded.Candles.Count,
                 split.Training.Count, split.Validation.Count, trainingDurationMs,
@@ -758,13 +655,13 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
 
         _metrics?.MLCpcPromotions.Add(1, CpcTags(candidate, config));
         await WriteTrainingLogAsync(
+            auditService,
             writeCtx, candidate, config,
-            CpcOutcome.Promoted, CpcReason.Accepted,
             loaded.CandlesLoaded, loaded.Candles.Count,
             split.Training.Count, split.Validation.Count, trainingDurationMs,
             trainLoss, gateResult.ValidationInfoNceLoss, newEncoder.Id,
             extraDiagnostics: gateResult.Diagnostics, ct: ct);
-        await TryResolveRecoveredCandidateAlertsAsync(writeCtx, candidate, config, ct);
+        await auditService.TryResolveRecoveredCandidateAlertsAsync(writeCtx, candidate, config, ct);
 
         LogEncoderPromoted(
             candidate, trainLoss, gateResult.ValidationInfoNceLoss ?? 0.0,
@@ -776,7 +673,7 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
     // ── TrainOnePair helpers ──────────────────────────────────────────────────
 
     private void StampFreshEncoder(
-        MLCpcEncoder encoder, PairCandidate candidate, MLCpcRuntimeConfig config,
+        MLCpcEncoder encoder, CpcPairCandidate candidate, MLCpcRuntimeConfig config,
         CpcEncoderType pretrainerKind, int trainingSampleCount)
     {
         encoder.Symbol = candidate.Symbol;
@@ -827,7 +724,7 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
     // ── Candle loading ────────────────────────────────────────────────────────
 
     private async Task<LoadedCandles> LoadAndFilterCandlesAsync(
-        DbContext readCtx, PairCandidate candidate, MLCpcRuntimeConfig config, CancellationToken ct)
+        DbContext readCtx, CpcPairCandidate candidate, MLCpcRuntimeConfig config, CancellationToken ct)
     {
         var candles = await LoadTrainingCandlesAsync(readCtx, candidate, config, ct);
         int candlesLoaded = candles.Count;
@@ -845,7 +742,7 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
     }
 
     private static async Task<List<Candle>> LoadTrainingCandlesAsync(
-        DbContext readCtx, PairCandidate candidate, MLCpcRuntimeConfig config, CancellationToken ct)
+        DbContext readCtx, CpcPairCandidate candidate, MLCpcRuntimeConfig config, CancellationToken ct)
     {
         int take = candidate.Regime is null
             ? config.TrainingCandles
@@ -874,7 +771,7 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
     private static async Task<List<Candle>> FilterCandlesByRegimeAsync(
         DbContext readCtx,
         List<Candle> candles,
-        PairCandidate candidate,
+        CpcPairCandidate candidate,
         MLCpcRuntimeConfig config,
         CancellationToken ct)
     {
@@ -917,9 +814,9 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
     // ── Lock acquisition ──────────────────────────────────────────────────────
 
     private async Task<IAsyncDisposable?> TryAcquireCandidateLockAsync(
-        DbContext writeCtx, PairCandidate candidate, MLCpcRuntimeConfig config, CancellationToken ct)
+        DbContext writeCtx, CpcPairCandidate candidate, MLCpcRuntimeConfig config, CancellationToken ct)
     {
-        var lockKey = BuildCandidateLockKey(candidate, config);
+        var lockKey = CpcPretrainerKeys.BuildCandidateLockKey(candidate, config);
         var timeout = TimeSpan.FromSeconds(config.LockTimeoutSeconds);
         var started = Stopwatch.GetTimestamp();
         var lockHandle = await _distributedLock.TryAcquireAsync(lockKey, timeout, ct);
@@ -939,71 +836,13 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
         return null;
     }
 
-    private static string BuildCandidateLockKey(PairCandidate candidate, MLCpcRuntimeConfig config)
-        => $"{MLCpcPretrainerKey}:{EscapeKeyComponent(candidate.Symbol)}:{candidate.Timeframe}:{candidate.Regime?.ToString() ?? "global"}:{config.EncoderType}";
-
-    private static string EscapeKeyComponent(string value)
-        // ':' is our lock-key / dedupe-key separator. '/' appears in crypto symbols and
-        // would otherwise visually collide with URL path segments when logs are rendered.
-        => value.Replace(':', '_').Replace('/', '_');
-
-    // ── Stale-encoder alerts (pre-loop) ───────────────────────────────────────
-
-    private async Task RecordStaleEncoderAlertsAsync(
-        DbContext writeCtx,
-        IReadOnlyList<PairCandidate> candidates,
-        MLCpcRuntimeConfig config,
-        CancellationToken ct)
-    {
-        var cutoff = _timeProvider.GetUtcNow().UtcDateTime.AddHours(-config.StaleEncoderAlertHours);
-        foreach (var candidate in candidates)
-        {
-            if (candidate.PriorEncoderId is null ||
-                candidate.PriorTrainedAt is null ||
-                candidate.PriorTrainedAt.Value > cutoff)
-            {
-                continue;
-            }
-
-            _metrics?.MLCpcStaleEncoders.Add(1, CpcTags(candidate, config));
-
-            var regimeLabel = candidate.Regime?.ToString() ?? "global";
-            var dedupeKey = BuildStaleEncoderAlertDedupeKey(candidate, config);
-            var now = _timeProvider.GetUtcNow().UtcDateTime;
-            var ageHours = Math.Max(0.0, (now - candidate.PriorTrainedAt.Value).TotalHours);
-            var conditionJson = JsonSerializer.Serialize(new
-            {
-                SchemaVersion = AlertPayloadSchemaVersion,
-                Message = $"Active CPC encoder for {candidate.Symbol}/{candidate.Timeframe}/{regimeLabel}/{config.EncoderType} is stale ({ageHours:F1}h old).",
-                candidate.Symbol,
-                Timeframe = candidate.Timeframe.ToString(),
-                Regime = regimeLabel,
-                EncoderType = config.EncoderType.ToString(),
-                PriorEncoderId = candidate.PriorEncoderId,
-                PriorTrainedAt = candidate.PriorTrainedAt,
-                AgeHours = ageHours,
-                StaleEncoderAlertHours = config.StaleEncoderAlertHours,
-            });
-
-            await UpsertActiveAlertAsync(
-                writeCtx,
-                AlertType.DataQualityIssue,
-                AlertSeverity.Medium,
-                candidate.Symbol,
-                dedupeKey,
-                cooldownSeconds: 3600,
-                conditionJson,
-                now,
-                ct);
-        }
-    }
-
     // ── Unexpected-failure handler ────────────────────────────────────────────
 
     private async Task<TrainOutcome> RecordUnexpectedCandidateFailureAsync(
         DbContext writeCtx,
-        PairCandidate candidate,
+        CpcPairCandidate candidate,
         MLCpcRuntimeConfig config,
+        ICpcPretrainerAuditService auditService,
         Exception ex,
         CancellationToken ct)
     {
@@ -1016,6 +855,7 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
         {
             RecordCpcRejection(candidate, config, CpcReason.WorkerException);
             return await RejectCandidateAsync(
+                auditService,
                 writeCtx, candidate, config, CpcReason.WorkerException,
                 candlesLoaded: 0, candlesAfterRegimeFilter: 0,
                 trainingSequences: 0, validationSequences: 0, trainingDurationMs: 0,
@@ -1072,7 +912,7 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
     // ── Metric helpers ────────────────────────────────────────────────────────
 
     private void RecordGateMetrics(
-        PairCandidate candidate, MLCpcRuntimeConfig config, CpcEncoderGateResult gateResult)
+        CpcPairCandidate candidate, MLCpcRuntimeConfig config, CpcEncoderGateResult gateResult)
     {
         if (gateResult.ValidationScore is { } validation)
         {
@@ -1111,7 +951,7 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
     }
 
     private void RecordDownstreamProbeMetric(
-        PairCandidate candidate, MLCpcRuntimeConfig config,
+        CpcPairCandidate candidate, MLCpcRuntimeConfig config,
         string probeCandidate, double? balancedAccuracy)
     {
         if (balancedAccuracy is not { } value || !double.IsFinite(value))
@@ -1122,28 +962,28 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
             CpcTags(candidate, config).Append(new("candidate", probeCandidate)).ToArray());
     }
 
-    private void RecordCpcRejection(PairCandidate candidate, MLCpcRuntimeConfig config, CpcReason reason)
+    private void RecordCpcRejection(CpcPairCandidate candidate, MLCpcRuntimeConfig config, CpcReason reason)
     {
         _metrics?.MLCpcRejections.Add(
             1,
             CpcTags(candidate, config).Append(new("reason", reason.ToWire())).ToArray());
     }
 
-    private void RecordCpcSequences(PairCandidate candidate, MLCpcRuntimeConfig config, string split, int count)
+    private void RecordCpcSequences(CpcPairCandidate candidate, MLCpcRuntimeConfig config, string split, int count)
     {
         _metrics?.MLCpcSequences.Record(
             count,
             CpcTags(candidate, config).Append(new("split", split)).ToArray());
     }
 
-    private void RecordCpcCandles(PairCandidate candidate, MLCpcRuntimeConfig config, string stage, int count)
+    private void RecordCpcCandles(CpcPairCandidate candidate, MLCpcRuntimeConfig config, string stage, int count)
     {
         _metrics?.MLCpcCandles.Record(
             count,
             CpcTags(candidate, config).Append(new("stage", stage)).ToArray());
     }
 
-    private static KeyValuePair<string, object?>[] CpcTags(PairCandidate candidate, MLCpcRuntimeConfig config)
+    private static KeyValuePair<string, object?>[] CpcTags(CpcPairCandidate candidate, MLCpcRuntimeConfig config)
         =>
         [
             new("symbol", candidate.Symbol),
@@ -1154,14 +994,10 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
 
     // ── Audit log + failure counter + alert upsert (transactional) ────────────
 
-    /// <summary>
-    /// Writes a rejection audit row, computes consecutive-failure count from the log
-    /// history (so the counter survives replica restart), and — if the threshold is hit —
-    /// upserts the consecutive-fail alert. All three steps run in one transaction.
-    /// </summary>
     private async Task<TrainOutcome> RejectCandidateAsync(
+        ICpcPretrainerAuditService auditService,
         DbContext writeCtx,
-        PairCandidate candidate,
+        CpcPairCandidate candidate,
         MLCpcRuntimeConfig config,
         CpcReason reason,
         int candlesLoaded,
@@ -1175,31 +1011,29 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
         IReadOnlyDictionary<string, object?>? extraDiagnostics,
         CancellationToken ct)
     {
-        var strategy = writeCtx.Database.CreateExecutionStrategy();
-        await strategy.ExecuteAsync(async token =>
-        {
-            await using var tx = await writeCtx.Database.BeginTransactionAsync(token);
-
-            AddTrainingLogEntity(writeCtx, candidate, config,
-                CpcOutcome.Rejected, reason,
-                candlesLoaded, candlesAfterRegimeFilter,
-                trainingSequences, validationSequences, trainingDurationMs,
-                trainLoss, validationLoss, promotedEncoderId, extraDiagnostics);
-            await writeCtx.SaveChangesAsync(token);
-
-            int count = await CountConsecutiveFailuresAsync(writeCtx, candidate, config, token);
-            if (count >= config.ConsecutiveFailAlertThreshold)
-                await UpsertConsecutiveFailAlertAsync(writeCtx, candidate, config, reason, count, token);
-
-            await tx.CommitAsync(token);
-        }, ct);
-
+        await auditService.RecordRejectedAttemptAsync(
+            writeCtx,
+            candidate,
+            config,
+            reason,
+            BuildAuditSnapshot(
+                candlesLoaded,
+                candlesAfterRegimeFilter,
+                trainingSequences,
+                validationSequences,
+                trainingDurationMs,
+                trainLoss,
+                validationLoss,
+                promotedEncoderId,
+                extraDiagnostics),
+            ct);
         return TrainOutcome.Rejected;
     }
 
     private async Task<TrainOutcome> SkipAndAuditAsync(
+        ICpcPretrainerAuditService auditService,
         DbContext writeCtx,
-        PairCandidate candidate,
+        CpcPairCandidate candidate,
         MLCpcRuntimeConfig config,
         CpcReason reason,
         int candlesLoaded,
@@ -1212,19 +1046,29 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
         IReadOnlyDictionary<string, object?>? extraDiagnostics,
         CancellationToken ct)
     {
-        await WriteTrainingLogAsync(
-            writeCtx, candidate, config,
-            CpcOutcome.Skipped, reason,
-            candlesLoaded, candlesAfterRegimeFilter,
-            trainingSequences, validationSequences, trainingDurationMs,
-            trainLoss, validationLoss, promotedEncoderId: null,
-            extraDiagnostics: extraDiagnostics, ct: ct);
+        await auditService.RecordSkippedAttemptAsync(
+            writeCtx,
+            candidate,
+            config,
+            reason,
+            BuildAuditSnapshot(
+                candlesLoaded,
+                candlesAfterRegimeFilter,
+                trainingSequences,
+                validationSequences,
+                trainingDurationMs,
+                trainLoss,
+                validationLoss,
+                promotedEncoderId: null,
+                extraDiagnostics),
+            ct);
         return TrainOutcome.Skipped;
     }
 
     private Task WriteSkippedLogAsync(
+        ICpcPretrainerAuditService auditService,
         DbContext writeCtx,
-        PairCandidate candidate,
+        CpcPairCandidate candidate,
         MLCpcRuntimeConfig config,
         CpcReason reason,
         int candlesLoaded,
@@ -1237,20 +1081,28 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
         long? promotedEncoderId,
         IReadOnlyDictionary<string, object?>? extraDiagnostics,
         CancellationToken ct)
-        => WriteTrainingLogAsync(
-            writeCtx, candidate, config,
-            CpcOutcome.Skipped, reason,
-            candlesLoaded, candlesAfterRegimeFilter,
-            trainingSequences, validationSequences, trainingDurationMs,
-            trainLoss, validationLoss, promotedEncoderId,
-            extraDiagnostics, ct);
+        => auditService.RecordSkippedAttemptAsync(
+            writeCtx,
+            candidate,
+            config,
+            reason,
+            BuildAuditSnapshot(
+                candlesLoaded,
+                candlesAfterRegimeFilter,
+                trainingSequences,
+                validationSequences,
+                trainingDurationMs,
+                trainLoss,
+                validationLoss,
+                promotedEncoderId,
+                extraDiagnostics),
+            ct);
 
-    private async Task WriteTrainingLogAsync(
+    private Task WriteTrainingLogAsync(
+        ICpcPretrainerAuditService auditService,
         DbContext writeCtx,
-        PairCandidate candidate,
+        CpcPairCandidate candidate,
         MLCpcRuntimeConfig config,
-        CpcOutcome outcome,
-        CpcReason reason,
         int candlesLoaded,
         int candlesAfterRegimeFilter,
         int trainingSequences,
@@ -1261,21 +1113,23 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
         long? promotedEncoderId,
         IReadOnlyDictionary<string, object?>? extraDiagnostics,
         CancellationToken ct)
-    {
-        AddTrainingLogEntity(writeCtx, candidate, config,
-            outcome, reason,
-            candlesLoaded, candlesAfterRegimeFilter,
-            trainingSequences, validationSequences, trainingDurationMs,
-            trainLoss, validationLoss, promotedEncoderId, extraDiagnostics);
-        await writeCtx.SaveChangesAsync(ct);
-    }
+        => auditService.RecordPromotedAttemptAsync(
+            writeCtx,
+            candidate,
+            config,
+            BuildAuditSnapshot(
+                candlesLoaded,
+                candlesAfterRegimeFilter,
+                trainingSequences,
+                validationSequences,
+                trainingDurationMs,
+                trainLoss,
+                validationLoss,
+                promotedEncoderId,
+                extraDiagnostics),
+            ct);
 
-    private void AddTrainingLogEntity(
-        DbContext writeCtx,
-        PairCandidate candidate,
-        MLCpcRuntimeConfig config,
-        CpcOutcome outcome,
-        CpcReason reason,
+    private static CpcTrainingAttemptSnapshot BuildAuditSnapshot(
         int candlesLoaded,
         int candlesAfterRegimeFilter,
         int trainingSequences,
@@ -1285,331 +1139,18 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
         double? validationLoss,
         long? promotedEncoderId,
         IReadOnlyDictionary<string, object?>? extraDiagnostics)
-    {
-        var diagnostics = BuildTrainingLogDiagnostics(config, extraDiagnostics);
-
-        writeCtx.Set<MLCpcEncoderTrainingLog>().Add(new MLCpcEncoderTrainingLog
+        => new()
         {
-            Symbol = candidate.Symbol,
-            Timeframe = candidate.Timeframe,
-            Regime = candidate.Regime,
-            EncoderType = config.EncoderType,
-            EvaluatedAt = _timeProvider.GetUtcNow().UtcDateTime,
-            Outcome = outcome.ToWire(),
-            Reason = reason.ToWire(),
-            PriorEncoderId = candidate.PriorEncoderId,
-            PriorInfoNceLoss = candidate.PriorInfoNceLoss,
-            PromotedEncoderId = promotedEncoderId,
-            TrainInfoNceLoss = trainLoss,
-            ValidationInfoNceLoss = validationLoss,
             CandlesLoaded = candlesLoaded,
             CandlesAfterRegimeFilter = candlesAfterRegimeFilter,
             TrainingSequences = trainingSequences,
             ValidationSequences = validationSequences,
             TrainingDurationMs = trainingDurationMs,
-            DiagnosticsJson = JsonSerializer.Serialize(diagnostics),
-        });
-    }
-
-    private static Dictionary<string, object?> BuildTrainingLogDiagnostics(
-        MLCpcRuntimeConfig config,
-        IReadOnlyDictionary<string, object?>? extraDiagnostics)
-    {
-        var diagnostics = new Dictionary<string, object?>
-        {
-            ["SchemaVersion"] = TrainingLogSchemaVersion,
-            ["SequenceLength"] = config.SequenceLength,
-            ["SequenceStride"] = config.SequenceStride,
-            ["MaxSequences"] = config.MaxSequences,
-            ["ValidationSplit"] = config.ValidationSplit,
-            ["MinValidationSequences"] = config.MinValidationSequences,
-            ["MaxValidationLoss"] = config.MaxValidationLoss,
-            ["MinValidationEmbeddingL2Norm"] = config.MinValidationEmbeddingL2Norm,
-            ["MinValidationEmbeddingVariance"] = config.MinValidationEmbeddingVariance,
-            ["EnableDownstreamProbeGate"] = config.EnableDownstreamProbeGate,
-            ["MinDownstreamProbeSamples"] = config.MinDownstreamProbeSamples,
-            ["MinDownstreamProbeBalancedAccuracy"] = config.MinDownstreamProbeBalancedAccuracy,
-            ["MinDownstreamProbeImprovement"] = config.MinDownstreamProbeImprovement,
-            ["EnableRepresentationDriftGate"] = config.EnableRepresentationDriftGate,
-            ["MinCentroidCosineDistance"] = config.MinCentroidCosineDistance,
-            ["MaxRepresentationMeanPsi"] = config.MaxRepresentationMeanPsi,
-            ["EnableArchitectureSwitchGate"] = config.EnableArchitectureSwitchGate,
-            ["MaxArchitectureSwitchAccuracyRegression"] = config.MaxArchitectureSwitchAccuracyRegression,
-            ["EnableAdversarialValidationGate"] = config.EnableAdversarialValidationGate,
-            ["MaxAdversarialValidationAuc"] = config.MaxAdversarialValidationAuc,
-            ["MinAdversarialValidationSamples"] = config.MinAdversarialValidationSamples,
-            ["StaleEncoderAlertHours"] = config.StaleEncoderAlertHours,
-            ["PredictionSteps"] = config.PredictionSteps,
-            ["EmbeddingDim"] = config.EmbeddingDim,
-            ["LockTimeoutSeconds"] = config.LockTimeoutSeconds,
-            ["RegimeCandleBackfillMultiplier"] = config.RegimeCandleBackfillMultiplier,
-            ["ConfigurationDriftAlertCycles"] = config.ConfigurationDriftAlertCycles,
-            ["SystemicPauseAlertHours"] = config.SystemicPauseAlertHours,
+            TrainLoss = trainLoss,
+            ValidationLoss = validationLoss,
+            PromotedEncoderId = promotedEncoderId,
+            ExtraDiagnostics = extraDiagnostics,
         };
-        if (extraDiagnostics is not null)
-        {
-            foreach (var kvp in extraDiagnostics)
-                diagnostics[kvp.Key] = kvp.Value;
-        }
-        return diagnostics;
-    }
-
-    private static async Task<int> CountConsecutiveFailuresAsync(
-        DbContext writeCtx,
-        PairCandidate candidate,
-        MLCpcRuntimeConfig config,
-        CancellationToken ct)
-    {
-        string promotedWire = CpcOutcome.Promoted.ToWire();
-        string rejectedWire = CpcOutcome.Rejected.ToWire();
-
-        var promotedQuery = writeCtx.Set<MLCpcEncoderTrainingLog>()
-            .AsNoTracking()
-            .Where(l => l.Symbol == candidate.Symbol
-                     && l.Timeframe == candidate.Timeframe
-                     && l.EncoderType == config.EncoderType
-                     && l.Outcome == promotedWire
-                     && !l.IsDeleted);
-        promotedQuery = WhereTrainingLogRegime(promotedQuery, candidate.Regime);
-
-        var lastPromotedAt = await promotedQuery
-            .OrderByDescending(l => l.EvaluatedAt)
-            .Select(l => (DateTime?)l.EvaluatedAt)
-            .FirstOrDefaultAsync(ct);
-
-        var query = writeCtx.Set<MLCpcEncoderTrainingLog>()
-            .AsNoTracking()
-            .Where(l => l.Symbol == candidate.Symbol
-                     && l.Timeframe == candidate.Timeframe
-                     && l.EncoderType == config.EncoderType
-                     && l.Outcome == rejectedWire
-                     && !l.IsDeleted);
-        query = WhereTrainingLogRegime(query, candidate.Regime);
-        if (lastPromotedAt is not null)
-            query = query.Where(l => l.EvaluatedAt > lastPromotedAt.Value);
-
-        return await query.CountAsync(ct);
-    }
-
-    private static IQueryable<MLCpcEncoderTrainingLog> WhereTrainingLogRegime(
-        IQueryable<MLCpcEncoderTrainingLog> query,
-        CandleMarketRegime? regime)
-    {
-        if (regime is null)
-            return query.Where(l => l.Regime == null);
-
-        var value = regime.Value;
-        return query.Where(l => l.Regime == value);
-    }
-
-    private async Task UpsertConsecutiveFailAlertAsync(
-        DbContext writeCtx,
-        PairCandidate candidate,
-        MLCpcRuntimeConfig config,
-        CpcReason reason,
-        int count,
-        CancellationToken ct)
-    {
-        var regimeLabel = candidate.Regime?.ToString() ?? "global";
-        var dedupeKey = BuildConsecutiveFailureAlertDedupeKey(candidate, config);
-        var now = _timeProvider.GetUtcNow().UtcDateTime;
-        var conditionJson = JsonSerializer.Serialize(new
-        {
-            SchemaVersion = AlertPayloadSchemaVersion,
-            Message = $"CPC encoder training failed {count} consecutive cycles for {candidate.Symbol}/{candidate.Timeframe}/{regimeLabel}/{config.EncoderType} (reason={reason.ToWire()}).",
-            Symbol = candidate.Symbol,
-            Timeframe = candidate.Timeframe.ToString(),
-            Regime = regimeLabel,
-            EncoderType = config.EncoderType.ToString(),
-            Reason = reason.ToWire(),
-            ConsecutiveFailures = count,
-        });
-
-        await UpsertActiveAlertAsync(
-            writeCtx,
-            AlertType.DataQualityIssue,
-            AlertSeverity.Medium,
-            candidate.Symbol,
-            dedupeKey,
-            cooldownSeconds: 3600,
-            conditionJson,
-            now,
-            ct);
-    }
-
-    private async Task UpsertActiveAlertAsync(
-        DbContext writeCtx,
-        AlertType alertType,
-        AlertSeverity severity,
-        string? symbol,
-        string dedupeKey,
-        int cooldownSeconds,
-        string conditionJson,
-        DateTime now,
-        CancellationToken ct)
-    {
-        if (IsPostgresProvider(writeCtx))
-        {
-            var outboxId = Guid.NewGuid();
-            await writeCtx.Database.ExecuteSqlInterpolatedAsync($"""
-                INSERT INTO "Alert"
-                    ("AlertType", "Symbol", "ConditionJson", "IsActive", "LastTriggeredAt",
-                     "Severity", "DeduplicationKey", "CooldownSeconds", "AutoResolvedAt", "IsDeleted", "OutboxId")
-                VALUES
-                    ({alertType.ToString()}, {symbol}, {conditionJson}, TRUE, {now},
-                     {severity.ToString()}, {dedupeKey}, {cooldownSeconds}, NULL, FALSE, {outboxId})
-                ON CONFLICT ("DeduplicationKey")
-                    WHERE "IsActive" = TRUE
-                      AND "IsDeleted" = FALSE
-                      AND "DeduplicationKey" IS NOT NULL
-                DO UPDATE SET
-                    "AlertType" = EXCLUDED."AlertType",
-                    "Symbol" = EXCLUDED."Symbol",
-                    "ConditionJson" = EXCLUDED."ConditionJson",
-                    "LastTriggeredAt" = EXCLUDED."LastTriggeredAt",
-                    "Severity" = EXCLUDED."Severity",
-                    "CooldownSeconds" = EXCLUDED."CooldownSeconds",
-                    "AutoResolvedAt" = NULL
-                """, ct);
-            return;
-        }
-
-        var existing = await writeCtx.Set<Alert>()
-            .Where(a => a.DeduplicationKey == dedupeKey && a.IsActive && !a.IsDeleted)
-            .OrderByDescending(a => a.Id)
-            .FirstOrDefaultAsync(ct);
-
-        if (existing is not null)
-        {
-            existing.AlertType = alertType;
-            existing.Symbol = symbol;
-            existing.ConditionJson = conditionJson;
-            existing.LastTriggeredAt = now;
-            existing.Severity = severity;
-            existing.CooldownSeconds = cooldownSeconds;
-            existing.AutoResolvedAt = null;
-        }
-        else
-        {
-            writeCtx.Set<Alert>().Add(new Alert
-            {
-                AlertType = alertType,
-                Severity = severity,
-                Symbol = symbol,
-                DeduplicationKey = dedupeKey,
-                CooldownSeconds = cooldownSeconds,
-                ConditionJson = conditionJson,
-                LastTriggeredAt = now,
-                IsActive = true,
-            });
-        }
-
-        try
-        {
-            await writeCtx.SaveChangesAsync(ct);
-        }
-        catch (DbUpdateException ex) when (IsUniqueConstraintViolation(ex))
-        {
-            LogAlertUpsertRace(dedupeKey, ex);
-            writeCtx.ChangeTracker.Clear();
-            await UpdateExistingActiveAlertAsync(
-                writeCtx,
-                alertType,
-                severity,
-                symbol,
-                dedupeKey,
-                cooldownSeconds,
-                conditionJson,
-                now,
-                ct);
-        }
-    }
-
-    private static async Task UpdateExistingActiveAlertAsync(
-        DbContext writeCtx,
-        AlertType alertType,
-        AlertSeverity severity,
-        string? symbol,
-        string dedupeKey,
-        int cooldownSeconds,
-        string conditionJson,
-        DateTime now,
-        CancellationToken ct)
-    {
-        var existing = await writeCtx.Set<Alert>()
-            .Where(a => a.DeduplicationKey == dedupeKey && a.IsActive && !a.IsDeleted)
-            .OrderByDescending(a => a.Id)
-            .FirstOrDefaultAsync(ct);
-        if (existing is null)
-            throw new InvalidOperationException(
-                $"Alert upsert raced for {dedupeKey}, but no active row could be reloaded.");
-
-        existing.AlertType = alertType;
-        existing.Symbol = symbol;
-        existing.ConditionJson = conditionJson;
-        existing.LastTriggeredAt = now;
-        existing.Severity = severity;
-        existing.CooldownSeconds = cooldownSeconds;
-        existing.AutoResolvedAt = null;
-        await writeCtx.SaveChangesAsync(ct);
-    }
-
-    private async Task TryResolveRecoveredCandidateAlertsAsync(
-        DbContext writeCtx,
-        PairCandidate candidate,
-        MLCpcRuntimeConfig config,
-        CancellationToken ct)
-    {
-        await TryResolveActiveAlertAsync(
-            writeCtx,
-            BuildConsecutiveFailureAlertDedupeKey(candidate, config),
-            ct);
-        await TryResolveActiveAlertAsync(
-            writeCtx,
-            BuildStaleEncoderAlertDedupeKey(candidate, config),
-            ct);
-    }
-
-    private async Task TryResolveActiveAlertAsync(DbContext writeCtx, string dedupeKey, CancellationToken ct)
-    {
-        try
-        {
-            await ResolveActiveAlertAsync(writeCtx, dedupeKey, ct);
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            LogAlertResolutionFailed(dedupeKey, ex);
-            writeCtx.ChangeTracker.Clear();
-        }
-    }
-
-    private async Task ResolveActiveAlertAsync(DbContext writeCtx, string dedupeKey, CancellationToken ct)
-    {
-        var now = _timeProvider.GetUtcNow().UtcDateTime;
-        if (IsPostgresProvider(writeCtx))
-        {
-            await writeCtx.Database.ExecuteSqlInterpolatedAsync($"""
-                UPDATE "Alert"
-                   SET "IsActive" = FALSE,
-                       "AutoResolvedAt" = {now}
-                 WHERE "DeduplicationKey" = {dedupeKey}
-                   AND "IsActive" = TRUE
-                   AND "IsDeleted" = FALSE
-                """, ct);
-            return;
-        }
-
-        var existing = await writeCtx.Set<Alert>()
-            .Where(a => a.DeduplicationKey == dedupeKey && a.IsActive && !a.IsDeleted)
-            .OrderByDescending(a => a.Id)
-            .FirstOrDefaultAsync(ct);
-        if (existing is null)
-            return;
-
-        existing.IsActive = false;
-        existing.AutoResolvedAt = now;
-        await writeCtx.SaveChangesAsync(ct);
-    }
 
     private bool IsUniqueConstraintViolation(DbUpdateException ex)
     {
@@ -1633,27 +1174,6 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
     private static bool IsPostgresProvider(DbContext ctx)
         => string.Equals(ctx.Database.ProviderName, PostgresProvider, StringComparison.Ordinal);
 
-    private static string BuildConsecutiveFailureAlertDedupeKey(
-        PairCandidate candidate,
-        MLCpcRuntimeConfig config)
-    {
-        var regimeLabel = candidate.Regime?.ToString() ?? "global";
-        return $"{MLCpcPretrainerKey}:{EscapeKeyComponent(candidate.Symbol)}:{candidate.Timeframe}:{regimeLabel}:{config.EncoderType}";
-    }
-
-    private static string BuildStaleEncoderAlertDedupeKey(
-        PairCandidate candidate,
-        MLCpcRuntimeConfig config)
-    {
-        var regimeLabel = candidate.Regime?.ToString() ?? "global";
-        return $"{MLCpcPretrainerKey}:StaleEncoder:{EscapeKeyComponent(candidate.Symbol)}:{candidate.Timeframe}:{regimeLabel}:{config.EncoderType}";
-    }
-
-    private static string BuildConfigurationDriftAlertDedupeKey(
-        string kind,
-        CpcEncoderType encoderType)
-        => $"{MLCpcPretrainerKey}:ConfigurationDrift:{kind}:{encoderType}";
-
     // ── Supporting types ──────────────────────────────────────────────────────
 
     internal enum TrainOutcome { Promoted, Rejected, Skipped }
@@ -1661,14 +1181,6 @@ public sealed partial class CpcPretrainerWorker : BackgroundService
     internal sealed record SequenceSplit(
         IReadOnlyList<float[][]> Training,
         IReadOnlyList<float[][]> Validation);
-
-    internal sealed record PairCandidate(
-        string Symbol,
-        Timeframe Timeframe,
-        CandleMarketRegime? Regime,
-        long? PriorEncoderId,
-        double? PriorInfoNceLoss,
-        DateTime? PriorTrainedAt);
 
     private sealed record LoadedCandles(
         List<Candle> Candles,

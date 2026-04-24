@@ -8,4 +8,5 @@ public interface ICorrelationMatrixProvider
 {
     IReadOnlyDictionary<string, decimal> GetCorrelations();
     DateTime LastComputedAtUtc { get; }
+    DateTime LastAttemptedAtUtc { get; }
 }

@@ -150,6 +150,9 @@ public sealed class TradingMetrics
     public Histogram<double> WorkerCycleDurationMs  { get; }
     public Counter<long>     WorkerErrors           { get; }
 
+    // ── Candle Aggregation ──────────────────────────────────────────────────
+    public Counter<long>     CandlesSynthesized     { get; }
+
     // ── Broker PnL Reconciliation ───────────────────────────────────────────
     public Histogram<double> BrokerReconciliationVariance { get; }
     public Counter<long>     BrokerReconciliationOutcomes { get; }
@@ -435,6 +438,12 @@ public sealed class TradingMetrics
         // Workers
         WorkerCycleDurationMs = _meter.CreateHistogram<double>("trading.workers.cycle_duration", "ms", "Worker poll cycle duration");
         WorkerErrors          = _meter.CreateCounter<long>("trading.workers.errors", "errors", "Unhandled worker errors");
+
+        // Candle Aggregation
+        CandlesSynthesized = _meter.CreateCounter<long>(
+            "trading.candles.synthesized",
+            "candles",
+            "Higher-timeframe candles synthesised from M1 by CandleAggregationWorker. Tagged with symbol and timeframe={H1|H4|D1}.");
 
         // Broker PnL Reconciliation
         BrokerReconciliationVariance = _meter.CreateHistogram<double>(

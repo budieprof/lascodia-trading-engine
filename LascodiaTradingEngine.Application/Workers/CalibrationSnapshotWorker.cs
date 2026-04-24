@@ -25,25 +25,59 @@ namespace LascodiaTradingEngine.Application.Workers;
 ///
 /// <para>
 /// <b>Cadence:</b> runs once on startup (after a small initial delay) and then
-/// every <c>Calibration:PollIntervalHours</c> (default 24). On each cycle it
-/// writes the snapshot for all complete months not yet snapshotted. The worker
-/// is idempotent — the unique index on
-/// <c>(PeriodStart, PeriodGranularity, Stage, Reason)</c> turns repeated inserts
-/// for the same period into no-ops rather than duplicates.
+/// every <c>Calibration:PollIntervalHours</c> (default 24, clamped to
+/// <c>[1, 168]</c>). On each cycle it writes the snapshot for all complete
+/// months not yet snapshotted.
 /// </para>
 ///
 /// <para>
-/// Configuration keys (read from <see cref="EngineConfig"/>):
+/// <b>Idempotency:</b> each month is guarded by an <c>AnyAsync</c> existence
+/// check keyed on <c>(PeriodStart, PeriodGranularity)</c> — that is the primary
+/// defence against duplicate work. The unique index on
+/// <c>(PeriodStart, PeriodGranularity, Stage, Reason)</c> is a defense-in-depth
+/// backstop: if two writers race past the guard, one succeeds and the other
+/// surfaces as a <c>DbUpdateException</c>, is logged by the per-month catch,
+/// and retried on the next poll cycle.
+/// </para>
+///
+/// <para>
+/// <b>Failure isolation:</b> each month is processed in its own DI scope and
+/// its own <c>SaveChangesAsync</c>. A transient DB blip or malformed row fails
+/// exactly one month — the remaining months in the back-fill window continue
+/// to be processed in the same cycle. The failed scope (and its change
+/// tracker) is disposed immediately, so no pending entities leak into the next
+/// month's save.
+/// </para>
+///
+/// <para>
+/// <b>Configuration</b> (read from <see cref="EngineConfig"/>):
 /// <list type="bullet">
-///   <item><c>Calibration:PollIntervalHours</c>  — default 24</item>
-///   <item><c>Calibration:BackfillMonths</c>     — how far back to look on first run, default 6</item>
+///   <item><c>Calibration:PollIntervalHours</c> — default 24, clamped to <c>[1, 168]</c></item>
+///   <item><c>Calibration:BackfillMonths</c>    — default 6, clamped to <c>[1, 120]</c>
+///         (the ceiling prevents a config typo like "6000" from triggering a decade-plus scan)</item>
 /// </list>
+/// </para>
+///
+/// <para>
+/// <b>Observability:</b> emits <c>trading.calibration.snapshots_written</c>
+/// counter (tagged <c>period="Monthly"</c>) — incremented only after a
+/// successful per-month save, so a rolled-back batch never inflates the
+/// counter. Per-month failures increment <c>WorkerErrors</c> with
+/// <c>worker="CalibrationSnapshotWorker"</c>. The end-of-cycle summary log
+/// reports processed / skipped / failed counts.
 /// </para>
 /// </summary>
 public sealed class CalibrationSnapshotWorker : BackgroundService
 {
     private const string CK_PollHours      = "Calibration:PollIntervalHours";
     private const string CK_BackfillMonths = "Calibration:BackfillMonths";
+
+    internal const string GranularityMonthly = "Monthly";
+
+    private const int DefaultBackfillMonths =   6;
+    private const int MaxBackfillMonths     = 120;
+    private const int DefaultPollHours      =  24;
+    private const int MaxPollHours          = 168;
 
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<CalibrationSnapshotWorker> _logger;
@@ -72,14 +106,14 @@ public sealed class CalibrationSnapshotWorker : BackgroundService
 
         while (!stoppingToken.IsCancellationRequested)
         {
-            int pollHours = 24;
+            int pollHours = DefaultPollHours;
             try
             {
                 await RunCycleAsync(stoppingToken);
 
-                using var scope = _scopeFactory.CreateScope();
+                await using var scope = _scopeFactory.CreateAsyncScope();
                 var readCtx = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
-                pollHours = await ReadIntConfigAsync(readCtx.GetDbContext(), CK_PollHours, 24, stoppingToken);
+                pollHours = await ReadIntConfigAsync(readCtx.GetDbContext(), CK_PollHours, DefaultPollHours, stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -92,7 +126,7 @@ public sealed class CalibrationSnapshotWorker : BackgroundService
                     new KeyValuePair<string, object?>("worker", "CalibrationSnapshotWorker"));
             }
 
-            try { await Task.Delay(TimeSpan.FromHours(Math.Max(1, pollHours)), stoppingToken); }
+            try { await Task.Delay(TimeSpan.FromHours(Math.Clamp(pollHours, 1, MaxPollHours)), stoppingToken); }
             catch (OperationCanceledException) { return; }
         }
     }
@@ -102,23 +136,29 @@ public sealed class CalibrationSnapshotWorker : BackgroundService
     /// in the back-fill window that hasn't already been snapshotted. A "complete
     /// month" is any month whose end boundary is strictly before <c>UtcNow</c>
     /// — the current month is deliberately excluded because partial data would
-    /// make the series non-monotonic.
+    /// make the series non-monotonic. Each month is processed in its own DI
+    /// scope so a single bad month does not stall the remaining window.
     /// </summary>
-    internal async Task RunCycleAsync(CancellationToken ct)
+    internal async Task<CycleResult> RunCycleAsync(CancellationToken ct)
     {
-        using var scope = _scopeFactory.CreateScope();
-        var readCtx  = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
-        var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
-
         var now = _timeProvider.GetUtcNow().UtcDateTime;
-        var backfillMonths = await ReadIntConfigAsync(readCtx.GetDbContext(), CK_BackfillMonths, 6, ct);
-        backfillMonths = Math.Max(1, backfillMonths);
 
-        // Walk back <backfillMonths> complete months from the current one.
+        int backfillMonths;
+        await using (var cfgScope = _scopeFactory.CreateAsyncScope())
+        {
+            var readCtx = cfgScope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+            backfillMonths = await ReadIntConfigAsync(readCtx.GetDbContext(), CK_BackfillMonths, DefaultBackfillMonths, ct);
+        }
+        backfillMonths = Math.Clamp(backfillMonths, 1, MaxBackfillMonths);
+
         var currentMonthStart = new DateTime(now.Year, now.Month, 1, 0, 0, 0, DateTimeKind.Utc);
-        var writeDb = writeCtx.GetDbContext();
 
-        int snapshotsWritten = 0;
+        int  monthsProcessed          = 0;
+        int  monthsSkippedAlreadyDone = 0;
+        int  monthsSkippedEmpty       = 0;
+        int  monthsFailed             = 0;
+        long snapshotsWritten         = 0;
+
         for (int i = 1; i <= backfillMonths; i++)
         {
             if (ct.IsCancellationRequested) break;
@@ -126,55 +166,115 @@ public sealed class CalibrationSnapshotWorker : BackgroundService
             var periodStart = currentMonthStart.AddMonths(-i);
             var periodEnd   = periodStart.AddMonths(1);
 
-            // Skip months already snapshotted.
-            bool alreadyExists = await writeDb.Set<CalibrationSnapshot>()
-                .AnyAsync(s => s.PeriodStart == periodStart && s.PeriodGranularity == "Monthly", ct);
-            if (alreadyExists) continue;
-
-            var aggregates = await readCtx.GetDbContext()
-                .Set<SignalRejectionAudit>()
-                .Where(a => a.RejectedAt >= periodStart && a.RejectedAt < periodEnd)
-                .GroupBy(a => new { a.Stage, a.Reason })
-                .Select(g => new
-                {
-                    g.Key.Stage,
-                    g.Key.Reason,
-                    Count = (long)g.Count(),
-                    DistinctSymbols = g.Select(x => x.Symbol).Distinct().Count(),
-                    DistinctStrategies = g.Select(x => x.StrategyId).Distinct().Count(),
-                })
-                .ToListAsync(ct);
-
-            if (aggregates.Count == 0) continue;
-
-            foreach (var agg in aggregates)
+            try
             {
-                writeDb.Set<CalibrationSnapshot>().Add(new CalibrationSnapshot
+                var outcome = await ProcessMonthAsync(periodStart, periodEnd, computedAt: now, ct);
+                switch (outcome.Outcome)
                 {
-                    PeriodStart        = periodStart,
-                    PeriodEnd          = periodEnd,
-                    PeriodGranularity  = "Monthly",
-                    Stage              = agg.Stage,
-                    Reason             = agg.Reason,
-                    RejectionCount     = agg.Count,
-                    DistinctSymbols    = agg.DistinctSymbols,
-                    DistinctStrategies = agg.DistinctStrategies,
-                    ComputedAt         = now,
-                });
-                snapshotsWritten++;
-                _metrics.CalibrationSnapshotsWritten.Add(1,
-                    new KeyValuePair<string, object?>("period", "Monthly"));
+                    case MonthOutcome.Written:
+                        monthsProcessed++;
+                        snapshotsWritten += outcome.Rows;
+                        break;
+                    case MonthOutcome.AlreadyExists:
+                        monthsSkippedAlreadyDone++;
+                        break;
+                    case MonthOutcome.Empty:
+                        monthsSkippedEmpty++;
+                        break;
+                }
             }
-
-            await writeCtx.SaveChangesAsync(ct);
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "CalibrationSnapshotWorker: failed to process period {PeriodStart:yyyy-MM} — continuing with remaining months",
+                    periodStart);
+                monthsFailed++;
+                _metrics.WorkerErrors.Add(1,
+                    new KeyValuePair<string, object?>("worker", "CalibrationSnapshotWorker"));
+            }
         }
 
-        if (snapshotsWritten > 0)
+        if (snapshotsWritten > 0 || monthsFailed > 0)
         {
             _logger.LogInformation(
-                "CalibrationSnapshotWorker: wrote {Count} snapshot rows across recent months",
-                snapshotsWritten);
+                "CalibrationSnapshotWorker: cycle complete — processed={Processed} alreadyExists={AlreadyExists} empty={Empty} failed={Failed} rowsWritten={Rows}",
+                monthsProcessed, monthsSkippedAlreadyDone, monthsSkippedEmpty, monthsFailed, snapshotsWritten);
         }
+
+        return new CycleResult(
+            monthsProcessed,
+            monthsSkippedAlreadyDone,
+            monthsSkippedEmpty,
+            monthsFailed,
+            snapshotsWritten);
+    }
+
+    /// <summary>
+    /// Processes exactly one month in its own DI scope. Returns an outcome
+    /// distinguishing a successful write, a skip because the month was
+    /// already snapshotted, and a skip because the month had no rejections.
+    /// Throws on DB failures — the outer loop catches and keeps the cycle
+    /// alive.
+    /// </summary>
+    private async Task<MonthResult> ProcessMonthAsync(
+        DateTime periodStart,
+        DateTime periodEnd,
+        DateTime computedAt,
+        CancellationToken ct)
+    {
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        var readCtx  = scope.ServiceProvider.GetRequiredService<IReadApplicationDbContext>();
+        var writeCtx = scope.ServiceProvider.GetRequiredService<IWriteApplicationDbContext>();
+        var writeDb  = writeCtx.GetDbContext();
+
+        bool alreadyExists = await writeDb.Set<CalibrationSnapshot>()
+            .AnyAsync(s => s.PeriodStart == periodStart && s.PeriodGranularity == GranularityMonthly, ct);
+        if (alreadyExists) return new MonthResult(MonthOutcome.AlreadyExists, 0);
+
+        var aggregates = await readCtx.GetDbContext()
+            .Set<SignalRejectionAudit>()
+            .AsNoTracking()
+            .Where(a => a.RejectedAt >= periodStart && a.RejectedAt < periodEnd)
+            .GroupBy(a => new { a.Stage, a.Reason })
+            .Select(g => new
+            {
+                g.Key.Stage,
+                g.Key.Reason,
+                Count = (long)g.Count(),
+                DistinctSymbols = g.Select(x => x.Symbol).Distinct().Count(),
+                DistinctStrategies = g.Select(x => x.StrategyId).Distinct().Count(),
+            })
+            .ToListAsync(ct);
+
+        if (aggregates.Count == 0) return new MonthResult(MonthOutcome.Empty, 0);
+
+        foreach (var agg in aggregates)
+        {
+            writeDb.Set<CalibrationSnapshot>().Add(new CalibrationSnapshot
+            {
+                PeriodStart        = periodStart,
+                PeriodEnd          = periodEnd,
+                PeriodGranularity  = GranularityMonthly,
+                Stage              = agg.Stage,
+                Reason             = agg.Reason,
+                RejectionCount     = agg.Count,
+                DistinctSymbols    = agg.DistinctSymbols,
+                DistinctStrategies = agg.DistinctStrategies,
+                ComputedAt         = computedAt,
+            });
+        }
+
+        await writeCtx.SaveChangesAsync(ct);
+
+        // Metric only after the save — a rolled-back batch must not inflate it.
+        _metrics.CalibrationSnapshotsWritten.Add(aggregates.Count,
+            new KeyValuePair<string, object?>("period", GranularityMonthly));
+
+        return new MonthResult(MonthOutcome.Written, aggregates.Count);
     }
 
     private static async Task<int> ReadIntConfigAsync(DbContext ctx, string key, int defaultValue, CancellationToken ct)
@@ -185,4 +285,18 @@ public sealed class CalibrationSnapshotWorker : BackgroundService
         if (entry?.Value is null || !int.TryParse(entry.Value, out var parsed)) return defaultValue;
         return parsed;
     }
+
+    /// <summary>Outcome of one cycle — per-month counts and total rows written.</summary>
+    internal readonly record struct CycleResult(
+        int  MonthsProcessed,
+        int  MonthsSkippedAlreadyExists,
+        int  MonthsSkippedEmpty,
+        int  MonthsFailed,
+        long SnapshotsWritten);
+
+    /// <summary>Outcome of a single month's processing.</summary>
+    private enum MonthOutcome { Written, AlreadyExists, Empty }
+
+    /// <summary>Result of <c>ProcessMonthAsync</c>: the outcome and, on Written, the row count.</summary>
+    private readonly record struct MonthResult(MonthOutcome Outcome, long Rows);
 }

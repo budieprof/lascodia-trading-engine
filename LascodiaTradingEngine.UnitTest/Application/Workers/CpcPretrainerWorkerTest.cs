@@ -288,6 +288,78 @@ public class CpcPretrainerWorkerTest
     }
 
     [Fact]
+    public async Task RunCycleAsync_Auto_Resolves_Consecutive_Failure_Alert_When_External_Promotion_Resets_Streak()
+    {
+        await using var db = CreateDbContext();
+        SeedModelAndCandles(db, "EURUSD", Timeframe.H1, candleCount: 1500);
+        AddConfig(db, "MLCpc:ConsecutiveFailAlertThreshold", "2", ConfigDataType.Int);
+        await db.SaveChangesAsync();
+
+        var trainer = new Mock<ICpcPretrainer>();
+        trainer.SetupGet(t => t.Kind).Returns(CpcEncoderType.Linear);
+        trainer.Setup(t => t.TrainAsync(It.IsAny<string>(), It.IsAny<Timeframe>(),
+                It.IsAny<IReadOnlyList<float[][]>>(), It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((string s, Timeframe tf, IReadOnlyList<float[][]> _, int embed, int steps, CancellationToken _ct) =>
+                new MLCpcEncoder
+                {
+                    Symbol = s, Timeframe = tf,
+                    EmbeddingDim = embed, PredictionSteps = steps,
+                    InfoNceLoss = double.NaN,
+                    EncoderBytes = [1], TrainedAt = DateTime.UtcNow, IsActive = true
+                });
+
+        var worker = CreateWorker(db, trainer.Object, options: new MLCpcOptions
+        {
+            ConsecutiveFailAlertThreshold = 99
+        });
+
+        await worker.RunCycleAsync(CancellationToken.None);
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        var activeAlert = Assert.Single(await db.Set<Alert>()
+            .Where(a => a.AlertType == AlertType.DataQualityIssue &&
+                        a.DeduplicationKey != null &&
+                        !a.DeduplicationKey.Contains("StaleEncoder") &&
+                        a.IsActive)
+            .ToListAsync());
+        Assert.Contains("ConsecutiveFailures", activeAlert.ConditionJson);
+
+        db.Set<MLCpcEncoder>().Add(new MLCpcEncoder
+        {
+            Symbol = "EURUSD",
+            Timeframe = Timeframe.H1,
+            EncoderType = CpcEncoderType.Linear,
+            EmbeddingDim = 16,
+            PredictionSteps = 3,
+            InfoNceLoss = 1.0,
+            EncoderBytes = [7],
+            TrainedAt = DateTime.UtcNow,
+            IsActive = true
+        });
+        db.Set<MLCpcEncoderTrainingLog>().Add(new MLCpcEncoderTrainingLog
+        {
+            Symbol = "EURUSD",
+            Timeframe = Timeframe.H1,
+            EncoderType = CpcEncoderType.Linear,
+            EvaluatedAt = DateTime.UtcNow,
+            Outcome = CpcOutcome.Promoted.ToWire(),
+            Reason = CpcReason.Accepted.ToWire(),
+            PromotedEncoderId = 999,
+            ValidationInfoNceLoss = 1.0,
+        });
+        await db.SaveChangesAsync();
+
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        var resolvedAlert = Assert.Single(await db.Set<Alert>()
+            .Where(a => a.AlertType == AlertType.DataQualityIssue &&
+                        a.DeduplicationKey == activeAlert.DeduplicationKey)
+            .ToListAsync());
+        Assert.False(resolvedAlert.IsActive);
+        Assert.NotNull(resolvedAlert.AutoResolvedAt);
+    }
+
+    [Fact]
     public async Task RunCycleAsync_Per_Regime_Trains_Separate_Encoder_With_Regime_Tagged()
     {
         await using var db = CreateDbContext();
@@ -529,6 +601,49 @@ public class CpcPretrainerWorkerTest
         await worker.RunCycleAsync(CancellationToken.None);
 
         Assert.Empty(await db.Set<MLCpcEncoder>().ToListAsync());
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_Records_Gate_Evaluator_Exception_Accurately()
+    {
+        await using var db = CreateDbContext();
+        SeedModelAndCandles(db, "EURUSD", Timeframe.H1, candleCount: 1500);
+        await db.SaveChangesAsync();
+
+        var trainer = new Mock<ICpcPretrainer>();
+        trainer.SetupGet(t => t.Kind).Returns(CpcEncoderType.Linear);
+        trainer.Setup(t => t.TrainAsync(It.IsAny<string>(), It.IsAny<Timeframe>(),
+                It.IsAny<IReadOnlyList<float[][]>>(), It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((string s, Timeframe tf, IReadOnlyList<float[][]> _, int embed, int steps, CancellationToken _ct) =>
+                new MLCpcEncoder
+                {
+                    Symbol = s, Timeframe = tf,
+                    EmbeddingDim = embed, PredictionSteps = steps,
+                    InfoNceLoss = 1.0,
+                    EncoderBytes = [1],
+                    TrainedAt = DateTime.UtcNow,
+                    IsActive = true
+                });
+
+        var gateEvaluator = new Mock<ICpcEncoderGateEvaluator>();
+        gateEvaluator.Setup(g => g.EvaluateAsync(
+                It.IsAny<DbContext>(),
+                It.IsAny<CpcEncoderGateRequest>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("gate boom"));
+
+        var worker = CreateWorker(
+            db,
+            trainer.Object,
+            gateEvaluator: gateEvaluator.Object);
+
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        Assert.Empty(await db.Set<MLCpcEncoder>().ToListAsync());
+        var log = await db.Set<MLCpcEncoderTrainingLog>().SingleAsync();
+        Assert.Equal("rejected", log.Outcome);
+        Assert.Equal("gate_evaluation_exception", log.Reason);
+        Assert.Contains("InvalidOperationException", log.DiagnosticsJson);
     }
 
     [Fact]
@@ -834,6 +949,52 @@ public class CpcPretrainerWorkerTest
     }
 
     [Fact]
+    public async Task RunCycleAsync_Auto_Resolves_Stale_Encoder_Alert_When_Encoder_Is_Refreshed_Externally()
+    {
+        await using var db = CreateDbContext();
+        AddConfig(db, "MLCpc:StaleEncoderAlertHours", "240", ConfigDataType.Int);
+        SeedModelAndCandles(db, "EURUSD", Timeframe.H1, candleCount: 100);
+        db.Set<MLCpcEncoder>().Add(new MLCpcEncoder
+        {
+            Id = 1,
+            Symbol = "EURUSD",
+            Timeframe = Timeframe.H1,
+            EncoderType = CpcEncoderType.Linear,
+            EmbeddingDim = 16,
+            InfoNceLoss = 1.0,
+            EncoderBytes = [1],
+            TrainedAt = DateTime.UtcNow.AddDays(-20),
+            IsActive = true
+        });
+        await db.SaveChangesAsync();
+
+        var trainer = new Mock<ICpcPretrainer>();
+        trainer.SetupGet(t => t.Kind).Returns(CpcEncoderType.Linear);
+        var worker = CreateWorker(db, trainer.Object);
+
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        var alert = Assert.Single(await db.Set<Alert>()
+            .Where(a => a.AlertType == AlertType.DataQualityIssue &&
+                        a.DeduplicationKey != null &&
+                        a.DeduplicationKey.Contains("StaleEncoder") &&
+                        a.IsActive)
+            .ToListAsync());
+
+        var encoder = await db.Set<MLCpcEncoder>().SingleAsync(e => e.Id == 1);
+        encoder.TrainedAt = DateTime.UtcNow;
+        await db.SaveChangesAsync();
+
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        var resolvedAlert = Assert.Single(await db.Set<Alert>()
+            .Where(a => a.DeduplicationKey == alert.DeduplicationKey)
+            .ToListAsync());
+        Assert.False(resolvedAlert.IsActive);
+        Assert.NotNull(resolvedAlert.AutoResolvedAt);
+    }
+
+    [Fact]
     public async Task RunCycleAsync_Skips_When_No_Pretrainer_Matches_Configured_EncoderType()
     {
         await using var db = CreateDbContext();
@@ -968,6 +1129,74 @@ public class CpcPretrainerWorkerTest
         var log = await db.Set<MLCpcEncoderTrainingLog>().SingleAsync();
         Assert.Equal("skipped", log.Outcome);
         Assert.Equal("superseded_by_better_active", log.Reason);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_Does_Not_Replace_Newer_Different_Architecture_Encoder_Promoted_During_Training()
+    {
+        await using var db = CreateDbContext();
+        SeedModelAndCandles(db, "EURUSD", Timeframe.H1, candleCount: 1500);
+        db.Set<MLCpcEncoder>().Add(new MLCpcEncoder
+        {
+            Id = 1,
+            Symbol = "EURUSD",
+            Timeframe = Timeframe.H1,
+            EncoderType = CpcEncoderType.Linear,
+            EmbeddingDim = 16,
+            InfoNceLoss = 3.0,
+            EncoderBytes = [1],
+            TrainedAt = DateTime.UtcNow.AddDays(-30),
+            IsActive = true
+        });
+        await db.SaveChangesAsync();
+
+        var trainer = new Mock<ICpcPretrainer>();
+        trainer.SetupGet(t => t.Kind).Returns(CpcEncoderType.Linear);
+        trainer.Setup(t => t.TrainAsync("EURUSD", Timeframe.H1,
+                It.IsAny<IReadOnlyList<float[][]>>(), 16, 3, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(() =>
+            {
+                var old = db.Set<MLCpcEncoder>().Single(e => e.Id == 1);
+                old.IsActive = false;
+                db.Set<MLCpcEncoder>().Add(new MLCpcEncoder
+                {
+                    Id = 2,
+                    Symbol = "EURUSD",
+                    Timeframe = Timeframe.H1,
+                    EncoderType = CpcEncoderType.Tcn,
+                    EmbeddingDim = 16,
+                    InfoNceLoss = 1.0,
+                    EncoderBytes = [2],
+                    TrainedAt = DateTime.UtcNow,
+                    IsActive = true
+                });
+                db.SaveChanges();
+
+                return new MLCpcEncoder
+                {
+                    Symbol = "EURUSD",
+                    Timeframe = Timeframe.H1,
+                    EncoderType = CpcEncoderType.Linear,
+                    EmbeddingDim = 16,
+                    PredictionSteps = 3,
+                    InfoNceLoss = 0.5,
+                    EncoderBytes = [3],
+                    TrainedAt = DateTime.UtcNow,
+                    IsActive = true
+                };
+            });
+
+        var worker = CreateWorker(db, trainer.Object);
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        var active = await db.Set<MLCpcEncoder>().SingleAsync(e => e.IsActive);
+        Assert.Equal(2, active.Id);
+        Assert.Equal(CpcEncoderType.Tcn, active.EncoderType);
+        Assert.False(await db.Set<MLCpcEncoder>().AnyAsync(e => e.EncoderBytes != null && e.EncoderBytes.SequenceEqual(new byte[] { 3 })));
+
+        var log = await db.Set<MLCpcEncoderTrainingLog>().SingleAsync();
+        Assert.Equal("skipped", log.Outcome);
+        Assert.Equal("promotion_conflict", log.Reason);
     }
 
     [Fact]
@@ -1206,6 +1435,45 @@ public class CpcPretrainerWorkerTest
     }
 
     [Fact]
+    public async Task RunCycleAsync_Disabling_Worker_Resolves_ConfigurationDrift_Alert()
+    {
+        await using var db = CreateDbContext();
+        AddConfig(db, "MLCpc:EmbeddingDim", "4", ConfigDataType.Int);
+        SeedModelAndCandles(db, "EURUSD", Timeframe.H1, candleCount: 100);
+        await db.SaveChangesAsync();
+
+        var trainer = new Mock<ICpcPretrainer>();
+        trainer.SetupGet(t => t.Kind).Returns(CpcEncoderType.Linear);
+        var worker = CreateWorker(db, trainer.Object, options: new MLCpcOptions
+        {
+            EmbeddingDim = 16,
+            MinCandles = 1000,
+            SequenceLength = 60,
+            PollIntervalSeconds = 3600,
+            ConfigurationDriftAlertCycles = 1,
+        });
+
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        var activeAlert = Assert.Single(await db.Set<Alert>()
+            .Where(a => a.AlertType == AlertType.ConfigurationDrift && a.IsActive)
+            .ToListAsync());
+        Assert.NotNull(activeAlert.DeduplicationKey);
+        Assert.Contains("embedding_dim", activeAlert.DeduplicationKey);
+
+        AddConfig(db, "MLCpc:Enabled", "false", ConfigDataType.Bool);
+        await db.SaveChangesAsync();
+
+        await worker.RunCycleAsync(CancellationToken.None);
+
+        var resolvedAlert = Assert.Single(await db.Set<Alert>()
+            .Where(a => a.AlertType == AlertType.ConfigurationDrift)
+            .ToListAsync());
+        Assert.False(resolvedAlert.IsActive);
+        Assert.NotNull(resolvedAlert.AutoResolvedAt);
+    }
+
+    [Fact]
     public async Task RunCycleAsync_Raises_ConfigurationDrift_Alert_When_No_Pretrainer_Matches()
     {
         await using var db = CreateDbContext();
@@ -1429,15 +1697,19 @@ public class CpcPretrainerWorkerTest
         ICpcPretrainer trainer,
         MLCpcOptions? options = null,
         ICpcEncoderProjection? projection = null,
-        IDistributedLock? distributedLock = null)
-        => CreateWorker(db, trainers: new[] { trainer }, options, projection, distributedLock);
+        IDistributedLock? distributedLock = null,
+        ICpcEncoderGateEvaluator? gateEvaluator = null,
+        ICpcEncoderPromotionService? promotionService = null)
+        => CreateWorker(db, trainers: new[] { trainer }, options, projection, distributedLock, gateEvaluator, promotionService);
 
     private static CpcPretrainerWorker CreateWorker(
         DbContext db,
         IReadOnlyList<ICpcPretrainer> trainers,
         MLCpcOptions? options = null,
         ICpcEncoderProjection? projection = null,
-        IDistributedLock? distributedLock = null)
+        IDistributedLock? distributedLock = null,
+        ICpcEncoderGateEvaluator? gateEvaluator = null,
+        ICpcEncoderPromotionService? promotionService = null)
     {
         options ??= new MLCpcOptions
         {
@@ -1475,8 +1747,16 @@ public class CpcPretrainerWorkerTest
         services.AddScoped<ICpcDownstreamProbeEvaluator, CpcDownstreamProbeEvaluator>();
         services.AddScoped<ICpcRepresentationDriftScorer, CpcRepresentationDriftScorer>();
         services.AddScoped<ICpcAdversarialValidationScorer, CpcAdversarialValidationScorer>();
-        services.AddScoped<ICpcEncoderGateEvaluator, CpcEncoderGateEvaluator>();
-        services.AddScoped<ICpcEncoderPromotionService>(_ => new CpcEncoderPromotionService());
+        if (gateEvaluator is null)
+            services.AddScoped<ICpcEncoderGateEvaluator, CpcEncoderGateEvaluator>();
+        else
+            services.AddScoped(_ => gateEvaluator);
+        if (promotionService is null)
+            services.AddScoped<ICpcEncoderPromotionService>(_ => new CpcEncoderPromotionService());
+        else
+            services.AddScoped(_ => promotionService);
+        services.AddScoped<ICpcPretrainerCandidateSelector>(_ => new CpcPretrainerCandidateSelector(TimeProvider.System));
+        services.AddScoped<ICpcPretrainerAuditService>(_ => new CpcPretrainerAuditService(TimeProvider.System));
         var provider = services.BuildServiceProvider();
 
         return new CpcPretrainerWorker(

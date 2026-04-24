@@ -59,7 +59,7 @@ public class IngestCOTReportCommandValidator : AbstractValidator<IngestCOTReport
 /// <summary>
 /// Persists a COT report with upsert semantics (Currency + ReportDate is unique).
 /// Computes net non-commercial positioning and the week-over-week change by querying
-/// the previous week's report for the same currency.
+/// the previous published report for the same currency.
 /// </summary>
 public class IngestCOTReportCommandHandler : IRequestHandler<IngestCOTReportCommand, ResponseData<long>>
 {

@@ -63,11 +63,16 @@ public class CalibrationSnapshotWorkerTest : IDisposable
             MakeRejection(mar.AddDays(10), strategyId: 10, symbol: "EURUSD", stage: "MTF",    reason: "mtf_not_confirmed"));
 
         var worker = NewWorker();
-        await worker.RunCycleAsync(CancellationToken.None);
+        var result = await worker.RunCycleAsync(CancellationToken.None);
 
         // Expect 2 rows for March: (Regime,regime_blocked,count=3,symbols=2,strategies=2)
         //                          (MTF,mtf_not_confirmed,count=1,symbols=1,strategies=1)
         Assert.Equal(2, _writtenSnapshots.Count);
+        Assert.Equal(1, result.MonthsProcessed);
+        Assert.Equal(0, result.MonthsSkippedAlreadyExists);
+        Assert.Equal(5, result.MonthsSkippedEmpty);   // the other 5 months in the default 6-month window are empty
+        Assert.Equal(0, result.MonthsFailed);
+        Assert.Equal(2L, result.SnapshotsWritten);
 
         var regimeRow = _writtenSnapshots.Single(s => s.Stage == "Regime" && s.Reason == "regime_blocked");
         Assert.Equal(3L, regimeRow.RejectionCount);
@@ -75,7 +80,7 @@ public class CalibrationSnapshotWorkerTest : IDisposable
         Assert.Equal(2,  regimeRow.DistinctStrategies);
         Assert.Equal(mar, regimeRow.PeriodStart);
         Assert.Equal(mar.AddMonths(1), regimeRow.PeriodEnd);
-        Assert.Equal("Monthly", regimeRow.PeriodGranularity);
+        Assert.Equal(CalibrationSnapshotWorker.GranularityMonthly, regimeRow.PeriodGranularity);
 
         var mtfRow = _writtenSnapshots.Single(s => s.Stage == "MTF" && s.Reason == "mtf_not_confirmed");
         Assert.Equal(1L, mtfRow.RejectionCount);
@@ -92,7 +97,8 @@ public class CalibrationSnapshotWorkerTest : IDisposable
         // Pre-populate an existing snapshot for March so the worker must skip it.
         _existingSnapshots.Add(new CalibrationSnapshot
         {
-            PeriodStart = mar, PeriodEnd = mar.AddMonths(1), PeriodGranularity = "Monthly",
+            PeriodStart = mar, PeriodEnd = mar.AddMonths(1),
+            PeriodGranularity = CalibrationSnapshotWorker.GranularityMonthly,
             Stage = "Regime", Reason = "regime_blocked", RejectionCount = 999,
         });
         RebindSnapshots();
@@ -100,9 +106,13 @@ public class CalibrationSnapshotWorkerTest : IDisposable
         SetRejections(MakeRejection(mar.AddDays(5), 1, "EURUSD", "Regime", "regime_blocked"));
 
         var worker = NewWorker();
-        await worker.RunCycleAsync(CancellationToken.None);
+        var result = await worker.RunCycleAsync(CancellationToken.None);
 
         Assert.Empty(_writtenSnapshots);
+        Assert.Equal(0, result.MonthsProcessed);
+        Assert.Equal(1, result.MonthsSkippedAlreadyExists);  // March
+        Assert.Equal(5, result.MonthsSkippedEmpty);          // the other 5 months in the window
+        Assert.Equal(0L, result.SnapshotsWritten);
     }
 
     [Fact]
@@ -112,9 +122,13 @@ public class CalibrationSnapshotWorkerTest : IDisposable
         SetRejections();
 
         var worker = NewWorker();
-        await worker.RunCycleAsync(CancellationToken.None);
+        var result = await worker.RunCycleAsync(CancellationToken.None);
 
         Assert.Empty(_writtenSnapshots);
+        Assert.Equal(0, result.MonthsProcessed);
+        Assert.Equal(0, result.MonthsSkippedAlreadyExists);
+        Assert.Equal(6, result.MonthsSkippedEmpty);
+        Assert.Equal(0, result.MonthsFailed);
     }
 
     [Fact]
@@ -127,9 +141,103 @@ public class CalibrationSnapshotWorkerTest : IDisposable
         SetRejections(MakeRejection(apr, 1, "EURUSD", "Regime", "regime_blocked"));
 
         var worker = NewWorker();
-        await worker.RunCycleAsync(CancellationToken.None);
+        var result = await worker.RunCycleAsync(CancellationToken.None);
 
         Assert.Empty(_writtenSnapshots);
+        Assert.Equal(0, result.MonthsProcessed);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_MultiMonthBackfill_WritesOneBatchPerCompleteMonth()
+    {
+        _timeProvider.SetNow(new DateTime(2026, 4, 15, 0, 0, 0, DateTimeKind.Utc));
+
+        var mar = new DateTime(2026, 3, 1, 0, 0, 0, DateTimeKind.Utc);
+        var feb = new DateTime(2026, 2, 1, 0, 0, 0, DateTimeKind.Utc);
+
+        SetRejections(
+            MakeRejection(mar.AddDays(3), 10, "EURUSD", "Regime", "regime_blocked"),
+            MakeRejection(feb.AddDays(7), 11, "GBPUSD", "MTF",    "mtf_not_confirmed"));
+
+        var worker = NewWorker();
+        var result = await worker.RunCycleAsync(CancellationToken.None);
+
+        Assert.Equal(2, _writtenSnapshots.Count);
+        Assert.Equal(2, result.MonthsProcessed);
+        Assert.Equal(0, result.MonthsSkippedAlreadyExists);
+        Assert.Equal(4, result.MonthsSkippedEmpty);    // 6-month window, 2 processed, 4 empty
+        Assert.Equal(2L, result.SnapshotsWritten);
+
+        Assert.Single(_writtenSnapshots, s => s.PeriodStart == mar && s.Stage == "Regime");
+        Assert.Single(_writtenSnapshots, s => s.PeriodStart == feb && s.Stage == "MTF");
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_BackfillMonthsConfig_HonouredSoOlderMonthsAreIgnored()
+    {
+        _timeProvider.SetNow(new DateTime(2026, 4, 15, 0, 0, 0, DateTimeKind.Utc));
+        SetEngineConfig(new EngineConfig { Key = "Calibration:BackfillMonths", Value = "1" });
+
+        var mar = new DateTime(2026, 3, 1, 0, 0, 0, DateTimeKind.Utc);
+        var feb = new DateTime(2026, 2, 1, 0, 0, 0, DateTimeKind.Utc);
+
+        SetRejections(
+            MakeRejection(mar.AddDays(3), 1, "EURUSD", "Regime", "regime_blocked"),
+            MakeRejection(feb.AddDays(7), 2, "GBPUSD", "MTF",    "mtf_not_confirmed"));
+
+        var worker = NewWorker();
+        var result = await worker.RunCycleAsync(CancellationToken.None);
+
+        // Only March (the single complete month) is in the window — Feb must be ignored.
+        Assert.Single(_writtenSnapshots);
+        Assert.Equal(mar, _writtenSnapshots[0].PeriodStart);
+        Assert.Equal(1, result.MonthsProcessed);
+        Assert.Equal(0, result.MonthsSkippedAlreadyExists);
+        Assert.Equal(0, result.MonthsSkippedEmpty);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_BackfillMonthsConfig_ClampedToMinimumOfOne()
+    {
+        _timeProvider.SetNow(new DateTime(2026, 4, 15, 0, 0, 0, DateTimeKind.Utc));
+        SetEngineConfig(new EngineConfig { Key = "Calibration:BackfillMonths", Value = "0" });
+
+        var mar = new DateTime(2026, 3, 1, 0, 0, 0, DateTimeKind.Utc);
+        SetRejections(MakeRejection(mar.AddDays(3), 1, "EURUSD", "Regime", "regime_blocked"));
+
+        var worker = NewWorker();
+        var result = await worker.RunCycleAsync(CancellationToken.None);
+
+        // 0 is clamped up to 1, so March still gets processed.
+        Assert.Single(_writtenSnapshots);
+        Assert.Equal(1, result.MonthsProcessed);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_MonthFailure_LogsAndContinuesWithRemainingMonths()
+    {
+        _timeProvider.SetNow(new DateTime(2026, 4, 15, 0, 0, 0, DateTimeKind.Utc));
+
+        var mar = new DateTime(2026, 3, 1, 0, 0, 0, DateTimeKind.Utc);
+        var feb = new DateTime(2026, 2, 1, 0, 0, 0, DateTimeKind.Utc);
+
+        SetRejections(
+            MakeRejection(mar.AddDays(3), 10, "EURUSD", "Regime", "regime_blocked"),
+            MakeRejection(feb.AddDays(7), 11, "GBPUSD", "MTF",    "mtf_not_confirmed"));
+
+        // March is processed first (i=1). Its SaveChangesAsync throws; February's must still run.
+        _writeCtx.SetupSequence(c => c.SaveChangesAsync(It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("simulated DB failure"))
+            .ReturnsAsync(1);
+
+        var worker = NewWorker();
+        var result = await worker.RunCycleAsync(CancellationToken.None);
+
+        Assert.Equal(1, result.MonthsProcessed);            // Feb succeeded
+        Assert.Equal(1, result.MonthsFailed);               // Mar failed
+        Assert.Equal(0, result.MonthsSkippedAlreadyExists);
+        Assert.Equal(4, result.MonthsSkippedEmpty);         // 4 empty months in the rest of the window
+        Assert.Equal(1L, result.SnapshotsWritten);
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────

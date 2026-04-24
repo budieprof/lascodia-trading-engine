@@ -117,6 +117,13 @@ public static class DependencyInjection
             .ValidateOnStart();
         services.AddSingleton(sp => sp.GetRequiredService<IOptions<MLErgodicityOptions>>().Value);
 
+        services.RemoveAll<CorrelationMatrixOptions>();
+        services.AddSingleton<IValidateOptions<CorrelationMatrixOptions>, CorrelationMatrixOptionsValidator>();
+        services.AddOptions<CorrelationMatrixOptions>()
+            .Bind(configuration.GetSection(nameof(CorrelationMatrixOptions)))
+            .ValidateOnStart();
+        services.AddSingleton(sp => sp.GetRequiredService<IOptions<CorrelationMatrixOptions>>().Value);
+
         // ── Strategy Worker ──────────────────────────────────────────────────────
         // Registered as singleton so the same instance is used both as the hosted
         // service and as the IIntegrationEventHandler resolved by the event bus.

@@ -76,28 +76,46 @@ public class SubmitExecutionReportCommandHandler : IRequestHandler<SubmitExecuti
 
     public async Task<ResponseData<string>> Handle(SubmitExecutionReportCommand request, CancellationToken cancellationToken)
     {
-        var entity = await _context.GetDbContext()
-            .Set<Domain.Entities.Order>()
-            .FirstOrDefaultAsync(
-                x => x.Id == request.Id && !x.IsDeleted,
-                cancellationToken);
-
-        if (entity == null)
-            return ResponseData<string>.Init(null, false, "Order not found", "-14");
-
+        var ctx = _context.GetDbContext();
         var newStatus = Enum.Parse<OrderStatus>(request.Status, ignoreCase: true);
-        var previousStatus = entity.Status;
-        entity.Status          = newStatus;
-        entity.BrokerOrderId   = request.BrokerOrderId ?? entity.BrokerOrderId;
-        entity.FilledPrice     = request.FilledPrice ?? entity.FilledPrice;
-        entity.FilledQuantity  = request.FilledQuantity ?? entity.FilledQuantity;
-        entity.RejectionReason = request.RejectionReason ?? entity.RejectionReason;
-        entity.FilledAt        = request.FilledAt ?? entity.FilledAt;
 
-        // Only publish OrderFilledIntegrationEvent if status actually transitioned to Filled
-        // (prevents duplicate events on retry/resubmission)
-        if (newStatus == OrderStatus.Filled && previousStatus != OrderStatus.Filled)
+        // ── Atomic idempotency for Filled transitions ──────────────────────────
+        // Two concurrent EA reports for the same order previously both observed
+        // previousStatus != Filled and both published OrderFilledIntegrationEvent,
+        // double-triggering downstream position management. Use a DB-level CAS
+        // (WHERE Status != Filled) so only the winning UPDATE affects a row; the
+        // loser sees 0 rows and skips the publish. Tracked-entity updates are
+        // still used for non-Filled transitions since they don't emit events.
+        if (newStatus == OrderStatus.Filled)
         {
+            int rows = await ctx.Set<Domain.Entities.Order>()
+                .Where(o => o.Id == request.Id && o.Status != OrderStatus.Filled && !o.IsDeleted)
+                .ExecuteUpdateAsync(s => s
+                    .SetProperty(o => o.Status,          OrderStatus.Filled)
+                    .SetProperty(o => o.BrokerOrderId,   o => request.BrokerOrderId   ?? o.BrokerOrderId)
+                    .SetProperty(o => o.FilledPrice,     o => request.FilledPrice     ?? o.FilledPrice)
+                    .SetProperty(o => o.FilledQuantity,  o => request.FilledQuantity  ?? o.FilledQuantity)
+                    .SetProperty(o => o.RejectionReason, o => request.RejectionReason ?? o.RejectionReason)
+                    .SetProperty(o => o.FilledAt,        o => request.FilledAt        ?? o.FilledAt),
+                    cancellationToken);
+
+            if (rows == 0)
+            {
+                // Either the order doesn't exist or it is already Filled. Distinguish
+                // so legitimate "already filled" retries return success (idempotent).
+                bool exists = await ctx.Set<Domain.Entities.Order>().AsNoTracking()
+                    .AnyAsync(o => o.Id == request.Id && !o.IsDeleted, cancellationToken);
+                return exists
+                    ? ResponseData<string>.Init(null, true, "Successful (already filled — idempotent)", "00")
+                    : ResponseData<string>.Init(null, false, "Order not found", "-14");
+            }
+
+            // Won the CAS. Re-load canonical row to build the event payload.
+            var entity = await ctx.Set<Domain.Entities.Order>().AsNoTracking()
+                .FirstOrDefaultAsync(o => o.Id == request.Id && !o.IsDeleted, cancellationToken);
+            if (entity is null)
+                return ResponseData<string>.Init(null, false, "Order not found", "-14");
+
             var filledPrice = entity.FilledPrice ?? 0;
             var filledQty   = entity.FilledQuantity ?? 0;
             var fillRate    = entity.Quantity > 0 ? filledQty / entity.Quantity : 1m;
@@ -120,11 +138,24 @@ public class SubmitExecutionReportCommandHandler : IRequestHandler<SubmitExecuti
                 BrokerRetcode      = request.BrokerRetcode,
                 BrokerOrderId      = entity.BrokerOrderId,
             });
+
+            return ResponseData<string>.Init(null, true, "Successful", "00");
         }
-        else
-        {
-            await _context.SaveChangesAsync(cancellationToken);
-        }
+
+        // ── Non-Filled transitions (Rejected/Cancelled/PartialFill/Failed) ─────
+        // These do not emit integration events, so tracked-entity updates are safe.
+        var nonFilledEntity = await ctx.Set<Domain.Entities.Order>()
+            .FirstOrDefaultAsync(o => o.Id == request.Id && !o.IsDeleted, cancellationToken);
+        if (nonFilledEntity is null)
+            return ResponseData<string>.Init(null, false, "Order not found", "-14");
+
+        nonFilledEntity.Status          = newStatus;
+        nonFilledEntity.BrokerOrderId   = request.BrokerOrderId   ?? nonFilledEntity.BrokerOrderId;
+        nonFilledEntity.FilledPrice     = request.FilledPrice     ?? nonFilledEntity.FilledPrice;
+        nonFilledEntity.FilledQuantity  = request.FilledQuantity  ?? nonFilledEntity.FilledQuantity;
+        nonFilledEntity.RejectionReason = request.RejectionReason ?? nonFilledEntity.RejectionReason;
+        nonFilledEntity.FilledAt        = request.FilledAt        ?? nonFilledEntity.FilledAt;
+        await _context.SaveChangesAsync(cancellationToken);
 
         return ResponseData<string>.Init(null, true, "Successful", "00");
     }

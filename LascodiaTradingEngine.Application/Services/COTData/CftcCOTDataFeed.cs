@@ -1,5 +1,7 @@
+using System.Collections.Concurrent;
 using System.Globalization;
 using System.IO.Compression;
+using System.Threading;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Logging;
@@ -7,7 +9,7 @@ using Microsoft.Extensions.Logging;
 namespace LascodiaTradingEngine.Application.Services.COTData;
 
 /// <summary>
-/// Fetches COT positioning data from the CFTC's public bulk CSV files.
+/// Fetches the latest published COT positioning data from the CFTC's public bulk CSV files.
 /// </summary>
 /// <remarks>
 /// The CFTC publishes the Legacy COT report as a yearly ZIP archive containing a single
@@ -27,17 +29,20 @@ namespace LascodiaTradingEngine.Application.Services.COTData;
 /// NZD → "NZ DOLLAR", MXN → "MEXICAN PESO", ZAR → "SOUTH AFRICAN RAND",
 /// BRL → "BRAZILIAN REAL", RUB → "RUSSIAN RUBLE", USD → "USD INDEX".
 ///
-/// <b>Caching:</b> The entire year's CSV is cached in memory for 6 hours after download,
-/// so multiple currency lookups within the same ingestion cycle do not re-download.
+/// <b>Caching:</b> The entire year's CSV is cached in memory for 1 hour after download,
+/// which keeps per-cycle lookups cheap while still allowing the hourly worker to observe
+/// a newly published Friday release promptly.
 /// </remarks>
 public class CftcCOTDataFeed : ICOTDataFeed
 {
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly IMemoryCache _cache;
     private readonly ILogger<CftcCOTDataFeed> _logger;
+    private readonly TimeProvider _timeProvider;
+    private readonly ConcurrentDictionary<int, Lazy<Task<List<CftcCsvRecord>?>>> _inflightYearLoads = new();
 
     /// <summary>How long to cache a downloaded year's parsed COT data.</summary>
-    private static readonly TimeSpan CacheDuration = TimeSpan.FromHours(6);
+    private static readonly TimeSpan CacheDuration = TimeSpan.FromHours(1);
 
     /// <summary>
     /// Maps ISO 4217 currency codes to CFTC contract name substrings as they appear in the
@@ -74,82 +79,54 @@ public class CftcCOTDataFeed : ICOTDataFeed
     public CftcCOTDataFeed(
         IHttpClientFactory httpClientFactory,
         IMemoryCache cache,
-        ILogger<CftcCOTDataFeed> logger)
+        ILogger<CftcCOTDataFeed> logger,
+        TimeProvider? timeProvider = null)
     {
         _httpClientFactory = httpClientFactory;
         _cache             = cache;
         _logger            = logger;
+        _timeProvider      = timeProvider ?? TimeProvider.System;
+    }
+
+    public bool SupportsCurrency(string currency)
+    {
+        currency = currency.ToUpperInvariant();
+        return CurrencyToContractName.ContainsKey(currency);
     }
 
     /// <inheritdoc/>
-    public async Task<COTPositioningData?> GetReportAsync(string currency, DateTime reportDate, CancellationToken ct)
+    public async Task<COTPositioningData?> GetLatestPublishedReportAsync(string currency, CancellationToken ct)
     {
         currency = currency.ToUpperInvariant();
 
         if (!CurrencyToContractName.TryGetValue(currency, out var contractName))
-        {
-            _logger.LogWarning("CftcCOTDataFeed: no CFTC contract mapping for currency {Currency}", currency);
             return null;
-        }
 
-        var yearRecords = await GetYearRecordsAsync(reportDate.Year, ct);
+        var yearTasks = GetCandidateYears()
+            .Distinct()
+            .Select(year => GetYearRecordsAsync(year, ct))
+            .ToList();
 
-        // CFTC publishes the year-to-date ZIP on a weekly lag — early in a new calendar
-        // year the {YYYY}.zip file simply doesn't exist yet and GetYearRecordsAsync
-        // returns null. Silently fall back to the previous year's full archive so ML
-        // features keep seeing the last known COT positioning instead of suddenly going
-        // null across every pair on Jan 1 / Apr 1 / etc.
-        if (yearRecords == null)
-        {
-            yearRecords = await GetYearRecordsAsync(reportDate.Year - 1, ct);
-            if (yearRecords == null)
-            {
-                _logger.LogWarning(
-                    "CftcCOTDataFeed: neither {Year} nor {PrevYear} archive available for {Currency}",
-                    reportDate.Year, reportDate.Year - 1, currency);
-                return null;
-            }
-        }
+        var candidateRecords = (await Task.WhenAll(yearTasks))
+            .Where(records => records != null)
+            .SelectMany(records => records!)
+            .Where(r => r.ContractName.Contains(contractName, StringComparison.OrdinalIgnoreCase))
+            .ToList();
 
-        // Find the record matching the contract name and report date.
-        // CFTC report dates are Tuesdays; match by exact date.
-        var match = yearRecords.FirstOrDefault(r =>
-            r.ContractName.Contains(contractName, StringComparison.OrdinalIgnoreCase) &&
-            r.ReportDate.Date == reportDate.Date);
+        var match = candidateRecords
+            .OrderByDescending(r => r.ReportDate)
+            .FirstOrDefault();
 
         if (match == null)
         {
-            // If the report date falls near the year boundary, also check the previous year's data.
-            if (reportDate.Month == 1 && reportDate.Day <= 7)
-            {
-                var prevYearRecords = await GetYearRecordsAsync(reportDate.Year - 1, ct);
-                match = prevYearRecords?.FirstOrDefault(r =>
-                    r.ContractName.Contains(contractName, StringComparison.OrdinalIgnoreCase) &&
-                    r.ReportDate.Date == reportDate.Date);
-            }
-
-            // Exact-date match failed — fall back to the most recent record on or before
-            // reportDate (CFTC publishes weekly; the caller's reportDate may not align with
-            // a publication Tuesday). This is strictly more useful than returning null.
-            if (match == null)
-            {
-                match = yearRecords
-                    .Where(r => r.ContractName.Contains(contractName, StringComparison.OrdinalIgnoreCase) &&
-                                r.ReportDate.Date <= reportDate.Date)
-                    .OrderByDescending(r => r.ReportDate)
-                    .FirstOrDefault();
-            }
-
-            if (match == null)
-            {
-                _logger.LogDebug(
-                    "CftcCOTDataFeed: no COT record found for {Currency} ({Contract}) on or before {Date:yyyy-MM-dd}",
-                    currency, contractName, reportDate);
-                return null;
-            }
+            _logger.LogDebug(
+                "CftcCOTDataFeed: no published COT record found for {Currency} ({Contract})",
+                currency, contractName);
+            return null;
         }
 
         return new COTPositioningData(
+            ReportDate:        match.ReportDate.Date,
             CommercialLong:     match.CommercialLong,
             CommercialShort:    match.CommercialShort,
             NonCommercialLong:  match.NonCommercialLong,
@@ -159,17 +136,52 @@ public class CftcCOTDataFeed : ICOTDataFeed
             TotalOpenInterest:  match.OpenInterest);
     }
 
+    private IEnumerable<int> GetCandidateYears()
+    {
+        int currentYear = _timeProvider.GetUtcNow().UtcDateTime.Year;
+        yield return currentYear;
+        yield return currentYear - 1;
+    }
+
     /// <summary>
     /// Downloads and parses the CFTC bulk CSV for the given year, with in-memory caching.
     /// </summary>
     private async Task<List<CftcCsvRecord>?> GetYearRecordsAsync(int year, CancellationToken ct)
     {
-        string cacheKey = $"cftc_cot_{year}";
+        string cacheKey = BuildCacheKey(year);
 
         if (_cache.TryGetValue(cacheKey, out List<CftcCsvRecord>? cached))
             return cached;
 
-        var records = await DownloadAndParseAsync(year, ct);
+        var lazyLoad = _inflightYearLoads.GetOrAdd(
+            year,
+            static (requestedYear, self) => new Lazy<Task<List<CftcCsvRecord>?>>(
+                () => self.LoadYearRecordsAsync(requestedYear),
+                LazyThreadSafetyMode.ExecutionAndPublication),
+            this);
+
+        try
+        {
+            return await lazyLoad.Value.WaitAsync(ct);
+        }
+        finally
+        {
+            if (lazyLoad.IsValueCreated && lazyLoad.Value.IsCompleted)
+            {
+                _inflightYearLoads.TryRemove(
+                    new KeyValuePair<int, Lazy<Task<List<CftcCsvRecord>?>>>(year, lazyLoad));
+            }
+        }
+    }
+
+    private async Task<List<CftcCsvRecord>?> LoadYearRecordsAsync(int year)
+    {
+        string cacheKey = BuildCacheKey(year);
+
+        if (_cache.TryGetValue(cacheKey, out List<CftcCsvRecord>? cached))
+            return cached;
+
+        var records = await DownloadAndParseAsync(year, CancellationToken.None);
         if (records == null)
             return null;
 
@@ -181,6 +193,8 @@ public class CftcCOTDataFeed : ICOTDataFeed
 
         return records;
     }
+
+    private static string BuildCacheKey(int year) => $"cftc_cot_{year}";
 
     /// <summary>
     /// Downloads the CFTC Legacy COT ZIP for the given year and parses its CSV contents.
@@ -229,7 +243,8 @@ public class CftcCOTDataFeed : ICOTDataFeed
 
         // Downgraded from Error to Debug — this commonly occurs for the current year
         // before CFTC has published the first ZIP (release lag is typically 1–2 weeks
-        // into January) and the caller in GetPositioningAsync now falls back to year-1.
+        // into January) and the caller in GetLatestPublishedReportAsync now falls back
+        // to year-1.
         // An unhandled download failure is still surfaced via the LogWarning at each URL
         // attempt, so operators retain visibility without one Error-level line per symbol.
         _logger.LogDebug("CftcCOTDataFeed: no COT archive available for year {Year} — caller will fall back", year);

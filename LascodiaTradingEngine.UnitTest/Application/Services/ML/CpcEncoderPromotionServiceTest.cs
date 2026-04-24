@@ -82,6 +82,41 @@ public class CpcEncoderPromotionServiceTest
         cache.Verify(c => c.Invalidate(It.IsAny<string>(), It.IsAny<Timeframe>(), It.IsAny<MarketRegime?>()), Times.Never);
     }
 
+    [Fact]
+    public async Task PromoteAsync_Skips_When_Different_Architecture_Active_Appeared()
+    {
+        await using var db = CreateDbContext();
+        db.Set<MLCpcEncoder>().Add(new MLCpcEncoder
+        {
+            Id = 2,
+            Symbol = "EURUSD",
+            Timeframe = Timeframe.H1,
+            EncoderType = CpcEncoderType.Tcn,
+            EmbeddingDim = 16,
+            InfoNceLoss = 1.0,
+            EncoderBytes = [2],
+            TrainedAt = DateTime.UtcNow,
+            IsActive = true
+        });
+        await db.SaveChangesAsync();
+
+        var cache = new Mock<IActiveCpcEncoderProvider>();
+        var service = new CpcEncoderPromotionService(cache.Object);
+        var candidate = NewEncoder(loss: 0.5);
+
+        var result = await service.PromoteAsync(
+            db,
+            new CpcEncoderPromotionRequest("EURUSD", Timeframe.H1, null, PriorEncoderId: 1, MinImprovement: 0.02),
+            candidate,
+            CancellationToken.None);
+
+        Assert.False(result.Promoted);
+        Assert.Equal("promotion_conflict", result.Reason);
+        Assert.True((await db.Set<MLCpcEncoder>().SingleAsync(e => e.Id == 2)).IsActive);
+        Assert.False(await db.Set<MLCpcEncoder>().AnyAsync(e => e.EncoderBytes != null && e.EncoderBytes.SequenceEqual(new byte[] { 3 })));
+        cache.Verify(c => c.Invalidate(It.IsAny<string>(), It.IsAny<Timeframe>(), It.IsAny<MarketRegime?>()), Times.Never);
+    }
+
     private static MLCpcEncoder NewEncoder(double loss)
         => new()
         {

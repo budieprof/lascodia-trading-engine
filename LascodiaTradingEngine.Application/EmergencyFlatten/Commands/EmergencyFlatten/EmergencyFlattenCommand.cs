@@ -73,9 +73,37 @@ public class EmergencyFlattenCommandHandler : IRequestHandler<EmergencyFlattenCo
             .Where(p => p.Status == PositionStatus.Open && !p.IsDeleted)
             .ToListAsync(cancellationToken);
 
+        // Idempotency: re-invoking EmergencyFlatten must not queue duplicate close
+        // commands for positions that already have a pending one. PositionId lives
+        // inside the Parameters JSON ("...\"positionId\":42}"), so extract it here
+        // and skip positions already queued.
+        var pendingCloseParams = await ctx.Set<EACommand>()
+            .Where(c => c.CommandType == EACommandType.ClosePosition
+                     && !c.Acknowledged
+                     && !c.IsDeleted
+                     && c.Parameters != null)
+            .Select(c => c.Parameters!)
+            .ToListAsync(cancellationToken);
+
+        var positionsWithPendingClose = new HashSet<long>();
+        const string positionIdMarker = "\"positionId\":";
+        foreach (var p in pendingCloseParams)
+        {
+            int idx = p.IndexOf(positionIdMarker, StringComparison.Ordinal);
+            if (idx < 0) continue;
+            int start = idx + positionIdMarker.Length;
+            int end = start;
+            while (end < p.Length && (char.IsDigit(p[end]) || (p[end] == '-' && end == start))) end++;
+            if (end > start && long.TryParse(p.AsSpan(start, end - start), out var posId))
+                positionsWithPendingClose.Add(posId);
+        }
+
+        int queued = 0;
         foreach (var position in openPositions)
         {
-            // Queue an EA close command for each position
+            if (positionsWithPendingClose.Contains(position.Id))
+                continue;
+
             var closeCommand = new EACommand
             {
                 CommandType      = EACommandType.ClosePosition,
@@ -86,9 +114,12 @@ public class EmergencyFlattenCommandHandler : IRequestHandler<EmergencyFlattenCo
                 CreatedAt        = now
             };
             await ctx.Set<EACommand>().AddAsync(closeCommand, cancellationToken);
+            queued++;
         }
 
-        _logger.LogCritical("Emergency flatten: queued close commands for {Count} open positions", openPositions.Count);
+        _logger.LogCritical(
+            "Emergency flatten: queued {Queued} new close commands ({Skipped} positions already had pending close commands)",
+            queued, openPositions.Count - queued);
 
         // 3. Pause all active strategies
         var activeStrategies = await ctx.Set<Strategy>()

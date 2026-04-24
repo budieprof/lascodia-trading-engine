@@ -41,18 +41,34 @@ public sealed class CpcEncoderPromotionService : ICpcEncoderPromotionService
             var existingActive = await LoadActiveRowsForPromotionAsync(writeCtx, request, token);
 
             var currentActive = existingActive.FirstOrDefault();
-            if (currentActive is not null &&
-                currentActive.EncoderType == newEncoder.EncoderType &&
-                currentActive.Id != request.PriorEncoderId &&
-                !BeatsPriorLoss(newEncoder.InfoNceLoss, currentActive.InfoNceLoss, request.MinImprovement))
+            if (currentActive is not null && currentActive.Id != request.ExpectedActiveEncoderId)
             {
-                await tx.RollbackAsync(token);
-                result = new CpcEncoderPromotionResult(
-                    Promoted: false,
-                    Reason: "superseded_by_better_active",
-                    CurrentActiveEncoderId: currentActive.Id,
-                    CurrentActiveInfoNceLoss: currentActive.InfoNceLoss);
-                return;
+                // If another replica (or an operator) has already rotated in a different
+                // architecture while this candidate was training, we no longer have a safe
+                // apples-to-apples gate comparison for the now-current incumbent. In that case
+                // we treat the slot as changed-under-us and skip rather than clobbering the
+                // newer encoder. Same-architecture incumbents can still be compared by loss.
+                if (currentActive.EncoderType != newEncoder.EncoderType)
+                {
+                    await tx.RollbackAsync(token);
+                    result = new CpcEncoderPromotionResult(
+                        Promoted: false,
+                        Reason: "promotion_conflict",
+                        CurrentActiveEncoderId: currentActive.Id,
+                        CurrentActiveInfoNceLoss: currentActive.InfoNceLoss);
+                    return;
+                }
+
+                if (!BeatsPriorLoss(newEncoder.InfoNceLoss, currentActive.InfoNceLoss, request.MinImprovement))
+                {
+                    await tx.RollbackAsync(token);
+                    result = new CpcEncoderPromotionResult(
+                        Promoted: false,
+                        Reason: "superseded_by_better_active",
+                        CurrentActiveEncoderId: currentActive.Id,
+                        CurrentActiveInfoNceLoss: currentActive.InfoNceLoss);
+                    return;
+                }
             }
 
             foreach (var row in existingActive)

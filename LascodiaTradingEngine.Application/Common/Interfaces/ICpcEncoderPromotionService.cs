@@ -20,7 +20,8 @@ public sealed record CpcEncoderPromotionRequest(
     global::LascodiaTradingEngine.Domain.Enums.Timeframe Timeframe,
     global::LascodiaTradingEngine.Domain.Enums.MarketRegime? Regime,
     long? PriorEncoderId,
-    double MinImprovement);
+    double MinImprovement,
+    long? ExpectedActiveEncoderId = null);
 
 public sealed record CpcEncoderPromotionResult(
     bool Promoted,

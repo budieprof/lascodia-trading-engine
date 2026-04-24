@@ -7,8 +7,10 @@ namespace LascodiaTradingEngine.Domain.Entities;
 /// as published by the CFTC (Commodity Futures Trading Commission).
 /// </summary>
 /// <remarks>
-/// COT data is released every Friday and covers futures contract positions as of the
-/// preceding Tuesday. The report distinguishes between three participant categories:
+/// COT data is released every Friday and usually covers futures contract positions as of the
+/// preceding Tuesday. On some holiday weeks the CFTC uses an alternate cutoff date
+/// (for example Monday when Tuesday is a federal holiday). The report distinguishes
+/// between three participant categories:
 /// <list type="bullet">
 ///   <item><description><b>Commercial</b> — hedgers (banks, exporters) who use futures to offset real business risk.</description></item>
 ///   <item><description><b>Non-Commercial</b> — large speculators (hedge funds, CTAs) whose positioning is the primary sentiment signal.</description></item>
@@ -26,8 +28,8 @@ public class COTReport : Entity<long>
     public string  Currency                     { get; set; } = string.Empty;
 
     /// <summary>
-    /// The Friday date on which this CFTC report was published.
-    /// Data reflects positions as of the previous Tuesday.
+    /// The CFTC data cutoff date carried by the published report itself.
+    /// This is usually Tuesday, but may shift on holiday weeks.
     /// </summary>
     public DateTime ReportDate                  { get; set; }
 

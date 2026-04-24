@@ -32,6 +32,7 @@ public enum CpcReason
     ValidationLossOutOfBounds  = 41,
     EmbeddingCollapsed         = 42,
     NoImprovement              = 43,
+    GateEvaluationException    = 44,
 
     // Downstream probe gates.
     DownstreamProbeInsufficientSamples       = 50,
@@ -91,6 +92,7 @@ public static class CpcOutcomeExtensions
         CpcReason.ValidationLossOutOfBounds                => "validation_loss_out_of_bounds",
         CpcReason.EmbeddingCollapsed                       => "embedding_collapsed",
         CpcReason.NoImprovement                            => "no_improvement",
+        CpcReason.GateEvaluationException                  => "gate_evaluation_exception",
         CpcReason.DownstreamProbeInsufficientSamples       => "downstream_probe_insufficient_samples",
         CpcReason.DownstreamProbeInsufficientLabels        => "downstream_probe_insufficient_labels",
         CpcReason.DownstreamProbeBelowFloor                => "downstream_probe_below_floor",

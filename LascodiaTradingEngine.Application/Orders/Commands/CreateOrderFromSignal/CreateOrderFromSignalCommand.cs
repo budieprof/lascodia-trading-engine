@@ -392,6 +392,35 @@ public class CreateOrderFromSignalCommandHandler
         // throw InvalidOperationException.
         var wdb = _writeContext.GetDbContext();
 
+        // ── Orphan reaper ─────────────────────────────────────────────────────
+        // Guards the narrow crash window between CreateOrderCommand (which commits
+        // an Order with TradeSignalId = signal.Id) and the linkback ExecuteUpdate
+        // below. If the engine crashes in that window, the Order stays Pending
+        // with no signal back-reference and the TradeSignal has OrderId = null.
+        // The SignalAccountAttempt is also not yet recorded, so a retry would
+        // pass the alreadyAttempted check and create a second Order — leaking
+        // duplicates. Cancel any such orphan here before creating a new one.
+        // Runs only when signal.OrderId is still null (the post-linkback state
+        // would have bounced us at the "alreadyAttempted" or status guard).
+        if (signal.OrderId is null)
+        {
+            int reaped = await wdb.Set<Order>()
+                .Where(o => o.TradeSignalId == signal.Id
+                         && (o.Status == OrderStatus.Pending || o.Status == OrderStatus.Submitted)
+                         && !o.IsDeleted)
+                .ExecuteUpdateAsync(s => s
+                    .SetProperty(o => o.Status, OrderStatus.Cancelled)
+                    .SetProperty(o => o.Notes,  "Cancelled: orphaned — prior attempt crashed before signal linkback"),
+                    cancellationToken);
+            if (reaped > 0)
+            {
+                _logger.LogWarning(
+                    "CreateOrderFromSignal: reaped {Count} orphaned order(s) for signal {SignalId} " +
+                    "(prior attempt crashed between order create and linkback)",
+                    reaped, signal.Id);
+            }
+        }
+
         // Use the per-account resolved lot if Tier 2 rewrote it (drawdown recovery cap).
         // The risk checker does NOT mutate signal.SuggestedLotSize — doing so would leak
         // one account's cap into the next account's Tier 2 evaluation. null means "no
