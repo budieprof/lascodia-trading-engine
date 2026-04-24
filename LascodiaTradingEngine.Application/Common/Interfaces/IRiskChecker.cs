@@ -48,7 +48,7 @@ public record RiskCheckContext
     public decimal? CurrentSpread { get; init; }
 
     /// <summary>
-    /// Today's starting balance (balance at 00:00 UTC).
+    /// Starting balance/equity at the configured trading-day rollover boundary.
     /// Used to calculate daily drawdown independently from total (peak-to-trough) drawdown.
     /// </summary>
     public decimal DailyStartBalance { get; init; }

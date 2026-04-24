@@ -4,6 +4,7 @@ using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using Lascodia.Trading.Engine.SharedApplication.Common.Services;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedLibrary;
+using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Application.StrategyGeneration.Commands.TriggerStrategyGenerationCycle;
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
@@ -29,17 +30,12 @@ public class StrategyGenerationController : AuthControllerBase<StrategyGeneratio
     /// schedule. Still obeys the distributed generation lock and cycle-run bookkeeping,
     /// so calling this twice in quick succession will serialise the requests. Long-
     /// running — a full cycle can take tens of seconds.
-    ///
-    /// <para>
-    /// <b>Dev/ops endpoint</b> — marked <see cref="AllowAnonymousAttribute"/> because it's
-    /// meant to be called by operators or integration tests against a development engine
-    /// to validate a freshly-deployed generation change without waiting for the 02:12 UTC
-    /// polling window. Before exposing on a production deployment, wrap it in a proper
-    /// admin-auth policy or put it behind an IP allow-list at the ingress layer.
-    /// </para>
+    /// Gated on the Operator policy per E9 so only authenticated operators/admins can
+    /// force a cycle outside the schedule — the previous AllowAnonymous was a dev
+    /// convenience that no longer holds now that RBAC is wired.
     /// </summary>
     [HttpPost("cycles/trigger")]
-    [AllowAnonymous]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<ResponseData<string>> TriggerCycle()
         => await Mediator.Send(new TriggerStrategyGenerationCycleCommand());
 }

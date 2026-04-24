@@ -1,8 +1,10 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using Lascodia.Trading.Engine.SharedApplication.Common.Services;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedLibrary;
+using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Application.TradeSignals.Commands.ApproveTradeSignal;
 using LascodiaTradingEngine.Application.TradeSignals.Commands.RejectTradeSignal;
 using LascodiaTradingEngine.Application.TradeSignals.Commands.ExpireTradeSignal;
@@ -29,11 +31,13 @@ public class TradeSignalController : AuthControllerBase<TradeSignalController>
 
     /// <summary>Approve a pending trade signal</summary>
     [HttpPut("{id}/approve")]
+    [Authorize(Policy = Policies.Trader)]
     public async Task<ResponseData<string>> Approve(long id)
         => await Mediator.Send(new ApproveTradeSignalCommand { Id = id });
 
     /// <summary>Reject a pending trade signal</summary>
     [HttpPut("{id}/reject")]
+    [Authorize(Policy = Policies.Trader)]
     public async Task<ResponseData<string>> Reject(long id, RejectTradeSignalCommand command)
     {
         if (!ModelState.IsValid)
@@ -45,6 +49,7 @@ public class TradeSignalController : AuthControllerBase<TradeSignalController>
 
     /// <summary>Expire a trade signal</summary>
     [HttpPut("{id}/expire")]
+    [Authorize(Policy = Policies.Trader)]
     public async Task<ResponseData<string>> Expire(long id)
         => await Mediator.Send(new ExpireTradeSignalCommand { Id = id });
 

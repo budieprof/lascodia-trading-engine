@@ -4099,6 +4099,45 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     b.ToTable("MarketRegimeSnapshot");
                 });
 
+            modelBuilder.Entity("LascodiaTradingEngine.Domain.Entities.OperatorRole", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<DateTime>("AssignedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<long?>("AssignedByAccountId")
+                        .HasColumnType("bigint");
+
+                    b.Property<bool>("IsDeleted")
+                        .HasColumnType("boolean");
+
+                    b.Property<Guid>("OutboxId")
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("Role")
+                        .IsRequired()
+                        .HasMaxLength(50)
+                        .HasColumnType("character varying(50)");
+
+                    b.Property<long>("TradingAccountId")
+                        .HasColumnType("bigint");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("TradingAccountId");
+
+                    b.HasIndex("TradingAccountId", "Role")
+                        .IsUnique()
+                        .HasFilter("\"IsDeleted\" = FALSE");
+
+                    b.ToTable("OperatorRole");
+                });
+
             modelBuilder.Entity("LascodiaTradingEngine.Domain.Entities.OptimizationRun", b =>
                 {
                     b.Property<long>("Id")
@@ -5081,6 +5120,45 @@ namespace LascodiaTradingEngine.Infrastructure.Migrations
                     b.HasIndex("InstanceId", "RunAt");
 
                     b.ToTable("ReconciliationRun");
+                });
+
+            modelBuilder.Entity("LascodiaTradingEngine.Domain.Entities.RevokedToken", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<DateTime>("ExpiresAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("Jti")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<Guid>("OutboxId")
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("Reason")
+                        .HasMaxLength(200)
+                        .HasColumnType("character varying(200)");
+
+                    b.Property<DateTime>("RevokedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<long>("TradingAccountId")
+                        .HasColumnType("bigint");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Jti")
+                        .IsUnique();
+
+                    b.HasIndex("TradingAccountId", "ExpiresAt");
+
+                    b.ToTable("RevokedToken");
                 });
 
             modelBuilder.Entity("LascodiaTradingEngine.Domain.Entities.RiskProfile", b =>

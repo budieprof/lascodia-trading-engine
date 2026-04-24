@@ -47,6 +47,7 @@ public static class EngineConfigKeys
         "MLScoring:",
         "MLModel:",
         "MLTrainingCost:",
+        "DeadLetter:",
         "RegimeDetector:",
         "WorkerGroups:",
         "RiskCheckerOptions:",

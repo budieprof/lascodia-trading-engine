@@ -57,6 +57,7 @@ public class CreateOrderFromSignalCommandHandler
     private readonly ILivePriceCache _livePriceCache;
     private readonly ILogger<CreateOrderFromSignalCommandHandler> _logger;
     private readonly RiskCheckerOptions _riskOptions;
+    private readonly TradingDayOptions _tradingDayOptions;
     private readonly TradingMetrics _metrics;
     private readonly IDegradationModeManager _degradationManager;
     private readonly IKillSwitchService _killSwitch;
@@ -69,6 +70,7 @@ public class CreateOrderFromSignalCommandHandler
         ILivePriceCache livePriceCache,
         ILogger<CreateOrderFromSignalCommandHandler> logger,
         RiskCheckerOptions riskOptions,
+        TradingDayOptions tradingDayOptions,
         TradingMetrics metrics,
         IDegradationModeManager degradationManager,
         IKillSwitchService killSwitch)
@@ -80,6 +82,7 @@ public class CreateOrderFromSignalCommandHandler
         _livePriceCache      = livePriceCache;
         _logger              = logger;
         _riskOptions         = riskOptions;
+        _tradingDayOptions   = tradingDayOptions;
         _metrics             = metrics;
         _degradationManager  = degradationManager;
         _killSwitch          = killSwitch;
@@ -235,9 +238,12 @@ public class CreateOrderFromSignalCommandHandler
         var symbolSpec = await db.Set<CurrencyPair>()
             .FirstOrDefaultAsync(c => c.Symbol == signal.Symbol && !c.IsDeleted, cancellationToken);
 
-        var todayStart = DateTime.UtcNow.Date;
+        var nowUtc = DateTime.UtcNow;
+        var tradingDayStartUtc = TradingDayBoundaryHelper.GetTradingDayStartUtc(
+            nowUtc,
+            _tradingDayOptions.RolloverMinuteOfDayUtc);
         int tradesToday = await db.Set<Order>()
-            .CountAsync(o => o.CreatedAt >= todayStart && !o.IsDeleted, cancellationToken);
+            .CountAsync(o => o.CreatedAt >= tradingDayStartUtc && !o.IsDeleted, cancellationToken);
 
         // Count consecutive recent losses and track the timestamp of the last loss
         var recentClosedPositions = await db.Set<Position>()
@@ -260,13 +266,24 @@ public class CreateOrderFromSignalCommandHandler
         }
 
         // Daily starting balance
-        decimal dailyStartBalance = account.Balance;
-        var todaySnapshot = await db.Set<DrawdownSnapshot>()
-            .Where(s => s.RecordedAt >= todayStart)
-            .OrderBy(s => s.RecordedAt)
-            .FirstOrDefaultAsync(cancellationToken);
-        if (todaySnapshot is not null)
-            dailyStartBalance = todaySnapshot.CurrentEquity;
+        decimal dailyStartBalance = 0m;
+        var tradingDayBaseline = await TradingDayBoundaryHelper.ResolveStartOfDayEquityAsync(
+            db,
+            account.Id,
+            nowUtc,
+            _tradingDayOptions,
+            cancellationToken);
+        if (tradingDayBaseline is not null)
+        {
+            dailyStartBalance = tradingDayBaseline.StartOfDayEquity;
+        }
+        else
+        {
+            _logger.LogWarning(
+                "CreateOrderFromSignal: no trusted trading-day baseline available for account {AccountId} at {TradingDayStart:o}; daily drawdown gates will be skipped",
+                account.Id,
+                tradingDayStartUtc);
+        }
 
         // Current spread. An inverted quote (Ask < Bid) is a data-quality anomaly — the
         // feed is either mid-update or broken. RiskChecker rejects inverted quotes as a

@@ -1,8 +1,10 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using Lascodia.Trading.Engine.SharedApplication.Common.Services;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedLibrary;
+using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Application.WalkForward.Commands.RunWalkForward;
 using LascodiaTradingEngine.Application.WalkForward.Queries.DTOs;
 using LascodiaTradingEngine.Application.WalkForward.Queries.GetWalkForwardRun;
@@ -26,6 +28,7 @@ public class WalkForwardController : AuthControllerBase<WalkForwardController>
 
     /// <summary>Queue a new walk-forward optimisation run</summary>
     [HttpPost]
+    [Authorize(Policy = Policies.Analyst)]
     public async Task<ResponseData<long>> Run(RunWalkForwardCommand command)
     {
         if (!ModelState.IsValid)

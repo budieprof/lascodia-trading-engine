@@ -1,9 +1,11 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using Lascodia.Trading.Engine.SharedApplication.Common.Services;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedLibrary;
 using LascodiaTradingEngine.Application.AuditTrail.Commands.LogDecision;
+using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Application.AuditTrail.Queries.DTOs;
 using LascodiaTradingEngine.Application.AuditTrail.Queries.GetPagedDecisionLogs;
 
@@ -25,6 +27,7 @@ public class AuditTrailController : AuthControllerBase<AuditTrailController>
 
     /// <summary>Append an immutable decision log entry</summary>
     [HttpPost]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<ResponseData<long>> Log(LogDecisionCommand command)
     {
         if (!ModelState.IsValid)

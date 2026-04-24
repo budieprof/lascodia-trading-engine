@@ -1,10 +1,14 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using Lascodia.Trading.Engine.SharedApplication.Common.Services;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
+using Lascodia.Trading.Engine.SharedLibrary;
+using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Application.DrawdownRecovery.Commands.RecordDrawdownSnapshot;
 using LascodiaTradingEngine.Application.DrawdownRecovery.Queries.DTOs;
 using LascodiaTradingEngine.Application.DrawdownRecovery.Queries.GetLatestDrawdownSnapshot;
+using LascodiaTradingEngine.Application.DrawdownRecovery.Queries.GetPagedDrawdownSnapshots;
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
@@ -24,6 +28,7 @@ public class DrawdownRecoveryController : AuthControllerBase<DrawdownRecoveryCon
 
     /// <summary>Record a drawdown snapshot and get the current recovery mode</summary>
     [HttpPost]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<ResponseData<string>> Record(RecordDrawdownSnapshotCommand command)
     {
         if (!ModelState.IsValid)
@@ -36,4 +41,9 @@ public class DrawdownRecoveryController : AuthControllerBase<DrawdownRecoveryCon
     [HttpGet("latest")]
     public async Task<ResponseData<DrawdownSnapshotDto>> GetLatest()
         => await Mediator.Send(new GetLatestDrawdownSnapshotQuery());
+
+    /// <summary>Get a paginated list of historical drawdown snapshots, newest first.</summary>
+    [HttpPost("history")]
+    public async Task<ResponseData<PagedData<DrawdownSnapshotDto>>> GetHistory(GetPagedDrawdownSnapshotsQuery query)
+        => await Mediator.Send(query);
 }

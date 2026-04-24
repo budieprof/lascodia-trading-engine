@@ -1,7 +1,9 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using Lascodia.Trading.Engine.SharedApplication.Common.Services;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Application.TrailingStop.Commands.UpdateTrailingStop;
 using LascodiaTradingEngine.Application.TrailingStop.Commands.ScalePosition;
 
@@ -23,6 +25,7 @@ public class TrailingStopController : AuthControllerBase<TrailingStopController>
 
     /// <summary>Update trailing stop settings on a position</summary>
     [HttpPut("{positionId}")]
+    [Authorize(Policy = Policies.Trader)]
     public async Task<ResponseData<string>> UpdateTrailingStop(long positionId, UpdateTrailingStopCommand command)
     {
         if (!ModelState.IsValid)
@@ -34,6 +37,7 @@ public class TrailingStopController : AuthControllerBase<TrailingStopController>
 
     /// <summary>Scale a position in or out</summary>
     [HttpPost("scale")]
+    [Authorize(Policy = Policies.Trader)]
     public async Task<ResponseData<long>> ScalePosition(ScalePositionCommand command)
     {
         if (!ModelState.IsValid)

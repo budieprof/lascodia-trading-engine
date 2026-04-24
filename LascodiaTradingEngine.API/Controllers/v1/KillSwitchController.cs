@@ -1,8 +1,10 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using Lascodia.Trading.Engine.SharedApplication.Common.Services;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Security;
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
 
@@ -29,6 +31,7 @@ namespace LascodiaTradingEngine.API.Controllers.v1;
 /// </remarks>
 [Route("api/v1/lascodia-trading-engine/admin/kill-switch")]
 [ApiController]
+[Authorize(Policy = Policies.Operator)]
 public class KillSwitchController : AuthControllerBase<KillSwitchController>
 {
     private readonly IKillSwitchService _killSwitch;

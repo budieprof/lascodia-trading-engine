@@ -6,7 +6,10 @@ using Lascodia.Trading.Engine.SharedLibrary;
 using LascodiaTradingEngine.Application.Orders.Commands.CreateOrder;
 using LascodiaTradingEngine.Application.Orders.Commands.DeleteOrder;
 using LascodiaTradingEngine.Application.Orders.Commands.UpdateOrder;
+using Microsoft.AspNetCore.Authorization;
+using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Application.Orders.Commands.CancelOrder;
+using LascodiaTradingEngine.Application.Orders.Commands.BatchCancelOrders;
 using LascodiaTradingEngine.Application.Orders.Commands.ModifyOrder;
 using LascodiaTradingEngine.Application.Orders.Commands.SubmitOrder;
 using LascodiaTradingEngine.Application.Orders.Commands.SubmitExecutionReport;
@@ -38,6 +41,7 @@ public class OrderController : AuthControllerBase<OrderController>
     /// Runs Tier 2 (account-level) risk checks. The signal stays Approved if the check fails.
     /// </summary>
     [HttpPost("from-signal")]
+    [Authorize(Policy = Policies.Trader)]
     public async Task<ResponseData<long>> CreateFromSignal(CreateOrderFromSignalCommand command)
     {
         if (!ModelState.IsValid)
@@ -48,6 +52,7 @@ public class OrderController : AuthControllerBase<OrderController>
 
     /// <summary>Create a new manual order</summary>
     [HttpPost]
+    [Authorize(Policy = Policies.Trader)]
     public async Task<ResponseData<long>> Create(CreateOrderCommand command)
     {
         if (!ModelState.IsValid)
@@ -58,6 +63,7 @@ public class OrderController : AuthControllerBase<OrderController>
 
     /// <summary>Update an order (metadata only)</summary>
     [HttpPut("{id}")]
+    [Authorize(Policy = Policies.Trader)]
     public async Task<ResponseData<string>> Update(long id, UpdateOrderCommand command)
     {
         if (!ModelState.IsValid)
@@ -69,16 +75,30 @@ public class OrderController : AuthControllerBase<OrderController>
 
     /// <summary>Submit a Pending order to the broker</summary>
     [HttpPost("{id}/submit")]
+    [Authorize(Policy = Policies.Trader)]
     public async Task<ResponseData<SubmitOrderResult>> Submit(long id)
         => await Mediator.Send(new SubmitOrderCommand { Id = id });
 
     /// <summary>Cancel an order</summary>
     [HttpPost("{id}/cancel")]
+    [Authorize(Policy = Policies.Trader)]
     public async Task<ResponseData<string>> Cancel(long id)
         => await Mediator.Send(new CancelOrderCommand { Id = id });
 
+    /// <summary>Cancel multiple orders in a single call (best-effort, capped at 50)</summary>
+    [HttpPost("cancel/batch")]
+    [Authorize(Policy = Policies.Operator)]
+    public async Task<ResponseData<BatchCancelOrdersResult>> CancelBatch(BatchCancelOrdersCommand command)
+    {
+        if (!ModelState.IsValid)
+            return ResponseData<BatchCancelOrdersResult>.Init(null, false, "Model state failed", "-11");
+
+        return await Mediator.Send(command);
+    }
+
     /// <summary>Modify stop loss / take profit of an existing order</summary>
     [HttpPut("{id}/modify")]
+    [Authorize(Policy = Policies.Trader)]
     public async Task<ResponseData<string>> Modify(long id, ModifyOrderCommand command)
     {
         command.Id = id;
@@ -105,6 +125,7 @@ public class OrderController : AuthControllerBase<OrderController>
 
     /// <summary>Soft-delete an order</summary>
     [HttpDelete("{id}")]
+    [Authorize(Policy = Policies.Trader)]
     public async Task<ResponseData<string>> Delete(long id)
         => await Mediator.Send(new DeleteOrderCommand { Id = id });
 

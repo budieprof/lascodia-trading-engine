@@ -50,6 +50,12 @@ public class LoginTradingAccountCommandTest
     {
         var mockSet = accounts.AsQueryable().BuildMockDbSet();
         _mockDbContext.Setup(c => c.Set<TradingAccount>()).Returns(mockSet.Object);
+
+        // The login handler queries OperatorRole to embed role claims (E9 RBAC).
+        // Default to an empty set so tests that don't care about RBAC still pass —
+        // the handler then falls back to the Viewer role, which is the safe default.
+        var emptyRoles = new List<OperatorRole>().AsQueryable().BuildMockDbSet();
+        _mockDbContext.Setup(c => c.Set<OperatorRole>()).Returns(emptyRoles.Object);
     }
 
     private TradingAccount CreateTestAccount(string password = "correctpassword", string? apiKey = null)

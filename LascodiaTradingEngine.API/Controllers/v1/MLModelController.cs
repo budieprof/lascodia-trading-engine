@@ -1,18 +1,22 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using Lascodia.Trading.Engine.SharedApplication.Common.Services;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedLibrary;
+using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Application.MLModels.Commands.TriggerMLTraining;
 using LascodiaTradingEngine.Application.MLModels.Commands.ActivateMLModel;
 using LascodiaTradingEngine.Application.MLModels.Commands.RollbackMLModel;
 using LascodiaTradingEngine.Application.MLModels.Commands.TriggerMLHyperparamSearch;
 using LascodiaTradingEngine.Application.MLModels.Queries.DTOs;
+using LascodiaTradingEngine.Application.MLModels.Queries.GetDriftReport;
 using LascodiaTradingEngine.Application.MLModels.Queries.GetMLModel;
 using LascodiaTradingEngine.Application.MLModels.Queries.GetMLSignalAbTestResult;
 using LascodiaTradingEngine.Application.MLModels.Queries.GetPagedMLModels;
 using LascodiaTradingEngine.Application.MLModels.Queries.GetPagedMLSignalAbTestResults;
 using LascodiaTradingEngine.Application.MLModels.Queries.GetMLTrainingRun;
+using LascodiaTradingEngine.Application.MLModels.Queries.GetMLTrainingRunDiagnostics;
 using LascodiaTradingEngine.Application.MLModels.Queries.GetPagedMLTrainingRuns;
 
 namespace LascodiaTradingEngine.API.Controllers.v1;
@@ -33,6 +37,7 @@ public class MLModelController : AuthControllerBase<MLModelController>
 
     /// <summary>Trigger ML model training for a symbol/timeframe</summary>
     [HttpPost("training/trigger")]
+    [Authorize(Policy = Policies.Analyst)]
     public async Task<ResponseData<long>> TriggerTraining(TriggerMLTrainingCommand command)
     {
         if (!ModelState.IsValid)
@@ -43,11 +48,13 @@ public class MLModelController : AuthControllerBase<MLModelController>
 
     /// <summary>Activate an ML model (deactivates previous active model for same symbol/timeframe)</summary>
     [HttpPut("{id}/activate")]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<ResponseData<string>> Activate(long id)
         => await Mediator.Send(new ActivateMLModelCommand { Id = id });
 
     /// <summary>Trigger a random hyperparameter search — queues N training candidate runs</summary>
     [HttpPost("training/hyperparam-search")]
+    [Authorize(Policy = Policies.Analyst)]
     public async Task<ResponseData<int>> TriggerHyperparamSearch(TriggerMLHyperparamSearchCommand command)
     {
         if (!ModelState.IsValid)
@@ -58,6 +65,7 @@ public class MLModelController : AuthControllerBase<MLModelController>
 
     /// <summary>Roll back to the most recently superseded model for a symbol/timeframe</summary>
     [HttpPost("rollback")]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<ResponseData<long>> Rollback(RollbackMLModelCommand command)
     {
         if (!ModelState.IsValid)
@@ -87,6 +95,11 @@ public class MLModelController : AuthControllerBase<MLModelController>
     public async Task<ResponseData<MLTrainingRunDto>> GetTrainingRun(long id)
         => await Mediator.Send(new GetMLTrainingRunQuery { Id = id });
 
+    /// <summary>Get full diagnostic record for a training run — advanced metrics, dataset stats, hyperparameter config, drift context, and training feature-flag audit trail</summary>
+    [HttpGet("training/{id}/diagnostics")]
+    public async Task<ResponseData<MLTrainingRunDiagnosticsDto>> GetTrainingRunDiagnostics(long id)
+        => await Mediator.Send(new GetMLTrainingRunDiagnosticsQuery { Id = id });
+
     /// <summary>Get paged list of ML training runs</summary>
     [HttpPost("training/list")]
     public async Task<ResponseData<PagedData<MLTrainingRunDto>>> GetPagedTrainingRuns(
@@ -111,6 +124,17 @@ public class MLModelController : AuthControllerBase<MLModelController>
     {
         if (!ModelState.IsValid)
             return ResponseData<PagedData<MLSignalAbTestResultDto>>.Init(null, false, "Model state failed", "-11");
+
+        Logger.LogInformation(query.GetJson());
+        return await Mediator.Send(query);
+    }
+
+    /// <summary>Get paged list of ML-drift alerts across detector families (Adwin, CUSUM, CovariateShift, MultiScale, DriftAgreement)</summary>
+    [HttpPost("drift-report")]
+    public async Task<ResponseData<PagedData<DriftAlertDto>>> GetDriftReport(GetDriftReportQuery query)
+    {
+        if (!ModelState.IsValid)
+            return ResponseData<PagedData<DriftAlertDto>>.Init(null, false, "Model state failed", "-11");
 
         Logger.LogInformation(query.GetJson());
         return await Mediator.Send(query);

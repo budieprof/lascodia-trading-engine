@@ -14,12 +14,22 @@ namespace LascodiaTradingEngine.Application.Common.Security;
 public static class TradingAccountTokenGenerator
 {
     /// <summary>
-    /// Generates a JWT token containing the trading account's identity claims.
-    /// The token is scoped to a single <see cref="TradingAccount"/> with configurable expiration.
+    /// Generates a JWT token containing the trading account's identity claims plus the
+    /// canonical role claims used by the RBAC policy ladder. EA logins receive
+    /// <see cref="OperatorRoleNames.EA"/> as the sole role; web logins should pass the union of
+    /// the account's <c>OperatorRole</c> grants — falling back to <see cref="OperatorRoleNames.Viewer"/>
+    /// when the caller passes an empty set.
     /// </summary>
     /// <param name="account">The trading account to generate the token for.</param>
     /// <param name="configuration">Application configuration providing JWT settings (SecretKey, Issuer, Audience, ExpirationMinutes).</param>
-    public static AuthTokenResult GenerateToken(TradingAccount account, IConfiguration configuration)
+    /// <param name="roles">
+    /// Roles to embed in the token. Pass <c>null</c> or an empty list to default to
+    /// <see cref="OperatorRoleNames.Viewer"/> — never silently grant elevated access.
+    /// </param>
+    public static AuthTokenResult GenerateToken(
+        TradingAccount account,
+        IConfiguration configuration,
+        IEnumerable<string>? roles = null)
     {
         var jwtSection = configuration.GetSection("JwtSettings");
         var secretKey  = jwtSection["SecretKey"]
@@ -32,6 +42,14 @@ public static class TradingAccountTokenGenerator
         var signingKey  = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secretKey));
         var credentials = new SigningCredentials(signingKey, SecurityAlgorithms.HmacSha256);
 
+        var roleClaims = (roles ?? Array.Empty<string>())
+            .Where(r => !string.IsNullOrWhiteSpace(r))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        if (roleClaims.Length == 0)
+            roleClaims = [OperatorRoleNames.Viewer];
+
         var claims = new List<Claim>
         {
             new("tradingAccountId", account.Id.ToString()),
@@ -39,6 +57,8 @@ public static class TradingAccountTokenGenerator
             new(JwtRegisteredClaimNames.Sub, account.Id.ToString()),
             new(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString()),
         };
+
+        claims.AddRange(roleClaims.Select(r => new Claim(ClaimTypes.Role, r)));
 
         var token = new JwtSecurityToken(
             issuer:             issuer,

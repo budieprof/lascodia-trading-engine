@@ -1,8 +1,10 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using Lascodia.Trading.Engine.SharedApplication.Common.Services;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedLibrary;
+using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Application.ExecutionQuality.Commands.RecordExecutionQuality;
 using LascodiaTradingEngine.Application.ExecutionQuality.Queries.DTOs;
 using LascodiaTradingEngine.Application.ExecutionQuality.Queries.GetExecutionQualityLog;
@@ -26,6 +28,7 @@ public class ExecutionQualityController : AuthControllerBase<ExecutionQualityCon
 
     /// <summary>Record an execution quality log entry</summary>
     [HttpPost]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<ResponseData<long>> Record(RecordExecutionQualityCommand command)
     {
         if (!ModelState.IsValid)

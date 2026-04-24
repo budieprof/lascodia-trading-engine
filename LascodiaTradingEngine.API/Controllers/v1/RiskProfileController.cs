@@ -1,8 +1,10 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using Lascodia.Trading.Engine.SharedApplication.Common.Services;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedLibrary;
+using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Application.RiskProfiles.Commands.CreateRiskProfile;
 using LascodiaTradingEngine.Application.RiskProfiles.Commands.UpdateRiskProfile;
 using LascodiaTradingEngine.Application.RiskProfiles.Commands.DeleteRiskProfile;
@@ -28,6 +30,7 @@ public class RiskProfileController : AuthControllerBase<RiskProfileController>
 
     /// <summary>Create a new risk profile</summary>
     [HttpPost]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<ResponseData<long>> Create(CreateRiskProfileCommand command)
     {
         if (!ModelState.IsValid)
@@ -38,6 +41,7 @@ public class RiskProfileController : AuthControllerBase<RiskProfileController>
 
     /// <summary>Update a risk profile</summary>
     [HttpPut("{id}")]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<ResponseData<string>> Update(long id, UpdateRiskProfileCommand command)
     {
         if (!ModelState.IsValid)
@@ -49,6 +53,7 @@ public class RiskProfileController : AuthControllerBase<RiskProfileController>
 
     /// <summary>Delete a risk profile</summary>
     [HttpDelete("{id}")]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<ResponseData<string>> Delete(long id)
         => await Mediator.Send(new DeleteRiskProfileCommand { Id = id });
 

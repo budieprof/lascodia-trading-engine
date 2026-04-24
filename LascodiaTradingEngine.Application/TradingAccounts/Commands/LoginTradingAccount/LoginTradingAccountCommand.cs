@@ -138,7 +138,27 @@ public class LoginTradingAccountCommandHandler : IRequestHandler<LoginTradingAcc
                 return ResponseData<AuthTokenResult>.Init(null, false, "Invalid API key", "-11");
         }
 
-        var tokenResult = TradingAccountTokenGenerator.GenerateToken(entity, _configuration);
+        // EA tokens always carry a single, fixed role so the EA cannot be locked out by
+        // a misconfigured operator-role grant. Web tokens get the union of the account's
+        // OperatorRole rows, defaulting to Viewer when nothing is granted.
+        IEnumerable<string> roles;
+        if (request.LoginSource == "ea")
+        {
+            roles = new[] { OperatorRoleNames.EA };
+        }
+        else
+        {
+            var grants = await _context.GetDbContext()
+                .Set<Domain.Entities.OperatorRole>()
+                .AsNoTracking()
+                .Where(x => x.TradingAccountId == entity.Id)
+                .Select(x => x.Role)
+                .ToListAsync(cancellationToken);
+
+            roles = grants.Count > 0 ? grants : new List<string> { OperatorRoleNames.Viewer };
+        }
+
+        var tokenResult = TradingAccountTokenGenerator.GenerateToken(entity, _configuration, roles);
 
         // Advertise bridge endpoint when the bridge is enabled
         if (_bridgeOptions.Enabled)

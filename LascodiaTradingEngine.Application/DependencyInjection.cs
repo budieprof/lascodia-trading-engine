@@ -124,6 +124,20 @@ public static class DependencyInjection
             .ValidateOnStart();
         services.AddSingleton(sp => sp.GetRequiredService<IOptions<CorrelationMatrixOptions>>().Value);
 
+        services.RemoveAll<TradingDayOptions>();
+        services.AddSingleton<IValidateOptions<TradingDayOptions>, TradingDayOptionsValidator>();
+        services.AddOptions<TradingDayOptions>()
+            .Bind(configuration.GetSection(nameof(TradingDayOptions)))
+            .ValidateOnStart();
+        services.AddSingleton(sp => sp.GetRequiredService<IOptions<TradingDayOptions>>().Value);
+
+        services.RemoveAll<DataRetentionOptions>();
+        services.AddSingleton<IValidateOptions<DataRetentionOptions>, DataRetentionOptionsValidator>();
+        services.AddOptions<DataRetentionOptions>()
+            .Bind(configuration.GetSection(nameof(DataRetentionOptions)))
+            .ValidateOnStart();
+        services.AddSingleton(sp => sp.GetRequiredService<IOptions<DataRetentionOptions>>().Value);
+
         // ── Strategy Worker ──────────────────────────────────────────────────────
         // Registered as singleton so the same instance is used both as the hosted
         // service and as the IIntegrationEventHandler resolved by the event bus.
@@ -206,6 +220,12 @@ public static class DependencyInjection
         // gate reads closed rows to enforce real-data promotion instead of a
         // backtest-trade proxy. Router is [RegisterService]-auto-wired.
         services.AddHostedService<PaperExecutionMonitorWorker>();
+
+        // ── Revoked-token GC (E10) ─────────────────────────────────────────────
+        // Daily sweep that drops RevokedToken rows whose underlying JWT has expired.
+        // The blacklist only needs to cover live tokens; without this the table grows
+        // unbounded over time.
+        services.AddHostedService<RevokedTokenCleanupWorker>();
 
         // ── ML model auto-rollback ─────────────────────────────────────────────
         // Live-degradation reactor: on detected calibration drift / accuracy floor /

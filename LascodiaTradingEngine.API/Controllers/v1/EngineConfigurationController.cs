@@ -1,7 +1,9 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using Lascodia.Trading.Engine.SharedApplication.Common.Services;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Application.EngineConfiguration.Commands.UpsertEngineConfig;
 using LascodiaTradingEngine.Application.EngineConfiguration.Queries.DTOs;
 using LascodiaTradingEngine.Application.EngineConfiguration.Queries.GetEngineConfig;
@@ -25,6 +27,7 @@ public class EngineConfigurationController : AuthControllerBase<EngineConfigurat
 
     /// <summary>Upsert an engine configuration entry</summary>
     [HttpPut]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<ResponseData<long>> Upsert(UpsertEngineConfigCommand command)
     {
         if (!ModelState.IsValid)

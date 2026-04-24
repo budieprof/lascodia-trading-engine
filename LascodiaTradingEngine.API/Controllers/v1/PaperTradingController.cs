@@ -1,7 +1,9 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using Lascodia.Trading.Engine.SharedApplication.Common.Services;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Application.PaperTrading.Commands.BackfillPaperExecutions;
 using LascodiaTradingEngine.Application.PaperTrading.Commands.SetPaperTradingMode;
 using LascodiaTradingEngine.Application.PaperTrading.Queries.GetPaperTradingStatus;
@@ -24,6 +26,7 @@ public class PaperTradingController : AuthControllerBase<PaperTradingController>
 
     /// <summary>Enable or disable paper trading mode</summary>
     [HttpPut("mode")]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<ResponseData<string>> SetMode(SetPaperTradingModeCommand command)
     {
         if (!ModelState.IsValid)
@@ -46,6 +49,7 @@ public class PaperTradingController : AuthControllerBase<PaperTradingController>
     /// table without waiting for live signals to accrue.
     /// </summary>
     [HttpPost("backfill")]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<ResponseData<int>> BackfillPaperExecutions(BackfillPaperExecutionsCommand command)
     {
         if (!ModelState.IsValid)

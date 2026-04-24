@@ -1,8 +1,10 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using Lascodia.Trading.Engine.SharedApplication.Common.Services;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedLibrary;
+using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Application.Strategies.Commands.ActivateStrategy;
 using LascodiaTradingEngine.Application.Strategies.Commands.AssignRiskProfile;
 using LascodiaTradingEngine.Application.Strategies.Commands.CreateStrategy;
@@ -30,6 +32,7 @@ public class StrategyController : AuthControllerBase<StrategyController>
 
     /// <summary>Create a new strategy</summary>
     [HttpPost]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<ResponseData<long>> Create(CreateStrategyCommand command)
     {
         if (!ModelState.IsValid)
@@ -40,21 +43,25 @@ public class StrategyController : AuthControllerBase<StrategyController>
 
     /// <summary>Delete a strategy</summary>
     [HttpDelete("{id}")]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<ResponseData<string>> Delete(long id)
         => await Mediator.Send(new DeleteStrategyCommand { Id = id });
 
     /// <summary>Activate a strategy</summary>
     [HttpPut("{id}/activate")]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<ResponseData<string>> Activate(long id)
         => await Mediator.Send(new ActivateStrategyCommand { Id = id });
 
     /// <summary>Pause a strategy</summary>
     [HttpPut("{id}/pause")]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<ResponseData<string>> Pause(long id)
         => await Mediator.Send(new PauseStrategyCommand { Id = id });
 
     /// <summary>Assign a risk profile to a strategy</summary>
     [HttpPut("{id}/risk-profile")]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<ResponseData<string>> AssignRiskProfile(long id, AssignRiskProfileCommand command)
     {
         if (!ModelState.IsValid)

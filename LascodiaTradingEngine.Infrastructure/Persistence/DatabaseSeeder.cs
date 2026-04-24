@@ -363,10 +363,34 @@ public sealed class DatabaseSeeder
             },
             new EngineConfig
             {
-                Key = "DrawdownMonitor:IntervalSeconds",
-                Value = "30",
-                Description = "Interval in seconds between drawdown monitoring checks",
+                Key = "Drawdown:PollIntervalSeconds",
+                Value = "60",
+                Description = "Interval in seconds between regular drawdown snapshot polls",
                 DataType = ConfigDataType.Int,
+                IsHotReloadable = true,
+            },
+            new EngineConfig
+            {
+                Key = "Drawdown:EmergencyLossPct",
+                Value = "2.0",
+                Description = "Realised loss percentage of equity that triggers an immediate drawdown snapshot outside the normal poll cycle",
+                DataType = ConfigDataType.Decimal,
+                IsHotReloadable = true,
+            },
+            new EngineConfig
+            {
+                Key = "Drawdown:CriticalMarginPct",
+                Value = "150",
+                Description = "Margin-level percentage below which drawdown monitoring logs a critical broker-margin warning",
+                DataType = ConfigDataType.Decimal,
+                IsHotReloadable = true,
+            },
+            new EngineConfig
+            {
+                Key = "Drawdown:CautionMarginPct",
+                Value = "200",
+                Description = "Margin-level percentage below which drawdown monitoring logs an early-warning safety alert",
+                DataType = ConfigDataType.Decimal,
                 IsHotReloadable = true,
             },
             // ── ML model quality improvements ─────────────────────────────────

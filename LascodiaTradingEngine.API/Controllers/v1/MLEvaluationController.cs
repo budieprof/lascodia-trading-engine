@@ -1,8 +1,10 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using Lascodia.Trading.Engine.SharedApplication.Common.Services;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedLibrary;
+using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Application.MLEvaluation.Commands.StartShadowEvaluation;
 using LascodiaTradingEngine.Application.MLEvaluation.Commands.RecordPredictionOutcome;
 using LascodiaTradingEngine.Application.MLEvaluation.Queries.DTOs;
@@ -27,6 +29,7 @@ public class MLEvaluationController : AuthControllerBase<MLEvaluationController>
 
     /// <summary>Start a champion-challenger shadow evaluation</summary>
     [HttpPost("shadow/start")]
+    [Authorize(Policy = Policies.Analyst)]
     public async Task<ResponseData<long>> StartShadow(StartShadowEvaluationCommand command)
     {
         if (!ModelState.IsValid)
@@ -37,6 +40,7 @@ public class MLEvaluationController : AuthControllerBase<MLEvaluationController>
 
     /// <summary>Record actual outcome for predictions linked to a trade signal</summary>
     [HttpPut("outcome")]
+    [Authorize(Policy = Policies.Analyst)]
     public async Task<ResponseData<string>> RecordOutcome(RecordPredictionOutcomeCommand command)
     {
         if (!ModelState.IsValid)

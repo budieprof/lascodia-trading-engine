@@ -9,25 +9,32 @@ using LascodiaTradingEngine.Domain.Enums;
 namespace LascodiaTradingEngine.Application.Services;
 
 /// <summary>
-/// Enforces tiered data retention policies: deletes aged records from hot storage (RDBMS)
-/// in configurable batches. Each entity type has its own retention period.
-/// All timestamp filters are applied at the database level to avoid materializing excess data.
+/// Enforces tiered data retention policies in configurable batches. Each entity type has its own
+/// retention period, and all timestamp filters are applied at the database level to avoid
+/// materializing excess data.
 /// </summary>
 [RegisterService]
-public class DataRetentionManager : IDataRetentionManager
+public sealed class DataRetentionManager : IDataRetentionManager
 {
     private readonly IWriteApplicationDbContext _writeContext;
     private readonly DataRetentionOptions _options;
     private readonly ILogger<DataRetentionManager> _logger;
+    private readonly TimeProvider _timeProvider;
 
     public DataRetentionManager(
         IWriteApplicationDbContext writeContext,
         DataRetentionOptions options,
-        ILogger<DataRetentionManager> logger)
+        ILogger<DataRetentionManager> logger,
+        TimeProvider? timeProvider = null)
     {
+        ArgumentNullException.ThrowIfNull(writeContext);
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(logger);
+
         _writeContext = writeContext;
         _options      = options;
         _logger       = logger;
+        _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     public async Task<IReadOnlyList<RetentionResult>> EnforceRetentionAsync(
@@ -35,19 +42,21 @@ public class DataRetentionManager : IDataRetentionManager
     {
         var results = new List<RetentionResult>();
         var ctx = _writeContext.GetDbContext();
+        var now = _timeProvider.GetUtcNow().UtcDateTime;
 
         // Each entity type gets its own DB-side filtered query to avoid materializing excess data.
 
-        results.Add(await PurgePredictionLogsAsync(ctx, cancellationToken));
-        results.Add(await PurgeTickRecordsAsync(ctx, cancellationToken));
-        results.Add(await PurgeWorkerHealthAsync(ctx, cancellationToken));
-        results.Add(await PurgeAnomaliesAsync(ctx, cancellationToken));
-        results.Add(await PurgePublishedIntegrationEventsAsync(ctx, cancellationToken));
-        results.Add(await PurgeDecisionLogsAsync(ctx, cancellationToken));
-        results.Add(await PurgePendingModelStrategiesAsync(ctx, cancellationToken));
+        results.Add(await PurgePredictionLogsAsync(ctx, now, cancellationToken));
+        results.Add(await PurgeTickRecordsAsync(ctx, now, cancellationToken));
+        results.Add(await PurgeCandlesAsync(ctx, now, cancellationToken));
+        results.Add(await PurgeWorkerHealthAsync(ctx, now, cancellationToken));
+        results.Add(await PurgeAnomaliesAsync(ctx, now, cancellationToken));
+        results.Add(await PurgePublishedIntegrationEventsAsync(ctx, now, cancellationToken));
+        results.Add(await PurgeDecisionLogsAsync(ctx, now, cancellationToken));
+        results.Add(await PurgePendingModelStrategiesAsync(ctx, now, cancellationToken));
 
-        var idempotencyPurged = await PurgeExpiredIdempotencyKeysAsync(cancellationToken);
-        results.Add(new RetentionResult("ProcessedIdempotencyKey", 0, idempotencyPurged, DateTime.UtcNow));
+        var idempotencyPurged = await PurgeExpiredIdempotencyKeysAsync(now, cancellationToken);
+        results.Add(new RetentionResult("ProcessedIdempotencyKey", 0, idempotencyPurged, now));
 
         foreach (var r in results.Where(r => r.RowsPurged > 0))
         {
@@ -60,12 +69,17 @@ public class DataRetentionManager : IDataRetentionManager
     }
 
     public async Task<int> PurgeExpiredIdempotencyKeysAsync(CancellationToken cancellationToken)
+        => await PurgeExpiredIdempotencyKeysAsync(_timeProvider.GetUtcNow().UtcDateTime, cancellationToken);
+
+    private async Task<int> PurgeExpiredIdempotencyKeysAsync(DateTime now, CancellationToken cancellationToken)
     {
         var ctx = _writeContext.GetDbContext();
-        var cutoff = DateTime.UtcNow;
+        var cutoff = now;
 
         var expired = await ctx.Set<ProcessedIdempotencyKey>()
             .Where(k => k.ExpiresAt < cutoff)
+            .OrderBy(k => k.ExpiresAt)
+            .ThenBy(k => k.Id)
             .Take(_options.BatchSize)
             .ToListAsync(cancellationToken);
 
@@ -79,13 +93,18 @@ public class DataRetentionManager : IDataRetentionManager
     }
 
     private async Task<RetentionResult> PurgePredictionLogsAsync(
-        DbContext ctx, CancellationToken ct)
+        DbContext ctx, DateTime now, CancellationToken ct)
     {
-        var cutoff = DateTime.UtcNow.AddDays(-_options.PredictionLogHotDays);
+        // Prediction logs are first retired from operational queries by MLPredictionLogPruningWorker
+        // via soft-delete. This sweep physically reclaims only those already-retired rows, which
+        // avoids racing the outcome worker on still-active unresolved logs.
+        var cutoff = now.AddDays(-_options.PredictionLogHotDays);
 
         var batch = await ctx.Set<MLModelPredictionLog>()
-            .Where(e => e.PredictedAt < cutoff)
+            .IgnoreQueryFilters()
+            .Where(e => e.IsDeleted && e.PredictedAt < cutoff)
             .OrderBy(e => e.PredictedAt)
+            .ThenBy(e => e.Id)
             .Take(_options.BatchSize)
             .ToListAsync(ct);
 
@@ -99,17 +118,18 @@ public class DataRetentionManager : IDataRetentionManager
     }
 
     private async Task<RetentionResult> PurgeDecisionLogsAsync(
-        DbContext ctx, CancellationToken ct)
+        DbContext ctx, DateTime now, CancellationToken ct)
     {
         // DecisionLog is written on every signal-filter rejection and every audit-worthy
         // pipeline decision. At observed peak rates (~400 rows per 5 minutes during heavy
         // signal generation) the table can grow ~120k rows/day, so pruning past the hot
         // retention window is essential to keep the table queryable.
-        var cutoff = DateTime.UtcNow.AddDays(-_options.DecisionLogHotDays);
+        var cutoff = now.AddDays(-_options.DecisionLogHotDays);
 
         var batch = await ctx.Set<DecisionLog>()
             .Where(e => e.CreatedAt < cutoff)
             .OrderBy(e => e.CreatedAt)
+            .ThenBy(e => e.Id)
             .Take(_options.BatchSize)
             .ToListAsync(ct);
 
@@ -123,7 +143,7 @@ public class DataRetentionManager : IDataRetentionManager
     }
 
     private async Task<RetentionResult> PurgePendingModelStrategiesAsync(
-        DbContext ctx, CancellationToken ct)
+        DbContext ctx, DateTime now, CancellationToken ct)
     {
         // Strategies parked in LifecycleStage = PendingModel by DeferredCompositeMLRegistrar
         // are waiting for an MLTrainingRun to complete. If the training never succeeds
@@ -131,16 +151,17 @@ public class DataRetentionManager : IDataRetentionManager
         // TTL sweep prunes them past the configured horizon so the generation pipeline
         // doesn't accumulate zombie rows. Setting the option to 0 disables pruning.
         if (_options.PendingModelStrategyTtlDays <= 0)
-            return new RetentionResult("Strategy.PendingModel", 0, 0, DateTime.UtcNow);
+            return new RetentionResult("Strategy.PendingModel", 0, 0, now);
 
-        var cutoff = DateTime.UtcNow.AddDays(-_options.PendingModelStrategyTtlDays);
-        var now = DateTime.UtcNow;
+        var cutoff = now.AddDays(-_options.PendingModelStrategyTtlDays);
 
         var stuck = await ctx.Set<Strategy>()
             .Where(s => !s.IsDeleted
                      && s.LifecycleStage == StrategyLifecycleStage.PendingModel
                      && s.LifecycleStageEnteredAt != null
                      && s.LifecycleStageEnteredAt < cutoff)
+            .OrderBy(s => s.LifecycleStageEnteredAt)
+            .ThenBy(s => s.Id)
             .Take(_options.BatchSize)
             .ToListAsync(ct);
 
@@ -159,13 +180,14 @@ public class DataRetentionManager : IDataRetentionManager
     }
 
     private async Task<RetentionResult> PurgeTickRecordsAsync(
-        DbContext ctx, CancellationToken ct)
+        DbContext ctx, DateTime now, CancellationToken ct)
     {
-        var cutoff = DateTime.UtcNow.AddDays(-_options.TickRecordHotDays);
+        var cutoff = now.AddDays(-_options.TickRecordHotDays);
 
         var batch = await ctx.Set<TickRecord>()
             .Where(e => e.ReceivedAt < cutoff)
             .OrderBy(e => e.ReceivedAt)
+            .ThenBy(e => e.Id)
             .Take(_options.BatchSize)
             .ToListAsync(ct);
 
@@ -178,14 +200,36 @@ public class DataRetentionManager : IDataRetentionManager
         return new RetentionResult("TickRecord", 0, batch.Count, cutoff);
     }
 
-    private async Task<RetentionResult> PurgeWorkerHealthAsync(
-        DbContext ctx, CancellationToken ct)
+    private async Task<RetentionResult> PurgeCandlesAsync(
+        DbContext ctx, DateTime now, CancellationToken ct)
     {
-        var cutoff = DateTime.UtcNow.AddDays(-_options.WorkerHealthSnapshotDays);
+        var cutoff = now.AddDays(-_options.CandleHotDays);
+
+        var batch = await ctx.Set<Candle>()
+            .Where(e => e.Timestamp < cutoff)
+            .OrderBy(e => e.Timestamp)
+            .ThenBy(e => e.Id)
+            .Take(_options.BatchSize)
+            .ToListAsync(ct);
+
+        if (batch.Count > 0)
+        {
+            ctx.Set<Candle>().RemoveRange(batch);
+            await ctx.SaveChangesAsync(ct);
+        }
+
+        return new RetentionResult("Candle", 0, batch.Count, cutoff);
+    }
+
+    private async Task<RetentionResult> PurgeWorkerHealthAsync(
+        DbContext ctx, DateTime now, CancellationToken ct)
+    {
+        var cutoff = now.AddDays(-_options.WorkerHealthSnapshotDays);
 
         var batch = await ctx.Set<WorkerHealthSnapshot>()
             .Where(e => e.CapturedAt < cutoff)
             .OrderBy(e => e.CapturedAt)
+            .ThenBy(e => e.Id)
             .Take(_options.BatchSize)
             .ToListAsync(ct);
 
@@ -199,13 +243,14 @@ public class DataRetentionManager : IDataRetentionManager
     }
 
     private async Task<RetentionResult> PurgeAnomaliesAsync(
-        DbContext ctx, CancellationToken ct)
+        DbContext ctx, DateTime now, CancellationToken ct)
     {
-        var cutoff = DateTime.UtcNow.AddDays(-_options.MarketDataAnomalyDays);
+        var cutoff = now.AddDays(-_options.MarketDataAnomalyDays);
 
         var batch = await ctx.Set<MarketDataAnomaly>()
             .Where(e => e.DetectedAt < cutoff)
             .OrderBy(e => e.DetectedAt)
+            .ThenBy(e => e.Id)
             .Take(_options.BatchSize)
             .ToListAsync(ct);
 
@@ -225,9 +270,9 @@ public class DataRetentionManager : IDataRetentionManager
     /// assembly and isn't a project-level entity.
     /// </summary>
     private async Task<RetentionResult> PurgePublishedIntegrationEventsAsync(
-        DbContext ctx, CancellationToken ct)
+        DbContext ctx, DateTime now, CancellationToken ct)
     {
-        var cutoff = DateTime.UtcNow.AddDays(-_options.IntegrationEventLogPublishedDays);
+        var cutoff = now.AddDays(-_options.IntegrationEventLogPublishedDays);
         var batchSize = _options.BatchSize;
 
         // CTE-based batch delete keeps the txn small and the lock window short on a hot table.
@@ -237,14 +282,14 @@ WITH victims AS (
     SELECT ""EventId""
     FROM ""IntegrationEventLog""
     WHERE ""State"" = 2 AND ""CreationTime"" < {0}
-    ORDER BY ""CreationTime""
+    ORDER BY ""CreationTime"", ""EventId""
     LIMIT {1}
 )
 DELETE FROM ""IntegrationEventLog""
 WHERE ""EventId"" IN (SELECT ""EventId"" FROM victims);";
 
         var rowsDeleted = await ctx.Database.ExecuteSqlRawAsync(
-            sql.Replace("{0}", "{0}").Replace("{1}", "{1}"),
+            sql,
             new object[] { cutoff, batchSize },
             ct);
 

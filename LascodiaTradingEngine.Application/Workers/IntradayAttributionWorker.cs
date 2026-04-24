@@ -4,6 +4,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Options;
+using LascodiaTradingEngine.Application.Common.Utilities;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 
@@ -20,17 +21,20 @@ public class IntradayAttributionWorker : BackgroundService
     private readonly ILogger<IntradayAttributionWorker> _logger;
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IntradayAttributionOptions _options;
+    private readonly TradingDayOptions _tradingDayOptions;
     private static readonly TimeSpan MaxBackoff = TimeSpan.FromHours(2);
     private int _consecutiveFailures;
 
     public IntradayAttributionWorker(
         ILogger<IntradayAttributionWorker> logger,
         IServiceScopeFactory scopeFactory,
-        IntradayAttributionOptions options)
+        IntradayAttributionOptions options,
+        TradingDayOptions tradingDayOptions)
     {
-        _logger       = logger;
-        _scopeFactory = scopeFactory;
-        _options      = options;
+        _logger          = logger;
+        _scopeFactory    = scopeFactory;
+        _options         = options;
+        _tradingDayOptions = tradingDayOptions;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -79,7 +83,9 @@ public class IntradayAttributionWorker : BackgroundService
 
         var now = DateTime.UtcNow;
         var hourStart = new DateTime(now.Year, now.Month, now.Day, now.Hour, 0, 0, DateTimeKind.Utc);
-        var dayStart  = now.Date;
+        var tradingDayStart = TradingDayBoundaryHelper.GetTradingDayStartUtc(
+            now,
+            _tradingDayOptions.RolloverMinuteOfDayUtc);
 
         var accounts = await readDb
             .Set<TradingAccount>()
@@ -98,12 +104,13 @@ public class IntradayAttributionWorker : BackgroundService
 
             if (existing) continue;
 
-            // ── Determine SOD equity from the most reliable source ────────────
-            // 1st: Previous hourly attribution record from today
-            // 2nd: DrawdownSnapshot recorded near SOD
-            // 3rd: Fallback to current equity minus today's P&L (approximation)
-            decimal startOfDayEquity = await DetermineStartOfDayEquityAsync(
-                readDb, account.Id, dayStart, ct);
+            var baseline = await TradingDayBoundaryHelper.ResolveStartOfDayEquityAsync(
+                readDb,
+                account.Id,
+                now,
+                _tradingDayOptions,
+                ct);
+            decimal startOfDayEquity = baseline?.StartOfDayEquity ?? 0m;
 
             // ── Closed positions scoped to this account via Order link ────────
             var accountOrderIds = await readDb.Set<Order>()
@@ -116,7 +123,7 @@ public class IntradayAttributionWorker : BackgroundService
             var closedPositions = await readDb
                 .Set<Position>()
                 .Where(p => p.Status == PositionStatus.Closed
-                         && p.ClosedAt >= dayStart && p.ClosedAt <= now
+                         && p.ClosedAt >= tradingDayStart && p.ClosedAt <= now
                          && p.OpenOrderId != null
                          && !p.IsDeleted)
                 .ToListAsync(ct);
@@ -143,7 +150,7 @@ public class IntradayAttributionWorker : BackgroundService
             // ── TCA records for today scoped to account orders ───────────────
             var tcaRecords = await readDb
                 .Set<TransactionCostAnalysis>()
-                .Where(t => t.AnalyzedAt >= dayStart && t.AnalyzedAt <= now && !t.IsDeleted)
+                .Where(t => t.AnalyzedAt >= tradingDayStart && t.AnalyzedAt <= now && !t.IsDeleted)
                 .ToListAsync(ct);
 
             tcaRecords = tcaRecords
@@ -246,41 +253,4 @@ public class IntradayAttributionWorker : BackgroundService
             processedCount, hourStart);
     }
 
-    /// <summary>
-    /// Determines the start-of-day equity for an account from the most reliable
-    /// available source: previous attribution record, then DrawdownSnapshot.
-    /// Returns 0 if no source is found (caller falls back to approximation).
-    /// </summary>
-    private static async Task<decimal> DetermineStartOfDayEquityAsync(
-        Microsoft.EntityFrameworkCore.DbContext readDb,
-        long accountId,
-        DateTime dayStart,
-        CancellationToken ct)
-    {
-        // 1st: Use the first attribution record of the day (which captured the opening state)
-        var firstAttribution = await readDb
-            .Set<AccountPerformanceAttribution>()
-            .Where(a => a.TradingAccountId == accountId
-                     && a.AttributionDate >= dayStart
-                     && !a.IsDeleted)
-            .OrderBy(a => a.AttributionDate)
-            .FirstOrDefaultAsync(ct);
-
-        if (firstAttribution is not null)
-            return firstAttribution.StartOfDayEquity;
-
-        // 2nd: Use the end-of-day equity from yesterday's last attribution
-        var yesterdayLast = await readDb
-            .Set<AccountPerformanceAttribution>()
-            .Where(a => a.TradingAccountId == accountId
-                     && a.AttributionDate < dayStart
-                     && !a.IsDeleted)
-            .OrderByDescending(a => a.AttributionDate)
-            .FirstOrDefaultAsync(ct);
-
-        if (yesterdayLast is not null)
-            return yesterdayLast.EndOfDayEquity;
-
-        return 0m;
-    }
 }

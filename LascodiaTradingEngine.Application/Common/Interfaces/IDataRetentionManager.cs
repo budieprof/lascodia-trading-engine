@@ -1,8 +1,8 @@
 namespace LascodiaTradingEngine.Application.Common.Interfaces;
 
 /// <summary>
-/// Manages tiered data retention: migrates aged data from hot (RDBMS) to warm storage,
-/// prunes expired records, and enforces retention policies per entity type.
+/// Manages retention sweeps for hot storage: prunes expired records, reclaims already-retired
+/// rows, and soft-deletes stale PendingModel strategies.
 /// </summary>
 public record RetentionResult(
     string EntityType,
@@ -12,7 +12,7 @@ public record RetentionResult(
 
 public interface IDataRetentionManager
 {
-    /// <summary>Runs the full retention sweep: archives aged data and purges expired records per entity type.</summary>
+    /// <summary>Runs the full retention sweep across all configured entity types.</summary>
     Task<IReadOnlyList<RetentionResult>> EnforceRetentionAsync(
         CancellationToken cancellationToken);
 

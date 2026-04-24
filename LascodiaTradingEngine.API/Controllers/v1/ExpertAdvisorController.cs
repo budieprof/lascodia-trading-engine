@@ -1,9 +1,11 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using Lascodia.Trading.Engine.SharedApplication.Common.Services;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedLibrary;
+using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Application.ExpertAdvisor.Commands.RegisterEA;
 using LascodiaTradingEngine.Application.ExpertAdvisor.Commands.DeregisterEA;
 using LascodiaTradingEngine.Application.ExpertAdvisor.Commands.ProcessHeartbeat;
@@ -49,6 +51,7 @@ public class ExpertAdvisorController : AuthControllerBase<ExpertAdvisorControlle
 
     /// <summary>Register a new EA instance</summary>
     [HttpPost("register")]
+    [Authorize(Policy = Policies.Operator)]
     [ProducesResponseType(typeof(ResponseData<long>), StatusCodes.Status200OK)]
     public async Task<IActionResult> Register(RegisterEACommand command)
     {
@@ -61,6 +64,7 @@ public class ExpertAdvisorController : AuthControllerBase<ExpertAdvisorControlle
 
     /// <summary>Deregister an EA instance</summary>
     [HttpPost("deregister")]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<IActionResult> Deregister(DeregisterEACommand command)
         => Ok(await Mediator.Send(command));
 
@@ -76,6 +80,7 @@ public class ExpertAdvisorController : AuthControllerBase<ExpertAdvisorControlle
 
     /// <summary>Request the EA to refresh and re-send symbol specifications</summary>
     [HttpPut("symbol-specs/refresh")]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<IActionResult> RefreshSymbolSpecs(RefreshSymbolSpecsCommand command)
         => Ok(await Mediator.Send(command));
 
@@ -113,6 +118,7 @@ public class ExpertAdvisorController : AuthControllerBase<ExpertAdvisorControlle
 
     /// <summary>Process reconciliation between engine and broker state</summary>
     [HttpPost("reconciliation")]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<IActionResult> ProcessReconciliation(ProcessReconciliationCommand command)
         => Ok(await Mediator.Send(command));
 
@@ -141,6 +147,7 @@ public class ExpertAdvisorController : AuthControllerBase<ExpertAdvisorControlle
     /// Zero values are ignored by the EA (keeps current value).
     /// </summary>
     [HttpPost("commands/update-config")]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<IActionResult> UpdateEAConfig(UpdateEAConfigCommand command)
         => Ok(await Mediator.Send(command));
 

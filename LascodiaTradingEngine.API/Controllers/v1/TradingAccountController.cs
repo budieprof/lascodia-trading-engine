@@ -1,8 +1,10 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using Lascodia.Trading.Engine.SharedApplication.Common.Services;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedLibrary;
+using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Application.TradingAccounts.Commands.CreateTradingAccount;
 using LascodiaTradingEngine.Application.TradingAccounts.Commands.UpdateTradingAccount;
 using LascodiaTradingEngine.Application.TradingAccounts.Commands.DeleteTradingAccount;
@@ -33,6 +35,7 @@ public class TradingAccountController : AuthControllerBase<TradingAccountControl
 
     /// <summary>Create a new trading account</summary>
     [HttpPost]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<ResponseData<long>> Create(CreateTradingAccountCommand command)
     {
         if (!ModelState.IsValid)
@@ -43,6 +46,7 @@ public class TradingAccountController : AuthControllerBase<TradingAccountControl
 
     /// <summary>Update a trading account</summary>
     [HttpPut("{id}")]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<ResponseData<string>> Update(long id, UpdateTradingAccountCommand command)
     {
         if (!ModelState.IsValid)
@@ -54,16 +58,19 @@ public class TradingAccountController : AuthControllerBase<TradingAccountControl
 
     /// <summary>Delete a trading account</summary>
     [HttpDelete("{id}")]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<ResponseData<string>> Delete(long id)
         => await Mediator.Send(new DeleteTradingAccountCommand { Id = id });
 
     /// <summary>Activate a trading account</summary>
     [HttpPut("{id}/activate")]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<ResponseData<string>> Activate(long id)
         => await Mediator.Send(new ActivateTradingAccountCommand { Id = id });
 
     /// <summary>Sync account balance</summary>
     [HttpPut("{id}/sync")]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<ResponseData<string>> Sync(long id, SyncAccountBalanceCommand command)
     {
         if (!ModelState.IsValid)
@@ -75,6 +82,7 @@ public class TradingAccountController : AuthControllerBase<TradingAccountControl
 
     /// <summary>Change trading account password</summary>
     [HttpPut("{id}/password")]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<ResponseData<string>> ChangePassword(long id, ChangePasswordCommand command)
     {
         if (!ModelState.IsValid)
@@ -86,6 +94,7 @@ public class TradingAccountController : AuthControllerBase<TradingAccountControl
 
     /// <summary>Rotate the EA API key for a trading account</summary>
     [HttpPost("{id}/rotate-api-key")]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<ResponseData<RotateApiKeyResult>> RotateApiKey(long id)
         => await Mediator.Send(new RotateApiKeyCommand { Id = id });
 

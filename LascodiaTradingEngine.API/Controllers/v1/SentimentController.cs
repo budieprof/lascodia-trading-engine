@@ -1,8 +1,10 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using Lascodia.Trading.Engine.SharedApplication.Common.Services;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedLibrary;
+using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Application.Sentiment.Commands.RecordSentiment;
 using LascodiaTradingEngine.Application.Sentiment.Commands.IngestCOTReport;
 using LascodiaTradingEngine.Application.Sentiment.Queries.DTOs;
@@ -27,6 +29,7 @@ public class SentimentController : AuthControllerBase<SentimentController>
 
     /// <summary>Record a new sentiment snapshot</summary>
     [HttpPost("snapshot")]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<ResponseData<long>> RecordSentiment(RecordSentimentCommand command)
     {
         if (!ModelState.IsValid)
@@ -37,6 +40,7 @@ public class SentimentController : AuthControllerBase<SentimentController>
 
     /// <summary>Ingest a COT report</summary>
     [HttpPost("cot")]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<ResponseData<long>> IngestCOT(IngestCOTReportCommand command)
     {
         if (!ModelState.IsValid)

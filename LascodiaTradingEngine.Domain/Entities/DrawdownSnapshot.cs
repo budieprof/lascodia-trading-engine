@@ -40,8 +40,8 @@ public class DrawdownSnapshot : Entity<long>
     /// <summary>
     /// The risk engine operating mode at this point in time:
     /// <c>Normal</c> — standard trading parameters apply;
-    /// <c>Recovery</c> — reduced lot sizes and tighter risk limits are in effect;
-    /// <c>Suspended</c> — all automated trading is halted pending manual review.
+    /// <c>Reduced</c> — reduced lot sizes and tighter risk limits are in effect;
+    /// <c>Halted</c> — all automated trading is halted pending manual review.
     /// </summary>
     public RecoveryMode   RecoveryMode  { get; set; } = RecoveryMode.Normal;
 

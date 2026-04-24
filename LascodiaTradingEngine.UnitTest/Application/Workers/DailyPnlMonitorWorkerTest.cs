@@ -6,6 +6,7 @@ using Moq;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Options;
+using LascodiaTradingEngine.Application.Common.Utilities;
 using LascodiaTradingEngine.Application.EmergencyFlatten.Commands.EmergencyFlatten;
 using LascodiaTradingEngine.Application.Workers;
 using LascodiaTradingEngine.Domain.Entities;
@@ -45,6 +46,7 @@ public class DailyPnlMonitorWorkerTest
     public async Task RunCycleAsync_BreachDetected_DispatchesEmergencyFlatten_AndPersistsMarker()
     {
         var today = DateTime.UtcNow.Date;
+        var expectedTradingDayKey = TradingDayBoundaryHelper.FormatTradingDayKey(today);
 
         using var harness = CreateHarness(db =>
         {
@@ -74,11 +76,11 @@ public class DailyPnlMonitorWorkerTest
         var markers = await harness.LoadEngineConfigsAsync(includeDeleted: true);
         var marker = Assert.Single(markers);
         Assert.False(marker.IsDeleted);
-        Assert.Equal(today.ToString("yyyy-MM-dd"), marker.Value);
+        Assert.Equal(expectedTradingDayKey, marker.Value);
     }
 
     [Fact]
-    public async Task RunCycleAsync_SkipsWhenFlattenAlreadyRecordedToday()
+    public async Task RunCycleAsync_SkipsWhenFlattenAlreadyRecordedToday_WithLegacyMarker()
     {
         var today = DateTime.UtcNow.Date;
         var todayStr = today.ToString("yyyy-MM-dd");
@@ -114,9 +116,46 @@ public class DailyPnlMonitorWorkerTest
     }
 
     [Fact]
+    public async Task RunCycleAsync_SkipsWhenFlattenAlreadyRecordedToday_WithCurrentTradingDayMarker()
+    {
+        var today = DateTime.UtcNow.Date;
+        var tradingDayKey = TradingDayBoundaryHelper.FormatTradingDayKey(today);
+
+        using var harness = CreateHarness(db =>
+        {
+            var account = EntityFactory.CreateAccount(equity: 8000m);
+            account.MaxAbsoluteDailyLoss = 500m;
+            db.Add(account);
+            db.Add(new AccountPerformanceAttribution
+            {
+                Id = 1,
+                TradingAccountId = account.Id,
+                AttributionDate = today,
+                StartOfDayEquity = 10000m,
+                EndOfDayEquity = 10000m,
+                IsDeleted = false
+            });
+            db.Add(new EngineConfig
+            {
+                Id = 9,
+                Key = $"DailyPnlFlatten:{account.Id}",
+                Value = tradingDayKey,
+                IsDeleted = false
+            });
+        });
+
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        harness.Mediator.Verify(
+            m => m.Send(It.IsAny<EmergencyFlattenCommand>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
     public async Task RunCycleAsync_RevivesSoftDeletedFlattenMarker_InsteadOfCreatingDuplicate()
     {
         var today = DateTime.UtcNow.Date;
+        var expectedTradingDayKey = TradingDayBoundaryHelper.FormatTradingDayKey(today);
 
         using var harness = CreateHarness(db =>
         {
@@ -147,7 +186,7 @@ public class DailyPnlMonitorWorkerTest
         var marker = Assert.Single(markers);
         Assert.Equal(42, marker.Id);
         Assert.False(marker.IsDeleted);
-        Assert.Equal(today.ToString("yyyy-MM-dd"), marker.Value);
+        Assert.Equal(expectedTradingDayKey, marker.Value);
     }
 
     [Fact]
@@ -179,25 +218,35 @@ public class DailyPnlMonitorWorkerTest
     }
 
     [Fact]
-    public async Task RunCycleAsync_UsesSnapshotCurrentEquity_AsLastResortFallback()
+    public async Task RunCycleAsync_UsesBrokerSnapshotFallback_AsLastResort()
     {
-        var today = DateTime.UtcNow.Date;
+        var now = DateTime.UtcNow;
+        var tradingDayOptions = new TradingDayOptions
+        {
+            RolloverMinuteOfDayUtc = 0,
+            BrokerSnapshotBoundaryToleranceMinutes = 180
+        };
+        var tradingDayStart = TradingDayBoundaryHelper.GetTradingDayStartUtc(now, tradingDayOptions.RolloverMinuteOfDayUtc);
 
         using var harness = CreateHarness(db =>
         {
             var account = EntityFactory.CreateAccount(equity: 9500m);
             account.MaxAbsoluteDailyLoss = 800m;
             db.Add(account);
-            db.Add(new DrawdownSnapshot
+            db.Add(new BrokerAccountSnapshot
             {
                 Id = 1,
-                CurrentEquity = 10000m,
-                PeakEquity = 12000m,
-                DrawdownPct = 10m,
-                RecordedAt = today.AddMinutes(5),
+                TradingAccountId = account.Id,
+                InstanceId = "EA-001",
+                Balance = 10000m,
+                Equity = 10000m,
+                MarginUsed = 0m,
+                FreeMargin = 10000m,
+                Currency = "USD",
+                ReportedAt = tradingDayStart.AddMinutes(5),
                 IsDeleted = false
             });
-        });
+        }, tradingDayOptions: tradingDayOptions);
 
         await harness.Worker.RunCycleAsync(CancellationToken.None);
 
@@ -269,7 +318,8 @@ public class DailyPnlMonitorWorkerTest
 
     private static WorkerHarness CreateHarness(
         Action<TestDailyPnlDbContext> seed,
-        bool flattenEnabled = true)
+        bool flattenEnabled = true,
+        TradingDayOptions? tradingDayOptions = null)
     {
         var services = new ServiceCollection();
         var databaseName = $"daily-pnl-monitor-{Guid.NewGuid()}";
@@ -299,6 +349,7 @@ public class DailyPnlMonitorWorkerTest
                 PollIntervalSeconds = 30,
                 EmergencyFlattenEnabled = flattenEnabled
             },
+            tradingDayOptions ?? new TradingDayOptions(),
             NullLogger<DailyPnlMonitorWorker>.Instance);
 
         return new WorkerHarness(provider, worker, mediator);
@@ -351,6 +402,12 @@ public class DailyPnlMonitorWorkerTest
             });
 
             modelBuilder.Entity<DrawdownSnapshot>(builder =>
+            {
+                builder.HasKey(x => x.Id);
+                builder.HasQueryFilter(x => !x.IsDeleted);
+            });
+
+            modelBuilder.Entity<BrokerAccountSnapshot>(builder =>
             {
                 builder.HasKey(x => x.Id);
                 builder.HasQueryFilter(x => !x.IsDeleted);

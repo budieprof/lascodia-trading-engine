@@ -1,8 +1,10 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using Lascodia.Trading.Engine.SharedApplication.Common.Services;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedLibrary;
+using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Application.EconomicEvents.Commands.CreateEconomicEvent;
 using LascodiaTradingEngine.Application.EconomicEvents.Commands.UpdateEconomicEventActual;
 using LascodiaTradingEngine.Application.EconomicEvents.Queries.DTOs;
@@ -26,6 +28,7 @@ public class EconomicEventController : AuthControllerBase<EconomicEventControlle
 
     /// <summary>Create a new economic event</summary>
     [HttpPost]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<ResponseData<long>> Create(CreateEconomicEventCommand command)
     {
         if (!ModelState.IsValid)
@@ -36,6 +39,7 @@ public class EconomicEventController : AuthControllerBase<EconomicEventControlle
 
     /// <summary>Update the actual value for an economic event</summary>
     [HttpPut("{id}/actual")]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<ResponseData<string>> UpdateActual(long id, UpdateEconomicEventActualCommand command)
     {
         if (!ModelState.IsValid)

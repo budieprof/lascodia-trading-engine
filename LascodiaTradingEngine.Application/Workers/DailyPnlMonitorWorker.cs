@@ -1,4 +1,3 @@
-using System.Globalization;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -6,8 +5,10 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Options;
+using LascodiaTradingEngine.Application.Common.Utilities;
 using LascodiaTradingEngine.Application.EmergencyFlatten.Commands.EmergencyFlatten;
 using LascodiaTradingEngine.Domain.Entities;
+using System.Globalization;
 
 namespace LascodiaTradingEngine.Application.Workers;
 
@@ -20,9 +21,10 @@ namespace LascodiaTradingEngine.Application.Workers;
 /// <para>
 /// <b>Daily P&amp;L computation:</b> Uses the earliest <see cref="AccountPerformanceAttribution"/>
 /// record for today (if available) to determine start-of-day equity, falling back to the most
-/// recent prior attribution record's end-of-day equity. Only if attribution history is absent
-/// does it fall back to the earliest <see cref="DrawdownSnapshot"/> recorded today for the
-/// single active account. The daily loss is computed as <c>startOfDayEquity - currentEquity</c>.
+/// recent prior attribution record's end-of-day equity. If attribution history is absent,
+/// it falls back to the nearest account-scoped <see cref="BrokerAccountSnapshot"/> around the
+/// configured trading-day rollover boundary. The daily loss is computed as
+/// <c>startOfDayEquity - currentEquity</c>.
 /// </para>
 ///
 /// <para>
@@ -41,6 +43,7 @@ public class DailyPnlMonitorWorker : BackgroundService
 {
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly DailyPnlMonitorOptions _options;
+    private readonly TradingDayOptions _tradingDayOptions;
     private readonly ILogger<DailyPnlMonitorWorker> _logger;
 
     /// <summary>Max backoff delay on consecutive failures (5 minutes).</summary>
@@ -50,7 +53,7 @@ public class DailyPnlMonitorWorker : BackgroundService
 
     /// <summary>
     /// EngineConfig key prefix for persisting flattened account dedup state.
-    /// Format: "DailyPnlFlatten:{AccountId}" with value = date string (yyyy-MM-dd).
+    /// Format: "DailyPnlFlatten:{AccountId}" with value = trading-day-start timestamp (round-trip UTC).
     /// This replaces the previous in-memory HashSet which was lost on restart,
     /// allowing the dedup state to survive process restarts within the same trading day.
     /// </summary>
@@ -59,11 +62,13 @@ public class DailyPnlMonitorWorker : BackgroundService
     public DailyPnlMonitorWorker(
         IServiceScopeFactory scopeFactory,
         DailyPnlMonitorOptions options,
+        TradingDayOptions tradingDayOptions,
         ILogger<DailyPnlMonitorWorker> logger)
     {
-        _scopeFactory = scopeFactory;
-        _options      = options;
-        _logger       = logger;
+        _scopeFactory     = scopeFactory;
+        _options          = options;
+        _tradingDayOptions = tradingDayOptions;
+        _logger           = logger;
     }
 
     /// <summary>
@@ -154,59 +159,51 @@ public class DailyPnlMonitorWorker : BackgroundService
         if (account.MaxAbsoluteDailyLoss <= 0)
             return;
 
-        var todayUtc = DateTime.UtcNow.Date;
-        var todayStr = todayUtc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+        var nowUtc = DateTime.UtcNow;
+        var baseline = await TradingDayBoundaryHelper.ResolveStartOfDayEquityAsync(
+            ctx,
+            account.Id,
+            nowUtc,
+            _tradingDayOptions,
+            ct);
+        var tradingDayStartUtc = baseline?.TradingDayStartUtc
+            ?? TradingDayBoundaryHelper.GetTradingDayStartUtc(nowUtc, _tradingDayOptions.RolloverMinuteOfDayUtc);
+        var tradingDayKey = TradingDayBoundaryHelper.FormatTradingDayKey(tradingDayStartUtc);
 
         var flattenKey = BuildFlattenKey(account.Id);
         var flattenEntry = await writeCtx.Set<EngineConfig>()
             .IgnoreQueryFilters()
             .FirstOrDefaultAsync(c => c.Key == flattenKey, ct);
-        if (flattenEntry is not null && !flattenEntry.IsDeleted && flattenEntry.Value == todayStr)
+        if (flattenEntry is not null && !flattenEntry.IsDeleted && FlattenMarkerMatchesTradingDay(flattenEntry.Value, tradingDayKey, tradingDayStartUtc))
             return;
 
-        decimal startOfDayEquity = await DetermineStartOfDayEquityAsync(ctx, account.Id, todayUtc, ct);
-        if (startOfDayEquity <= 0)
+        if (baseline is null || baseline.StartOfDayEquity <= 0)
         {
-            var earliestSnapshot = await ctx.Set<DrawdownSnapshot>()
-                .Where(s => s.RecordedAt >= todayUtc)
-                .OrderBy(s => s.RecordedAt)
-                .FirstOrDefaultAsync(ct);
-
-            if (earliestSnapshot is not null)
-            {
-                startOfDayEquity = earliestSnapshot.CurrentEquity;
-                _logger.LogWarning(
-                    "DailyPnlMonitorWorker: attribution history missing for account {AccountId}; " +
-                    "using earliest drawdown snapshot current equity {Start:F2} as an approximate start-of-day baseline",
-                    account.Id,
-                    startOfDayEquity);
-            }
-        }
-
-        if (startOfDayEquity <= 0)
-        {
-            _logger.LogDebug(
-                "DailyPnlMonitorWorker: no start-of-day equity for account {AccountId}, skipping",
-                account.Id);
+            _logger.LogWarning(
+                "DailyPnlMonitorWorker: no trusted start-of-day equity found for account {AccountId} at trading-day start {TradingDayStart:o}; skipping",
+                account.Id,
+                tradingDayStartUtc);
             return;
         }
+
+        decimal startOfDayEquity = baseline.StartOfDayEquity;
 
         decimal dailyLoss = startOfDayEquity - account.Equity;
         if (dailyLoss <= 0)
             return;
 
         _logger.LogDebug(
-            "DailyPnlMonitorWorker: account {AccountId} daily loss {Loss:F2} / limit {Limit:F2}",
-            account.Id, dailyLoss, account.MaxAbsoluteDailyLoss);
+            "DailyPnlMonitorWorker: account {AccountId} daily loss {Loss:F2} / limit {Limit:F2} (baseline source: {Source})",
+            account.Id, dailyLoss, account.MaxAbsoluteDailyLoss, baseline.Source);
 
         if (dailyLoss < account.MaxAbsoluteDailyLoss)
             return;
 
         _logger.LogCritical(
             "DailyPnlMonitorWorker: account {AccountId} BREACHED daily loss limit — " +
-            "loss={Loss:F2}, limit={Limit:F2}, startEquity={Start:F2}, currentEquity={Current:F2}",
+            "loss={Loss:F2}, limit={Limit:F2}, startEquity={Start:F2}, currentEquity={Current:F2}, source={Source}, tradingDayStart={TradingDayStart:o}",
             account.Id, dailyLoss, account.MaxAbsoluteDailyLoss,
-            startOfDayEquity, account.Equity);
+            startOfDayEquity, account.Equity, baseline.Source, tradingDayStartUtc);
 
         if (!_options.EmergencyFlattenEnabled)
         {
@@ -222,7 +219,7 @@ public class DailyPnlMonitorWorker : BackgroundService
             Reason = $"Daily P&L loss limit breached: loss={dailyLoss:F2} exceeds MaxAbsoluteDailyLoss={account.MaxAbsoluteDailyLoss:F2}"
         }, ct);
 
-        await PersistFlattenMarkerAsync(writeCtx, flattenEntry, todayStr, account.Id, ct);
+        await PersistFlattenMarkerAsync(writeCtx, flattenEntry, tradingDayKey, account.Id, ct);
 
         _logger.LogCritical(
             "DailyPnlMonitorWorker: EmergencyFlatten dispatched for account {AccountId}",
@@ -231,43 +228,44 @@ public class DailyPnlMonitorWorker : BackgroundService
 
     private static string BuildFlattenKey(long accountId) => $"{FlattenConfigKeyPrefix}:{accountId}";
 
-    private static async Task<decimal> DetermineStartOfDayEquityAsync(
-        DbContext ctx,
-        long accountId,
-        DateTime dayStartUtc,
-        CancellationToken ct)
+    private static bool FlattenMarkerMatchesTradingDay(
+        string? persistedValue,
+        string tradingDayKey,
+        DateTime tradingDayStartUtc)
     {
-        var todayAttribution = await ctx.Set<AccountPerformanceAttribution>()
-            .Where(a => a.TradingAccountId == accountId
-                     && a.AttributionDate >= dayStartUtc
-                     && !a.IsDeleted)
-            .OrderBy(a => a.AttributionDate)
-            .FirstOrDefaultAsync(ct);
+        if (string.Equals(persistedValue, tradingDayKey, StringComparison.Ordinal))
+            return true;
 
-        if (todayAttribution is not null)
-            return todayAttribution.StartOfDayEquity;
+        // Backward compatibility: older builds persisted yyyy-MM-dd for UTC-midnight trading
+        // days. Accept that legacy shape only when the configured trading-day boundary is
+        // still midnight UTC so upgrades do not re-trigger a same-day flatten.
+        if (tradingDayStartUtc.TimeOfDay != TimeSpan.Zero)
+            return false;
 
-        var previousAttribution = await ctx.Set<AccountPerformanceAttribution>()
-            .Where(a => a.TradingAccountId == accountId
-                     && a.AttributionDate < dayStartUtc
-                     && !a.IsDeleted)
-            .OrderByDescending(a => a.AttributionDate)
-            .FirstOrDefaultAsync(ct);
+        if (!DateTime.TryParseExact(
+                persistedValue,
+                "yyyy-MM-dd",
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+                out var legacyDayUtc))
+        {
+            return false;
+        }
 
-        return previousAttribution?.EndOfDayEquity ?? 0m;
+        return legacyDayUtc.Date == tradingDayStartUtc.Date;
     }
 
     private static async Task PersistFlattenMarkerAsync(
         DbContext writeCtx,
         EngineConfig? flattenEntry,
-        string todayStr,
+        string tradingDayKey,
         long accountId,
         CancellationToken ct)
     {
         var entry = flattenEntry;
         if (entry is not null)
         {
-            entry.Value = todayStr;
+            entry.Value = tradingDayKey;
             entry.Description = $"DailyPnl flatten dedup for account {accountId}";
             entry.DataType = Domain.Enums.ConfigDataType.String;
             entry.IsHotReloadable = false;
@@ -279,7 +277,7 @@ public class DailyPnlMonitorWorker : BackgroundService
             await writeCtx.Set<EngineConfig>().AddAsync(new EngineConfig
             {
                 Key = BuildFlattenKey(accountId),
-                Value = todayStr,
+                Value = tradingDayKey,
                 Description = $"DailyPnl flatten dedup for account {accountId}",
                 DataType = Domain.Enums.ConfigDataType.String,
                 IsHotReloadable = false,

@@ -2,11 +2,18 @@
 // Configures DI, JWT authentication, CORS, rate limiting, OpenTelemetry metrics,
 // EF Core database contexts, middleware pipeline, and background worker registration.
 
+using LascodiaTradingEngine.API.Realtime;
 using LascodiaTradingEngine.Application;
 using LascodiaTradingEngine.Application.Common.Interfaces;
+using LascodiaTradingEngine.Application.Common.Realtime;
 using LascodiaTradingEngine.Application.Services.Cache;
+using LascodiaTradingEngine.Application.TradingAccounts.Commands.LogoutTradingAccount;
+using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Infrastructure;
 using LascodiaTradingEngine.Infrastructure.Persistence.DbContexts;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Caching.Memory;
+using System.IdentityModel.Tokens.Jwt;
 using Lascodia.Trading.Engine.SharedApplication;
 using Lascodia.Trading.Engine.IntegrationEventLogEF;
 using Lascodia.Trading.Engine.SharedApplication.Common.Filters;
@@ -76,6 +83,16 @@ builder.Services.ConfigureApplicationServices(builder.Configuration);
 builder.Services.ConfigureDbContexts(builder.Configuration);
 builder.Services.AddSharedApplicationDependency(builder.Configuration);
 
+// Layer the operator-role policy ladder on top of the shared library's "apiScope" policy.
+// AddAuthorization is additive — calling it again merges these policies with anything the
+// shared library already registered.
+builder.Services.AddAuthorization(LascodiaTradingEngine.Application.Common.Security.Policies.Register);
+
+// SignalR push (E1). The relay handlers in the Application assembly depend on the
+// IRealtimeNotifier abstraction so they don't take a Web framework dependency.
+builder.Services.AddSignalR();
+builder.Services.AddSingleton<IRealtimeNotifier, SignalRRealtimeNotifier>();
+
 // Worker health check — reports aggregate health of all background workers
 builder.Services.AddHealthChecks()
     .AddCheck<LascodiaTradingEngine.Application.Common.Services.WorkerHealthCheck>(
@@ -138,6 +155,18 @@ builder.Services.AddAuthentication("Bearer")
     };
     options.Events = new JwtBearerEvents
     {
+        // Browsers can't send Authorization headers on WebSocket upgrades, so SignalR
+        // clients pass the JWT in the `access_token` query string. We only honour it for
+        // requests targeting /api/hubs to keep the surface tight.
+        OnMessageReceived = context =>
+        {
+            var accessToken = context.Request.Query["access_token"];
+            var path = context.HttpContext.Request.Path;
+            if (!string.IsNullOrEmpty(accessToken) && path.StartsWithSegments("/api/hubs"))
+                context.Token = accessToken;
+            return Task.CompletedTask;
+        },
+
         OnAuthenticationFailed = context =>
         {
             var logger = context.HttpContext.RequestServices.GetRequiredService<ILoggerFactory>()
@@ -157,6 +186,46 @@ builder.Services.AddAuthentication("Bearer")
                 message = "Authentication failed."
             });
             return context.Response.WriteAsync(result);
+        },
+
+        // Token-revocation check (E10). Cache hit short-circuits in microseconds; cold
+        // path is one indexed PK lookup. Documented "fail open on DB outage" — if the
+        // DB read throws we log and accept the request rather than locking the platform
+        // out. This is the trade-off called out in DESIGN_DOCS.md.
+        OnTokenValidated = async context =>
+        {
+            var jti = context.Principal?.FindFirst(JwtRegisteredClaimNames.Jti)?.Value;
+            if (string.IsNullOrWhiteSpace(jti)) return;
+
+            var services = context.HttpContext.RequestServices;
+            var cache    = services.GetRequiredService<IMemoryCache>();
+            var cacheKey = LogoutTradingAccountCommandHandler.RevokedCacheKeyPrefix + jti;
+
+            if (cache.TryGetValue(cacheKey, out _))
+            {
+                context.Fail("Token has been revoked.");
+                return;
+            }
+
+            try
+            {
+                var db = services.GetRequiredService<IReadApplicationDbContext>().GetDbContext();
+                var isRevoked = await db.Set<RevokedToken>()
+                    .AsNoTracking()
+                    .AnyAsync(x => x.Jti == jti);
+
+                if (isRevoked)
+                {
+                    cache.Set(cacheKey, true, LogoutTradingAccountCommandHandler.CacheTtl);
+                    context.Fail("Token has been revoked.");
+                }
+            }
+            catch (Exception ex)
+            {
+                services.GetRequiredService<ILoggerFactory>()
+                    .CreateLogger("JwtAuthentication")
+                    .LogWarning(ex, "Revocation check failed; failing open for jti={Jti}", jti);
+            }
         }
     };
 });
@@ -290,6 +359,31 @@ builder.Services.AddSwaggerGen(c =>
         }
         return type.Name;
     });
+
+    // Bearer JWT — lets "Try it out" work from the Swagger UI, and documents the
+    // auth contract for downstream tooling generating typed clients.
+    c.AddSecurityDefinition("Bearer", new Microsoft.OpenApi.Models.OpenApiSecurityScheme
+    {
+        Type = Microsoft.OpenApi.Models.SecuritySchemeType.Http,
+        Scheme = "bearer",
+        BearerFormat = "JWT",
+        In = Microsoft.OpenApi.Models.ParameterLocation.Header,
+        Description = "Enter the JWT token obtained from POST /auth/login (no 'Bearer ' prefix required).",
+    });
+    c.AddSecurityRequirement(new Microsoft.OpenApi.Models.OpenApiSecurityRequirement
+    {
+        {
+            new Microsoft.OpenApi.Models.OpenApiSecurityScheme
+            {
+                Reference = new Microsoft.OpenApi.Models.OpenApiReference
+                {
+                    Type = Microsoft.OpenApi.Models.ReferenceType.SecurityScheme,
+                    Id = "Bearer",
+                },
+            },
+            Array.Empty<string>()
+        },
+    });
 });
 
 var app = builder.Build();
@@ -312,9 +406,13 @@ app.UseCors("LascodiaPolicy");
 // Prometheus scrape endpoint — rate-limited, no auth required
 app.MapPrometheusScrapingEndpoint().RequireRateLimiting("metrics");
 
+// Serve the OpenAPI spec at /swagger/v1/swagger.json in every environment so
+// downstream tooling (client codegen, uptime monitors, the admin UI type-check)
+// has a stable discovery URL. The interactive UI stays Development-only so
+// operators don't accidentally poke production endpoints from a browser.
+app.UseSwagger();
 if (app.Environment.IsDevelopment())
 {
-    app.UseSwagger();
     app.UseSwaggerUI();
 }
 
@@ -355,6 +453,10 @@ app.MapHealthChecks("/health/detail", new Microsoft.AspNetCore.Diagnostics.Healt
         await context.Response.WriteAsJsonAsync(result);
     }
 });
+
+// SignalR realtime hub (E1). Auth runs over the WebSocket upgrade via the
+// `access_token` query string handled by JwtBearerOptions.OnMessageReceived above.
+app.MapHub<TradingEngineRealtimeHub>("/api/hubs/trading");
 
 app.RunAppPipeline<Program, WriteApplicationDbContext, IWriteApplicationDbContext>(services =>
 {

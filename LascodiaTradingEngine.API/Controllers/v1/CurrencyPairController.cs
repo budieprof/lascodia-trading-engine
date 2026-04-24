@@ -1,8 +1,10 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using Lascodia.Trading.Engine.SharedApplication.Common.Services;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedLibrary;
+using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Application.CurrencyPairs.Commands.CreateCurrencyPair;
 using LascodiaTradingEngine.Application.CurrencyPairs.Commands.UpdateCurrencyPair;
 using LascodiaTradingEngine.Application.CurrencyPairs.Commands.DeleteCurrencyPair;
@@ -28,6 +30,7 @@ public class CurrencyPairController : AuthControllerBase<CurrencyPairController>
 
     /// <summary>Create a new currency pair</summary>
     [HttpPost]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<ResponseData<long>> Create(CreateCurrencyPairCommand command)
     {
         if (!ModelState.IsValid)
@@ -38,6 +41,7 @@ public class CurrencyPairController : AuthControllerBase<CurrencyPairController>
 
     /// <summary>Update a currency pair</summary>
     [HttpPut("{id}")]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<ResponseData<string>> Update(long id, UpdateCurrencyPairCommand command)
     {
         if (!ModelState.IsValid)
@@ -49,6 +53,7 @@ public class CurrencyPairController : AuthControllerBase<CurrencyPairController>
 
     /// <summary>Delete a currency pair</summary>
     [HttpDelete("{id}")]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<ResponseData<string>> Delete(long id)
         => await Mediator.Send(new DeleteCurrencyPairCommand { Id = id });
 

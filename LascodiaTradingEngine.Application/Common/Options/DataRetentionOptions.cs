@@ -5,7 +5,10 @@ namespace LascodiaTradingEngine.Application.Common.Options;
 /// <summary>Configuration for tiered data retention and pruning policies.</summary>
 public class DataRetentionOptions : ConfigurationOption<DataRetentionOptions>
 {
-    /// <summary>Prediction logs hot retention in days.</summary>
+    /// <summary>
+    /// Physical hot-storage retention in days for prediction logs after they have been
+    /// retired from operational queries by the dedicated pruning worker.
+    /// </summary>
     public int PredictionLogHotDays { get; set; } = 90;
 
     /// <summary>Tick records hot retention in days.</summary>
@@ -41,6 +44,15 @@ public class DataRetentionOptions : ConfigurationOption<DataRetentionOptions>
     /// <summary>Batch size for each retention sweep cycle.</summary>
     public int BatchSize { get; set; } = 1000;
 
+    /// <summary>Delay after application startup before the first retention cycle begins.</summary>
+    public int InitialDelaySeconds { get; set; } = 300;
+
     /// <summary>Polling interval in seconds.</summary>
     public int PollIntervalSeconds { get; set; } = 3600;
+
+    /// <summary>Maximum random delay added after each poll interval to avoid synchronized workers.</summary>
+    public int PollJitterSeconds { get; set; } = 300;
+
+    /// <summary>Timeout for acquiring the singleton retention-cycle distributed lock.</summary>
+    public int LockTimeoutSeconds { get; set; } = 5;
 }

@@ -149,6 +149,7 @@ public sealed class TradingMetrics
     // ── Workers ─────────────────────────────────────────────────────────────
     public Histogram<double> WorkerCycleDurationMs  { get; }
     public Counter<long>     WorkerErrors           { get; }
+    public Counter<long>     DrawdownEmergencySnapshots { get; }
 
     // ── Candle Aggregation ──────────────────────────────────────────────────
     public Counter<long>     CandlesSynthesized     { get; }
@@ -438,6 +439,10 @@ public sealed class TradingMetrics
         // Workers
         WorkerCycleDurationMs = _meter.CreateHistogram<double>("trading.workers.cycle_duration", "ms", "Worker poll cycle duration");
         WorkerErrors          = _meter.CreateCounter<long>("trading.workers.errors", "errors", "Unhandled worker errors");
+        DrawdownEmergencySnapshots = _meter.CreateCounter<long>(
+            "trading.drawdown.emergency_snapshots",
+            "snapshots",
+            "Out-of-cycle drawdown snapshots triggered by large realised losses. Tagged with worker and trigger.");
 
         // Candle Aggregation
         CandlesSynthesized = _meter.CreateCounter<long>(

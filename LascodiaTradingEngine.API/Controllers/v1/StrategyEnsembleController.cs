@@ -1,8 +1,10 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using Lascodia.Trading.Engine.SharedApplication.Common.Services;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedLibrary;
+using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Application.StrategyEnsemble.Commands.RebalanceEnsemble;
 using LascodiaTradingEngine.Application.StrategyEnsemble.Queries.DTOs;
 using LascodiaTradingEngine.Application.StrategyEnsemble.Queries.GetStrategyAllocations;
@@ -26,6 +28,7 @@ public class StrategyEnsembleController : AuthControllerBase<StrategyEnsembleCon
 
     /// <summary>Rebalance strategy weights based on Sharpe ratios</summary>
     [HttpPost("rebalance")]
+    [Authorize(Policy = Policies.Operator)]
     public async Task<ResponseData<string>> Rebalance()
         => await Mediator.Send(new RebalanceEnsembleCommand());
 

@@ -1,8 +1,10 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using Lascodia.Trading.Engine.SharedApplication.Common.Services;
 using Lascodia.Trading.Engine.SharedApplication.Common.Interfaces;
 using Lascodia.Trading.Engine.SharedLibrary;
+using LascodiaTradingEngine.Application.Common.Security;
 using LascodiaTradingEngine.Application.StrategyFeedback.Commands.TriggerOptimization;
 using LascodiaTradingEngine.Application.StrategyFeedback.Commands.ApproveOptimization;
 using LascodiaTradingEngine.Application.StrategyFeedback.Commands.RejectOptimization;
@@ -36,6 +38,7 @@ public class StrategyFeedbackController : AuthControllerBase<StrategyFeedbackCon
 
     /// <summary>Trigger an optimization run for a strategy</summary>
     [HttpPost("optimization/trigger")]
+    [Authorize(Policy = Policies.Analyst)]
     public async Task<ResponseData<long>> TriggerOptimization(TriggerOptimizationCommand command)
     {
         if (!ModelState.IsValid)
@@ -46,11 +49,13 @@ public class StrategyFeedbackController : AuthControllerBase<StrategyFeedbackCon
 
     /// <summary>Approve a completed optimization run and apply best parameters to the strategy</summary>
     [HttpPut("optimization/{id}/approve")]
+    [Authorize(Policy = Policies.Analyst)]
     public async Task<ResponseData<string>> ApproveOptimization(long id)
         => await Mediator.Send(new ApproveOptimizationCommand { Id = id });
 
     /// <summary>Reject a completed optimization run</summary>
     [HttpPut("optimization/{id}/reject")]
+    [Authorize(Policy = Policies.Analyst)]
     public async Task<ResponseData<string>> RejectOptimization(long id)
         => await Mediator.Send(new RejectOptimizationCommand { Id = id });
 
