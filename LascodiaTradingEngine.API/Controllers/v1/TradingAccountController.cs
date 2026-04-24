@@ -70,7 +70,7 @@ public class TradingAccountController : AuthControllerBase<TradingAccountControl
 
     /// <summary>Sync account balance</summary>
     [HttpPut("{id}/sync")]
-    [Authorize(Policy = Policies.Operator)]
+    [Authorize(Policy = Policies.EAIngest)]
     public async Task<ResponseData<string>> Sync(long id, SyncAccountBalanceCommand command)
     {
         if (!ModelState.IsValid)

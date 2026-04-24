@@ -51,7 +51,7 @@ public class ExpertAdvisorController : AuthControllerBase<ExpertAdvisorControlle
 
     /// <summary>Register a new EA instance</summary>
     [HttpPost("register")]
-    [Authorize(Policy = Policies.Operator)]
+    [Authorize(Policy = Policies.EAIngest)]
     [ProducesResponseType(typeof(ResponseData<long>), StatusCodes.Status200OK)]
     public async Task<IActionResult> Register(RegisterEACommand command)
     {
@@ -64,7 +64,7 @@ public class ExpertAdvisorController : AuthControllerBase<ExpertAdvisorControlle
 
     /// <summary>Deregister an EA instance</summary>
     [HttpPost("deregister")]
-    [Authorize(Policy = Policies.Operator)]
+    [Authorize(Policy = Policies.EAIngest)]
     public async Task<IActionResult> Deregister(DeregisterEACommand command)
         => Ok(await Mediator.Send(command));
 
@@ -126,7 +126,7 @@ public class ExpertAdvisorController : AuthControllerBase<ExpertAdvisorControlle
 
     /// <summary>Process reconciliation between engine and broker state</summary>
     [HttpPost("reconciliation")]
-    [Authorize(Policy = Policies.Operator)]
+    [Authorize(Policy = Policies.EAIngest)]
     public async Task<IActionResult> ProcessReconciliation(ProcessReconciliationCommand command)
         => Ok(await Mediator.Send(command));
 

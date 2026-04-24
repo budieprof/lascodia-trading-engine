@@ -41,7 +41,7 @@ public class OrderController : AuthControllerBase<OrderController>
     /// Runs Tier 2 (account-level) risk checks. The signal stays Approved if the check fails.
     /// </summary>
     [HttpPost("from-signal")]
-    [Authorize(Policy = Policies.Trader)]
+    [Authorize(Policy = Policies.EAIngest)]
     public async Task<ResponseData<long>> CreateFromSignal(CreateOrderFromSignalCommand command)
     {
         if (!ModelState.IsValid)
