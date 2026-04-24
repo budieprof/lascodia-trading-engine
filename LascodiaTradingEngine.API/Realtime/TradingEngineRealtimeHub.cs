@@ -40,19 +40,19 @@ public class TradingEngineRealtimeHub : Hub
 
     /// <summary>
     /// On connect, read the <c>tradingAccountId</c> claim from the principal and add the
-    /// caller's connection to <c>account:{tradingAccountId}</c>. Connections without the
-    /// claim are aborted — every authenticated browser session is scoped to one account.
+    /// caller's connection to <c>account:{tradingAccountId}</c>. Tokens without the claim
+    /// (e.g. the shared-library dev <c>/auth/token</c> endpoint) are kept connected but
+    /// not subscribed to any account group — they only receive the broadcast stream
+    /// (<c>orderFilled</c>, <c>positionOpened</c>, etc.), which is what dev dashboards
+    /// actually consume. Aborting these connections made the dev banner show
+    /// "Live updates offline" on every page load.
     /// </summary>
     public override async Task OnConnectedAsync()
     {
         var accountClaim = Context.User?.FindFirst("tradingAccountId")?.Value;
-        if (!long.TryParse(accountClaim, out var accountId))
-        {
-            Context.Abort();
-            return;
-        }
+        if (long.TryParse(accountClaim, out var accountId))
+            await Groups.AddToGroupAsync(Context.ConnectionId, GroupForAccount(accountId));
 
-        await Groups.AddToGroupAsync(Context.ConnectionId, GroupForAccount(accountId));
         await base.OnConnectedAsync();
     }
 

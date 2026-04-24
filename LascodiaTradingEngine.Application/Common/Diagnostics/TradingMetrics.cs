@@ -180,12 +180,20 @@ public sealed class TradingMetrics
     public Histogram<double> ExecutionQualityAvgLatencyMs { get; }
     public Histogram<double> ExecutionQualityAvgFillRate { get; }
     public Histogram<double> ExecutionQualityCycleDurationMs { get; }
+    public Counter<long>     FeatureSchemaBackfillModelsSeen { get; }
+    public Counter<long>     FeatureSchemaBackfillModelsUpdated { get; }
+    public Counter<long>     FeatureSchemaBackfillModelsUnresolved { get; }
+    public Counter<long>     FeatureSchemaBackfillLockAttempts { get; }
+    public Counter<long>     FeatureSchemaBackfillCyclesSkipped { get; }
+    public Histogram<double> FeatureSchemaBackfillCycleDurationMs { get; }
     public Counter<long>     FeaturePrecomputePairsEvaluated { get; }
     public Counter<long>     FeaturePrecomputeVectorsWritten { get; }
     public Counter<long>     FeaturePrecomputePairsSkipped { get; }
     public Counter<long>     FeaturePrecomputeLineageWrites { get; }
     public Counter<long>     FeaturePrecomputeLockAttempts { get; }
+    public Counter<long>     FeaturePrecomputeCyclesSkipped { get; }
     public Histogram<double> FeaturePrecomputeCatchUpBars { get; }
+    public Histogram<double> FeaturePrecomputePendingVectors { get; }
     public Histogram<double> FeaturePrecomputeCycleDurationMs { get; }
 
     // ── Candle Aggregation ──────────────────────────────────────────────────
@@ -200,6 +208,10 @@ public sealed class TradingMetrics
     public Counter<long>     EventRetrySuccesses    { get; }
     public Counter<long>     EventRetryExhausted    { get; }
     public Counter<long>     EventRetryDeadLettered { get; }
+    public Counter<long>     EventRetryLockAttempts { get; }
+    public Counter<long>     EventRetryCyclesSkipped { get; }
+    public Histogram<double> EventRetryBacklogDepth { get; }
+    public Histogram<double> EventRetryCycleDurationMs { get; }
 
     // ── Degradation & Dead-Letter ─────────────────────────────────────────
     public Counter<long>     DegradationTransitions     { get; }
@@ -587,6 +599,30 @@ public sealed class TradingMetrics
             "trading.execution_quality.cycle_duration_ms",
             "ms",
             "ExecutionQualityCircuitBreakerWorker cycle duration.");
+        FeatureSchemaBackfillModelsSeen = _meter.CreateCounter<long>(
+            "trading.feature_schema_backfill.models_seen",
+            "models",
+            "MLModel rows scanned by FeatureSchemaVersionBackfillWorker.");
+        FeatureSchemaBackfillModelsUpdated = _meter.CreateCounter<long>(
+            "trading.feature_schema_backfill.models_updated",
+            "models",
+            "Legacy MLModel snapshots successfully backfilled with an explicit FeatureSchemaVersion.");
+        FeatureSchemaBackfillModelsUnresolved = _meter.CreateCounter<long>(
+            "trading.feature_schema_backfill.models_unresolved",
+            "models",
+            "Legacy MLModel snapshots left unresolved by FeatureSchemaVersionBackfillWorker. Tagged with reason={deserialize_failed|empty_snapshot|insufficient_evidence|conflicting_evidence|unknown_feature_count}.");
+        FeatureSchemaBackfillLockAttempts = _meter.CreateCounter<long>(
+            "trading.feature_schema_backfill.lock_attempts",
+            "cycles",
+            "FeatureSchemaVersionBackfillWorker distributed-lock attempts. Tagged with outcome={acquired|busy|unavailable}.");
+        FeatureSchemaBackfillCyclesSkipped = _meter.CreateCounter<long>(
+            "trading.feature_schema_backfill.cycles_skipped",
+            "cycles",
+            "FeatureSchemaVersionBackfillWorker cycles skipped without processing. Tagged with reason={lock_busy|already_completed}.");
+        FeatureSchemaBackfillCycleDurationMs = _meter.CreateHistogram<double>(
+            "trading.feature_schema_backfill.cycle_duration_ms",
+            "ms",
+            "FeatureSchemaVersionBackfillWorker cycle duration.");
         FeaturePrecomputePairsEvaluated = _meter.CreateCounter<long>(
             "trading.feature_precompute.pairs_evaluated",
             "pairs",
@@ -607,10 +643,18 @@ public sealed class TradingMetrics
             "trading.feature_precompute.lock_attempts",
             "cycles",
             "FeaturePreComputationWorker distributed-lock attempts. Tagged with outcome={acquired|busy|unavailable}.");
+        FeaturePrecomputeCyclesSkipped = _meter.CreateCounter<long>(
+            "trading.feature_precompute.cycles_skipped",
+            "cycles",
+            "FeaturePreComputationWorker cycles skipped without processing. Tagged with reason={lock_busy|no_active_pairs}.");
         FeaturePrecomputeCatchUpBars = _meter.CreateHistogram<double>(
             "trading.feature_precompute.catch_up_bars",
             "bars",
             "Number of recent bars refreshed for a pair in a FeaturePreComputationWorker cycle.");
+        FeaturePrecomputePendingVectors = _meter.CreateHistogram<double>(
+            "trading.feature_precompute.pending_vectors",
+            "vectors",
+            "Pending recent feature vectors detected in a FeaturePreComputationWorker cycle before writes.");
         FeaturePrecomputeCycleDurationMs = _meter.CreateHistogram<double>(
             "trading.feature_precompute.cycle_duration_ms",
             "ms",
@@ -640,6 +684,22 @@ public sealed class TradingMetrics
         EventRetrySuccesses    = _meter.CreateCounter<long>("trading.events.retry_successes", "events", "Integration events successfully re-published by retry worker");
         EventRetryExhausted    = _meter.CreateCounter<long>("trading.events.retry_exhausted", "events", "Integration events that exhausted retry attempts");
         EventRetryDeadLettered = _meter.CreateCounter<long>("trading.events.retry_dead_lettered", "events", "Integration events dead-lettered after retry exhaustion");
+        EventRetryLockAttempts = _meter.CreateCounter<long>(
+            "trading.events.retry_lock_attempts",
+            "cycles",
+            "IntegrationEventRetryWorker distributed-lock attempts. Tagged with outcome=acquired|busy|unavailable.");
+        EventRetryCyclesSkipped = _meter.CreateCounter<long>(
+            "trading.events.retry_cycles_skipped",
+            "cycles",
+            "IntegrationEventRetryWorker cycles skipped without processing. Tagged with reason=lock_busy|event_bus_degraded.");
+        EventRetryBacklogDepth = _meter.CreateHistogram<double>(
+            "trading.events.retry_backlog_depth",
+            "events",
+            "Retryable plus stale-published outbox rows loaded for an IntegrationEventRetryWorker cycle.");
+        EventRetryCycleDurationMs = _meter.CreateHistogram<double>(
+            "trading.events.retry_cycle_duration_ms",
+            "ms",
+            "IntegrationEventRetryWorker cycle duration.");
 
         // Degradation & Dead-Letter
         DegradationTransitions       = _meter.CreateCounter<long>("trading.degradation.transitions", "transitions", "Engine degradation mode transitions");

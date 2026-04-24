@@ -17,12 +17,15 @@ public interface IEventLogReader
     /// <summary>
     /// Returns failed or stuck integration event log entries eligible for retry.
     /// </summary>
-    /// <param name="stuckThreshold">Events in InProgress state older than this are considered stuck.</param>
-    /// <param name="maxRetries">Skip events that have already been sent this many times.</param>
+    /// <param name="stuckInProgressBeforeUtc">
+    /// Events still in <c>InProgress</c> before this UTC timestamp are considered stuck.
+    /// </param>
     /// <param name="batchSize">Maximum number of events to return.</param>
     /// <param name="ct">Cancellation token.</param>
     Task<List<IntegrationEventLogEntry>> GetRetryableEventsAsync(
-        TimeSpan stuckThreshold, int maxRetries, int batchSize, CancellationToken ct);
+        DateTime stuckInProgressBeforeUtc,
+        int batchSize,
+        CancellationToken ct);
 
     /// <summary>
     /// Returns current event-log state for a known set of integration event ids.
@@ -35,13 +38,19 @@ public interface IEventLogReader
     /// <summary>
     /// Returns events marked as <c>Published</c> but older than the given threshold.
     /// These events may have been lost in transit (broker ACK not confirmed) and should
-    /// be re-published to close the data-loss window.
+    /// be re-published to close the data-loss window. The caller also provides a
+    /// <paramref name="maxTimesSentExclusive"/> guard so a stale-published safety replay
+    /// can be bounded without introducing a separate last-attempt timestamp column.
     /// </summary>
-    /// <param name="staleThreshold">Events marked Published longer ago than this are considered stale.</param>
+    /// <param name="stalePublishedBeforeUtc">Events marked Published before this UTC timestamp are considered stale.</param>
+    /// <param name="maxTimesSentExclusive">Only rows whose <c>TimesSent</c> is below this value are returned.</param>
     /// <param name="batchSize">Maximum number of events to return.</param>
     /// <param name="ct">Cancellation token.</param>
     Task<List<IntegrationEventLogEntry>> GetStalePublishedEventsAsync(
-        TimeSpan staleThreshold, int batchSize, CancellationToken ct);
+        DateTime stalePublishedBeforeUtc,
+        int maxTimesSentExclusive,
+        int batchSize,
+        CancellationToken ct);
 
     /// <summary>Persists state changes to event log entries modified in-memory.</summary>
     Task SaveChangesAsync(CancellationToken ct);

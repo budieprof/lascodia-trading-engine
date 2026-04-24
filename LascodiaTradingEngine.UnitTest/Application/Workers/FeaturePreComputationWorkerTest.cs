@@ -99,6 +99,44 @@ public sealed class FeaturePreComputationWorkerTest
     }
 
     [Fact]
+    public async Task RunCycleAsync_CurrentSchemaRowWithCorruptPayload_IsRefreshedInPlace()
+    {
+        var now = new DateTimeOffset(2026, 04, 24, 12, 0, 0, TimeSpan.Zero);
+        using var harness = CreateHarness(db =>
+        {
+            db.Set<Strategy>().Add(NewStrategy(1, "EURUSD", Timeframe.M5));
+            var candles = NewCandles("EURUSD", Timeframe.M5, now.UtcDateTime.AddMinutes(-150), MLFeatureHelper.LookbackWindow + 1);
+            db.Set<Candle>().AddRange(candles);
+            db.Set<FeatureVector>().Add(new FeatureVector
+            {
+                CandleId = candles[^1].Id,
+                Symbol = "EURUSD",
+                Timeframe = Timeframe.M5,
+                BarTimestamp = candles[^1].Timestamp,
+                Features = [0x01, 0x02, 0x03, 0x04],
+                SchemaVersion = 1,
+                SchemaHash = DatabaseFeatureStore.ComputeCurrentSchemaVersion(),
+                FeatureCount = MLFeatureHelper.FeatureCount,
+                FeatureNamesJson = "[\"Bad\"]",
+                ComputedAt = now.UtcDateTime.AddMinutes(-1),
+                IsDeleted = false,
+                RowVersion = 1
+            });
+        }, new TestTimeProvider(now));
+
+        var result = await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        var vectors = await harness.LoadFeatureVectorsAsync(ignoreQueryFilters: true);
+
+        Assert.Equal(1, result.VectorCount);
+        var vector = Assert.Single(vectors);
+        Assert.False(vector.IsDeleted);
+        Assert.Equal(harness.FeatureStore.CurrentSchemaHash, vector.SchemaHash);
+        Assert.Equal(MLFeatureHelper.FeatureCount * sizeof(double), vector.Features.Length);
+        Assert.Equal(MLFeatureHelper.FeatureCount, vector.FeatureCount);
+    }
+
+    [Fact]
     public async Task RunCycleAsync_UsesPointInTimeCotLookup_WhenPrecomputingBar()
     {
         var now = new DateTimeOffset(2026, 04, 10, 12, 0, 0, TimeSpan.Zero);
@@ -142,6 +180,18 @@ public sealed class FeaturePreComputationWorkerTest
 
         Assert.Equal("lock_busy", result.SkippedReason);
         Assert.Empty(await harness.LoadFeatureVectorsAsync());
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_WhenNoActivePairs_ReturnsSkippedReason()
+    {
+        using var harness = CreateHarness(_ => { });
+
+        var result = await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        Assert.Equal("no_active_pairs", result.SkippedReason);
+        Assert.Equal(0, result.ActivePairCount);
+        Assert.Equal(0, result.EvaluatedPairCount);
     }
 
     [Fact]

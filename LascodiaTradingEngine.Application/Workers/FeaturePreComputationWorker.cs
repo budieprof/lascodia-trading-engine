@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -44,6 +45,8 @@ public sealed class FeaturePreComputationWorker : BackgroundService
     private static readonly TimeSpan InitialRetryDelay = TimeSpan.FromMinutes(1);
     private static readonly TimeSpan MaxRetryDelay = TimeSpan.FromMinutes(15);
     private static readonly string[] BaseFeatureNames = MLFeatureHelper.ResolveFeatureNames(MLFeatureHelper.FeatureCount);
+    private static readonly string SerializedBaseFeatureNamesJson = JsonSerializer.Serialize(BaseFeatureNames);
+    private static readonly int ExpectedFeatureByteLength = MLFeatureHelper.FeatureCount * sizeof(double);
 
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<FeaturePreComputationWorker> _logger;
@@ -112,6 +115,7 @@ public sealed class FeaturePreComputationWorker : BackgroundService
                         durationMs,
                         new KeyValuePair<string, object?>("worker", WorkerName));
                     _metrics?.FeaturePrecomputeCycleDurationMs.Record(durationMs);
+                    _metrics?.FeaturePrecomputePendingVectors.Record(result.PendingVectorCount);
 
                     if (result.SkippedReason is { Length: > 0 })
                     {
@@ -219,6 +223,9 @@ public sealed class FeaturePreComputationWorker : BackgroundService
                 _metrics?.FeaturePrecomputeLockAttempts.Add(
                     1,
                     new KeyValuePair<string, object?>("outcome", "busy"));
+                _metrics?.FeaturePrecomputeCyclesSkipped.Add(
+                    1,
+                    new KeyValuePair<string, object?>("reason", "lock_busy"));
                 return FeaturePreComputationCycleResult.Skipped(settings, "lock_busy");
             }
 
@@ -255,7 +262,12 @@ public sealed class FeaturePreComputationWorker : BackgroundService
     {
         var activePairs = await LoadActivePairsAsync(db, ct);
         if (activePairs.Count == 0)
-            return FeaturePreComputationCycleResult.Empty(settings);
+        {
+            _metrics?.FeaturePrecomputeCyclesSkipped.Add(
+                1,
+                new KeyValuePair<string, object?>("reason", "no_active_pairs"));
+            return FeaturePreComputationCycleResult.Skipped(settings, "no_active_pairs");
+        }
 
         int evaluatedPairs = 0;
         int pendingVectors = 0;
@@ -411,10 +423,11 @@ public sealed class FeaturePreComputationWorker : BackgroundService
                 continue;
             }
 
-            if (!cotLookupCache.TryGetValue(pair.Symbol, out var cotLookup))
+            var cotLookupKey = GetCotLookupCacheKey(pair.Symbol);
+            if (!cotLookupCache.TryGetValue(cotLookupKey, out var cotLookup))
             {
                 cotLookup = await CotFeatureLookupSnapshot.LoadAsync(db, pair.Symbol, ct);
-                cotLookupCache[pair.Symbol] = cotLookup;
+                cotLookupCache[cotLookupKey] = cotLookup;
             }
 
             var previous = candles[index - 1];
@@ -523,7 +536,37 @@ public sealed class FeaturePreComputationWorker : BackgroundService
         return !existing.IsDeleted &&
                existing.SchemaHash == currentSchemaHash &&
                existing.SchemaVersion == currentSchemaVersion &&
-               existing.FeatureCount == MLFeatureHelper.FeatureCount;
+               existing.FeatureCount == MLFeatureHelper.FeatureCount &&
+               existing.Features.Length == ExpectedFeatureByteLength &&
+               HasExpectedFeatureNames(existing.FeatureNamesJson);
+    }
+
+    private static bool HasExpectedFeatureNames(string featureNamesJson)
+    {
+        if (string.Equals(featureNamesJson, SerializedBaseFeatureNamesJson, StringComparison.Ordinal))
+            return true;
+
+        try
+        {
+            var featureNames = JsonSerializer.Deserialize<string[]>(featureNamesJson);
+            return featureNames is not null &&
+                   featureNames.Length == BaseFeatureNames.Length &&
+                   featureNames.SequenceEqual(BaseFeatureNames, StringComparer.Ordinal);
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    private static string GetCotLookupCacheKey(string symbol)
+    {
+        if (string.IsNullOrWhiteSpace(symbol))
+            return string.Empty;
+
+        return symbol.Length >= 3
+            ? symbol[..3].ToUpperInvariant()
+            : symbol.ToUpperInvariant();
     }
 
     private static async Task<int> GetIntAsync(DbContext db, string key, int defaultValue, CancellationToken ct)

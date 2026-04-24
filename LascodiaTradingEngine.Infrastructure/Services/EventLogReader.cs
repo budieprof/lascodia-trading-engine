@@ -19,29 +19,32 @@ public class EventLogReader : IEventLogReader
     }
 
     public async Task<List<IntegrationEventLogEntry>> GetRetryableEventsAsync(
-        TimeSpan stuckThreshold, int maxRetries, int batchSize, CancellationToken ct)
+        DateTime stuckInProgressBeforeUtc,
+        int batchSize,
+        CancellationToken ct)
     {
-        var cutoff = DateTime.UtcNow - stuckThreshold;
-
         // Include events that have exhausted retries but were never transitioned to a
         // terminal state (e.g., process crashed between incrementing TimesSent and
-        // marking NotPublished). The caller is responsible for detecting exhaustion
-        // and transitioning these to NotPublished/dead-letter rather than re-publishing.
+        // marking DeadLettered). The caller is responsible for detecting exhaustion
+        // and transitioning these to a terminal state rather than re-publishing.
         return await _context.IntegrationEventLogs
             .Where(e => e.State == EventStateEnum.PublishedFailed
-                     || (e.State == EventStateEnum.InProgress && e.CreationTime < cutoff))
+                     || (e.State == EventStateEnum.InProgress && e.CreationTime < stuckInProgressBeforeUtc))
             .OrderBy(e => e.CreationTime)
             .Take(batchSize)
             .ToListAsync(ct);
     }
 
     public async Task<List<IntegrationEventLogEntry>> GetStalePublishedEventsAsync(
-        TimeSpan staleThreshold, int batchSize, CancellationToken ct)
+        DateTime stalePublishedBeforeUtc,
+        int maxTimesSentExclusive,
+        int batchSize,
+        CancellationToken ct)
     {
-        var cutoff = DateTime.UtcNow - staleThreshold;
-
         return await _context.IntegrationEventLogs
-            .Where(e => e.State == EventStateEnum.Published && e.CreationTime < cutoff)
+            .Where(e => e.State == EventStateEnum.Published
+                     && e.CreationTime < stalePublishedBeforeUtc
+                     && e.TimesSent < maxTimesSentExclusive)
             .OrderBy(e => e.CreationTime)
             .Take(batchSize)
             .ToListAsync(ct);
