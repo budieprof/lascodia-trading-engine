@@ -209,6 +209,11 @@ public sealed class TradingMetrics
     public Counter<long>     IntradayAttributionLockAttempts { get; }
     public Counter<long>     IntradayAttributionCyclesSkipped { get; }
     public Histogram<double> IntradayAttributionCycleDurationMs { get; }
+    public Counter<long>     LatencySlaAlertTransitions { get; }
+    public Counter<long>     LatencySlaLockAttempts { get; }
+    public Counter<long>     LatencySlaCyclesSkipped { get; }
+    public Histogram<double> LatencySlaObservedP99Ms { get; }
+    public Histogram<double> LatencySlaCycleDurationMs { get; }
 
     // ── Candle Aggregation ──────────────────────────────────────────────────
     public Counter<long>     CandlesSynthesized     { get; }
@@ -729,6 +734,26 @@ public sealed class TradingMetrics
             "trading.intraday_attribution.cycle_duration_ms",
             "ms",
             "IntradayAttributionWorker cycle duration.");
+        LatencySlaAlertTransitions = _meter.CreateCounter<long>(
+            "trading.latency_sla.alert_transitions",
+            "alerts",
+            "LatencySlaWorker alert notifications and auto-resolutions. Tagged with segment and transition={dispatched|resolved}.");
+        LatencySlaLockAttempts = _meter.CreateCounter<long>(
+            "trading.latency_sla.lock_attempts",
+            "cycles",
+            "LatencySlaWorker distributed-lock attempts. Tagged with outcome={acquired|busy|unavailable}.");
+        LatencySlaCyclesSkipped = _meter.CreateCounter<long>(
+            "trading.latency_sla.cycles_skipped",
+            "cycles",
+            "LatencySlaWorker cycles skipped without processing. Tagged with reason={disabled|lock_busy}.");
+        LatencySlaObservedP99Ms = _meter.CreateHistogram<double>(
+            "trading.latency_sla.observed_p99_ms",
+            "ms",
+            "Observed rolling P99 latency per monitored SLA segment. Tagged with segment.");
+        LatencySlaCycleDurationMs = _meter.CreateHistogram<double>(
+            "trading.latency_sla.cycle_duration_ms",
+            "ms",
+            "LatencySlaWorker cycle duration.");
 
         // Candle Aggregation
         CandlesSynthesized = _meter.CreateCounter<long>(

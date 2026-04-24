@@ -42,6 +42,7 @@ public class SignalOrderBridgeWorker : BackgroundService, IIntegrationEventHandl
     private readonly TimeProvider _timeProvider;
     private readonly ISignalRejectionAuditor _rejectionAuditor;
     private readonly IKillSwitchService _killSwitch;
+    private readonly ILatencySlaRecorder? _latencySlaRecorder;
 
     /// <summary>
     /// Caps the number of signals processed concurrently to protect the DB connection pool
@@ -68,7 +69,8 @@ public class SignalOrderBridgeWorker : BackgroundService, IIntegrationEventHandl
         TradingMetrics metrics,
         TimeProvider timeProvider,
         ISignalRejectionAuditor rejectionAuditor,
-        IKillSwitchService killSwitch)
+        IKillSwitchService killSwitch,
+        ILatencySlaRecorder? latencySlaRecorder = null)
     {
         _logger           = logger;
         _scopeFactory     = scopeFactory;
@@ -77,6 +79,7 @@ public class SignalOrderBridgeWorker : BackgroundService, IIntegrationEventHandl
         _timeProvider     = timeProvider;
         _rejectionAuditor = rejectionAuditor;
         _killSwitch       = killSwitch;
+        _latencySlaRecorder = latencySlaRecorder;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -262,19 +265,30 @@ public class SignalOrderBridgeWorker : BackgroundService, IIntegrationEventHandl
     private async Task ProcessSignalAsync(TradeSignalCreatedIntegrationEvent @event, CancellationToken ct)
     {
         var sw = Stopwatch.StartNew();
+        bool recordSignalToTier1Latency = false;
         try
         {
-            await ProcessSignalCoreAsync(@event, ct);
+            recordSignalToTier1Latency = await ProcessSignalCoreAsync(@event, ct);
         }
         finally
         {
             sw.Stop();
             _metrics.WorkerCycleDurationMs.Record(sw.Elapsed.TotalMilliseconds,
                 new KeyValuePair<string, object?>("worker", "SignalOrderBridge"));
+
+            if (recordSignalToTier1Latency)
+            {
+                var signalToTier1Ms = Math.Max(
+                    0,
+                    (DateTime.UtcNow - @event.CreationDate).TotalMilliseconds);
+                _latencySlaRecorder?.RecordSample(
+                    LatencySlaSegments.SignalToTier1,
+                    (long)Math.Round(signalToTier1Ms));
+            }
         }
     }
 
-    private async Task ProcessSignalCoreAsync(TradeSignalCreatedIntegrationEvent @event, CancellationToken ct)
+    private async Task<bool> ProcessSignalCoreAsync(TradeSignalCreatedIntegrationEvent @event, CancellationToken ct)
     {
         // Structured logging scope — CorrelationId appears in every log line within this scope
         using var correlationScope = _logger.BeginScope(
@@ -296,7 +310,7 @@ public class SignalOrderBridgeWorker : BackgroundService, IIntegrationEventHandl
         if (signal is null)
         {
             _logger.LogWarning("SignalOrderBridgeWorker: signal {Id} not found", @event.TradeSignalId);
-            return;
+            return false;
         }
 
         if (signal.Status != TradeSignalStatus.Pending)
@@ -304,7 +318,7 @@ public class SignalOrderBridgeWorker : BackgroundService, IIntegrationEventHandl
             _logger.LogInformation(
                 "SignalOrderBridgeWorker: signal {Id} is no longer Pending (status={Status}) — skipping",
                 signal.Id, signal.Status);
-            return;
+            return false;
         }
 
         // Expiry is checked by SignalValidator in Tier 1 validation below.
@@ -330,7 +344,7 @@ public class SignalOrderBridgeWorker : BackgroundService, IIntegrationEventHandl
                 Source       = "SignalOrderBridgeWorker"
             }, ct);
 
-            return;
+            return true;
         }
 
         if (signal.Strategy.Status != StrategyStatus.Active)
@@ -362,7 +376,7 @@ public class SignalOrderBridgeWorker : BackgroundService, IIntegrationEventHandl
                 Source       = "SignalOrderBridgeWorker"
             }, ct);
 
-            return;
+            return true;
         }
 
         // ── Guard: ML model liveness (if the signal claims ML scoring) ────
@@ -424,7 +438,7 @@ public class SignalOrderBridgeWorker : BackgroundService, IIntegrationEventHandl
                     Source       = "SignalOrderBridgeWorker"
                 }, ct);
 
-                return;
+                return true;
             }
         }
 
@@ -463,7 +477,7 @@ public class SignalOrderBridgeWorker : BackgroundService, IIntegrationEventHandl
                 Source       = "SignalOrderBridgeWorker"
             }, ct);
 
-            return;
+            return true;
         }
 
         // Resolve risk profile: strategy-level first, then system default
@@ -488,7 +502,7 @@ public class SignalOrderBridgeWorker : BackgroundService, IIntegrationEventHandl
                 Source       = "SignalOrderBridgeWorker"
             }, ct);
 
-            return;
+            return true;
         }
 
         // Load symbol spec for pip size calculations
@@ -535,7 +549,7 @@ public class SignalOrderBridgeWorker : BackgroundService, IIntegrationEventHandl
                 Source       = "SignalOrderBridgeWorker"
             }, ct);
 
-            return;
+            return true;
         }
 
         // ── Tier 1: Signal-level validation ──────────────────────────────
@@ -579,7 +593,7 @@ public class SignalOrderBridgeWorker : BackgroundService, IIntegrationEventHandl
                 Source       = "SignalOrderBridgeWorker"
             }, ct);
 
-            return;
+            return true;
         }
 
         // ── Approve signal ───────────────────────────────────────────────
@@ -590,7 +604,7 @@ public class SignalOrderBridgeWorker : BackgroundService, IIntegrationEventHandl
             _logger.LogWarning(
                 "SignalOrderBridgeWorker: failed to approve signal {Id} — {Message} (likely already processed)",
                 signal.Id, approveResult.message);
-            return;
+            return false;
         }
 
         _metrics.SignalsAccepted.Add(1,
@@ -610,6 +624,8 @@ public class SignalOrderBridgeWorker : BackgroundService, IIntegrationEventHandl
             Reason       = $"{signal.Direction} {signal.Symbol} at {signal.EntryPrice}, lot={signal.SuggestedLotSize}, confidence={signal.Confidence:P0}",
             Source       = "SignalOrderBridgeWorker"
         }, ct);
+
+        return true;
     }
 
     /// <summary>

@@ -122,6 +122,7 @@ public partial class StrategyWorker :
     private readonly IDegradationModeManager _degradationManager;
     private readonly IExternalServiceCircuitBreaker _circuitBreaker;
     private readonly IDbOperationBulkhead _dbBulkhead;
+    private readonly ILatencySlaRecorder? _latencySlaRecorder;
 
     // Named service keys for circuit-breaker bookkeeping — kept in one place so
     // dashboards can filter by the canonical string without typo-driven splits.
@@ -223,7 +224,8 @@ public partial class StrategyWorker :
         IKillSwitchService killSwitch,
         IDegradationModeManager degradationManager,
         IExternalServiceCircuitBreaker circuitBreaker,
-        IDbOperationBulkhead dbBulkhead)
+        IDbOperationBulkhead dbBulkhead,
+        ILatencySlaRecorder? latencySlaRecorder = null)
     {
         _logger                       = logger;
         _scopeFactory                 = scopeFactory;    // Creates per-event/per-strategy DI scopes
@@ -246,6 +248,7 @@ public partial class StrategyWorker :
         _degradationManager           = degradationManager;          // Engine degradation state machine
         _circuitBreaker               = circuitBreaker;              // Per-service circuit breakers for hot-path externals
         _dbBulkhead                   = dbBulkhead;                  // Per-worker-group DB-operation bulkhead
+        _latencySlaRecorder           = latencySlaRecorder;
     }
 
     /// <summary>
@@ -2158,6 +2161,13 @@ public partial class StrategyWorker :
                     Direction     = pending.Direction.ToString(),
                     EntryPrice    = pending.EntryPrice
                 });
+
+                var tickToSignalMs = Math.Max(
+                    0,
+                    (DateTime.UtcNow - @event.Timestamp).TotalMilliseconds);
+                _latencySlaRecorder?.RecordSample(
+                    LatencySlaSegments.TickToSignal,
+                    (long)Math.Round(tickToSignalMs));
 
                 // Record cooldown timestamp (TryAdd avoids overwriting a timestamp
                 // set by a parallel winner for the same strategy on a different timeframe)

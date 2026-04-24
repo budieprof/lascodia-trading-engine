@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using FluentValidation;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
@@ -61,6 +62,7 @@ public class CreateOrderFromSignalCommandHandler
     private readonly TradingMetrics _metrics;
     private readonly IDegradationModeManager _degradationManager;
     private readonly IKillSwitchService _killSwitch;
+    private readonly ILatencySlaRecorder? _latencySlaRecorder;
 
     public CreateOrderFromSignalCommandHandler(
         IReadApplicationDbContext readContext,
@@ -73,7 +75,8 @@ public class CreateOrderFromSignalCommandHandler
         TradingDayOptions tradingDayOptions,
         TradingMetrics metrics,
         IDegradationModeManager degradationManager,
-        IKillSwitchService killSwitch)
+        IKillSwitchService killSwitch,
+        ILatencySlaRecorder? latencySlaRecorder = null)
     {
         _readContext         = readContext;
         _writeContext        = writeContext;
@@ -86,6 +89,7 @@ public class CreateOrderFromSignalCommandHandler
         _metrics             = metrics;
         _degradationManager  = degradationManager;
         _killSwitch          = killSwitch;
+        _latencySlaRecorder  = latencySlaRecorder;
     }
 
     /// <summary>
@@ -230,6 +234,7 @@ public class CreateOrderFromSignalCommandHandler
             return ResponseData<long>.Init(0, false, "No risk profile configured", "-11");
 
         // ── Build Tier 2 risk check context ──────────────────────────────────
+        var tier2LatencyStopwatch = Stopwatch.StartNew();
         var openPositions = await db.Set<Position>()
             .Where(p => p.Status == PositionStatus.Open && !p.IsDeleted)
             .AsNoTracking()
@@ -359,6 +364,10 @@ public class CreateOrderFromSignalCommandHandler
 
         // ── Run Tier 2 risk check ────────────────────────────────────────────
         var riskResult = await _riskChecker.CheckAsync(signal, riskContext, cancellationToken);
+        tier2LatencyStopwatch.Stop();
+        _latencySlaRecorder?.RecordSample(
+            LatencySlaSegments.Tier2RiskCheck,
+            (long)Math.Round(tier2LatencyStopwatch.Elapsed.TotalMilliseconds));
 
         if (!riskResult.Passed)
         {

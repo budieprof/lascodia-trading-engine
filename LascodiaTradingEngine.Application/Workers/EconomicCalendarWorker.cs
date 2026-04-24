@@ -592,7 +592,9 @@ public sealed class EconomicCalendarWorker : BackgroundService
                             && eventRow.ScheduledAt < nowUtc
                             && eventRow.ScheduledAt >= staleCutoffUtc)
             .OrderByDescending(eventRow =>
-                GetImpactPriority(eventRow.Impact))
+                eventRow.Impact == EconomicImpact.High ? 3 :
+                eventRow.Impact == EconomicImpact.Medium ? 2 :
+                eventRow.Impact == EconomicImpact.Low ? 1 : 0)
             .ThenBy(eventRow => eventRow.ScheduledAt)
             .Take(settings.ActualsPatchBatchSize)
             .ToListAsync(ct);

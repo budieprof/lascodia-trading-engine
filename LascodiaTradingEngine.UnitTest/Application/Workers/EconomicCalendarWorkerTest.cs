@@ -7,6 +7,7 @@ using LascodiaTradingEngine.Application.Workers;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.Domain.Enums;
 using LascodiaTradingEngine.UnitTest.TestHelpers;
+using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -80,6 +81,37 @@ public sealed class EconomicCalendarWorkerTest : IDisposable
         Assert.Equal(1, result.PatchedActualCount);
         Assert.Equal(1, result.InlineActualCandidateCount);
         Assert.Equal("3.1%", patchedEvent.Actual);
+        Assert.Equal(0, result.DispatchedAlertCount);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_PendingActualQueryUsesProviderTranslatableImpactOrdering()
+    {
+        var now = new DateTimeOffset(2026, 04, 24, 12, 0, 0, TimeSpan.Zero);
+        var timeProvider = new TestTimeProvider(now);
+        await using var connection = new SqliteConnection("DataSource=:memory:");
+        await connection.OpenAsync();
+        await using var db = NewSqliteContext(connection);
+        await db.Database.EnsureCreatedAsync();
+        db.CurrencyPairs.Add(MakeCurrencyPair());
+        db.EconomicEvents.AddRange(
+            MakePendingActualEvent(1, "US CPI", EconomicImpact.High, now.AddMinutes(-30).UtcDateTime),
+            MakePendingActualEvent(2, "EU Services PMI", EconomicImpact.Medium, now.AddMinutes(-35).UtcDateTime),
+            MakePendingActualEvent(3, "Bank Holiday", EconomicImpact.Holiday, now.AddMinutes(-40).UtcDateTime));
+        await db.SaveChangesAsync();
+
+        var feed = new TestEconomicCalendarFeed
+        {
+            UpcomingHandler = (_, _, _, _) => Task.FromResult<IReadOnlyList<EconomicCalendarEvent>>([])
+        };
+
+        var dispatcher = new TestAlertDispatcher(timeProvider);
+        using var provider = BuildProvider(db, feed, dispatcher);
+        var worker = CreateWorker(provider, NewOptions(), timeProvider);
+
+        var result = await worker.RunCycleAsync(CancellationToken.None);
+
+        Assert.Equal(0, result.PatchedActualCount);
         Assert.Equal(0, result.DispatchedAlertCount);
     }
 
@@ -344,6 +376,15 @@ public sealed class EconomicCalendarWorkerTest : IDisposable
         return new EconomicCalendarWorkerTestContext(options);
     }
 
+    private static EconomicCalendarWorkerTestContext NewSqliteContext(SqliteConnection connection)
+    {
+        var options = new DbContextOptionsBuilder<EconomicCalendarWorkerTestContext>()
+            .UseSqlite(connection)
+            .Options;
+
+        return new EconomicCalendarWorkerTestContext(options);
+    }
+
     private static CurrencyPair MakeCurrencyPair()
         => new()
         {
@@ -352,6 +393,21 @@ public sealed class EconomicCalendarWorkerTest : IDisposable
             BaseCurrency = "EUR",
             QuoteCurrency = "USD",
             IsActive = true
+        };
+
+    private static EconomicEvent MakePendingActualEvent(long id, string title, EconomicImpact impact, DateTime scheduledAtUtc)
+        => new()
+        {
+            Id = id,
+            Title = title,
+            Currency = "USD",
+            Impact = impact,
+            ScheduledAt = scheduledAtUtc,
+            Actual = null,
+            Forecast = "1.0%",
+            Previous = "0.9%",
+            ExternalKey = $"{id}-event",
+            Source = EconomicEventSource.ForexFactory
         };
 
     private sealed class EconomicCalendarWorkerTestContext(DbContextOptions<EconomicCalendarWorkerTestContext> options)

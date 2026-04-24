@@ -24,6 +24,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\LascodiaTradingEngine.API\LascodiaTradingEngine.API.csproj" />
     <ProjectReference Include="..\LascodiaTradingEngine.Application\LascodiaTradingEngine.Application.csproj" />
     <ProjectReference Include="..\LascodiaTradingEngine.Infrastructure\LascodiaTradingEngine.Infrastructure.csproj" />
   </ItemGroup>

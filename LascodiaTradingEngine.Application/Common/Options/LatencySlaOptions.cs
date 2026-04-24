@@ -5,6 +5,12 @@ namespace LascodiaTradingEngine.Application.Common.Options;
 /// <summary>Latency SLA targets for the critical trading path. Alerts when P99 breaches for consecutive minutes.</summary>
 public class LatencySlaOptions : ConfigurationOption<LatencySlaOptions>
 {
+    /// <summary>Whether the latency-SLA monitor is enabled.</summary>
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>Polling interval in minutes for the SLA monitor.</summary>
+    public int PollIntervalMinutes { get; set; } = 1;
+
     /// <summary>P99 target in ms: tick → signal creation.</summary>
     public int TickToSignalP99Ms { get; set; } = 500;
 
@@ -22,4 +28,13 @@ public class LatencySlaOptions : ConfigurationOption<LatencySlaOptions>
 
     /// <summary>Consecutive minutes of SLA breach before alerting.</summary>
     public int ConsecutiveBreachMinutesBeforeAlert { get; set; } = 5;
+
+    /// <summary>Minimum rolling sample count required before evaluating per-segment P99.</summary>
+    public int MinimumSegmentSamples { get; set; } = 5;
+
+    /// <summary>Lookback window in hours for total tick-to-fill calculations.</summary>
+    public int TotalTickToFillLookbackHours { get; set; } = 24;
+
+    /// <summary>Minimum completed fill samples required before evaluating total tick-to-fill P99.</summary>
+    public int MinimumTotalTickToFillSamples { get; set; } = 10;
 }

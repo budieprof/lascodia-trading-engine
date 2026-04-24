@@ -38,6 +38,7 @@ public sealed class EACommandPushWorker : BackgroundService
     private readonly TimeProvider _timeProvider;
     private readonly IWorkerHealthMonitor? _healthMonitor;
     private readonly TradingMetrics? _metrics;
+    private readonly ILatencySlaRecorder? _latencySlaRecorder;
     private int _consecutiveFailures;
     private DateTimeOffset _nextBacklogSampleAtUtc = DateTimeOffset.MinValue;
     private EACommandScanCursor? _scanCursor;
@@ -57,7 +58,8 @@ public sealed class EACommandPushWorker : BackgroundService
         WebSocketBridgeOptions wsOptions,
         TimeProvider? timeProvider = null,
         IWorkerHealthMonitor? healthMonitor = null,
-        TradingMetrics? metrics = null)
+        TradingMetrics? metrics = null,
+        ILatencySlaRecorder? latencySlaRecorder = null)
     {
         _logger       = logger;
         _scopeFactory = scopeFactory;
@@ -66,6 +68,7 @@ public sealed class EACommandPushWorker : BackgroundService
         _timeProvider = timeProvider ?? TimeProvider.System;
         _healthMonitor = healthMonitor;
         _metrics = metrics;
+        _latencySlaRecorder = latencySlaRecorder;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -235,6 +238,9 @@ public sealed class EACommandPushWorker : BackgroundService
                 pushedCount++;
                 _healthMonitor?.RecordQueueLatency(WorkerName, (long)queueLatencyMs);
                 _healthMonitor?.RecordExecutionDuration(WorkerName, (long)pushDurationMs);
+                _latencySlaRecorder?.RecordSample(
+                    LatencySlaSegments.EaPollToSubmit,
+                    (long)Math.Round(queueLatencyMs + pushDurationMs));
                 _metrics?.EaCommandsPushed.Add(
                     1,
                     new KeyValuePair<string, object?>("command_type", commandTypeTag));

@@ -132,6 +132,7 @@ public class ExpertAdvisorController : AuthControllerBase<ExpertAdvisorControlle
 
     /// <summary>Get pending commands for an EA instance to execute</summary>
     [HttpGet("commands")]
+    [Authorize(Policy = Policies.EAIngest)]
     public async Task<IActionResult> GetPendingCommands(
         [FromQuery] string eaInstanceId,
         [FromQuery] DateTime? since)
