@@ -39,25 +39,34 @@ public class ActivateTradingAccountCommandHandler : IRequestHandler<ActivateTrad
 
     public async Task<ResponseData<string>> Handle(ActivateTradingAccountCommand request, CancellationToken cancellationToken)
     {
-        var target = await _context.GetDbContext()
-            .Set<Domain.Entities.TradingAccount>()
-            .FirstOrDefaultAsync(x => x.Id == request.Id && !x.IsDeleted, cancellationToken);
+        var db = _context.GetDbContext();
 
-        if (target == null)
+        var targetExists = await db
+            .Set<Domain.Entities.TradingAccount>()
+            .AnyAsync(x => x.Id == request.Id && !x.IsDeleted, cancellationToken);
+
+        if (!targetExists)
             return ResponseData<string>.Init(null, false, "Trading account not found", "-14");
 
-        // Deactivate all other active accounts
-        var siblings = await _context.GetDbContext()
+        await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
+
+        await db
             .Set<Domain.Entities.TradingAccount>()
-            .Where(x => x.Id != target.Id && x.IsActive && !x.IsDeleted)
-            .ToListAsync(cancellationToken);
+            .Where(x => x.Id != request.Id && x.IsActive && !x.IsDeleted)
+            .ExecuteUpdateAsync(s => s.SetProperty(a => a.IsActive, false), cancellationToken);
 
-        foreach (var account in siblings)
-            account.IsActive = false;
+        var affected = await db
+            .Set<Domain.Entities.TradingAccount>()
+            .Where(x => x.Id == request.Id && !x.IsDeleted)
+            .ExecuteUpdateAsync(s => s.SetProperty(a => a.IsActive, true), cancellationToken);
 
-        target.IsActive = true;
+        if (affected == 0)
+        {
+            await transaction.RollbackAsync(cancellationToken);
+            return ResponseData<string>.Init(null, false, "Trading account not found", "-14");
+        }
 
-        await _context.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
 
         return ResponseData<string>.Init("Activated", true, "Successful", "00");
     }

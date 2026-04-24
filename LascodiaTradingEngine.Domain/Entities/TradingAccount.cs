@@ -120,7 +120,7 @@ public class TradingAccount : Entity<long>
 
     /// <summary>
     /// When <c>true</c>, this account is actively used for order routing and strategy evaluation.
-    /// Only one account should be active at a time.
+    /// Only one non-deleted account may be active at a time.
     /// </summary>
     public bool IsActive { get; set; }
 

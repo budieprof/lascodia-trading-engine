@@ -65,6 +65,10 @@ public class TradingAccountConfiguration : IEntityTypeConfiguration<TradingAccou
         builder.HasQueryFilter(x => !x.IsDeleted);
 
         builder.HasIndex(x => x.IsActive);
+        builder.HasIndex(x => x.IsActive)
+            .HasDatabaseName("IX_TradingAccount_IsActive_SingleTrue")
+            .IsUnique()
+            .HasFilter("\"IsActive\" = true AND \"IsDeleted\" = false");
         builder.HasIndex(x => new { x.AccountId, x.BrokerServer }).IsUnique()
             .HasFilter("\"IsDeleted\" = false");
     }

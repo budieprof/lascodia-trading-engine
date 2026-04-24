@@ -1,145 +1,367 @@
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
-using MockQueryable.Moq;
+using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 using LascodiaTradingEngine.Application.Common.Interfaces;
 using LascodiaTradingEngine.Application.Common.Options;
 using LascodiaTradingEngine.Application.EmergencyFlatten.Commands.EmergencyFlatten;
 using LascodiaTradingEngine.Application.Workers;
 using LascodiaTradingEngine.Domain.Entities;
 using LascodiaTradingEngine.UnitTest.TestHelpers;
-using Lascodia.Trading.Engine.SharedApplication.Common.Models;
 
 namespace LascodiaTradingEngine.UnitTest.Application.Workers;
 
 public class DailyPnlMonitorWorkerTest
 {
-    private static (DailyPnlMonitorWorker worker, Mock<IMediator> mediator) CreateWorkerWithScope(
-        List<TradingAccount> accounts,
-        List<AccountPerformanceAttribution> attributions,
-        List<DrawdownSnapshot> snapshots)
-    {
-        var mockDbContext = new Mock<DbContext>();
-        var mockAccountSet = accounts.AsQueryable().BuildMockDbSet();
-        mockDbContext.Setup(c => c.Set<TradingAccount>()).Returns(mockAccountSet.Object);
-
-        var mockAttributionSet = attributions.AsQueryable().BuildMockDbSet();
-        mockDbContext.Setup(c => c.Set<AccountPerformanceAttribution>()).Returns(mockAttributionSet.Object);
-
-        var mockSnapshotSet = snapshots.AsQueryable().BuildMockDbSet();
-        mockDbContext.Setup(c => c.Set<DrawdownSnapshot>()).Returns(mockSnapshotSet.Object);
-
-        var mockReadContext = new Mock<IReadApplicationDbContext>();
-        mockReadContext.Setup(c => c.GetDbContext()).Returns(mockDbContext.Object);
-
-        // Write context for EngineConfig persistence (flatten dedup)
-        var mockWriteDbContext = new Mock<DbContext>();
-        var mockEngineConfigSet = new List<EngineConfig>().AsQueryable().BuildMockDbSet();
-        mockWriteDbContext.Setup(c => c.Set<EngineConfig>()).Returns(mockEngineConfigSet.Object);
-        mockWriteDbContext.Setup(c => c.SaveChangesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(0);
-        var mockWriteContext = new Mock<IWriteApplicationDbContext>();
-        mockWriteContext.Setup(c => c.GetDbContext()).Returns(mockWriteDbContext.Object);
-        mockWriteContext.Setup(c => c.SaveChangesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(0);
-
-        // Also add EngineConfig set to read context for the flatten dedup check
-        var mockReadEngineConfigSet = new List<EngineConfig>().AsQueryable().BuildMockDbSet();
-        mockDbContext.Setup(c => c.Set<EngineConfig>()).Returns(mockReadEngineConfigSet.Object);
-
-        var mockMediator = new Mock<IMediator>();
-        mockMediator
-            .Setup(m => m.Send(It.IsAny<EmergencyFlattenCommand>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(ResponseData<bool>.Init(true, true, "Flattened", "00"));
-
-        var mockServiceProvider = new Mock<IServiceProvider>();
-        mockServiceProvider.Setup(p => p.GetService(typeof(IReadApplicationDbContext))).Returns(mockReadContext.Object);
-        mockServiceProvider.Setup(p => p.GetService(typeof(IWriteApplicationDbContext))).Returns(mockWriteContext.Object);
-        mockServiceProvider.Setup(p => p.GetService(typeof(IMediator))).Returns(mockMediator.Object);
-
-        var mockScope = new Mock<IServiceScope>();
-        mockScope.Setup(s => s.ServiceProvider).Returns(mockServiceProvider.Object);
-
-        var mockScopeFactory = new Mock<IServiceScopeFactory>();
-        mockScopeFactory.Setup(f => f.CreateScope()).Returns(mockScope.Object);
-
-        var options = new DailyPnlMonitorOptions
-        {
-            PollIntervalSeconds = 30,
-            EmergencyFlattenEnabled = true
-        };
-
-        var worker = new DailyPnlMonitorWorker(
-            mockScopeFactory.Object,
-            options,
-            Mock.Of<ILogger<DailyPnlMonitorWorker>>());
-
-        return (worker, mockMediator);
-    }
-
     [Fact]
-    public async Task ExecuteAsync_NoBreach_NoFlattenDispatched()
+    public async Task RunCycleAsync_NoBreach_NoFlattenDispatched()
     {
-        // Account with 10000 equity, max daily loss 500, and start-of-day equity 10100
-        // Daily loss = 10100 - 10000 = 100, which is below 500 threshold
-        var account = EntityFactory.CreateAccount(equity: 10000m);
-        account.MaxAbsoluteDailyLoss = 500m;
-
-        var attribution = new AccountPerformanceAttribution
+        using var harness = CreateHarness(db =>
         {
-            Id = 1,
-            TradingAccountId = account.Id,
-            AttributionDate = DateTime.UtcNow.Date,
-            StartOfDayEquity = 10100m,
-            IsDeleted = false
-        };
+            var account = EntityFactory.CreateAccount(equity: 10000m);
+            account.MaxAbsoluteDailyLoss = 500m;
+            db.Add(account);
+            db.Add(new AccountPerformanceAttribution
+            {
+                Id = 1,
+                TradingAccountId = account.Id,
+                AttributionDate = DateTime.UtcNow.Date,
+                StartOfDayEquity = 10100m,
+                EndOfDayEquity = 10100m,
+                IsDeleted = false
+            });
+        });
 
-        var (worker, mockMediator) = CreateWorkerWithScope(
-            new List<TradingAccount> { account },
-            new List<AccountPerformanceAttribution> { attribution },
-            new List<DrawdownSnapshot>());
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
 
-        // Use ExecuteAsync via reflection since it's protected
-        // Instead, we start the worker with a cancellation that fires quickly
-        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
-        await worker.StartAsync(cts.Token);
-        await Task.Delay(300); // Give worker one cycle
-        await worker.StopAsync(CancellationToken.None);
-
-        mockMediator.Verify(
+        harness.Mediator.Verify(
             m => m.Send(It.IsAny<EmergencyFlattenCommand>(), It.IsAny<CancellationToken>()),
             Times.Never);
     }
 
     [Fact]
-    public async Task ExecuteAsync_BreachDetected_DispatchesEmergencyFlatten()
+    public async Task RunCycleAsync_BreachDetected_DispatchesEmergencyFlatten_AndPersistsMarker()
     {
-        // Account with 8000 equity, max daily loss 500, start-of-day equity 10000
-        // Daily loss = 10000 - 8000 = 2000, which exceeds 500 threshold
-        var account = EntityFactory.CreateAccount(equity: 8000m);
-        account.MaxAbsoluteDailyLoss = 500m;
+        var today = DateTime.UtcNow.Date;
 
-        var attribution = new AccountPerformanceAttribution
+        using var harness = CreateHarness(db =>
         {
-            Id = 1,
-            TradingAccountId = account.Id,
-            AttributionDate = DateTime.UtcNow.Date,
-            StartOfDayEquity = 10000m,
-            IsDeleted = false
-        };
+            var account = EntityFactory.CreateAccount(equity: 8000m);
+            account.MaxAbsoluteDailyLoss = 500m;
+            db.Add(account);
+            db.Add(new AccountPerformanceAttribution
+            {
+                Id = 1,
+                TradingAccountId = account.Id,
+                AttributionDate = today,
+                StartOfDayEquity = 10000m,
+                EndOfDayEquity = 10000m,
+                IsDeleted = false
+            });
+        });
 
-        var (worker, mockMediator) = CreateWorkerWithScope(
-            new List<TradingAccount> { account },
-            new List<AccountPerformanceAttribution> { attribution },
-            new List<DrawdownSnapshot>());
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
 
-        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
-        await worker.StartAsync(cts.Token);
-        await Task.Delay(300); // Give worker one cycle
-        await worker.StopAsync(CancellationToken.None);
+        harness.Mediator.Verify(
+            m => m.Send(
+                It.Is<EmergencyFlattenCommand>(c => c.TriggeredByAccountId > 0
+                    && c.Reason.Contains("Daily P&L loss limit breached", StringComparison.Ordinal)),
+                It.IsAny<CancellationToken>()),
+            Times.Once);
 
-        mockMediator.Verify(
+        var markers = await harness.LoadEngineConfigsAsync(includeDeleted: true);
+        var marker = Assert.Single(markers);
+        Assert.False(marker.IsDeleted);
+        Assert.Equal(today.ToString("yyyy-MM-dd"), marker.Value);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_SkipsWhenFlattenAlreadyRecordedToday()
+    {
+        var today = DateTime.UtcNow.Date;
+        var todayStr = today.ToString("yyyy-MM-dd");
+
+        using var harness = CreateHarness(db =>
+        {
+            var account = EntityFactory.CreateAccount(equity: 8000m);
+            account.MaxAbsoluteDailyLoss = 500m;
+            db.Add(account);
+            db.Add(new AccountPerformanceAttribution
+            {
+                Id = 1,
+                TradingAccountId = account.Id,
+                AttributionDate = today,
+                StartOfDayEquity = 10000m,
+                EndOfDayEquity = 10000m,
+                IsDeleted = false
+            });
+            db.Add(new EngineConfig
+            {
+                Id = 9,
+                Key = $"DailyPnlFlatten:{account.Id}",
+                Value = todayStr,
+                IsDeleted = false
+            });
+        });
+
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        harness.Mediator.Verify(
             m => m.Send(It.IsAny<EmergencyFlattenCommand>(), It.IsAny<CancellationToken>()),
-            Times.AtLeastOnce);
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_RevivesSoftDeletedFlattenMarker_InsteadOfCreatingDuplicate()
+    {
+        var today = DateTime.UtcNow.Date;
+
+        using var harness = CreateHarness(db =>
+        {
+            var account = EntityFactory.CreateAccount(equity: 8000m);
+            account.MaxAbsoluteDailyLoss = 500m;
+            db.Add(account);
+            db.Add(new AccountPerformanceAttribution
+            {
+                Id = 1,
+                TradingAccountId = account.Id,
+                AttributionDate = today,
+                StartOfDayEquity = 10000m,
+                EndOfDayEquity = 10000m,
+                IsDeleted = false
+            });
+            db.Add(new EngineConfig
+            {
+                Id = 42,
+                Key = $"DailyPnlFlatten:{account.Id}",
+                Value = today.AddDays(-1).ToString("yyyy-MM-dd"),
+                IsDeleted = true
+            });
+        });
+
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        var markers = await harness.LoadEngineConfigsAsync(includeDeleted: true);
+        var marker = Assert.Single(markers);
+        Assert.Equal(42, marker.Id);
+        Assert.False(marker.IsDeleted);
+        Assert.Equal(today.ToString("yyyy-MM-dd"), marker.Value);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_UsesPreviousAttributionClose_WhenTodayAttributionMissing()
+    {
+        var today = DateTime.UtcNow.Date;
+
+        using var harness = CreateHarness(db =>
+        {
+            var account = EntityFactory.CreateAccount(equity: 8000m);
+            account.MaxAbsoluteDailyLoss = 500m;
+            db.Add(account);
+            db.Add(new AccountPerformanceAttribution
+            {
+                Id = 1,
+                TradingAccountId = account.Id,
+                AttributionDate = today.AddDays(-1).AddHours(23),
+                StartOfDayEquity = 9500m,
+                EndOfDayEquity = 10000m,
+                IsDeleted = false
+            });
+        });
+
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        harness.Mediator.Verify(
+            m => m.Send(It.IsAny<EmergencyFlattenCommand>(), It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_UsesSnapshotCurrentEquity_AsLastResortFallback()
+    {
+        var today = DateTime.UtcNow.Date;
+
+        using var harness = CreateHarness(db =>
+        {
+            var account = EntityFactory.CreateAccount(equity: 9500m);
+            account.MaxAbsoluteDailyLoss = 800m;
+            db.Add(account);
+            db.Add(new DrawdownSnapshot
+            {
+                Id = 1,
+                CurrentEquity = 10000m,
+                PeakEquity = 12000m,
+                DrawdownPct = 10m,
+                RecordedAt = today.AddMinutes(5),
+                IsDeleted = false
+            });
+        });
+
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        harness.Mediator.Verify(
+            m => m.Send(It.IsAny<EmergencyFlattenCommand>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_SkipsWhenMultipleActiveAccountsExist()
+    {
+        var today = DateTime.UtcNow.Date;
+
+        using var harness = CreateHarness(db =>
+        {
+            var primary = EntityFactory.CreateAccount(equity: 8000m);
+            primary.MaxAbsoluteDailyLoss = 500m;
+            db.Add(primary);
+            db.Add(new AccountPerformanceAttribution
+            {
+                Id = 1,
+                TradingAccountId = primary.Id,
+                AttributionDate = today,
+                StartOfDayEquity = 10000m,
+                EndOfDayEquity = 10000m,
+                IsDeleted = false
+            });
+
+            var secondary = EntityFactory.CreateAccount(equity: 12000m);
+            secondary.MaxAbsoluteDailyLoss = 0m;
+            db.Add(secondary);
+        });
+
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        harness.Mediator.Verify(
+            m => m.Send(It.IsAny<EmergencyFlattenCommand>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task RunCycleAsync_DoesNotDispatchOrPersistMarker_WhenFlattenDisabled()
+    {
+        var today = DateTime.UtcNow.Date;
+
+        using var harness = CreateHarness(db =>
+        {
+            var account = EntityFactory.CreateAccount(equity: 8000m);
+            account.MaxAbsoluteDailyLoss = 500m;
+            db.Add(account);
+            db.Add(new AccountPerformanceAttribution
+            {
+                Id = 1,
+                TradingAccountId = account.Id,
+                AttributionDate = today,
+                StartOfDayEquity = 10000m,
+                EndOfDayEquity = 10000m,
+                IsDeleted = false
+            });
+        }, flattenEnabled: false);
+
+        await harness.Worker.RunCycleAsync(CancellationToken.None);
+
+        harness.Mediator.Verify(
+            m => m.Send(It.IsAny<EmergencyFlattenCommand>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+        Assert.Empty(await harness.LoadEngineConfigsAsync(includeDeleted: true));
+    }
+
+    private static WorkerHarness CreateHarness(
+        Action<TestDailyPnlDbContext> seed,
+        bool flattenEnabled = true)
+    {
+        var services = new ServiceCollection();
+        var databaseName = $"daily-pnl-monitor-{Guid.NewGuid()}";
+
+        services.AddDbContext<TestDailyPnlDbContext>(options => options.UseInMemoryDatabase(databaseName));
+        services.AddScoped<IReadApplicationDbContext>(sp => sp.GetRequiredService<TestDailyPnlDbContext>());
+        services.AddScoped<IWriteApplicationDbContext>(sp => sp.GetRequiredService<TestDailyPnlDbContext>());
+
+        var mediator = new Mock<IMediator>();
+        mediator
+            .Setup(m => m.Send(It.IsAny<EmergencyFlattenCommand>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(ResponseData<bool>.Init(true, true, "Flattened", "00"));
+        services.AddScoped(_ => mediator.Object);
+
+        var provider = services.BuildServiceProvider();
+        using (var scope = provider.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<TestDailyPnlDbContext>();
+            seed(db);
+            db.SaveChanges();
+        }
+
+        var worker = new DailyPnlMonitorWorker(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            new DailyPnlMonitorOptions
+            {
+                PollIntervalSeconds = 30,
+                EmergencyFlattenEnabled = flattenEnabled
+            },
+            NullLogger<DailyPnlMonitorWorker>.Instance);
+
+        return new WorkerHarness(provider, worker, mediator);
+    }
+
+    private sealed class WorkerHarness(
+        ServiceProvider provider,
+        DailyPnlMonitorWorker worker,
+        Mock<IMediator> mediator) : IDisposable
+    {
+        public DailyPnlMonitorWorker Worker { get; } = worker;
+        public Mock<IMediator> Mediator { get; } = mediator;
+
+        public async Task<List<EngineConfig>> LoadEngineConfigsAsync(bool includeDeleted)
+        {
+            using var scope = provider.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<TestDailyPnlDbContext>();
+            var query = includeDeleted
+                ? db.Set<EngineConfig>().IgnoreQueryFilters()
+                : db.Set<EngineConfig>().AsQueryable();
+
+            return await query
+                .OrderBy(c => c.Id)
+                .ToListAsync();
+        }
+
+        public void Dispose() => provider.Dispose();
+    }
+
+    private sealed class TestDailyPnlDbContext(DbContextOptions<TestDailyPnlDbContext> options)
+        : DbContext(options), IReadApplicationDbContext, IWriteApplicationDbContext
+    {
+        public DbContext GetDbContext() => this;
+
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<TradingAccount>(builder =>
+            {
+                builder.HasKey(x => x.Id);
+                builder.HasQueryFilter(x => !x.IsDeleted);
+                builder.Ignore(x => x.Orders);
+                builder.Ignore(x => x.EAInstances);
+            });
+
+            modelBuilder.Entity<AccountPerformanceAttribution>(builder =>
+            {
+                builder.HasKey(x => x.Id);
+                builder.HasQueryFilter(x => !x.IsDeleted);
+                builder.Ignore(x => x.TradingAccount);
+            });
+
+            modelBuilder.Entity<DrawdownSnapshot>(builder =>
+            {
+                builder.HasKey(x => x.Id);
+                builder.HasQueryFilter(x => !x.IsDeleted);
+            });
+
+            modelBuilder.Entity<EngineConfig>(builder =>
+            {
+                builder.HasKey(x => x.Id);
+                builder.HasQueryFilter(x => !x.IsDeleted);
+                builder.HasIndex(x => x.Key).IsUnique();
+            });
+        }
     }
 }
